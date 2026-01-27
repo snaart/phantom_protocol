@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  server:
+    build: .
+    ports:
+      - "3001:3001"
+    environment:
+      - RUST_LOG=info
+      - DATABASE_URL=postgres://phantom:phantom_pass@db:5432/phantom
+      - PHANTOM_AUTH_TOKEN=secret_production_token_xyz
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - db
+      - redis
+    restart: always
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=phantom
+      - POSTGRES_PASSWORD=phantom_pass
+      - POSTGRES_DB=phantom
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
