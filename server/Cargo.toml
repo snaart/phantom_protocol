@@ -7,14 +7,18 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 log = "0.4"
-env_logger = "0.10"
+env_logger = "0.11"
 deadpool-postgres = "0.10"
 tokio-postgres = "0.7"
 phantom_core = { path = "../core" }
 
 # TLS
-tokio-rustls = "0.24"
-rustls = "0.21"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 dotenv = "0.15.0"
 blake3 = "1.8.3"
 ed25519-dalek = "2.2.0"
+bytes = "1.11.0"
+rkyv = { version = "0.7", features = ["validation", "strict"] }
+
+
