@@ -1,0 +1,20 @@
+[package]
+name = "phantom_server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.10"
+deadpool-postgres = "0.10"
+tokio-postgres = "0.7"
+phantom_core = { path = "../core" }
+
+# TLS
+tokio-rustls = "0.24"
+rustls = "0.21"
+dotenv = "0.15.0"
+blake3 = "1.8.3"
+ed25519-dalek = "2.2.0"
