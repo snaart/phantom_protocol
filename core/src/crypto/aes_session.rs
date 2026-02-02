@@ -7,7 +7,7 @@
 //! `ring` uses hand-optimized assembly for both ARM64 and x86_64,
 //! ensuring maximum throughput compared to pure-Rust crates.
 
-use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Overhead bytes added by AES-256-GCM (16-byte auth tag)
@@ -31,73 +31,77 @@ pub struct AesSession {
 impl AesSession {
     /// Create from a 32-byte shared secret (derived from PQC handshake).
     /// This is the "initiator" side.
-    pub fn from_shared_secret(shared_secret: &[u8; 32]) -> Self {
+    /// Create from a 32-byte shared secret (derived from PQC handshake).
+    /// This is the "initiator" side.
+    pub fn from_shared_secret(shared_secret: &[u8; 32]) -> Result<Self, crate::CoreError> {
         Self::build(shared_secret, false)
     }
 
     /// Create the "peer" (responder) side — send/recv keys are swapped so that
     /// initiator's encrypt can be decrypted by peer's decrypt, and vice versa.
-    pub fn from_shared_secret_peer(shared_secret: &[u8; 32]) -> Self {
+    /// Create the "peer" (responder) side — send/recv keys are swapped so that
+    /// initiator's encrypt can be decrypted by peer's decrypt, and vice versa.
+    pub fn from_shared_secret_peer(shared_secret: &[u8; 32]) -> Result<Self, crate::CoreError> {
         Self::build(shared_secret, true)
     }
 
-    fn build(shared_secret: &[u8; 32], swap: bool) -> Self {
+    fn build(shared_secret: &[u8; 32], swap: bool) -> Result<Self, crate::CoreError> {
         let key_a = blake3::derive_key("phantom-aes-send-v1", shared_secret);
         let key_b = blake3::derive_key("phantom-aes-recv-v1", shared_secret);
 
         let (send_bytes, recv_bytes) = if swap { (key_b, key_a) } else { (key_a, key_b) };
 
-        let send_unbound = UnboundKey::new(&AES_256_GCM, &send_bytes).unwrap();
-        let recv_unbound = UnboundKey::new(&AES_256_GCM, &recv_bytes).unwrap();
+        let send_unbound = UnboundKey::new(&AES_256_GCM, &send_bytes).map_err(|_| crate::CoreError::CryptoError("Invalid key".into()))?;
+        let recv_unbound = UnboundKey::new(&AES_256_GCM, &recv_bytes).map_err(|_| crate::CoreError::CryptoError("Invalid key".into()))?;
 
         let prefix_bytes = blake3::derive_key("phantom-nonce-pfx-v1", shared_secret);
         let mut nonce_prefix = [0u8; 4];
         nonce_prefix.copy_from_slice(&prefix_bytes[..4]);
 
-        Self {
+        Ok(Self {
             send_key: LessSafeKey::new(send_unbound),
             recv_key: LessSafeKey::new(recv_unbound),
             send_counter: AtomicU64::new(0),
             recv_counter: AtomicU64::new(0),
             nonce_prefix,
-        }
+        })
     }
 
     /// Encrypt in place: appends 16-byte tag. Returns total ciphertext length.
     #[inline]
-    pub fn encrypt_in_place(&self, buf: &mut Vec<u8>) -> Result<(), EncryptError> {
+    pub fn encrypt_in_place(&self, aad: &[u8], buf: &mut Vec<u8>) -> Result<(), EncryptError> {
         let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = self.make_nonce(counter);
         self.send_key
-            .seal_in_place_append_tag(nonce, Aad::empty(), buf)
+            .seal_in_place_append_tag(nonce, Aad::from(aad), buf)
             .map_err(|_| EncryptError::EncryptionFailed)?;
         Ok(())
     }
 
     /// Encrypt: allocates a new Vec with ciphertext.
     #[inline]
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
+    pub fn encrypt(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
         let mut buf = Vec::with_capacity(plaintext.len() + AES_GCM_OVERHEAD);
         buf.extend_from_slice(plaintext);
-        self.encrypt_in_place(&mut buf)?;
+        self.encrypt_in_place(aad, &mut buf)?;
         Ok(buf)
     }
 
     /// Decrypt in place: verifies tag and truncates. Returns plaintext slice.
     #[inline]
-    pub fn decrypt_in_place<'a>(&self, buf: &'a mut [u8]) -> Result<&'a mut [u8], EncryptError> {
+    pub fn decrypt_in_place<'a>(&self, aad: &[u8], buf: &'a mut [u8]) -> Result<&'a mut [u8], EncryptError> {
         let counter = self.recv_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = self.make_nonce(counter);
         self.recv_key
-            .open_in_place(nonce, Aad::empty(), buf)
+            .open_in_place(nonce, Aad::from(aad), buf)
             .map_err(|_| EncryptError::DecryptionFailed)
     }
 
     /// Decrypt: allocates a new Vec with plaintext.
     #[inline]
-    pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, EncryptError> {
+    pub fn decrypt(&self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, EncryptError> {
         let mut buf = ciphertext.to_vec();
-        let plaintext = self.decrypt_in_place(&mut buf)?;
+        let plaintext = self.decrypt_in_place(aad, &mut buf)?;
         let len = plaintext.len();
         buf.truncate(len);
         Ok(buf)
@@ -138,14 +142,15 @@ mod tests {
     fn round_trip() {
         let secret = [0xABu8; 32];
         // Two "peers" derived from the same secret, but with swapped keys
-        let session_a = AesSession::from_shared_secret(&secret);
-        let session_b = AesSession::from_shared_secret(&secret);
+        // Two "peers" derived from the same secret, but with swapped keys
+        let session_a = AesSession::from_shared_secret(&secret).unwrap();
+        let session_b = AesSession::from_shared_secret_peer(&secret).unwrap();
 
         let msg = b"Hello, PQC world!";
-        let ct = session_a.encrypt(msg).unwrap();
+        let ct = session_a.encrypt(&[], msg).expect("Encryption failed");
 
         // session_b decrypt uses recv_key which matches session_a's send_key
-        let pt = session_b.decrypt(&ct).unwrap();
+        let pt = session_b.decrypt(&[], &ct).expect("Decryption failed");
         assert_eq!(&pt, msg);
     }
 
@@ -153,13 +158,13 @@ mod tests {
     fn throughput_smoke() {
         use std::time::Instant;
 
-        let session = AesSession::from_shared_secret(&[0xAB; 32]);
+        let session = AesSession::from_shared_secret(&[0xAB; 32]).unwrap();
         let data = vec![0u8; 64 * 1024];
         let iters = 50_000;
 
         let start = Instant::now();
         for _ in 0..iters {
-            let enc = session.encrypt(&data).unwrap();
+            let enc = session.encrypt(&[], &data).expect("Encryption failed");
             std::hint::black_box(enc);
         }
         let elapsed = start.elapsed();

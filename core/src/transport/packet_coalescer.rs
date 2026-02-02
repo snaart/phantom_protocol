@@ -265,18 +265,18 @@ mod tests {
         let packet = vec![0xABu8; 1024]; // 1KB packets
         let total_packets = 100_000;
         let mut datagrams = 0usize;
-        let mut total_bytes = 0usize;
+        let mut _total_bytes = 0usize;
 
         let start = Instant::now();
         for _ in 0..total_packets {
             if let Some(d) = c.push(&packet) {
                 datagrams += 1;
-                total_bytes += d.len();
+                _total_bytes += d.len();
             }
         }
         if let Some(d) = c.flush() {
             datagrams += 1;
-            total_bytes += d.len();
+            _total_bytes += d.len();
         }
         let elapsed = start.elapsed();
 

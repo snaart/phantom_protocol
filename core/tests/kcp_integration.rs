@@ -18,7 +18,7 @@ async fn test_kcp_echo() {
     let config = KcpConfig::new().fast_mode();
     
     let mut listener = KcpListener::bind(server_addr, config.clone()).await.unwrap();
-    let actual_addr = listener.local_addr();
+    let actual_addr = *listener.local_addr();
     
     // Spawn server task
     let server_handle = tokio::spawn(async move {
@@ -60,7 +60,7 @@ async fn test_kcp_length_prefixed() {
     let config = KcpConfig::new().turbo_mode();
     
     let mut listener = KcpListener::bind(server_addr, config.clone()).await.unwrap();
-    let actual_addr = listener.local_addr();
+    let actual_addr = *listener.local_addr();
     
     // Server with length-prefixed framing
     let server_handle = tokio::spawn(async move {
@@ -113,7 +113,7 @@ async fn test_kcp_concurrent_streams() {
     let config = KcpConfig::new().fast_mode();
     
     let mut listener = KcpListener::bind(server_addr, config.clone()).await.unwrap();
-    let actual_addr = listener.local_addr();
+    let actual_addr = *listener.local_addr();
     
     // Server handles multiple connections
     let server_handle = tokio::spawn(async move {

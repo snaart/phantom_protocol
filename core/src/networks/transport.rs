@@ -1,8 +1,5 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use async_trait::async_trait;
 
 /// Универсальный транспорт.
 /// Это может быть TCP, QUIC Stream, WebSocket, Serial Port или Bluetooth.

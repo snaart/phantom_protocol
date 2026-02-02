@@ -4,21 +4,25 @@ use pqcrypto_traits::kem::{Ciphertext as KyberCiphertext, PublicKey as KyberPubl
 use hkdf::Hkdf;
 use sha2::Sha256;
 use rand::rngs::OsRng;
-use rkyv::{Archive, Deserialize, Serialize};
+use borsh::{BorshSerialize, BorshDeserialize};
 use std::fmt;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+use crate::crypto::keys::KyberSecretKey;
+
 
 // Secret keys should not be blindly cloned or debug-printed.
 // But we need to store them in OpenMLS KeyStore (encrypted at rest usually).
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct HybridSecretKey {
     pub x25519_sk: StaticSecret,
-    pub kyber_sk: kyber768::SecretKey,
+    pub kyber_sk: KyberSecretKey,
 }
 
 impl HybridSecretKey {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.x25519_sk.to_bytes());
-        out.extend_from_slice(self.kyber_sk.as_bytes());
+        out.extend_from_slice(self.kyber_sk.0.as_bytes());
         out
     }
 
@@ -34,7 +38,7 @@ impl HybridSecretKey {
         let kyber_sk = kyber768::SecretKey::from_bytes(kyber_bytes)
             .map_err(|_| anyhow::anyhow!("Invalid Kyber SK bytes"))?;
             
-        Ok(Self { x25519_sk, kyber_sk })
+        Ok(Self { x25519_sk, kyber_sk: KyberSecretKey(kyber_sk) })
     }
 }
 
@@ -49,15 +53,13 @@ impl fmt::Debug for HybridSecretKey {
 }
 
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-#[archive(check_bytes)]
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct HybridKeyPackage {
     pub x25519_pk: [u8; 32],
     pub kyber_pk: Vec<u8>,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-#[archive(check_bytes)]
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct HybridCiphertext {
     pub x25519_pk: [u8; 32], // Ephemeral public key from sender
     pub kyber_ct: Vec<u8>,
@@ -76,7 +78,7 @@ impl HybridSecretKey {
 
         let secret_key = HybridSecretKey {
             x25519_sk,
-            kyber_sk,
+            kyber_sk: KyberSecretKey(kyber_sk),
         };
 
         let key_package = HybridKeyPackage {
@@ -95,7 +97,7 @@ impl HybridSecretKey {
         // 2. Kyber
         let kyber_ct = kyber768::Ciphertext::from_bytes(&ciphertext.kyber_ct)
             .map_err(|_| anyhow::anyhow!("Invalid Kyber ciphertext"))?;
-        let kyber_shared = kyber768::decapsulate(&kyber_ct, &self.kyber_sk);
+        let kyber_shared = kyber768::decapsulate(&kyber_ct, &self.kyber_sk.0);
 
         // 3. Combine (KDF)
         Self::combine_secrets(x25519_shared.as_bytes(), kyber_shared.as_bytes())

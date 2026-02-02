@@ -9,6 +9,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use rand::Rng;
 
 /// Network condition simulator for testing
 #[derive(Clone)]
@@ -127,7 +128,7 @@ impl NetworkSimulator {
         if loss >= 100 {
             return true;
         }
-        rand::random::<u32>() % 100 < loss
+        rand::rngs::OsRng.gen::<u32>() % 100 < loss
     }
     
     // === Bandwidth Limit ===

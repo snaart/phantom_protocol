@@ -7,8 +7,11 @@
 //! На устройствах без HW AES ChaCha20 в 3-4x быстрее.
 //! На устройствах с HW AES AES-GCM в ~1.3x быстрее ChaCha20.
 
+use crate::errors::CoreError;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 
 /// Overhead bytes: both AES-GCM and ChaCha20-Poly1305 produce a 16-byte tag
 pub const AEAD_OVERHEAD: usize = 16;
@@ -108,7 +111,15 @@ pub fn negotiate_cipher(
 /// Unified crypto session — works with any supported cipher suite.
 ///
 /// Drop-in replacement for `AesSession` with auto cipher selection.
+/// Unified crypto session — works with any supported cipher suite.
+///
+/// Drop-in replacement for `AesSession` with auto cipher selection.
+#[derive(Clone)]
 pub struct CryptoSession {
+    inner: Arc<CryptoSessionInner>,
+}
+
+struct CryptoSessionInner {
     suite: CipherSuite,
     send_key: LessSafeKey,
     recv_key: LessSafeKey,
@@ -120,29 +131,29 @@ pub struct CryptoSession {
 impl CryptoSession {
     /// Auto-detect best cipher and create session from shared secret.
     /// Initiator side.
-    pub fn from_shared_secret(shared_secret: &[u8; 32]) -> Self {
+    pub fn from_shared_secret(shared_secret: &[u8; 32]) -> Result<Self, CoreError> {
         let suite = HwCaps::detect().recommended_cipher();
         Self::build(shared_secret, suite, false)
     }
 
     /// Auto-detect, peer (responder) side — keys swapped.
-    pub fn from_shared_secret_peer(shared_secret: &[u8; 32]) -> Self {
+    pub fn from_shared_secret_peer(shared_secret: &[u8; 32]) -> Result<Self, CoreError> {
         let suite = HwCaps::detect().recommended_cipher();
         Self::build(shared_secret, suite, true)
     }
 
     /// Create with explicit cipher suite (for negotiation scenarios).
     /// Initiator side.
-    pub fn with_suite(shared_secret: &[u8; 32], suite: CipherSuite) -> Self {
+    pub fn with_suite(shared_secret: &[u8; 32], suite: CipherSuite) -> Result<Self, CoreError> {
         Self::build(shared_secret, suite, false)
     }
 
     /// Create with explicit cipher suite. Peer side.
-    pub fn with_suite_peer(shared_secret: &[u8; 32], suite: CipherSuite) -> Self {
+    pub fn with_suite_peer(shared_secret: &[u8; 32], suite: CipherSuite) -> Result<Self, CoreError> {
         Self::build(shared_secret, suite, true)
     }
 
-    fn build(shared_secret: &[u8; 32], suite: CipherSuite, swap: bool) -> Self {
+    fn build(shared_secret: &[u8; 32], suite: CipherSuite, swap: bool) -> Result<Self, CoreError> {
         let ctx = match suite {
             CipherSuite::Aes256Gcm => "phantom-aes-",
             CipherSuite::ChaCha20Poly1305 => "phantom-cc20-",
@@ -156,36 +167,41 @@ impl CryptoSession {
         let (send_bytes, recv_bytes) = if swap { (key_b, key_a) } else { (key_a, key_b) };
 
         let algo = suite.algorithm();
-        let send_unbound = UnboundKey::new(algo, &send_bytes).unwrap();
-        let recv_unbound = UnboundKey::new(algo, &recv_bytes).unwrap();
+        let send_unbound = UnboundKey::new(algo, &send_bytes)
+            .map_err(|_| CoreError::CryptoError("Failed to create send key".into()))?;
+        let recv_unbound = UnboundKey::new(algo, &recv_bytes)
+            .map_err(|_| CoreError::CryptoError("Failed to create recv key".into()))?;
 
         let prefix_bytes = blake3::derive_key("phantom-nonce-pfx-v1", shared_secret);
         let mut nonce_prefix = [0u8; 4];
         nonce_prefix.copy_from_slice(&prefix_bytes[..4]);
 
-        Self {
-            suite,
-            send_key: LessSafeKey::new(send_unbound),
-            recv_key: LessSafeKey::new(recv_unbound),
-            send_counter: AtomicU64::new(0),
-            recv_counter: AtomicU64::new(0),
-            nonce_prefix,
-        }
+        Ok(Self {
+            inner: Arc::new(CryptoSessionInner {
+                suite,
+                send_key: LessSafeKey::new(send_unbound),
+                recv_key: LessSafeKey::new(recv_unbound),
+                send_counter: AtomicU64::new(0),
+                recv_counter: AtomicU64::new(0),
+                nonce_prefix,
+            }),
+        })
     }
 
     /// Which cipher suite is active
     #[inline]
     pub fn cipher_suite(&self) -> CipherSuite {
-        self.suite
+        self.inner.suite
     }
 
     /// Encrypt in place: appends 16-byte tag.
     #[inline]
-    pub fn encrypt_in_place(&self, buf: &mut Vec<u8>) -> Result<(), CryptoError> {
-        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
+    pub fn encrypt_in_place(&self, aad: &[u8], buf: &mut Vec<u8>) -> Result<(), CryptoError> {
+        let counter = self.inner.send_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = self.make_nonce(counter);
-        self.send_key
-            .seal_in_place_append_tag(nonce, Aad::empty(), buf)
+        self.inner
+            .send_key
+            .seal_in_place_append_tag(nonce, Aad::from(aad), buf)
             .map_err(|_| CryptoError::EncryptionFailed)?;
         Ok(())
     }
@@ -196,44 +212,48 @@ impl CryptoSession {
     #[inline]
     pub fn encrypt_in_place_offset(
         &self,
+        aad: &[u8],
         buf: &mut Vec<u8>,
         offset: usize,
     ) -> Result<usize, CryptoError> {
-        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
+        let counter = self.inner.send_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = self.make_nonce(counter);
         // seal_in_place_separate_tag works on &mut [u8] (no Extend needed)
-        let tag = self.send_key
-            .seal_in_place_separate_tag(nonce, Aad::empty(), &mut buf[offset..])
+        let tag = self.inner
+            .send_key
+            .seal_in_place_separate_tag(nonce, Aad::from(aad), &mut buf[offset..])
             .map_err(|_| CryptoError::EncryptionFailed)?;
         // Manually append the 16-byte auth tag
         buf.extend_from_slice(tag.as_ref());
         Ok(buf.len() - offset)
     }
 
+
     /// Encrypt: allocates a new Vec.
     #[inline]
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    pub fn encrypt(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let mut buf = Vec::with_capacity(plaintext.len() + AEAD_OVERHEAD);
         buf.extend_from_slice(plaintext);
-        self.encrypt_in_place(&mut buf)?;
+        self.encrypt_in_place(aad, &mut buf)?;
         Ok(buf)
     }
 
     /// Decrypt in place: verifies tag and returns plaintext slice.
     #[inline]
-    pub fn decrypt_in_place<'a>(&self, buf: &'a mut [u8]) -> Result<&'a mut [u8], CryptoError> {
-        let counter = self.recv_counter.fetch_add(1, Ordering::Relaxed);
+    pub fn decrypt_in_place<'a>(&self, aad: &[u8], buf: &'a mut [u8]) -> Result<&'a mut [u8], CryptoError> {
+        let counter = self.inner.recv_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = self.make_nonce(counter);
-        self.recv_key
-            .open_in_place(nonce, Aad::empty(), buf)
+        self.inner
+            .recv_key
+            .open_in_place(nonce, Aad::from(aad), buf)
             .map_err(|_| CryptoError::DecryptionFailed)
     }
 
     /// Decrypt: allocates a new Vec.
     #[inline]
-    pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    pub fn decrypt(&self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let mut buf = ciphertext.to_vec();
-        let plaintext = self.decrypt_in_place(&mut buf)?;
+        let plaintext = self.decrypt_in_place(aad, &mut buf)?;
         let len = plaintext.len();
         buf.truncate(len);
         Ok(buf)
@@ -242,11 +262,12 @@ impl CryptoSession {
     #[inline(always)]
     fn make_nonce(&self, counter: u64) -> Nonce {
         let mut n = [0u8; 12];
-        n[..4].copy_from_slice(&self.nonce_prefix);
+        n[..4].copy_from_slice(&self.inner.nonce_prefix);
         n[4..12].copy_from_slice(&counter.to_be_bytes());
         Nonce::assume_unique_for_key(n)
     }
 }
+
 
 /// Crypto errors
 #[derive(Debug, Clone, Copy)]
@@ -282,45 +303,45 @@ mod tests {
     #[test]
     fn round_trip_aes() {
         let secret = [0xABu8; 32];
-        let a = CryptoSession::with_suite(&secret, CipherSuite::Aes256Gcm);
-        let b = CryptoSession::with_suite_peer(&secret, CipherSuite::Aes256Gcm);
+        let a = CryptoSession::with_suite(&secret, CipherSuite::Aes256Gcm).unwrap();
+        let b = CryptoSession::with_suite_peer(&secret, CipherSuite::Aes256Gcm).unwrap();
 
         let msg = b"Hello, PQ AES world!";
-        let ct = a.encrypt(msg).unwrap();
-        let pt = b.decrypt(&ct).unwrap();
+        let ct = a.encrypt(&[], msg).unwrap();
+        let pt = b.decrypt(&[], &ct).unwrap();
         assert_eq!(&pt, msg);
     }
 
     #[test]
     fn round_trip_chacha() {
         let secret = [0xCDu8; 32];
-        let a = CryptoSession::with_suite(&secret, CipherSuite::ChaCha20Poly1305);
-        let b = CryptoSession::with_suite_peer(&secret, CipherSuite::ChaCha20Poly1305);
+        let a = CryptoSession::with_suite(&secret, CipherSuite::ChaCha20Poly1305).unwrap();
+        let b = CryptoSession::with_suite_peer(&secret, CipherSuite::ChaCha20Poly1305).unwrap();
 
         let msg = b"Hello, PQ ChaCha world!";
-        let ct = a.encrypt(msg).unwrap();
-        let pt = b.decrypt(&ct).unwrap();
+        let ct = a.encrypt(&[], msg).unwrap();
+        let pt = b.decrypt(&[], &ct).unwrap();
         assert_eq!(&pt, msg);
     }
 
     #[test]
     fn round_trip_auto() {
         let secret = [0xEFu8; 32];
-        let a = CryptoSession::from_shared_secret(&secret);
-        let b = CryptoSession::from_shared_secret_peer(&secret);
+        let a = CryptoSession::from_shared_secret(&secret).unwrap();
+        let b = CryptoSession::from_shared_secret_peer(&secret).unwrap();
 
         assert_eq!(a.cipher_suite(), b.cipher_suite());
         let msg = b"Auto-detected cipher!";
-        let ct = a.encrypt(msg).unwrap();
-        let pt = b.decrypt(&ct).unwrap();
+        let ct = a.encrypt(&[], msg).unwrap();
+        let pt = b.decrypt(&[], &ct).unwrap();
         assert_eq!(&pt, msg);
     }
 
     #[test]
     fn in_place_with_offset() {
         let secret = [0xAB; 32];
-        let session = CryptoSession::with_suite(&secret, CipherSuite::Aes256Gcm);
-        let peer = CryptoSession::with_suite_peer(&secret, CipherSuite::Aes256Gcm);
+        let session = CryptoSession::with_suite(&secret, CipherSuite::Aes256Gcm).unwrap();
+        let peer = CryptoSession::with_suite_peer(&secret, CipherSuite::Aes256Gcm).unwrap();
 
         let data = b"Payload after header";
         let header_len = 4usize;
@@ -328,14 +349,15 @@ mod tests {
         buf.extend_from_slice(&[0u8; 4]); // placeholder for header
         buf.extend_from_slice(data);
 
-        let ct_len = session.encrypt_in_place_offset(&mut buf, header_len).unwrap();
+        let ct_len = session.encrypt_in_place_offset(&[0u8; 4], &mut buf, header_len).unwrap();
 
         // Write header
         buf[..4].copy_from_slice(&(ct_len as u32).to_be_bytes());
 
         // Decrypt on peer side
         let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        let pt = peer.decrypt_in_place(&mut buf[4..4 + len]).unwrap();
+        let (_header, payload) = buf.split_at_mut(4);
+        let pt = peer.decrypt_in_place(&[0u8; 4], &mut payload[..len]).unwrap();
         assert_eq!(pt, data);
     }
 
@@ -375,10 +397,10 @@ mod tests {
         let iters = 50_000;
 
         for suite in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
-            let session = CryptoSession::with_suite(&secret, suite);
+            let session = CryptoSession::with_suite(&secret, suite).unwrap();
             let start = Instant::now();
             for _ in 0..iters {
-                let e = session.encrypt(&data).unwrap();
+                let e = session.encrypt(&[], &data).unwrap();
                 std::hint::black_box(e);
             }
             let elapsed = start.elapsed();

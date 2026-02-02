@@ -30,9 +30,8 @@ async def main():
             cert_pem = f.read()
 
         # Connect returns Arc<PhantomClient>, which UniFFI exposes as the object
-        # Note: shared_secret is now the 5th argument
-        shared_secret = b"my_super_secret_group_password"
-        client = await phantom_core.PhantomClient.connect(addr, group_id, identity, cert_pem, shared_secret)
+        # shared_secret removed. Added client_cert_pem=None, client_key_pem=None for mTLS
+        client = await phantom_core.PhantomClient.connect(addr, group_id, identity, cert_pem, None, None)
         print("Connected!")
         
         # Send JOIN (as bytes)

@@ -51,7 +51,7 @@ fn bench_aead(algo: &'static ring::aead::Algorithm, key_bytes: &[u8; 32]) {
             let nonce = Nonce::assume_unique_for_key(n);
 
             // IN-PLACE encrypt (zero allocation)
-            key.seal_in_place_separate_tag(nonce, Aad::empty(), &mut buf[..size]).unwrap();
+            let _ = key.seal_in_place_separate_tag(nonce, Aad::empty(), &mut buf[..size]).unwrap();
         }
         let elapsed = start.elapsed();
 
