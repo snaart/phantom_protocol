@@ -24,22 +24,19 @@
 //! ```
 
 // Re-export core types
-pub use crate::transport::types::{SessionId, PacketHeader, PacketFlags};
+pub use crate::transport::types::{SessionId, PacketHeader, PacketFlags, LegType, SchedulerMode};
 pub use crate::transport::session::{Session, CryptoState};
-pub use crate::transport::scheduler::{Scheduler, SchedulerMode};
+pub use crate::transport::scheduler::Scheduler;
 pub use crate::transport::stream::Stream;
 
-// Re-export PQC handshake
-pub use crate::transport::pqc_handshake::{
-    PqcHandshakeServer,
-    PqcHandshakeClient, 
+// Re-export Handshake
+pub use crate::transport::handshake::{
+    HandshakeServer,
+    HandshakeClient, 
     ClientHello,
     ServerHello,
     HandshakeError,
 };
-
-// Re-export MLS bridge
-pub use crate::transport::mls_bridge::MlsSessionBuilder;
 
 // Re-export crypto primitives
 pub use crate::crypto::hybrid_kem::{
@@ -56,7 +53,7 @@ pub use crate::crypto::hybrid_sign::{
 
 /// Configuration for Phantom transport
 #[derive(Debug, Clone)]
-pub struct PhantomConfig {
+pub struct TransportConfig {
     /// Enable post-quantum cryptography (default: true)
     pub pqc_enabled: bool,
     /// Scheduler mode for path selection
@@ -67,7 +64,7 @@ pub struct PhantomConfig {
     pub stealth_mode: bool,
 }
 
-impl Default for PhantomConfig {
+impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             pqc_enabled: true,
@@ -78,7 +75,7 @@ impl Default for PhantomConfig {
     }
 }
 
-impl PhantomConfig {
+impl TransportConfig {
     /// Create a config optimized for latency
     pub fn low_latency() -> Self {
         Self {
@@ -107,7 +104,7 @@ impl PhantomConfig {
 
 /// Builder for establishing Phantom connections
 pub struct PhantomBuilder {
-    config: PhantomConfig,
+    config: TransportConfig,
     server_key: Option<HybridVerifyingKey>,
 }
 
@@ -115,13 +112,13 @@ impl PhantomBuilder {
     /// Create a new builder with default config
     pub fn new() -> Self {
         Self {
-            config: PhantomConfig::default(),
+            config: TransportConfig::default(),
             server_key: None,
         }
     }
     
     /// Set configuration
-    pub fn config(mut self, config: PhantomConfig) -> Self {
+    pub fn config(mut self, config: TransportConfig) -> Self {
         self.config = config;
         self
     }
@@ -138,18 +135,18 @@ impl PhantomBuilder {
     }
     
     /// Get the configuration
-    pub fn get_config(&self) -> &PhantomConfig {
+    pub fn get_config(&self) -> &TransportConfig {
         &self.config
     }
     
     /// Initiate a PQC handshake as client
-    pub fn create_client_handshake(&self) -> PqcHandshakeClient {
-        PqcHandshakeClient::new()
+    pub fn create_client_handshake(&self) -> HandshakeClient {
+        HandshakeClient::new()
     }
     
     /// Create a server handshake handler
-    pub fn create_server_handshake() -> PqcHandshakeServer {
-        PqcHandshakeServer::new()
+    pub fn create_server_handshake() -> HandshakeServer {
+        HandshakeServer::new().expect("Failed to initialize server keys")
     }
 }
 
@@ -165,13 +162,13 @@ mod tests {
     
     #[test]
     fn test_config_presets() {
-        let low_lat = PhantomConfig::low_latency();
+        let low_lat = TransportConfig::low_latency();
         assert!(matches!(low_lat.scheduler_mode, SchedulerMode::LowLatency));
         
-        let high_throughput = PhantomConfig::high_throughput();
+        let high_throughput = TransportConfig::high_throughput();
         assert!(matches!(high_throughput.scheduler_mode, SchedulerMode::HighThroughput));
         
-        let stealth = PhantomConfig::stealth();
+        let stealth = TransportConfig::stealth();
         assert!(stealth.stealth_mode);
         assert!(matches!(stealth.scheduler_mode, SchedulerMode::Stealth));
     }
@@ -179,7 +176,7 @@ mod tests {
     #[test]
     fn test_builder_flow() {
         let builder = PhantomBuilder::new()
-            .config(PhantomConfig::stealth());
+            .config(TransportConfig::stealth());
         
         assert!(builder.get_config().stealth_mode);
         

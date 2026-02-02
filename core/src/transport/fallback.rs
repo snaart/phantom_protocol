@@ -3,292 +3,169 @@
 //! Automatic transport mode degradation:
 //! Turbo (KCP) → Reliable (TCP) → Stealth (FakeTLS)
 
-use crate::transport::legs::LegType;
-use crate::transport::scheduler::{Scheduler, SchedulerMode};
-
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use crate::transport::scheduler::Scheduler;
 
-/// Transport mode (fallback levels)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Transport modes supported by the system
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
-    /// KCP over UDP - fastest, primary transport
-    Turbo = 0,
-    /// Pure TCP - reliable fallback
-    Reliable = 1,
-    /// FakeTLS over TCP - obfuscated for DPI bypass
-    Stealth = 2,
+    /// High-performance Mode (KCP over UDP)
+    Turbo,
+    /// Reliable Mode (Standard TCP)
+    Reliable,
+    /// Stealth Mode (FakeTLS for DPI bypass)
+    Stealth,
 }
 
-impl TransportMode {
-    /// Get corresponding scheduler mode
-    pub fn scheduler_mode(&self) -> SchedulerMode {
-        match self {
-            TransportMode::Turbo => SchedulerMode::LowLatency,
-            TransportMode::Reliable => SchedulerMode::Reliable,
-            TransportMode::Stealth => SchedulerMode::Stealth,
-        }
-    }
-
-    /// Get preferred leg type for this mode
-    pub fn preferred_leg(&self) -> LegType {
-        match self {
-            TransportMode::Turbo => LegType::Kcp,
-            TransportMode::Reliable => LegType::Tcp,
-            TransportMode::Stealth => LegType::FakeTls,
-        }
-    }
-
-    /// Next fallback level
-    pub fn fallback(&self) -> Option<TransportMode> {
-        match self {
-            TransportMode::Turbo => Some(TransportMode::Reliable),
-            TransportMode::Reliable => Some(TransportMode::Stealth),
-            TransportMode::Stealth => None, // No further fallback in MVP
-        }
-    }
-
-    /// Previous (upgrade) level
-    pub fn upgrade(&self) -> Option<TransportMode> {
-        match self {
-            TransportMode::Turbo => None,
-            TransportMode::Reliable => Some(TransportMode::Turbo),
-            TransportMode::Stealth => Some(TransportMode::Reliable),
-        }
-    }
-}
-
-/// Trigger conditions for fallback
-#[derive(Debug, Clone, Copy)]
+/// Conditions that trigger a fallback
+#[derive(Debug, Clone)]
 pub struct FallbackTrigger {
-    /// Packet loss threshold to trigger fallback (0-100)
-    pub loss_threshold_percent: u8,
-    /// Connection failures before fallback
-    pub failure_count_threshold: u32,
-    /// Timeout for connection attempts (milliseconds)
-    pub connect_timeout_ms: u64,
-    /// Time to wait before trying to upgrade (seconds)
-    pub upgrade_delay_secs: u64,
+    pub max_rtt: u32,
+    pub max_loss: u8,
+    pub failure_threshold: u32,
 }
 
 impl Default for FallbackTrigger {
     fn default() -> Self {
         Self {
-            loss_threshold_percent: 15,
-            failure_count_threshold: 3,
-            connect_timeout_ms: 5000,
-            upgrade_delay_secs: 60,
+            max_rtt: 500,
+            max_loss: 10,
+            failure_threshold: 3,
         }
     }
 }
 
-/// Metrics for fallback decisions
 #[derive(Debug, Default)]
 pub struct FallbackMetrics {
-    /// Consecutive connection failures
-    pub connection_failures: AtomicU32,
-    /// Packets sent
     pub packets_sent: AtomicU64,
-    /// Packets acknowledged
     pub packets_acked: AtomicU64,
-    /// Last successful send timestamp (unix millis)
+    pub connection_failures: AtomicU32,
     pub last_success_ms: AtomicU64,
-    /// DPI detection suspected
-    pub dpi_detected: std::sync::atomic::AtomicBool,
 }
 
 impl FallbackMetrics {
-    /// Calculate current loss percentage
-    pub fn loss_percent(&self) -> u8 {
-        let sent = self.packets_sent.load(Ordering::Relaxed);
-        let acked = self.packets_acked.load(Ordering::Relaxed);
-        
-        if sent == 0 {
-            return 0;
-        }
-        
-        let lost = sent.saturating_sub(acked);
-        ((lost * 100) / sent).min(100) as u8
-    }
-
-    /// Reset metrics (after mode change)
-    pub fn reset(&self) {
-        self.connection_failures.store(0, Ordering::Relaxed);
-        self.packets_sent.store(0, Ordering::Relaxed);
-        self.packets_acked.store(0, Ordering::Relaxed);
-    }
-
-    /// Record a successful packet
-    pub fn record_success(&self) {
-        self.packets_acked.fetch_add(1, Ordering::Relaxed);
-        self.connection_failures.store(0, Ordering::Relaxed);
-        self.last_success_ms.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            Ordering::Relaxed,
-        );
-    }
-
-    /// Record a sent packet
     pub fn record_sent(&self) {
         self.packets_sent.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a connection failure
-    pub fn record_failure(&self) {
-        self.connection_failures.fetch_add(1, Ordering::Relaxed);
+    pub fn record_success(&self) {
+        self.packets_acked.fetch_add(1, Ordering::Relaxed);
+        self.connection_failures.store(0, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default();
+        self.last_success_ms.store(now, Ordering::Relaxed);
     }
 
-    /// Record DPI detection
-    pub fn record_dpi_detection(&self) {
-        self.dpi_detected.store(true, std::sync::atomic::Ordering::Relaxed);
+    pub fn record_failure(&self) {
+        self.connection_failures.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 /// Fallback state machine
 pub struct FallbackStateMachine {
     /// Current transport mode
-    current_mode: std::sync::RwLock<TransportMode>,
+    current_mode: RwLock<TransportMode>,
     /// Trigger conditions
     trigger: FallbackTrigger,
     /// Metrics for decisions
     metrics: FallbackMetrics,
     /// Last mode change time
-    last_change: std::sync::RwLock<Instant>,
+    last_change: RwLock<Instant>,
+    /// Last probe attempt time
+    last_probe: RwLock<Instant>,
+    /// Best available mode to aim for
+    best_mode: TransportMode,
     /// Reference to scheduler (to update mode)
+    #[allow(dead_code)]
     scheduler: Option<Arc<Scheduler>>,
 }
 
 impl FallbackStateMachine {
-    /// Create a new fallback state machine
-    pub fn new(trigger: FallbackTrigger) -> Self {
-        Self {
-            current_mode: std::sync::RwLock::new(TransportMode::Turbo),
-            trigger,
-            metrics: FallbackMetrics::default(),
-            last_change: std::sync::RwLock::new(Instant::now()),
-            scheduler: None,
-        }
-    }
-
-    /// Create with default triggers
     pub fn with_defaults() -> Self {
         Self::new(FallbackTrigger::default())
     }
 
-    /// Attach a scheduler to update its mode
-    pub fn attach_scheduler(&mut self, scheduler: Arc<Scheduler>) {
-        self.scheduler = Some(scheduler);
+    pub fn new(trigger: FallbackTrigger) -> Self {
+        Self {
+            current_mode: RwLock::new(TransportMode::Turbo),
+            best_mode: TransportMode::Turbo,
+            trigger,
+            metrics: FallbackMetrics::default(),
+            last_change: RwLock::new(Instant::now()),
+            last_probe: RwLock::new(Instant::now()),
+            scheduler: None,
+        }
     }
 
-    /// Get current mode
-    pub fn current_mode(&self) -> TransportMode {
-        *self.current_mode.read().unwrap()
-    }
-
-    /// Get metrics
     pub fn metrics(&self) -> &FallbackMetrics {
         &self.metrics
     }
 
-    /// Check and potentially trigger fallback
-    /// 
-    /// Returns true if mode changed.
+    pub fn current_mode(&self) -> TransportMode {
+        *self.current_mode.read()
+    }
+
     pub fn check_and_fallback(&self) -> bool {
-        let loss = self.metrics.loss_percent();
         let failures = self.metrics.connection_failures.load(Ordering::Relaxed);
-        let dpi = self.metrics.dpi_detected.load(std::sync::atomic::Ordering::Relaxed);
-
-        let should_fallback = 
-            loss > self.trigger.loss_threshold_percent ||
-            failures >= self.trigger.failure_count_threshold ||
-            dpi;
-
-        if should_fallback {
-            return self.fallback();
-        }
-
-        false
-    }
-
-    /// Force fallback to next level
-    pub fn fallback(&self) -> bool {
-        let current = *self.current_mode.read().unwrap();
-        
-        if let Some(next) = current.fallback() {
-            *self.current_mode.write().unwrap() = next;
-            *self.last_change.write().unwrap() = Instant::now();
-            self.metrics.reset();
-            
-            // Update scheduler if attached
-            if let Some(ref scheduler) = self.scheduler {
-                scheduler.set_mode(next.scheduler_mode());
-            }
-            
-            log::info!("Fallback: {:?} → {:?}", current, next);
+        if failures >= self.trigger.failure_threshold {
+            self.degrade();
             return true;
         }
-        
         false
     }
 
-    /// Try to upgrade to faster mode
-    /// 
-    /// Returns true if mode changed.
-    pub fn try_upgrade(&self) -> bool {
-        let current = *self.current_mode.read().unwrap();
-        let last_change = *self.last_change.read().unwrap();
-        
-        // Don't upgrade too quickly
-        if last_change.elapsed() < Duration::from_secs(self.trigger.upgrade_delay_secs) {
-            return false;
-        }
-        
-        // Only upgrade if metrics are good
-        if self.metrics.loss_percent() > 5 ||
-           self.metrics.connection_failures.load(Ordering::Relaxed) > 0 {
-            return false;
-        }
-        
-        if let Some(prev) = current.upgrade() {
-            *self.current_mode.write().unwrap() = prev;
-            *self.last_change.write().unwrap() = Instant::now();
-            self.metrics.reset();
-            
-            // Update scheduler if attached
-            if let Some(ref scheduler) = self.scheduler {
-                scheduler.set_mode(prev.scheduler_mode());
-            }
-            
-            log::info!("Upgrade: {:?} → {:?}", current, prev);
-            return true;
-        }
-        
-        false
+    pub fn record_failure(&self) {
+        self.metrics.record_failure();
+        let _ = self.check_and_fallback();
     }
 
-    /// Force set mode (for testing or manual override)
-    pub fn set_mode(&self, mode: TransportMode) {
-        *self.current_mode.write().unwrap() = mode;
-        *self.last_change.write().unwrap() = Instant::now();
-        self.metrics.reset();
+    fn degrade(&self) {
+        let mut mode = self.current_mode.write();
+        let new_mode = match *mode {
+            TransportMode::Turbo => TransportMode::Reliable,
+            TransportMode::Reliable => TransportMode::Stealth,
+            TransportMode::Stealth => TransportMode::Stealth,
+        };
         
-        if let Some(ref scheduler) = self.scheduler {
-            scheduler.set_mode(mode.scheduler_mode());
+        if new_mode != *mode {
+            log::warn!("Transport degradation: {:?} -> {:?}", *mode, new_mode);
+            *mode = new_mode;
+            *self.last_change.write() = Instant::now();
         }
     }
-}
 
-impl std::fmt::Debug for FallbackStateMachine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FallbackStateMachine")
-            .field("mode", &self.current_mode())
-            .field("loss%", &self.metrics.loss_percent())
-            .field("failures", &self.metrics.connection_failures.load(Ordering::Relaxed))
-            .finish()
+    pub fn upgrade(&self) {
+        let mut mode = self.current_mode.write();
+        if *mode != self.best_mode {
+            log::info!("Transport healing: {:?} -> {:?}", *mode, self.best_mode);
+            *mode = self.best_mode;
+            *self.last_change.write() = Instant::now();
+            // Reset failures on upgrade
+            self.metrics.connection_failures.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn should_probe(&self) -> bool {
+        let mode = self.current_mode.read();
+        if *mode == self.best_mode {
+            return false;
+        }
+
+        let last_probe = self.last_probe.read();
+        let last_change = self.last_change.read();
+        
+        // Probe if it's been > 30s since last probe AND since last mode change
+        last_probe.elapsed() > std::time::Duration::from_secs(30) && 
+        last_change.elapsed() > std::time::Duration::from_secs(30)
+    }
+
+    pub fn record_probe(&self) {
+        *self.last_probe.write() = Instant::now();
     }
 }
 
@@ -297,59 +174,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_transport_mode_fallback() {
-        assert_eq!(TransportMode::Turbo.fallback(), Some(TransportMode::Reliable));
-        assert_eq!(TransportMode::Reliable.fallback(), Some(TransportMode::Stealth));
-        assert_eq!(TransportMode::Stealth.fallback(), None);
-    }
-
-    #[test]
-    fn test_transport_mode_upgrade() {
-        assert_eq!(TransportMode::Stealth.upgrade(), Some(TransportMode::Reliable));
-        assert_eq!(TransportMode::Reliable.upgrade(), Some(TransportMode::Turbo));
-        assert_eq!(TransportMode::Turbo.upgrade(), None);
-    }
-
-    #[test]
-    fn test_fallback_on_loss() {
+    fn test_fallback_cycle() {
         let fsm = FallbackStateMachine::with_defaults();
-        
-        // Simulate high loss
-        for _ in 0..100 {
-            fsm.metrics.record_sent();
-        }
-        for _ in 0..80 {
-            fsm.metrics.record_success();
-        }
-        // 20% loss
-        
         assert_eq!(fsm.current_mode(), TransportMode::Turbo);
-        assert!(fsm.check_and_fallback());
-        assert_eq!(fsm.current_mode(), TransportMode::Reliable);
-    }
 
-    #[test]
-    fn test_fallback_on_failures() {
-        let fsm = FallbackStateMachine::with_defaults();
-        
-        // Simulate connection failures
-        fsm.metrics.record_failure();
-        fsm.metrics.record_failure();
-        fsm.metrics.record_failure();
-        
-        assert!(fsm.check_and_fallback());
+        // Degrade to Reliable
+        fsm.degrade();
         assert_eq!(fsm.current_mode(), TransportMode::Reliable);
-    }
 
-    #[test]
-    fn test_dpi_fallback() {
-        let fsm = FallbackStateMachine::with_defaults();
-        
-        fsm.metrics.record_dpi_detection();
-        
-        assert!(fsm.check_and_fallback());
-        // Should skip to stealth on DPI
-        fsm.check_and_fallback();
+        // Degrade to Stealth
+        fsm.degrade();
         assert_eq!(fsm.current_mode(), TransportMode::Stealth);
+
+        // Upgrade back to Turbo
+        fsm.upgrade();
+        assert_eq!(fsm.current_mode(), TransportMode::Turbo);
+    }
+
+    #[test]
+    fn test_should_probe() {
+        let fsm = FallbackStateMachine::with_defaults();
+        
+        // No probe needed if already in best mode
+        assert!(!fsm.should_probe());
+
+        fsm.degrade();
+        assert_eq!(fsm.current_mode(), TransportMode::Reliable);
+
+        // No probe immediately after change
+        assert!(!fsm.should_probe());
+
+        // We can't easily fast-forward time in these tests without mocking Instant
+        // But we can verify that after reset it's still false
+        fsm.record_probe();
+        assert!(!fsm.should_probe());
     }
 }

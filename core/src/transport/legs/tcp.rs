@@ -5,11 +5,10 @@
 use crate::transport::legs::TransportLeg;
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut, Buf, BufMut};
+use bytes::{Bytes, BytesMut, Buf};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU8, AtomicBool, Ordering};
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -23,6 +22,7 @@ pub struct TcpLeg {
     /// Current RTT estimate (ms)
     rtt_ms: AtomicU32,
     /// Packet loss percentage (always 0 for TCP)
+    #[allow(dead_code)]
     loss_percent: AtomicU8,
     /// Whether leg is available
     available: AtomicBool,

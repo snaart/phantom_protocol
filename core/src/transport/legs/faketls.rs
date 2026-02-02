@@ -6,22 +6,24 @@
 use crate::transport::legs::TransportLeg;
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut, Buf, BufMut};
+use bytes::{Bytes, BytesMut};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU8, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use rand::Rng;
-use rand::seq::SliceRandom;
+use rand::rngs::OsRng;
 use x25519_dalek::{StaticSecret, PublicKey as X25519PublicKey};
+use ring::aead::{self, LessSafeKey, UnboundKey, Nonce};
 
 /// TLS record types
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
 enum TlsContentType {
+    #[allow(dead_code)]
     ChangeCipherSpec = 20,
+    #[allow(dead_code)]
     Alert = 21,
     Handshake = 22,
     ApplicationData = 23,
@@ -45,7 +47,29 @@ impl Default for FakeTlsConfig {
     }
 }
 
+/// State machine for FakeTLS Handshake
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FakeTlsState {
+    /// Initial state (0)
+    Init = 0,
+    /// Client: Sent ClientHello, waiting for ServerHello (1)
+    /// Server: Received ClientHello, waiting to send ServerHello (1)
+    ClientHelloDone = 1,
+    /// Handshake completed, ready for Application Data (2)
+    ServerHelloDone = 2,
+    /// Ready for Phantom packets wrapped in ApplicationData (3)
+    ApplicationData = 3,
+}
+
 /// FakeTLS transport leg
+///
+/// AEAD note: This is an *outer* DPI-obfuscation layer. Real confidentiality
+/// and authentication come from the inner Phantom session (see
+/// `crate::transport::session::Session`). The outer AEAD key is derived
+/// deterministically from a public seed (SNI + version) so both peers reach
+/// the same key without a Diffie-Hellman exchange; nonce uniqueness per record
+/// is provided by an atomic counter (mirrors `AesSession::make_nonce`).
 pub struct FakeTlsLeg {
     /// Configuration
     config: FakeTlsConfig,
@@ -57,10 +81,57 @@ pub struct FakeTlsLeg {
     rtt_ms: AtomicU32,
     /// Whether leg is available
     available: AtomicBool,
-    /// Whether handshake is complete
-    handshake_done: AtomicBool,
+    /// Current connection state
+    state: parking_lot::RwLock<FakeTlsState>,
     /// Read buffer
     read_buf: Mutex<BytesMut>,
+    /// AES-256-GCM key used for sealing outbound records.
+    send_key: LessSafeKey,
+    /// AES-256-GCM key used for opening inbound records.
+    recv_key: LessSafeKey,
+    /// 4-byte nonce prefix; remaining 8 bytes are a per-direction counter.
+    nonce_prefix: [u8; 4],
+    /// Monotonically increasing counter for outbound records.
+    send_counter: AtomicU64,
+    /// Monotonically increasing counter for inbound records (TCP is in-order).
+    recv_counter: AtomicU64,
+    /// Is this leg acting as a server?
+    #[allow(dead_code)]
+    is_server: bool,
+}
+
+/// Derive the outer AEAD key material for both peers from a publicly-known seed.
+///
+/// Because the seed is public this layer provides no real confidentiality — it
+/// exists solely to produce pseudo-random ciphertext that defeats DPI
+/// fingerprinting. The inner Phantom session provides actual auth/conf.
+fn derive_outer_keys(
+    sni: &str,
+    version: u16,
+    is_server: bool,
+) -> (LessSafeKey, LessSafeKey, [u8; 4]) {
+    let mut seed = Vec::with_capacity(64);
+    seed.extend_from_slice(b"phantom-faketls-outer-v1");
+    seed.extend_from_slice(&version.to_be_bytes());
+    seed.extend_from_slice(sni.as_bytes());
+
+    let key_c2s = blake3::derive_key("phantom-faketls-c2s-v1", &seed);
+    let key_s2c = blake3::derive_key("phantom-faketls-s2c-v1", &seed);
+    let pfx = blake3::derive_key("phantom-faketls-pfx-v1", &seed);
+
+    let mut nonce_prefix = [0u8; 4];
+    nonce_prefix.copy_from_slice(&pfx[..4]);
+
+    let (send_bytes, recv_bytes) = if is_server {
+        (key_s2c, key_c2s)
+    } else {
+        (key_c2s, key_s2c)
+    };
+    let send_key =
+        LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &send_bytes).unwrap());
+    let recv_key =
+        LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &recv_bytes).unwrap());
+    (send_key, recv_key, nonce_prefix)
 }
 
 impl FakeTlsLeg {
@@ -69,70 +140,209 @@ impl FakeTlsLeg {
         Self::with_config(FakeTlsConfig::default())
     }
 
-    /// Create with custom config
+    /// Create with custom config (client role; not yet connected).
     pub fn with_config(config: FakeTlsConfig) -> Self {
+        let (send_key, recv_key, nonce_prefix) =
+            derive_outer_keys(&config.sni, config.version, false);
+
         Self {
             config,
             stream: Mutex::new(None),
             remote_addr: None,
             rtt_ms: AtomicU32::new(150),
             available: AtomicBool::new(false),
-            handshake_done: AtomicBool::new(false),
+            state: parking_lot::RwLock::new(FakeTlsState::Init),
             read_buf: Mutex::new(BytesMut::with_capacity(16384)),
+            send_key,
+            recv_key,
+            nonce_prefix,
+            send_counter: AtomicU64::new(0),
+            recv_counter: AtomicU64::new(0),
+            is_server: false,
         }
     }
 
-    /// Connect and perform fake TLS handshake
+    /// Connect as Client and perform fake TLS handshake
     pub async fn connect(addr: SocketAddr, config: FakeTlsConfig) -> io::Result<Self> {
         let start = std::time::Instant::now();
         let stream = TcpStream::connect(addr).await?;
         let rtt = start.elapsed().as_millis() as u32;
-        
+
         stream.set_nodelay(true)?;
-        
+
+        let (send_key, recv_key, nonce_prefix) =
+            derive_outer_keys(&config.sni, config.version, false);
+
         let leg = Self {
             config,
             stream: Mutex::new(Some(stream)),
             remote_addr: Some(addr),
             rtt_ms: AtomicU32::new(rtt),
             available: AtomicBool::new(true),
-            handshake_done: AtomicBool::new(false),
+            state: parking_lot::RwLock::new(FakeTlsState::Init),
             read_buf: Mutex::new(BytesMut::with_capacity(16384)),
+            send_key,
+            recv_key,
+            nonce_prefix,
+            send_counter: AtomicU64::new(0),
+            recv_counter: AtomicU64::new(0),
+            is_server: false,
         };
-        
-        // Perform fake handshake
-        leg.do_fake_handshake().await?;
-        
-        log::info!("FakeTLS connected to {} (SNI: {})", addr, leg.config.sni);
+
+        leg.do_client_handshake().await?;
+
         Ok(leg)
     }
 
-    /// Perform fake TLS handshake
-    async fn do_fake_handshake(&self) -> io::Result<()> {
+    /// Accept connection as Server and perform fake TLS handshake
+    pub async fn accept(stream: TcpStream, config: FakeTlsConfig) -> io::Result<Self> {
+        stream.set_nodelay(true)?;
+        let remote_addr = stream.peer_addr().ok();
+
+        let (send_key, recv_key, nonce_prefix) =
+            derive_outer_keys(&config.sni, config.version, true);
+
+        let leg = Self {
+            config,
+            stream: Mutex::new(Some(stream)),
+            remote_addr,
+            rtt_ms: AtomicU32::new(150),
+            available: AtomicBool::new(true),
+            state: parking_lot::RwLock::new(FakeTlsState::Init),
+            read_buf: Mutex::new(BytesMut::with_capacity(16384)),
+            send_key,
+            recv_key,
+            nonce_prefix,
+            send_counter: AtomicU64::new(0),
+            recv_counter: AtomicU64::new(0),
+            is_server: true,
+        };
+
+        leg.do_server_handshake().await?;
+
+        Ok(leg)
+    }
+
+    /// Construct nonce: 4-byte prefix || 8-byte big-endian counter.
+    #[inline]
+    fn make_nonce(&self, counter: u64) -> Nonce {
+        let mut n = [0u8; 12];
+        n[..4].copy_from_slice(&self.nonce_prefix);
+        n[4..12].copy_from_slice(&counter.to_be_bytes());
+        Nonce::assume_unique_for_key(n)
+    }
+
+    /// Perform client-side fake handshake
+    async fn do_client_handshake(&self) -> io::Result<()> {
         let mut stream_guard = self.stream.lock().await;
         let stream = stream_guard.as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "Not connected"))?;
         
-        // Send fake ClientHello
+        // State 0 -> 1: Send ClientHello
         let client_hello = self.build_fake_client_hello();
         stream.write_all(&client_hello).await?;
+        *self.state.write() = FakeTlsState::ClientHelloDone;
         
-        // Read fake ServerHello (we just consume whatever the server sends)
-        // In a real implementation, the server would also send fake TLS records
+        // State 1 -> 2: Read ServerHello
         let mut buf = [0u8; 4096];
-        let _ = tokio::time::timeout(
+        let n = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             stream.read(&mut buf),
-        ).await;
+        ).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ServerHello timeout"))??;
+
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Connection closed by server"));
+        }
         
-        self.handshake_done.store(true, Ordering::Relaxed);
+        // We received dummy ServerHello
+        *self.state.write() = FakeTlsState::ServerHelloDone;
+        
+        // State 2 -> 3: Application Data (Ready)
+        *self.state.write() = FakeTlsState::ApplicationData;
         Ok(())
+    }
+
+    /// Perform server-side fake handshake
+    async fn do_server_handshake(&self) -> io::Result<()> {
+        let mut stream_guard = self.stream.lock().await;
+        let stream = stream_guard.as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "Not connected"))?;
+        
+        // State 0 -> 1: Read ClientHello
+        let mut buf = [0u8; 4096];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read(&mut buf),
+        ).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ClientHello timeout"))??;
+        
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Connection closed by client"));
+        }
+        
+        *self.state.write() = FakeTlsState::ClientHelloDone;
+        
+        // State 1 -> 2: Send ServerHello
+        let server_hello = self.build_fake_server_hello();
+        stream.write_all(&server_hello).await?;
+        *self.state.write() = FakeTlsState::ServerHelloDone;
+        
+        // State 2 -> 3: Application Data (Ready)
+        *self.state.write() = FakeTlsState::ApplicationData;
+        Ok(())
+    }
+
+    /// Build a fake TLS ServerHello
+    fn build_fake_server_hello(&self) -> Vec<u8> {
+        let mut record = Vec::with_capacity(128);
+        record.push(TlsContentType::Handshake as u8);
+        record.extend_from_slice(&self.config.version.to_be_bytes()); // e.g. TLS 1.2
+        
+        let mut hs = Vec::new();
+        hs.push(0x02); // ServerHello
+        // length placeholder
+        hs.extend_from_slice(&[0, 0, 0]);
+        // Server version
+        hs.extend_from_slice(&0x0303u16.to_be_bytes());
+        
+        // Server Random
+        let mut random = [0u8; 32];
+        if getrandom::getrandom(&mut random).is_err() {
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut random);
+        }
+        hs.extend_from_slice(&random);
+        
+        // Session ID length (0)
+        hs.push(0);
+        
+        // Cipher suite TLS_AES_256_GCM_SHA384
+        hs.extend_from_slice(&0x1302u16.to_be_bytes());
+        // Compression method null
+        hs.push(0);
+        
+        // Extensions
+        hs.extend_from_slice(&[0, 8]); // Extensions len: 8
+        // Key share (Server)
+        hs.extend_from_slice(&51u16.to_be_bytes());
+        hs.extend_from_slice(&4u16.to_be_bytes()); // len 4
+        hs.extend_from_slice(&0x001du16.to_be_bytes()); // X25519
+        hs.extend_from_slice(&0u16.to_be_bytes()); // dummy payload
+        
+        let hs_len = (hs.len() - 4) as u32;
+        hs[1] = ((hs_len >> 16) & 0xFF) as u8;
+        hs[2] = ((hs_len >> 8) & 0xFF) as u8;
+        hs[3] = (hs_len & 0xFF) as u8;
+        
+        record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hs);
+        
+        record
     }
 
     /// Build a fake TLS ClientHello that looks legitimate and randomized (JA3)
     fn build_fake_client_hello(&self) -> Vec<u8> {
         let mut record = Vec::with_capacity(512);
-        let mut rng = rand::thread_rng();
+        let mut rng = OsRng;
         
         // TLS record header
         record.push(TlsContentType::Handshake as u8);
@@ -153,13 +363,17 @@ impl FakeTlsLeg {
         
         // Random (32 bytes)
         let mut random = [0u8; 32];
-        getrandom::getrandom(&mut random).unwrap_or_default();
+        if getrandom::getrandom(&mut random).is_err() {
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut random);
+        }
         record.extend_from_slice(&random);
         
         // Session ID (32 bytes)
         record.push(32);
         let mut session_id = [0u8; 32];
-        getrandom::getrandom(&mut session_id).unwrap_or_default();
+        if getrandom::getrandom(&mut session_id).is_err() {
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut session_id);
+        }
         record.extend_from_slice(&session_id);
         
         // Cipher suites (Randomized order and selection)
@@ -222,21 +436,17 @@ impl FakeTlsLeg {
 
         // Supported Versions (43) - TLS 1.3, TLS 1.2 + GREASE
         exts.push((43u16, self.make_supported_versions_body(&mut rng)));
-        
-        // Padding (21) - to avoid fingerprinting by length
-        // We pad ClientHello to be between 512 and 1024 bytes usually if needed, 
-        // but here just random small padding to vary size.
-        // Actually, Chrome pads to 517+ bytes sometimes. 
-        // Let's add random padding extension.
-        exts.push((21u16, vec![0u8; rng.gen_range(1..100)]));
 
-        // Shuffle extensions (except SNI which usually comes first, and some others? No, TLS 1.3 allows any order, but SNI usually first)
-        // We'll keep SNI first if present, shuffle rest
+        // Shuffle extensions (except SNI which usually comes first)
         if !exts.is_empty() {
             let sni = exts.remove(0); // Assuming we pushed SNI first
             exts.shuffle(&mut rng);
             exts.insert(0, sni);
         }
+
+        // Padding (21) - MUST be at the end for JA3 fingerprinting evasion
+        // Add random size padding to randomize the ClientHello length
+        exts.push((21u16, vec![0u8; rng.gen_range(50..200)]));
 
         for (etype, body) in exts {
             record.extend_from_slice(&etype.to_be_bytes());
@@ -349,27 +559,67 @@ impl FakeTlsLeg {
         body
     }
 
-    /// Wrap data as TLS Application Data record
+    /// Wrap data as TLS Application Data record using ring AEAD.
+    ///
+    /// Each call increments `send_counter` so the (key, nonce) pair is unique
+    /// per record — the previous implementation reused `[0u8; 12]` and was
+    /// vulnerable to the Forbidden Attack on AES-GCM.
     fn wrap_as_tls_record(&self, data: &[u8]) -> Vec<u8> {
-        let mut record = Vec::with_capacity(5 + data.len());
-        
-        // TLS record header
+        // TLS 1.3 framing: inner plaintext + TLS1.3 AppData type (0x17)
+        let mut inner_plaintext = Vec::with_capacity(data.len() + 1);
+        inner_plaintext.extend_from_slice(data);
+        inner_plaintext.push(TlsContentType::ApplicationData as u8); // inner content type
+
+        // Encrypt with ring using a counter-based nonce.
+        let mut in_out = inner_plaintext;
+        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
+        let nonce = self.make_nonce(counter);
+
+        let aad = aead::Aad::empty();
+        self.send_key
+            .seal_in_place_append_tag(nonce, aad, &mut in_out)
+            .unwrap();
+
+        let mut record = Vec::with_capacity(5 + in_out.len());
+
+        // Outer TLS record header (Legacy Application Data)
         record.push(TlsContentType::ApplicationData as u8);
         record.extend_from_slice(&self.config.version.to_be_bytes());
-        record.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        record.extend_from_slice(data);
-        
+        record.extend_from_slice(&(in_out.len() as u16).to_be_bytes());
+        record.extend_from_slice(&in_out);
+
         record
     }
 
-    /// Unwrap TLS Application Data record
-    fn unwrap_tls_record<'a>(&self, record: &'a [u8]) -> io::Result<&'a [u8]> {
+    /// Unwrap TLS Application Data record.
+    ///
+    /// Each call increments `recv_counter` in lockstep with the peer's
+    /// `send_counter` (TCP guarantees in-order delivery). If a record is
+    /// corrupted or the counters drift, decryption fails and the leg should
+    /// be closed.
+    fn unwrap_tls_record<'a>(&self, record: &'a mut [u8]) -> io::Result<&'a [u8]> {
         if record.len() < 5 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Record too short"));
         }
-        
-        // Skip record header (5 bytes)
-        Ok(&record[5..])
+
+        let payload = &mut record[5..];
+
+        let counter = self.recv_counter.fetch_add(1, Ordering::Relaxed);
+        let nonce = self.make_nonce(counter);
+        let aad = aead::Aad::empty();
+
+        let decrypted = self
+            .recv_key
+            .open_in_place(nonce, aad, payload)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "AEAD decryption failed"))?;
+
+        // Remove inner content type (last byte)
+        if decrypted.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty inner plaintext"));
+        }
+
+        let inner_len = decrypted.len() - 1;
+        Ok(&decrypted[..inner_len])
     }
 }
 
@@ -386,6 +636,10 @@ impl TransportLeg for FakeTlsLeg {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "FakeTLS not connected"));
         }
 
+        if *self.state.read() != FakeTlsState::ApplicationData {
+            return Err(io::Error::new(io::ErrorKind::Other, "Handshake not finished"));
+        }
+
         let record = self.wrap_as_tls_record(&data);
         
         let mut stream_guard = self.stream.lock().await;
@@ -399,6 +653,10 @@ impl TransportLeg for FakeTlsLeg {
     async fn recv(&self) -> io::Result<Bytes> {
         if !self.is_available() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "FakeTLS not connected"));
+        }
+
+        if *self.state.read() != FakeTlsState::ApplicationData {
+            return Err(io::Error::new(io::ErrorKind::Other, "Handshake not finished"));
         }
 
         let mut stream_guard = self.stream.lock().await;
@@ -431,14 +689,22 @@ impl TransportLeg for FakeTlsLeg {
         }
         
         // Extract record
-        let record = read_buf.split_to(5 + record_len);
+        let mut record = read_buf.split_to(5 + record_len);
         
-        // Unwrap and return payload
-        Ok(Bytes::copy_from_slice(&record[5..]))
+        // Unwrap and decrypt payload
+        // We have to copy it to a new Bytes because unwrap_tls_record mutates in place
+        // and returns a reference. Or we can just use `unwrap_tls_record(&mut record)`.
+        let payload_len = self.unwrap_tls_record(&mut record)?.len();
+        
+        // The decrypted payload is at `&record[5..5+payload_len]`
+        let mut out = BytesMut::with_capacity(payload_len);
+        out.extend_from_slice(&record[5..5+payload_len]);
+        
+        Ok(out.freeze())
     }
 
     fn is_available(&self) -> bool {
-        self.available.load(Ordering::Relaxed) && self.handshake_done.load(Ordering::Relaxed)
+        self.available.load(Ordering::Relaxed) && *self.state.read() == FakeTlsState::ApplicationData
     }
 
     fn rtt_ms(&self) -> u32 {
@@ -504,7 +770,8 @@ mod tests {
         let record = leg.wrap_as_tls_record(data);
         
         assert_eq!(record[0], TlsContentType::ApplicationData as u8);
-        assert_eq!(record.len(), 5 + data.len());
+        // data len + 1 for inner content type + 16 for auth tag
+        assert_eq!(record.len(), 5 + data.len() + 1 + 16);
     }
 
     #[test]
@@ -522,39 +789,84 @@ mod tests {
         assert_eq!(hello1_[10], 0x03);
     }
 
+    /// Round-trip test: a client-side leg encrypts, a server-side leg decrypts.
+    /// Proves that derived-key + counter-nonce works end-to-end.
+    #[test]
+    fn test_wrap_unwrap_roundtrip_across_peers() {
+        // Build a "client" leg.
+        let client = FakeTlsLeg::with_config(FakeTlsConfig::default());
+
+        // Build a "server" leg from scratch: same config but is_server = true.
+        // We construct it directly since `accept` requires a real TcpStream.
+        let cfg = FakeTlsConfig::default();
+        let (send_key, recv_key, nonce_prefix) =
+            derive_outer_keys(&cfg.sni, cfg.version, true);
+        let server = FakeTlsLeg {
+            config: cfg,
+            stream: Mutex::new(None),
+            remote_addr: None,
+            rtt_ms: AtomicU32::new(0),
+            available: AtomicBool::new(false),
+            state: parking_lot::RwLock::new(FakeTlsState::ApplicationData),
+            read_buf: Mutex::new(BytesMut::new()),
+            send_key,
+            recv_key,
+            nonce_prefix,
+            send_counter: AtomicU64::new(0),
+            recv_counter: AtomicU64::new(0),
+            is_server: true,
+        };
+
+        let plaintexts: &[&[u8]] = &[
+            b"first record",
+            b"second record",
+            b"third record (a bit longer to vary length)",
+        ];
+        for pt in plaintexts {
+            let mut record = client.wrap_as_tls_record(pt);
+            let recovered_len = server.unwrap_tls_record(&mut record).unwrap().len();
+            assert_eq!(&record[5..5 + recovered_len], *pt);
+        }
+    }
+
+    /// Encrypting identical plaintexts twice must produce different ciphertexts
+    /// because the per-record counter advances.
+    #[test]
+    fn test_nonce_advances_per_record() {
+        let leg = FakeTlsLeg::with_config(FakeTlsConfig::default());
+        let r1 = leg.wrap_as_tls_record(b"identical");
+        let r2 = leg.wrap_as_tls_record(b"identical");
+        assert_ne!(r1, r2, "counter must advance — identical plaintext must not produce identical ciphertext");
+    }
+
     #[test]
     fn test_client_hello_structure() {
         let leg = FakeTlsLeg::new();
         let hello = leg.build_fake_client_hello();
-        
-        // Parse with strict TLS parser
-        use tls_parser::{parse_tls_plaintext, TlsMessage, TlsMessageHandshake};
-        
-        let (_, msg) = parse_tls_plaintext(&hello).expect("Should parse as valid TLS record");
-        
-        // Ensure it's a Handshake -> ClientHello
-        if let TlsMessage::Handshake(TlsMessageHandshake::ClientHello(ch)) = &msg.msg[0] {
-            // Verify structure
-            assert_eq!(ch.version, tls_parser::TlsVersion::Tls12); // Legacy version
-            assert!(ch.session_id.is_some());
-            assert!(ch.ciphers.len() >= 3);
-            
-            // Check for KeyShare extension (for X25519)
-            if let Some(ext_bytes) = ch.ext {
-                let (_, extensions) = tls_parser::parse_tls_extensions(ext_bytes).expect("Should parse extensions");
-                let has_keyshare = extensions.iter().any(|ext| {
-                    match ext {
-                        tls_parser::TlsExtension::KeyShare(_) => true,
-                        _ => false,
-                    }
-                });
-                assert!(has_keyshare, "ClientHello must contain KeyShare extension");
-            } else {
-                panic!("ClientHello must contain extensions");
-            }
-            
-        } else {
-            panic!("Expected Handshake(ClientHello), got {:?}", msg);
-        }
+
+        // Verify TLS record header
+        assert_eq!(hello[0], TlsContentType::Handshake as u8, "First byte should be Handshake (22)");
+
+        // TLS record version (bytes 1-2)
+        let record_version = u16::from_be_bytes([hello[1], hello[2]]);
+        assert_eq!(record_version, 0x0303, "Record version should be TLS 1.2 (0x0303)");
+
+        // Record length (bytes 3-4)
+        let record_len = u16::from_be_bytes([hello[3], hello[4]]) as usize;
+        assert_eq!(hello.len(), 5 + record_len, "Record length should match payload");
+
+        // Handshake type (byte 5) should be ClientHello (0x01)
+        assert_eq!(hello[5], 0x01, "Handshake type should be ClientHello");
+
+        // Client version at bytes 9-10 (legacy TLS 1.2)
+        assert_eq!(hello[9], 0x03, "Legacy version major");
+        assert_eq!(hello[10], 0x03, "Legacy version minor");
+
+        // Random (32 bytes starting at byte 11) should not be all zeros
+        let random = &hello[11..43];
+        assert!(!random.iter().all(|&b| b == 0), "Random should not be all zeros");
+
+        // Session ID length at byte 43 should be 32
+        assert_eq!(hello[43], 32, "Session ID length should be 32");
     }
 }

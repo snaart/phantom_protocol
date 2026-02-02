@@ -1,4 +1,4 @@
-//! Complete Protocol Comparison Benchmarks
+//! Complete Protocol Comparison Benchmarks (recompile)
 //!
 //! Real comparison of:
 //! - Phantom PQC Transport encryption
@@ -9,7 +9,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Benchmark
 use std::time::Duration;
 
 // Phantom imports
-use phantom_core::transport::pqc_handshake::{PqcHandshakeClient, PqcHandshakeServer, HandshakeResponse};
+use phantom_core::transport::handshake::{HandshakeClient, HandshakeServer, HandshakeResponse};
 use phantom_core::crypto::hybrid_kem::HybridSecretKey;
 use phantom_core::crypto::hybrid_sign::HybridSigningKey;
 
@@ -21,20 +21,33 @@ fn phantom_handshake_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("handshake_comparison");
     group.measurement_time(Duration::from_secs(15));
     
-    // Phantom PQC Handshake (full)
+    // Phantom PQC Handshake (full, with server-key pinning enabled — matches prod path)
     group.bench_function("phantom_pqc_full", |b| {
+        let client_ip = "127.0.0.1".parse().unwrap();
         b.iter(|| {
-            let client = PqcHandshakeClient::new();
-            let server = PqcHandshakeServer::new();
-            
+            let client = HandshakeClient::new();
+            let server = HandshakeServer::new().unwrap();
+            let server_pk = server.verifying_key().clone();
+
             let client_hello = client.create_client_hello();
-            let result = server.process_client_hello(&client_hello, 0, &[0u8; 4]).unwrap();
+            let result = server.process_client_hello(&client_hello, 0, client_ip);
+
+            // Handle mandatory cookie retry
+            let cookie = match result {
+                HandshakeResponse::Retry(r) => r.cookie.unwrap(),
+                _ => panic!("Expected retry, got {:?}", result),
+            };
+
+            let mut client_hello_retry = client_hello.clone();
+            client_hello_retry.cookie = Some(cookie);
+
+            let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
             let (server_hello, _) = match result {
                 HandshakeResponse::Success(h, s) => (h, s),
-                _ => panic!("Expected success"),
+                _ => panic!("Expected success, got {:?}", result),
             };
-            let _ = client.process_server_hello(&server_hello, None).unwrap();
-            
+            let _ = client.process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk)).unwrap();
+
             black_box(())
         })
     });
@@ -47,40 +60,60 @@ fn phantom_throughput_bench(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
     
     // Setup Phantom session once
-    let client = PqcHandshakeClient::new();
-    let server = PqcHandshakeServer::new();
+    let client = HandshakeClient::new();
+    let server = HandshakeServer::new().unwrap();
+    let server_pk = server.verifying_key().clone();
+    let client_ip = "127.0.0.1".parse().unwrap();
     let client_hello = client.create_client_hello();
-    let result = server.process_client_hello(&client_hello, 0).unwrap();
+    let result = server.process_client_hello(&client_hello, 0, client_ip);
+
+    // Handle mandatory cookie retry
+    let cookie = match result {
+        HandshakeResponse::Retry(r) => r.cookie.unwrap(),
+        _ => panic!("Expected retry"),
+    };
+
+    let mut client_hello_retry = client_hello.clone();
+    client_hello_retry.cookie = Some(cookie);
+
+    let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
     let (server_hello, server_session) = match result {
         HandshakeResponse::Success(h, s) => (h, s),
         _ => panic!("Expected success"),
     };
-    let client_session = client.process_server_hello(&server_hello, None).unwrap();
+    let client_session = client.process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk)).unwrap();
     
     // Different payload sizes
     for size in [1024, 4096, 16384, 65536].iter() {
         let data = vec![0xAB; *size];
         group.throughput(Throughput::Bytes(*size as u64));
         
+        let header = phantom_core::transport::types::PacketHeader::new(
+            *server_session.id(),
+            1,
+            1,
+            phantom_core::transport::types::PacketFlags::empty(),
+        );
+
         group.bench_with_input(BenchmarkId::new("phantom_encrypt", size), size, |b, _| {
             b.iter(|| {
-                let encrypted = server_session.encrypt_packet(&data).unwrap();
+                let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
                 black_box(encrypted)
             })
         });
         
-        let encrypted = server_session.encrypt_packet(&data).unwrap();
+        let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
         group.bench_with_input(BenchmarkId::new("phantom_decrypt", size), size, |b, _| {
             b.iter(|| {
-                let decrypted = client_session.decrypt_packet(&encrypted).unwrap();
+                let decrypted = client_session.decrypt_packet(&header, &encrypted).unwrap();
                 black_box(decrypted)
             })
         });
         
         group.bench_with_input(BenchmarkId::new("phantom_roundtrip", size), size, |b, _| {
             b.iter(|| {
-                let encrypted = server_session.encrypt_packet(&data).unwrap();
-                let decrypted = client_session.decrypt_packet(&encrypted).unwrap();
+                let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
+                let decrypted = client_session.decrypt_packet(&header, &encrypted).unwrap();
                 black_box(decrypted)
             })
         });
@@ -242,24 +275,44 @@ fn encryption_bench(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
     
     // Setup session
-    let client = PqcHandshakeClient::new();
-    let server = PqcHandshakeServer::new();
+    let client = HandshakeClient::new();
+    let server = HandshakeServer::new().unwrap();
+    let server_pk = server.verifying_key().clone();
+    let client_ip = "127.0.0.1".parse().unwrap();
     let client_hello = client.create_client_hello();
-    let result = server.process_client_hello(&client_hello, 0).unwrap();
+    let result = server.process_client_hello(&client_hello, 0, client_ip);
+
+    // Handle mandatory cookie retry
+    let cookie = match result {
+        HandshakeResponse::Retry(r) => r.cookie.unwrap(),
+        _ => panic!("Expected retry"),
+    };
+
+    let mut client_hello_retry = client_hello.clone();
+    client_hello_retry.cookie = Some(cookie);
+
+    let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
     let (server_hello, server_session) = match result {
         HandshakeResponse::Success(h, s) => (h, s),
         _ => panic!("Expected success"),
     };
-    let client_session = client.process_server_hello(&server_hello, None).unwrap();
-    
+    let client_session = client.process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk)).unwrap();
+
     for size in [64, 256, 1024, 4096, 16384, 65536, 262144, 1048576].iter() {
         let data = vec![0xAB; *size];
         group.throughput(Throughput::Bytes(*size as u64 * 2)); // encrypt + decrypt
         
+        let header = phantom_core::transport::types::PacketHeader::new(
+            *server_session.id(),
+            1,
+            1,
+            phantom_core::transport::types::PacketFlags::empty(),
+        );
+
         group.bench_with_input(BenchmarkId::new("chacha20poly1305", size), size, |b, _| {
             b.iter(|| {
-                let encrypted = server_session.encrypt_packet(&data).unwrap();
-                let decrypted = client_session.decrypt_packet(&encrypted).unwrap();
+                let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
+                let decrypted = client_session.decrypt_packet(&header, &encrypted).unwrap();
                 black_box(decrypted)
             })
         });

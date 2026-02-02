@@ -13,23 +13,27 @@ use ed25519_dalek::{
 use pqcrypto_dilithium::dilithium3;
 use pqcrypto_traits::sign::{
     PublicKey as DilithiumPublicKey,
-    SecretKey as DilithiumSecretKey,
-    SignedMessage,
+    SecretKey as DilithiumSecretKeyTrait,
     DetachedSignature,
 };
 use rand::rngs::OsRng;
-use rkyv::{Archive, Deserialize, Serialize};
-use bytecheck::CheckBytes;
+use borsh::{BorshSerialize, BorshDeserialize};
 use std::fmt;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+use crate::crypto::keys::DilithiumSecretKey;
+
 
 /// Hybrid signing key (Ed25519 + Dilithium3)
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct HybridSigningKey {
     /// Ed25519 signing key (32 bytes)
-    ed25519_sk: SigningKey,
+    #[zeroize(skip)] // Implements ZeroizeOnDrop internally
+    pub ed25519_sk: SigningKey,
     /// Dilithium3 secret key (~4KB)
-    dilithium_sk: dilithium3::SecretKey,
+    pub dilithium_sk: DilithiumSecretKey,
     /// Dilithium3 public key (~1.5KB) - needed for verifying_key()
-    dilithium_pk: dilithium3::PublicKey,
+    #[zeroize(skip)] // Public key
+    pub dilithium_pk: dilithium3::PublicKey,
 }
 
 impl HybridSigningKey {
@@ -46,7 +50,7 @@ impl HybridSigningKey {
         
         let signing_key = Self {
             ed25519_sk,
-            dilithium_sk,
+            dilithium_sk: DilithiumSecretKey(dilithium_sk),
             dilithium_pk,
         };
         
@@ -64,7 +68,7 @@ impl HybridSigningKey {
         let ed25519_sig = self.ed25519_sk.sign(message);
         
         // Dilithium3 detached signature
-        let dilithium_sig = dilithium3::detached_sign(message, &self.dilithium_sk);
+        let dilithium_sig = dilithium3::detached_sign(message, &self.dilithium_sk.0);
         
         HybridSignature {
             ed25519_sig: ed25519_sig.to_bytes(),
@@ -76,7 +80,7 @@ impl HybridSigningKey {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.ed25519_sk.to_bytes());
-        out.extend_from_slice(self.dilithium_sk.as_bytes());
+        out.extend_from_slice(self.dilithium_sk.0.as_bytes());
         out.extend_from_slice(self.dilithium_pk.as_bytes());
         out
     }
@@ -103,7 +107,7 @@ impl HybridSigningKey {
         let dilithium_pk = dilithium3::PublicKey::from_bytes(&bytes[sk_end..])
             .map_err(|_| HybridSignError::InvalidKeyFormat)?;
         
-        Ok(Self { ed25519_sk, dilithium_sk, dilithium_pk })
+        Ok(Self { ed25519_sk, dilithium_sk: DilithiumSecretKey(dilithium_sk), dilithium_pk })
     }
     
     /// Get the corresponding verifying key
@@ -127,8 +131,7 @@ impl fmt::Debug for HybridSigningKey {
 }
 
 /// Hybrid verifying key (Ed25519 + Dilithium3 public keys)
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-#[archive(check_bytes)]
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct HybridVerifyingKey {
     /// Ed25519 public key (32 bytes)
     pub ed25519_pk: [u8; 32],
@@ -185,8 +188,7 @@ impl HybridVerifyingKey {
 }
 
 /// Hybrid signature (Ed25519 + Dilithium3)
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-#[archive(check_bytes)]
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct HybridSignature {
     /// Ed25519 signature (64 bytes)
     pub ed25519_sig: [u8; 64],

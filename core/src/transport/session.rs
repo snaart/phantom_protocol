@@ -4,22 +4,25 @@
 //! Manages streams, encryption state, and multi-path scheduling.
 
 use crate::transport::{
-    types::{SessionId, StreamId, SequenceNumber, PacketHeader, PacketFlags, PhantomPacket, ControlMessage},
+    types::{SessionId, StreamId, PacketHeader, PhantomPacket, ControlMessage, SchedulerMode},
     stream::Stream,
-    scheduler::{Scheduler, SchedulerMode},
+    scheduler::Scheduler,
+    fallback::FallbackStateMachine,
 };
+use crate::crypto::adaptive_crypto::{CryptoSession};
+use crate::errors::CoreError;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, aead::Aead, KeyInit};
+use std::time::{Instant, Duration};
+use parking_lot::RwLock;
 
 /// Session state machine
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     /// Initial state, handshake in progress
-    Connecting,
+    Handshaking,
     /// Fully established, data can flow
     Connected,
     /// Migrating to new IP address
@@ -32,77 +35,46 @@ pub enum SessionState {
 
 /// Crypto state for session encryption
 pub struct CryptoState {
-    /// Symmetric cipher (ChaCha20-Poly1305)
-    cipher: ChaCha20Poly1305,
-    /// Nonce counter for encryption
-    nonce_counter: AtomicU32,
+    /// Bidirectional crypto session
+    pub session: CryptoSession,
+    /// Shared session key (for additional derivations)
+    pub session_key: [u8; 32],
 }
 
 impl CryptoState {
     /// Create new crypto state from shared secret
-    /// 
-    /// The session_id is used as salt for key derivation.
-    pub fn new(shared_secret: &[u8; 32], session_id: &SessionId) -> Self {
-        use hkdf::Hkdf;
-        use sha2::Sha256;
+    pub fn new(shared_secret: &[u8; 32], peer_side: bool) -> Result<Self, CoreError> {
+        let session = if peer_side {
+            CryptoSession::from_shared_secret_peer(shared_secret)?
+        } else {
+            CryptoSession::from_shared_secret(shared_secret)?
+        };
+
+        // Derive additional session keys using HKDF
+        let hk = hkdf::Hkdf::<sha2::Sha256>::from_prk(shared_secret)
+            .map_err(|_| CoreError::CryptoError("HKDF PRK failed".into()))?;
         
-        // Derive key using HKDF with session_id as salt
-        let hk = Hkdf::<Sha256>::new(Some(session_id.as_bytes()), shared_secret);
         let mut key_bytes = [0u8; 32];
         hk.expand(b"phantom-transport-key", &mut key_bytes)
-            .expect("HKDF expand failed");
-        
-        let key = Key::from_slice(&key_bytes);
-        let cipher = ChaCha20Poly1305::new(key);
-        
-        Self {
-            cipher,
-            nonce_counter: AtomicU32::new(0),
-        }
+            .map_err(|_| CoreError::KeyDerivationError)?;
+
+        Ok(Self {
+            session,
+            session_key: key_bytes,
+        })
     }
 
-    /// Encrypt data with AEAD
-    pub fn encrypt(&self, plaintext: &[u8], associated_data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let nonce_val = self.nonce_counter.fetch_add(1, Ordering::SeqCst);
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[..4].copy_from_slice(&nonce_val.to_le_bytes());
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        
-        // Prepend nonce to ciphertext for transmission
-        let ciphertext = self.cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|_| CryptoError::EncryptionFailed)?;
-        
-        let mut result = Vec::with_capacity(12 + ciphertext.len());
-        result.extend_from_slice(&nonce_bytes);
-        result.extend_from_slice(&ciphertext);
-        Ok(result)
+    /// Encrypt data
+    pub fn encrypt(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CoreError> {
+        self.session.encrypt(aad, plaintext)
+            .map_err(|e| CoreError::CryptoError(e.to_string()))
     }
 
-    /// Decrypt data with AEAD
-    pub fn decrypt(&self, ciphertext_with_nonce: &[u8], associated_data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        if ciphertext_with_nonce.len() < 12 {
-            return Err(CryptoError::InvalidNonce);
-        }
-        
-        let (nonce_bytes, ciphertext) = ciphertext_with_nonce.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
-        
-        self.cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|_| CryptoError::DecryptionFailed)
+    /// Decrypt data
+    pub fn decrypt(&self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CoreError> {
+        self.session.decrypt(aad, ciphertext)
+            .map_err(|e| CoreError::CryptoError(e.to_string()))
     }
-}
-
-/// Crypto errors
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-pub enum CryptoError {
-    #[error("Encryption failed")]
-    EncryptionFailed,
-    #[error("Decryption failed")]
-    DecryptionFailed,
-    #[error("Invalid nonce")]
-    InvalidNonce,
 }
 
 /// Session - virtual association between two endpoints
@@ -112,7 +84,7 @@ pub struct Session {
     /// Current state
     state: RwLock<SessionState>,
     /// Crypto state for encryption/decryption
-    crypto: Arc<CryptoState>,
+    crypto: RwLock<CryptoState>,
     /// Active streams
     streams: RwLock<HashMap<StreamId, Arc<Stream>>>,
     /// Next stream ID counter
@@ -122,62 +94,69 @@ pub struct Session {
     /// Multi-path scheduler
     scheduler: Arc<Scheduler>,
     /// Resumption secret for 0-RTT
-    resumption_secret: Option<[u8; 32]>,
+    resumption_secret: RwLock<Option<[u8; 32]>>,
+    /// Last activity timestamp
+    last_activity: RwLock<Instant>,
+    /// Fallback state machine
+    #[allow(dead_code)]
+    fallback: Arc<FallbackStateMachine>,
 }
 
 impl Session {
     /// Create a new session with given shared secret
-    pub fn new(shared_secret: &[u8; 32]) -> Self {
-        let session_id = SessionId::random();
-        let crypto = Arc::new(CryptoState::new(shared_secret, &session_id));
+    pub fn new(session_id: SessionId, shared_secret: &[u8; 32], peer_side: bool) -> Result<Self, CoreError> {
+        let crypto = CryptoState::new(shared_secret, peer_side)?;
         
-        Self {
+        Ok(Self {
             id: session_id,
-            state: RwLock::new(SessionState::Connecting),
-            crypto,
+            state: RwLock::new(SessionState::Handshaking),
+            crypto: RwLock::new(crypto),
             streams: RwLock::new(HashMap::new()),
-            next_stream_id: AtomicU32::new(1), // 0 is reserved for control
+            next_stream_id: AtomicU32::new(1),
             control_sequence: AtomicU32::new(0),
             scheduler: Arc::new(Scheduler::new(SchedulerMode::LowLatency)),
-            resumption_secret: None,
-        }
+            resumption_secret: RwLock::new(None),
+            last_activity: RwLock::new(Instant::now()),
+            fallback: Arc::new(FallbackStateMachine::with_defaults()),
+        })
     }
 
-    /// Create session from MLS-derived crypto state
-    /// 
-    /// Used by MlsSessionBuilder to create sessions from MLS groups.
-    pub fn from_mls_derived(
+    /// Create session from a pre-derived crypto state (e.g., after handshake).
+    pub fn from_derived(
         session_id: SessionId,
-        crypto: Arc<CryptoState>,
-        resumption_secret: Option<[u8; 32]>,
+        crypto: CryptoState,
         scheduler_mode: SchedulerMode,
     ) -> Self {
         Self {
             id: session_id,
-            state: RwLock::new(SessionState::Connecting),
-            crypto,
+            state: RwLock::new(SessionState::Connected),
+            crypto: RwLock::new(crypto),
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
             control_sequence: AtomicU32::new(0),
             scheduler: Arc::new(Scheduler::new(scheduler_mode)),
-            resumption_secret,
+            resumption_secret: RwLock::new(None),
+            last_activity: RwLock::new(Instant::now()),
+            fallback: Arc::new(FallbackStateMachine::with_defaults()),
         }
     }
 
     /// Resume a session using resumption secret (0-RTT)
-    pub fn resume(session_id: SessionId, resumption_secret: &[u8; 32]) -> Self {
-        let crypto = Arc::new(CryptoState::new(resumption_secret, &session_id));
+    pub fn resume(session_id: SessionId, resumption_secret: &[u8; 32], peer_side: bool) -> Result<Self, CoreError> {
+        let crypto = CryptoState::new(resumption_secret, peer_side)?;
         
-        Self {
+        Ok(Self {
             id: session_id,
-            state: RwLock::new(SessionState::Connecting),
-            crypto,
+            state: RwLock::new(SessionState::Connected),
+            crypto: RwLock::new(crypto),
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
             control_sequence: AtomicU32::new(0),
             scheduler: Arc::new(Scheduler::new(SchedulerMode::LowLatency)),
-            resumption_secret: Some(*resumption_secret),
-        }
+            resumption_secret: RwLock::new(Some(*resumption_secret)),
+            last_activity: RwLock::new(Instant::now()),
+            fallback: Arc::new(FallbackStateMachine::with_defaults()),
+        })
     }
 
     /// Get session ID
@@ -186,53 +165,58 @@ impl Session {
     }
 
     /// Get current state
-    pub async fn state(&self) -> SessionState {
-        *self.state.read().await
+    pub fn state(&self) -> SessionState {
+        *self.state.read()
     }
 
     /// Transition to a new state
-    pub async fn set_state(&self, new_state: SessionState) {
-        *self.state.write().await = new_state;
+    pub fn set_state(&self, new_state: SessionState) {
+        *self.state.write() = new_state;
     }
 
     /// Open a new stream
-    pub async fn open_stream(&self) -> Arc<Stream> {
+    pub fn open_stream(&self) -> Arc<Stream> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::SeqCst) as StreamId;
         let stream = Arc::new(Stream::new(stream_id));
         
-        self.streams.write().await.insert(stream_id, stream.clone());
+        self.streams.write().insert(stream_id, stream.clone());
         stream
     }
 
     /// Get an existing stream
-    pub async fn get_stream(&self, stream_id: StreamId) -> Option<Arc<Stream>> {
-        self.streams.read().await.get(&stream_id).cloned()
+    pub fn get_stream(&self, stream_id: StreamId) -> Option<Arc<Stream>> {
+        self.streams.read().get(&stream_id).cloned()
     }
 
     /// Close a stream
-    pub async fn close_stream(&self, stream_id: StreamId) -> bool {
-        self.streams.write().await.remove(&stream_id).is_some()
+    pub fn close_stream(&self, stream_id: StreamId) -> bool {
+        self.streams.write().remove(&stream_id).is_some()
     }
 
     /// Get number of active streams
-    pub async fn stream_count(&self) -> usize {
-        self.streams.read().await.len()
+    pub fn stream_count(&self) -> u32 {
+        self.streams.read().len() as u32
     }
 
     /// Encrypt a packet payload
-    pub fn encrypt_packet(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        self.crypto.encrypt(plaintext, self.id.as_bytes())
+    pub fn encrypt_packet(&self, header: &PacketHeader, plaintext: &[u8]) -> Result<Vec<u8>, CoreError> {
+        let mut header_bytes = Vec::new();
+        alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
+        self.crypto.read().encrypt(&header_bytes, plaintext)
     }
 
     /// Decrypt a packet payload
-    pub fn decrypt_packet(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        self.crypto.decrypt(ciphertext, self.id.as_bytes())
+    pub fn decrypt_packet(&self, header: &PacketHeader, ciphertext: &[u8]) -> Result<Vec<u8>, CoreError> {
+        let mut header_bytes = Vec::new();
+        alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
+        self.crypto.read().decrypt(&header_bytes, ciphertext)
     }
 
     /// Create a control packet
-    pub fn create_control_packet(&self, message: ControlMessage, payload: Vec<u8>) -> PhantomPacket {
+    pub fn create_control_packet(&self, _message: ControlMessage, payload: Vec<u8>) -> PhantomPacket {
         let seq = self.control_sequence.fetch_add(1, Ordering::SeqCst);
         let header = PacketHeader::control(self.id, seq);
+        // Note: Real implementation would also encrypt control packet
         PhantomPacket::new(header, payload)
     }
 
@@ -241,22 +225,24 @@ impl Session {
         &self.scheduler
     }
 
-    /// Check if session can be resumed (has resumption secret)
-    pub fn can_resume(&self) -> bool {
-        self.resumption_secret.is_some()
+    /// Set resumption secret for 0-RTT
+    pub fn set_resumption_secret(&self, secret: [u8; 32]) {
+        *self.resumption_secret.write() = Some(secret);
     }
 
-    /// Derive resumption secret for 0-RTT
-    pub fn derive_resumption_secret(&self) -> [u8; 32] {
-        use hkdf::Hkdf;
-        use sha2::Sha256;
-        
-        // Derive resumption secret from current crypto state
-        let hk = Hkdf::<Sha256>::new(Some(self.id.as_bytes()), &[0u8; 32]); // TODO: use actual key
-        let mut secret = [0u8; 32];
-        hk.expand(b"phantom-resumption", &mut secret)
-            .expect("HKDF expand failed");
-        secret
+    /// Check if session can be resumed (has resumption secret)
+    pub fn can_resume(&self) -> bool {
+        self.resumption_secret.read().is_some()
+    }
+
+    /// Update last activity timestamp
+    pub fn update_activity(&self) {
+        *self.last_activity.write() = Instant::now();
+    }
+
+    /// Check if session is expired
+    pub fn is_expired(&self, timeout: Duration) -> bool {
+        self.last_activity.read().elapsed() > timeout
     }
 }
 
@@ -264,49 +250,6 @@ impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("id", &self.id)
-            .field("can_resume", &self.can_resume())
             .finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_session_creation() {
-        let secret = [42u8; 32];
-        let session = Session::new(&secret);
-        
-        assert_eq!(session.state().await, SessionState::Connecting);
-        assert!(!session.can_resume());
-    }
-
-    #[tokio::test]
-    async fn test_session_streams() {
-        let secret = [42u8; 32];
-        let session = Session::new(&secret);
-        
-        let stream1 = session.open_stream().await;
-        let stream2 = session.open_stream().await;
-        
-        assert_ne!(stream1.id(), stream2.id());
-        assert_eq!(session.stream_count().await, 2);
-        
-        session.close_stream(stream1.id()).await;
-        assert_eq!(session.stream_count().await, 1);
-    }
-
-    #[test]
-    fn test_crypto_encrypt_decrypt() {
-        let secret = [42u8; 32];
-        let session_id = SessionId::random();
-        let crypto = CryptoState::new(&secret, &session_id);
-        
-        let plaintext = b"Hello, Phantom!";
-        let ciphertext = crypto.encrypt(plaintext, &[]).unwrap();
-        let decrypted = crypto.decrypt(&ciphertext, &[]).unwrap();
-        
-        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
     }
 }

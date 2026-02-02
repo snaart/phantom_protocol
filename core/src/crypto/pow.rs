@@ -1,20 +1,16 @@
-use blake3::Hasher;
-use rand::Rng;
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
-use rkyv::{Archive, Deserialize, Serialize};
-use bytecheck::CheckBytes;
+use borsh::{BorshSerialize, BorshDeserialize};
+use blake3::Hasher;
 
 /// Proof-of-Work Challenge
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[archive(check_bytes)]
+#[derive(BorshSerialize, BorshDeserialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct PoWChallenge {
     pub nonce: [u8; 32], // Increased to 32 bytes for stateless cookie
     pub difficulty: u8, // Number of leading zero bits required
 }
 
 /// Proof-of-Work Solution
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[archive(check_bytes)]
+#[derive(BorshSerialize, BorshDeserialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
 pub struct PoWSolution {
     pub nonce: [u8; 32],
     pub solution: u64,
@@ -76,37 +72,35 @@ impl PoWChallenge {
         }
         
         // 4. Verify PoW solution
-        // Calculate hash: BLAKE3(nonce || solution)
-        let mut hasher = Hasher::new();
-        hasher.update(&self.nonce);
-        hasher.update(&solution.solution.to_le_bytes());
-        let hash = hasher.finalize();
+        // Calculate hash: Blake3(nonce || solution)
+        let hash = compute_blake3_hash(&self.nonce, solution.solution);
         
         // Check leading zeros
-        check_leading_zeros(hash.as_bytes(), self.difficulty)
+        check_leading_zeros(&hash, self.difficulty)
     }
     
-    /// Solve the challenge (Blocking!)
     pub fn solve(&self) -> PoWSolution {
         let mut solution = 0u64;
-        let mut hasher = Hasher::new();
         
         loop {
-            hasher.update(&self.nonce);
-            hasher.update(&solution.to_le_bytes());
-            let hash = hasher.finalize();
+            let hash = compute_blake3_hash(&self.nonce, solution);
             
-            if check_leading_zeros(hash.as_bytes(), self.difficulty) {
+            if check_leading_zeros(&hash, self.difficulty) {
                 return PoWSolution {
                     nonce: self.nonce,
                     solution,
                 };
             }
             
-            hasher.reset();
             solution += 1;
         }
     }
+}
+fn compute_blake3_hash(nonce: &[u8; 32], solution: u64) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(nonce);
+    hasher.update(&solution.to_le_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 fn check_leading_zeros(hash: &[u8], difficulty: u8) -> bool {

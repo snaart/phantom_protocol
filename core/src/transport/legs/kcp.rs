@@ -9,12 +9,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU8, AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU8, AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use kcp_tokio::{KcpConfig, async_kcp::KcpStream};
+use crate::transport::bandwidth_estimator;
 
 /// KCP leg configuration
 #[derive(Debug, Clone)]
@@ -81,6 +82,8 @@ pub struct KcpLeg {
     bytes_sent: AtomicU32,
     /// Bytes received counter
     bytes_received: AtomicU32,
+    /// Bandwidth estimator
+    estimator: Option<Arc<parking_lot::Mutex<bandwidth_estimator::BandwidthEstimator>>>,
 }
 
 impl KcpLeg {
@@ -100,6 +103,7 @@ impl KcpLeg {
             available: AtomicBool::new(false),
             bytes_sent: AtomicU32::new(0),
             bytes_received: AtomicU32::new(0),
+            estimator: None,
         }
     }
 
@@ -128,6 +132,7 @@ impl KcpLeg {
             available: AtomicBool::new(true),
             bytes_sent: AtomicU32::new(0),
             bytes_received: AtomicU32::new(0),
+            estimator: None, // Will be set after creation if multi-path is active
         })
     }
 
@@ -142,6 +147,7 @@ impl KcpLeg {
             available: AtomicBool::new(true),
             bytes_sent: AtomicU32::new(0),
             bytes_received: AtomicU32::new(0),
+            estimator: None,
         }
     }
 
@@ -166,6 +172,11 @@ impl KcpLeg {
     /// Get bytes received
     pub fn bytes_received(&self) -> u32 {
         self.bytes_received.load(Ordering::Relaxed)
+    }
+
+    /// Set the bandwidth estimator for this leg
+    pub fn set_estimator(&mut self, estimator: Arc<parking_lot::Mutex<bandwidth_estimator::BandwidthEstimator>>) {
+        self.estimator = Some(estimator);
     }
 }
 
@@ -193,6 +204,11 @@ impl TransportLeg for KcpLeg {
         stream.write_all(&len.to_be_bytes()).await?;
         stream.write_all(&data).await?;
         stream.flush().await?;
+        
+        // Notify estimator
+        if let Some(ref est) = self.estimator {
+            est.lock().on_send(data.len() as u64 + 4);
+        }
         
         // Update RTT estimate
         let elapsed = start.elapsed().as_millis() as u32;

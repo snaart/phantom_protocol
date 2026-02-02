@@ -4,27 +4,29 @@
 //! Routes packets through the scheduler, handles fallback.
 
 use crate::transport::{
-    types::{PhantomPacket, PacketHeader, PacketFlags},
-    legs::{TransportLeg, LegType},
+    types::{LegType, SchedulerMode},
+    legs::TransportLeg,
     scheduler::Scheduler,
     fallback::{FallbackStateMachine, TransportMode},
 };
+use crate::transport::bandwidth_estimator;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use bytes::Bytes;
 use std::io;
+use std::time::{Duration, Instant};
 
 /// Virtual socket configuration
 #[derive(Debug, Clone)]
 pub struct VirtualSocketConfig {
     /// Maximum packet size (MTU)
-    pub max_packet_size: usize,
+    pub max_packet_size: u32,
     /// Send buffer size
-    pub send_buffer_size: usize,
+    pub send_buffer_size: u32,
     /// Receive buffer size  
-    pub recv_buffer_size: usize,
+    pub recv_buffer_size: u32,
     /// Enable automatic fallback
     pub auto_fallback: bool,
 }
@@ -53,6 +55,10 @@ pub struct VirtualSocket {
     /// Receive channel
     recv_tx: mpsc::Sender<Bytes>,
     recv_rx: Mutex<mpsc::Receiver<Bytes>>,
+    /// Per-leg bandwidth estimators — each network path has independent BBR state.
+    /// Sharing a single estimator across LTE and Wi-Fi is mathematically incorrect
+    /// since RTT, BDP, and loss patterns differ significantly per path.
+    estimators: Arc<Mutex<HashMap<LegType, bandwidth_estimator::BandwidthEstimator>>>,
     /// Whether socket is closed
     closed: std::sync::atomic::AtomicBool,
 }
@@ -64,7 +70,7 @@ impl VirtualSocket {
         scheduler: Arc<Scheduler>,
         fallback: Arc<FallbackStateMachine>,
     ) -> Self {
-        let (recv_tx, recv_rx) = mpsc::channel(config.recv_buffer_size);
+        let (recv_tx, recv_rx) = mpsc::channel(config.recv_buffer_size as usize);
         
         Self {
             config,
@@ -73,6 +79,7 @@ impl VirtualSocket {
             fallback,
             recv_tx,
             recv_rx: Mutex::new(recv_rx),
+            estimators: Arc::new(Mutex::new(HashMap::new())),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -80,7 +87,7 @@ impl VirtualSocket {
     /// Create with default configuration
     pub fn with_defaults() -> Self {
         let scheduler = Arc::new(Scheduler::new(
-            crate::transport::scheduler::SchedulerMode::LowLatency,
+            SchedulerMode::LowLatency,
         ));
         let fallback = Arc::new(FallbackStateMachine::with_defaults());
         Self::new(VirtualSocketConfig::default(), scheduler, fallback)
@@ -206,12 +213,12 @@ impl VirtualSocket {
 
         let tx = self.recv_tx.clone();
         let scheduler = self.scheduler.clone();
+        let estimators = self.estimators.clone();
+        let fallback = self.fallback.clone();
         // Clone the AtomicBool into an Arc so we can move it into the spawned task
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(
             self.closed.load(std::sync::atomic::Ordering::Relaxed)
         ));
-        // Store a reference to check later - not ideal but works for MVP
-        // In production, we'd use a shared Arc<AtomicBool> from the start
 
         tokio::spawn(async move {
             loop {
@@ -221,8 +228,40 @@ impl VirtualSocket {
 
                 match leg.recv().await {
                     Ok(data) => {
+                        // If we receive ANY data on KCP leg, try to upgrade from degraded modes
+                        if leg_type == LegType::Kcp {
+                            fallback.upgrade();
+                        }
+
                         // Update RTT
                         scheduler.update_rtt(leg_type, leg.rtt_ms());
+                        
+                        // Detect ACKs for BBR feedback; update the leg-specific estimator.
+                        // Each leg maintains independent BBR state so that different network
+                        // paths (LTE, Wi-Fi, TCP) don't corrupt each other's bandwidth estimate.
+                        if data.len() >= crate::transport::types::PacketHeader::SIZE {
+                            let flags = data[38]; // flags byte is always at offset 38
+                            if (flags & 0b0000_0010) != 0 { // PacketFlags::ACK
+                                let mut ests: tokio::sync::MutexGuard<'_, HashMap<LegType, bandwidth_estimator::BandwidthEstimator>> = estimators.lock().await;
+                                let est = ests.entry(leg_type)
+                                    .or_insert_with(bandwidth_estimator::BandwidthEstimator::new);
+                                // Read ack_delay from packet header (bytes 39..41, little-endian u16)
+                                let ack_delay_us = if data.len() >= 41 {
+                                    u16::from_le_bytes([data[39], data[40]]) as u64
+                                } else {
+                                    0
+                                };
+                                let sample = bandwidth_estimator::DeliverySample {
+                                    delivered_bytes: 0,
+                                    sent_at: Instant::now() - Duration::from_millis(leg.rtt_ms() as u64),
+                                    acked_at: Instant::now(),
+                                    packet_bytes: data.len() as u64,
+                                    is_app_limited: false,
+                                    ack_delay_us,
+                                };
+                                est.on_ack(sample);
+                            }
+                        }
                         
                         if tx.send(data).await.is_err() {
                             break; // Receiver dropped
@@ -276,6 +315,34 @@ impl VirtualSocket {
     /// Get fallback state machine reference
     pub fn fallback(&self) -> &Arc<FallbackStateMachine> {
         &self.fallback
+    }
+
+    /// Start the background probe loop to allow transport healing
+    pub fn start_probe_loop(self: Arc<Self>) {
+        let socket = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                
+                if socket.is_closed() {
+                    break;
+                }
+
+                if socket.fallback.should_probe() {
+                    let legs = socket.legs.read().await;
+                    if let Some(leg) = legs.get(&LegType::Kcp) {
+                        socket.fallback.record_probe();
+                        
+                        // Send a dummy probe packet (40 bytes of zeros)
+                        // Peer will receive it, and its recv_loop will trigger their upgrade
+                        let probe = Bytes::from(vec![0u8; 40]);
+                        let _ = leg.send(probe).await;
+                        log::debug!("Sent transport upgrade probe via KCP");
+                    }
+                }
+            }
+        });
     }
 }
 

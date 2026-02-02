@@ -200,6 +200,8 @@ impl AdaptiveCompressor {
 
     // ── Zstd ─────────────────────────────────────────────────────────────
 
+    // ── Zstd ─────────────────────────────────────────────────────────────
+
     fn compress_zstd(data: &[u8], level: i32) -> Vec<u8> {
         zstd::encode_all(data, level).unwrap_or_else(|_| data.to_vec())
     }
@@ -263,7 +265,7 @@ mod tests {
     fn zstd_round_trip() {
         let mut c = AdaptiveCompressor::zstd(1);
         // Compressible text-like data
-        let data: Vec<u8> = (0..2048).map(|i| b"The quick brown fox jumps over the lazy dog. "[i % 46]).collect();
+        let data: Vec<u8> = (0..2048).map(|i| b"The quick brown fox jumps over the lazy dog. "[i % 45]).collect();
         let (algo, compressed) = c.compress(&data);
         assert_eq!(algo, CompressionAlgo::Zstd1.to_byte());
         assert!(compressed.len() < data.len(), "Zstd should compress text");

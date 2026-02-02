@@ -35,26 +35,3 @@ pub trait TransportLeg: Send + Sync {
     /// Gracefully close the transport
     async fn close(&self) -> io::Result<()>;
 }
-
-/// Leg type identifier for scheduler decisions
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LegType {
-    /// KCP over UDP - fast, reliable, primary transport
-    Kcp,
-    /// Raw TCP - reliable fallback
-    Tcp,
-    /// FakeTLS over TCP - obfuscated for DPI bypass
-    FakeTls,
-}
-
-impl LegType {
-    /// Whether this leg type provides reliability at transport level
-    pub fn is_reliable(&self) -> bool {
-        matches!(self, LegType::Kcp | LegType::Tcp | LegType::FakeTls)
-    }
-    
-    /// Whether this leg type uses encryption/obfuscation
-    pub fn is_obfuscated(&self) -> bool {
-        matches!(self, LegType::FakeTls)
-    }
-}

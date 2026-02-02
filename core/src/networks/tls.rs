@@ -1,37 +1,13 @@
 use anyhow::Result;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::{ServerConfig, ClientConfig, RootCertStore};
-use rcgen::generate_simple_self_signed;
-
-/// Generate self-signed certificate for testing
-pub fn generate_self_signed_cert(subject_alt_names: Vec<String>) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let certified_key = generate_simple_self_signed(subject_alt_names)?;
-    let cert_der = CertificateDer::from(certified_key.cert.der().to_vec());
-    let priv_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified_key.key_pair.serialize_der()));
-
-    Ok((vec![cert_der], priv_key))
-}
-
-/// Configure TLS for server with self-signed certificate
-pub fn configure_server_tls() -> Result<(ServerConfig, String)> {
-    // Install default crypto provider for rustls 0.23
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    // Generate certificate for localhost and IP (for testing)
-    let certified_key = generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
-    let cert_der = CertificateDer::from(certified_key.cert.der().to_vec());
-    let priv_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified_key.key_pair.serialize_der()));
-    let cert_pem = certified_key.cert.pem();
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], priv_key)?;
-
-    Ok((config, cert_pem))
-}
+use rustls::pki_types::PrivateKeyDer;
+use rustls::{ClientConfig, RootCertStore};
 
 /// Configure TLS for client with optional certificate pinning
-pub fn configure_client_tls(server_ca_pem: Option<String>) -> Result<ClientConfig> {
+pub fn configure_client_tls(
+    server_ca_pem: Option<String>,
+    client_cert: Option<String>,
+    client_key: Option<String>
+) -> Result<ClientConfig> {
     // Install default crypto provider for rustls 0.23
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -46,13 +22,45 @@ pub fn configure_client_tls(server_ca_pem: Option<String>) -> Result<ClientConfi
             root_store.add(cert)?;
         }
     } else {
-        // Use system WebPKI root certificates
+        // SECURITY: Certificate pinning is REQUIRED for production
+        // Falling back to system roots is a security risk
+        if !cfg!(debug_assertions) {
+             return Err(anyhow::anyhow!(
+                "Certificate pinning is required. \
+                 Provide server CA certificate via server_ca_pem parameter. \
+                 Using system WebPKI roots is disabled for security in release mode."
+            ));
+        }
+        log::warn!("Using system WebPKI roots (DEBUG MODE ONLY)");
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let builder = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(root_store);
+
+    let config = if let (Some(cert_pem), Some(key_pem)) = (client_cert, client_key) {
+        let mut cert_reader = std::io::BufReader::new(cert_pem.as_bytes());
+        let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+        
+        // Parse key
+        let mut key_reader = std::io::BufReader::new(key_pem.as_bytes());
+        // Try pkcs8
+        let key = if let Some(pkcs8) = rustls_pemfile::pkcs8_private_keys(&mut key_reader).next() {
+             PrivateKeyDer::Pkcs8(pkcs8?)
+        } else {
+            // Reset reader
+             let mut key_reader = std::io::BufReader::new(key_pem.as_bytes());
+             if let Some(rsa) = rustls_pemfile::private_key(&mut key_reader)? {
+                 rsa
+             } else {
+                 return Err(anyhow::anyhow!("No private key found"));
+             }
+        };
+
+        builder.with_client_auth_cert(certs, key)?
+    } else {
+        builder.with_no_client_auth()
+    };
 
     Ok(config)
 }

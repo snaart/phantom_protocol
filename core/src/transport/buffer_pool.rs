@@ -3,15 +3,20 @@
 //! Eliminates per-packet memory allocations for maximum throughput.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use parking_lot::Mutex;
+use crossbeam_queue::ArrayQueue;
+use std::cell::RefCell;
+
+const BATCH_SIZE: usize = 32;
+const MAX_LOCAL_BUFFERS: usize = 64;
 
 /// A pool of pre-allocated buffers for zero-allocation I/O
 pub struct BufferPool {
-    /// Pool of available buffers
-    buffers: Mutex<Vec<Vec<u8>>>,
+    /// Global pool of available buffers
+    buffers: ArrayQueue<Vec<u8>>,
     /// Buffer size
     buffer_size: usize,
     /// Max pool size
+    #[allow(dead_code)]
     max_buffers: usize,
     /// Stats: total allocations
     allocations: AtomicUsize,
@@ -19,31 +24,62 @@ pub struct BufferPool {
     hits: AtomicUsize,
 }
 
+thread_local! {
+    static LOCAL_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::with_capacity(MAX_LOCAL_BUFFERS));
+}
+
 impl BufferPool {
     /// Create a new buffer pool
     pub fn new(buffer_size: usize, initial_count: usize, max_buffers: usize) -> Self {
-        let mut buffers = Vec::with_capacity(max_buffers);
-        for _ in 0..initial_count {
-            buffers.push(vec![0u8; buffer_size]);
+        let buffers = ArrayQueue::new(max_buffers);
+        let count = std::cmp::min(initial_count, max_buffers);
+        for _ in 0..count {
+            let _ = buffers.push(vec![0u8; buffer_size]);
         }
         
         Self {
-            buffers: Mutex::new(buffers),
+            buffers,
             buffer_size,
             max_buffers,
-            allocations: AtomicUsize::new(initial_count),
+            allocations: AtomicUsize::new(count),
             hits: AtomicUsize::new(0),
         }
     }
     
     /// Acquire a buffer from the pool
     #[inline]
-    pub fn acquire(&self) -> PooledBuffer {
-        let mut pool = self.buffers.lock();
-        
-        let buffer = if let Some(mut buf) = pool.pop() {
+    pub fn acquire(&self) -> PooledBuffer<'_> {
+        let mut buffer: Option<Vec<u8>> = LOCAL_POOL.with(|local| {
+            let mut local_pool = local.borrow_mut();
+            if let Some(mut buf) = local_pool.pop() {
+                buf.clear();
+                return Some(buf);
+            }
+            None
+        });
+
+        if buffer.is_none() {
+            // Refill local pool from global pool
+            LOCAL_POOL.with(|local| {
+                let mut local_pool = local.borrow_mut();
+                for _ in 0..BATCH_SIZE {
+                    if let Some(mut buf) = self.buffers.pop() {
+                        buf.clear();
+                        local_pool.push(buf);
+                    } else {
+                        break;
+                    }
+                }
+            });
+
+            buffer = LOCAL_POOL.with(|local| {
+                let mut local_pool = local.borrow_mut();
+                local_pool.pop()
+            });
+        }
+
+        let buffer = if let Some(buf) = buffer {
             self.hits.fetch_add(1, Ordering::Relaxed);
-            buf.clear();
             buf
         } else {
             self.allocations.fetch_add(1, Ordering::Relaxed);
@@ -59,12 +95,23 @@ impl BufferPool {
     /// Return a buffer to the pool
     #[inline]
     fn return_buffer(&self, mut buffer: Vec<u8>) {
-        let mut pool = self.buffers.lock();
-        if pool.len() < self.max_buffers {
-            buffer.clear();
-            pool.push(buffer);
-        }
-        // If pool is full, buffer is dropped
+        buffer.clear();
+        LOCAL_POOL.with(|local| {
+            let mut local_pool = local.borrow_mut();
+            if local_pool.len() < MAX_LOCAL_BUFFERS {
+                local_pool.push(buffer);
+            } else {
+                // If local pool is full, flush half back to global pool
+                let half = MAX_LOCAL_BUFFERS / 2;
+                for _ in 0..half {
+                    if let Some(buf) = local_pool.pop() {
+                        let _ = self.buffers.push(buf);
+                    }
+                }
+                
+                local_pool.push(buffer);
+            }
+        });
     }
     
     /// Get pool statistics
@@ -72,7 +119,7 @@ impl BufferPool {
         PoolStats {
             allocations: self.allocations.load(Ordering::Relaxed),
             hits: self.hits.load(Ordering::Relaxed),
-            pool_size: self.buffers.lock().len(),
+            pool_size: self.buffers.len(),
         }
     }
 }
@@ -128,7 +175,10 @@ impl<'a> std::ops::DerefMut for PooledBuffer<'a> {
 impl<'a> Drop for PooledBuffer<'a> {
     fn drop(&mut self) {
         let buffer = std::mem::take(&mut self.buffer);
-        self.pool.return_buffer(buffer);
+        // Only return if it has some capacity (not completely empty shell)
+        if buffer.capacity() > 0 {
+            self.pool.return_buffer(buffer);
+        }
     }
 }
 
@@ -157,20 +207,20 @@ static GLOBAL_POOL: std::sync::OnceLock<BufferPool> = std::sync::OnceLock::new()
 /// Get the global buffer pool
 pub fn global_pool() -> &'static BufferPool {
     GLOBAL_POOL.get_or_init(|| {
-        // 64 KB buffers, 16 initial, max 256
-        BufferPool::new(64 * 1024, 16, 256)
+        // 64 KB buffers, 1024 initial, 65536 max
+        BufferPool::new(64 * 1024, 1024, 65536)
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+    use std::thread;
+
     #[test]
     fn test_buffer_pool() {
         let pool = BufferPool::new(1024, 4, 16);
         
-        // Acquire buffers
         let mut buf1 = pool.acquire();
         buf1.extend_from_slice(b"hello");
         assert_eq!(buf1.len(), 5);
@@ -178,31 +228,40 @@ mod tests {
         let buf2 = pool.acquire();
         assert_eq!(buf2.len(), 0);
         
-        // Return buffers
         drop(buf1);
         drop(buf2);
         
-        // Pool should have 2 buffers now
-        let stats = pool.stats();
-        assert_eq!(stats.pool_size, 2);
+        // After returning, buffers are pushed to local pool.
+        // It preloaded 4 buffers initially, we used 2 and returned 2. So it has 4.
+        LOCAL_POOL.with(|local| {
+            assert_eq!(local.borrow().len(), 4);
+        });
     }
-    
+
     #[test]
-    fn test_buffer_pool_reuse() {
-        let pool = BufferPool::new(1024, 0, 16);
+    fn test_thread_local_flushing() {
+        let pool = std::sync::Arc::new(BufferPool::new(1024, 0, 100));
+
+        let p_clone = pool.clone();
+        thread::spawn(move || {
+            let mut bufs = Vec::new();
+            // Allocate 70 buffers to exceed MAX_LOCAL_BUFFERS (64)
+            for _ in 0..70 {
+                bufs.push(p_clone.acquire());
+            }
+
+            // Drop all
+            drop(bufs);
+
+            // Local pool should have 64 buffers (or less if flushed), global should have some
+            let mut count = 0;
+            LOCAL_POOL.with(|local| {
+                count = local.borrow().len();
+            });
+            assert!(count <= MAX_LOCAL_BUFFERS);
+        }).join().unwrap();
         
-        // First acquire allocates
-        {
-            let _buf = pool.acquire();
-        }
-        
-        // Second acquire should hit
-        {
-            let _buf = pool.acquire();
-        }
-        
-        let stats = pool.stats();
-        assert_eq!(stats.allocations, 1);
-        assert_eq!(stats.hits, 1);
+        // global pool should have received the flushed buffers
+        assert!(pool.buffers.len() > 0);
     }
 }
