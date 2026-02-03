@@ -1,0 +1,11 @@
+# Phantom Core uses Rust stable by default. The minimum supported version
+# (MSRV) is declared in `core/Cargo.toml` via `rust-version` (once added)
+# and enforced by a dedicated CI job using `dtolnay/rust-toolchain@1.75`.
+#
+# This file deliberately does NOT pin a specific version, so:
+#   - Local developers use whatever stable they already have (faster CI).
+#   - CI explicitly selects `stable` or `1.75` per workflow job.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

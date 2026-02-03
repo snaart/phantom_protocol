@@ -1,0 +1,8 @@
+msrv = "1.75"
+cognitive-complexity-threshold = 30
+type-complexity-threshold = 250
+too-many-arguments-threshold = 8
+disallowed-methods = [
+    { path = "std::option::Option::unwrap", reason = "use `.ok_or(..)` or `match` and propagate errors" },
+    { path = "std::result::Result::unwrap", reason = "propagate the error or convert with `.map_err(..)`" },
+]
