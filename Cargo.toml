@@ -3,3 +3,42 @@ resolver = "2"
 members = [
     "core",
 ]
+# `cli/` and `tests/` are sibling crates that depend on `phantom_core` via a
+# path dependency but are intentionally NOT workspace members (see CLAUDE.md).
+# Listing them here makes cargo's workspace-membership check explicit and
+# silences "package believes it's in a workspace when it's not" errors.
+exclude = [
+    "cli",
+    "tests",
+]
+
+# Release profile lives at the workspace root so cargo actually picks it up;
+# `[profile.release]` declarations in non-root members are silently ignored.
+# We optimize for **speed** here (production transport library), not size — a
+# separate `release-size` profile is provided for footprint-constrained targets.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+debug = false
+overflow-checks = false
+
+# Size-optimized build for embedded / mobile bundles.
+[profile.release-size]
+inherits = "release"
+opt-level = "z"
+strip = "symbols"
+
+# Bench profile inherits release but keeps debug info for profilers (perf, samply,
+# flamegraph). Use `cargo bench --profile=bench` (the default).
+[profile.bench]
+inherits = "release"
+debug = true
+strip = "none"
+
+# Dist profile for final shipped artifacts: identical to release plus PGO-ready
+# layout. PGO instrumentation is added on the command line, not in this profile.
+[profile.dist]
+inherits = "release"
