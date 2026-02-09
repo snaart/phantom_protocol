@@ -17,6 +17,17 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use dashmap::DashMap;
 use bytes::Bytes;
 
+/// Generate a fresh 128-bit session identifier from the thread-local CSPRNG.
+///
+/// Replaces the historical `rand::random::<u32>()` (32 bits, insufficient to
+/// avoid birthday collisions at scale and not advertised as cryptographic).
+/// `rand::thread_rng` is seeded from the OS at thread startup and uses a
+/// modern stream cipher (ChaCha) — adequate for non-secret identifiers.
+fn new_session_id() -> String {
+    let bytes: [u8; 16] = rand::random();
+    format!("phantom-{}", hex::encode(bytes))
+}
+
 // ─── Connection State ───────────────────────────────────────────────────────
 
 /// Connection state for `PhantomSession`.
@@ -162,7 +173,7 @@ impl PhantomSession {
         let streams = Arc::new(DashMap::new());
 
         let session = Self {
-            id: format!("phantom-{}", rand::random::<u32>()),
+            id: new_session_id(),
             peer_addr: peer.clone(),
             state: state.clone(),
             send_queue: send_queue.clone(),
@@ -199,7 +210,7 @@ impl PhantomSession {
         let streams = Arc::new(DashMap::new());
 
         let session = Arc::new(Self {
-            id: format!("phantom-{}", rand::random::<u32>()),
+            id: new_session_id(),
             peer_addr: peer_addr.clone(),
             state: state.clone(),
             send_queue: send_queue.clone(),
@@ -236,12 +247,29 @@ impl PhantomSession {
         log::info!("PhantomSession: starting handshake with {}", peer);
 
         // ── Stage 1 & 2: Hybrid Handshake ──
-        let handshake = HandshakeClient::new();
+        let handshake = match HandshakeClient::new() {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!("PhantomSession: failed to initialize handshake client: {}", e);
+                state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
+                return;
+            }
+        };
         let mut hello = handshake.create_client_hello();
 
         let server_hello = loop {
-            // Send our hello (Full Hybrid ClientHello)
-            let hello_bytes = borsh::to_vec(&hello).unwrap();
+            // Send our hello (Full Hybrid ClientHello). Borsh serialization of
+            // our own well-formed handshake structs only fails on allocator
+            // exhaustion; we still surface it as a connection failure rather
+            // than panicking, so library callers don't see an aborted process.
+            let hello_bytes = match borsh::to_vec(&hello) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::error!("PhantomSession: failed to serialize ClientHello: {}", e);
+                    state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
+                    return;
+                }
+            };
             if let Err(e) = transport.send_bytes(&hello_bytes).await {
                 log::error!("PhantomSession: failed to send hello: {}", e);
                 state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
@@ -580,7 +608,7 @@ impl PhantomSession {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(256);
         let streams = Arc::new(DashMap::new());
         Arc::new(Self {
-            id: format!("phantom-{}", rand::random::<u32>()),
+            id: new_session_id(),
             peer_addr,
             state: Arc::new(AtomicU8::new(ConnectionState::Connecting as u8)),
             send_queue: Arc::new(Mutex::new(Vec::new())),

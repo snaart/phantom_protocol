@@ -13,7 +13,7 @@ fn bench_syn_flood(c: &mut Criterion) {
     let reputation = Arc::new(ReputationTracker::new());
     
     // Create a legitimate-looking ClientHello payload
-    let client = HandshakeClient::new();
+    let client = HandshakeClient::new().expect("HandshakeClient::new");
     let original_hello = client.create_client_hello();
     let payload = borsh::to_vec(&original_hello).unwrap();
     

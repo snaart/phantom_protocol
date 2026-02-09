@@ -139,14 +139,16 @@ impl PhantomBuilder {
         &self.config
     }
     
-    /// Initiate a PQC handshake as client
-    pub fn create_client_handshake(&self) -> HandshakeClient {
+    /// Initiate a PQC handshake as client. Returns an error if the OS RNG
+    /// cannot be read.
+    pub fn create_client_handshake(&self) -> Result<HandshakeClient, crate::transport::handshake::HandshakeError> {
         HandshakeClient::new()
     }
-    
-    /// Create a server handshake handler
-    pub fn create_server_handshake() -> HandshakeServer {
-        HandshakeServer::new().expect("Failed to initialize server keys")
+
+    /// Create a server handshake handler. Returns an error if RNG / keygen
+    /// fails.
+    pub fn create_server_handshake() -> Result<HandshakeServer, crate::transport::handshake::HandshakeError> {
+        HandshakeServer::new()
     }
 }
 
@@ -181,10 +183,13 @@ mod tests {
         assert!(builder.get_config().stealth_mode);
         
         // Create handshake components
-        let client_hs = builder.create_client_handshake();
+        let client_hs = builder
+            .create_client_handshake()
+            .expect("create_client_handshake");
         let _client_hello = client_hs.create_client_hello();
-        
-        let server_hs = PhantomBuilder::create_server_handshake();
+
+        let server_hs =
+            PhantomBuilder::create_server_handshake().expect("create_server_handshake");
         let _server_pk = server_hs.verifying_key();
     }
 }
