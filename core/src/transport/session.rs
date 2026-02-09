@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 use parking_lot::RwLock;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Session state machine
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,9 +34,16 @@ pub enum SessionState {
     Closed,
 }
 
-/// Crypto state for session encryption
+/// Crypto state for session encryption.
+///
+/// On drop, `session_key` is zeroed. The wrapped [`CryptoSession`] holds AEAD
+/// keys in ring's opaque `LessSafeKey` (which cannot be zeroed directly — we
+/// rely on the OS reclaiming memory and on the `Arc<CryptoSessionInner>` going
+/// out of scope alongside this struct).
+#[derive(ZeroizeOnDrop)]
 pub struct CryptoState {
     /// Bidirectional crypto session
+    #[zeroize(skip)]
     pub session: CryptoSession,
     /// Shared session key (for additional derivations)
     pub session_key: [u8; 32],
@@ -225,9 +233,17 @@ impl Session {
         &self.scheduler
     }
 
-    /// Set resumption secret for 0-RTT
+    /// Set resumption secret for 0-RTT.
+    ///
+    /// If a secret was already set, the previous bytes are explicitly zeroed
+    /// before being replaced — defense in depth in case `set_resumption_secret`
+    /// is called multiple times within a session.
     pub fn set_resumption_secret(&self, secret: [u8; 32]) {
-        *self.resumption_secret.write() = Some(secret);
+        let mut guard = self.resumption_secret.write();
+        if let Some(mut old) = guard.take() {
+            old.zeroize();
+        }
+        *guard = Some(secret);
     }
 
     /// Check if session can be resumed (has resumption secret)
@@ -251,5 +267,16 @@ impl std::fmt::Debug for Session {
         f.debug_struct("Session")
             .field("id", &self.id)
             .finish()
+    }
+}
+
+impl Drop for Session {
+    /// On session drop, explicitly zero the resumption secret. The
+    /// `CryptoState` inside `crypto` is itself `ZeroizeOnDrop`, so its
+    /// `session_key` is handled there.
+    fn drop(&mut self) {
+        if let Some(mut secret) = self.resumption_secret.write().take() {
+            secret.zeroize();
+        }
     }
 }
