@@ -94,7 +94,7 @@ fn bench_handshake(c: &mut Criterion) {
     group.bench_function("phantom_pqc_handshake", |b| {
         let client_ip = "127.0.0.1".parse().unwrap();
         b.iter(|| {
-            let client = HandshakeClient::new();
+            let client = HandshakeClient::new().expect("HandshakeClient::new");
             let server = HandshakeServer::new().unwrap();
             let server_pk = server.verifying_key().clone();
 
@@ -128,7 +128,7 @@ fn bench_handshake(c: &mut Criterion) {
         let client_ip = "127.0.0.1".parse().unwrap();
         
         b.iter(|| {
-            let client = HandshakeClient::new();
+            let client = HandshakeClient::new().expect("HandshakeClient::new");
             
             let client_hello = client.create_client_hello();
             let result = server.process_client_hello(&client_hello, 0, client_ip);
@@ -162,7 +162,7 @@ fn bench_encryption(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
     
     // Setup session
-    let client = HandshakeClient::new();
+    let client = HandshakeClient::new().expect("HandshakeClient::new");
     let server = HandshakeServer::new().unwrap();
     let server_pk = server.verifying_key().clone();
     let client_ip = "127.0.0.1".parse().unwrap();
@@ -224,7 +224,7 @@ fn bench_throughput(c: &mut Criterion) {
     group.sample_size(50);
     
     // Setup session
-    let client = HandshakeClient::new();
+    let client = HandshakeClient::new().expect("HandshakeClient::new");
     let server = HandshakeServer::new().unwrap();
     let server_pk = server.verifying_key().clone();
     let client_ip = "127.0.0.1".parse().unwrap();

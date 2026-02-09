@@ -48,7 +48,7 @@ fn fuzz_garbage_input_to_server() {
 #[test]
 fn test_valid_handshake_flow() {
     let server = HandshakeServer::new().unwrap();
-    let client = HandshakeClient::new();
+    let client = HandshakeClient::new().expect("HandshakeClient::new");
     let client_ip = "127.0.0.1".parse().unwrap();
 
     // 1. Client creates Hello

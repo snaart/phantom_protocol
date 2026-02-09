@@ -25,7 +25,7 @@ fn phantom_handshake_bench(c: &mut Criterion) {
     group.bench_function("phantom_pqc_full", |b| {
         let client_ip = "127.0.0.1".parse().unwrap();
         b.iter(|| {
-            let client = HandshakeClient::new();
+            let client = HandshakeClient::new().expect("HandshakeClient::new");
             let server = HandshakeServer::new().unwrap();
             let server_pk = server.verifying_key().clone();
 
@@ -60,7 +60,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
     
     // Setup Phantom session once
-    let client = HandshakeClient::new();
+    let client = HandshakeClient::new().expect("HandshakeClient::new");
     let server = HandshakeServer::new().unwrap();
     let server_pk = server.verifying_key().clone();
     let client_ip = "127.0.0.1".parse().unwrap();
@@ -275,7 +275,7 @@ fn encryption_bench(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
     
     // Setup session
-    let client = HandshakeClient::new();
+    let client = HandshakeClient::new().expect("HandshakeClient::new");
     let server = HandshakeServer::new().unwrap();
     let server_pk = server.verifying_key().clone();
     let client_ip = "127.0.0.1".parse().unwrap();
