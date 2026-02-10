@@ -12,6 +12,27 @@
 //! The core transmits only `Vec<u8>` / `Bytes`.
 //! Serialization (JSON, Protobuf, etc.) is the user's responsibility.
 
+// Security-friendly lints. Initially `warn` (not `deny`) so the codebase can
+// drift toward zero panics without breaking existing call sites. A follow-up
+// PR (Production Readiness, Phase 1.3) will tighten these to `deny` and audit
+// the remaining sites.
+//
+// `clippy::indexing_slicing` is deliberately omitted at this stage — it fires
+// on every constant-bounded array index and would generate too much noise.
+// It is tracked as a separate phase 1.13 item (bounds-check audit).
+#![warn(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::missing_safety_doc
+)]
+// `#[forbid(unsafe_code)]` would be appropriate for most modules; the few
+// that require `unsafe` (crypto FFI key wrapping, libc syscalls for UDP GSO)
+// opt in via module-level `#[allow]` and `// SAFETY:` comments.
+
 mod errors;
 pub mod config;
 pub mod validation;
