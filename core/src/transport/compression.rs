@@ -143,7 +143,11 @@ impl AdaptiveCompressor {
         let compressed = match active_algo {
             CompressionAlgo::Lz4 => Self::compress_lz4(data),
             CompressionAlgo::Zstd1 => Self::compress_zstd(data, self.zstd_level),
-            CompressionAlgo::None => unreachable!(),
+            // The `None` arm is already eliminated by the early-return at the
+            // top of this function, but matching defensively (rather than
+            // calling `unreachable!()`) means malformed enum extensions
+            // cannot become a panic source.
+            CompressionAlgo::None => return (CompressionAlgo::None.to_byte(), data.to_vec()),
         };
 
         // Update stats

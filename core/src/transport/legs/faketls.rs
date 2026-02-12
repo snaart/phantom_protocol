@@ -109,7 +109,7 @@ fn derive_outer_keys(
     sni: &str,
     version: u16,
     is_server: bool,
-) -> (LessSafeKey, LessSafeKey, [u8; 4]) {
+) -> io::Result<(LessSafeKey, LessSafeKey, [u8; 4])> {
     let mut seed = Vec::with_capacity(64);
     seed.extend_from_slice(b"phantom-faketls-outer-v1");
     seed.extend_from_slice(&version.to_be_bytes());
@@ -127,25 +127,36 @@ fn derive_outer_keys(
     } else {
         (key_c2s, key_s2c)
     };
-    let send_key =
-        LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &send_bytes).unwrap());
-    let recv_key =
-        LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &recv_bytes).unwrap());
-    (send_key, recv_key, nonce_prefix)
+    // `UnboundKey::new(&AES_256_GCM, key)` only fails if the slice length is
+    // wrong — `blake3::derive_key` always emits exactly 32 bytes and
+    // `AES_256_GCM.key_len()` is 32, so this is structurally infallible.
+    // Surface it as a typed error anyway so the function stays total.
+    let send_unbound = UnboundKey::new(&aead::AES_256_GCM, &send_bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("AES key init (send): {}", e)))?;
+    let recv_unbound = UnboundKey::new(&aead::AES_256_GCM, &recv_bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("AES key init (recv): {}", e)))?;
+    Ok((
+        LessSafeKey::new(send_unbound),
+        LessSafeKey::new(recv_unbound),
+        nonce_prefix,
+    ))
 }
 
 impl FakeTlsLeg {
-    /// Create a new FakeTLS leg with default config
-    pub fn new() -> Self {
+    /// Create a new FakeTLS leg with default config. Returns an error only
+    /// in the structurally-impossible case that AES-256-GCM key initialization
+    /// fails (preserved as a `Result` to keep the API panic-free).
+    pub fn new() -> io::Result<Self> {
         Self::with_config(FakeTlsConfig::default())
     }
 
-    /// Create with custom config (client role; not yet connected).
-    pub fn with_config(config: FakeTlsConfig) -> Self {
+    /// Create with custom config (client role; not yet connected). See
+    /// [`FakeTlsLeg::new`] for the error contract.
+    pub fn with_config(config: FakeTlsConfig) -> io::Result<Self> {
         let (send_key, recv_key, nonce_prefix) =
-            derive_outer_keys(&config.sni, config.version, false);
+            derive_outer_keys(&config.sni, config.version, false)?;
 
-        Self {
+        Ok(Self {
             config,
             stream: Mutex::new(None),
             remote_addr: None,
@@ -159,7 +170,7 @@ impl FakeTlsLeg {
             send_counter: AtomicU64::new(0),
             recv_counter: AtomicU64::new(0),
             is_server: false,
-        }
+        })
     }
 
     /// Connect as Client and perform fake TLS handshake
@@ -171,7 +182,7 @@ impl FakeTlsLeg {
         stream.set_nodelay(true)?;
 
         let (send_key, recv_key, nonce_prefix) =
-            derive_outer_keys(&config.sni, config.version, false);
+            derive_outer_keys(&config.sni, config.version, false)?;
 
         let leg = Self {
             config,
@@ -200,7 +211,7 @@ impl FakeTlsLeg {
         let remote_addr = stream.peer_addr().ok();
 
         let (send_key, recv_key, nonce_prefix) =
-            derive_outer_keys(&config.sni, config.version, true);
+            derive_outer_keys(&config.sni, config.version, true)?;
 
         let leg = Self {
             config,
@@ -624,8 +635,12 @@ impl FakeTlsLeg {
 }
 
 impl Default for FakeTlsLeg {
+    /// `Default` panics on key-init failure — see [`FakeTlsLeg::new`] for the
+    /// structurally-impossible error contract. Prefer the explicit
+    /// `FakeTlsLeg::new()` in code that cares about the error.
     fn default() -> Self {
-        Self::new()
+        #[allow(clippy::expect_used)]
+        Self::new().expect("FakeTlsLeg::default: AES key init invariant violated")
     }
 }
 
@@ -748,14 +763,14 @@ mod tests {
 
     #[test]
     fn test_faketls_leg_creation() {
-        let leg = FakeTlsLeg::new();
+        let leg = FakeTlsLeg::new().expect("FakeTlsLeg::new");
         assert!(!leg.is_available());
         assert_eq!(leg.config.sni, "www.google.com");
     }
 
     #[test]
     fn test_fake_client_hello() {
-        let leg = FakeTlsLeg::new();
+        let leg = FakeTlsLeg::new().expect("FakeTlsLeg::new");
         let hello = leg.build_fake_client_hello();
         
         // Should start with TLS handshake record
@@ -765,7 +780,7 @@ mod tests {
 
     #[test]
     fn test_wrap_tls_record() {
-        let leg = FakeTlsLeg::new();
+        let leg = FakeTlsLeg::new().expect("FakeTlsLeg::new");
         let data = b"test payload";
         let record = leg.wrap_as_tls_record(data);
         
@@ -776,7 +791,7 @@ mod tests {
 
     #[test]
     fn test_ja3_randomization() {
-        let leg = FakeTlsLeg::new();
+        let leg = FakeTlsLeg::new().expect("FakeTlsLeg::new");
         let hello1_ = leg.build_fake_client_hello();
         let hello2 = leg.build_fake_client_hello();
         
@@ -794,13 +809,13 @@ mod tests {
     #[test]
     fn test_wrap_unwrap_roundtrip_across_peers() {
         // Build a "client" leg.
-        let client = FakeTlsLeg::with_config(FakeTlsConfig::default());
+        let client = FakeTlsLeg::with_config(FakeTlsConfig::default()).expect("FakeTlsLeg::with_config");
 
         // Build a "server" leg from scratch: same config but is_server = true.
         // We construct it directly since `accept` requires a real TcpStream.
         let cfg = FakeTlsConfig::default();
         let (send_key, recv_key, nonce_prefix) =
-            derive_outer_keys(&cfg.sni, cfg.version, true);
+            derive_outer_keys(&cfg.sni, cfg.version, true).expect("derive_outer_keys");
         let server = FakeTlsLeg {
             config: cfg,
             stream: Mutex::new(None),
@@ -833,7 +848,7 @@ mod tests {
     /// because the per-record counter advances.
     #[test]
     fn test_nonce_advances_per_record() {
-        let leg = FakeTlsLeg::with_config(FakeTlsConfig::default());
+        let leg = FakeTlsLeg::with_config(FakeTlsConfig::default()).expect("FakeTlsLeg::with_config");
         let r1 = leg.wrap_as_tls_record(b"identical");
         let r2 = leg.wrap_as_tls_record(b"identical");
         assert_ne!(r1, r2, "counter must advance — identical plaintext must not produce identical ciphertext");
@@ -841,7 +856,7 @@ mod tests {
 
     #[test]
     fn test_client_hello_structure() {
-        let leg = FakeTlsLeg::new();
+        let leg = FakeTlsLeg::new().expect("FakeTlsLeg::new");
         let hello = leg.build_fake_client_hello();
 
         // Verify TLS record header
