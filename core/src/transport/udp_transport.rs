@@ -14,6 +14,12 @@
 //! `PacedSender` wraps `UdpTransport` + `Pacer` to enforce a rate limit
 //! set by the `BandwidthEstimator`. Prevents burst-induced congestion.
 
+// This module opts back in to `unsafe` (denied at the crate root in lib.rs).
+// The `unsafe` blocks here are required to call `libc::sendmmsg` /
+// `libc::recvmmsg` and to allocate `libc::mmsghdr` via `MaybeUninit::zeroed`.
+// Every block must carry a `// SAFETY:` comment.
+#![allow(unsafe_code)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -328,6 +334,10 @@ fn sendmmsg_batch(
     let mut msgs: Vec<libc::mmsghdr> = iovs
         .iter_mut()
         .map(|iov| {
+            // SAFETY: `libc::mmsghdr` is `#[repr(C)]` with primitive integer
+            // and raw-pointer fields. The all-zero bit pattern is a valid
+            // (though uninitialized-by-protocol) instance: every field is
+            // populated below before the struct is read by the kernel.
             let mut hdr: libc::mmsghdr = unsafe { MaybeUninit::zeroed().assume_init() };
             hdr.msg_hdr.msg_name = &sin as *const _ as *mut _;
             hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
@@ -337,6 +347,11 @@ fn sendmmsg_batch(
         })
         .collect();
 
+    // SAFETY: `fd` is owned by `self.socket` and remains valid for the duration
+    // of this call. `msgs` is a `Vec<libc::mmsghdr>` of `msgs.len()` initialized
+    // entries (populated above) — `as_mut_ptr()` is valid for that range. The
+    // kernel reads through each `msg_hdr.msg_iov` which points to the `iov_base`
+    // of a `datagrams[i]` byte slice, also alive for the duration of this call.
     let ret = unsafe {
         libc::sendmmsg(fd, msgs.as_mut_ptr(), msgs.len() as u32, 0)
     };
