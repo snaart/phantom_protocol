@@ -1,10 +1,11 @@
 # Build Stage
-FROM rust:1.84-slim-bookworm as builder
+# Обновили до 1.93, чтобы соответствовать вашей локальной версии
+FROM rust:1.93-slim-bookworm as builder
 
 WORKDIR /usr/src/phantom
 COPY . .
 
-# Install dependencies (SQLCipher/openssl if needed, though we use pure rust or bundled)
+# Install dependencies
 RUN apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler clang
 
 # Build Server Release

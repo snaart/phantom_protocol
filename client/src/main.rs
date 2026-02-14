@@ -1,7 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use phantom_core::client::PhantomClient;
-use std::io::{self, Write};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -38,25 +37,41 @@ async fn main() -> Result<()> {
     match &cli.command {
         Commands::Listen { addr, group_id } => {
             let gid_bytes = hex::decode(group_id).expect("Invalid Hex GroupID");
-            let client = PhantomClient::connect(addr.clone(), gid_bytes, vec![]).await?;
+            let client = PhantomClient::connect(
+                addr.clone(),
+                gid_bytes,
+                vec![],           // identity (unused)
+                None,             // server_ca_pem (no pinning)
+                vec![],           // shared_secret
+            ).await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
             
             // Send JOIN frame to register subscription
-            client.send_message(b"JOIN".to_vec()).await?;
+            client.send_message(b"JOIN".to_vec()).await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
             println!("Connected to {}. Listening on Group {}...", addr, group_id);
             
             loop {
-                let payload = client.recv_message().await?;
+                let payload = client.recv_message().await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
                 println!("Received: {:?}", String::from_utf8_lossy(&payload));
             }
         }
         Commands::Send { addr, group_id, msg } => {
             let gid_bytes = hex::decode(group_id).expect("Invalid Hex GroupID");
-            let client = PhantomClient::connect(addr.clone(), gid_bytes, vec![]).await?;
+            let client = PhantomClient::connect(
+                addr.clone(),
+                gid_bytes,
+                vec![],           // identity (unused)
+                None,             // server_ca_pem (no pinning)
+                vec![],           // shared_secret
+            ).await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
             
-            client.send_message(msg.as_bytes().to_vec()).await?;
+            client.send_message(msg.as_bytes().to_vec()).await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
             println!("Message sent!");
         }
     }
-    // Need to keep alive? For send it exits.
     Ok(())
 }

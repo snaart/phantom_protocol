@@ -3,7 +3,7 @@ use anyhow::Result;
 use log::{info, error};
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
-use phantom_core::network::tls;
+use phantom_core::networks::tls;
 
 mod db;
 mod network;
@@ -68,4 +68,3 @@ async fn main() -> Result<()> {
         });
     }
 }
-

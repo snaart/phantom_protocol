@@ -4,72 +4,95 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Async Runtime
-tokio = { version = "1", features = ["full"] }
+# --- OpenMLS Stack ---
+# Фиксируем версию 0.5.0 для стабильности traits
+openmls = { version = "0.8.0" }
+openmls_traits = "0.5.0"
+openmls_rust_crypto = "0.5.0"
+openmls_memory_storage = "0.5.0"
+openmls_basic_credential = "0.5.0"
+tls_codec = { version = "0.4.1", features = ["derive", "serde", "mls"] }
 
-# Memory Allocator
-mimalloc = "0.1"
+# --- Async & Runtime ---
+tokio = { version = "1.36", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+async-trait = "0.1"
 
-# Serialization & Compression
-# Serialization & Compression
+# --- Serialization & Utils ---
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
 rkyv = { version = "0.7", features = ["validation", "strict"] }
 bytecheck = "0.6"
-zstd = "0.13"
-serde = { version = "1", features = ["derive"] }
-
-# Cryptography
-rand = "0.8"
-zeroize = "1"
-# Classical
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-ed25519-dalek = "2"
-chacha20poly1305 = "0.10" # Authenticated Encryption (Fixes C-02)
-# Post-Quantum (Using pqcrypto-kyber for FFI binding to reference impl)
-pqcrypto-kyber = "0.8" 
-pqcrypto-traits = "0.3"
-
-# KDF & Hashing
-hkdf = "0.12"
-sha2 = "0.10"
-# MLS (0.6.x compatible set)
-openmls = "0.6"
-openmls_rust_crypto = "0.3"
-openmls_basic_credential = "0.3"
-
-# Database
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
-
-# Error Handling
-thiserror = "1"
+hex = "0.4"
+base64 = "0.22"
 anyhow = "1"
-
-# Utils
-bytes = "1"
-futures = "0.3"
+thiserror = "1"
 log = "0.4"
+env_logger = "0.11"
+rand = "0.8"
 once_cell = "1.18"
 
-# TLS
-tokio-rustls = "0.24"
-rustls = { version = "0.21" }
-rustls-pemfile = "1"
-webpki-roots = "0.25"
-rcgen = "0.11" 
-time = "=0.3.36" # Pin to avoid rustc version issues
+# --- Crypto ---
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = "2"
+chacha20poly1305 = "0.10"
+ring = "0.17"  # HW-accelerated AES-GCM (ARM64 AES intrinsics / x86 AES-NI)
+pqcrypto-kyber = "0.8"
+pqcrypto-traits = "0.3"
+pqcrypto-dilithium = "0.5"
+hkdf = "0.12"
+sha2 = "0.10"
+blake3 = "1.5"
+getrandom = "0.2"
+bitflags = "2.4"
+parking_lot = "0.12"  # Fast mutex for buffer pool
+lz4_flex = "0.11"     # Fastest pure-Rust LZ4 (safe, no C bindings)
+zstd = "0.13"          # Zstandard compression (C bindings via zstd-sys)
 
-# FFI
-uniffi = { version = "0.28", features = ["tokio", "cli"] }
-blake3 = "1.8.3"
-hex = "0.4.3"
+# --- Database ---
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# --- Networking ---
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+rcgen = "0.13"
+time = "0.3"
+kcp-tokio = "0.3"
+
+# --- FFI ---
+uniffi = { version = "0.29", features = ["tokio", "cli"] }
 
 [build-dependencies]
-uniffi = { version = "0.28", features = ["build"] }
+uniffi = { version = "0.29", features = ["build"] }
 
 [dev-dependencies]
-blake3 = "1.8.3"
+blake3 = "1.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
-uniffi = { version = "0.28", features = ["bindgen-tests"] }
+uniffi = { version = "0.29", features = ["bindgen-tests"] }
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+tonic = "0.12"
+prost = "0.13"
+reqwest = { version = "0.12", features = ["json"] }
+tokio-test = "0.4"
+hyper = { version = "1", features = ["full"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["full"] }
+tokio-rustls = "0.26"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
+tls-parser = "0.12.2"
+
+[[bench]]
+name = "transport_bench"
+harness = false
+
+[[bench]]
+name = "protocol_comparison"
+harness = false
 
 [lib]
 name = "phantom_core"
