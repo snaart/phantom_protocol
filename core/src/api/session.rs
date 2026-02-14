@@ -121,8 +121,10 @@ pub struct PhantomSession {
     /// Command receiver — taken by the background task when spawned
     #[allow(dead_code)]
     cmd_rx: Mutex<Option<mpsc::Receiver<SessionCommand>>>,
-    /// Received messages channel
-    recv_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// Received messages channel. Carries `Bytes` (not `Vec<u8>`) so the recv
+    /// path can fan out via cheap refcount clones to both the stream demux
+    /// and the synchronous `recv()` consumer without deep-copying the payload.
+    recv_rx: Mutex<mpsc::Receiver<Bytes>>,
     /// Multiplexes incoming packets to independent streams
     demux: Arc<StreamDemultiplexer>,
     /// Active outgoing streams (ARQ management)
@@ -237,7 +239,7 @@ impl PhantomSession {
         send_queue: Arc<Mutex<Vec<Vec<u8>>>>,
         _cmd_tx: mpsc::Sender<SessionCommand>,
         cmd_rx: mpsc::Receiver<SessionCommand>,
-        recv_tx: mpsc::Sender<Vec<u8>>,
+        recv_tx: mpsc::Sender<Bytes>,
         transport: T,
         peer: String,
         demux: Arc<StreamDemultiplexer>,
@@ -354,7 +356,7 @@ async fn run_data_pump<T: SessionTransport>(
     state: Arc<AtomicU8>,
     send_queue: Arc<Mutex<Vec<Vec<u8>>>>,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
-    recv_tx: mpsc::Sender<Vec<u8>>,
+    recv_tx: mpsc::Sender<Bytes>,
     demux: Arc<StreamDemultiplexer>,
     streams: Arc<DashMap<u32, Arc<Stream>>>,
     next_app_seq: Arc<AtomicU32>,
@@ -451,10 +453,15 @@ async fn run_data_pump<T: SessionTransport>(
             }
 
             if !plaintext.is_empty() {
+                // Convert the plaintext Vec once and fan out via cheap
+                // refcount clones. The deep `plaintext.clone()` that used
+                // to live here was the largest per-packet allocation on the
+                // recv hot path (Phase 2.2 in PRODUCTION_READINESS.md).
+                let bytes = Bytes::from(plaintext);
                 demux_recv
-                    .route_data_async(stream_id, Bytes::from(plaintext.clone()))
+                    .route_data_async(stream_id, bytes.clone())
                     .await;
-                if recv_tx_for_task.send(plaintext).await.is_err() {
+                if recv_tx_for_task.send(bytes).await.is_err() {
                     break;
                 }
             }
@@ -658,11 +665,19 @@ impl PhantomSession {
     }
 
     /// Receive data from the session.
+    ///
+    /// Internally the recv pipeline keeps payloads as `Bytes` to avoid the
+    /// per-packet Vec clone that used to fan out to the stream demux. The
+    /// FFI surface still hands callers a `Vec<u8>`; if this is the last
+    /// refcount the Vec is moved out of the underlying buffer, otherwise
+    /// `Bytes::to_vec` copies.
     pub async fn recv(&self) -> Result<Vec<u8>, CoreError> {
         let mut rx = self.recv_rx.lock().await;
-        rx.recv()
+        let bytes = rx
+            .recv()
             .await
-            .ok_or_else(|| CoreError::NetworkError("Session closed".into()))
+            .ok_or_else(|| CoreError::NetworkError("Session closed".into()))?;
+        Ok(bytes.to_vec())
     }
 
     /// Get the current connection state (lock-free).
