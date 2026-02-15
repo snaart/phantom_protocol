@@ -16,6 +16,23 @@ use std::sync::Arc;
 /// Overhead bytes: both AES-GCM and ChaCha20-Poly1305 produce a 16-byte tag
 pub const AEAD_OVERHEAD: usize = 16;
 
+/// Hard upper bound on per-direction AEAD invocations before forcing a key
+/// rotation (or, in the absence of rekey, failing the operation).
+///
+/// AES-GCM's safety margins under deterministic-counter nonces are governed
+/// by NIST SP 800-38D: with this construction the key may be used for up to
+/// 2^48 invocations before the security level meaningfully degrades. We pick
+/// 2^48 as a defensive ceiling.  At 10^6 packets/sec it is ~9 years away —
+/// effectively unreachable for any real session — but the explicit check
+/// prevents catastrophic key abuse if a counter ever rolls back or a callsite
+/// loops pathologically.
+///
+/// When mid-session key rotation lands (Phase 1.5 in
+/// `docs/PRODUCTION_READINESS.md`) the rekey trigger will fire well before
+/// this limit so the error path here becomes a backstop, not a normal failure
+/// mode.
+pub const AEAD_MAX_INVOCATIONS: u64 = 1u64 << 48;
+
 /// Supported cipher suites
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -198,6 +215,9 @@ impl CryptoSession {
     #[inline]
     pub fn encrypt_in_place(&self, aad: &[u8], buf: &mut Vec<u8>) -> Result<(), CryptoError> {
         let counter = self.inner.send_counter.fetch_add(1, Ordering::Relaxed);
+        if counter >= AEAD_MAX_INVOCATIONS {
+            return Err(CryptoError::NonceExhausted);
+        }
         let nonce = self.make_nonce(counter);
         self.inner
             .send_key
@@ -217,6 +237,9 @@ impl CryptoSession {
         offset: usize,
     ) -> Result<usize, CryptoError> {
         let counter = self.inner.send_counter.fetch_add(1, Ordering::Relaxed);
+        if counter >= AEAD_MAX_INVOCATIONS {
+            return Err(CryptoError::NonceExhausted);
+        }
         let nonce = self.make_nonce(counter);
         // seal_in_place_separate_tag works on &mut [u8] (no Extend needed)
         let tag = self.inner
@@ -242,11 +265,28 @@ impl CryptoSession {
     #[inline]
     pub fn decrypt_in_place<'a>(&self, aad: &[u8], buf: &'a mut [u8]) -> Result<&'a mut [u8], CryptoError> {
         let counter = self.inner.recv_counter.fetch_add(1, Ordering::Relaxed);
+        if counter >= AEAD_MAX_INVOCATIONS {
+            return Err(CryptoError::NonceExhausted);
+        }
         let nonce = self.make_nonce(counter);
         self.inner
             .recv_key
             .open_in_place(nonce, Aad::from(aad), buf)
             .map_err(|_| CryptoError::DecryptionFailed)
+    }
+
+    /// Number of encryptions performed on this session (per-direction send counter).
+    /// Useful for emitting `aead_invocations_total` metrics and for rekey-trigger
+    /// logic when mid-session key rotation lands.
+    #[inline]
+    pub fn send_invocations(&self) -> u64 {
+        self.inner.send_counter.load(Ordering::Relaxed)
+    }
+
+    /// Number of decryptions performed on this session (per-direction recv counter).
+    #[inline]
+    pub fn recv_invocations(&self) -> u64 {
+        self.inner.recv_counter.load(Ordering::Relaxed)
     }
 
     /// Decrypt: allocates a new Vec.
@@ -274,6 +314,9 @@ impl CryptoSession {
 pub enum CryptoError {
     EncryptionFailed,
     DecryptionFailed,
+    /// Per-direction AEAD counter would exceed [`AEAD_MAX_INVOCATIONS`].
+    /// Callers must rotate keys (Phase 1.5) or close the session.
+    NonceExhausted,
 }
 
 impl std::fmt::Display for CryptoError {
@@ -281,6 +324,12 @@ impl std::fmt::Display for CryptoError {
         match self {
             Self::EncryptionFailed => write!(f, "Encryption failed"),
             Self::DecryptionFailed => write!(f, "Decryption / authentication failed"),
+            Self::NonceExhausted => write!(
+                f,
+                "AEAD nonce exhausted: per-direction counter exceeded {} invocations \
+                 (rotate keys before reusing this session)",
+                AEAD_MAX_INVOCATIONS
+            ),
         }
     }
 }
