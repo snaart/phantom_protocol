@@ -186,7 +186,15 @@ impl HandshakeServer {
             Err(e) => return HandshakeResponse::Fail(HandshakeError::KemFailed(e.to_string())),
         };
 
-        // Generate ephemeral keys for this connection
+        // Generate a per-session ephemeral hybrid KEM keypair. The public half
+        // is bound into the transcript signature (defense-in-depth: commits
+        // the server to a session-specific value beyond `session_id` and the
+        // client's nonce). The secret half is intentionally discarded — the
+        // current protocol does not perform a second KEM round trip using it.
+        //
+        // TODO(phase 4.1, 0-RTT): when 0-RTT lands, either consume the secret
+        // for the post-handshake KEM upgrade or remove this field from the
+        // wire (which requires bumping `VersionedPacket` to V2).
         let (_ephemeral_kem_secret, ephemeral_kem_public) = HybridSecretKey::generate();
 
         // 5. Session Derivation
@@ -345,10 +353,21 @@ impl HandshakeClient {
         Ok(session)
     }
 
+    /// Queue a plaintext payload to be sent as early-data once the secure
+    /// channel is up.
+    ///
+    /// NOTE: Early-data is currently queued at the API layer (see
+    /// `PhantomSession::send_queue`) and the data-pump flushes it through the
+    /// regular AEAD path after the handshake completes. This per-handshake
+    /// buffer is reserved for the future 0-RTT path (Phase 4.1).
     pub fn queue_early_data(&self, data: Vec<u8>) {
         self.early_data.write().push(data);
     }
 
+    /// Drain the queued early-data buffer. See [`queue_early_data`] — the
+    /// production `send_queue` path is currently used instead; this hook is
+    /// reserved for 0-RTT.
+    #[allow(dead_code)]
     pub fn take_early_data(&self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.early_data.write())
     }
