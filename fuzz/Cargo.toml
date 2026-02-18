@@ -1,0 +1,49 @@
+[package]
+name = "phantom-core-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+borsh = { version = "1.0", features = ["derive"] }
+alkahest = { version = "0.3.0", features = ["derive"] }
+
+[dependencies.phantom_core]
+path = "../core"
+
+# Disable default-targets so cargo doesn't auto-build bench/example/test for
+# this crate (fuzz crates only have bin targets).
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fuzz_client_hello"
+path = "fuzz_targets/fuzz_client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_server_hello"
+path = "fuzz_targets/fuzz_server_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_packet_parse"
+path = "fuzz_targets/fuzz_packet_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_aead_decrypt"
+path = "fuzz_targets/fuzz_aead_decrypt.rs"
+test = false
+doc = false
+bench = false
