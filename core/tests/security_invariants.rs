@@ -250,6 +250,50 @@ fn encrypted_packet_round_trip_preserves_payload() {
     assert_eq!(&pt, payload);
 }
 
+/// Sliding-window replay protection (Phase 1.4) — re-feeding an
+/// already-decrypted ciphertext with the same `(stream_id, sequence)` must
+/// fail with `CoreError::ReplayDetected`, and the per-session counter must
+/// increment.
+#[test]
+fn replay_window_rejects_duplicate_sequence() {
+    use phantom_core::CoreError;
+
+    let (client, server) = make_session_pair([0xE5u8; 32]);
+    let header = PacketHeader::new(
+        *server.id(),
+        3,
+        17,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
+    );
+
+    let ct = client.encrypt_packet(&header, b"some-payload").expect("encrypt");
+
+    // First decrypt accepted.
+    let _ = server.decrypt_packet(&header, &ct).expect("first decrypt");
+    assert_eq!(server.replay_rejected_total(), 0);
+
+    // The same ciphertext is, by the AEAD strict-counter invariant, no longer
+    // decryptable (recv_counter has advanced) — so we re-encrypt a *new*
+    // ciphertext with the same (stream_id, sequence) header to isolate the
+    // window check from the AEAD-counter check.
+    let ct2 = client
+        .encrypt_packet(&header, b"some-payload")
+        .expect("re-encrypt");
+    let result = server.decrypt_packet(&header, &ct2);
+    match result {
+        Err(CoreError::ReplayDetected(_)) => { /* expected */ }
+        other => panic!(
+            "expected ReplayDetected on duplicate sequence, got {:?}",
+            other.as_ref().map(|_| "Ok(...)").unwrap_or("Err(<other>)")
+        ),
+    }
+    assert_eq!(
+        server.replay_rejected_total(),
+        1,
+        "replay_rejected_total counter must increment on duplicate"
+    );
+}
+
 /// The wire format embeds `PhantomPacketV1` inside a `VersionedPacket` enum;
 /// V1-only roundtrips must preserve every header bit.
 #[test]

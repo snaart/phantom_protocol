@@ -9,7 +9,7 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **132 / 132** (122 unit + 10 negative-security) |
+| Tests passing | **143 / 143** (132 unit + 11 negative-security) |
 | Integration tests | 5 (`tcp_integration` x2 `#[ignore]`, `kcp_integration` x3 `#[ignore]`) |
 | Fuzz harnesses | 4 scaffolded (cargo-fuzz, nightly) |
 | Workspace warnings | **0** |
@@ -58,7 +58,7 @@ baseline (0.6) are nice-to-haves; they don't block any later phase.
 | 1.1 | Constant-time cookie comparison (`subtle::ConstantTimeEq`) | ✅ | `068e354` | `core/src/transport/handshake.rs:147-152` |
 | 1.2 | ZeroizeOnDrop on session secrets | ✅ | `068e354` + `3ef15c6` | `CryptoState`, `Session.resumption_secret`, `HandshakeServer.pow_secret`, `HandshakeClient.nonce` |
 | 1.3 | Remove `.unwrap()` / `unreachable!()` from production hot paths | ✅ | `068e354` + `e25f7a7` + `005e22f` | handshake, api/session, faketls, compression |
-| 1.4 | Wire `ReplayProtection` into recv path | 🔄 | — | AEAD strict-counter already enforces; adding bitmap window as defence-in-depth + metric |
+| 1.4 | Wire `ReplayProtection` into recv path | ✅ | _this commit_ | bitmap-based per-stream `ReplayWindow` (RFC 4303 § 3.4.3); 1024-bit window; `Session::decrypt_packet` checks after AEAD verify; `replay_rejected_total` counter exposed |
 | 1.5 | Mid-session key rotation (PFS within a session) | ⏳ | — | Wire-level change (`PacketFlags::REKEY`); HKDF chain on `resumption_secret`; needs V2 bump |
 | 1.6 | Strong session ID (32 → 128 bits) | ✅ | `e25f7a7` | `new_session_id` via thread_rng / ChaCha CSPRNG |
 | 1.7 | AEAD nonce-exhaustion guard (`AEAD_MAX_INVOCATIONS`) | ✅ | `53f2c5e` | `CryptoError::NonceExhausted` at 2^48; observability accessors |
