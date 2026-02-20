@@ -11,12 +11,14 @@ use crate::transport::{
 };
 use crate::crypto::adaptive_crypto::{CryptoSession};
 use crate::errors::CoreError;
+use crate::security::ReplayWindow;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, Duration};
-use parking_lot::RwLock;
+use dashmap::DashMap;
+use parking_lot::{Mutex, RwLock};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Session state machine
@@ -108,13 +110,20 @@ pub struct Session {
     /// Fallback state machine
     #[allow(dead_code)]
     fallback: Arc<FallbackStateMachine>,
+    /// Per-stream sliding-window replay protection. Lazily populated as
+    /// streams appear on the wire. Sits alongside (not in place of) the AEAD
+    /// strict-counter replay protection — see `decrypt_packet`.
+    replay_windows: DashMap<StreamId, Mutex<ReplayWindow>>,
+    /// Cumulative count of replay rejections (across all streams) — exposed
+    /// for metrics/telemetry.
+    replay_rejected_total: AtomicU64,
 }
 
 impl Session {
     /// Create a new session with given shared secret
     pub fn new(session_id: SessionId, shared_secret: &[u8; 32], peer_side: bool) -> Result<Self, CoreError> {
         let crypto = CryptoState::new(shared_secret, peer_side)?;
-        
+
         Ok(Self {
             id: session_id,
             state: RwLock::new(SessionState::Handshaking),
@@ -126,6 +135,8 @@ impl Session {
             resumption_secret: RwLock::new(None),
             last_activity: RwLock::new(Instant::now()),
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
+            replay_windows: DashMap::new(),
+            replay_rejected_total: AtomicU64::new(0),
         })
     }
 
@@ -146,13 +157,15 @@ impl Session {
             resumption_secret: RwLock::new(None),
             last_activity: RwLock::new(Instant::now()),
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
+            replay_windows: DashMap::new(),
+            replay_rejected_total: AtomicU64::new(0),
         }
     }
 
     /// Resume a session using resumption secret (0-RTT)
     pub fn resume(session_id: SessionId, resumption_secret: &[u8; 32], peer_side: bool) -> Result<Self, CoreError> {
         let crypto = CryptoState::new(resumption_secret, peer_side)?;
-        
+
         Ok(Self {
             id: session_id,
             state: RwLock::new(SessionState::Connected),
@@ -164,6 +177,8 @@ impl Session {
             resumption_secret: RwLock::new(Some(*resumption_secret)),
             last_activity: RwLock::new(Instant::now()),
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
+            replay_windows: DashMap::new(),
+            replay_rejected_total: AtomicU64::new(0),
         })
     }
 
@@ -213,11 +228,46 @@ impl Session {
         self.crypto.read().encrypt(&header_bytes, plaintext)
     }
 
-    /// Decrypt a packet payload
+    /// Decrypt a packet payload.
+    ///
+    /// **Replay protection (defense in depth).** The AEAD layer already
+    /// cryptographically prevents replay: each `decrypt` call advances the
+    /// per-direction `recv_counter`, and a replayed ciphertext was sealed
+    /// against an earlier counter — the derived nonce no longer matches,
+    /// AEAD authentication fails. On top of that, this function consults
+    /// a per-stream sliding-window replay table keyed on `header.sequence`
+    /// (which is authenticated by the AEAD AAD), giving operators an
+    /// observable `ReplayDetected` error and a `replay_rejected_total`
+    /// counter for telemetry.
+    ///
+    /// The window check runs **after** successful AEAD verification so we
+    /// never key off un-authenticated sequence numbers.
     pub fn decrypt_packet(&self, header: &PacketHeader, ciphertext: &[u8]) -> Result<Vec<u8>, CoreError> {
         let mut header_bytes = Vec::new();
         alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
-        self.crypto.read().decrypt(&header_bytes, ciphertext)
+        let plaintext = self.crypto.read().decrypt(&header_bytes, ciphertext)?;
+
+        // Sliding-window replay check. Lazily create the per-stream window.
+        let window_entry = self
+            .replay_windows
+            .entry(header.stream_id)
+            .or_insert_with(|| Mutex::new(ReplayWindow::new()));
+        let accepted = window_entry.lock().accept(header.sequence);
+        if !accepted {
+            self.replay_rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(CoreError::ReplayDetected(format!(
+                "stream {} sequence {} already seen (within window) or beyond window",
+                header.stream_id, header.sequence
+            )));
+        }
+        Ok(plaintext)
+    }
+
+    /// Total number of replayed packets rejected by the sliding-window check
+    /// across all streams in this session. Intended for the
+    /// `replay_rejected_total` metric.
+    pub fn replay_rejected_total(&self) -> u64 {
+        self.replay_rejected_total.load(Ordering::Relaxed)
     }
 
     /// Create a control packet

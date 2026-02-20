@@ -47,6 +47,13 @@ pub enum CoreError {
 
     #[error("Timeout")]
     Timeout,
+
+    /// Sliding-window replay protection rejected a packet. The AEAD layer
+    /// already cryptographically prevents replay (strict-counter nonces), but
+    /// the explicit window catches duplicates earlier and gives operators a
+    /// metric signal (`replay_rejected_total`).
+    #[error("replay protection rejected packet: {0}")]
+    ReplayDetected(String),
 }
 
 // --- Converters for internal errors ---
