@@ -146,17 +146,22 @@ impl HandshakeServer {
         }
 
         // 2. Stateless Checks (Cookie & PoW)
+        //
+        // Cookie freshness (Phase 1.10): `validate_cookie` accepts the current
+        // bucket OR the immediately-previous bucket (5-minute buckets, so
+        // 5-10 min effective validity). Comparisons are constant-time.
+        let cookie_valid = match client_hello.cookie {
+            Some(c) => match validate_cookie(&self.pow_secret, client_ip, &c) {
+                Ok(v) => v,
+                Err(e) => return HandshakeResponse::Fail(e),
+            },
+            None => false,
+        };
+        // Pre-compute a fresh cookie to hand to the client on a retry.
         let expected_cookie = match generate_cookie(&self.pow_secret, client_ip) {
             Ok(c) => c,
             Err(e) => return HandshakeResponse::Fail(e),
         };
-        // Constant-time comparison: a non-CT `==` here leaks the cookie via
-        // timing (an attacker would only need O(N) probes per byte instead of
-        // 2^256). `subtle::ConstantTimeEq` is the standard remedy.
-        let cookie_valid = client_hello
-            .cookie
-            .map(|c| bool::from(c.ct_eq(&expected_cookie)))
-            .unwrap_or(false);
         
         let mut pow_valid = true;
         let mut challenge = None;
@@ -386,26 +391,67 @@ fn derive_session_id(shared_secret: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn generate_cookie(server_secret: &[u8; 32], ip: IpAddr) -> Result<[u8; 32], HandshakeError> {
-    // SystemTime can be before UNIX_EPOCH only if the host clock is broken
-    // backwards (e.g. mis-set RTC). Return a clear error instead of panicking
-    // so DoS via malicious time configuration manifests as a handshake error,
-    // not a process abort.
-    let timestamp_min = SystemTime::now()
+/// Bucket size in seconds for the rolling cookie salt.
+///
+/// Cookies are valid for the current bucket and the previous bucket — so the
+/// effective validity window is between `COOKIE_BUCKET_SECONDS` and
+/// `2 * COOKIE_BUCKET_SECONDS` depending on when within the bucket the cookie
+/// was minted. 5 minutes is a reasonable trade-off: long enough for slow
+/// clients (mobile networks, paused/resumed processes) to complete a retry
+/// round trip, short enough to bound the replay window for an attacker that
+/// captures a cookie.
+const COOKIE_BUCKET_SECONDS: u64 = 300;
+
+fn current_cookie_bucket() -> Result<u64, HandshakeError> {
+    Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| HandshakeError::ClockBackwards)?
         .as_secs()
-        / 60;
+        / COOKIE_BUCKET_SECONDS)
+}
+
+fn generate_cookie_for_bucket(
+    server_secret: &[u8; 32],
+    ip: IpAddr,
+    bucket: u64,
+) -> Result<[u8; 32], HandshakeError> {
     // HMAC-SHA-256 accepts any key length (longer keys are hashed). For our
     // fixed 32-byte secret this never fails, but we surface the error rather
     // than panic to keep the function total.
     let mut mac = Hmac::<Sha256>::new_from_slice(server_secret)
         .map_err(|e| HandshakeError::InternalError(format!("HMAC init: {}", e)))?;
     mac.update(ip.to_string().as_bytes());
-    mac.update(&timestamp_min.to_be_bytes());
+    mac.update(&bucket.to_be_bytes());
     let mut result = [0u8; 32];
     result.copy_from_slice(&mac.finalize().into_bytes());
     Ok(result)
+}
+
+fn generate_cookie(server_secret: &[u8; 32], ip: IpAddr) -> Result<[u8; 32], HandshakeError> {
+    generate_cookie_for_bucket(server_secret, ip, current_cookie_bucket()?)
+}
+
+/// Validate a client-supplied cookie against the current bucket OR the
+/// immediately-previous bucket (sliding-window freshness). All comparisons
+/// are constant-time via [`subtle::ConstantTimeEq`] — a non-CT `==` here
+/// would reintroduce the timing leak that Phase 1.1 closed.
+fn validate_cookie(
+    server_secret: &[u8; 32],
+    ip: IpAddr,
+    cookie: &[u8; 32],
+) -> Result<bool, HandshakeError> {
+    let bucket = current_cookie_bucket()?;
+    // saturating_sub avoids underflow at u64::MIN — bucket 0 is far in the
+    // past (1970-01-01) and never reachable in practice; the saturating arm
+    // keeps the function total for clarity.
+    let prev = bucket.saturating_sub(1);
+    let candidates = if bucket == prev { [bucket, bucket] } else { [bucket, prev] };
+    let mut accept = subtle::Choice::from(0u8);
+    for b in candidates {
+        let expected = generate_cookie_for_bucket(server_secret, ip, b)?;
+        accept |= cookie.ct_eq(&expected);
+    }
+    Ok(bool::from(accept))
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
