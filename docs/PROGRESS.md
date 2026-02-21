@@ -59,12 +59,12 @@ baseline (0.6) are nice-to-haves; they don't block any later phase.
 | 1.2 | ZeroizeOnDrop on session secrets | ✅ | `068e354` + `3ef15c6` | `CryptoState`, `Session.resumption_secret`, `HandshakeServer.pow_secret`, `HandshakeClient.nonce` |
 | 1.3 | Remove `.unwrap()` / `unreachable!()` from production hot paths | ✅ | `068e354` + `e25f7a7` + `005e22f` | handshake, api/session, faketls, compression |
 | 1.4 | Wire `ReplayProtection` into recv path | ✅ | _this commit_ | bitmap-based per-stream `ReplayWindow` (RFC 4303 § 3.4.3); 1024-bit window; `Session::decrypt_packet` checks after AEAD verify; `replay_rejected_total` counter exposed |
-| 1.5 | Mid-session key rotation (PFS within a session) | ⏳ | — | Wire-level change (`PacketFlags::REKEY`); HKDF chain on `resumption_secret`; needs V2 bump |
+| 1.5 | Mid-session key rotation (PFS within a session) | ⏭️ | — | **Blocked on V2 bump.** All 8 `PacketFlags` bits are used in V1; no room for `REKEY`. Resumes when Phase 4.2 introduces V2. |
 | 1.6 | Strong session ID (32 → 128 bits) | ✅ | `e25f7a7` | `new_session_id` via thread_rng / ChaCha CSPRNG |
 | 1.7 | AEAD nonce-exhaustion guard (`AEAD_MAX_INVOCATIONS`) | ✅ | `53f2c5e` | `CryptoError::NonceExhausted` at 2^48; observability accessors |
-| 1.8 | Wire format & version-list negotiation | ⏳ | — | Requires `VersionedPacket::V2` and transcript-binding of offered versions |
+| 1.8 | Wire format & version-list negotiation | ⏭️ | — | **Blocked on V2 bump.** `ClientHello.version` is a `u8`; needs `Vec<u8>` of offered versions, transcript-bound. Resumes alongside V2. |
 | 1.9 | Strict `PacketFlags::ENCRYPTED` invariant | ✅ | (pre-existing) | `api/session.rs:430-437` drops stripped-flag packets; covered by negative tests |
-| 1.10 | Cookie freshness (rotating salt) | ⏳ | — | extend `generate_cookie` salt with rotating secret id |
+| 1.10 | Cookie freshness (rotating salt) | ✅ | _this commit_ | 5-min buckets; current + previous bucket accepted (sliding-window) via constant-time `subtle::Choice` accumulator |
 | 1.11 | PoW secret rotation | ⏳ | — | hourly rotation with overlap window |
 | 1.12 | Phantom-limb cleanup (docs on `_ephemeral_kem_secret` / `take_early_data`) | ✅ | `49180ee` | non-breaking — full removal blocked on V2 bump |
 | 1.13 | `#![deny(unsafe_code)]` everywhere except 2 documented modules | ✅ | `8b4ee23` | SAFETY comments on every remaining `unsafe { }` block |
