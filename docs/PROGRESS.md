@@ -65,7 +65,7 @@ baseline (0.6) are nice-to-haves; they don't block any later phase.
 | 1.8 | Wire format & version-list negotiation | ⏭️ | — | **Blocked on V2 bump.** `ClientHello.version` is a `u8`; needs `Vec<u8>` of offered versions, transcript-bound. Resumes alongside V2. |
 | 1.9 | Strict `PacketFlags::ENCRYPTED` invariant | ✅ | (pre-existing) | `api/session.rs:430-437` drops stripped-flag packets; covered by negative tests |
 | 1.10 | Cookie freshness (rotating salt) | ✅ | _this commit_ | 5-min buckets; current + previous bucket accepted (sliding-window) via constant-time `subtle::Choice` accumulator |
-| 1.11 | PoW secret rotation | ⏳ | — | hourly rotation with overlap window |
+| 1.11 | PoW secret rotation | ✅ | _this commit_ | hour-bucketed HKDF derivation from a long-lived master; cookie/PoW validation accepts current + previous hour |
 | 1.12 | Phantom-limb cleanup (docs on `_ephemeral_kem_secret` / `take_early_data`) | ✅ | `49180ee` | non-breaking — full removal blocked on V2 bump |
 | 1.13 | `#![deny(unsafe_code)]` everywhere except 2 documented modules | ✅ | `8b4ee23` | SAFETY comments on every remaining `unsafe { }` block |
 | 1.14 | Adaptive PoW difficulty under load | ⏳ | — | hooks half_open.rs reputation tracker |

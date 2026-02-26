@@ -105,8 +105,16 @@ fn compute_transcript_hash(transcript: &HandshakeTranscript) -> Result<[u8; 32],
 /// Handshake Server State Machine
 ///
 /// Holds the server's long-lived signing key (via [`HybridSigningKey`], which
-/// itself zeroes on drop) and the stateless PoW secret. On drop, `pow_secret`
-/// is zeroed via the derived `ZeroizeOnDrop`.
+/// itself zeroes on drop) and a *master* secret from which the actually-used
+/// per-hour PoW/cookie secret is derived on each call (see
+/// [`derive_session_secret_for_hour`]). On drop the master is zeroed via the
+/// derived `ZeroizeOnDrop`.
+///
+/// Rotation (Phase 1.11): the master itself rotates only on process restart,
+/// but the derived hour-bucketed secret rotates every hour. Validation
+/// accepts the current hour and the immediately-previous hour, so a cookie
+/// or PoW solution captured at minute 59 of one hour is still honored at
+/// minute 5 of the next.
 #[derive(ZeroizeOnDrop)]
 pub struct HandshakeServer {
     // SAFETY: `HybridSigningKey` has its own ZeroizeOnDrop. The wrapping field
@@ -117,20 +125,21 @@ pub struct HandshakeServer {
     // Public material — never sensitive.
     #[zeroize(skip)]
     verifying_key: HybridVerifyingKey,
-    pow_secret: [u8; 32],
+    master_secret: [u8; 32],
 }
 
 impl HandshakeServer {
     pub fn new() -> Result<Self, HandshakeError> {
         let (signing_key, verifying_key) = HybridSigningKey::generate();
-        
-        let mut pow_secret = [0u8; 32];
-        getrandom::getrandom(&mut pow_secret).map_err(|e| HandshakeError::RngError(e.to_string()))?;
-        
+
+        let mut master_secret = [0u8; 32];
+        getrandom::getrandom(&mut master_secret)
+            .map_err(|e| HandshakeError::RngError(e.to_string()))?;
+
         Ok(Self {
             signing_key,
             verifying_key,
-            pow_secret,
+            master_secret,
         })
     }
 
@@ -151,26 +160,62 @@ impl HandshakeServer {
         // bucket OR the immediately-previous bucket (5-minute buckets, so
         // 5-10 min effective validity). Comparisons are constant-time.
         let cookie_valid = match client_hello.cookie {
-            Some(c) => match validate_cookie(&self.pow_secret, client_ip, &c) {
+            Some(c) => match validate_cookie(&self.master_secret, client_ip, &c) {
                 Ok(v) => v,
                 Err(e) => return HandshakeResponse::Fail(e),
             },
             None => false,
         };
         // Pre-compute a fresh cookie to hand to the client on a retry.
-        let expected_cookie = match generate_cookie(&self.pow_secret, client_ip) {
+        let expected_cookie = match generate_cookie(&self.master_secret, client_ip) {
             Ok(c) => c,
             Err(e) => return HandshakeResponse::Fail(e),
         };
-        
+
         let mut pow_valid = true;
         let mut challenge = None;
         if difficulty > 0 {
+            // PoW verification (Phase 1.11): the derived hour-bucketed secret
+            // rotates every `SECRET_ROTATION_SECONDS`. Accept either the
+            // current or the previous hour's derivation so a client that
+            // computed a solution just before the rotation boundary doesn't
+            // have to redo the work.
+            let cur_hour = match current_secret_hour() {
+                Ok(h) => h,
+                Err(e) => return HandshakeResponse::Fail(e),
+            };
+            let prev_hour = cur_hour.saturating_sub(1);
+            let hours: &[u64] = if cur_hour == prev_hour {
+                &[cur_hour]
+            } else {
+                &[cur_hour, prev_hour]
+            };
+
             if let Some(sol) = &client_hello.pow_solution {
-                pow_valid = PoWChallenge { nonce: sol.nonce, difficulty }.verify(sol, client_ip.to_string().as_bytes(), &self.pow_secret);
+                let mut any_valid = false;
+                for &h in hours {
+                    let derived = match derive_session_secret_for_hour(&self.master_secret, h) {
+                        Ok(s) => s,
+                        Err(e) => return HandshakeResponse::Fail(e),
+                    };
+                    let challenge_ref = PoWChallenge { nonce: sol.nonce, difficulty };
+                    if challenge_ref.verify(sol, client_ip.to_string().as_bytes(), &derived) {
+                        any_valid = true;
+                        break;
+                    }
+                }
+                pow_valid = any_valid;
             } else {
                 pow_valid = false;
-                challenge = Some(PoWChallenge::new_stateless(difficulty, client_ip.to_string().as_bytes(), &self.pow_secret));
+                let derived = match derive_session_secret_for_hour(&self.master_secret, cur_hour) {
+                    Ok(s) => s,
+                    Err(e) => return HandshakeResponse::Fail(e),
+                };
+                challenge = Some(PoWChallenge::new_stateless(
+                    difficulty,
+                    client_ip.to_string().as_bytes(),
+                    &derived,
+                ));
             }
         }
 
@@ -396,11 +441,13 @@ fn derive_session_id(shared_secret: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
 /// Cookies are valid for the current bucket and the previous bucket — so the
 /// effective validity window is between `COOKIE_BUCKET_SECONDS` and
 /// `2 * COOKIE_BUCKET_SECONDS` depending on when within the bucket the cookie
-/// was minted. 5 minutes is a reasonable trade-off: long enough for slow
-/// clients (mobile networks, paused/resumed processes) to complete a retry
-/// round trip, short enough to bound the replay window for an attacker that
-/// captures a cookie.
+/// was minted.
 const COOKIE_BUCKET_SECONDS: u64 = 300;
+
+/// Rotation interval in seconds for the derived per-hour PoW/cookie secret.
+/// The master_secret in `HandshakeServer` only rotates on process restart;
+/// this constant controls the cadence of the derived sub-secret.
+const SECRET_ROTATION_SECONDS: u64 = 3600;
 
 fn current_cookie_bucket() -> Result<u64, HandshakeError> {
     Ok(SystemTime::now()
@@ -410,15 +457,37 @@ fn current_cookie_bucket() -> Result<u64, HandshakeError> {
         / COOKIE_BUCKET_SECONDS)
 }
 
+fn current_secret_hour() -> Result<u64, HandshakeError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| HandshakeError::ClockBackwards)?
+        .as_secs()
+        / SECRET_ROTATION_SECONDS)
+}
+
+/// HKDF-derive a fresh sub-secret from `master` for the given hour bucket.
+/// The same master + hour always produces the same derived secret, so this
+/// is just a deterministic function of (master, hour) — no internal state.
+pub(crate) fn derive_session_secret_for_hour(
+    master: &[u8; 32],
+    hour: u64,
+) -> Result<[u8; 32], HandshakeError> {
+    let hk = hkdf::Hkdf::<Sha256>::new(None, master);
+    let mut out = [0u8; 32];
+    let mut info = Vec::with_capacity(16 + 8);
+    info.extend_from_slice(b"phantom-pow-cookie-v1");
+    info.extend_from_slice(&hour.to_be_bytes());
+    hk.expand(&info, &mut out)
+        .map_err(|e| HandshakeError::InternalError(format!("HKDF expand: {}", e)))?;
+    Ok(out)
+}
+
 fn generate_cookie_for_bucket(
-    server_secret: &[u8; 32],
+    derived_secret: &[u8; 32],
     ip: IpAddr,
     bucket: u64,
 ) -> Result<[u8; 32], HandshakeError> {
-    // HMAC-SHA-256 accepts any key length (longer keys are hashed). For our
-    // fixed 32-byte secret this never fails, but we surface the error rather
-    // than panic to keep the function total.
-    let mut mac = Hmac::<Sha256>::new_from_slice(server_secret)
+    let mut mac = Hmac::<Sha256>::new_from_slice(derived_secret)
         .map_err(|e| HandshakeError::InternalError(format!("HMAC init: {}", e)))?;
     mac.update(ip.to_string().as_bytes());
     mac.update(&bucket.to_be_bytes());
@@ -427,29 +496,45 @@ fn generate_cookie_for_bucket(
     Ok(result)
 }
 
-fn generate_cookie(server_secret: &[u8; 32], ip: IpAddr) -> Result<[u8; 32], HandshakeError> {
-    generate_cookie_for_bucket(server_secret, ip, current_cookie_bucket()?)
+fn generate_cookie(master: &[u8; 32], ip: IpAddr) -> Result<[u8; 32], HandshakeError> {
+    let hour = current_secret_hour()?;
+    let derived = derive_session_secret_for_hour(master, hour)?;
+    generate_cookie_for_bucket(&derived, ip, current_cookie_bucket()?)
 }
 
-/// Validate a client-supplied cookie against the current bucket OR the
-/// immediately-previous bucket (sliding-window freshness). All comparisons
-/// are constant-time via [`subtle::ConstantTimeEq`] — a non-CT `==` here
-/// would reintroduce the timing leak that Phase 1.1 closed.
+/// Validate a client-supplied cookie against the 2x2 combinations of
+/// (current/previous hour) × (current/previous bucket). All comparisons are
+/// constant-time via [`subtle::ConstantTimeEq`], and the accept signal is
+/// accumulated as a [`subtle::Choice`] so the function never branches on
+/// any individual comparison's outcome.
 fn validate_cookie(
-    server_secret: &[u8; 32],
+    master: &[u8; 32],
     ip: IpAddr,
     cookie: &[u8; 32],
 ) -> Result<bool, HandshakeError> {
     let bucket = current_cookie_bucket()?;
-    // saturating_sub avoids underflow at u64::MIN — bucket 0 is far in the
-    // past (1970-01-01) and never reachable in practice; the saturating arm
-    // keeps the function total for clarity.
-    let prev = bucket.saturating_sub(1);
-    let candidates = if bucket == prev { [bucket, bucket] } else { [bucket, prev] };
+    let hour = current_secret_hour()?;
+    let prev_bucket = bucket.saturating_sub(1);
+    let prev_hour = hour.saturating_sub(1);
+
+    let bucket_candidates: [u64; 2] = if bucket == prev_bucket {
+        [bucket, bucket]
+    } else {
+        [bucket, prev_bucket]
+    };
+    let hour_candidates: [u64; 2] = if hour == prev_hour {
+        [hour, hour]
+    } else {
+        [hour, prev_hour]
+    };
+
     let mut accept = subtle::Choice::from(0u8);
-    for b in candidates {
-        let expected = generate_cookie_for_bucket(server_secret, ip, b)?;
-        accept |= cookie.ct_eq(&expected);
+    for h in hour_candidates {
+        let derived = derive_session_secret_for_hour(master, h)?;
+        for b in bucket_candidates {
+            let expected = generate_cookie_for_bucket(&derived, ip, b)?;
+            accept |= cookie.ct_eq(&expected);
+        }
     }
     Ok(bool::from(accept))
 }
