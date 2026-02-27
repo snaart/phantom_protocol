@@ -68,7 +68,12 @@ async fn drive_server_handshake(
         let hello = borsh::from_slice::<ClientHello>(&hello_bytes).map_err(|e| {
             CoreError::NetworkError(format!("ClientHello parse failed: {}", e))
         })?;
-        match hs.process_client_hello(&hello, 0, client_ip) {
+        // Adaptive PoW difficulty (Phase 1.14): under load the listener
+        // automatically requires more proof-of-work from each new client.
+        // At idle (<100 handshakes/min) this stays at 0 and PoW is skipped
+        // entirely.
+        let difficulty = hs.adaptive_difficulty();
+        match hs.process_client_hello(&hello, difficulty, client_ip) {
             HandshakeResponse::Retry(retry) => {
                 let bytes = borsh::to_vec(&retry).map_err(|e| {
                     CoreError::NetworkError(format!("Retry encode failed: {}", e))
