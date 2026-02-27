@@ -56,7 +56,7 @@ baseline (0.6) are nice-to-haves; they don't block any later phase.
 | # | Item | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
 | 1.1 | Constant-time cookie comparison (`subtle::ConstantTimeEq`) | ✅ | `068e354` | `core/src/transport/handshake.rs:147-152` |
-| 1.2 | ZeroizeOnDrop on session secrets | ✅ | `068e354` + `3ef15c6` | `CryptoState`, `Session.resumption_secret`, `HandshakeServer.pow_secret`, `HandshakeClient.nonce` |
+| 1.2 | ZeroizeOnDrop on session secrets | ✅ | `068e354` + `3ef15c6` | `CryptoState`, `Session.resumption_secret`, `HandshakeServer.master_secret` (was `pow_secret`), `HandshakeClient.nonce` |
 | 1.3 | Remove `.unwrap()` / `unreachable!()` from production hot paths | ✅ | `068e354` + `e25f7a7` + `005e22f` | handshake, api/session, faketls, compression |
 | 1.4 | Wire `ReplayProtection` into recv path | ✅ | _this commit_ | bitmap-based per-stream `ReplayWindow` (RFC 4303 § 3.4.3); 1024-bit window; `Session::decrypt_packet` checks after AEAD verify; `replay_rejected_total` counter exposed |
 | 1.5 | Mid-session key rotation (PFS within a session) | ⏭️ | — | **Blocked on V2 bump.** All 8 `PacketFlags` bits are used in V1; no room for `REKEY`. Resumes when Phase 4.2 introduces V2. |
@@ -68,7 +68,7 @@ baseline (0.6) are nice-to-haves; they don't block any later phase.
 | 1.11 | PoW secret rotation | ✅ | _this commit_ | hour-bucketed HKDF derivation from a long-lived master; cookie/PoW validation accepts current + previous hour |
 | 1.12 | Phantom-limb cleanup (docs on `_ephemeral_kem_secret` / `take_early_data`) | ✅ | `49180ee` | non-breaking — full removal blocked on V2 bump |
 | 1.13 | `#![deny(unsafe_code)]` everywhere except 2 documented modules | ✅ | `8b4ee23` | SAFETY comments on every remaining `unsafe { }` block |
-| 1.14 | Adaptive PoW difficulty under load | ⏳ | — | hooks half_open.rs reputation tracker |
+| 1.14 | Adaptive PoW difficulty under load | ✅ | _this commit_ | per-minute handshake counter on `HandshakeServer`; `adaptive_difficulty()` tiers (0/4/8/12/16); `PhantomListener::accept` now passes it instead of hard-coded 0 |
 
 **Phase 1 verdict:** ~⅔ done by item count; the deferred ones (1.4, 1.5, 1.8,
 1.10, 1.11, 1.14) are bundled into the next development cycle.

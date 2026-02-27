@@ -4,6 +4,7 @@
 //! for optimistic start, Early Data, and 0-RTT resumption.
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::RwLock;
 use borsh::{BorshSerialize, BorshDeserialize};
@@ -126,6 +127,13 @@ pub struct HandshakeServer {
     #[zeroize(skip)]
     verifying_key: HybridVerifyingKey,
     master_secret: [u8; 32],
+    /// Adaptive-difficulty counters (Phase 1.14). Atomics so they are
+    /// thread-safe for the concurrent `accept()` path; not secret, hence
+    /// `#[zeroize(skip)]`.
+    #[zeroize(skip)]
+    handshakes_this_minute: AtomicU64,
+    #[zeroize(skip)]
+    minute_start_unix_sec: AtomicU64,
 }
 
 impl HandshakeServer {
@@ -136,11 +144,69 @@ impl HandshakeServer {
         getrandom::getrandom(&mut master_secret)
             .map_err(|e| HandshakeError::RngError(e.to_string()))?;
 
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
         Ok(Self {
             signing_key,
             verifying_key,
             master_secret,
+            handshakes_this_minute: AtomicU64::new(0),
+            minute_start_unix_sec: AtomicU64::new(now_sec),
         })
+    }
+
+    /// Increment the per-minute handshake-count counter and roll over the
+    /// minute window if necessary. Called at the start of every
+    /// `process_client_hello`.
+    fn record_handshake(&self) {
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let start = self.minute_start_unix_sec.load(Ordering::Relaxed);
+        if now_sec.saturating_sub(start) >= 60 {
+            // Reset the bucket. Racing other threads here is acceptable —
+            // multiple resets within a single boundary just under-count by a
+            // few; the next minute is unaffected.
+            self.handshakes_this_minute.store(0, Ordering::Relaxed);
+            self.minute_start_unix_sec.store(now_sec, Ordering::Relaxed);
+        }
+        self.handshakes_this_minute.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Recommended PoW difficulty for the current handshake load. Callers
+    /// (e.g. `PhantomListener::accept`) pass this into `process_client_hello`
+    /// so the cost imposed on each new client scales with server load.
+    ///
+    /// Difficulty tiers (handshakes-per-minute → difficulty):
+    /// ```text
+    ///   <100         → 0   (no PoW)
+    ///   100..500     → 4   (~16 hash evaluations expected)
+    ///   500..2000    → 8   (~256 evaluations)
+    ///   2000..10000  → 12  (~4k evaluations)
+    ///   >=10000      → 16  (~64k evaluations)
+    /// ```
+    /// These tiers err on the side of leniency: a healthy server doing a few
+    /// hundred handshakes per minute imposes no PoW work on clients. Only at
+    /// high load — where DoS protection matters most — does the cost ramp up.
+    pub fn adaptive_difficulty(&self) -> u8 {
+        let count = self.handshakes_this_minute.load(Ordering::Relaxed);
+        match count {
+            0..=99 => 0,
+            100..=499 => 4,
+            500..=1999 => 8,
+            2000..=9999 => 12,
+            _ => 16,
+        }
+    }
+
+    /// Current per-minute handshake count. Exposed for metrics
+    /// (`handshakes_per_minute`).
+    pub fn handshakes_this_minute(&self) -> u64 {
+        self.handshakes_this_minute.load(Ordering::Relaxed)
     }
 
     pub fn process_client_hello(
@@ -149,6 +215,10 @@ impl HandshakeServer {
         difficulty: u8,
         client_ip: IpAddr,
     ) -> HandshakeResponse {
+        // Phase 1.14: tally this call before any work is done, so the
+        // load counter reflects attempts (including the rejected ones).
+        self.record_handshake();
+
         // 1. Version Check
         if client_hello.version != 1 {
             return HandshakeResponse::Fail(HandshakeError::UnsupportedVersion);
