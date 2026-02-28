@@ -81,7 +81,7 @@ baseline (0.6) are nice-to-haves; they don't block any later phase.
 | --- | --- | --- | --- | --- |
 | 2.1 | Wire `BufferPool` into `TcpSessionTransport::recv_bytes` | ⏳ | — | requires `SessionTransport` trait signature change |
 | 2.2 | Drop `plaintext.clone()` in recv path | ✅ | `9d92262` | recv channel now carries `Bytes`; single `to_vec` at FFI boundary |
-| 2.3 | Stack-buffered serialization for small packets | ⏳ | — | `SmallVec` / fixed-array for ACK packets |
+| 2.3 | Pre-sized serialization buffer (small packets) | ✅ | _this commit_ | ACK buf hoisted out of recv loop (single `Vec::with_capacity(256)` reused via `clear()`); `send_app_data` uses `Vec::with_capacity(payload.len() + 64)` to avoid realloc-and-copy cycles |
 | 2.4 | Event-driven send loop (replace 10 ms `interval`) | ⏳ | — | `Notify` per stream → no polling |
 | 2.5 | Wire `PacketCoalescer` into send path | ⏳ | — | aggregate per-tick packets into single transport write |
 | 2.6 | Wire `Pacer` + `BandwidthEstimator` | ⏳ | — | foundation for Phase 4.4 congestion control |
