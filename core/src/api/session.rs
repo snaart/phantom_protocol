@@ -393,6 +393,13 @@ async fn run_data_pump<T: SessionTransport>(
     let streams_recv = streams.clone();
     let recv_tx_for_task = recv_tx.clone();
     let mut recv_handle = tokio::spawn(async move {
+        // Reusable buffer for ACK frame serialization. Hoisted out of the
+        // loop (Phase 2.3) so we don't pay a fresh `Vec::new()` allocation
+        // for every ACK we emit on a busy reliable stream. 256 bytes is
+        // comfortably larger than a serialized empty PhantomPacketV1 +
+        // VersionedPacket envelope (header is 41 bytes on the wire), so
+        // the underlying buffer is never reallocated after the first frame.
+        let mut ack_buf: Vec<u8> = Vec::with_capacity(256);
         loop {
             let data = match transport_recv.recv_bytes().await {
                 Ok(b) => b,
@@ -447,9 +454,10 @@ async fn run_data_pump<T: SessionTransport>(
                     PacketFlags::new(PacketFlags::ACK),
                 );
                 let ack_packet = PhantomPacketV1::new(ack_header, Vec::new()).into_versioned();
-                let mut buf = Vec::new();
-                let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&ack_packet, &mut buf);
-                let _ = transport_send_ack.send_bytes(&buf[..size]).await;
+                ack_buf.clear();
+                let (size, _) =
+                    alkahest::serialize_to_vec::<VersionedPacket, _>(&ack_packet, &mut ack_buf);
+                let _ = transport_send_ack.send_bytes(&ack_buf[..size]).await;
             }
 
             if !plaintext.is_empty() {
@@ -592,7 +600,11 @@ async fn send_app_data<T: SessionTransport>(
         }
     };
     let packet = PhantomPacketV1::new(header, ciphertext).into_versioned();
-    let mut buf = Vec::new();
+    // Phase 2.3: pre-size the serialization buffer so alkahest does a single
+    // allocation rather than incrementally growing through power-of-two
+    // realloc-and-copy cycles. Header is 41 wire bytes + alkahest envelope
+    // overhead (a few bytes) + payload + AEAD tag (16 bytes).
+    let mut buf: Vec<u8> = Vec::with_capacity(payload.len() + 64);
     let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
     if let Err(e) = transport.send_bytes(&buf[..size]).await {
         log::error!("PhantomSession: transport send failed: {}", e);
