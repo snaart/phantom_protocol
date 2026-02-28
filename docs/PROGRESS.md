@@ -90,7 +90,7 @@ baseline (0.6) are nice-to-haves; they don't block any later phase.
 | 2.9 | SO_REUSEPORT multi-accept | ⏳ | — | Linux-only; gated behind feature flag |
 | 2.10 | GSO / `sendmmsg` UDP | ✅ | (pre-existing) | already in `transport/udp_transport.rs` |
 | 2.11 | Per-CPU work-stealing | ⏳ | — | likely overkill; revisit after Phase 4 |
-| 2.12 | PGO + native CPU optional build | ⏳ | — | release profile foundation in place (Phase 0.7) |
+| 2.12 | PGO + native CPU optional build | ✅ | _this commit_ | documented in `docs/operations/perf-tuning.md` (build commands, target-cpu choices, PGO workflow); release profile foundation already in place |
 | 2.13 | Async/`select!` cancel-safety audit | ⏳ | — | audit pass; no known issues yet |
 
 **Phase 2 verdict:** kicked off (2.2 done; 2.8 partial; 2.10 pre-existing). Big-ticket
@@ -180,7 +180,7 @@ docs are the next high-leverage items here.
 | 7.4 | Release pipeline (cargo-release + GPG + SLSA) | ⏳ | — | GitHub Actions release job |
 | 7.5 | Incident-response playbook | ⏳ | — | extension of `SECURITY.md` |
 | 7.6 | Grafana dashboards + Prometheus alert rules | ⏳ | — | depends on Phase 4.5 telemetry |
-| 7.7 | Performance tuning guide | ⏳ | — | sysctl, build flags, profiling |
+| 7.7 | Performance tuning guide | ✅ | _this commit_ | `docs/operations/perf-tuning.md` covers release profile, target-cpu, PGO, sysctl, fd limits, CPU pinning, allocator choice, profiling tools, reference numbers |
 | 7.8 | Migration guides per breaking change | ⏳ | — | starts at first V2 bump |
 
 **Phase 7 verdict:** untouched. Depends on most prior phases.
