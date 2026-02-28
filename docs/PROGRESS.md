@@ -83,9 +83,9 @@ baseline (0.6) are nice-to-haves; they don't block any later phase.
 | 2.2 | Drop `plaintext.clone()` in recv path | ✅ | `9d92262` | recv channel now carries `Bytes`; single `to_vec` at FFI boundary |
 | 2.3 | Pre-sized serialization buffer (small packets) | ✅ | _this commit_ | ACK buf hoisted out of recv loop (single `Vec::with_capacity(256)` reused via `clear()`); `send_app_data` uses `Vec::with_capacity(payload.len() + 64)` to avoid realloc-and-copy cycles |
 | 2.4 | Event-driven send loop (replace 10 ms `interval`) | ⏳ | — | `Notify` per stream → no polling |
-| 2.5 | Wire `PacketCoalescer` into send path | ⏳ | — | aggregate per-tick packets into single transport write |
+| 2.5 | Wire `PacketCoalescer` into send path | ⏭️ | — | **Blocked on V2 bump.** Coalescer's `[count][len1][p1]...` envelope is a wire format change requiring coordinated peer upgrade. Resumes alongside V2. |
 | 2.6 | Wire `Pacer` + `BandwidthEstimator` | ⏳ | — | foundation for Phase 4.4 congestion control |
-| 2.7 | `ArcSwap` on crypto state (lock-free read) | ⏳ | — | interacts with rekey (Phase 1.5) |
+| 2.7 | Lock-free crypto state read path | ✅ | _this commit_ | dropped `RwLock<CryptoState>` — CryptoState is immutable post-handshake (no rekey yet), so encrypt/decrypt take a plain `&CryptoState`. Will become `ArcSwap` when Phase 1.5 rekey lands. |
 | 2.8 | `Bytes` throughout API boundary | 🔄 | (partial via 2.2) | recv channel is `Bytes`; `SessionTransport` still `Vec<u8>` |
 | 2.9 | SO_REUSEPORT multi-accept | ⏳ | — | Linux-only; gated behind feature flag |
 | 2.10 | GSO / `sendmmsg` UDP | ✅ | (pre-existing) | already in `transport/udp_transport.rs` |
