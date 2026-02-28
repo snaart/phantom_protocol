@@ -93,8 +93,15 @@ pub struct Session {
     id: SessionId,
     /// Current state
     state: RwLock<SessionState>,
-    /// Crypto state for encryption/decryption
-    crypto: RwLock<CryptoState>,
+    /// Crypto state for encryption/decryption.
+    ///
+    /// Lock-free read path (Phase 2.7): no `RwLock` because the current
+    /// design has no mid-session rekey — once derived during handshake the
+    /// `CryptoState` is immutable; interior mutation (per-direction AEAD
+    /// counters) lives in atomics inside `CryptoSessionInner`. When key
+    /// rotation lands (Phase 1.5 / 4.x) this will become `ArcSwap<CryptoState>`
+    /// so the swap stays lock-free.
+    crypto: CryptoState,
     /// Active streams
     streams: RwLock<HashMap<StreamId, Arc<Stream>>>,
     /// Next stream ID counter
@@ -127,7 +134,7 @@ impl Session {
         Ok(Self {
             id: session_id,
             state: RwLock::new(SessionState::Handshaking),
-            crypto: RwLock::new(crypto),
+            crypto,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
             control_sequence: AtomicU32::new(0),
@@ -149,7 +156,7 @@ impl Session {
         Self {
             id: session_id,
             state: RwLock::new(SessionState::Connected),
-            crypto: RwLock::new(crypto),
+            crypto,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
             control_sequence: AtomicU32::new(0),
@@ -169,7 +176,7 @@ impl Session {
         Ok(Self {
             id: session_id,
             state: RwLock::new(SessionState::Connected),
-            crypto: RwLock::new(crypto),
+            crypto,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
             control_sequence: AtomicU32::new(0),
@@ -225,7 +232,7 @@ impl Session {
     pub fn encrypt_packet(&self, header: &PacketHeader, plaintext: &[u8]) -> Result<Vec<u8>, CoreError> {
         let mut header_bytes = Vec::new();
         alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
-        self.crypto.read().encrypt(&header_bytes, plaintext)
+        self.crypto.encrypt(&header_bytes, plaintext)
     }
 
     /// Decrypt a packet payload.
@@ -245,7 +252,7 @@ impl Session {
     pub fn decrypt_packet(&self, header: &PacketHeader, ciphertext: &[u8]) -> Result<Vec<u8>, CoreError> {
         let mut header_bytes = Vec::new();
         alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
-        let plaintext = self.crypto.read().decrypt(&header_bytes, ciphertext)?;
+        let plaintext = self.crypto.decrypt(&header_bytes, ciphertext)?;
 
         // Sliding-window replay check. Lazily create the per-stream window.
         let window_entry = self
