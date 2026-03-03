@@ -112,7 +112,7 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | 3.8 | RNG abstraction (`getrandom` features) | ⏳ | — | feature-gate per target |
 | 3.9 | FFI bindings generation (Swift, Kotlin, C) | ⏳ | — | only Python ships today |
 | 3.10 | WASM-specific tweaks | ⏳ | — | drop `tokio = "full"`, etc. |
-| 3.11 | Cross-platform CI matrix (8+ triples) | ⏳ | — | extends `.github/workflows/ci.yml` |
+| 3.11 | Cross-platform CI matrix (12 triples) | ✅ | _this commit_ | new `.github/workflows/cross.yml` covers Linux x86_64/aarch64 (gnu, musl), macOS x86_64/aarch64, iOS device+sim, Windows x86_64/aarch64, WASM (browser+WASI, `allow_failure: true`), thumbv7em-none-eabihf embedded (`allow_failure: true`). |
 
 **Phase 3 verdict:** untouched. XL effort — independent of Phase 1/2.
 
