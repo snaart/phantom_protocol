@@ -1,0 +1,103 @@
+name: cross-platform
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# This workflow only verifies that `phantom_core` *compiles* on each target —
+# we do not run tests here because most targets cannot run unit tests on a
+# GitHub-Actions hosted runner (cross-toolchain limitations, no QEMU, no
+# browser sandbox). The CI matrix in `ci.yml` runs the full test suite on
+# x86_64-unknown-linux-gnu.
+#
+# Each "compile-check" matrix entry is intentionally `cargo check` (not
+# `cargo build`) so the job is fast and CI doesn't pay link time. The
+# `--lib` target keeps the focus on the library; binaries / tests / examples
+# may require target-specific code paths that are not yet ported.
+
+jobs:
+  compile-check:
+    name: cargo check (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux server / mobile NDK ────────────────────────────────────
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            install_target: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            install_target: true
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            install_target: true
+            cross: true
+          # ── macOS / iOS ──────────────────────────────────────────────────
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            install_target: false
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            install_target: false
+          - target: aarch64-apple-ios
+            runner: macos-latest
+            install_target: true
+          - target: aarch64-apple-ios-sim
+            runner: macos-latest
+            install_target: true
+          # ── Windows ──────────────────────────────────────────────────────
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            install_target: false
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+            install_target: true
+          # ── WASM (Phase 3.3 / 3.10) — currently *expected* to fail until
+          #    the Runtime/Clock abstractions land; left in the matrix as
+          #    `continue-on-error` so the failure is visible but doesn't
+          #    block PRs.
+          - target: wasm32-unknown-unknown
+            runner: ubuntu-latest
+            install_target: true
+            allow_failure: true
+          - target: wasm32-wasi
+            runner: ubuntu-latest
+            install_target: true
+            allow_failure: true
+          # ── Embedded smoke (Phase 3.4) — same: expected to fail until
+          #    runtime abstractions and feature-gates land.
+          - target: thumbv7em-none-eabihf
+            runner: ubuntu-latest
+            install_target: true
+            allow_failure: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.install_target && matrix.target || '' }}
+      - name: Install cross (Linux cross targets)
+        if: matrix.cross
+        run: cargo install cross --locked
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: ${{ matrix.target }}
+      - name: cargo check (lib)
+        continue-on-error: ${{ matrix.allow_failure == true }}
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross check --manifest-path core/Cargo.toml --lib --target ${{ matrix.target }}
+          else
+            cargo check --manifest-path core/Cargo.toml --lib --target ${{ matrix.target }}
+          fi
+        shell: bash
