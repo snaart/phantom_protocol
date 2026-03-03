@@ -5,8 +5,15 @@ edition = "2021"
 description = "Phantom Universal Transport Core SDK — post-quantum secure L4/L6 network framework"
 
 [features]
-default = ["pqc-standard"]
+default = ["pqc-standard", "compression-zstd"]
+# Hybrid PQ primitives (Kyber768 + Dilithium3 via `pqcrypto-*`). Without this
+# feature the build is classical-only and the hybrid security guarantee is
+# downgraded — intended for embedded / constrained targets only.
 pqc-standard = ["dep:pqcrypto-kyber", "dep:pqcrypto-traits", "dep:pqcrypto-dilithium"]
+# zstd compression. Disabled when building for WASM / embedded targets where
+# the C bindings in `zstd-sys` are unavailable. lz4_flex (pure-Rust) remains
+# the always-on fallback.
+compression-zstd = ["dep:zstd"]
 
 [dependencies]
 # --- Async & Runtime ---
@@ -45,9 +52,10 @@ getrandom = "0.2"
 bitflags = "2.4"
 parking_lot = "0.12"  # Fast mutex for buffer pool
 lz4_flex = "0.11"     # Fastest pure-Rust LZ4 (safe, no C bindings)
-# zstd pinned to a release version. Avoid `git = "..."`/branch = "master" —
-# unstable upstream and a supply-chain concern (no provenance).
-zstd = "0.13"
+# zstd pinned to a release version. Optional (gated by `compression-zstd`
+# feature) so WASM / embedded builds can opt out of the C bindings in
+# zstd-sys, falling back to lz4_flex.
+zstd = { version = "0.13", optional = true }
 
 # --- Networking ---
 tokio-rustls = "0.26"

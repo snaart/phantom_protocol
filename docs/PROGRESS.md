@@ -108,7 +108,7 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | 3.4 | `EmbeddedLeg` (UART / serial / CAN) | ⏳ | — | generic over `embedded-io-async` traits |
 | 3.5 | Conditional compilation matrix (`std` / `wasm` / `embedded` / ...) | ⏳ | — | features in `core/Cargo.toml` |
 | 3.6 | no_std + `alloc` for embedded | ⏳ | — | swap `pqcrypto-*` → `ml-kem` / `ml-dsa` |
-| 3.7 | Drop `zstd` C bindings (already on `0.13` release) | 🔄 | — | needs `ruzstd` for full pure-Rust |
+| 3.7 | `zstd` C bindings now optional behind `compression-zstd` feature | ✅ | _this commit_ | `--no-default-features --features pqc-standard` produces a build with only `lz4_flex` (pure-Rust) — WASM/embedded compatible. Full pure-Rust zstd via `ruzstd` decode is a future-add. |
 | 3.8 | RNG abstraction (`getrandom` features) | ⏳ | — | feature-gate per target |
 | 3.9 | FFI bindings generation (Swift, Kotlin, C) | ⏳ | — | only Python ships today |
 | 3.10 | WASM-specific tweaks | ⏳ | — | drop `tokio = "full"`, etc. |
