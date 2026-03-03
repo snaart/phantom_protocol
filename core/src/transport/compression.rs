@@ -142,7 +142,11 @@ impl AdaptiveCompressor {
 
         let compressed = match active_algo {
             CompressionAlgo::Lz4 => Self::compress_lz4(data),
+            #[cfg(feature = "compression-zstd")]
             CompressionAlgo::Zstd1 => Self::compress_zstd(data, self.zstd_level),
+            // Without `compression-zstd`, fall back to LZ4 transparently.
+            #[cfg(not(feature = "compression-zstd"))]
+            CompressionAlgo::Zstd1 => Self::compress_lz4(data),
             // The `None` arm is already eliminated by the early-return at the
             // top of this function, but matching defensively (rather than
             // calling `unreachable!()`) means malformed enum extensions
@@ -176,7 +180,15 @@ impl AdaptiveCompressor {
         match algo {
             CompressionAlgo::None => Ok(data.to_vec()),
             CompressionAlgo::Lz4 => Self::decompress_lz4(data),
+            #[cfg(feature = "compression-zstd")]
             CompressionAlgo::Zstd1 => Self::decompress_zstd(data),
+            // Without `compression-zstd`, we cannot decode Zstd payloads.
+            // Surface the failure as a typed error rather than fabricating
+            // garbage plaintext.
+            #[cfg(not(feature = "compression-zstd"))]
+            CompressionAlgo::Zstd1 => Err(CompressionError::DecompressFailed(
+                "Zstd disabled in this build (compression-zstd feature off)".into(),
+            )),
         }
     }
 
@@ -204,12 +216,12 @@ impl AdaptiveCompressor {
 
     // ── Zstd ─────────────────────────────────────────────────────────────
 
-    // ── Zstd ─────────────────────────────────────────────────────────────
-
+    #[cfg(feature = "compression-zstd")]
     fn compress_zstd(data: &[u8], level: i32) -> Vec<u8> {
         zstd::encode_all(data, level).unwrap_or_else(|_| data.to_vec())
     }
 
+    #[cfg(feature = "compression-zstd")]
     fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
         zstd::decode_all(data)
             .map_err(|e| CompressionError::DecompressFailed(format!("Zstd: {}", e)))
@@ -265,6 +277,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "compression-zstd")]
     #[test]
     fn zstd_round_trip() {
         let mut c = AdaptiveCompressor::zstd(1);
@@ -339,6 +352,7 @@ mod tests {
         eprintln!("LZ4 decompress: {:.0} MiB/s (64KB payload)", tput);
     }
 
+    #[cfg(feature = "compression-zstd")]
     #[test]
     fn zstd_throughput() {
         use std::time::Instant;
