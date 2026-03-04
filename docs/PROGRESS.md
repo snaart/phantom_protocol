@@ -155,7 +155,7 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | --- | --- | --- | --- | --- |
 | 6.1 | Threat model (`docs/security/threat-model.md`) | ✅ | _this commit_ | STRIDE + LINDDUN, trust-boundary diagram, asset table, adversary model, mitigation traceability to file:line; 9 sections |
 | 6.2 | Protocol specification (`docs/protocol/PROTOCOL.md`) | ✅ | _this commit_ | 10 sections: versioning, primitives, KDF labels, packet structure, AEAD construction, handshake state machine + messages, transcript signing, cookie/PoW, reserved fields, error model |
-| 6.3 | Architecture document (`docs/architecture/ARCHITECTURE.md`) | ⏳ | — | module diagram + data flow |
+| 6.3 | Architecture document (`docs/architecture/ARCHITECTURE.md`) | ✅ | _this commit_ | 11 sections: layer overview, types per layer, encryption boundary, concurrency / task topology, ownership model, wire framing, error propagation, performance landmarks, module dep map, evolution roadmap |
 | 6.4 | cargo-fuzz harnesses + OSS-Fuzz integration | ✅ | `24015d2` | 4 targets in `fuzz/`; OSS-Fuzz job tracked separately |
 | 6.5 | Property tests (`proptest`) | ⏳ | — | round-trip / handshake / replay |
 | 6.6 | Loom tests (concurrency invariants) | ⏳ | — | DashMap, atomic counters, send_queue |
