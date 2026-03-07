@@ -9,7 +9,7 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **143 / 143** (132 unit + 11 negative-security) |
+| Tests passing | **148 / 148** (132 unit + 11 negative-security + 5 proptest) |
 | Integration tests | 5 (`tcp_integration` x2 `#[ignore]`, `kcp_integration` x3 `#[ignore]`) |
 | Fuzz harnesses | 4 scaffolded (cargo-fuzz, nightly) |
 | Workspace warnings | **0** |
@@ -157,7 +157,7 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | 6.2 | Protocol specification (`docs/protocol/PROTOCOL.md`) | ✅ | _this commit_ | 10 sections: versioning, primitives, KDF labels, packet structure, AEAD construction, handshake state machine + messages, transcript signing, cookie/PoW, reserved fields, error model |
 | 6.3 | Architecture document (`docs/architecture/ARCHITECTURE.md`) | ✅ | _this commit_ | 11 sections: layer overview, types per layer, encryption boundary, concurrency / task topology, ownership model, wire framing, error propagation, performance landmarks, module dep map, evolution roadmap |
 | 6.4 | cargo-fuzz harnesses + OSS-Fuzz integration | ✅ | `24015d2` | 4 targets in `fuzz/`; OSS-Fuzz job tracked separately |
-| 6.5 | Property tests (`proptest`) | ⏳ | — | round-trip / handshake / replay |
+| 6.5 | Property tests (`proptest`) | ✅ | _this commit_ | `core/tests/property.rs`: AEAD round-trip, AEAD AAD-mismatch reject, ReplayWindow monotonic accept, ReplayWindow duplicate reject, wire-format round-trip. Configurable via `PROPTEST_CASES=N`. |
 | 6.6 | Loom tests (concurrency invariants) | ⏳ | — | DashMap, atomic counters, send_queue |
 | 6.7 | `cargo miri` CI job | ⏳ | — | catches UB, leaks |
 | 6.8 | Formal negative-security tests | ✅ | `8d69521` | `core/tests/security_invariants.rs` — 10 tests |
