@@ -159,9 +159,9 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | 6.4 | cargo-fuzz harnesses + OSS-Fuzz integration | ✅ | `24015d2` | 4 targets in `fuzz/`; OSS-Fuzz job tracked separately |
 | 6.5 | Property tests (`proptest`) | ✅ | _this commit_ | `core/tests/property.rs`: AEAD round-trip, AEAD AAD-mismatch reject, ReplayWindow monotonic accept, ReplayWindow duplicate reject, wire-format round-trip. Configurable via `PROPTEST_CASES=N`. |
 | 6.6 | Loom tests (concurrency invariants) | ⏳ | — | DashMap, atomic counters, send_queue |
-| 6.7 | `cargo miri` CI job | ⏳ | — | catches UB, leaks |
+| 6.7 | `cargo miri` CI job | ✅ | _this commit_ | `.github/workflows/miri.yml`; runs `cargo +nightly miri test` weekly + on each PR over the synchronous subset (replay_window, adaptive_crypto, transport::types) with strict-provenance + symbolic alignment checks |
 | 6.8 | Formal negative-security tests | ✅ | `8d69521` | `core/tests/security_invariants.rs` — 10 tests |
-| 6.9 | Coverage measurement (`cargo-llvm-cov`) | ⏳ | — | aim ≥85 % line / ≥75 % branch |
+| 6.9 | Coverage measurement (`cargo-llvm-cov`) | ✅ | _this commit_ | `.github/workflows/coverage.yml`; generates lcov.info with branch coverage; soft-uploads to Codecov when `CODECOV_TOKEN` secret present |
 | 6.10 | Formal verification (ProVerif / Tamarin) | ⏳ | — | optional; only if audit demands |
 | 6.11 | Inline `SAFETY` / `PANIC-SAFETY` comments | 🔄 | `8b4ee23` | unsafe blocks done; remaining `expect_used` sites are test-only |
 

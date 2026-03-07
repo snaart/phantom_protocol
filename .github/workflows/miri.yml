@@ -1,0 +1,58 @@
+name: miri
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly Sunday 03:00 UTC — miri is slow, no need to run on every PR
+    # for the full suite; the trimmed scope below is fast enough to run
+    # on each PR too.
+    - cron: "0 3 * * 0"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Miri is the Rust mid-level-IR interpreter. It catches:
+# - Undefined behavior (out-of-bounds, uninitialized memory, aliasing
+#   violations, mis-aligned references, ...).
+# - Data races (under the `-Zmiri-disable-isolation` flag).
+# - Memory leaks (`-Zmiri-disable-isolation` + symbol resolution).
+#
+# It cannot run tests that rely on the OS or async runtimes (no syscalls,
+# no real time, no thread scheduling). We therefore scope to the
+# synchronous unit tests in modules that have NO tokio dependency.
+
+jobs:
+  miri:
+    name: cargo miri test (synchronous suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain with miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: miri
+      - name: cargo miri setup
+        run: cargo +nightly miri setup
+      - name: cargo miri test (filtered)
+        # Run only the synchronous test modules. Tokio-heavy tests would
+        # need `-Zmiri-disable-isolation` + simulated syscalls and are
+        # currently out of scope.
+        env:
+          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
+        run: |
+          cargo +nightly miri test --manifest-path core/Cargo.toml --lib -- \
+              security::replay_window \
+              crypto::adaptive_crypto::tests::round_trip_aes \
+              crypto::adaptive_crypto::tests::round_trip_chacha \
+              crypto::adaptive_crypto::tests::round_trip_auto \
+              crypto::adaptive_crypto::tests::in_place_with_offset \
+              crypto::adaptive_crypto::tests::negotiation \
+              transport::types::tests
