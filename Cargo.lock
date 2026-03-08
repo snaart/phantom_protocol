@@ -1347,6 +1347,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-test",
  "tokio-util",
+ "tracing",
  "uniffi",
  "webpki-roots 0.26.11",
  "x25519-dalek",

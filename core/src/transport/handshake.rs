@@ -209,6 +209,17 @@ impl HandshakeServer {
         self.handshakes_this_minute.load(Ordering::Relaxed)
     }
 
+    #[tracing::instrument(
+        name = "phantom.handshake.process_client_hello",
+        skip_all,
+        fields(
+            client_ip = %client_ip,
+            difficulty = difficulty,
+            has_cookie = client_hello.cookie.is_some(),
+            has_pow = client_hello.pow_solution.is_some(),
+            resume = client_hello.resume_session_id.is_some(),
+        ),
+    )]
     pub fn process_client_hello(
         &self,
         client_hello: &ClientHello,
@@ -426,6 +437,13 @@ impl HandshakeClient {
         }
     }
 
+    #[tracing::instrument(
+        name = "phantom.handshake.process_server_hello",
+        skip_all,
+        fields(
+            pinned = expected_server_key.is_some(),
+        ),
+    )]
     pub fn process_server_hello(
         &self,
         client_hello: &ClientHello,
