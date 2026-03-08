@@ -18,6 +18,7 @@ pub struct PhantomListener {
 #[uniffi::export]
 impl PhantomListener {
     #[uniffi::constructor]
+    #[tracing::instrument(name = "phantom.listener.bind", skip_all, fields(addr = %addr))]
     pub async fn bind(addr: String) -> Result<Arc<Self>, CoreError> {
         let listener = TcpListener::bind(&addr)
             .await
@@ -37,6 +38,7 @@ impl PhantomListener {
         self.handshake_server.verifying_key().to_bytes()
     }
 
+    #[tracing::instrument(name = "phantom.listener.accept", skip_all)]
     pub async fn accept(&self) -> Result<Arc<PhantomSession>, CoreError> {
         let (stream, peer) = self
             .listener

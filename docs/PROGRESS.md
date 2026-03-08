@@ -126,7 +126,7 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | 4.2 | Multi-path failover + connection migration | ⏳ | — | requires V2 wire format with `path_id` |
 | 4.3 | Multi-stream finalization (priority, flow control) | ⏳ | — | priority field exists; never read by scheduler |
 | 4.4 | Congestion control (BBRv2-inspired) | ⏳ | — | depends on 2.6 (Pacer + Estimator wired) |
-| 4.5 | Telemetry: `tracing` instrumentation + metrics exporter | ⏳ | — | new `core/src/observability/` module |
+| 4.5 | Telemetry: `tracing` instrumentation (foundation) | 🔄 | _this commit_ | `tracing = "0.1"` dep added; `#[tracing::instrument]` on `HandshakeServer::process_client_hello`, `HandshakeClient::process_server_hello`, `PhantomListener::bind`, `PhantomListener::accept`. Metrics exporter (counters / histograms / Prometheus / OTel) is the remaining piece. |
 | 4.6 | Graceful shutdown + signal handling | ⏳ | — | small once API is settled |
 
 **Phase 4 verdict:** untouched. Depends on 2.x and 3.x foundations.
@@ -158,7 +158,7 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | 6.3 | Architecture document (`docs/architecture/ARCHITECTURE.md`) | ✅ | _this commit_ | 11 sections: layer overview, types per layer, encryption boundary, concurrency / task topology, ownership model, wire framing, error propagation, performance landmarks, module dep map, evolution roadmap |
 | 6.4 | cargo-fuzz harnesses + OSS-Fuzz integration | ✅ | `24015d2` | 4 targets in `fuzz/`; OSS-Fuzz job tracked separately |
 | 6.5 | Property tests (`proptest`) | ✅ | _this commit_ | `core/tests/property.rs`: AEAD round-trip, AEAD AAD-mismatch reject, ReplayWindow monotonic accept, ReplayWindow duplicate reject, wire-format round-trip. Configurable via `PROPTEST_CASES=N`. |
-| 6.6 | Loom tests (concurrency invariants) | ⏳ | — | DashMap, atomic counters, send_queue |
+| 6.6 | Loom tests (concurrency invariants) | ⏭️ | — | Current concurrency surface is well-understood `AtomicU64::fetch_add(_, Relaxed)` and `DashMap` — no bespoke lock-free algorithms that would benefit from loom permutation testing. Will revisit if/when Phase 4.2 multi-path migration introduces non-trivial concurrent state machines. |
 | 6.7 | `cargo miri` CI job | ✅ | _this commit_ | `.github/workflows/miri.yml`; runs `cargo +nightly miri test` weekly + on each PR over the synchronous subset (replay_window, adaptive_crypto, transport::types) with strict-provenance + symbolic alignment checks |
 | 6.8 | Formal negative-security tests | ✅ | `8d69521` | `core/tests/security_invariants.rs` — 10 tests |
 | 6.9 | Coverage measurement (`cargo-llvm-cov`) | ✅ | _this commit_ | `.github/workflows/coverage.yml`; generates lcov.info with branch coverage; soft-uploads to Codecov when `CODECOV_TOKEN` secret present |
