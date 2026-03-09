@@ -141,7 +141,7 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | 5.2 | Constant-time audit pass | 🔄 | — | cookie path done (1.1); rest pending |
 | 5.3 | RNG / DRBG audit | ⏳ | — | document Linux / macOS / WASM RNG sources |
 | 5.4 | CAVP test vectors | ⏳ | — | `tests/cavp/` directory |
-| 5.5 | Compliance docs (`docs/compliance/`) | ⏳ | — | FIPS security policy, key management, self-tests |
+| 5.5 | Compliance docs (`docs/compliance/`) | 🔄 | _this commit_ | `docs/compliance/fips-readiness.md` — gap analysis vs FIPS 140-3, primitive table, proposed `fips` feature, self-test plan, CAVP test-vector plan, validation pathway, ~15% readiness score. Security-policy / key-management / self-tests sub-docs still pending. |
 | 5.6 | Common Criteria Protection Profile mapping | ⏳ | — | NIAP PP-Mobile Device VPN Client likely |
 | 5.7 | Validation pathway (CMVP / CC submission) | ⏳ | — | external lab; out of code scope |
 
