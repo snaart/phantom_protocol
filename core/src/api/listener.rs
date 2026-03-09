@@ -4,7 +4,7 @@ use crate::errors::CoreError;
 use crate::transport::handshake::{
     ClientHello, HandshakeResponse, HandshakeServer,
 };
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -13,6 +13,10 @@ use tokio::sync::Mutex;
 pub struct PhantomListener {
     listener: Mutex<TcpListener>,
     handshake_server: Arc<HandshakeServer>,
+    /// The local socket address the listener is actually bound to.
+    /// Cached so callers can read it without acquiring the listener mutex.
+    /// Useful when `bind("0.0.0.0:0")` is used and the OS chose the port.
+    local_addr: SocketAddr,
 }
 
 #[uniffi::export]
@@ -23,11 +27,15 @@ impl PhantomListener {
         let listener = TcpListener::bind(&addr)
             .await
             .map_err(|e| CoreError::NetworkError(e.to_string()))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| CoreError::NetworkError(format!("local_addr: {}", e)))?;
         let hs = HandshakeServer::new()
             .map_err(|e| CoreError::InternalError(e.to_string()))?;
         Ok(Arc::new(Self {
             listener: Mutex::new(listener),
             handshake_server: Arc::new(hs),
+            local_addr,
         }))
     }
 
@@ -36,6 +44,13 @@ impl PhantomListener {
     /// completing a handshake to defeat MITM (see Vuln 1 in security review).
     pub fn verifying_key_bytes(&self) -> Vec<u8> {
         self.handshake_server.verifying_key().to_bytes()
+    }
+
+    /// Local socket address the listener is actually bound to (resolved at
+    /// bind time). Useful when the caller passed `"host:0"` and needs to
+    /// learn which port the OS assigned.
+    pub fn local_addr(&self) -> String {
+        self.local_addr.to_string()
     }
 
     #[tracing::instrument(name = "phantom.listener.accept", skip_all)]
