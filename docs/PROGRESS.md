@@ -176,7 +176,7 @@ docs are the next high-leverage items here.
 | --- | --- | --- | --- | --- |
 | 7.1 | End-to-end examples (loopback / mobile / WASM / embedded) | 🔄 | _this commit_ | `core/examples/loopback_demo.rs` — full server↔client encrypted echo in one binary, prints what happens on the wire. Mobile / WASM / embedded examples still pending the Phase 3 runtime abstraction. |
 | 7.2 | Deployment guides (Docker / k8s / systemd / mobile / WASM) | ⏳ | — | `docs/operations/` |
-| 7.3 | Versioning policy + `cargo-semver-checks` | ⏳ | — | `docs/policy/versioning.md` |
+| 7.3 | Versioning policy + `cargo-semver-checks` | ✅ | _this commit_ | `docs/policy/versioning.md` — three independent axes (Rust API SemVer, wire format `VersionedPacket::Vn`, FFI ABI); V1→V2 process; MSRV policy; deprecation policy; change-type matrix. cargo-semver-checks CI job is the natural follow-up. |
 | 7.4 | Release pipeline (cargo-release + GPG + SLSA) | ⏳ | — | GitHub Actions release job |
 | 7.5 | Incident-response playbook | ⏳ | — | extension of `SECURITY.md` |
 | 7.6 | Grafana dashboards + Prometheus alert rules | ⏳ | — | depends on Phase 4.5 telemetry |
