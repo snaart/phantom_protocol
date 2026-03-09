@@ -178,7 +178,7 @@ docs are the next high-leverage items here.
 | 7.2 | Deployment guides (Docker / k8s / systemd / mobile / WASM) | ⏳ | — | `docs/operations/` |
 | 7.3 | Versioning policy + `cargo-semver-checks` | ✅ | _this commit_ | `docs/policy/versioning.md` — three independent axes (Rust API SemVer, wire format `VersionedPacket::Vn`, FFI ABI); V1→V2 process; MSRV policy; deprecation policy; change-type matrix. cargo-semver-checks CI job is the natural follow-up. |
 | 7.4 | Release pipeline (cargo-release + GPG + SLSA) | ⏳ | — | GitHub Actions release job |
-| 7.5 | Incident-response playbook | ⏳ | — | extension of `SECURITY.md` |
+| 7.5 | Incident-response playbook | ✅ | _this commit_ | `docs/security/incident-response.md` — triage timeline, CVSS 4.0 severity buckets, roles (Triage Lead / Fix Author / Reviewer / Release Captain), reproduction discipline, fix authoring rules, embargo + coordinated disclosure, GHSA/CVE filing, post-mortem template |
 | 7.6 | Grafana dashboards + Prometheus alert rules | ⏳ | — | depends on Phase 4.5 telemetry |
 | 7.7 | Performance tuning guide | ✅ | _this commit_ | `docs/operations/perf-tuning.md` covers release profile, target-cpu, PGO, sysctl, fd limits, CPU pinning, allocator choice, profiling tools, reference numbers |
 | 7.8 | Migration guides per breaking change | ⏳ | — | starts at first V2 bump |
