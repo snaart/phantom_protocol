@@ -9,7 +9,8 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **148 / 148** (132 unit + 11 negative-security + 5 proptest) |
+| Tests passing | **152 / 152** (132 unit + 11 negative-security + 5 proptest + 3 fuzz + 1 alkahest) |
+| Atomic commits since `e4067b6` baseline | **36** |
 | Integration tests | 5 (`tcp_integration` x2 `#[ignore]`, `kcp_integration` x3 `#[ignore]`) |
 | Fuzz harnesses | 4 scaffolded (cargo-fuzz, nightly) |
 | Workspace warnings | **0** |
