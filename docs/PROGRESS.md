@@ -9,8 +9,9 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **152 / 152** (132 unit + 11 negative-security + 5 proptest + 3 fuzz + 1 alkahest) |
-| Atomic commits since `e4067b6` baseline | **36** |
+| Tests passing | **161 / 161** (136 unit + 16 negative-security + 5 proptest + 3 fuzz + 1 alkahest) |
+| Atomic commits since `e4067b6` baseline | **37** |
+| Wire format versions supported | **V1 + V2** (V2 wire types landed; opt-in usage starts in Phase 1.5 rekey commit) |
 | Integration tests | 5 (`tcp_integration` x2 `#[ignore]`, `kcp_integration` x3 `#[ignore]`) |
 | Fuzz harnesses | 4 scaffolded (cargo-fuzz, nightly) |
 | Workspace warnings | **0** |
