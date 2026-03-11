@@ -4,7 +4,10 @@
 //! Manages streams, encryption state, and multi-path scheduling.
 
 use crate::transport::{
-    types::{SessionId, StreamId, PacketHeader, PhantomPacket, ControlMessage, SchedulerMode},
+    types::{
+        ControlMessage, PacketHeader, PacketHeaderV2, PhantomPacket, SchedulerMode, SessionId,
+        StreamId,
+    },
     stream::Stream,
     scheduler::Scheduler,
     fallback::FallbackStateMachine,
@@ -275,6 +278,55 @@ impl Session {
     /// `replay_rejected_total` metric.
     pub fn replay_rejected_total(&self) -> u64 {
         self.replay_rejected_total.load(Ordering::Relaxed)
+    }
+
+    /// Encrypt a V2 packet payload (wire format V2).
+    ///
+    /// The AAD is the alkahest-serialised `PacketHeaderV2` — V2 headers
+    /// have a different on-wire layout than V1 (u16 flags, plus `epoch`
+    /// and `path_id` fields), so the AAD bytes are distinct from V1 even
+    /// for the "same" stream/sequence/flags combination. A V1 ciphertext
+    /// therefore cannot be replayed against `decrypt_packet_v2` on the
+    /// same key — the AEAD tag check fails by AAD mismatch.
+    pub fn encrypt_packet_v2(
+        &self,
+        header: &PacketHeaderV2,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CoreError> {
+        let mut header_bytes = Vec::new();
+        alkahest::serialize_to_vec::<PacketHeaderV2, _>(header, &mut header_bytes);
+        self.crypto.encrypt(&header_bytes, plaintext)
+    }
+
+    /// Decrypt a V2 packet payload (wire format V2). Performs AEAD verify
+    /// + per-stream sliding-window replay rejection, same as `decrypt_packet`.
+    pub fn decrypt_packet_v2(
+        &self,
+        header: &PacketHeaderV2,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, CoreError> {
+        let mut header_bytes = Vec::new();
+        alkahest::serialize_to_vec::<PacketHeaderV2, _>(header, &mut header_bytes);
+        let plaintext = self.crypto.decrypt(&header_bytes, ciphertext)?;
+
+        // Same sliding-window guard as the V1 path. ReplayWindow keys on
+        // `(stream_id, sequence)` only — the V2 `epoch` / `path_id` fields
+        // do NOT contribute to the replay identity because replay is a
+        // property of "is this sequence a duplicate", independent of which
+        // path it arrived over or which rekey generation produced it.
+        let window_entry = self
+            .replay_windows
+            .entry(header.stream_id)
+            .or_insert_with(|| Mutex::new(ReplayWindow::new()));
+        let accepted = window_entry.lock().accept(header.sequence);
+        if !accepted {
+            self.replay_rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(CoreError::ReplayDetected(format!(
+                "stream {} sequence {} (V2) already seen or beyond window",
+                header.stream_id, header.sequence
+            )));
+        }
+        Ok(plaintext)
     }
 
     /// Create a control packet
