@@ -34,8 +34,8 @@ fn make_session_pair(shared: [u8; 32]) -> (Session, Session) {
     let crypto_a = CryptoState::new(&shared, false).expect("client crypto");
     let crypto_b = CryptoState::new(&shared, true).expect("server crypto");
     (
-        Session::from_derived(id, crypto_a, SchedulerMode::LowLatency),
-        Session::from_derived(id, crypto_b, SchedulerMode::LowLatency),
+        Session::from_derived(id, crypto_a, SchedulerMode::LowLatency, shared, false),
+        Session::from_derived(id, crypto_b, SchedulerMode::LowLatency, shared, true),
     )
 }
 
@@ -411,6 +411,127 @@ fn v2_replay_window_rejects_duplicate_sequence() {
         ),
     }
     assert_eq!(server.replay_rejected_total(), 1);
+}
+
+/// V2 nonce-from-header property — a tampered packet that fails AEAD
+/// verification must NOT desync the receiver from the sender. The next
+/// legitimate packet must still decrypt cleanly.
+///
+/// This is the V2 architectural fix relative to V1: V1's recv_counter
+/// advances on every decrypt attempt (success or failure), so a single
+/// dropped / mutated packet permanently breaks the session. V2 derives
+/// the nonce from the authenticated `header.sequence`, so failed
+/// decrypts are stateless from the AEAD's perspective.
+#[test]
+fn v2_failed_decrypt_does_not_desync_session() {
+    let (client, server) = make_session_pair([0x20u8; 32]);
+
+    // Sender encrypts packet #1.
+    let h1 = PacketHeaderV2::new(
+        *server.id(),
+        1,
+        1,
+        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+    );
+    let ct1 = client.encrypt_packet_v2(&h1, b"first").expect("encrypt 1");
+
+    // Bad packet arrives in between — flipped tag byte.
+    let mut tampered = ct1.clone();
+    let n = tampered.len();
+    tampered[n - 1] ^= 0x80;
+    assert!(server.decrypt_packet_v2(&h1, &tampered).is_err());
+
+    // The original ct1 (same header, same payload) must still decrypt —
+    // in V1 this would fail because the recv_counter desynchronised; in
+    // V2 the nonce is reconstructible from h1 alone.
+    let pt1 = server.decrypt_packet_v2(&h1, &ct1).expect("decrypt 1");
+    assert_eq!(pt1, b"first");
+
+    // And a subsequent packet at sequence 2 also goes through.
+    let h2 = PacketHeaderV2 { sequence: 2, ..h1 };
+    let ct2 = client.encrypt_packet_v2(&h2, b"second").expect("encrypt 2");
+    let pt2 = server.decrypt_packet_v2(&h2, &ct2).expect("decrypt 2");
+    assert_eq!(pt2, b"second");
+}
+
+/// Mid-session rekey (Phase 1.5) — `Session::rekey()` increments the epoch
+/// and derives a new AEAD state. Ciphertext produced before rekey must NOT
+/// decrypt with the post-rekey state.
+#[test]
+fn rekey_changes_keys_and_breaks_old_ciphertexts() {
+    let (client, server) = make_session_pair([0x10u8; 32]);
+    assert_eq!(client.current_epoch(), 0);
+    assert_eq!(server.current_epoch(), 0);
+
+    let header = PacketHeaderV2::new(
+        *server.id(),
+        1,
+        100,
+        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+    );
+    let ct_epoch0 = client
+        .encrypt_packet_v2(&header, b"pre-rekey payload")
+        .expect("encrypt e0");
+
+    // Lock-step rekey on both ends.
+    let client_new = client.rekey().expect("client rekey");
+    let server_new = server.rekey().expect("server rekey");
+    assert_eq!(client_new, 1);
+    assert_eq!(server_new, 1);
+    assert_eq!(client.current_epoch(), 1);
+    assert_eq!(server.current_epoch(), 1);
+
+    // The OLD ciphertext must NOT authenticate under the new keys.
+    let header_epoch1 = PacketHeaderV2 { epoch: 1, ..header };
+    assert!(
+        server.decrypt_packet_v2(&header_epoch1, &ct_epoch0).is_err(),
+        "post-rekey CryptoState must reject pre-rekey ciphertext"
+    );
+
+    // A fresh encrypt under the new epoch round-trips successfully.
+    let header_v1_e1 = PacketHeaderV2::new(
+        *server.id(),
+        1,
+        101,
+        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+    )
+    .with_epoch(1);
+    let ct_epoch1 = client
+        .encrypt_packet_v2(&header_v1_e1, b"post-rekey payload")
+        .expect("encrypt e1");
+    let pt = server
+        .decrypt_packet_v2(&header_v1_e1, &ct_epoch1)
+        .expect("decrypt e1");
+    assert_eq!(pt, b"post-rekey payload");
+}
+
+/// `Session::ratchet_to_epoch(target)` advances the local epoch by repeated
+/// HKDF chain steps. Useful for a receiver that fell behind and needs to
+/// catch up to a higher-epoch packet.
+#[test]
+fn ratchet_to_epoch_walks_forward_n_steps() {
+    let (_client, server) = make_session_pair([0x11u8; 32]);
+    assert_eq!(server.current_epoch(), 0);
+    server.ratchet_to_epoch(5).expect("ratchet to 5");
+    assert_eq!(server.current_epoch(), 5);
+    // Going to a lower target is a no-op.
+    server.ratchet_to_epoch(3).expect("ratchet to 3 (no-op)");
+    assert_eq!(server.current_epoch(), 5);
+}
+
+/// `Session::rekey` saturates at `u8::MAX` rather than wrapping — long
+/// sessions must reconnect rather than reuse epoch 0 keys with a higher
+/// counter.
+#[test]
+fn rekey_saturates_at_u8_max() {
+    let (_, server) = make_session_pair([0x12u8; 32]);
+    server
+        .ratchet_to_epoch(u8::MAX)
+        .expect("walk up to u8::MAX");
+    assert_eq!(server.current_epoch(), u8::MAX);
+    // The 256th rekey must fail rather than wrap to 0.
+    assert!(server.rekey().is_err());
+    assert_eq!(server.current_epoch(), u8::MAX, "epoch must not wrap");
 }
 
 /// `VersionedPacket::V2` survives serialize + deserialize with all V2-only

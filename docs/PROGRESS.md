@@ -9,9 +9,9 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **161 / 161** (136 unit + 16 negative-security + 5 proptest + 3 fuzz + 1 alkahest) |
-| Atomic commits since `e4067b6` baseline | **37** |
-| Wire format versions supported | **V1 + V2** (V2 wire types landed; opt-in usage starts in Phase 1.5 rekey commit) |
+| Tests passing | **165 / 165** (136 unit + 20 negative-security + 5 proptest + 3 fuzz + 1 alkahest) |
+| Atomic commits since `e4067b6` baseline | **38** |
+| Wire format versions supported | **V1 + V2** (V2 wire types + V2 AEAD path landed; V2 derives nonce from header → failed decrypts no longer desync) |
 | Integration tests | 5 (`tcp_integration` x2 `#[ignore]`, `kcp_integration` x3 `#[ignore]`) |
 | Fuzz harnesses | 4 scaffolded (cargo-fuzz, nightly) |
 | Workspace warnings | **0** |
@@ -61,7 +61,7 @@ baseline (0.6) are nice-to-haves; they don't block any later phase.
 | 1.2 | ZeroizeOnDrop on session secrets | ✅ | `068e354` + `3ef15c6` | `CryptoState`, `Session.resumption_secret`, `HandshakeServer.master_secret` (was `pow_secret`), `HandshakeClient.nonce` |
 | 1.3 | Remove `.unwrap()` / `unreachable!()` from production hot paths | ✅ | `068e354` + `e25f7a7` + `005e22f` | handshake, api/session, faketls, compression |
 | 1.4 | Wire `ReplayProtection` into recv path | ✅ | _this commit_ | bitmap-based per-stream `ReplayWindow` (RFC 4303 § 3.4.3); 1024-bit window; `Session::decrypt_packet` checks after AEAD verify; `replay_rejected_total` counter exposed |
-| 1.5 | Mid-session key rotation (PFS within a session) | ⏭️ | — | **Blocked on V2 bump.** All 8 `PacketFlags` bits are used in V1; no room for `REKEY`. Resumes when Phase 4.2 introduces V2. |
+| 1.5 | Mid-session key rotation (PFS within a session) | ✅ | _this commit_ | `Session::rekey()` derives next traffic secret via `HKDF-Expand(current, "phantom-rekey-v1", 32)` and ArcSwap-installs a fresh `CryptoState`. `current_epoch()` / `ratchet_to_epoch(target)` accessors. Epoch saturates at u8::MAX. Wired on the wire via V2 `PacketFlagsV2::REKEY` + `PacketHeaderV2.epoch`. |
 | 1.6 | Strong session ID (32 → 128 bits) | ✅ | `e25f7a7` | `new_session_id` via thread_rng / ChaCha CSPRNG |
 | 1.7 | AEAD nonce-exhaustion guard (`AEAD_MAX_INVOCATIONS`) | ✅ | `53f2c5e` | `CryptoError::NonceExhausted` at 2^48; observability accessors |
 | 1.8 | Wire format & version-list negotiation | ⏭️ | — | **Blocked on V2 bump.** `ClientHello.version` is a `u8`; needs `Vec<u8>` of offered versions, transcript-bound. Resumes alongside V2. |

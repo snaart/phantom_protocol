@@ -359,7 +359,15 @@ impl HandshakeServer {
             Err(e) => return HandshakeResponse::Fail(HandshakeError::KemFailed(e.to_string())),
         };
 
-        let session = Session::from_derived(session_id, crypto, SchedulerMode::LowLatency);
+        // is_server=true and traffic_secret=shared_secret seed the rekey
+        // chain (Phase 1.5) so the server can later derive forward.
+        let session = Session::from_derived(
+            session_id,
+            crypto,
+            SchedulerMode::LowLatency,
+            shared_secret,
+            true,
+        );
         
         // Derive resumption secret
         let mut resumption_secret = [0u8; 32];
@@ -478,7 +486,16 @@ impl HandshakeClient {
         let crypto = CryptoState::new(&shared_secret, false)
             .map_err(|e| HandshakeError::KemFailed(e.to_string()))?;
 
-        let session = Session::from_derived(session_id, crypto, SchedulerMode::LowLatency);
+        // is_server=false and traffic_secret=shared_secret seed the rekey
+        // chain (Phase 1.5) so the client can later derive forward in lock-
+        // step with the server.
+        let session = Session::from_derived(
+            session_id,
+            crypto,
+            SchedulerMode::LowLatency,
+            shared_secret,
+            false,
+        );
         
         // 5. Derive resumption secret
         let mut resumption_secret = [0u8; 32];

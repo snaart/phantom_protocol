@@ -299,6 +299,77 @@ impl CryptoSession {
         Ok(buf)
     }
 
+    // ── V2 / explicit-nonce path ───────────────────────────────────────
+    //
+    // The V1 paths above derive the AEAD nonce from an internal monotonic
+    // counter — fast and minimal-on-wire, but fragile under attack: a
+    // failed decrypt still advances the counter, so a follow-up legitimate
+    // packet decrypts under a different nonce than the sender used.
+    //
+    // V2 fixes this by deriving the nonce from the authenticated header
+    // fields the caller supplies. Failed decrypts no longer desync the
+    // receiver. The counter API is kept in place so the caller can still
+    // track / cap invocation counts for telemetry.
+
+    /// Encrypt with an explicit caller-supplied nonce. The caller MUST
+    /// ensure uniqueness of `(key, nonce)` — the V2 path derives the nonce
+    /// from `(nonce_prefix, epoch, stream_id, sequence)` so uniqueness
+    /// follows from the wire-format invariant that sender never reuses
+    /// `(stream_id, sequence)` within an epoch.
+    #[inline]
+    pub fn encrypt_with_nonce(
+        &self,
+        nonce_bytes: [u8; 12],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let counter = self.inner.send_counter.fetch_add(1, Ordering::Relaxed);
+        if counter >= AEAD_MAX_INVOCATIONS {
+            return Err(CryptoError::NonceExhausted);
+        }
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let mut buf = Vec::with_capacity(plaintext.len() + AEAD_OVERHEAD);
+        buf.extend_from_slice(plaintext);
+        self.inner
+            .send_key
+            .seal_in_place_append_tag(nonce, Aad::from(aad), &mut buf)
+            .map_err(|_| CryptoError::EncryptionFailed)?;
+        Ok(buf)
+    }
+
+    /// Decrypt with an explicit caller-supplied nonce. Unlike [`decrypt`],
+    /// a tag-check failure does NOT advance the internal counter — only
+    /// the bounded telemetry counter increments.
+    #[inline]
+    pub fn decrypt_with_nonce(
+        &self,
+        nonce_bytes: [u8; 12],
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let counter = self.inner.recv_counter.fetch_add(1, Ordering::Relaxed);
+        if counter >= AEAD_MAX_INVOCATIONS {
+            return Err(CryptoError::NonceExhausted);
+        }
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let mut buf = ciphertext.to_vec();
+        let plaintext_slice = self
+            .inner
+            .recv_key
+            .open_in_place(nonce, Aad::from(aad), &mut buf)
+            .map_err(|_| CryptoError::DecryptionFailed)?;
+        let len = plaintext_slice.len();
+        buf.truncate(len);
+        Ok(buf)
+    }
+
+    /// Expose the 4-byte nonce prefix for the V2 nonce construction
+    /// (`prefix || epoch || stream_id_be || sequence_be`).
+    #[inline]
+    pub fn nonce_prefix(&self) -> [u8; 4] {
+        self.inner.nonce_prefix
+    }
+
     #[inline(always)]
     fn make_nonce(&self, counter: u64) -> Nonce {
         let mut n = [0u8; 12];

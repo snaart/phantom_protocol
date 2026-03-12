@@ -52,6 +52,7 @@ blake3 = "1.5"
 getrandom = "0.2"
 bitflags = "2.4"
 parking_lot = "0.12"  # Fast mutex for buffer pool
+arc-swap = "1"        # Lock-free atomic swap for the CryptoState rekey path (Phase 1.5)
 lz4_flex = "0.11"     # Fastest pure-Rust LZ4 (safe, no C bindings)
 # zstd pinned to a release version. Optional (gated by `compression-zstd`
 # feature) so WASM / embedded builds can opt out of the C bindings in
