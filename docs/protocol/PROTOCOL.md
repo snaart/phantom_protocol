@@ -16,14 +16,13 @@ The wire format is identified by a single byte in the
 [`VersionedPacket`](../../core/src/transport/types.rs) discriminant
 (alkahest enum tag). Current state:
 
-- **V1**: this document.
-- V2: reserved. Triggers when any of the following is needed:
-  - Rekey signal flag (Phase 1.5).
-  - Version-list negotiation (Phase 1.8).
-  - Multi-path `path_id` field (Phase 4.2).
-  - PacketCoalescer wrapper (Phase 2.5).
-
-Bumps are accompanied by a new `PROTOCOL_V2.md` and a migration guide.
+- **V1**: stable. Sections 4-9 of this document describe V1.
+- **V2**: landed. Section 11 describes the V2 packet format. V2 carries
+  the rekey signal (Phase 1.5 ✅), is ready for the multi-path `path_id`
+  field (Phase 4.2 — primitive wired, scheduler integration pending),
+  and reserves a flag for the PacketCoalescer wrapper (Phase 2.5).
+- V3+: reserved. Bumps are accompanied by a new section here and a
+  migration guide.
 
 ---
 
@@ -384,5 +383,117 @@ spec as follows:
 | Post-handshake ENCRYPTED flag | § 4.4 / § 5 |
 | FakeTLS per-record counter nonces (anti-Forbidden-Attack) | § 3 (`"phantom-faketls-*-v1"` labels) |
 
-Removing or weakening any of these requires a V2 bump and a corresponding
-update to `SECURITY.md`.
+Removing or weakening any of these requires a major version bump (V3+)
+and a corresponding update to `SECURITY.md`.
+
+---
+
+## 11. V2 wire format
+
+V2 is wire-incompatible with V1: it widens `PacketFlags` from u8 to u16
+and adds two single-byte fields. Sessions are version-pinned end-to-end
+— a V2 session never accepts V1 packets and vice versa. The
+`VersionedPacket` alkahest enum naturally distinguishes the two with
+its discriminant byte.
+
+### 11.1 `PacketFlagsV2` (u16 bitfield)
+
+Low byte mirrors V1's bit assignments verbatim (so `RELIABLE` is `0x0001`,
+`ENCRYPTED` is `0x0020`, etc. — full table in § 4.4). High byte
+introduces:
+
+| Bit | Constant | Meaning |
+| --- | --- | --- |
+| `0x0100` | `REKEY` | Sender has rekeyed; receiver must `ratchet_to_epoch(header.epoch)` before decrypting (Phase 1.5). |
+| `0x0200` | `PATH_VALIDATION` | Payload is a 32-byte challenge or response for multi-path validation (Phase 4.2). |
+| `0x0400` | `COALESCED` | Payload is a bundle of inner packets in `[count: u16][len1: u16][p1]...` format (Phase 2.5). |
+| `0x0800..0x8000` | _reserved_ | Future V2 amendments. |
+
+### 11.2 `PacketHeaderV2` (44 wire bytes)
+
+```rust
+struct PacketHeaderV2 {
+    session_id: SessionId,         // 32 bytes
+    stream_id: StreamId,           // u16
+    sequence: SequenceNumber,      // u32
+    flags: PacketFlagsV2,          // u16
+    ack_delay: u16,                // u16
+    epoch: u8,                     // u8  — rekey generation
+    path_id: u8,                   // u8  — multi-path leg identifier
+}
+```
+
+V1's 41-byte header + 3 new bytes (`flags` widened by one byte plus
+`epoch` and `path_id`).
+
+### 11.3 V2 AEAD construction
+
+V2 abandons V1's internal-counter-derived nonce in favour of a
+nonce derived from the AAD-bound header fields. This fixes V1's
+"failed-decrypt-desyncs-the-session" pathology (a tampered or replayed
+packet permanently broke the session because `recv_counter` advanced
+on every attempt).
+
+Nonce layout (12 bytes total):
+
+```
+nonce[0..4]  = nonce_prefix    (from CryptoState; fresh per rekey epoch)
+nonce[4]     = header.epoch
+nonce[5..7]  = header.stream_id  (big-endian)
+nonce[7..11] = header.sequence   (big-endian)
+nonce[11]    = header.path_id
+```
+
+Uniqueness: senders never reuse `(stream_id, sequence)` within an epoch,
+and `path_id` distinguishes the same logical packet across multi-path
+legs. The full 12 bytes are therefore unique under a given key.
+
+Failed decrypts do NOT advance any nonce-relevant state. The internal
+`recv_counter` is kept only as a telemetry counter (capped at
+`AEAD_MAX_INVOCATIONS = 1 << 48`).
+
+### 11.4 Mid-session rekey (Phase 1.5)
+
+`Session::rekey()`:
+
+1. Derives `next_secret = HKDF-Expand(current_traffic_secret,
+   "phantom-rekey-v1", 32)`.
+2. Builds a fresh `CryptoState` from `next_secret` with the same
+   `is_server` orientation as the original handshake.
+3. ArcSwap-installs the new state — concurrent encrypt/decrypt see
+   either the old or new state atomically.
+4. Zeroes the previous traffic secret in place before overwriting.
+5. Increments `Session.epoch` (saturating at `u8::MAX` — long-lived
+   sessions must reconnect rather than wrap to epoch 0).
+
+Wire signalling: the sender emits a V2 packet whose header carries the
+new `epoch` value and the `PacketFlagsV2::REKEY` flag. Receivers respond
+by calling `ratchet_to_epoch(header.epoch)` on themselves, which walks
+the HKDF chain forward until the local epoch matches.
+
+The KDF label `"phantom-rekey-v1"` is part of the V2 KDF inventory and
+is treated as a wire-format constant.
+
+### 11.5 V2 KDF additions
+
+Adds to the inventory in § 3:
+
+| Label | Construction | Purpose |
+| --- | --- | --- |
+| `b"phantom-rekey-v1"` | `HKDF-Expand(current_traffic_secret)` | Forward-derive the next per-epoch traffic secret |
+
+### 11.6 Session pinning
+
+A single `Session` is pinned to one wire version for its lifetime —
+mixed V1+V2 use within a session is not supported. Version selection
+happens at handshake time (Phase 1.8 work, currently in V1-only mode
+because the handshake itself remains V1).
+
+### 11.7 Cross-version isolation
+
+A V1 ciphertext + header cannot be replayed against `decrypt_packet_v2`
+on the same key: the AAD bytes differ (V1 header is 41 bytes,
+V2 header is 44 bytes, different serialisation), so the AEAD tag check
+fails by construction. Test
+`v1_ciphertext_does_not_decrypt_as_v2` in
+`core/tests/security_invariants.rs` pins this property.
