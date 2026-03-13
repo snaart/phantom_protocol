@@ -10,8 +10,9 @@ phase table.
 | Metric | Value |
 | --- | --- |
 | Tests passing | **165 / 165** (136 unit + 20 negative-security + 5 proptest + 3 fuzz + 1 alkahest) |
-| Atomic commits since `e4067b6` baseline | **38** |
+| Atomic commits since `e4067b6` baseline | **41** |
 | Wire format versions supported | **V1 + V2** (V2 wire types + V2 AEAD path landed; V2 derives nonce from header → failed decrypts no longer desync) |
+| Mid-session rekey | **available** — `Session::rekey()` + V2 `PacketFlagsV2::REKEY` + `header.epoch` |
 | Integration tests | 5 (`tcp_integration` x2 `#[ignore]`, `kcp_integration` x3 `#[ignore]`) |
 | Fuzz harnesses | 4 scaffolded (cargo-fuzz, nightly) |
 | Workspace warnings | **0** |
