@@ -129,7 +129,7 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | 4.3 | Multi-stream finalization (priority, flow control) | ⏳ | — | priority field exists; never read by scheduler |
 | 4.4 | Congestion control (BBRv2-inspired) | ⏳ | — | depends on 2.6 (Pacer + Estimator wired) |
 | 4.5 | Telemetry: `tracing` instrumentation (foundation) | 🔄 | _this commit_ | `tracing = "0.1"` dep added; `#[tracing::instrument]` on `HandshakeServer::process_client_hello`, `HandshakeClient::process_server_hello`, `PhantomListener::bind`, `PhantomListener::accept`. Metrics exporter (counters / histograms / Prometheus / OTel) is the remaining piece. |
-| 4.6 | Graceful shutdown + signal handling | ⏳ | — | small once API is settled |
+| 4.6 | Graceful shutdown + signal handling | ✅ | _this commit_ | `PhantomListener::shutdown()` flips `shutting_down: AtomicBool` and notifies waiters; parked `accept()` calls unwind with `CoreError::ConnectionClosed`. `is_shutting_down()` accessor. Already-accepted sessions continue until their owners close them. |
 
 **Phase 4 verdict:** untouched. Depends on 2.x and 3.x foundations.
 

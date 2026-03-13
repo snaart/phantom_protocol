@@ -6,8 +6,9 @@ use crate::transport::handshake::{
 };
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 #[derive(uniffi::Object)]
 pub struct PhantomListener {
@@ -17,6 +18,11 @@ pub struct PhantomListener {
     /// Cached so callers can read it without acquiring the listener mutex.
     /// Useful when `bind("0.0.0.0:0")` is used and the OS chose the port.
     local_addr: SocketAddr,
+    /// Graceful-shutdown signal (Phase 4.6). `shutdown()` flips
+    /// `shutting_down` and wakes all `accept()` calls currently parked
+    /// on the listener so they can unwind cleanly.
+    shutting_down: AtomicBool,
+    shutdown_notify: Arc<Notify>,
 }
 
 #[uniffi::export]
@@ -36,6 +42,8 @@ impl PhantomListener {
             listener: Mutex::new(listener),
             handshake_server: Arc::new(hs),
             local_addr,
+            shutting_down: AtomicBool::new(false),
+            shutdown_notify: Arc::new(Notify::new()),
         }))
     }
 
@@ -55,13 +63,25 @@ impl PhantomListener {
 
     #[tracing::instrument(name = "phantom.listener.accept", skip_all)]
     pub async fn accept(&self) -> Result<Arc<PhantomSession>, CoreError> {
-        let (stream, peer) = self
-            .listener
-            .lock()
-            .await
-            .accept()
-            .await
-            .map_err(|e| CoreError::NetworkError(e.to_string()))?;
+        // Cheap fast-path: if shutdown was already signalled before this
+        // accept was even called, return immediately.
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(CoreError::ConnectionClosed);
+        }
+        let listener_guard = self.listener.lock().await;
+        let shutdown_fut = self.shutdown_notify.notified();
+        tokio::pin!(shutdown_fut);
+        let (stream, peer) = tokio::select! {
+            result = listener_guard.accept() => {
+                result.map_err(|e| CoreError::NetworkError(e.to_string()))?
+            }
+            _ = &mut shutdown_fut => {
+                return Err(CoreError::ConnectionClosed);
+            }
+        };
+        // Release the listener lock before driving the handshake, so other
+        // tasks can call accept again concurrently.
+        drop(listener_guard);
         let transport = TcpSessionTransport::new(stream);
         let server_session =
             drive_server_handshake(&transport, &self.handshake_server, peer.ip()).await?;
@@ -70,6 +90,24 @@ impl PhantomListener {
             transport,
             Arc::new(server_session),
         ))
+    }
+
+    /// Signal graceful shutdown (Phase 4.6).
+    ///
+    /// Sets the `shutting_down` flag and wakes any `accept()` call currently
+    /// parked on the listener so it can unwind with
+    /// `CoreError::ConnectionClosed`. Idempotent — calling more than once is
+    /// safe. Already-accepted sessions are NOT affected; they continue
+    /// serving until their owning task closes them.
+    #[tracing::instrument(name = "phantom.listener.shutdown", skip_all)]
+    pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
+    }
+
+    /// Whether `shutdown()` has been called.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
     }
 }
 
