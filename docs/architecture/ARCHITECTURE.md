@@ -328,16 +328,51 @@ Hot paths still on the deferred list:
 The architecture sketched here is the V1 baseline. The major moves in
 the eight-phase production-readiness plan:
 
-- **Phase 3**: introduce a `Runtime` / `Clock` trait between the API
-  layer and the tokio types, so WASM / embedded backends can drop into
-  the same shape.
+- **Phase 3**: introduce a `Runtime` trait between the API layer and
+  the tokio types, so WASM / embedded backends can drop into the same
+  shape. The trait itself has landed in [`crate::runtime`] with
+  `TokioRuntime` as the default impl; call-site migration is in
+  progress.
 - **Phase 4**: turn `Scheduler` from a placeholder into a real
-  multi-path / migration policy (requires V2 wire format).
+  multi-path / migration policy (V2 wire format is in place with
+  `header.path_id`; scheduler integration is the next step).
 - **Phase 5**: gate the crypto layer behind `fips` feature so it can be
   built with ML-KEM / ML-DSA / aws-lc-rs primitives.
 - **Phase 4.5**: insert `tracing` instrumentation and `metrics`
   counters at the boundary between the API layer and the data pump
-  without altering the data flow.
+  without altering the data flow. Tracing foundation is in place on
+  the four entry points (Phase 4.5 partial).
 
-The split into the three layers (api / transport / crypto) is designed
-to keep each of those moves self-contained.
+The split into the four layers (api / transport / crypto / runtime) is
+designed to keep each of those moves self-contained.
+
+## 12. The `runtime/` module (Phase 3.1)
+
+```
+                ┌────────────────────────────────┐
+                │  runtime::Runtime  (trait)      │
+                │  ┌──────────────────────────┐  │
+                │  │ spawn(BoxFuture<()>)     │  │
+                │  │ sleep(Duration)          │  │
+                │  │ now_monotonic()          │  │
+                │  │ now_wall_clock()         │  │
+                │  └──────────────────────────┘  │
+                └────────────────┬───────────────┘
+                                 │ implemented by
+                  ┌──────────────┼──────────────┬─────────────┐
+                  ▼              ▼              ▼             ▼
+           TokioRuntime   (WasmRuntime)   (EmbeddedRuntime)  test mocks
+              ✅              scaffold         scaffold
+```
+
+`TokioRuntime` is a zero-sized struct that wraps the existing
+`tokio::spawn` / `tokio::time::sleep` / `std::time::Instant` /
+`std::time::SystemTime` calls. Callers that take `Arc<dyn Runtime>`
+have zero behavioural difference today.
+
+`SpawnHandle` is the runtime-agnostic equivalent of
+`tokio::task::JoinHandle<()>` — exposes `abort()` and `is_finished()`.
+Dropping it detaches the task (matches tokio semantics).
+
+When WASM and embedded backends land, they implement the same trait;
+no other code in the crate needs to change shape.

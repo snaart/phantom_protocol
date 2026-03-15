@@ -9,8 +9,8 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **165 / 165** (136 unit + 20 negative-security + 5 proptest + 3 fuzz + 1 alkahest) |
-| Atomic commits since `e4067b6` baseline | **41** |
+| Tests passing | **170 / 170** (141 unit + 20 negative-security + 5 proptest + 3 fuzz + 1 alkahest) |
+| Atomic commits since `e4067b6` baseline | **43** |
 | Wire format versions supported | **V1 + V2** (V2 wire types + V2 AEAD path landed; V2 derives nonce from header → failed decrypts no longer desync) |
 | Mid-session rekey | **available** — `Session::rekey()` + V2 `PacketFlagsV2::REKEY` + `header.epoch` |
 | Integration tests | 5 (`tcp_integration` x2 `#[ignore]`, `kcp_integration` x3 `#[ignore]`) |
@@ -105,8 +105,8 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 
 | # | Item | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
-| 3.1 | `Runtime` trait (decouple from tokio) | ⏳ | — | XL — touches every `tokio::spawn` / `tokio::time` site |
-| 3.2 | `Clock` trait (WASM-compatible time) | ⏳ | — | feeds 3.1 |
+| 3.1 | `Runtime` trait (decouple from tokio) | 🔄 | _this commit_ | trait + `TokioRuntime` default impl + 5 tests landed in `core/src/runtime/`. Call-site migration (every `tokio::spawn` / `tokio::time::sleep` → `runtime.spawn` / `runtime.sleep`) is the follow-up. |
+| 3.2 | `Clock` trait (WASM-compatible time) | ✅ | _this commit_ | folded into [`Runtime`] — `now_monotonic()` + `now_wall_clock()` are part of the trait surface. Per-target shims (e.g. `js-sys::Date` on WASM) land with the corresponding Runtime impls. |
 | 3.3 | `WebSocketLeg` for browser WASM | ⏳ | — | new `transport/legs/websocket.rs` |
 | 3.4 | `EmbeddedLeg` (UART / serial / CAN) | ⏳ | — | generic over `embedded-io-async` traits |
 | 3.5 | Conditional compilation matrix (`std` / `wasm` / `embedded` / ...) | ⏳ | — | features in `core/Cargo.toml` |

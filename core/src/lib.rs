@@ -51,6 +51,11 @@ pub mod transport;
 // Networks module (transport trait, pipeline, engine, tls)
 pub mod networks;
 
+// Async runtime abstraction (Phase 3.1). `TokioRuntime` is the default
+// implementation; the trait surface is in place for follow-up commits
+// that introduce WASM / embedded backends.
+pub mod runtime;
+
 // Public API facade
 pub mod api;
 
