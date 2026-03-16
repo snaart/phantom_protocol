@@ -78,6 +78,28 @@ dashmap = "6.1.0"
 [build-dependencies]
 uniffi = { version = "0.29", features = ["build"] }
 
+# ─── WASM-only dependencies (Phase 3.3) ───────────────────────────────────
+# Pulled in only for `wasm32-*` builds. Non-WASM hosts never see these
+# crates in their dependency graph, so the production server build is
+# unaffected.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "Blob",
+    "CloseEvent",
+    "ErrorEvent",
+    "Event",
+    "MessageEvent",
+    "WebSocket",
+] }
+# Phase 3.8 partial: enable getrandom's "js" feature for wasm32 so it
+# falls back to `crypto.getRandomValues` rather than emitting a
+# compile_error!. Non-wasm targets ignore this — it's a no-op there.
+getrandom = { version = "0.2", features = ["js"] }
+
 [dev-dependencies]
 blake3 = "1.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }

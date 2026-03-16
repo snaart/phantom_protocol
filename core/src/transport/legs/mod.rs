@@ -1,10 +1,18 @@
 //! Transport Legs Module
-//! 
-//! Pluggable physical transports (KCP, TCP, FakeTLS)
+//!
+//! Pluggable physical transports. Native targets carry KCP / TCP /
+//! FakeTLS; the `wasm32` target additionally exposes a WebSocket leg
+//! (Phase 3.3) since browsers cannot open raw TCP/UDP sockets.
 
 pub mod kcp;
 pub mod tcp;
 pub mod faketls;
+
+#[cfg(target_arch = "wasm32")]
+pub mod websocket;
+
+#[cfg(target_arch = "wasm32")]
+pub use websocket::WebSocketLeg;
 
 use async_trait::async_trait;
 use bytes::Bytes;

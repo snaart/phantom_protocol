@@ -925,8 +925,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1335,6 +1337,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "js-sys",
  "kcp-tokio",
  "log",
  "lz4_flex",
@@ -1359,6 +1362,9 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uniffi",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "webpki-roots 0.26.11",
  "x25519-dalek",
  "zeroize",
@@ -2508,6 +2514,20 @@ dependencies = [
  "rustversion",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
+]
+
+[[package]]
+name = "wasm-bindgen-futures"
+version = "0.4.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70a6e77fd0ae8029c9ea0063f87c46fde723e7d887703d74ad2616d792e51e6f"
+dependencies = [
+ "cfg-if",
+ "futures-util",
+ "js-sys",
+ "once_cell",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
