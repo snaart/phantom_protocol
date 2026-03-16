@@ -6,12 +6,13 @@
 
 use crate::errors::CoreError;
 use crate::crypto::hybrid_sign::HybridVerifyingKey;
+use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{HandshakeClient, ServerHello, HelloRetryRequest};
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::session::Session;
 use crate::transport::types::{VersionedPacket, SessionId, PacketHeader, PacketFlags, PhantomPacketV1, StreamId as TransportStreamId};
 use crate::transport::stream::Stream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use dashmap::DashMap;
@@ -157,11 +158,32 @@ impl PhantomSession {
     /// 2. Verify server identity against `expected_server_key`.
     /// 3. Derive AEAD keys; flush queued sends as encrypted packets.
     ///
-    /// All network I/O goes through the provided `SessionTransport`.
+    /// All network I/O goes through the provided `SessionTransport`. The
+    /// task that drives the handshake + data pump runs on the default
+    /// [`TokioRuntime`]; use
+    /// [`connect_with_transport_with_runtime`](Self::connect_with_transport_with_runtime)
+    /// to substitute a different `Runtime`.
     pub fn connect_with_transport<T: SessionTransport>(
         peer_addr: &str,
         transport: T,
         expected_server_key: HybridVerifyingKey,
+    ) -> Self {
+        Self::connect_with_transport_with_runtime(
+            peer_addr,
+            transport,
+            expected_server_key,
+            Arc::new(TokioRuntime),
+        )
+    }
+
+    /// Like [`connect_with_transport`](Self::connect_with_transport) but
+    /// runs the background task on the supplied `Runtime`. Intended for
+    /// WASM / embedded / test backends that don't drive `tokio::spawn`.
+    pub fn connect_with_transport_with_runtime<T: SessionTransport>(
+        peer_addr: &str,
+        transport: T,
+        expected_server_key: HybridVerifyingKey,
+        runtime: Arc<dyn Runtime>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (recv_tx, recv_rx) = mpsc::channel(256);
@@ -186,21 +208,41 @@ impl PhantomSession {
             streams: streams.clone(),
         };
 
-        // Spawn the background handshake + data pump task
-        tokio::spawn(Self::background_task(
+        // Spawn the background handshake + data pump task on the supplied
+        // runtime. `SpawnHandle` is detached: dropping it leaves the task
+        // running. The session is owned by the caller for its lifetime
+        // and natural shutdown comes via `SessionCommand::Close`.
+        let runtime_for_pump = runtime.clone();
+        let _detached = runtime.spawn(Box::pin(Self::background_task(
             state, send_queue, cmd_tx, cmd_rx, recv_tx, transport, peer,
-            demux, streams, expected_server_key,
-        ));
+            demux, streams, expected_server_key, runtime_for_pump,
+        )));
 
         session
     }
 
     /// Install a server-side `Session` (already derived by `HandshakeServer::process_client_hello`)
-    /// and spawn the data pump. Used by `PhantomListener::accept` after driving the server handshake.
+    /// and spawn the data pump on the default [`TokioRuntime`]. Used by
+    /// `PhantomListener::accept` after driving the server handshake.
     pub(crate) fn from_accepted_server_session<T: SessionTransport>(
         peer_addr: String,
         transport: T,
         server_session: Arc<Session>,
+    ) -> Arc<Self> {
+        Self::from_accepted_server_session_with_runtime(
+            peer_addr,
+            transport,
+            server_session,
+            Arc::new(TokioRuntime),
+        )
+    }
+
+    /// Runtime-aware variant of [`from_accepted_server_session`].
+    pub(crate) fn from_accepted_server_session_with_runtime<T: SessionTransport>(
+        peer_addr: String,
+        transport: T,
+        server_session: Arc<Session>,
+        runtime: Arc<dyn Runtime>,
     ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (recv_tx, recv_rx) = mpsc::channel(256);
@@ -225,10 +267,12 @@ impl PhantomSession {
 
         let session_id = *server_session.id();
         let next_app_seq = Arc::new(AtomicU32::new(1));
-        tokio::spawn(run_data_pump(
+        let runtime_for_pump = runtime.clone();
+        let _detached = runtime.spawn(Box::pin(run_data_pump(
             server_session, session_id, Arc::new(transport),
             state, send_queue, cmd_rx, recv_tx, demux, streams, next_app_seq,
-        ));
+            runtime_for_pump,
+        )));
 
         session
     }
@@ -245,6 +289,7 @@ impl PhantomSession {
         demux: Arc<StreamDemultiplexer>,
         streams: Arc<DashMap<u32, Arc<Stream>>>,
         expected_server_key: HybridVerifyingKey,
+        runtime: Arc<dyn Runtime>,
     ) {
         log::info!("PhantomSession: starting handshake with {}", peer);
 
@@ -336,6 +381,7 @@ impl PhantomSession {
             demux,
             streams,
             next_app_seq,
+            runtime,
         )
         .await;
     }
@@ -360,6 +406,7 @@ async fn run_data_pump<T: SessionTransport>(
     demux: Arc<StreamDemultiplexer>,
     streams: Arc<DashMap<u32, Arc<Stream>>>,
     next_app_seq: Arc<AtomicU32>,
+    runtime: Arc<dyn Runtime>,
 ) {
     // ── Flush queued early-data sends as encrypted packets ──
     {
@@ -392,7 +439,14 @@ async fn run_data_pump<T: SessionTransport>(
     let demux_recv = demux.clone();
     let streams_recv = streams.clone();
     let recv_tx_for_task = recv_tx.clone();
-    let mut recv_handle = tokio::spawn(async move {
+    // Completion signal for the receive task. `SpawnHandle` from the
+    // runtime trait does not expose a `Future` for `.await` directly
+    // (different runtimes provide different join futures), so we wire a
+    // one-shot channel — the recv task sends `()` right before exiting
+    // and the main loop selects on the receiver to detect transport
+    // closure.
+    let (recv_done_tx, mut recv_done_rx) = oneshot::channel::<()>();
+    let recv_handle = runtime.spawn(Box::pin(async move {
         // Reusable buffer for ACK frame serialization. Hoisted out of the
         // loop (Phase 2.3) so we don't pay a fresh `Vec::new()` allocation
         // for every ACK we emit on a busy reliable stream. 256 bytes is
@@ -478,7 +532,12 @@ async fn run_data_pump<T: SessionTransport>(
                 demux_recv.route_close_async(stream_id).await;
             }
         }
-    });
+        // Signal the main loop that the recv task has exited so it can
+        // also unwind. `send` returns `Err(())` if the receiver was
+        // already dropped — that case is harmless, the main loop has
+        // already shut down.
+        let _ = recv_done_tx.send(());
+    }));
 
     drop(recv_tx); // drop the parent clone so the channel closes when recv_handle exits
 
@@ -567,13 +626,15 @@ async fn run_data_pump<T: SessionTransport>(
                     }
                 }
             }
-            _ = &mut recv_handle => {
+            _ = &mut recv_done_rx => {
                 log::error!("PhantomSession: receive task ended unexpectedly (transport closed)");
                 break;
             }
         }
     }
 
+    // Abort the recv task if it's still running; idempotent on a finished
+    // handle. Goes through the runtime-agnostic `SpawnHandle::abort`.
     recv_handle.abort();
     state.store(ConnectionState::Closed as u8, Ordering::Relaxed);
 }

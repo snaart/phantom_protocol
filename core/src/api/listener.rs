@@ -1,6 +1,7 @@
 use crate::api::session::{PhantomSession, SessionTransport};
 use crate::api::tcp_transport::TcpSessionTransport;
 use crate::errors::CoreError;
+use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{
     ClientHello, HandshakeResponse, HandshakeServer,
 };
@@ -23,13 +24,30 @@ pub struct PhantomListener {
     /// on the listener so they can unwind cleanly.
     shutting_down: AtomicBool,
     shutdown_notify: Arc<Notify>,
+    /// Async runtime used for spawning accepted-session data pumps
+    /// (Phase 3.1). Defaults to [`TokioRuntime`] via [`bind`]; callers
+    /// that need a non-tokio runtime use [`bind_with_runtime`].
+    runtime: Arc<dyn Runtime>,
 }
 
-#[uniffi::export]
+// Rust-only constructors that take a non-UniFFI type (`Arc<dyn Runtime>`).
+// UniFFI doesn't support associated functions with non-UniFFI parameters
+// inside an `#[uniffi::export]` block, so this `impl` block stays plain.
 impl PhantomListener {
-    #[uniffi::constructor]
-    #[tracing::instrument(name = "phantom.listener.bind", skip_all, fields(addr = %addr))]
-    pub async fn bind(addr: String) -> Result<Arc<Self>, CoreError> {
+    /// Like [`bind`](Self::bind) but spawns accepted-session pumps on the
+    /// supplied [`Runtime`]. Rust-only (not UniFFI-exported because
+    /// `Arc<dyn Runtime>` is not a UniFFI type).
+    pub async fn bind_with_runtime(
+        addr: String,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<Arc<Self>, CoreError> {
+        Self::bind_inner(addr, runtime).await
+    }
+
+    async fn bind_inner(
+        addr: String,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<Arc<Self>, CoreError> {
         let listener = TcpListener::bind(&addr)
             .await
             .map_err(|e| CoreError::NetworkError(e.to_string()))?;
@@ -44,7 +62,17 @@ impl PhantomListener {
             local_addr,
             shutting_down: AtomicBool::new(false),
             shutdown_notify: Arc::new(Notify::new()),
+            runtime,
         }))
+    }
+}
+
+#[uniffi::export]
+impl PhantomListener {
+    #[uniffi::constructor]
+    #[tracing::instrument(name = "phantom.listener.bind", skip_all, fields(addr = %addr))]
+    pub async fn bind(addr: String) -> Result<Arc<Self>, CoreError> {
+        Self::bind_inner(addr, Arc::new(TokioRuntime)).await
     }
 
     /// The server's long-lived hybrid verifying key, serialized via
@@ -85,10 +113,11 @@ impl PhantomListener {
         let transport = TcpSessionTransport::new(stream);
         let server_session =
             drive_server_handshake(&transport, &self.handshake_server, peer.ip()).await?;
-        Ok(PhantomSession::from_accepted_server_session(
+        Ok(PhantomSession::from_accepted_server_session_with_runtime(
             peer.to_string(),
             transport,
             Arc::new(server_session),
+            self.runtime.clone(),
         ))
     }
 
