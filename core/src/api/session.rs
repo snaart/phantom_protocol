@@ -224,6 +224,12 @@ impl PhantomSession {
     /// Install a server-side `Session` (already derived by `HandshakeServer::process_client_hello`)
     /// and spawn the data pump on the default [`TokioRuntime`]. Used by
     /// `PhantomListener::accept` after driving the server handshake.
+    ///
+    /// `PhantomListener::accept` itself now uses
+    /// `from_accepted_server_session_with_runtime` so the listener's
+    /// runtime is honored. This wrapper is preserved for callers that
+    /// do not have a runtime handle and want the default `TokioRuntime`.
+    #[allow(dead_code)]
     pub(crate) fn from_accepted_server_session<T: SessionTransport>(
         peer_addr: String,
         transport: T,

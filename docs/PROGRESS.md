@@ -10,7 +10,7 @@ phase table.
 | Metric | Value |
 | --- | --- |
 | Tests passing | **171 / 171** (141 unit + 20 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
-| Atomic commits since `e4067b6` baseline | **44** |
+| Atomic commits since `e4067b6` baseline | **46** |
 | Wire format versions supported | **V1 + V2** (V2 wire types + V2 AEAD path landed; V2 derives nonce from header → failed decrypts no longer desync) |
 | Mid-session rekey | **available** — `Session::rekey()` + V2 `PacketFlagsV2::REKEY` + `header.epoch` |
 | Integration tests | 5 (`tcp_integration` x2 `#[ignore]`, `kcp_integration` x3 `#[ignore]`) |
@@ -107,12 +107,12 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | --- | --- | --- | --- | --- |
 | 3.1 | `Runtime` trait (decouple from tokio) | ✅ | _this commit_ | trait + `TokioRuntime` + 5 unit tests in `core/src/runtime/`, plus `PhantomSession::connect_with_transport_with_runtime` and `PhantomListener::bind_with_runtime` (Rust-only API surface) routing every `tokio::spawn` through `runtime.spawn`. recv-task completion via oneshot. `core/tests/runtime_integration.rs` pins it end-to-end with a counting runtime. Default `connect_with_transport` / `bind` preserved (UniFFI-stable). |
 | 3.2 | `Clock` trait (WASM-compatible time) | ✅ | _this commit_ | folded into [`Runtime`] — `now_monotonic()` + `now_wall_clock()` are part of the trait surface. Per-target shims (e.g. `js-sys::Date` on WASM) land with the corresponding Runtime impls. |
-| 3.3 | `WebSocketLeg` for browser WASM | ⏳ | — | new `transport/legs/websocket.rs` |
+| 3.3 | `WebSocketLeg` for browser WASM | 🔄 | _this commit_ | `core/src/transport/legs/websocket.rs` lands behind `#[cfg(target_arch = "wasm32")]`; implements `SessionTransport` over `web_sys::WebSocket`; deps gated by `[target.'cfg(...)']`. Module itself compiles on wasm32; full crate-level wasm build still blocked on Phase 3.5 (tokio "full" → wasm-only features). |
 | 3.4 | `EmbeddedLeg` (UART / serial / CAN) | ⏳ | — | generic over `embedded-io-async` traits |
 | 3.5 | Conditional compilation matrix (`std` / `wasm` / `embedded` / ...) | ⏳ | — | features in `core/Cargo.toml` |
 | 3.6 | no_std + `alloc` for embedded | ⏳ | — | swap `pqcrypto-*` → `ml-kem` / `ml-dsa` |
 | 3.7 | `zstd` C bindings now optional behind `compression-zstd` feature | ✅ | _this commit_ | `--no-default-features --features pqc-standard` produces a build with only `lz4_flex` (pure-Rust) — WASM/embedded compatible. Full pure-Rust zstd via `ruzstd` decode is a future-add. |
-| 3.8 | RNG abstraction (`getrandom` features) | ⏳ | — | feature-gate per target |
+| 3.8 | RNG abstraction (`getrandom` features) | 🔄 | _this commit_ | partial — `getrandom = "0.2"` gets the `"js"` feature in the wasm32 dependency block so the wasm32 build no longer fails at `compile_error!("the wasm*-unknown-unknown targets are not supported by default")`. Full per-target RNG abstraction (hardware RNG on embedded, DRBG on FIPS) remains Phase 5 work. |
 | 3.9 | FFI bindings generation (Swift, Kotlin, C) | ⏳ | — | only Python ships today |
 | 3.10 | WASM-specific tweaks | ⏳ | — | drop `tokio = "full"`, etc. |
 | 3.11 | Cross-platform CI matrix (12 triples) | ✅ | _this commit_ | new `.github/workflows/cross.yml` covers Linux x86_64/aarch64 (gnu, musl), macOS x86_64/aarch64, iOS device+sim, Windows x86_64/aarch64, WASM (browser+WASI, `allow_failure: true`), thumbv7em-none-eabihf embedded (`allow_failure: true`). |
