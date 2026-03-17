@@ -10,7 +10,7 @@ phase table.
 | Metric | Value |
 | --- | --- |
 | Tests passing | **171 / 171** (141 unit + 20 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
-| Atomic commits since `e4067b6` baseline | **46** |
+| Atomic commits since `e4067b6` baseline | **47** |
 | Wire format versions supported | **V1 + V2** (V2 wire types + V2 AEAD path landed; V2 derives nonce from header → failed decrypts no longer desync) |
 | Mid-session rekey | **available** — `Session::rekey()` + V2 `PacketFlagsV2::REKEY` + `header.epoch` |
 | Integration tests | 5 (`tcp_integration` x2 `#[ignore]`, `kcp_integration` x3 `#[ignore]`) |
@@ -109,7 +109,7 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | 3.2 | `Clock` trait (WASM-compatible time) | ✅ | _this commit_ | folded into [`Runtime`] — `now_monotonic()` + `now_wall_clock()` are part of the trait surface. Per-target shims (e.g. `js-sys::Date` on WASM) land with the corresponding Runtime impls. |
 | 3.3 | `WebSocketLeg` for browser WASM | 🔄 | _this commit_ | `core/src/transport/legs/websocket.rs` lands behind `#[cfg(target_arch = "wasm32")]`; implements `SessionTransport` over `web_sys::WebSocket`; deps gated by `[target.'cfg(...)']`. Module itself compiles on wasm32; full crate-level wasm build still blocked on Phase 3.5 (tokio "full" → wasm-only features). |
 | 3.4 | `EmbeddedLeg` (UART / serial / CAN) | ⏳ | — | generic over `embedded-io-async` traits |
-| 3.5 | Conditional compilation matrix (`std` / `wasm` / `embedded` / ...) | ⏳ | — | features in `core/Cargo.toml` |
+| 3.5 | Conditional compilation matrix (`std` / `wasm` / `embedded` / ...) | 🔄 | _this commit_ | `tokio` split into cross-target minimal (`sync`/`macros`/`rt`/`time`/`io-util`) + non-wasm-only (`net`/`rt-multi-thread`/`signal`/`process`/`fs`); `tokio-rustls`/`rustls`/`kcp-tokio`/`webpki-roots` moved to `[target.'cfg(not(target_arch="wasm32"))']`. Modules using `tokio::net::*` (`api/tcp_transport`, `api/listener`, `transport/udp_transport`, `transport/framing`, `transport/legs/{tcp,kcp,faketls}`, `transport/virtual_socket`, `networks/transport`, `networks/tls`) cfg-gated. `wasm32` build now passes tokio/mio/net and reaches `pqcrypto-internals` C bindings — that wall is Phase 5.1 (`ml-kem`/`ml-dsa` pure-Rust swap). |
 | 3.6 | no_std + `alloc` for embedded | ⏳ | — | swap `pqcrypto-*` → `ml-kem` / `ml-dsa` |
 | 3.7 | `zstd` C bindings now optional behind `compression-zstd` feature | ✅ | _this commit_ | `--no-default-features --features pqc-standard` produces a build with only `lz4_flex` (pure-Rust) — WASM/embedded compatible. Full pure-Rust zstd via `ruzstd` decode is a future-add. |
 | 3.8 | RNG abstraction (`getrandom` features) | 🔄 | _this commit_ | partial — `getrandom = "0.2"` gets the `"js"` feature in the wasm32 dependency block so the wasm32 build no longer fails at `compile_error!("the wasm*-unknown-unknown targets are not supported by default")`. Full per-target RNG abstraction (hardware RNG on embedded, DRBG on FIPS) remains Phase 5 work. |

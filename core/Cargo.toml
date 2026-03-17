@@ -17,7 +17,15 @@ compression-zstd = ["dep:zstd"]
 
 [dependencies]
 # --- Async & Runtime ---
-tokio = { version = "1.36", features = ["full"] }
+# `tokio` is split per target (Phase 3.5 conditional compilation matrix):
+# - Cross-target features: sync primitives, time, io-util, macros, single-thread
+#   runtime. These work on both native and wasm32.
+# - Native-only features (`net`, `rt-multi-thread`, `signal`, `process`, `fs`,
+#   `io-std`) are added in the `[target.'cfg(not(target_arch = "wasm32"))']`
+#   block at the bottom of this file.
+tokio = { version = "1.36", default-features = false, features = [
+    "sync", "macros", "rt", "time", "io-util",
+] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
 async-trait = "0.1"
@@ -60,12 +68,9 @@ lz4_flex = "0.11"     # Fastest pure-Rust LZ4 (safe, no C bindings)
 zstd = { version = "0.13", optional = true }
 
 # --- Networking ---
-tokio-rustls = "0.26"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
-webpki-roots = "0.26"
+# TCP/UDP-using crates are non-wasm-only (Phase 3.5). Moved to the
+# `[target.'cfg(not(target_arch = "wasm32"))']` block at the bottom.
 time = "0.3"
-kcp-tokio = "0.3"
 
 # --- FFI ---
 uniffi = { version = "0.29", features = ["tokio", "cli"] }
@@ -77,6 +82,19 @@ dashmap = "6.1.0"
 
 [build-dependencies]
 uniffi = { version = "0.29", features = ["build"] }
+
+# ─── Native (non-wasm32) dependencies (Phase 3.5) ────────────────────────
+# TCP/UDP transport legs, raw sockets, and rustls live here. wasm32 builds
+# skip these entirely and use the `WebSocketLeg` instead (see below).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.36", features = [
+    "net", "rt-multi-thread", "signal", "process", "fs", "io-std",
+] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+kcp-tokio = "0.3"
 
 # ─── WASM-only dependencies (Phase 3.3) ───────────────────────────────────
 # Pulled in only for `wasm32-*` builds. Non-WASM hosts never see these
