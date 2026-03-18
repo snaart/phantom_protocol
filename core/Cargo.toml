@@ -5,11 +5,7 @@ edition = "2021"
 description = "Phantom Universal Transport Core SDK — post-quantum secure L4/L6 network framework"
 
 [features]
-default = ["pqc-standard", "compression-zstd"]
-# Hybrid PQ primitives (Kyber768 + Dilithium3 via `pqcrypto-*`). Without this
-# feature the build is classical-only and the hybrid security guarantee is
-# downgraded — intended for embedded / constrained targets only.
-pqc-standard = ["dep:pqcrypto-kyber", "dep:pqcrypto-traits", "dep:pqcrypto-dilithium"]
+default = ["compression-zstd"]
 # zstd compression. Disabled when building for WASM / embedded targets where
 # the C bindings in `zstd-sys` are unavailable. lz4_flex (pure-Rust) remains
 # the always-on fallback.
@@ -51,9 +47,16 @@ x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 ed25519-dalek = { version = "2", features = ["zeroize", "rand_core"] }
 chacha20poly1305 = "0.10"
 ring = "0.17"  # HW-accelerated AES-GCM (ARM64 AES intrinsics / x86 AES-NI)
-pqcrypto-kyber = { version = "0.8", optional = true }
-pqcrypto-traits = { version = "0.3", optional = true }
-pqcrypto-dilithium = { version = "0.5", optional = true }
+# Phase 5.1: switched from `pqcrypto-kyber` / `pqcrypto-dilithium` (which
+# wrap NIST PQC round-3 C reference impls and require libc) to the
+# RustCrypto pure-Rust FIPS-203 / FIPS-204 implementations. These compile
+# on every target (server, mobile, embedded, wasm32) without C bindings.
+# Wire-incompatible with the prior build — bytes laid out per FIPS, not
+# per NIST round-3.
+ml-kem = "0.2"
+ml-dsa = "=0.1.0-rc.11"
+# `signature` traits are re-exported via `ml_dsa::{Signer, Verifier}` from
+# the version ml-dsa pins (3.x); we do not need a direct dependency here.
 hkdf = "0.12"
 sha2 = "0.10"
 blake3 = "1.5"

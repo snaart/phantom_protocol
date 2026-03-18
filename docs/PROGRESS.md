@@ -9,8 +9,9 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **171 / 171** (141 unit + 20 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
-| Atomic commits since `e4067b6` baseline | **47** |
+| Tests passing | **175 / 175** (145 unit + 20 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
+| Atomic commits since `e4067b6` baseline | **48** |
+| `#[allow(unsafe_code)]` opt-ins outside the deny-by-default | **1** (was 2 — `crypto/keys.rs` deleted in Phase 5.1) |
 | Wire format versions supported | **V1 + V2** (V2 wire types + V2 AEAD path landed; V2 derives nonce from header → failed decrypts no longer desync) |
 | Mid-session rekey | **available** — `Session::rekey()` + V2 `PacketFlagsV2::REKEY` + `header.epoch` |
 | Integration tests | 5 (`tcp_integration` x2 `#[ignore]`, `kcp_integration` x3 `#[ignore]`) |
@@ -140,7 +141,7 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 
 | # | Item | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
-| 5.1 | `fips` feature flag (primitive swap) | ⏳ | — | ML-KEM / ML-DSA / SHA-256 / AES-256-GCM via aws-lc-rs |
+| 5.1 | FIPS-approved PQ primitives (ML-KEM-768 + ML-DSA-65) | ✅ | _this commit_ | swapped `pqcrypto-kyber` → `ml-kem` and `pqcrypto-dilithium` → `ml-dsa` (RustCrypto pure-Rust). No C bindings, no `libc`, native Zeroize. Deleted `crypto/keys.rs` (was the last `unsafe` opt-in module in `crypto/`). FIPS 203 / FIPS 204 wire encodings. Wire-incompatible with prior builds — pre-1.0 acceptable. |
 | 5.2 | Constant-time audit pass | 🔄 | — | cookie path done (1.1); rest pending |
 | 5.3 | RNG / DRBG audit | ⏳ | — | document Linux / macOS / WASM RNG sources |
 | 5.4 | CAVP test vectors | ⏳ | — | `tests/cavp/` directory |

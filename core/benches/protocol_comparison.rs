@@ -143,27 +143,27 @@ fn crypto_comparison_bench(c: &mut Criterion) {
         })
     });
     
-    // Post-Quantum: Dilithium3 only
-    use pqcrypto_dilithium::dilithium3;
-    
-    group.bench_function("keygen_dilithium3", |b| {
+    // Post-Quantum: ML-DSA-65 only (Phase 5.1 — was Dilithium3 / pqcrypto)
+    use ml_dsa::{Generate, MlDsa65, SigningKey as MlDsaSigningKey};
+
+    group.bench_function("keygen_ml_dsa_65", |b| {
         b.iter(|| {
-            let (pk, sk) = dilithium3::keypair();
-            black_box((pk, sk))
+            let sk = MlDsaSigningKey::<MlDsa65>::generate();
+            black_box(sk)
         })
     });
-    
-    // Hybrid: Ed25519 + Dilithium3
+
+    // Hybrid: Ed25519 + ML-DSA-65
     group.bench_function("keygen_hybrid_sign", |b| {
         b.iter(|| {
             let (sk, pk) = HybridSigningKey::generate();
             black_box((sk, pk))
         })
     });
-    
+
     // Classical: X25519 only
     use x25519_dalek::{StaticSecret, PublicKey as X25519PublicKey};
-    
+
     group.bench_function("keygen_x25519", |b| {
         b.iter(|| {
             let sk = StaticSecret::random_from_rng(OsRng);
@@ -171,14 +171,15 @@ fn crypto_comparison_bench(c: &mut Criterion) {
             black_box((sk, pk))
         })
     });
-    
-    // Post-Quantum: Kyber768 only
-    use pqcrypto_kyber::kyber768;
-    
-    group.bench_function("keygen_kyber768", |b| {
+
+    // Post-Quantum: ML-KEM-768 only (Phase 5.1 — was Kyber768 / pqcrypto)
+    use ml_kem::{KemCore, MlKem768};
+
+    group.bench_function("keygen_ml_kem_768", |b| {
         b.iter(|| {
-            let (pk, sk) = kyber768::keypair();
-            black_box((pk, sk))
+            let mut rng = OsRng;
+            let (dk, ek) = MlKem768::generate(&mut rng);
+            black_box((dk, ek))
         })
     });
     
@@ -201,10 +202,11 @@ fn crypto_comparison_bench(c: &mut Criterion) {
         })
     });
     
-    let (_, dil_sk) = dilithium3::keypair();
-    group.bench_function("sign_dilithium3", |b| {
+    let ml_dsa_sk_bench = MlDsaSigningKey::<MlDsa65>::generate();
+    group.bench_function("sign_ml_dsa_65", |b| {
         b.iter(|| {
-            let sig = dilithium3::detached_sign(message, &dil_sk);
+            use ml_dsa::Signer;
+            let sig: ml_dsa::Signature<MlDsa65> = ml_dsa_sk_bench.sign(message);
             black_box(sig)
         })
     });
@@ -227,11 +229,19 @@ fn crypto_comparison_bench(c: &mut Criterion) {
         })
     });
     
-    let (dil_pk, dil_sk2) = dilithium3::keypair();
-    let dil_sig = dilithium3::detached_sign(message, &dil_sk2);
-    group.bench_function("verify_dilithium3", |b| {
+    let ml_dsa_sk_verify = MlDsaSigningKey::<MlDsa65>::generate();
+    let ml_dsa_vk_verify = {
+        use ml_dsa::Keypair;
+        ml_dsa_sk_verify.verifying_key()
+    };
+    let ml_dsa_sig = {
+        use ml_dsa::Signer;
+        ml_dsa_sk_verify.sign(message)
+    };
+    group.bench_function("verify_ml_dsa_65", |b| {
         b.iter(|| {
-            let result = dilithium3::verify_detached_signature(&dil_sig, message, &dil_pk);
+            use ml_dsa::Verifier;
+            let result = ml_dsa_vk_verify.verify(message, &ml_dsa_sig);
             black_box(result)
         })
     });
