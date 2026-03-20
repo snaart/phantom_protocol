@@ -181,6 +181,11 @@ pub struct Session {
     /// in the `Validated` state so legacy single-leg sessions keep
     /// working without any explicit setup.
     path_registry: Arc<PathRegistry>,
+    /// Negotiated wire-format version (Phase 1.8). 1 = V1, 2 = V2. Set at
+    /// handshake completion from the `ClientHello.version` (which is
+    /// transcript-bound, defeating wire-level downgrade). Used by the
+    /// data pump to pick `encrypt_packet` (V1) vs `encrypt_packet_v2`.
+    wire_version: AtomicU8,
 }
 
 impl Session {
@@ -210,6 +215,7 @@ impl Session {
             replay_windows: DashMap::new(),
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
+            wire_version: AtomicU8::new(1),
         })
     }
 
@@ -245,6 +251,7 @@ impl Session {
             replay_windows: DashMap::new(),
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
+            wire_version: AtomicU8::new(1),
         }
     }
 
@@ -271,6 +278,7 @@ impl Session {
             replay_windows: DashMap::new(),
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
+            wire_version: AtomicU8::new(1),
         })
     }
 
@@ -481,6 +489,27 @@ impl Session {
     /// fresh for the timeout sweep.
     pub fn mark_path_seen(&self, path_id: u8) {
         self.path_registry.mark_seen(path_id);
+    }
+
+    // ── Wire-format version negotiation (Phase 1.8) ───────────────────
+
+    /// Negotiated wire-format version. `1` = V1 (default), `2` = V2.
+    /// Lock-free atomic read; safe to call per-packet.
+    pub fn wire_version(&self) -> u8 {
+        self.wire_version.load(Ordering::Acquire)
+    }
+
+    /// Set the negotiated wire-format version. Called by the handshake
+    /// once the peer's offered version has been authenticated (it lives
+    /// inside `ClientHello`, which the transcript signature covers).
+    ///
+    /// Refuses unknown versions silently — the handshake layer rejects
+    /// them earlier with `HandshakeError::UnsupportedVersion`, so reaching
+    /// here with `version > 2` would mean a logic bug upstream.
+    pub fn set_wire_version(&self, version: u8) {
+        if matches!(version, 1 | 2) {
+            self.wire_version.store(version, Ordering::Release);
+        }
     }
 
     /// Build the V2 AEAD nonce from the authenticated header fields.
