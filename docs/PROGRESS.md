@@ -9,8 +9,8 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **175 / 175** (145 unit + 20 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
-| Atomic commits since `e4067b6` baseline | **48** |
+| Tests passing | **191 / 191** (157 unit + 24 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
+| Atomic commits since `e4067b6` baseline | **49** |
 | `#[allow(unsafe_code)]` opt-ins outside the deny-by-default | **1** (was 2 — `crypto/keys.rs` deleted in Phase 5.1) |
 | Wire format versions supported | **V1 + V2** (V2 wire types + V2 AEAD path landed; V2 derives nonce from header → failed decrypts no longer desync) |
 | Mid-session rekey | **available** — `Session::rekey()` + V2 `PacketFlagsV2::REKEY` + `header.epoch` |
@@ -127,7 +127,7 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | # | Item | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
 | 4.1 | 0-RTT resumption (server `SessionCache` wire-in, early-data encrypt) | ⏳ | — | `session_cache.rs` exists but disconnected |
-| 4.2 | Multi-path failover + connection migration | ⏳ | — | requires V2 wire format with `path_id` |
+| 4.2 | Multi-path validation primitive | 🔄 | _this commit_ | new `transport::path::{PathRegistry, PathStateKind, PathState}`. Challenge-response: `Session::begin_path_validation(path_id) -> [u8; 32]`, `Session::complete_path_validation(path_id, response) -> bool`. CT-equality on response. State machine `Unvalidated → Validating → Validated | Failed`. Path 0 pre-validated at session establishment. Wire-level integration (PATH_VALIDATION flag emission in data pump + scheduler-driven outbound path selection) remains follow-up. |
 | 4.3 | Multi-stream finalization (priority, flow control) | ⏳ | — | priority field exists; never read by scheduler |
 | 4.4 | Congestion control (BBRv2-inspired) | ⏳ | — | depends on 2.6 (Pacer + Estimator wired) |
 | 4.5 | Telemetry: `tracing` instrumentation (foundation) | 🔄 | _this commit_ | `tracing = "0.1"` dep added; `#[tracing::instrument]` on `HandshakeServer::process_client_hello`, `HandshakeClient::process_server_hello`, `PhantomListener::bind`, `PhantomListener::accept`. Metrics exporter (counters / histograms / Prometheus / OTel) is the remaining piece. |

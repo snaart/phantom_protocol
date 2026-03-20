@@ -11,6 +11,7 @@ use crate::transport::{
     stream::Stream,
     scheduler::Scheduler,
     fallback::FallbackStateMachine,
+    path::{PathRegistry, PathStateKind, PATH_CHALLENGE_LEN},
 };
 use crate::crypto::adaptive_crypto::{CryptoSession};
 use crate::errors::CoreError;
@@ -172,12 +173,25 @@ pub struct Session {
     /// Cumulative count of replay rejections (across all streams) — exposed
     /// for metrics/telemetry.
     replay_rejected_total: AtomicU64,
+    /// Per-path validation state (Phase 4.2). Each `path_id` referenced in a
+    /// `PacketHeaderV2.path_id` must transit through `Unvalidated →
+    /// Validating → Validated` (via a challenge-response round trip)
+    /// before the data pump treats it as authoritative. Defaults to a
+    /// pre-populated entry for `path_id = 0` (the implicit single-path)
+    /// in the `Validated` state so legacy single-leg sessions keep
+    /// working without any explicit setup.
+    path_registry: Arc<PathRegistry>,
 }
 
 impl Session {
     /// Create a new session with given shared secret
     pub fn new(session_id: SessionId, shared_secret: &[u8; 32], peer_side: bool) -> Result<Self, CoreError> {
         let crypto = CryptoState::new(shared_secret, peer_side)?;
+        let path_registry = Arc::new(PathRegistry::new());
+        // Pre-register `path_id = 0` as the implicit default path — the
+        // handshake itself proved reachability over this path, so no
+        // additional PATH_CHALLENGE is needed (Phase 4.2).
+        path_registry.register_validated(0);
 
         Ok(Self {
             id: session_id,
@@ -195,6 +209,7 @@ impl Session {
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
             replay_windows: DashMap::new(),
             replay_rejected_total: AtomicU64::new(0),
+            path_registry,
         })
     }
 
@@ -211,6 +226,8 @@ impl Session {
         traffic_secret: [u8; 32],
         is_server: bool,
     ) -> Self {
+        let path_registry = Arc::new(PathRegistry::new());
+        path_registry.register_validated(0);
         Self {
             id: session_id,
             state: RwLock::new(SessionState::Connected),
@@ -227,12 +244,15 @@ impl Session {
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
             replay_windows: DashMap::new(),
             replay_rejected_total: AtomicU64::new(0),
+            path_registry,
         }
     }
 
     /// Resume a session using resumption secret (0-RTT)
     pub fn resume(session_id: SessionId, resumption_secret: &[u8; 32], peer_side: bool) -> Result<Self, CoreError> {
         let crypto = CryptoState::new(resumption_secret, peer_side)?;
+        let path_registry = Arc::new(PathRegistry::new());
+        path_registry.register_validated(0);
 
         Ok(Self {
             id: session_id,
@@ -250,6 +270,7 @@ impl Session {
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
             replay_windows: DashMap::new(),
             replay_rejected_total: AtomicU64::new(0),
+            path_registry,
         })
     }
 
@@ -418,6 +439,48 @@ impl Session {
             current = self.epoch.load(Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    // ── Multi-path / migration (Phase 4.2) ────────────────────────────
+
+    /// Snapshot of currently `Validated` path ids. Useful for the
+    /// scheduler when picking an outbound path.
+    pub fn validated_paths(&self) -> Vec<u8> {
+        self.path_registry.validated_paths()
+    }
+
+    /// State of a specific path within this session. Returns `None` for
+    /// path ids the session has never observed.
+    pub fn path_state(&self, path_id: u8) -> Option<PathStateKind> {
+        self.path_registry.state(path_id)
+    }
+
+    /// Register a new path id and immediately issue a 32-byte
+    /// PATH_CHALLENGE for it. Returns the challenge bytes; the caller
+    /// must transmit them in a V2 packet with `PacketFlagsV2::PATH_VALIDATION`
+    /// set on the new path. Subsequent calls on an already-Validating
+    /// path re-issue a fresh challenge.
+    ///
+    /// Returns `None` if the path is in a terminal state (`Validated`
+    /// or `Failed`).
+    pub fn begin_path_validation(&self, path_id: u8) -> Option<[u8; PATH_CHALLENGE_LEN]> {
+        self.path_registry.register(path_id);
+        self.path_registry.issue_challenge(path_id)
+    }
+
+    /// Verify a peer's `PATH_VALIDATION` response. Returns `true` if
+    /// the response matches the in-flight challenge (path is now
+    /// `Validated`). Returns `false` otherwise — the path may have
+    /// transitioned to `Failed`.
+    pub fn complete_path_validation(&self, path_id: u8, response: &[u8]) -> bool {
+        self.path_registry.verify_response(path_id, response)
+    }
+
+    /// Record that a packet was observed on the path. Cheap to call
+    /// per-packet — used by the data pump to keep `last_packet_seen`
+    /// fresh for the timeout sweep.
+    pub fn mark_path_seen(&self, path_id: u8) {
+        self.path_registry.mark_seen(path_id);
     }
 
     /// Build the V2 AEAD nonce from the authenticated header fields.

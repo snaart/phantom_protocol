@@ -86,11 +86,14 @@ proptest! {
     #[test]
     fn replay_window_rejects_duplicates(
         base in 1024u32..(u32::MAX / 2),
-        offset in 0u32..1023,
+        // offset must be strictly positive — `offset == 0` would mean
+        // `seq == base`, and `base` was already accepted on the first
+        // call, so the "first time it shows up" precondition fails.
+        offset in 1u32..1023,
     ) {
         let mut w = ReplayWindow::new();
         prop_assert!(w.accept(base));
-        let seq = base - offset; // strictly within the window
+        let seq = base - offset; // strictly within the window, strictly below base
         // First time within-window-out-of-order: accept.
         prop_assert!(w.accept(seq));
         // Same seq again: replay, reject.
