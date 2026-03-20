@@ -230,8 +230,18 @@ impl HandshakeServer {
         // load counter reflects attempts (including the rejected ones).
         self.record_handshake();
 
-        // 1. Version Check
-        if client_hello.version != 1 {
+        // 1. Version negotiation (Phase 1.8).
+        //
+        // Two wire formats are currently defined: V1 (stable) and V2
+        // (rekey + multi-path + coalescing — see PROTOCOL.md § 11).
+        // Downgrade resistance: `client_hello.version` is borsh-serialized
+        // into the `HandshakeTranscript` that the server signs, so a
+        // network attacker rewriting the byte forces a transcript-signature
+        // mismatch on the client side. The server simply accepts what the
+        // client offers and binds it into the signature.
+        //
+        // V3+ rejection here keeps the surface narrow.
+        if !matches!(client_hello.version, 1 | 2) {
             return HandshakeResponse::Fail(HandshakeError::UnsupportedVersion);
         }
 
@@ -368,7 +378,11 @@ impl HandshakeServer {
             shared_secret,
             true,
         );
-        
+        // Phase 1.8: bind the negotiated wire version. `client_hello.version`
+        // is transcript-bound (the signature covers the whole ClientHello),
+        // so a wire-level downgrade attempt is detected by the client.
+        session.set_wire_version(client_hello.version);
+
         // Derive resumption secret
         let mut resumption_secret = [0u8; 32];
         let hk = hkdf::Hkdf::<Sha256>::new(None, &shared_secret);
@@ -496,7 +510,12 @@ impl HandshakeClient {
             shared_secret,
             false,
         );
-        
+        // Phase 1.8: the wire version the client offered is exactly the
+        // one the server bound into the transcript signature; a
+        // network downgrade would have failed signature verification
+        // above. Setting it here keeps both ends in sync.
+        session.set_wire_version(client_hello.version);
+
         // 5. Derive resumption secret
         let mut resumption_secret = [0u8; 32];
         let hk = hkdf::Hkdf::<Sha256>::new(None, &shared_secret);
