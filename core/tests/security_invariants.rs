@@ -21,6 +21,7 @@ use phantom_core::crypto::hybrid_sign::HybridSigningKey;
 use phantom_core::transport::handshake::{
     HandshakeClient, HandshakeError, HandshakeResponse, HandshakeServer,
 };
+use phantom_core::transport::path::PathStateKind;
 use phantom_core::transport::session::{CryptoState, Session};
 use phantom_core::transport::types::{
     PacketFlags, PacketFlagsV2, PacketHeader, PacketHeaderV2, PhantomPacketV1, PhantomPacketV2,
@@ -532,6 +533,64 @@ fn rekey_saturates_at_u8_max() {
     // The 256th rekey must fail rather than wrap to 0.
     assert!(server.rekey().is_err());
     assert_eq!(server.current_epoch(), u8::MAX, "epoch must not wrap");
+}
+
+// ── Multi-path / migration (Phase 4.2) ────────────────────────────────────
+
+/// New paths must NOT be implicitly trusted. After session creation,
+/// path 0 is the validated default; an unfamiliar path id starts at
+/// `Unvalidated` and only transitions to `Validated` through the
+/// challenge-response API.
+#[test]
+fn new_paths_default_to_unvalidated() {
+    let (_client, server) = make_session_pair([0x40u8; 32]);
+    // Path 0 was registered at construction and pre-validated — it's
+    // the path the handshake traversed.
+    assert_eq!(server.path_state(0), Some(PathStateKind::Validated));
+    // Path 7 has never been seen.
+    assert_eq!(server.path_state(7), None);
+
+    // begin_path_validation registers + issues challenge.
+    let challenge = server.begin_path_validation(7).expect("challenge");
+    assert_eq!(challenge.len(), 32);
+    assert_eq!(server.path_state(7), Some(PathStateKind::Validating));
+}
+
+/// A correct challenge response transitions the path to `Validated`
+/// and surfaces it in `validated_paths`.
+#[test]
+fn correct_response_validates_path() {
+    let (_client, server) = make_session_pair([0x41u8; 32]);
+    let challenge = server.begin_path_validation(3).expect("challenge");
+    assert!(server.complete_path_validation(3, &challenge));
+    assert_eq!(server.path_state(3), Some(PathStateKind::Validated));
+
+    let mut validated = server.validated_paths();
+    validated.sort();
+    // Path 0 was pre-validated at construction; path 3 just was.
+    assert_eq!(validated, vec![0, 3]);
+}
+
+/// A wrong response transitions the path to `Failed` — application data
+/// must NOT cross over it.
+#[test]
+fn wrong_response_marks_path_failed() {
+    let (_client, server) = make_session_pair([0x42u8; 32]);
+    let mut challenge = server.begin_path_validation(5).expect("challenge");
+    challenge[0] ^= 0xFF;
+    assert!(!server.complete_path_validation(5, &challenge));
+    assert_eq!(server.path_state(5), Some(PathStateKind::Failed));
+    assert!(!server.validated_paths().contains(&5));
+}
+
+/// `complete_path_validation` returns `false` for paths that were never
+/// challenged — protects against an attacker bypassing the challenge step.
+#[test]
+fn unchallenged_path_cannot_be_completed() {
+    let (_client, server) = make_session_pair([0x43u8; 32]);
+    assert!(!server.complete_path_validation(9, &[0u8; 32]));
+    // No state was created (registry wasn't touched).
+    assert_eq!(server.path_state(9), None);
 }
 
 /// `VersionedPacket::V2` survives serialize + deserialize with all V2-only

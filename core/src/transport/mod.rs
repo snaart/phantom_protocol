@@ -15,6 +15,7 @@ pub mod fallback;
 pub mod legs;
 pub mod handshake;
 pub mod buffer_pool;
+pub mod path;
 pub mod packet_coalescer;
 pub mod pacer;
 pub mod bandwidth_estimator;
