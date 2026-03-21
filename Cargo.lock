@@ -1510,6 +1510,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "sha2",
+ "socket2",
  "subtle",
  "thiserror 1.0.69",
  "time",

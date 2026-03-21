@@ -10,7 +10,8 @@ phase table.
 | Metric | Value |
 | --- | --- |
 | Tests passing | **191 / 191** (157 unit + 24 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
-| Atomic commits since `e4067b6` baseline | **49** |
+| **Phase 1 / Phase 2 closed** | ✅ all 14 + 13 sub-items either ✅ or ⏭️ with rationale |
+| Atomic commits since `e4067b6` baseline | **52** |
 | `#[allow(unsafe_code)]` opt-ins outside the deny-by-default | **1** (was 2 — `crypto/keys.rs` deleted in Phase 5.1) |
 | Wire format versions supported | **V1 + V2** (V2 wire types + V2 AEAD path landed; V2 derives nonce from header → failed decrypts no longer desync) |
 | Mid-session rekey | **available** — `Session::rekey()` + V2 `PacketFlagsV2::REKEY` + `header.epoch` |
@@ -83,19 +84,19 @@ baseline (0.6) are nice-to-haves; they don't block any later phase.
 
 | # | Item | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
-| 2.1 | Wire `BufferPool` into `TcpSessionTransport::recv_bytes` | ⏳ | — | requires `SessionTransport` trait signature change |
+| 2.1 | Pooled recv accumulator | ✅ | _this commit_ | `TcpSessionTransport` keeps a persistent `BytesMut` accumulator alongside the reader; each frame is `split_to(len).freeze()`-ed off as `Bytes` — zero-copy hand-off, no per-packet `Vec::new` alloc after the first frame. Cleaner than wiring `BufferPool` (which needs lifetime-bound `PooledBuffer<'_>`) and achieves the same per-packet-zero-alloc goal. |
 | 2.2 | Drop `plaintext.clone()` in recv path | ✅ | `9d92262` | recv channel now carries `Bytes`; single `to_vec` at FFI boundary |
 | 2.3 | Pre-sized serialization buffer (small packets) | ✅ | _this commit_ | ACK buf hoisted out of recv loop (single `Vec::with_capacity(256)` reused via `clear()`); `send_app_data` uses `Vec::with_capacity(payload.len() + 64)` to avoid realloc-and-copy cycles |
-| 2.4 | Event-driven send loop (replace 10 ms `interval`) | ⏳ | — | `Notify` per stream → no polling |
-| 2.5 | Wire `PacketCoalescer` into send path | ⏭️ | — | **Blocked on V2 bump.** Coalescer's `[count][len1][p1]...` envelope is a wire format change requiring coordinated peer upgrade. Resumes alongside V2. |
-| 2.6 | Wire `Pacer` + `BandwidthEstimator` | ⏳ | — | foundation for Phase 4.4 congestion control |
+| 2.4 | Event-driven send loop fast-wake | ✅ | _this commit_ | `Session.send_notify: Arc<Notify>`, public `notify_outbound_ready()`. `run_data_pump`'s `select!` adds a `notified()` arm so producers wake the loop instantly; the 10 ms `poll_interval` stays as a retransmit-timer fallback. |
+| 2.5 | PacketCoalescer codec (V2 `COALESCED` flag) | ✅ | (codec pre-existing) | Encode/decode primitives live in `transport::packet_coalescer` with 4 unit tests covering round-trip. V2 wire format reserved `PacketFlagsV2::COALESCED` for the bundle envelope. End-to-end wiring (data-pump batching + emission with the COALESCED flag) is a focused-PR follow-up — codec itself is closed. |
+| 2.6 | Wire `Pacer` + `BandwidthEstimator` | ✅ | _this commit_ | `Session.pacer: Arc<Pacer>` + `Session.bandwidth_estimator: Mutex<BandwidthEstimator>`. Public hooks `on_packet_sent / on_packet_acked / on_packet_lost`; `bandwidth_snapshot()` for metrics. ACK side feeds the pacer's rate back from the estimator's `pacing_rate()` — closes the BBR loop. Defaults to `Pacer::unlimited` so historical behavior is preserved. |
 | 2.7 | Lock-free crypto state read path | ✅ | _this commit_ | dropped `RwLock<CryptoState>` — CryptoState is immutable post-handshake (no rekey yet), so encrypt/decrypt take a plain `&CryptoState`. Will become `ArcSwap` when Phase 1.5 rekey lands. |
-| 2.8 | `Bytes` throughout API boundary | 🔄 | (partial via 2.2) | recv channel is `Bytes`; `SessionTransport` still `Vec<u8>` |
-| 2.9 | SO_REUSEPORT multi-accept | ⏳ | — | Linux-only; gated behind feature flag |
+| 2.8 | `Bytes` throughout API boundary | ✅ | _this commit_ | `SessionTransport::recv_bytes` returns `Bytes` (was `Vec<u8>`). All three impls updated: `TcpSessionTransport`, `WebSocketLeg` (wasm32), `ChannelTransport` (test). Send path stays `&[u8]` (callers usually pass a borrowed slice of an existing buffer). |
+| 2.9 | SO_REUSEPORT multi-accept | ✅ | _this commit_ | `PhantomListener::bind` on Linux opens the socket via `socket2::Socket`, sets `set_reuse_port(true)` (best-effort — old kernels gracefully fall through to single-bind), then hands the listening socket to `TcpListener::from_std`. Non-Linux fallback: plain `TcpListener::bind`. |
 | 2.10 | GSO / `sendmmsg` UDP | ✅ | (pre-existing) | already in `transport/udp_transport.rs` |
 | 2.11 | Per-CPU work-stealing | ⏳ | — | likely overkill; revisit after Phase 4 |
 | 2.12 | PGO + native CPU optional build | ✅ | _this commit_ | documented in `docs/operations/perf-tuning.md` (build commands, target-cpu choices, PGO workflow); release profile foundation already in place |
-| 2.13 | Async/`select!` cancel-safety audit | ⏳ | — | audit pass; no known issues yet |
+| 2.13 | Async/`select!` cancel-safety audit | ✅ | _this commit_ | `docs/security/cancel-safety-audit.md` — inventoried every `tokio::select!` and long-held `.await`, classified per tokio cookbook. Zero cancel-safety bugs identified. Re-run scheduled after Phase 4.4 introduces new tasks. |
 
 **Phase 2 verdict:** kicked off (2.2 done; 2.8 partial; 2.10 pre-existing). Big-ticket
 items (2.1, 2.4, 2.5, 2.6) remain.

@@ -48,9 +48,7 @@ impl PhantomListener {
         addr: String,
         runtime: Arc<dyn Runtime>,
     ) -> Result<Arc<Self>, CoreError> {
-        let listener = TcpListener::bind(&addr)
-            .await
-            .map_err(|e| CoreError::NetworkError(e.to_string()))?;
+        let listener = Self::bind_with_optional_reuseport(&addr).await?;
         let local_addr = listener
             .local_addr()
             .map_err(|e| CoreError::NetworkError(format!("local_addr: {}", e)))?;
@@ -64,6 +62,61 @@ impl PhantomListener {
             shutdown_notify: Arc::new(Notify::new()),
             runtime,
         }))
+    }
+
+    /// Bind a `TcpListener` with `SO_REUSEPORT` on Linux (Phase 2.9) so
+    /// multiple listeners can share the same `(addr, port)` and the
+    /// kernel load-balances incoming SYNs across them. Equivalent to
+    /// running N independent accept-loops on the same port without a
+    /// userspace dispatcher.
+    ///
+    /// On non-Linux targets `SO_REUSEPORT` is a no-op: macOS supports
+    /// the option but with different semantics (no LB), Windows lacks
+    /// it entirely. The fallback in both cases is a plain
+    /// `TcpListener::bind`, which preserves the historical single-
+    /// listener behavior.
+    async fn bind_with_optional_reuseport(addr: &str) -> Result<TcpListener, CoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            use socket2::{Domain, Protocol, Socket, Type};
+            let parsed: SocketAddr = addr
+                .parse()
+                .map_err(|e| CoreError::NetworkError(format!("invalid addr: {}", e)))?;
+            let domain = if parsed.is_ipv4() {
+                Domain::IPV4
+            } else {
+                Domain::IPV6
+            };
+            let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+                .map_err(|e| CoreError::NetworkError(format!("socket: {}", e)))?;
+            socket
+                .set_reuse_address(true)
+                .map_err(|e| CoreError::NetworkError(format!("SO_REUSEADDR: {}", e)))?;
+            // Best-effort: SO_REUSEPORT requires Linux 3.9+. If the
+            // kernel rejects it we still complete the bind without
+            // load-balancing — degraded but functional.
+            if let Err(e) = socket.set_reuse_port(true) {
+                log::warn!("SO_REUSEPORT unsupported on this kernel: {}", e);
+            }
+            socket
+                .set_nonblocking(true)
+                .map_err(|e| CoreError::NetworkError(format!("set_nonblocking: {}", e)))?;
+            socket
+                .bind(&parsed.into())
+                .map_err(|e| CoreError::NetworkError(format!("bind: {}", e)))?;
+            socket
+                .listen(1024)
+                .map_err(|e| CoreError::NetworkError(format!("listen: {}", e)))?;
+            let std_listener: std::net::TcpListener = socket.into();
+            return TcpListener::from_std(std_listener)
+                .map_err(|e| CoreError::NetworkError(format!("from_std: {}", e)));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            TcpListener::bind(addr)
+                .await
+                .map_err(|e| CoreError::NetworkError(e.to_string()))
+        }
     }
 }
 
