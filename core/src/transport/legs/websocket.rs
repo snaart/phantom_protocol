@@ -244,10 +244,10 @@ impl SessionTransport for WebSocketLeg {
             .map_err(|_| CoreError::NetworkError("WebSocket send queue closed".into()))
     }
 
-    async fn recv_bytes(&self) -> Result<Vec<u8>, CoreError> {
+    async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
         let mut rx = self.recv_rx.lock().await;
         match rx.recv().await {
-            Some(bytes) => Ok(bytes),
+            Some(bytes) => Ok(Bytes::from(bytes)),
             None => Err(CoreError::ConnectionClosed),
         }
     }

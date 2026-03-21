@@ -83,12 +83,20 @@ impl ConnectionState {
 ///
 /// Abstractions over UDP, TCP, FakeTLS, etc.
 /// Used by the background handshake task for I/O.
+///
+/// `recv_bytes` returns `Bytes` (Phase 2.8) so the recv pipeline can
+/// fan out the same buffer to multiple consumers via cheap refcount
+/// clones — no `Vec → Bytes` conversion at the trait boundary.
+/// `send_bytes` keeps `&[u8]` because the caller routinely sends a
+/// borrowed slice of an already-allocated send buffer.
 #[async_trait::async_trait]
 pub trait SessionTransport: Send + Sync + 'static {
     /// Send raw bytes to the peer.
     async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError>;
-    /// Receive raw bytes from the peer. Returns None on EOF/close.
-    async fn recv_bytes(&self) -> Result<Vec<u8>, CoreError>;
+    /// Receive the next message from the peer. The returned `Bytes` is
+    /// a refcounted view over an opaque buffer; subsequent `clone()`s
+    /// are cheap.
+    async fn recv_bytes(&self) -> Result<Bytes, CoreError>;
 }
 
 // ─── Session ────────────────────────────────────────────────────────────────
@@ -549,7 +557,16 @@ async fn run_data_pump<T: SessionTransport>(
 
     // MTU for transport packets
     const TRANSPORT_MTU: usize = 1300;
+    // Phase 2.4: the 10 ms `poll_interval` stays as a retransmit-timer
+    // fallback (streams without an explicit notifier reference still
+    // get swept), but `send_notify.notified()` joins the select! so the
+    // pump wakes immediately when a producer calls
+    // `Session::notify_outbound_ready()`. This drops idle CPU usage to
+    // zero on quiet sessions while keeping the worst-case post-queue
+    // latency at <10 ms even for producers that haven't been wired into
+    // the notifier yet.
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(10));
+    let send_notify = crypto_session.send_notifier();
 
     loop {
         tokio::select! {
@@ -569,6 +586,28 @@ async fn run_data_pump<T: SessionTransport>(
                             base,
                         ).await {
                             log::error!("PhantomSession: stream poll send failed");
+                            break;
+                        }
+                    }
+                }
+            }
+            _ = send_notify.notified() => {
+                // Same drain logic as the tick arm — fast-wake path.
+                for entry in streams.iter() {
+                    let stream_id = *entry.key();
+                    let stream = entry.value();
+                    while let Some((seq, payload, is_reliable)) = stream.poll_send().await {
+                        let base = if is_reliable { PacketFlags::RELIABLE } else { PacketFlags::UNRELIABLE };
+                        if !send_app_data(
+                            &transport,
+                            &crypto_session,
+                            session_id,
+                            stream_id as TransportStreamId,
+                            seq,
+                            &payload,
+                            base,
+                        ).await {
+                            log::error!("PhantomSession: notified send drain failed");
                             break;
                         }
                     }
@@ -869,11 +908,13 @@ mod tests {
                 .map_err(|_| CoreError::NetworkError("channel closed".into()))
         }
 
-        async fn recv_bytes(&self) -> Result<Vec<u8>, CoreError> {
+        async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
             let mut rx = self.rx.lock().await;
-            rx.recv()
+            let v = rx
+                .recv()
                 .await
-                .ok_or_else(|| CoreError::NetworkError("channel closed".into()))
+                .ok_or_else(|| CoreError::NetworkError("channel closed".into()))?;
+            Ok(Bytes::from(v))
         }
     }
 

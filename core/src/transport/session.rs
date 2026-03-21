@@ -12,6 +12,8 @@ use crate::transport::{
     scheduler::Scheduler,
     fallback::FallbackStateMachine,
     path::{PathRegistry, PathStateKind, PATH_CHALLENGE_LEN},
+    pacer::Pacer,
+    bandwidth_estimator::{BandwidthEstimator, DeliverySample},
 };
 use crate::crypto::adaptive_crypto::{CryptoSession};
 use crate::errors::CoreError;
@@ -186,6 +188,24 @@ pub struct Session {
     /// transcript-bound, defeating wire-level downgrade). Used by the
     /// data pump to pick `encrypt_packet` (V1) vs `encrypt_packet_v2`.
     wire_version: AtomicU8,
+    /// Outbound rate-limiter (Phase 2.6). Defaults to
+    /// [`Pacer::unlimited`] so the historical no-pacing behavior is
+    /// unchanged unless the caller explicitly sets a rate via
+    /// [`Session::pacer`]. The data pump consults this before every
+    /// outbound packet — the existing implementation just calls
+    /// `try_consume` and falls through if the pacer is disabled, so the
+    /// integration is zero-overhead in the default configuration.
+    pacer: Arc<Pacer>,
+    /// BBR-style bandwidth + RTT estimator (Phase 2.6 / Phase 4.4
+    /// foundation). The data pump feeds it via [`Session::on_packet_sent`]
+    /// and [`Session::on_packet_acked`]; the resulting `pacing_rate()`
+    /// feeds back into the `pacer` to close the loop.
+    bandwidth_estimator: parking_lot::Mutex<BandwidthEstimator>,
+    /// Outbound-ready signal (Phase 2.4). Streams or the application
+    /// can `notify_one()` this to wake the data pump immediately
+    /// instead of waiting for the next 10 ms `poll_interval` tick.
+    /// The pump keeps the tick as a retransmit-timer fallback.
+    send_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Session {
@@ -216,6 +236,9 @@ impl Session {
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
             wire_version: AtomicU8::new(1),
+            pacer: Arc::new(Pacer::unlimited()),
+            bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
+            send_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -252,6 +275,9 @@ impl Session {
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
             wire_version: AtomicU8::new(1),
+            pacer: Arc::new(Pacer::unlimited()),
+            bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
+            send_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -279,6 +305,9 @@ impl Session {
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
             wire_version: AtomicU8::new(1),
+            pacer: Arc::new(Pacer::unlimited()),
+            bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
+            send_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -512,6 +541,72 @@ impl Session {
         }
     }
 
+    // ── Pacer / BandwidthEstimator (Phase 2.6) ─────────────────────────
+
+    /// Shared handle to this session's outbound rate-limiter. Cheap to
+    /// clone (`Arc`). The data pump consults this before every outbound
+    /// packet; idle by default ([`Pacer::unlimited`]).
+    pub fn pacer(&self) -> Arc<Pacer> {
+        self.pacer.clone()
+    }
+
+    /// Record that a packet of `bytes` length is going on the wire.
+    /// Feeds the BBR-style bandwidth estimator. Cheap (one mutex lock
+    /// + a counter increment).
+    pub fn on_packet_sent(&self, bytes: u64) {
+        self.bandwidth_estimator.lock().on_send(bytes);
+    }
+
+    /// Record that an ACK arrived with delivery sample `sample`. The
+    /// returned `u64` is the updated bottleneck bandwidth estimate; we
+    /// reflect it into the pacer so the outbound rate tracks the
+    /// peer's actual receive throughput.
+    pub fn on_packet_acked(&self, sample: DeliverySample) -> u64 {
+        let bw = self.bandwidth_estimator.lock().on_ack(sample);
+        // Mirror the estimator's pacing decision onto the pacer so the
+        // two stay in lock-step.
+        let rate = self.bandwidth_estimator.lock().pacing_rate();
+        if rate > 0 {
+            self.pacer.set_rate(rate);
+        }
+        bw
+    }
+
+    /// Record that a packet of `bytes` length was lost (no ACK before
+    /// retransmit timer fired). Drives BBR's loss-based feedback.
+    pub fn on_packet_lost(&self, bytes: u64) {
+        self.bandwidth_estimator.lock().on_loss(bytes);
+    }
+
+    /// Read a snapshot of the bandwidth / pacing estimator. Cheap; held
+    /// over a single mutex lock.
+    pub fn bandwidth_snapshot(&self) -> BandwidthSnapshot {
+        let est = self.bandwidth_estimator.lock();
+        BandwidthSnapshot {
+            bottleneck_bw_bps: est.bottleneck_bandwidth(),
+            min_rtt: est.min_rtt(),
+            pacing_rate_bps: est.pacing_rate(),
+            cwnd_bytes: est.cwnd(),
+            inflight_bytes: est.inflight_bytes(),
+        }
+    }
+
+    // ── Event-driven send-loop wake-up (Phase 2.4) ─────────────────────
+
+    /// Shared handle to the outbound-ready notify. The API-layer data
+    /// pump awaits this via `Notify::notified()`; any task with the
+    /// handle can wake it instantly via [`notify_outbound_ready`].
+    pub fn send_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.send_notify.clone()
+    }
+
+    /// Wake the data pump's send loop immediately so it can drain newly-
+    /// queued packets instead of waiting for the next 10 ms tick. Cheap
+    /// (a single `notify_one()`); duplicate calls collapse to one wake.
+    pub fn notify_outbound_ready(&self) {
+        self.send_notify.notify_one();
+    }
+
     /// Build the V2 AEAD nonce from the authenticated header fields.
     ///
     /// Layout (12 bytes total):
@@ -640,6 +735,18 @@ impl Session {
     pub fn is_expired(&self, timeout: Duration) -> bool {
         self.last_activity.read().elapsed() > timeout
     }
+}
+
+/// Read-only snapshot of the session's pacing / bandwidth state
+/// (Phase 2.6). Returned by [`Session::bandwidth_snapshot`] for
+/// telemetry / debugging without exposing the mutable estimator.
+#[derive(Debug, Clone, Copy)]
+pub struct BandwidthSnapshot {
+    pub bottleneck_bw_bps: u64,
+    pub min_rtt: Duration,
+    pub pacing_rate_bps: u64,
+    pub cwnd_bytes: u64,
+    pub inflight_bytes: u64,
 }
 
 impl std::fmt::Debug for Session {

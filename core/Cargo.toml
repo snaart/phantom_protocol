@@ -98,6 +98,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 webpki-roots = "0.26"
 kcp-tokio = "0.3"
+# socket2 gives portable access to SO_REUSEPORT (Phase 2.9 — Linux
+# multi-accept). Already in the transitive tree via tokio so this is
+# free from a build-size standpoint.
+socket2 = "0.6"
 
 # ─── WASM-only dependencies (Phase 3.3) ───────────────────────────────────
 # Pulled in only for `wasm32-*` builds. Non-WASM hosts never see these
