@@ -3,13 +3,13 @@
 //! Multiplexed streams within a session.
 //! Each stream has independent sequence numbers (no Head-of-Line blocking).
 
-use crate::transport::types::{StreamId, SequenceNumber};
+use crate::transport::types::{SequenceNumber, StreamId};
 
+use bytes::Bytes;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, Semaphore};
-use bytes::Bytes;
 
 const MAX_PENDING_PACKETS: usize = 1024;
 
@@ -107,36 +107,45 @@ impl Stream {
     }
 
     /// Queue data for sending with reliability
-    /// 
+    ///
     /// Returns the sequence number assigned to this chunk.
     pub async fn send_reliable(&self, data: Bytes) -> SequenceNumber {
-        // Backpressure: wait until there is space in the buffer
-        let permit = self.send_semaphore.acquire().await.expect("Semaphore closed");
+        // Backpressure: wait until there is space in the buffer.
+        // PANIC-SAFETY: `Semaphore::acquire` only errors after `close()`. The
+        // `send_semaphore` is a private field of this struct, constructed in
+        // `Stream::new` and never closed anywhere in the crate — the variant
+        // is structurally unreachable.
+        #[allow(clippy::expect_used)]
+        let permit = self
+            .send_semaphore
+            .acquire()
+            .await
+            .expect("Semaphore closed");
         permit.forget();
-        
+
         let seq = self.send_sequence.fetch_add(1, Ordering::SeqCst);
-        
+
         let pending = PendingData {
             sequence: seq,
             data,
             sent_at: None,
             retries: 0,
         };
-        
+
         self.send_buffer.lock().await.push_back(pending);
-        
+
         seq
     }
 
     /// Queue data for unreliable sending
-    /// 
+    ///
     /// Returns the sequence number assigned to this chunk.
     pub async fn send_unreliable(&self, data: Bytes) -> SequenceNumber {
         // Unreliable data does not consume buffer permits
         let seq = self.send_sequence.fetch_add(1, Ordering::SeqCst);
-        
+
         self.unreliable_buffer.lock().await.push_back((seq, data));
-        
+
         seq
     }
 
@@ -151,7 +160,7 @@ impl Stream {
         let mut buffer = self.send_buffer.lock().await;
         let now = tokio::time::Instant::now();
         let timeout = std::time::Duration::from_millis(500);
-        
+
         // Find reliable data not yet sent or needing retransmission
         for pending in buffer.iter_mut() {
             if pending.sent_at.is_none() {
@@ -165,7 +174,7 @@ impl Stream {
                 }
             }
         }
-        
+
         None
     }
 
@@ -174,7 +183,7 @@ impl Stream {
     pub async fn ack(&self, sequence: SequenceNumber) -> Option<(tokio::time::Instant, u64)> {
         let mut buffer = self.send_buffer.lock().await;
         let mut result = None;
-        
+
         // Find the packet and get its sent_at time
         if let Some(pos) = buffer.iter().position(|p| p.sequence == sequence) {
             let pending = &buffer[pos];
@@ -182,28 +191,28 @@ impl Stream {
                 result = Some((sent_at, pending.data.len() as u64));
             }
             buffer.remove(pos);
-            
+
             // Released space, add permit back
             self.send_semaphore.add_permits(1);
         }
-        
+
         result
     }
 
     /// Handle received data
-    /// 
+    ///
     /// Data is buffered until it can be delivered in order.
     pub async fn on_receive(&self, sequence: SequenceNumber, data: Bytes) {
         let expected = self.recv_sequence.load(Ordering::SeqCst);
-        
+
         if sequence == expected {
             // In-order delivery
             self.recv_ready.lock().await.push_back(data);
             self.recv_sequence.fetch_add(1, Ordering::SeqCst);
-            
+
             // Try to deliver buffered out-of-order data
             self.deliver_buffered().await;
-            
+
             // Notify waiters
             self.recv_notify.notify_waiters();
         } else if sequence > expected {
@@ -217,12 +226,17 @@ impl Stream {
     async fn deliver_buffered(&self) {
         let mut recv_buf = self.recv_buffer.lock().await;
         let mut ready = self.recv_ready.lock().await;
-        
+
         loop {
             let expected = self.recv_sequence.load(Ordering::SeqCst);
-            
-            // Find and remove the expected sequence
+
+            // Find and remove the expected sequence.
+            // PANIC-SAFETY: `pos` was just returned by `iter().position(...)`,
+            // so `recv_buf` has an element at that index — `remove` cannot
+            // return `None`. `recv_buf` is locked for the duration of this
+            // loop, so no other task can drain it.
             if let Some(pos) = recv_buf.iter().position(|(seq, _)| *seq == expected) {
+                #[allow(clippy::unwrap_used)]
                 let (_, data) = recv_buf.remove(pos).unwrap();
                 ready.push_back(data);
                 self.recv_sequence.fetch_add(1, Ordering::SeqCst);
@@ -240,13 +254,13 @@ impl Stream {
                 if let Some(data) = ready.pop_front() {
                     return Some(data);
                 }
-                
+
                 // Check if stream is closed
                 if self.remote_finished.load(Ordering::SeqCst) {
                     return None;
                 }
             }
-            
+
             // Wait for new data
             self.recv_notify.notified().await;
         }
@@ -274,14 +288,14 @@ impl Stream {
     async fn update_state(&self) {
         let local = self.local_finished.load(Ordering::SeqCst);
         let remote = self.remote_finished.load(Ordering::SeqCst);
-        
+
         let new_state = match (local, remote) {
             (true, true) => StreamState::Closed,
             (true, false) => StreamState::HalfClosedLocal,
             (false, true) => StreamState::HalfClosedRemote,
             (false, false) => StreamState::Open,
         };
-        
+
         *self.state.lock().await = new_state;
     }
 
@@ -297,8 +311,7 @@ impl Stream {
 
     /// Check if stream is closed
     pub fn is_closed(&self) -> bool {
-        self.local_finished.load(Ordering::SeqCst) && 
-        self.remote_finished.load(Ordering::SeqCst)
+        self.local_finished.load(Ordering::SeqCst) && self.remote_finished.load(Ordering::SeqCst)
     }
 }
 
@@ -320,25 +333,25 @@ mod tests {
     #[tokio::test]
     async fn test_stream_send_recv() {
         let stream = Stream::new(1);
-        
+
         // Send data
         stream.send_reliable(Bytes::from("hello")).await;
         stream.send_reliable(Bytes::from("world")).await;
-        
+
         // Check pending
         assert_eq!(stream.pending_send_count().await, 2);
-        
+
         // Poll send twice, the second should be None because it's already sent and hasn't timed out
         let (seq, data, is_reliable) = stream.poll_send().await.unwrap();
         assert_eq!(seq, 0);
         assert_eq!(data, Bytes::from("hello"));
         assert!(is_reliable);
-        
+
         let (seq2, data2, is_reliable2) = stream.poll_send().await.unwrap();
         assert_eq!(seq2, 1);
         assert_eq!(data2, Bytes::from("world"));
         assert!(is_reliable2);
-        
+
         assert!(stream.poll_send().await.is_none());
     }
 
@@ -347,34 +360,34 @@ mod tests {
         // We use tokio::time::pause to mock time and test timeout
         tokio::time::pause();
         let stream = Stream::new(1);
-        
+
         stream.send_reliable(Bytes::from("hello")).await;
-        
+
         // First send
         let (seq, _, is_reliable) = stream.poll_send().await.unwrap();
         assert_eq!(seq, 0);
         assert!(is_reliable);
-        
+
         // Immediate poll should be None
         assert!(stream.poll_send().await.is_none());
-        
+
         // Advance time by 400ms (less than timeout)
         tokio::time::advance(std::time::Duration::from_millis(400)).await;
         assert!(stream.poll_send().await.is_none());
-        
+
         // Advance time past 500ms
         tokio::time::advance(std::time::Duration::from_millis(150)).await;
-        
+
         // Now it should retransmit
         let (seq2, data2, is_reliable2) = stream.poll_send().await.unwrap();
         assert_eq!(seq2, 0);
         assert_eq!(data2, Bytes::from("hello"));
         assert!(is_reliable2);
-        
+
         // Ack it
         let acked = stream.ack(0).await;
         assert!(acked.is_some());
-        
+
         // Poll again - queue is empty
         assert!(stream.poll_send().await.is_none());
     }
@@ -382,11 +395,11 @@ mod tests {
     #[tokio::test]
     async fn test_stream_in_order_receive() {
         let stream = Stream::new(1);
-        
+
         // Receive in order
         stream.on_receive(0, Bytes::from("first")).await;
         stream.on_receive(1, Bytes::from("second")).await;
-        
+
         assert_eq!(stream.try_recv().await, Some(Bytes::from("first")));
         assert_eq!(stream.try_recv().await, Some(Bytes::from("second")));
         assert_eq!(stream.try_recv().await, None);
@@ -395,11 +408,11 @@ mod tests {
     #[tokio::test]
     async fn test_stream_out_of_order_receive() {
         let stream = Stream::new(1);
-        
+
         // Receive out of order
         stream.on_receive(1, Bytes::from("second")).await;
         stream.on_receive(0, Bytes::from("first")).await;
-        
+
         // Should be reordered
         assert_eq!(stream.try_recv().await, Some(Bytes::from("first")));
         assert_eq!(stream.try_recv().await, Some(Bytes::from("second")));
@@ -408,12 +421,12 @@ mod tests {
     #[tokio::test]
     async fn test_stream_state() {
         let stream = Stream::new(1);
-        
+
         assert_eq!(stream.state().await, StreamState::Open);
-        
+
         stream.finish().await;
         assert_eq!(stream.state().await, StreamState::HalfClosedLocal);
-        
+
         stream.on_remote_finish().await;
         assert_eq!(stream.state().await, StreamState::Closed);
         assert!(stream.is_closed());
@@ -422,22 +435,22 @@ mod tests {
     #[tokio::test]
     async fn test_stream_backpressure() {
         let stream = Stream::new(1);
-        
+
         // Fill the buffer
         for _ in 0..MAX_PENDING_PACKETS {
             stream.send_reliable(Bytes::from("data")).await;
         }
-        
+
         assert_eq!(stream.pending_send_count().await, MAX_PENDING_PACKETS);
-        
+
         // Try to send one more with timeout
         let send_future = stream.send_reliable(Bytes::from("blocked"));
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), send_future).await;
         assert!(result.is_err(), "Send should have blocked");
-        
+
         // Ack one
         stream.ack(0).await;
-        
+
         // Now it should succeed
         let send_future = stream.send_reliable(Bytes::from("resumed"));
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), send_future).await;
