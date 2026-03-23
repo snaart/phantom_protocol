@@ -2,12 +2,12 @@ use crate::api::session::{PhantomSession, SessionTransport};
 use crate::api::tcp_transport::TcpSessionTransport;
 use crate::errors::CoreError;
 use crate::runtime::{Runtime, TokioRuntime};
-use crate::transport::handshake::{
-    ClientHello, HandshakeResponse, HandshakeServer,
-};
+use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+use crate::transport::metrics::TransportMetrics;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
 
@@ -28,6 +28,10 @@ pub struct PhantomListener {
     /// (Phase 3.1). Defaults to [`TokioRuntime`] via [`bind`]; callers
     /// that need a non-tokio runtime use [`bind_with_runtime`].
     runtime: Arc<dyn Runtime>,
+    /// Listener-wide metrics (Phase 4.5). Tracks accept-side counters
+    /// — handshake success/failure, latency histogram, active-session
+    /// gauge. Exposed via [`metrics_prometheus_text`].
+    metrics: Arc<TransportMetrics>,
 }
 
 // Rust-only constructors that take a non-UniFFI type (`Arc<dyn Runtime>`).
@@ -44,16 +48,12 @@ impl PhantomListener {
         Self::bind_inner(addr, runtime).await
     }
 
-    async fn bind_inner(
-        addr: String,
-        runtime: Arc<dyn Runtime>,
-    ) -> Result<Arc<Self>, CoreError> {
+    async fn bind_inner(addr: String, runtime: Arc<dyn Runtime>) -> Result<Arc<Self>, CoreError> {
         let listener = Self::bind_with_optional_reuseport(&addr).await?;
         let local_addr = listener
             .local_addr()
             .map_err(|e| CoreError::NetworkError(format!("local_addr: {}", e)))?;
-        let hs = HandshakeServer::new()
-            .map_err(|e| CoreError::InternalError(e.to_string()))?;
+        let hs = HandshakeServer::new().map_err(|e| CoreError::InternalError(e.to_string()))?;
         Ok(Arc::new(Self {
             listener: Mutex::new(listener),
             handshake_server: Arc::new(hs),
@@ -61,6 +61,7 @@ impl PhantomListener {
             shutting_down: AtomicBool::new(false),
             shutdown_notify: Arc::new(Notify::new()),
             runtime,
+            metrics: Arc::new(TransportMetrics::new()),
         }))
     }
 
@@ -164,14 +165,34 @@ impl PhantomListener {
         // tasks can call accept again concurrently.
         drop(listener_guard);
         let transport = TcpSessionTransport::new(stream);
+        // Phase 4.5 metrics: time the full handshake from accept to
+        // session-installed; account success vs failure separately.
+        let started = Instant::now();
         let server_session =
-            drive_server_handshake(&transport, &self.handshake_server, peer.ip()).await?;
+            match drive_server_handshake(&transport, &self.handshake_server, peer.ip()).await {
+                Ok(s) => s,
+                Err(e) => {
+                    self.metrics.record_handshake_failure();
+                    return Err(e);
+                }
+            };
+        let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.metrics.record_handshake_success(elapsed_ns);
+        self.metrics.session_opened();
         Ok(PhantomSession::from_accepted_server_session_with_runtime(
             peer.to_string(),
             transport,
             Arc::new(server_session),
             self.runtime.clone(),
         ))
+    }
+
+    /// Return the listener's metrics rendered in Prometheus text
+    /// exposition format (Phase 4.5). Suitable for serving from a
+    /// `/metrics` HTTP endpoint — the SDK does not bundle an HTTP
+    /// server, downstream applications wire one up.
+    pub fn metrics_prometheus_text(&self) -> String {
+        self.metrics.snapshot().to_prometheus_text()
     }
 
     /// Signal graceful shutdown (Phase 4.6).
@@ -193,6 +214,17 @@ impl PhantomListener {
     }
 }
 
+// Rust-only accessors (not UniFFI-exported because the return type
+// is not a UniFFI primitive).
+impl PhantomListener {
+    /// Borrow the underlying metrics handle. Allows callers that need
+    /// to plumb additional recordings (e.g., per-session aggregations)
+    /// to share the listener's counter set.
+    pub fn metrics(&self) -> Arc<TransportMetrics> {
+        self.metrics.clone()
+    }
+}
+
 /// Drive the server side of the Phantom hybrid PQC handshake on a freshly
 /// accepted transport, handling the optional cookie / PoW retry round.
 async fn drive_server_handshake(
@@ -202,9 +234,8 @@ async fn drive_server_handshake(
 ) -> Result<crate::transport::session::Session, CoreError> {
     loop {
         let hello_bytes = transport.recv_bytes().await?;
-        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).map_err(|e| {
-            CoreError::NetworkError(format!("ClientHello parse failed: {}", e))
-        })?;
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes)
+            .map_err(|e| CoreError::NetworkError(format!("ClientHello parse failed: {}", e)))?;
         // Adaptive PoW difficulty (Phase 1.14): under load the listener
         // automatically requires more proof-of-work from each new client.
         // At idle (<100 handshakes/min) this stays at 0 and PoW is skipped
@@ -212,9 +243,8 @@ async fn drive_server_handshake(
         let difficulty = hs.adaptive_difficulty();
         match hs.process_client_hello(&hello, difficulty, client_ip) {
             HandshakeResponse::Retry(retry) => {
-                let bytes = borsh::to_vec(&retry).map_err(|e| {
-                    CoreError::NetworkError(format!("Retry encode failed: {}", e))
-                })?;
+                let bytes = borsh::to_vec(&retry)
+                    .map_err(|e| CoreError::NetworkError(format!("Retry encode failed: {}", e)))?;
                 transport.send_bytes(&bytes).await?;
                 // Loop back and read the retried hello.
             }
