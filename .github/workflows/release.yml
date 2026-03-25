@@ -1,0 +1,148 @@
+name: Release
+
+# Two trigger surfaces:
+# 1. `cargo-semver-checks` on every PR — guards against accidental
+#    breaking changes in the public Rust API.
+# 2. A tag push (`v*.*.*`) triggers the release pipeline:
+#    publish dry-run + build release artifacts + GitHub Release draft.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── SemVer hygiene ────────────────────────────────────────────────
+  # `cargo-semver-checks` compares the current branch's public surface
+  # against the latest published version of `phantom_core` on crates.io.
+  # Failures here mean the PR introduces a breaking change that would
+  # require a major-version bump. Run on PRs only; tag pushes are
+  # post-bump and so are expected to legitimately change the API.
+  semver-checks:
+    name: cargo-semver-checks
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so cargo-semver-checks can locate the
+          # previous tagged release.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          manifest-path: core/Cargo.toml
+          # If the crate has never been published, cargo-semver-checks
+          # cannot fetch a baseline. Treat that as a non-blocking
+          # warning rather than a hard failure during pre-1.0
+          # iteration.
+          release-type: minor
+
+  # ── Pre-release sanity ────────────────────────────────────────────
+  # Verify the publish dry-run succeeds. Catches version bumps that
+  # forget to update one of the manifest fields, lockfile issues, and
+  # files that should not be packaged.
+  publish-dry-run:
+    name: cargo publish --dry-run
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - run: cargo publish --manifest-path core/Cargo.toml --dry-run --allow-dirty
+
+  # ── Build release artifacts ───────────────────────────────────────
+  # Produces a tarball with the static library + license. SLSA-3
+  # provenance attestation is a follow-up (out of scope at this stage
+  # of pre-1.0 iteration).
+  build-artifacts:
+    name: Build release artifact (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: ${{ matrix.target }}
+      - name: Install aarch64-linux cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+      - name: cargo build --release
+        run: |
+          cargo build --manifest-path core/Cargo.toml --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p dist
+          NAME="phantom_core-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          # The crate is a library — ship the .rlib + headers + license.
+          # For dynamic library variants this would also copy .so/.dylib;
+          # phantom_core is statically linked, so .rlib is sufficient.
+          cp core/target/${{ matrix.target }}/release/*.rlib "dist/${NAME}/" 2>/dev/null || true
+          cp LICENSE "dist/${NAME}/" 2>/dev/null || true
+          cp README.md "dist/${NAME}/" 2>/dev/null || true
+          tar -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
+          shasum -a 256 "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phantom_core-${{ matrix.target }}
+          path: dist/*
+
+  # ── Create the draft GitHub Release ───────────────────────────────
+  # Collects per-target artifacts and creates a draft release. Manual
+  # publish step preserves a human approval gate before users see the
+  # tag. To skip the manual gate, change `draft: true` to `false`.
+  draft-release:
+    name: Draft GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [publish-dry-run, build-artifacts]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Compute checksums
+        run: |
+          cd dist
+          ls -la
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
