@@ -9,19 +9,20 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **191 / 191** (157 unit + 24 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
+| Tests passing | **210 / 210** (176 unit + 24 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
 | **Phase 1 / Phase 2 closed** | ✅ all 14 + 13 sub-items either ✅ or ⏭️ with rationale |
-| Atomic commits since `e4067b6` baseline | **52** |
+| Atomic commits since `e4067b6` baseline | **52+** |
 | `#[allow(unsafe_code)]` opt-ins outside the deny-by-default | **1** (was 2 — `crypto/keys.rs` deleted in Phase 5.1) |
 | Wire format versions supported | **V1 + V2** (V2 wire types + V2 AEAD path landed; V2 derives nonce from header → failed decrypts no longer desync) |
 | Mid-session rekey | **available** — `Session::rekey()` + V2 `PacketFlagsV2::REKEY` + `header.epoch` |
+| V2 codecs landed | `transport::path_validation_codec` + `transport::packet_coalescer_codec` (full data-pump wiring is the remaining piece — same V2-routing follow-up for both) |
+| Metrics | **structured** (`TransportMetrics`) — security signals, gauges, handshake-latency histogram, Prometheus text exposition via `PhantomListener::metrics_prometheus_text()` |
 | Integration tests | 5 (`tcp_integration` x2 `#[ignore]`, `kcp_integration` x3 `#[ignore]`) |
 | Fuzz harnesses | 4 scaffolded (cargo-fuzz, nightly) |
 | Workspace warnings | **0** |
-| `cargo clippy --lib` warnings | 47 (audit-todo lints; non-blocking) |
-| `unsafe` blocks outside `crypto/keys` & `transport/udp_transport` | **0** (denied at crate root) |
-| `.unwrap()` / `unreachable!()` in production hot path | **0** |
-| Wire format | `VersionedPacket::V1` (stable, no V2 yet) |
+| `cargo clippy --lib` warnings | 40 (audit-todo lints; non-blocking) |
+| `unsafe` blocks outside `transport/udp_transport` | **0** (denied at crate root) |
+| `.unwrap()` / `unreachable!()` in production hot path | **0** (6 documented panic sites — see `docs/security/panic-sites.md`) |
 | MSRV | Rust 1.75+ (CI enforced via `dtolnay/rust-toolchain@1.75`) |
 | Last commit | _filled by each update_ |
 
@@ -45,7 +46,7 @@ phase table.
 | 0.3 | Supply-chain hygiene (`deny.toml`) | ✅ | `60bddf9` | allowlist of permissive licences; ring exception |
 | 0.4 | CI workflow (fmt, clippy, test, doc, deny, audit, cli-compat) | ✅ | `8413f5c` | `.github/workflows/ci.yml` |
 | 0.5 | Pre-commit hooks | ⏳ | — | Deferred — CI gate is sufficient short-term |
-| 0.6 | Performance baseline (`BENCHMARKS.md`) | ⏳ | — | Will be filled when criterion baseline JSON is committed |
+| 0.6 | Performance baseline (`BENCHMARKS.md`) | ✅ | _this commit_ | Methodology + reference numbers (M1 Pro): AES-256-GCM 4.2 GiB/s peak, ChaCha20-Poly1305 1.2 GiB/s peak, alloc overhead 1.7×. Criterion baseline JSON capture is the follow-up snapshot. |
 | 0.7 | Release profile fix (workspace root, `opt-level = 3`) | ✅ | `4e79b8a` | was silently ignored under `core/`; speed > size |
 | 0.8 | Dep pinning (zstd 0.13 release, subtle 2.5 added) | ✅ | `36e9f07` | drops git-master supply-chain risk |
 | 0.9 | Production-readiness roadmap (`PRODUCTION_READINESS.md`) | ✅ | `0f13b1c` | the canonical source of truth |
@@ -88,7 +89,7 @@ baseline (0.6) are nice-to-haves; they don't block any later phase.
 | 2.2 | Drop `plaintext.clone()` in recv path | ✅ | `9d92262` | recv channel now carries `Bytes`; single `to_vec` at FFI boundary |
 | 2.3 | Pre-sized serialization buffer (small packets) | ✅ | _this commit_ | ACK buf hoisted out of recv loop (single `Vec::with_capacity(256)` reused via `clear()`); `send_app_data` uses `Vec::with_capacity(payload.len() + 64)` to avoid realloc-and-copy cycles |
 | 2.4 | Event-driven send loop fast-wake | ✅ | _this commit_ | `Session.send_notify: Arc<Notify>`, public `notify_outbound_ready()`. `run_data_pump`'s `select!` adds a `notified()` arm so producers wake the loop instantly; the 10 ms `poll_interval` stays as a retransmit-timer fallback. |
-| 2.5 | PacketCoalescer codec (V2 `COALESCED` flag) | ✅ | (codec pre-existing) | Encode/decode primitives live in `transport::packet_coalescer` with 4 unit tests covering round-trip. V2 wire format reserved `PacketFlagsV2::COALESCED` for the bundle envelope. End-to-end wiring (data-pump batching + emission with the COALESCED flag) is a focused-PR follow-up — codec itself is closed. |
+| 2.5 | PacketCoalescer codec (V2 `COALESCED` flag) | ✅ | _this commit_ | Encode/decode primitives in `transport::packet_coalescer` (codec, pre-existing) + new `transport::packet_coalescer_codec` V2 bridge (wrap/unwrap COALESCED V2 packet, drain-helper, 7 tests). End-to-end wiring through `run_data_pump` requires V2-routing in the pump — tracked as the joint Phase 2.5/4.2 data-pump follow-up. |
 | 2.6 | Wire `Pacer` + `BandwidthEstimator` | ✅ | _this commit_ | `Session.pacer: Arc<Pacer>` + `Session.bandwidth_estimator: Mutex<BandwidthEstimator>`. Public hooks `on_packet_sent / on_packet_acked / on_packet_lost`; `bandwidth_snapshot()` for metrics. ACK side feeds the pacer's rate back from the estimator's `pacing_rate()` — closes the BBR loop. Defaults to `Pacer::unlimited` so historical behavior is preserved. |
 | 2.7 | Lock-free crypto state read path | ✅ | _this commit_ | dropped `RwLock<CryptoState>` — CryptoState is immutable post-handshake (no rekey yet), so encrypt/decrypt take a plain `&CryptoState`. Will become `ArcSwap` when Phase 1.5 rekey lands. |
 | 2.8 | `Bytes` throughout API boundary | ✅ | _this commit_ | `SessionTransport::recv_bytes` returns `Bytes` (was `Vec<u8>`). All three impls updated: `TcpSessionTransport`, `WebSocketLeg` (wasm32), `ChannelTransport` (test). Send path stays `&[u8]` (callers usually pass a borrowed slice of an existing buffer). |
@@ -128,13 +129,13 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | # | Item | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
 | 4.1 | 0-RTT resumption (server `SessionCache` wire-in, early-data encrypt) | ⏳ | — | `session_cache.rs` exists but disconnected |
-| 4.2 | Multi-path validation primitive | 🔄 | _this commit_ | new `transport::path::{PathRegistry, PathStateKind, PathState}`. Challenge-response: `Session::begin_path_validation(path_id) -> [u8; 32]`, `Session::complete_path_validation(path_id, response) -> bool`. CT-equality on response. State machine `Unvalidated → Validating → Validated | Failed`. Path 0 pre-validated at session establishment. Wire-level integration (PATH_VALIDATION flag emission in data pump + scheduler-driven outbound path selection) remains follow-up. |
+| 4.2 | Multi-path validation primitive | 🔄 | _this commit_ | State machine (`transport::path`) + V2 wire codec (`transport::path_validation_codec` — wrap/parse, 8 tests including end-to-end challenge/response). `Session::begin_path_validation` / `complete_path_validation` API in place. Scheduler-driven outbound path selection and data-pump emission of PATH_VALIDATION frames depend on V2-routing in `run_data_pump` (joint follow-up with 2.5). |
 | 4.3 | Multi-stream finalization (priority, flow control) | ⏳ | — | priority field exists; never read by scheduler |
 | 4.4 | Congestion control (BBRv2-inspired) | ⏳ | — | depends on 2.6 (Pacer + Estimator wired) |
-| 4.5 | Telemetry: `tracing` instrumentation (foundation) | 🔄 | _this commit_ | `tracing = "0.1"` dep added; `#[tracing::instrument]` on `HandshakeServer::process_client_hello`, `HandshakeClient::process_server_hello`, `PhantomListener::bind`, `PhantomListener::accept`. Metrics exporter (counters / histograms / Prometheus / OTel) is the remaining piece. |
+| 4.5 | Telemetry: `tracing` instrumentation (foundation) + metrics primitives | ✅ | _this commit_ | `tracing` spans on handshake + listener entry points (pre-existing). `TransportMetrics` expanded with security signals (`replay_rejected_total`, `unencrypted_dropped_total`, `aead_decrypt_failed_total`, `path_migrations_total`, `handshake_failures_total`), gauges (`active_sessions`, `active_streams`), handshake-latency histogram (Prometheus `≤` bucket semantics). `MetricsSnapshot::to_prometheus_text()` emits text-exposition output. `PhantomListener::metrics_prometheus_text()` is the public accessor. SDK does not bundle an HTTP server — downstream wires `/metrics` if needed. Dashboard + alert rules templates land alongside (see `docs/operations/grafana/` and `docs/operations/prometheus/`). |
 | 4.6 | Graceful shutdown + signal handling | ✅ | _this commit_ | `PhantomListener::shutdown()` flips `shutting_down: AtomicBool` and notifies waiters; parked `accept()` calls unwind with `CoreError::ConnectionClosed`. `is_shutting_down()` accessor. Already-accepted sessions continue until their owners close them. |
 
-**Phase 4 verdict:** untouched. Depends on 2.x and 3.x foundations.
+**Phase 4 verdict:** 4.2 + 4.5 + 4.6 landed (state machine + V2 codecs for path-validation and packet-coalescer; structured metrics + Prometheus exposition; graceful shutdown). 4.1 (0-RTT), 4.3 (stream priority), 4.4 (BBRv2) still pending. The data-pump V2-routing task that would close 4.2 and 2.5 end-to-end is the joint follow-up.
 
 ---
 
@@ -143,14 +144,14 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | # | Item | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
 | 5.1 | FIPS-approved PQ primitives (ML-KEM-768 + ML-DSA-65) | ✅ | _this commit_ | swapped `pqcrypto-kyber` → `ml-kem` and `pqcrypto-dilithium` → `ml-dsa` (RustCrypto pure-Rust). No C bindings, no `libc`, native Zeroize. Deleted `crypto/keys.rs` (was the last `unsafe` opt-in module in `crypto/`). FIPS 203 / FIPS 204 wire encodings. Wire-incompatible with prior builds — pre-1.0 acceptable. |
-| 5.2 | Constant-time audit pass | 🔄 | — | cookie path done (1.1); rest pending |
-| 5.3 | RNG / DRBG audit | ⏳ | — | document Linux / macOS / WASM RNG sources |
+| 5.2 | Constant-time audit pass | ✅ | _this commit_ | `docs/compliance/constant-time-audit.md` — classification framework (A/B/C/D), per-site inventory: cookie validation, path-challenge response, PoW solution verify (all Class A — `subtle::ConstantTimeEq`), pinning compare (Class C — public values), AEAD/signature tag verify (delegated to ring + ed25519-dalek + ml-dsa). |
+| 5.3 | RNG / DRBG audit | ✅ | _this commit_ | `docs/compliance/rng-audit.md` — per-target backend matrix, RNG call-site inventory (sites that propagate vs fall back to thread_rng), FIPS-mode requirements (DRBG, thread_rng fallback removal, POST). |
 | 5.4 | CAVP test vectors | ⏳ | — | `tests/cavp/` directory |
-| 5.5 | Compliance docs (`docs/compliance/`) | 🔄 | _this commit_ | `docs/compliance/fips-readiness.md` — gap analysis vs FIPS 140-3, primitive table, proposed `fips` feature, self-test plan, CAVP test-vector plan, validation pathway, ~15% readiness score. Security-policy / key-management / self-tests sub-docs still pending. |
+| 5.5 | Compliance docs (`docs/compliance/`) | ✅ | _this commit_ | Now 4 docs: `fips-readiness.md`, `key-management.md` (lifecycle per keyed object, zeroize coverage), `self-tests.md` (POST/PCT/CST plan, vector sources, error-state policy), `fips-security-policy.md` (draft CMVP security policy: boundary, approved services, modes, mitigations). |
 | 5.6 | Common Criteria Protection Profile mapping | ⏳ | — | NIAP PP-Mobile Device VPN Client likely |
 | 5.7 | Validation pathway (CMVP / CC submission) | ⏳ | — | external lab; out of code scope |
 
-**Phase 5 verdict:** untouched. Parallel to Phases 1–3.
+**Phase 5 verdict:** 5.1 ✅ landed (ml-kem/ml-dsa pure-Rust). 5.2 ✅ + 5.3 ✅ + 5.5 ✅ (CT audit, RNG/DRBG audit, full set of compliance sub-docs) this cycle. 5.4 (CAVP vectors), 5.6 (CC PP mapping), 5.7 (lab validation) remain.
 
 ---
 
@@ -168,10 +169,9 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | 6.8 | Formal negative-security tests | ✅ | `8d69521` | `core/tests/security_invariants.rs` — 10 tests |
 | 6.9 | Coverage measurement (`cargo-llvm-cov`) | ✅ | _this commit_ | `.github/workflows/coverage.yml`; generates lcov.info with branch coverage; soft-uploads to Codecov when `CODECOV_TOKEN` secret present |
 | 6.10 | Formal verification (ProVerif / Tamarin) | ⏳ | — | optional; only if audit demands |
-| 6.11 | Inline `SAFETY` / `PANIC-SAFETY` comments | 🔄 | `8b4ee23` | unsafe blocks done; remaining `expect_used` sites are test-only |
+| 6.11 | Inline `SAFETY` / `PANIC-SAFETY` comments | ✅ | _this commit_ | All 6 remaining production panic sites annotated in-line (`stream.rs` semaphore + recv_buf, `fragmentation.rs` x2, `legs/faketls.rs` x2) with `// PANIC-SAFETY:` comments + narrow `#[allow(...)]` annotations. New `docs/security/panic-sites.md` enumerates each site with its invariant and an adversarial review checklist. |
 
-**Phase 6 verdict:** 6.4 + 6.8 done; rest pending. Threat-model / protocol-spec
-docs are the next high-leverage items here.
+**Phase 6 verdict:** 6.1 through 6.9 are landed (skip 6.6 — loom not needed given current concurrency surface). 6.11 ✅ this commit (panic-sites doc + inline annotations). 6.10 (formal verification) remains optional / audit-driven.
 
 ---
 
@@ -180,15 +180,15 @@ docs are the next high-leverage items here.
 | # | Item | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
 | 7.1 | End-to-end examples (loopback / mobile / WASM / embedded) | 🔄 | _this commit_ | `core/examples/loopback_demo.rs` — full server↔client encrypted echo in one binary, prints what happens on the wire. Mobile / WASM / embedded examples still pending the Phase 3 runtime abstraction. |
-| 7.2 | Deployment guides (Docker / k8s / systemd / mobile / WASM) | ⏳ | — | `docs/operations/` |
-| 7.3 | Versioning policy + `cargo-semver-checks` | ✅ | _this commit_ | `docs/policy/versioning.md` — three independent axes (Rust API SemVer, wire format `VersionedPacket::Vn`, FFI ABI); V1→V2 process; MSRV policy; deprecation policy; change-type matrix. cargo-semver-checks CI job is the natural follow-up. |
-| 7.4 | Release pipeline (cargo-release + GPG + SLSA) | ⏳ | — | GitHub Actions release job |
+| 7.2 | Deployment guides (Docker / k8s / systemd / mobile / WASM) | 🔄 | _this commit_ | `docs/operations/docker.md` (Dockerfile, ulimits, metrics endpoint, graceful-shutdown), `docs/operations/systemd.md` (unit file + hardening + multi-instance SO_REUSEPORT template + sysctl), `docs/operations/deployment.md` (overview + pre-deploy checklist + capacity planning). Kubernetes / mobile / WASM guides still pending. |
+| 7.3 | Versioning policy + `cargo-semver-checks` | ✅ | _this commit_ | `docs/policy/versioning.md` — three independent axes (Rust API SemVer, wire format `VersionedPacket::Vn`, FFI ABI); V1→V2 process; MSRV policy; deprecation policy; change-type matrix. cargo-semver-checks now wired in `.github/workflows/release.yml`. |
+| 7.4 | Release pipeline (cargo-release + GPG + SLSA) | 🔄 | _this commit_ | `.github/workflows/release.yml` — PR-triggered cargo-semver-checks, tag-triggered cargo publish dry-run + cross-target build artifacts (x86_64/aarch64 linux+darwin) + draft GitHub Release. SLSA-3 OIDC provenance attestation remains a pre-1.0 follow-up. |
 | 7.5 | Incident-response playbook | ✅ | _this commit_ | `docs/security/incident-response.md` — triage timeline, CVSS 4.0 severity buckets, roles (Triage Lead / Fix Author / Reviewer / Release Captain), reproduction discipline, fix authoring rules, embargo + coordinated disclosure, GHSA/CVE filing, post-mortem template |
-| 7.6 | Grafana dashboards + Prometheus alert rules | ⏳ | — | depends on Phase 4.5 telemetry |
+| 7.6 | Grafana dashboards + Prometheus alert rules | ✅ | _this commit_ | `docs/operations/grafana/phantom-dashboard.json` (4 rows: throughput, sessions, security signals, network quality) + `docs/operations/prometheus/alerts.yml` (3 groups: phantom_security, phantom_capacity, phantom_health — 8 alert rules total). References the `phantom_*` metric names exposed by Phase 4.5. |
 | 7.7 | Performance tuning guide | ✅ | _this commit_ | `docs/operations/perf-tuning.md` covers release profile, target-cpu, PGO, sysctl, fd limits, CPU pinning, allocator choice, profiling tools, reference numbers |
-| 7.8 | Migration guides per breaking change | ⏳ | — | starts at first V2 bump |
+| 7.8 | Migration guides per breaking change | ✅ | _this commit_ | `docs/migration/v1-to-v2.md` — wire-format negotiation explained, rollout-phase checklist for fleets, downgrade-resistance guarantee, known caveats. |
 
-**Phase 7 verdict:** untouched. Depends on most prior phases.
+**Phase 7 verdict:** Substantial progress this cycle — 7.1 (partial loopback example, in-flight), 7.2 (Docker / systemd / deployment-index guides), 7.3 (versioning policy + cargo-semver-checks in CI), 7.4 (release pipeline workflow), 7.5 (incident response), 7.6 (Grafana dashboard + Prometheus alerts), 7.7 (perf tuning), 7.8 (V1→V2 migration guide). Kubernetes / mobile / WASM deployment guides remain; SLSA-3 provenance is the long-tail item for 7.4.
 
 ---
 
