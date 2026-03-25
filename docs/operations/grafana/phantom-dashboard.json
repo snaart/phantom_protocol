@@ -1,0 +1,252 @@
+{
+  "uid": "phantom-core",
+  "title": "Phantom Core",
+  "description": "Server-side health and security signals for a Phantom Core listener fleet. Pairs with docs/operations/prometheus/alerts.yml.",
+  "tags": ["phantom", "transport", "security"],
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["10s", "30s", "1m", "5m"]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus"
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": "label_values(phantom_active_sessions, instance)",
+        "label": "Instance",
+        "multi": true,
+        "includeAll": true,
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Throughput",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Packets per second",
+      "datasource": "$datasource",
+      "gridPos": { "x": 0, "y": 1, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (direction) (rate(phantom_packets_sent_total{instance=~\"$instance\"}[1m])) or vector(0)",
+          "legendFormat": "sent"
+        },
+        {
+          "expr": "sum by (direction) (rate(phantom_packets_recv_total{instance=~\"$instance\"}[1m])) or vector(0)",
+          "legendFormat": "recv"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Bytes per second",
+      "datasource": "$datasource",
+      "gridPos": { "x": 12, "y": 1, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum (rate(phantom_bytes_sent_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "sent"
+        },
+        {
+          "expr": "sum (rate(phantom_bytes_recv_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "recv"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "Bps" }
+      }
+    },
+    {
+      "id": 4,
+      "type": "row",
+      "title": "Sessions",
+      "gridPos": { "x": 0, "y": 9, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Active sessions",
+      "datasource": "$datasource",
+      "gridPos": { "x": 0, "y": 10, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(phantom_active_sessions{instance=~\"$instance\"})"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Active streams",
+      "datasource": "$datasource",
+      "gridPos": { "x": 6, "y": 10, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(phantom_active_streams{instance=~\"$instance\"})"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Handshakes (1m rate)",
+      "datasource": "$datasource",
+      "gridPos": { "x": 12, "y": 10, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(rate(phantom_handshakes_total{instance=~\"$instance\"}[1m]))"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Handshake failures (1m rate)",
+      "datasource": "$datasource",
+      "gridPos": { "x": 18, "y": 10, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(rate(phantom_handshake_failures_total{instance=~\"$instance\"}[1m]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.1 },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Handshake latency (p50 / p95 / p99)",
+      "datasource": "$datasource",
+      "gridPos": { "x": 0, "y": 14, "w": 24, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(phantom_handshake_latency_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(phantom_handshake_latency_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(phantom_handshake_latency_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Security signals",
+      "gridPos": { "x": 0, "y": 22, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Replay window rejections (per second)",
+      "datasource": "$datasource",
+      "gridPos": { "x": 0, "y": 23, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(phantom_replay_rejected_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "replay_rejected"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Unencrypted post-handshake drops (per second)",
+      "datasource": "$datasource",
+      "gridPos": { "x": 8, "y": 23, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(phantom_unencrypted_dropped_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "unencrypted_dropped"
+        }
+      ],
+      "description": "Any non-zero value here is a downgrade-attempt indicator."
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "AEAD decryption failures (per second)",
+      "datasource": "$datasource",
+      "gridPos": { "x": 16, "y": 23, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(phantom_aead_decrypt_failed_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "aead_decrypt_failed"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "Network quality",
+      "gridPos": { "x": 0, "y": 31, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "RTT (µs)",
+      "datasource": "$datasource",
+      "gridPos": { "x": 0, "y": 32, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "avg(phantom_rtt_us{instance=~\"$instance\"})",
+          "legendFormat": "avg rtt"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Path migrations (per second)",
+      "datasource": "$datasource",
+      "gridPos": { "x": 12, "y": 32, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(phantom_path_migrations_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "migrations"
+        }
+      ]
+    }
+  ]
+}

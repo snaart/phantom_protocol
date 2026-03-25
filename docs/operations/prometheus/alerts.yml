@@ -1,0 +1,140 @@
+# Prometheus alert rules for Phantom Core.
+#
+# Import this file into Prometheus via `rule_files:` in `prometheus.yml`,
+# or via the corresponding ConfigMap in Kubernetes.
+#
+# Severity buckets follow the operational policy in
+# docs/security/incident-response.md.
+
+groups:
+  - name: phantom_security
+    interval: 30s
+    rules:
+      - alert: PhantomUnencryptedDowngradeAttempt
+        # Any non-empty post-handshake packet that arrived without
+        # the ENCRYPTED flag is an active downgrade signal. A single
+        # increment over a one-minute window is treated as a
+        # security incident — the receiver already dropped the packet,
+        # the alert is for forensic visibility.
+        expr: increase(phantom_unencrypted_dropped_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: security
+        annotations:
+          summary: "Phantom session(s) received unencrypted post-handshake data"
+          description: |
+            Over the past 5 minutes, {{ $value }} application-data
+            packets arrived without the ENCRYPTED flag set. This is
+            a downgrade signal (an attacker may be stripping
+            packet flags). Phantom drops these packets, but the
+            occurrence itself is an indicator of compromise.
+            See docs/security/incident-response.md.
+
+      - alert: PhantomAeadDecryptFailureSpike
+        # AEAD decryption failures over baseline indicate either
+        # tampering on the wire or a state-sync bug. >0.1 failures
+        # per second sustained for 5 minutes is the alert threshold.
+        expr: rate(phantom_aead_decrypt_failed_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: high
+          team: security
+        annotations:
+          summary: "Phantom AEAD decryption failure rate elevated"
+          description: |
+            AEAD tag-mismatch rate is {{ $value | humanize }} per
+            second over the past 5 minutes. Investigate for active
+            tampering, MitM, or a peer running an incompatible
+            wire-format build.
+
+      - alert: PhantomReplayWindowSaturated
+        # Sustained high replay-rejection rate may indicate either
+        # severe network reordering (operational issue) or an
+        # attacker replaying captured packets (security issue).
+        expr: rate(phantom_replay_rejected_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "Phantom replay-window rejection rate elevated"
+          description: |
+            Replay-rejection rate is {{ $value | humanize }} per
+            second over 10 minutes. May be benign (reordered
+            network) or malicious (replay attack). Cross-check with
+            packet-loss metrics from your network monitoring.
+
+      - alert: PhantomHandshakeFailureSpike
+        # Sudden burst of handshake failures may be a DoS attempt
+        # or a fleet-wide misconfiguration after a deploy.
+        expr: rate(phantom_handshake_failures_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "Phantom handshake failure rate elevated"
+          description: |
+            {{ $value | humanize }} handshake failures per second
+            over the past 5 minutes. Check adaptive-PoW tier and
+            recent client deploys.
+
+  - name: phantom_capacity
+    interval: 30s
+    rules:
+      - alert: PhantomActiveSessionsHigh
+        # Heuristic: alert when active sessions exceed 80% of a
+        # nominal capacity. Tune the constant in the expression to
+        # your deployment's tested capacity.
+        expr: phantom_active_sessions > 8000
+        for: 10m
+        labels:
+          severity: warning
+          team: ops
+        annotations:
+          summary: "Phantom active-sessions gauge near capacity"
+          description: |
+            Active sessions = {{ $value }}. Consider scaling
+            horizontally or raising the configured capacity limit.
+
+      - alert: PhantomHandshakeLatencyP95High
+        # p95 handshake latency above 1 s suggests CPU saturation
+        # or adaptive-PoW pushing back too aggressively.
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(phantom_handshake_latency_seconds_bucket[5m])
+            )
+          ) > 1.0
+        for: 10m
+        labels:
+          severity: warning
+          team: ops
+        annotations:
+          summary: "Phantom handshake p95 latency > 1 s"
+          description: |
+            p95 handshake latency over the past 5 minutes is
+            {{ $value }} s. Investigate CPU saturation, RNG
+            starvation, or aggressive PoW difficulty.
+
+  - name: phantom_health
+    interval: 30s
+    rules:
+      - alert: PhantomNoSuccessfulHandshakes
+        # Listener is up (scrapes succeed) but no handshakes have
+        # completed in the past 15 minutes. May indicate the
+        # listener is no longer reachable from the public network,
+        # or all clients are failing PoW.
+        expr: rate(phantom_handshakes_total[15m]) == 0 and phantom_active_sessions == 0
+        for: 15m
+        labels:
+          severity: critical
+          team: ops
+        annotations:
+          summary: "Phantom listener has accepted no sessions in 15 minutes"
+          description: |
+            handshakes/sec = 0 and active_sessions = 0 for 15+ minutes.
+            Listener may be unreachable. Cross-check from outside the
+            host (telnet / nc to the public address).
