@@ -48,65 +48,76 @@ fn bench_pool(c: &mut Criterion) {
     let pool_size = 65536;
     let buffer_size = 1024;
     let allocations_per_thread = 50_000;
-    
-    for thread_count in [1, 2, 8, 16, 32].iter() {
-        group.throughput(Throughput::Elements((*thread_count * allocations_per_thread) as u64));
-        
-        group.bench_with_input(BenchmarkId::new("Legacy_Mutex", thread_count), thread_count, |b, &threads| {
-            b.iter_custom(|iters| {
-                let mut total_time = std::time::Duration::new(0, 0);
-                for _ in 0..iters {
-                    let pool = Arc::new(LegacyBufferPool::new(buffer_size, pool_size, pool_size));
-                    let start = std::time::Instant::now();
-                    
-                    let mut handles = vec![];
-                    for _ in 0..threads {
-                        let pool_clone = pool.clone();
-                        handles.push(thread::spawn(move || {
-                            for _ in 0..allocations_per_thread {
-                                let buf = pool_clone.acquire();
-                                pool_clone.return_buffer(buf);
-                            }
-                        }));
-                    }
-                    
-                    for h in handles {
-                        h.join().unwrap();
-                    }
-                    total_time += start.elapsed();
-                }
-                total_time
-            });
-        });
 
-        group.bench_with_input(BenchmarkId::new("LockFree_ThreadLocal", thread_count), thread_count, |b, &threads| {
-            b.iter_custom(|iters| {
-                let mut total_time = std::time::Duration::new(0, 0);
-                for _ in 0..iters {
-                    let pool = Arc::new(BufferPool::new(buffer_size, pool_size, pool_size));
-                    let start = std::time::Instant::now();
-                    
-                    let mut handles = vec![];
-                    for _ in 0..threads {
-                        let pool_clone = pool.clone();
-                        handles.push(thread::spawn(move || {
-                            for _ in 0..allocations_per_thread {
-                                let buf = pool_clone.acquire();
-                                drop(buf); // dropped back to pool via Drop trait
-                            }
-                        }));
+    for thread_count in [1, 2, 8, 16, 32].iter() {
+        group.throughput(Throughput::Elements(
+            (*thread_count * allocations_per_thread) as u64,
+        ));
+
+        group.bench_with_input(
+            BenchmarkId::new("Legacy_Mutex", thread_count),
+            thread_count,
+            |b, &threads| {
+                b.iter_custom(|iters| {
+                    let mut total_time = std::time::Duration::new(0, 0);
+                    for _ in 0..iters {
+                        let pool =
+                            Arc::new(LegacyBufferPool::new(buffer_size, pool_size, pool_size));
+                        let start = std::time::Instant::now();
+
+                        let mut handles = vec![];
+                        for _ in 0..threads {
+                            let pool_clone = pool.clone();
+                            handles.push(thread::spawn(move || {
+                                for _ in 0..allocations_per_thread {
+                                    let buf = pool_clone.acquire();
+                                    pool_clone.return_buffer(buf);
+                                }
+                            }));
+                        }
+
+                        for h in handles {
+                            h.join().unwrap();
+                        }
+                        total_time += start.elapsed();
                     }
-                    
-                    for h in handles {
-                        h.join().unwrap();
+                    total_time
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("LockFree_ThreadLocal", thread_count),
+            thread_count,
+            |b, &threads| {
+                b.iter_custom(|iters| {
+                    let mut total_time = std::time::Duration::new(0, 0);
+                    for _ in 0..iters {
+                        let pool = Arc::new(BufferPool::new(buffer_size, pool_size, pool_size));
+                        let start = std::time::Instant::now();
+
+                        let mut handles = vec![];
+                        for _ in 0..threads {
+                            let pool_clone = pool.clone();
+                            handles.push(thread::spawn(move || {
+                                for _ in 0..allocations_per_thread {
+                                    let buf = pool_clone.acquire();
+                                    drop(buf); // dropped back to pool via Drop trait
+                                }
+                            }));
+                        }
+
+                        for h in handles {
+                            h.join().unwrap();
+                        }
+                        total_time += start.elapsed();
                     }
-                    total_time += start.elapsed();
-                }
-                total_time
-            });
-        });
+                    total_time
+                });
+            },
+        );
     }
-    
+
     group.finish();
 }
 

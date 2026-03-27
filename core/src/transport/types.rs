@@ -9,11 +9,11 @@
 #![allow(unused_assignments)]
 
 use alkahest::alkahest;
-use borsh::{BorshSerialize, BorshDeserialize};
+use borsh::{BorshDeserialize, BorshSerialize};
 use std::fmt;
 
 /// 256-bit Session Identifier
-/// 
+///
 /// Used as salt for encryption and session persistence across IP changes.
 /// Post-quantum safe size (32 bytes = 256 bits).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,12 +30,12 @@ impl SessionId {
         }
         Self(bytes)
     }
-    
+
     /// Create from bytes
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
-    
+
     /// Get as byte slice
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -55,7 +55,7 @@ impl fmt::Display for SessionId {
 }
 
 /// Stream identifier within a session
-/// 
+///
 /// Stream 0 is reserved for control messages.
 /// Each stream has independent sequence numbers (no HoL blocking).
 pub type StreamId = u16;
@@ -142,20 +142,36 @@ impl PacketFlags {
 impl fmt::Debug for PacketFlags {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut flags = Vec::new();
-        if self.contains(Self::RELIABLE) { flags.push("RELIABLE"); }
-        if self.contains(Self::ACK) { flags.push("ACK"); }
-        if self.contains(Self::FIN) { flags.push("FIN"); }
-        if self.contains(Self::UNRELIABLE) { flags.push("UNRELIABLE"); }
-        if self.contains(Self::PRIORITY) { flags.push("PRIORITY"); }
-        if self.contains(Self::ENCRYPTED) { flags.push("ENCRYPTED"); }
-        if self.contains(Self::COMPRESSED) { flags.push("COMPRESSED"); }
-        if self.contains(Self::CONTROL) { flags.push("CONTROL"); }
+        if self.contains(Self::RELIABLE) {
+            flags.push("RELIABLE");
+        }
+        if self.contains(Self::ACK) {
+            flags.push("ACK");
+        }
+        if self.contains(Self::FIN) {
+            flags.push("FIN");
+        }
+        if self.contains(Self::UNRELIABLE) {
+            flags.push("UNRELIABLE");
+        }
+        if self.contains(Self::PRIORITY) {
+            flags.push("PRIORITY");
+        }
+        if self.contains(Self::ENCRYPTED) {
+            flags.push("ENCRYPTED");
+        }
+        if self.contains(Self::COMPRESSED) {
+            flags.push("COMPRESSED");
+        }
+        if self.contains(Self::CONTROL) {
+            flags.push("CONTROL");
+        }
         write!(f, "PacketFlags({})", flags.join("|"))
     }
 }
 
 /// Packet header - fixed 40 bytes
-/// 
+///
 /// Layout:
 /// - session_id: [u8; 32] - 256-bit session identifier (salt)
 /// - stream_id: u16 - stream within session
@@ -332,17 +348,39 @@ impl PacketFlagsV2 {
 impl fmt::Debug for PacketFlagsV2 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut flags = Vec::new();
-        if self.contains(Self::RELIABLE) { flags.push("RELIABLE"); }
-        if self.contains(Self::ACK) { flags.push("ACK"); }
-        if self.contains(Self::FIN) { flags.push("FIN"); }
-        if self.contains(Self::UNRELIABLE) { flags.push("UNRELIABLE"); }
-        if self.contains(Self::PRIORITY) { flags.push("PRIORITY"); }
-        if self.contains(Self::ENCRYPTED) { flags.push("ENCRYPTED"); }
-        if self.contains(Self::COMPRESSED) { flags.push("COMPRESSED"); }
-        if self.contains(Self::CONTROL) { flags.push("CONTROL"); }
-        if self.contains(Self::REKEY) { flags.push("REKEY"); }
-        if self.contains(Self::PATH_VALIDATION) { flags.push("PATH_VALIDATION"); }
-        if self.contains(Self::COALESCED) { flags.push("COALESCED"); }
+        if self.contains(Self::RELIABLE) {
+            flags.push("RELIABLE");
+        }
+        if self.contains(Self::ACK) {
+            flags.push("ACK");
+        }
+        if self.contains(Self::FIN) {
+            flags.push("FIN");
+        }
+        if self.contains(Self::UNRELIABLE) {
+            flags.push("UNRELIABLE");
+        }
+        if self.contains(Self::PRIORITY) {
+            flags.push("PRIORITY");
+        }
+        if self.contains(Self::ENCRYPTED) {
+            flags.push("ENCRYPTED");
+        }
+        if self.contains(Self::COMPRESSED) {
+            flags.push("COMPRESSED");
+        }
+        if self.contains(Self::CONTROL) {
+            flags.push("CONTROL");
+        }
+        if self.contains(Self::REKEY) {
+            flags.push("REKEY");
+        }
+        if self.contains(Self::PATH_VALIDATION) {
+            flags.push("PATH_VALIDATION");
+        }
+        if self.contains(Self::COALESCED) {
+            flags.push("COALESCED");
+        }
         write!(f, "PacketFlagsV2({})", flags.join("|"))
     }
 }
@@ -442,7 +480,11 @@ pub struct PhantomPacketV2 {
 impl PhantomPacketV2 {
     /// Create a new packet (extensions empty by default)
     pub fn new(header: PacketHeaderV2, payload: Vec<u8>) -> Self {
-        Self { header, payload, extensions: Vec::new() }
+        Self {
+            header,
+            payload,
+            extensions: Vec::new(),
+        }
     }
 
     /// Total wire size including extensions
@@ -570,7 +612,11 @@ pub type PhantomPacket = PhantomPacketV1;
 impl PhantomPacketV1 {
     /// Create a new packet (extensions empty by default)
     pub fn new(header: PacketHeader, payload: Vec<u8>) -> Self {
-        Self { header, payload, extensions: Vec::new() }
+        Self {
+            header,
+            payload,
+            extensions: Vec::new(),
+        }
     }
 
     /// Create an ACK packet
@@ -615,7 +661,7 @@ impl fmt::Debug for PhantomPacketV1 {
 
 /// Control message types for session management
 #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-#[borsh(use_discriminant=true)]
+#[borsh(use_discriminant = true)]
 #[repr(u8)]
 pub enum ControlMessage {
     /// Initial handshake request
@@ -656,7 +702,7 @@ impl LegType {
     pub fn is_reliable(&self) -> bool {
         matches!(self, LegType::Kcp | LegType::Tcp | LegType::FakeTls)
     }
-    
+
     /// Whether this leg type uses encryption/obfuscation
     pub fn is_obfuscated(&self) -> bool {
         matches!(self, LegType::FakeTls)
@@ -691,14 +737,14 @@ mod tests {
     fn test_packet_flags() {
         let mut flags = PacketFlags::empty();
         assert!(!flags.is_reliable());
-        
+
         flags.set(PacketFlags::RELIABLE);
         assert!(flags.is_reliable());
-        
+
         flags.set(PacketFlags::ENCRYPTED);
         assert!(flags.contains(PacketFlags::RELIABLE));
         assert!(flags.contains(PacketFlags::ENCRYPTED));
-        
+
         flags.clear(PacketFlags::RELIABLE);
         assert!(!flags.is_reliable());
         assert!(flags.contains(PacketFlags::ENCRYPTED));
@@ -716,7 +762,7 @@ mod tests {
     fn test_phantom_packet_ack() {
         let session_id = SessionId::random();
         let ack = PhantomPacket::ack(session_id, 5, 100);
-        
+
         assert!(ack.header.flags.is_ack());
         assert_eq!(ack.header.stream_id, 5);
         assert_eq!(ack.header.sequence, 100);
@@ -738,8 +784,9 @@ mod tests {
         let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&versioned, &mut bytes);
 
         // Deserialize and verify
-        let deserialized = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&bytes[..size])
-            .expect("alkahest deserialize failed");
+        let deserialized =
+            alkahest::deserialize::<VersionedPacket, VersionedPacket>(&bytes[..size])
+                .expect("alkahest deserialize failed");
 
         let inner = deserialized.into_v1().expect("expected V1");
         assert_eq!(inner.header.stream_id, 1);
@@ -751,10 +798,7 @@ mod tests {
     #[test]
     fn test_extensions_preserved_on_roundtrip() {
         let session_id = SessionId::random();
-        let mut packet = PhantomPacketV1::new(
-            PacketHeader::control(session_id, 1),
-            vec![1, 2, 3],
-        );
+        let mut packet = PhantomPacketV1::new(PacketHeader::control(session_id, 1), vec![1, 2, 3]);
         // Write some extension data
         packet.extensions = vec![0xFF, 0x01, 0x00, 0x04, b't', b'e', b's', b't'];
 
@@ -765,7 +809,10 @@ mod tests {
             .expect("deserialize failed");
         let inner = deser.into_v1().unwrap();
 
-        assert_eq!(inner.extensions, vec![0xFF, 0x01, 0x00, 0x04, b't', b'e', b's', b't']);
+        assert_eq!(
+            inner.extensions,
+            vec![0xFF, 0x01, 0x00, 0x04, b't', b'e', b's', b't']
+        );
     }
 
     #[test]
@@ -785,7 +832,10 @@ mod tests {
     fn v2_flags_bit_assignments() {
         // Low byte mirrors V1.
         assert_eq!(PacketFlagsV2::RELIABLE as u16, PacketFlags::RELIABLE as u16);
-        assert_eq!(PacketFlagsV2::ENCRYPTED as u16, PacketFlags::ENCRYPTED as u16);
+        assert_eq!(
+            PacketFlagsV2::ENCRYPTED as u16,
+            PacketFlags::ENCRYPTED as u16
+        );
         assert_eq!(PacketFlagsV2::CONTROL as u16, PacketFlags::CONTROL as u16);
         // High byte unique to V2.
         assert_eq!(PacketFlagsV2::REKEY, 0x0100);
@@ -821,11 +871,9 @@ mod tests {
         let versioned = VersionedPacket::v2(packet);
 
         let mut bytes = Vec::new();
-        let (size, _) =
-            alkahest::serialize_to_vec::<VersionedPacket, _>(&versioned, &mut bytes);
-        let decoded =
-            alkahest::deserialize::<VersionedPacket, VersionedPacket>(&bytes[..size])
-                .expect("v2 roundtrip");
+        let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&versioned, &mut bytes);
+        let decoded = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&bytes[..size])
+            .expect("v2 roundtrip");
         assert_eq!(decoded.wire_version(), 2);
         let inner = decoded.into_v2().expect("v2 inner");
         assert_eq!(inner.header.stream_id, 7);
@@ -849,7 +897,12 @@ mod tests {
         )
         .into_versioned();
         let v2 = PhantomPacketV2::new(
-            PacketHeaderV2::new(session_id, 1, 1, PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED)),
+            PacketHeaderV2::new(
+                session_id,
+                1,
+                1,
+                PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED),
+            ),
             vec![1, 2, 3],
         )
         .into_versioned();

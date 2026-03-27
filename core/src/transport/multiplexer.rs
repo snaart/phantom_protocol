@@ -4,11 +4,11 @@
 //! extracted from `PhantomPacketV1` headers. Replaces the old smoltcp-based
 //! multiplexer with a lightweight, zero-copy routing table.
 
+use crate::transport::types::SequenceNumber;
+use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
-use bytes::Bytes;
-use crate::transport::types::SequenceNumber;
 
 /// Messages routed to a stream by the demultiplexer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +81,9 @@ impl StreamDemultiplexer {
         let (tx, rx) = mpsc::channel(buffer_size);
         self.streams.insert(stream_id, tx);
         // Update next_stream_id if necessary to avoid collisions
-        let _ = self.next_stream_id.fetch_max(stream_id + 1, Ordering::Relaxed);
+        let _ = self
+            .next_stream_id
+            .fetch_max(stream_id + 1, Ordering::Relaxed);
         StreamHandle { stream_id, rx }
     }
 

@@ -37,10 +37,10 @@
 // lint and must justify itself explicitly.
 #![deny(unsafe_code)]
 
-mod errors;
 pub mod config;
-pub mod validation;
+mod errors;
 pub mod security;
+pub mod validation;
 
 // Crypto module (hybrid KEM, hybrid sign)
 pub mod crypto;
@@ -64,7 +64,7 @@ pub mod api;
 pub mod test_harness;
 
 // Public exports
-pub use errors::CoreError;
 pub use config::PhantomConfig;
+pub use errors::CoreError;
 
 uniffi::setup_scaffolding!();

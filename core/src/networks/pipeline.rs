@@ -1,6 +1,6 @@
+use anyhow::Result;
 use async_trait::async_trait;
 use bytes::BytesMut;
-use anyhow::Result;
 
 /// Слой обработки данных.
 /// Inbound: Сеть -> Приложение (Декапсуляция, Расшифровка)

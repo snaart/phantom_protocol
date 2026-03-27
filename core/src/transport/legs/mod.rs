@@ -5,11 +5,11 @@
 //! since browsers cannot open raw TCP/UDP sockets.
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod faketls;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod kcp;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tcp;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod faketls;
 
 #[cfg(target_arch = "wasm32")]
 pub mod websocket;
@@ -27,22 +27,22 @@ use std::net::SocketAddr;
 pub trait TransportLeg: Send + Sync {
     /// Send data to the remote peer
     async fn send(&self, data: Bytes) -> io::Result<()>;
-    
+
     /// Receive data from the remote peer
     async fn recv(&self) -> io::Result<Bytes>;
-    
+
     /// Check if this leg is currently available
     fn is_available(&self) -> bool;
-    
+
     /// Get the current RTT estimate in milliseconds
     fn rtt_ms(&self) -> u32;
-    
+
     /// Get packet loss percentage (0-100)
     fn loss_percent(&self) -> u8;
-    
+
     /// Get the remote address
     fn remote_addr(&self) -> Option<SocketAddr>;
-    
+
     /// Gracefully close the transport
     async fn close(&self) -> io::Result<()>;
 }

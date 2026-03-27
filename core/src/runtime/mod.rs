@@ -102,7 +102,9 @@ impl SpawnHandle {
     /// Used by runtime adapters (e.g. [`TokioRuntime`]) to wrap their
     /// concrete `JoinHandle`-equivalent into the trait object.
     pub fn from_inner<T: SpawnHandleInner>(inner: T) -> Self {
-        Self { inner: Box::new(inner) }
+        Self {
+            inner: Box::new(inner),
+        }
     }
 
     /// Request cancellation of the spawned task. Idempotent.

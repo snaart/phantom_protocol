@@ -282,7 +282,9 @@ mod tests {
     fn zstd_round_trip() {
         let mut c = AdaptiveCompressor::zstd(1);
         // Compressible text-like data
-        let data: Vec<u8> = (0..2048).map(|i| b"The quick brown fox jumps over the lazy dog. "[i % 45]).collect();
+        let data: Vec<u8> = (0..2048)
+            .map(|i| b"The quick brown fox jumps over the lazy dog. "[i % 45])
+            .collect();
         let (algo, compressed) = c.compress(&data);
         assert_eq!(algo, CompressionAlgo::Zstd1.to_byte());
         assert!(compressed.len() < data.len(), "Zstd should compress text");
@@ -313,9 +315,9 @@ mod tests {
 
         // Compress pseudo-random (incompressible) data
         for i in 0u32..10 {
-            let data: Vec<u8> = (0..256).map(|j| {
-                ((i.wrapping_mul(2654435761).wrapping_add(j)) & 0xFF) as u8
-            }).collect();
+            let data: Vec<u8> = (0..256)
+                .map(|j| ((i.wrapping_mul(2654435761).wrapping_add(j)) & 0xFF) as u8)
+                .collect();
             let _ = c.compress(&data);
         }
         // After probe_samples, should be disabled

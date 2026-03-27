@@ -10,16 +10,16 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::{
-    Signature as Ed25519Signature, Signer as Ed25519Signer, SigningKey, Verifier as Ed25519Verifier,
-    VerifyingKey,
-};
-use ml_dsa::{
-    EncodedSignature, EncodedVerifyingKey, Generate, KeyExport, KeyInit, Keypair, MlDsa65, Signer,
-    Verifier,
+    Signature as Ed25519Signature, Signer as Ed25519Signer, SigningKey,
+    Verifier as Ed25519Verifier, VerifyingKey,
 };
 use ml_dsa::Signature as MlDsaSignature;
 use ml_dsa::SigningKey as MlDsaSigningKey;
 use ml_dsa::VerifyingKey as MlDsaVerifyingKey;
+use ml_dsa::{
+    EncodedSignature, EncodedVerifyingKey, Generate, KeyExport, KeyInit, Keypair, MlDsa65, Signer,
+    Verifier,
+};
 use rand::rngs::OsRng;
 use std::fmt;
 use zeroize::ZeroizeOnDrop;
@@ -61,7 +61,10 @@ impl HybridSigningKey {
         let ml_dsa_sk = Box::new(MlDsaSigningKey::<MlDsa65>::generate());
         let ml_dsa_vk = ml_dsa_sk.verifying_key();
 
-        let signing_key = Self { ed25519_sk, ml_dsa_sk };
+        let signing_key = Self {
+            ed25519_sk,
+            ml_dsa_sk,
+        };
         let verifying_key = HybridVerifyingKey {
             ed25519_pk: ed25519_pk.to_bytes(),
             ml_dsa_pk: ml_dsa_vk.encode().to_vec(),
@@ -110,13 +113,16 @@ impl HybridSigningKey {
             .try_into()
             .map_err(|_| HybridSignError::InvalidKeyFormat)?;
         let ed25519_sk = SigningKey::from_bytes(&ed25519_bytes);
-        let ml_dsa_seed = ml_dsa::B32::try_from(&bytes[32..])
-            .map_err(|_| HybridSignError::InvalidKeyFormat)?;
+        let ml_dsa_seed =
+            ml_dsa::B32::try_from(&bytes[32..]).map_err(|_| HybridSignError::InvalidKeyFormat)?;
         // `KeyInit::new(&seed)` reconstructs the SigningKey from its seed
         // (algorithm 1 in FIPS 204: ML-DSA.KeyGen). Boxed for the same
         // stack-overflow reason as `generate`.
         let ml_dsa_sk = Box::new(MlDsaSigningKey::<MlDsa65>::new(&ml_dsa_seed));
-        Ok(Self { ed25519_sk, ml_dsa_sk })
+        Ok(Self {
+            ed25519_sk,
+            ml_dsa_sk,
+        })
     }
 }
 
@@ -151,14 +157,12 @@ impl HybridVerifyingKey {
             .map_err(|_| HybridSignError::Ed25519VerificationFailed)?;
 
         // ML-DSA-65 (FIPS 204)
-        let vk_encoded =
-            EncodedVerifyingKey::<MlDsa65>::try_from(self.ml_dsa_pk.as_slice())
-                .map_err(|_| HybridSignError::InvalidPublicKey)?;
+        let vk_encoded = EncodedVerifyingKey::<MlDsa65>::try_from(self.ml_dsa_pk.as_slice())
+            .map_err(|_| HybridSignError::InvalidPublicKey)?;
         let vk = MlDsaVerifyingKey::<MlDsa65>::decode(&vk_encoded);
 
-        let sig_encoded =
-            EncodedSignature::<MlDsa65>::try_from(signature.ml_dsa_sig.as_slice())
-                .map_err(|_| HybridSignError::InvalidSignature)?;
+        let sig_encoded = EncodedSignature::<MlDsa65>::try_from(signature.ml_dsa_sig.as_slice())
+            .map_err(|_| HybridSignError::InvalidSignature)?;
         let sig = MlDsaSignature::<MlDsa65>::decode(&sig_encoded)
             .ok_or(HybridSignError::InvalidSignature)?;
 
@@ -184,7 +188,10 @@ impl HybridVerifyingKey {
             .try_into()
             .map_err(|_| HybridSignError::InvalidKeyFormat)?;
         let ml_dsa_pk = bytes[ED_SIZE..].to_vec();
-        Ok(Self { ed25519_pk, ml_dsa_pk })
+        Ok(Self {
+            ed25519_pk,
+            ml_dsa_pk,
+        })
     }
 }
 
@@ -214,7 +221,10 @@ impl HybridSignature {
             .try_into()
             .map_err(|_| HybridSignError::InvalidKeyFormat)?;
         let ml_dsa_sig = bytes[64..].to_vec();
-        Ok(Self { ed25519_sig, ml_dsa_sig })
+        Ok(Self {
+            ed25519_sig,
+            ml_dsa_sig,
+        })
     }
 }
 

@@ -7,9 +7,9 @@
 //!
 //! LRU eviction для ограничения памяти на IoT.
 
+use crate::crypto::adaptive_crypto::CipherSuite;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use crate::crypto::adaptive_crypto::CipherSuite;
 
 /// Maximum tickets in cache (Constrained: 8, Standard: 64, Performance: 256)
 const DEFAULT_MAX_TICKETS: usize = 64;
@@ -148,11 +148,13 @@ impl SessionCache {
     fn evict_oldest(&mut self) {
         // First try to evict expired tickets
         let now = Instant::now();
-        let expired: Vec<SessionId> = self.tickets.iter()
+        let expired: Vec<SessionId> = self
+            .tickets
+            .iter()
             .filter(|(_, t)| now >= t.expires_at)
             .map(|(id, _)| *id)
             .collect();
-        
+
         for id in &expired {
             self.tickets.remove(id);
         }

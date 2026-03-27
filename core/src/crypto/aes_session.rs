@@ -51,8 +51,10 @@ impl AesSession {
 
         let (send_bytes, recv_bytes) = if swap { (key_b, key_a) } else { (key_a, key_b) };
 
-        let send_unbound = UnboundKey::new(&AES_256_GCM, &send_bytes).map_err(|_| crate::CoreError::CryptoError("Invalid key".into()))?;
-        let recv_unbound = UnboundKey::new(&AES_256_GCM, &recv_bytes).map_err(|_| crate::CoreError::CryptoError("Invalid key".into()))?;
+        let send_unbound = UnboundKey::new(&AES_256_GCM, &send_bytes)
+            .map_err(|_| crate::CoreError::CryptoError("Invalid key".into()))?;
+        let recv_unbound = UnboundKey::new(&AES_256_GCM, &recv_bytes)
+            .map_err(|_| crate::CoreError::CryptoError("Invalid key".into()))?;
 
         let prefix_bytes = blake3::derive_key("phantom-nonce-pfx-v1", shared_secret);
         let mut nonce_prefix = [0u8; 4];
@@ -89,7 +91,11 @@ impl AesSession {
 
     /// Decrypt in place: verifies tag and truncates. Returns plaintext slice.
     #[inline]
-    pub fn decrypt_in_place<'a>(&self, aad: &[u8], buf: &'a mut [u8]) -> Result<&'a mut [u8], EncryptError> {
+    pub fn decrypt_in_place<'a>(
+        &self,
+        aad: &[u8],
+        buf: &'a mut [u8],
+    ) -> Result<&'a mut [u8], EncryptError> {
         let counter = self.recv_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = self.make_nonce(counter);
         self.recv_key

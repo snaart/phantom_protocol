@@ -2,9 +2,9 @@
 //!
 //! Eliminates per-packet memory allocations for maximum throughput.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use crossbeam_queue::ArrayQueue;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const BATCH_SIZE: usize = 32;
 const MAX_LOCAL_BUFFERS: usize = 64;
@@ -36,7 +36,7 @@ impl BufferPool {
         for _ in 0..count {
             let _ = buffers.push(vec![0u8; buffer_size]);
         }
-        
+
         Self {
             buffers,
             buffer_size,
@@ -45,7 +45,7 @@ impl BufferPool {
             hits: AtomicUsize::new(0),
         }
     }
-    
+
     /// Acquire a buffer from the pool
     #[inline]
     pub fn acquire(&self) -> PooledBuffer<'_> {
@@ -85,13 +85,10 @@ impl BufferPool {
             self.allocations.fetch_add(1, Ordering::Relaxed);
             Vec::with_capacity(self.buffer_size)
         };
-        
-        PooledBuffer {
-            buffer,
-            pool: self,
-        }
+
+        PooledBuffer { buffer, pool: self }
     }
-    
+
     /// Return a buffer to the pool
     #[inline]
     fn return_buffer(&self, mut buffer: Vec<u8>) {
@@ -108,12 +105,12 @@ impl BufferPool {
                         let _ = self.buffers.push(buf);
                     }
                 }
-                
+
                 local_pool.push(buffer);
             }
         });
     }
-    
+
     /// Get pool statistics
     pub fn stats(&self) -> PoolStats {
         PoolStats {
@@ -136,19 +133,19 @@ impl<'a> PooledBuffer<'a> {
     pub fn as_mut(&mut self) -> &mut Vec<u8> {
         &mut self.buffer
     }
-    
+
     /// Get reference to inner buffer
     #[inline]
     pub fn as_ref(&self) -> &[u8] {
         &self.buffer
     }
-    
+
     /// Get the buffer length
     #[inline]
     pub fn len(&self) -> usize {
         self.buffer.len()
     }
-    
+
     /// Check if buffer is empty
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -158,7 +155,7 @@ impl<'a> PooledBuffer<'a> {
 
 impl<'a> std::ops::Deref for PooledBuffer<'a> {
     type Target = Vec<u8>;
-    
+
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.buffer
@@ -220,17 +217,17 @@ mod tests {
     #[test]
     fn test_buffer_pool() {
         let pool = BufferPool::new(1024, 4, 16);
-        
+
         let mut buf1 = pool.acquire();
         buf1.extend_from_slice(b"hello");
         assert_eq!(buf1.len(), 5);
-        
+
         let buf2 = pool.acquire();
         assert_eq!(buf2.len(), 0);
-        
+
         drop(buf1);
         drop(buf2);
-        
+
         // After returning, buffers are pushed to local pool.
         // It preloaded 4 buffers initially, we used 2 and returned 2. So it has 4.
         LOCAL_POOL.with(|local| {
@@ -259,8 +256,10 @@ mod tests {
                 count = local.borrow().len();
             });
             assert!(count <= MAX_LOCAL_BUFFERS);
-        }).join().unwrap();
-        
+        })
+        .join()
+        .unwrap();
+
         // global pool should have received the flushed buffers
         assert!(pool.buffers.len() > 0);
     }

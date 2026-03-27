@@ -12,7 +12,6 @@ use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA2
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-
 /// Overhead bytes: both AES-GCM and ChaCha20-Poly1305 produce a 16-byte tag
 pub const AEAD_OVERHEAD: usize = 16;
 
@@ -112,17 +111,17 @@ impl HwCaps {
 }
 
 /// Negotiate best cipher suite between client and server
-pub fn negotiate_cipher(
-    client_preferred: &[CipherSuite],
-    server_caps: &HwCaps,
-) -> CipherSuite {
+pub fn negotiate_cipher(client_preferred: &[CipherSuite], server_caps: &HwCaps) -> CipherSuite {
     let server_pref = server_caps.recommended_cipher();
     // If server's preference is in client's list, use it
     if client_preferred.contains(&server_pref) {
         return server_pref;
     }
     // Otherwise use client's first choice
-    client_preferred.first().copied().unwrap_or(CipherSuite::ChaCha20Poly1305)
+    client_preferred
+        .first()
+        .copied()
+        .unwrap_or(CipherSuite::ChaCha20Poly1305)
 }
 
 /// Unified crypto session — works with any supported cipher suite.
@@ -166,7 +165,10 @@ impl CryptoSession {
     }
 
     /// Create with explicit cipher suite. Peer side.
-    pub fn with_suite_peer(shared_secret: &[u8; 32], suite: CipherSuite) -> Result<Self, CoreError> {
+    pub fn with_suite_peer(
+        shared_secret: &[u8; 32],
+        suite: CipherSuite,
+    ) -> Result<Self, CoreError> {
         Self::build(shared_secret, suite, true)
     }
 
@@ -242,7 +244,8 @@ impl CryptoSession {
         }
         let nonce = self.make_nonce(counter);
         // seal_in_place_separate_tag works on &mut [u8] (no Extend needed)
-        let tag = self.inner
+        let tag = self
+            .inner
             .send_key
             .seal_in_place_separate_tag(nonce, Aad::from(aad), &mut buf[offset..])
             .map_err(|_| CryptoError::EncryptionFailed)?;
@@ -250,7 +253,6 @@ impl CryptoSession {
         buf.extend_from_slice(tag.as_ref());
         Ok(buf.len() - offset)
     }
-
 
     /// Encrypt: allocates a new Vec.
     #[inline]
@@ -263,7 +265,11 @@ impl CryptoSession {
 
     /// Decrypt in place: verifies tag and returns plaintext slice.
     #[inline]
-    pub fn decrypt_in_place<'a>(&self, aad: &[u8], buf: &'a mut [u8]) -> Result<&'a mut [u8], CryptoError> {
+    pub fn decrypt_in_place<'a>(
+        &self,
+        aad: &[u8],
+        buf: &'a mut [u8],
+    ) -> Result<&'a mut [u8], CryptoError> {
         let counter = self.inner.recv_counter.fetch_add(1, Ordering::Relaxed);
         if counter >= AEAD_MAX_INVOCATIONS {
             return Err(CryptoError::NonceExhausted);
@@ -379,7 +385,6 @@ impl CryptoSession {
     }
 }
 
-
 /// Crypto errors
 #[derive(Debug, Clone, Copy)]
 pub enum CryptoError {
@@ -469,7 +474,9 @@ mod tests {
         buf.extend_from_slice(&[0u8; 4]); // placeholder for header
         buf.extend_from_slice(data);
 
-        let ct_len = session.encrypt_in_place_offset(&[0u8; 4], &mut buf, header_len).unwrap();
+        let ct_len = session
+            .encrypt_in_place_offset(&[0u8; 4], &mut buf, header_len)
+            .unwrap();
 
         // Write header
         buf[..4].copy_from_slice(&(ct_len as u32).to_be_bytes());
@@ -477,7 +484,9 @@ mod tests {
         // Decrypt on peer side
         let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         let (_header, payload) = buf.split_at_mut(4);
-        let pt = peer.decrypt_in_place(&[0u8; 4], &mut payload[..len]).unwrap();
+        let pt = peer
+            .decrypt_in_place(&[0u8; 4], &mut payload[..len])
+            .unwrap();
         assert_eq!(pt, data);
     }
 
@@ -501,10 +510,7 @@ mod tests {
         assert_eq!(result, CipherSuite::ChaCha20Poly1305);
 
         // Client only ChaCha, server has AES → ChaCha (client's preference)
-        let result = negotiate_cipher(
-            &[CipherSuite::ChaCha20Poly1305],
-            &server_aes,
-        );
+        let result = negotiate_cipher(&[CipherSuite::ChaCha20Poly1305], &server_aes);
         assert_eq!(result, CipherSuite::ChaCha20Poly1305);
     }
 

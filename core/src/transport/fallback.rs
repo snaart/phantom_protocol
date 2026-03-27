@@ -3,11 +3,11 @@
 //! Automatic transport mode degradation:
 //! Turbo (KCP) → Reliable (TCP) → Stealth (FakeTLS)
 
+use crate::transport::scheduler::Scheduler;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Instant;
 use std::sync::Arc;
-use crate::transport::scheduler::Scheduler;
+use std::time::Instant;
 
 /// Transport modes supported by the system
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +55,9 @@ impl FallbackMetrics {
         self.packets_acked.fetch_add(1, Ordering::Relaxed);
         self.connection_failures.store(0, Ordering::Relaxed);
         let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or_default();
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
         self.last_success_ms.store(now, Ordering::Relaxed);
     }
 
@@ -131,7 +131,7 @@ impl FallbackStateMachine {
             TransportMode::Reliable => TransportMode::Stealth,
             TransportMode::Stealth => TransportMode::Stealth,
         };
-        
+
         if new_mode != *mode {
             log::warn!("Transport degradation: {:?} -> {:?}", *mode, new_mode);
             *mode = new_mode;
@@ -158,10 +158,10 @@ impl FallbackStateMachine {
 
         let last_probe = self.last_probe.read();
         let last_change = self.last_change.read();
-        
+
         // Probe if it's been > 30s since last probe AND since last mode change
-        last_probe.elapsed() > std::time::Duration::from_secs(30) && 
-        last_change.elapsed() > std::time::Duration::from_secs(30)
+        last_probe.elapsed() > std::time::Duration::from_secs(30)
+            && last_change.elapsed() > std::time::Duration::from_secs(30)
     }
 
     pub fn record_probe(&self) {
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn test_should_probe() {
         let fsm = FallbackStateMachine::with_defaults();
-        
+
         // No probe needed if already in best mode
         assert!(!fsm.should_probe());
 

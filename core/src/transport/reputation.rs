@@ -43,7 +43,7 @@ impl ReputationTracker {
     /// Record a violation (e.g., failed handshake)
     pub fn record_violation(&self, ip: IpAddr) {
         let now = Self::now_secs();
-        
+
         if let Some(entry) = self.entries.get(&ip) {
             let last_seen = entry.last_seen_secs.load(Ordering::Relaxed);
             if now > last_seen + WINDOW_SECS {
@@ -88,7 +88,7 @@ impl ReputationTracker {
             if diff > MAX_DIFFICULTY as u32 {
                 diff = MAX_DIFFICULTY as u32;
             }
-            
+
             diff as u8
         } else {
             // New IP
@@ -106,7 +106,11 @@ impl ReputationTracker {
         });
         let after = self.entries.len();
         if before > after {
-            log::info!("Reputation GC: removed {} expired entries, {} remaining", before - after, after);
+            log::info!(
+                "Reputation GC: removed {} expired entries, {} remaining",
+                before - after,
+                after
+            );
         }
     }
 }

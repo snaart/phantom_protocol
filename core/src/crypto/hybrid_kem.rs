@@ -65,19 +65,14 @@ impl HybridSecretKey {
         (secret_key, key_package)
     }
 
-    pub fn decapsulate(
-        &self,
-        ciphertext: &HybridCiphertext,
-    ) -> Result<[u8; 32], anyhow::Error> {
+    pub fn decapsulate(&self, ciphertext: &HybridCiphertext) -> Result<[u8; 32], anyhow::Error> {
         // 1. X25519 ECDH.
         let peer_x25519 = X25519PublicKey::from(ciphertext.x25519_pk);
         let x25519_shared = self.x25519_sk.diffie_hellman(&peer_x25519);
 
         // 2. ML-KEM-768 decapsulation.
-        let ct_array =
-            decode_ml_kem_ciphertext(&ciphertext.ml_kem_ct).ok_or_else(|| {
-                anyhow::anyhow!("invalid ML-KEM-768 ciphertext length")
-            })?;
+        let ct_array = decode_ml_kem_ciphertext(&ciphertext.ml_kem_ct)
+            .ok_or_else(|| anyhow::anyhow!("invalid ML-KEM-768 ciphertext length"))?;
         let ml_kem_shared = self
             .ml_kem_dk
             .decapsulate(&ct_array)
@@ -129,20 +124,16 @@ impl HybridKeyPackage {
         let x25519_shared = ephemeral_sk.diffie_hellman(&peer_x25519);
 
         // 2. ML-KEM-768 encapsulation against the peer's encap key.
-        let ek_array =
-            decode_ml_kem_encap_key(&self.ml_kem_pk).ok_or_else(|| {
-                anyhow::anyhow!("invalid ML-KEM-768 public key length")
-            })?;
+        let ek_array = decode_ml_kem_encap_key(&self.ml_kem_pk)
+            .ok_or_else(|| anyhow::anyhow!("invalid ML-KEM-768 public key length"))?;
         let ek = MlKem768EncapKey::from_bytes(&ek_array);
         let (ct, ml_kem_shared) = ek
             .encapsulate(&mut rng)
             .map_err(|e| anyhow::anyhow!("ML-KEM encapsulation failed: {:?}", e))?;
 
         // 3. Combine via HKDF.
-        let shared_secret = HybridSecretKey::combine_secrets(
-            x25519_shared.as_bytes(),
-            ml_kem_shared.as_slice(),
-        )?;
+        let shared_secret =
+            HybridSecretKey::combine_secrets(x25519_shared.as_bytes(), ml_kem_shared.as_slice())?;
 
         let ciphertext = HybridCiphertext {
             x25519_pk: *ephemeral_pk.as_bytes(),
@@ -187,7 +178,10 @@ mod tests {
         let (sk, pk) = HybridSecretKey::generate();
         let (ss_send, ct) = pk.encapsulate().expect("encap");
         let ss_recv = sk.decapsulate(&ct).expect("decap");
-        assert_eq!(ss_send, ss_recv, "encap/decap must agree on the shared secret");
+        assert_eq!(
+            ss_send, ss_recv,
+            "encap/decap must agree on the shared secret"
+        );
     }
 
     #[test]

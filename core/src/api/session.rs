@@ -4,19 +4,22 @@
 //! automatic send queuing during handshake. This is the transport-level
 //! API that sits below MLS and above the raw UDP/TCP transport.
 
-use crate::errors::CoreError;
 use crate::crypto::hybrid_sign::HybridVerifyingKey;
+use crate::errors::CoreError;
 use crate::runtime::{Runtime, TokioRuntime};
-use crate::transport::handshake::{HandshakeClient, ServerHello, HelloRetryRequest};
+use crate::transport::handshake::{HandshakeClient, HelloRetryRequest, ServerHello};
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::session::Session;
-use crate::transport::types::{VersionedPacket, SessionId, PacketHeader, PacketFlags, PhantomPacketV1, StreamId as TransportStreamId};
 use crate::transport::stream::Stream;
-use tokio::sync::{mpsc, oneshot, Mutex};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
-use dashmap::DashMap;
+use crate::transport::types::{
+    PacketFlags, PacketHeader, PhantomPacketV1, SessionId, StreamId as TransportStreamId,
+    VersionedPacket,
+};
 use bytes::Bytes;
+use dashmap::DashMap;
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 /// Generate a fresh 128-bit session identifier from the thread-local CSPRNG.
 ///
@@ -222,8 +225,17 @@ impl PhantomSession {
         // and natural shutdown comes via `SessionCommand::Close`.
         let runtime_for_pump = runtime.clone();
         let _detached = runtime.spawn(Box::pin(Self::background_task(
-            state, send_queue, cmd_tx, cmd_rx, recv_tx, transport, peer,
-            demux, streams, expected_server_key, runtime_for_pump,
+            state,
+            send_queue,
+            cmd_tx,
+            cmd_rx,
+            recv_tx,
+            transport,
+            peer,
+            demux,
+            streams,
+            expected_server_key,
+            runtime_for_pump,
         )));
 
         session
@@ -283,8 +295,16 @@ impl PhantomSession {
         let next_app_seq = Arc::new(AtomicU32::new(1));
         let runtime_for_pump = runtime.clone();
         let _detached = runtime.spawn(Box::pin(run_data_pump(
-            server_session, session_id, Arc::new(transport),
-            state, send_queue, cmd_rx, recv_tx, demux, streams, next_app_seq,
+            server_session,
+            session_id,
+            Arc::new(transport),
+            state,
+            send_queue,
+            cmd_rx,
+            recv_tx,
+            demux,
+            streams,
+            next_app_seq,
             runtime_for_pump,
         )));
 
@@ -311,7 +331,10 @@ impl PhantomSession {
         let handshake = match HandshakeClient::new() {
             Ok(h) => h,
             Err(e) => {
-                log::error!("PhantomSession: failed to initialize handshake client: {}", e);
+                log::error!(
+                    "PhantomSession: failed to initialize handshake client: {}",
+                    e
+                );
                 state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
                 return;
             }
@@ -365,23 +388,25 @@ impl PhantomSession {
             }
         };
 
-        let crypto_session = match handshake.process_server_hello(
-            &hello,
-            &server_hello,
-            Some(&expected_server_key),
-        ) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                log::error!("PhantomSession: handshake failed: {:?}", e);
-                state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
-                return;
-            }
-        };
+        let crypto_session =
+            match handshake.process_server_hello(&hello, &server_hello, Some(&expected_server_key))
+            {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    log::error!("PhantomSession: handshake failed: {:?}", e);
+                    state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
+                    return;
+                }
+            };
         log::info!("PhantomSession: Handshake complete — hybrid channel ready");
 
         let session_id = *crypto_session.id();
         state.store(ConnectionState::Connected as u8, Ordering::Relaxed);
-        log::info!("PhantomSession: fully connected to {} (stage: {:?})", peer, handshake.stage());
+        log::info!(
+            "PhantomSession: fully connected to {} (stage: {:?})",
+            peer,
+            handshake.stage()
+        );
 
         let next_app_seq = Arc::new(AtomicU32::new(1));
         run_data_pump(
@@ -488,7 +513,9 @@ async fn run_data_pump<T: SessionTransport>(
                 if let Some(stream) = streams_recv.get(&stream_id) {
                     stream.ack(packet.header.sequence).await;
                 }
-                demux_recv.route_ack_async(stream_id, packet.header.sequence).await;
+                demux_recv
+                    .route_ack_async(stream_id, packet.header.sequence)
+                    .await;
                 if packet.header.flags.is_fin() {
                     demux_recv.route_close_async(stream_id).await;
                 }
@@ -534,9 +561,7 @@ async fn run_data_pump<T: SessionTransport>(
                 // to live here was the largest per-packet allocation on the
                 // recv hot path (Phase 2.2 in PRODUCTION_READINESS.md).
                 let bytes = Bytes::from(plaintext);
-                demux_recv
-                    .route_data_async(stream_id, bytes.clone())
-                    .await;
+                demux_recv.route_data_async(stream_id, bytes.clone()).await;
                 if recv_tx_for_task.send(bytes).await.is_err() {
                     break;
                 }
@@ -749,11 +774,14 @@ impl PhantomSession {
     pub fn open_stream(&self) -> Arc<crate::api::stream::PhantomStream> {
         let handle = self.demux.open_stream(1024);
         let stream_id = handle.stream_id;
-        
+
         let transport_stream = Arc::new(Stream::new(stream_id as TransportStreamId));
         self.streams.insert(stream_id, transport_stream);
-        
-        Arc::new(crate::api::stream::PhantomStream::new(handle, self.cmd_tx.clone()))
+
+        Arc::new(crate::api::stream::PhantomStream::new(
+            handle,
+            self.cmd_tx.clone(),
+        ))
     }
 
     /// Send data through the session.
@@ -876,8 +904,8 @@ impl std::fmt::Debug for PhantomSession {
 
 #[cfg(test)]
 mod tests {
-    use crate::transport::handshake::{HandshakeServer, HandshakeResponse, ClientHello};
     use super::*;
+    use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
 
     // ── Mock transport for testing ──
 
@@ -893,8 +921,14 @@ mod tests {
             let (a_tx, b_rx) = mpsc::channel(64);
             let (b_tx, a_rx) = mpsc::channel(64);
             (
-                Self { tx: a_tx, rx: Mutex::new(a_rx) },
-                Self { tx: b_tx, rx: Mutex::new(b_rx) },
+                Self {
+                    tx: a_tx,
+                    rx: Mutex::new(a_rx),
+                },
+                Self {
+                    tx: b_tx,
+                    rx: Mutex::new(b_rx),
+                },
             )
         }
     }
@@ -1058,7 +1092,10 @@ mod tests {
                         match resp2 {
                             HandshakeResponse::Success(server_hello, session) => {
                                 let server_hello_bytes = borsh::to_vec(&server_hello).unwrap();
-                                server_transport.send_bytes(&server_hello_bytes).await.unwrap();
+                                server_transport
+                                    .send_bytes(&server_hello_bytes)
+                                    .await
+                                    .unwrap();
                                 break session;
                             }
                             _ => panic!("Expected success after retry"),
@@ -1066,7 +1103,10 @@ mod tests {
                     }
                     HandshakeResponse::Success(server_hello, session) => {
                         let server_hello_bytes = borsh::to_vec(&server_hello).unwrap();
-                        server_transport.send_bytes(&server_hello_bytes).await.unwrap();
+                        server_transport
+                            .send_bytes(&server_hello_bytes)
+                            .await
+                            .unwrap();
                         break session;
                     }
                     HandshakeResponse::Fail(e) => panic!("handshake failed: {:?}", e),
@@ -1078,7 +1118,9 @@ mod tests {
             // 3. Receive the flushed early data — must be ENCRYPTED.
             let early_frame = server_transport.recv_bytes().await.unwrap();
             assert!(
-                !early_frame.windows(b"early-data".len()).any(|w| w == b"early-data"),
+                !early_frame
+                    .windows(b"early-data".len())
+                    .any(|w| w == b"early-data"),
                 "encrypted frame must not contain plaintext early-data"
             );
             let early_plain = decrypt_incoming(&server_session, &early_frame);

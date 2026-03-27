@@ -447,7 +447,8 @@ impl BandwidthEstimator {
                 // Exit FastRecovery when inflight drops below BDP (pipe drained)
                 // or after one min_rtt has elapsed with no new losses
                 let bdp = self.bdp();
-                let should_exit = self.inflight_bytes <= (bdp as f64 * FAST_RECOVERY_EXIT_FRACTION) as u64
+                let should_exit = self.inflight_bytes
+                    <= (bdp as f64 * FAST_RECOVERY_EXIT_FRACTION) as u64
                     || bdp == 0;
 
                 if should_exit {
@@ -558,8 +559,11 @@ mod tests {
         }
 
         // Should have positive bandwidth estimate
-        assert!(est.bottleneck_bandwidth() > 0,
-            "btl_bw = {} should be > 0", est.bottleneck_bandwidth());
+        assert!(
+            est.bottleneck_bandwidth() > 0,
+            "btl_bw = {} should be > 0",
+            est.bottleneck_bandwidth()
+        );
         assert_eq!(est.delivered_bytes(), 14_000);
     }
 
@@ -575,8 +579,11 @@ mod tests {
 
         let s2 = make_sample(now + Duration::from_millis(200), 5, 1400);
         est.on_ack(s2);
-        assert!(est.min_rtt() <= Duration::from_millis(6),
-            "min_rtt = {:?}", est.min_rtt());
+        assert!(
+            est.min_rtt() <= Duration::from_millis(6),
+            "min_rtt = {:?}",
+            est.min_rtt()
+        );
     }
 
     #[test]
@@ -596,7 +603,12 @@ mod tests {
         let est = BandwidthEstimator::new();
         // Even with zero BW, CWND should have a minimum floor
         let cwnd = est.cwnd();
-        assert!(cwnd >= 4 * 1400, "cwnd = {} should be >= {}", cwnd, 4 * 1400);
+        assert!(
+            cwnd >= 4 * 1400,
+            "cwnd = {} should be >= {}",
+            cwnd,
+            4 * 1400
+        );
     }
 
     #[test]
@@ -615,7 +627,9 @@ mod tests {
         // After enough rounds with no BW growth, should exit startup
         assert!(
             est.state() != BbrState::Startup || est.round_count < 20,
-            "expected startup exit, state = {:?}, rounds = {}", est.state(), est.round_count
+            "expected startup exit, state = {:?}, rounds = {}",
+            est.state(),
+            est.round_count
         );
     }
 
@@ -677,9 +691,12 @@ mod tests {
         }
 
         // BW should NOT have decreased
-        assert!(est.bottleneck_bandwidth() >= real_bw,
+        assert!(
+            est.bottleneck_bandwidth() >= real_bw,
             "BW should not decrease from app-limited samples: {} < {}",
-            est.bottleneck_bandwidth(), real_bw);
+            est.bottleneck_bandwidth(),
+            real_bw
+        );
     }
 
     #[test]
@@ -702,9 +719,13 @@ mod tests {
             est.on_ack(make_sample(sent, 10, 1400));
             // Should still be in Drain (inflight > BDP)
             if est.inflight_bytes > est.bdp() {
-                assert_eq!(est.state(), BbrState::Drain,
+                assert_eq!(
+                    est.state(),
+                    BbrState::Drain,
                     "should stay in Drain while inflight ({}) > BDP ({})",
-                    est.inflight_bytes, est.bdp());
+                    est.inflight_bytes,
+                    est.bdp()
+                );
             }
         }
     }
@@ -734,8 +755,12 @@ mod tests {
         // Force ProbeRTT state
         est.state = BbrState::ProbeRTT;
         let cwnd = est.cwnd();
-        assert_eq!(cwnd, PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE,
-            "ProbeRTT CWND should be {} (4 packets), got {}", 
-            PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE, cwnd);
+        assert_eq!(
+            cwnd,
+            PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE,
+            "ProbeRTT CWND should be {} (4 packets), got {}",
+            PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE,
+            cwnd
+        );
     }
 }

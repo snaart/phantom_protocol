@@ -227,7 +227,7 @@ mod tests {
         let mut w = ReplayWindow::new();
         assert!(w.accept(5));
         assert!(w.accept(10)); // shifts by 5
-        // 5 should still be marked (bit 5 of word 0).
+                               // 5 should still be marked (bit 5 of word 0).
         assert!(!w.accept(5));
         assert!(!w.accept(10));
     }

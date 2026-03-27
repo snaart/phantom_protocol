@@ -134,7 +134,10 @@ fn cookie_equality_smoke_via_subtle() {
     let mut c = [0x42u8; 32];
     c[31] ^= 1;
     assert!(bool::from(a.ct_eq(&b)), "equal cookies must compare equal");
-    assert!(!bool::from(a.ct_eq(&c)), "different cookies must compare unequal");
+    assert!(
+        !bool::from(a.ct_eq(&c)),
+        "different cookies must compare unequal"
+    );
 }
 
 /// Server identity mismatch (the Vuln-1 fix from the May 2026 review) must
@@ -186,7 +189,11 @@ fn server_identity_mismatch_aborts_handshake() {
 fn aead_invocations_counter_increments_per_op() {
     let secret = [0xC3u8; 32];
     let session = CryptoSession::with_suite(&secret, CipherSuite::Aes256Gcm).expect("session");
-    assert_eq!(session.send_invocations(), 0, "fresh session has zero count");
+    assert_eq!(
+        session.send_invocations(),
+        0,
+        "fresh session has zero count"
+    );
     let _ = session.encrypt(&[], b"first").expect("encrypt 1");
     assert_eq!(session.send_invocations(), 1);
     let _ = session.encrypt(&[], b"second").expect("encrypt 2");
@@ -268,7 +275,9 @@ fn replay_window_rejects_duplicate_sequence() {
         PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
 
-    let ct = client.encrypt_packet(&header, b"some-payload").expect("encrypt");
+    let ct = client
+        .encrypt_packet(&header, b"some-payload")
+        .expect("encrypt");
 
     // First decrypt accepted.
     let _ = server.decrypt_packet(&header, &ct).expect("first decrypt");
@@ -343,14 +352,20 @@ fn v2_tampered_epoch_or_path_id_is_rejected() {
         .expect("encrypt");
 
     // Mutate epoch.
-    let tampered_epoch = PacketHeaderV2 { epoch: 6, ..real_header };
+    let tampered_epoch = PacketHeaderV2 {
+        epoch: 6,
+        ..real_header
+    };
     assert!(server.decrypt_packet_v2(&tampered_epoch, &ct).is_err());
 
     // Re-encrypt fresh so the AEAD recv counter aligns, then mutate path_id.
     let ct2 = client
         .encrypt_packet_v2(&real_header, b"path-bound payload")
         .expect("re-encrypt");
-    let tampered_path = PacketHeaderV2 { path_id: 7, ..real_header };
+    let tampered_path = PacketHeaderV2 {
+        path_id: 7,
+        ..real_header
+    };
     assert!(server.decrypt_packet_v2(&tampered_path, &ct2).is_err());
 }
 
@@ -400,7 +415,9 @@ fn v2_replay_window_rejects_duplicate_sequence() {
         PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
     );
     let ct1 = client.encrypt_packet_v2(&header, b"payload").expect("e1");
-    server.decrypt_packet_v2(&header, &ct1).expect("first decrypt");
+    server
+        .decrypt_packet_v2(&header, &ct1)
+        .expect("first decrypt");
     assert_eq!(server.replay_rejected_total(), 0);
 
     let ct2 = client.encrypt_packet_v2(&header, b"payload").expect("e2");
@@ -485,7 +502,9 @@ fn rekey_changes_keys_and_breaks_old_ciphertexts() {
     // The OLD ciphertext must NOT authenticate under the new keys.
     let header_epoch1 = PacketHeaderV2 { epoch: 1, ..header };
     assert!(
-        server.decrypt_packet_v2(&header_epoch1, &ct_epoch0).is_err(),
+        server
+            .decrypt_packet_v2(&header_epoch1, &ct_epoch0)
+            .is_err(),
         "post-rekey CryptoState must reject pre-rekey ciphertext"
     );
 
@@ -631,8 +650,7 @@ fn versioned_packet_v1_roundtrip_preserves_header() {
     );
     let packet = PhantomPacketV1::new(header, vec![1, 2, 3, 4, 5]).into_versioned();
     let mut buf = Vec::new();
-    let (size, _) =
-        alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+    let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
     let decoded = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&buf[..size])
         .expect("round-trip decode");
     let v1 = decoded.into_v1().expect("v1");

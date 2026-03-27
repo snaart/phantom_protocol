@@ -42,8 +42,8 @@
 #![cfg(target_arch = "wasm32")]
 #![allow(unsafe_code)] // wasm-bindgen generates `unsafe` JS-boundary glue
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use js_sys::Uint8Array;
@@ -194,9 +194,7 @@ impl WebSocketLeg {
                     break;
                 }
                 if let Err(e) = ws.send_with_u8_array(&bytes) {
-                    web_sys::console::warn_1(
-                        &format!("WebSocketLeg send failed: {:?}", e).into(),
-                    );
+                    web_sys::console::warn_1(&format!("WebSocketLeg send failed: {:?}", e).into());
                     closed_send.store(true, Ordering::Release);
                     break;
                 }
@@ -208,9 +206,7 @@ impl WebSocketLeg {
         // Block until the open handshake resolves.
         open_rx
             .await
-            .map_err(|_| {
-                CoreError::NetworkError("WebSocket open signal lost".into())
-            })??;
+            .map_err(|_| CoreError::NetworkError("WebSocket open signal lost".into()))??;
 
         Ok(Self {
             send_tx,
