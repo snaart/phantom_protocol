@@ -3,20 +3,20 @@
 //! Unified socket abstraction over multiple transport legs.
 //! Routes packets through the scheduler, handles fallback.
 
+use crate::transport::bandwidth_estimator;
 use crate::transport::{
-    types::{LegType, SchedulerMode},
+    fallback::{FallbackStateMachine, TransportMode},
     legs::TransportLeg,
     scheduler::Scheduler,
-    fallback::{FallbackStateMachine, TransportMode},
+    types::{LegType, SchedulerMode},
 };
-use crate::transport::bandwidth_estimator;
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, mpsc};
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 /// Virtual socket configuration
 #[derive(Debug, Clone)]
@@ -71,7 +71,7 @@ impl VirtualSocket {
         fallback: Arc<FallbackStateMachine>,
     ) -> Self {
         let (recv_tx, recv_rx) = mpsc::channel(config.recv_buffer_size as usize);
-        
+
         Self {
             config,
             legs: RwLock::new(HashMap::new()),
@@ -86,9 +86,7 @@ impl VirtualSocket {
 
     /// Create with default configuration
     pub fn with_defaults() -> Self {
-        let scheduler = Arc::new(Scheduler::new(
-            SchedulerMode::LowLatency,
-        ));
+        let scheduler = Arc::new(Scheduler::new(SchedulerMode::LowLatency));
         let fallback = Arc::new(FallbackStateMachine::with_defaults());
         Self::new(VirtualSocketConfig::default(), scheduler, fallback)
     }
@@ -112,12 +110,12 @@ impl VirtualSocket {
     }
 
     /// Send data through the virtual socket
-    /// 
+    ///
     /// The scheduler selects the optimal path(s).
     pub async fn send(&self, data: Bytes, is_priority: bool) -> io::Result<()> {
         // Allow one fallback retry
         const MAX_FALLBACK_ATTEMPTS: u8 = 2;
-        
+
         for attempt in 0..MAX_FALLBACK_ATTEMPTS {
             if self.is_closed() {
                 return Err(io::Error::new(io::ErrorKind::NotConnected, "Socket closed"));
@@ -125,14 +123,17 @@ impl VirtualSocket {
 
             // Select paths via scheduler
             let paths = self.scheduler.select_paths(is_priority);
-            
+
             if paths.is_empty() {
                 // Check for fallback on first attempt
                 if attempt == 0 && self.config.auto_fallback {
                     self.fallback.check_and_fallback();
                     continue; // Retry with new mode
                 }
-                return Err(io::Error::new(io::ErrorKind::NotConnected, "No available paths"));
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "No available paths",
+                ));
             }
 
             let legs = self.legs.read().await;
@@ -142,22 +143,22 @@ impl VirtualSocket {
             for leg_type in paths {
                 if let Some(leg) = legs.get(&leg_type) {
                     self.fallback.metrics().record_sent();
-                    
+
                     match leg.send(data.clone()).await {
                         Ok(()) => {
                             self.fallback.metrics().record_success();
                             self.scheduler.record_sent(leg_type, data.len() as u64);
-                            
+
                             // Update RTT from leg
                             self.scheduler.update_rtt(leg_type, leg.rtt_ms());
-                            
+
                             send_succeeded = true;
                             break;
                         }
                         Err(e) => {
                             self.fallback.metrics().record_failure();
                             last_error = Some(e);
-                            
+
                             // Mark path as potentially unavailable
                             if leg.loss_percent() > 50 {
                                 self.scheduler.set_path_available(leg_type, false);
@@ -177,12 +178,14 @@ impl VirtualSocket {
                 continue;
             }
 
-            return Err(last_error.unwrap_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "All paths failed")
-            }));
+            return Err(last_error
+                .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "All paths failed")));
         }
 
-        Err(io::Error::new(io::ErrorKind::Other, "Max fallback attempts reached"))
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Max fallback attempts reached",
+        ))
     }
 
     /// Receive data from the virtual socket
@@ -192,10 +195,10 @@ impl VirtualSocket {
         }
 
         let mut rx = self.recv_rx.lock().await;
-        
-        rx.recv().await.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "Channel closed")
-        })
+
+        rx.recv()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "Channel closed"))
     }
 
     /// Try to receive without blocking
@@ -206,7 +209,10 @@ impl VirtualSocket {
 
     /// Start background receive loop for a leg
     pub async fn start_recv_loop(&self, leg_type: LegType) -> io::Result<()> {
-        let leg = self.legs.read().await
+        let leg = self
+            .legs
+            .read()
+            .await
             .get(&leg_type)
             .cloned()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Leg not found"))?;
@@ -217,7 +223,7 @@ impl VirtualSocket {
         let fallback = self.fallback.clone();
         // Clone the AtomicBool into an Arc so we can move it into the spawned task
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(
-            self.closed.load(std::sync::atomic::Ordering::Relaxed)
+            self.closed.load(std::sync::atomic::Ordering::Relaxed),
         ));
 
         tokio::spawn(async move {
@@ -235,15 +241,20 @@ impl VirtualSocket {
 
                         // Update RTT
                         scheduler.update_rtt(leg_type, leg.rtt_ms());
-                        
+
                         // Detect ACKs for BBR feedback; update the leg-specific estimator.
                         // Each leg maintains independent BBR state so that different network
                         // paths (LTE, Wi-Fi, TCP) don't corrupt each other's bandwidth estimate.
                         if data.len() >= crate::transport::types::PacketHeader::SIZE {
                             let flags = data[38]; // flags byte is always at offset 38
-                            if (flags & 0b0000_0010) != 0 { // PacketFlags::ACK
-                                let mut ests: tokio::sync::MutexGuard<'_, HashMap<LegType, bandwidth_estimator::BandwidthEstimator>> = estimators.lock().await;
-                                let est = ests.entry(leg_type)
+                            if (flags & 0b0000_0010) != 0 {
+                                // PacketFlags::ACK
+                                let mut ests: tokio::sync::MutexGuard<
+                                    '_,
+                                    HashMap<LegType, bandwidth_estimator::BandwidthEstimator>,
+                                > = estimators.lock().await;
+                                let est = ests
+                                    .entry(leg_type)
                                     .or_insert_with(bandwidth_estimator::BandwidthEstimator::new);
                                 // Read ack_delay from packet header (bytes 39..41, little-endian u16)
                                 let ack_delay_us = if data.len() >= 41 {
@@ -253,7 +264,8 @@ impl VirtualSocket {
                                 };
                                 let sample = bandwidth_estimator::DeliverySample {
                                     delivered_bytes: 0,
-                                    sent_at: Instant::now() - Duration::from_millis(leg.rtt_ms() as u64),
+                                    sent_at: Instant::now()
+                                        - Duration::from_millis(leg.rtt_ms() as u64),
                                     acked_at: Instant::now(),
                                     packet_bytes: data.len() as u64,
                                     is_app_limited: false,
@@ -262,7 +274,7 @@ impl VirtualSocket {
                                 est.on_ack(sample);
                             }
                         }
-                        
+
                         if tx.send(data).await.is_err() {
                             break; // Receiver dropped
                         }
@@ -296,14 +308,15 @@ impl VirtualSocket {
 
     /// Close the virtual socket
     pub async fn close(&self) -> io::Result<()> {
-        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
-        
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
         // Close all legs
         let legs = self.legs.write().await;
         for (_, leg) in legs.iter() {
             let _ = leg.close().await;
         }
-        
+
         Ok(())
     }
 
@@ -324,7 +337,7 @@ impl VirtualSocket {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                
+
                 if socket.is_closed() {
                     break;
                 }
@@ -333,7 +346,7 @@ impl VirtualSocket {
                     let legs = socket.legs.read().await;
                     if let Some(leg) = legs.get(&LegType::Kcp) {
                         socket.fallback.record_probe();
-                        
+
                         // Send a dummy probe packet (40 bytes of zeros)
                         // Peer will receive it, and its recv_loop will trigger their upgrade
                         let probe = Bytes::from(vec![0u8; 40]);
@@ -362,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn test_virtual_socket_creation() {
         let socket = VirtualSocket::with_defaults();
-        
+
         assert!(!socket.is_closed());
         assert_eq!(socket.current_mode(), TransportMode::Turbo);
         assert!(socket.available_legs().await.is_empty());

@@ -3,29 +3,29 @@
 //! Virtual association that persists across IP changes.
 //! Manages streams, encryption state, and multi-path scheduling.
 
+use crate::crypto::adaptive_crypto::CryptoSession;
+use crate::errors::CoreError;
+use crate::security::ReplayWindow;
 use crate::transport::{
+    bandwidth_estimator::{BandwidthEstimator, DeliverySample},
+    fallback::FallbackStateMachine,
+    pacer::Pacer,
+    path::{PathRegistry, PathStateKind, PATH_CHALLENGE_LEN},
+    scheduler::Scheduler,
+    stream::Stream,
     types::{
         ControlMessage, PacketHeader, PacketHeaderV2, PhantomPacket, SchedulerMode, SessionId,
         StreamId,
     },
-    stream::Stream,
-    scheduler::Scheduler,
-    fallback::FallbackStateMachine,
-    path::{PathRegistry, PathStateKind, PATH_CHALLENGE_LEN},
-    pacer::Pacer,
-    bandwidth_estimator::{BandwidthEstimator, DeliverySample},
 };
-use crate::crypto::adaptive_crypto::{CryptoSession};
-use crate::errors::CoreError;
-use crate::security::ReplayWindow;
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Instant, Duration};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Session state machine
@@ -70,7 +70,7 @@ impl CryptoState {
         // Derive additional session keys using HKDF
         let hk = hkdf::Hkdf::<sha2::Sha256>::from_prk(shared_secret)
             .map_err(|_| CoreError::CryptoError("HKDF PRK failed".into()))?;
-        
+
         let mut key_bytes = [0u8; 32];
         hk.expand(b"phantom-transport-key", &mut key_bytes)
             .map_err(|_| CoreError::KeyDerivationError)?;
@@ -83,13 +83,15 @@ impl CryptoState {
 
     /// Encrypt data
     pub fn encrypt(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CoreError> {
-        self.session.encrypt(aad, plaintext)
+        self.session
+            .encrypt(aad, plaintext)
             .map_err(|e| CoreError::CryptoError(e.to_string()))
     }
 
     /// Decrypt data
     pub fn decrypt(&self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CoreError> {
-        self.session.decrypt(aad, ciphertext)
+        self.session
+            .decrypt(aad, ciphertext)
             .map_err(|e| CoreError::CryptoError(e.to_string()))
     }
 
@@ -210,7 +212,11 @@ pub struct Session {
 
 impl Session {
     /// Create a new session with given shared secret
-    pub fn new(session_id: SessionId, shared_secret: &[u8; 32], peer_side: bool) -> Result<Self, CoreError> {
+    pub fn new(
+        session_id: SessionId,
+        shared_secret: &[u8; 32],
+        peer_side: bool,
+    ) -> Result<Self, CoreError> {
         let crypto = CryptoState::new(shared_secret, peer_side)?;
         let path_registry = Arc::new(PathRegistry::new());
         // Pre-register `path_id = 0` as the implicit default path — the
@@ -282,7 +288,11 @@ impl Session {
     }
 
     /// Resume a session using resumption secret (0-RTT)
-    pub fn resume(session_id: SessionId, resumption_secret: &[u8; 32], peer_side: bool) -> Result<Self, CoreError> {
+    pub fn resume(
+        session_id: SessionId,
+        resumption_secret: &[u8; 32],
+        peer_side: bool,
+    ) -> Result<Self, CoreError> {
         let crypto = CryptoState::new(resumption_secret, peer_side)?;
         let path_registry = Arc::new(PathRegistry::new());
         path_registry.register_validated(0);
@@ -330,7 +340,7 @@ impl Session {
     pub fn open_stream(&self) -> Arc<Stream> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::SeqCst) as StreamId;
         let stream = Arc::new(Stream::new(stream_id));
-        
+
         self.streams.write().insert(stream_id, stream.clone());
         stream
     }
@@ -351,7 +361,11 @@ impl Session {
     }
 
     /// Encrypt a packet payload
-    pub fn encrypt_packet(&self, header: &PacketHeader, plaintext: &[u8]) -> Result<Vec<u8>, CoreError> {
+    pub fn encrypt_packet(
+        &self,
+        header: &PacketHeader,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CoreError> {
         let mut header_bytes = Vec::new();
         alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
         self.crypto.load().encrypt(&header_bytes, plaintext)
@@ -371,7 +385,11 @@ impl Session {
     ///
     /// The window check runs **after** successful AEAD verification so we
     /// never key off un-authenticated sequence numbers.
-    pub fn decrypt_packet(&self, header: &PacketHeader, ciphertext: &[u8]) -> Result<Vec<u8>, CoreError> {
+    pub fn decrypt_packet(
+        &self,
+        header: &PacketHeader,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, CoreError> {
         let mut header_bytes = Vec::new();
         alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
         let plaintext = self.crypto.load().decrypt(&header_bytes, ciphertext)?;
@@ -696,7 +714,11 @@ impl Session {
     }
 
     /// Create a control packet
-    pub fn create_control_packet(&self, _message: ControlMessage, payload: Vec<u8>) -> PhantomPacket {
+    pub fn create_control_packet(
+        &self,
+        _message: ControlMessage,
+        payload: Vec<u8>,
+    ) -> PhantomPacket {
         let seq = self.control_sequence.fetch_add(1, Ordering::SeqCst);
         let header = PacketHeader::control(self.id, seq);
         // Note: Real implementation would also encrypt control packet
@@ -751,9 +773,7 @@ pub struct BandwidthSnapshot {
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Session")
-            .field("id", &self.id)
-            .finish()
+        f.debug_struct("Session").field("id", &self.id).finish()
     }
 }
 

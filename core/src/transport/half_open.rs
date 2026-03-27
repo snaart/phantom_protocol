@@ -6,7 +6,7 @@
 
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default TTL for half-open handshake slots (2 seconds).
 const DEFAULT_TTL: Duration = Duration::from_secs(2);
@@ -139,7 +139,8 @@ impl<T> HalfOpenSlots<T> {
     pub fn gc(&self) {
         let now = Self::now_ms();
         let ttl_ms = self.ttl.as_millis() as u64;
-        self.slots.retain(|_, entry| now <= entry.created_at_ms + ttl_ms);
+        self.slots
+            .retain(|_, entry| now <= entry.created_at_ms + ttl_ms);
     }
 }
 

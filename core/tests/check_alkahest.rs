@@ -9,10 +9,10 @@ fn test_header_size() {
         flags: PacketFlags(0),
         ack_delay: 0,
     };
-    
+
     let mut buf = Vec::new();
     let (size, _) = alkahest::serialize_to_vec::<PacketHeader, _>(&header, &mut buf);
-    
+
     // PhantomPacket header should be compact
     assert!(size > 0, "Header size should be non-zero");
     assert!(size < 256, "Header should be compact, got {} bytes", size);

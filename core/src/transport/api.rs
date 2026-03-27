@@ -7,7 +7,7 @@
 //! - Connection migration and fallback
 //!
 //! # Quick Start
-//! 
+//!
 //! ```rust,ignore
 //! use phantom_core::transport::api::*;
 //!
@@ -24,31 +24,20 @@
 //! ```
 
 // Re-export core types
-pub use crate::transport::types::{SessionId, PacketHeader, PacketFlags, LegType, SchedulerMode};
-pub use crate::transport::session::{Session, CryptoState};
 pub use crate::transport::scheduler::Scheduler;
+pub use crate::transport::session::{CryptoState, Session};
 pub use crate::transport::stream::Stream;
+pub use crate::transport::types::{LegType, PacketFlags, PacketHeader, SchedulerMode, SessionId};
 
 // Re-export Handshake
 pub use crate::transport::handshake::{
-    HandshakeServer,
-    HandshakeClient, 
-    ClientHello,
-    ServerHello,
-    HandshakeError,
+    ClientHello, HandshakeClient, HandshakeError, HandshakeServer, ServerHello,
 };
 
 // Re-export crypto primitives
-pub use crate::crypto::hybrid_kem::{
-    HybridSecretKey,
-    HybridKeyPackage,
-    HybridCiphertext,
-};
+pub use crate::crypto::hybrid_kem::{HybridCiphertext, HybridKeyPackage, HybridSecretKey};
 pub use crate::crypto::hybrid_sign::{
-    HybridSigningKey,
-    HybridVerifyingKey,
-    HybridSignature,
-    HybridSignError,
+    HybridSignError, HybridSignature, HybridSigningKey, HybridVerifyingKey,
 };
 
 /// Configuration for Phantom transport
@@ -83,7 +72,7 @@ impl TransportConfig {
             ..Default::default()
         }
     }
-    
+
     /// Create a config optimized for high throughput
     pub fn high_throughput() -> Self {
         Self {
@@ -91,7 +80,7 @@ impl TransportConfig {
             ..Default::default()
         }
     }
-    
+
     /// Create a config for stealth operation
     pub fn stealth() -> Self {
         Self {
@@ -116,38 +105,41 @@ impl PhantomBuilder {
             server_key: None,
         }
     }
-    
+
     /// Set configuration
     pub fn config(mut self, config: TransportConfig) -> Self {
         self.config = config;
         self
     }
-    
+
     /// Pin a server's public key for verification (TOFU alternative)
     pub fn pin_server_key(mut self, key: HybridVerifyingKey) -> Self {
         self.server_key = Some(key);
         self
     }
-    
+
     /// Get the expected server key
     pub fn server_key(&self) -> Option<&HybridVerifyingKey> {
         self.server_key.as_ref()
     }
-    
+
     /// Get the configuration
     pub fn get_config(&self) -> &TransportConfig {
         &self.config
     }
-    
+
     /// Initiate a PQC handshake as client. Returns an error if the OS RNG
     /// cannot be read.
-    pub fn create_client_handshake(&self) -> Result<HandshakeClient, crate::transport::handshake::HandshakeError> {
+    pub fn create_client_handshake(
+        &self,
+    ) -> Result<HandshakeClient, crate::transport::handshake::HandshakeError> {
         HandshakeClient::new()
     }
 
     /// Create a server handshake handler. Returns an error if RNG / keygen
     /// fails.
-    pub fn create_server_handshake() -> Result<HandshakeServer, crate::transport::handshake::HandshakeError> {
+    pub fn create_server_handshake(
+    ) -> Result<HandshakeServer, crate::transport::handshake::HandshakeError> {
         HandshakeServer::new()
     }
 }
@@ -161,35 +153,36 @@ impl Default for PhantomBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_config_presets() {
         let low_lat = TransportConfig::low_latency();
         assert!(matches!(low_lat.scheduler_mode, SchedulerMode::LowLatency));
-        
+
         let high_throughput = TransportConfig::high_throughput();
-        assert!(matches!(high_throughput.scheduler_mode, SchedulerMode::HighThroughput));
-        
+        assert!(matches!(
+            high_throughput.scheduler_mode,
+            SchedulerMode::HighThroughput
+        ));
+
         let stealth = TransportConfig::stealth();
         assert!(stealth.stealth_mode);
         assert!(matches!(stealth.scheduler_mode, SchedulerMode::Stealth));
     }
-    
+
     #[test]
     fn test_builder_flow() {
-        let builder = PhantomBuilder::new()
-            .config(TransportConfig::stealth());
-        
+        let builder = PhantomBuilder::new().config(TransportConfig::stealth());
+
         assert!(builder.get_config().stealth_mode);
-        
+
         // Create handshake components
         let client_hs = builder
             .create_client_handshake()
             .expect("create_client_handshake");
         let _client_hello = client_hs.create_client_hello();
 
-        let server_hs =
-            PhantomBuilder::create_server_handshake().expect("create_server_handshake");
+        let server_hs = PhantomBuilder::create_server_handshake().expect("create_server_handshake");
         let _server_pk = server_hs.verifying_key();
     }
 }

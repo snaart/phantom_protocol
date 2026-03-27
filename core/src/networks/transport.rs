@@ -1,10 +1,12 @@
-use tokio::io::{AsyncRead, AsyncWrite};
 use std::net::SocketAddr;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Универсальный транспорт.
 /// Это может быть TCP, QUIC Stream, WebSocket, Serial Port или Bluetooth.
 pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static {
-    fn remote_addr(&self) -> Option<SocketAddr> { None }
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        None
+    }
 }
 
 // Псевдоним для удобства использования в Box
@@ -25,8 +27,7 @@ impl<T: Transport> Transport for tokio_rustls::client::TlsStream<T> {
 }
 
 // 3. TLS Server Stream
-impl<T: Transport> Transport for tokio_rustls::server::TlsStream<T> {
-}
+impl<T: Transport> Transport for tokio_rustls::server::TlsStream<T> {}
 
 // --- Заготовка для UDP (QUIC) ---
 // В будущем сюда добавится реализация для quinn::SendStream + RecvStream

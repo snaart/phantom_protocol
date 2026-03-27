@@ -358,9 +358,9 @@ mod tests {
         r.register(1);
         let _ = r.issue_challenge(1);
         assert!(!r.verify_response(1, &[0u8; 16])); // wrong length
-        // The path remains in Validating — short response is not a
-        // failed validation, it's a malformed packet that doesn't even
-        // get to the equality check.
+                                                    // The path remains in Validating — short response is not a
+                                                    // failed validation, it's a malformed packet that doesn't even
+                                                    // get to the equality check.
         assert_eq!(r.state(1), Some(PathStateKind::Validating));
     }
 

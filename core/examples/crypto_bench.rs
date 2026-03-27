@@ -1,12 +1,12 @@
 //! Focused encryption-only benchmark.
 //! Measures raw ring AES-256-GCM speed with zero allocation overhead.
 
-use std::time::Instant;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
+use std::time::Instant;
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║      CRYPTO MICROBENCHMARK: ring AES-GCM vs ChaCha20        ║");
+    println!("║      CRYPTO MICROBENCHMARK: ring AES-GCM vs ChaCha20         ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -33,7 +33,13 @@ fn bench_aead(algo: &'static ring::aead::Algorithm, key_bytes: &[u8; 32]) {
         let mut buf = vec![0xCDu8; size + 16];
         let tag_len = algo.tag_len();
 
-        let iters: usize = if size <= 1024 { 1_000_000 } else if size <= 65536 { 200_000 } else { 50_000 };
+        let iters: usize = if size <= 1024 {
+            1_000_000
+        } else if size <= 65536 {
+            200_000
+        } else {
+            50_000
+        };
 
         let start = Instant::now();
         let mut counter: u64 = 0;
@@ -51,7 +57,9 @@ fn bench_aead(algo: &'static ring::aead::Algorithm, key_bytes: &[u8; 32]) {
             let nonce = Nonce::assume_unique_for_key(n);
 
             // IN-PLACE encrypt (zero allocation)
-            let _ = key.seal_in_place_separate_tag(nonce, Aad::empty(), &mut buf[..size]).unwrap();
+            let _ = key
+                .seal_in_place_separate_tag(nonce, Aad::empty(), &mut buf[..size])
+                .unwrap();
         }
         let elapsed = start.elapsed();
 
@@ -94,19 +102,22 @@ fn bench_alloc_overhead() {
     let noalloc_tput = alloc_mb / noalloc_elapsed.as_secs_f64();
 
     println!(
-        "  Vec::clone (alloc every time): {:>10.1} MiB/s", alloc_tput
+        "  Vec::clone (alloc every time): {:>10.1} MiB/s",
+        alloc_tput
     );
     println!(
-        "  copy_from_slice (zero alloc):  {:>10.1} MiB/s", noalloc_tput
+        "  copy_from_slice (zero alloc):  {:>10.1} MiB/s",
+        noalloc_tput
     );
-    println!(
-        "  Alloc overhead: {:.1}x slower",
-        noalloc_tput / alloc_tput
-    );
+    println!("  Alloc overhead: {:.1}x slower", noalloc_tput / alloc_tput);
 }
 
 fn format_size(n: usize) -> String {
-    if n >= 1_048_576 { format!("{} MB", n / 1_048_576) }
-    else if n >= 1024 { format!("{} KB", n / 1024) }
-    else { format!("{} B", n) }
+    if n >= 1_048_576 {
+        format!("{} MB", n / 1_048_576)
+    } else if n >= 1024 {
+        format!("{} KB", n / 1024)
+    } else {
+        format!("{} B", n)
+    }
 }

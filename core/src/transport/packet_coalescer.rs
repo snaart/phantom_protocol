@@ -98,9 +98,7 @@ impl PacketCoalescer {
             return false;
         }
         match self.batch_start {
-            Some(start) => {
-                start.elapsed() >= Duration::from_micros(self.config.flush_timeout_us)
-            }
+            Some(start) => start.elapsed() >= Duration::from_micros(self.config.flush_timeout_us),
             None => false,
         }
     }
@@ -180,10 +178,7 @@ impl<'a> Iterator for Decoalescer<'a> {
             return None;
         }
 
-        let len = u16::from_be_bytes([
-            self.data[self.offset],
-            self.data[self.offset + 1],
-        ]) as usize;
+        let len = u16::from_be_bytes([self.data[self.offset], self.data[self.offset + 1]]) as usize;
         self.offset += SUB_HEADER_SIZE;
 
         if self.offset + len > self.data.len() {
@@ -283,7 +278,10 @@ mod tests {
         let mib_s = (total_packets * 1024) as f64 / 1_048_576.0 / elapsed.as_secs_f64();
         eprintln!(
             "Coalescer: {} packets → {} datagrams ({:.0} MiB/s, {:.3}ms)",
-            total_packets, datagrams, mib_s, elapsed.as_secs_f64() * 1000.0,
+            total_packets,
+            datagrams,
+            mib_s,
+            elapsed.as_secs_f64() * 1000.0,
         );
         // Should be >10 GiB/s (pure memory)
         assert!(mib_s > 1000.0, "Coalescer too slow: {:.0} MiB/s", mib_s);

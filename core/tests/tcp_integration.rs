@@ -27,8 +27,8 @@ async fn tcp_integration_pinned_and_encrypted() {
         .await
         .expect("bind listener");
     let server_key_bytes = listener.verifying_key_bytes();
-    let expected_key = HybridVerifyingKey::from_bytes(&server_key_bytes)
-        .expect("deserialize verifying key");
+    let expected_key =
+        HybridVerifyingKey::from_bytes(&server_key_bytes).expect("deserialize verifying key");
 
     // Server side: accept one connection, then echo a single message.
     let server_handle = tokio::spawn(async move {
@@ -37,7 +37,10 @@ async fn tcp_integration_pinned_and_encrypted() {
         let msg = session.recv().await.expect("server recv");
         assert_eq!(msg, b"hello-from-client");
         // Send a reply.
-        session.send(b"hello-from-server".to_vec()).await.expect("server send");
+        session
+            .send(b"hello-from-server".to_vec())
+            .await
+            .expect("server send");
         // Keep the session alive briefly so the client can drain its reply.
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
@@ -45,14 +48,13 @@ async fn tcp_integration_pinned_and_encrypted() {
     // Client side: connect with the pinned server key.
     let tcp = TcpStream::connect(ADDR).await.expect("tcp connect");
     let transport = TcpSessionTransport::new(tcp);
-    let client = PhantomSession::connect_with_transport(
-        ADDR,
-        transport,
-        expected_key,
-    );
+    let client = PhantomSession::connect_with_transport(ADDR, transport, expected_key);
 
     // Send our message.
-    client.send(b"hello-from-client".to_vec()).await.expect("client send");
+    client
+        .send(b"hello-from-client".to_vec())
+        .await
+        .expect("client send");
 
     // Read the reply (with a timeout to avoid hanging the test if anything wedges).
     let reply = timeout(Duration::from_secs(5), client.recv())

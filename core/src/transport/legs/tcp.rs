@@ -5,10 +5,10 @@
 use crate::transport::legs::TransportLeg;
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut, Buf};
+use bytes::{Buf, Bytes, BytesMut};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU8, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -48,12 +48,12 @@ impl TcpLeg {
         let start = std::time::Instant::now();
         let stream = TcpStream::connect(addr).await?;
         let rtt = start.elapsed().as_millis() as u32;
-        
+
         // Disable Nagle's algorithm for lower latency
         stream.set_nodelay(true)?;
-        
+
         log::info!("TCP connected to {} (RTT {}ms)", addr, rtt);
-        
+
         Ok(Self {
             stream: Mutex::new(Some(stream)),
             remote_addr: Some(addr),
@@ -67,7 +67,7 @@ impl TcpLeg {
     /// Wrap an existing TCP stream
     pub fn from_stream(stream: TcpStream, addr: SocketAddr) -> Self {
         let _ = stream.set_nodelay(true);
-        
+
         Self {
             stream: Mutex::new(Some(stream)),
             remote_addr: Some(addr),
@@ -88,58 +88,68 @@ impl TcpLeg {
     /// Read a length-prefixed message
     async fn read_framed(&self) -> io::Result<Bytes> {
         let mut stream_guard = self.stream.lock().await;
-        let stream = stream_guard.as_mut()
+        let stream = stream_guard
+            .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "Not connected"))?;
-        
+
         let mut read_buf = self.read_buf.lock().await;
-        
+
         // Read length prefix (4 bytes)
         while read_buf.len() < 4 {
             let mut temp = [0u8; 4096];
             let n = stream.read(&mut temp).await?;
             if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Connection closed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Connection closed",
+                ));
             }
             read_buf.extend_from_slice(&temp[..n]);
         }
-        
-        let length = u32::from_be_bytes([
-            read_buf[0], read_buf[1], read_buf[2], read_buf[3]
-        ]) as usize;
-        
+
+        let length =
+            u32::from_be_bytes([read_buf[0], read_buf[1], read_buf[2], read_buf[3]]) as usize;
+
         // Sanity check
         if length > 10 * 1024 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Message too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Message too large",
+            ));
         }
-        
+
         // Read full message
         while read_buf.len() < 4 + length {
             let mut temp = [0u8; 4096];
             let n = stream.read(&mut temp).await?;
             if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Connection closed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Connection closed",
+                ));
             }
             read_buf.extend_from_slice(&temp[..n]);
         }
-        
+
         // Extract message
         read_buf.advance(4);
         let data = read_buf.split_to(length).freeze();
-        
+
         Ok(data)
     }
 
     /// Write a length-prefixed message
     async fn write_framed(&self, data: &[u8]) -> io::Result<()> {
         let mut stream_guard = self.stream.lock().await;
-        let stream = stream_guard.as_mut()
+        let stream = stream_guard
+            .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "Not connected"))?;
-        
+
         let length = data.len() as u32;
         stream.write_all(&length.to_be_bytes()).await?;
         stream.write_all(data).await?;
         stream.flush().await?;
-        
+
         Ok(())
     }
 }
@@ -154,7 +164,10 @@ impl Default for TcpLeg {
 impl TransportLeg for TcpLeg {
     async fn send(&self, data: Bytes) -> io::Result<()> {
         if !self.is_available() {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "TCP not connected"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "TCP not connected",
+            ));
         }
 
         self.write_framed(&data).await
@@ -162,7 +175,10 @@ impl TransportLeg for TcpLeg {
 
     async fn recv(&self) -> io::Result<Bytes> {
         if !self.is_available() {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "TCP not connected"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "TCP not connected",
+            ));
         }
 
         self.read_framed().await
@@ -186,11 +202,11 @@ impl TransportLeg for TcpLeg {
 
     async fn close(&self) -> io::Result<()> {
         self.available.store(false, Ordering::Relaxed);
-        
+
         if let Some(stream) = self.stream.lock().await.take() {
             drop(stream); // Gracefully close
         }
-        
+
         log::info!("TCP closed");
         Ok(())
     }

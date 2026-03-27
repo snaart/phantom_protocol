@@ -20,16 +20,16 @@
 // Every block must carry a `// SAFETY:` comment.
 #![allow(unsafe_code)]
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::net::UdpSocket;
-use tokio::io::{self, Result as IoResult};
 use super::buffer_pool::BufferPool;
 use super::pacer::Pacer;
-use crate::transport::bandwidth_estimator;
 use crate::crypto::aes_session::AesSession;
-use crate::transport::handshake::{HandshakeServer, ClientHello, HandshakeResponse};
+use crate::transport::bandwidth_estimator;
+use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
 use borsh::BorshDeserialize;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::io::{self, Result as IoResult};
+use tokio::net::UdpSocket;
 
 /// High-performance UDP transport with batching and encryption
 pub struct UdpTransport {
@@ -45,9 +45,10 @@ impl UdpTransport {
         let socket = UdpSocket::bind(local_addr).await?;
         socket.set_broadcast(false)?;
 
-        let peer_addr = "0.0.0.0:0".parse()
+        let peer_addr = "0.0.0.0:0"
+            .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            
+
         let session = AesSession::from_shared_secret(&[0u8; 32])
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
@@ -68,7 +69,9 @@ impl UdpTransport {
     /// Send encrypted data
     #[inline]
     pub async fn send(&self, data: &[u8]) -> IoResult<usize> {
-        let encrypted = self.session.encrypt(&[], data)
+        let encrypted = self
+            .session
+            .encrypt(&[], data)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.socket.send_to(&encrypted, self.peer_addr).await
     }
@@ -78,7 +81,8 @@ impl UdpTransport {
     pub async fn send_zero_copy(&self, data: &[u8]) -> IoResult<usize> {
         let mut buf = Vec::with_capacity(data.len() + 16);
         buf.extend_from_slice(data);
-        self.session.encrypt_in_place(&[], &mut buf)
+        self.session
+            .encrypt_in_place(&[], &mut buf)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.socket.send_to(&buf, self.peer_addr).await
     }
@@ -91,7 +95,9 @@ impl UdpTransport {
 
         let (len, addr) = self.socket.recv_from(&mut buf).await?;
 
-        let decrypted = self.session.decrypt(&[], &buf[..len])
+        let decrypted = self
+            .session
+            .decrypt(&[], &buf[..len])
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         Ok((decrypted, addr))
@@ -117,7 +123,9 @@ impl UdpTransport {
         // Encrypt all packets first
         let mut encrypted: Vec<Vec<u8>> = Vec::with_capacity(packets.len());
         for pkt in packets {
-            let ct = self.session.encrypt(&[], pkt)
+            let ct = self
+                .session
+                .encrypt(&[], pkt)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             encrypted.push(ct);
         }
@@ -219,7 +227,7 @@ impl UdpHandshakeListener {
                 }
             };
 
-            // Process ClientHello 
+            // Process ClientHello
             match server.process_client_hello(&client_hello, difficulty, addr.ip()) {
                 HandshakeResponse::Retry(retry_req) => {
                     // Server demands PoW or Cookie, send Retry (stateless) and forget
@@ -238,11 +246,11 @@ impl UdpHandshakeListener {
                     // Handshake error, drop silently
                 }
             }
-            
+
             // For now, this is a demonstration of the listener loop
             break;
         }
-        
+
         Ok(())
     }
 }
@@ -292,11 +300,9 @@ async fn platform_send_batch(
     // Clone datagrams for the blocking closure
     let owned: Vec<Vec<u8>> = datagrams.to_vec();
 
-    let sent = tokio::task::spawn_blocking(move || {
-        sendmmsg_batch(fd, &addr, &owned)
-    })
-    .await
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+    let sent = tokio::task::spawn_blocking(move || sendmmsg_batch(fd, &addr, &owned))
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
 
     Ok(sent)
 }
@@ -352,9 +358,7 @@ fn sendmmsg_batch(
     // entries (populated above) — `as_mut_ptr()` is valid for that range. The
     // kernel reads through each `msg_hdr.msg_iov` which points to the `iov_base`
     // of a `datagrams[i]` byte slice, also alive for the duration of this call.
-    let ret = unsafe {
-        libc::sendmmsg(fd, msgs.as_mut_ptr(), msgs.len() as u32, 0)
-    };
+    let ret = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), msgs.len() as u32, 0) };
 
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -397,7 +401,11 @@ impl PacedSender {
         pacer: Arc<Pacer>,
         estimator: Arc<parking_lot::Mutex<bandwidth_estimator::BandwidthEstimator>>,
     ) -> Self {
-        Self { transport, pacer, estimator }
+        Self {
+            transport,
+            pacer,
+            estimator,
+        }
     }
 
     /// Send data respecting the pacing rate.
@@ -465,7 +473,11 @@ pub struct FastSender {
 
 impl FastSender {
     pub fn new(socket: Arc<UdpSocket>, session: Arc<AesSession>, peer_addr: SocketAddr) -> Self {
-        Self { socket, session, peer_addr }
+        Self {
+            socket,
+            session,
+            peer_addr,
+        }
     }
 
     /// Send with in-place encryption
@@ -473,7 +485,8 @@ impl FastSender {
     pub async fn send(&self, data: &[u8]) -> IoResult<usize> {
         let mut buf = Vec::with_capacity(data.len() + 16);
         buf.extend_from_slice(data);
-        self.session.encrypt_in_place(&[], &mut buf)
+        self.session
+            .encrypt_in_place(&[], &mut buf)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.socket.send_to(&buf, self.peer_addr).await
     }
@@ -510,7 +523,9 @@ mod tests {
     async fn test_paced_sender_creation() {
         let transport = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
         let pacer = Arc::new(Pacer::new(1_000_000)); // 1 MB/s
-        let estimator = Arc::new(parking_lot::Mutex::new(bandwidth_estimator::BandwidthEstimator::new()));
+        let estimator = Arc::new(parking_lot::Mutex::new(
+            bandwidth_estimator::BandwidthEstimator::new(),
+        ));
         let sender = PacedSender::new(transport, pacer, estimator);
 
         assert_eq!(sender.rate(), 1_000_000);

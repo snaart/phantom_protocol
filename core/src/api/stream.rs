@@ -1,9 +1,9 @@
+use crate::api::session::SessionCommand;
 use crate::errors::CoreError;
+use crate::transport::multiplexer::{StreamHandle, StreamMessage};
+use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use bytes::Bytes;
-use crate::transport::multiplexer::{StreamHandle, StreamMessage};
-use crate::api::session::SessionCommand;
 
 #[derive(uniffi::Object)]
 pub struct PhantomStream {
@@ -31,17 +31,23 @@ impl PhantomStream {
     }
 
     pub async fn send_reliable(&self, data: Vec<u8>) -> Result<(), CoreError> {
-        self.tx.send(SessionCommand::SendStreamReliable {
-            stream_id: self.stream_id,
-            data: Bytes::from(data),
-        }).await.map_err(|_| CoreError::NetworkError("Session closed".into()))
+        self.tx
+            .send(SessionCommand::SendStreamReliable {
+                stream_id: self.stream_id,
+                data: Bytes::from(data),
+            })
+            .await
+            .map_err(|_| CoreError::NetworkError("Session closed".into()))
     }
 
     pub async fn send_unreliable(&self, data: Vec<u8>) -> Result<(), CoreError> {
-        self.tx.send(SessionCommand::SendStreamUnreliable {
-            stream_id: self.stream_id,
-            data: Bytes::from(data),
-        }).await.map_err(|_| CoreError::NetworkError("Session closed".into()))
+        self.tx
+            .send(SessionCommand::SendStreamUnreliable {
+                stream_id: self.stream_id,
+                data: Bytes::from(data),
+            })
+            .await
+            .map_err(|_| CoreError::NetworkError("Session closed".into()))
     }
 
     pub async fn recv(&self) -> Result<Vec<u8>, CoreError> {
@@ -50,7 +56,11 @@ impl PhantomStream {
             match rx.recv().await {
                 Some(StreamMessage::Data(b)) => return Ok(b.to_vec()),
                 Some(StreamMessage::Ack(seq)) => {
-                    log::debug!("PhantomStream {}: received ACK for seq {}", self.stream_id, seq);
+                    log::debug!(
+                        "PhantomStream {}: received ACK for seq {}",
+                        self.stream_id,
+                        seq
+                    );
                     // Just log for now until ARQ is implemented
                     continue;
                 }
@@ -63,9 +73,13 @@ impl PhantomStream {
             }
         }
     }
-    
+
     pub async fn close(&self) -> Result<(), CoreError> {
-        self.tx.send(SessionCommand::CloseStream { stream_id: self.stream_id }).await
+        self.tx
+            .send(SessionCommand::CloseStream {
+                stream_id: self.stream_id,
+            })
+            .await
             .map_err(|_| CoreError::NetworkError("Session closed".into()))
     }
 }

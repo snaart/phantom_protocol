@@ -72,9 +72,11 @@ impl DeviceProfile {
         let caps = HwCaps::detect();
         let available_ram = Self::estimate_available_ram();
 
-        let tier = if available_ram < 1_048_576 { // < 1MB
+        let tier = if available_ram < 1_048_576 {
+            // < 1MB
             DeviceTier::Constrained
-        } else if available_ram < 512_000_000 { // < 512MB
+        } else if available_ram < 512_000_000 {
+            // < 512MB
             DeviceTier::Standard
         } else {
             DeviceTier::Performance
@@ -89,37 +91,37 @@ impl DeviceProfile {
             DeviceTier::Constrained => Self {
                 tier,
                 cipher: CipherSuite::ChaCha20Poly1305, // Always ChaCha20 for constrained
-                pq_kem: PqKemLevel::Kyber512,       // Light PQ — 21KB RAM
-                pq_sign: PqSignLevel::Dilithium2,    // Light PQ sig — 40KB RAM
-                buffer_size: 2 * 1024,               // 2KB buffers
+                pq_kem: PqKemLevel::Kyber512,          // Light PQ — 21KB RAM
+                pq_sign: PqSignLevel::Dilithium2,      // Light PQ sig — 40KB RAM
+                buffer_size: 2 * 1024,                 // 2KB buffers
                 max_streams: 4,
-                coalescing: false,                    // No coalescing overhead
-                max_datagram_size: 512,               // Tiny datagrams
-                compression: false,                   // CPU more precious than bandwidth
+                coalescing: false,      // No coalescing overhead
+                max_datagram_size: 512, // Tiny datagrams
+                compression: false,     // CPU more precious than bandwidth
                 max_payload: 256,
             },
             DeviceTier::Standard => Self {
                 tier,
-                cipher: caps.recommended_cipher(),    // Auto: AES if HW, else ChaCha
-                pq_kem: PqKemLevel::Kyber768,        // Full PQ — 29KB RAM
-                pq_sign: PqSignLevel::Dilithium3,    // Full PQ sig
-                buffer_size: 16 * 1024,              // 16KB buffers
+                cipher: caps.recommended_cipher(), // Auto: AES if HW, else ChaCha
+                pq_kem: PqKemLevel::Kyber768,      // Full PQ — 29KB RAM
+                pq_sign: PqSignLevel::Dilithium3,  // Full PQ sig
+                buffer_size: 16 * 1024,            // 16KB buffers
                 max_streams: 64,
                 coalescing: true,
                 max_datagram_size: 4096,
-                compression: true,                    // Zstd-1
-                max_payload: 1400,                    // Standard MTU
+                compression: true, // Zstd-1
+                max_payload: 1400, // Standard MTU
             },
             DeviceTier::Performance => Self {
                 tier,
-                cipher: CipherSuite::Aes256Gcm,      // Always AES-GCM (HW)
-                pq_kem: PqKemLevel::Kyber768,        // Full PQ
-                pq_sign: PqSignLevel::Dilithium3,    // Full PQ sig
-                buffer_size: 64 * 1024,              // 64KB buffers
+                cipher: CipherSuite::Aes256Gcm, // Always AES-GCM (HW)
+                pq_kem: PqKemLevel::Kyber768,   // Full PQ
+                pq_sign: PqSignLevel::Dilithium3, // Full PQ sig
+                buffer_size: 64 * 1024,         // 64KB buffers
                 max_streams: 256,
                 coalescing: true,
-                max_datagram_size: 8192,              // Jumbo-like
-                compression: true,                    // LZ4 (ultra-fast)
+                max_datagram_size: 8192, // Jumbo-like
+                compression: true,       // LZ4 (ultra-fast)
                 max_payload: 8192,
             },
         }
@@ -143,13 +145,19 @@ impl DeviceProfile {
         // On std targets, use sysinfo-like heuristics
         // For now, use a simple approach based on pointer size
         #[cfg(target_pointer_width = "64")]
-        { 8_000_000_000 } // 64-bit → assume Performance-class
+        {
+            8_000_000_000
+        } // 64-bit → assume Performance-class
 
         #[cfg(target_pointer_width = "32")]
-        { 512_000 } // 32-bit → assume Constrained-class
+        {
+            512_000
+        } // 32-bit → assume Constrained-class
 
         #[cfg(not(any(target_pointer_width = "64", target_pointer_width = "32")))]
-        { 256_000 } // 16-bit → definitely Constrained
+        {
+            256_000
+        } // 16-bit → definitely Constrained
     }
 
     /// Whether this profile supports the full PQ handshake (Kyber768)
@@ -230,12 +238,22 @@ mod tests {
 
     #[test]
     fn all_tiers_have_pq() {
-        for tier in [DeviceTier::Constrained, DeviceTier::Standard, DeviceTier::Performance] {
+        for tier in [
+            DeviceTier::Constrained,
+            DeviceTier::Standard,
+            DeviceTier::Performance,
+        ] {
             let p = DeviceProfile::for_tier(tier, &HwCaps::detect());
             // PQ KEM is always present
-            assert!(matches!(p.pq_kem, PqKemLevel::Kyber512 | PqKemLevel::Kyber768));
+            assert!(matches!(
+                p.pq_kem,
+                PqKemLevel::Kyber512 | PqKemLevel::Kyber768
+            ));
             // PQ Signature is always present
-            assert!(matches!(p.pq_sign, PqSignLevel::Dilithium2 | PqSignLevel::Dilithium3));
+            assert!(matches!(
+                p.pq_sign,
+                PqSignLevel::Dilithium2 | PqSignLevel::Dilithium3
+            ));
             eprintln!("{:?}: PQ KEM={:?}, PQ Sign={:?}", tier, p.pq_kem, p.pq_sign);
         }
     }

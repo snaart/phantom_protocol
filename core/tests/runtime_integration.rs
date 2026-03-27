@@ -9,8 +9,8 @@
 //! through the data pump.
 
 use phantom_core::runtime::{BoxFuture, Runtime, SpawnHandle, TokioRuntime};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Wrapper runtime that counts spawn / sleep calls. Delegates all real
@@ -70,8 +70,7 @@ async fn runtime_substitution_drives_session_and_listener() {
     .expect("bind");
 
     let server_addr: std::net::SocketAddr = listener.local_addr().parse().expect("addr");
-    let server_key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes())
-        .expect("key");
+    let server_key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).expect("key");
 
     let listener_clone = listener.clone();
     let server_handle = tokio::spawn(async move {

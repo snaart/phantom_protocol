@@ -19,7 +19,7 @@ pub mod listener;
 pub mod tcp_transport;
 
 // Cross-target re-exports
-pub use session::{PhantomSession, ConnectionState, SessionTransport};
+pub use session::{ConnectionState, PhantomSession, SessionTransport};
 pub use stream::PhantomStream;
 
 // Native-only re-exports

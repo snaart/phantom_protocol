@@ -67,7 +67,11 @@ impl FrameWriter {
                     buf.extend_from_slice(chunk);
                     // Encrypt in-place at offset
                     session
-                        .encrypt_in_place_offset(&len_bytes, &mut buf, frame_start + FRAME_HEADER_SIZE)
+                        .encrypt_in_place_offset(
+                            &len_bytes,
+                            &mut buf,
+                            frame_start + FRAME_HEADER_SIZE,
+                        )
                         .map_err(|_| FrameError::EncryptFailed)?;
                 }
                 Ok::<Vec<u8>, FrameError>(buf)
@@ -86,7 +90,11 @@ impl FrameWriter {
                 batch_buf.extend_from_slice(chunk);
                 // Encrypt in-place at offset
                 session
-                    .encrypt_in_place_offset(&len_bytes, &mut batch_buf, frame_start + FRAME_HEADER_SIZE)
+                    .encrypt_in_place_offset(
+                        &len_bytes,
+                        &mut batch_buf,
+                        frame_start + FRAME_HEADER_SIZE,
+                    )
                     .map_err(|_| FrameError::EncryptFailed)?;
             }
         }
@@ -337,8 +345,8 @@ impl FrameReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
     use std::sync::Arc;
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn frame_round_trip() {
@@ -384,7 +392,7 @@ mod tests {
             let (mut tcp, _) = listener.accept().await.unwrap();
             let mut reader = FrameReader::new();
             let mut received_data = Vec::new();
-            
+
             let num_chunks = (data_clone.len() + MAX_FRAME_PAYLOAD - 1) / MAX_FRAME_PAYLOAD;
             for _ in 0..num_chunks {
                 let chunk = reader.read_frame(&mut tcp, &ss2).await.unwrap();

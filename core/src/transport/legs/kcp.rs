@@ -9,13 +9,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU8, AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use kcp_tokio::{KcpConfig, async_kcp::KcpStream};
 use crate::transport::bandwidth_estimator;
+use kcp_tokio::{async_kcp::KcpStream, KcpConfig};
 
 /// KCP leg configuration
 #[derive(Debug, Clone)]
@@ -110,19 +110,25 @@ impl KcpLeg {
     /// Connect to remote address
     pub async fn connect(addr: SocketAddr, config: KcpLegConfig) -> io::Result<Self> {
         let start = std::time::Instant::now();
-        
+
         // Create KCP config
         let mut kcp_config = KcpConfig::new();
         kcp_config = config.mode.apply(kcp_config);
-        
+
         // Connect via KCP
-        let stream = KcpStream::connect(addr, kcp_config).await
+        let stream = KcpStream::connect(addr, kcp_config)
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
-        
+
         let rtt = start.elapsed().as_millis() as u32;
-        
-        log::info!("KCP connected to {} (RTT {}ms, mode {:?})", addr, rtt, config.mode);
-        
+
+        log::info!(
+            "KCP connected to {} (RTT {}ms, mode {:?})",
+            addr,
+            rtt,
+            config.mode
+        );
+
         Ok(Self {
             config,
             stream: Mutex::new(Some(stream)),
@@ -175,7 +181,10 @@ impl KcpLeg {
     }
 
     /// Set the bandwidth estimator for this leg
-    pub fn set_estimator(&mut self, estimator: Arc<parking_lot::Mutex<bandwidth_estimator::BandwidthEstimator>>) {
+    pub fn set_estimator(
+        &mut self,
+        estimator: Arc<parking_lot::Mutex<bandwidth_estimator::BandwidthEstimator>>,
+    ) {
         self.estimator = Some(estimator);
     }
 }
@@ -190,63 +199,76 @@ impl Default for KcpLeg {
 impl TransportLeg for KcpLeg {
     async fn send(&self, data: Bytes) -> io::Result<()> {
         if !self.is_available() {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "KCP not connected"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "KCP not connected",
+            ));
         }
 
         let mut stream_guard = self.stream.lock().await;
-        let stream = stream_guard.as_mut()
+        let stream = stream_guard
+            .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "No stream"))?;
-        
+
         let start = std::time::Instant::now();
-        
+
         // Write length prefix (4 bytes) + data
         let len = data.len() as u32;
         stream.write_all(&len.to_be_bytes()).await?;
         stream.write_all(&data).await?;
         stream.flush().await?;
-        
+
         // Notify estimator
         if let Some(ref est) = self.estimator {
             est.lock().on_send(data.len() as u64 + 4);
         }
-        
+
         // Update RTT estimate
         let elapsed = start.elapsed().as_millis() as u32;
         self.update_rtt(elapsed);
-        
+
         // Update bytes counter
-        self.bytes_sent.fetch_add(data.len() as u32 + 4, Ordering::Relaxed);
-        
+        self.bytes_sent
+            .fetch_add(data.len() as u32 + 4, Ordering::Relaxed);
+
         log::trace!("KCP send {} bytes", data.len());
         Ok(())
     }
 
     async fn recv(&self) -> io::Result<Bytes> {
         if !self.is_available() {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "KCP not connected"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "KCP not connected",
+            ));
         }
 
         let mut stream_guard = self.stream.lock().await;
-        let stream = stream_guard.as_mut()
+        let stream = stream_guard
+            .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "No stream"))?;
-        
+
         // Read length prefix
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
-        
+
         // Sanity check
         if len > 10 * 1024 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Message too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Message too large",
+            ));
         }
-        
+
         // Read data
         let mut data = vec![0u8; len];
         stream.read_exact(&mut data).await?;
-        
+
         // Update bytes counter
-        self.bytes_received.fetch_add(len as u32 + 4, Ordering::Relaxed);
-        
+        self.bytes_received
+            .fetch_add(len as u32 + 4, Ordering::Relaxed);
+
         log::trace!("KCP recv {} bytes", len);
         Ok(Bytes::from(data))
     }
@@ -269,14 +291,17 @@ impl TransportLeg for KcpLeg {
 
     async fn close(&self) -> io::Result<()> {
         self.available.store(false, Ordering::Relaxed);
-        
+
         // Drop the stream to close connection
         if let Some(stream) = self.stream.lock().await.take() {
             drop(stream);
         }
-        
-        log::info!("KCP closed (sent: {} bytes, recv: {} bytes)", 
-            self.bytes_sent(), self.bytes_received());
+
+        log::info!(
+            "KCP closed (sent: {} bytes, recv: {} bytes)",
+            self.bytes_sent(),
+            self.bytes_received()
+        );
         Ok(())
     }
 }

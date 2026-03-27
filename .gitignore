@@ -35,3 +35,8 @@ client_ca.pem
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .env
+
+# macOS / Python debris
+.DS_Store
+**/__pycache__/
+*.proptest-regressions

@@ -2,10 +2,10 @@
 //!
 //! Round-robin and low-latency scheduling across multiple transport legs.
 
+use crate::transport::types::{LegType, SchedulerMode};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use crate::transport::types::{LegType, SchedulerMode};
 
 pub struct PathInfo {
     pub leg_type: LegType,
@@ -47,7 +47,9 @@ impl Scheduler {
 
     pub fn register_path(&self, leg_type: LegType) {
         let mut paths = self.paths.write();
-        paths.entry(leg_type).or_insert_with(|| PathInfo::new(leg_type));
+        paths
+            .entry(leg_type)
+            .or_insert_with(|| PathInfo::new(leg_type));
     }
 
     pub fn set_path_available(&self, leg_type: LegType, available: bool) {
@@ -61,9 +63,7 @@ impl Scheduler {
         let paths = self.paths.read();
         let mode = self.mode.read();
 
-        let mut available: Vec<_> = paths.iter()
-            .filter(|(_, p)| p.active)
-            .collect();
+        let mut available: Vec<_> = paths.iter().filter(|(_, p)| p.active).collect();
 
         if available.is_empty() {
             return Vec::new();

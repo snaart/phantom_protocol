@@ -14,8 +14,8 @@
 //! The pacer operates in conjunction with the `BandwidthEstimator` which feeds
 //! the target rate. When BBR says "send at X MB/s", the pacer enforces that rate.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 /// Minimum pacing rate (1 KB/s) — prevents stalling
 const MIN_PACING_RATE: u64 = 1_024;
@@ -145,12 +145,11 @@ impl Pacer {
             loop {
                 let current = self.tokens.load(Ordering::Relaxed);
                 let updated = (current + new_tokens).min(self.max_burst);
-                if self.tokens.compare_exchange_weak(
-                    current,
-                    updated,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ).is_ok() {
+                if self
+                    .tokens
+                    .compare_exchange_weak(current, updated, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
                     break;
                 }
             }
@@ -177,7 +176,7 @@ mod tests {
     #[test]
     fn test_pacer_allows_burst() {
         let pacer = Pacer::new(1_000_000); // 1 MB/s
-        // Initial burst should be allowed (MAX_BURST_BYTES = 64 KB)
+                                           // Initial burst should be allowed (MAX_BURST_BYTES = 64 KB)
         assert!(pacer.try_consume(1400)); // one packet
         assert!(pacer.try_consume(1400)); // another packet
     }
@@ -185,7 +184,7 @@ mod tests {
     #[test]
     fn test_pacer_blocks_when_empty() {
         let pacer = Pacer::new(1_024); // 1 KB/s — very slow
-        // Exhaust the burst allowance
+                                       // Exhaust the burst allowance
         assert!(pacer.try_consume(MAX_BURST_BYTES));
         // No tokens left
         assert!(!pacer.try_consume(1));
@@ -194,7 +193,7 @@ mod tests {
     #[test]
     fn test_pacer_refills_over_time() {
         let pacer = Pacer::new(100_000); // 100 KB/s
-        // Drain all tokens
+                                         // Drain all tokens
         assert!(pacer.try_consume(MAX_BURST_BYTES));
         assert!(!pacer.try_consume(1));
 
@@ -203,7 +202,11 @@ mod tests {
 
         // Should have some tokens now (~5KB at 100KB/s over 50ms)
         let available = pacer.available_tokens();
-        assert!(available > 0, "expected tokens after sleep, got {}", available);
+        assert!(
+            available > 0,
+            "expected tokens after sleep, got {}",
+            available
+        );
     }
 
     #[test]
@@ -233,7 +236,7 @@ mod tests {
     #[test]
     fn test_pacer_time_until_available() {
         let pacer = Pacer::new(1_000_000); // 1 MB/s
-        // Drain tokens
+                                           // Drain tokens
         pacer.try_consume(MAX_BURST_BYTES);
 
         // Need 10_000 bytes at 1 MB/s = 10ms

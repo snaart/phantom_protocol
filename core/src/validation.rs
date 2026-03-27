@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 
 pub struct InputValidator;
 
@@ -9,7 +9,11 @@ impl InputValidator {
             bail!("Empty message");
         }
         if data.len() > max_size {
-            bail!("Message too large: {} bytes (max: {})", data.len(), max_size);
+            bail!(
+                "Message too large: {} bytes (max: {})",
+                data.len(),
+                max_size
+            );
         }
         Ok(())
     }
@@ -17,9 +21,12 @@ impl InputValidator {
     /// Validate Group ID length (must be 16 bytes)
     pub fn validate_group_id(group_id: &[u8]) -> Result<[u8; 16]> {
         if group_id.len() != 16 {
-            bail!("Invalid group_id length: expected 16, got {}", group_id.len());
+            bail!(
+                "Invalid group_id length: expected 16, got {}",
+                group_id.len()
+            );
         }
-        
+
         // Check for zero-ID (reserved)
         if group_id.iter().all(|&b| b == 0) {
             bail!("Zero group_id not allowed");
@@ -36,7 +43,11 @@ impl InputValidator {
 
         // Future check
         if epoch > current_epoch + MAX_EPOCH_DRIFT {
-            bail!("Epoch too far in future: {} (current: {})", epoch, current_epoch);
+            bail!(
+                "Epoch too far in future: {} (current: {})",
+                epoch,
+                current_epoch
+            );
         }
 
         // Past check (strictness depends on application logic, usually we reject old epochs)

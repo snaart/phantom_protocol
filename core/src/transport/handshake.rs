@@ -1,24 +1,24 @@
 //! Unified Phantom Handshake Protocol
 //!
-//! Combines PQC security (Hybrid KEM/Sign) with Staged state machine 
+//! Combines PQC security (Hybrid KEM/Sign) with Staged state machine
 //! for optimistic start, Early Data, and 0-RTT resumption.
 
+use borsh::{BorshDeserialize, BorshSerialize};
+use hmac::{Hmac, Mac};
+use parking_lot::RwLock;
+use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use parking_lot::RwLock;
-use borsh::{BorshSerialize, BorshDeserialize};
-use sha2::{Sha256, Digest};
-use hmac::{Hmac, Mac};
 use subtle::ConstantTimeEq;
 use zeroize::ZeroizeOnDrop;
 
-use crate::crypto::hybrid_kem::{HybridSecretKey, HybridKeyPackage, HybridCiphertext};
-use crate::crypto::hybrid_sign::{HybridSigningKey, HybridVerifyingKey, HybridSignature};
-use crate::crypto::pow::{PoWSolution, PoWChallenge};
-use crate::transport::session::{Session, CryptoState};
-use crate::transport::types::{SessionId, SchedulerMode};
+use crate::crypto::hybrid_kem::{HybridCiphertext, HybridKeyPackage, HybridSecretKey};
+use crate::crypto::hybrid_sign::{HybridSignature, HybridSigningKey, HybridVerifyingKey};
+use crate::crypto::pow::{PoWChallenge, PoWSolution};
 use crate::errors::CoreError;
+use crate::transport::session::{CryptoState, Session};
+use crate::transport::types::{SchedulerMode, SessionId};
 
 /// Handshake processing stages
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,8 +97,8 @@ struct HandshakeTranscript<'a> {
 
 fn compute_transcript_hash(transcript: &HandshakeTranscript) -> Result<[u8; 32], HandshakeError> {
     let mut hasher = Sha256::new();
-    let bytes = borsh::to_vec(transcript)
-        .map_err(|e| HandshakeError::SerializationError(e.to_string()))?;
+    let bytes =
+        borsh::to_vec(transcript).map_err(|e| HandshakeError::SerializationError(e.to_string()))?;
     hasher.update(&bytes);
     Ok(hasher.finalize().into())
 }
@@ -289,7 +289,10 @@ impl HandshakeServer {
                         Ok(s) => s,
                         Err(e) => return HandshakeResponse::Fail(e),
                     };
-                    let challenge_ref = PoWChallenge { nonce: sol.nonce, difficulty };
+                    let challenge_ref = PoWChallenge {
+                        nonce: sol.nonce,
+                        difficulty,
+                    };
                     if challenge_ref.verify(sol, client_ip.to_string().as_bytes(), &derived) {
                         any_valid = true;
                         break;
@@ -313,13 +316,17 @@ impl HandshakeServer {
         if !cookie_valid || !pow_valid {
             return HandshakeResponse::Retry(HelloRetryRequest {
                 challenge,
-                cookie: if !cookie_valid { Some(expected_cookie) } else { None },
+                cookie: if !cookie_valid {
+                    Some(expected_cookie)
+                } else {
+                    None
+                },
             });
         }
 
         // 3. 0-RTT Resumption Check (Placeholder)
         // In a real implementation, we would look up the resume_session_id in a session cache
-        
+
         // 4. Hybrid Key Exchange
         let result = client_hello.client_key_package.encapsulate();
         let (shared_secret, ciphertext) = match result {
@@ -386,7 +393,10 @@ impl HandshakeServer {
         // Derive resumption secret
         let mut resumption_secret = [0u8; 32];
         let hk = hkdf::Hkdf::<Sha256>::new(None, &shared_secret);
-        if hk.expand(b"phantom-resumption-secret-v1", &mut resumption_secret).is_ok() {
+        if hk
+            .expand(b"phantom-resumption-secret-v1", &mut resumption_secret)
+            .is_ok()
+        {
             session.set_resumption_secret(resumption_secret);
         }
 
@@ -488,11 +498,15 @@ impl HandshakeClient {
             session_id: &server_hello.session_id,
         };
         let transcript_hash = compute_transcript_hash(&transcript)?;
-        server_hello.server_verify_key.verify(&transcript_hash, &server_hello.signature)
+        server_hello
+            .server_verify_key
+            .verify(&transcript_hash, &server_hello.signature)
             .map_err(|e| HandshakeError::KemFailed(format!("Signature check failed: {:?}", e)))?;
 
         // 3. Decapsulate
-        let shared_secret = self.kem_secret.decapsulate(&server_hello.ciphertext)
+        let shared_secret = self
+            .kem_secret
+            .decapsulate(&server_hello.ciphertext)
             .map_err(|e| HandshakeError::KemFailed(e.to_string()))?;
 
         // 4. Create Session
@@ -519,7 +533,10 @@ impl HandshakeClient {
         // 5. Derive resumption secret
         let mut resumption_secret = [0u8; 32];
         let hk = hkdf::Hkdf::<Sha256>::new(None, &shared_secret);
-        if hk.expand(b"phantom-resumption-secret-v1", &mut resumption_secret).is_ok() {
+        if hk
+            .expand(b"phantom-resumption-secret-v1", &mut resumption_secret)
+            .is_ok()
+        {
             session.set_resumption_secret(resumption_secret);
         }
 
@@ -699,7 +716,7 @@ mod tests {
 
         // 1. Initial Hello
         let hello = client.create_client_hello();
-        
+
         // 2. Server Retry (Cookie)
         let response = server.process_client_hello(&hello, 0, client_ip);
         let cookie = match response {
@@ -718,7 +735,9 @@ mod tests {
         };
 
         // 4. Client Process
-        let _client_session = client.process_server_hello(&hello_retry, &server_hello, Some(server.verifying_key())).unwrap();
+        let _client_session = client
+            .process_server_hello(&hello_retry, &server_hello, Some(server.verifying_key()))
+            .unwrap();
         assert_eq!(*client.stage.read(), HandshakeStage::Established);
     }
 }
