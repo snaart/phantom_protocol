@@ -9,13 +9,13 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **210 / 210** (176 unit + 24 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
+| Tests passing | **214 / 214** (180 unit + 24 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
 | **Phase 1 / Phase 2 closed** | ✅ all 14 + 13 sub-items either ✅ or ⏭️ with rationale |
 | Atomic commits since `e4067b6` baseline | **52+** |
 | `#[allow(unsafe_code)]` opt-ins outside the deny-by-default | **1** (was 2 — `crypto/keys.rs` deleted in Phase 5.1) |
 | Wire format versions supported | **V1 + V2** (V2 wire types + V2 AEAD path landed; V2 derives nonce from header → failed decrypts no longer desync) |
 | Mid-session rekey | **available** — `Session::rekey()` + V2 `PacketFlagsV2::REKEY` + `header.epoch` |
-| V2 codecs landed | `transport::path_validation_codec` + `transport::packet_coalescer_codec` (full data-pump wiring is the remaining piece — same V2-routing follow-up for both) |
+| V2 codecs landed | `transport::path_validation_codec` + `transport::packet_coalescer_codec`; `run_data_pump` now routes V1 vs V2 per `Session::wire_version()`, V2 path handles PATH_VALIDATION (auto-echo) and COALESCED (split-and-fan-out) |
 | Metrics | **structured** (`TransportMetrics`) — security signals, gauges, handshake-latency histogram, Prometheus text exposition via `PhantomListener::metrics_prometheus_text()` |
 | Integration tests | 5 (`tcp_integration` x2 `#[ignore]`, `kcp_integration` x3 `#[ignore]`) |
 | Fuzz harnesses | 4 scaffolded (cargo-fuzz, nightly) |
@@ -89,7 +89,7 @@ baseline (0.6) are nice-to-haves; they don't block any later phase.
 | 2.2 | Drop `plaintext.clone()` in recv path | ✅ | `9d92262` | recv channel now carries `Bytes`; single `to_vec` at FFI boundary |
 | 2.3 | Pre-sized serialization buffer (small packets) | ✅ | _this commit_ | ACK buf hoisted out of recv loop (single `Vec::with_capacity(256)` reused via `clear()`); `send_app_data` uses `Vec::with_capacity(payload.len() + 64)` to avoid realloc-and-copy cycles |
 | 2.4 | Event-driven send loop fast-wake | ✅ | _this commit_ | `Session.send_notify: Arc<Notify>`, public `notify_outbound_ready()`. `run_data_pump`'s `select!` adds a `notified()` arm so producers wake the loop instantly; the 10 ms `poll_interval` stays as a retransmit-timer fallback. |
-| 2.5 | PacketCoalescer codec (V2 `COALESCED` flag) | ✅ | _this commit_ | Encode/decode primitives in `transport::packet_coalescer` (codec, pre-existing) + new `transport::packet_coalescer_codec` V2 bridge (wrap/unwrap COALESCED V2 packet, drain-helper, 7 tests). End-to-end wiring through `run_data_pump` requires V2-routing in the pump — tracked as the joint Phase 2.5/4.2 data-pump follow-up. |
+| 2.5 | PacketCoalescer codec (V2 `COALESCED` flag) | ✅ | _this commit_ | Encode/decode primitives in `transport::packet_coalescer` + V2 bridge `transport::packet_coalescer_codec`. **End-to-end wiring complete**: `run_data_pump`'s V2 recv path detects `COALESCED` after decrypt, splits the bundle, and routes each sub-payload through the stream demux + session recv channel. Send-side bulk coalescing remains an optional optimisation (the codec primitives are ready to be called from a batching wrapper). |
 | 2.6 | Wire `Pacer` + `BandwidthEstimator` | ✅ | _this commit_ | `Session.pacer: Arc<Pacer>` + `Session.bandwidth_estimator: Mutex<BandwidthEstimator>`. Public hooks `on_packet_sent / on_packet_acked / on_packet_lost`; `bandwidth_snapshot()` for metrics. ACK side feeds the pacer's rate back from the estimator's `pacing_rate()` — closes the BBR loop. Defaults to `Pacer::unlimited` so historical behavior is preserved. |
 | 2.7 | Lock-free crypto state read path | ✅ | _this commit_ | dropped `RwLock<CryptoState>` — CryptoState is immutable post-handshake (no rekey yet), so encrypt/decrypt take a plain `&CryptoState`. Will become `ArcSwap` when Phase 1.5 rekey lands. |
 | 2.8 | `Bytes` throughout API boundary | ✅ | _this commit_ | `SessionTransport::recv_bytes` returns `Bytes` (was `Vec<u8>`). All three impls updated: `TcpSessionTransport`, `WebSocketLeg` (wasm32), `ChannelTransport` (test). Send path stays `&[u8]` (callers usually pass a borrowed slice of an existing buffer). |
@@ -129,13 +129,13 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | # | Item | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
 | 4.1 | 0-RTT resumption (server `SessionCache` wire-in, early-data encrypt) | ⏳ | — | `session_cache.rs` exists but disconnected |
-| 4.2 | Multi-path validation primitive | 🔄 | _this commit_ | State machine (`transport::path`) + V2 wire codec (`transport::path_validation_codec` — wrap/parse, 8 tests including end-to-end challenge/response). `Session::begin_path_validation` / `complete_path_validation` API in place. Scheduler-driven outbound path selection and data-pump emission of PATH_VALIDATION frames depend on V2-routing in `run_data_pump` (joint follow-up with 2.5). |
+| 4.2 | Multi-path validation primitive | ✅ | _this commit_ | State machine (`transport::path`) + V2 wire codec (`transport::path_validation_codec`) + **end-to-end data-pump wiring**. `run_data_pump`'s V2 recv path decrypts the AEAD payload, then drives the path registry: if the local side already has a pending challenge for the path it verifies and transitions to Validated; otherwise it auto-echoes the payload back as a response. Validator-side challenge emission still happens on caller demand via `Session::begin_path_validation`; scheduler-driven outbound path selection remains an optional optimisation. |
 | 4.3 | Multi-stream finalization (priority, flow control) | ⏳ | — | priority field exists; never read by scheduler |
 | 4.4 | Congestion control (BBRv2-inspired) | ⏳ | — | depends on 2.6 (Pacer + Estimator wired) |
 | 4.5 | Telemetry: `tracing` instrumentation (foundation) + metrics primitives | ✅ | _this commit_ | `tracing` spans on handshake + listener entry points (pre-existing). `TransportMetrics` expanded with security signals (`replay_rejected_total`, `unencrypted_dropped_total`, `aead_decrypt_failed_total`, `path_migrations_total`, `handshake_failures_total`), gauges (`active_sessions`, `active_streams`), handshake-latency histogram (Prometheus `≤` bucket semantics). `MetricsSnapshot::to_prometheus_text()` emits text-exposition output. `PhantomListener::metrics_prometheus_text()` is the public accessor. SDK does not bundle an HTTP server — downstream wires `/metrics` if needed. Dashboard + alert rules templates land alongside (see `docs/operations/grafana/` and `docs/operations/prometheus/`). |
 | 4.6 | Graceful shutdown + signal handling | ✅ | _this commit_ | `PhantomListener::shutdown()` flips `shutting_down: AtomicBool` and notifies waiters; parked `accept()` calls unwind with `CoreError::ConnectionClosed`. `is_shutting_down()` accessor. Already-accepted sessions continue until their owners close them. |
 
-**Phase 4 verdict:** 4.2 + 4.5 + 4.6 landed (state machine + V2 codecs for path-validation and packet-coalescer; structured metrics + Prometheus exposition; graceful shutdown). 4.1 (0-RTT), 4.3 (stream priority), 4.4 (BBRv2) still pending. The data-pump V2-routing task that would close 4.2 and 2.5 end-to-end is the joint follow-up.
+**Phase 4 verdict:** 4.2 ✅ + 4.5 ✅ + 4.6 ✅ landed. Data-pump V2-routing this commit closes 4.2 and 2.5 end-to-end. 4.1 (0-RTT), 4.3 (stream priority), 4.4 (BBRv2 congestion control) still pending.
 
 ---
 
