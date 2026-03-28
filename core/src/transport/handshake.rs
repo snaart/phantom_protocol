@@ -458,11 +458,25 @@ impl HandshakeClient {
     }
 
     pub fn create_client_hello(&self) -> ClientHello {
+        self.create_client_hello_with_version(1)
+    }
+
+    /// Like [`create_client_hello`](Self::create_client_hello) but offers
+    /// a specific wire-format version. Accepted values: `1` (V1, the
+    /// safe default) and `2` (V2 — widened flags, rekey epoch in
+    /// header, path id). Rust-only; not on the UniFFI surface because
+    /// most callers stay on the default.
+    ///
+    /// The wire version is signed under the handshake transcript, so a
+    /// network-level rewrite of this byte aborts the handshake at the
+    /// client-side signature verification step (Phase 1.8 downgrade
+    /// resistance).
+    pub fn create_client_hello_with_version(&self, version: u8) -> ClientHello {
         ClientHello {
             client_key_package: self.kem_public.clone(),
             client_verify_key: self.verifying_key.clone(),
             nonce: self.nonce,
-            version: 1,
+            version,
             cookie: None,
             pow_solution: None,
             resume_session_id: None,
