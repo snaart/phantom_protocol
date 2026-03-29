@@ -1367,24 +1367,40 @@ mod tests {
         assert!(!session.is_data_ready());
     }
 
-    /// Helper: decrypt an incoming encrypted PhantomPacketV1 frame on the test server side.
+    /// Helper: decrypt an incoming encrypted frame on the test server
+    /// side. Wire-version-aware — handles both V1 and V2 packets so
+    /// the test still works after the V2-default flip.
     fn decrypt_incoming(
         server_session: &crate::transport::session::Session,
         bytes: &[u8],
     ) -> Vec<u8> {
         let versioned = alkahest::deserialize::<VersionedPacket, VersionedPacket>(bytes)
             .expect("deserialize VersionedPacket");
-        let pkt = versioned.into_v1().expect("v1");
-        assert!(
-            pkt.header.flags.contains(PacketFlags::ENCRYPTED),
-            "expected ENCRYPTED flag on application data"
-        );
-        server_session
-            .decrypt_packet(&pkt.header, &pkt.payload)
-            .expect("decrypt application data")
+        match versioned {
+            VersionedPacket::V1(pkt) => {
+                assert!(
+                    pkt.header.flags.contains(PacketFlags::ENCRYPTED),
+                    "expected ENCRYPTED flag on V1 application data"
+                );
+                server_session
+                    .decrypt_packet(&pkt.header, &pkt.payload)
+                    .expect("decrypt V1 application data")
+            }
+            VersionedPacket::V2(pkt) => {
+                assert!(
+                    pkt.header.flags.contains(PacketFlagsV2::ENCRYPTED),
+                    "expected ENCRYPTED flag on V2 application data"
+                );
+                server_session
+                    .decrypt_packet_v2(&pkt.header, &pkt.payload)
+                    .expect("decrypt V2 application data")
+            }
+        }
     }
 
-    /// Helper: build an encrypted reply frame to send from the test server side.
+    /// Helper: build an encrypted reply frame from the test server
+    /// side. Wire-version-aware — emits V1 or V2 based on the
+    /// negotiated `wire_version()`.
     fn encrypt_outgoing(
         server_session: &crate::transport::session::Session,
         session_id: SessionId,
@@ -1392,16 +1408,34 @@ mod tests {
         sequence: u32,
         payload: &[u8],
     ) -> Vec<u8> {
-        let mut flags = PacketFlags::new(PacketFlags::RELIABLE);
-        flags.set(PacketFlags::ENCRYPTED);
-        let header = PacketHeader::new(session_id, stream_id, sequence, flags);
-        let ct = server_session
-            .encrypt_packet(&header, payload)
-            .expect("encrypt reply");
-        let packet = PhantomPacketV1::new(header, ct).into_versioned();
-        let mut buf = Vec::new();
-        let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
-        buf[..size].to_vec()
+        if server_session.wire_version() == 2 {
+            let flag_bits = PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED;
+            let header = PacketHeaderV2::new(
+                session_id,
+                stream_id,
+                sequence,
+                PacketFlagsV2::new(flag_bits),
+            )
+            .with_epoch(server_session.current_epoch());
+            let ct = server_session
+                .encrypt_packet_v2(&header, payload)
+                .expect("encrypt V2 reply");
+            let packet = PhantomPacketV2::new(header, ct).into_versioned();
+            let mut buf = Vec::new();
+            let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+            buf[..size].to_vec()
+        } else {
+            let mut flags = PacketFlags::new(PacketFlags::RELIABLE);
+            flags.set(PacketFlags::ENCRYPTED);
+            let header = PacketHeader::new(session_id, stream_id, sequence, flags);
+            let ct = server_session
+                .encrypt_packet(&header, payload)
+                .expect("encrypt V1 reply");
+            let packet = PhantomPacketV1::new(header, ct).into_versioned();
+            let mut buf = Vec::new();
+            let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+            buf[..size].to_vec()
+        }
     }
 
     /// Integration test: Client handshake via ChannelTransport with a
