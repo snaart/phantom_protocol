@@ -457,8 +457,13 @@ impl HandshakeClient {
         })
     }
 
+    /// Default `ClientHello` offers wire-format **V2**. V2 has been
+    /// negotiable since Phase 1.8 (server accepts {1, 2}); the data
+    /// pump V2-routes since the 4.2 / 2.5 closeout commit.
+    /// Downgrade resistance comes from the transcript signature over
+    /// `client_hello.version` — see `docs/migration/v1-to-v2.md`.
     pub fn create_client_hello(&self) -> ClientHello {
-        self.create_client_hello_with_version(1)
+        self.create_client_hello_with_version(2)
     }
 
     /// Like [`create_client_hello`](Self::create_client_hello) but offers

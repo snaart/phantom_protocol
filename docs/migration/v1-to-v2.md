@@ -1,10 +1,13 @@
 # Migrating from wire-format V1 to V2
 
-> **Status.** Wire-format V2 has been on the wire-types layer since Phase
-> 1.5 (rekey) + Phase 4.2 (path validation). Both V1 and V2 are accepted
-> by the handshake (Phase 1.8) — V3+ is rejected. Data-pump routing
-> between V1 and V2 is incremental: existing deployments stay on V1 until
-> both peers opt into V2 negotiation in a future release.
+> **Status.** Wire-format V2 is now the **client default**
+> (`HandshakeClient::create_client_hello` offers `version: 2`). Servers
+> built from `phantom_core ≥ 0.2.x` accept both V1 and V2 (V3+ is
+> rejected). The data pump V2-routes per `Session::wire_version()`
+> negotiated at handshake time. Operators upgrading a heterogeneous
+> fleet should still follow the rollout phases below to avoid a
+> Phase 1 → Phase 2 ordering bug, but new deployments can take V2 by
+> default with no further configuration.
 
 This guide is for SDK consumers and operators upgrading a fleet that
 mixes pre-V2 and V2-capable peers.
