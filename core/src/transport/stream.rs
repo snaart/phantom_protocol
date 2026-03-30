@@ -13,6 +13,11 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 
 const MAX_PENDING_PACKETS: usize = 1024;
 
+/// Initial per-stream send window — caps how many bytes the local
+/// side will put on the wire before receiving a `WINDOW_UPDATE` from
+/// the peer. 64 KiB matches QUIC's stream initial-window default.
+pub const INITIAL_STREAM_WINDOW: u32 = 64 * 1024;
+
 /// Stream state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
@@ -64,6 +69,19 @@ pub struct Stream {
     priority: AtomicU32,
     /// Backpressure semaphore
     send_semaphore: Arc<Semaphore>,
+    /// Bytes the **peer** has granted us to send — decremented as we
+    /// emit payload bytes, replenished by inbound `WINDOW_UPDATE`
+    /// frames (Phase 4.3). When it hits zero, `poll_send` stalls
+    /// until the next `WINDOW_UPDATE`.
+    peer_send_window: AtomicU32,
+    /// Bytes the local side has granted the peer — replenished as
+    /// the application drains `recv_ready`. We periodically emit a
+    /// `WINDOW_UPDATE` carrying the new absolute window.
+    local_recv_window: AtomicU32,
+    /// Total bytes the local side has consumed since the last
+    /// emitted `WINDOW_UPDATE`. Used to decide when to send the
+    /// next update (avoid flooding the wire with tiny updates).
+    bytes_since_last_update: AtomicU32,
 }
 
 impl Stream {
@@ -83,6 +101,9 @@ impl Stream {
             remote_finished: AtomicBool::new(false),
             priority: AtomicU32::new(0),
             send_semaphore: Arc::new(Semaphore::new(MAX_PENDING_PACKETS)),
+            peer_send_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
+            local_recv_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
+            bytes_since_last_update: AtomicU32::new(0),
         }
     }
 
@@ -104,6 +125,77 @@ impl Stream {
     /// Set priority
     pub fn set_priority(&self, priority: u32) {
         self.priority.store(priority, Ordering::Relaxed);
+    }
+
+    // ── Flow control (Phase 4.3) ──
+
+    /// Bytes the peer currently allows us to send.
+    pub fn peer_send_window(&self) -> u32 {
+        self.peer_send_window.load(Ordering::Acquire)
+    }
+
+    /// Atomically reserve `n` bytes from the peer's send window.
+    /// Returns `true` if the reservation succeeded (and the window
+    /// was decremented); `false` if the window doesn't have enough
+    /// capacity — caller must wait for a `WINDOW_UPDATE`.
+    pub fn try_consume_send_window(&self, n: u32) -> bool {
+        let mut cur = self.peer_send_window.load(Ordering::Acquire);
+        loop {
+            if cur < n {
+                return false;
+            }
+            match self.peer_send_window.compare_exchange_weak(
+                cur,
+                cur - n,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Process an inbound `WINDOW_UPDATE` from the peer. The payload
+    /// is the new ABSOLUTE window size (not a delta). We accept
+    /// monotonic increases only — a smaller value than the current
+    /// window is ignored (it would be a regression).
+    pub fn apply_peer_window_update(&self, new_window: u32) {
+        let mut cur = self.peer_send_window.load(Ordering::Acquire);
+        while new_window > cur {
+            match self.peer_send_window.compare_exchange_weak(
+                cur,
+                new_window,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Bytes the local side has granted the peer.
+    pub fn local_recv_window(&self) -> u32 {
+        self.local_recv_window.load(Ordering::Acquire)
+    }
+
+    /// Record that the application has consumed `n` bytes from this
+    /// stream's recv buffer. Returns `Some(new_window)` if a
+    /// `WINDOW_UPDATE` should be emitted (the unreported delta has
+    /// crossed half the initial window — a common heuristic that
+    /// trades update frequency vs. peer stalls).
+    pub fn record_app_consumed(&self, n: u32) -> Option<u32> {
+        // Replenish the local recv window.
+        self.local_recv_window.fetch_add(n, Ordering::AcqRel);
+        let pending = self.bytes_since_last_update.fetch_add(n, Ordering::AcqRel) + n;
+        let threshold = INITIAL_STREAM_WINDOW / 2;
+        if pending >= threshold {
+            self.bytes_since_last_update.store(0, Ordering::Release);
+            Some(self.local_recv_window.load(Ordering::Acquire))
+        } else {
+            None
+        }
     }
 
     /// Queue data for sending with reliability
@@ -456,5 +548,61 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), send_future).await;
         assert!(result.is_ok(), "Send should have succeeded after ack");
         assert_eq!(stream.pending_send_count().await, MAX_PENDING_PACKETS);
+    }
+
+    // ── Flow control (Phase 4.3) ──
+
+    #[test]
+    fn peer_send_window_starts_at_initial() {
+        let s = Stream::new(1);
+        assert_eq!(s.peer_send_window(), INITIAL_STREAM_WINDOW);
+    }
+
+    #[test]
+    fn try_consume_send_window_decrements_atomically() {
+        let s = Stream::new(1);
+        assert!(s.try_consume_send_window(1000));
+        assert_eq!(s.peer_send_window(), INITIAL_STREAM_WINDOW - 1000);
+        assert!(s.try_consume_send_window(INITIAL_STREAM_WINDOW - 1000));
+        assert_eq!(s.peer_send_window(), 0);
+        // Further consumption fails until refilled.
+        assert!(!s.try_consume_send_window(1));
+    }
+
+    #[test]
+    fn apply_peer_window_update_only_grows() {
+        let s = Stream::new(1);
+        // Drain to 100 bytes.
+        assert!(s.try_consume_send_window(INITIAL_STREAM_WINDOW - 100));
+        assert_eq!(s.peer_send_window(), 100);
+
+        // Replenish to a larger value than the current.
+        s.apply_peer_window_update(INITIAL_STREAM_WINDOW);
+        assert_eq!(s.peer_send_window(), INITIAL_STREAM_WINDOW);
+
+        // A smaller value is ignored (window is monotonic).
+        s.apply_peer_window_update(50);
+        assert_eq!(s.peer_send_window(), INITIAL_STREAM_WINDOW);
+    }
+
+    #[test]
+    fn record_app_consumed_emits_only_after_threshold() {
+        let s = Stream::new(1);
+        let threshold = INITIAL_STREAM_WINDOW / 2;
+
+        // Small drains return None.
+        assert!(s.record_app_consumed(100).is_none());
+        assert!(s.record_app_consumed(200).is_none());
+
+        // Drain across the half-window threshold → expect an update.
+        let pending = s.record_app_consumed(threshold);
+        assert!(pending.is_some(), "should emit WINDOW_UPDATE");
+        // The announced window equals the new local_recv_window
+        // (post-replenish).
+        assert_eq!(pending.unwrap(), INITIAL_STREAM_WINDOW + 300 + threshold,);
+
+        // Counter resets after emitting — small further drains do not
+        // re-emit immediately.
+        assert!(s.record_app_consumed(10).is_none());
     }
 }

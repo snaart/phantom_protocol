@@ -502,6 +502,9 @@ async fn run_data_pump<T: SessionTransport>(
         // challenges. Wraps via `wrapping_add` — sequence space is the
         // session's overall stream-0 control space.
         let mut path_validation_seq: u32 = 0;
+        // Monotonic sequence space for outbound WINDOW_UPDATE control
+        // packets emitted by the recv path (Phase 4.3).
+        let mut window_update_seq: u32 = 0;
         loop {
             let data = match transport_recv.recv_bytes().await {
                 Ok(b) => b,
@@ -538,6 +541,7 @@ async fn run_data_pump<T: SessionTransport>(
                         &recv_tx_for_task,
                         &mut ack_buf,
                         &mut path_validation_seq,
+                        &mut window_update_seq,
                     )
                     .await;
                 }
@@ -568,47 +572,23 @@ async fn run_data_pump<T: SessionTransport>(
     loop {
         tokio::select! {
             _ = poll_interval.tick() => {
-                for entry in streams.iter() {
-                    let stream_id = *entry.key();
-                    let stream = entry.value();
-                    while let Some((seq, payload, is_reliable)) = stream.poll_send().await {
-                        let base = if is_reliable { PacketFlags::RELIABLE } else { PacketFlags::UNRELIABLE };
-                        if !send_app_data(
-                            &transport,
-                            &crypto_session,
-                            session_id,
-                            stream_id as TransportStreamId,
-                            seq,
-                            &payload,
-                            base,
-                        ).await {
-                            log::error!("PhantomSession: stream poll send failed");
-                            break;
-                        }
-                    }
-                }
+                drain_streams_priority_ordered(
+                    &transport,
+                    &crypto_session,
+                    session_id,
+                    &streams,
+                )
+                .await;
             }
             _ = send_notify.notified() => {
                 // Same drain logic as the tick arm — fast-wake path.
-                for entry in streams.iter() {
-                    let stream_id = *entry.key();
-                    let stream = entry.value();
-                    while let Some((seq, payload, is_reliable)) = stream.poll_send().await {
-                        let base = if is_reliable { PacketFlags::RELIABLE } else { PacketFlags::UNRELIABLE };
-                        if !send_app_data(
-                            &transport,
-                            &crypto_session,
-                            session_id,
-                            stream_id as TransportStreamId,
-                            seq,
-                            &payload,
-                            base,
-                        ).await {
-                            log::error!("PhantomSession: notified send drain failed");
-                            break;
-                        }
-                    }
-                }
+                drain_streams_priority_ordered(
+                    &transport,
+                    &crypto_session,
+                    session_id,
+                    &streams,
+                )
+                .await;
             }
             cmd_opt = cmd_rx.recv() => {
                 match cmd_opt {
@@ -683,6 +663,57 @@ async fn run_data_pump<T: SessionTransport>(
 
 /// Encrypt `payload` and emit a single `PhantomPacketV1` over the transport.
 /// Returns `false` on a transport or crypto error so the caller can react.
+/// Drain every stream with pending data, scheduling them in strict
+/// priority order (higher `Stream::priority()` wins). Streams of equal
+/// priority are drained in stream-id order (deterministic so tests
+/// don't get flaky under DashMap's hash-order shuffle).
+///
+/// This is **strict priority**: a stream with priority N never yields
+/// to a stream with priority < N while it still has data. A future
+/// weighted-fair scheduler can replace this without changing the
+/// caller surface. Phase 4.3.
+async fn drain_streams_priority_ordered<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    streams: &Arc<DashMap<u32, Arc<Stream>>>,
+) {
+    // Snapshot the stream set so we can sort without holding DashMap
+    // shard locks across awaits. Each entry is (priority, stream_id,
+    // stream-Arc) — Arc clones are cheap (refcount bump).
+    let mut snapshot: Vec<(u32, u32, Arc<Stream>)> = streams
+        .iter()
+        .map(|e| (e.value().priority(), *e.key(), e.value().clone()))
+        .collect();
+    // Descending priority; ties broken by stream id ascending so the
+    // order is stable across iterations.
+    snapshot.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+    for (_priority, stream_id, stream) in snapshot {
+        while let Some((seq, payload, is_reliable)) = stream.poll_send().await {
+            let base = if is_reliable {
+                PacketFlags::RELIABLE
+            } else {
+                PacketFlags::UNRELIABLE
+            };
+            if !send_app_data(
+                transport,
+                crypto_session,
+                session_id,
+                stream_id as TransportStreamId,
+                seq,
+                &payload,
+                base,
+            )
+            .await
+            {
+                log::error!("PhantomSession: priority-ordered drain send failed");
+                break;
+            }
+        }
+    }
+}
+
 async fn send_app_data<T: SessionTransport>(
     transport: &Arc<T>,
     crypto_session: &Arc<Session>,
@@ -791,6 +822,43 @@ async fn send_app_data_v2<T: SessionTransport>(
     let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
     if let Err(e) = transport.send_bytes(&buf[..size]).await {
         log::error!("PhantomSession: transport send failed (V2): {}", e);
+        return false;
+    }
+    true
+}
+
+/// Emit a V2 WINDOW_UPDATE packet announcing `new_window` bytes of
+/// receive capacity for `stream_id`. Encrypted under the current
+/// session epoch (Phase 4.3 flow control).
+async fn send_window_update_v2<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    stream_id: TransportStreamId,
+    sequence: u32,
+    new_window: u32,
+) -> bool {
+    let flag_bits = PacketFlagsV2::ENCRYPTED | PacketFlagsV2::WINDOW_UPDATE;
+    let header = PacketHeaderV2::new(
+        session_id,
+        stream_id,
+        sequence,
+        PacketFlagsV2::new(flag_bits),
+    )
+    .with_epoch(crypto_session.current_epoch());
+    let payload = new_window.to_be_bytes();
+    let ciphertext = match crypto_session.encrypt_packet_v2(&header, &payload) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("PhantomSession: WINDOW_UPDATE encrypt failed: {}", e);
+            return false;
+        }
+    };
+    let packet = PhantomPacketV2::new(header, ciphertext).into_versioned();
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+    if let Err(e) = transport.send_bytes(&buf[..size]).await {
+        log::error!("PhantomSession: WINDOW_UPDATE send failed: {}", e);
         return false;
     }
     true
@@ -927,6 +995,7 @@ async fn handle_v2_packet<T: SessionTransport>(
     recv_tx: &mpsc::Sender<Bytes>,
     ack_buf: &mut Vec<u8>,
     path_validation_seq: &mut u32,
+    window_update_seq: &mut u32,
 ) {
     let stream_id: u32 = packet.header.stream_id.into();
     let path_id = packet.header.path_id;
@@ -967,6 +1036,25 @@ async fn handle_v2_packet<T: SessionTransport>(
     } else {
         Vec::new()
     };
+
+    // WINDOW_UPDATE dispatch (Phase 4.3 flow control). Payload is a
+    // big-endian u32 carrying the peer's new absolute send-window
+    // for this stream_id.
+    if packet.header.flags.contains(PacketFlagsV2::WINDOW_UPDATE) {
+        if plaintext.len() != 4 {
+            log::warn!(
+                "PhantomSession: WINDOW_UPDATE payload length {} (expected 4)",
+                plaintext.len()
+            );
+            return;
+        }
+        let new_window =
+            u32::from_be_bytes([plaintext[0], plaintext[1], plaintext[2], plaintext[3]]);
+        if let Some(stream) = streams_recv.get(&stream_id) {
+            stream.apply_peer_window_update(new_window);
+        }
+        return;
+    }
 
     // PATH_VALIDATION dispatch (Phase 4.2): the codec inspects the *plaintext*
     // because the wire packet was sealed by the AEAD layer.
@@ -1070,8 +1158,38 @@ async fn handle_v2_packet<T: SessionTransport>(
         let _ = transport_send_ack.send_bytes(&ack_buf[..size]).await;
     }
 
+    // Track bytes received for the stream's flow-control accounting
+    // (Phase 4.3). The pump treats "received and routed to the recv
+    // channel" as consumed — slow consumers experience some over-
+    // budget queueing on the FFI receive channel, but the wire-level
+    // window stays in lockstep with the pump's view.
+    let consumed_bytes = plaintext.len() as u32;
+    let window_update_to_emit = if consumed_bytes > 0 {
+        if let Some(stream) = streams_recv.get(&stream_id) {
+            stream.record_app_consumed(consumed_bytes)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if !plaintext_into_router(plaintext, stream_id, demux_recv, recv_tx).await {
         return;
+    }
+
+    if let Some(new_window) = window_update_to_emit {
+        let seq = *window_update_seq;
+        *window_update_seq = window_update_seq.wrapping_add(1);
+        let _ = send_window_update_v2(
+            transport_send_ack,
+            crypto_recv,
+            session_id,
+            stream_id as TransportStreamId,
+            seq,
+            new_window,
+        )
+        .await;
     }
 
     if packet.header.flags.contains(PacketFlagsV2::FIN) {
@@ -1620,6 +1738,7 @@ mod tests {
 
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
+        let mut window_update_seq: u32 = 0;
         handle_v2_packet(
             v2,
             session_id,
@@ -1631,6 +1750,7 @@ mod tests {
             &recv_tx,
             &mut ack_buf,
             &mut path_validation_seq,
+            &mut window_update_seq,
         )
         .await;
 
@@ -1669,6 +1789,7 @@ mod tests {
 
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
+        let mut window_update_seq: u32 = 0;
         handle_v2_packet(
             bad_packet,
             session_id,
@@ -1680,6 +1801,7 @@ mod tests {
             &recv_tx,
             &mut ack_buf,
             &mut path_validation_seq,
+            &mut window_update_seq,
         )
         .await;
 
@@ -1729,6 +1851,7 @@ mod tests {
 
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
+        let mut window_update_seq: u32 = 0;
         handle_v2_packet(
             v2,
             session_id,
@@ -1740,6 +1863,7 @@ mod tests {
             &recv_tx,
             &mut ack_buf,
             &mut path_validation_seq,
+            &mut window_update_seq,
         )
         .await;
 
@@ -1749,6 +1873,204 @@ mod tests {
         assert_eq!(&a[..], b"alpha");
         assert_eq!(&b[..], b"bravo");
         assert_eq!(&c[..], b"charlie");
+    }
+
+    /// Phase 4.3 — WINDOW_UPDATE round-trip. After the receive side
+    /// has crossed the half-window threshold, it emits a V2
+    /// WINDOW_UPDATE packet announcing its absolute window. The
+    /// sender-side `Stream::apply_peer_window_update` lifts its
+    /// `peer_send_window` to that value.
+    #[tokio::test]
+    async fn flow_control_window_update_round_trip() {
+        use crate::transport::stream::INITIAL_STREAM_WINDOW;
+
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_v2_sessions(session_id);
+
+        // Register a stream on the server side so handle_v2_packet
+        // can record the bytes-consumed accounting. The stream id
+        // matches the packet header.
+        let stream_id: TransportStreamId = 9;
+        let server_streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        server_streams.insert(stream_id as u32, Arc::new(TransportStream::new(stream_id)));
+
+        // Client also has a Stream so we can apply the inbound update.
+        let client_stream = Arc::new(TransportStream::new(stream_id));
+        let client_streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        client_streams.insert(stream_id as u32, client_stream.clone());
+
+        // Pre-drain client's peer_send_window so the WINDOW_UPDATE
+        // has a real effect to assert against.
+        let drain = INITIAL_STREAM_WINDOW - 1000;
+        assert!(client_stream.try_consume_send_window(drain));
+        assert_eq!(client_stream.peer_send_window(), 1000);
+
+        // Build a single large app-data packet that crosses the
+        // server's half-window threshold in one shot.
+        let big = vec![0u8; (INITIAL_STREAM_WINDOW / 2 + 1) as usize];
+        let frame = build_v2_app_frame(&client_session, session_id, stream_id, 0, &big);
+
+        // Server processes the packet via handle_v2_packet. We
+        // capture its outbound transport so we can intercept the
+        // WINDOW_UPDATE it emits.
+        let versioned = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&frame).unwrap();
+        let v2 = match versioned {
+            VersionedPacket::V2(p) => p,
+            VersionedPacket::V1(_) => panic!("V2 expected"),
+        };
+
+        let (demux, _ctrl) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let (recv_tx, mut _recv_rx) = mpsc::channel::<Bytes>(4);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (back_tx, back_rx) = mpsc::channel::<Vec<u8>>(4);
+        let server_outbound: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: out_tx,
+            rx: Mutex::new(back_rx),
+        });
+        let _keep = back_tx;
+
+        let mut ack_buf = Vec::with_capacity(256);
+        let mut path_validation_seq: u32 = 0;
+        let mut window_update_seq: u32 = 0;
+        handle_v2_packet(
+            v2,
+            session_id,
+            &server_session,
+            &server_streams,
+            &demux,
+            &server_outbound,
+            &server_outbound,
+            &recv_tx,
+            &mut ack_buf,
+            &mut path_validation_seq,
+            &mut window_update_seq,
+        )
+        .await;
+
+        // The server's recv path should have crossed the threshold
+        // and emitted exactly one WINDOW_UPDATE. (There will be an
+        // ACK first because the inbound was RELIABLE.) Pull frames
+        // until we find the WINDOW_UPDATE.
+        let mut announced: Option<u32> = None;
+        for _ in 0..3 {
+            let frame = tokio::time::timeout(std::time::Duration::from_millis(100), out_rx.recv())
+                .await
+                .expect("expected an outbound frame")
+                .expect("channel open");
+            let v = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&frame).unwrap();
+            let pv2 = match v {
+                VersionedPacket::V2(p) => p,
+                VersionedPacket::V1(_) => panic!("V2 expected"),
+            };
+            if pv2.header.flags.contains(PacketFlagsV2::WINDOW_UPDATE) {
+                // Decrypt the payload to read the new window.
+                let pt = client_session
+                    .decrypt_packet_v2(&pv2.header, &pv2.payload)
+                    .expect("decrypt WINDOW_UPDATE");
+                assert_eq!(pt.len(), 4);
+                announced = Some(u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]));
+                break;
+            }
+        }
+        let announced = announced.expect("WINDOW_UPDATE must have been emitted");
+
+        // Apply the update on the client side; peer_send_window
+        // jumps to the announced value (it's larger than the
+        // current 1000).
+        client_stream.apply_peer_window_update(announced);
+        assert_eq!(client_stream.peer_send_window(), announced);
+        // Sanity: announced window is the receiver-side replenished
+        // total — at least the initial window's size.
+        assert!(announced >= INITIAL_STREAM_WINDOW);
+        // Exactly one WINDOW_UPDATE was emitted.
+        assert_eq!(window_update_seq, 1);
+    }
+
+    /// Phase 4.3 — priority scheduler ordering. Two streams enqueue
+    /// data simultaneously; the higher-priority one must be drained
+    /// first, all of its data before any of the lower one's.
+    #[tokio::test]
+    async fn priority_scheduler_drains_higher_priority_stream_first() {
+        // Build a real Session (any crypto state — we only inspect
+        // send order, not ciphertext) and an Arc<Stream> per stream.
+        let session_id = fixed_session_id();
+        let (client_session, _server_session) = paired_v2_sessions(session_id);
+
+        // Capture every outbound packet by stuffing into a channel-
+        // backed transport whose tx end we can drain after.
+        let (tx_a, mut rx_a) = mpsc::channel::<Vec<u8>>(32);
+        let (tx_b, rx_b) = mpsc::channel::<Vec<u8>>(32);
+        let transport: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: tx_a,
+            rx: Mutex::new(rx_b),
+        });
+        let _keep = tx_b; // keep the recv side alive
+
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+
+        // Stream 11: low priority (1), 3 reliable chunks.
+        let low = Arc::new(TransportStream::new(11));
+        low.set_priority(1);
+        low.send_reliable(Bytes::from_static(b"L0")).await;
+        low.send_reliable(Bytes::from_static(b"L1")).await;
+        low.send_reliable(Bytes::from_static(b"L2")).await;
+        streams.insert(11, low);
+
+        // Stream 22: HIGH priority (100), 3 reliable chunks.
+        let hi = Arc::new(TransportStream::new(22));
+        hi.set_priority(100);
+        hi.send_reliable(Bytes::from_static(b"H0")).await;
+        hi.send_reliable(Bytes::from_static(b"H1")).await;
+        hi.send_reliable(Bytes::from_static(b"H2")).await;
+        streams.insert(22, hi);
+
+        drain_streams_priority_ordered(&transport, &client_session, session_id, &streams).await;
+
+        // Pull all packets off the channel and verify their order:
+        // the three H* chunks must come before any L* chunk.
+        let mut order: Vec<&'static str> = Vec::new();
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx_a.recv()).await
+        {
+            let bytes = match frame {
+                Some(b) => b,
+                None => break,
+            };
+            let versioned =
+                alkahest::deserialize::<VersionedPacket, VersionedPacket>(&bytes).unwrap();
+            let v2 = match versioned {
+                VersionedPacket::V2(p) => p,
+                VersionedPacket::V1(_) => panic!("expected V2"),
+            };
+            // Decrypt under the SERVER role so the per-direction key
+            // matches the client-side encrypt.
+            let plaintext = _server_session
+                .decrypt_packet_v2(&v2.header, &v2.payload)
+                .expect("decrypt");
+            let tag: &'static str = match &plaintext[..] {
+                b"H0" => "H0",
+                b"H1" => "H1",
+                b"H2" => "H2",
+                b"L0" => "L0",
+                b"L1" => "L1",
+                b"L2" => "L2",
+                other => panic!("unexpected payload {:?}", other),
+            };
+            order.push(tag);
+        }
+
+        // All H* before any L*.
+        let first_low = order
+            .iter()
+            .position(|s| s.starts_with('L'))
+            .unwrap_or(order.len());
+        let last_high = order.iter().rposition(|s| s.starts_with('H')).unwrap();
+        assert!(
+            last_high < first_low,
+            "strict priority violated: order = {:?}",
+            order
+        );
     }
 
     #[tokio::test]
@@ -1787,6 +2109,7 @@ mod tests {
 
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 100;
+        let mut window_update_seq: u32 = 0;
 
         handle_v2_packet(
             v2,
@@ -1799,6 +2122,7 @@ mod tests {
             &recv_tx,
             &mut ack_buf,
             &mut path_validation_seq,
+            &mut window_update_seq,
         )
         .await;
 
