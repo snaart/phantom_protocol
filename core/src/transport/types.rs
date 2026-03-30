@@ -284,7 +284,12 @@ impl PacketFlagsV2 {
     /// Payload is a coalesced bundle of inner packets in
     /// `[count: u16][len1: u16][payload1]...` format (Phase 2.5).
     pub const COALESCED: u16 = 0x0400;
-    // 0x0800 .. 0x8000 — reserved for future V2 amendments.
+    /// Per-stream flow control update (Phase 4.3). Payload is a
+    /// big-endian `u32` carrying the receiver's newly-available
+    /// window in bytes (absolute window size, NOT a delta — simpler
+    /// and self-correcting under packet loss).
+    pub const WINDOW_UPDATE: u16 = 0x0800;
+    // 0x1000 .. 0x8000 — reserved for future V2 amendments.
 
     /// Create new flags with no bits set
     pub const fn empty() -> Self {
