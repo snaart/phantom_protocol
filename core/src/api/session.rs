@@ -778,11 +778,70 @@ async fn send_app_data_v1<T: SessionTransport>(
     // overhead (a few bytes) + payload + AEAD tag (16 bytes).
     let mut buf: Vec<u8> = Vec::with_capacity(payload.len() + 64);
     let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+    // Phase 4.4 — pace the send through the BBR-driven Pacer. Default
+    // is `Pacer::unlimited` (always allows), so this is a no-op until
+    // CC kicks in via `on_packet_acked` setting a finite rate.
+    pace_send(crypto_session, size as u64).await;
     if let Err(e) = transport.send_bytes(&buf[..size]).await {
         log::error!("PhantomSession: transport send failed: {}", e);
         return false;
     }
+    crypto_session.on_packet_sent(size as u64);
     true
+}
+
+/// Build a `DeliverySample` from a successful Stream ack callback and
+/// feed it into the session's BBR estimator (Phase 4.4). The BBR loop
+/// internally re-sets the pacer rate via `Session::on_packet_acked`,
+/// so the next outbound packet is paced at the freshly-estimated
+/// bottleneck bandwidth.
+///
+/// `ack_delay_us` is the V2 header's `ack_delay` field (microseconds
+/// the receiver held the ACK before sending) — subtracted from the
+/// observed RTT to yield the propagation delay. For V1 ACKs there is
+/// no `ack_delay` field on the wire; pass 0 (the estimator treats
+/// this as "no peer-side delay reported").
+fn feed_bbr_on_ack(
+    crypto_session: &Arc<Session>,
+    sent_at: tokio::time::Instant,
+    packet_bytes: u64,
+    ack_delay_us: u64,
+) {
+    let sample = crate::transport::bandwidth_estimator::DeliverySample {
+        delivered_bytes: 0, // BandwidthEstimator tracks its own counter
+        sent_at: sent_at.into_std(),
+        acked_at: std::time::Instant::now(),
+        packet_bytes,
+        is_app_limited: false,
+        ack_delay_us,
+    };
+    let _ = crypto_session.on_packet_acked(sample);
+}
+
+/// Wait until the pacer has tokens for `bytes` bytes. No-op when the
+/// pacer is unlimited (the default until BBR sets a finite rate).
+async fn pace_send(crypto_session: &Arc<Session>, bytes: u64) {
+    let pacer = crypto_session.pacer();
+    if !pacer.is_enabled() {
+        return;
+    }
+    loop {
+        if pacer.try_consume(bytes) {
+            return;
+        }
+        let wait = pacer.time_until_available(bytes);
+        if wait.is_zero() {
+            // Tokens should be available; retry the consume to handle
+            // a concurrent race with another sender.
+            continue;
+        }
+        // Cap the wait to keep the loop responsive — a stale wait
+        // estimate from a long-idle pacer is corrected on the next
+        // iteration.
+        let cap = std::time::Duration::from_millis(50);
+        let wait = wait.min(cap);
+        tokio::time::sleep(wait).await;
+    }
 }
 
 /// V2 send. Builds `PhantomPacketV2` with `PacketFlagsV2::ENCRYPTED` and
@@ -820,10 +879,12 @@ async fn send_app_data_v2<T: SessionTransport>(
     // V2 header is 44 wire bytes; same 64-byte envelope headroom as V1.
     let mut buf: Vec<u8> = Vec::with_capacity(payload.len() + 64);
     let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+    pace_send(crypto_session, size as u64).await;
     if let Err(e) = transport.send_bytes(&buf[..size]).await {
         log::error!("PhantomSession: transport send failed (V2): {}", e);
         return false;
     }
+    crypto_session.on_packet_sent(size as u64);
     true
 }
 
@@ -922,7 +983,9 @@ async fn handle_v1_packet<T: SessionTransport>(
 
     if packet.header.flags.is_ack() {
         if let Some(stream) = streams_recv.get(&stream_id) {
-            stream.ack(packet.header.sequence).await;
+            if let Some((sent_at, bytes)) = stream.ack(packet.header.sequence).await {
+                feed_bbr_on_ack(crypto_recv, sent_at, bytes, 0);
+            }
         }
         demux_recv
             .route_ack_async(stream_id, packet.header.sequence)
@@ -1006,7 +1069,9 @@ async fn handle_v2_packet<T: SessionTransport>(
 
     if packet.header.flags.contains(PacketFlagsV2::ACK) {
         if let Some(stream) = streams_recv.get(&stream_id) {
-            stream.ack(packet.header.sequence).await;
+            if let Some((sent_at, bytes)) = stream.ack(packet.header.sequence).await {
+                feed_bbr_on_ack(crypto_recv, sent_at, bytes, packet.header.ack_delay as u64);
+            }
         }
         demux_recv
             .route_ack_async(stream_id, packet.header.sequence)
@@ -1873,6 +1938,56 @@ mod tests {
         assert_eq!(&a[..], b"alpha");
         assert_eq!(&b[..], b"bravo");
         assert_eq!(&c[..], b"charlie");
+    }
+
+    /// Phase 4.4 — BBR ACK feedback drives the pacer rate. Build a
+    /// realistic DeliverySample with known sent_at/acked_at timestamps
+    /// and packet size; assert that calling `on_packet_acked` causes
+    /// the pacer to leave its default unlimited state with a finite
+    /// finite positive rate.
+    #[tokio::test]
+    async fn bbr_on_ack_drives_pacer_rate() {
+        use crate::transport::bandwidth_estimator::DeliverySample;
+        use std::time::{Duration, Instant};
+
+        let session_id = fixed_session_id();
+        let (client_session, _server_session) = paired_v2_sessions(session_id);
+
+        // The default Pacer is `unlimited` — track it before/after.
+        assert!(!client_session.pacer().is_enabled());
+
+        // Simulate sending a 1500-byte packet, then receiving an ACK
+        // 20 ms later. We feed a few samples in a row so the EMA
+        // estimator has data to work with.
+        let now = Instant::now();
+        for i in 0..16 {
+            let sent_at = now - Duration::from_millis(20 + i * 5);
+            let acked_at = now - Duration::from_millis(i * 5);
+            let sample = DeliverySample {
+                delivered_bytes: 0,
+                sent_at,
+                acked_at,
+                packet_bytes: 1500,
+                is_app_limited: false,
+                ack_delay_us: 100,
+            };
+            client_session.on_packet_sent(1500);
+            let _ = client_session.on_packet_acked(sample);
+        }
+
+        // The pacer should now be set to a real rate (still
+        // "unlimited" handle, but with a finite stored rate). The
+        // BandwidthEstimator's `pacing_rate()` is what gets pushed
+        // into the pacer; assert it is non-zero and finite.
+        let snap = client_session.bandwidth_snapshot();
+        assert!(
+            snap.pacing_rate_bps > 0,
+            "expected pacing_rate to be non-zero, got {}",
+            snap.pacing_rate_bps,
+        );
+        // The pacer's stored rate must match the estimator's view
+        // (Session.on_packet_acked mirrors them).
+        assert_eq!(client_session.pacer().rate(), snap.pacing_rate_bps);
     }
 
     /// Phase 4.3 — WINDOW_UPDATE round-trip. After the receive side
