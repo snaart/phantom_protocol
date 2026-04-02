@@ -9,11 +9,11 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **214 / 214** (180 unit + 24 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
+| Tests passing | **224 / 224** (190 unit + 24 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration) |
 | **Phase 1 / Phase 2 closed** | ✅ all 14 + 13 sub-items either ✅ or ⏭️ with rationale |
 | Atomic commits since `e4067b6` baseline | **52+** |
 | `#[allow(unsafe_code)]` opt-ins outside the deny-by-default | **1** (was 2 — `crypto/keys.rs` deleted in Phase 5.1) |
-| Wire format versions supported | **V1 + V2** (V2 wire types + V2 AEAD path landed; V2 derives nonce from header → failed decrypts no longer desync) |
+| Wire format versions supported | **V1 + V2** (V2 is now the **client default** via `create_client_hello`; downgrade resistance via transcript signature) |
 | Mid-session rekey | **available** — `Session::rekey()` + V2 `PacketFlagsV2::REKEY` + `header.epoch` |
 | V2 codecs landed | `transport::path_validation_codec` + `transport::packet_coalescer_codec`; `run_data_pump` now routes V1 vs V2 per `Session::wire_version()`, V2 path handles PATH_VALIDATION (auto-echo) and COALESCED (split-and-fan-out) |
 | Metrics | **structured** (`TransportMetrics`) — security signals, gauges, handshake-latency histogram, Prometheus text exposition via `PhantomListener::metrics_prometheus_text()` |
@@ -128,14 +128,14 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 
 | # | Item | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
-| 4.1 | 0-RTT resumption (server `SessionCache` wire-in, early-data encrypt) | ⏳ | — | `session_cache.rs` exists but disconnected |
+| 4.1 | 0-RTT resumption (server `SessionCache` wire-in, early-data encrypt) | 🔄 | _this commit_ | Server-side cache wired into `HandshakeServer`; tickets stored on success keyed by negotiated session_id. Client-side `Session::resumption_hint() -> Option<(id, secret)>` + `HandshakeClient::create_client_hello_with_resume`. ClientHello carrying a known `resume_session_id` bypasses cookie/PoW gate (forward secrecy via fresh KEM preserved). **Wire-level early-data encrypt under prior `resumption_secret`** is the remaining piece — needs a wire-format extension. |
 | 4.2 | Multi-path validation primitive | ✅ | _this commit_ | State machine (`transport::path`) + V2 wire codec (`transport::path_validation_codec`) + **end-to-end data-pump wiring**. `run_data_pump`'s V2 recv path decrypts the AEAD payload, then drives the path registry: if the local side already has a pending challenge for the path it verifies and transitions to Validated; otherwise it auto-echoes the payload back as a response. Validator-side challenge emission still happens on caller demand via `Session::begin_path_validation`; scheduler-driven outbound path selection remains an optional optimisation. |
-| 4.3 | Multi-stream finalization (priority, flow control) | ⏳ | — | priority field exists; never read by scheduler |
-| 4.4 | Congestion control (BBRv2-inspired) | ⏳ | — | depends on 2.6 (Pacer + Estimator wired) |
+| 4.3 | Multi-stream finalization (priority, flow control) | ✅ | _this commit_ | Strict-priority scheduler in `run_data_pump` (`drain_streams_priority_ordered`); ties broken by stream id ascending for determinism. Per-stream flow control via new `PacketFlagsV2::WINDOW_UPDATE` (0x0800) — `Stream::peer_send_window` / `local_recv_window` atomics with monotonic-grow semantics, half-window threshold heuristic for emission, send-side `send_window_update_v2`, recv-side auto-application on inbound flag. HOL-blocking elimination (per-stream tasks) remains an optional refinement. |
+| 4.4 | Congestion control (BBRv2-inspired) | ✅ | _this commit_ | BBR state machine in `BandwidthEstimator` (Startup/Drain/ProbeBW/ProbeRTT/FastRecovery) wired end-to-end. `send_app_data_v{1,2}` paces via `pace_send` and records `on_packet_sent`. Recv ACK handlers build `DeliverySample` from `Stream::ack` callback and call `Session::on_packet_acked` which mirrors the estimator's pacing rate onto the `Pacer`. Loss-based feedback (`on_packet_lost`) is caller-driven — retransmit-timer wiring is the next refinement. ECN support is a deferred subitem. |
 | 4.5 | Telemetry: `tracing` instrumentation (foundation) + metrics primitives | ✅ | _this commit_ | `tracing` spans on handshake + listener entry points (pre-existing). `TransportMetrics` expanded with security signals (`replay_rejected_total`, `unencrypted_dropped_total`, `aead_decrypt_failed_total`, `path_migrations_total`, `handshake_failures_total`), gauges (`active_sessions`, `active_streams`), handshake-latency histogram (Prometheus `≤` bucket semantics). `MetricsSnapshot::to_prometheus_text()` emits text-exposition output. `PhantomListener::metrics_prometheus_text()` is the public accessor. SDK does not bundle an HTTP server — downstream wires `/metrics` if needed. Dashboard + alert rules templates land alongside (see `docs/operations/grafana/` and `docs/operations/prometheus/`). |
 | 4.6 | Graceful shutdown + signal handling | ✅ | _this commit_ | `PhantomListener::shutdown()` flips `shutting_down: AtomicBool` and notifies waiters; parked `accept()` calls unwind with `CoreError::ConnectionClosed`. `is_shutting_down()` accessor. Already-accepted sessions continue until their owners close them. |
 
-**Phase 4 verdict:** 4.2 ✅ + 4.5 ✅ + 4.6 ✅ landed. Data-pump V2-routing this commit closes 4.2 and 2.5 end-to-end. 4.1 (0-RTT), 4.3 (stream priority), 4.4 (BBRv2 congestion control) still pending.
+**Phase 4 verdict:** **closed for this cycle.** 4.2 ✅, 4.3 ✅, 4.4 ✅, 4.5 ✅, 4.6 ✅ all landed end-to-end. 4.1 🔄 — server-side cache + client-side hint are wired; wire-level early-data encrypt remains the natural follow-up (needs a wire-format extension to carry encrypted-under-resumption-secret bytes on the same flight as the ClientHello).
 
 ---
 
