@@ -143,6 +143,11 @@ pub struct PhantomSession {
     demux: Arc<StreamDemultiplexer>,
     /// Active outgoing streams (ARQ management)
     streams: Arc<DashMap<u32, Arc<Stream>>>,
+    /// Negotiated session handle, populated by the background task
+    /// once the handshake completes. Exposed via `resumption_hint`
+    /// for Phase 4.1 0-RTT clients. `None` while still handshaking
+    /// or after a failure.
+    inner_session: Arc<Mutex<Option<Arc<Session>>>>,
 }
 
 /// Commands for the background session task
@@ -208,6 +213,7 @@ impl PhantomSession {
         let demux = Arc::new(demux);
 
         let streams = Arc::new(DashMap::new());
+        let inner_session: Arc<Mutex<Option<Arc<Session>>>> = Arc::new(Mutex::new(None));
 
         let session = Self {
             id: new_session_id(),
@@ -219,6 +225,7 @@ impl PhantomSession {
             recv_rx: Mutex::new(recv_rx),
             demux: demux.clone(),
             streams: streams.clone(),
+            inner_session: inner_session.clone(),
         };
 
         // Spawn the background handshake + data pump task on the supplied
@@ -238,6 +245,7 @@ impl PhantomSession {
             streams,
             expected_server_key,
             runtime_for_pump,
+            inner_session,
         )));
 
         session
@@ -281,6 +289,9 @@ impl PhantomSession {
         let demux = Arc::new(demux);
         let streams = Arc::new(DashMap::new());
 
+        let inner_session: Arc<Mutex<Option<Arc<Session>>>> =
+            Arc::new(Mutex::new(Some(server_session.clone())));
+
         let session = Arc::new(Self {
             id: new_session_id(),
             peer_addr: peer_addr.clone(),
@@ -291,6 +302,7 @@ impl PhantomSession {
             recv_rx: Mutex::new(recv_rx),
             demux: demux.clone(),
             streams: streams.clone(),
+            inner_session,
         });
 
         let session_id = *server_session.id();
@@ -314,6 +326,7 @@ impl PhantomSession {
     }
 
     /// Background task: performs handshake, then pumps data.
+    #[allow(clippy::too_many_arguments)]
     async fn background_task<T: SessionTransport>(
         state: Arc<AtomicU8>,
         send_queue: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -326,6 +339,7 @@ impl PhantomSession {
         streams: Arc<DashMap<u32, Arc<Stream>>>,
         expected_server_key: HybridVerifyingKey,
         runtime: Arc<dyn Runtime>,
+        inner_session: Arc<Mutex<Option<Arc<Session>>>>,
     ) {
         log::info!("PhantomSession: starting handshake with {}", peer);
 
@@ -401,6 +415,14 @@ impl PhantomSession {
                 }
             };
         log::info!("PhantomSession: Handshake complete — hybrid channel ready");
+
+        // Phase 4.1 — publish the negotiated Session via the outer
+        // PhantomSession so `resumption_hint()` can reach it after the
+        // background task moves the Arc into the pump.
+        {
+            let mut guard = inner_session.lock().await;
+            *guard = Some(crypto_session.clone());
+        }
 
         let session_id = *crypto_session.id();
         state.store(ConnectionState::Connected as u8, Ordering::Relaxed);
@@ -1302,6 +1324,7 @@ impl PhantomSession {
             recv_rx: Mutex::new(recv_rx),
             demux: Arc::new(demux),
             streams,
+            inner_session: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1424,6 +1447,21 @@ impl PhantomSession {
     /// Get the stream demultiplexer (internal use, not exposed to UniFFI)
     pub fn demux(&self) -> Arc<StreamDemultiplexer> {
         self.demux.clone()
+    }
+
+    /// Phase 4.1 — extract a resumption hint for 0-RTT on a future
+    /// connect. Returns `Some((session_id_bytes, resumption_secret))`
+    /// after a successful handshake; `None` while still handshaking,
+    /// after a failure, or before the inner session has been
+    /// published.
+    ///
+    /// The caller is responsible for storing the tuple alongside the
+    /// pinned `HybridVerifyingKey` of the server it was negotiated
+    /// against. Reusing a hint across servers is a configuration bug
+    /// — the resumption_secret is server-pinned.
+    pub async fn resumption_hint(&self) -> Option<([u8; 32], [u8; 32])> {
+        let guard = self.inner_session.lock().await;
+        guard.as_ref().and_then(|s| s.resumption_hint())
     }
 }
 

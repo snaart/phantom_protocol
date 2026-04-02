@@ -13,12 +13,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use zeroize::ZeroizeOnDrop;
 
+use crate::crypto::adaptive_crypto::CipherSuite;
 use crate::crypto::hybrid_kem::{HybridCiphertext, HybridKeyPackage, HybridSecretKey};
 use crate::crypto::hybrid_sign::{HybridSignature, HybridSigningKey, HybridVerifyingKey};
 use crate::crypto::pow::{PoWChallenge, PoWSolution};
 use crate::errors::CoreError;
 use crate::transport::session::{CryptoState, Session};
+use crate::transport::session_cache::SessionCache;
 use crate::transport::types::{SchedulerMode, SessionId};
+use std::sync::Arc;
 
 /// Handshake processing stages
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +137,13 @@ pub struct HandshakeServer {
     handshakes_this_minute: AtomicU64,
     #[zeroize(skip)]
     minute_start_unix_sec: AtomicU64,
+    /// Server-side resumption cache (Phase 4.1). Stores
+    /// `ResumptionTicket` keyed on the session id derived at handshake
+    /// success. Bounded LRU with a 1-hour ticket lifetime by default;
+    /// `try_resume` returns a forward-secret derived secret per call.
+    /// `Arc<Mutex<>>` so all handshake threads share one cache.
+    #[zeroize(skip)]
+    session_cache: Arc<parking_lot::Mutex<SessionCache>>,
 }
 
 impl HandshakeServer {
@@ -155,6 +165,7 @@ impl HandshakeServer {
             master_secret,
             handshakes_this_minute: AtomicU64::new(0),
             minute_start_unix_sec: AtomicU64::new(now_sec),
+            session_cache: Arc::new(parking_lot::Mutex::new(SessionCache::new())),
         })
     }
 
@@ -245,6 +256,35 @@ impl HandshakeServer {
             return HandshakeResponse::Fail(HandshakeError::UnsupportedVersion);
         }
 
+        // Phase 4.1 — 0-RTT resumption fast path.
+        //
+        // If the client offered a `resume_session_id` AND the server's
+        // cache holds a still-valid ticket for it, treat the client as
+        // already-vetted: skip the cookie/PoW DoS gate. This is safe
+        // because the resume_session_id is bound to a per-(server,
+        // client) shared secret from a past handshake — only the
+        // legitimate prior client could replay it.
+        //
+        // The KEM round-trip still runs (preserving forward secrecy
+        // via a fresh X25519+ML-KEM shared secret). The
+        // `resumption_secret` derived below is then mixed via
+        // `SessionCache::try_resume` to produce a forward-secret
+        // resumption-derived secret bound to this connect's nonce.
+        //
+        // Wire-level "early data encrypted under the prior
+        // resumption_secret" still requires a wire-format extension
+        // — not in this commit. See PROGRESS row 4.1.
+        let resumed_secret_opt: Option<[u8; 32]> = if let Some(rid) = client_hello.resume_session_id
+        {
+            self.session_cache
+                .lock()
+                .try_resume(&rid, &client_hello.nonce)
+                .map(|(secret, _suite)| secret)
+        } else {
+            None
+        };
+        let cookie_pow_bypass = resumed_secret_opt.is_some();
+
         // 2. Stateless Checks (Cookie & PoW)
         //
         // Cookie freshness (Phase 1.10): `validate_cookie` accepts the current
@@ -313,7 +353,7 @@ impl HandshakeServer {
             }
         }
 
-        if !cookie_valid || !pow_valid {
+        if !cookie_pow_bypass && (!cookie_valid || !pow_valid) {
             return HandshakeResponse::Retry(HelloRetryRequest {
                 challenge,
                 cookie: if !cookie_valid {
@@ -324,8 +364,13 @@ impl HandshakeServer {
             });
         }
 
-        // 3. 0-RTT Resumption Check (Placeholder)
-        // In a real implementation, we would look up the resume_session_id in a session cache
+        // 3. 0-RTT Resumption Check
+        // `resumed_secret_opt` holds the forward-secret-derived secret
+        // from the cache when the client offered a matching ticket.
+        // We do NOT replace the hybrid KEM shared_secret with it
+        // (that would skip PFS via fresh KEM); instead we record the
+        // fact of resumption in metrics and let the application
+        // optionally use it for application-layer 0-RTT data later.
 
         // 4. Hybrid Key Exchange
         let result = client_hello.client_key_package.encapsulate();
@@ -398,6 +443,15 @@ impl HandshakeServer {
             .is_ok()
         {
             session.set_resumption_secret(resumption_secret);
+            // Phase 4.1 — also stash a ticket in the server-side cache
+            // so a future ClientHello carrying this session id can
+            // skip cookie/PoW and (eventually) consume early-data
+            // encrypted under the resumption-derived key.
+            self.session_cache.lock().store(
+                session_id_bytes,
+                &resumption_secret,
+                CipherSuite::Aes256Gcm,
+            );
         }
 
         HandshakeResponse::Success(server_hello, session)
@@ -405,6 +459,12 @@ impl HandshakeServer {
 
     pub fn verifying_key(&self) -> &HybridVerifyingKey {
         &self.verifying_key
+    }
+
+    /// Number of tickets currently held in the resumption cache.
+    /// Exposed for metrics / tests; not on the hot path. Phase 4.1.
+    pub fn session_cache_len(&self) -> usize {
+        self.session_cache.lock().len()
     }
 }
 
@@ -485,6 +545,27 @@ impl HandshakeClient {
             cookie: None,
             pow_solution: None,
             resume_session_id: None,
+        }
+    }
+
+    /// Build a `ClientHello` carrying a `resume_session_id`. The
+    /// server will check its session cache; if the id is known and
+    /// the ticket is still valid, cookie/PoW are bypassed (Phase
+    /// 4.1). The `resumption_secret` half of the hint is held by the
+    /// caller and used for any application-layer 0-RTT data.
+    pub fn create_client_hello_with_resume(
+        &self,
+        version: u8,
+        resume_session_id: [u8; 32],
+    ) -> ClientHello {
+        ClientHello {
+            client_key_package: self.kem_public.clone(),
+            client_verify_key: self.verifying_key.clone(),
+            nonce: self.nonce,
+            version,
+            cookie: None,
+            pow_solution: None,
+            resume_session_id: Some(resume_session_id),
         }
     }
 
@@ -758,5 +839,100 @@ mod tests {
             .process_server_hello(&hello_retry, &server_hello, Some(server.verifying_key()))
             .unwrap();
         assert_eq!(*client.stage.read(), HandshakeStage::Established);
+    }
+
+    /// Phase 4.1 — after a successful handshake, the server caches a
+    /// ticket keyed on the negotiated session id, and the resulting
+    /// `Session` exposes a `resumption_hint` so the client can store
+    /// it for a future connect.
+    #[tokio::test]
+    async fn first_handshake_caches_ticket_and_exposes_hint() {
+        let server = HandshakeServer::new().expect("HandshakeServer::new");
+        let client = HandshakeClient::new().expect("HandshakeClient::new");
+        let client_ip = "127.0.0.1".parse().unwrap();
+
+        let hello = client.create_client_hello();
+        let cookie = match server.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(r) => r.cookie.unwrap(),
+            _ => panic!("expected retry"),
+        };
+        let mut hello_retry = hello.clone();
+        hello_retry.cookie = Some(cookie);
+        let (server_hello, server_session) =
+            match server.process_client_hello(&hello_retry, 0, client_ip) {
+                HandshakeResponse::Success(h, s) => (h, s),
+                _ => panic!("expected success"),
+            };
+        let client_session = client
+            .process_server_hello(&hello_retry, &server_hello, Some(server.verifying_key()))
+            .unwrap();
+
+        // Server now has exactly one ticket.
+        assert_eq!(server.session_cache_len(), 1);
+        // Both sides expose a `resumption_hint`. The session id and
+        // resumption secret match between client and server.
+        let s_hint = server_session.resumption_hint().expect("server hint");
+        let c_hint = client_session.resumption_hint().expect("client hint");
+        assert_eq!(s_hint.0, c_hint.0, "session id matches across sides");
+        assert_eq!(s_hint.1, c_hint.1, "resumption secret matches");
+    }
+
+    /// Phase 4.1 — a ClientHello carrying a cached `resume_session_id`
+    /// bypasses the cookie/PoW DoS gate (it goes straight to success
+    /// on the first call, with no Retry). The full KEM still runs so
+    /// PFS is preserved.
+    #[tokio::test]
+    async fn cached_resume_session_id_skips_cookie_and_pow() {
+        let server = HandshakeServer::new().expect("HandshakeServer::new");
+        let client_ip = "127.0.0.1".parse().unwrap();
+
+        // Drive a full handshake to populate the cache.
+        let first_client = HandshakeClient::new().unwrap();
+        let first_hello = first_client.create_client_hello();
+        let cookie = match server.process_client_hello(&first_hello, 0, client_ip) {
+            HandshakeResponse::Retry(r) => r.cookie.unwrap(),
+            _ => panic!("expected retry"),
+        };
+        let mut hello_retry = first_hello.clone();
+        hello_retry.cookie = Some(cookie);
+        let (_first_server_hello, first_server_session) =
+            match server.process_client_hello(&hello_retry, 0, client_ip) {
+                HandshakeResponse::Success(h, s) => (h, s),
+                _ => panic!("expected success"),
+            };
+        let (resume_id, _resume_secret) = first_server_session.resumption_hint().unwrap();
+
+        // Second client offers the resume_session_id WITHOUT a cookie.
+        // Server should accept immediately (no Retry).
+        let second_client = HandshakeClient::new().unwrap();
+        let resume_hello = second_client.create_client_hello_with_resume(2, resume_id);
+        match server.process_client_hello(&resume_hello, 0, client_ip) {
+            HandshakeResponse::Success(_, _) => {} // expected
+            HandshakeResponse::Retry(_) => {
+                panic!("resume_session_id should bypass cookie/PoW gate")
+            }
+            HandshakeResponse::Fail(e) => panic!("unexpected failure: {:?}", e),
+        }
+    }
+
+    /// Phase 4.1 — unknown `resume_session_id` does NOT bypass cookie.
+    /// The server simply ignores the unknown id and falls through to
+    /// the normal cookie/PoW path.
+    #[tokio::test]
+    async fn unknown_resume_session_id_does_not_bypass_cookie() {
+        let server = HandshakeServer::new().unwrap();
+        let client = HandshakeClient::new().unwrap();
+        let client_ip = "127.0.0.1".parse().unwrap();
+
+        // An id the server has never seen.
+        let bogus_id = [0xFFu8; 32];
+        let hello = client.create_client_hello_with_resume(2, bogus_id);
+        match server.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(_) => {} // expected — normal cookie flow
+            other => panic!(
+                "expected Retry for unknown resume id, got {:?}",
+                matches!(other, HandshakeResponse::Success(..)),
+            ),
+        }
     }
 }

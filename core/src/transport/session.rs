@@ -748,6 +748,21 @@ impl Session {
         self.resumption_secret.read().is_some()
     }
 
+    /// Extract the resumption hint needed to attempt 0-RTT resume on
+    /// a future connect (Phase 4.1). Returns `Some((session_id_bytes,
+    /// resumption_secret))` only after a successful handshake — the
+    /// resumption_secret is set by `process_client_hello` /
+    /// `process_server_hello` once shared key material is in place.
+    ///
+    /// The caller is responsible for storing the tuple alongside the
+    /// pinned `HybridVerifyingKey` of the server it was negotiated
+    /// with. Mixing tickets across servers is a configuration bug —
+    /// the resumption_secret is server-pinned.
+    pub fn resumption_hint(&self) -> Option<([u8; 32], [u8; 32])> {
+        let secret = (*self.resumption_secret.read())?;
+        Some((self.id.0, secret))
+    }
+
     /// Update last activity timestamp
     pub fn update_activity(&self) {
         *self.last_activity.write() = Instant::now();
