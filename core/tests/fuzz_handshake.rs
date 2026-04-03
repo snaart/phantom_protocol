@@ -4,7 +4,7 @@
 //! state transitions and parsing logic.
 
 use phantom_core::transport::handshake::{
-    ClientHello, HandshakeClient, HandshakeResponse, HandshakeServer,
+    ClientHelloEnvelope, HandshakeClient, HandshakeResponse, HandshakeServer,
 };
 use rand::Rng;
 
@@ -20,8 +20,10 @@ fn fuzz_process_client_hello() {
         let mut bytes = vec![0u8; 1024];
         rng.fill(&mut bytes[..]);
 
-        // Attempt to deserialize random bytes as ClientHello
-        if let Ok(hello) = borsh::from_slice::<ClientHello>(&bytes) {
+        // Attempt to deserialize random bytes as a ClientHello envelope
+        if let Ok(ClientHelloEnvelope::V12(hello)) =
+            borsh::from_slice::<ClientHelloEnvelope>(&bytes)
+        {
             // This should return Success, Retry, or Fail, but never panic
             let _ = server.process_client_hello(&hello, 0, client_ip);
         }
@@ -40,8 +42,8 @@ fn fuzz_garbage_input_to_server() {
         rng.fill(&mut bytes[..]);
 
         // Handshake protocol logic usually involves Borsh deserialization first
-        let res = borsh::from_slice::<ClientHello>(&bytes);
-        if let Ok(hello) = res {
+        let res = borsh::from_slice::<ClientHelloEnvelope>(&bytes);
+        if let Ok(ClientHelloEnvelope::V12(hello)) = res {
             let _ = server.process_client_hello(&hello, 5, client_ip);
         }
     }

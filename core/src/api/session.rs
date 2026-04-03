@@ -7,7 +7,9 @@
 use crate::crypto::hybrid_sign::HybridVerifyingKey;
 use crate::errors::CoreError;
 use crate::runtime::{Runtime, TokioRuntime};
-use crate::transport::handshake::{HandshakeClient, HelloRetryRequest, ServerHello};
+use crate::transport::handshake::{
+    ClientHelloEnvelope, HandshakeClient, HelloRetryRequestEnvelope, ServerHelloEnvelope,
+};
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::packet_coalescer_codec::unwrap_coalesced_v2_packet;
 use crate::transport::path_validation_codec::build_path_validation_packet;
@@ -362,7 +364,9 @@ impl PhantomSession {
             // our own well-formed handshake structs only fails on allocator
             // exhaustion; we still surface it as a connection failure rather
             // than panicking, so library callers don't see an aborted process.
-            let hello_bytes = match borsh::to_vec(&hello) {
+            // Wire V3: the ClientHello rides inside a version-prefixed
+            // envelope. V1/V2 clients send the `V12` arm.
+            let hello_bytes = match borsh::to_vec(&ClientHelloEnvelope::V12(hello.clone())) {
                 Ok(b) => b,
                 Err(e) => {
                     log::error!("PhantomSession: failed to serialize ClientHello: {}", e);
@@ -386,10 +390,15 @@ impl PhantomSession {
                 }
             };
 
-            // Try to deserialize ServerHello
-            if let Ok(sh) = borsh::from_slice::<ServerHello>(&resp_bytes) {
+            // Try to deserialize the response envelope — either a
+            // ServerHello or a HelloRetryRequest.
+            if let Ok(ServerHelloEnvelope::V12(sh)) =
+                borsh::from_slice::<ServerHelloEnvelope>(&resp_bytes)
+            {
                 break sh;
-            } else if let Ok(retry) = borsh::from_slice::<HelloRetryRequest>(&resp_bytes) {
+            } else if let Ok(HelloRetryRequestEnvelope::V12(retry)) =
+                borsh::from_slice::<HelloRetryRequestEnvelope>(&resp_bytes)
+            {
                 log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
                 hello.cookie = retry.cookie;
                 if let Some(challenge) = retry.challenge {
@@ -1478,7 +1487,10 @@ impl std::fmt::Debug for PhantomSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+    use crate::transport::handshake::{
+        ClientHelloEnvelope, HandshakeResponse, HandshakeServer, HelloRetryRequestEnvelope,
+        ServerHelloEnvelope,
+    };
 
     // ── Mock transport for testing ──
 
@@ -1681,24 +1693,28 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let client_ip = "127.0.0.1".parse().unwrap();
 
-            // 1. Receive client hello
+            // 1. Receive client hello (wire V3: version-prefixed envelope).
             let client_hello_bytes = server_transport.recv_bytes().await.unwrap();
-            let client_hello = borsh::from_slice::<ClientHello>(&client_hello_bytes).unwrap();
+            let ClientHelloEnvelope::V12(client_hello) =
+                borsh::from_slice::<ClientHelloEnvelope>(&client_hello_bytes).unwrap();
 
             // 2. Process — may retry with cookie/PoW.
             let server_session = loop {
                 let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
                 match response {
                     HandshakeResponse::Retry(retry) => {
-                        let retry_bytes = borsh::to_vec(&retry).unwrap();
+                        let retry_bytes =
+                            borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry)).unwrap();
                         server_transport.send_bytes(&retry_bytes).await.unwrap();
                         // Receive retried client hello
                         let next_bytes = server_transport.recv_bytes().await.unwrap();
-                        let next_hello = borsh::from_slice::<ClientHello>(&next_bytes).unwrap();
+                        let ClientHelloEnvelope::V12(next_hello) =
+                            borsh::from_slice::<ClientHelloEnvelope>(&next_bytes).unwrap();
                         let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
                         match resp2 {
                             HandshakeResponse::Success(server_hello, session) => {
-                                let server_hello_bytes = borsh::to_vec(&server_hello).unwrap();
+                                let server_hello_bytes =
+                                    borsh::to_vec(&ServerHelloEnvelope::V12(server_hello)).unwrap();
                                 server_transport
                                     .send_bytes(&server_hello_bytes)
                                     .await
@@ -1709,7 +1725,8 @@ mod tests {
                         }
                     }
                     HandshakeResponse::Success(server_hello, session) => {
-                        let server_hello_bytes = borsh::to_vec(&server_hello).unwrap();
+                        let server_hello_bytes =
+                            borsh::to_vec(&ServerHelloEnvelope::V12(server_hello)).unwrap();
                         server_transport
                             .send_bytes(&server_hello_bytes)
                             .await

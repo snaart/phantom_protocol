@@ -88,6 +88,45 @@ pub struct ServerHello {
     pub session_id: [u8; 32],
 }
 
+// ── Version-prefixed handshake envelopes (wire V3, Phase 4.1) ────────────
+//
+// Every handshake message now travels inside a borsh enum. Borsh writes a
+// 1-byte discriminant ahead of the body, so a receiver dispatches off that
+// prefix instead of guessing the struct shape. From this point every wire
+// bump adds an enum arm and stays cleanly forward-decodable.
+//
+// Introducing the envelope is a one-time pre-1.0 wire break for *every*
+// version (the discriminant byte shifts the layout) — accepted on the same
+// footing as the `ml-kem` primitive swap. See `docs/protocol/PROTOCOL.md`
+// §12.
+
+/// Versioned wire envelope for the `ClientHello` message. The `V12` arm
+/// carries the V1/V2 `ClientHello` (its inner `version` byte distinguishes
+/// 1 vs 2). The `V3` arm carries `ClientHelloV3` for 0-RTT early-data.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub enum ClientHelloEnvelope {
+    /// V1 / V2 `ClientHello`.
+    V12(ClientHello),
+}
+
+/// Versioned wire envelope for the `ServerHello` message. The `Unsupported`
+/// arm is a transcript-free, pre-session reply telling a client "I do not
+/// speak the envelope variant you sent" — the client then falls back to V2.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub enum ServerHelloEnvelope {
+    /// V1 / V2 `ServerHello`.
+    V12(ServerHello),
+}
+
+/// Versioned wire envelope for the `HelloRetryRequest` message. Retry
+/// carries no version-specific data; the envelope exists only so every
+/// handshake frame shares the uniform 1-byte prefix.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub enum HelloRetryRequestEnvelope {
+    /// V1 / V2 `HelloRetryRequest`.
+    V12(HelloRetryRequest),
+}
+
 /// Handshake transcript for signing
 #[derive(BorshSerialize)]
 struct HandshakeTranscript<'a> {

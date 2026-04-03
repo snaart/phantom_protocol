@@ -24,7 +24,10 @@ use super::buffer_pool::BufferPool;
 use super::pacer::Pacer;
 use crate::crypto::aes_session::AesSession;
 use crate::transport::bandwidth_estimator;
-use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+use crate::transport::handshake::{
+    ClientHelloEnvelope, HandshakeResponse, HandshakeServer, HelloRetryRequestEnvelope,
+    ServerHelloEnvelope,
+};
 use borsh::BorshDeserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -218,11 +221,15 @@ impl UdpHandshakeListener {
                 continue;
             }
 
-            // Attempt to decode ClientHello
-            let client_hello = match ClientHello::try_from_slice(&buf[..len]) {
-                Ok(ch) => ch,
+            // Attempt to decode the ClientHello envelope (wire V3:
+            // version-prefixed). This UDP listener is a V1/V2-only demo
+            // path — a `V3` ClientHello is not decodable here and is
+            // dropped just like any other malformed input. The TCP
+            // `PhantomListener` is the V3-capable handshake path.
+            let client_hello = match ClientHelloEnvelope::try_from_slice(&buf[..len]) {
+                Ok(ClientHelloEnvelope::V12(ch)) => ch,
                 Err(_) => {
-                    // Not a valid ClientHello, drop silently
+                    // Not a valid V12 ClientHello envelope, drop silently
                     continue;
                 }
             };
@@ -231,13 +238,13 @@ impl UdpHandshakeListener {
             match server.process_client_hello(&client_hello, difficulty, addr.ip()) {
                 HandshakeResponse::Retry(retry_req) => {
                     // Server demands PoW or Cookie, send Retry (stateless) and forget
-                    if let Ok(encoded) = borsh::to_vec(&retry_req) {
+                    if let Ok(encoded) = borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry_req)) {
                         let _ = self.socket.send_to(&encoded, addr).await;
                     }
                 }
                 HandshakeResponse::Success(server_hello, _session) => {
                     // Handshake Success, send ServerHello
-                    if let Ok(encoded) = borsh::to_vec(&server_hello) {
+                    if let Ok(encoded) = borsh::to_vec(&ServerHelloEnvelope::V12(server_hello)) {
                         let _ = self.socket.send_to(&encoded, addr).await;
                     }
                     // Transition connection to established state...
