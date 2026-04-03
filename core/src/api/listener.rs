@@ -2,7 +2,10 @@ use crate::api::session::{PhantomSession, SessionTransport};
 use crate::api::tcp_transport::TcpSessionTransport;
 use crate::errors::CoreError;
 use crate::runtime::{Runtime, TokioRuntime};
-use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+use crate::transport::handshake::{
+    ClientHelloEnvelope, HandshakeResponse, HandshakeServer, HelloRetryRequestEnvelope,
+    ServerHelloEnvelope,
+};
 use crate::transport::metrics::TransportMetrics;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -234,8 +237,18 @@ async fn drive_server_handshake(
 ) -> Result<crate::transport::session::Session, CoreError> {
     loop {
         let hello_bytes = transport.recv_bytes().await?;
-        let hello = borsh::from_slice::<ClientHello>(&hello_bytes)
-            .map_err(|e| CoreError::NetworkError(format!("ClientHello parse failed: {}", e)))?;
+        // Wire V3: hello messages are version-prefixed envelopes. Only the
+        // `V12` arm is decodable today; a future / unknown discriminant
+        // surfaces as a borsh parse error.
+        let hello = match borsh::from_slice::<ClientHelloEnvelope>(&hello_bytes) {
+            Ok(ClientHelloEnvelope::V12(ch)) => ch,
+            Err(e) => {
+                return Err(CoreError::NetworkError(format!(
+                    "ClientHello parse failed: {}",
+                    e
+                )))
+            }
+        };
         // Adaptive PoW difficulty (Phase 1.14): under load the listener
         // automatically requires more proof-of-work from each new client.
         // At idle (<100 handshakes/min) this stays at 0 and PoW is skipped
@@ -243,15 +256,16 @@ async fn drive_server_handshake(
         let difficulty = hs.adaptive_difficulty();
         match hs.process_client_hello(&hello, difficulty, client_ip) {
             HandshakeResponse::Retry(retry) => {
-                let bytes = borsh::to_vec(&retry)
+                let bytes = borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry))
                     .map_err(|e| CoreError::NetworkError(format!("Retry encode failed: {}", e)))?;
                 transport.send_bytes(&bytes).await?;
                 // Loop back and read the retried hello.
             }
             HandshakeResponse::Success(server_hello, session) => {
-                let bytes = borsh::to_vec(&server_hello).map_err(|e| {
-                    CoreError::NetworkError(format!("ServerHello encode failed: {}", e))
-                })?;
+                let bytes =
+                    borsh::to_vec(&ServerHelloEnvelope::V12(server_hello)).map_err(|e| {
+                        CoreError::NetworkError(format!("ServerHello encode failed: {}", e))
+                    })?;
                 transport.send_bytes(&bytes).await?;
                 return Ok(session);
             }
