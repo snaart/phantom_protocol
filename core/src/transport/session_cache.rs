@@ -20,10 +20,17 @@ const DEFAULT_TICKET_LIFETIME: Duration = Duration::from_secs(3600); // 1 hour
 /// Session ID type
 pub type SessionId = [u8; 32];
 
-/// Resumption ticket — stored after successful handshake
+/// Resumption ticket — stored after a successful handshake. Single-use:
+/// [`SessionCache::try_resume`] removes the ticket on the first lookup,
+/// which is the one-shot anti-replay guarantee for 0-RTT early-data
+/// (Phase 4.1).
 #[derive(Clone)]
 pub struct ResumptionTicket {
-    /// Resumption secret (derived from handshake shared_secret)
+    /// Resumption secret — stored **verbatim**, byte-identical to the
+    /// value `Session::resumption_hint()` hands the client. Both peers
+    /// feed it into `crypto::kdf::derive_early_data_keying`, so the
+    /// stored bytes MUST equal the client's hint — no extra derivation
+    /// layer here.
     pub resumption_secret: [u8; 32],
     /// Negotiated cipher suite
     pub cipher_suite: CipherSuite,
@@ -31,38 +38,33 @@ pub struct ResumptionTicket {
     pub created_at: Instant,
     /// When the ticket expires
     pub expires_at: Instant,
-    /// Number of times this ticket has been used for rekeying
-    pub rekey_count: u32,
 }
 
 impl ResumptionTicket {
-    /// Create a new ticket from a handshake shared secret
-    pub fn new(shared_secret: &[u8; 32], cipher_suite: CipherSuite, lifetime: Duration) -> Self {
-        let resumption_secret = blake3::derive_key("phantom-resumption-v1", shared_secret);
+    /// Create a ticket holding `resumption_secret` **verbatim**.
+    ///
+    /// The caller passes the already-HKDF-derived `resumption_secret`
+    /// (the same value the client's `Session::resumption_hint()`
+    /// exposes). No further derivation happens here — an extra
+    /// derivation layer would desync the server's stored secret from
+    /// the client's hint and break early-data key agreement.
+    pub fn new(
+        resumption_secret: &[u8; 32],
+        cipher_suite: CipherSuite,
+        lifetime: Duration,
+    ) -> Self {
         let now = Instant::now();
         Self {
-            resumption_secret,
+            resumption_secret: *resumption_secret,
             cipher_suite,
             created_at: now,
             expires_at: now + lifetime,
-            rekey_count: 0,
         }
     }
 
     /// Check if ticket is still valid
     pub fn is_valid(&self) -> bool {
         Instant::now() < self.expires_at
-    }
-
-    /// Derive a new shared secret for session resumption (forward secrecy)
-    /// Each resumption derives a fresh key, so compromising one doesn't affect others.
-    pub fn derive_session_secret(&mut self, client_nonce: &[u8; 32]) -> [u8; 32] {
-        self.rekey_count += 1;
-        let mut input = [0u8; 68]; // 32 + 32 + 4
-        input[..32].copy_from_slice(&self.resumption_secret);
-        input[32..64].copy_from_slice(client_nonce);
-        input[64..68].copy_from_slice(&self.rekey_count.to_be_bytes());
-        blake3::derive_key("phantom-resume-session-v1", &input)
     }
 }
 
@@ -96,11 +98,15 @@ impl SessionCache {
         }
     }
 
-    /// Store a ticket after successful handshake
+    /// Store a ticket after a successful handshake.
+    ///
+    /// `resumption_secret` must be the same value
+    /// `Session::resumption_hint()` exposes to the client — it is
+    /// stored verbatim so both peers derive the same early-data key.
     pub fn store(
         &mut self,
         session_id: SessionId,
-        shared_secret: &[u8; 32],
+        resumption_secret: &[u8; 32],
         cipher_suite: CipherSuite,
     ) {
         // Evict if full
@@ -108,32 +114,35 @@ impl SessionCache {
             self.evict_oldest();
         }
 
-        let ticket = ResumptionTicket::new(shared_secret, cipher_suite, self.ticket_lifetime);
+        let ticket = ResumptionTicket::new(resumption_secret, cipher_suite, self.ticket_lifetime);
         self.tickets.insert(session_id, ticket);
         self.lru_order.retain(|id| id != &session_id);
         self.lru_order.push(session_id);
     }
 
-    /// Try to resume a session (0-RTT)
-    /// Returns (new_shared_secret, cipher_suite) if ticket exists and is valid
-    pub fn try_resume(
-        &mut self,
-        session_id: &SessionId,
-        client_nonce: &[u8; 32],
-    ) -> Option<([u8; 32], CipherSuite)> {
-        let ticket = self.tickets.get_mut(session_id)?;
+    /// Attempt to resume a session (0-RTT). **One-shot**: a successful
+    /// lookup REMOVES the ticket, so a replayed `ClientHello` carrying
+    /// the same `resume_session_id` finds nothing and falls back to a
+    /// full 1-RTT handshake. This is the anti-replay guarantee for
+    /// 0-RTT early-data (Phase 4.1).
+    ///
+    /// Returns `(raw resumption_secret, cipher_suite)` — the verbatim
+    /// secret stored at `store` time, ready to feed into
+    /// `crypto::kdf::derive_early_data_keying`.
+    pub fn try_resume(&mut self, session_id: &SessionId) -> Option<([u8; 32], CipherSuite)> {
+        let ticket = self.tickets.get(session_id)?;
 
         if !ticket.is_valid() {
             self.remove(session_id);
             return None;
         }
 
+        let secret = ticket.resumption_secret;
         let suite = ticket.cipher_suite;
-        let secret = ticket.derive_session_secret(client_nonce);
 
-        // Move to end of LRU
-        self.lru_order.retain(|id| id != session_id);
-        self.lru_order.push(*session_id);
+        // One-shot consume: a replayed ClientHello must not find this
+        // ticket a second time.
+        self.remove(session_id);
 
         Some((secret, suite))
     }
@@ -186,36 +195,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn store_and_resume() {
+    fn store_and_resume_returns_verbatim_secret() {
         let mut cache = SessionCache::new();
         let session_id = [0xABu8; 32];
         let secret = [0xCDu8; 32];
-        let nonce = [0xEFu8; 32];
 
         cache.store(session_id, &secret, CipherSuite::Aes256Gcm);
         assert_eq!(cache.len(), 1);
 
-        let result = cache.try_resume(&session_id, &nonce);
-        assert!(result.is_some());
-        let (new_secret, suite) = result.unwrap();
+        let (returned, suite) = cache.try_resume(&session_id).expect("ticket present");
         assert_eq!(suite, CipherSuite::Aes256Gcm);
-        assert_ne!(new_secret, secret); // Derived key should differ
+        // try_resume returns the secret VERBATIM — the client's
+        // `resumption_hint()` exposes the identical bytes, which is
+        // what lets both sides derive the same early-data key.
+        assert_eq!(returned, secret);
     }
 
     #[test]
-    fn forward_secrecy() {
+    fn try_resume_is_one_shot() {
+        // Anti-replay: the first try_resume consumes the ticket, the
+        // second finds nothing. A replayed ClientHello carrying the
+        // same resume_session_id therefore cannot re-use 0-RTT.
         let mut cache = SessionCache::new();
         let session_id = [0xABu8; 32];
         let secret = [0xCDu8; 32];
-        let nonce1 = [0x01u8; 32];
-        let nonce2 = [0x02u8; 32];
 
         cache.store(session_id, &secret, CipherSuite::ChaCha20Poly1305);
+        assert_eq!(cache.len(), 1);
 
-        let (s1, _) = cache.try_resume(&session_id, &nonce1).unwrap();
-        let (s2, _) = cache.try_resume(&session_id, &nonce2).unwrap();
-        // Each resumption produces a different key (forward secrecy)
-        assert_ne!(s1, s2);
+        assert!(
+            cache.try_resume(&session_id).is_some(),
+            "first resume succeeds"
+        );
+        assert_eq!(cache.len(), 0, "ticket consumed");
+        assert!(
+            cache.try_resume(&session_id).is_none(),
+            "second resume must find nothing (one-shot)"
+        );
     }
 
     #[test]
@@ -234,8 +250,8 @@ mod tests {
         // Adding third should evict id1 (LRU)
         cache.store(id3, &secret, CipherSuite::Aes256Gcm);
         assert_eq!(cache.len(), 2);
-        assert!(cache.try_resume(&id1, &[0; 32]).is_none());
-        assert!(cache.try_resume(&id2, &[0; 32]).is_some());
+        assert!(cache.try_resume(&id1).is_none(), "id1 was evicted");
+        assert!(cache.try_resume(&id2).is_some(), "id2 still present");
     }
 
     #[test]
@@ -246,6 +262,6 @@ mod tests {
 
         // Wait for expiry
         std::thread::sleep(Duration::from_millis(5));
-        assert!(cache.try_resume(&id, &[0; 32]).is_none());
+        assert!(cache.try_resume(&id).is_none());
     }
 }
