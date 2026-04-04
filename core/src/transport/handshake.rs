@@ -295,34 +295,30 @@ impl HandshakeServer {
             return HandshakeResponse::Fail(HandshakeError::UnsupportedVersion);
         }
 
-        // Phase 4.1 — 0-RTT resumption fast path.
+        // Phase 4.1 — 0-RTT resumption fast path (V12 path).
         //
         // If the client offered a `resume_session_id` AND the server's
         // cache holds a still-valid ticket for it, treat the client as
         // already-vetted: skip the cookie/PoW DoS gate. This is safe
         // because the resume_session_id is bound to a per-(server,
         // client) shared secret from a past handshake — only the
-        // legitimate prior client could replay it.
+        // legitimate prior client could hold it.
         //
-        // The KEM round-trip still runs (preserving forward secrecy
-        // via a fresh X25519+ML-KEM shared secret). The
-        // `resumption_secret` derived below is then mixed via
-        // `SessionCache::try_resume` to produce a forward-secret
-        // resumption-derived secret bound to this connect's nonce.
+        // `try_resume` is **one-shot**: it consumes the ticket here. A
+        // V12 resume therefore burns the resume credit for the
+        // cookie/PoW bypass; on handshake success a fresh ticket is
+        // minted below, so the credit "rolls over". A replayed
+        // ClientHello finds no ticket and falls back to the normal
+        // cookie/PoW gate. The KEM round-trip still runs, so forward
+        // secrecy is preserved by the fresh X25519+ML-KEM secret.
         //
-        // Wire-level "early data encrypted under the prior
-        // resumption_secret" still requires a wire-format extension
-        // — not in this commit. See PROGRESS row 4.1.
-        let resumed_secret_opt: Option<[u8; 32]> = if let Some(rid) = client_hello.resume_session_id
-        {
-            self.session_cache
-                .lock()
-                .try_resume(&rid, &client_hello.nonce)
-                .map(|(secret, _suite)| secret)
+        // The V3 path (`process_client_hello_v3`) additionally uses the
+        // returned secret to decrypt early-data — see that method.
+        let cookie_pow_bypass = if let Some(rid) = client_hello.resume_session_id {
+            self.session_cache.lock().try_resume(&rid).is_some()
         } else {
-            None
+            false
         };
-        let cookie_pow_bypass = resumed_secret_opt.is_some();
 
         // 2. Stateless Checks (Cookie & PoW)
         //
