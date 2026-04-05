@@ -90,6 +90,9 @@ fn test_valid_handshake_flow() {
                 .process_server_hello(&hello, &server_hello, Some(server.verifying_key()))
                 .expect("Handshake failed");
         }
+        HandshakeResponse::SuccessV3(..) => {
+            panic!("V12 process_client_hello must not return SuccessV3")
+        }
         HandshakeResponse::Fail(e) => panic!("Handshake failed: {:?}", e),
     }
 }

@@ -32,7 +32,7 @@ async fn tcp_integration_pinned_and_encrypted() {
 
     // Server side: accept one connection, then echo a single message.
     let server_handle = tokio::spawn(async move {
-        let session = listener.accept().await.expect("accept");
+        let session = listener.accept().await.expect("accept").session();
         // Receive a message from the client.
         let msg = session.recv().await.expect("server recv");
         assert_eq!(msg, b"hello-from-client");

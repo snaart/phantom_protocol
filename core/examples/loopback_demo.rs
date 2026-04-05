@@ -46,7 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 2. Server task ────────────────────────────────────────────────────
     let server_handle = tokio::spawn(async move {
         // Accept exactly one connection, echo one message, then close.
-        let session = listener.accept().await.expect("accept failed");
+        // `accept()` yields an `AcceptOutcome`; `.session()` is the
+        // established session (`.take_early_data()` would be the 0-RTT
+        // payload, if any — none in this plain V2 demo).
+        let session = listener.accept().await.expect("accept failed").session();
         println!("▶ server: accepted connection from {}", session.peer_addr());
 
         let request = session.recv().await.expect("server recv failed");
