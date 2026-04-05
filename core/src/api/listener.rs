@@ -146,8 +146,15 @@ impl PhantomListener {
         self.local_addr.to_string()
     }
 
+    /// Accept the next inbound connection and complete its handshake.
+    ///
+    /// Returns an [`AcceptOutcome`] — the established session plus any
+    /// 0-RTT early-data the client carried on a V3 ClientHello. Use
+    /// `.session()` for the session and `.take_early_data()` for the
+    /// early-data (the latter is `None` for a plain V1/V2 handshake or
+    /// when the server rejected the early-data).
     #[tracing::instrument(name = "phantom.listener.accept", skip_all)]
-    pub async fn accept(&self) -> Result<Arc<PhantomSession>, CoreError> {
+    pub async fn accept(&self) -> Result<Arc<AcceptOutcome>, CoreError> {
         // Cheap fast-path: if shutdown was already signalled before this
         // accept was even called, return immediately.
         if self.shutting_down.load(Ordering::Acquire) {
@@ -171,9 +178,9 @@ impl PhantomListener {
         // Phase 4.5 metrics: time the full handshake from accept to
         // session-installed; account success vs failure separately.
         let started = Instant::now();
-        let server_session =
+        let (server_session, early_data) =
             match drive_server_handshake(&transport, &self.handshake_server, peer.ip()).await {
-                Ok(s) => s,
+                Ok(pair) => pair,
                 Err(e) => {
                     self.metrics.record_handshake_failure();
                     return Err(e);
@@ -182,12 +189,13 @@ impl PhantomListener {
         let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         self.metrics.record_handshake_success(elapsed_ns);
         self.metrics.session_opened();
-        Ok(PhantomSession::from_accepted_server_session_with_runtime(
+        let session = PhantomSession::from_accepted_server_session_with_runtime(
             peer.to_string(),
             transport,
             Arc::new(server_session),
             self.runtime.clone(),
-        ))
+        );
+        Ok(AcceptOutcome::new(session, early_data))
     }
 
     /// Return the listener's metrics rendered in Prometheus text
@@ -228,33 +236,79 @@ impl PhantomListener {
     }
 }
 
+/// Outcome of a successful [`PhantomListener::accept`] — the accepted
+/// session plus any 0-RTT early-data the client carried on its V3
+/// ClientHello (wire V3, Phase 4.1).
+///
+/// A `uniffi::Object` rather than a record: it returns an
+/// `Arc<PhantomSession>` (itself a `uniffi::Object`) from a method,
+/// the same known-good pattern `accept()` used before V3. `take_*`
+/// is take-once so a ≤16 KiB blob is moved out, not cloned.
+#[derive(uniffi::Object)]
+pub struct AcceptOutcome {
+    session: Arc<PhantomSession>,
+    early_data: parking_lot::Mutex<Option<Vec<u8>>>,
+}
+
+#[uniffi::export]
+impl AcceptOutcome {
+    /// The accepted, fully-established session.
+    pub fn session(&self) -> Arc<PhantomSession> {
+        self.session.clone()
+    }
+
+    /// Take the 0-RTT early-data the client sent on its ClientHello.
+    /// Take-once — a second call returns `None`. `None` also means the
+    /// client sent no early-data, or the server rejected it (unknown /
+    /// expired ticket, oversized blob, AEAD failure).
+    pub fn take_early_data(&self) -> Option<Vec<u8>> {
+        self.early_data.lock().take()
+    }
+
+    /// Whether 0-RTT early-data is present and not yet taken.
+    pub fn has_early_data(&self) -> bool {
+        self.early_data.lock().is_some()
+    }
+}
+
+impl AcceptOutcome {
+    pub(crate) fn new(session: Arc<PhantomSession>, early_data: Option<Vec<u8>>) -> Arc<Self> {
+        Arc::new(Self {
+            session,
+            early_data: parking_lot::Mutex::new(early_data),
+        })
+    }
+}
+
 /// Drive the server side of the Phantom hybrid PQC handshake on a freshly
 /// accepted transport, handling the optional cookie / PoW retry round.
+///
+/// Returns the established `Session` plus any decrypted 0-RTT
+/// early-data (`Some` only on a V3 handshake where the client carried
+/// a valid early-data blob).
 async fn drive_server_handshake(
     transport: &TcpSessionTransport,
     hs: &HandshakeServer,
     client_ip: IpAddr,
-) -> Result<crate::transport::session::Session, CoreError> {
+) -> Result<(crate::transport::session::Session, Option<Vec<u8>>), CoreError> {
     loop {
         let hello_bytes = transport.recv_bytes().await?;
-        // Wire V3: hello messages are version-prefixed envelopes. Only the
-        // `V12` arm is decodable today; a future / unknown discriminant
-        // surfaces as a borsh parse error.
-        let hello = match borsh::from_slice::<ClientHelloEnvelope>(&hello_bytes) {
-            Ok(ClientHelloEnvelope::V12(ch)) => ch,
-            Err(e) => {
-                return Err(CoreError::NetworkError(format!(
-                    "ClientHello parse failed: {}",
-                    e
-                )))
-            }
-        };
+        // Wire V3: hello messages are version-prefixed envelopes.
+        // `V12` and `V3` dispatch to their respective server paths; an
+        // unknown / future discriminant surfaces as a borsh parse error.
+        let envelope = borsh::from_slice::<ClientHelloEnvelope>(&hello_bytes)
+            .map_err(|e| CoreError::NetworkError(format!("ClientHello parse failed: {}", e)))?;
+
         // Adaptive PoW difficulty (Phase 1.14): under load the listener
         // automatically requires more proof-of-work from each new client.
         // At idle (<100 handshakes/min) this stays at 0 and PoW is skipped
         // entirely.
         let difficulty = hs.adaptive_difficulty();
-        match hs.process_client_hello(&hello, difficulty, client_ip) {
+        let response = match &envelope {
+            ClientHelloEnvelope::V12(ch) => hs.process_client_hello(ch, difficulty, client_ip),
+            ClientHelloEnvelope::V3(ch3) => hs.process_client_hello_v3(ch3, difficulty, client_ip),
+        };
+        match response {
             HandshakeResponse::Retry(retry) => {
                 let bytes = borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry))
                     .map_err(|e| CoreError::NetworkError(format!("Retry encode failed: {}", e)))?;
@@ -267,7 +321,15 @@ async fn drive_server_handshake(
                         CoreError::NetworkError(format!("ServerHello encode failed: {}", e))
                     })?;
                 transport.send_bytes(&bytes).await?;
-                return Ok(session);
+                return Ok((session, None));
+            }
+            HandshakeResponse::SuccessV3(server_hello_v3, session, early_data) => {
+                let bytes =
+                    borsh::to_vec(&ServerHelloEnvelope::V3(server_hello_v3)).map_err(|e| {
+                        CoreError::NetworkError(format!("ServerHelloV3 encode failed: {}", e))
+                    })?;
+                transport.send_bytes(&bytes).await?;
+                return Ok((session, early_data));
             }
             HandshakeResponse::Fail(e) => {
                 return Err(CoreError::InternalError(format!(

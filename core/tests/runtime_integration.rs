@@ -74,7 +74,7 @@ async fn runtime_substitution_drives_session_and_listener() {
 
     let listener_clone = listener.clone();
     let server_handle = tokio::spawn(async move {
-        let session = listener_clone.accept().await.expect("accept");
+        let session = listener_clone.accept().await.expect("accept").session();
         let req = session.recv().await.expect("recv");
         session.send(req).await.expect("echo");
         tokio::time::sleep(Duration::from_millis(50)).await;

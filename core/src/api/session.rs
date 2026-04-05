@@ -9,6 +9,7 @@ use crate::errors::CoreError;
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{
     ClientHelloEnvelope, HandshakeClient, HelloRetryRequestEnvelope, ServerHelloEnvelope,
+    EARLY_DATA_MAX_LEN,
 };
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::packet_coalescer_codec::unwrap_coalesced_v2_packet;
@@ -150,6 +151,12 @@ pub struct PhantomSession {
     /// for Phase 4.1 0-RTT clients. `None` while still handshaking
     /// or after a failure.
     inner_session: Arc<Mutex<Option<Arc<Session>>>>,
+    /// 0-RTT verdict (wire V3, Phase 4.1). `None` while handshaking,
+    /// after a failure, or after a plain V1/V2 handshake (no 0-RTT
+    /// attempted). `Some(true)` the server consumed the early-data;
+    /// `Some(false)` a V3 handshake where the server rejected it (or
+    /// the client offered none). Exposed via `early_data_accepted()`.
+    early_data_accepted: Arc<Mutex<Option<bool>>>,
 }
 
 /// Commands for the background session task
@@ -205,6 +212,60 @@ impl PhantomSession {
         expected_server_key: HybridVerifyingKey,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
+        Self::spawn_client(peer_addr, transport, expected_server_key, runtime, None)
+    }
+
+    /// Connect with a **0-RTT resumption attempt** (wire V3, Phase 4.1).
+    ///
+    /// `resumption_hint` is the `(session_id, resumption_secret)` tuple
+    /// from a prior session's [`PhantomSession::resumption_hint`].
+    /// `early_data` (≤ [`EARLY_DATA_MAX_LEN`] bytes) is sealed and
+    /// carried inside the V3 ClientHello so it reaches the server on
+    /// the very first flight — saving a round-trip versus 1-RTT.
+    ///
+    /// If the server does not speak V3 it replies `Unsupported` and
+    /// the client transparently falls back to a plain V2 handshake;
+    /// in that case the `early_data` is **not** sent 0-RTT and
+    /// [`early_data_accepted`](Self::early_data_accepted) returns
+    /// `None` — the caller must send that payload over the normal
+    /// channel. Returns `Err` only when `early_data` exceeds the cap.
+    ///
+    /// Runs on the default [`TokioRuntime`].
+    pub fn connect_with_resumption<T: SessionTransport>(
+        peer_addr: &str,
+        transport: T,
+        expected_server_key: HybridVerifyingKey,
+        resumption_hint: ([u8; 32], [u8; 32]),
+        early_data: Vec<u8>,
+    ) -> Result<Self, CoreError> {
+        if early_data.len() > EARLY_DATA_MAX_LEN {
+            return Err(CoreError::ValidationError(format!(
+                "early_data is {} bytes, exceeds the {}-byte 0-RTT cap",
+                early_data.len(),
+                EARLY_DATA_MAX_LEN
+            )));
+        }
+        let (resume_id, resume_secret) = resumption_hint;
+        Ok(Self::spawn_client(
+            peer_addr,
+            transport,
+            expected_server_key,
+            Arc::new(TokioRuntime),
+            Some((resume_id, resume_secret, early_data)),
+        ))
+    }
+
+    /// Shared constructor body for [`connect_with_transport_with_runtime`]
+    /// and [`connect_with_resumption`]. `resumption_request` is `None`
+    /// for a plain V1/V2 handshake, `Some((id, secret, early_data))` to
+    /// attempt a V3 0-RTT handshake.
+    fn spawn_client<T: SessionTransport>(
+        peer_addr: &str,
+        transport: T,
+        expected_server_key: HybridVerifyingKey,
+        runtime: Arc<dyn Runtime>,
+        resumption_request: Option<([u8; 32], [u8; 32], Vec<u8>)>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (recv_tx, recv_rx) = mpsc::channel(256);
 
@@ -216,6 +277,7 @@ impl PhantomSession {
 
         let streams = Arc::new(DashMap::new());
         let inner_session: Arc<Mutex<Option<Arc<Session>>>> = Arc::new(Mutex::new(None));
+        let early_data_accepted: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
 
         let session = Self {
             id: new_session_id(),
@@ -228,6 +290,7 @@ impl PhantomSession {
             demux: demux.clone(),
             streams: streams.clone(),
             inner_session: inner_session.clone(),
+            early_data_accepted: early_data_accepted.clone(),
         };
 
         // Spawn the background handshake + data pump task on the supplied
@@ -248,6 +311,8 @@ impl PhantomSession {
             expected_server_key,
             runtime_for_pump,
             inner_session,
+            early_data_accepted,
+            resumption_request,
         )));
 
         session
@@ -305,6 +370,9 @@ impl PhantomSession {
             demux: demux.clone(),
             streams: streams.clone(),
             inner_session,
+            // Server side: 0-RTT early-data is delivered via
+            // `AcceptOutcome`, not this client-facing field.
+            early_data_accepted: Arc::new(Mutex::new(None)),
         });
 
         let session_id = *server_session.id();
@@ -342,104 +410,41 @@ impl PhantomSession {
         expected_server_key: HybridVerifyingKey,
         runtime: Arc<dyn Runtime>,
         inner_session: Arc<Mutex<Option<Arc<Session>>>>,
+        early_data_accepted: Arc<Mutex<Option<bool>>>,
+        resumption_request: Option<([u8; 32], [u8; 32], Vec<u8>)>,
     ) {
         log::info!("PhantomSession: starting handshake with {}", peer);
 
-        // ── Stage 1 & 2: Hybrid Handshake ──
-        let handshake = match HandshakeClient::new() {
-            Ok(h) => h,
+        // ── Stage 1 & 2: Hybrid Handshake (V12, or V3 0-RTT) ──
+        let (crypto_session, ed_accepted) = match run_client_handshake(
+            &transport,
+            &expected_server_key,
+            resumption_request,
+        )
+        .await
+        {
+            Ok((session, accepted)) => (Arc::new(session), accepted),
             Err(e) => {
-                log::error!(
-                    "PhantomSession: failed to initialize handshake client: {}",
-                    e
-                );
+                log::error!("PhantomSession: handshake failed: {}", e);
                 state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
                 return;
             }
         };
-        let mut hello = handshake.create_client_hello();
-
-        let server_hello = loop {
-            // Send our hello (Full Hybrid ClientHello). Borsh serialization of
-            // our own well-formed handshake structs only fails on allocator
-            // exhaustion; we still surface it as a connection failure rather
-            // than panicking, so library callers don't see an aborted process.
-            // Wire V3: the ClientHello rides inside a version-prefixed
-            // envelope. V1/V2 clients send the `V12` arm.
-            let hello_bytes = match borsh::to_vec(&ClientHelloEnvelope::V12(hello.clone())) {
-                Ok(b) => b,
-                Err(e) => {
-                    log::error!("PhantomSession: failed to serialize ClientHello: {}", e);
-                    state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
-                    return;
-                }
-            };
-            if let Err(e) = transport.send_bytes(&hello_bytes).await {
-                log::error!("PhantomSession: failed to send hello: {}", e);
-                state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
-                return;
-            }
-
-            // Receive peer's response
-            let resp_bytes = match transport.recv_bytes().await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    log::error!("PhantomSession: failed to receive server response: {}", e);
-                    state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
-                    return;
-                }
-            };
-
-            // Try to deserialize the response envelope — either a
-            // ServerHello or a HelloRetryRequest.
-            if let Ok(ServerHelloEnvelope::V12(sh)) =
-                borsh::from_slice::<ServerHelloEnvelope>(&resp_bytes)
-            {
-                break sh;
-            } else if let Ok(HelloRetryRequestEnvelope::V12(retry)) =
-                borsh::from_slice::<HelloRetryRequestEnvelope>(&resp_bytes)
-            {
-                log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
-                hello.cookie = retry.cookie;
-                if let Some(challenge) = retry.challenge {
-                    log::info!("PhantomSession: Solving PoW challenge...");
-                    hello.pow_solution = Some(challenge.solve());
-                }
-                continue;
-            } else {
-                log::error!("PhantomSession: invalid ServerHello or Retry received");
-                state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
-                return;
-            }
-        };
-
-        let crypto_session =
-            match handshake.process_server_hello(&hello, &server_hello, Some(&expected_server_key))
-            {
-                Ok(s) => Arc::new(s),
-                Err(e) => {
-                    log::error!("PhantomSession: handshake failed: {:?}", e);
-                    state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
-                    return;
-                }
-            };
         log::info!("PhantomSession: Handshake complete — hybrid channel ready");
 
-        // Phase 4.1 — publish the negotiated Session via the outer
-        // PhantomSession so `resumption_hint()` can reach it after the
+        // Phase 4.1 — publish the negotiated Session + the 0-RTT
+        // verdict via the outer PhantomSession so `resumption_hint()`
+        // and `early_data_accepted()` can reach them after the
         // background task moves the Arc into the pump.
         {
             let mut guard = inner_session.lock().await;
             *guard = Some(crypto_session.clone());
         }
+        *early_data_accepted.lock().await = ed_accepted;
 
         let session_id = *crypto_session.id();
         state.store(ConnectionState::Connected as u8, Ordering::Relaxed);
-        log::info!(
-            "PhantomSession: fully connected to {} (stage: {:?})",
-            peer,
-            handshake.stage()
-        );
+        log::info!("PhantomSession: fully connected to {}", peer);
 
         let next_app_seq = Arc::new(AtomicU32::new(1));
         run_data_pump(
@@ -456,6 +461,125 @@ impl PhantomSession {
             runtime,
         )
         .await;
+    }
+}
+
+/// Drive the client side of the Phantom handshake to completion.
+///
+/// When `resumption` is `Some((resume_id, resume_secret, early_data))`
+/// this attempts a **V3 0-RTT handshake** — the `early_data` rides
+/// sealed inside the ClientHello so it reaches the server on the first
+/// flight. If the server replies `ServerHelloEnvelope::Unsupported`
+/// (it does not speak V3) the function transparently falls back to a
+/// plain V2 handshake, reusing the same `HandshakeClient`; the
+/// early-data is then NOT sent 0-RTT.
+///
+/// Returns the established `Session` and the 0-RTT verdict:
+/// - `Some(true)`  — V3 handshake, the server consumed the early-data
+/// - `Some(false)` — V3 handshake, the server rejected it (stale
+///   ticket / oversized / AEAD failure) or the client offered none
+/// - `None`        — a V2 handshake (no 0-RTT was attempted, or the
+///   V3 attempt fell back via `Unsupported`)
+async fn run_client_handshake<T: SessionTransport>(
+    transport: &T,
+    expected_server_key: &HybridVerifyingKey,
+    resumption: Option<([u8; 32], [u8; 32], Vec<u8>)>,
+) -> Result<(Session, Option<bool>), CoreError> {
+    let handshake = HandshakeClient::new()?;
+
+    // ── V3 0-RTT attempt ──
+    if let Some((resume_id, resume_secret, early_data)) = &resumption {
+        // Empty early-data → resume without a 0-RTT payload (still a
+        // V3 handshake, but no sealed blob).
+        let ed: Option<&[u8]> = if early_data.is_empty() {
+            None
+        } else {
+            Some(early_data.as_slice())
+        };
+        let mut ch3 = handshake.create_client_hello_v3(*resume_id, resume_secret, ed);
+        loop {
+            let bytes = borsh::to_vec(&ClientHelloEnvelope::V3(ch3.clone())).map_err(|e| {
+                CoreError::SerializationError(format!("ClientHelloV3 encode failed: {}", e))
+            })?;
+            transport.send_bytes(&bytes).await?;
+            let resp = transport.recv_bytes().await?;
+
+            // The response is a `ServerHelloEnvelope` (V3 / Unsupported)
+            // or a `HelloRetryRequestEnvelope` (stale-ticket cookie
+            // demand). Parse ServerHelloEnvelope first — a retry blob
+            // does not parse cleanly as one.
+            if let Ok(env) = borsh::from_slice::<ServerHelloEnvelope>(&resp) {
+                match env {
+                    ServerHelloEnvelope::V3(sh3) => {
+                        let (session, accepted) = handshake.process_server_hello_v3(
+                            &ch3,
+                            &sh3,
+                            Some(expected_server_key),
+                        )?;
+                        return Ok((session, Some(accepted)));
+                    }
+                    ServerHelloEnvelope::Unsupported => {
+                        // Server does not speak V3 — drop out of the V3
+                        // loop and fall through to the V2 handshake
+                        // below, reusing the same `HandshakeClient`.
+                        log::info!(
+                            "PhantomSession: server replied Unsupported to V3 — falling back to V2"
+                        );
+                        break;
+                    }
+                    ServerHelloEnvelope::V12(_) => {
+                        return Err(CoreError::HandshakeError(
+                            "server replied a V12 ServerHello to a V3 ClientHello".into(),
+                        ));
+                    }
+                }
+            } else if let Ok(HelloRetryRequestEnvelope::V12(retry)) =
+                borsh::from_slice::<HelloRetryRequestEnvelope>(&resp)
+            {
+                // Stale / unknown ticket → the server fell back to the
+                // cookie/PoW gate. Fill the demand into the V3
+                // ClientHello's base and re-send.
+                log::info!("PhantomSession: V3 ClientHello got HelloRetryRequest, retrying...");
+                ch3.base.cookie = retry.cookie;
+                if let Some(challenge) = retry.challenge {
+                    ch3.base.pow_solution = Some(challenge.solve());
+                }
+                continue;
+            } else {
+                return Err(CoreError::HandshakeError(
+                    "invalid server response to V3 ClientHello".into(),
+                ));
+            }
+        }
+    }
+
+    // ── V2 handshake (default path, or V3 → Unsupported fallback) ──
+    let mut hello = handshake.create_client_hello();
+    loop {
+        let bytes = borsh::to_vec(&ClientHelloEnvelope::V12(hello.clone())).map_err(|e| {
+            CoreError::SerializationError(format!("ClientHello encode failed: {}", e))
+        })?;
+        transport.send_bytes(&bytes).await?;
+        let resp = transport.recv_bytes().await?;
+
+        if let Ok(ServerHelloEnvelope::V12(sh)) = borsh::from_slice::<ServerHelloEnvelope>(&resp) {
+            let session = handshake.process_server_hello(&hello, &sh, Some(expected_server_key))?;
+            return Ok((session, None));
+        } else if let Ok(HelloRetryRequestEnvelope::V12(retry)) =
+            borsh::from_slice::<HelloRetryRequestEnvelope>(&resp)
+        {
+            log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
+            hello.cookie = retry.cookie;
+            if let Some(challenge) = retry.challenge {
+                log::info!("PhantomSession: Solving PoW challenge...");
+                hello.pow_solution = Some(challenge.solve());
+            }
+            continue;
+        } else {
+            return Err(CoreError::HandshakeError(
+                "invalid ServerHello or Retry received".into(),
+            ));
+        }
     }
 }
 
@@ -1334,6 +1458,7 @@ impl PhantomSession {
             demux: Arc::new(demux),
             streams,
             inner_session: Arc::new(Mutex::new(None)),
+            early_data_accepted: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1442,6 +1567,21 @@ impl PhantomSession {
     /// Target peer address.
     pub fn peer_addr(&self) -> String {
         self.peer_addr.clone()
+    }
+
+    /// The 0-RTT verdict for this session (wire V3, Phase 4.1).
+    ///
+    /// - `None` — still handshaking, the handshake failed, or this was
+    ///   a plain V1/V2 handshake (no 0-RTT attempted, or a V3 attempt
+    ///   fell back to V2 because the server replied `Unsupported`).
+    ///   The caller must send any intended early-data over the normal
+    ///   channel.
+    /// - `Some(true)` — the server consumed the 0-RTT early-data.
+    /// - `Some(false)` — a V3 handshake where the server rejected the
+    ///   early-data (stale/unknown ticket, oversized blob, or AEAD
+    ///   failure). The caller must re-send that payload normally.
+    pub async fn early_data_accepted(&self) -> Option<bool> {
+        *self.early_data_accepted.lock().await
     }
 
     /// Close the session.
@@ -1693,10 +1833,16 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let client_ip = "127.0.0.1".parse().unwrap();
 
-            // 1. Receive client hello (wire V3: version-prefixed envelope).
+            // 1. Receive client hello. This responder only handles the
+            // V12 envelope (the default client offers V2); a V3
+            // ClientHello would be a test bug.
             let client_hello_bytes = server_transport.recv_bytes().await.unwrap();
-            let ClientHelloEnvelope::V12(client_hello) =
-                borsh::from_slice::<ClientHelloEnvelope>(&client_hello_bytes).unwrap();
+            let client_hello = match borsh::from_slice::<ClientHelloEnvelope>(&client_hello_bytes)
+                .unwrap()
+            {
+                ClientHelloEnvelope::V12(ch) => ch,
+                ClientHelloEnvelope::V3(_) => panic!("test responder expects a V12 ClientHello"),
+            };
 
             // 2. Process — may retry with cookie/PoW.
             let server_session = loop {
@@ -1708,8 +1854,13 @@ mod tests {
                         server_transport.send_bytes(&retry_bytes).await.unwrap();
                         // Receive retried client hello
                         let next_bytes = server_transport.recv_bytes().await.unwrap();
-                        let ClientHelloEnvelope::V12(next_hello) =
-                            borsh::from_slice::<ClientHelloEnvelope>(&next_bytes).unwrap();
+                        let next_hello =
+                            match borsh::from_slice::<ClientHelloEnvelope>(&next_bytes).unwrap() {
+                                ClientHelloEnvelope::V12(ch) => ch,
+                                ClientHelloEnvelope::V3(_) => {
+                                    panic!("test responder expects a V12 ClientHello")
+                                }
+                            };
                         let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
                         match resp2 {
                             HandshakeResponse::Success(server_hello, session) => {
@@ -1732,6 +1883,9 @@ mod tests {
                             .await
                             .unwrap();
                         break session;
+                    }
+                    HandshakeResponse::SuccessV3(..) => {
+                        panic!("V12 process_client_hello must not return SuccessV3")
                     }
                     HandshakeResponse::Fail(e) => panic!("handshake failed: {:?}", e),
                 }

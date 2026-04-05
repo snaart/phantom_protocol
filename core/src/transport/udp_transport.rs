@@ -223,13 +223,20 @@ impl UdpHandshakeListener {
 
             // Attempt to decode the ClientHello envelope (wire V3:
             // version-prefixed). This UDP listener is a V1/V2-only demo
-            // path — a `V3` ClientHello is not decodable here and is
-            // dropped just like any other malformed input. The TCP
-            // `PhantomListener` is the V3-capable handshake path.
+            // path. A `V3` ClientHello decodes fine but the V3 0-RTT
+            // flow is not implemented here — we reply with the
+            // transcript-free `Unsupported` so the client falls back
+            // to V2. The TCP `PhantomListener` is the V3-capable path.
             let client_hello = match ClientHelloEnvelope::try_from_slice(&buf[..len]) {
                 Ok(ClientHelloEnvelope::V12(ch)) => ch,
+                Ok(ClientHelloEnvelope::V3(_)) => {
+                    if let Ok(encoded) = borsh::to_vec(&ServerHelloEnvelope::Unsupported) {
+                        let _ = self.socket.send_to(&encoded, addr).await;
+                    }
+                    continue;
+                }
                 Err(_) => {
-                    // Not a valid V12 ClientHello envelope, drop silently
+                    // Not a valid ClientHello envelope, drop silently
                     continue;
                 }
             };
@@ -249,6 +256,11 @@ impl UdpHandshakeListener {
                     }
                     // Transition connection to established state...
                 }
+                // `process_client_hello` (the V12 entry point) never
+                // returns `SuccessV3` — that comes only from
+                // `process_client_hello_v3`, which this listener does
+                // not call. The arm exists solely for exhaustiveness.
+                HandshakeResponse::SuccessV3(..) => {}
                 HandshakeResponse::Fail(_) => {
                     // Handshake error, drop silently
                 }
