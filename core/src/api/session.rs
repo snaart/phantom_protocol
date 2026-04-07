@@ -2476,4 +2476,193 @@ mod tests {
         // Sequence space advanced by exactly one (we sent one echo).
         assert_eq!(path_validation_seq, 101);
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Wire V3 — 0-RTT early-data (Phase 4.1)
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Full 0-RTT round-trip over `ChannelTransport`: a priming V12
+    /// handshake populates the server cache and yields a resumption
+    /// hint; a second connect via `connect_with_resumption` carries
+    /// application early-data inside the V3 ClientHello, which the
+    /// server decrypts and surfaces. The client learns the verdict
+    /// via `early_data_accepted()`.
+    ///
+    /// The server side runs inline (not a spawned task) so its
+    /// `ChannelTransport` halves stay alive in scope — dropping them
+    /// would close the client's data pump and flip the session to
+    /// `Closed` before the assertions run.
+    #[tokio::test]
+    async fn zero_rtt_early_data_full_round_trip() {
+        // One HandshakeServer shared across both phases so its session
+        // cache persists between the priming handshake and the resume.
+        let server_hs = HandshakeServer::new().unwrap();
+        let server_pinned_key = server_hs.verifying_key().clone();
+        let client_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        // ── Phase 1: prime — a normal V12 handshake fills the cache ──
+        let (c1, s1) = ChannelTransport::pair();
+        let phase1_session =
+            PhantomSession::connect_with_transport("test:9000", c1, server_pinned_key.clone());
+
+        let hello_bytes = s1.recv_bytes().await.unwrap();
+        let ch = match borsh::from_slice::<ClientHelloEnvelope>(&hello_bytes).unwrap() {
+            ClientHelloEnvelope::V12(ch) => ch,
+            ClientHelloEnvelope::V3(_) => panic!("phase 1 expects a V12 ClientHello"),
+        };
+        let retry = match server_hs.process_client_hello(&ch, 0, client_ip) {
+            HandshakeResponse::Retry(r) => r,
+            _ => panic!("expected Retry"),
+        };
+        s1.send_bytes(&borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry)).unwrap())
+            .await
+            .unwrap();
+        let next = s1.recv_bytes().await.unwrap();
+        let ch2 = match borsh::from_slice::<ClientHelloEnvelope>(&next).unwrap() {
+            ClientHelloEnvelope::V12(ch) => ch,
+            ClientHelloEnvelope::V3(_) => panic!("phase 1 retry expects V12"),
+        };
+        match server_hs.process_client_hello(&ch2, 0, client_ip) {
+            HandshakeResponse::Success(sh, _session) => {
+                s1.send_bytes(&borsh::to_vec(&ServerHelloEnvelope::V12(sh)).unwrap())
+                    .await
+                    .unwrap();
+            }
+            _ => panic!("expected Success"),
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            phase1_session.connection_state(),
+            ConnectionState::Connected
+        );
+        let hint = phase1_session
+            .resumption_hint()
+            .await
+            .expect("phase 1 produced a resumption hint");
+
+        // ── Phase 2: resume — V3 ClientHello carries the early-data ──
+        let early_payload = b"zero-rtt application bytes".to_vec();
+        let (c2, s2) = ChannelTransport::pair();
+        let phase2_session = PhantomSession::connect_with_resumption(
+            "test:9000",
+            c2,
+            server_pinned_key.clone(),
+            hint,
+            early_payload.clone(),
+        )
+        .expect("early_data is within the size cap");
+
+        let hello_bytes = s2.recv_bytes().await.unwrap();
+        let ch3 = match borsh::from_slice::<ClientHelloEnvelope>(&hello_bytes).unwrap() {
+            ClientHelloEnvelope::V3(ch3) => ch3,
+            ClientHelloEnvelope::V12(_) => panic!("phase 2 expects a V3 ClientHello"),
+        };
+        match server_hs.process_client_hello_v3(&ch3, 0, client_ip) {
+            HandshakeResponse::SuccessV3(sh3, _session, early_data) => {
+                // The server decrypted exactly what the client sealed.
+                assert_eq!(early_data.as_deref(), Some(&early_payload[..]));
+                assert!(sh3.early_data_accepted);
+                s2.send_bytes(&borsh::to_vec(&ServerHelloEnvelope::V3(sh3)).unwrap())
+                    .await
+                    .unwrap();
+            }
+            _ => panic!("expected SuccessV3 — the resumption ticket is fresh"),
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            phase2_session.connection_state(),
+            ConnectionState::Connected
+        );
+        assert_eq!(
+            phase2_session.early_data_accepted().await,
+            Some(true),
+            "client must see the server accepted its 0-RTT early-data"
+        );
+
+        // Keep the server transports alive until every assertion has
+        // run — see the doc comment above.
+        drop((s1, s2));
+    }
+
+    /// A V3 client whose server does not speak V3 receives
+    /// `ServerHelloEnvelope::Unsupported` and transparently falls back
+    /// to a plain V2 handshake. The handshake still completes;
+    /// `early_data_accepted()` is `None` (no 0-RTT happened).
+    #[tokio::test]
+    async fn v3_client_falls_back_to_v2_on_unsupported() {
+        let server_hs = HandshakeServer::new().unwrap();
+        let server_pinned_key = server_hs.verifying_key().clone();
+        let client_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        // The hint is fabricated — the server replies `Unsupported`
+        // before ever looking at the resumption ticket.
+        let fake_hint = ([0u8; 32], [0u8; 32]);
+        let (c, s) = ChannelTransport::pair();
+        let session = PhantomSession::connect_with_resumption(
+            "test:9000",
+            c,
+            server_pinned_key,
+            fake_hint,
+            b"early-data-that-will-not-be-sent".to_vec(),
+        )
+        .unwrap();
+
+        // 1. The first flight is a V3 ClientHello — reply Unsupported.
+        let hello_bytes = s.recv_bytes().await.unwrap();
+        assert!(
+            matches!(
+                borsh::from_slice::<ClientHelloEnvelope>(&hello_bytes).unwrap(),
+                ClientHelloEnvelope::V3(_)
+            ),
+            "client's first flight must be a V3 ClientHello"
+        );
+        s.send_bytes(&borsh::to_vec(&ServerHelloEnvelope::Unsupported).unwrap())
+            .await
+            .unwrap();
+
+        // 2. The client must fall back to a V2 ClientHello — drive the
+        //    normal cookie/PoW V12 dance to completion.
+        let v2_bytes = s.recv_bytes().await.unwrap();
+        let ch = match borsh::from_slice::<ClientHelloEnvelope>(&v2_bytes).unwrap() {
+            ClientHelloEnvelope::V12(ch) => ch,
+            ClientHelloEnvelope::V3(_) => panic!("client should have fallen back to V12"),
+        };
+        let retry = match server_hs.process_client_hello(&ch, 0, client_ip) {
+            HandshakeResponse::Retry(r) => r,
+            _ => panic!("expected Retry on the V2 fallback"),
+        };
+        s.send_bytes(&borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry)).unwrap())
+            .await
+            .unwrap();
+        let next = s.recv_bytes().await.unwrap();
+        let ch2 = match borsh::from_slice::<ClientHelloEnvelope>(&next).unwrap() {
+            ClientHelloEnvelope::V12(ch) => ch,
+            ClientHelloEnvelope::V3(_) => panic!("expected a V12 retry"),
+        };
+        match server_hs.process_client_hello(&ch2, 0, client_ip) {
+            HandshakeResponse::Success(sh, _session) => {
+                s.send_bytes(&borsh::to_vec(&ServerHelloEnvelope::V12(sh)).unwrap())
+                    .await
+                    .unwrap();
+            }
+            _ => panic!("expected Success on the V2 fallback"),
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            session.connection_state(),
+            ConnectionState::Connected,
+            "the V3 → V2 fallback handshake must complete"
+        );
+        assert_eq!(
+            session.early_data_accepted().await,
+            None,
+            "fell back to V2 — there is no 0-RTT verdict"
+        );
+
+        // Keep the server transport alive until the assertions run.
+        drop(s);
+    }
 }

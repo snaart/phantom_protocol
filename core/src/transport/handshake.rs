@@ -1361,4 +1361,170 @@ mod tests {
             ),
         }
     }
+
+    // ── Wire V3 / 0-RTT early-data (Phase 4.1) ──
+
+    /// Drive a full V12 handshake and return the resumption hint the
+    /// server minted for it — the `(session_id, resumption_secret)`
+    /// a V3 client needs.
+    fn first_handshake_for_hint(
+        server: &HandshakeServer,
+        client_ip: std::net::IpAddr,
+    ) -> ([u8; 32], [u8; 32]) {
+        let client = HandshakeClient::new().unwrap();
+        let hello = client.create_client_hello();
+        let cookie = match server.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(r) => r.cookie.unwrap(),
+            _ => panic!("expected retry"),
+        };
+        let mut retry = hello.clone();
+        retry.cookie = Some(cookie);
+        match server.process_client_hello(&retry, 0, client_ip) {
+            HandshakeResponse::Success(_, session) => session.resumption_hint().unwrap(),
+            _ => panic!("expected success"),
+        }
+    }
+
+    #[test]
+    fn envelope_roundtrip_v12_and_v3() {
+        let client = HandshakeClient::new().unwrap();
+
+        // ClientHelloEnvelope::V12 round-trips.
+        let v12 = ClientHelloEnvelope::V12(client.create_client_hello());
+        let bytes = borsh::to_vec(&v12).unwrap();
+        assert!(matches!(
+            borsh::from_slice::<ClientHelloEnvelope>(&bytes).unwrap(),
+            ClientHelloEnvelope::V12(_)
+        ));
+
+        // ClientHelloEnvelope::V3 round-trips, early-data preserved.
+        let v3 = ClientHelloEnvelope::V3(client.create_client_hello_v3(
+            [7u8; 32],
+            &[9u8; 32],
+            Some(b"early"),
+        ));
+        let bytes = borsh::to_vec(&v3).unwrap();
+        match borsh::from_slice::<ClientHelloEnvelope>(&bytes).unwrap() {
+            ClientHelloEnvelope::V3(ch3) => {
+                assert_eq!(ch3.base.version, 3);
+                assert!(ch3.early_data.is_some(), "sealed blob preserved");
+            }
+            ClientHelloEnvelope::V12(_) => panic!("expected V3"),
+        }
+
+        // ServerHelloEnvelope::Unsupported is a 1-byte wire token.
+        let bytes = borsh::to_vec(&ServerHelloEnvelope::Unsupported).unwrap();
+        assert!(matches!(
+            borsh::from_slice::<ServerHelloEnvelope>(&bytes).unwrap(),
+            ServerHelloEnvelope::Unsupported
+        ));
+    }
+
+    #[test]
+    fn unknown_envelope_discriminant_errors_not_panics() {
+        // `ClientHelloEnvelope` has discriminants 0 (V12) and 1 (V3).
+        // An out-of-range discriminant must produce a clean `Err`, not
+        // a panic — this is what makes future version bumps decode
+        // cleanly off the 1-byte prefix.
+        let bogus = [99u8, 0, 0, 0, 0, 0, 0, 0];
+        assert!(borsh::from_slice::<ClientHelloEnvelope>(&bogus).is_err());
+        assert!(borsh::from_slice::<ServerHelloEnvelope>(&bogus).is_err());
+    }
+
+    #[tokio::test]
+    async fn v3_early_data_round_trip() {
+        let server = HandshakeServer::new().unwrap();
+        let client_ip = "127.0.0.1".parse().unwrap();
+        let (resume_id, resume_secret) = first_handshake_for_hint(&server, client_ip);
+
+        // Second connect: V3 with a 0-RTT early-data payload.
+        let client = HandshakeClient::new().unwrap();
+        let early_payload = b"zero-rtt application bytes";
+        let ch3 = client.create_client_hello_v3(resume_id, &resume_secret, Some(early_payload));
+
+        match server.process_client_hello_v3(&ch3, 0, client_ip) {
+            HandshakeResponse::SuccessV3(sh3, _session, early_data) => {
+                assert!(sh3.early_data_accepted, "server accepted the early-data");
+                assert_eq!(
+                    early_data.as_deref(),
+                    Some(&early_payload[..]),
+                    "server decrypted the exact payload the client sealed"
+                );
+                // The client verifies the V3 ServerHello and learns the
+                // same verdict.
+                let (_session, accepted) = client
+                    .process_server_hello_v3(&ch3, &sh3, Some(server.verifying_key()))
+                    .expect("client verifies the V3 ServerHello");
+                assert!(accepted, "client sees early_data_accepted == true");
+            }
+            other => panic!(
+                "expected SuccessV3, got {}",
+                match other {
+                    HandshakeResponse::Retry(_) => "Retry",
+                    HandshakeResponse::Success(..) => "Success",
+                    HandshakeResponse::Fail(_) => "Fail",
+                    HandshakeResponse::SuccessV3(..) => unreachable!(),
+                }
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_oversized_early_data_rejected_but_handshake_succeeds() {
+        let server = HandshakeServer::new().unwrap();
+        let client_ip = "127.0.0.1".parse().unwrap();
+        let (resume_id, resume_secret) = first_handshake_for_hint(&server, client_ip);
+
+        // A blob whose sealed length exceeds EARLY_DATA_MAX_LEN + tag.
+        let huge = vec![0u8; EARLY_DATA_MAX_LEN + 1];
+        let client = HandshakeClient::new().unwrap();
+        let ch3 = client.create_client_hello_v3(resume_id, &resume_secret, Some(&huge));
+
+        match server.process_client_hello_v3(&ch3, 0, client_ip) {
+            HandshakeResponse::SuccessV3(sh3, _session, early_data) => {
+                assert!(!sh3.early_data_accepted, "oversized blob rejected");
+                assert!(early_data.is_none(), "no plaintext surfaces");
+            }
+            _ => panic!("handshake must still succeed as 1-RTT"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_corrupted_early_data_rejected_but_handshake_succeeds() {
+        let server = HandshakeServer::new().unwrap();
+        let client_ip = "127.0.0.1".parse().unwrap();
+        let (resume_id, resume_secret) = first_handshake_for_hint(&server, client_ip);
+
+        // Build a V3 ClientHello, then replace the sealed blob with
+        // in-range garbage — AEAD verification must fail.
+        let client = HandshakeClient::new().unwrap();
+        let mut ch3 = client.create_client_hello_v3(resume_id, &resume_secret, None);
+        ch3.early_data = Some(vec![0xFFu8; 128]);
+
+        match server.process_client_hello_v3(&ch3, 0, client_ip) {
+            HandshakeResponse::SuccessV3(sh3, _session, early_data) => {
+                assert!(!sh3.early_data_accepted, "AEAD failure → rejected");
+                assert!(early_data.is_none());
+            }
+            _ => panic!("handshake must still succeed as 1-RTT"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_unknown_ticket_falls_back_to_cookie_retry() {
+        // A V3 ClientHello whose resume_session_id the server has never
+        // seen gets no cookie/PoW bypass — and with no cookie attached,
+        // the server demands one via Retry.
+        let server = HandshakeServer::new().unwrap();
+        let client_ip = "127.0.0.1".parse().unwrap();
+        let client = HandshakeClient::new().unwrap();
+        let ch3 = client.create_client_hello_v3([0xAB; 32], &[0xCD; 32], Some(b"hi"));
+        assert!(
+            matches!(
+                server.process_client_hello_v3(&ch3, 0, client_ip),
+                HandshakeResponse::Retry(_)
+            ),
+            "unknown ticket → no bypass → cookie Retry"
+        );
+    }
 }
