@@ -486,8 +486,10 @@ Adds to the inventory in § 3:
 
 A single `Session` is pinned to one wire version for its lifetime —
 mixed V1+V2 use within a session is not supported. Version selection
-happens at handshake time (Phase 1.8 work, currently in V1-only mode
-because the handshake itself remains V1).
+happens at handshake time: `client_hello.version` is transcript-bound
+(Phase 1.8) and `HandshakeClient::create_client_hello` offers V2 by
+default. A V3 handshake (§12) negotiates a handshake-only bump and the
+resulting session still routes V2 *packets*.
 
 ### 11.7 Cross-version isolation
 
@@ -497,3 +499,139 @@ V2 header is 44 bytes, different serialisation), so the AEAD tag check
 fails by construction. Test
 `v1_ciphertext_does_not_decrypt_as_v2` in
 `core/tests/security_invariants.rs` pins this property.
+
+---
+
+## 12. V3 wire format — 0-RTT early-data
+
+V3 is a **handshake-only** bump. It adds nothing to the *packet* layer:
+a V3-negotiated session routes ordinary V2 packets (§11). What V3 adds
+is the ability for a resuming client to carry application "early data"
+*inside the ClientHello*, so the first application bytes reach the
+server without waiting a full handshake round-trip.
+
+### 12.1 Version-prefixed handshake envelope
+
+Before V3, `ClientHello` / `ServerHello` / `HelloRetryRequest` travelled
+on the wire as bare borsh blobs. V3 wraps each in a borsh enum, so every
+handshake frame now carries a 1-byte version discriminant ahead of its
+body:
+
+```rust
+enum ClientHelloEnvelope    { V12(ClientHello), V3(ClientHelloV3) }
+enum ServerHelloEnvelope    { V12(ServerHello), V3(ServerHelloV3), Unsupported }
+enum HelloRetryRequestEnvelope { V12(HelloRetryRequest) }
+```
+
+A receiver dispatches off the discriminant instead of guessing the
+struct shape — every future bump adds an arm and stays cleanly
+forward-decodable. Introducing the envelope is a **one-time pre-1.0
+wire break for every version** (the discriminant byte shifts the
+layout), accepted on the same footing as the `ml-kem` primitive swap.
+The 4-byte length-prefix transport framing is unchanged — the envelope
+prefix is just one more payload byte.
+
+`ServerHelloEnvelope::Unsupported` is a transcript-free, pre-session
+1-byte token: a handshake path that does not implement V3 (e.g.
+`UdpHandshakeListener`) replies with it, and the client transparently
+falls back to a plain V2 handshake.
+
+### 12.2 `ClientHelloV3` / `ServerHelloV3`
+
+```rust
+struct ClientHelloV3 {
+    base: ClientHello,            // §6 fields; base.version == 3
+    early_data: Option<Vec<u8>>,  // AEAD-sealed blob, or None
+}
+struct ServerHelloV3 {
+    base: ServerHello,            // §6 fields
+    early_data_accepted: bool,    // the 0-RTT verdict
+}
+```
+
+`base.resume_session_id` carries the prior session's id — the ticket
+the early-data is keyed against. `base.version` is `3` and is covered
+by the transcript signature (§12.4).
+
+### 12.3 Early-data key derivation and AEAD
+
+Both peers hold the two inputs and derive identical keying material:
+
+- `resumption_secret` — 32 bytes from the prior handshake. The server
+  keeps it verbatim in its `SessionCache`; the client gets it from
+  `Session::resumption_hint().1`.
+- `client_nonce` — the fresh 32-byte nonce in *this* ClientHello.
+
+```
+PRK             = HKDF-Extract(salt = client_nonce, ikm = resumption_secret)
+early_data_key  = HKDF-Expand(PRK, "phantom-early-data-key-v3",   32)
+early_data_nonce= HKDF-Expand(PRK, "phantom-early-data-nonce-v3", 12)
+```
+
+HKDF-SHA256, not BLAKE3 — keeps the path FIPS-eligible. The `(key,
+nonce)` pair is single-use: the key is bound to one `client_nonce`,
+which is one-shot because the server consumes the resumption ticket on
+first sight (§12.5).
+
+The blob is sealed with **AES-256-GCM** (fixed — the cipher suite is
+not yet negotiated at ClientHello time). AAD = `resume_session_id ||
+client_nonce` (64 bytes). The early-data plaintext is capped at
+**16 KiB** (`EARLY_DATA_MAX_LEN`): the client constructor rejects a
+larger payload, and the server drops an oversized blob and continues
+1-RTT — this caps the work an unauthenticated peer can force before
+the handshake completes.
+
+### 12.4 Transcript binding
+
+`HandshakeTranscriptV3` embeds the whole `ClientHelloV3` — including
+the `early_data` ciphertext — so the server's signature covers it. A
+tampered or stripped early-data blob breaks the client-side signature
+check. The V12 transcript (`HandshakeTranscript`) is byte-identical to
+pre-V3 builds.
+
+### 12.5 One-shot anti-replay
+
+Early-data is inherently replayable. The defence is the resumption
+ticket itself: `SessionCache::try_resume` **removes** the ticket on the
+first lookup. A replayed ClientHello carrying the same
+`resume_session_id` finds no ticket → no cookie/PoW bypass → the
+server falls back to a normal 1-RTT handshake and the early-data is
+ignored. Each ticket therefore authorises exactly one 0-RTT attempt.
+
+### 12.6 Best-effort semantics
+
+Early-data acceptance is best-effort. The handshake **always**
+completes (as 1-RTT) even when the early-data is rejected — unknown or
+expired ticket, oversized blob, or AEAD failure. `ServerHelloV3.
+early_data_accepted` is the verdict the client reads via
+`PhantomSession::early_data_accepted()`:
+
+| Verdict | Meaning |
+| --- | --- |
+| `Some(true)` | server decrypted and surfaced the early-data |
+| `Some(false)` | V3 handshake, early-data rejected — caller must re-send normally |
+| `None` | V2 handshake (no 0-RTT attempted, or a V3 attempt fell back via `Unsupported`) |
+
+### 12.7 Forward-secrecy caveat
+
+Early-data is encrypted under a key derived from a **past** session's
+`resumption_secret`. Compromise of that secret exposes this connect's
+early-data — the standard TLS-1.3-style 0-RTT forward-secrecy gap. The
+*post-handshake* session retains full PFS: the V3 handshake still runs
+a fresh hybrid X25519 + ML-KEM-768 exchange, exactly like V1/V2.
+
+### 12.8 KDF additions
+
+Adds to the inventory in § 3:
+
+| Label | Construction | Purpose |
+| --- | --- | --- |
+| `b"phantom-early-data-key-v3"` | `HKDF-Expand(HKDF-Extract(client_nonce, resumption_secret))` | 0-RTT early-data AEAD key |
+| `b"phantom-early-data-nonce-v3"` | `HKDF-Expand(HKDF-Extract(client_nonce, resumption_secret))` | 0-RTT early-data AEAD nonce |
+
+### 12.9 Scope
+
+`UdpHandshakeListener` (`transport/udp_transport.rs`) is a V1/V2-only
+demo path: it speaks the envelope but does not implement the V3 flow,
+replying `ServerHelloEnvelope::Unsupported` to a V3 ClientHello. The
+TCP `PhantomListener` is the V3-capable handshake path.
