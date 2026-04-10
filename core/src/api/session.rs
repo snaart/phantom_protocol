@@ -87,25 +87,11 @@ impl ConnectionState {
 
 // ─── Transport Abstraction ──────────────────────────────────────────────────
 
-/// Async transport trait for PhantomSession.
-///
-/// Abstractions over UDP, TCP, FakeTLS, etc.
-/// Used by the background handshake task for I/O.
-///
-/// `recv_bytes` returns `Bytes` (Phase 2.8) so the recv pipeline can
-/// fan out the same buffer to multiple consumers via cheap refcount
-/// clones — no `Vec → Bytes` conversion at the trait boundary.
-/// `send_bytes` keeps `&[u8]` because the caller routinely sends a
-/// borrowed slice of an already-allocated send buffer.
-#[async_trait::async_trait]
-pub trait SessionTransport: Send + Sync + 'static {
-    /// Send raw bytes to the peer.
-    async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError>;
-    /// Receive the next message from the peer. The returned `Bytes` is
-    /// a refcounted view over an opaque buffer; subsequent `clone()`s
-    /// are cheap.
-    async fn recv_bytes(&self) -> Result<Bytes, CoreError>;
-}
+// `SessionTransport` now lives in `crate::transport::session_transport` — a
+// dependency-light module that can compile in a `no_std + alloc` build. It is
+// re-exported here so `crate::api::session::SessionTransport` and the public
+// `phantom_core::api::SessionTransport` path stay stable.
+pub use crate::transport::session_transport::SessionTransport;
 
 // ─── Session ────────────────────────────────────────────────────────────────
 
@@ -1658,7 +1644,6 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl SessionTransport for ChannelTransport {
         async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError> {
             self.tx

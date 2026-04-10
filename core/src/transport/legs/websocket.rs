@@ -228,7 +228,6 @@ impl WebSocketLeg {
     }
 }
 
-#[async_trait::async_trait]
 impl SessionTransport for WebSocketLeg {
     async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError> {
         if self.closed.load(Ordering::Acquire) {

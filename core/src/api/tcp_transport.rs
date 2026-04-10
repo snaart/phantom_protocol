@@ -44,7 +44,6 @@ impl TcpSessionTransport {
     }
 }
 
-#[async_trait::async_trait]
 impl SessionTransport for TcpSessionTransport {
     async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError> {
         if data.len() > MAX_FRAME_BYTES {
