@@ -28,6 +28,7 @@ pub mod reputation;
 pub mod scheduler;
 pub mod session;
 pub mod session_cache;
+pub mod session_transport;
 pub mod stream;
 pub mod types;
 

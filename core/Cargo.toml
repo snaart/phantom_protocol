@@ -11,6 +11,10 @@ default = ["compression-zstd"]
 # the always-on fallback.
 compression-zstd = ["dep:zstd"]
 
+# `EmbeddedLeg` transport over `embedded-io-async` byte streams (Phase 3.4).
+# Pure-Rust + no_std-friendly; safe to enable on the host for `cargo test`.
+embedded = ["dep:embedded-io-async", "dep:async-lock"]
+
 [dependencies]
 # --- Async & Runtime ---
 # `tokio` is split per target (Phase 3.5 conditional compilation matrix):
@@ -82,6 +86,17 @@ argon2 = "0.5.3"
 crossbeam-queue = "0.3.12"
 hmac = "0.12.1"
 dashmap = "6.1.0"
+
+# --- Embedded transport (optional, behind the `embedded` feature) ---
+# Pure-Rust, no_std + alloc. `embedded-io-async` 0.6 is the byte-stream trait
+# the `EmbeddedLeg` is generic over — 0.6 keeps MSRV 1.75, 0.7 bumped it to
+# 1.81. `async-lock` is the async mutex guarding the split read/write handles;
+# chosen over `embassy-sync` because the latter drags in `heapless` (MSRV 1.87)
+# and would need a link-time `critical-section` impl. `async-lock` >= 3.4
+# bumped its MSRV to 1.85, so it is capped at `< 3.4` to hold the crate MSRV of
+# 1.75 — relax this cap once the crate MSRV moves.
+embedded-io-async = { version = "0.6", optional = true }
+async-lock = { version = ">=3, <3.4", optional = true, default-features = false }
 
 [build-dependencies]
 uniffi = { version = "0.29", features = ["build"] }

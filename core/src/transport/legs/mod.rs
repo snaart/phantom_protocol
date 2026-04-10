@@ -17,6 +17,12 @@ pub mod websocket;
 #[cfg(target_arch = "wasm32")]
 pub use websocket::WebSocketLeg;
 
+// `EmbeddedLeg` — `SessionTransport` over `embedded-io-async` byte streams,
+// behind the `embedded` feature. Compiles on any target (host included) so the
+// tests run there. Phase 3.4.
+#[cfg(feature = "embedded")]
+pub mod embedded;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::io;
