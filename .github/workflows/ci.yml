@@ -81,6 +81,20 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  embedded-feature:
+    name: cargo test + clippy (--features embedded)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - run: cargo test --manifest-path core/Cargo.toml --lib --features embedded
+      - run: cargo clippy --manifest-path core/Cargo.toml --lib --features embedded -- -D warnings
+
   cli-check:
     name: cli compiles against core
     runs-on: ubuntu-latest
