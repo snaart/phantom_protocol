@@ -99,14 +99,65 @@ where
     }
 }
 
+/// Generate a [`SessionTransport`] impl for a concrete
+/// `EmbeddedLeg<$reader, $writer, $n>`.
+///
+/// `embedded-io-async`'s `Read::read` / `Write::write` are async-fn-in-trait
+/// methods whose returned futures are **not** `Send`-bounded. A generic blanket
+/// `impl<R, W> SessionTransport for EmbeddedLeg<R, W, N>` therefore cannot
+/// satisfy [`SessionTransport`]'s `+ Send` constraint without the unstable
+/// `return_type_notation` feature. By emitting the impl with *concrete*
+/// `$reader` / `$writer` types, the compiler sees the HAL's actual future at
+/// the use site and can prove `Send` directly.
+///
+/// Downstream HAL adapters call this once per `(reader, writer, N)` triple
+/// they expose:
+///
+/// ```ignore
+/// use phantom_core::impl_embedded_session_transport;
+/// impl_embedded_session_transport!(MyUartRx, MyUartTx, 1024);
+/// ```
+///
+/// [`SessionTransport`]: crate::transport::session_transport::SessionTransport
+#[macro_export]
+macro_rules! impl_embedded_session_transport {
+    ($reader:ty, $writer:ty, $n:expr) => {
+        impl $crate::transport::session_transport::SessionTransport
+            for $crate::transport::legs::embedded::EmbeddedLeg<$reader, $writer, $n>
+        {
+            fn send_bytes(
+                &self,
+                data: &[u8],
+            ) -> impl core::future::Future<Output = Result<(), $crate::errors::CoreError>> + Send
+            {
+                self.send_frame(data)
+            }
+            fn recv_bytes(
+                &self,
+            ) -> impl core::future::Future<
+                Output = Result<bytes::Bytes, $crate::errors::CoreError>,
+            > + Send {
+                self.recv_frame()
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::session_transport::SessionTransport;
     use core::convert::Infallible;
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{Mutex as TokioMutex, Notify};
+
+    // Install the `SessionTransport` impl for the test mock pair. Lives inside
+    // the test module so the macro's `+ Send` future bound is genuinely
+    // exercised on the `MockReader` / `MockWriter` future types; if either
+    // were `!Send`, this invocation would fail to compile.
+    crate::impl_embedded_session_transport!(MockReader, MockWriter, 1024);
 
     // ── Mock duplex over `embedded-io-async` ────────────────────────────
     //
@@ -256,5 +307,156 @@ mod tests {
             .expect("recv_frame");
 
         assert_eq!(&frame[..], b"world");
+    }
+
+    /// Even when the underlying byte stream hands out one byte at a time
+    /// (worst-case UART with a 1-byte FIFO), `recv_frame` must drain
+    /// `HEADER_LEN + payload` bytes via the internal `read_exact` loop and
+    /// reassemble the original frame.
+    #[tokio::test]
+    async fn recv_frame_reassembles_under_adversarial_chunking() {
+        let ((a_r, a_w), (_b_r, mut b_w)) = duplex_pair_with_chunk(1);
+        let leg: EmbeddedLeg<MockReader, MockWriter, 1024> = EmbeddedLeg::new(a_r, a_w);
+
+        // Spawn a writer that dribbles the header + payload one byte at a
+        // time, with a yield in between so the receiver gets a chance to
+        // observe each step.
+        let writer = tokio::spawn(async move {
+            for &b in &[0x00, 0x00, 0x00, 0x05] {
+                b_w.write_all(&[b]).await.expect("write header byte");
+                tokio::task::yield_now().await;
+            }
+            for &b in b"abcde" {
+                b_w.write_all(&[b]).await.expect("write payload byte");
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let frame = tokio::time::timeout(Duration::from_secs(1), leg.recv_frame())
+            .await
+            .expect("recv should not hang under 1-byte chunking")
+            .expect("recv_frame");
+
+        writer.await.expect("writer task");
+        assert_eq!(&frame[..], b"abcde");
+    }
+
+    /// A header announcing a length that exceeds the leg's buffer capacity
+    /// `N` must be rejected at the framing layer **before** any payload bytes
+    /// are pulled off the wire. This guards a remote peer (or attacker) from
+    /// forcing an `N`-bounded receiver to read megabytes.
+    #[tokio::test]
+    async fn recv_frame_rejects_oversized_header() {
+        // N = 8, peer claims a 16-byte payload and writes no payload bytes.
+        // If the implementation tried to drain the announced payload, the
+        // recv would hang and the timeout would fire instead of an error.
+        let ((a_r, a_w), (_b_r, mut b_w)) = duplex_pair();
+        let leg: EmbeddedLeg<MockReader, MockWriter, 8> = EmbeddedLeg::new(a_r, a_w);
+
+        b_w.write_all(&[0x00, 0x00, 0x00, 0x10])
+            .await
+            .expect("write bogus header");
+        // Deliberately no payload bytes follow.
+
+        let err = tokio::time::timeout(Duration::from_secs(1), leg.recv_frame())
+            .await
+            .expect("recv should error fast, not hang on payload");
+        match err {
+            Err(CoreError::NetworkError(msg)) => {
+                assert!(
+                    msg.contains("framing"),
+                    "expected framing error, got: {msg}"
+                );
+            }
+            other => panic!("expected NetworkError(framing), got {other:?}"),
+        }
+    }
+
+    /// If the peer closes the pipe mid-header (fewer than 4 bytes delivered),
+    /// `read_exact` returns `UnexpectedEof`, which `recv_frame` maps to a
+    /// `NetworkError("read header")`. Pinning this prevents a silent stall
+    /// or a misleading "read payload" error from a future refactor.
+    #[tokio::test]
+    async fn recv_frame_returns_error_on_eof_mid_header() {
+        let ((a_r, a_w), (_b_r, b_w)) = duplex_pair();
+        let leg: EmbeddedLeg<MockReader, MockWriter, 1024> = EmbeddedLeg::new(a_r, a_w);
+
+        // Reach into the peer-side `MockWriter` to push 2 header bytes, then
+        // mark the pipe closed and wake the reader.
+        let target = b_w.write_to.clone();
+        let notify = b_w.write_notify.clone();
+        {
+            let mut p = target.lock().await;
+            p.buf.extend([0x00u8, 0x00]);
+            p.closed = true;
+        }
+        notify.notify_waiters();
+
+        let err = tokio::time::timeout(Duration::from_secs(1), leg.recv_frame())
+            .await
+            .expect("recv should error fast on EOF");
+        match err {
+            Err(CoreError::NetworkError(msg)) => {
+                assert!(
+                    msg.contains("read header"),
+                    "expected `read header` in error msg, got: {msg}"
+                );
+            }
+            other => panic!("expected NetworkError(read header), got {other:?}"),
+        }
+    }
+
+    /// `send_frame` and `recv_frame` take distinct `Mutex`es (`tx` vs `rx`),
+    /// so a send on one side and a recv on the other can race without one
+    /// blocking the other. Spawning both concurrently and asserting both
+    /// finish within a 1-second window confirms the lock-split design.
+    #[tokio::test]
+    async fn send_recv_run_concurrently_without_blocking() {
+        let ((a_r, a_w), (b_r, b_w)) = duplex_pair();
+        let leg_a: Arc<EmbeddedLeg<MockReader, MockWriter, 1024>> =
+            Arc::new(EmbeddedLeg::new(a_r, a_w));
+        let leg_b: Arc<EmbeddedLeg<MockReader, MockWriter, 1024>> =
+            Arc::new(EmbeddedLeg::new(b_r, b_w));
+
+        let leg_a_send = Arc::clone(&leg_a);
+        let send = tokio::spawn(async move { leg_a_send.send_frame(b"ping").await });
+        let leg_b_recv = Arc::clone(&leg_b);
+        let recv = tokio::spawn(async move { leg_b_recv.recv_frame().await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            send.await.expect("send task").expect("send_frame result");
+            let frame = recv.await.expect("recv task").expect("recv_frame result");
+            assert_eq!(&frame[..], b"ping");
+        })
+        .await
+        .expect("concurrent send+recv should complete within 1s");
+    }
+
+    /// Round-trip a payload through the `SessionTransport` trait surface
+    /// (`send_bytes` / `recv_bytes`). This is the proof that the
+    /// `impl_embedded_session_transport!` macro invocation above actually
+    /// produces a usable impl — without it, the `.send_bytes` and
+    /// `.recv_bytes` calls would not resolve.
+    #[tokio::test]
+    async fn session_transport_round_trip() {
+        let ((a_r, a_w), (b_r, b_w)) = duplex_pair();
+        let leg_a: EmbeddedLeg<MockReader, MockWriter, 1024> = EmbeddedLeg::new(a_r, a_w);
+        let leg_b: EmbeddedLeg<MockReader, MockWriter, 1024> = EmbeddedLeg::new(b_r, b_w);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            <EmbeddedLeg<MockReader, MockWriter, 1024> as SessionTransport>::send_bytes(
+                &leg_a,
+                b"hello-trait",
+            )
+            .await
+            .expect("send_bytes");
+            let frame =
+                <EmbeddedLeg<MockReader, MockWriter, 1024> as SessionTransport>::recv_bytes(&leg_b)
+                    .await
+                    .expect("recv_bytes");
+            assert_eq!(&frame[..], b"hello-trait");
+        })
+        .await
+        .expect("trait round-trip should complete within 1s");
     }
 }
