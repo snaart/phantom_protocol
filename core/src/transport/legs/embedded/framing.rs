@@ -105,8 +105,7 @@ mod tests {
     #[test]
     fn decode_header_rejects_length_over_capacity() {
         // 0x0000_0800 = 2048; the receiver buffer is only 1024 bytes.
-        let err =
-            decode_header(&[0x00, 0x00, 0x08, 0x00], 1024).expect_err("2048 > 1024 capacity");
+        let err = decode_header(&[0x00, 0x00, 0x08, 0x00], 1024).expect_err("2048 > 1024 capacity");
         assert_eq!(
             err,
             FramingError::FrameTooLarge {
