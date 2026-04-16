@@ -14,6 +14,7 @@ alkahest = { version = "0.3.0", features = ["derive"] }
 
 [dependencies.phantom_core]
 path = "../core"
+features = ["embedded"]
 
 # Disable default-targets so cargo doesn't auto-build bench/example/test for
 # this crate (fuzz crates only have bin targets).
@@ -44,6 +45,13 @@ bench = false
 [[bin]]
 name = "fuzz_aead_decrypt"
 path = "fuzz_targets/fuzz_aead_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_embedded_framing"
+path = "fuzz_targets/fuzz_embedded_framing.rs"
 test = false
 doc = false
 bench = false

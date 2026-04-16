@@ -43,6 +43,5 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// Receive the next message from the peer. The returned `Bytes` is
     /// a refcounted view over an opaque buffer; subsequent `clone()`s
     /// are cheap.
-    fn recv_bytes(&self)
-        -> impl core::future::Future<Output = Result<Bytes, CoreError>> + Send;
+    fn recv_bytes(&self) -> impl core::future::Future<Output = Result<Bytes, CoreError>> + Send;
 }
