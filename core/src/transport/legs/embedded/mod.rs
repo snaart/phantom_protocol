@@ -459,4 +459,314 @@ mod tests {
         .await
         .expect("trait round-trip should complete within 1s");
     }
+
+    // ── End-to-end handshake mirror (Phase 3.4.6 deferred e2e) ──────────
+    //
+    // Mirrors the canonical `test_phantom_session_handshake_via_transport`
+    // (in `crate::api::session::tests`) but swaps `ChannelTransport::pair()`
+    // for two `EmbeddedLeg<MockReader, MockWriter, 1024>` instances cross-
+    // connected via `duplex_pair()`. The decrypt / encrypt helpers are
+    // duplicated locally rather than promoted — keeps file-overlap surface
+    // at zero so parallel agents in adjacent modules can't conflict.
+
+    use crate::api::session::{ConnectionState, PhantomSession};
+    use crate::transport::handshake::{
+        ClientHelloEnvelope, HandshakeResponse, HandshakeServer, HelloRetryRequestEnvelope,
+        ServerHelloEnvelope,
+    };
+    use crate::transport::types::{
+        PacketFlags, PacketFlagsV2, PacketHeader, PacketHeaderV2, PhantomPacketV1, PhantomPacketV2,
+        SessionId, StreamId as TransportStreamId, VersionedPacket,
+    };
+
+    /// Decrypt an incoming encrypted frame on the test server side.
+    /// Wire-version-aware (V1 or V2). Local duplicate of the helper in
+    /// `api::session::tests` — see module comment above.
+    fn decrypt_incoming_local(
+        server_session: &crate::transport::session::Session,
+        bytes: &[u8],
+    ) -> Vec<u8> {
+        let versioned = alkahest::deserialize::<VersionedPacket, VersionedPacket>(bytes)
+            .expect("deserialize VersionedPacket");
+        match versioned {
+            VersionedPacket::V1(pkt) => {
+                assert!(
+                    pkt.header.flags.contains(PacketFlags::ENCRYPTED),
+                    "expected ENCRYPTED flag on V1 application data"
+                );
+                server_session
+                    .decrypt_packet(&pkt.header, &pkt.payload)
+                    .expect("decrypt V1 application data")
+            }
+            VersionedPacket::V2(pkt) => {
+                assert!(
+                    pkt.header.flags.contains(PacketFlagsV2::ENCRYPTED),
+                    "expected ENCRYPTED flag on V2 application data"
+                );
+                server_session
+                    .decrypt_packet_v2(&pkt.header, &pkt.payload)
+                    .expect("decrypt V2 application data")
+            }
+        }
+    }
+
+    /// Build an encrypted reply frame from the test server side.
+    /// Wire-version-aware. Local duplicate of the helper in
+    /// `api::session::tests` — see module comment above.
+    fn encrypt_outgoing_local(
+        server_session: &crate::transport::session::Session,
+        session_id: SessionId,
+        stream_id: TransportStreamId,
+        sequence: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        if server_session.wire_version() == 2 {
+            let flag_bits = PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED;
+            let header = PacketHeaderV2::new(
+                session_id,
+                stream_id,
+                sequence,
+                PacketFlagsV2::new(flag_bits),
+            )
+            .with_epoch(server_session.current_epoch());
+            let ct = server_session
+                .encrypt_packet_v2(&header, payload)
+                .expect("encrypt V2 reply");
+            let packet = PhantomPacketV2::new(header, ct).into_versioned();
+            let mut buf = Vec::new();
+            let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+            buf[..size].to_vec()
+        } else {
+            let mut flags = PacketFlags::new(PacketFlags::RELIABLE);
+            flags.set(PacketFlags::ENCRYPTED);
+            let header = PacketHeader::new(session_id, stream_id, sequence, flags);
+            let ct = server_session
+                .encrypt_packet(&header, payload)
+                .expect("encrypt V1 reply");
+            let packet = PhantomPacketV1::new(header, ct).into_versioned();
+            let mut buf = Vec::new();
+            let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+            buf[..size].to_vec()
+        }
+    }
+
+    /// `MockWriter` wrapper that tees every byte through to a side recorder
+    /// before forwarding to the underlying pipe. Used to sniff the wire and
+    /// assert plaintext like `b"early-data"` never appears in the framed
+    /// bytes the client writes.
+    struct TeeWriter {
+        inner: MockWriter,
+        recorder: Arc<TokioMutex<Vec<u8>>>,
+    }
+
+    impl embedded_io_async::ErrorType for TeeWriter {
+        type Error = Infallible;
+    }
+
+    impl Write for TeeWriter {
+        async fn write(&mut self, data: &[u8]) -> Result<usize, Infallible> {
+            self.recorder.lock().await.extend_from_slice(data);
+            self.inner.write(data).await
+        }
+    }
+
+    // The macro generates the `SessionTransport` impl for this concrete
+    // `(MockReader, TeeWriter, 16384)` triple — same `+ Send` future bound
+    // as the production embedded triple. A real PQ ClientHello / ServerHello
+    // (ML-KEM-768 1184-byte ek + ML-DSA-65 ~3.3 KiB signature + envelope)
+    // exceeds the 1024-byte capacity used by the unit framing tests above,
+    // so the e2e test uses a 16 KiB buffer.
+    crate::impl_embedded_session_transport!(MockReader, TeeWriter, 16384);
+    crate::impl_embedded_session_transport!(MockReader, MockWriter, 16384);
+
+    /// End-to-end handshake + encrypted data exchange over `EmbeddedLeg`.
+    /// Mirrors `test_phantom_session_handshake_via_transport` from
+    /// `api::session::tests`, with a `TeeWriter` on the client side so the
+    /// negative assertion (plaintext never on the wire) can read the actual
+    /// bytes the client emitted.
+    #[tokio::test]
+    async fn test_phantom_session_handshake_via_embedded_leg() {
+        // Client leg uses TeeWriter to record every transmitted byte.
+        // Server leg is a plain MockReader/MockWriter pair.
+        let ((client_r, client_w_inner), (server_r, server_w)) = duplex_pair();
+        let client_wire_recorder: Arc<TokioMutex<Vec<u8>>> = Arc::new(TokioMutex::new(Vec::new()));
+        let client_w = TeeWriter {
+            inner: client_w_inner,
+            recorder: Arc::clone(&client_wire_recorder),
+        };
+
+        let client_leg: EmbeddedLeg<MockReader, TeeWriter, 16384> =
+            EmbeddedLeg::new(client_r, client_w);
+        let server_leg: EmbeddedLeg<MockReader, MockWriter, 16384> =
+            EmbeddedLeg::new(server_r, server_w);
+
+        let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
+        let server_pinned_key = server_hs.verifying_key().clone();
+
+        // Spawn the client session — kicks off the background handshake.
+        let session = PhantomSession::connect_with_transport(
+            "test-server:9000",
+            client_leg,
+            server_pinned_key,
+        );
+
+        // Queue an early message before the handshake completes.
+        session
+            .send(b"early-data".to_vec())
+            .await
+            .expect("queue early-data");
+
+        // Server responder task: handles ClientHello (+ optional retry),
+        // emits ServerHello, receives the flushed early-data + a post-
+        // handshake message, then sends an encrypted reply.
+        let server_handle = tokio::spawn(async move {
+            let client_ip = "127.0.0.1".parse().expect("parse loopback IP");
+
+            // 1. Receive the first ClientHello. Default client offers V12.
+            let client_hello_bytes =
+                tokio::time::timeout(Duration::from_secs(5), server_leg.recv_frame())
+                    .await
+                    .expect("recv ClientHello within 5s")
+                    .expect("recv ClientHello frame");
+            let client_hello = match borsh::from_slice::<ClientHelloEnvelope>(&client_hello_bytes)
+                .expect("deserialize ClientHelloEnvelope")
+            {
+                ClientHelloEnvelope::V12(ch) => ch,
+                ClientHelloEnvelope::V3(_) => {
+                    panic!("test responder expects a V12 ClientHello")
+                }
+            };
+
+            // 2. Process — may retry with a cookie/PoW challenge.
+            let server_session = loop {
+                let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
+                match response {
+                    HandshakeResponse::Retry(retry) => {
+                        let retry_bytes = borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry))
+                            .expect("serialize HelloRetryRequest");
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            server_leg.send_frame(&retry_bytes),
+                        )
+                        .await
+                        .expect("send retry within 5s")
+                        .expect("send retry frame");
+
+                        let next_bytes =
+                            tokio::time::timeout(Duration::from_secs(5), server_leg.recv_frame())
+                                .await
+                                .expect("recv retried ClientHello within 5s")
+                                .expect("recv retried ClientHello frame");
+                        let next_hello = match borsh::from_slice::<ClientHelloEnvelope>(&next_bytes)
+                            .expect("deserialize retried envelope")
+                        {
+                            ClientHelloEnvelope::V12(ch) => ch,
+                            ClientHelloEnvelope::V3(_) => {
+                                panic!("test responder expects a V12 ClientHello")
+                            }
+                        };
+                        let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
+                        match resp2 {
+                            HandshakeResponse::Success(server_hello, session) => {
+                                let server_hello_bytes =
+                                    borsh::to_vec(&ServerHelloEnvelope::V12(server_hello))
+                                        .expect("serialize ServerHello");
+                                tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    server_leg.send_frame(&server_hello_bytes),
+                                )
+                                .await
+                                .expect("send ServerHello within 5s")
+                                .expect("send ServerHello frame");
+                                break session;
+                            }
+                            other => panic!("expected success after retry, got {other:?}"),
+                        }
+                    }
+                    HandshakeResponse::Success(server_hello, session) => {
+                        let server_hello_bytes =
+                            borsh::to_vec(&ServerHelloEnvelope::V12(server_hello))
+                                .expect("serialize ServerHello");
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            server_leg.send_frame(&server_hello_bytes),
+                        )
+                        .await
+                        .expect("send ServerHello within 5s")
+                        .expect("send ServerHello frame");
+                        break session;
+                    }
+                    HandshakeResponse::SuccessV3(..) => {
+                        panic!("V12 process_client_hello must not return SuccessV3")
+                    }
+                    HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+                }
+            };
+
+            let session_id = *server_session.id();
+
+            // 3. Receive the flushed early-data frame and decrypt it.
+            let early_frame = tokio::time::timeout(Duration::from_secs(5), server_leg.recv_frame())
+                .await
+                .expect("recv early-data within 5s")
+                .expect("recv early-data frame");
+            let early_plain = decrypt_incoming_local(&server_session, &early_frame);
+            assert_eq!(early_plain, b"early-data");
+
+            // 4. Receive the post-handshake message.
+            let post_frame = tokio::time::timeout(Duration::from_secs(5), server_leg.recv_frame())
+                .await
+                .expect("recv after-handshake within 5s")
+                .expect("recv after-handshake frame");
+            let post_plain = decrypt_incoming_local(&server_session, &post_frame);
+            assert_eq!(post_plain, b"after-handshake");
+
+            // 5. Send an encrypted reply.
+            let reply = encrypt_outgoing_local(&server_session, session_id, 1, 1, b"server-reply");
+            tokio::time::timeout(Duration::from_secs(5), server_leg.send_frame(&reply))
+                .await
+                .expect("send reply within 5s")
+                .expect("send reply frame");
+        });
+
+        // Give the handshake time to progress to Connected.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(session.connection_state(), ConnectionState::Connected);
+
+        // Send the post-handshake message.
+        session
+            .send(b"after-handshake".to_vec())
+            .await
+            .expect("send after-handshake");
+
+        // Receive the (decrypted) server reply.
+        let reply = tokio::time::timeout(Duration::from_secs(5), session.recv())
+            .await
+            .expect("recv reply within 5s")
+            .expect("recv server-reply");
+        assert_eq!(reply, b"server-reply");
+
+        tokio::time::timeout(Duration::from_secs(5), server_handle)
+            .await
+            .expect("server task within 5s")
+            .expect("server task joined");
+        session.close().await.expect("close session");
+
+        // Negative assertion: plaintext like "early-data" / "after-handshake"
+        // must never appear in the bytes the client emitted on the wire.
+        // Mirrors the canonical test's confidentiality check.
+        let wire = client_wire_recorder.lock().await;
+        assert!(
+            !wire
+                .windows(b"early-data".len())
+                .any(|w| w == b"early-data"),
+            "plaintext early-data leaked onto the embedded wire"
+        );
+        assert!(
+            !wire
+                .windows(b"after-handshake".len())
+                .any(|w| w == b"after-handshake"),
+            "plaintext after-handshake leaked onto the embedded wire"
+        );
+    }
 }
