@@ -63,13 +63,19 @@ jobs:
       - run: cargo publish --manifest-path core/Cargo.toml --dry-run --allow-dirty
 
   # ── Build release artifacts ───────────────────────────────────────
-  # Produces a tarball with the static library + license. SLSA-3
-  # provenance attestation is a follow-up (out of scope at this stage
-  # of pre-1.0 iteration).
+  # Produces a tarball with the static library + license, plus a
+  # sigstore-backed in-toto v1 SLSA build-provenance statement
+  # (.intoto.jsonl) per artifact — verifiable with:
+  #   gh attestation verify --owner <org> <artifact>
+  #   cosign verify-blob-attestation <artifact>
   build-artifacts:
     name: Build release artifact (${{ matrix.target }})
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -113,10 +119,17 @@ jobs:
           cp README.md "dist/${NAME}/" 2>/dev/null || true
           tar -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
           shasum -a 256 "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
+      - name: Generate SLSA build provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/phantom_core-*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: phantom_core-${{ matrix.target }}
-          path: dist/*
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.intoto.jsonl
 
   # ── Create the draft GitHub Release ───────────────────────────────
   # Collects per-target artifacts and creates a draft release. Manual
@@ -146,3 +159,4 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/*.intoto.jsonl
