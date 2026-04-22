@@ -13,7 +13,7 @@ containerized, packaged, or daemonized.
 | --- | --- | --- |
 | Docker | `docs/operations/docker.md` | Distroless / alpine variants; multi-arch builds. |
 | systemd | `docs/operations/systemd.md` | Hardening profile, sysctl tuning, multi-instance template. |
-| Kubernetes | _planned_ | Will land alongside the operator + helm chart in a follow-up. |
+| Kubernetes | [`kubernetes.md`](kubernetes.md) | Deployment + Service + probes + Secrets + PDB + HPA + NetworkPolicy. Helm chart + operator remain a follow-up. |
 | AWS EC2 / bare metal | use `systemd` guide | Same unit file applies. |
 
 ## Client-side
