@@ -130,6 +130,7 @@ web-sys = { version = "0.3", features = [
     "BinaryType",
     "Blob",
     "CloseEvent",
+    "console",
     "ErrorEvent",
     "Event",
     "MessageEvent",
@@ -139,6 +140,13 @@ web-sys = { version = "0.3", features = [
 # falls back to `crypto.getRandomValues` rather than emitting a
 # compile_error!. Non-wasm targets ignore this — it's a no-op there.
 getrandom = { version = "0.2", features = ["js"] }
+# Force-enable the `wasm_js` feature on getrandom 0.4 for wasm32.
+# getrandom 0.4 is pulled in transitively by `ml-dsa → crypto-common 0.2` and
+# `uniffi → tempfile`. For `wasm32-unknown-unknown` it auto-selects the wasm
+# path but requires the `wasm_js` Cargo feature (not a --cfg rustflag) to
+# compile in the js-sys/wasm-bindgen backend. Adding it here as a forced direct
+# dep activates the feature for the whole transitive tree on this target.
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 blake3 = "1.5"
