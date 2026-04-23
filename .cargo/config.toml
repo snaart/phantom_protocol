@@ -1,0 +1,5 @@
+# .cargo/config.toml — workspace-level Cargo configuration
+#
+# (Reserved for future per-target rustflags, e.g. thumbv7em linker scripts.
+#  getrandom 0.4 backend for wasm32 is handled via core/Cargo.toml — see the
+#  [target.'cfg(target_arch = "wasm32")'] block.)
