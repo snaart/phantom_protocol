@@ -36,7 +36,7 @@
 //! | Impl | Status | Target |
 //! | --- | --- | --- |
 //! | [`TokioRuntime`] | ✅ | Linux / macOS / Windows / iOS / Android servers and clients |
-//! | `WasmRuntime`    | scaffold | `wasm32-unknown-unknown` browsers via `wasm-bindgen-futures` |
+//! | `WasmRuntime`    | ✅ (`cfg(target_arch = "wasm32")`) | `wasm32-unknown-unknown` browsers via `wasm-bindgen-futures` |
 //! | `EmbeddedRuntime` | scaffold | `embassy` / bare metal |
 //!
 //! The non-tokio implementations are scaffolded under future feature
@@ -50,6 +50,12 @@ use std::time::{Duration, Instant, SystemTime};
 mod tokio_runtime;
 
 pub use tokio_runtime::TokioRuntime;
+
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_runtime;
+
+#[cfg(target_arch = "wasm32")]
+pub use wasm_runtime::WasmRuntime;
 
 /// Boxed, owned, `Send` future of unit output — the shape `Runtime::spawn`
 /// and `Runtime::sleep` work in.
