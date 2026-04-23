@@ -61,14 +61,16 @@ jobs:
           - target: aarch64-pc-windows-msvc
             runner: windows-latest
             install_target: true
-          # ── WASM (Phase 3.3 / 3.10) — currently *expected* to fail until
-          #    the Runtime/Clock abstractions land; left in the matrix as
-          #    `continue-on-error` so the failure is visible but doesn't
-          #    block PRs.
+          # ── WASM ─────────────────────────────────────────────────────────
+          # wasm32-unknown-unknown is now a hard gate as of Phase 3.3 + 3.5:
+          # WebSocketLeg + WasmRuntime land; getrandom 0.4's `wasm_js` Cargo
+          # feature is forced via core/Cargo.toml so the transitive
+          # ml-dsa / uniffi-tempfile pulls compile cleanly. wasm32-wasi remains
+          # allow_failure pending a wasi-flavored leg (tokio-wasi or compat
+          # shim) — separate Phase 3.10 follow-up.
           - target: wasm32-unknown-unknown
             runner: ubuntu-latest
             install_target: true
-            allow_failure: true
           - target: wasm32-wasi
             runner: ubuntu-latest
             install_target: true
