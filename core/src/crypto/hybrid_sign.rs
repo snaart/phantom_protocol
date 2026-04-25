@@ -17,10 +17,8 @@ use ml_dsa::Signature as MlDsaSignature;
 use ml_dsa::SigningKey as MlDsaSigningKey;
 use ml_dsa::VerifyingKey as MlDsaVerifyingKey;
 use ml_dsa::{
-    EncodedSignature, EncodedVerifyingKey, Generate, KeyExport, KeyInit, Keypair, MlDsa65, Signer,
-    Verifier,
+    EncodedSignature, EncodedVerifyingKey, KeyExport, KeyInit, Keypair, MlDsa65, Signer, Verifier,
 };
-use rand::rngs::OsRng;
 use std::fmt;
 use zeroize::ZeroizeOnDrop;
 
@@ -48,17 +46,47 @@ pub struct HybridSigningKey {
 
 impl HybridSigningKey {
     /// Generate a fresh hybrid keypair using the OS RNG.
+    ///
+    /// Equivalent to `Self::generate_with_provider(&crate::crypto::rng::OsRng)`.
+    /// Preserved as the call-compatible default so the rest of the crate
+    /// (and downstream callers) does not change shape.
     pub fn generate() -> (Self, HybridVerifyingKey) {
-        let mut rng = OsRng;
+        Self::generate_with_provider(&crate::crypto::rng::OsRng)
+    }
 
-        // Ed25519
-        let ed25519_sk = SigningKey::generate(&mut rng);
+    /// Generate a fresh hybrid keypair using an arbitrary
+    /// [`RngProvider`](crate::crypto::rng::RngProvider).
+    ///
+    /// Phase 3.8 demonstration of the `RngProvider` indirection: this is
+    /// the canonical "small, well-bounded crypto entry point that needs
+    /// randomness" call site. Embedders that need to drive key generation
+    /// from a hardware TRNG (on no_std) or a FIPS-approved DRBG plug in
+    /// here without disturbing the default surface.
+    ///
+    /// Internally, 32 bytes are drawn from the provider for each algorithm:
+    ///
+    /// - Ed25519: the 32 bytes are the seed for `SigningKey::from_bytes`.
+    /// - ML-DSA-65: the 32 bytes are the FIPS 204 § Algorithm 1 seed `xi`
+    ///   passed to `SigningKey::<MlDsa65>::new(&seed)` (== KeyInit /
+    ///   `from_seed`).
+    pub fn generate_with_provider<R: crate::crypto::rng::RngProvider + ?Sized>(
+        provider: &R,
+    ) -> (Self, HybridVerifyingKey) {
+        // Ed25519 — 32-byte seed.
+        let mut ed_seed = [0u8; 32];
+        provider.fill_bytes(&mut ed_seed);
+        let ed25519_sk = SigningKey::from_bytes(&ed_seed);
         let ed25519_pk = ed25519_sk.verifying_key();
 
-        // ML-DSA-65 (FIPS 204). `Generate::generate()` reads OsRng under the hood
-        // (via the `rand_core` feature ml-dsa pulls in). Box it immediately so
-        // we never carry the ~4 KiB expanded signing key on the stack.
-        let ml_dsa_sk = Box::new(MlDsaSigningKey::<MlDsa65>::generate());
+        // ML-DSA-65 (FIPS 204 § Algorithm 1 ML-DSA.KeyGen). The seed is
+        // the 32-byte `xi`. `KeyInit::new` runs the algorithm
+        // deterministically over it. Box immediately so the ~4 KiB
+        // expanded signing key never lives on the stack (matches the
+        // rationale in `from_bytes`).
+        let mut ml_seed_bytes = [0u8; 32];
+        provider.fill_bytes(&mut ml_seed_bytes);
+        let ml_dsa_seed = ml_dsa::B32::from(ml_seed_bytes);
+        let ml_dsa_sk = Box::new(MlDsaSigningKey::<MlDsa65>::new(&ml_dsa_seed));
         let ml_dsa_vk = ml_dsa_sk.verifying_key();
 
         let signing_key = Self {
