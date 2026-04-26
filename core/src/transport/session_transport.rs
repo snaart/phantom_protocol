@@ -15,6 +15,14 @@
 //! future `no_std + alloc` build ahead of the rest of the crate.
 //! Re-exported from [`crate::api::session`] so the historical import path
 //! stays stable.
+//!
+//! Phase 3.6 (no-std foundation): under the optional `no-std` feature this
+//! module compiles without `std`. The implementation already uses
+//! `core::future::Future` and pulls nothing from `std::*`; the feature gate
+//! is an audit pin — a future PR that introduces a `std::*` dep here will
+//! break the `--features no-std` build and be caught early.
+
+#![cfg_attr(feature = "no-std", no_std)]
 
 use crate::errors::CoreError;
 use bytes::Bytes;
