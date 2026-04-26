@@ -15,6 +15,20 @@ compression-zstd = ["dep:zstd"]
 # Pure-Rust + no_std-friendly; safe to enable on the host for `cargo test`.
 embedded = ["dep:embedded-io-async", "dep:async-lock"]
 
+# `no-std` foundation (Phase 3.6). Off by default — today's std build is
+# unaffected. When ON, the embedded-transport subset (`SessionTransport` trait,
+# `EmbeddedLeg`, length-prefix framing, `CoreError`) is compiled with
+# `#![no_std] + extern crate alloc`. The rest of the crate is still std-bound
+# (tokio, parking_lot, dashmap, std::time::Instant, ...) — flipping `no-std`
+# alone does NOT make the whole crate compile on bare-metal. It is an audit
+# gate: it proves the subset itself does not accidentally pull `std::*` paths,
+# so future phases can widen the subset module-by-module without regression.
+# Note: a Cargo feature cannot subtract std from a hard-std dep tree, so this
+# feature only flips per-module `#![cfg_attr(...)]` attributes on the
+# in-subset files. Whole-crate `cargo check --target thumbv7em-none-eabihf`
+# will still fail on the out-of-subset modules until they are migrated.
+no-std = []
+
 [dependencies]
 # --- Async & Runtime ---
 # `tokio` is split per target (Phase 3.5 conditional compilation matrix):

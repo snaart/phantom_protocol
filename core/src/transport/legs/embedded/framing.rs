@@ -5,6 +5,13 @@
 //! `TcpSessionTransport`'s framing, so an embedded client and a TCP server
 //! interoperate at this layer. Pure: no I/O and no state — the leg drives the
 //! actual reads and writes and owns the buffer.
+//!
+//! Phase 3.6 (no-std foundation): pure logic, zero imports outside the
+//! prelude — opts into `#![no_std]` under the `no-std` feature so a future
+//! refactor that accidentally pulls a std-only path here is caught at build
+//! time.
+
+#![cfg_attr(feature = "no-std", no_std)]
 
 /// Width of the big-endian length prefix prepended to every frame.
 pub const HEADER_LEN: usize = 4;
