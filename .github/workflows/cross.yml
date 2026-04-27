@@ -75,12 +75,16 @@ jobs:
             runner: ubuntu-latest
             install_target: true
             allow_failure: true
-          # ── Embedded smoke (Phase 3.4) — same: expected to fail until
-          #    runtime abstractions and feature-gates land.
+          # ── Embedded smoke (Phase 3.4 + 3.6) — bare-metal-green as of
+          #    722c6cb via the no_std subset. Hard gate. Note the
+          #    `cargo_args` matrix field: thumbv7em requires
+          #    `--no-default-features --features embedded,no-std` to drop
+          #    std-only deps (tokio, parking_lot, dashmap, etc.) from the
+          #    dep graph and pick up only the embedded transport surface.
           - target: thumbv7em-none-eabihf
             runner: ubuntu-latest
             install_target: true
-            allow_failure: true
+            cargo_args: "--no-default-features --features embedded,no-std"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -98,8 +102,8 @@ jobs:
         continue-on-error: ${{ matrix.allow_failure == true }}
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross check --manifest-path core/Cargo.toml --lib --target ${{ matrix.target }}
+            cross check --manifest-path core/Cargo.toml --lib --target ${{ matrix.target }} ${{ matrix.cargo_args }}
           else
-            cargo check --manifest-path core/Cargo.toml --lib --target ${{ matrix.target }}
+            cargo check --manifest-path core/Cargo.toml --lib --target ${{ matrix.target }} ${{ matrix.cargo_args }}
           fi
         shell: bash
