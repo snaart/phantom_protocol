@@ -5,84 +5,141 @@ edition = "2021"
 description = "Phantom Universal Transport Core SDK — post-quantum secure L4/L6 network framework"
 
 [features]
-default = ["compression-zstd"]
+default = ["compression-zstd", "std"]
+
+# `std` (Phase 3.6): the standard "everything on" build. Pulls every std-bound
+# optional dep into the graph and unlocks all top-level modules (`api`, `runtime`,
+# `transport/legs/{tcp,kcp,faketls,websocket}`, `networks`, `config`, `validation`,
+# `crypto/*`, `security/*`, std-bound parts of `transport/*`). Default-on so the
+# historical surface keeps compiling unchanged.
+#
+# Bare-metal targets pass `--no-default-features --features embedded,no-std` to
+# drop this entirely.
+std = [
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:futures",
+    "dep:async-trait",
+    "dep:parking_lot",
+    "dep:dashmap",
+    "dep:arc-swap",
+    "dep:env_logger",
+    "dep:tracing",
+    "dep:time",
+    "dep:uniffi",
+    "dep:argon2",
+    "dep:crossbeam-queue",
+    "dep:lz4_flex",
+    "dep:alkahest",
+    "dep:base64",
+    "dep:once_cell",
+    "dep:anyhow",
+    "dep:thiserror",
+    "dep:rand",
+    "dep:ring",
+    "dep:x25519-dalek",
+    "dep:ed25519-dalek",
+    "dep:ml-kem",
+    "dep:ml-dsa",
+    "dep:chacha20poly1305",
+    "dep:log",
+    "dep:hmac",
+    "dep:borsh",
+    "dep:hex",
+    "dep:bitflags",
+    "dep:zeroize",
+    "dep:subtle",
+    "dep:blake3",
+    "dep:hkdf",
+    "dep:sha2",
+    "dep:getrandom",
+    # Native (non-wasm32) optional deps; activating these on a wasm32 target
+    # is a no-op because the deps themselves are gated by the
+    # `[target.'cfg(not(target_arch = "wasm32"))']` table.
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:webpki-roots",
+    "dep:kcp-tokio",
+    "dep:socket2",
+    "bytes/std",
+    "serde/std",
+]
+
 # zstd compression. Disabled when building for WASM / embedded targets where
 # the C bindings in `zstd-sys` are unavailable. lz4_flex (pure-Rust) remains
-# the always-on fallback.
-compression-zstd = ["dep:zstd"]
+# the always-on fallback. Implies `std`.
+compression-zstd = ["dep:zstd", "std"]
 
 # `EmbeddedLeg` transport over `embedded-io-async` byte streams (Phase 3.4).
 # Pure-Rust + no_std-friendly; safe to enable on the host for `cargo test`.
 embedded = ["dep:embedded-io-async", "dep:async-lock"]
 
-# `no-std` foundation (Phase 3.6). Off by default — today's std build is
-# unaffected. When ON, the embedded-transport subset (`SessionTransport` trait,
-# `EmbeddedLeg`, length-prefix framing, `CoreError`) is compiled with
-# `#![no_std] + extern crate alloc`. The rest of the crate is still std-bound
-# (tokio, parking_lot, dashmap, std::time::Instant, ...) — flipping `no-std`
-# alone does NOT make the whole crate compile on bare-metal. It is an audit
-# gate: it proves the subset itself does not accidentally pull `std::*` paths,
-# so future phases can widen the subset module-by-module without regression.
-# Note: a Cargo feature cannot subtract std from a hard-std dep tree, so this
-# feature only flips per-module `#![cfg_attr(...)]` attributes on the
-# in-subset files. Whole-crate `cargo check --target thumbv7em-none-eabihf`
-# will still fail on the out-of-subset modules until they are migrated.
+# `no-std` foundation (Phase 3.6). The audit-gate marker. When ON, the
+# in-subset modules (`errors`, `transport::session_transport`, `transport::legs::
+# embedded`) compile with `#![no_std] + extern crate alloc`. Whole-crate
+# bare-metal compilation additionally requires `--no-default-features` to drop
+# the `std` feature and all the std-bound optional deps it gates.
 no-std = []
 
 [dependencies]
-# --- Async & Runtime ---
+# --- Async & Runtime (std-only) ---
 # `tokio` is split per target (Phase 3.5 conditional compilation matrix):
 # - Cross-target features: sync primitives, time, io-util, macros, single-thread
 #   runtime. These work on both native and wasm32.
 # - Native-only features (`net`, `rt-multi-thread`, `signal`, `process`, `fs`,
 #   `io-std`) are added in the `[target.'cfg(not(target_arch = "wasm32"))']`
 #   block at the bottom of this file.
-tokio = { version = "1.36", default-features = false, features = [
+tokio = { version = "1.36", default-features = false, optional = true, features = [
     "sync", "macros", "rt", "time", "io-util",
 ] }
-tokio-util = { version = "0.7", features = ["codec"] }
-futures = "0.3"
-async-trait = "0.1"
+tokio-util = { version = "0.7", optional = true, features = ["codec"] }
+futures = { version = "0.3", optional = true }
+async-trait = { version = "0.1", optional = true }
 
 # --- Serialization & Utils ---
-bytes = "1"
-serde = { version = "1", features = ["derive"] }
-alkahest = { version = "0.3.0", features = ["derive"] }
-borsh = { version = "1.0", features = ["derive"] }
-hex = "0.4"
-base64 = "0.22"
-anyhow = "1"
-thiserror = "1"
-log = "0.4"
-env_logger = "0.11"
-rand = "0.8"
-once_cell = "1.18"
-subtle = "2.5"  # Constant-time equality for secrets (cookies, tokens)
-tracing = "0.1"  # Structured spans / events for observability (Phase 4.5)
+# `bytes` and `serde` have first-class no_std modes (`default-features = false`
+# + the `alloc` feature). Kept as required deps so the no-std subset can use
+# them; the `std` feature wires the `std` cargo feature back in for richer
+# `std::io::Read`-style integration.
+bytes = { version = "1", default-features = false, features = ["serde"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+alkahest = { version = "0.3.0", optional = true, features = ["derive"] }
+borsh = { version = "1.0", default-features = false, optional = true, features = ["derive"] }
+hex = { version = "0.4", default-features = false, optional = true, features = ["alloc"] }
+base64 = { version = "0.22", default-features = false, optional = true, features = ["alloc"] }
+anyhow = { version = "1", optional = true }
+thiserror = { version = "1", optional = true }
+log = { version = "0.4", optional = true }
+env_logger = { version = "0.11", optional = true }
+rand = { version = "0.8", optional = true }
+once_cell = { version = "1.18", optional = true }
+subtle = { version = "2.5", default-features = false, optional = true }  # Constant-time equality for secrets (cookies, tokens)
+tracing = { version = "0.1", optional = true }  # Structured spans / events for observability (Phase 4.5)
 
-# --- Crypto ---
-x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
-ed25519-dalek = { version = "2", features = ["zeroize", "rand_core"] }
-chacha20poly1305 = "0.10"
-ring = "0.17"  # HW-accelerated AES-GCM (ARM64 AES intrinsics / x86 AES-NI)
+# --- Crypto (std-only) ---
+x25519-dalek = { version = "2", optional = true, features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "2", optional = true, features = ["zeroize", "rand_core"] }
+chacha20poly1305 = { version = "0.10", optional = true }
+ring = { version = "0.17", optional = true }  # HW-accelerated AES-GCM (ARM64 AES intrinsics / x86 AES-NI)
 # Phase 5.1: switched from `pqcrypto-kyber` / `pqcrypto-dilithium` (which
 # wrap NIST PQC round-3 C reference impls and require libc) to the
 # RustCrypto pure-Rust FIPS-203 / FIPS-204 implementations. These compile
 # on every target (server, mobile, embedded, wasm32) without C bindings.
 # Wire-incompatible with the prior build — bytes laid out per FIPS, not
 # per NIST round-3.
-ml-kem = "0.2"
-ml-dsa = "=0.1.0-rc.11"
+ml-kem = { version = "0.2", optional = true }
+ml-dsa = { version = "=0.1.0-rc.11", optional = true }
 # `signature` traits are re-exported via `ml_dsa::{Signer, Verifier}` from
 # the version ml-dsa pins (3.x); we do not need a direct dependency here.
-hkdf = "0.12"
-sha2 = "0.10"
-blake3 = "1.5"
-getrandom = "0.2"
-bitflags = "2.4"
-parking_lot = "0.12"  # Fast mutex for buffer pool
-arc-swap = "1"        # Lock-free atomic swap for the CryptoState rekey path (Phase 1.5)
-lz4_flex = "0.11"     # Fastest pure-Rust LZ4 (safe, no C bindings)
+hkdf = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+blake3 = { version = "1.5", optional = true }
+getrandom = { version = "0.2", optional = true }
+bitflags = { version = "2.4", optional = true }
+parking_lot = { version = "0.12", optional = true }  # Fast mutex for buffer pool
+arc-swap = { version = "1", optional = true }        # Lock-free atomic swap for the CryptoState rekey path (Phase 1.5)
+lz4_flex = { version = "0.11", optional = true }     # Fastest pure-Rust LZ4 (safe, no C bindings)
 # zstd pinned to a release version. Optional (gated by `compression-zstd`
 # feature) so WASM / embedded builds can opt out of the C bindings in
 # zstd-sys, falling back to lz4_flex.
@@ -91,15 +148,15 @@ zstd = { version = "0.13", optional = true }
 # --- Networking ---
 # TCP/UDP-using crates are non-wasm-only (Phase 3.5). Moved to the
 # `[target.'cfg(not(target_arch = "wasm32"))']` block at the bottom.
-time = "0.3"
+time = { version = "0.3", optional = true }
 
 # --- FFI ---
-uniffi = { version = "0.29", features = ["tokio", "cli"] }
-zeroize = { version = "1.8.2", features = ["derive"] }
-argon2 = "0.5.3"
-crossbeam-queue = "0.3.12"
-hmac = "0.12.1"
-dashmap = "6.1.0"
+uniffi = { version = "0.29", optional = true, features = ["tokio", "cli"] }
+zeroize = { version = "1.8.2", optional = true, features = ["derive"] }
+argon2 = { version = "0.5.3", optional = true }
+crossbeam-queue = { version = "0.3.12", optional = true }
+hmac = { version = "0.12.1", optional = true }
+dashmap = { version = "6.1.0", optional = true }
 
 # --- Embedded transport (optional, behind the `embedded` feature) ---
 # Pure-Rust, no_std + alloc. `embedded-io-async` 0.6 is the byte-stream trait
@@ -119,18 +176,18 @@ uniffi = { version = "0.29", features = ["build"] }
 # TCP/UDP transport legs, raw sockets, and rustls live here. wasm32 builds
 # skip these entirely and use the `WebSocketLeg` instead (see below).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1.36", features = [
+tokio = { version = "1.36", optional = true, features = [
     "net", "rt-multi-thread", "signal", "process", "fs", "io-std",
 ] }
-tokio-rustls = "0.26"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
-webpki-roots = "0.26"
-kcp-tokio = "0.3"
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", default-features = false, optional = true, features = ["ring", "std", "tls12"] }
+rustls-pemfile = { version = "2", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+kcp-tokio = { version = "0.3", optional = true }
 # socket2 gives portable access to SO_REUSEPORT (Phase 2.9 — Linux
 # multi-accept). Already in the transitive tree via tokio so this is
 # free from a build-size standpoint.
-socket2 = "0.6"
+socket2 = { version = "0.6", optional = true }
 
 # ─── WASM-only dependencies (Phase 3.3) ───────────────────────────────────
 # Pulled in only for `wasm32-*` builds. Non-WASM hosts never see these

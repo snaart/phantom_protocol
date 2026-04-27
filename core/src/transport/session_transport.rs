@@ -16,13 +16,10 @@
 //! Re-exported from [`crate::api::session`] so the historical import path
 //! stays stable.
 //!
-//! Phase 3.6 (no-std foundation): under the optional `no-std` feature this
-//! module compiles without `std`. The implementation already uses
-//! `core::future::Future` and pulls nothing from `std::*`; the feature gate
-//! is an audit pin — a future PR that introduces a `std::*` dep here will
-//! break the `--features no-std` build and be caught early.
-
-#![cfg_attr(feature = "no-std", no_std)]
+//! Phase 3.6 (no-std foundation): module compiles without `std` because the
+//! implementation uses only `core::future::Future` and pulls nothing from
+//! `std::*`. The crate-level `#![cfg_attr(not(feature = "std"), no_std)]` in
+//! `lib.rs` drives the no_std switch; this module needs no extra attribute.
 
 use crate::errors::CoreError;
 use bytes::Bytes;
