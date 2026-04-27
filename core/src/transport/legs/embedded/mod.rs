@@ -19,17 +19,13 @@
 //! only depends on `core`/`alloc`, `bytes`, `async_lock`, and `embedded-io-
 //! async`.
 //!
-//! Phase 3.6 (no-std foundation): under the optional `no-std` feature the
-//! production code in this module compiles without `std`. `format!` and
-//! `String`/`Vec` are pulled from `alloc` via an `extern crate alloc;` shim.
-//! The `#[cfg(test)]` block below intentionally stays std-bound — host tests
-//! lean on `tokio`, `std::collections::VecDeque`, `std::sync::Arc`, etc.
+//! Phase 3.6 (no-std foundation): production code in this module compiles
+//! without `std`. `format!` / `String` / `Vec` come from `alloc`, pulled in by
+//! the crate-level `extern crate alloc;` in `lib.rs`. The `#[cfg(test)]` block
+//! below intentionally stays std-bound — host tests lean on `tokio`,
+//! `std::collections::VecDeque`, `std::sync::Arc`, etc.
 
-#![cfg_attr(feature = "no-std", no_std)]
-
-#[cfg(feature = "no-std")]
-extern crate alloc;
-#[cfg(feature = "no-std")]
+#[cfg(not(feature = "std"))]
 use alloc::format;
 
 pub mod framing;

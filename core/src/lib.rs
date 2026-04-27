@@ -36,35 +36,68 @@
 // any future PR touching `unsafe` outside those two modules will fail this
 // lint and must justify itself explicitly.
 #![deny(unsafe_code)]
+// Phase 3.6: when neither `std` nor any std-implying feature is on, drop std
+// from the crate root so a bare-metal `--no-default-features --features
+// embedded,no-std` build links only `core` + `alloc`. The std build (the
+// default) is unchanged.
+#![cfg_attr(not(feature = "std"), no_std)]
 
-pub mod config;
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+// `errors` and the `transport::session_transport` / `transport::legs::embedded`
+// subtree are no_std-clean and compile under both feature configurations.
 mod errors;
+
+// ── std-only top-level modules ─────────────────────────────────────────
+// The bare-metal subset (Phase 3.6) compiles only `errors` and the embedded
+// transport subset. Everything below is gated behind `std`: it either uses
+// `tokio`, `parking_lot`, `dashmap`, raw sockets, `std::time::Instant`,
+// `std::sync::*`, or a std-bound dep (e.g. `ring`, `ml-kem`, `x25519-dalek`)
+// that is itself only compiled when `std` is on.
+
+#[cfg(feature = "std")]
+pub mod config;
+#[cfg(feature = "std")]
 pub mod security;
+#[cfg(feature = "std")]
 pub mod validation;
 
-// Crypto module (hybrid KEM, hybrid sign)
+// Crypto module (hybrid KEM, hybrid sign) — std-only: pulls `ring`,
+// `x25519-dalek`, `ed25519-dalek`, `ml-kem`, `ml-dsa`, `chacha20poly1305`.
+#[cfg(feature = "std")]
 pub mod crypto;
 
-// Transport module (Universal Transport Core)
+// Transport module (Universal Transport Core). The module itself has a
+// no_std-clean subset (`session_transport`, `legs::embedded`). The rest of the
+// sub-modules opt into `std` from within `transport/mod.rs`.
 pub mod transport;
 
-// Networks module (transport trait, pipeline, engine, tls)
+// Networks module (transport trait, pipeline, engine, tls) — std-only.
+#[cfg(feature = "std")]
 pub mod networks;
 
 // Async runtime abstraction (Phase 3.1). `TokioRuntime` is the default
 // implementation; the trait surface is in place for follow-up commits
 // that introduce WASM / embedded backends.
+#[cfg(feature = "std")]
 pub mod runtime;
 
-// Public API facade
+// Public API facade — std-only: every entry point (`PhantomSession`,
+// `PhantomListener`, `TcpSessionTransport`) depends on `tokio`.
+#[cfg(feature = "std")]
 pub mod api;
 
 // Test harness for network simulation
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 pub mod test_harness;
 
 // Public exports
+#[cfg(feature = "std")]
 pub use config::PhantomConfig;
 pub use errors::CoreError;
 
+// UniFFI scaffolding is std-bound (the `uniffi` crate pulls `std`). Gated so
+// the bare-metal build does not see it.
+#[cfg(feature = "std")]
 uniffi::setup_scaffolding!();

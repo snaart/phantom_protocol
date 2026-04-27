@@ -4,51 +4,60 @@
 //! FakeTLS; the `wasm32` target exposes a WebSocket leg (Phase 3.3)
 //! since browsers cannot open raw TCP/UDP sockets.
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod faketls;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod kcp;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod tcp;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(feature = "std", target_arch = "wasm32"))]
 pub mod websocket;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(feature = "std", target_arch = "wasm32"))]
 pub use websocket::WebSocketLeg;
 
 // `EmbeddedLeg` — `SessionTransport` over `embedded-io-async` byte streams,
 // behind the `embedded` feature. Compiles on any target (host included) so the
-// tests run there. Phase 3.4.
+// tests run there. Phase 3.4. no_std-clean, so it is NOT gated behind `std`.
 #[cfg(feature = "embedded")]
 pub mod embedded;
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use std::io;
-use std::net::SocketAddr;
+// The `TransportLeg` trait below uses `async_trait`, `std::io`, and
+// `std::net::SocketAddr` — std-only. The `embedded` leg implements
+// `SessionTransport` directly and does not need `TransportLeg`.
+#[cfg(feature = "std")]
+mod trait_def {
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use std::io;
+    use std::net::SocketAddr;
 
-/// Transport leg trait - abstraction over different physical transports
-#[async_trait]
-pub trait TransportLeg: Send + Sync {
-    /// Send data to the remote peer
-    async fn send(&self, data: Bytes) -> io::Result<()>;
+    /// Transport leg trait - abstraction over different physical transports
+    #[async_trait]
+    pub trait TransportLeg: Send + Sync {
+        /// Send data to the remote peer
+        async fn send(&self, data: Bytes) -> io::Result<()>;
 
-    /// Receive data from the remote peer
-    async fn recv(&self) -> io::Result<Bytes>;
+        /// Receive data from the remote peer
+        async fn recv(&self) -> io::Result<Bytes>;
 
-    /// Check if this leg is currently available
-    fn is_available(&self) -> bool;
+        /// Check if this leg is currently available
+        fn is_available(&self) -> bool;
 
-    /// Get the current RTT estimate in milliseconds
-    fn rtt_ms(&self) -> u32;
+        /// Get the current RTT estimate in milliseconds
+        fn rtt_ms(&self) -> u32;
 
-    /// Get packet loss percentage (0-100)
-    fn loss_percent(&self) -> u8;
+        /// Get packet loss percentage (0-100)
+        fn loss_percent(&self) -> u8;
 
-    /// Get the remote address
-    fn remote_addr(&self) -> Option<SocketAddr>;
+        /// Get the remote address
+        fn remote_addr(&self) -> Option<SocketAddr>;
 
-    /// Gracefully close the transport
-    async fn close(&self) -> io::Result<()>;
+        /// Gracefully close the transport
+        async fn close(&self) -> io::Result<()>;
+    }
 }
+
+#[cfg(feature = "std")]
+pub use trait_def::TransportLeg;

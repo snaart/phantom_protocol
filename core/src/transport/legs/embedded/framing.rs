@@ -7,11 +7,8 @@
 //! actual reads and writes and owns the buffer.
 //!
 //! Phase 3.6 (no-std foundation): pure logic, zero imports outside the
-//! prelude — opts into `#![no_std]` under the `no-std` feature so a future
-//! refactor that accidentally pulls a std-only path here is caught at build
-//! time.
-
-#![cfg_attr(feature = "no-std", no_std)]
+//! prelude. The crate-level `#![cfg_attr(not(feature = "std"), no_std)]` in
+//! `lib.rs` drives the no_std switch; this module needs no extra attribute.
 
 /// Width of the big-endian length prefix prepended to every frame.
 pub const HEADER_LEN: usize = 4;

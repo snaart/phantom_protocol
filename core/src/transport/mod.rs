@@ -7,29 +7,60 @@
 //! - Connection migration (session persists across IP changes)
 //! - Adaptive fallback (Turbo → Reliable → Stealth)
 
-pub mod api;
-pub mod bandwidth_estimator;
-pub mod buffer_pool;
-pub mod compression;
-pub mod device_profile;
-pub mod fallback;
-pub mod fragmentation;
-pub mod half_open;
-pub mod handshake;
+// ── no_std-clean subset (Phase 3.6) ────────────────────────────────────
+// `session_transport` and `legs::embedded` compile on bare-metal and are the
+// only modules required for the embedded build.
 pub mod legs;
-pub mod metrics;
-pub mod multiplexer;
-pub mod pacer;
-pub mod packet_coalescer;
-pub mod packet_coalescer_codec;
-pub mod path;
-pub mod path_validation_codec;
-pub mod reputation;
-pub mod scheduler;
-pub mod session;
-pub mod session_cache;
 pub mod session_transport;
+
+// ── std-bound modules ──────────────────────────────────────────────────
+// Everything below pulls `tokio`, `parking_lot`, `dashmap`, `arc-swap`,
+// `std::sync::*`, `std::time::Instant`, raw sockets, or a std-bound crypto dep
+// (`ring`, `ml-kem`, `ml-dsa`, `x25519-dalek`, `ed25519-dalek`,
+// `chacha20poly1305`). Gated behind `std`.
+#[cfg(feature = "std")]
+pub mod api;
+#[cfg(feature = "std")]
+pub mod bandwidth_estimator;
+#[cfg(feature = "std")]
+pub mod buffer_pool;
+#[cfg(feature = "std")]
+pub mod compression;
+#[cfg(feature = "std")]
+pub mod device_profile;
+#[cfg(feature = "std")]
+pub mod fallback;
+#[cfg(feature = "std")]
+pub mod fragmentation;
+#[cfg(feature = "std")]
+pub mod half_open;
+#[cfg(feature = "std")]
+pub mod handshake;
+#[cfg(feature = "std")]
+pub mod metrics;
+#[cfg(feature = "std")]
+pub mod multiplexer;
+#[cfg(feature = "std")]
+pub mod pacer;
+#[cfg(feature = "std")]
+pub mod packet_coalescer;
+#[cfg(feature = "std")]
+pub mod packet_coalescer_codec;
+#[cfg(feature = "std")]
+pub mod path;
+#[cfg(feature = "std")]
+pub mod path_validation_codec;
+#[cfg(feature = "std")]
+pub mod reputation;
+#[cfg(feature = "std")]
+pub mod scheduler;
+#[cfg(feature = "std")]
+pub mod session;
+#[cfg(feature = "std")]
+pub mod session_cache;
+#[cfg(feature = "std")]
 pub mod stream;
+#[cfg(feature = "std")]
 pub mod types;
 
 // ── Native-only sub-modules (Phase 3.5) ────────────────────────────────
@@ -37,19 +68,25 @@ pub mod types;
 // equivalent. On wasm32 the corresponding functionality is provided
 // either by `legs::WebSocketLeg` (transport) or by simply not being
 // available (listening for incoming TCP — browsers cannot listen).
-#[cfg(not(target_arch = "wasm32"))]
+// All require `std`.
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod framing;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod udp_transport;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod virtual_socket;
 
 // Re-exports for convenience
+#[cfg(feature = "std")]
 pub use fallback::{FallbackStateMachine, TransportMode};
+#[cfg(feature = "std")]
 pub use scheduler::Scheduler;
+#[cfg(feature = "std")]
 pub use session::Session;
+#[cfg(feature = "std")]
 pub use stream::Stream;
+#[cfg(feature = "std")]
 pub use types::*;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub use virtual_socket::VirtualSocket;
