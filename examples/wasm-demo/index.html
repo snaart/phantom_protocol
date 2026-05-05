@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Phantom Core — Browser Demo</title>
+</head>
+<body>
+  <h1>Phantom Core WASM demo</h1>
+  <p>Open the browser console to see logs. Set <code>SERVER_URL</code>
+     and <code>SERVER_PK_HEX</code> in the script below, then refresh.</p>
+  <script type="module">
+    import init, { run_demo } from './pkg/phantom_wasm_demo.js';
+    const SERVER_URL = 'wss://localhost:8443/ws';
+    const SERVER_PK_HEX = '00'.repeat(64);  // replace with your server's
+                                             // HybridVerifyingKey hex
+    await init();
+    try {
+      const result = await run_demo(SERVER_URL, SERVER_PK_HEX);
+      console.log('Demo result:', result);
+    } catch (e) {
+      console.error('Demo error:', e);
+    }
+  </script>
+</body>
+</html>
