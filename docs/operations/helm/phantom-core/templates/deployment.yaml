@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "phantom-core.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "phantom-core.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  # When HPA is enabled, HPA controls replica count; omit here to avoid conflicts.
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "phantom-core.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable: 0 ensures capacity is never reduced during rollout.
+      # A new pod must pass readiness before the old one is terminated.
+      # See: docs/operations/kubernetes.md "Rolling updates"
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "phantom-core.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "phantom-core.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      # fsGroup ensures the mounted signing-key Secret is readable by the container user.
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # PhantomListener::shutdown() is triggered on SIGTERM; in-flight handshakes
+      # drain within terminationGracePeriodSeconds before force-kill.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: {{ include "phantom-core.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: phantom
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.service.metricsPort }}
+              protocol: TCP
+          {{- with .Values.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # Liveness: tcpSocket on the app port — a successful accept proves the
+          # listener is alive. No /healthz endpoint; SDK ships no HTTP server.
+          livenessProbe:
+            tcpSocket:
+              port: phantom
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+            successThreshold: {{ .Values.livenessProbe.successThreshold }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+          # Readiness: same probe, tighter delays. Pod is removed from Service
+          # endpoints until ready, preventing traffic from reaching starting pods.
+          readinessProbe:
+            tcpSocket:
+              port: phantom
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+            successThreshold: {{ .Values.readinessProbe.successThreshold }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          # Hardened container security context (restricted PSS).
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            # Signing key mounted read-only; path must match what the server binary reads.
+            - name: signing-key
+              mountPath: {{ .Values.signingKey.mountPath }}
+              readOnly: true
+            # tmpfs scratch space; readOnlyRootFilesystem requires this for any temp writes.
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: signing-key
+          secret:
+            secretName: {{ include "phantom-core.signingKeySecretName" . }}
+            items:
+              - key: {{ .Values.signingKey.existingSecretKey }}
+                path: {{ .Values.signingKey.fileName }}
+        # tmpfs: avoids disk I/O and keeps readOnlyRootFilesystem=true functional.
+        - name: tmp
+          emptyDir:
+            medium: Memory
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

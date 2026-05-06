@@ -1,0 +1,19 @@
+apiVersion: v2
+name: phantom-core
+description: "Post-quantum-secure L4/L6 transport server (Phantom Core)"
+type: application
+version: 0.1.0
+# appVersion tracks core/Cargo.toml package.version
+appVersion: "0.2.0"
+home: https://github.com/phantom-core
+sources:
+  - https://github.com/phantom-core/phantom_core_rust
+keywords:
+  - phantom-core
+  - post-quantum
+  - transport
+  - pqc
+  - networking
+maintainers:
+  - name: Phantom Core Maintainers
+    email: stepanov.iop@gmail.com

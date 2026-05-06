@@ -1,0 +1,281 @@
+# values.yaml — Phantom Core Helm chart defaults
+# Every value has a comment explaining why the default is what it is.
+# Values marked "MUST set in production" are intentionally left empty or safe-fail
+# to force the operator to make an explicit decision rather than silently use a bad default.
+
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+image:
+  # Container registry + image name. Override for your private registry.
+  repository: phantom-server
+  # IfNotPresent avoids pull rate-limits on restarts; use Always when tagging
+  # non-immutably (e.g. "latest"). In production, pin to a digest.
+  pullPolicy: IfNotPresent
+  # Defaults to the chart's appVersion (0.2.0). Set to a digest in production:
+  #   image.tag: "sha256:abc123..."
+  tag: ""
+
+# Pull secrets if your registry requires authentication.
+# e.g. imagePullSecrets: [{name: regcred}]
+imagePullSecrets: []
+
+# ---------------------------------------------------------------------------
+# Replica count
+# ---------------------------------------------------------------------------
+# 3 replicas provides zone-spread redundancy and allows a rolling update
+# (maxUnavailable: 0, maxSurge: 1) without capacity drop.
+# Overridden by HPA when autoscaling.enabled=true.
+replicaCount: 3
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+service:
+  # ClusterIP keeps the Phantom port internal; expose via LoadBalancer or
+  # Ingress in front if you need external access.
+  type: ClusterIP
+  # Default app port. Match the value your server binary binds on.
+  # The kubernetes.md reference uses 4242; 8443 is conventional for TLS-like protocols.
+  port: 8443
+  # Prometheus metrics port. The wrapper binary must expose
+  # PhantomListener::metrics_prometheus_text() here (e.g. via hyper).
+  metricsPort: 9090
+
+# ---------------------------------------------------------------------------
+# Resource budgets
+# ---------------------------------------------------------------------------
+# From perf-tuning.md / kubernetes.md:
+#   ~64 KiB working memory per session; 3-4 GB/s per core (AES-256-GCM + AES-NI).
+# Defaults target ~1 000 concurrent sessions on a single pod:
+#   memory request = N*64KiB + ~64MiB overhead ≈ 128 MiB
+#   memory limit   = 4x request for burst headroom
+# CPU: 500m request keeps scheduling flexible; 2000m limit caps at ~2 cores
+#   (sufficient for the PQC keygen path at ~10-15 ms/handshake).
+resources:
+  requests:
+    cpu: "500m"
+    memory: "128Mi"
+  limits:
+    cpu: "2000m"
+    memory: "512Mi"
+
+# ---------------------------------------------------------------------------
+# Liveness probe
+# ---------------------------------------------------------------------------
+# tcpSocket on the app port: a successful accept means PhantomListener is alive.
+# The SDK ships no /healthz HTTP endpoint; tcpSocket is the recommended probe.
+livenessProbe:
+  tcpSocket:
+    port: phantom
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+  successThreshold: 1
+  timeoutSeconds: 3
+
+# ---------------------------------------------------------------------------
+# Readiness probe
+# ---------------------------------------------------------------------------
+# Pod is removed from Service endpoints until the probe passes. Lower delays
+# than liveness so traffic is only routed once the listener is fully ready.
+readinessProbe:
+  tcpSocket:
+    port: phantom
+  initialDelaySeconds: 3
+  periodSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+  timeoutSeconds: 3
+
+# ---------------------------------------------------------------------------
+# Container security context
+# ---------------------------------------------------------------------------
+# Hardened defaults following CIS Kubernetes Benchmark and Pod Security Standards
+# (restricted profile). runAsUser 65532 is the conventional "nonroot" UID used
+# by distroless images; adjust if your image uses a different UID.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  seccompProfile:
+    type: RuntimeDefault
+  capabilities:
+    drop:
+      - ALL
+
+# ---------------------------------------------------------------------------
+# Pod security context
+# ---------------------------------------------------------------------------
+# fsGroup ensures volume mounts (signing key Secret) are readable by the container user.
+podSecurityContext:
+  fsGroup: 65532
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
+# PhantomListener::shutdown() is called on SIGTERM; in-flight handshakes have
+# up to terminationGracePeriodSeconds to complete before the pod is force-killed.
+# 30 s matches the kubernetes.md reference and the PQC handshake budget (~10-15 ms).
+terminationGracePeriodSeconds: 30
+
+# ---------------------------------------------------------------------------
+# Signing key (HybridSigningKey)
+# ---------------------------------------------------------------------------
+# The HybridSigningKey is the server's long-lived identity; clients pin it.
+# MUST be stored in a Kubernetes Secret — NEVER a ConfigMap (ConfigMaps are
+# not RBAC-restricted; key material would land in etcd plaintext).
+#
+# Recommended approach (production): use external-secrets-operator or sealed-secrets.
+# See README.md for an ExternalSecret snippet.
+#
+# Three mutually exclusive options (evaluated in order):
+#   1. existingSecret: point at a pre-created Secret (recommended)
+#   2. createSecret + secretValue: let the chart create the Secret (CI/dev only)
+#   3. neither: chart will skip the Secret resource; you must create it manually.
+signingKey:
+  # Name of a pre-existing Secret that holds the key. Empty = chart manages the Secret.
+  # MUST set in production via: --set signingKey.existingSecret=<name>
+  existingSecret: ""
+  # Key inside the Secret that contains the raw signing key bytes (base64 or binary).
+  existingSecretKey: "hybrid_signing_key"
+  # Set to true only in dev/CI when you want the chart to create the Secret.
+  # WARNING: with createSecret=true and secretValue set, the key appears in
+  # `helm get values` and Helm release history (stored in cluster Secrets).
+  # Use external-secrets-operator for anything beyond throwaway environments.
+  createSecret: false
+  # Raw key value (base64-encoded). Only used when createSecret=true.
+  # NEVER set this in a values file committed to version control.
+  secretValue: ""
+  # Volume mount path inside the container.
+  mountPath: "/etc/phantom-core"
+  # Filename inside the mounted volume.
+  fileName: "hybrid_signing_key"
+
+# ---------------------------------------------------------------------------
+# Environment variables passed to the container
+# ---------------------------------------------------------------------------
+# Override RUST_LOG or add PHANTOM_BIND_PORT etc. as required by your wrapper binary.
+env:
+  - name: RUST_LOG
+    value: "info,phantom_core=info"
+
+# ---------------------------------------------------------------------------
+# Extra volumes / volume mounts
+# ---------------------------------------------------------------------------
+# Useful for injecting CA bundles, additional config files, etc.
+extraVolumes: []
+# - name: ca-bundle
+#   configMap:
+#     name: ca-bundle
+
+extraVolumeMounts: []
+# - name: ca-bundle
+#   mountPath: /etc/ssl/certs/ca-bundle.crt
+#   subPath: ca-bundle.crt
+
+# ---------------------------------------------------------------------------
+# PodDisruptionBudget
+# ---------------------------------------------------------------------------
+# maxUnavailable: 0 ensures at least one pod is always Ready during voluntary
+# disruptions (node drain, cluster upgrades). Combined with maxUnavailable: 0
+# in the rolling-update strategy, capacity is never reduced.
+pdb:
+  enabled: true
+  maxUnavailable: 0
+
+# ---------------------------------------------------------------------------
+# HorizontalPodAutoscaler
+# ---------------------------------------------------------------------------
+# Disabled by default; enable only after deploying prometheus-adapter or KEDA.
+# phantom_active_sessions is emitted by PhantomListener::metrics_prometheus_text().
+# Scale threshold of 800 leaves 20% headroom below the ~1000-session-per-pod budget.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  # Metric name from PhantomListener::metrics_prometheus_text()
+  targetMetric: phantom_active_sessions
+  # Sessions per pod before a scale-out is triggered
+  targetValue: "800"
+  # Prometheus server URL; required for the external metric query.
+  # Used by the HPA's external metric source or a KEDA ScaledObject.
+  prometheusAddress: "http://prometheus.monitoring.svc:9090"
+
+# ---------------------------------------------------------------------------
+# NetworkPolicy
+# ---------------------------------------------------------------------------
+# Disabled by default; enable when your cluster has a CNI that enforces
+# NetworkPolicies (Calico, Cilium, Weave). Without a network plugin that
+# enforces policies, this resource is a no-op.
+networkPolicy:
+  enabled: false
+  # Ingress: list of namespaceSelector / podSelector blocks allowed to reach
+  # the app port and metrics port. Empty = deny all ingress (except DNS).
+  # Example:
+  #   ingressFrom:
+  #     - namespaceSelector:
+  #         matchLabels:
+  #           kubernetes.io/metadata.name: ingress-system
+  ingressFrom: []
+  # Egress: additional CIDRs / podSelectors your binary dials out to.
+  # DNS (53/UDP+TCP) is always included.
+  egressTo: []
+
+# ---------------------------------------------------------------------------
+# Service account
+# ---------------------------------------------------------------------------
+serviceAccount:
+  # Creates a dedicated ServiceAccount. Recommended: keep true for RBAC isolation.
+  create: true
+  # Annotations for e.g. IRSA (AWS IAM Roles for Service Accounts):
+  #   serviceAccount.annotations: {eks.amazonaws.com/role-arn: arn:aws:iam::...}
+  annotations: {}
+  # Leave empty to use the fullname template as the service account name.
+  name: ""
+  # Automount the service account token. Phantom Core does not call the
+  # Kubernetes API; disable mounting to reduce the attack surface.
+  automountServiceAccountToken: false
+
+# ---------------------------------------------------------------------------
+# Scheduling
+# ---------------------------------------------------------------------------
+# Spread pods across nodes / zones using affinity rules. The example below
+# sets a preferred zone-spread anti-affinity (soft rule — scheduling still
+# succeeds if only one zone is available).
+tolerations: []
+
+nodeSelector: {}
+
+affinity: {}
+# Example zone-spread anti-affinity (recommended for >=3 replicas):
+# affinity:
+#   podAntiAffinity:
+#     preferredDuringSchedulingIgnoredDuringExecution:
+#       - weight: 100
+#         podAffinityTerm:
+#           labelSelector:
+#             matchLabels:
+#               app.kubernetes.io/name: phantom-core
+#           topologyKey: topology.kubernetes.io/zone
+
+# ---------------------------------------------------------------------------
+# Pod annotations / labels (extra, beyond chart-managed ones)
+# ---------------------------------------------------------------------------
+podAnnotations: {}
+# Example: inject Prometheus scrape annotations if you use annotation-based
+# discovery instead of a ServiceMonitor:
+# podAnnotations:
+#   prometheus.io/scrape: "true"
+#   prometheus.io/port: "9090"
+#   prometheus.io/path: "/metrics"
+
+podLabels: {}
+
+# ---------------------------------------------------------------------------
+# Name overrides
+# ---------------------------------------------------------------------------
+nameOverride: ""
+fullnameOverride: ""

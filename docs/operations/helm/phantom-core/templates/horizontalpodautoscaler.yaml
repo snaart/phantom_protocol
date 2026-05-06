@@ -1,0 +1,51 @@
+{{- if .Values.autoscaling.enabled -}}
+# HPA using an external metric sourced from Prometheus via prometheus-adapter or KEDA.
+# phantom_active_sessions is emitted by PhantomListener::metrics_prometheus_text().
+# Prerequisites: prometheus-adapter OR KEDA must be installed and configured.
+# See README.md "HPA prerequisites" for setup instructions.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "phantom-core.fullname" . }}-hpa
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "phantom-core.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "phantom-core.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    # External metric: phantom_active_sessions aggregated across all pods.
+    # This requires prometheus-adapter to be configured with a custom metric rule
+    # mapping the Prometheus query to the external metric name below.
+    # Alternatively, replace with a KEDA ScaledObject (see kubernetes.md example).
+    - type: External
+      external:
+        metric:
+          name: {{ .Values.autoscaling.targetMetric }}
+          selector:
+            matchLabels:
+              # Scope the metric query to pods belonging to this release.
+              app.kubernetes.io/instance: {{ .Release.Name }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.targetValue }}
+  behavior:
+    scaleDown:
+      # Conservative scale-down: wait 5 minutes before reducing replicas to
+      # avoid premature scale-in when session counts briefly dip.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Replicas
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Replicas
+          value: 2
+          periodSeconds: 60
+{{- end }}
