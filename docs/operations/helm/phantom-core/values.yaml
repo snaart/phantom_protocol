@@ -35,9 +35,10 @@ service:
   # ClusterIP keeps the Phantom port internal; expose via LoadBalancer or
   # Ingress in front if you need external access.
   type: ClusterIP
-  # Default app port. Match the value your server binary binds on.
-  # The kubernetes.md reference uses 4242; 8443 is conventional for TLS-like protocols.
-  port: 8443
+  # Default app port. Matches the canonical reference port used in
+  # docs/operations/kubernetes.md so the chart + raw-manifest examples
+  # stay in lockstep. Operators override via --set service.port=…
+  port: 4242
   # Prometheus metrics port. The wrapper binary must expose
   # PhantomListener::metrics_prometheus_text() here (e.g. via hyper).
   metricsPort: 9090
