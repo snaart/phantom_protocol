@@ -1,0 +1,67 @@
+Phantom Core has been deployed.
+
+Release name : {{ .Release.Name }}
+Namespace    : {{ .Release.Namespace }}
+Chart version: {{ .Chart.Version }}
+App version  : {{ .Chart.AppVersion }}
+
+---------------------------------------------------------------------------
+Service endpoint
+---------------------------------------------------------------------------
+
+The Phantom Core server is available within the cluster at:
+
+  {{ include "phantom-core.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+To forward the port locally for testing:
+
+  kubectl port-forward -n {{ .Release.Namespace }} \
+    svc/{{ include "phantom-core.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+
+---------------------------------------------------------------------------
+Metrics endpoint
+---------------------------------------------------------------------------
+
+Prometheus metrics (PhantomListener::metrics_prometheus_text()) are exposed at:
+
+  http://{{ include "phantom-core.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.metricsPort }}/metrics
+
+To verify:
+
+  kubectl port-forward -n {{ .Release.Namespace }} \
+    svc/{{ include "phantom-core.fullname" . }} {{ .Values.service.metricsPort }}:{{ .Values.service.metricsPort }}
+  curl http://localhost:{{ .Values.service.metricsPort }}/metrics | grep phantom_active_sessions
+
+---------------------------------------------------------------------------
+Signing key
+---------------------------------------------------------------------------
+
+{{- if .Values.signingKey.existingSecret }}
+Using pre-existing Secret: {{ .Values.signingKey.existingSecret }}
+{{- else if .Values.signingKey.createSecret }}
+WARNING: The chart created the signing key Secret. This embeds key material
+in Helm release history. Migrate to external-secrets-operator or sealed-secrets
+before moving to production.
+{{- else }}
+ACTION REQUIRED: No signing key Secret is configured.
+The Deployment will fail to start until a Secret is available.
+
+Create the Secret manually:
+
+  kubectl create secret generic {{ include "phantom-core.fullname" . }}-signing-key \
+    -n {{ .Release.Namespace }} \
+    --from-file=hybrid_signing_key=/path/to/hybrid_signing_key.bin
+
+Or re-install with:
+
+  helm upgrade {{ .Release.Name }} ./docs/operations/helm/phantom-core \
+    --set signingKey.existingSecret=<your-secret-name>
+{{- end }}
+
+---------------------------------------------------------------------------
+Further reading
+---------------------------------------------------------------------------
+
+  docs/operations/kubernetes.md  — underlying patterns and rationale
+  docs/operations/docker.md      — container image and graceful shutdown wiring
+  docs/operations/perf-tuning.md — resource sizing and throughput benchmarks

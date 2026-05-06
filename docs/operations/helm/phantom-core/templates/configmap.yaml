@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "phantom-core.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "phantom-core.labels" . | nindent 4 }}
+data:
+  # Non-secret server configuration. Keep sensitive values (keys, tokens) out
+  # of ConfigMaps — use Secrets or external-secrets-operator instead.
+  #
+  # The Phantom Core library is configured entirely via the server binary's
+  # environment and the signing key Secret. Extend this ConfigMap if your
+  # wrapper binary reads a config file.
+  #
+  # Example:
+  #   PHANTOM_BIND_ADDR: "0.0.0.0:{{ .Values.service.port }}"
+  #   PHANTOM_METRICS_ADDR: "0.0.0.0:{{ .Values.service.metricsPort }}"
+  PHANTOM_BIND_PORT: {{ .Values.service.port | quote }}
+  PHANTOM_METRICS_PORT: {{ .Values.service.metricsPort | quote }}
+  PHANTOM_SIGNING_KEY_PATH: {{ printf "%s/%s" .Values.signingKey.mountPath .Values.signingKey.fileName | quote }}
