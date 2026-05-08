@@ -436,6 +436,11 @@ uint64_t uniffi_phantom_core_fn_method_phantomstream_send_unreliable(void*_Nonnu
 uint32_t uniffi_phantom_core_fn_method_phantomstream_stream_id(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FUNC_CONNECT_PINNED
+#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FUNC_CONNECT_PINNED
+uint64_t uniffi_phantom_core_fn_func_connect_pinned(RustBuffer host, uint16_t port, RustBuffer pinned_key
+);
+#endif
 #ifndef UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUSTBUFFER_ALLOC
 #define UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUSTBUFFER_ALLOC
 RustBuffer ffi_phantom_core_rustbuffer_alloc(uint64_t size, RustCallStatus *_Nonnull out_status
@@ -714,6 +719,12 @@ void ffi_phantom_core_rust_future_free_void(uint64_t handle
 #ifndef UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_COMPLETE_VOID
 #define UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_COMPLETE_VOID
 void ffi_phantom_core_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_FUNC_CONNECT_PINNED
+#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_FUNC_CONNECT_PINNED
+uint16_t uniffi_phantom_core_checksum_func_connect_pinned(void
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_ACCEPTOUTCOME_HAS_EARLY_DATA
