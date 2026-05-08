@@ -1610,6 +1610,48 @@ impl std::fmt::Debug for PhantomSession {
     }
 }
 
+// ─── Pinned-Connect Shim (Phase 7.2 mobile bridge) ──────────────────────────
+//
+// `connect_with_transport` itself can't cross the UniFFI boundary directly —
+// it takes a generic `T: SessionTransport` trait object and a typed
+// `HybridVerifyingKey`, neither of which is a UniFFI primitive. Mobile
+// callers (iOS / Android) need a single async entry point that opens a TCP
+// connection, wraps it in `TcpSessionTransport`, parses the pinned key from
+// bytes (per security invariant 1 in CLAUDE.md), and hands back an
+// `Arc<PhantomSession>` ready for `send` / `recv`.
+//
+// Native-only: `TcpSessionTransport` lives behind `cfg(not(target_arch =
+// "wasm32"))`, mirroring `crate::api::tcp_transport`. Wasm consumers use
+// the in-tree `WebSocketLeg` instead.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+pub async fn connect_pinned(
+    host: String,
+    port: u16,
+    pinned_key: Vec<u8>,
+) -> Result<Arc<PhantomSession>, CoreError> {
+    // Decode the server's hybrid verifying key. A malformed blob is a
+    // crypto-layer problem (wrong length, wrong encoding) rather than a
+    // network failure — surface it as `CryptoError`.
+    let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
+        .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
+
+    // Open the TCP stream. The `format!` is shared between the actual
+    // connect target and the `peer_addr` recorded inside the session
+    // (`connect_with_transport` takes it as a free-form string).
+    let addr = format!("{}:{}", host, port);
+    let stream = tokio::net::TcpStream::connect(&addr)
+        .await
+        .map_err(|e| CoreError::NetworkError(format!("connect {}: {}", addr, e)))?;
+    let transport = crate::api::tcp_transport::TcpSessionTransport::new(stream);
+
+    // The handshake is driven by the background task spawned inside
+    // `connect_with_transport`; the returned `PhantomSession` is usable
+    // immediately (state `Connecting`, sends auto-queued until ready).
+    let session = PhantomSession::connect_with_transport(&addr, transport, expected_server_key);
+    Ok(Arc::new(session))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

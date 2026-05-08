@@ -416,6 +416,22 @@ fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
+    typealias FfiType = UInt16
+    typealias SwiftType = UInt16
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt16 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
     typealias FfiType = UInt32
     typealias SwiftType = UInt32
@@ -2307,6 +2323,20 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
         print("uniffiFutureContinuationCallback invalid handle")
     }
 }
+public func connectPinned(host: String, port: UInt16, pinnedKey: Data)async throws  -> PhantomSession  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_core_fn_func_connect_pinned(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey)
+                )
+            },
+            pollFunc: ffi_phantom_core_rust_future_poll_pointer,
+            completeFunc: ffi_phantom_core_rust_future_complete_pointer,
+            freeFunc: ffi_phantom_core_rust_future_free_pointer,
+            liftFunc: FfiConverterTypePhantomSession_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
 
 private enum InitializationResult {
     case ok
@@ -2322,6 +2352,9 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_phantom_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_phantom_core_checksum_func_connect_pinned() != 59015) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data() != 16642) {
         return InitializationResult.apiChecksumMismatch

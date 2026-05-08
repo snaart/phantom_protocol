@@ -471,19 +471,38 @@ PhantomRustBuffer uniffi_phantom_core_fn_method_acceptoutcome_take_early_data(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
+/* ----------------------- Free (top-level) functions ----------------- */
+
+/* connect_pinned(host: string, port: u16, pinned_key: Vec<u8>) ->
+ *     async Result<PhantomSession, CoreError>.
+ *
+ * Phase 7.2 mobile bridge. Opens a TCP connection to `host:port`, wraps
+ * it in the length-prefixed `TcpSessionTransport`, parses `pinned_key`
+ * into a `HybridVerifyingKey` (per server-identity-pinning invariant 1
+ * in CLAUDE.md), and drives the hybrid PQC handshake in the background.
+ *
+ * Returns a u64 future handle that, when complete, yields a `void *`
+ * PhantomSession pointer (use `_poll_pointer` + `_complete_pointer`).
+ * Decode failures of `pinned_key` surface as `CoreError::CryptoError`;
+ * TCP connect failures as `CoreError::NetworkError`. */
+uint64_t uniffi_phantom_core_fn_func_connect_pinned(
+    PhantomRustBuffer        host,
+    uint16_t                 port,
+    PhantomRustBuffer        pinned_key);
+
 /* ====================================================================
  * SECTION 5 — Caveats & non-exported items
  *
- *  - There is no UniFFI-exported entry point for the pinned
- *    `connect_with_transport` / `connect_with_resumption` client paths,
- *    nor for the `_with_runtime` overloads. The `_constructor_phantomsession_connect`
- *    above is the only client constructor on the FFI surface; it
- *    establishes a placeholder session shell rather than a fully-pinned
- *    PQC handshake. Production C clients that need pinning must either:
- *      (a) build a thin Rust shim that wraps the desired Rust-only API
- *          and re-exports it via `#[uniffi::export]`, or
- *      (b) invoke a higher-level binding language (Swift / Kotlin /
- *          Python) from C via that language's embedding API.
+ *  - Pinned client connect is available on the FFI surface via
+ *    `uniffi_phantom_core_fn_func_connect_pinned` (Phase 7.2 mobile
+ *    bridge). The placeholder `_constructor_phantomsession_connect`
+ *    above remains for backwards compatibility but does NOT perform
+ *    a fully-pinned PQC handshake. Production C / mobile clients MUST
+ *    use `connect_pinned` and supply the server's `HybridVerifyingKey`
+ *    bytes (obtainable from `verifying_key_bytes()` on the listener).
+ *
+ *    `connect_with_resumption` and the `_with_runtime` overloads remain
+ *    Rust-only; callers needing them should build an analogous shim.
  *
  *  - The `transport::SessionTransport` trait, `HybridSigningKey`,
  *    `HybridVerifyingKey`, `PhantomConfig`, runtime injection, and the
