@@ -65,12 +65,15 @@ jobs:
           # wasm32-unknown-unknown is now a hard gate as of Phase 3.3 + 3.5:
           # WebSocketLeg + WasmRuntime land; getrandom 0.4's `wasm_js` Cargo
           # feature is forced via core/Cargo.toml so the transitive
-          # ml-dsa / uniffi-tempfile pulls compile cleanly. wasm32-wasi remains
-          # allow_failure pending a wasi-flavored leg (tokio-wasi or compat
-          # shim) — separate Phase 3.10 follow-up.
+          # ml-dsa / uniffi-tempfile pulls compile cleanly.
           - target: wasm32-unknown-unknown
             runner: ubuntu-latest
             install_target: true
+          # wasm32-wasi remains allow_failure: true — needs a WasiLeg +
+          # WasiRuntime (mio does not support WASI; no tokio-wasi shim yet).
+          # Scope, rationale, and step-by-step path forward documented in
+          # docs/operations/wasi.md. Flip allow_failure once Step 4 there
+          # is complete.
           - target: wasm32-wasi
             runner: ubuntu-latest
             install_target: true
