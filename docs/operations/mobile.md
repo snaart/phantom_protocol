@@ -47,10 +47,11 @@ let package = Package(
 )
 ```
 
-**Using `PhantomSession` from Swift.** The current UniFFI surface exposes only
-`connect(addr:)` — NOT pinned. `connect_with_transport_*` takes non-UniFFI types
-and is NOT yet on the surface. **Production apps must ship a thin Rust shim**
-(see Security caveats). Pattern below assumes that shim:
+**Using `PhantomSession` from Swift.** The UniFFI surface exposes
+`connectPinned(host:port:pinnedKey:)` (landed in commit `bfbf808`) which
+internally opens a `TcpSessionTransport`, pins via `HybridVerifyingKey::
+from_bytes`, and delegates to `PhantomSession::connect_with_transport`
+(Security Invariant 1 enforced unconditionally). Use it directly:
 
 ```swift
 import PhantomCore
@@ -118,8 +119,8 @@ dependencies {
 }
 ```
 
-**Using `PhantomSession` from Kotlin.** Same caveat — ship the Rust shim until
-the UniFFI surface is extended:
+**Using `PhantomSession` from Kotlin.** `connectPinned` is on the UniFFI
+surface as of `bfbf808` — call it directly:
 
 ```kotlin
 import uniffi.phantom_core.*
@@ -213,23 +214,16 @@ devices). 0-RTT resumption skips keygen entirely.
 
 ## Security caveats
 
-**Pinned-connect gap (CRITICAL).** The current UniFFI surface exposes only
-`connect(addr)`, which is NOT pinned. `connect_with_transport_*` takes non-UniFFI
-types and cannot be called from Swift/Kotlin without a Rust shim. Ship a thin
-shim crate with a UniFFI-compatible wrapper:
-
-```rust
-#[uniffi::export]
-pub async fn connect_pinned(host: String, port: u16, pinned_key: Vec<u8>)
-    -> Result<PhantomSession, PhantomError>
-{
-    let key = HybridVerifyingKey::from_bytes(&pinned_key)?;
-    let transport = TcpSessionTransport::connect(&format!("{host}:{port}")).await?;
-    PhantomSession::connect_with_transport(&format!("{host}:{port}"), transport, key).await
-}
-```
-
-Tracking item: land `connect_pinned` on the main UniFFI surface.
+**Pinned-connect shim (LANDED).** Commit `bfbf808` adds
+`#[uniffi::export] pub async fn connect_pinned(host, port, pinned_key)
+-> Result<Arc<PhantomSession>, CoreError>` to `core/src/api/session.rs`.
+Internally: parses `pinned_key: Vec<u8>` into a `HybridVerifyingKey`,
+opens a `TcpSessionTransport` via `tokio::net::TcpStream::connect`, and
+delegates to `PhantomSession::connect_with_transport` — Security
+Invariant 1 (server pinning) is enforced unconditionally. Available
+in all four binding languages (Swift, Kotlin, Python, C). The
+placeholder `connect(addr)` is still on the surface as the unpinned
+back-compat path — do NOT use it in production.
 
 **Resumption secret access.** Keychain / EncryptedSharedPreferences secrets are
 accessible to apps sharing the same team ID (iOS) or user ID (Android). Assess
