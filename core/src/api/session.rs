@@ -577,6 +577,12 @@ async fn run_client_handshake<T: SessionTransport>(
 ///   - listens for incoming packets and decrypts them,
 ///   - encrypts outgoing application/stream packets,
 ///   - sends ACKs for reliable packets.
+// The 11 parameters represent the complete session-identity and I/O surface.
+// Grouping them into a struct would require a generic struct (due to `T:
+// SessionTransport`), add indirection with no safety or clarity gain, and
+// constitute a public-API change. The function is private (`async fn`, no
+// `pub`), so the extra arguments are contained here.
+#[allow(clippy::too_many_arguments)]
 async fn run_data_pump<T: SessionTransport>(
     crypto_session: Arc<Session>,
     session_id: SessionId,

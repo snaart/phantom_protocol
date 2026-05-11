@@ -87,28 +87,18 @@ impl NetworkEngine {
     }
 
     async fn process_inbound(&mut self) -> Result<()> {
-        // Пытаемся извлечь столько пакетов, сколько есть в буфере
-        loop {
-            // Для упрощения примера: у нас пока 1 слой (Framer).
-            // В реальной системе тут цикл по self.pipeline.
-            // Но layers мутируют буфер.
-
-            // ВАЖНО: Архитектура pipeline с BytesMut сложнее, для примера хардкодим вызов единственного слоя
-            // или предполагаем цепочку.
-
-            // Берем первый слой (Framer)
-            if let Some(layer) = self.pipeline.first() {
-                match layer.on_inbound(&mut self.in_buffer).await? {
-                    Some(payload) => {
-                        // Пакет готов!
-                        // Если есть Crypto слой, передали бы payload ему.
-                        // Сейчас считаем payload готовым сообщением.
-                        let _ = self.event_tx.send(payload.to_vec());
-                    }
-                    None => break, // Мало данных, ждем еще
+        // Extract as many complete packets from the buffer as possible.
+        // The pipeline currently has at most one layer (Framer); the while-let
+        // terminates when no layer is present or when the layer signals it
+        // needs more data (returns None).
+        while let Some(layer) = self.pipeline.first() {
+            match layer.on_inbound(&mut self.in_buffer).await? {
+                Some(payload) => {
+                    // Packet is ready — forward it to the event channel.
+                    // A future crypto layer would decrypt here before sending.
+                    let _ = self.event_tx.send(payload.to_vec());
                 }
-            } else {
-                break;
+                None => break, // Not enough data yet; wait for more.
             }
         }
         Ok(())

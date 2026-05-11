@@ -25,6 +25,12 @@ struct AssemblyState {
     last_update: Instant,
 }
 
+impl Default for FragmentAssembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FragmentAssembler {
     pub fn new() -> Self {
         Self {
@@ -54,7 +60,7 @@ impl FragmentAssembler {
             // PANIC-SAFETY: the `is_complete` branch above just inserted the
             // entry under `key` via `entry(key).or_insert_with(...)` and we
             // hold `&mut self` — nothing else can have removed it.
-            #[allow(clippy::unwrap_used)]
+            #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
             let state = self.assemblies.remove(&key).unwrap();
             let mut total_size = 0;
             for i in 0..state.total_chunks {
@@ -70,7 +76,7 @@ impl FragmentAssembler {
                 // PANIC-SAFETY: the preceding loop returned early if any
                 // chunk `i` was missing; reaching this loop proves every
                 // index in `0..total_chunks` is present.
-                #[allow(clippy::unwrap_used)]
+                #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
                 packet.extend_from_slice(state.chunks.get(&i).unwrap());
             }
 

@@ -57,7 +57,7 @@ impl PoWChallenge {
         hasher.update(client_id);
         let mac = hasher.finalize();
 
-        if &self.nonce[8..32] != &mac.as_bytes()[0..24] {
+        if self.nonce[8..32] != mac.as_bytes()[0..24] {
             return false;
         }
 

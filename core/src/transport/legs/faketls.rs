@@ -132,9 +132,9 @@ fn derive_outer_keys(
     // `AES_256_GCM.key_len()` is 32, so this is structurally infallible.
     // Surface it as a typed error anyway so the function stays total.
     let send_unbound = UnboundKey::new(&aead::AES_256_GCM, &send_bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("AES key init (send): {}", e)))?;
+        .map_err(|e| io::Error::other(format!("AES key init (send): {}", e)))?;
     let recv_unbound = UnboundKey::new(&aead::AES_256_GCM, &recv_bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("AES key init (recv): {}", e)))?;
+        .map_err(|e| io::Error::other(format!("AES key init (recv): {}", e)))?;
     Ok((
         LessSafeKey::new(send_unbound),
         LessSafeKey::new(recv_unbound),
@@ -433,26 +433,26 @@ impl FakeTlsLeg {
         let extensions_start = record.len();
         record.extend_from_slice(&[0u8; 2]); // Extensions length placeholder
 
-        // Generate and shuffle extensions
-        let mut exts = Vec::new();
-
-        // SNI (0)
-        exts.push((0u16, self.make_sni_extension_body()));
-
-        // Supported Groups (10) - X25519, P-256, P-384 + GREASE
-        exts.push((10u16, self.make_supported_groups_body(&mut rng)));
-
-        // EC Point Formats (11)
-        exts.push((11u16, vec![1, 0])); // Len 1, Uncompressed (0)
-
-        // Signature Algorithms (13)
-        exts.push((13u16, self.make_signature_algorithms_body()));
-
-        // Key Share (51)
-        exts.push((51u16, self.make_key_share_body(&mut rng)));
-
-        // Supported Versions (43) - TLS 1.3, TLS 1.2 + GREASE
-        exts.push((43u16, self.make_supported_versions_body(&mut rng)));
+        // Generate extensions. The `make_*` helpers that take `&mut rng` must
+        // be called in sequence, so we build the vec eagerly then push the
+        // rng-dependent entries afterwards.
+        let supported_groups = self.make_supported_groups_body(&mut rng);
+        let key_share = self.make_key_share_body(&mut rng);
+        let supported_versions = self.make_supported_versions_body(&mut rng);
+        let mut exts: Vec<(u16, Vec<u8>)> = vec![
+            // SNI (0)
+            (0u16, self.make_sni_extension_body()),
+            // Supported Groups (10) - X25519, P-256, P-384 + GREASE
+            (10u16, supported_groups),
+            // EC Point Formats (11)
+            (11u16, vec![1, 0]),
+            // Signature Algorithms (13)
+            (13u16, self.make_signature_algorithms_body()),
+            // Key Share (51)
+            (51u16, key_share),
+            // Supported Versions (43) - TLS 1.3, TLS 1.2 + GREASE
+            (43u16, supported_versions),
+        ];
 
         // Shuffle extensions (except SNI which usually comes first)
         if !exts.is_empty() {
@@ -596,7 +596,7 @@ impl FakeTlsLeg {
         // bytes for AES-GCM, per NIST SP 800-38D). Phantom records are MTU-
         // bounded (≤ 1300 + framing) and any reasonable application payload
         // is many orders of magnitude below that ceiling.
-        #[allow(clippy::unwrap_used)]
+        #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
         self.send_key
             .seal_in_place_append_tag(nonce, aad, &mut in_out)
             .unwrap();
@@ -671,10 +671,7 @@ impl TransportLeg for FakeTlsLeg {
         }
 
         if *self.state.read() != FakeTlsState::ApplicationData {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Handshake not finished",
-            ));
+            return Err(io::Error::other("Handshake not finished"));
         }
 
         let record = self.wrap_as_tls_record(&data);
@@ -697,10 +694,7 @@ impl TransportLeg for FakeTlsLeg {
         }
 
         if *self.state.read() != FakeTlsState::ApplicationData {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Handshake not finished",
-            ));
+            return Err(io::Error::other("Handshake not finished"));
         }
 
         let mut stream_guard = self.stream.lock().await;

@@ -47,7 +47,7 @@ impl HybridSecretKey {
         let mut rng = OsRng;
 
         // X25519 (classical)
-        let x25519_sk = StaticSecret::random_from_rng(&mut rng);
+        let x25519_sk = StaticSecret::random_from_rng(rng);
         let x25519_pk = X25519PublicKey::from(&x25519_sk);
 
         // ML-KEM-768 (post-quantum, FIPS 203). Box the decap key so the
@@ -118,7 +118,7 @@ impl HybridKeyPackage {
         let mut rng = OsRng;
 
         // 1. X25519 ECDH: fresh ephemeral on the sender side.
-        let ephemeral_sk = StaticSecret::random_from_rng(&mut rng);
+        let ephemeral_sk = StaticSecret::random_from_rng(rng);
         let ephemeral_pk = X25519PublicKey::from(&ephemeral_sk);
         let peer_x25519 = X25519PublicKey::from(self.x25519_pk);
         let x25519_shared = ephemeral_sk.diffie_hellman(&peer_x25519);

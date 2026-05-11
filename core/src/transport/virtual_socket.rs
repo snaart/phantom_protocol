@@ -178,14 +178,10 @@ impl VirtualSocket {
                 continue;
             }
 
-            return Err(last_error
-                .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "All paths failed")));
+            return Err(last_error.unwrap_or_else(|| io::Error::other("All paths failed")));
         }
 
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Max fallback attempts reached",
-        ))
+        Err(io::Error::other("Max fallback attempts reached"))
     }
 
     /// Receive data from the virtual socket
@@ -253,9 +249,7 @@ impl VirtualSocket {
                                     '_,
                                     HashMap<LegType, bandwidth_estimator::BandwidthEstimator>,
                                 > = estimators.lock().await;
-                                let est = ests
-                                    .entry(leg_type)
-                                    .or_insert_with(bandwidth_estimator::BandwidthEstimator::new);
+                                let est = ests.entry(leg_type).or_default();
                                 // Read ack_delay from packet header (bytes 39..41, little-endian u16)
                                 let ack_delay_us = if data.len() >= 41 {
                                     u16::from_le_bytes([data[39], data[40]]) as u64

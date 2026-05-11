@@ -571,6 +571,11 @@ impl HandshakeServer {
     /// yet proceed; `Ok(())` when it has cleared the gate (or `bypass`
     /// was set by a valid one-shot resumption ticket). Shared by the
     /// V12 and V3 server paths.
+    // `HandshakeResponse` is intentionally large — boxing it would add a
+    // heap allocation on every call, penalising the hot non-error path.
+    // The type is internal and lives only on the handshake stack, so the
+    // size is acceptable.
+    #[allow(clippy::result_large_err)]
     fn cookie_pow_gate(
         &self,
         client_hello: &ClientHello,
@@ -668,6 +673,7 @@ impl HandshakeServer {
     /// `2` for the V3 path (V3 is a handshake-only bump; early-data is
     /// consumed at handshake time and the session then routes V2
     /// packets).
+    #[allow(clippy::result_large_err)]
     fn finalize_session(
         &self,
         shared_secret: &[u8; 32],

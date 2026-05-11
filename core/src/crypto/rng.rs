@@ -165,6 +165,12 @@ impl RngProvider for OsRng {
         // in `Cargo.toml`'s wasm-only block). A failure here means the OS
         // RNG itself returned an error, which is unrecoverable at this
         // layer — surface it loudly rather than silently producing zeros.
+        // PANIC-SAFETY: A failure from `getrandom` means the OS CSPRNG itself
+        // is broken or unavailable — a condition from which this crate cannot
+        // recover. Panicking loudly is preferable to silently producing zeros
+        // or propagating a partially-filled buffer that the caller would treat
+        // as good entropy.
+        #[allow(clippy::expect_used)]
         getrandom(dest).expect("OS RNG (getrandom) failed");
     }
 }

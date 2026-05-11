@@ -52,8 +52,7 @@ impl UdpTransport {
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-        let session = AesSession::from_shared_secret(&[0u8; 32])
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let session = AesSession::from_shared_secret(&[0u8; 32]).map_err(io::Error::other)?;
 
         Ok(Self {
             socket: Arc::new(socket),
@@ -72,10 +71,7 @@ impl UdpTransport {
     /// Send encrypted data
     #[inline]
     pub async fn send(&self, data: &[u8]) -> IoResult<usize> {
-        let encrypted = self
-            .session
-            .encrypt(&[], data)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let encrypted = self.session.encrypt(&[], data).map_err(io::Error::other)?;
         self.socket.send_to(&encrypted, self.peer_addr).await
     }
 
@@ -86,7 +82,7 @@ impl UdpTransport {
         buf.extend_from_slice(data);
         self.session
             .encrypt_in_place(&[], &mut buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         self.socket.send_to(&buf, self.peer_addr).await
     }
 
@@ -101,7 +97,7 @@ impl UdpTransport {
         let decrypted = self
             .session
             .decrypt(&[], &buf[..len])
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         Ok((decrypted, addr))
     }
@@ -126,10 +122,7 @@ impl UdpTransport {
         // Encrypt all packets first
         let mut encrypted: Vec<Vec<u8>> = Vec::with_capacity(packets.len());
         for pkt in packets {
-            let ct = self
-                .session
-                .encrypt(&[], pkt)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let ct = self.session.encrypt(&[], pkt).map_err(io::Error::other)?;
             encrypted.push(ct);
         }
 
@@ -506,7 +499,7 @@ impl FastSender {
         buf.extend_from_slice(data);
         self.session
             .encrypt_in_place(&[], &mut buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         self.socket.send_to(&buf, self.peer_addr).await
     }
 }

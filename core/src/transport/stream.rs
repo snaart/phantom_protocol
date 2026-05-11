@@ -328,7 +328,7 @@ impl Stream {
             // return `None`. `recv_buf` is locked for the duration of this
             // loop, so no other task can drain it.
             if let Some(pos) = recv_buf.iter().position(|(seq, _)| *seq == expected) {
-                #[allow(clippy::unwrap_used)]
+                #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
                 let (_, data) = recv_buf.remove(pos).unwrap();
                 ready.push_back(data);
                 self.recv_sequence.fetch_add(1, Ordering::SeqCst);
