@@ -87,7 +87,15 @@ impl SessionCache {
             ticket_lifetime: DEFAULT_TICKET_LIFETIME,
         }
     }
+}
 
+impl Default for SessionCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionCache {
     /// Create with custom limits (for Device Profiles)
     pub fn with_capacity(max_entries: usize, ticket_lifetime: Duration) -> Self {
         Self {
@@ -181,6 +189,11 @@ impl SessionCache {
     /// Number of cached tickets
     pub fn len(&self) -> usize {
         self.tickets.len()
+    }
+
+    /// Returns `true` if no tickets are cached
+    pub fn is_empty(&self) -> bool {
+        self.tickets.is_empty()
     }
 
     /// Clear all tickets

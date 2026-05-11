@@ -49,6 +49,12 @@ pub struct CompressionStats {
     pub samples: u32,
 }
 
+impl Default for CompressionStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CompressionStats {
     pub fn new() -> Self {
         Self {

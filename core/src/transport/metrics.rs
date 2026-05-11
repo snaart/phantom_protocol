@@ -121,7 +121,15 @@ impl TransportMetrics {
             started_at: Instant::now(),
         }
     }
+}
 
+impl Default for TransportMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TransportMetrics {
     // --- Recording helpers (hot path, Relaxed ordering) ---
 
     #[inline]

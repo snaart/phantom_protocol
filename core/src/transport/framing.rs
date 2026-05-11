@@ -19,6 +19,12 @@ pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024; // 64 KB
 /// Zero-copy frame writer — encrypts and writes in a single syscall
 pub struct FrameWriter;
 
+impl Default for FrameWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameWriter {
     /// Create a new frame writer
     pub fn new() -> Self {
@@ -44,7 +50,7 @@ impl FrameWriter {
         }
 
         let total_len = data.len();
-        let num_chunks = (total_len + MAX_FRAME_PAYLOAD - 1) / MAX_FRAME_PAYLOAD;
+        let num_chunks = total_len.div_ceil(MAX_FRAME_PAYLOAD);
 
         // Calculate total buffer size needed for all chunks
         let total_cap = num_chunks * (FRAME_HEADER_SIZE + AEAD_OVERHEAD) + total_len;
@@ -100,10 +106,7 @@ impl FrameWriter {
         }
 
         // Single syscall write for all chunks
-        stream
-            .write_all(&batch_buf)
-            .await
-            .map_err(|e| FrameError::Io(e))?;
+        stream.write_all(&batch_buf).await.map_err(FrameError::Io)?;
 
         Ok(total_len)
     }
@@ -150,10 +153,7 @@ impl FrameWriter {
         }
 
         // Single write for all frames
-        stream
-            .write_all(&batch_buf)
-            .await
-            .map_err(|e| FrameError::Io(e))?;
+        stream.write_all(&batch_buf).await.map_err(FrameError::Io)?;
 
         Ok(total_payload)
     }
@@ -163,6 +163,12 @@ impl FrameWriter {
 pub struct FrameReader {
     /// Internal read buffer
     header_buf: [u8; FRAME_HEADER_SIZE],
+}
+
+impl Default for FrameReader {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FrameReader {
@@ -184,7 +190,7 @@ impl FrameReader {
         stream
             .read_exact(&mut self.header_buf)
             .await
-            .map_err(|e| FrameError::Io(e))?;
+            .map_err(FrameError::Io)?;
 
         let ct_len = u32::from_be_bytes(self.header_buf) as usize;
 
@@ -194,10 +200,7 @@ impl FrameReader {
 
         // Read ciphertext
         let mut ct = vec![0u8; ct_len];
-        stream
-            .read_exact(&mut ct)
-            .await
-            .map_err(|e| FrameError::Io(e))?;
+        stream.read_exact(&mut ct).await.map_err(FrameError::Io)?;
 
         // Decrypt in-place
         // Offload to spawn_blocking if frame is large

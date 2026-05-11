@@ -135,8 +135,8 @@ impl ReplayWindow {
             for i in (word_shift..WINDOW_WORDS).rev() {
                 bitmap[i] = bitmap[i - word_shift];
             }
-            for i in 0..word_shift {
-                bitmap[i] = 0;
+            for word in bitmap[..word_shift].iter_mut() {
+                *word = 0;
             }
         }
 

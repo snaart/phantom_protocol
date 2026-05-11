@@ -129,12 +129,22 @@ pub struct PooledBuffer<'a> {
 
 impl<'a> PooledBuffer<'a> {
     /// Get mutable reference to inner buffer
+    ///
+    /// Note: returns `&mut Vec<u8>` (not `&mut T`) so it cannot implement
+    /// `std::convert::AsMut` without a concrete target type — the inherent
+    /// method intentionally provides the richer `Vec` interface.
+    #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn as_mut(&mut self) -> &mut Vec<u8> {
         &mut self.buffer
     }
 
     /// Get reference to inner buffer
+    ///
+    /// Note: returns `&[u8]` (not `&Vec<u8>`) so the signature differs from
+    /// what `std::convert::AsRef<Vec<u8>>` would produce — an inherent method
+    /// avoids the ambiguity.
+    #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn as_ref(&self) -> &[u8] {
         &self.buffer
