@@ -1,0 +1,25 @@
+[package]
+name = "phantom-server"
+version = "0.2.0"
+edition = "2021"
+description = "Reference production server for phantom_core"
+
+# Out of the core/-only workspace — sibling crate convention.
+[workspace]
+
+[[bin]]
+name = "phantom-server"
+path = "src/main.rs"
+
+[dependencies]
+phantom_core = { path = "../core" }
+tokio = { version = "1.36", features = ["full"] }   # binary owns its runtime
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
+http-body-util = "0.1"
+hex = "0.4"
+futures = "0.3"
