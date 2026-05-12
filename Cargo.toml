@@ -3,8 +3,9 @@ resolver = "2"
 members = [
     "core",
 ]
-# `cli/` and `tests/` are sibling crates that depend on `phantom_core` via a
-# path dependency but are intentionally NOT workspace members (see CLAUDE.md).
+# `cli/`, `tests/`, and `server/` are sibling crates that depend on
+# `phantom_core` via a path dependency but are intentionally NOT workspace
+# members (see CLAUDE.md). `server/` is the reference embedder binary.
 # `fuzz/` is the cargo-fuzz harness crate, also excluded because libfuzzer-sys
 # requires nightly and we don't want to pull it into stable builds.
 # Listing them here makes cargo's workspace-membership check explicit and
@@ -13,6 +14,7 @@ exclude = [
     "cli",
     "tests",
     "fuzz",
+    "server",
 ]
 
 # Release profile lives at the workspace root so cargo actually picks it up;
