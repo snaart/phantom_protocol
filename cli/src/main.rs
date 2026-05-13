@@ -1,16 +1,36 @@
-use phantom_core::crypto::hybrid_kem::HybridSecretKey;
+use clap::{Parser, Subcommand};
 
-fn main() {
-    println!("--- Quantum Rust Teapot CLI ---");
-    println!("Generating Hybrid Keypair (X25519 + ML-KEM-768)...");
+mod keygen;
+mod ping;
+mod pubkey;
+mod version;
 
-    let (sk, pk) = HybridSecretKey::generate();
+#[derive(Parser, Debug)]
+#[command(name = "phantom-cli", version, about = "Phantom Core admin CLI")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
 
-    println!("Keys generated successfully!");
-    // println!("X25519 PK: {:?}", pk.x25519_pk); // Bytes
-    println!("X25519 PK: [32 bytes]");
-    println!("ML-KEM-768 PK Size: {} bytes (Expected ~1184)", pk.ml_kem_pk.len());
-    println!("Secret Key Debug: {:?}", sk);
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Generate a new HybridSigningKey and save it to a file.
+    Keygen(keygen::Args),
+    /// Print the verifying-key hex from a signing-key file (for client pinning).
+    Pubkey(pubkey::Args),
+    /// Connect via connect_pinned, send a message, await echo, print round-trip.
+    Ping(ping::Args),
+    /// Print version and compile-time feature set.
+    Version,
+}
 
-    println!("\nCore library functional.");
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Keygen(args) => keygen::run(args),
+        Cmd::Pubkey(args) => pubkey::run(args),
+        Cmd::Ping(args) => ping::run(args).await,
+        Cmd::Version => version::run(),
+    }
 }
