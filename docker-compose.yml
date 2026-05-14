@@ -1,38 +1,60 @@
-version: '3.8'
+# Phantom Core reference deployment — single-host docker-compose.
+#
+# Brings up one phantom-server with a persistent signing-key volume so the
+# server keeps the same verifying key across restarts (clients pin the
+# verifying key, so it must be stable). See docs/operations/docker.md for
+# the manual `docker run` equivalent and docs/operations/kubernetes.md +
+# docs/operations/helm/phantom-core/ for the production cluster story.
+#
+# Usage:
+#   docker compose up -d              # detached
+#   docker compose logs -f            # follow logs (verifying-key hex at WARN)
+#   docker compose down               # graceful (SIGTERM → drain ≤10s → exit)
+#   docker compose down -v            # also delete the signing-key volume
+#                                       (clients will need to re-pin!)
+#
+# Production note: replace the inline signing-key volume with a Kubernetes
+# Secret + ExternalSecret operator (see helm chart README) or use Docker
+# secrets in Swarm mode. NEVER bake the signing key into the image.
 
 services:
-  server:
-    build: .
+  phantom-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: phantom-server:0.2.0
+    container_name: phantom-server
+    restart: unless-stopped
     ports:
-      - "3001:3001"
+      - "4242:4242"   # app — canonical port (matches kubernetes.md + helm)
+      - "9090:9090"   # Prometheus /metrics
     environment:
-      - RUST_LOG=${RUST_LOG:-info}
-      - DATABASE_URL=${DATABASE_URL}
-      - PHANTOM_AUTH_TOKEN=${PHANTOM_AUTH_TOKEN}
-      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
-    depends_on:
-      - db
-      - redis
-    restart: always
-
-  db:
-    image: postgres:15-alpine
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER:-phantom}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB:-phantom}
+      # Override the in-image defaults here if needed. RUST_LOG is the most
+      # common operator knob.
+      RUST_LOG: ${RUST_LOG:-info,phantom_core=info}
+      PHANTOM_BIND: 0.0.0.0:4242
+      PHANTOM_METRICS_BIND: 0.0.0.0:9090
+      PHANTOM_SIGNING_KEY_FILE: /etc/phantom-server/signing.key
+      PHANTOM_LOG_JSON: "true"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
+      # The signing key must persist across restarts so clients can keep
+      # pinning the same verifying key. Wipe this volume only if you
+      # intentionally want to rotate the server identity (and re-pin all
+      # clients).
+      - phantom_signing_key:/etc/phantom-server
+    # PhantomListener::shutdown() drains in-flight sessions on SIGTERM;
+    # SHUTDOWN_DRAIN_GRACE in server/src/main.rs is 10s. Compose's default
+    # of 10s is borderline; 30s matches kubernetes.md / the helm chart.
+    stop_grace_period: 30s
+    healthcheck:
+      # tcpSocket-equivalent: a successful TCP accept on 4242 means
+      # PhantomListener is alive (the SDK ships no /healthz HTTP endpoint).
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/4242 && exec 3<&- 3>&-"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
 volumes:
-  postgres_data:
-  redis_data:
+  phantom_signing_key:
+    driver: local
