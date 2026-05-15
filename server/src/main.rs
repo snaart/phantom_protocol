@@ -50,36 +50,27 @@ async fn main() -> Result<()> {
         signing_key::load_or_create(&cfg.signing_key_file).context("load_or_create signing key")?;
     let vk_hex = hex::encode(signing_key.verifying_key().to_bytes());
 
+    // Thread the persisted signing key into the listener so the
+    // verifying material clients pin is stable across restarts.
+    // `bind_with_signing_key` constructs the listener's
+    // `HandshakeServer` around our key — the listener's
+    // `verifying_key_bytes()` is the SAME bytes we just logged from
+    // disk, so we only need to surface one value to operators.
+    let listener =
+        PhantomListener::bind_with_signing_key(cfg.bind.to_string(), signing_key)
+            .await
+            .context("PhantomListener::bind_with_signing_key")?;
+    debug_assert_eq!(
+        hex::encode(listener.verifying_key_bytes()),
+        vk_hex,
+        "listener verifying key must equal the on-disk verifying key"
+    );
+
     // Operator-facing pinning material. Emit at WARN so it survives
     // every reasonable log filter and isn't easy to miss in startup
-    // output. The value is the same as `verifying_key_bytes()` on
-    // the listener — pinning identity not session-specific.
+    // output. Same value as both the on-disk verifying key and
+    // `listener.verifying_key_bytes()`.
     tracing::warn!("server verifying key (pin this on clients): {}", vk_hex);
-
-    // The reference embedder does NOT thread the on-disk signing key
-    // into the listener — `PhantomListener::bind` generates its own
-    // listener-internal key. Persisting our `signing_key` and logging
-    // its verifying hex matches the contract documented for operators
-    // (the listener exposes the SAME key, see assertion below). The
-    // on-disk key persists across restarts.
-    //
-    // NOTE: `PhantomListener::bind` currently constructs its own
-    // `HandshakeServer` (which generates a fresh hybrid keypair). For
-    // a strict "key file is the source of truth" contract, an
-    // embedder would need a `bind_with_signing_key` constructor on the
-    // listener. Until that exists we still surface the persisted key
-    // in logs and the operator MUST capture the listener-reported
-    // verifying-key bytes (logged below) for client pinning.
-    drop(signing_key);
-
-    let listener = PhantomListener::bind(cfg.bind.to_string())
-        .await
-        .context("PhantomListener::bind")?;
-    let runtime_vk_hex = hex::encode(listener.verifying_key_bytes());
-    tracing::warn!(
-        "listener verifying key (pin this on clients): {}",
-        runtime_vk_hex
-    );
     tracing::info!(local_addr = %listener.local_addr(), "listener bound");
 
     if let Some(metrics_addr) = cfg.metrics_bind {
