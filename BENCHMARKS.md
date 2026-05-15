@@ -39,14 +39,14 @@ hardware accel is ~1-1.5 GiB/s on the same class of hardware.
 
 `cargo run --manifest-path core/Cargo.toml --release --example crypto_bench`
 
-| Payload | AES-256-GCM | ChaCha20-Poly1305 |
-| ---     | ---         | ---               |
-| 64 B    |   771 MiB/s |   283 MiB/s |
-| 1 KiB   | 4,435 MiB/s | 1,177 MiB/s |
-| 16 KiB  | 5,454 MiB/s | 1,512 MiB/s |
-| 64 KiB  | 5,514 MiB/s | 1,540 MiB/s |
-| 256 KiB | 5,508 MiB/s | 1,547 MiB/s |
-| 1 MiB   | 5,433 MiB/s | 1,555 MiB/s |
+| Payload | AES-256-GCM   | ChaCha20-Poly1305 |
+| ------- | ------------- | ----------------- |
+| 64 B    |     771 MiB/s |         283 MiB/s |
+| 1 KiB   |   4,435 MiB/s |       1,177 MiB/s |
+| 16 KiB  |   5,454 MiB/s |       1,512 MiB/s |
+| 64 KiB  |   5,514 MiB/s |       1,540 MiB/s |
+| 256 KiB |   5,508 MiB/s |       1,547 MiB/s |
+| 1 MiB   |   5,433 MiB/s |       1,555 MiB/s |
 
 **Reading:** AES-256-GCM peaks at ~5.5 GiB/s on Apple M1 with hardware
 AES-PMULL acceleration on payloads ≥16 KiB. ChaCha20-Poly1305 is
@@ -60,10 +60,10 @@ this as the new baseline; future regressions are measured against it.)
 
 **Allocation overhead:**
 
-| Pattern                       | Throughput   |
-| ---                           | ---          |
-| `Vec::clone` per call         | 33,887 MiB/s |
-| `copy_from_slice` zero-alloc  | 58,182 MiB/s |
+| Pattern                      | Throughput   |
+| ---------------------------- | ------------ |
+| `Vec::clone` per call        | 33,887 MiB/s |
+| `copy_from_slice` zero-alloc | 58,182 MiB/s |
 
 Result: **1.7× slowdown** from per-call allocation. This is what Phase
 2.1 (pooled recv accumulator) and 2.3 (pre-sized serialization buffer)
@@ -79,24 +79,24 @@ canonical payload sizes.
 
 ### PQ primitives (per-operation, single-thread)
 
-| Operation                                  | Time      | Ops/sec/core |
-| ---                                        | ---       | ---          |
-| `hybrid_kem_keygen` (X25519 + ML-KEM-768)  | 47.4 µs   | ~21,100      |
-| `hybrid_sign_keygen` (Ed25519 + ML-DSA-65) | 182.4 µs  | ~5,500       |
-| `kem_encapsulate`                          | 81.4 µs   | ~12,300      |
-| `kem_decapsulate`                          | 73.5 µs   | ~13,600      |
-| `hybrid_sign`                              | 313.0 µs  | ~3,200       |
-| `hybrid_verify`                            | 133.9 µs  | ~7,500       |
+| Operation                                  | Time     | Ops/sec/core |
+| ------------------------------------------ | -------- | ------------ |
+| `hybrid_kem_keygen` (X25519 + ML-KEM-768)  |  47.4 µs |      ~21,100 |
+| `hybrid_sign_keygen` (Ed25519 + ML-DSA-65) | 182.4 µs |       ~5,500 |
+| `kem_encapsulate`                          |  81.4 µs |      ~12,300 |
+| `kem_decapsulate`                          |  73.5 µs |      ~13,600 |
+| `hybrid_sign`                              | 313.0 µs |       ~3,200 |
+| `hybrid_verify`                            | 133.9 µs |       ~7,500 |
 
 ML-KEM-768 dominates `hybrid_kem_keygen`; ML-DSA-65 dominates the
 `hybrid_sign_keygen` / `hybrid_sign` paths.
 
 ### Full handshake (end-to-end client + server exchange)
 
-| Scenario                          | Time    | Connections/sec/core |
-| ---                               | ---     | ---                  |
-| `phantom_pqc_handshake`           | 1.19 ms |  ~840                |
-| `phantom_pqc_handshake_pinned`    | 0.99 ms |  **~1,010**          |
+| Scenario                       | Time    | Connections/sec/core |
+| ------------------------------ | ------- | -------------------- |
+| `phantom_pqc_handshake`        | 1.19 ms |                 ~840 |
+| `phantom_pqc_handshake_pinned` | 0.99 ms |          **~1,010**  |
 
 `phantom_pqc_handshake_pinned` is the production path (Security Invariant
 1 — pinning mandatory). On 8 perf cores: **~8,100 cold handshakes/sec
@@ -108,14 +108,14 @@ lookup is microseconds — order ~10⁵ resumptions/sec/core).
 This is the full crate path including header AAD binding, replay counter
 bump, and packet flag setting — NOT the raw `ring` AEAD measured above.
 
-| Payload | Encrypt time | Encrypt thrpt | Decrypt time | Decrypt thrpt |
-| ---     | ---          | ---           | ---          | ---           |
-| 64 B    | 116 ns       |   523 MiB/s   | 152 ns       |   400 MiB/s   |
-| 256 B   | 165 ns       |  1.44 GiB/s   | 203 ns       |  1.18 GiB/s   |
-| 1 KiB   | 304 ns       |  3.13 GiB/s   | 362 ns       |  2.63 GiB/s   |
-| 4 KiB   | 887 ns       |  4.30 GiB/s   | 948 ns       |  4.03 GiB/s   |
-| 16 KiB  | 3.18 µs      |  **4.79 GiB/s** | 3.31 µs    |  4.61 GiB/s   |
-| 64 KiB  | 13.3 µs      |  4.60 GiB/s   | 13.9 µs      |  4.40 GiB/s   |
+| Payload | Encrypt time | Encrypt thrpt   | Decrypt time | Decrypt thrpt |
+| ------- | ------------ | --------------- | ------------ | ------------- |
+| 64 B    |       116 ns |       523 MiB/s |       152 ns |     400 MiB/s |
+| 256 B   |       165 ns |      1.44 GiB/s |       203 ns |    1.18 GiB/s |
+| 1 KiB   |       304 ns |      3.13 GiB/s |       362 ns |    2.63 GiB/s |
+| 4 KiB   |       887 ns |      4.30 GiB/s |       948 ns |    4.03 GiB/s |
+| 16 KiB  |      3.18 µs |  **4.79 GiB/s** |      3.31 µs |    4.61 GiB/s |
+| 64 KiB  |      13.3 µs |      4.60 GiB/s |      13.9 µs |    4.40 GiB/s |
 
 Peak `encrypt_packet` throughput is **~4.8 GiB/s per core at 16 KiB**,
 slightly below the raw `ring` ceiling (`~5.5 GiB/s`) because of the
@@ -140,9 +140,9 @@ Measures the per-packet cost of the listener's DoS gate: parse the
 incoming `ClientHelloEnvelope::V12`, run reputation tracker
 (`ReputationTracker::record`), issue a stateless cookie.
 
-| Operation                                          | Time    | Events/sec/core |
-| ---                                                | ---     | ---             |
-| `Process ClientHello (Parse + Cookie + Reputation)`| 4.60 µs | **~217,000**    |
+| Operation                                           | Time    | Events/sec/core |
+| --------------------------------------------------- | ------- | --------------- |
+| `Process ClientHello (Parse + Cookie + Reputation)` | 4.60 µs |    **~217,000** |
 
 Throughput in payload-bytes: ~672 MiB/s (5 KiB ClientHello envelope ×
 ~134K events/sec). On 8 perf cores this floor is **~1.7M ClientHellos/
@@ -157,13 +157,13 @@ so the gate stays open under flood without burning host CPU.
 Buffer pool is exercised by N threads each grabbing and returning a
 4 KiB buffer. Values are throughput (elements/s) — higher is better.
 
-| Threads | LockFree ThreadLocal | Legacy Mutex |
-| ---     | ---                  | ---          |
-|  1      | **178 Melem/s**      |  54 Melem/s  |
-|  2      |  55 Melem/s          |  38 Melem/s  |
-|  8      |  19 Melem/s          |  **33 Melem/s** |
-| 16      |  19 Melem/s          |  **33 Melem/s** |
-| 32      |  19 Melem/s          |  **29 Melem/s** |
+| Threads | LockFree ThreadLocal | Legacy Mutex    |
+| ------: | -------------------- | --------------- |
+|       1 |     **178 Melem/s**  |      54 Melem/s |
+|       2 |          55 Melem/s  |      38 Melem/s |
+|       8 |          19 Melem/s  |  **33 Melem/s** |
+|      16 |          19 Melem/s  |  **33 Melem/s** |
+|      32 |          19 Melem/s  |  **29 Melem/s** |
 
 **Reading:** the lock-free thread-local design wins by **3.3×** at
 single-thread (the global queue is uncontended; thread-local hits a hot
@@ -184,10 +184,10 @@ floor on the pool itself.
 Cross-validation against `transport_bench` — separate compilation unit,
 independent timing.
 
-| Bench                                | Time     | Notes                       |
-| ---                                  | ---      | ---                         |
-| `handshake_comparison/phantom_pqc_full`        | 1.23 ms  | matches `transport_bench` ±3%      |
-| `throughput_comparison/phantom_encrypt/1024`   | 306 ns / 3.12 GiB/s | matches `transport_bench` ±0.5% |
+| Bench                                        | Time                | Notes                              |
+| -------------------------------------------- | ------------------- | ---------------------------------- |
+| `handshake_comparison/phantom_pqc_full`      | 1.23 ms             | matches `transport_bench` ±3%      |
+| `throughput_comparison/phantom_encrypt/1024` | 306 ns / 3.12 GiB/s | matches `transport_bench` ±0.5%    |
 
 **Known bench bug:** the `throughput_comparison/phantom_decrypt/*`
 group panics with `CryptoError("Decryption / authentication failed")` —
@@ -204,18 +204,18 @@ TODOs; the actively-measured rows are listed above.
 Estimates for **one 8-core M1-class server** running production
 workloads. Bottleneck column flags what gives out first.
 
-| Workload                              | Capacity (one box)               | Bottleneck         |
-| ---                                   | ---                              | ---                |
-| Mobile messenger (idle sessions, ~64 KiB/session) | **~250,000 concurrent**          | RAM (16 GiB)       |
-| Cold-handshake churn                  | ~8,000 conn/sec                  | CPU (PQ sign)      |
-| 0-RTT resumption                      | ~800,000 reconnects/sec          | CPU (DashMap lookup) |
-| AES-GCM bulk throughput (≥16 KiB)     | ~38 GiB/s = 304 Gbps             | NIC (100 GbE × 3)  |
-| Small-packet load (≤256 B)            | ~11 GiB/s = 88 Gbps              | CPU (AEAD overhead) |
-| 4K H.265 video streams (~25 Mbps each)| ~1,000 concurrent @ 25 Gbps NIC  | NIC                |
-| File transfer (100 Mbps/user)         | ~2,000 concurrent @ 25 Gbps NIC  | NIC                |
-| IoT telemetry (100 B every 60 s)      | ~250,000 devices (RAM-bound)     | RAM                |
-| Game backend (60 Hz tick, 300 B)      | ~10,000 players                  | game logic, not us |
-| SYN-flood / handshake-DoS gate        | ~1.7M ClientHellos/sec parsed    | CPU (parse + rep)  |
+| Workload                                           | Capacity (one box)              | Bottleneck           |
+| -------------------------------------------------- | ------------------------------- | -------------------- |
+| Mobile messenger (idle sessions, ~64 KiB/session)  | **~250,000 concurrent**         | RAM (16 GiB)         |
+| Cold-handshake churn                               | ~8,000 conn/sec                 | CPU (PQ sign)        |
+| 0-RTT resumption                                   | ~800,000 reconnects/sec         | CPU (DashMap lookup) |
+| AES-GCM bulk throughput (≥16 KiB)                  | ~38 GiB/s = 304 Gbps            | NIC (100 GbE × 3)    |
+| Small-packet load (≤256 B)                         | ~11 GiB/s = 88 Gbps             | CPU (AEAD overhead)  |
+| 4K H.265 video streams (~25 Mbps each)             | ~1,000 concurrent @ 25 Gbps NIC | NIC                  |
+| File transfer (100 Mbps/user)                      | ~2,000 concurrent @ 25 Gbps NIC | NIC                  |
+| IoT telemetry (100 B every 60 s)                   | ~250,000 devices (RAM-bound)    | RAM                  |
+| Game backend (60 Hz tick, 300 B)                   | ~10,000 players                 | game logic, not us   |
+| SYN-flood / handshake-DoS gate                     | ~1.7M ClientHellos/sec parsed   | CPU (parse + rep)    |
 
 Where Phantom is **never** the bottleneck in practice: bulk encryption.
 A 100 Gbps NIC carries ~12.5 GB/s, well below the 38 GiB/s crypto
