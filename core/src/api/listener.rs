@@ -1,5 +1,6 @@
 use crate::api::session::{PhantomSession, SessionTransport};
 use crate::api::tcp_transport::TcpSessionTransport;
+use crate::crypto::hybrid_sign::HybridSigningKey;
 use crate::errors::CoreError;
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{
@@ -48,15 +49,56 @@ impl PhantomListener {
         addr: String,
         runtime: Arc<dyn Runtime>,
     ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, runtime).await
+        Self::bind_inner(addr, runtime, None).await
     }
 
-    async fn bind_inner(addr: String, runtime: Arc<dyn Runtime>) -> Result<Arc<Self>, CoreError> {
+    /// Like [`bind`](Self::bind) but uses the caller-supplied long-lived
+    /// [`HybridSigningKey`] as the server's signing identity instead of
+    /// generating a fresh one on every bind.
+    ///
+    /// This is the entry point for production embedders that persist
+    /// the server's signing key across restarts so the verifying-key
+    /// material clients pin does not change on every boot. The
+    /// listener's [`verifying_key_bytes`](Self::verifying_key_bytes)
+    /// will return the verifying half of `signing_key`.
+    ///
+    /// Rust-only (not UniFFI-exported because `HybridSigningKey` is
+    /// not in the UniFFI surface).
+    pub async fn bind_with_signing_key(
+        addr: String,
+        signing_key: HybridSigningKey,
+    ) -> Result<Arc<Self>, CoreError> {
+        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(signing_key)).await
+    }
+
+    /// Composition of [`bind_with_signing_key`](Self::bind_with_signing_key)
+    /// and [`bind_with_runtime`](Self::bind_with_runtime): supply both a
+    /// long-lived signing key and a non-tokio [`Runtime`]. Rust-only.
+    pub async fn bind_with_signing_key_with_runtime(
+        addr: String,
+        signing_key: HybridSigningKey,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<Arc<Self>, CoreError> {
+        Self::bind_inner(addr, runtime, Some(signing_key)).await
+    }
+
+    /// Shared bind path. If `signing_key` is `Some`, the resulting
+    /// [`HandshakeServer`] uses that long-lived key. Otherwise the
+    /// historical generate-internal-key behavior is preserved.
+    async fn bind_inner(
+        addr: String,
+        runtime: Arc<dyn Runtime>,
+        signing_key: Option<HybridSigningKey>,
+    ) -> Result<Arc<Self>, CoreError> {
         let listener = Self::bind_with_optional_reuseport(&addr).await?;
         let local_addr = listener
             .local_addr()
             .map_err(|e| CoreError::NetworkError(format!("local_addr: {}", e)))?;
-        let hs = HandshakeServer::new().map_err(|e| CoreError::InternalError(e.to_string()))?;
+        let hs = match signing_key {
+            Some(sk) => HandshakeServer::with_signing_key(sk),
+            None => HandshakeServer::new(),
+        }
+        .map_err(|e| CoreError::InternalError(e.to_string()))?;
         Ok(Arc::new(Self {
             listener: Mutex::new(listener),
             handshake_server: Arc::new(hs),
@@ -129,7 +171,7 @@ impl PhantomListener {
     #[uniffi::constructor]
     #[tracing::instrument(name = "phantom.listener.bind", skip_all, fields(addr = %addr))]
     pub async fn bind(addr: String) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, Arc::new(TokioRuntime)).await
+        Self::bind_inner(addr, Arc::new(TokioRuntime), None).await
     }
 
     /// The server's long-lived hybrid verifying key, serialized via
@@ -338,5 +380,72 @@ async fn drive_server_handshake(
                 )));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::hybrid_sign::HybridSigningKey;
+
+    /// `bind_with_signing_key` pins the listener's verifying identity to
+    /// the supplied long-lived signing key — exactly the contract
+    /// production embedders that persist a key file rely on.
+    #[tokio::test]
+    async fn bind_with_signing_key_pins_verifying_identity() {
+        let (signing_key, verifying_key) = HybridSigningKey::generate();
+        let expected_vk_bytes = verifying_key.to_bytes();
+
+        let listener =
+            PhantomListener::bind_with_signing_key("127.0.0.1:0".to_string(), signing_key)
+                .await
+                .expect("bind_with_signing_key should succeed on a free port");
+
+        assert_eq!(
+            listener.verifying_key_bytes(),
+            expected_vk_bytes,
+            "listener must expose the verifying half of the supplied signing key"
+        );
+    }
+
+    /// Round-trip through `to_bytes`/`from_bytes` mimics the production
+    /// "load from disk" flow and proves the listener pins the *same*
+    /// identity the on-disk key encodes.
+    #[tokio::test]
+    async fn bind_with_signing_key_round_trips_via_bytes() {
+        let (orig_signing_key, orig_verifying_key) = HybridSigningKey::generate();
+        let on_disk = orig_signing_key.to_bytes();
+        // `HybridSigningKey` is not `Clone`; reload from bytes as a
+        // server restart would.
+        let reloaded =
+            HybridSigningKey::from_bytes(&on_disk).expect("from_bytes round-trip should succeed");
+
+        let listener = PhantomListener::bind_with_signing_key("127.0.0.1:0".to_string(), reloaded)
+            .await
+            .expect("bind_with_signing_key should succeed on a free port");
+
+        assert_eq!(
+            listener.verifying_key_bytes(),
+            orig_verifying_key.to_bytes(),
+            "reloaded-from-bytes signing key must yield the original verifying key"
+        );
+    }
+
+    /// The plain `bind` constructor must keep its historical
+    /// generate-internal-key semantics — every call produces a different
+    /// verifying key. Pins the back-compat guarantee.
+    #[tokio::test]
+    async fn bind_still_generates_fresh_key_per_call() {
+        let l1 = PhantomListener::bind("127.0.0.1:0".to_string())
+            .await
+            .expect("first bind should succeed");
+        let l2 = PhantomListener::bind("127.0.0.1:0".to_string())
+            .await
+            .expect("second bind should succeed");
+        assert_ne!(
+            l1.verifying_key_bytes(),
+            l2.verifying_key_bytes(),
+            "two independent binds must produce distinct verifying keys"
+        );
     }
 }

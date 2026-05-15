@@ -254,7 +254,25 @@ pub struct HandshakeServer {
 
 impl HandshakeServer {
     pub fn new() -> Result<Self, HandshakeError> {
-        let (signing_key, verifying_key) = HybridSigningKey::generate();
+        let (signing_key, _verifying_key) = HybridSigningKey::generate();
+        Self::with_signing_key(signing_key)
+    }
+
+    /// Build a `HandshakeServer` from a caller-supplied long-lived
+    /// [`HybridSigningKey`] (Phase 7.4 follow-up).
+    ///
+    /// Used by embedders that persist the server's signing key across
+    /// restarts so client pinning material does not change on every
+    /// boot. The verifying key is derived from the supplied signing key,
+    /// the per-process master secret is freshly generated, and the
+    /// remaining state (PoW counters, session cache) initializes the
+    /// same way as [`Self::new`].
+    ///
+    /// The supplied `signing_key` is moved in and held under
+    /// `HandshakeServer`'s [`ZeroizeOnDrop`] — the same memory-hygiene
+    /// invariant as the auto-generated path.
+    pub fn with_signing_key(signing_key: HybridSigningKey) -> Result<Self, HandshakeError> {
+        let verifying_key = signing_key.verifying_key();
 
         let mut master_secret = [0u8; 32];
         getrandom::getrandom(&mut master_secret)
