@@ -205,19 +205,24 @@ latencies.
 
 ## Sanity benchmarks
 
-A clean release build on a 2024-era x86_64 server with AES-NI should
-hit roughly:
+A clean release build on a 2024-era server with hardware AES acceleration
+(AES-NI on x86_64, AES-PMULL on ARM) should hit roughly:
 
 | Metric | Reference (single thread) |
 | --- | --- |
-| AES-256-GCM encrypt | ~3-4 GB/s |
-| ChaCha20-Poly1305 encrypt | ~1-1.5 GB/s |
-| Phantom hybrid handshake | ~10-15 ms (server side) |
-| End-to-end TCP loopback throughput (single stream) | 1-2 GB/s |
+| AES-256-GCM raw (`ring`, ≥16 KiB payload) | ~5.5 GiB/s (M1 Pro) / ~3–5 GiB/s (x86_64 AES-NI) |
+| AES-256-GCM practical (`encrypt_packet_v2` with header-AAD + replay) | ~4.7 GiB/s at 64 KiB |
+| ChaCha20-Poly1305 encrypt | ~1.55 GiB/s (software-only; faster than AES on ARM cores without AES extensions) |
+| Phantom hybrid PQ handshake (pinned, production path) | ~1.06 ms → ~945 conn/sec/core |
+| End-to-end TCP loopback throughput (single stream) | 1–4 GiB/s (NIC / socket bound, not crypto) |
 
-Numbers above 4 GB/s per stream usually indicate the bottleneck has
-moved to the socket / memory subsystem. Reach for Phase 4 (multi-path,
-multi-stream) before adding more cores to a single session.
+Numbers above ~5 GiB/s per stream on the application path indicate the
+bottleneck has moved to the socket / memory subsystem — crypto is no
+longer the ceiling. Reach for Phase 4 (multi-path, multi-stream) before
+adding more cores to a single session.
+
+See `BENCHMARKS.md` for the full snapshot, methodology, and capacity
+scenario derivations.
 
 Reference benchmarks live in `core/benches/`:
 
