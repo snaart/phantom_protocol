@@ -184,7 +184,7 @@ scrape config:
 scrape_configs:
   - job_name: phantom
     static_configs:
-      - targets: ['phantom-1.internal:9090', 'phantom-2.internal:9090']
+      - targets: ['phantom-1.example.com:9090', 'phantom-2.example.com:9090']
 ```
 
 Use the Grafana dashboard template under
