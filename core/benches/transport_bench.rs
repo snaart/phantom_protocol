@@ -6,13 +6,17 @@
 //! - gRPC (tonic) baseline
 //! - HTTP (hyper) baseline
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 // Import Phantom types
 use phantom_core::crypto::hybrid_kem::HybridSecretKey;
 use phantom_core::crypto::hybrid_sign::HybridSigningKey;
 use phantom_core::transport::handshake::{HandshakeClient, HandshakeResponse, HandshakeServer};
+use phantom_core::transport::types::{PacketFlagsV2, PacketHeaderV2};
 
 /// Benchmark PQC key generation
 fn bench_pqc_keygen(c: &mut Criterion) {
@@ -191,32 +195,59 @@ fn bench_encryption(c: &mut Criterion) {
         .process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk))
         .unwrap();
 
-    // Benchmark different payload sizes
+    // Benchmark different payload sizes.
+    //
+    // V2 wire format (`encrypt_packet_v2` / `decrypt_packet_v2`) derives the
+    // AEAD nonce from the authenticated header fields rather than an internal
+    // monotonic counter, so a sender/receiver pair cannot desync. To stay
+    // clear of the per-stream sliding-window replay guard, each iteration
+    // uses a fresh `header.sequence` from a monotonic counter that is
+    // hoisted outside the payload-size loop (so it never resets and never
+    // collides with a previously-accepted sequence on the same stream).
+    let session_id = *server_session.id();
+    let flags = PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE);
+    let encrypt_seq = AtomicU32::new(1);
+    let decrypt_seq = AtomicU32::new(1);
+
     for size in [64, 256, 1024, 4096, 16384, 65536].iter() {
         let data = vec![0xAB; *size];
 
         group.throughput(Throughput::Bytes(*size as u64));
 
-        let header = phantom_core::transport::types::PacketHeader::new(
-            *server_session.id(),
-            1,
-            1,
-            phantom_core::transport::types::PacketFlags::empty(),
-        );
-
+        // Encrypt-only — encrypt has no replay-window dependency, but using
+        // V2 keeps both halves consistent.
         group.bench_with_input(BenchmarkId::new("encrypt", size), size, |b, _| {
-            b.iter(|| {
-                let encrypted = server_session.encrypt_packet(&header, &data);
-                black_box(encrypted)
-            })
+            b.iter_batched(
+                || {
+                    let seq = encrypt_seq.fetch_add(1, Ordering::Relaxed);
+                    PacketHeaderV2::new(session_id, 1, seq, flags)
+                },
+                |header| {
+                    let encrypted = server_session.encrypt_packet_v2(&header, &data);
+                    black_box(encrypted)
+                },
+                BatchSize::SmallInput,
+            )
         });
 
-        let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
+        // Dedicated stream id (2) for the decrypt half so its sliding-window
+        // state is independent from the encrypt side's stream 1.
         group.bench_with_input(BenchmarkId::new("decrypt", size), size, |b, _| {
-            b.iter(|| {
-                let decrypted = client_session.decrypt_packet(&header, &encrypted);
-                black_box(decrypted)
-            })
+            b.iter_batched(
+                || {
+                    let seq = decrypt_seq.fetch_add(1, Ordering::Relaxed);
+                    let header = PacketHeaderV2::new(session_id, 2, seq, flags);
+                    let encrypted = server_session
+                        .encrypt_packet_v2(&header, &data)
+                        .expect("encrypt setup");
+                    (header, encrypted)
+                },
+                |(header, encrypted)| {
+                    let decrypted = client_session.decrypt_packet_v2(&header, &encrypted);
+                    black_box(decrypted)
+                },
+                BatchSize::SmallInput,
+            )
         });
     }
 
@@ -259,19 +290,26 @@ fn bench_throughput(c: &mut Criterion) {
     let data = vec![0xAB; 1024 * 1024];
     group.throughput(Throughput::Bytes(data.len() as u64 * 2)); // encrypt + decrypt
 
-    let header = phantom_core::transport::types::PacketHeader::new(
-        *server_session.id(),
-        1,
-        1,
-        phantom_core::transport::types::PacketFlags::empty(),
-    );
+    // Switched to V2 (`encrypt_packet_v2` / `decrypt_packet_v2`) so the AEAD
+    // nonce is header-derived and a sender/receiver pair cannot desync. Each
+    // iteration bumps `header.sequence` to dodge the per-stream replay window.
+    let session_id = *server_session.id();
+    let flags = PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE);
+    let seq_counter = AtomicU32::new(1);
 
     group.bench_function("1MB_roundtrip", |b| {
-        b.iter(|| {
-            let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
-            let decrypted = client_session.decrypt_packet(&header, &encrypted).unwrap();
-            black_box(decrypted)
-        })
+        b.iter_batched(
+            || {
+                let seq = seq_counter.fetch_add(1, Ordering::Relaxed);
+                PacketHeaderV2::new(session_id, 1, seq, flags)
+            },
+            |header| {
+                let encrypted = server_session.encrypt_packet_v2(&header, &data).unwrap();
+                let decrypted = client_session.decrypt_packet_v2(&header, &encrypted).unwrap();
+                black_box(decrypted)
+            },
+            BatchSize::PerIteration,
+        )
     });
 
     group.finish();
