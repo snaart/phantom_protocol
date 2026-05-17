@@ -14,43 +14,51 @@ This is **not** a Security Policy document yet — that lives under
 | Operation | What we use today | FIPS-approved? | Mitigation under `fips` feature |
 | --- | --- | --- | --- |
 | Classical KEM | X25519 (`x25519-dalek`) | ❌ No FIPS-approved KEM uses X25519 | Replace with ECDH P-256 / P-384, OR drop the classical leg and rely on PQ alone |
-| Post-quantum KEM | Kyber768 (`pqcrypto-kyber`) | ❌ Kyber768 is the NIST PQC Round-3 spec; ML-KEM-768 (FIPS 203) is the standardised variant | Switch to `ml-kem` crate or aws-lc-rs's ML-KEM impl |
+| Post-quantum KEM | ML-KEM-768 (`ml-kem = 0.2`, FIPS 203 RustCrypto pure-Rust) | ✅ FIPS-approved primitive shipped; CAVP vectors in `core/tests/cavp.rs` (Phase 5.4 ✅) | — already done (Phase 5.1, commit `7c7bde7`) |
 | Classical signature | Ed25519 (`ed25519-dalek`) | ✅ FIPS 186-5 approves EdDSA(Ed25519) | Keep as-is |
-| Post-quantum signature | Dilithium3 (`pqcrypto-dilithium`) | ❌ ML-DSA-65 (FIPS 204) is the standardised variant | Switch to `ml-dsa` crate or aws-lc-rs's ML-DSA impl |
+| Post-quantum signature | ML-DSA-65 (`ml-dsa = =0.1.0-rc.11`, FIPS 204 RustCrypto pure-Rust) | ✅ FIPS-approved primitive shipped; CAVP vectors in `core/tests/cavp.rs` (Phase 5.4 ✅) | — already done (Phase 5.1, commit `7c7bde7`) |
 | Symmetric AEAD | AES-256-GCM (`ring`) | ⚠️ Approved only if built against a FIPS-validated cryptographic module | Use `aws-lc-rs` (Amazon's FIPS module) instead of `ring`'s default build |
-| Symmetric AEAD (alt) | ChaCha20-Poly1305 (`ring`) | ❌ Not FIPS-approved | Drop in `fips` mode |
+| Symmetric AEAD (alt) | ChaCha20-Poly1305 (`chacha20poly1305`) | ❌ Not FIPS-approved | Drop in `fips` mode |
 | Hash | SHA-256 (`sha2`) | ✅ FIPS 180-4 | Keep |
 | Hash (KDF context) | blake3 keyed-derivation | ❌ Not FIPS | Replace with HKDF-SHA-256 / SHA-512 |
 | KDF (HKDF) | HKDF-SHA-256 (`hkdf`) | ✅ NIST SP 800-56C | Keep |
 | HMAC | HMAC-SHA-256 (`hmac`) | ✅ FIPS 198-1 | Keep |
 | RNG | `getrandom` → OS DRBG | ⚠️ FIPS approves only specific DRBGs (SP 800-90A: CTR_DRBG, HMAC_DRBG, Hash_DRBG) | Use `aws-lc-rs::rand` (CTR_DRBG inside the FIPS module) |
 
-Bottom line: **two out of seven** crypto-relevant primitive choices are
-FIPS-approved out of the box (Ed25519, SHA-256, HKDF, HMAC). The rest
-need the `fips` feature swap.
+Bottom line: **six out of nine** crypto-relevant primitive choices are
+FIPS-approved out of the box (ML-KEM-768, ML-DSA-65, Ed25519, SHA-256,
+HKDF-SHA-256, HMAC-SHA-256). The remaining gaps are X25519 (classical
+KEM leg), AES-256-GCM via `ring` (module validation), ChaCha20-Poly1305,
+blake3, and the RNG — these need the `fips` feature swap.
 
 ---
 
 ## 2. Proposed `fips` feature
 
-When implemented (Phase 5.1), `--features fips`:
+There is **no `fips` cargo feature gate today**. The PQ primitive swap
+(Phase 5.1, commit `7c7bde7`) was applied **unconditionally**: every
+build now uses `ml-kem = 0.2` (FIPS 203) and `ml-dsa = =0.1.0-rc.11`
+(FIPS 204) — the `pqcrypto-kyber` / `pqcrypto-dilithium` dependencies
+are gone. CAVP known-answer tests for both primitives (plus AES-256-GCM,
+Ed25519, SHA-256, HMAC-SHA-256, and HKDF-SHA-256) landed in Phase 5.4
+and run on every `cargo test` invocation via `core/tests/cavp.rs`.
+
+The remaining items below still require a future `fips` feature to gate:
 
 - Replaces `ring` → `aws-lc-rs` everywhere AES-256-GCM is invoked. Both
   crates expose a sibling `ring`-shaped API; the swap is mostly a
   workspace dependency-rewrite plus a few `use` lines.
-- Replaces `pqcrypto-kyber` → `ml-kem`.
-- Replaces `pqcrypto-dilithium` → `ml-dsa`.
 - Replaces every `blake3::derive_key("phantom-...-v1", seed)` call with
   `hkdf::Hkdf::<Sha256>::new(None, seed).expand("phantom-...-v1", &mut out)`.
 - Removes `ChaCha20Poly1305` from the `CipherSuite` enum (and removes
   the dependency).
 - Removes X25519 from the hybrid construction. Two policy options:
   - **PQ-only**: drop the classical leg entirely. Simpler; loses the
-    defense-in-depth against an undiscovered Kyber/ML-KEM flaw.
+    defense-in-depth against an undiscovered ML-KEM flaw.
   - **PQ + ECDH P-256**: keep a classical leg but FIPS-approved. More
     work; matches NIAP's hybrid recommendations for VPN PPs.
 
-Default: PQ + ECDH P-256, behind a sub-feature `fips-hybrid`.
+Default plan: PQ + ECDH P-256, behind a sub-feature `fips-hybrid`.
 
 ---
 
@@ -87,21 +95,24 @@ The Cryptographic Algorithm Validation Program (CAVP) is the
 prerequisite for CMVP. It validates each approved algorithm against
 NIST-provided test vectors.
 
-Plan (Phase 5.4):
+Status (Phase 5.4 ✅): CAVP-style known-answer tests are **implemented**
+in `core/tests/cavp.rs`. Coverage:
 
 ```
-tests/cavp/
-    aes_256_gcm.json        # encrypt + decrypt vectors
-    ml_kem_768.json         # KAT vectors per FIPS 203 §6.4
-    ml_dsa_65.json           # KAT vectors per FIPS 204 §A.4
-    ed25519.json             # RFC 8032 vectors
-    sha_256.json             # NIST hash vectors
-    hmac_sha256.json
-    hkdf_sha256.json         # RFC 5869 + NIST SP 800-56C
+core/tests/cavp.rs
+    ML-KEM-768  (FIPS 203 §7.2/§7.3 — Encaps / Decaps round-trip + hybrid wiring)
+    ML-DSA-65   (FIPS 204 — Sign / Verify round-trip + hybrid wiring)
+    AES-256-GCM (encrypt + decrypt via ring)
+    SHA-256     (deterministic digest)
+    HMAC-SHA-256
+    HKDF-SHA-256 (RFC 5869 + NIST SP 800-56C)
+    Ed25519     (sign / verify via ed25519-dalek)
 ```
 
-CI job `cavp.yml` runs every vector on every push under the `fips`
-feature build. Failure of any vector = hard CI failure.
+These run on every `cargo test --manifest-path core/Cargo.toml`
+invocation with no feature flag required. Failure of any vector = hard
+red. No separate `cavp.yml` CI job exists; coverage is provided by the
+main `ci.yml` test step.
 
 ---
 
@@ -142,16 +153,18 @@ itself is a separate business decision.
 Switching primitives is a **wire-incompatible** change. A `--features fips`
 build cannot interoperate with a default build:
 
-- ML-KEM-768 ciphertexts have different bytes than Kyber768 ciphertexts
-  even though the math is structurally identical.
-- ML-DSA-65 signatures have different bytes than Dilithium3 signatures.
+- ML-KEM-768 (FIPS 203) ciphertexts have different bytes than the prior
+  Kyber768 (NIST PQC Round-3) format — this break already occurred in
+  Phase 5.1; current builds are ML-KEM-768 only.
+- ML-DSA-65 (FIPS 204) signatures have different bytes than the prior
+  Dilithium3 format — same break, already shipped.
 - Removing ChaCha20-Poly1305 means a non-FIPS-AES-only peer cannot
   negotiate.
 - Removing X25519 (PQ-only variant) cuts off classical compatibility.
 
-This means the `fips` feature is the natural place to bump
-`VersionedPacket` to `V2` (or to introduce a separate `V1_FIPS`
-variant). Either way Phase 5 work intersects Phase 4.2's V2 bump.
+Any future `fips` feature changes (e.g. dropping ChaCha20-Poly1305 or
+X25519) remain wire-incompatible between `fips` and non-`fips` builds
+and should be reflected in `VersionedPacket` or a negotiation extension.
 
 ---
 
@@ -161,16 +174,19 @@ Rough scoring against FIPS 140-3 Level 1 requirements:
 
 | Category | Status | Notes |
 | --- | --- | --- |
-| Approved primitive set | 25% | 2 of 7 default primitives are FIPS-approved |
+| Approved primitive set | 55% | 6 of 9 default primitives are FIPS-approved (ML-KEM-768, ML-DSA-65, Ed25519, SHA-256, HKDF-SHA-256, HMAC-SHA-256); X25519, ChaCha20-Poly1305, blake3 remain non-FIPS |
 | Implementation roles | n/a for L1 | Operator + Cryptographic-Officer split is L2+ |
 | Self-tests | 0% | none implemented |
 | Key management | partial | Generation + destruction are right; storage + lifecycle docs missing |
 | RNG | conditional | depends on OS; `aws-lc-rs::rand` swap fixes |
-| Constant-time properties | 80% | cookie path done (Phase 1.1); rest relies on ring / dalek / pqcrypto upstream |
+| Constant-time properties | 80% | cookie path done (Phase 1.1); rest relies on ring / dalek / ml-kem / ml-dsa upstream |
 | Documentation | 5% | this file is the only Phase 5 artifact today |
 
-**Overall: ~15%.** The remaining 85% is Phase 5.1-5.5 work and is the
-single largest gap between today's codebase and a CMVP submission.
+**Overall: ~30%.** Phase 5.1 (PQ primitive swap) and 5.4 (CAVP vectors)
+are complete. The remaining gap is Phase 5.2 (`fips` feature: ring →
+aws-lc-rs, drop ChaCha20-Poly1305 and blake3 in FIPS mode, X25519 →
+P-256) and Phase 5.5 (self-tests, security policy docs, key-management
+docs).
 
 ---
 

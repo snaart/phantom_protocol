@@ -31,14 +31,23 @@ The wire format is identified by a single byte in the
 | Role | Primitive | Crate |
 | --- | --- | --- |
 | Classical KEM | X25519 | `x25519-dalek` |
-| Post-quantum KEM | Kyber768 | `pqcrypto-kyber` |
+| Post-quantum KEM | ML-KEM-768 (FIPS 203) | `ml-kem = 0.2` (RustCrypto pure-Rust) |
 | Classical signature | Ed25519 | `ed25519-dalek` |
-| Post-quantum signature | Dilithium3 | `pqcrypto-dilithium` |
+| Post-quantum signature | ML-DSA-65 (FIPS 204) | `ml-dsa = =0.1.0-rc.11` (RustCrypto pure-Rust) |
 | AEAD | AES-256-GCM or ChaCha20-Poly1305 | `ring` |
 | Hash | SHA-256 | `sha2` |
 | Hash (KDF context) | blake3 keyed-derivation | `blake3` |
 | KDF (HKDF) | HKDF-SHA-256 | `hkdf` |
 | HMAC | HMAC-SHA-256 | `hmac` |
+
+**Phase 5.1 note (commit `7c7bde7`):** the PQ primitives were swapped from the
+`pqcrypto-kyber` / `pqcrypto-dilithium` crates (Kyber768 / Dilithium3) to the
+RustCrypto `ml-kem` / `ml-dsa` crates (ML-KEM-768 / ML-DSA-65). This is a
+wire-incompatible change relative to pre-Phase-5.1 builds, accepted as a
+pre-1.0 break. Note that the KDF label `"HybridKEM_X25519_Kyber768"` (§ 3) is
+**intentionally preserved verbatim** as a wire-stable label string — it
+identifies the KDF domain, not the specific crate or FIPS encoding. See
+`core/src/crypto/hybrid_kem.rs:91-94` for the rationale comment.
 
 The AEAD choice is auto-selected by `HwCaps::detect()` (AES-NI present → AES;
 otherwise ChaCha). Cipher is `CipherSuite::Aes256Gcm = 1` or
@@ -55,7 +64,7 @@ change.
 
 | Label | Construction | Purpose |
 | --- | --- | --- |
-| `"HybridKEM_X25519_Kyber768"` | `HKDF-SHA-256(ecc_secret \|\| kyber_secret)` | hybrid KEM shared secret (`core/src/crypto/hybrid_kem.rs:106-111`) |
+| `"HybridKEM_X25519_Kyber768"` | `HKDF-SHA-256(ecc_secret \|\| kyber_secret)` | hybrid KEM shared secret (`core/src/crypto/hybrid_kem.rs:95`) |
 | `b"phantom-transport-key"` | `HKDF-Expand(shared_secret)` | session AEAD master before per-direction derivation (`core/src/transport/session.rs:54-59`) |
 | `b"phantom-resumption-secret-v1"` | `HKDF-Expand(shared_secret)` | 0-RTT resumption secret (`core/src/transport/handshake.rs::process_client_hello`) |
 | `b"phantom-session-id-v1"` | `SHA256(shared_secret \|\| nonce)` | session id derivation (`core/src/transport/handshake.rs:derive_session_id`) |

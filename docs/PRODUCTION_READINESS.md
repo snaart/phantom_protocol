@@ -1,5 +1,19 @@
 # Phantom Core Rust → Production-Ready: дорожная карта
 
+> ⚠ **Historical baseline (pre-implementation, 2026).** This document is the
+> original gap-analysis roadmap that motivated the Phase 0–7 effort. Most
+> items framed below as "to-do" or "future work" have since been
+> **implemented and shipped** — see [`PROGRESS.md`](PROGRESS.md) for the
+> live status tracker, updated alongside every feature commit with
+> `file:line` evidence and commit SHAs. Phases 0–7 are now closed:
+> Phase 3 (11 of 11 ✅), Phase 4 (6 of 6 ✅), Phase 5 (code-side ✅,
+> external CMVP lab validation remains), Phase 6 (code-side ✅, formal
+> verification audit-driven), Phase 7 (8 of 8 ✅). The cryptographic
+> primitives referenced as `pqcrypto-kyber` / `pqcrypto-dilithium`
+> throughout this doc were swapped to `ml-kem` (FIPS 203) / `ml-dsa`
+> (FIPS 204) in Phase 5.1. Use this file as historical context + design
+> rationale; use `PROGRESS.md` for current state.
+
 ## Context
 
 **Что есть сейчас.** Phantom Core (0.2.0, ~11.8 KLOC) — это пост-квантово-безопасный L4/L6 транспорт на Rust с гибридной криптографией (X25519+Kyber768 KEM, Ed25519+Dilithium3 signatures), AEAD (ring AES-256-GCM или ChaCha20-Poly1305), мульти-leg транспортом (TCP, KCP-over-UDP, FakeTLS) и публичным API через UniFFI. Архитектурный фундамент крепкий: три HIGH-severity уязвимости из security review мая 2026 закрыты, инварианты соблюдены (pin server-key, ENCRYPTED-flag enforcement, FakeTLS per-record counter nonces), 122 unit-теста проходят, бенчи существуют.
