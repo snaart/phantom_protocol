@@ -36,7 +36,7 @@ derive).
 
 **Rotation:** rebind a fresh listener. There is no in-place rotation today.
 
-### 2. Per-handshake KEM ephemeral keypair — `HybridKemSecret`
+### 2. Per-handshake KEM ephemeral keypair — `HybridSecretKey`
 
 **Components:** `x25519-dalek::StaticSecret` + ML-KEM-768 decapsulation key.
 
@@ -160,7 +160,7 @@ type exists but is not exchanged on the wire.
 | Type | Storage | Zeroize? |
 | --- | --- | --- |
 | `HybridSigningKey` (Ed25519 + ML-DSA-65) | heap (boxed in `Arc`) | ✅ via crate impls |
-| `HybridKemSecret` | heap | ✅ via crate impls |
+| `HybridSecretKey` | heap | ✅ via crate impls |
 | `CryptoState` | heap (in `ArcSwap`) | ✅ derive |
 | `HandshakeServer.master_secret` | inline `[u8; 32]` | ✅ derive |
 | `HandshakeClient.nonce` | inline `[u8; 32]` | ✅ derive |
