@@ -213,8 +213,8 @@ the session from the wire:
 
 | SFR | Title | Implementation | Status | Notes / Evidence |
 |-----|-------|---------------|--------|-----------------|
-| FTP_ITC.1.1 | Trusted channel between the TOE and remote endpoints | The Phantom session protocol is the trusted channel. After handshake, every application-data packet is AEAD-encrypted (`api/session.rs:906` — `PacketFlags::ENCRYPTED` set unconditionally). Unencrypted application-data packets are dropped on receipt (`api/session.rs:1141-1150`). | ✅ | Security invariant 2 (`CLAUDE.md §Security Invariants`). Negative: `security_invariants.rs:48` (`tampered_ciphertext_is_rejected`), `security_invariants.rs:76` (`tampered_header_is_rejected_via_aad`). |
-| FTP_ITC.1.2 | Channel initiation | Clients always initiate via `PhantomSession::connect_with_transport`. Server identity pinning is mandatory: `expected_server_key: HybridVerifyingKey` is a required parameter (`api/session.rs:182`). The handshake passes `Some(&expected_server_key)` to `process_server_hello` — never `None`. | ✅ | Security invariant 1 (`CLAUDE.md §Security Invariants`). Negative: `security_invariants.rs:146` (`server_identity_mismatch_aborts_handshake`). |
+| FTP_ITC.1.1 | Trusted channel between the TOE and remote endpoints | The Phantom session protocol is the trusted channel. After handshake, every application-data packet is AEAD-encrypted (`api/session.rs:906` — `PacketFlags::ENCRYPTED` set unconditionally). Unencrypted application-data packets are dropped on receipt (`api/session.rs:1141-1150`). | ✅ | Security invariant 2 (`SECURITY.md` / `docs/security/threat-model.md`). Negative: `security_invariants.rs:48` (`tampered_ciphertext_is_rejected`), `security_invariants.rs:76` (`tampered_header_is_rejected_via_aad`). |
+| FTP_ITC.1.2 | Channel initiation | Clients always initiate via `PhantomSession::connect_with_transport`. Server identity pinning is mandatory: `expected_server_key: HybridVerifyingKey` is a required parameter (`api/session.rs:182`). The handshake passes `Some(&expected_server_key)` to `process_server_hello` — never `None`. | ✅ | Security invariant 1 (`SECURITY.md` / `docs/security/threat-model.md`). Negative: `security_invariants.rs:146` (`server_identity_mismatch_aborts_handshake`). |
 
 ---
 
@@ -225,7 +225,7 @@ the session from the wire:
 | FPT_SKP_EXT.1.1 | Protection of TSF data in transit | AEAD on every packet (FTP_ITC.1.1 above). No raw key bytes cross the `SessionTransport` interface after handshake. | ✅ | `api/session.rs:906-912` — encrypt path. `api/session.rs:1141` — decrypt path with flag check. |
 | FPT_SKP_EXT.1.2 | Protection of TSF data at rest | Key material is not persisted (see FCS_STO_EXT.1). Zeroize-on-drop on all in-memory secrets. | 🔄 | Partial — ring `LessSafeKey` interior is opaque, input bytes are zeroed but ring does not guarantee interior zeroization. Documented in `key-management.md §Storage classes table`. |
 | FPT_TST_EXT.1.1 | TSF self-test | CAVP-style known-answer tests are implemented for all approved primitives: `core/tests/cavp.rs`. Power-on self-tests (POST) are planned in Phase 5.5 at `core/src/crypto/self_tests.rs`. | 🔄 | KAT vectors present and always-on in CI. Formal POST invoked-at-startup mechanism not yet implemented. `self-tests.md` has the Phase 5.5 plan. |
-| FPT_AEX_EXT.1 | Anti-exploitation features | `#![deny(unsafe_code)]` at crate root (`core/src/lib.rs:38`). Single remaining `unsafe` opt-in: `transport/udp_transport.rs` (libc GSO / `recvmmsg`). MSRV 1.75 enforced in CI. Fuzz harnesses: `fuzz/` (five targets). | ✅ | Unsafe discipline documented in `CLAUDE.md §Lint & Code-Quality Policy`. |
+| FPT_AEX_EXT.1 | Anti-exploitation features | `#![deny(unsafe_code)]` at crate root (`core/src/lib.rs:38`). Single remaining `unsafe` opt-in: `transport/udp_transport.rs` (libc GSO / `recvmmsg`). MSRV 1.75 enforced in CI. Fuzz harnesses: `fuzz/` (five targets). | ✅ | Unsafe discipline enforced at `core/src/lib.rs:38` (`#![deny(unsafe_code)]`); contributor lint policy in `CONTRIBUTING.md`. |
 
 ---
 
@@ -243,7 +243,7 @@ the session from the wire:
 | SFR | Title | Implementation | Status | Notes / Evidence |
 |-----|-------|---------------|--------|-----------------|
 | FDP_RIP.1 | Residual information protection | `CryptoState` zeroized on drop. Per-handshake KEM ephemeral keys consumed and dropped after `process_server_hello` (`key-management.md §2`). Session traffic secret zeroed on rekey via `ArcSwap` drop of old `Arc<CryptoState>`. | ✅ | `key-management.md §Storage classes table`. |
-| FDP_IFC.1 | Subset information flow control | Replay protection: `security/replay_window.rs` + `security/replay_protection.rs` — per-stream sliding-window bitmap per RFC 4303 §3.4.3. Check occurs *after* AEAD verify (`transport/session.rs:377`). | ✅ | Security invariant 4 (`CLAUDE.md §Security Invariants`). Negative: `security_invariants.rs:267` (`replay_window_rejects_duplicate_sequence`), `security_invariants.rs:407` (`v2_replay_window_rejects_duplicate_sequence`). |
+| FDP_IFC.1 | Subset information flow control | Replay protection: `security/replay_window.rs` + `security/replay_protection.rs` — per-stream sliding-window bitmap per RFC 4303 §3.4.3. Check occurs *after* AEAD verify (`transport/session.rs:377`). | ✅ | Security invariant 4 (`SECURITY.md` / `docs/security/threat-model.md`). Negative: `security_invariants.rs:267` (`replay_window_rejects_duplicate_sequence`), `security_invariants.rs:407` (`v2_replay_window_rejects_duplicate_sequence`). |
 
 ---
 
@@ -277,7 +277,7 @@ the client's IP address protection. Phantom's position:
 | SAR | Title | Evidence Document(s) | Gap / Note |
 |-----|-------|---------------------|------------|
 | ADV_ARC.1 | Architectural Design | `docs/architecture/ARCHITECTURE.md` — layer overview, module dep map, concurrency topology, encryption boundary, wire framing, error propagation. | None. |
-| ADV_FSP.1 | Functional Specification | `core/src/api/` public surface (`session.rs`, `listener.rs`, `tcp_transport.rs`). UniFFI-generated bindings under `tests/bindings/`. `CLAUDE.md §High-Level Architecture`. | Formal FSP document (separate from ARCHITECTURE.md) is not yet written. Will be required by the lab. |
+| ADV_FSP.1 | Functional Specification | `core/src/api/` public surface (`session.rs`, `listener.rs`, `tcp_transport.rs`). UniFFI-generated bindings under `tests/bindings/`. `docs/architecture/ARCHITECTURE.md`. | Formal FSP document (separate from ARCHITECTURE.md) is not yet written. Will be required by the lab. |
 | ADV_TDS.1 | TOE Design | `docs/architecture/ARCHITECTURE.md §2-6` (layer descriptions). Source files are the authoritative design artifact. | A structured design document per CC Part 3 ADV_TDS.1 evidence requirements must be produced for the lab. |
 | AGD_OPE.1 | Operational User Guidance | `docs/operations/deployment.md`, `docs/operations/kubernetes.md`, `docs/operations/mobile.md`, `docs/operations/wasm.md`, `docs/operations/docker.md`, `docs/operations/systemd.md`. | Helm chart at `docs/operations/helm/`. Grafana / Prometheus dashboards at `docs/operations/grafana/` and `prometheus/`. |
 | AGD_PRE.1 | Preparative Procedures | `docs/operations/deployment.md` — installation, configuration, network prerequisites. `docs/operations/perf-tuning.md` — tuning and validation steps. | Ensure the preparative guide is self-contained for the evaluated configuration (`std` build, default features). |
@@ -352,8 +352,8 @@ the client's IP address protection. Phantom's position:
 3. **Prepare the Evidence Package.**
    - Security Target (ST): expand this document into a formal ST per
      CC:2022 Part 2/3 requirements.
-   - Developer Evidence: source tree + build instructions (`CLAUDE.md
-     §Common Commands`), CI logs, SLSA-3 attestation artifacts.
+   - Developer Evidence: source tree + build instructions (`README.md`
+     §Quick start + `CONTRIBUTING.md`), CI logs, SLSA-3 attestation artifacts.
    - Test Evidence: `core/tests/security_invariants.rs`, `core/tests/cavp.rs`,
      `core/tests/property.rs` outputs. The lab will likely run these
      independently.

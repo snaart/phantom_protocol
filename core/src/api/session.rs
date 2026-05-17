@@ -1623,7 +1623,7 @@ impl std::fmt::Debug for PhantomSession {
 // `HybridVerifyingKey`, neither of which is a UniFFI primitive. Mobile
 // callers (iOS / Android) need a single async entry point that opens a TCP
 // connection, wraps it in `TcpSessionTransport`, parses the pinned key from
-// bytes (per security invariant 1 in CLAUDE.md), and hands back an
+// bytes (per security invariant 1 in SECURITY.md), and hands back an
 // `Arc<PhantomSession>` ready for `send` / `recv`.
 //
 // Native-only: `TcpSessionTransport` lives behind `cfg(not(target_arch =

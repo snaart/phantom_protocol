@@ -383,7 +383,7 @@ shape of the failure.
 
 ## 10. Compliance with documented invariants
 
-The invariants from `SECURITY.md` and `CLAUDE.md` are enforced by this
+The invariants from `SECURITY.md` and `docs/security/threat-model.md` are enforced by this
 spec as follows:
 
 | Invariant | Spec section |

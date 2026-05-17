@@ -41,8 +41,8 @@ Files in these paths require **codeowner review** before merge:
 - `core/src/transport/session.rs`
 - `core/src/security/`
 
-The three documented security invariants in [`SECURITY.md`](SECURITY.md) and
-[`CLAUDE.md`](CLAUDE.md) must be preserved.
+The documented security invariants in [`SECURITY.md`](SECURITY.md) and
+[`docs/security/threat-model.md`](docs/security/threat-model.md) must be preserved.
 
 ## Adding a dependency
 

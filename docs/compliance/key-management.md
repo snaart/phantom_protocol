@@ -109,7 +109,7 @@ dedicated key plus a 4-byte nonce prefix and an 8-byte invocation counter.
 **Stored in:** `FakeTlsLeg` value.
 
 **Used for:** the **outer** FakeTLS-record AEAD (anti-DPI obfuscation
-only — see security note in `CLAUDE.md` invariant 3).
+only — see security note in `SECURITY.md` invariant 3).
 
 **Lifetime:** lifetime of the FakeTLS leg.
 

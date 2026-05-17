@@ -65,7 +65,8 @@ The implementation enforces (and integration tests verify) the following invaria
    increments a per-direction `u64` counter on each record (preventing the
    Forbidden Attack on AES-GCM).
 
-Future edits must preserve these. See `CLAUDE.md` for code-level enforcement notes.
+Future edits must preserve these. See [`docs/security/threat-model.md`](docs/security/threat-model.md)
+for the full STRIDE / LINDDUN analysis and per-mitigation file:line traceability.
 
 ## Disclosure timeline (template)
 

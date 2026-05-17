@@ -1,6 +1,6 @@
 //! Formal negative-security tests for the documented invariants.
 //!
-//! Each test pins a specific property from `SECURITY.md` / `CLAUDE.md` so that
+//! Each test pins a specific property from `SECURITY.md` / `docs/security/threat-model.md` so that
 //! a future regression which silently weakens one of them surfaces as a hard
 //! red here. These run on every `cargo test --lib`-equivalent path — they are
 //! NOT `#[ignore]`-gated — because they do not need real network sockets.
