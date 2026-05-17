@@ -22,7 +22,7 @@ critical-path benches deserve a comment in the PR.
 - **Background noise:** quiesce the system (close browsers, disable
   background indexing) before capturing.
 
-## Reference hardware (snapshot of 2026-05-17)
+## Reference hardware (snapshot of 2026-05-17, post bench-harness V2 fix)
 
 ```
 Apple M1 Pro (8 perf + 2 efficiency cores), 16 GiB RAM
@@ -71,22 +71,22 @@ target on the recv/send hot paths.
 
 ## Transport bench (criterion `transport_bench`)
 
-`cargo bench --manifest-path core/Cargo.toml --bench transport_bench -- 'pqc|handshake|encryption'`
+`cargo bench --manifest-path core/Cargo.toml --bench transport_bench`
 
 Exercises: PQ keygen, PQ encap/decap/sign/verify, full client+server
-handshake, and `encrypt_packet` / `decrypt_packet` round-trip across the
-canonical payload sizes.
+handshake, `encrypt_packet_v2` / `decrypt_packet_v2` round-trip across
+the canonical payload sizes, and a 1 MiB encrypt+decrypt round-trip.
 
 ### PQ primitives (per-operation, single-thread)
 
 | Operation                                  | Time     | Ops/sec/core |
 | ------------------------------------------ | -------- | ------------ |
-| `hybrid_kem_keygen` (X25519 + ML-KEM-768)  |  47.4 µs |      ~21,100 |
-| `hybrid_sign_keygen` (Ed25519 + ML-DSA-65) | 182.4 µs |       ~5,500 |
-| `kem_encapsulate`                          |  81.4 µs |      ~12,300 |
-| `kem_decapsulate`                          |  73.5 µs |      ~13,600 |
-| `hybrid_sign`                              | 313.0 µs |       ~3,200 |
-| `hybrid_verify`                            | 133.9 µs |       ~7,500 |
+| `hybrid_kem_keygen` (X25519 + ML-KEM-768)  |  47.0 µs |      ~21,300 |
+| `hybrid_sign_keygen` (Ed25519 + ML-DSA-65) | 181.3 µs |       ~5,500 |
+| `kem_encapsulate`                          |  80.7 µs |      ~12,400 |
+| `kem_decapsulate`                          |  72.3 µs |      ~13,800 |
+| `hybrid_sign`                              | 310.0 µs |       ~3,200 |
+| `hybrid_verify`                            | 131.6 µs |       ~7,600 |
 
 ML-KEM-768 dominates `hybrid_kem_keygen`; ML-DSA-65 dominates the
 `hybrid_sign_keygen` / `hybrid_sign` paths.
@@ -95,42 +95,65 @@ ML-KEM-768 dominates `hybrid_kem_keygen`; ML-DSA-65 dominates the
 
 | Scenario                       | Time    | Connections/sec/core |
 | ------------------------------ | ------- | -------------------- |
-| `phantom_pqc_handshake`        | 1.19 ms |                 ~840 |
-| `phantom_pqc_handshake_pinned` | 0.99 ms |          **~1,010**  |
+| `phantom_pqc_handshake`        | 1.22 ms |                 ~820 |
+| `phantom_pqc_handshake_pinned` | 1.06 ms |            **~945**  |
 
 `phantom_pqc_handshake_pinned` is the production path (Security Invariant
-1 — pinning mandatory). On 8 perf cores: **~8,100 cold handshakes/sec
+1 — pinning mandatory). On 8 perf cores: **~7,500 cold handshakes/sec
 aggregate**. 0-RTT resumption bypasses the handshake entirely (ticket
 lookup is microseconds — order ~10⁵ resumptions/sec/core).
 
-### Application-data encrypt/decrypt (`encrypt_packet` / `decrypt_packet`)
+### Application-data encrypt/decrypt (`encrypt_packet_v2` / `decrypt_packet_v2`)
 
-This is the full crate path including header AAD binding, replay counter
-bump, and packet flag setting — NOT the raw `ring` AEAD measured above.
+This is the full crate path including header-derived AEAD nonce, header-AAD
+binding, and per-stream sliding-window replay check on the decrypt side —
+NOT the raw `ring` AEAD measured above. Switched from V1 to V2 in the
+bench harness to dodge the V1 internal-counter-desync issue that
+previously broke the back-to-back bench iter pattern (see "Bench
+history" below).
 
 | Payload | Encrypt time | Encrypt thrpt   | Decrypt time | Decrypt thrpt |
 | ------- | ------------ | --------------- | ------------ | ------------- |
-| 64 B    |       116 ns |       523 MiB/s |       152 ns |     400 MiB/s |
-| 256 B   |       165 ns |      1.44 GiB/s |       203 ns |    1.18 GiB/s |
-| 1 KiB   |       304 ns |      3.13 GiB/s |       362 ns |    2.63 GiB/s |
-| 4 KiB   |       887 ns |      4.30 GiB/s |       948 ns |    4.03 GiB/s |
-| 16 KiB  |      3.18 µs |  **4.79 GiB/s** |      3.31 µs |    4.61 GiB/s |
-| 64 KiB  |      13.3 µs |      4.60 GiB/s |      13.9 µs |    4.40 GiB/s |
+| 64 B    |       108 ns |       567 MiB/s |       149 ns |     409 MiB/s |
+| 256 B   |       158 ns |      1.51 GiB/s |       261 ns |     934 MiB/s |
+| 1 KiB   |       331 ns |      2.88 GiB/s |       411 ns |    2.32 GiB/s |
+| 4 KiB   |       945 ns |      4.04 GiB/s |       990 ns |    3.85 GiB/s |
+| 16 KiB  |      3.37 µs |      4.53 GiB/s |      3.26 µs |    4.68 GiB/s |
+| 64 KiB  |      13.1 µs |  **4.67 GiB/s** |      14.6 µs |    4.18 GiB/s |
 
-Peak `encrypt_packet` throughput is **~4.8 GiB/s per core at 16 KiB**,
+Peak `encrypt_packet_v2` throughput is **~4.7 GiB/s per core at 64 KiB**,
 slightly below the raw `ring` ceiling (`~5.5 GiB/s`) because of the
-header-AAD + replay-window bookkeeping. On 8 perf cores: **~38 GiB/s
-aggregate AEAD ceiling** (~300 Gbps). In production this is essentially
-never the bottleneck — NIC bandwidth caps the system long before crypto
-does on any standard host.
+header-AAD + sequence-derived-nonce work. Decrypt peaks at ~4.7 GiB/s at
+16 KiB. On 8 perf cores: **~37 GiB/s aggregate AEAD ceiling** (~300 Gbps).
+In production this is essentially never the bottleneck — NIC bandwidth
+caps the system long before crypto does on any standard host.
 
-**Known bench bug:** the `transport_bench` `throughput/` group (1 MB
-round-trip via the full `Session` recv loop) panics with
-`ReplayDetected` because it re-sends back-to-back packets with the same
-sequence number — a bench-harness artifact, not a production bug.
-Filter it out: `cargo bench … -- 'pqc|handshake|encryption'`. Fix is
-tracked but low priority since `encryption/encrypt/65536` already covers
-the same primitive at a more realistic batch size.
+### 1 MiB round-trip (`encrypt + decrypt` measured together)
+
+| Bench               | Time     | Throughput   |
+| ------------------- | -------- | ------------ |
+| `1MB_roundtrip` (V2)| 391.5 µs | **5.0 GiB/s** |
+
+Throughput here doubles the payload bytes (encrypt + decrypt) so a higher
+number is normal — the work per direction is identical to the 64 KiB row
+above, scaled by ~16× and amortising fixed overhead.
+
+### Bench history
+
+The encrypt/decrypt rows above use **V2 wire format
+(`encrypt_packet_v2` / `decrypt_packet_v2`)**. Earlier snapshots used V1,
+which derives the AEAD nonce from an internal `send_counter` /
+`recv_counter` per `Session`. Re-using a fixed `PacketHeader` across
+iterations made the V1 throughput bench desync the counter on the
+sender vs the receiver and panic with `ReplayDetected` (1 MiB
+round-trip) or with `CryptoError("Decryption / authentication failed")`
+(decrypt-only on protocol_comparison). The decrypt-only row in
+transport_bench did not panic only because it omitted `.unwrap()`, so it
+silently measured the AEAD-verify failure path. V2 derives the nonce
+from the authenticated header fields, so a fresh `PacketHeaderV2` with
+an incremented sequence per iteration round-trips cleanly. See
+`core/benches/transport_bench.rs` and
+`core/benches/protocol_comparison.rs`.
 
 ## SYN-flood / cookie-PoW bench (criterion `syn_flood_bench`)
 
@@ -179,24 +202,28 @@ floor on the pool itself.
 
 ## Protocol comparison (criterion `protocol_comparison`)
 
-`cargo bench --manifest-path core/Cargo.toml --bench protocol_comparison -- --quick handshake_comparison`
+`cargo bench --manifest-path core/Cargo.toml --bench protocol_comparison`
 
 Cross-validation against `transport_bench` — separate compilation unit,
-independent timing.
+independent timing. All groups use V2 wire format
+(`encrypt_packet_v2` / `decrypt_packet_v2`) with a per-iter
+header.sequence bump to avoid the V1 desync issue.
 
-| Bench                                        | Time                | Notes                              |
-| -------------------------------------------- | ------------------- | ---------------------------------- |
-| `handshake_comparison/phantom_pqc_full`      | 1.23 ms             | matches `transport_bench` ±3%      |
-| `throughput_comparison/phantom_encrypt/1024` | 306 ns / 3.12 GiB/s | matches `transport_bench` ±0.5%    |
+| Bench                                          | Time                  | Notes                          |
+| ---------------------------------------------- | --------------------- | ------------------------------ |
+| `handshake_comparison/phantom_pqc_full`        | 1.18 ms               | matches `transport_bench` ±10% |
+| `throughput_comparison/phantom_encrypt/1024`   | 336 ns / 2.83 GiB/s   | matches `transport_bench` ±2%  |
+| `throughput_comparison/phantom_decrypt/1024`   | 385 ns / 2.48 GiB/s   |                                |
+| `throughput_comparison/phantom_roundtrip/1024` | 661 ns / 1.44 GiB/s   | encrypt + decrypt              |
+| `throughput_comparison/phantom_encrypt/65536`  | 13.4 µs / 4.55 GiB/s  |                                |
+| `throughput_comparison/phantom_decrypt/65536`  | 17.1 µs / 3.57 GiB/s  |                                |
+| `throughput_comparison/phantom_roundtrip/65536`| 26.0 µs / 2.34 GiB/s  | encrypt + decrypt              |
+| `encryption_sizes/chacha20poly1305/65536`      | 26.0 µs / 4.69 GiB/s  | wire-path encrypt + decrypt    |
+| `encryption_sizes/chacha20poly1305/1048576`    | 393.6 µs / 4.96 GiB/s | 1 MiB encrypt + decrypt        |
 
-**Known bench bug:** the `throughput_comparison/phantom_decrypt/*`
-group panics with `CryptoError("Decryption / authentication failed")` —
-same root cause as the `transport_bench` throughput bug (back-to-back
-operations violate the per-direction nonce / AAD contract). Filter:
-`-- 'handshake_comparison|throughput_comparison/phantom_encrypt'`.
-
-The bench file also has scaffolding for raw-TCP echo and
-RSA-vs-PQC handshake comparisons, but those rows are commented-out
+(`encryption_sizes` throughput counts encrypt + decrypt bytes; divide by 2
+for per-direction.) The bench file also has scaffolding for raw-TCP echo
+and RSA-vs-PQC handshake comparisons, but those rows are commented-out
 TODOs; the actively-measured rows are listed above.
 
 ## Capacity scenarios (derived from the per-core numbers)
@@ -227,11 +254,11 @@ When refreshing this file:
 
 ```sh
 git switch -c perf/snapshot-$(date +%Y-%m-%d)
-RUSTFLAGS="-C target-cpu=native" cargo run     --manifest-path core/Cargo.toml --release --example crypto_bench                                  2>&1 | tee /tmp/crypto.log
-RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml --bench transport_bench       -- --quick 'pqc|handshake|encryption' 2>&1 | tee /tmp/transport.log
-RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml --bench buffer_pool_bench     -- --quick                            2>&1 | tee /tmp/buffer.log
-RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml --bench syn_flood_bench       -- --quick                            2>&1 | tee /tmp/synflood.log
-RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml --bench protocol_comparison   -- --quick 'handshake_comparison|throughput_comparison/phantom_encrypt' 2>&1 | tee /tmp/proto.log
+RUSTFLAGS="-C target-cpu=native" cargo run     --manifest-path core/Cargo.toml --release --example crypto_bench                  2>&1 | tee /tmp/crypto.log
+RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml --bench transport_bench       -- --quick          2>&1 | tee /tmp/transport.log
+RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml --bench buffer_pool_bench     -- --quick          2>&1 | tee /tmp/buffer.log
+RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml --bench syn_flood_bench       -- --quick          2>&1 | tee /tmp/synflood.log
+RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml --bench protocol_comparison   -- --quick          2>&1 | tee /tmp/proto.log
 ```
 
 Distill point-estimates from each log into the tables above. Commit the
