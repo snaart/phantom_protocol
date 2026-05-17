@@ -251,7 +251,7 @@ TCP byte stream:
 ```
 
 Maximum frame size: `MAX_FRAME_BYTES = 16 MiB`
-(`core/src/api/tcp_transport.rs:15`). Frames larger than the cap are
+(`core/src/api/tcp_transport.rs:21`). Frames larger than the cap are
 rejected at the framing layer before alkahest sees them.
 
 KCP-based legs reuse KCP's own segmentation; FakeTLS wraps frames in

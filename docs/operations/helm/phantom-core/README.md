@@ -67,7 +67,7 @@ you have a backup of the key material.
 | `image.repository` | `phantom-server` | Override with your registry path |
 | `image.tag` | Chart appVersion (`0.2.0`) | Pin to a digest in production |
 | `replicaCount` | `3` | Overridden by HPA when enabled |
-| `service.port` | `8443` | TCP port the server binary binds |
+| `service.port` | `4242` | TCP port the server binary binds (matches the canonical port used in `kubernetes.md` + the `phantom-server` binary default) |
 | `service.metricsPort` | `9090` | Prometheus metrics port |
 | `signingKey.existingSecret` | `""` | **MUST set in production** |
 | `pdb.enabled` | `true` | Keeps at least one pod Ready at all times |
