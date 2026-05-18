@@ -5,8 +5,7 @@
 Please report security vulnerabilities **privately** before disclosing them
 publicly. Do not file public GitHub issues for security problems.
 
-- **Email:** security@phantom-core.invalid (replace with real contact before
-  publishing the crate)
+- **Email:** ceo@snaart.com
 - **Embargo SLA:** 90 days from initial report to public disclosure.
 - For ongoing reports, expect an acknowledgement within 5 business days and
   a triage outcome within 14 business days.
