@@ -408,12 +408,11 @@ The `cli-compat` CI job requires that `core` API edits keep
 
 ## Acknowledgements
 
-Substantial portions of the codebase and documentation were authored with
-extensive assistance from Anthropic's **Claude Opus 4.6** running in
-**Max Effort** mode via [Claude Code](https://claude.com/claude-code). All
-output is reviewed, tested, and maintained by the human author; the security
-invariants, threat model, and FIPS / CC compliance artifacts in particular
-went through repeated human audit passes.
+Developed with AI assistance from Anthropic's **Claude Opus 4.6** via
+[Claude Code](https://claude.com/claude-code). All architectural decisions,
+security invariants, threat model, and FIPS / CC compliance artifacts are
+authored, reviewed, tested, and maintained by the human author.
+
 
 ## License
 
