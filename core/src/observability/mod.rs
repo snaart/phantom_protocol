@@ -23,8 +23,9 @@ pub(crate) mod instruments;
 pub mod snapshot;
 
 pub use attrs::{
-    AeadAlgorithm, CookieOutcome, Direction, EarlyDataOutcome, FallbackReason, HandshakeOutcome,
-    PathValidationOutcome, PowOutcome, ProtocolVersion, ReplayReason, ResumptionMode,
+    leg_str, AeadAlgorithm, CookieOutcome, Direction, EarlyDataOutcome, FallbackReason,
+    HandshakeOutcome, PathValidationOutcome, PowOutcome, ProtocolVersion, ReplayReason,
+    ResumptionMode,
 };
 pub use config::{HistogramConfig, ObservabilityConfig, ObservabilityConfigBuilder};
 pub use snapshot::MetricsSnapshot;
@@ -153,23 +154,48 @@ impl Observability {
 
     // --- Labeled OTel event recorders (step 7) ---
 
-    /// Record a handshake outcome with full OTel attribution.
+    /// Record a handshake outcome and its latency with full OTel
+    /// attribution. Atomic counters, OTel `Counter` (count by outcome),
+    /// and OTel `Histogram` (duration distribution) are updated together.
     ///
-    /// Atomic counters and OTel `Counter` are updated together. Latency
-    /// goes into a separate `Histogram` instrument that lands in step 9.
+    /// Exemplars: when this call happens inside a `tracing` span (e.g.
+    /// `HandshakeServer::process_client_hello`), the SDK attaches the
+    /// active span's `trace_id` / `span_id` to the histogram observation,
+    /// enabling Grafana / Tempo drill-down from a latency outlier to the
+    /// specific trace.
     pub fn record_handshake(
         &self,
+        duration: std::time::Duration,
         outcome: HandshakeOutcome,
         leg: LegType,
         cipher: AeadAlgorithm,
         version: ProtocolVersion,
     ) {
+        let duration_ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         match outcome {
-            HandshakeOutcome::Success => self.atomics.record_handshake_success(0),
+            HandshakeOutcome::Success => self.atomics.record_handshake_success(duration_ns),
             HandshakeOutcome::Failure => self.atomics.record_handshake_failure(),
         }
         self.instruments
             .record_handshake(outcome, leg, cipher, version);
+        self.instruments.record_handshake_duration(
+            duration.as_secs_f64(),
+            outcome,
+            leg,
+            cipher,
+            version,
+        );
+    }
+
+    /// Record a `PATH_VALIDATION` exchange latency.
+    pub fn record_path_validation(
+        &self,
+        duration: std::time::Duration,
+        path_id: u8,
+        outcome: PathValidationOutcome,
+    ) {
+        self.instruments
+            .record_path_validation_duration(duration.as_secs_f64(), path_id, outcome);
     }
 
     pub fn record_resumption(&self, mode: ResumptionMode, accepted: bool) {

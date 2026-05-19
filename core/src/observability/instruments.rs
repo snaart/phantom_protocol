@@ -46,6 +46,8 @@ mod otel_off {
         }
 
         #[inline(always)] pub(crate) fn record_handshake(&self, _outcome: HandshakeOutcome, _leg: crate::transport::types::LegType, _cipher: AeadAlgorithm, _version: ProtocolVersion) {}
+        #[inline(always)] pub(crate) fn record_handshake_duration(&self, _duration_s: f64, _outcome: HandshakeOutcome, _leg: crate::transport::types::LegType, _cipher: AeadAlgorithm, _version: ProtocolVersion) {}
+        #[inline(always)] pub(crate) fn record_path_validation_duration(&self, _duration_s: f64, _path_id: u8, _outcome: PathValidationOutcome) {}
         #[inline(always)] pub(crate) fn record_resumption(&self, _mode: ResumptionMode, _accepted: bool) {}
         #[inline(always)] pub(crate) fn record_replay_rejected(&self, _reason: ReplayReason) {}
         #[inline(always)] pub(crate) fn record_aead_failure(&self, _leg: crate::transport::types::LegType, _algorithm: AeadAlgorithm) {}
@@ -71,7 +73,7 @@ mod otel_off {
 mod otel_on {
     use super::*;
     use crate::observability::config::ObservabilityConfig;
-    use opentelemetry::metrics::{Counter, UpDownCounter};
+    use opentelemetry::metrics::{Counter, Histogram, UpDownCounter};
     use opentelemetry::KeyValue;
 
     /// OpenTelemetry instrument holder (counters + gauges).
@@ -106,6 +108,14 @@ mod otel_on {
         // Gauges.
         active_sessions: UpDownCounter<i64>,
         active_streams: UpDownCounter<i64>,
+
+        // Histograms (seconds). The SDK is told via View in
+        // `server/src/telemetry.rs` to aggregate these into base-2
+        // exponential buckets (sparse, auto-scaling). The default
+        // aggregation falls back to explicit buckets if the SDK can't
+        // honor the view request.
+        handshake_duration: Histogram<f64>,
+        path_validation_duration: Histogram<f64>,
     }
 
     impl PhantomInstruments {
@@ -169,6 +179,20 @@ mod otel_on {
                 .with_description("Currently active streams across all sessions")
                 .build();
 
+            // Histograms. Unit is seconds; aggregation strategy
+            // (exponential vs explicit buckets) is controlled by the
+            // embedder via SDK Views.
+            let handshake_duration = meter
+                .f64_histogram(format!("{ns}.handshake.duration"))
+                .with_description("Handshake latency end-to-end")
+                .with_unit("s")
+                .build();
+            let path_validation_duration = meter
+                .f64_histogram(format!("{ns}.path.validation.duration"))
+                .with_description("PATH_VALIDATION challenge / response latency")
+                .with_unit("s")
+                .build();
+
             Self {
                 handshake,
                 resumptions,
@@ -183,6 +207,8 @@ mod otel_on {
                 pow,
                 active_sessions,
                 active_streams,
+                handshake_duration,
+                path_validation_duration,
             }
         }
 
@@ -310,6 +336,46 @@ mod otel_on {
 
         pub(crate) fn stream_closed(&self) {
             self.active_streams.add(-1, &[]);
+        }
+
+        /// Record handshake completion latency.
+        ///
+        /// Inside an active `tracing` span the OTel SDK attaches the
+        /// current span's `trace_id`/`span_id` as exemplars to the
+        /// observation, so a Grafana drill-down from a P99 latency
+        /// point lands on the actual trace.
+        pub(crate) fn record_handshake_duration(
+            &self,
+            duration_s: f64,
+            outcome: HandshakeOutcome,
+            leg: crate::transport::types::LegType,
+            cipher: AeadAlgorithm,
+            version: ProtocolVersion,
+        ) {
+            self.handshake_duration.record(
+                duration_s,
+                &[
+                    KeyValue::new("outcome", outcome.as_str()),
+                    KeyValue::new("leg", leg_str(leg)),
+                    KeyValue::new("cipher_suite", cipher.as_str()),
+                    KeyValue::new("version", version.as_str()),
+                ],
+            );
+        }
+
+        pub(crate) fn record_path_validation_duration(
+            &self,
+            duration_s: f64,
+            path_id: u8,
+            outcome: PathValidationOutcome,
+        ) {
+            self.path_validation_duration.record(
+                duration_s,
+                &[
+                    KeyValue::new("path_id", path_id as i64),
+                    KeyValue::new("outcome", outcome.as_str()),
+                ],
+            );
         }
     }
 }
