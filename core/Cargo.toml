@@ -29,6 +29,7 @@ std = [
     "dep:uniffi",
     "dep:argon2",
     "dep:crossbeam-queue",
+    "dep:crossbeam-utils",
     "dep:lz4_flex",
     "dep:alkahest",
     "dep:base64",
@@ -155,6 +156,7 @@ uniffi = { version = "0.29", optional = true, features = ["tokio", "cli"] }
 zeroize = { version = "1.8.2", optional = true, features = ["derive"] }
 argon2 = { version = "0.5.3", optional = true }
 crossbeam-queue = { version = "0.3.12", optional = true }
+crossbeam-utils = { version = "0.8", optional = true }  # CachePadded for observability hot-path atomics
 hmac = { version = "0.12.1", optional = true }
 dashmap = { version = "6.1.0", optional = true }
 
