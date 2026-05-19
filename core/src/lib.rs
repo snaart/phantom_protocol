@@ -60,6 +60,8 @@ mod errors;
 #[cfg(feature = "std")]
 pub mod config;
 #[cfg(feature = "std")]
+pub mod observability;
+#[cfg(feature = "std")]
 pub mod security;
 #[cfg(feature = "std")]
 pub mod validation;
