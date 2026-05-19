@@ -592,8 +592,8 @@ Tick `[x]` and add the short SHA when landed.
 | 1 | Doc plan committed | `docs(observability): OTel refactor working plan` | [x] | `5db2fbc` |
 | 2 | Module scaffold + feature gate | `observability: scaffold module + ObservabilityConfig (no OTel deps yet)` | [x] | `e59a1f1` |
 | 3 | HotPathAtomics + per-leg arrays + CachePadded | `observability: lock-free HotPathAtomics with per-leg padding` | [x] | `02af467` |
-| 4 | Migrate recording sites from old TransportMetrics | `observability: migrate handshake/listener recording sites` | [x] | _next_ |
-| 5 | Delete `transport/metrics.rs`, update CLAUDE.md/PROGRESS.md cross-refs | `observability: remove legacy transport/metrics.rs` | [ ] | — |
+| 4 | Migrate recording sites from old TransportMetrics | `observability: migrate handshake/listener recording sites` | [x] | `f266415` |
+| 5 | Delete `transport/metrics.rs`, update CLAUDE.md/PROGRESS.md cross-refs | `observability: remove legacy transport/metrics.rs` | [x] | _next_ |
 | 6 | Add `telemetry-otel` feature + opentelemetry/_sdk deps + ZST shim | `observability: feature-gate OTel deps + ZST no-op PhantomInstruments` | [ ] | — |
 | 7 | PhantomInstruments + pre-interned attribute sets | `observability: PhantomInstruments + pre-interned attribute sets` | [ ] | — |
 | 8 | Observable callbacks (with_callback) for hot atomics | `observability: bind ObservableCounter callbacks to HotPathAtomics` | [ ] | — |
