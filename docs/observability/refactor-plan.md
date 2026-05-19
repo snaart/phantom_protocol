@@ -608,7 +608,7 @@ Each row is one atomic commit. Each commit compiled and passed `cargo test
 | 17 | examples/observability-demo crate with docker-compose stack | `examples: observability-demo (docker-compose: server + collector + grafana)` | [x] | `27721da` |
 | 18 | CHANGELOG + README Observability section | `docs: CHANGELOG + README Observability section for OTel pipeline` | [x] | `5822e6f` |
 | 19 | CI: add `cargo clippy --features telemetry-otel` job | `ci: clippy job for telemetry-otel feature` | [x] | `5675ecc` |
-| 20 | Final sweep: mark this document shipped | `docs(observability): Phase 8 — OTel observability shipped` | [x] | _next_ |
+| 20 | Final sweep: mark this document shipped | `docs(observability): Phase 8 — OTel observability shipped` | [x] | `9d07053` |
 
 ---
 
