@@ -601,8 +601,8 @@ Tick `[x]` and add the short SHA when landed.
 | 10 | tracing-opentelemetry span integration | `observability: tracing-opentelemetry bridge + handshake/accept spans` | [x] | `bcaf13b` |
 | 11 | Server: telemetry init (OTLP gRPC + zstd + Delta) | `server: OTLP telemetry init (gRPC + zstd + Delta temporality)` | [x] | `a324e5f` |
 | 12 | Server: drop metrics_http.rs + hyper deps | `server: drop hand-rolled metrics_http.rs + hyper deps` | [x] | `527addf` |
-| 13 | Tests: observability suite (atomics, no-op, otel-integration, cardinality, exemplars) | `tests(observability): atomics, cardinality, exemplars, no-op fallback` | [x] | _next_ |
-| 14 | Bench: hot-path overhead microbench | `bench(observability): hot-path record_send overhead microbench` | [ ] | — |
+| 13 | Tests: observability suite (atomics, no-op, otel-integration, cardinality, exemplars) | `tests(observability): atomics, cardinality, exemplars, no-op fallback` | [x] | `623a572` |
+| 14 | Bench: hot-path overhead microbench | `bench(observability): hot-path record_send overhead microbench` | [x] | _next_ |
 | 15 | Docs: README + metrics-catalog + otlp-setup + tracing-guide | `docs(observability): metrics catalog + OTLP setup + tracing guide` | [ ] | — |
 | 16 | Docs: rewrite Grafana dashboards + Prometheus alerts under new naming | `docs(observability): rewrite Grafana dashboards + Prometheus alerts` | [ ] | — |
 | 17 | examples/observability-demo crate with docker-compose stack | `examples: observability-demo (docker-compose: server + collector + grafana)` | [ ] | — |
