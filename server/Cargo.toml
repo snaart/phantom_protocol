@@ -12,14 +12,26 @@ name = "phantom-server"
 path = "src/main.rs"
 
 [dependencies]
-phantom_core = { path = "../core" }
+phantom_core = { path = "../core", features = ["telemetry-otel"] }
 tokio = { version = "1.36", features = ["full"] }   # binary owns its runtime
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Transitional — metrics_http.rs gets deleted in step 12.
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
 hex = "0.4"
 futures = "0.3"
+
+# --- OpenTelemetry (Phase 8) ---
+# The library exports OTel instruments; the server owns the SDK lifecycle —
+# installs `MeterProvider` / `TracerProvider` and the OTLP exporter before
+# any handshake records anything.
+opentelemetry = { version = "0.28", features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.28", features = ["metrics", "trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", default-features = false, features = [
+    "grpc-tonic", "metrics", "trace",
+] }
+tracing-opentelemetry = "0.29"

@@ -17,6 +17,7 @@ mod config;
 mod handler;
 mod metrics_http;
 mod signing_key;
+mod telemetry;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -26,6 +27,7 @@ use tokio::task::JoinSet;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::config::Config;
+use crate::telemetry::{TelemetryCfg, TelemetryHandle};
 
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(10);
@@ -33,12 +35,24 @@ const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(10);
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = Config::parse();
-    init_tracing(&cfg);
+
+    // OTel must be installed BEFORE the tracing subscriber so the
+    // `tracing-opentelemetry` layer has a tracer to bridge into. The
+    // subscriber then composes the OTel layer alongside the fmt layer.
+    let telemetry = TelemetryHandle::init(&TelemetryCfg {
+        service_name: cfg.otel_service_name.clone(),
+        otlp_endpoint: cfg.otlp_endpoint.clone(),
+        export_interval: Duration::from_millis(cfg.otel_metric_export_interval_ms),
+        trace_sample_ratio: cfg.otel_trace_sample_ratio,
+    })
+    .context("telemetry init")?;
+    init_tracing(&cfg, &telemetry);
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         bind = %cfg.bind,
         metrics_bind = ?cfg.metrics_bind,
+        otlp_endpoint = %cfg.otlp_endpoint,
         signing_key_file = %cfg.signing_key_file.display(),
         "phantom-server starting"
     );
@@ -163,21 +177,30 @@ async fn main() -> Result<()> {
         handlers.shutdown().await;
     }
 
+    // Flush telemetry before exit so the last handshake counter / span
+    // makes it out.
+    telemetry.shutdown();
     tracing::info!("phantom-server shut down cleanly");
     Ok(())
 }
 
-fn init_tracing(cfg: &Config) {
+fn init_tracing(cfg: &Config, telemetry: &TelemetryHandle) {
     let filter = EnvFilter::try_new(&cfg.log_filter)
         .unwrap_or_else(|_| EnvFilter::new("info,phantom_core=debug"));
+    // OTel layer goes BEFORE fmt — fmt::layer doesn't forward `LookupSpan`
+    // through, so OpenTelemetryLayer would not find the registry if
+    // composed after it.
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(telemetry.tracer());
     if cfg.log_json {
         tracing_subscriber::registry()
             .with(filter)
+            .with(otel_layer)
             .with(fmt::layer().json())
             .init();
     } else {
         tracing_subscriber::registry()
             .with(filter)
+            .with(otel_layer)
             .with(fmt::layer().with_target(true))
             .init();
     }
