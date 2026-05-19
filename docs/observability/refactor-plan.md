@@ -597,8 +597,8 @@ Tick `[x]` and add the short SHA when landed.
 | 6 | Add `telemetry-otel` feature + opentelemetry/_sdk deps + ZST shim | `observability: feature-gate OTel deps + ZST no-op PhantomInstruments` | [x] | `085e735` |
 | 7 | PhantomInstruments + pre-interned attribute sets | `observability: PhantomInstruments + pre-interned attribute sets` | [x] | `327c641` |
 | 8 | Observable callbacks (with_callback) for hot atomics | `observability: bind ObservableCounter callbacks to HotPathAtomics` | [x] | `03c35fb` |
-| 9 | Handshake exponential Histogram + exemplars | `observability: Histogram for handshake.duration (exponential base-2)` | [x] | _next_ |
-| 10 | tracing-opentelemetry span integration | `observability: tracing-opentelemetry bridge + handshake/accept spans` | [ ] | — |
+| 9 | Handshake exponential Histogram + exemplars | `observability: Histogram for handshake.duration (exponential base-2)` | [x] | `36b06da` |
+| 10 | tracing-opentelemetry span integration | `observability: tracing-opentelemetry bridge + handshake/accept spans` | [x] | _next_ |
 | 11 | Server: telemetry init (OTLP gRPC + zstd + Delta) | `server: OTLP telemetry init (gRPC + zstd + Delta temporality)` | [ ] | — |
 | 12 | Server: drop metrics_http.rs + hyper deps | `server: drop hand-rolled metrics_http.rs + hyper deps` | [ ] | — |
 | 13 | Tests: observability suite (atomics, no-op, otel-integration, cardinality, exemplars) | `tests(observability): atomics, cardinality, exemplars, no-op fallback` | [ ] | — |
