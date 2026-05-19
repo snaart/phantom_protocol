@@ -7,7 +7,7 @@ use crate::transport::handshake::{
     ClientHelloEnvelope, HandshakeResponse, HandshakeServer, HelloRetryRequestEnvelope,
     ServerHelloEnvelope,
 };
-use crate::transport::metrics::TransportMetrics;
+use crate::observability::{Observability, ObservabilityConfig};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -32,10 +32,10 @@ pub struct PhantomListener {
     /// (Phase 3.1). Defaults to [`TokioRuntime`] via [`bind`]; callers
     /// that need a non-tokio runtime use [`bind_with_runtime`].
     runtime: Arc<dyn Runtime>,
-    /// Listener-wide metrics (Phase 4.5). Tracks accept-side counters
-    /// — handshake success/failure, latency histogram, active-session
-    /// gauge. Exposed via [`metrics_prometheus_text`].
-    metrics: Arc<TransportMetrics>,
+    /// Listener-wide observability (Phase 8 — OTel refactor). Wraps the
+    /// lock-free hot-path atomics and (when the `telemetry-otel` feature is
+    /// on) the OTel instrument holders. Exposed via [`observability`].
+    observability: Arc<Observability>,
 }
 
 // Rust-only constructors that take a non-UniFFI type (`Arc<dyn Runtime>`).
@@ -106,7 +106,7 @@ impl PhantomListener {
             shutting_down: AtomicBool::new(false),
             shutdown_notify: Arc::new(Notify::new()),
             runtime,
-            metrics: Arc::new(TransportMetrics::new()),
+            observability: Observability::new(ObservabilityConfig::default()),
         }))
     }
 
@@ -224,13 +224,13 @@ impl PhantomListener {
             match drive_server_handshake(&transport, &self.handshake_server, peer.ip()).await {
                 Ok(pair) => pair,
                 Err(e) => {
-                    self.metrics.record_handshake_failure();
+                    self.observability.record_handshake_failure();
                     return Err(e);
                 }
             };
         let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        self.metrics.record_handshake_success(elapsed_ns);
-        self.metrics.session_opened();
+        self.observability.record_handshake_success(elapsed_ns);
+        self.observability.session_opened();
         let session = PhantomSession::from_accepted_server_session_with_runtime(
             peer.to_string(),
             transport,
@@ -240,12 +240,15 @@ impl PhantomListener {
         Ok(AcceptOutcome::new(session, early_data))
     }
 
-    /// Return the listener's metrics rendered in Prometheus text
-    /// exposition format (Phase 4.5). Suitable for serving from a
-    /// `/metrics` HTTP endpoint — the SDK does not bundle an HTTP
-    /// server, downstream applications wire one up.
+    /// Return the listener's metrics in Prometheus text-exposition format.
+    ///
+    /// **Transitional** — emits a stub-quality output of the post-Phase-8
+    /// observability snapshot. Step 12 of the OTel refactor removes this
+    /// method entirely; downstream scrapers should migrate to the OTel
+    /// Collector's `prometheusexporter` consuming the OTLP push from
+    /// `server/src/telemetry.rs`.
     pub fn metrics_prometheus_text(&self) -> String {
-        self.metrics.snapshot().to_prometheus_text()
+        self.observability.snapshot().to_prometheus_text()
     }
 
     /// Signal graceful shutdown (Phase 4.6).
@@ -270,11 +273,18 @@ impl PhantomListener {
 // Rust-only accessors (not UniFFI-exported because the return type
 // is not a UniFFI primitive).
 impl PhantomListener {
-    /// Borrow the underlying metrics handle. Allows callers that need
+    /// Borrow the underlying observability handle. Allows callers that need
     /// to plumb additional recordings (e.g., per-session aggregations)
     /// to share the listener's counter set.
-    pub fn metrics(&self) -> Arc<TransportMetrics> {
-        self.metrics.clone()
+    pub fn observability(&self) -> Arc<Observability> {
+        self.observability.clone()
+    }
+
+    /// Deprecated alias for [`observability`]. Kept for one release so
+    /// downstream embedders can migrate; removed in step 12.
+    #[deprecated(note = "renamed to `observability()` (Phase 8 OTel refactor)")]
+    pub fn metrics(&self) -> Arc<Observability> {
+        self.observability.clone()
     }
 }
 
