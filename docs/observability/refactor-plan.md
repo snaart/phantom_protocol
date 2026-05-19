@@ -599,8 +599,8 @@ Tick `[x]` and add the short SHA when landed.
 | 8 | Observable callbacks (with_callback) for hot atomics | `observability: bind ObservableCounter callbacks to HotPathAtomics` | [x] | `03c35fb` |
 | 9 | Handshake exponential Histogram + exemplars | `observability: Histogram for handshake.duration (exponential base-2)` | [x] | `36b06da` |
 | 10 | tracing-opentelemetry span integration | `observability: tracing-opentelemetry bridge + handshake/accept spans` | [x] | `bcaf13b` |
-| 11 | Server: telemetry init (OTLP gRPC + zstd + Delta) | `server: OTLP telemetry init (gRPC + zstd + Delta temporality)` | [x] | _next_ |
-| 12 | Server: drop metrics_http.rs + hyper deps | `server: drop hand-rolled metrics_http.rs + hyper deps` | [ ] | — |
+| 11 | Server: telemetry init (OTLP gRPC + zstd + Delta) | `server: OTLP telemetry init (gRPC + zstd + Delta temporality)` | [x] | `a324e5f` |
+| 12 | Server: drop metrics_http.rs + hyper deps | `server: drop hand-rolled metrics_http.rs + hyper deps` | [x] | _next_ |
 | 13 | Tests: observability suite (atomics, no-op, otel-integration, cardinality, exemplars) | `tests(observability): atomics, cardinality, exemplars, no-op fallback` | [ ] | — |
 | 14 | Bench: hot-path overhead microbench | `bench(observability): hot-path record_send overhead microbench` | [ ] | — |
 | 15 | Docs: README + metrics-catalog + otlp-setup + tracing-guide | `docs(observability): metrics catalog + OTLP setup + tracing guide` | [ ] | — |
