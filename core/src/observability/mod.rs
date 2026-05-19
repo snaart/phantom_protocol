@@ -17,6 +17,7 @@
 
 pub(crate) mod atomics;
 pub mod attrs;
+pub(crate) mod bridge;
 pub mod config;
 pub(crate) mod instruments;
 pub mod snapshot;
@@ -43,8 +44,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct Observability {
     config: ObservabilityConfig,
-    atomics: HotPathAtomics,
-    #[allow(dead_code)] // step 7 populates; step 8 wires callbacks
+    atomics: Arc<HotPathAtomics>,
     instruments: PhantomInstruments,
 }
 
@@ -56,9 +56,15 @@ impl Observability {
     /// observable callbacks registered in a later step.
     pub fn new(config: ObservabilityConfig) -> Arc<Self> {
         let instruments = PhantomInstruments::new(&config);
+        let atomics = Arc::new(HotPathAtomics::new());
+        // Register OTel observable callbacks that read the atomic counters
+        // on each export tick. The atomics live behind `Arc` so the
+        // callbacks own a strong ref independent of `Observability`'s
+        // lifetime.
+        bridge::register_observables(&atomics, &config);
         Arc::new(Self {
             config,
-            atomics: HotPathAtomics::new(),
+            atomics,
             instruments,
         })
     }
