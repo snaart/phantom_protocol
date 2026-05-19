@@ -243,17 +243,6 @@ impl PhantomListener {
         Ok(AcceptOutcome::new(session, early_data))
     }
 
-    /// Return the listener's metrics in Prometheus text-exposition format.
-    ///
-    /// **Transitional** — emits a stub-quality output of the post-Phase-8
-    /// observability snapshot. Step 12 of the OTel refactor removes this
-    /// method entirely; downstream scrapers should migrate to the OTel
-    /// Collector's `prometheusexporter` consuming the OTLP push from
-    /// `server/src/telemetry.rs`.
-    pub fn metrics_prometheus_text(&self) -> String {
-        self.observability.snapshot().to_prometheus_text()
-    }
-
     /// Signal graceful shutdown (Phase 4.6).
     ///
     /// Sets the `shutting_down` flag and wakes any `accept()` call currently
@@ -280,13 +269,6 @@ impl PhantomListener {
     /// to plumb additional recordings (e.g., per-session aggregations)
     /// to share the listener's counter set.
     pub fn observability(&self) -> Arc<Observability> {
-        self.observability.clone()
-    }
-
-    /// Deprecated alias for [`observability`]. Kept for one release so
-    /// downstream embedders can migrate; removed in step 12.
-    #[deprecated(note = "renamed to `observability()` (Phase 8 OTel refactor)")]
-    pub fn metrics(&self) -> Arc<Observability> {
         self.observability.clone()
     }
 }

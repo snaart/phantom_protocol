@@ -29,14 +29,6 @@ pub struct Config {
     )]
     pub signing_key_file: PathBuf,
 
-    /// If set, bind a /metrics HTTP listener (Prometheus text exposition).
-    ///
-    /// **Deprecated** (Phase 8 OTel refactor). Step 12 removes this in
-    /// favor of OTLP push. For a Prometheus pull workflow, point an OTel
-    /// Collector with a `prometheusexporter` at the server's OTLP endpoint.
-    #[arg(long, env = "PHANTOM_METRICS_BIND")]
-    pub metrics_bind: Option<SocketAddr>,
-
     /// OTLP/gRPC endpoint for OpenTelemetry metrics + traces export.
     ///
     /// Default targets a local OTel Collector. Override for Datadog /
