@@ -17,6 +17,7 @@
 
 pub(crate) mod atomics;
 pub mod config;
+pub(crate) mod instruments;
 pub mod snapshot;
 
 pub use config::{HistogramConfig, ObservabilityConfig, ObservabilityConfigBuilder};
@@ -24,6 +25,7 @@ pub use snapshot::MetricsSnapshot;
 
 use crate::transport::types::LegType;
 use atomics::HotPathAtomics;
+use instruments::PhantomInstruments;
 use std::sync::Arc;
 
 /// Public observability facade.
@@ -33,10 +35,12 @@ use std::sync::Arc;
 /// Recording sites in `transport`, `api`, and `crypto` call methods on this
 /// struct via an `Arc<Observability>` borrowed from `PhantomListener` /
 /// `PhantomSession`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Observability {
     config: ObservabilityConfig,
     atomics: HotPathAtomics,
+    #[allow(dead_code)] // step 7 populates; step 8 wires callbacks
+    instruments: PhantomInstruments,
 }
 
 impl Observability {
@@ -46,9 +50,11 @@ impl Observability {
     /// (in `Session`, `Listener`, handshake code paths) and the OTel
     /// observable callbacks registered in a later step.
     pub fn new(config: ObservabilityConfig) -> Arc<Self> {
+        let instruments = PhantomInstruments::new(&config);
         Arc::new(Self {
             config,
             atomics: HotPathAtomics::new(),
+            instruments,
         })
     }
 
@@ -136,7 +142,7 @@ mod tests {
 
     #[test]
     fn default_observability_has_default_config() {
-        let obs = Observability::default();
+        let obs = Observability::new(ObservabilityConfig::default());
         assert_eq!(obs.config().namespace.as_ref(), "phantom");
     }
 
@@ -152,7 +158,7 @@ mod tests {
 
     #[test]
     fn record_send_round_trips_through_snapshot() {
-        let obs = Observability::default();
+        let obs = Observability::new(ObservabilityConfig::default());
         obs.record_send(1024, LegType::Tcp);
         obs.record_send(2048, LegType::Tcp);
         obs.record_recv(512, LegType::Kcp);
