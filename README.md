@@ -33,9 +33,11 @@ Kotlin, C); native WASM target; bare-metal `EmbeddedLeg` for no_std.
   master) + adaptive blake3 proof-of-work (load-tiered difficulty 0–16).
 - **Per-stream replay protection** — RFC 4303 §3.4.3 sliding-window bitmap,
   default 1024 bits, checked _after_ AEAD verify.
-- **Observability** — Prometheus text exposition via
-  `PhantomListener::metrics_prometheus_text()`; Grafana dashboard +
-  Prometheus alert templates ship in `docs/operations/`.
+- **Observability** — OpenTelemetry metrics + traces (opt-in
+  `telemetry-otel` feature). Lock-free hot-path atomics (≤ 2.5 ns / call),
+  OTLP/gRPC push to any backend (Datadog, Honeycomb, Grafana Cloud,
+  self-hosted via OTel Collector). Pre-built Grafana dashboard + Prometheus
+  alert rules in `docs/observability/`.
 - **SLSA-3 build provenance** — OIDC attestation on every release artifact.
 - **Cross-platform** — 11 hard CI gates (Linux x4, macOS x2, iOS x2, Windows x2,
   wasm32-unknown-unknown, thumbv7em-none-eabihf). Only `wasm32-wasi` is
@@ -192,19 +194,23 @@ production tuning (`bbr`, `fq`, `LimitNOFILE`, allocator swap, CPU pinning) in
 ### `phantom-server` (reference binary)
 
 Production embedder. Auto-loads-or-creates a persistent `HybridSigningKey`,
-exposes `/metrics`, handles SIGTERM / SIGINT with a 10s drain.
+pushes OTLP telemetry to an OTel Collector / SaaS backend, handles SIGTERM
+/ SIGINT with a 10s drain.
 
 | Flag | Env | Default |
 | --- | --- | --- |
 | `--bind` | `PHANTOM_BIND` | `0.0.0.0:4242` |
-| `--metrics-bind` | `PHANTOM_METRICS_BIND` | unset (disabled) |
+| `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` |
+| `--otel-service-name` | `OTEL_SERVICE_NAME` | `phantom-server` |
+| `--otel-trace-sample-ratio` | `OTEL_TRACES_SAMPLER_ARG` | `0.01` |
 | `--signing-key-file` | `PHANTOM_SIGNING_KEY_FILE` | `/etc/phantom-server/signing.key` (0600, auto-created) |
 | `--log-json` | `PHANTOM_LOG_JSON` | `false` |
 | `--log-filter` | `RUST_LOG` | `info,phantom_core=debug` |
 
 ```bash
 cargo run --manifest-path server/Cargo.toml -- \
-    --bind 0.0.0.0:4242 --metrics-bind 127.0.0.1:9090
+    --bind 0.0.0.0:4242 \
+    --otlp-endpoint http://otel-collector:4317
 ```
 
 ### Docker / docker-compose
@@ -234,12 +240,19 @@ Hardened unit text in [`docs/operations/systemd.md`](docs/operations/systemd.md)
 `SystemCallFilter`, 30s `TimeoutStopSec`) plus a multi-instance template using
 `SO_REUSEPORT`.
 
-### Metrics
+### Observability
 
-Prometheus text via `/metrics` (HTTP listener in `server/src/metrics_http.rs`
-scraping `PhantomListener::metrics_prometheus_text()`). Ready-to-import
-[`docs/operations/prometheus/alerts.yml`](docs/operations/prometheus/alerts.yml)
-and [`docs/operations/grafana/phantom-dashboard.json`](docs/operations/grafana/phantom-dashboard.json).
+OpenTelemetry metrics + traces over OTLP/gRPC (Phase 8 — replaces the
+Phase 4.5 hand-rolled Prometheus endpoint). The reference server pushes to
+`OTEL_EXPORTER_OTLP_ENDPOINT`; backends supported include OTel Collector
+(→ Prometheus / Tempo / Loki), Datadog, Honeycomb, Grafana Cloud, AWS
+CloudWatch — anything OTLP-compatible. Pre-built Grafana dashboard at
+[`docs/observability/grafana/phantom-otel-dashboard.json`](docs/observability/grafana/phantom-otel-dashboard.json)
+and Prometheus alert rules at
+[`docs/observability/prometheus/alerts.yml`](docs/observability/prometheus/alerts.yml).
+End-to-end docker-compose demo in
+[`examples/observability-demo/`](examples/observability-demo/). Full setup
+recipes in [`docs/observability/otlp-setup.md`](docs/observability/otlp-setup.md).
 
 ### CLI
 
@@ -364,11 +377,9 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   identities don't survive restart. Pin-stable production deployments must use
   `bind_with_signing_key()` with a key loaded from disk (`phantom-cli keygen`
   writes 0600 seed files).
-- **The library ships no HTTP server.** `/metrics` HTTP scraping is the
-  embedder's responsibility; `server/src/metrics_http.rs` is the reference
-  implementation.
-- **OpenTelemetry export** is a follow-up; only Prometheus text exposition
-  ships in-library today.
+- **The library ships no HTTP server.** The library exposes OTel
+  instruments; embedders configure the exporter. `server/src/telemetry.rs`
+  is the reference OTLP/gRPC wiring.
 - **MSRV: Rust 1.75.** `cli/` uses edition 2024 and builds on stable but not
   on the 1.75 gate.
 - **4 of 5 fuzz harnesses** still need nightly; `fuzz_embedded_framing` builds
