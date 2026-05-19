@@ -589,8 +589,8 @@ Tick `[x]` and add the short SHA when landed.
 
 | # | Step | Commit subject | Status | SHA |
 |---|------|---------------|--------|-----|
-| 1 | Doc plan committed | `docs(observability): OTel refactor working plan` | [ ] | — |
-| 2 | Module scaffold + feature gate | `observability: scaffold module + ObservabilityConfig (no OTel deps yet)` | [ ] | — |
+| 1 | Doc plan committed | `docs(observability): OTel refactor working plan` | [x] | `5db2fbc` |
+| 2 | Module scaffold + feature gate | `observability: scaffold module + ObservabilityConfig (no OTel deps yet)` | [x] | _next_ |
 | 3 | HotPathAtomics + per-leg arrays + CachePadded | `observability: lock-free HotPathAtomics with per-leg padding` | [ ] | — |
 | 4 | Migrate recording sites from old TransportMetrics | `observability: migrate handshake/listener recording sites` | [ ] | — |
 | 5 | Delete `transport/metrics.rs`, update CLAUDE.md/PROGRESS.md cross-refs | `observability: remove legacy transport/metrics.rs` | [ ] | — |
