@@ -13,6 +13,61 @@ the foundation and security-hardening phases of the production-readiness
 roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
 132; the new ten cover the documented security invariants directly.
 
+### Phase 8 — OpenTelemetry refactor (Observability)
+
+**Breaking changes for embedders:**
+- Removed `phantom_core::transport::metrics` module entirely.
+- Removed `PhantomListener::metrics_prometheus_text()` and the deprecated
+  `PhantomListener::metrics()` alias. Use `PhantomListener::observability()`
+  → `Arc<Observability>` and capture snapshots via `observability.snapshot()`.
+- The reference server (`phantom-server`) no longer ships an HTTP
+  `/metrics` endpoint. `--metrics-bind` and `PHANTOM_METRICS_BIND` are
+  removed. For Prometheus pull, run an OTel Collector with a
+  `prometheusexporter` consuming the server's OTLP stream.
+- Metric names changed (post-Collector translation):
+  - `phantom_packets_sent_total` →
+    `phantom_session_packets_total{direction="send"}`
+  - `phantom_bytes_sent_total` →
+    `phantom_session_io_By_total{direction="send"}`
+  - `phantom_handshakes_total` + `phantom_handshake_failures_total` →
+    `phantom_handshake_attempts_total{outcome=…}`
+  - `phantom_handshake_latency_seconds_*` →
+    `phantom_handshake_duration_seconds_*`
+  - Full mapping in `docs/observability/metrics-catalog.md`.
+
+**Added:**
+- New Cargo feature `telemetry-otel` (off by default) — opt-in OTel
+  pipeline. When on, the library exposes `Counter` / `Histogram` /
+  `UpDownCounter` / `ObservableCounter` instruments under the configurable
+  `phantom.*` namespace (env: `PHANTOM_TELEMETRY_NAMESPACE`).
+- `phantom_core::observability::*` module: `Observability` facade,
+  `ObservabilityConfig` builder, `MetricsSnapshot` (always available for
+  FFI / debug), pre-interned attribute sets (`Direction`,
+  `HandshakeOutcome`, `AeadAlgorithm`, `ProtocolVersion`, `ReplayReason`,
+  `CookieOutcome`, `PowOutcome`, `EarlyDataOutcome`, `ResumptionMode`,
+  `PathValidationOutcome`, `FallbackReason`).
+- Lock-free hot-path atomics with `crossbeam_utils::CachePadded` —
+  microbench on Apple M1 records `record_send` at **2.5 ns / call**,
+  contended at **84 ns / call** across 8 threads.
+- OTel observable callbacks for hot-path atomics; sync labeled
+  instruments for security signals, cookie/PoW gate, rekey, fallback,
+  early-data outcomes; base-2 exponential `Histogram`s for handshake
+  and path-validation latency.
+- `tracing-opentelemetry` bridge under `telemetry-otel`. Existing
+  `#[tracing::instrument]` spans (`phantom.handshake.*`,
+  `phantom.listener.*`) now flow into OTLP traces. Added spans on
+  `Session::rekey`, `begin_path_validation`, `complete_path_validation`.
+- `server/src/telemetry.rs` — installs OTLP/gRPC `MeterProvider` /
+  `TracerProvider` and wires `tracing-opentelemetry` into the global
+  subscriber. New CLI flags: `--otlp-endpoint`, `--otel-service-name`,
+  `--otel-metric-export-interval-ms`, `--otel-trace-sample-ratio`.
+- `examples/observability-demo` — sibling crate with a `docker-compose.yml`
+  bringing up OTel Collector + Prometheus + Tempo + Grafana.
+- Documentation under `docs/observability/`: `README.md`,
+  `metrics-catalog.md`, `otlp-setup.md`, `tracing-guide.md`,
+  rewritten Grafana dashboard and Prometheus alert rules under the new
+  OTel-translated names.
+
 ### Added
 - Governance: `LICENSE` (Apache-2.0), `README.md`, `CHANGELOG.md`,
   `SECURITY.md`, `CONTRIBUTING.md`.
