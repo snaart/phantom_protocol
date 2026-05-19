@@ -15,7 +15,6 @@
 
 mod config;
 mod handler;
-mod metrics_http;
 mod signing_key;
 mod telemetry;
 
@@ -51,7 +50,6 @@ async fn main() -> Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         bind = %cfg.bind,
-        metrics_bind = ?cfg.metrics_bind,
         otlp_endpoint = %cfg.otlp_endpoint,
         signing_key_file = %cfg.signing_key_file.display(),
         "phantom-server starting"
@@ -86,15 +84,6 @@ async fn main() -> Result<()> {
     // `listener.verifying_key_bytes()`.
     tracing::warn!("server verifying key (pin this on clients): {}", vk_hex);
     tracing::info!(local_addr = %listener.local_addr(), "listener bound");
-
-    if let Some(metrics_addr) = cfg.metrics_bind {
-        let l = listener.clone();
-        tokio::spawn(async move {
-            if let Err(e) = metrics_http::serve(metrics_addr, l).await {
-                tracing::error!(error = %e, "metrics HTTP server exited");
-            }
-        });
-    }
 
     let shutdown = install_shutdown_signal();
 

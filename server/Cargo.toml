@@ -18,10 +18,6 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-# Transitional — metrics_http.rs gets deleted in step 12.
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
-http-body-util = "0.1"
 hex = "0.4"
 futures = "0.3"
 
