@@ -110,6 +110,23 @@ impl Observability {
     pub fn stream_closed(&self) {
         self.atomics.stream_closed();
     }
+
+    /// Record a successful handshake completion with its duration (ns).
+    ///
+    /// Transitional API — step 7 introduces a labeled `record_handshake`
+    /// that takes `(outcome, leg, cipher_suite, version)` and writes to an
+    /// OTel `Histogram`. Until then, the duration accumulates in atomic
+    /// sum+count fields surfaced via [`Self::snapshot`].
+    pub fn record_handshake_success(&self, duration_ns: u64) {
+        self.atomics.record_handshake_success(duration_ns);
+    }
+
+    /// Record a handshake failure. Cause attribution (cookie / signature /
+    /// transcript / KEM) lands with the labeled API in step 7.
+    #[inline]
+    pub fn record_handshake_failure(&self) {
+        self.atomics.record_handshake_failure();
+    }
 }
 
 
