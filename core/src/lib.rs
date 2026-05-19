@@ -30,8 +30,9 @@
     clippy::missing_safety_doc
 )]
 // Deny `unsafe` by default at the crate root. The two modules that genuinely
-// require `unsafe` (PQC key-bytes zeroing in `crypto::keys`, libc GSO/recvmmsg
-// syscalls in `transport::udp_transport`) opt back in with a module-level
+// require `unsafe` (libc GSO/recvmmsg syscalls in `transport::udp_transport`,
+// native-only; wasm-bindgen-generated JS-boundary glue in
+// `transport::legs::websocket`, wasm32-only) opt back in with a module-level
 // `#![allow(unsafe_code)]` and per-block `// SAFETY:` comments. Audit lens:
 // any future PR touching `unsafe` outside those two modules will fail this
 // lint and must justify itself explicitly.
