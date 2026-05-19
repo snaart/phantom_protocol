@@ -603,8 +603,8 @@ Tick `[x]` and add the short SHA when landed.
 | 12 | Server: drop metrics_http.rs + hyper deps | `server: drop hand-rolled metrics_http.rs + hyper deps` | [x] | `527addf` |
 | 13 | Tests: observability suite (atomics, no-op, otel-integration, cardinality, exemplars) | `tests(observability): atomics, cardinality, exemplars, no-op fallback` | [x] | `623a572` |
 | 14 | Bench: hot-path overhead microbench | `bench(observability): hot-path record_send overhead microbench` | [x] | `c8563c6` |
-| 15 | Docs: README + metrics-catalog + otlp-setup + tracing-guide | `docs(observability): metrics catalog + OTLP setup + tracing guide` | [x] | _next_ |
-| 16 | Docs: rewrite Grafana dashboards + Prometheus alerts under new naming | `docs(observability): rewrite Grafana dashboards + Prometheus alerts` | [ ] | — |
+| 15 | Docs: README + metrics-catalog + otlp-setup + tracing-guide | `docs(observability): metrics catalog + OTLP setup + tracing guide` | [x] | `9f731a2` |
+| 16 | Docs: rewrite Grafana dashboards + Prometheus alerts under new naming | `docs(observability): rewrite Grafana dashboards + Prometheus alerts` | [x] | _next_ |
 | 17 | examples/observability-demo crate with docker-compose stack | `examples: observability-demo (docker-compose: server + collector + grafana)` | [ ] | — |
 | 18 | CHANGELOG + README Observability section | `docs: CHANGELOG + README Observability section for OTel pipeline` | [ ] | — |
 | 19 | CI: add `cargo clippy --features telemetry-otel` job | `ci: clippy job for telemetry-otel feature` | [ ] | — |
