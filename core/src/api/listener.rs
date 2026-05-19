@@ -230,7 +230,10 @@ impl PhantomListener {
             };
         let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         self.observability.record_handshake_success(elapsed_ns);
-        self.observability.session_opened();
+        // Reference server accepts over TCP today; tighten when WebSocket /
+        // KCP variants land.
+        self.observability
+            .session_opened(crate::transport::types::LegType::Tcp);
         let session = PhantomSession::from_accepted_server_session_with_runtime(
             peer.to_string(),
             transport,
