@@ -36,6 +36,11 @@ pub struct MetricsSnapshot {
     pub active_sessions: i64,
     pub active_streams: i64,
 
+    pub handshakes_success: u64,
+    pub handshakes_failure: u64,
+    pub handshake_latency_ns_sum: u64,
+    pub handshake_latency_count: u64,
+
     pub uptime_secs: u64,
 }
 
@@ -63,6 +68,10 @@ impl Default for MetricsSnapshot {
             rtt_us_path_0: 0,
             active_sessions: 0,
             active_streams: 0,
+            handshakes_success: 0,
+            handshakes_failure: 0,
+            handshake_latency_ns_sum: 0,
+            handshake_latency_count: 0,
             uptime_secs: 0,
         }
     }
@@ -122,8 +131,105 @@ impl MetricsSnapshot {
             rtt_us_path_0: h.rtt_us(0),
             active_sessions: h.active_sessions(),
             active_streams: h.active_streams(),
+            handshakes_success: h.handshake_success_count(),
+            handshakes_failure: h.handshake_failure_count(),
+            handshake_latency_ns_sum: h.handshake_latency_ns_sum(),
+            handshake_latency_count: h.handshake_latency_count(),
             uptime_secs: h.uptime_secs(),
         }
+    }
+
+    /// Transitional Prometheus text-exposition output.
+    ///
+    /// This is a thin, stub-quality formatter used **only** while the OTel
+    /// pipeline lands (steps 7-12). The new `phantom.*` names follow the
+    /// long-term OTel semantic conventions, but a downstream Prometheus
+    /// scraper still reads them through this endpoint. Step 12 removes
+    /// this method entirely when the OTel Collector becomes the sole
+    /// metrics path.
+    ///
+    /// Limitations vs Phase 4.5:
+    /// - No per-leg slicing in the body (the per-leg data is in the
+    ///   snapshot fields; expose it once OTel labels arrive in step 7).
+    /// - No histogram buckets for handshake latency (sum + count only;
+    ///   buckets land with the OTel exponential `Histogram` in step 9).
+    /// - No security signals yet (replay/AEAD/unencrypted; those are
+    ///   OTel-only counters added in step 7).
+    pub fn to_prometheus_text(&self) -> String {
+        let mut s = String::with_capacity(1024);
+        for (name, help, kind, value) in [
+            (
+                "phantom_packets_sent_total",
+                "Packets transmitted (all legs)",
+                "counter",
+                self.packets_sent,
+            ),
+            (
+                "phantom_packets_recv_total",
+                "Packets received (all legs)",
+                "counter",
+                self.packets_recv,
+            ),
+            (
+                "phantom_bytes_sent_total",
+                "Bytes transmitted (all legs)",
+                "counter",
+                self.bytes_sent,
+            ),
+            (
+                "phantom_bytes_recv_total",
+                "Bytes received (all legs)",
+                "counter",
+                self.bytes_recv,
+            ),
+            (
+                "phantom_handshakes_total",
+                "Successful handshakes",
+                "counter",
+                self.handshakes_success,
+            ),
+            (
+                "phantom_handshake_failures_total",
+                "Failed handshakes",
+                "counter",
+                self.handshakes_failure,
+            ),
+        ] {
+            s.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+            ));
+        }
+        s.push_str(&format!(
+            "# HELP phantom_active_sessions Current active sessions\n\
+             # TYPE phantom_active_sessions gauge\n\
+             phantom_active_sessions {}\n",
+            self.active_sessions,
+        ));
+        s.push_str(&format!(
+            "# HELP phantom_active_streams Current active streams\n\
+             # TYPE phantom_active_streams gauge\n\
+             phantom_active_streams {}\n",
+            self.active_streams,
+        ));
+        s.push_str(&format!(
+            "# HELP phantom_rtt_us Latest observed RTT path 0 (microseconds)\n\
+             # TYPE phantom_rtt_us gauge\n\
+             phantom_rtt_us {}\n",
+            self.rtt_us_path_0,
+        ));
+        s.push_str(&format!(
+            "# HELP phantom_handshake_latency_seconds_sum Cumulative handshake latency\n\
+             # TYPE phantom_handshake_latency_seconds_sum counter\n\
+             phantom_handshake_latency_seconds_sum {:.9}\n",
+            self.handshake_latency_ns_sum as f64 / 1_000_000_000.0,
+        ));
+        s.push_str(&format!(
+            "# HELP phantom_handshake_latency_seconds_count Handshake latency observation count\n\
+             # TYPE phantom_handshake_latency_seconds_count counter\n\
+             phantom_handshake_latency_seconds_count {}\n",
+            self.handshake_latency_count,
+        ));
+        s
     }
 }
 

@@ -75,6 +75,12 @@ pub(crate) struct HotPathAtomics {
     active_sessions: CachePadded<AtomicI64>,
     active_streams: CachePadded<AtomicI64>,
 
+    /// Handshake counters (transitional; full labeled API lands in step 7).
+    handshake_success_count: CachePadded<AtomicU64>,
+    handshake_failure_count: CachePadded<AtomicU64>,
+    handshake_latency_ns_sum: CachePadded<AtomicU64>,
+    handshake_latency_count: CachePadded<AtomicU64>,
+
     /// Process-start timestamp for uptime calculation. Set once at
     /// construction; the snapshot reader computes `elapsed()` on read.
     started_at: Instant,
@@ -96,6 +102,10 @@ impl HotPathAtomics {
             rtt_us_per_path: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
             active_sessions: CachePadded::new(AtomicI64::new(0)),
             active_streams: CachePadded::new(AtomicI64::new(0)),
+            handshake_success_count: CachePadded::new(AtomicU64::new(0)),
+            handshake_failure_count: CachePadded::new(AtomicU64::new(0)),
+            handshake_latency_ns_sum: CachePadded::new(AtomicU64::new(0)),
+            handshake_latency_count: CachePadded::new(AtomicU64::new(0)),
             started_at: Instant::now(),
         }
     }
@@ -158,6 +168,26 @@ impl HotPathAtomics {
         self.active_streams.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Record a successful handshake completion with its duration (ns).
+    ///
+    /// Transitional API — step 7 introduces a labeled `record_handshake`
+    /// that takes `(outcome, leg, cipher_suite, version)` and feeds an
+    /// OTel `Histogram`. Until then this is a sum+count pair that drives
+    /// the transitional Prometheus output and the live snapshot.
+    pub(crate) fn record_handshake_success(&self, duration_ns: u64) {
+        self.handshake_success_count.fetch_add(1, Ordering::Relaxed);
+        self.handshake_latency_ns_sum
+            .fetch_add(duration_ns, Ordering::Relaxed);
+        self.handshake_latency_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a handshake failure. Cause attribution (cookie / signature /
+    /// transcript / KEM) lands with the labeled API in step 7.
+    #[cold]
+    pub(crate) fn record_handshake_failure(&self) {
+        self.handshake_failure_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     // --- Read accessors (cold path) ---
 
     pub(crate) fn packets_total(&self, dir: usize) -> u64 {
@@ -211,6 +241,22 @@ impl HotPathAtomics {
 
     pub(crate) fn active_streams(&self) -> i64 {
         self.active_streams.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn handshake_success_count(&self) -> u64 {
+        self.handshake_success_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn handshake_failure_count(&self) -> u64 {
+        self.handshake_failure_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn handshake_latency_ns_sum(&self) -> u64 {
+        self.handshake_latency_ns_sum.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn handshake_latency_count(&self) -> u64 {
+        self.handshake_latency_count.load(Ordering::Relaxed)
     }
 
     pub(crate) fn uptime_secs(&self) -> u64 {
