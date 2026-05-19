@@ -594,8 +594,8 @@ Tick `[x]` and add the short SHA when landed.
 | 3 | HotPathAtomics + per-leg arrays + CachePadded | `observability: lock-free HotPathAtomics with per-leg padding` | [x] | `02af467` |
 | 4 | Migrate recording sites from old TransportMetrics | `observability: migrate handshake/listener recording sites` | [x] | `f266415` |
 | 5 | Delete `transport/metrics.rs`, update CLAUDE.md/PROGRESS.md cross-refs | `observability: remove legacy transport/metrics.rs` | [x] | `e49ad5d` |
-| 6 | Add `telemetry-otel` feature + opentelemetry/_sdk deps + ZST shim | `observability: feature-gate OTel deps + ZST no-op PhantomInstruments` | [x] | _next_ |
-| 7 | PhantomInstruments + pre-interned attribute sets | `observability: PhantomInstruments + pre-interned attribute sets` | [ ] | — |
+| 6 | Add `telemetry-otel` feature + opentelemetry/_sdk deps + ZST shim | `observability: feature-gate OTel deps + ZST no-op PhantomInstruments` | [x] | `085e735` |
+| 7 | PhantomInstruments + pre-interned attribute sets | `observability: PhantomInstruments + pre-interned attribute sets` | [x] | _next_ |
 | 8 | Observable callbacks (with_callback) for hot atomics | `observability: bind ObservableCounter callbacks to HotPathAtomics` | [ ] | — |
 | 9 | Handshake exponential Histogram + exemplars | `observability: Histogram for handshake.duration (exponential base-2)` | [ ] | — |
 | 10 | tracing-opentelemetry span integration | `observability: tracing-opentelemetry bridge + handshake/accept spans` | [ ] | — |

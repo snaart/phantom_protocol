@@ -16,10 +16,15 @@
 //! land in subsequent atomic commits.
 
 pub(crate) mod atomics;
+pub mod attrs;
 pub mod config;
 pub(crate) mod instruments;
 pub mod snapshot;
 
+pub use attrs::{
+    AeadAlgorithm, CookieOutcome, Direction, EarlyDataOutcome, FallbackReason, HandshakeOutcome,
+    PathValidationOutcome, PowOutcome, ProtocolVersion, ReplayReason, ResumptionMode,
+};
 pub use config::{HistogramConfig, ObservabilityConfig, ObservabilityConfigBuilder};
 pub use snapshot::MetricsSnapshot;
 
@@ -97,24 +102,30 @@ impl Observability {
 
     // --- Gauges ---
 
+    /// Mark a new session as opened. Updates both the lock-free gauge and
+    /// the OTel `UpDownCounter` (when the `telemetry-otel` feature is on).
     #[inline]
-    pub fn session_opened(&self) {
+    pub fn session_opened(&self, leg: LegType) {
         self.atomics.session_opened();
+        self.instruments.session_opened(leg);
     }
 
     #[inline]
-    pub fn session_closed(&self) {
+    pub fn session_closed(&self, leg: LegType) {
         self.atomics.session_closed();
+        self.instruments.session_closed(leg);
     }
 
     #[inline]
     pub fn stream_opened(&self) {
         self.atomics.stream_opened();
+        self.instruments.stream_opened();
     }
 
     #[inline]
     pub fn stream_closed(&self) {
         self.atomics.stream_closed();
+        self.instruments.stream_closed();
     }
 
     /// Record a successful handshake completion with its duration (ns).
@@ -133,6 +144,71 @@ impl Observability {
     pub fn record_handshake_failure(&self) {
         self.atomics.record_handshake_failure();
     }
+
+    // --- Labeled OTel event recorders (step 7) ---
+
+    /// Record a handshake outcome with full OTel attribution.
+    ///
+    /// Atomic counters and OTel `Counter` are updated together. Latency
+    /// goes into a separate `Histogram` instrument that lands in step 9.
+    pub fn record_handshake(
+        &self,
+        outcome: HandshakeOutcome,
+        leg: LegType,
+        cipher: AeadAlgorithm,
+        version: ProtocolVersion,
+    ) {
+        match outcome {
+            HandshakeOutcome::Success => self.atomics.record_handshake_success(0),
+            HandshakeOutcome::Failure => self.atomics.record_handshake_failure(),
+        }
+        self.instruments
+            .record_handshake(outcome, leg, cipher, version);
+    }
+
+    pub fn record_resumption(&self, mode: ResumptionMode, accepted: bool) {
+        self.instruments.record_resumption(mode, accepted);
+    }
+
+    #[inline]
+    pub fn record_replay_rejected(&self, reason: ReplayReason) {
+        self.instruments.record_replay_rejected(reason);
+    }
+
+    #[inline]
+    pub fn record_aead_failure(&self, leg: LegType, algorithm: AeadAlgorithm) {
+        self.instruments.record_aead_failure(leg, algorithm);
+    }
+
+    #[inline]
+    pub fn record_unencrypted_dropped(&self, leg: LegType) {
+        self.instruments.record_unencrypted_dropped(leg);
+    }
+
+    pub fn record_path_migration(&self, from: u8, to: u8) {
+        self.instruments.record_path_migration(from, to);
+    }
+
+    pub fn record_cookie(&self, outcome: CookieOutcome) {
+        self.instruments.record_cookie(outcome);
+    }
+
+    pub fn record_pow(&self, outcome: PowOutcome, difficulty: u8) {
+        self.instruments.record_pow(outcome, difficulty);
+    }
+
+    pub fn record_early_data(&self, outcome: EarlyDataOutcome) {
+        self.instruments.record_early_data(outcome);
+    }
+
+    pub fn record_rekey(&self, direction: Direction) {
+        self.instruments.record_rekey(direction);
+    }
+
+    pub fn record_fallback(&self, from_leg: LegType, to_leg: LegType, reason: FallbackReason) {
+        self.instruments.record_fallback(from_leg, to_leg, reason);
+    }
+
 }
 
 
@@ -164,7 +240,7 @@ mod tests {
         obs.record_recv(512, LegType::Kcp);
         obs.record_encrypt_ns(100);
         obs.record_encrypt_ns(300);
-        obs.session_opened();
+        obs.session_opened(LegType::Tcp);
         obs.stream_opened();
         obs.stream_opened();
         obs.record_rtt_us(5_000, 0);
