@@ -41,7 +41,6 @@ async fn main() -> Result<()> {
     let telemetry = TelemetryHandle::init(&TelemetryCfg {
         service_name: cfg.otel_service_name.clone(),
         otlp_endpoint: cfg.otlp_endpoint.clone(),
-        export_interval: Duration::from_millis(cfg.otel_metric_export_interval_ms),
         trace_sample_ratio: cfg.otel_trace_sample_ratio,
     })
     .context("telemetry init")?;

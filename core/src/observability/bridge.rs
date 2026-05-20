@@ -27,7 +27,7 @@ pub(crate) fn register_observables(
 
 #[cfg(feature = "telemetry-otel")]
 mod otel_on {
-    use crate::observability::atomics::{HotPathAtomics, DIR_RECV, DIR_SEND};
+    use crate::observability::atomics::{HotPathAtomics, DIR_RECV, DIR_SEND, MAX_PATHS};
     use crate::observability::attrs::{leg_str, Direction};
     use crate::observability::config::ObservabilityConfig;
     use crate::transport::types::LegType;
@@ -130,7 +130,7 @@ mod otel_on {
             .with_description("Latest observed RTT per path")
             .with_unit("us")
             .with_callback(move |observer| {
-                for path_id in 0u8..16 {
+                for path_id in 0..MAX_PATHS as u8 {
                     let v = rtt_atomics.rtt_us(path_id);
                     if v > 0 {
                         observer.observe(v, &[KeyValue::new("path_id", path_id as i64)]);

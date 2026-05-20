@@ -2,9 +2,8 @@
 //!
 //! Configuration is captured at `Observability::new` time and frozen for the
 //! lifetime of the instance. The values it carries (namespace prefix,
-//! histogram bucketing strategy, runtime kill-switch) are formatted into
-//! instrument names and aggregation views on first use, so freezing avoids
-//! per-call cost.
+//! histogram bucket boundaries) are formatted into instrument names and
+//! applied to instruments on construction, so freezing avoids per-call cost.
 //!
 //! Env-var conventions follow the OpenTelemetry SDK spec where applicable,
 //! with `PHANTOM_TELEMETRY_*` for project-specific knobs. See
@@ -22,44 +21,39 @@ pub struct ObservabilityConfig {
     /// Instrument-name prefix. Default `"phantom"`.
     ///
     /// Populated from `PHANTOM_TELEMETRY_NAMESPACE` by [`Self::from_env`].
+    ///
+    /// Note: this prefixes **metric instrument names** only. `tracing`
+    /// span names are compile-time string literals (`phantom.handshake.*`,
+    /// `phantom.listener.*`) and are not affected by this knob.
     pub namespace: Cow<'static, str>,
 
-    /// Histogram bucketing strategy for latency instruments
+    /// Bucket boundaries for latency instruments
     /// (`handshake.duration`, `path.validation.duration`).
     pub histogram: HistogramConfig,
-
-    /// Runtime kill-switch for the OTel pipeline. When `true`, every
-    /// recording call short-circuits to a no-op regardless of Cargo
-    /// features. Useful for emergency disablement without redeploy.
-    ///
-    /// Populated from `PHANTOM_TELEMETRY_DISABLED` by [`Self::from_env`]
-    /// when the value parses as `"1" | "true" | "TRUE"`.
-    pub disable_otel: bool,
 }
 
-/// Histogram bucketing strategy.
+/// Explicit bucket boundaries (in seconds) for latency histograms
+/// (`{ns}.handshake.duration`, `{ns}.path.validation.duration`).
+///
+/// Applied directly to the OTel `Histogram` instrument via
+/// `f64_histogram(...).with_boundaries(...)` — a version-stable API across
+/// the `opentelemetry` 0.27–0.29 line. (Base-2 exponential aggregation
+/// would need an SDK View; the View API is still in flux across these
+/// versions, so explicit boundaries are the supported choice for now.)
 #[derive(Debug, Clone)]
-pub enum HistogramConfig {
-    /// Explicit fixed bucket boundaries (in seconds).
-    Explicit(Vec<f64>),
-    /// Base-2 exponential bucketing — OTel native (OTEP 149). Sparse,
-    /// auto-scaling, ~2-3× the precision of fixed buckets at the same wire
-    /// size. Requires `opentelemetry_sdk` 0.27+ when the `telemetry-otel`
-    /// feature is enabled; falls back to the SDK default otherwise.
-    ExponentialBase2 {
-        /// Maximum number of buckets (positive + negative ranges combined).
-        max_size: u32,
-        /// Maximum scale factor; SDK auto-scales below this on heavy spread.
-        max_scale: i8,
-    },
+pub struct HistogramConfig {
+    /// Bucket upper bounds, seconds, ascending.
+    pub boundaries: Vec<f64>,
 }
 
 impl Default for HistogramConfig {
     fn default() -> Self {
-        // OTel SDK defaults for base-2 exponential histograms.
-        Self::ExponentialBase2 {
-            max_size: 160,
-            max_scale: 20,
+        // Latency-tuned for a post-quantum handshake: ~2-50 ms typical,
+        // up to multi-second under PoW back-pressure / CPU saturation.
+        Self {
+            boundaries: vec![
+                0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ],
         }
     }
 }
@@ -69,7 +63,6 @@ impl Default for ObservabilityConfig {
         Self {
             namespace: Cow::Borrowed("phantom"),
             histogram: HistogramConfig::default(),
-            disable_otel: false,
         }
     }
 }
@@ -77,19 +70,20 @@ impl Default for ObservabilityConfig {
 impl ObservabilityConfig {
     /// Construct a config from environment variables. Unset or empty
     /// variables fall back to defaults.
+    ///
+    /// To disable telemetry at runtime, build without the `telemetry-otel`
+    /// Cargo feature, or simply do not point `OTEL_EXPORTER_OTLP_ENDPOINT`
+    /// at a reachable collector — the SDK's bounded export queue then drops
+    /// telemetry at near-zero cost.
     pub fn from_env() -> Self {
         let namespace = std::env::var("PHANTOM_TELEMETRY_NAMESPACE")
             .ok()
             .filter(|s| !s.is_empty())
             .map(Cow::Owned)
             .unwrap_or(Cow::Borrowed("phantom"));
-        let disable_otel = std::env::var("PHANTOM_TELEMETRY_DISABLED")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
-            .unwrap_or(false);
         Self {
             namespace,
             histogram: HistogramConfig::default(),
-            disable_otel,
         }
     }
 
@@ -104,7 +98,6 @@ impl ObservabilityConfig {
 pub struct ObservabilityConfigBuilder {
     namespace: Option<Cow<'static, str>>,
     histogram: Option<HistogramConfig>,
-    disable_otel: Option<bool>,
 }
 
 impl ObservabilityConfigBuilder {
@@ -114,15 +107,9 @@ impl ObservabilityConfigBuilder {
         self
     }
 
-    /// Override the histogram strategy.
+    /// Override the histogram bucket boundaries.
     pub fn histogram(mut self, h: HistogramConfig) -> Self {
         self.histogram = Some(h);
-        self
-    }
-
-    /// Override the runtime kill-switch.
-    pub fn disable_otel(mut self, disabled: bool) -> Self {
-        self.disable_otel = Some(disabled);
         self
     }
 
@@ -134,9 +121,6 @@ impl ObservabilityConfigBuilder {
         }
         if let Some(h) = self.histogram {
             cfg.histogram = h;
-        }
-        if let Some(d) = self.disable_otel {
-            cfg.disable_otel = d;
         }
         cfg
     }
@@ -150,14 +134,10 @@ mod tests {
     fn default_namespace_is_phantom() {
         let cfg = ObservabilityConfig::default();
         assert_eq!(cfg.namespace.as_ref(), "phantom");
-        assert!(!cfg.disable_otel);
-        match cfg.histogram {
-            HistogramConfig::ExponentialBase2 { max_size, max_scale } => {
-                assert_eq!(max_size, 160);
-                assert_eq!(max_scale, 20);
-            }
-            HistogramConfig::Explicit(_) => panic!("default should be exponential"),
-        }
+        // Default histogram boundaries are ascending and non-empty.
+        let b = &cfg.histogram.boundaries;
+        assert!(!b.is_empty());
+        assert!(b.windows(2).all(|w| w[0] < w[1]), "boundaries must ascend");
     }
 
     #[test]
@@ -167,19 +147,12 @@ mod tests {
     }
 
     #[test]
-    fn builder_overrides_disable_flag() {
-        let cfg = ObservabilityConfig::builder().disable_otel(true).build();
-        assert!(cfg.disable_otel);
-    }
-
-    #[test]
     fn builder_overrides_histogram() {
         let cfg = ObservabilityConfig::builder()
-            .histogram(HistogramConfig::Explicit(vec![0.001, 0.01, 0.1, 1.0]))
+            .histogram(HistogramConfig {
+                boundaries: vec![0.001, 0.01, 0.1, 1.0],
+            })
             .build();
-        match cfg.histogram {
-            HistogramConfig::Explicit(b) => assert_eq!(b.len(), 4),
-            _ => panic!("expected explicit"),
-        }
+        assert_eq!(cfg.histogram.boundaries.len(), 4);
     }
 }
