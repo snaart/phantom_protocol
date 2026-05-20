@@ -45,7 +45,6 @@ mod otel_off {
             Self
         }
 
-        #[inline(always)] pub(crate) fn record_handshake(&self, _outcome: HandshakeOutcome, _leg: crate::transport::types::LegType, _cipher: AeadAlgorithm, _version: ProtocolVersion) {}
         #[inline(always)] pub(crate) fn record_handshake_duration(&self, _duration_s: f64, _outcome: HandshakeOutcome, _leg: crate::transport::types::LegType, _cipher: AeadAlgorithm, _version: ProtocolVersion) {}
         #[inline(always)] pub(crate) fn record_path_validation_duration(&self, _duration_s: f64, _path_id: u8, _outcome: PathValidationOutcome) {}
         #[inline(always)] pub(crate) fn record_resumption(&self, _mode: ResumptionMode, _accepted: bool) {}
@@ -76,16 +75,18 @@ mod otel_on {
     use opentelemetry::metrics::{Counter, Histogram, UpDownCounter};
     use opentelemetry::KeyValue;
 
-    /// OpenTelemetry instrument holder (counters + gauges).
+    /// OpenTelemetry instrument holder (counters, gauges, histograms).
     ///
-    /// Observable instruments (`ObservableCounter` / `ObservableGauge`) for
-    /// the hot-path atomics are wired up in step 8 via `with_callback`.
-    /// The `phantom.handshake.duration` `Histogram` lands in step 9.
+    /// Hot-path packet/byte counters are NOT here — those are
+    /// `ObservableCounter`s registered against the atomics in
+    /// `bridge.rs`. This holder carries the synchronous event instruments.
+    ///
+    /// Handshake *count* is intentionally not a standalone counter: the
+    /// `handshake_duration` `Histogram` already emits a `_count` series
+    /// (sliced by the same `outcome` attribute), so a separate
+    /// `handshake.attempts` counter would double-represent the same event.
     #[derive(Debug)]
     pub(crate) struct PhantomInstruments {
-        // Handshake outcome counter (count by outcome; latency goes to
-        // Histogram in step 9).
-        handshake: Counter<u64>,
         resumptions: Counter<u64>,
 
         // Security signals (cold path; all marked #[cold] at call sites).
@@ -109,11 +110,9 @@ mod otel_on {
         active_sessions: UpDownCounter<i64>,
         active_streams: UpDownCounter<i64>,
 
-        // Histograms (seconds). The SDK is told via View in
-        // `server/src/telemetry.rs` to aggregate these into base-2
-        // exponential buckets (sparse, auto-scaling). The default
-        // aggregation falls back to explicit buckets if the SDK can't
-        // honor the view request.
+        // Latency histograms (seconds). Bucket boundaries come from
+        // `ObservabilityConfig::histogram` and are applied directly on the
+        // instrument via `.with_boundaries(...)`.
         handshake_duration: Histogram<f64>,
         path_validation_duration: Histogram<f64>,
     }
@@ -124,10 +123,6 @@ mod otel_on {
             let ns = config.namespace.as_ref();
 
             // Counters
-            let handshake = meter
-                .u64_counter(format!("{ns}.handshake.attempts"))
-                .with_description("Handshake attempts by outcome")
-                .build();
             let resumptions = meter
                 .u64_counter(format!("{ns}.handshake.resumptions"))
                 .with_description("Handshake resumption ticket usage")
@@ -179,22 +174,23 @@ mod otel_on {
                 .with_description("Currently active streams across all sessions")
                 .build();
 
-            // Histograms. Unit is seconds; aggregation strategy
-            // (exponential vs explicit buckets) is controlled by the
-            // embedder via SDK Views.
+            // Latency histograms (unit: seconds). Explicit bucket
+            // boundaries from the config — see `HistogramConfig`.
+            let boundaries = config.histogram.boundaries.clone();
             let handshake_duration = meter
                 .f64_histogram(format!("{ns}.handshake.duration"))
                 .with_description("Handshake latency end-to-end")
                 .with_unit("s")
+                .with_boundaries(boundaries.clone())
                 .build();
             let path_validation_duration = meter
                 .f64_histogram(format!("{ns}.path.validation.duration"))
                 .with_description("PATH_VALIDATION challenge / response latency")
                 .with_unit("s")
+                .with_boundaries(boundaries)
                 .build();
 
             Self {
-                handshake,
                 resumptions,
                 replay_rejected,
                 aead_failed,
@@ -213,24 +209,6 @@ mod otel_on {
         }
 
         // --- Recording API ---
-
-        pub(crate) fn record_handshake(
-            &self,
-            outcome: HandshakeOutcome,
-            leg: crate::transport::types::LegType,
-            cipher: AeadAlgorithm,
-            version: ProtocolVersion,
-        ) {
-            self.handshake.add(
-                1,
-                &[
-                    KeyValue::new("outcome", outcome.as_str()),
-                    KeyValue::new("leg", leg_str(leg)),
-                    KeyValue::new("cipher_suite", cipher.as_str()),
-                    KeyValue::new("version", version.as_str()),
-                ],
-            );
-        }
 
         pub(crate) fn record_resumption(&self, mode: ResumptionMode, accepted: bool) {
             self.resumptions.add(
@@ -338,12 +316,15 @@ mod otel_on {
             self.active_streams.add(-1, &[]);
         }
 
-        /// Record handshake completion latency.
+        /// Record handshake completion latency into the
+        /// `{ns}.handshake.duration` histogram.
         ///
-        /// Inside an active `tracing` span the OTel SDK attaches the
-        /// current span's `trace_id`/`span_id` as exemplars to the
-        /// observation, so a Grafana drill-down from a P99 latency
-        /// point lands on the actual trace.
+        /// Exemplar note: when the embedder configures an exemplar
+        /// reservoir on the SDK (not on by default in `opentelemetry_sdk`
+        /// 0.28) and this call happens inside an active `tracing` span,
+        /// the observation carries that span's `trace_id` — enabling a
+        /// Grafana → Tempo drill-down. Without reservoir configuration the
+        /// histogram still records normally, just without exemplars.
         pub(crate) fn record_handshake_duration(
             &self,
             duration_s: f64,

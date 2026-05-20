@@ -41,10 +41,6 @@ pub struct Config {
     )]
     pub otlp_endpoint: String,
 
-    /// OTel metric export interval (milliseconds). OTel SDK default 10s.
-    #[arg(long, env = "OTEL_METRIC_EXPORT_INTERVAL", default_value = "10000")]
-    pub otel_metric_export_interval_ms: u64,
-
     /// Trace sampling ratio (0.0 — 1.0). Default 1% baseline; bump to 1.0
     /// when investigating an incident, or set to 0 to disable trace export.
     #[arg(long, env = "OTEL_TRACES_SAMPLER_ARG", default_value = "0.01")]
