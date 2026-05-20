@@ -249,7 +249,7 @@ FFI even on no-OTel builds.
 | (avg_encrypt_ns derived) | `phantom.crypto.encrypt.duration_sum` + `…count` | ObservableCounter pair | `ns` / `{op}` | `algorithm` |
 | (avg_decrypt_ns derived) | `phantom.crypto.decrypt.duration_sum` + `…count` | ObservableCounter pair | `ns` / `{op}` | `algorithm` |
 | `phantom_rtt_us` | `phantom.path.rtt` | ObservableGauge | `us` | `path_id` |
-| `phantom_handshakes_total`, `…_failures_total`, `…_latency_seconds_bucket` | `phantom.handshake.duration` | **Histogram** (exponential) | `s` | `outcome`, `leg`, `cipher_suite`, `version` |
+| `phantom_handshakes_total`, `…_failures_total`, `…_latency_seconds_bucket` | `phantom.handshake.duration` | **Histogram** (explicit latency buckets; `_count` is the canonical handshake count) | `s` | `outcome`, `leg`, `cipher_suite`, `version` |
 | `phantom_resumptions_total` | `phantom.handshake.resumptions` | Counter | `{resumption}` | `mode`, `accepted` |
 | `phantom_replay_rejected_total` | `phantom.security.replay_rejected` | Counter | `{packet}` | `reason` |
 | `phantom_unencrypted_dropped_total` | `phantom.security.unencrypted_dropped` | Counter | `{packet}` | `leg` |
@@ -266,7 +266,7 @@ FFI even on no-OTel builds.
 | `phantom.security.pow` | Counter | `{challenge}` | `outcome` (`solved`/`rejected`), `difficulty` | PoW gate health |
 | `phantom.session.early_data` | Counter | `{attempt}` | `outcome` (`accepted`/`rejected_unknown_ticket`/`rejected_oversized`/`rejected_aead`/`rejected_replay`) | 0-RTT diagnostics |
 | `phantom.session.rekey` | Counter | `{rekey}` | `direction` | Epoch hygiene |
-| `phantom.path.validation.duration` | Histogram (exponential) | `s` | `path_id`, `outcome` | PATH_VALIDATION latency |
+| `phantom.path.validation.duration` | Histogram (explicit latency buckets) | `s` | `path_id`, `outcome` | PATH_VALIDATION latency |
 | `phantom.transport.fallback` | Counter | `{fallback}` | `from_leg`, `to_leg`, `reason` | Multi-path fallback visibility |
 | `phantom.pacer.rate` | ObservableGauge | `By/s` | `path_id` | BBR pacer output |
 | `phantom.bandwidth.estimate` | ObservableGauge | `By/s` | `path_id`, `direction` | Bandwidth estimator output |
@@ -293,57 +293,66 @@ limits (default 2000 per instrument) act as a second line of defense.
 
 ## 5. Performance Techniques
 
-The hot-path overhead target is **≤ 2 ns** for unlabeled atomic adds and
-**≤ 20 ns** for labeled OTel `Counter::add` with a pre-interned attribute
-set, on x86_64 (Apple M1 reference: scale accordingly).
+The hot-path overhead target is **≤ 3 ns** for the per-packet atomic
+recorders. Measured on the Apple M1 reference: `record_send` ≈ 2.5 ns,
+contended ≈ 84 ns across 8 threads (`core/benches/observability_bench.rs`).
 
-1. **Cache-line padding** (`crossbeam_utils::CachePadded`) around hot
-   `AtomicU64` fields to eliminate false sharing across tx/rx threads.
-   `~256 B` per instance; double-digit-ns savings on multi-core.
-2. **Pre-interned attribute sets** in `attrs.rs`. Every combination of
-   `(direction, leg, algorithm)` produces a `&'static AttributeSet`
-   (interior `Arc<[KeyValue]>`). Recording APIs take an enum index, not a
-   `Vec<KeyValue>` allocation. ≥10× faster than building attributes per
-   call.
-3. **Cardinality limits** via `MeterProviderBuilder::with_cardinality_limit`
-   (OTel SDK 0.27+). Default 2000 per instrument; overflow goes to the
-   `overflow` bucket.
-4. **Base-2 exponential histogram** aggregation for `handshake.duration` and
-   `path.validation.duration` (`Aggregation::Base2ExponentialHistogram`).
-   Sparse, auto-scaling; ~2-3× the precision of fixed buckets at the same
-   wire size. Native in OTLP; collapsed to fixed buckets by the Prometheus
-   exporter automatically.
-5. **Delta temporality for OTLP push, Cumulative for Prometheus pull.** The
-   SDK aggregates once; views select the temporality per exporter. Smaller
-   OTLP payloads, Prometheus stays compatible. Configured via
-   `Reader::with_temporality(Temporality::Delta)` on the OTLP reader.
-6. **Lossy bounded queue.** `BatchSpanProcessor` and `PeriodicReader` use
-   bounded internal queues. Backend slow → telemetry drops; hot path never
-   blocks. `OTEL_BSP_MAX_QUEUE_SIZE=2048`, `OTEL_BSP_EXPORT_TIMEOUT=5s`.
-   Drops increment `phantom.telemetry.export_failures`.
-7. **zstd compression on OTLP/gRPC.** `tonic::transport` with `zstd` (fall
-   back to `gzip` if backend doesn't speak it). 5-10× payload reduction for
-   repeated attribute keys.
-8. **Frozen Resource at startup.** `opentelemetry_sdk::Resource::default()`
-   auto-detects `host.name`, `os.type`, `process.pid`,
-   `process.runtime.name=rust`, `service.version` from `CARGO_PKG_VERSION`.
-   No runtime detection cost; embedder may augment.
-9. **`#[cold]` on error paths.** `record_aead_failure`,
-   `record_replay_rejected`, `record_unencrypted_dropped` are annotated
-   `#[cold]`. Inside `record_handshake`, the failure-outcome branch is
-   isolated behind a `#[cold]` helper. Branch predictor and code-section
-   placement favor the happy path.
-10. **Async runtime isolation.** Server runs OTLP exporter on a dedicated
-    `tokio::runtime::Builder::new_multi_thread().worker_threads(2)` named
-    `"phantom-telemetry"`. Exporter network blocking does not back-pressure
-    the listener / data-pump runtime.
-11. **Sampling-aware exemplars.** Histogram buckets store
-    `Vec<Exemplar>` (reservoir size 1 per bucket). One atomic swap per
-    observation worst case. Trace context attaches automatically when a
-    `tracing` span is active.
-12. **Lazy instrument cache.** Each `Counter` / `Histogram` is constructed
-    once at `PhantomInstruments::new` and stored in fields — never
-    re-resolved through `Meter` HashMap.
+### Shipped
+
+1. **Cache-line padding** (`crossbeam_utils::CachePadded`) around every hot
+   `AtomicU64` / `AtomicI64` in `HotPathAtomics` — eliminates false sharing
+   across tx/rx threads.
+2. **Hot path stays off the OTel API.** Per-packet recording touches only
+   the lock-free atomics. The OTel `ObservableCounter` callbacks
+   (`bridge.rs`) read those atomics once per SDK collection cycle (~10 s),
+   so the per-packet path never builds a `KeyValue` or enters the SDK's
+   labeled-add code. The synchronous labeled instruments are reserved for
+   genuinely cold events (handshake completion, security signals).
+3. **Delta temporality** on the OTLP metric exporter
+   (`telemetry.rs`, `Temporality::Delta`) — smaller push payloads; the
+   Collector's `prometheusexporter` converts to cumulative for any
+   Prometheus pull downstream.
+4. **gzip compression** on both OTLP/gRPC exporters
+   (`Compression::Gzip`) — large reduction for the repeated attribute keys
+   in metric/span batches.
+5. **Lossy bounded export queues.** The SDK's `BatchSpanProcessor` and
+   periodic metric reader have bounded internal queues — a slow backend
+   drops telemetry rather than back-pressuring the hot path. Tunable via
+   the standard `OTEL_BSP_*` env vars.
+6. **Frozen Resource at startup.** `Resource::builder()…build()` runs once;
+   `service.version` is baked from `CARGO_PKG_VERSION`.
+7. **`#[cold]` on error paths.** `record_aead_failure`,
+   `record_replay_rejected`, `record_unencrypted_dropped`, and
+   `HotPathAtomics::record_handshake_failure` are `#[cold]` — branch
+   predictor and code-section placement favor the happy path.
+8. **Instruments built once.** Every `Counter` / `Histogram` /
+   `UpDownCounter` is constructed in `PhantomInstruments::new` and stored
+   in a field — never re-resolved through the `Meter` on a recording call.
+9. **Latency-tuned histogram buckets.** `handshake.duration` and
+   `path.validation.duration` get explicit boundaries
+   (`HistogramConfig`, `.with_boundaries(...)`) sized for a PQ handshake's
+   sub-ms-to-multi-second spread.
+
+### Deliberately deferred / dropped
+
+- **Pre-interned attribute sets.** The original design pre-built every
+  attribute combination behind `OnceLock`. Dropped as YAGNI: the only
+  per-call `KeyValue` construction left is on cold event paths (handshakes,
+  security signals), where a few `&'static str`-valued `KeyValue`s per call
+  is immaterial. The hot path doesn't build attributes at all (see #2).
+- **Base-2 exponential histograms.** Would need an SDK metrics *View*; the
+  View API is unstable across `opentelemetry` 0.27–0.29. Explicit
+  latency-tuned buckets (#9) ship instead — a follow-up can add the View
+  once the API settles.
+- **Explicit cardinality limit.** The SDK applies a built-in default
+  per-instrument cardinality cap; no explicit `with_cardinality_limit`
+  call is made (the builder API is not stable across these versions). The
+  contract is still upheld at the type level — see §4.
+- **Dedicated telemetry runtime.** The OTLP exporter runs on the server's
+  tokio runtime via `rt-tokio`. A separate worker pool was scoped but is
+  not needed at current load; revisit if exporter stalls are observed.
+- **Exemplars.** Reservoirs are not enabled by default in
+  `opentelemetry_sdk` 0.28 and are not yet wired — see §6.
 
 ---
 
@@ -377,11 +386,15 @@ Span fields capture: `leg`, `cipher_suite`, `version`, `outcome`, `peer_addr`
 
 ### Exemplar correlation
 
-The `record_handshake(...)` call inside a span automatically picks up
-`Span::current().context().span().span_context()` via the OTel SDK's
-exemplar reservoir. Result: histogram observations carry the trace_id of
-the handshake span. In Grafana / Tempo, clicking a P99 latency point jumps
-to the actual trace.
+`record_handshake(...)` is called from inside the handshake span, so the
+trace context is on `Context::current()`. When the embedder configures an
+exemplar reservoir on the `MeterProvider`, histogram observations then
+carry the span's trace_id and Grafana → Tempo drill-down works.
+
+**Status:** exemplar reservoirs are not enabled by default in
+`opentelemetry_sdk` 0.28 and `server/src/telemetry.rs` does not yet wire
+one — exemplar drill-down is "reservoir-ready", not on-by-default. Wiring
+the reservoir is a follow-up; the histograms record correctly regardless.
 
 ### Sampling
 
@@ -534,15 +547,32 @@ In-tree, committed alongside the code:
 
 ## 10. Testing Plan
 
+### Shipped
+
 | Test | Location | Coverage |
 |------|----------|----------|
-| Atomics correctness | `core/tests/observability_atomics.rs` | Per-leg counters monotone, concurrent contention |
-| ZST no-op path | `core/tests/observability_no_otel.rs` | Compiles + runs with feature off; snapshot still works |
-| OTel integration | `core/tests/observability_otel.rs` (feature-gated) | `InMemoryMetricExporter` catches exports; assert instrument names, attributes, units, types |
-| Cardinality limit | `core/tests/observability_cardinality.rs` (feature-gated) | Overflow attrs land in `overflow` bucket |
-| Exemplar correlation | `core/tests/observability_exemplars.rs` (feature-gated) | Histogram observation inside span carries span_id |
-| Hot-path bench | `core/benches/observability_bench.rs` | `record_send` overhead OTel on vs off; labeled vs unlabeled; cache-padding effect |
-| Security: no PII attrs | `core/tests/security_invariants.rs` (extended) | No `peer_ip` / `session_id` ever passed as KeyValue |
+| Atomics correctness | `core/tests/observability_atomics.rs` | Per-leg counters monotone, concurrent 8-thread contention, snapshot round-trip |
+| ZST no-op path | `core/tests/observability_no_otel.rs` | Compiles + runs with the feature off; labeled API is a no-op but atomics still account |
+| OTel labeled surface | `core/tests/observability_otel.rs` (feature-gated) | Every labeled recorder is callable and panic-free with a live global `MeterProvider`; snapshot stays consistent |
+| Hot-path bench | `core/benches/observability_bench.rs` | `record_send` overhead, contended + uncontended; snapshot cost |
+| Config | `core/src/observability/config.rs` unit tests | Namespace default/override, histogram boundary ordering |
+
+### Cardinality contract — enforced by the type system
+
+There is intentionally no runtime "no-PII" test. The contract is enforced
+at **compile time**: every `record_*` method takes typed enums
+(`HandshakeOutcome`, `ReplayReason`, `LegType`, …), never a free-form
+string. There is no API surface through which `peer_ip` / `session_id` /
+`stream_id` could be passed as a label — the compiler rejects it. A
+runtime test would be strictly weaker than this static guarantee.
+
+### Deferred follow-ups
+
+- **Export-capture test** (`InMemoryMetricExporter`) asserting emitted
+  instrument names / units / attribute keys. Deferred: the in-memory
+  exporter's API is unstable across the `opentelemetry_sdk` 0.27–0.29
+  line. Worth adding once the project pins a single SDK minor.
+- **Exemplar test** — blocked on exemplar-reservoir wiring (see §6).
 
 ---
 
@@ -610,6 +640,21 @@ Tick `[x]` and add the short SHA when landed.
 | 18 | CHANGELOG + README Observability section | `docs: CHANGELOG + README Observability section for OTel pipeline` | [x] | `5822e6f` |
 | 19 | CI: add `cargo clippy --features telemetry-otel` job | `ci: clippy job for telemetry-otel feature` | [x] | `5675ecc` |
 | 20 | Final sweep: PROGRESS.md Phase 8 entry + CLAUDE.md observability paragraph | `docs(progress): Phase 8 — OTel observability shipped` | [x] | `9d07053` |
+
+### Post-review amendments
+
+A code-review pass after step 20 found doc/code drift — the fixes below
+landed as follow-up commits. They are the source of truth where they
+contradict the original step rows above (commit subjects are immutable
+history; the rows are not edited retroactively).
+
+| Step subject vs. reality | Correction |
+|--------------------------|------------|
+| Step 9 said "exponential base-2" Histogram | Ships **explicit latency-tuned buckets** (`HistogramConfig` + `.with_boundaries()`). Exponential needs the unstable SDK View API — deferred (§5). |
+| Step 11 said "zstd + Delta" | Ships **gzip** compression + **Delta** temporality. zstd is not enabled on the tonic channel; gzip is. |
+| Step 13 said "cardinality, exemplars" tests | The cardinality contract is **compile-time** type enforcement (no runtime test needed — §10); the exemplar test is deferred with exemplar wiring. `observability_cardinality.rs` / `observability_exemplars.rs` were not created. |
+| Step 7 said "pre-interned attribute sets" | `attrs.rs` ships **typed attribute enums**, not `OnceLock`-interned sets. Interning was dropped as YAGNI for the cold event paths (§5). |
+| Deployment surface | `docker-compose.yml` / `Dockerfile` / `.env.example` were updated post-review to drop the removed `PHANTOM_METRICS_BIND` / port 9090. |
 
 ---
 

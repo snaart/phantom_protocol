@@ -32,8 +32,7 @@ These fire at the point of the event.
 
 | OTel name | Type | Unit | Attributes |
 |-----------|------|------|------------|
-| `phantom.handshake.attempts` | Counter | `{attempt}` | `outcome` (success/failure), `leg`, `cipher_suite` (aes-256-gcm/chacha20-poly1305), `version` (v12/v3) |
-| `phantom.handshake.duration` | Histogram (base-2 exponential) | `s` | same as above |
+| `phantom.handshake.duration` | Histogram (explicit latency buckets) | `s` | `outcome` (success/failure), `leg`, `cipher_suite` (aes-256-gcm/chacha20-poly1305), `version` (v12/v3) |
 | `phantom.handshake.resumptions` | Counter | `{resumption}` | `mode` (1rtt/0rtt), `accepted` (bool) |
 | `phantom.session.early_data` | Counter | `{attempt}` | `outcome` (accepted / rejected_unknown_ticket / rejected_oversized / rejected_aead / rejected_replay) |
 | `phantom.session.rekey` | Counter | `{rekey}` | `direction` (send/recv) |
@@ -88,7 +87,7 @@ Indicative starting points — tune to your traffic profile and SLO.
 |-------|---------------------------|----------|
 | AEAD failures spike | `rate(phantom_security_aead_failed_total[5m]) > 0.5/s` | high — active tampering or corruption |
 | Unencrypted-flag downgrade | `increase(phantom_security_unencrypted_dropped_total[15m]) > 0` | critical — active downgrade attempt |
-| Handshake failure rate | `rate(phantom_handshake_attempts_total{outcome="failure"}[5m]) / rate(phantom_handshake_attempts_total[5m]) > 0.1` | medium |
+| Handshake failure rate | `rate(phantom_handshake_duration_seconds_count{outcome="failure"}[5m]) / rate(phantom_handshake_duration_seconds_count[5m]) > 0.1` | medium |
 | P99 handshake latency | `histogram_quantile(0.99, sum by (le) (rate(phantom_handshake_duration_seconds_bucket[5m]))) > 0.5` | medium |
 | Active sessions saturation | `phantom_session_active >= 0.9 * <provisioned-max>` | warn — scale up |
 | Replay rejections rising | `rate(phantom_security_replay_rejected_total[10m]) > 1/s` | medium — possible attack or clock skew |

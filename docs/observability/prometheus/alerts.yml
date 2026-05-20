@@ -57,8 +57,10 @@ groups:
             over 10 minutes. Could be reordered traffic or replay attack.
 
       - alert: PhantomHandshakeFailureSpike
+        # The handshake-duration histogram's `_count` series is the
+        # canonical handshake count (sliced by the `outcome` attribute).
         expr: |
-          rate(phantom_handshake_attempts_total{outcome="failure"}[5m]) > 1
+          rate(phantom_handshake_duration_seconds_count{outcome="failure"}[5m]) > 1
         for: 5m
         labels:
           severity: warning
@@ -138,7 +140,7 @@ groups:
     rules:
       - alert: PhantomNoSuccessfulHandshakes
         expr: |
-          rate(phantom_handshake_attempts_total{outcome="success"}[15m]) == 0
+          rate(phantom_handshake_duration_seconds_count{outcome="success"}[15m]) == 0
           and sum(phantom_session_active) == 0
         for: 15m
         labels:
