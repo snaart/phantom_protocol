@@ -6,14 +6,19 @@
 //! `telemetry-otel` Cargo feature.
 //!
 //! See `docs/observability/refactor-plan.md` for the full design and
-//! atomic-commit rollout. This file is the public module surface; concrete
-//! types live in the submodules below.
+//! `docs/observability/metrics-catalog.md` for the instrument inventory.
+//! This file is the public module surface; concrete types live in the
+//! submodules below.
 //!
-//! ## Status (Phase 8 rollout)
+//! ## Layout
 //!
-//! Step 2 — scaffold only. The `Observability` facade is a placeholder; the
-//! hot-path atomics, OTel instruments, observable bridge, and recording APIs
-//! land in subsequent atomic commits.
+//! - [`atomics`] — lock-free hot-path counters (`HotPathAtomics`).
+//! - [`config`] — [`ObservabilityConfig`] (namespace, histogram buckets).
+//! - [`instruments`] — OTel instrument holder; ZST no-op when the feature
+//!   is off.
+//! - [`bridge`] — registers `ObservableCounter` callbacks over the atomics.
+//! - [`attrs`] — typed attribute-value enums (the cardinality contract).
+//! - [`snapshot`] — [`MetricsSnapshot`], a cold-path read for FFI / debug.
 
 pub(crate) mod atomics;
 pub mod attrs;
@@ -54,7 +59,15 @@ impl Observability {
     ///
     /// Returns an `Arc` because the handle is shared between recording sites
     /// (in `Session`, `Listener`, handshake code paths) and the OTel
-    /// observable callbacks registered in a later step.
+    /// observable callbacks.
+    ///
+    /// **Call once per process.** When `telemetry-otel` is on, this
+    /// registers observable-instrument callbacks against the *global* OTel
+    /// meter; those callbacks are never unregistered (the meter owns them
+    /// for process life). Constructing many `Observability` instances would
+    /// therefore accumulate callbacks. `PhantomListener` / `PhantomSession`
+    /// each hold one shared `Arc<Observability>` — that is the intended
+    /// usage.
     pub fn new(config: ObservabilityConfig) -> Arc<Self> {
         let instruments = PhantomInstruments::new(&config);
         let atomics = Arc::new(HotPathAtomics::new());
@@ -155,14 +168,10 @@ impl Observability {
     // --- Labeled OTel event recorders (step 7) ---
 
     /// Record a handshake outcome and its latency with full OTel
-    /// attribution. Atomic counters, OTel `Counter` (count by outcome),
-    /// and OTel `Histogram` (duration distribution) are updated together.
-    ///
-    /// Exemplars: when this call happens inside a `tracing` span (e.g.
-    /// `HandshakeServer::process_client_hello`), the SDK attaches the
-    /// active span's `trace_id` / `span_id` to the histogram observation,
-    /// enabling Grafana / Tempo drill-down from a latency outlier to the
-    /// specific trace.
+    /// attribution. The lock-free atomic counters and the OTel
+    /// `Histogram` (`{ns}.handshake.duration`) are updated together; the
+    /// histogram's `_count` series — sliced by the `outcome` attribute —
+    /// is the canonical handshake count, so there is no separate counter.
     pub fn record_handshake(
         &self,
         duration: std::time::Duration,
@@ -176,8 +185,6 @@ impl Observability {
             HandshakeOutcome::Success => self.atomics.record_handshake_success(duration_ns),
             HandshakeOutcome::Failure => self.atomics.record_handshake_failure(),
         }
-        self.instruments
-            .record_handshake(outcome, leg, cipher, version);
         self.instruments.record_handshake_duration(
             duration.as_secs_f64(),
             outcome,
