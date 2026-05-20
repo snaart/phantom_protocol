@@ -42,25 +42,25 @@ roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
   `phantom.*` namespace (env: `PHANTOM_TELEMETRY_NAMESPACE`).
 - `phantom_core::observability::*` module: `Observability` facade,
   `ObservabilityConfig` builder, `MetricsSnapshot` (always available for
-  FFI / debug), pre-interned attribute sets (`Direction`,
-  `HandshakeOutcome`, `AeadAlgorithm`, `ProtocolVersion`, `ReplayReason`,
-  `CookieOutcome`, `PowOutcome`, `EarlyDataOutcome`, `ResumptionMode`,
+  FFI / debug), typed attribute enums (`Direction`, `HandshakeOutcome`,
+  `AeadAlgorithm`, `ProtocolVersion`, `ReplayReason`, `CookieOutcome`,
+  `PowOutcome`, `EarlyDataOutcome`, `ResumptionMode`,
   `PathValidationOutcome`, `FallbackReason`).
 - Lock-free hot-path atomics with `crossbeam_utils::CachePadded` —
   microbench on Apple M1 records `record_send` at **2.5 ns / call**,
   contended at **84 ns / call** across 8 threads.
 - OTel observable callbacks for hot-path atomics; sync labeled
   instruments for security signals, cookie/PoW gate, rekey, fallback,
-  early-data outcomes; base-2 exponential `Histogram`s for handshake
-  and path-validation latency.
+  early-data outcomes; latency `Histogram`s for handshake and
+  path-validation with explicit, latency-tuned bucket boundaries.
 - `tracing-opentelemetry` bridge under `telemetry-otel`. Existing
   `#[tracing::instrument]` spans (`phantom.handshake.*`,
   `phantom.listener.*`) now flow into OTLP traces. Added spans on
   `Session::rekey`, `begin_path_validation`, `complete_path_validation`.
 - `server/src/telemetry.rs` — installs OTLP/gRPC `MeterProvider` /
-  `TracerProvider` and wires `tracing-opentelemetry` into the global
-  subscriber. New CLI flags: `--otlp-endpoint`, `--otel-service-name`,
-  `--otel-metric-export-interval-ms`, `--otel-trace-sample-ratio`.
+  `TracerProvider` (Delta temporality, gzip compression) and wires
+  `tracing-opentelemetry` into the global subscriber. New CLI flags:
+  `--otlp-endpoint`, `--otel-service-name`, `--otel-trace-sample-ratio`.
 - `examples/observability-demo` — sibling crate with a `docker-compose.yml`
   bringing up OTel Collector + Prometheus + Tempo + Grafana.
 - Documentation under `docs/observability/`: `README.md`,

@@ -48,14 +48,22 @@ ratio-based dropping for failure traces.
 
 ## Exemplar correlation
 
-OTel histograms attach the current span's `trace_id` / `span_id` to each
-observation. When `Observability::record_handshake(duration, …)` is called
-inside the active `phantom.handshake.*` span, the histogram entry carries
-that trace_id — Grafana / Tempo drill-down from a P99 latency point lands
-on the specific failed handshake's full trace.
+OTel histograms can attach the active span's `trace_id` / `span_id` to an
+observation as an *exemplar* — the hook for a Grafana → Tempo drill-down
+from a P99 latency point to the specific handshake's trace.
 
-No code change required at recording sites; the SDK reads
-`Context::current()` automatically.
+`Observability::record_handshake(duration, …)` is deliberately called from
+inside the `phantom.handshake.*` span, so the trace context is on
+`Context::current()` and available to the SDK with no extra plumbing at the
+recording site.
+
+**Reservoir configuration required.** Exemplar reservoirs are not enabled
+by default in `opentelemetry_sdk` 0.28. Until the embedder configures one
+on the `MeterProvider`, histograms record normally but emit no exemplars.
+The reference `server/src/telemetry.rs` does not yet configure a reservoir;
+treat exemplar drill-down as "available once the reservoir is wired", not
+as on-by-default. The Grafana dashboard's `exemplar: true` query flags are
+harmless no-ops until then.
 
 ## Sampling
 

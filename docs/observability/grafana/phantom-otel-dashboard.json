@@ -101,7 +101,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
       "targets": [
         {
-          "expr": "sum by (outcome, version) (rate(phantom_handshake_attempts_total{instance=~\"$instance\"}[1m]))",
+          "expr": "sum by (outcome, version) (rate(phantom_handshake_duration_seconds_count{instance=~\"$instance\"}[1m]))",
           "legendFormat": "{{outcome}} / {{version}}"
         }
       ]
@@ -109,7 +109,7 @@
     {
       "id": 14,
       "type": "timeseries",
-      "title": "Handshake latency p50/p95/p99 (with exemplars)",
+      "title": "Handshake latency p50/p95/p99",
       "datasource": "$datasource",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 18 },
       "fieldConfig": { "defaults": { "unit": "s" } },
