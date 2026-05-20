@@ -27,15 +27,19 @@ services:
     restart: unless-stopped
     ports:
       - "4242:4242"   # app — canonical port (matches kubernetes.md + helm)
-      - "9090:9090"   # Prometheus /metrics
     environment:
       # Override the in-image defaults here if needed. RUST_LOG is the most
       # common operator knob.
       RUST_LOG: ${RUST_LOG:-info,phantom_core=info}
       PHANTOM_BIND: 0.0.0.0:4242
-      PHANTOM_METRICS_BIND: 0.0.0.0:9090
       PHANTOM_SIGNING_KEY_FILE: /etc/phantom-server/signing.key
       PHANTOM_LOG_JSON: "true"
+      # Observability is OTLP push (Phase 8 — no inbound /metrics port).
+      # Point this at your OTel Collector. The end-to-end stack
+      # (collector + Prometheus + Tempo + Grafana) lives in
+      # examples/observability-demo/docker-compose.yml.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      OTEL_SERVICE_NAME: phantom-server
     volumes:
       # The signing key must persist across restarts so clients can keep
       # pinning the same verifying key. Wipe this volume only if you
