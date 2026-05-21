@@ -417,6 +417,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). PRs must pass `cargo fmt --check`,
 The `cli-compat` CI job requires that `core` API edits keep
 `cli/` building.
 
+## Acknowledgements
+
+Developed with AI assistance from Anthropic's **Claude Opus 4.6** via
+[Claude Code](https://claude.com/claude-code). All architectural decisions,
+security invariants, threat model, and FIPS / CC compliance artifacts are
+authored, reviewed, tested, and maintained by the human author.
+
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE).
