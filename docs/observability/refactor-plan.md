@@ -624,7 +624,7 @@ Tick `[x]` and add the short SHA when landed.
 | 2 | Module scaffold + feature gate | `observability: scaffold module + ObservabilityConfig (no OTel deps yet)` | [x] | `e59a1f1` |
 | 3 | HotPathAtomics + per-leg arrays + CachePadded | `observability: lock-free HotPathAtomics with per-leg padding` | [x] | `02af467` |
 | 4 | Migrate recording sites from old TransportMetrics | `observability: migrate handshake/listener recording sites` | [x] | `f266415` |
-| 5 | Delete `transport/metrics.rs`, update CLAUDE.md/PROGRESS.md cross-refs | `observability: remove legacy transport/metrics.rs` | [x] | `e49ad5d` |
+| 5 | Delete `transport/metrics.rs`, update PROGRESS.md cross-refs | `observability: remove legacy transport/metrics.rs` | [x] | `e49ad5d` |
 | 6 | Add `telemetry-otel` feature + opentelemetry/_sdk deps + ZST shim | `observability: feature-gate OTel deps + ZST no-op PhantomInstruments` | [x] | `085e735` |
 | 7 | PhantomInstruments + pre-interned attribute sets | `observability: PhantomInstruments + pre-interned attribute sets` | [x] | `327c641` |
 | 8 | Observable callbacks (with_callback) for hot atomics | `observability: bind ObservableCounter callbacks to HotPathAtomics` | [x] | `03c35fb` |
@@ -639,7 +639,7 @@ Tick `[x]` and add the short SHA when landed.
 | 17 | examples/observability-demo crate with docker-compose stack | `examples: observability-demo (docker-compose: server + collector + grafana)` | [x] | `27721da` |
 | 18 | CHANGELOG + README Observability section | `docs: CHANGELOG + README Observability section for OTel pipeline` | [x] | `5822e6f` |
 | 19 | CI: add `cargo clippy --features telemetry-otel` job | `ci: clippy job for telemetry-otel feature` | [x] | `5675ecc` |
-| 20 | Final sweep: PROGRESS.md Phase 8 entry + CLAUDE.md observability paragraph | `docs(progress): Phase 8 — OTel observability shipped` | [x] | `9d07053` |
+| 20 | Final sweep: PROGRESS.md Phase 8 entry | `docs(progress): Phase 8 — OTel observability shipped` | [x] | `9d07053` |
 
 ### Post-review amendments
 

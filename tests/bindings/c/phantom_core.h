@@ -479,7 +479,8 @@ PhantomRustBuffer uniffi_phantom_core_fn_method_acceptoutcome_take_early_data(
  * Phase 7.2 mobile bridge. Opens a TCP connection to `host:port`, wraps
  * it in the length-prefixed `TcpSessionTransport`, parses `pinned_key`
  * into a `HybridVerifyingKey` (per server-identity-pinning invariant 1
- * in CLAUDE.md), and drives the hybrid PQC handshake in the background.
+ * in the security docs), and drives the hybrid PQC handshake in the
+ * background.
  *
  * Returns a u64 future handle that, when complete, yields a `void *`
  * PhantomSession pointer (use `_poll_pointer` + `_complete_pointer`).
