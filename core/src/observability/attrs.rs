@@ -1,23 +1,28 @@
-//! Pre-interned OpenTelemetry attribute sets.
+//! Typed attribute values for OpenTelemetry instruments.
 //!
-//! `KeyValue` allocation on every recording call would dominate the cost of
-//! labeled instruments — `Vec<KeyValue>` building, string interning, and
-//! `AttributeSet` hashing each contribute. We pre-build the full set of
-//! attribute combinations the library will ever emit, store them in
-//! `OnceLock`s, and have recording APIs take an enum index into that table.
+//! Every dimension the library slices a metric by is a small `Copy` enum
+//! here with a `const fn as_str()` returning a `&'static str`. Recording
+//! sites pass the enum; the instrument layer builds the `KeyValue` list.
 //!
-//! Cost on hot path: one indexed slice borrow, then OTel SDK's labeled-add
-//! path (HashMap lookup on a stable already-interned set).
+//! Why typed enums rather than free-form strings: the enum *is* the
+//! cardinality contract. A metric can only be labeled by a value that
+//! exists as an enum variant, so the unbounded-cardinality offenders
+//! (`peer_ip`, `session_id`, `stream_id`) simply cannot be passed — there
+//! is no enum that admits them. See `docs/observability/refactor-plan.md`
+//! §4 "Cardinality contract".
 //!
-//! Pre-interned sets cover the *finite* attribute combinations the library
-//! emits. Per-path attributes (`path_id`) are bounded by `MAX_PATHS=16` and
-//! also pre-built. Unbounded attributes (`peer_ip`, `session_id`,
-//! `stream_id`) are NEVER emitted as OTel labels — see "Cardinality
-//! contract" in `docs/observability/refactor-plan.md` §4.
+//! Performance: the labeled instruments these feed (`record_handshake`,
+//! `record_replay_rejected`, …) are all cold / low-frequency event paths,
+//! so the `KeyValue` list is built per-call. The genuinely hot path
+//! (per-packet counts) does NOT go through here — it uses lock-free
+//! atomics drained by `ObservableCounter` callbacks (`bridge.rs`), which
+//! build their `KeyValue`s once per SDK collection cycle, not per packet.
+//! Per-call attribute construction on the cold paths is not worth
+//! interning away.
 //!
-//! When `telemetry-otel` is disabled the attribute-set machinery still
-//! compiles (cheap `&'static str` constants) so call sites don't need
-//! `#[cfg]` guards.
+//! `as_str()` is `const` and the enums are feature-independent, so this
+//! module compiles identically with or without `telemetry-otel` — call
+//! sites need no `#[cfg]` guards.
 
 use crate::transport::types::LegType;
 
