@@ -1098,6 +1098,22 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
     func recv() async throws  -> Data
     
     /**
+     * Extract a [`ResumptionHint`] for a future 0-RTT reconnect
+     * (wire V3, Phase 4.1).
+     *
+     * Returns `Some` after a successful handshake; `None` while still
+     * handshaking, after a failure, or before the inner session has
+     * been published.
+     *
+     * Store the hint alongside the pinned `HybridVerifyingKey` of the
+     * server it was negotiated against and feed it back to
+     * [`connect_pinned_with_resumption`]. Reusing a hint across
+     * servers is a configuration bug — the `resumption_secret` is
+     * server-pinned.
+     */
+    func resumptionHint() async  -> ResumptionHint?
+    
+    /**
      * Send data through the session.
      *
      * - If the session is connected: sends immediately
@@ -1368,6 +1384,38 @@ open func recv()async throws  -> Data  {
             freeFunc: ffi_phantom_core_rust_future_free_rust_buffer,
             liftFunc: FfiConverterData.lift,
             errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Extract a [`ResumptionHint`] for a future 0-RTT reconnect
+     * (wire V3, Phase 4.1).
+     *
+     * Returns `Some` after a successful handshake; `None` while still
+     * handshaking, after a failure, or before the inner session has
+     * been published.
+     *
+     * Store the hint alongside the pinned `HybridVerifyingKey` of the
+     * server it was negotiated against and feed it back to
+     * [`connect_pinned_with_resumption`]. Reusing a hint across
+     * servers is a configuration bug — the `resumption_secret` is
+     * server-pinned.
+     */
+open func resumptionHint()async  -> ResumptionHint?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_core_fn_method_phantomsession_resumption_hint(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_phantom_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_phantom_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_phantom_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeResumptionHint.lift,
+            errorHandler: nil
+            
         )
 }
     
@@ -1879,6 +1927,107 @@ public func FfiConverterTypePhantomConfig_lower(_ value: PhantomConfig) -> RustB
     return FfiConverterTypePhantomConfig.lower(value)
 }
 
+
+/**
+ * 0-RTT resumption material extracted from a completed session
+ * (wire V3, Phase 4.1).
+ *
+ * Produced by [`PhantomSession::resumption_hint`] after a handshake
+ * completes, and fed back into [`connect_pinned_with_resumption`] to
+ * attempt a 0-RTT reconnect to the same server.
+ *
+ * Both fields are exactly 32 bytes — this record is the
+ * UniFFI-representable surface for the internal `(session_id,
+ * resumption_secret)` tuple. The fields are `Vec<u8>` because UniFFI
+ * has no fixed-size-array type, so the length is a runtime invariant
+ * checked when the hint is used.
+ *
+ * Store the hint alongside the pinned `HybridVerifyingKey` of the
+ * server it was negotiated against: the `resumption_secret` is
+ * server-pinned, and reusing a hint across servers is a configuration
+ * bug.
+ */
+public struct ResumptionHint {
+    /**
+     * The negotiated session id (32 bytes).
+     */
+    public var sessionId: Data
+    /**
+     * The resumption secret (32 bytes) — sensitive; treat like a key.
+     */
+    public var resumptionSecret: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The negotiated session id (32 bytes).
+         */sessionId: Data, 
+        /**
+         * The resumption secret (32 bytes) — sensitive; treat like a key.
+         */resumptionSecret: Data) {
+        self.sessionId = sessionId
+        self.resumptionSecret = resumptionSecret
+    }
+}
+
+#if compiler(>=6)
+extension ResumptionHint: Sendable {}
+#endif
+
+
+extension ResumptionHint: Equatable, Hashable {
+    public static func ==(lhs: ResumptionHint, rhs: ResumptionHint) -> Bool {
+        if lhs.sessionId != rhs.sessionId {
+            return false
+        }
+        if lhs.resumptionSecret != rhs.resumptionSecret {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(sessionId)
+        hasher.combine(resumptionSecret)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeResumptionHint: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ResumptionHint {
+        return
+            try ResumptionHint(
+                sessionId: FfiConverterData.read(from: &buf), 
+                resumptionSecret: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ResumptionHint, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.sessionId, into: &buf)
+        FfiConverterData.write(value.resumptionSecret, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeResumptionHint_lift(_ buf: RustBuffer) throws -> ResumptionHint {
+    return try FfiConverterTypeResumptionHint.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeResumptionHint_lower(_ value: ResumptionHint) -> RustBuffer {
+    return FfiConverterTypeResumptionHint.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -2277,6 +2426,30 @@ fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
         }
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeResumptionHint: FfiConverterRustBuffer {
+    typealias SwiftType = ResumptionHint?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeResumptionHint.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeResumptionHint.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_MAYBE_READY: Int8 = 1
 
@@ -2337,6 +2510,39 @@ public func connectPinned(host: String, port: UInt16, pinnedKey: Data)async thro
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
+/**
+ * Connect to a pinned server with a **0-RTT resumption attempt**
+ * (wire V3, Phase 4.1) — the resumption-aware analogue of
+ * [`connect_pinned`].
+ *
+ * `hint` is a [`ResumptionHint`] from a prior session's
+ * [`PhantomSession::resumption_hint`]; both of its fields must be
+ * exactly 32 bytes or the call fails with `ValidationError` before any
+ * socket is opened. `early_data` (≤ 16 KiB) is sealed into the V3
+ * ClientHello so it reaches the server on the very first flight.
+ *
+ * If the server does not speak V3 the handshake transparently falls
+ * back to 1-RTT and `early_data` is *not* delivered 0-RTT — the caller
+ * checks [`PhantomSession::early_data_accepted`] and re-sends over the
+ * normal channel when it is not `Some(true)`.
+ *
+ * Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
+ * behind `cfg(not(target_arch = "wasm32"))`.
+ */
+public func connectPinnedWithResumption(host: String, port: UInt16, pinnedKey: Data, hint: ResumptionHint, earlyData: Data)async throws  -> PhantomSession  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_core_fn_func_connect_pinned_with_resumption(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey),FfiConverterTypeResumptionHint_lower(hint),FfiConverterData.lower(earlyData)
+                )
+            },
+            pollFunc: ffi_phantom_core_rust_future_poll_pointer,
+            completeFunc: ffi_phantom_core_rust_future_complete_pointer,
+            freeFunc: ffi_phantom_core_rust_future_free_pointer,
+            liftFunc: FfiConverterTypePhantomSession_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
 
 private enum InitializationResult {
     case ok
@@ -2354,6 +2560,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_phantom_core_checksum_func_connect_pinned() != 59015) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_core_checksum_func_connect_pinned_with_resumption() != 31650) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data() != 16642) {
@@ -2414,6 +2623,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_core_checksum_method_phantomsession_recv() != 61516) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_core_checksum_method_phantomsession_resumption_hint() != 36484) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_core_checksum_method_phantomsession_send() != 35674) {

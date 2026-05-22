@@ -787,6 +787,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -803,6 +807,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 internal interface IntegrityCheckingUniffiLib : Library {
     // Integrity check functions only
     fun uniffi_phantom_core_checksum_func_connect_pinned(
+): Short
+fun uniffi_phantom_core_checksum_func_connect_pinned_with_resumption(
 ): Short
 fun uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data(
 ): Short
@@ -843,6 +849,8 @@ fun uniffi_phantom_core_checksum_method_phantomsession_peer_addr(
 fun uniffi_phantom_core_checksum_method_phantomsession_queued_count(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomsession_recv(
+): Short
+fun uniffi_phantom_core_checksum_method_phantomsession_resumption_hint(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomsession_send(
 ): Short
@@ -967,6 +975,8 @@ fun uniffi_phantom_core_fn_method_phantomsession_queued_count(`ptr`: Pointer,
 ): Long
 fun uniffi_phantom_core_fn_method_phantomsession_recv(`ptr`: Pointer,
 ): Long
+fun uniffi_phantom_core_fn_method_phantomsession_resumption_hint(`ptr`: Pointer,
+): Long
 fun uniffi_phantom_core_fn_method_phantomsession_send(`ptr`: Pointer,`data`: RustBuffer.ByValue,
 ): Long
 fun uniffi_phantom_core_fn_method_phantomsession_set_state(`ptr`: Pointer,`newState`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -986,6 +996,8 @@ fun uniffi_phantom_core_fn_method_phantomstream_send_unreliable(`ptr`: Pointer,`
 fun uniffi_phantom_core_fn_method_phantomstream_stream_id(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
 fun uniffi_phantom_core_fn_func_connect_pinned(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,
+): Long
+fun uniffi_phantom_core_fn_func_connect_pinned_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: RustBuffer.ByValue,`earlyData`: RustBuffer.ByValue,
 ): Long
 fun ffi_phantom_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1116,6 +1128,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_core_checksum_func_connect_pinned() != 59015.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_phantom_core_checksum_func_connect_pinned_with_resumption() != 31650.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data() != 16642.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1174,6 +1189,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_core_checksum_method_phantomsession_recv() != 61516.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_core_checksum_method_phantomsession_resumption_hint() != 36484.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_core_checksum_method_phantomsession_send() != 35674.toShort()) {
@@ -2497,6 +2515,22 @@ public interface PhantomSessionInterface {
     suspend fun `recv`(): kotlin.ByteArray
     
     /**
+     * Extract a [`ResumptionHint`] for a future 0-RTT reconnect
+     * (wire V3, Phase 4.1).
+     *
+     * Returns `Some` after a successful handshake; `None` while still
+     * handshaking, after a failure, or before the inner session has
+     * been published.
+     *
+     * Store the hint alongside the pinned `HybridVerifyingKey` of the
+     * server it was negotiated against and feed it back to
+     * [`connect_pinned_with_resumption`]. Reusing a hint across
+     * servers is a configuration bug — the `resumption_secret` is
+     * server-pinned.
+     */
+    suspend fun `resumptionHint`(): ResumptionHint?
+    
+    /**
      * Send data through the session.
      *
      * - If the session is connected: sends immediately
@@ -2832,6 +2866,40 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
         { FfiConverterByteArray.lift(it) },
         // Error FFI converter
         CoreException.ErrorHandler,
+    )
+    }
+
+    
+    /**
+     * Extract a [`ResumptionHint`] for a future 0-RTT reconnect
+     * (wire V3, Phase 4.1).
+     *
+     * Returns `Some` after a successful handshake; `None` while still
+     * handshaking, after a failure, or before the inner session has
+     * been published.
+     *
+     * Store the hint alongside the pinned `HybridVerifyingKey` of the
+     * server it was negotiated against and feed it back to
+     * [`connect_pinned_with_resumption`]. Reusing a hint across
+     * servers is a configuration bug — the `resumption_secret` is
+     * server-pinned.
+     */
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `resumptionHint`() : ResumptionHint? {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_phantom_core_fn_method_phantomsession_resumption_hint(
+                thisPtr,
+                
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterOptionalTypeResumptionHint.lift(it) },
+        // Error FFI converter
+        UniffiNullRustCallStatusErrorHandler,
     )
     }
 
@@ -3372,6 +3440,63 @@ public object FfiConverterTypePhantomConfig: FfiConverterRustBuffer<PhantomConfi
 
 
 /**
+ * 0-RTT resumption material extracted from a completed session
+ * (wire V3, Phase 4.1).
+ *
+ * Produced by [`PhantomSession::resumption_hint`] after a handshake
+ * completes, and fed back into [`connect_pinned_with_resumption`] to
+ * attempt a 0-RTT reconnect to the same server.
+ *
+ * Both fields are exactly 32 bytes — this record is the
+ * UniFFI-representable surface for the internal `(session_id,
+ * resumption_secret)` tuple. The fields are `Vec<u8>` because UniFFI
+ * has no fixed-size-array type, so the length is a runtime invariant
+ * checked when the hint is used.
+ *
+ * Store the hint alongside the pinned `HybridVerifyingKey` of the
+ * server it was negotiated against: the `resumption_secret` is
+ * server-pinned, and reusing a hint across servers is a configuration
+ * bug.
+ */
+data class ResumptionHint (
+    /**
+     * The negotiated session id (32 bytes).
+     */
+    var `sessionId`: kotlin.ByteArray, 
+    /**
+     * The resumption secret (32 bytes) — sensitive; treat like a key.
+     */
+    var `resumptionSecret`: kotlin.ByteArray
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeResumptionHint: FfiConverterRustBuffer<ResumptionHint> {
+    override fun read(buf: ByteBuffer): ResumptionHint {
+        return ResumptionHint(
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ResumptionHint) = (
+            FfiConverterByteArray.allocationSize(value.`sessionId`) +
+            FfiConverterByteArray.allocationSize(value.`resumptionSecret`)
+    )
+
+    override fun write(value: ResumptionHint, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`sessionId`, buf)
+            FfiConverterByteArray.write(value.`resumptionSecret`, buf)
+    }
+}
+
+
+
+/**
  * Connection state for `PhantomSession`.
  *
  * The session is usable from the moment it's created — sends are queued
@@ -3857,6 +3982,38 @@ public object FfiConverterOptionalByteArray: FfiConverterRustBuffer<kotlin.ByteA
 
 
 
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeResumptionHint: FfiConverterRustBuffer<ResumptionHint?> {
+    override fun read(buf: ByteBuffer): ResumptionHint? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeResumptionHint.read(buf)
+    }
+
+    override fun allocationSize(value: ResumptionHint?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeResumptionHint.allocationSize(value)
+        }
+    }
+
+    override fun write(value: ResumptionHint?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeResumptionHint.write(value, buf)
+        }
+    }
+}
+
+
+
+
 
 
 
@@ -3866,6 +4023,40 @@ public object FfiConverterOptionalByteArray: FfiConverterRustBuffer<kotlin.ByteA
      suspend fun `connectPinned`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray) : PhantomSession {
         return uniffiRustCallAsync(
         UniffiLib.INSTANCE.uniffi_phantom_core_fn_func_connect_pinned(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),),
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_poll_pointer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_complete_pointer(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_free_pointer(future) },
+        // lift function
+        { FfiConverterTypePhantomSession.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+        /**
+         * Connect to a pinned server with a **0-RTT resumption attempt**
+         * (wire V3, Phase 4.1) — the resumption-aware analogue of
+         * [`connect_pinned`].
+         *
+         * `hint` is a [`ResumptionHint`] from a prior session's
+         * [`PhantomSession::resumption_hint`]; both of its fields must be
+         * exactly 32 bytes or the call fails with `ValidationError` before any
+         * socket is opened. `early_data` (≤ 16 KiB) is sealed into the V3
+         * ClientHello so it reaches the server on the very first flight.
+         *
+         * If the server does not speak V3 the handshake transparently falls
+         * back to 1-RTT and `early_data` is *not* delivered 0-RTT — the caller
+         * checks [`PhantomSession::early_data_accepted`] and re-sends over the
+         * normal channel when it is not `Some(true)`.
+         *
+         * Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
+         * behind `cfg(not(target_arch = "wasm32"))`.
+         */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `connectPinnedWithResumption`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray, `hint`: ResumptionHint, `earlyData`: kotlin.ByteArray) : PhantomSession {
+        return uniffiRustCallAsync(
+        UniffiLib.INSTANCE.uniffi_phantom_core_fn_func_connect_pinned_with_resumption(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),FfiConverterTypeResumptionHint.lower(`hint`),FfiConverterByteArray.lower(`earlyData`),),
         { future, callback, continuation -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_poll_pointer(future, callback, continuation) },
         { future, continuation -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_complete_pointer(future, continuation) },
         { future -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_free_pointer(future) },

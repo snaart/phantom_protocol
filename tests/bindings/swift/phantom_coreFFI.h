@@ -391,6 +391,11 @@ uint64_t uniffi_phantom_core_fn_method_phantomsession_queued_count(void*_Nonnull
 uint64_t uniffi_phantom_core_fn_method_phantomsession_recv(void*_Nonnull ptr
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_RESUMPTION_HINT
+#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_RESUMPTION_HINT
+uint64_t uniffi_phantom_core_fn_method_phantomsession_resumption_hint(void*_Nonnull ptr
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_SEND
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_SEND
 uint64_t uniffi_phantom_core_fn_method_phantomsession_send(void*_Nonnull ptr, RustBuffer data
@@ -439,6 +444,11 @@ uint32_t uniffi_phantom_core_fn_method_phantomstream_stream_id(void*_Nonnull ptr
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FUNC_CONNECT_PINNED
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FUNC_CONNECT_PINNED
 uint64_t uniffi_phantom_core_fn_func_connect_pinned(RustBuffer host, uint16_t port, RustBuffer pinned_key
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FUNC_CONNECT_PINNED_WITH_RESUMPTION
+#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FUNC_CONNECT_PINNED_WITH_RESUMPTION
+uint64_t uniffi_phantom_core_fn_func_connect_pinned_with_resumption(RustBuffer host, uint16_t port, RustBuffer pinned_key, RustBuffer hint, RustBuffer early_data
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUSTBUFFER_ALLOC
@@ -727,6 +737,12 @@ uint16_t uniffi_phantom_core_checksum_func_connect_pinned(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_FUNC_CONNECT_PINNED_WITH_RESUMPTION
+#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_FUNC_CONNECT_PINNED_WITH_RESUMPTION
+uint16_t uniffi_phantom_core_checksum_func_connect_pinned_with_resumption(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_ACCEPTOUTCOME_HAS_EARLY_DATA
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_ACCEPTOUTCOME_HAS_EARLY_DATA
 uint16_t uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data(void
@@ -844,6 +860,12 @@ uint16_t uniffi_phantom_core_checksum_method_phantomsession_queued_count(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_RECV
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_RECV
 uint16_t uniffi_phantom_core_checksum_method_phantomsession_recv(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_RESUMPTION_HINT
+#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_RESUMPTION_HINT
+uint16_t uniffi_phantom_core_checksum_method_phantomsession_resumption_hint(void
     
 );
 #endif
