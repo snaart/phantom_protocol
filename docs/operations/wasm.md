@@ -97,8 +97,9 @@ server signing key requires a wasm rebuild and redeploy.
 ## Session resumption via IndexedDB
 
 After a session establishes, `PhantomSession::resumption_hint()` returns
-`Option<([u8; 32], [u8; 32])>` — `(session_id, resumption_secret)`. Persist
-it in IndexedDB for 0-RTT resumption on subsequent page loads.
+`Option<ResumptionHint>` — a record with 32-byte `session_id` and
+`resumption_secret` fields. Persist it in IndexedDB for 0-RTT resumption
+on subsequent page loads.
 
 **Recommended JSON shape** (keyed by server hostname):
 
@@ -109,19 +110,22 @@ it in IndexedDB for 0-RTT resumption on subsequent page loads.
 **Resumption TTL.** Discard hints older than 3 600 000 ms (server
 `SessionCache` default: 1 hour).
 
-**Resuming:**
+**Resuming.** The native `connect_pinned_with_resumption` shim is
+`cfg(not(wasm32))`; browser builds resume through the Rust-level
+`connect_with_resumption`, which takes the raw `(session_id,
+resumption_secret)` tuple and an early-data `Vec<u8>` (≤ 16 KiB):
 
 ```rust
 let session = PhantomSession::connect_with_resumption(
     "wss://phantom.example.com",
     leg,
     pinned,
-    Some((sid, secret)),  // hex-decoded from IndexedDB
-    None,                 // early_data: Option<&[u8]>, max 16 KiB
-).await?;
+    (sid, secret),        // [u8; 32] each, hex-decoded from IndexedDB
+    Vec::new(),           // early_data: Vec<u8>, max 16 KiB
+)?;
 
 // None = no V3 attempt; Some(true) = server accepted early data.
-if session.early_data_accepted() == Some(true) { /* ... */ }
+if session.early_data_accepted().await == Some(true) { /* ... */ }
 ```
 
 **Anti-replay.** `SessionCache::try_resume` is one-shot — a replayed or expired

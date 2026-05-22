@@ -77,9 +77,10 @@ Phantom's `HybridVerifyingKey` provides the post-quantum auth layer.
 
 **Background mode.** iOS suspends connections when the app backgrounds. Register
 for Background App Refresh (`BGAppRefreshTask`); on `sceneDidEnterBackground`
-persist `session.resumptionHint()` — `(sessionId, resumptionSecret)` — to
-Keychain (`SecItemAdd`); on foreground reload and pass to `connectWithResumption`
-(0-RTT skips PQC keygen). Discard hints older than 1 hour (server default).
+persist `session.resumptionHint()` — a `ResumptionHint` with `sessionId` /
+`resumptionSecret` — to Keychain (`SecItemAdd`); on foreground reload pass it
+to `connectPinnedWithResumption` (0-RTT skips PQC keygen). Discard hints older
+than 1 hour (server default).
 
 ## Android (Kotlin)
 
@@ -184,8 +185,8 @@ the app — iOS: `Bundle.main.url(forResource:withExtension:)`; Android:
 `R.raw.phantom_server_pk`. **Never** fetch the key at runtime — that voids the
 trust model. Rotating the signing key requires an app update.
 
-**Resumption ticket storage.** Persist `(session_id, resumption_secret)` from
-`session.resumptionHint()` to secure storage:
+**Resumption ticket storage.** Persist the `ResumptionHint` (`sessionId`,
+`resumptionSecret`) from `session.resumptionHint()` to secure storage:
 
 - iOS: Keychain (`SecItemAdd`/`SecItemCopyMatching`),
   `kSecAttrAccessible = kSecAttrAccessibleAfterFirstUnlock`.
