@@ -26,6 +26,7 @@ cargo run --release --manifest-path "${REPO_ROOT}/core/Cargo.toml" \
     --bin uniffi-bindgen -- generate \
     --library "${DYLIB}" \
     --language swift \
+    --no-format \
     --out-dir "${SCRIPT_DIR}/swift"
 
 echo "Swift bindings generated in ${SCRIPT_DIR}/swift/"
