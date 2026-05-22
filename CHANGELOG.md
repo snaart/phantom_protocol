@@ -14,6 +14,12 @@ roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
 132; the new ten cover the documented security invariants directly.
 
 ### Added
+- FFI 0-RTT resumption: new `ResumptionHint` UniFFI record and the
+  native `connect_pinned_with_resumption` free function expose 0-RTT
+  session resumption to FFI / mobile consumers.
+  `PhantomSession::resumption_hint()` now returns `Option<ResumptionHint>`
+  and is on the UniFFI surface — it was previously a Rust-only
+  `Option<([u8; 32], [u8; 32])>` tuple defined outside the export block.
 - Governance: `LICENSE` (Apache-2.0), `README.md`, `CHANGELOG.md`,
   `SECURITY.md`, `CONTRIBUTING.md`.
 - Toolchain: `rust-toolchain.toml` (stable), `.rustfmt.toml`, `.clippy.toml`.
