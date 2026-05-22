@@ -95,6 +95,21 @@ jobs:
       - run: cargo test --manifest-path core/Cargo.toml --lib --features embedded
       - run: cargo clippy --manifest-path core/Cargo.toml --lib --features embedded -- -D warnings
 
+  telemetry-otel-feature:
+    name: cargo test + clippy (--features telemetry-otel)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - run: cargo test --manifest-path core/Cargo.toml --lib --features telemetry-otel
+      - run: cargo test --manifest-path core/Cargo.toml --test observability_otel --features telemetry-otel
+      - run: cargo clippy --manifest-path core/Cargo.toml --lib --features telemetry-otel -- -D warnings
+
   cli-check:
     name: cli compiles against core
     runs-on: ubuntu-latest
