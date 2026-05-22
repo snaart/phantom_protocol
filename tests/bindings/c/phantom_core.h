@@ -402,6 +402,11 @@ uint64_t uniffi_phantom_core_fn_method_phantomsession_queued_count(
 uint64_t uniffi_phantom_core_fn_method_phantomsession_recv(
     void                    *ptr);
 
+/* resumption_hint() -> async Option<ResumptionHint> (rust_buffer result).
+ * Some(...) after a completed handshake; feeds connect_pinned_with_resumption. */
+uint64_t uniffi_phantom_core_fn_method_phantomsession_resumption_hint(
+    void                    *ptr);
+
 /* send(data: Vec<u8>) -> async void. */
 uint64_t uniffi_phantom_core_fn_method_phantomsession_send(
     void                    *ptr,
@@ -490,6 +495,26 @@ uint64_t uniffi_phantom_core_fn_func_connect_pinned(
     uint16_t                 port,
     PhantomRustBuffer        pinned_key);
 
+/* connect_pinned_with_resumption(host: string, port: u16,
+ *     pinned_key: Vec<u8>, hint: ResumptionHint, early_data: Vec<u8>) ->
+ *     async Result<PhantomSession, CoreError>.
+ *
+ * Resumption-aware analogue of `connect_pinned` — attempts a 0-RTT (wire
+ * V3) reconnect using the `ResumptionHint` from a prior session's
+ * `resumption_hint()`. `hint` is the lowered `ResumptionHint` record
+ * (two length-prefixed 32-byte buffers); a field whose length is not 32
+ * surfaces as `CoreError::ValidationError`. `early_data` (<= 16 KiB) is
+ * sealed into the V3 ClientHello.
+ *
+ * Returns a u64 future handle yielding a `void *` PhantomSession pointer
+ * (use `_poll_pointer` + `_complete_pointer`). */
+uint64_t uniffi_phantom_core_fn_func_connect_pinned_with_resumption(
+    PhantomRustBuffer        host,
+    uint16_t                 port,
+    PhantomRustBuffer        pinned_key,
+    PhantomRustBuffer        hint,
+    PhantomRustBuffer        early_data);
+
 /* ====================================================================
  * SECTION 5 — Caveats & non-exported items
  *
@@ -501,8 +526,10 @@ uint64_t uniffi_phantom_core_fn_func_connect_pinned(
  *    use `connect_pinned` and supply the server's `HybridVerifyingKey`
  *    bytes (obtainable from `verifying_key_bytes()` on the listener).
  *
- *    `connect_with_resumption` and the `_with_runtime` overloads remain
- *    Rust-only; callers needing them should build an analogous shim.
+ *    0-RTT resumption is available via
+ *    `uniffi_phantom_core_fn_func_connect_pinned_with_resumption`. The
+ *    generic `connect_with_resumption` and the `_with_runtime` overloads
+ *    remain Rust-only; callers needing those should build a similar shim.
  *
  *  - The `transport::SessionTransport` trait, `HybridSigningKey`,
  *    `HybridVerifyingKey`, `PhantomConfig`, runtime injection, and the
