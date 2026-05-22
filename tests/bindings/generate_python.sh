@@ -26,6 +26,7 @@ cargo run --release --manifest-path "${REPO_ROOT}/core/Cargo.toml" \
     --bin uniffi-bindgen -- generate \
     --library "${DYLIB}" \
     --language python \
+    --no-format \
     --out-dir "${SCRIPT_DIR}"
 
 echo "Python bindings generated at ${SCRIPT_DIR}/phantom_core.py"

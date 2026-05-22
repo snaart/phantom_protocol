@@ -21,4 +21,5 @@ mkdir -p "${OUT_DIR}"
 "${UNIFFI_BINDGEN}" generate \
     --library "${CDYLIB}" \
     --language kotlin \
+    --no-format \
     --out-dir "${OUT_DIR}"
