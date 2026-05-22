@@ -85,6 +85,33 @@ impl ConnectionState {
     }
 }
 
+// ─── Resumption Hint ────────────────────────────────────────────────────────
+
+/// 0-RTT resumption material extracted from a completed session
+/// (wire V3, Phase 4.1).
+///
+/// Produced by [`PhantomSession::resumption_hint`] after a handshake
+/// completes, and fed back into [`connect_pinned_with_resumption`] to
+/// attempt a 0-RTT reconnect to the same server.
+///
+/// Both fields are exactly 32 bytes — this record is the
+/// UniFFI-representable surface for the internal `(session_id,
+/// resumption_secret)` tuple. The fields are `Vec<u8>` because UniFFI
+/// has no fixed-size-array type, so the length is a runtime invariant
+/// checked when the hint is used.
+///
+/// Store the hint alongside the pinned `HybridVerifyingKey` of the
+/// server it was negotiated against: the `resumption_secret` is
+/// server-pinned, and reusing a hint across servers is a configuration
+/// bug.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ResumptionHint {
+    /// The negotiated session id (32 bytes).
+    pub session_id: Vec<u8>,
+    /// The resumption secret (32 bytes) — sensitive; treat like a key.
+    pub resumption_secret: Vec<u8>,
+}
+
 // ─── Transport Abstraction ──────────────────────────────────────────────────
 
 // `SessionTransport` now lives in `crate::transport::session_transport` — a
@@ -1576,6 +1603,29 @@ impl PhantomSession {
         *self.early_data_accepted.lock().await
     }
 
+    /// Extract a [`ResumptionHint`] for a future 0-RTT reconnect
+    /// (wire V3, Phase 4.1).
+    ///
+    /// Returns `Some` after a successful handshake; `None` while still
+    /// handshaking, after a failure, or before the inner session has
+    /// been published.
+    ///
+    /// Store the hint alongside the pinned `HybridVerifyingKey` of the
+    /// server it was negotiated against and feed it back to
+    /// [`connect_pinned_with_resumption`]. Reusing a hint across
+    /// servers is a configuration bug — the `resumption_secret` is
+    /// server-pinned.
+    pub async fn resumption_hint(&self) -> Option<ResumptionHint> {
+        let guard = self.inner_session.lock().await;
+        guard
+            .as_ref()
+            .and_then(|s| s.resumption_hint())
+            .map(|(session_id, resumption_secret)| ResumptionHint {
+                session_id: session_id.to_vec(),
+                resumption_secret: resumption_secret.to_vec(),
+            })
+    }
+
     /// Close the session.
     pub async fn close(&self) -> Result<(), CoreError> {
         self.set_state(ConnectionState::Closed);
@@ -1588,21 +1638,6 @@ impl PhantomSession {
     /// Get the stream demultiplexer (internal use, not exposed to UniFFI)
     pub fn demux(&self) -> Arc<StreamDemultiplexer> {
         self.demux.clone()
-    }
-
-    /// Phase 4.1 — extract a resumption hint for 0-RTT on a future
-    /// connect. Returns `Some((session_id_bytes, resumption_secret))`
-    /// after a successful handshake; `None` while still handshaking,
-    /// after a failure, or before the inner session has been
-    /// published.
-    ///
-    /// The caller is responsible for storing the tuple alongside the
-    /// pinned `HybridVerifyingKey` of the server it was negotiated
-    /// against. Reusing a hint across servers is a configuration bug
-    /// — the resumption_secret is server-pinned.
-    pub async fn resumption_hint(&self) -> Option<([u8; 32], [u8; 32])> {
-        let guard = self.inner_session.lock().await;
-        guard.as_ref().and_then(|s| s.resumption_hint())
     }
 }
 
@@ -1655,6 +1690,73 @@ pub async fn connect_pinned(
     // `connect_with_transport`; the returned `PhantomSession` is usable
     // immediately (state `Connecting`, sends auto-queued until ready).
     let session = PhantomSession::connect_with_transport(&addr, transport, expected_server_key);
+    Ok(Arc::new(session))
+}
+
+/// Connect to a pinned server with a **0-RTT resumption attempt**
+/// (wire V3, Phase 4.1) — the resumption-aware analogue of
+/// [`connect_pinned`].
+///
+/// `hint` is a [`ResumptionHint`] from a prior session's
+/// [`PhantomSession::resumption_hint`]; both of its fields must be
+/// exactly 32 bytes or the call fails with `ValidationError` before any
+/// socket is opened. `early_data` (≤ 16 KiB) is sealed into the V3
+/// ClientHello so it reaches the server on the very first flight.
+///
+/// If the server does not speak V3 the handshake transparently falls
+/// back to 1-RTT and `early_data` is *not* delivered 0-RTT — the caller
+/// checks [`PhantomSession::early_data_accepted`] and re-sends over the
+/// normal channel when it is not `Some(true)`.
+///
+/// Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
+/// behind `cfg(not(target_arch = "wasm32"))`.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+pub async fn connect_pinned_with_resumption(
+    host: String,
+    port: u16,
+    pinned_key: Vec<u8>,
+    hint: ResumptionHint,
+    early_data: Vec<u8>,
+) -> Result<Arc<PhantomSession>, CoreError> {
+    // Server-key pinning stays mandatory (security invariant 1): a
+    // malformed blob is a crypto-layer problem, surfaced as `CryptoError`.
+    let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
+        .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
+
+    // `ResumptionHint` fields are `Vec<u8>` (UniFFI has no fixed-size
+    // array type) — enforce the 32-byte invariant here, before any
+    // socket is opened, so a caller bug never becomes a network call.
+    let session_id: [u8; 32] = hint.session_id.as_slice().try_into().map_err(|_| {
+        CoreError::ValidationError(format!(
+            "resumption hint session_id must be 32 bytes, got {}",
+            hint.session_id.len()
+        ))
+    })?;
+    let resumption_secret: [u8; 32] =
+        hint.resumption_secret.as_slice().try_into().map_err(|_| {
+            CoreError::ValidationError(format!(
+                "resumption hint resumption_secret must be 32 bytes, got {}",
+                hint.resumption_secret.len()
+            ))
+        })?;
+
+    let addr = format!("{}:{}", host, port);
+    let stream = tokio::net::TcpStream::connect(&addr)
+        .await
+        .map_err(|e| CoreError::NetworkError(format!("connect {}: {}", addr, e)))?;
+    let transport = crate::api::tcp_transport::TcpSessionTransport::new(stream);
+
+    // Reuses the Rust-only `connect_with_resumption` — no new crypto and
+    // no new wire format. That path enforces the `EARLY_DATA_MAX_LEN`
+    // cap and keeps 0-RTT one-shot / best-effort (security invariant 9).
+    let session = PhantomSession::connect_with_resumption(
+        &addr,
+        transport,
+        expected_server_key,
+        (session_id, resumption_secret),
+        early_data,
+    )?;
     Ok(Arc::new(session))
 }
 
@@ -2573,6 +2675,15 @@ mod tests {
             .resumption_hint()
             .await
             .expect("phase 1 produced a resumption hint");
+        // The Rust-only `connect_with_resumption` takes the raw tuple;
+        // `resumption_hint()` now yields the UniFFI `ResumptionHint`
+        // record, so rebuild the tuple from its 32-byte fields.
+        let hint = (
+            <[u8; 32]>::try_from(hint.session_id.as_slice())
+                .expect("session_id is 32 bytes"),
+            <[u8; 32]>::try_from(hint.resumption_secret.as_slice())
+                .expect("resumption_secret is 32 bytes"),
+        );
 
         // ── Phase 2: resume — V3 ClientHello carries the early-data ──
         let early_payload = b"zero-rtt application bytes".to_vec();
@@ -2617,6 +2728,37 @@ mod tests {
         // Keep the server transports alive until every assertion has
         // run — see the doc comment above.
         drop((s1, s2));
+    }
+
+    /// `connect_pinned_with_resumption` validates the `ResumptionHint`
+    /// field lengths *before* opening any socket — a hint whose
+    /// `session_id` or `resumption_secret` is not exactly 32 bytes is a
+    /// caller bug and surfaces as `ValidationError`, never a network
+    /// round-trip.
+    #[tokio::test]
+    async fn connect_pinned_with_resumption_rejects_malformed_hint() {
+        let server_hs = HandshakeServer::new().unwrap();
+        let pinned = server_hs.verifying_key().to_bytes();
+
+        let bad_hint = ResumptionHint {
+            session_id: vec![0u8; 5], // not 32 bytes
+            resumption_secret: vec![0u8; 32],
+        };
+
+        let err = connect_pinned_with_resumption(
+            "127.0.0.1".to_string(),
+            9,
+            pinned,
+            bad_hint,
+            Vec::new(),
+        )
+        .await
+        .expect_err("a 5-byte session_id must be rejected");
+
+        assert!(
+            matches!(err, CoreError::ValidationError(_)),
+            "expected ValidationError, got {err:?}"
+        );
     }
 
     /// A V3 client whose server does not speak V3 receives
