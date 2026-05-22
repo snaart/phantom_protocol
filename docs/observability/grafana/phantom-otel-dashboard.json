@@ -1,0 +1,270 @@
+{
+  "uid": "phantom-core-otel",
+  "title": "Phantom Core (OTel)",
+  "description": "Phantom Core observability dashboard, Phase 8 OTel-native metric names. Pairs with docs/observability/prometheus/alerts.yml.",
+  "tags": ["phantom", "transport", "security", "otel"],
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": { "refresh_intervals": ["10s", "30s", "1m", "5m"] },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus"
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": "label_values(phantom_session_active, instance)",
+        "label": "Instance",
+        "multi": true,
+        "includeAll": true
+      },
+      {
+        "name": "tempo",
+        "type": "datasource",
+        "query": "tempo",
+        "label": "Tempo"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Throughput",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Packets/sec by direction × leg",
+      "datasource": "$datasource",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "expr": "sum by (direction, leg) (rate(phantom_session_packets_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{direction}} / {{leg}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Bytes/sec by direction × leg",
+      "datasource": "$datasource",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "Bps" } },
+      "targets": [
+        {
+          "expr": "sum by (direction, leg) (rate(phantom_session_io_By_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{direction}} / {{leg}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Sessions & Handshakes",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 }
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Active sessions",
+      "datasource": "$datasource",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 10 },
+      "targets": [
+        { "expr": "sum(phantom_session_active{instance=~\"$instance\"})" }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Active streams",
+      "datasource": "$datasource",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 10 },
+      "targets": [
+        { "expr": "sum(phantom_session_streams_active{instance=~\"$instance\"})" }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Handshakes/sec by outcome × version",
+      "datasource": "$datasource",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "targets": [
+        {
+          "expr": "sum by (outcome, version) (rate(phantom_handshake_duration_seconds_count{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{outcome}} / {{version}}"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Handshake latency p50/p95/p99",
+      "datasource": "$datasource",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "options": { "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(phantom_handshake_duration_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p50",
+          "exemplar": true
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(phantom_handshake_duration_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p95",
+          "exemplar": true
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(phantom_handshake_duration_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p99",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Security signals",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Replay rejected / sec (by reason)",
+      "datasource": "$datasource",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 27 },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(phantom_security_replay_rejected_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "AEAD failures / sec (by leg)",
+      "datasource": "$datasource",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 27 },
+      "targets": [
+        {
+          "expr": "sum by (leg) (rate(phantom_security_aead_failed_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{leg}}"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Unencrypted dropped / sec (DOWNGRADE)",
+      "datasource": "$datasource",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 27 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.0001 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(phantom_security_unencrypted_dropped_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "unencrypted/sec"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "DoS gate & 0-RTT",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Cookie outcomes / sec",
+      "datasource": "$datasource",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 35 },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(phantom_security_cookie_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "PoW outcomes / sec",
+      "datasource": "$datasource",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 35 },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(phantom_security_pow_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Early-data outcomes / sec",
+      "datasource": "$datasource",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 35 },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(phantom_session_early_data_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 40,
+      "type": "row",
+      "title": "Multi-path & paths",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 }
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Path migrations / sec",
+      "datasource": "$datasource",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 43 },
+      "targets": [
+        {
+          "expr": "sum by (from_path, to_path) (rate(phantom_path_migrations_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{from_path}} → {{to_path}}"
+        }
+      ]
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Path RTT (μs) by path_id",
+      "datasource": "$datasource",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 43 },
+      "fieldConfig": { "defaults": { "unit": "µs" } },
+      "targets": [
+        {
+          "expr": "phantom_path_rtt_us{instance=~\"$instance\"}",
+          "legendFormat": "path {{path_id}}"
+        }
+      ]
+    }
+  ]
+}
