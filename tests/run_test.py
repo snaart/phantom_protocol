@@ -1,72 +1,79 @@
-import sys
-import os
-import asyncio
-import time
+#!/usr/bin/env python3
+"""Loopback smoke test for the phantom_core Python (UniFFI) binding.
 
-# Add bindings directory to path
-bindings_path = os.path.join(os.path.dirname(__file__), "bindings")
-sys.path.append(bindings_path)
+Binds an in-process ``PhantomListener`` on an OS-chosen loopback port,
+connects a pinned client through ``connect_pinned``, and asserts an
+encrypted echo round-trip. Everything runs inside this process — no
+external server and no certificate files.
+
+Run::
+
+    python3 tests/run_test.py
+
+The phantom_core native library must be loadable: copy or symlink
+``libphantom_core.{so,dylib}`` next to ``tests/bindings/phantom_core.py``
+first (CI's ``bindings`` workflow does this automatically).
+"""
+
+import asyncio
+import os
+import sys
+
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "bindings")
+)
 
 try:
     import phantom_core
-except ImportError as e:
-    print(f"Failed to import phantom_core: {e}")
-    print(f"Ensure phantom_core.py is in {bindings_path}")
+except ImportError as exc:  # pragma: no cover - import-environment failure
+    print(f"FAIL: cannot import phantom_core: {exc}")
+    print("Ensure phantom_core.py and libphantom_core.{so,dylib} are in tests/bindings/")
     sys.exit(1)
 
-async def main():
-    print("--- Phantom Core FFI Test ---")
-    
-    # Connection Config
-    addr = "127.0.0.1:3001"
-    group_id = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
-    # Identity (ignored for now)
-    identity = b"Alice"
-    
-    print(f"Connecting to {addr}...")
-    try:
-        # Read server cert for pinning
-        with open("server.crt", "r") as f:
-            cert_pem = f.read()
+PAYLOAD = b"hello phantom core"
 
-        # Connect returns Arc<PhantomClient>, which UniFFI exposes as the object
-        # shared_secret removed. Added client_cert_pem=None, client_key_pem=None for mTLS
-        client = await phantom_core.PhantomClient.connect(addr, group_id, identity, cert_pem, None, None)
-        print("Connected!")
-        
-        # Send JOIN (as bytes)
-        print("Sending JOIN...")
-        await client.send_message(b"JOIN")
-        
-        # Listen for response (Echo)
-        print("Waiting for message...")
-        # In this demo, if we send a message, we might receive it back if we listen properly?
-        # But recv_message is a single frame read.
-        # If the server broadcasts, and we are the sender, do we get it back?
-        # The server implementation broadcasts to "active" connections.
-        # If we just connected, are we "active"? Yes.
-        # Does the broadcast context include the sender?
-        # In broadcast::channel, sender receives if it subscribes.
-        # But we create a NEW tx for the group if not exists.
-        # Code: `let tx = state.get_or_create_tx...; let rx = tx.subscribe(); ... tx.send(...)`
-        # So yes, subscribers receive what is sent to the channel.
-        # Since we subscribe immediately upon connection, we should receive our own JOIN message?
-        # Maybe.
-        
-        rx_msg = await client.recv_message()
-        print(f"Received: {rx_msg}")
-        
-        msg = b"Hello from Python"
-        print(f"Sending: {msg}")
-        await client.send_message(msg)
-        
-        rx_msg_2 = await client.recv_message()
-        print(f"Received: {rx_msg_2}")
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
+
+async def main() -> int:
+    # 1. Bind a loopback listener on an OS-chosen port.
+    listener = await phantom_core.PhantomListener.bind("127.0.0.1:0")
+    addr = listener.local_addr()
+    host, _, port = addr.rpartition(":")
+    pinned_key = listener.verifying_key_bytes()
+    print(f"listener bound on {addr}")
+
+    # 2. Server task: accept one connection and echo a single frame.
+    async def serve() -> None:
+        outcome = await listener.accept()
+        session = outcome.session()
+        msg = await session.recv()
+        await session.send(msg)
+        # Let the client drain the echo before the session closes.
+        await asyncio.sleep(0.2)
+        await session.close()
+
+    server = asyncio.create_task(serve())
+
+    # 3. Client: pinned connect, send, recv, assert the round-trip.
+    session = await phantom_core.connect_pinned(host, int(port), pinned_key)
+    await session.send(PAYLOAD)
+    reply = await asyncio.wait_for(session.recv(), timeout=10.0)
+    await session.close()
+    await server
+
+    if reply != PAYLOAD:
+        print(f"FAIL: echo mismatch — sent {PAYLOAD!r}, got {reply!r}")
+        return 1
+
+    print("OK: pinned loopback round-trip succeeded")
+    return 0
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        sys.exit(asyncio.run(main()))
+    except Exception as exc:  # pragma: no cover - surface any failure to CI
+        import traceback
+
+        traceback.print_exc()
+        print(f"FAIL: {exc}")
+        sys.exit(1)
