@@ -111,3 +111,74 @@ async fn tcp_integration_wrong_pinned_key_rejected() {
         state
     );
 }
+
+/// 0-RTT resumption over real TCP: a first pinned connection harvests a
+/// `ResumptionHint`; a second connection via `connect_pinned_with_resumption`
+/// reuses it (wire V3) and still round-trips application data. Mirrors the
+/// `connect_pinned` → `resumption_hint` → `connect_pinned_with_resumption`
+/// sequence an FFI / mobile consumer follows.
+#[tokio::test]
+#[ignore]
+async fn tcp_integration_zero_rtt_resumption_round_trip() {
+    use phantom_core::api::session::{connect_pinned, connect_pinned_with_resumption};
+
+    const HOST: &str = "127.0.0.1";
+    const PORT: u16 = 39713;
+    let addr = format!("{HOST}:{PORT}");
+
+    let listener = PhantomListener::bind(addr).await.expect("bind listener");
+    let pinned = listener.verifying_key_bytes();
+
+    // Server: accept two connections, echo one message on each.
+    let server_handle = tokio::spawn(async move {
+        for _ in 0..2 {
+            let session = listener.accept().await.expect("accept").session();
+            let msg = session.recv().await.expect("server recv");
+            session.send(msg).await.expect("server send");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    // ── Connection 1: plain pinned connect — harvest the resumption hint ──
+    let s1 = connect_pinned(HOST.to_string(), PORT, pinned.clone())
+        .await
+        .expect("connect_pinned");
+    s1.send(b"ping-1".to_vec()).await.expect("c1 send");
+    let r1 = timeout(Duration::from_secs(5), s1.recv())
+        .await
+        .expect("c1 recv timeout")
+        .expect("c1 recv");
+    assert_eq!(r1, b"ping-1");
+
+    // Let the handshake fully settle so the inner session publishes the hint.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let hint = s1
+        .resumption_hint()
+        .await
+        .expect("a completed handshake yields a resumption hint");
+    assert_eq!(hint.session_id.len(), 32, "session_id is 32 bytes");
+    assert_eq!(
+        hint.resumption_secret.len(),
+        32,
+        "resumption_secret is 32 bytes"
+    );
+
+    // ── Connection 2: 0-RTT resumption carrying early-data ──
+    let s2 = connect_pinned_with_resumption(
+        HOST.to_string(),
+        PORT,
+        pinned,
+        hint,
+        b"zero-rtt-early-data".to_vec(),
+    )
+    .await
+    .expect("connect_pinned_with_resumption");
+    s2.send(b"ping-2".to_vec()).await.expect("c2 send");
+    let r2 = timeout(Duration::from_secs(5), s2.recv())
+        .await
+        .expect("c2 recv timeout")
+        .expect("c2 recv");
+    assert_eq!(r2, b"ping-2");
+
+    let _ = server_handle.await;
+}
