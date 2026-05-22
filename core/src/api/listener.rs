@@ -166,7 +166,7 @@ impl PhantomListener {
     }
 }
 
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl PhantomListener {
     #[uniffi::constructor]
     #[tracing::instrument(name = "phantom.listener.bind", skip_all, fields(addr = %addr))]
