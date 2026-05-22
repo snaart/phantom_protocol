@@ -454,18 +454,76 @@ def _uniffi_load_indirect():
 
 def _uniffi_check_contract_api_version(lib):
     # Get the bindings contract version from our ComponentInterface
-    bindings_contract_version = 26
+    bindings_contract_version = 29
     # Get the scaffolding contract version by calling the into the dylib
     scaffolding_contract_version = lib.ffi_phantom_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version:
         raise InternalError("UniFFI contract version mismatch: try cleaning and rebuilding your project")
 
 def _uniffi_check_api_checksums(lib):
-    if lib.uniffi_phantom_core_checksum_method_phantomclient_recv_message() != 13835:
+    if lib.uniffi_phantom_core_checksum_func_connect_pinned() != 59015:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomclient_send_message() != 65049:
+    if lib.uniffi_phantom_core_checksum_func_connect_pinned_with_resumption() != 31650:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_constructor_phantomclient_connect() != 10376:
+    if lib.uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data() != 16642:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_acceptoutcome_session() != 49660:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_acceptoutcome_take_early_data() != 486:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomlistener_accept() != 39902:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomlistener_is_shutting_down() != 2657:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomlistener_local_addr() != 18579:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomlistener_metrics_prometheus_text() != 11863:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomlistener_shutdown() != 32103:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes() != 27980:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_close() != 2539:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 58300:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted() != 23395:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_flush_queue() != 41158:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_id() != 60002:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_is_data_ready() != 43904:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_is_pqc_ready() != 25634:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_open_stream() != 23478:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_peer_addr() != 2094:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_queued_count() != 9183:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_recv() != 61516:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_resumption_hint() != 36484:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_send() != 35674:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_set_state() != 24535:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomstream_close() != 59562:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomstream_recv() != 59636:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomstream_send_reliable() != 49428:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomstream_send_unreliable() != 4743:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomstream_stream_id() != 4640:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_constructor_phantomlistener_bind() != 5086:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_constructor_phantomsession_connect() != 9656:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
 
 # A ctypes library to expose the extern-C FFI definitions.
@@ -573,33 +631,201 @@ class _UniffiForeignFutureStructVoid(ctypes.Structure):
     ]
 _UNIFFI_FOREIGN_FUTURE_COMPLETE_VOID = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructVoid,
 )
-_UniffiLib.uniffi_phantom_core_fn_clone_phantomclient.argtypes = (
+_UniffiLib.uniffi_phantom_core_fn_clone_acceptoutcome.argtypes = (
     ctypes.c_void_p,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_clone_phantomclient.restype = ctypes.c_void_p
-_UniffiLib.uniffi_phantom_core_fn_free_phantomclient.argtypes = (
+_UniffiLib.uniffi_phantom_core_fn_clone_acceptoutcome.restype = ctypes.c_void_p
+_UniffiLib.uniffi_phantom_core_fn_free_acceptoutcome.argtypes = (
     ctypes.c_void_p,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_free_phantomclient.restype = None
-_UniffiLib.uniffi_phantom_core_fn_constructor_phantomclient_connect.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
+_UniffiLib.uniffi_phantom_core_fn_free_acceptoutcome.restype = None
+_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_has_early_data.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_has_early_data.restype = ctypes.c_int8
+_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_session.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_session.restype = ctypes.c_void_p
+_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_take_early_data.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_take_early_data.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_core_fn_clone_phantomlistener.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_clone_phantomlistener.restype = ctypes.c_void_p
+_UniffiLib.uniffi_phantom_core_fn_free_phantomlistener.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_free_phantomlistener.restype = None
+_UniffiLib.uniffi_phantom_core_fn_constructor_phantomlistener_bind.argtypes = (
     _UniffiRustBuffer,
 )
-_UniffiLib.uniffi_phantom_core_fn_constructor_phantomclient_connect.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomclient_recv_message.argtypes = (
+_UniffiLib.uniffi_phantom_core_fn_constructor_phantomlistener_bind.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_accept.argtypes = (
     ctypes.c_void_p,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomclient_recv_message.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomclient_send_message.argtypes = (
+_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_accept.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down.restype = ctypes.c_int8
+_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_local_addr.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_local_addr.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_metrics_prometheus_text.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_metrics_prometheus_text.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_shutdown.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_shutdown.restype = None
+_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_verifying_key_bytes.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_verifying_key_bytes.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_core_fn_clone_phantomsession.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_clone_phantomsession.restype = ctypes.c_void_p
+_UniffiLib.uniffi_phantom_core_fn_free_phantomsession.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_free_phantomsession.restype = None
+_UniffiLib.uniffi_phantom_core_fn_constructor_phantomsession_connect.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_constructor_phantomsession_connect.restype = ctypes.c_void_p
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_close.argtypes = (
+    ctypes.c_void_p,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_close.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_early_data_accepted.argtypes = (
+    ctypes.c_void_p,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_early_data_accepted.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_flush_queue.argtypes = (
+    ctypes.c_void_p,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_flush_queue.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_id.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_id.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_is_data_ready.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_is_data_ready.restype = ctypes.c_int8
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_is_pqc_ready.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_is_pqc_ready.restype = ctypes.c_int8
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_open_stream.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_open_stream.restype = ctypes.c_void_p
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_peer_addr.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_peer_addr.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_queued_count.argtypes = (
+    ctypes.c_void_p,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_queued_count.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_recv.argtypes = (
+    ctypes.c_void_p,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_recv.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_resumption_hint.argtypes = (
+    ctypes.c_void_p,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_resumption_hint.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_send.argtypes = (
     ctypes.c_void_p,
     _UniffiRustBuffer,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomclient_send_message.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_send.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_set_state.argtypes = (
+    ctypes.c_void_p,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_set_state.restype = None
+_UniffiLib.uniffi_phantom_core_fn_clone_phantomstream.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_clone_phantomstream.restype = ctypes.c_void_p
+_UniffiLib.uniffi_phantom_core_fn_free_phantomstream.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_free_phantomstream.restype = None
+_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_close.argtypes = (
+    ctypes.c_void_p,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_close.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_recv.argtypes = (
+    ctypes.c_void_p,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_recv.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_send_reliable.argtypes = (
+    ctypes.c_void_p,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_send_reliable.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_send_unreliable.argtypes = (
+    ctypes.c_void_p,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_send_unreliable.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_stream_id.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_stream_id.restype = ctypes.c_uint32
+_UniffiLib.uniffi_phantom_core_fn_func_connect_pinned.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.c_uint16,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_phantom_core_fn_func_connect_pinned.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_func_connect_pinned_with_resumption.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.c_uint16,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_phantom_core_fn_func_connect_pinned_with_resumption.restype = ctypes.c_uint64
 _UniffiLib.ffi_phantom_core_rustbuffer_alloc.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -868,15 +1094,102 @@ _UniffiLib.ffi_phantom_core_rust_future_complete_void.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_phantom_core_rust_future_complete_void.restype = None
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomclient_recv_message.argtypes = (
+_UniffiLib.uniffi_phantom_core_checksum_func_connect_pinned.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomclient_recv_message.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomclient_send_message.argtypes = (
+_UniffiLib.uniffi_phantom_core_checksum_func_connect_pinned.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_func_connect_pinned_with_resumption.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomclient_send_message.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_constructor_phantomclient_connect.argtypes = (
+_UniffiLib.uniffi_phantom_core_checksum_func_connect_pinned_with_resumption.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_constructor_phantomclient_connect.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_acceptoutcome_session.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_acceptoutcome_session.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_acceptoutcome_take_early_data.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_acceptoutcome_take_early_data.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_accept.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_accept.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_is_shutting_down.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_is_shutting_down.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_local_addr.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_local_addr.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_metrics_prometheus_text.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_metrics_prometheus_text.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_shutdown.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_shutdown.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_close.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_close.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_connection_state.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_connection_state.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_flush_queue.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_flush_queue.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_id.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_id.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_is_data_ready.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_is_data_ready.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_is_pqc_ready.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_is_pqc_ready.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_open_stream.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_open_stream.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_peer_addr.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_peer_addr.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_queued_count.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_queued_count.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_recv.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_recv.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_resumption_hint.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_resumption_hint.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_send.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_send.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_set_state.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_set_state.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_close.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_close.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_recv.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_recv.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_send_reliable.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_send_reliable.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_send_unreliable.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_send_unreliable.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_stream_id.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_stream_id.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_constructor_phantomlistener_bind.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_constructor_phantomlistener_bind.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_constructor_phantomsession_connect.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_constructor_phantomsession_connect.restype = ctypes.c_uint16
 _UniffiLib.ffi_phantom_core_uniffi_contract_version.argtypes = (
 )
 _UniffiLib.ffi_phantom_core_uniffi_contract_version.restype = ctypes.c_uint32
@@ -886,6 +1199,66 @@ _uniffi_check_contract_api_version(_UniffiLib)
 
 # Public interface members begin here.
 
+
+class _UniffiConverterUInt8(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u8"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**8
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u8()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u8(value)
+
+class _UniffiConverterUInt16(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u16"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**16
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u16()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u16(value)
+
+class _UniffiConverterUInt32(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u32"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**32
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u32()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u32(value)
+
+class _UniffiConverterBool:
+    @classmethod
+    def check_lower(cls, value):
+        return not not value
+
+    @classmethod
+    def lower(cls, value):
+        return 1 if value else 0
+
+    @staticmethod
+    def lift(value):
+        return value != 0
+
+    @classmethod
+    def read(cls, buf):
+        return cls.lift(buf.read_u8())
+
+    @classmethod
+    def write(cls, value, buf):
+        buf.write_u8(value)
 
 class _UniffiConverterString:
     @staticmethod
@@ -939,16 +1312,900 @@ class _UniffiConverterBytes(_UniffiConverterRustBuffer):
         buf.write_i32(len(value))
         buf.write(value)
 
+# The Duration type.
+Duration = datetime.timedelta
+
+# There is a loss of precision when converting from Rust durations,
+# which are accurate to the nanosecond,
+# to Python durations, which are only accurate to the microsecond.
+class _UniffiConverterDuration(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        seconds = buf.read_u64()
+        microseconds = buf.read_u32() / 1.0e3
+        return datetime.timedelta(seconds=seconds, microseconds=microseconds)
+
+    @staticmethod
+    def check_lower(value):
+        seconds = value.seconds + value.days * 24 * 3600
+        if seconds < 0:
+            raise ValueError("Invalid duration, must be non-negative")
+
+    @staticmethod
+    def write(value, buf):
+        seconds = value.seconds + value.days * 24 * 3600
+        nanoseconds = value.microseconds * 1000
+        buf.write_i64(seconds)
+        buf.write_u32(nanoseconds)
 
 
-class PhantomClientProtocol(typing.Protocol):
-    def recv_message(self, ):
+
+
+
+
+
+
+
+
+class PhantomConfig:
+    keepalive_interval: "Duration"
+    """
+    Interval between keep-alive pings
+    """
+
+    session_timeout: "Duration"
+    """
+    Session inactivity timeout
+    """
+
+    max_packet_size: "int"
+    """
+    Maximum packet size (MTU)
+    """
+
+    send_buffer_size: "int"
+    """
+    Send buffer size in packets
+    """
+
+    recv_buffer_size: "int"
+    """
+    Receive buffer size in packets
+    """
+
+    session_cache_capacity: "int"
+    """
+    Maximum tickets in session cache
+    """
+
+    session_ticket_lifetime: "Duration"
+    """
+    Lifetime of a session ticket
+    """
+
+    auto_fallback: "bool"
+    """
+    Enable automatic transport fallback
+    """
+
+    fallback_loss_threshold: "int"
+    """
+    Packet loss percentage to trigger fallback
+    """
+
+    fallback_failure_threshold: "int"
+    """
+    Connection failures to trigger fallback
+    """
+
+    connect_timeout: "Duration"
+    """
+    Timeout for connection attempts
+    """
+
+    upgrade_delay: "Duration"
+    """
+    Delay before attempting to upgrade transport
+    """
+
+    def __init__(self, *, keepalive_interval: "Duration", session_timeout: "Duration", max_packet_size: "int", send_buffer_size: "int", recv_buffer_size: "int", session_cache_capacity: "int", session_ticket_lifetime: "Duration", auto_fallback: "bool", fallback_loss_threshold: "int", fallback_failure_threshold: "int", connect_timeout: "Duration", upgrade_delay: "Duration"):
+        self.keepalive_interval = keepalive_interval
+        self.session_timeout = session_timeout
+        self.max_packet_size = max_packet_size
+        self.send_buffer_size = send_buffer_size
+        self.recv_buffer_size = recv_buffer_size
+        self.session_cache_capacity = session_cache_capacity
+        self.session_ticket_lifetime = session_ticket_lifetime
+        self.auto_fallback = auto_fallback
+        self.fallback_loss_threshold = fallback_loss_threshold
+        self.fallback_failure_threshold = fallback_failure_threshold
+        self.connect_timeout = connect_timeout
+        self.upgrade_delay = upgrade_delay
+
+    def __str__(self):
+        return "PhantomConfig(keepalive_interval={}, session_timeout={}, max_packet_size={}, send_buffer_size={}, recv_buffer_size={}, session_cache_capacity={}, session_ticket_lifetime={}, auto_fallback={}, fallback_loss_threshold={}, fallback_failure_threshold={}, connect_timeout={}, upgrade_delay={})".format(self.keepalive_interval, self.session_timeout, self.max_packet_size, self.send_buffer_size, self.recv_buffer_size, self.session_cache_capacity, self.session_ticket_lifetime, self.auto_fallback, self.fallback_loss_threshold, self.fallback_failure_threshold, self.connect_timeout, self.upgrade_delay)
+
+    def __eq__(self, other):
+        if self.keepalive_interval != other.keepalive_interval:
+            return False
+        if self.session_timeout != other.session_timeout:
+            return False
+        if self.max_packet_size != other.max_packet_size:
+            return False
+        if self.send_buffer_size != other.send_buffer_size:
+            return False
+        if self.recv_buffer_size != other.recv_buffer_size:
+            return False
+        if self.session_cache_capacity != other.session_cache_capacity:
+            return False
+        if self.session_ticket_lifetime != other.session_ticket_lifetime:
+            return False
+        if self.auto_fallback != other.auto_fallback:
+            return False
+        if self.fallback_loss_threshold != other.fallback_loss_threshold:
+            return False
+        if self.fallback_failure_threshold != other.fallback_failure_threshold:
+            return False
+        if self.connect_timeout != other.connect_timeout:
+            return False
+        if self.upgrade_delay != other.upgrade_delay:
+            return False
+        return True
+
+class _UniffiConverterTypePhantomConfig(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return PhantomConfig(
+            keepalive_interval=_UniffiConverterDuration.read(buf),
+            session_timeout=_UniffiConverterDuration.read(buf),
+            max_packet_size=_UniffiConverterUInt32.read(buf),
+            send_buffer_size=_UniffiConverterUInt32.read(buf),
+            recv_buffer_size=_UniffiConverterUInt32.read(buf),
+            session_cache_capacity=_UniffiConverterUInt32.read(buf),
+            session_ticket_lifetime=_UniffiConverterDuration.read(buf),
+            auto_fallback=_UniffiConverterBool.read(buf),
+            fallback_loss_threshold=_UniffiConverterUInt8.read(buf),
+            fallback_failure_threshold=_UniffiConverterUInt32.read(buf),
+            connect_timeout=_UniffiConverterDuration.read(buf),
+            upgrade_delay=_UniffiConverterDuration.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiConverterDuration.check_lower(value.keepalive_interval)
+        _UniffiConverterDuration.check_lower(value.session_timeout)
+        _UniffiConverterUInt32.check_lower(value.max_packet_size)
+        _UniffiConverterUInt32.check_lower(value.send_buffer_size)
+        _UniffiConverterUInt32.check_lower(value.recv_buffer_size)
+        _UniffiConverterUInt32.check_lower(value.session_cache_capacity)
+        _UniffiConverterDuration.check_lower(value.session_ticket_lifetime)
+        _UniffiConverterBool.check_lower(value.auto_fallback)
+        _UniffiConverterUInt8.check_lower(value.fallback_loss_threshold)
+        _UniffiConverterUInt32.check_lower(value.fallback_failure_threshold)
+        _UniffiConverterDuration.check_lower(value.connect_timeout)
+        _UniffiConverterDuration.check_lower(value.upgrade_delay)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiConverterDuration.write(value.keepalive_interval, buf)
+        _UniffiConverterDuration.write(value.session_timeout, buf)
+        _UniffiConverterUInt32.write(value.max_packet_size, buf)
+        _UniffiConverterUInt32.write(value.send_buffer_size, buf)
+        _UniffiConverterUInt32.write(value.recv_buffer_size, buf)
+        _UniffiConverterUInt32.write(value.session_cache_capacity, buf)
+        _UniffiConverterDuration.write(value.session_ticket_lifetime, buf)
+        _UniffiConverterBool.write(value.auto_fallback, buf)
+        _UniffiConverterUInt8.write(value.fallback_loss_threshold, buf)
+        _UniffiConverterUInt32.write(value.fallback_failure_threshold, buf)
+        _UniffiConverterDuration.write(value.connect_timeout, buf)
+        _UniffiConverterDuration.write(value.upgrade_delay, buf)
+
+
+class ResumptionHint:
+    """
+    0-RTT resumption material extracted from a completed session
+    (wire V3, Phase 4.1).
+
+    Produced by [`PhantomSession::resumption_hint`] after a handshake
+    completes, and fed back into [`connect_pinned_with_resumption`] to
+    attempt a 0-RTT reconnect to the same server.
+
+    Both fields are exactly 32 bytes — this record is the
+    UniFFI-representable surface for the internal `(session_id,
+    resumption_secret)` tuple. The fields are `Vec<u8>` because UniFFI
+    has no fixed-size-array type, so the length is a runtime invariant
+    checked when the hint is used.
+
+    Store the hint alongside the pinned `HybridVerifyingKey` of the
+    server it was negotiated against: the `resumption_secret` is
+    server-pinned, and reusing a hint across servers is a configuration
+    bug.
+    """
+
+    session_id: "bytes"
+    """
+    The negotiated session id (32 bytes).
+    """
+
+    resumption_secret: "bytes"
+    """
+    The resumption secret (32 bytes) — sensitive; treat like a key.
+    """
+
+    def __init__(self, *, session_id: "bytes", resumption_secret: "bytes"):
+        self.session_id = session_id
+        self.resumption_secret = resumption_secret
+
+    def __str__(self):
+        return "ResumptionHint(session_id={}, resumption_secret={})".format(self.session_id, self.resumption_secret)
+
+    def __eq__(self, other):
+        if self.session_id != other.session_id:
+            return False
+        if self.resumption_secret != other.resumption_secret:
+            return False
+        return True
+
+class _UniffiConverterTypeResumptionHint(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return ResumptionHint(
+            session_id=_UniffiConverterBytes.read(buf),
+            resumption_secret=_UniffiConverterBytes.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiConverterBytes.check_lower(value.session_id)
+        _UniffiConverterBytes.check_lower(value.resumption_secret)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiConverterBytes.write(value.session_id, buf)
+        _UniffiConverterBytes.write(value.resumption_secret, buf)
+
+
+
+
+
+class ConnectionState(enum.Enum):
+    """
+    Connection state for `PhantomSession`.
+
+    The session is usable from the moment it's created — sends are queued
+    until the handshake completes.
+    """
+
+    CONNECTING = 0
+    """
+    Connection initiated, handshake pending
+    """
+
+    
+    CLASSICAL_READY = 1
+    """
+    Classical (X25519) channel established — data flows
+    """
+
+    
+    PQC_UPGRADING = 2
+    """
+    PQC upgrade in progress
+    """
+
+    
+    PQC_READY = 3
+    """
+    Full hybrid PQC protection active
+    """
+
+    
+    CONNECTED = 4
+    """
+    Fully connected and operational
+    """
+
+    
+    FAILED = 5
+    """
+    Connection failed
+    """
+
+    
+    CLOSED = 6
+    """
+    Gracefully closed
+    """
+
+    
+
+
+class _UniffiConverterTypeConnectionState(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return ConnectionState.CONNECTING
+        if variant == 2:
+            return ConnectionState.CLASSICAL_READY
+        if variant == 3:
+            return ConnectionState.PQC_UPGRADING
+        if variant == 4:
+            return ConnectionState.PQC_READY
+        if variant == 5:
+            return ConnectionState.CONNECTED
+        if variant == 6:
+            return ConnectionState.FAILED
+        if variant == 7:
+            return ConnectionState.CLOSED
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == ConnectionState.CONNECTING:
+            return
+        if value == ConnectionState.CLASSICAL_READY:
+            return
+        if value == ConnectionState.PQC_UPGRADING:
+            return
+        if value == ConnectionState.PQC_READY:
+            return
+        if value == ConnectionState.CONNECTED:
+            return
+        if value == ConnectionState.FAILED:
+            return
+        if value == ConnectionState.CLOSED:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == ConnectionState.CONNECTING:
+            buf.write_i32(1)
+        if value == ConnectionState.CLASSICAL_READY:
+            buf.write_i32(2)
+        if value == ConnectionState.PQC_UPGRADING:
+            buf.write_i32(3)
+        if value == ConnectionState.PQC_READY:
+            buf.write_i32(4)
+        if value == ConnectionState.CONNECTED:
+            buf.write_i32(5)
+        if value == ConnectionState.FAILED:
+            buf.write_i32(6)
+        if value == ConnectionState.CLOSED:
+            buf.write_i32(7)
+
+
+
+
+# CoreError
+# We want to define each variant as a nested class that's also a subclass,
+# which is tricky in Python.  To accomplish this we're going to create each
+# class separately, then manually add the child classes to the base class's
+# __dict__.  All of this happens in dummy class to avoid polluting the module
+# namespace.
+class CoreError(Exception):
+    """
+    Universal Core Error Enum compatible with FFI exports
+    """
+
+    pass
+
+_UniffiTempCoreError = CoreError
+
+class CoreError:  # type: ignore
+    """
+    Universal Core Error Enum compatible with FFI exports
+    """
+
+    class NetworkError(_UniffiTempCoreError):
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.NetworkError({})".format(str(self))
+    _UniffiTempCoreError.NetworkError = NetworkError # type: ignore
+    class SerializationError(_UniffiTempCoreError):
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.SerializationError({})".format(str(self))
+    _UniffiTempCoreError.SerializationError = SerializationError # type: ignore
+    class Busy(_UniffiTempCoreError):
+        def __init__(self):
+            pass
+
+        def __repr__(self):
+            return "CoreError.Busy({})".format(str(self))
+    _UniffiTempCoreError.Busy = Busy # type: ignore
+    class ConfigError(_UniffiTempCoreError):
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.ConfigError({})".format(str(self))
+    _UniffiTempCoreError.ConfigError = ConfigError # type: ignore
+    class CryptoError(_UniffiTempCoreError):
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.CryptoError({})".format(str(self))
+    _UniffiTempCoreError.CryptoError = CryptoError # type: ignore
+    class ValidationError(_UniffiTempCoreError):
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.ValidationError({})".format(str(self))
+    _UniffiTempCoreError.ValidationError = ValidationError # type: ignore
+    class RuntimeError(_UniffiTempCoreError):
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.RuntimeError({})".format(str(self))
+    _UniffiTempCoreError.RuntimeError = RuntimeError # type: ignore
+    class KeyDerivationError(_UniffiTempCoreError):
+        def __init__(self):
+            pass
+
+        def __repr__(self):
+            return "CoreError.KeyDerivationError({})".format(str(self))
+    _UniffiTempCoreError.KeyDerivationError = KeyDerivationError # type: ignore
+    class RngError(_UniffiTempCoreError):
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.RngError({})".format(str(self))
+    _UniffiTempCoreError.RngError = RngError # type: ignore
+    class InternalError(_UniffiTempCoreError):
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.InternalError({})".format(str(self))
+    _UniffiTempCoreError.InternalError = InternalError # type: ignore
+    class HandshakeError(_UniffiTempCoreError):
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.HandshakeError({})".format(str(self))
+    _UniffiTempCoreError.HandshakeError = HandshakeError # type: ignore
+    class StreamError(_UniffiTempCoreError):
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.StreamError({})".format(str(self))
+    _UniffiTempCoreError.StreamError = StreamError # type: ignore
+    class SessionNotFound(_UniffiTempCoreError):
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.SessionNotFound({})".format(str(self))
+    _UniffiTempCoreError.SessionNotFound = SessionNotFound # type: ignore
+    class ConnectionClosed(_UniffiTempCoreError):
+        def __init__(self):
+            pass
+
+        def __repr__(self):
+            return "CoreError.ConnectionClosed({})".format(str(self))
+    _UniffiTempCoreError.ConnectionClosed = ConnectionClosed # type: ignore
+    class Timeout(_UniffiTempCoreError):
+        def __init__(self):
+            pass
+
+        def __repr__(self):
+            return "CoreError.Timeout({})".format(str(self))
+    _UniffiTempCoreError.Timeout = Timeout # type: ignore
+    class ReplayDetected(_UniffiTempCoreError):
+        """
+        Sliding-window replay protection rejected a packet. The AEAD layer
+        already cryptographically prevents replay (strict-counter nonces), but
+        the explicit window catches duplicates earlier and gives operators a
+        metric signal (`replay_rejected_total`).
+        """
+
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.ReplayDetected({})".format(str(self))
+    _UniffiTempCoreError.ReplayDetected = ReplayDetected # type: ignore
+
+CoreError = _UniffiTempCoreError # type: ignore
+del _UniffiTempCoreError
+
+
+class _UniffiConverterTypeCoreError(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return CoreError.NetworkError(
+                _UniffiConverterString.read(buf),
+            )
+        if variant == 2:
+            return CoreError.SerializationError(
+                _UniffiConverterString.read(buf),
+            )
+        if variant == 3:
+            return CoreError.Busy(
+            )
+        if variant == 4:
+            return CoreError.ConfigError(
+                _UniffiConverterString.read(buf),
+            )
+        if variant == 5:
+            return CoreError.CryptoError(
+                _UniffiConverterString.read(buf),
+            )
+        if variant == 6:
+            return CoreError.ValidationError(
+                _UniffiConverterString.read(buf),
+            )
+        if variant == 7:
+            return CoreError.RuntimeError(
+                _UniffiConverterString.read(buf),
+            )
+        if variant == 8:
+            return CoreError.KeyDerivationError(
+            )
+        if variant == 9:
+            return CoreError.RngError(
+                _UniffiConverterString.read(buf),
+            )
+        if variant == 10:
+            return CoreError.InternalError(
+                _UniffiConverterString.read(buf),
+            )
+        if variant == 11:
+            return CoreError.HandshakeError(
+                _UniffiConverterString.read(buf),
+            )
+        if variant == 12:
+            return CoreError.StreamError(
+                _UniffiConverterString.read(buf),
+            )
+        if variant == 13:
+            return CoreError.SessionNotFound(
+                _UniffiConverterString.read(buf),
+            )
+        if variant == 14:
+            return CoreError.ConnectionClosed(
+            )
+        if variant == 15:
+            return CoreError.Timeout(
+            )
+        if variant == 16:
+            return CoreError.ReplayDetected(
+                _UniffiConverterString.read(buf),
+            )
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if isinstance(value, CoreError.NetworkError):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
+        if isinstance(value, CoreError.SerializationError):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
+        if isinstance(value, CoreError.Busy):
+            return
+        if isinstance(value, CoreError.ConfigError):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
+        if isinstance(value, CoreError.CryptoError):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
+        if isinstance(value, CoreError.ValidationError):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
+        if isinstance(value, CoreError.RuntimeError):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
+        if isinstance(value, CoreError.KeyDerivationError):
+            return
+        if isinstance(value, CoreError.RngError):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
+        if isinstance(value, CoreError.InternalError):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
+        if isinstance(value, CoreError.HandshakeError):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
+        if isinstance(value, CoreError.StreamError):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
+        if isinstance(value, CoreError.SessionNotFound):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
+        if isinstance(value, CoreError.ConnectionClosed):
+            return
+        if isinstance(value, CoreError.Timeout):
+            return
+        if isinstance(value, CoreError.ReplayDetected):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
+
+    @staticmethod
+    def write(value, buf):
+        if isinstance(value, CoreError.NetworkError):
+            buf.write_i32(1)
+            _UniffiConverterString.write(value._values[0], buf)
+        if isinstance(value, CoreError.SerializationError):
+            buf.write_i32(2)
+            _UniffiConverterString.write(value._values[0], buf)
+        if isinstance(value, CoreError.Busy):
+            buf.write_i32(3)
+        if isinstance(value, CoreError.ConfigError):
+            buf.write_i32(4)
+            _UniffiConverterString.write(value._values[0], buf)
+        if isinstance(value, CoreError.CryptoError):
+            buf.write_i32(5)
+            _UniffiConverterString.write(value._values[0], buf)
+        if isinstance(value, CoreError.ValidationError):
+            buf.write_i32(6)
+            _UniffiConverterString.write(value._values[0], buf)
+        if isinstance(value, CoreError.RuntimeError):
+            buf.write_i32(7)
+            _UniffiConverterString.write(value._values[0], buf)
+        if isinstance(value, CoreError.KeyDerivationError):
+            buf.write_i32(8)
+        if isinstance(value, CoreError.RngError):
+            buf.write_i32(9)
+            _UniffiConverterString.write(value._values[0], buf)
+        if isinstance(value, CoreError.InternalError):
+            buf.write_i32(10)
+            _UniffiConverterString.write(value._values[0], buf)
+        if isinstance(value, CoreError.HandshakeError):
+            buf.write_i32(11)
+            _UniffiConverterString.write(value._values[0], buf)
+        if isinstance(value, CoreError.StreamError):
+            buf.write_i32(12)
+            _UniffiConverterString.write(value._values[0], buf)
+        if isinstance(value, CoreError.SessionNotFound):
+            buf.write_i32(13)
+            _UniffiConverterString.write(value._values[0], buf)
+        if isinstance(value, CoreError.ConnectionClosed):
+            buf.write_i32(14)
+        if isinstance(value, CoreError.Timeout):
+            buf.write_i32(15)
+        if isinstance(value, CoreError.ReplayDetected):
+            buf.write_i32(16)
+            _UniffiConverterString.write(value._values[0], buf)
+
+
+
+class _UniffiConverterOptionalBool(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiConverterBool.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiConverterBool.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiConverterBool.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+
+
+class _UniffiConverterOptionalBytes(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiConverterBytes.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiConverterBytes.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiConverterBytes.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+
+
+class _UniffiConverterOptionalTypeResumptionHint(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiConverterTypeResumptionHint.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiConverterTypeResumptionHint.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiConverterTypeResumptionHint.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+# objects.
+class AcceptOutcomeProtocol(typing.Protocol):
+    """
+    Outcome of a successful [`PhantomListener::accept`] — the accepted
+    session plus any 0-RTT early-data the client carried on its V3
+    ClientHello (wire V3, Phase 4.1).
+
+    A `uniffi::Object` rather than a record: it returns an
+    `Arc<PhantomSession>` (itself a `uniffi::Object`) from a method,
+    the same known-good pattern `accept()` used before V3. `take_*`
+    is take-once so a ≤16 KiB blob is moved out, not cloned.
+    """
+
+    def has_early_data(self, ):
+        """
+        Whether 0-RTT early-data is present and not yet taken.
+        """
+
         raise NotImplementedError
-    def send_message(self, msg: "bytes"):
+    def session(self, ):
+        """
+        The accepted, fully-established session.
+        """
+
         raise NotImplementedError
+    def take_early_data(self, ):
+        """
+        Take the 0-RTT early-data the client sent on its ClientHello.
+        Take-once — a second call returns `None`. `None` also means the
+        client sent no early-data, or the server rejected it (unknown /
+        expired ticket, oversized blob, AEAD failure).
+        """
 
+        raise NotImplementedError
+# AcceptOutcome is a Rust-only trait - it's a wrapper around a Rust implementation.
+class AcceptOutcome():
+    """
+    Outcome of a successful [`PhantomListener::accept`] — the accepted
+    session plus any 0-RTT early-data the client carried on its V3
+    ClientHello (wire V3, Phase 4.1).
 
-class PhantomClient:
+    A `uniffi::Object` rather than a record: it returns an
+    `Arc<PhantomSession>` (itself a `uniffi::Object`) from a method,
+    the same known-good pattern `accept()` used before V3. `take_*`
+    is take-once so a ≤16 KiB blob is moved out, not cloned.
+    """
+
     _pointer: ctypes.c_void_p
     
     def __init__(self, *args, **kwargs):
@@ -958,10 +2215,10 @@ class PhantomClient:
         # In case of partial initialization of instances.
         pointer = getattr(self, "_pointer", None)
         if pointer is not None:
-            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_free_phantomclient, pointer)
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_free_acceptoutcome, pointer)
 
     def _uniffi_clone_pointer(self):
-        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_clone_phantomclient, self._pointer)
+        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_clone_acceptoutcome, self._pointer)
 
     # Used by alternative constructors or any methods which return this type.
     @classmethod
@@ -971,95 +2228,66 @@ class PhantomClient:
         inst = cls.__new__(cls)
         inst._pointer = pointer
         return inst
-    @classmethod
-    async def connect(cls, addr: "str",group_id: "bytes",identity: "bytes",server_ca_pem: "typing.Optional[str]",shared_secret: "bytes"):
-        _UniffiConverterString.check_lower(addr)
-        
-        _UniffiConverterBytes.check_lower(group_id)
-        
-        _UniffiConverterBytes.check_lower(identity)
-        
-        _UniffiConverterOptionalString.check_lower(server_ca_pem)
-        
-        _UniffiConverterBytes.check_lower(shared_secret)
-        
-
-        return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_constructor_phantomclient_connect(
-        _UniffiConverterString.lower(addr),
-        _UniffiConverterBytes.lower(group_id),
-        _UniffiConverterBytes.lower(identity),
-        _UniffiConverterOptionalString.lower(server_ca_pem),
-        _UniffiConverterBytes.lower(shared_secret)),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_pointer,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_pointer,
-            _UniffiLib.ffi_phantom_core_rust_future_free_pointer,
-            _UniffiConverterTypePhantomClient.lift,
-            
-    # Error FFI converter
-_UniffiConverterTypePhantomError,
-
-        )
 
 
-    async def recv_message(self, ) -> "bytes":
-        return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomclient_recv_message(
-                self._uniffi_clone_pointer(), 
-            ),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer,
-            _UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer,
-            # lift function
-            _UniffiConverterBytes.lift,
-            
-    # Error FFI converter
-_UniffiConverterTypePhantomError,
+    def has_early_data(self, ) -> "bool":
+        """
+        Whether 0-RTT early-data is present and not yet taken.
+        """
 
-        )
-
-
-
-    async def send_message(self, msg: "bytes") -> None:
-
-        _UniffiConverterBytes.check_lower(msg)
-        
-        return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomclient_send_message(
-                self._uniffi_clone_pointer(), 
-        _UniffiConverterBytes.lower(msg)
-            ),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_void,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_void,
-            _UniffiLib.ffi_phantom_core_rust_future_free_void,
-            # lift function
-            lambda val: None,
-            
-            
-    # Error FFI converter
-_UniffiConverterTypePhantomError,
-
+        return _UniffiConverterBool.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_has_early_data,self._uniffi_clone_pointer(),)
         )
 
 
 
 
 
-class _UniffiConverterTypePhantomClient:
+    def session(self, ) -> "PhantomSession":
+        """
+        The accepted, fully-established session.
+        """
+
+        return _UniffiConverterTypePhantomSession.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_session,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+
+    def take_early_data(self, ) -> "typing.Optional[bytes]":
+        """
+        Take the 0-RTT early-data the client sent on its ClientHello.
+        Take-once — a second call returns `None`. `None` also means the
+        client sent no early-data, or the server rejected it (unknown /
+        expired ticket, oversized blob, AEAD failure).
+        """
+
+        return _UniffiConverterOptionalBytes.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_take_early_data,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+
+
+class _UniffiConverterTypeAcceptOutcome:
 
     @staticmethod
     def lift(value: int):
-        return PhantomClient._make_instance_(value)
+        return AcceptOutcome._make_instance_(value)
 
     @staticmethod
-    def check_lower(value: PhantomClient):
-        if not isinstance(value, PhantomClient):
-            raise TypeError("Expected PhantomClient instance, {} found".format(type(value).__name__))
+    def check_lower(value: AcceptOutcome):
+        if not isinstance(value, AcceptOutcome):
+            raise TypeError("Expected AcceptOutcome instance, {} found".format(type(value).__name__))
 
     @staticmethod
-    def lower(value: PhantomClientProtocol):
-        if not isinstance(value, PhantomClient):
-            raise TypeError("Expected PhantomClient instance, {} found".format(type(value).__name__))
+    def lower(value: AcceptOutcomeProtocol):
+        if not isinstance(value, AcceptOutcome):
+            raise TypeError("Expected AcceptOutcome instance, {} found".format(type(value).__name__))
         return value._uniffi_clone_pointer()
 
     @classmethod
@@ -1070,140 +2298,905 @@ class _UniffiConverterTypePhantomClient:
         return cls.lift(ptr)
 
     @classmethod
-    def write(cls, value: PhantomClientProtocol, buf: _UniffiRustBuffer):
+    def write(cls, value: AcceptOutcomeProtocol, buf: _UniffiRustBuffer):
         buf.write_u64(cls.lower(value))
+class PhantomListenerProtocol(typing.Protocol):
+    def accept(self, ):
+        """
+        Accept the next inbound connection and complete its handshake.
 
+        Returns an [`AcceptOutcome`] — the established session plus any
+        0-RTT early-data the client carried on a V3 ClientHello. Use
+        `.session()` for the session and `.take_early_data()` for the
+        early-data (the latter is `None` for a plain V1/V2 handshake or
+        when the server rejected the early-data).
+        """
 
-# PhantomError
-# We want to define each variant as a nested class that's also a subclass,
-# which is tricky in Python.  To accomplish this we're going to create each
-# class separately, then manually add the child classes to the base class's
-# __dict__.  All of this happens in dummy class to avoid polluting the module
-# namespace.
-class PhantomError(Exception):
-    pass
+        raise NotImplementedError
+    def is_shutting_down(self, ):
+        """
+        Whether `shutdown()` has been called.
+        """
 
-_UniffiTempPhantomError = PhantomError
+        raise NotImplementedError
+    def local_addr(self, ):
+        """
+        Local socket address the listener is actually bound to (resolved at
+        bind time). Useful when the caller passed `"host:0"` and needs to
+        learn which port the OS assigned.
+        """
 
-class PhantomError:  # type: ignore
-    class Network(_UniffiTempPhantomError):
-        def __init__(self, *values):
-            if len(values) != 1:
-                raise TypeError(f"Expected 1 arguments, found {len(values)}")
-            if not isinstance(values[0], str):
-                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
-            super().__init__(", ".join(map(repr, values)))
-            self._values = values
+        raise NotImplementedError
+    def metrics_prometheus_text(self, ):
+        """
+        Return the listener's metrics rendered in Prometheus text
+        exposition format (Phase 4.5). Suitable for serving from a
+        `/metrics` HTTP endpoint — the SDK does not bundle an HTTP
+        server, downstream applications wire one up.
+        """
 
-        def __getitem__(self, index):
-            return self._values[index]
+        raise NotImplementedError
+    def shutdown(self, ):
+        """
+        Signal graceful shutdown (Phase 4.6).
 
-        def __repr__(self):
-            return "PhantomError.Network({})".format(str(self))
-    _UniffiTempPhantomError.Network = Network # type: ignore
-    class Crypto(_UniffiTempPhantomError):
-        def __init__(self, *values):
-            if len(values) != 1:
-                raise TypeError(f"Expected 1 arguments, found {len(values)}")
-            if not isinstance(values[0], str):
-                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
-            super().__init__(", ".join(map(repr, values)))
-            self._values = values
+        Sets the `shutting_down` flag and wakes any `accept()` call currently
+        parked on the listener so it can unwind with
+        `CoreError::ConnectionClosed`. Idempotent — calling more than once is
+        safe. Already-accepted sessions are NOT affected; they continue
+        serving until their owning task closes them.
+        """
 
-        def __getitem__(self, index):
-            return self._values[index]
+        raise NotImplementedError
+    def verifying_key_bytes(self, ):
+        """
+        The server's long-lived hybrid verifying key, serialized via
+        `HybridVerifyingKey::to_bytes`. Clients MUST pin this value before
+        completing a handshake to defeat MITM (see Vuln 1 in security review).
+        """
 
-        def __repr__(self):
-            return "PhantomError.Crypto({})".format(str(self))
-    _UniffiTempPhantomError.Crypto = Crypto # type: ignore
-    class Generic(_UniffiTempPhantomError):
-        def __init__(self, *values):
-            if len(values) != 1:
-                raise TypeError(f"Expected 1 arguments, found {len(values)}")
-            if not isinstance(values[0], str):
-                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
-            super().__init__(", ".join(map(repr, values)))
-            self._values = values
+        raise NotImplementedError
+# PhantomListener is a Rust-only trait - it's a wrapper around a Rust implementation.
+class PhantomListener():
+    _pointer: ctypes.c_void_p
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
 
-        def __getitem__(self, index):
-            return self._values[index]
+    def __del__(self):
+        # In case of partial initialization of instances.
+        pointer = getattr(self, "_pointer", None)
+        if pointer is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_free_phantomlistener, pointer)
 
-        def __repr__(self):
-            return "PhantomError.Generic({})".format(str(self))
-    _UniffiTempPhantomError.Generic = Generic # type: ignore
+    def _uniffi_clone_pointer(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_clone_phantomlistener, self._pointer)
 
-PhantomError = _UniffiTempPhantomError # type: ignore
-del _UniffiTempPhantomError
-
-
-class _UniffiConverterTypePhantomError(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        variant = buf.read_i32()
-        if variant == 1:
-            return PhantomError.Network(
-                _UniffiConverterString.read(buf),
-            )
-        if variant == 2:
-            return PhantomError.Crypto(
-                _UniffiConverterString.read(buf),
-            )
-        if variant == 3:
-            return PhantomError.Generic(
-                _UniffiConverterString.read(buf),
-            )
-        raise InternalError("Raw enum value doesn't match any cases")
-
-    @staticmethod
-    def check_lower(value):
-        if isinstance(value, PhantomError.Network):
-            _UniffiConverterString.check_lower(value._values[0])
-            return
-        if isinstance(value, PhantomError.Crypto):
-            _UniffiConverterString.check_lower(value._values[0])
-            return
-        if isinstance(value, PhantomError.Generic):
-            _UniffiConverterString.check_lower(value._values[0])
-            return
-
-    @staticmethod
-    def write(value, buf):
-        if isinstance(value, PhantomError.Network):
-            buf.write_i32(1)
-            _UniffiConverterString.write(value._values[0], buf)
-        if isinstance(value, PhantomError.Crypto):
-            buf.write_i32(2)
-            _UniffiConverterString.write(value._values[0], buf)
-        if isinstance(value, PhantomError.Generic):
-            buf.write_i32(3)
-            _UniffiConverterString.write(value._values[0], buf)
-
-
-
-class _UniffiConverterOptionalString(_UniffiConverterRustBuffer):
+    # Used by alternative constructors or any methods which return this type.
     @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiConverterString.check_lower(value)
+    def _make_instance_(cls, pointer):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required pointer.
+        inst = cls.__new__(cls)
+        inst._pointer = pointer
+        return inst
+    @classmethod
+    async def bind(cls, addr: "str"):
+        _UniffiConverterString.check_lower(addr)
+        
+
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_constructor_phantomlistener_bind(
+        _UniffiConverterString.lower(addr)),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_pointer,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_pointer,
+            _UniffiLib.ffi_phantom_core_rust_future_free_pointer,
+            _UniffiConverterTypePhantomListener.lift,
+            
+    # Error FFI converter
+_UniffiConverterTypeCoreError,
+
+        )
+
+
+    async def accept(self, ) -> "AcceptOutcome":
+        """
+        Accept the next inbound connection and complete its handshake.
+
+        Returns an [`AcceptOutcome`] — the established session plus any
+        0-RTT early-data the client carried on a V3 ClientHello. Use
+        `.session()` for the session and `.take_early_data()` for the
+        early-data (the latter is `None` for a plain V1/V2 handshake or
+        when the server rejected the early-data).
+        """
+
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_accept(
+                self._uniffi_clone_pointer(), 
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_pointer,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_pointer,
+            _UniffiLib.ffi_phantom_core_rust_future_free_pointer,
+            # lift function
+            _UniffiConverterTypeAcceptOutcome.lift,
+            
+    # Error FFI converter
+_UniffiConverterTypeCoreError,
+
+        )
+
+
+
+
+    def is_shutting_down(self, ) -> "bool":
+        """
+        Whether `shutdown()` has been called.
+        """
+
+        return _UniffiConverterBool.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+
+    def local_addr(self, ) -> "str":
+        """
+        Local socket address the listener is actually bound to (resolved at
+        bind time). Useful when the caller passed `"host:0"` and needs to
+        learn which port the OS assigned.
+        """
+
+        return _UniffiConverterString.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_local_addr,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+
+    def metrics_prometheus_text(self, ) -> "str":
+        """
+        Return the listener's metrics rendered in Prometheus text
+        exposition format (Phase 4.5). Suitable for serving from a
+        `/metrics` HTTP endpoint — the SDK does not bundle an HTTP
+        server, downstream applications wire one up.
+        """
+
+        return _UniffiConverterString.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_metrics_prometheus_text,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+
+    def shutdown(self, ) -> None:
+        """
+        Signal graceful shutdown (Phase 4.6).
+
+        Sets the `shutting_down` flag and wakes any `accept()` call currently
+        parked on the listener so it can unwind with
+        `CoreError::ConnectionClosed`. Idempotent — calling more than once is
+        safe. Already-accepted sessions are NOT affected; they continue
+        serving until their owning task closes them.
+        """
+
+        _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_shutdown,self._uniffi_clone_pointer(),)
+
+
+
+
+
+
+    def verifying_key_bytes(self, ) -> "bytes":
+        """
+        The server's long-lived hybrid verifying key, serialized via
+        `HybridVerifyingKey::to_bytes`. Clients MUST pin this value before
+        completing a handshake to defeat MITM (see Vuln 1 in security review).
+        """
+
+        return _UniffiConverterBytes.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_verifying_key_bytes,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+
+
+class _UniffiConverterTypePhantomListener:
+
+    @staticmethod
+    def lift(value: int):
+        return PhantomListener._make_instance_(value)
+
+    @staticmethod
+    def check_lower(value: PhantomListener):
+        if not isinstance(value, PhantomListener):
+            raise TypeError("Expected PhantomListener instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: PhantomListenerProtocol):
+        if not isinstance(value, PhantomListener):
+            raise TypeError("Expected PhantomListener instance, {} found".format(type(value).__name__))
+        return value._uniffi_clone_pointer()
 
     @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiConverterString.write(value, buf)
+    def read(cls, buf: _UniffiRustBuffer):
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw pointer value was null")
+        return cls.lift(ptr)
 
     @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiConverterString.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
+    def write(cls, value: PhantomListenerProtocol, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+class PhantomSessionProtocol(typing.Protocol):
+    """
+    Client-first session — instant `connect()`, non-blocking `send()`.
+
+    # Design
+
+    ```text
+    let session = PhantomSession::connect("server:443");  // instant!
+    session.send(data).await;   // queued until handshake completes
+    session.send(data2).await;  // also queued
+    // ... handshake completes in background ...
+    // queued data auto-flushed, new sends go directly
+    ```
+
+    The session progresses through states:
+    `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
+    """
+
+    def close(self, ):
+        """
+        Close the session.
+        """
+
+        raise NotImplementedError
+    def connection_state(self, ):
+        """
+        Get the current connection state (lock-free).
+        """
+
+        raise NotImplementedError
+    def early_data_accepted(self, ):
+        """
+        The 0-RTT verdict for this session (wire V3, Phase 4.1).
+
+        - `None` — still handshaking, the handshake failed, or this was
+        a plain V1/V2 handshake (no 0-RTT attempted, or a V3 attempt
+        fell back to V2 because the server replied `Unsupported`).
+        The caller must send any intended early-data over the normal
+        channel.
+        - `Some(true)` — the server consumed the 0-RTT early-data.
+        - `Some(false)` — a V3 handshake where the server rejected the
+        early-data (stale/unknown ticket, oversized blob, or AEAD
+        failure). The caller must re-send that payload normally.
+        """
+
+        raise NotImplementedError
+    def flush_queue(self, ):
+        """
+        Flush all queued messages (called when handshake completes).
+        """
+
+        raise NotImplementedError
+    def id(self, ):
+        """
+        Session identifier.
+        """
+
+        raise NotImplementedError
+    def is_data_ready(self, ):
+        """
+        Whether the session is ready for data transmission.
+        """
+
+        raise NotImplementedError
+    def is_pqc_ready(self, ):
+        """
+        Whether the session has full PQC protection.
+        """
+
+        raise NotImplementedError
+    def open_stream(self, ):
+        """
+        Open a new multiplexed stream
+        """
+
+        raise NotImplementedError
+    def peer_addr(self, ):
+        """
+        Target peer address.
+        """
+
+        raise NotImplementedError
+    def queued_count(self, ):
+        """
+        Number of messages queued (waiting for handshake).
+        """
+
+        raise NotImplementedError
+    def recv(self, ):
+        """
+        Receive data from the session.
+
+        Internally the recv pipeline keeps payloads as `Bytes` to avoid the
+        per-packet Vec clone that used to fan out to the stream demux. The
+        FFI surface still hands callers a `Vec<u8>`; if this is the last
+        refcount the Vec is moved out of the underlying buffer, otherwise
+        `Bytes::to_vec` copies.
+        """
+
+        raise NotImplementedError
+    def resumption_hint(self, ):
+        """
+        Extract a [`ResumptionHint`] for a future 0-RTT reconnect
+        (wire V3, Phase 4.1).
+
+        Returns `Some` after a successful handshake; `None` while still
+        handshaking, after a failure, or before the inner session has
+        been published.
+
+        Store the hint alongside the pinned `HybridVerifyingKey` of the
+        server it was negotiated against and feed it back to
+        [`connect_pinned_with_resumption`]. Reusing a hint across
+        servers is a configuration bug — the `resumption_secret` is
+        server-pinned.
+        """
+
+        raise NotImplementedError
+    def send(self, data: "bytes"):
+        """
+        Send data through the session.
+
+        - If the session is connected: sends immediately
+        - If still handshaking: queues the data for auto-flush later
+        """
+
+        raise NotImplementedError
+    def set_state(self, new_state: "ConnectionState"):
+        """
+        Transition to a new connection state.
+        """
+
+        raise NotImplementedError
+# PhantomSession is a Rust-only trait - it's a wrapper around a Rust implementation.
+class PhantomSession():
+    """
+    Client-first session — instant `connect()`, non-blocking `send()`.
+
+    # Design
+
+    ```text
+    let session = PhantomSession::connect("server:443");  // instant!
+    session.send(data).await;   // queued until handshake completes
+    session.send(data2).await;  // also queued
+    // ... handshake completes in background ...
+    // queued data auto-flushed, new sends go directly
+    ```
+
+    The session progresses through states:
+    `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
+    """
+
+    _pointer: ctypes.c_void_p
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        pointer = getattr(self, "_pointer", None)
+        if pointer is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_free_phantomsession, pointer)
+
+    def _uniffi_clone_pointer(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_clone_phantomsession, self._pointer)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _make_instance_(cls, pointer):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required pointer.
+        inst = cls.__new__(cls)
+        inst._pointer = pointer
+        return inst
+    @classmethod
+    def connect(cls, peer_addr: "str"):
+        """
+        Create a new session — returns instantly.
+
+        Handshake is not started until a transport is provided.
+        Use `connect_with_transport()` for full integration.
+        """
+
+        _UniffiConverterString.check_lower(peer_addr)
+        
+        # Call the (fallible) function before creating any half-baked object instances.
+        pointer = _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_constructor_phantomsession_connect,
+        _UniffiConverterString.lower(peer_addr))
+        return cls._make_instance_(pointer)
+
+
+    async def close(self, ) -> None:
+
+        """
+        Close the session.
+        """
+
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_close(
+                self._uniffi_clone_pointer(), 
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_void,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_void,
+            _UniffiLib.ffi_phantom_core_rust_future_free_void,
+            # lift function
+            lambda val: None,
+            
+            
+    # Error FFI converter
+_UniffiConverterTypeCoreError,
+
+        )
+
+
+
+
+    def connection_state(self, ) -> "ConnectionState":
+        """
+        Get the current connection state (lock-free).
+        """
+
+        return _UniffiConverterTypeConnectionState.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+    async def early_data_accepted(self, ) -> "typing.Optional[bool]":
+        """
+        The 0-RTT verdict for this session (wire V3, Phase 4.1).
+
+        - `None` — still handshaking, the handshake failed, or this was
+        a plain V1/V2 handshake (no 0-RTT attempted, or a V3 attempt
+        fell back to V2 because the server replied `Unsupported`).
+        The caller must send any intended early-data over the normal
+        channel.
+        - `Some(true)` — the server consumed the 0-RTT early-data.
+        - `Some(false)` — a V3 handshake where the server rejected the
+        early-data (stale/unknown ticket, oversized blob, or AEAD
+        failure). The caller must re-send that payload normally.
+        """
+
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_early_data_accepted(
+                self._uniffi_clone_pointer(), 
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer,
+            # lift function
+            _UniffiConverterOptionalBool.lift,
+            
+    # Error FFI converter
+
+    None,
+
+        )
+
+
+
+    async def flush_queue(self, ) -> "int":
+        """
+        Flush all queued messages (called when handshake completes).
+        """
+
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_flush_queue(
+                self._uniffi_clone_pointer(), 
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_u32,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_u32,
+            _UniffiLib.ffi_phantom_core_rust_future_free_u32,
+            # lift function
+            _UniffiConverterUInt32.lift,
+            
+    # Error FFI converter
+_UniffiConverterTypeCoreError,
+
+        )
+
+
+
+
+    def id(self, ) -> "str":
+        """
+        Session identifier.
+        """
+
+        return _UniffiConverterString.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_id,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+
+    def is_data_ready(self, ) -> "bool":
+        """
+        Whether the session is ready for data transmission.
+        """
+
+        return _UniffiConverterBool.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_is_data_ready,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+
+    def is_pqc_ready(self, ) -> "bool":
+        """
+        Whether the session has full PQC protection.
+        """
+
+        return _UniffiConverterBool.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_is_pqc_ready,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+
+    def open_stream(self, ) -> "PhantomStream":
+        """
+        Open a new multiplexed stream
+        """
+
+        return _UniffiConverterTypePhantomStream.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_open_stream,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+
+    def peer_addr(self, ) -> "str":
+        """
+        Target peer address.
+        """
+
+        return _UniffiConverterString.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_peer_addr,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+    async def queued_count(self, ) -> "int":
+        """
+        Number of messages queued (waiting for handshake).
+        """
+
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_queued_count(
+                self._uniffi_clone_pointer(), 
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_u32,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_u32,
+            _UniffiLib.ffi_phantom_core_rust_future_free_u32,
+            # lift function
+            _UniffiConverterUInt32.lift,
+            
+    # Error FFI converter
+
+    None,
+
+        )
+
+
+
+    async def recv(self, ) -> "bytes":
+        """
+        Receive data from the session.
+
+        Internally the recv pipeline keeps payloads as `Bytes` to avoid the
+        per-packet Vec clone that used to fan out to the stream demux. The
+        FFI surface still hands callers a `Vec<u8>`; if this is the last
+        refcount the Vec is moved out of the underlying buffer, otherwise
+        `Bytes::to_vec` copies.
+        """
+
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_recv(
+                self._uniffi_clone_pointer(), 
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer,
+            # lift function
+            _UniffiConverterBytes.lift,
+            
+    # Error FFI converter
+_UniffiConverterTypeCoreError,
+
+        )
+
+
+
+    async def resumption_hint(self, ) -> "typing.Optional[ResumptionHint]":
+        """
+        Extract a [`ResumptionHint`] for a future 0-RTT reconnect
+        (wire V3, Phase 4.1).
+
+        Returns `Some` after a successful handshake; `None` while still
+        handshaking, after a failure, or before the inner session has
+        been published.
+
+        Store the hint alongside the pinned `HybridVerifyingKey` of the
+        server it was negotiated against and feed it back to
+        [`connect_pinned_with_resumption`]. Reusing a hint across
+        servers is a configuration bug — the `resumption_secret` is
+        server-pinned.
+        """
+
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_resumption_hint(
+                self._uniffi_clone_pointer(), 
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer,
+            # lift function
+            _UniffiConverterOptionalTypeResumptionHint.lift,
+            
+    # Error FFI converter
+
+    None,
+
+        )
+
+
+
+    async def send(self, data: "bytes") -> None:
+
+        """
+        Send data through the session.
+
+        - If the session is connected: sends immediately
+        - If still handshaking: queues the data for auto-flush later
+        """
+
+        _UniffiConverterBytes.check_lower(data)
+        
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_send(
+                self._uniffi_clone_pointer(), 
+        _UniffiConverterBytes.lower(data)
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_void,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_void,
+            _UniffiLib.ffi_phantom_core_rust_future_free_void,
+            # lift function
+            lambda val: None,
+            
+            
+    # Error FFI converter
+_UniffiConverterTypeCoreError,
+
+        )
+
+
+
+
+    def set_state(self, new_state: "ConnectionState") -> None:
+        """
+        Transition to a new connection state.
+        """
+
+        _UniffiConverterTypeConnectionState.check_lower(new_state)
+        
+        _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_set_state,self._uniffi_clone_pointer(),
+        _UniffiConverterTypeConnectionState.lower(new_state))
+
+
+
+
+
+
+
+class _UniffiConverterTypePhantomSession:
+
+    @staticmethod
+    def lift(value: int):
+        return PhantomSession._make_instance_(value)
+
+    @staticmethod
+    def check_lower(value: PhantomSession):
+        if not isinstance(value, PhantomSession):
+            raise TypeError("Expected PhantomSession instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: PhantomSessionProtocol):
+        if not isinstance(value, PhantomSession):
+            raise TypeError("Expected PhantomSession instance, {} found".format(type(value).__name__))
+        return value._uniffi_clone_pointer()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer):
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw pointer value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: PhantomSessionProtocol, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+class PhantomStreamProtocol(typing.Protocol):
+    def close(self, ):
+        raise NotImplementedError
+    def recv(self, ):
+        raise NotImplementedError
+    def send_reliable(self, data: "bytes"):
+        raise NotImplementedError
+    def send_unreliable(self, data: "bytes"):
+        raise NotImplementedError
+    def stream_id(self, ):
+        raise NotImplementedError
+# PhantomStream is a Rust-only trait - it's a wrapper around a Rust implementation.
+class PhantomStream():
+    _pointer: ctypes.c_void_p
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        pointer = getattr(self, "_pointer", None)
+        if pointer is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_free_phantomstream, pointer)
+
+    def _uniffi_clone_pointer(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_clone_phantomstream, self._pointer)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _make_instance_(cls, pointer):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required pointer.
+        inst = cls.__new__(cls)
+        inst._pointer = pointer
+        return inst
+
+    async def close(self, ) -> None:
+
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomstream_close(
+                self._uniffi_clone_pointer(), 
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_void,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_void,
+            _UniffiLib.ffi_phantom_core_rust_future_free_void,
+            # lift function
+            lambda val: None,
+            
+            
+    # Error FFI converter
+_UniffiConverterTypeCoreError,
+
+        )
+
+
+
+    async def recv(self, ) -> "bytes":
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomstream_recv(
+                self._uniffi_clone_pointer(), 
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer,
+            # lift function
+            _UniffiConverterBytes.lift,
+            
+    # Error FFI converter
+_UniffiConverterTypeCoreError,
+
+        )
+
+
+
+    async def send_reliable(self, data: "bytes") -> None:
+
+        _UniffiConverterBytes.check_lower(data)
+        
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomstream_send_reliable(
+                self._uniffi_clone_pointer(), 
+        _UniffiConverterBytes.lower(data)
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_void,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_void,
+            _UniffiLib.ffi_phantom_core_rust_future_free_void,
+            # lift function
+            lambda val: None,
+            
+            
+    # Error FFI converter
+_UniffiConverterTypeCoreError,
+
+        )
+
+
+
+    async def send_unreliable(self, data: "bytes") -> None:
+
+        _UniffiConverterBytes.check_lower(data)
+        
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomstream_send_unreliable(
+                self._uniffi_clone_pointer(), 
+        _UniffiConverterBytes.lower(data)
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_void,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_void,
+            _UniffiLib.ffi_phantom_core_rust_future_free_void,
+            # lift function
+            lambda val: None,
+            
+            
+    # Error FFI converter
+_UniffiConverterTypeCoreError,
+
+        )
+
+
+
+
+    def stream_id(self, ) -> "int":
+        return _UniffiConverterUInt32.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_stream_id,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+
+
+class _UniffiConverterTypePhantomStream:
+
+    @staticmethod
+    def lift(value: int):
+        return PhantomStream._make_instance_(value)
+
+    @staticmethod
+    def check_lower(value: PhantomStream):
+        if not isinstance(value, PhantomStream):
+            raise TypeError("Expected PhantomStream instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: PhantomStreamProtocol):
+        if not isinstance(value, PhantomStream):
+            raise TypeError("Expected PhantomStream instance, {} found".format(type(value).__name__))
+        return value._uniffi_clone_pointer()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer):
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw pointer value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: PhantomStreamProtocol, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
 
 # Async support# RustFuturePoll values
 _UNIFFI_RUST_FUTURE_POLL_READY = 0
@@ -1268,10 +3261,90 @@ async def _uniffi_rust_call_async(rust_future, ffi_poll, ffi_complete, ffi_free,
         )
     finally:
         ffi_free(rust_future)
+async def connect_pinned(host: "str",port: "int",pinned_key: "bytes") -> "PhantomSession":
+
+    _UniffiConverterString.check_lower(host)
+    
+    _UniffiConverterUInt16.check_lower(port)
+    
+    _UniffiConverterBytes.check_lower(pinned_key)
+    
+    return await _uniffi_rust_call_async(
+        _UniffiLib.uniffi_phantom_core_fn_func_connect_pinned(
+        _UniffiConverterString.lower(host),
+        _UniffiConverterUInt16.lower(port),
+        _UniffiConverterBytes.lower(pinned_key)),
+        _UniffiLib.ffi_phantom_core_rust_future_poll_pointer,
+        _UniffiLib.ffi_phantom_core_rust_future_complete_pointer,
+        _UniffiLib.ffi_phantom_core_rust_future_free_pointer,
+        # lift function
+        _UniffiConverterTypePhantomSession.lift,
+        
+    # Error FFI converter
+_UniffiConverterTypeCoreError,
+
+    )
+async def connect_pinned_with_resumption(host: "str",port: "int",pinned_key: "bytes",hint: "ResumptionHint",early_data: "bytes") -> "PhantomSession":
+
+    """
+    Connect to a pinned server with a **0-RTT resumption attempt**
+    (wire V3, Phase 4.1) — the resumption-aware analogue of
+    [`connect_pinned`].
+
+    `hint` is a [`ResumptionHint`] from a prior session's
+    [`PhantomSession::resumption_hint`]; both of its fields must be
+    exactly 32 bytes or the call fails with `ValidationError` before any
+    socket is opened. `early_data` (≤ 16 KiB) is sealed into the V3
+    ClientHello so it reaches the server on the very first flight.
+
+    If the server does not speak V3 the handshake transparently falls
+    back to 1-RTT and `early_data` is *not* delivered 0-RTT — the caller
+    checks [`PhantomSession::early_data_accepted`] and re-sends over the
+    normal channel when it is not `Some(true)`.
+
+    Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
+    behind `cfg(not(target_arch = "wasm32"))`.
+    """
+
+    _UniffiConverterString.check_lower(host)
+    
+    _UniffiConverterUInt16.check_lower(port)
+    
+    _UniffiConverterBytes.check_lower(pinned_key)
+    
+    _UniffiConverterTypeResumptionHint.check_lower(hint)
+    
+    _UniffiConverterBytes.check_lower(early_data)
+    
+    return await _uniffi_rust_call_async(
+        _UniffiLib.uniffi_phantom_core_fn_func_connect_pinned_with_resumption(
+        _UniffiConverterString.lower(host),
+        _UniffiConverterUInt16.lower(port),
+        _UniffiConverterBytes.lower(pinned_key),
+        _UniffiConverterTypeResumptionHint.lower(hint),
+        _UniffiConverterBytes.lower(early_data)),
+        _UniffiLib.ffi_phantom_core_rust_future_poll_pointer,
+        _UniffiLib.ffi_phantom_core_rust_future_complete_pointer,
+        _UniffiLib.ffi_phantom_core_rust_future_free_pointer,
+        # lift function
+        _UniffiConverterTypePhantomSession.lift,
+        
+    # Error FFI converter
+_UniffiConverterTypeCoreError,
+
+    )
 
 __all__ = [
     "InternalError",
-    "PhantomError",
-    "PhantomClient",
+    "ConnectionState",
+    "CoreError",
+    "PhantomConfig",
+    "ResumptionHint",
+    "connect_pinned",
+    "connect_pinned_with_resumption",
+    "AcceptOutcome",
+    "PhantomListener",
+    "PhantomSession",
+    "PhantomStream",
 ]
 
