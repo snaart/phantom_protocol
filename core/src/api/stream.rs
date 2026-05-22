@@ -24,7 +24,7 @@ impl PhantomStream {
     }
 }
 
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl PhantomStream {
     pub fn stream_id(&self) -> u32 {
         self.stream_id

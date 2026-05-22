@@ -1453,7 +1453,7 @@ async fn plaintext_into_router(
     recv_tx.send(bytes).await.is_ok()
 }
 
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl PhantomSession {
     /// Create a new session — returns instantly.
     ///
@@ -1665,7 +1665,7 @@ impl std::fmt::Debug for PhantomSession {
 // "wasm32"))`, mirroring `crate::api::tcp_transport`. Wasm consumers use
 // the in-tree `WebSocketLeg` instead.
 #[cfg(not(target_arch = "wasm32"))]
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 pub async fn connect_pinned(
     host: String,
     port: u16,
@@ -1711,7 +1711,7 @@ pub async fn connect_pinned(
 /// Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
 /// behind `cfg(not(target_arch = "wasm32"))`.
 #[cfg(not(target_arch = "wasm32"))]
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 pub async fn connect_pinned_with_resumption(
     host: String,
     port: u16,
