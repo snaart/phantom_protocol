@@ -1,0 +1,153 @@
+# Prometheus alert rules for Phantom Core (Phase 8 — OTel-native metric names).
+#
+# Consume via an OTel Collector's `prometheusexporter`, which translates
+# `phantom.session.packets` → `phantom_session_packets_total` etc. (dots
+# become underscores; counters get `_total`; Histogram bucket suffix is
+# `_seconds_bucket`).
+#
+# Import via `rule_files:` in `prometheus.yml`, or via the corresponding
+# ConfigMap in Kubernetes.
+#
+# Severity buckets follow the operational policy in
+# docs/security/incident-response.md.
+
+groups:
+  - name: phantom_security
+    interval: 30s
+    rules:
+      - alert: PhantomUnencryptedDowngradeAttempt
+        # Any non-empty post-handshake packet without the ENCRYPTED flag
+        # is an active downgrade signal. Phantom Core drops the packet;
+        # the alert is for forensic visibility.
+        expr: increase(phantom_security_unencrypted_dropped_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: security
+        annotations:
+          summary: "Phantom session(s) received unencrypted post-handshake data"
+          description: |
+            Over the past 5 minutes, {{ $value }} application-data packets
+            arrived without the ENCRYPTED flag set. Downgrade signal.
+            See docs/security/incident-response.md.
+
+      - alert: PhantomAeadDecryptFailureSpike
+        expr: rate(phantom_security_aead_failed_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: high
+          team: security
+        annotations:
+          summary: "Phantom AEAD decryption failure rate elevated"
+          description: |
+            AEAD tag-mismatch rate is {{ $value | humanize }} per second
+            over the past 5 minutes. Investigate active tampering, MitM,
+            or an incompatible wire-format peer.
+
+      - alert: PhantomReplayWindowElevated
+        expr: rate(phantom_security_replay_rejected_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "Phantom replay-window rejection rate elevated"
+          description: |
+            Replay-rejection rate is {{ $value | humanize }} per second
+            over 10 minutes. Could be reordered traffic or replay attack.
+
+      - alert: PhantomHandshakeFailureSpike
+        # The handshake-duration histogram's `_count` series is the
+        # canonical handshake count (sliced by the `outcome` attribute).
+        expr: |
+          rate(phantom_handshake_duration_seconds_count{outcome="failure"}[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "Phantom handshake failure rate elevated"
+          description: |
+            {{ $value | humanize }} handshake failures per second over the
+            past 5 minutes. Check adaptive-PoW tier and recent deploys.
+
+      - alert: PhantomPoWRejectionStorm
+        # Sudden volume of PoW rejections may indicate DoS attempt.
+        expr: rate(phantom_security_pow_total{outcome="rejected"}[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "Phantom PoW rejection rate elevated (possible DoS)"
+          description: |
+            PoW rejection rate is {{ $value | humanize }}/s. Adaptive PoW
+            is doing its job; verify normal client population is not
+            getting starved.
+
+  - name: phantom_capacity
+    interval: 30s
+    rules:
+      - alert: PhantomActiveSessionsHigh
+        # Tune the constant to your deployment's tested capacity.
+        expr: sum(phantom_session_active) > 8000
+        for: 10m
+        labels:
+          severity: warning
+          team: ops
+        annotations:
+          summary: "Phantom active-sessions gauge near capacity"
+          description: |
+            Active sessions = {{ $value }}. Consider scaling horizontally
+            or raising the configured capacity limit.
+
+      - alert: PhantomHandshakeP95LatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(phantom_handshake_duration_seconds_bucket[5m])
+            )
+          ) > 1.0
+        for: 10m
+        labels:
+          severity: warning
+          team: ops
+        annotations:
+          summary: "Phantom handshake p95 latency > 1 s"
+          description: |
+            p95 handshake latency over the past 5 minutes is {{ $value }} s.
+            Investigate CPU saturation, RNG starvation, or aggressive PoW
+            difficulty.
+
+      - alert: PhantomTelemetryExportFailing
+        # Phantom Core observes its own export failures via
+        # `phantom.telemetry.export_failures`. Non-zero rate means the
+        # OTel Collector / SaaS backend is congested or unreachable.
+        expr: rate(phantom_telemetry_export_failures_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: ops
+        annotations:
+          summary: "Phantom OTel exporter dropping batches"
+          description: |
+            Exporter has dropped {{ $value | humanize }} batches/s for
+            10 minutes. Inspect collector logs and backend reachability.
+
+  - name: phantom_health
+    interval: 30s
+    rules:
+      - alert: PhantomNoSuccessfulHandshakes
+        expr: |
+          rate(phantom_handshake_duration_seconds_count{outcome="success"}[15m]) == 0
+          and sum(phantom_session_active) == 0
+        for: 15m
+        labels:
+          severity: critical
+          team: ops
+        annotations:
+          summary: "Phantom listener has accepted no sessions in 15 minutes"
+          description: |
+            handshakes/sec = 0 and active_sessions = 0 for 15+ minutes.
+            Listener may be unreachable. Cross-check from outside the host.
