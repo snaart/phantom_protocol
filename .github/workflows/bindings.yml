@@ -39,6 +39,8 @@ jobs:
             echo "$MISSING"
             exit 1
           fi
+      - name: Check binding manifest versions match core/Cargo.toml
+        run: tests/bindings/check_versions.sh
       - name: Fail if committed bindings drifted
         run: git diff --exit-code -- tests/bindings/
 
