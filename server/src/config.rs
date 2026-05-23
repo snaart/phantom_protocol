@@ -29,9 +29,27 @@ pub struct Config {
     )]
     pub signing_key_file: PathBuf,
 
-    /// If set, bind a /metrics HTTP listener (Prometheus text exposition).
-    #[arg(long, env = "PHANTOM_METRICS_BIND")]
-    pub metrics_bind: Option<SocketAddr>,
+    /// OTLP/gRPC endpoint for OpenTelemetry metrics + traces export.
+    ///
+    /// Default targets a local OTel Collector. Override for Datadog /
+    /// Honeycomb / Grafana Cloud direct endpoints (and set
+    /// `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer ...` for auth).
+    #[arg(
+        long,
+        env = "OTEL_EXPORTER_OTLP_ENDPOINT",
+        default_value = "http://localhost:4317"
+    )]
+    pub otlp_endpoint: String,
+
+    /// Trace sampling ratio (0.0 — 1.0). Default 1% baseline; bump to 1.0
+    /// when investigating an incident, or set to 0 to disable trace export.
+    #[arg(long, env = "OTEL_TRACES_SAMPLER_ARG", default_value = "0.01")]
+    pub otel_trace_sample_ratio: f64,
+
+    /// Service name reported via OTel Resource. Defaults to the binary
+    /// name; override per-instance for multi-tenant deployments.
+    #[arg(long, env = "OTEL_SERVICE_NAME", default_value = "phantom-server")]
+    pub otel_service_name: String,
 
     /// Output structured JSON logs (default: pretty when stdout is a TTY).
     #[arg(long, env = "PHANTOM_LOG_JSON")]

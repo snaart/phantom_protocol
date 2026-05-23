@@ -37,8 +37,6 @@ pub mod half_open;
 #[cfg(feature = "std")]
 pub mod handshake;
 #[cfg(feature = "std")]
-pub mod metrics;
-#[cfg(feature = "std")]
 pub mod multiplexer;
 #[cfg(feature = "std")]
 pub mod pacer;

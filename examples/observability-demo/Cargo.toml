@@ -1,0 +1,25 @@
+[package]
+name = "phantom-observability-demo"
+version = "0.1.0"
+edition = "2021"
+description = "End-to-end OTel observability demo: phantom-server + OTel Collector + Prometheus + Tempo + Grafana"
+
+# Standalone — not a workspace member, matching `examples/wasm-demo` pattern.
+[workspace]
+
+[[bin]]
+name = "phantom-observability-demo"
+path = "src/main.rs"
+
+[dependencies]
+phantom_core = { path = "../../core", features = ["telemetry-otel"] }
+tokio = { version = "1.36", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = { version = "0.28", features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.28", features = ["metrics", "trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", default-features = false, features = [
+    "grpc-tonic", "metrics", "trace",
+] }
+tracing-opentelemetry = "0.29"

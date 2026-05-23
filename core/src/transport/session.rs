@@ -450,6 +450,7 @@ impl Session {
     /// the `PacketFlagsV2::REKEY` flag). Receivers respond by calling
     /// `rekey()` themselves once they see the bump — keeping both ends in
     /// lockstep.
+    #[tracing::instrument(name = "phantom.session.rekey", skip_all)]
     pub fn rekey(&self) -> Result<u8, CoreError> {
         let current_epoch = self.epoch.load(Ordering::Relaxed);
         if current_epoch == u8::MAX {
@@ -518,6 +519,7 @@ impl Session {
     ///
     /// Returns `None` if the path is in a terminal state (`Validated`
     /// or `Failed`).
+    #[tracing::instrument(name = "phantom.path.begin_validation", skip_all, fields(path_id = path_id))]
     pub fn begin_path_validation(&self, path_id: u8) -> Option<[u8; PATH_CHALLENGE_LEN]> {
         self.path_registry.register(path_id);
         self.path_registry.issue_challenge(path_id)
@@ -527,6 +529,7 @@ impl Session {
     /// the response matches the in-flight challenge (path is now
     /// `Validated`). Returns `false` otherwise — the path may have
     /// transitioned to `Failed`.
+    #[tracing::instrument(name = "phantom.path.complete_validation", skip(response), fields(path_id = path_id))]
     pub fn complete_path_validation(&self, path_id: u8, response: &[u8]) -> bool {
         self.path_registry.verify_response(path_id, response)
     }
