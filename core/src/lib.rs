@@ -66,6 +66,21 @@
 // default) is unchanged.
 #![cfg_attr(not(feature = "std"), no_std)]
 
+// Phase 5.5 — `fips` feature scaffold. The flag exists in `Cargo.toml` so
+// downstream tooling can pin it in advance, but the primitive-swap PR
+// (X25519 → ECDH-P-256, ring → aws-lc-rs, blake3 → HKDF-SHA256, drop
+// ChaCha20-Poly1305, CTR_DRBG RNG, POST hook) has not landed yet. Fail
+// the build loudly if a consumer enables the feature today rather than
+// silently shipping a non-FIPS binary that pretends to be FIPS.
+#[cfg(feature = "fips")]
+compile_error!(
+    "The `fips` Cargo feature is a scaffold only — the FIPS 140-3 primitive \
+     swap (ring → aws-lc-rs, X25519 → ECDH-P-256, blake3 → HKDF-SHA256, \
+     drop ChaCha20-Poly1305, CTR_DRBG RNG) has not yet landed. See \
+     `docs/compliance/fips-readiness.md` for current status. Build without \
+     `--features fips` until the follow-up PR ships."
+);
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
