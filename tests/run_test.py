@@ -49,7 +49,7 @@ async def main() -> int:
         await session.send(msg)
         # Let the client drain the echo before the session closes.
         await asyncio.sleep(0.2)
-        await session.close()
+        await session.disconnect()
 
     server = asyncio.create_task(serve())
 
@@ -57,7 +57,7 @@ async def main() -> int:
     session = await phantom_core.connect_pinned(host, int(port), pinned_key)
     await session.send(PAYLOAD)
     reply = await asyncio.wait_for(session.recv(), timeout=10.0)
-    await session.close()
+    await session.disconnect()
     await server
 
     if reply != PAYLOAD:

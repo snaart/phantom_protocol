@@ -483,9 +483,9 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes() != 27980:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_close() != 2539:
-        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 58300:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_disconnect() != 18611:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted() != 23395:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -511,7 +511,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomsession_set_state() != 24535:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomstream_close() != 59562:
+    if lib.uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 13449:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomstream_recv() != 59636:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -714,15 +714,15 @@ _UniffiLib.uniffi_phantom_core_fn_constructor_phantomsession_connect.argtypes = 
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_phantom_core_fn_constructor_phantomsession_connect.restype = ctypes.c_void_p
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_close.argtypes = (
-    ctypes.c_void_p,
-)
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_close.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state.argtypes = (
     ctypes.c_void_p,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_disconnect.argtypes = (
+    ctypes.c_void_p,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_disconnect.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_early_data_accepted.argtypes = (
     ctypes.c_void_p,
 )
@@ -789,10 +789,10 @@ _UniffiLib.uniffi_phantom_core_fn_free_phantomstream.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_phantom_core_fn_free_phantomstream.restype = None
-_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_close.argtypes = (
+_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_disconnect.argtypes = (
     ctypes.c_void_p,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_close.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_disconnect.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_core_fn_method_phantomstream_recv.argtypes = (
     ctypes.c_void_p,
 )
@@ -1127,12 +1127,12 @@ _UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_shutdown.restype 
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_close.argtypes = (
-)
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_close.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_connection_state.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_connection_state.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_disconnect.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_disconnect.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted.restype = ctypes.c_uint16
@@ -1169,9 +1169,9 @@ _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_send.restype = cty
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_set_state.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_set_state.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_close.argtypes = (
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_disconnect.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_close.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_disconnect.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_recv.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_recv.restype = ctypes.c_uint16
@@ -2551,15 +2551,19 @@ class PhantomSessionProtocol(typing.Protocol):
     `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
     """
 
-    def close(self, ):
-        """
-        Close the session.
-        """
-
-        raise NotImplementedError
     def connection_state(self, ):
         """
         Get the current connection state (lock-free).
+        """
+
+        raise NotImplementedError
+    def disconnect(self, ):
+        """
+        Send the graceful close frame and shut the session down.
+
+        Named `disconnect` rather than `close` because UniFFI's Kotlin
+        generator unconditionally adds `AutoCloseable.close()` to every
+        object, and a Rust-side `close` here would conflict with it.
         """
 
         raise NotImplementedError
@@ -2723,14 +2727,31 @@ class PhantomSession():
         return cls._make_instance_(pointer)
 
 
-    async def close(self, ) -> None:
+
+    def connection_state(self, ) -> "ConnectionState":
+        """
+        Get the current connection state (lock-free).
+        """
+
+        return _UniffiConverterTypeConnectionState.lift(
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+    async def disconnect(self, ) -> None:
 
         """
-        Close the session.
+        Send the graceful close frame and shut the session down.
+
+        Named `disconnect` rather than `close` because UniFFI's Kotlin
+        generator unconditionally adds `AutoCloseable.close()` to every
+        object, and a Rust-side `close` here would conflict with it.
         """
 
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_close(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_disconnect(
                 self._uniffi_clone_pointer(), 
             ),
             _UniffiLib.ffi_phantom_core_rust_future_poll_void,
@@ -2744,19 +2765,6 @@ class PhantomSession():
 _UniffiConverterTypeCoreError,
 
         )
-
-
-
-
-    def connection_state(self, ) -> "ConnectionState":
-        """
-        Get the current connection state (lock-free).
-        """
-
-        return _UniffiConverterTypeConnectionState.lift(
-            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state,self._uniffi_clone_pointer(),)
-        )
-
 
 
 
@@ -3040,7 +3048,15 @@ class _UniffiConverterTypePhantomSession:
     def write(cls, value: PhantomSessionProtocol, buf: _UniffiRustBuffer):
         buf.write_u64(cls.lower(value))
 class PhantomStreamProtocol(typing.Protocol):
-    def close(self, ):
+    def disconnect(self, ):
+        """
+        Close this stream; the peer will see EOF on its read half.
+
+        Named `disconnect` rather than `close` for the same reason as
+        `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
+        `AutoCloseable.close()` on every object.
+        """
+
         raise NotImplementedError
     def recv(self, ):
         raise NotImplementedError
@@ -3075,10 +3091,18 @@ class PhantomStream():
         inst._pointer = pointer
         return inst
 
-    async def close(self, ) -> None:
+    async def disconnect(self, ) -> None:
+
+        """
+        Close this stream; the peer will see EOF on its read half.
+
+        Named `disconnect` rather than `close` for the same reason as
+        `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
+        `AutoCloseable.close()` on every object.
+        """
 
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomstream_close(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomstream_disconnect(
                 self._uniffi_clone_pointer(), 
             ),
             _UniffiLib.ffi_phantom_core_rust_future_poll_void,

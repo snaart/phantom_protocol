@@ -43,6 +43,17 @@ roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
   roadmap with file:line traceability.
 
 ### Changed
+- FFI: renamed `PhantomSession::close()` and `PhantomStream::close()` to
+  `disconnect()`. UniFFI 0.29's Kotlin generator unconditionally adds an
+  `AutoCloseable.close()` to every object; a Rust-side method named
+  `close` collides with it and prevents the Kotlin binding from
+  compiling at all. The Rust API, all four FFI surfaces, internal
+  callers (`server/`, embedded tests, `runtime_integration.rs`) and the
+  mobile guide were updated together.
+- FFI: every `#[uniffi::export]` block with async methods now carries
+  `async_runtime = "tokio"`. Without it UniFFI polled the exported
+  futures on a non-tokio executor and every async FFI call panicked at
+  the first tokio I/O point (latent across all four bindings).
 - Moved `[profile.release]` from `core/Cargo.toml` (silently ignored —
   workspace warning) to the workspace root. `opt-level = "s"` (size) →
   `opt-level = 3` (speed); kept `lto = "fat"`, `codegen-units = 1`,

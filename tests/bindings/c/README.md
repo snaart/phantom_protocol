@@ -134,7 +134,7 @@ limits — please read before committing to a C-side integration:
    `PhantomConfig`, `EmbeddedLeg`, the network simulator, runtime
    injection, and `CoreError` variant introspection are not on the
    FFI surface.
-3. **Stale on UniFFI bump.** Contract version 26 is current as of
+3. **Stale on UniFFI bump.** Contract version 29 is current as of
    phantom_core 0.2.0. If you upgrade UniFFI, re-run
    `tests/bindings/generate_c.sh` and reconcile changes.
 4. **Integer-typed futures.** Only the `_pointer`, `_rust_buffer`,

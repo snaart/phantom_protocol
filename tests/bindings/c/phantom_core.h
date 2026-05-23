@@ -16,7 +16,7 @@
  * intended for low-level / embedded callers (or as a starting point for
  * a custom generator).
  *
- * The calling convention follows UniFFI 0.29 "contract version 26". The
+ * The calling convention follows UniFFI 0.29 "contract version 29". The
  * runtime contract version reported by the dylib MUST match what the
  * caller expects; check it via `ffi_phantom_core_uniffi_contract_version`
  * at startup.
@@ -163,7 +163,7 @@ typedef void (*PhantomRustFutureContinuationCallback)(uint64_t handle,
  * runtime value reported by ffi_phantom_core_uniffi_contract_version()
  * MUST match — if not, the dylib was rebuilt with an incompatible
  * UniFFI release and this header is stale. */
-#define PHANTOM_UNIFFI_CONTRACT_VERSION 26
+#define PHANTOM_UNIFFI_CONTRACT_VERSION 29
 
 /* ====================================================================
  * SECTION 3 — Runtime / infrastructure FFI
@@ -339,18 +339,19 @@ void uniffi_phantom_core_fn_free_phantomsession(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
-/* Constructor: connect(peer_addr: string) -> async PhantomSession.
+/* Constructor: connect(peer_addr: string) -> PhantomSession (sync).
  *
- * NOTE: This is the UniFFI-stable surface; it performs a placeholder /
- * pre-handshake setup. The full client connect path that pins the
- * server identity (`connect_with_transport`) is Rust-only and is NOT
- * exported through UniFFI — C callers therefore cannot drive a fully
- * pinned handshake without an additional Rust shim. See README.md. */
-uint64_t uniffi_phantom_core_fn_constructor_phantomsession_connect(
-    PhantomRustBuffer        peer_addr);
+ * NOTE: a placeholder constructor — it performs pre-handshake setup only
+ * and does NOT pin the server identity or run a handshake. Production C
+ * callers MUST use the `connect_pinned` / `connect_pinned_with_resumption`
+ * free functions below, which take the server's pinned verifying key.
+ * This is a sync call: the PhantomSession handle is returned directly. */
+void *uniffi_phantom_core_fn_constructor_phantomsession_connect(
+    PhantomRustBuffer        peer_addr,
+    PhantomRustCallStatus   *call_status);
 
-/* close() -> async void. */
-uint64_t uniffi_phantom_core_fn_method_phantomsession_close(
+/* disconnect() -> async void. Sends the graceful close frame. */
+uint64_t uniffi_phantom_core_fn_method_phantomsession_disconnect(
     void                    *ptr);
 
 /* connection_state() -> i32 enum (sync). 0=Idle 1=Connecting
@@ -428,8 +429,8 @@ void uniffi_phantom_core_fn_free_phantomstream(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
-/* close() -> async void. */
-uint64_t uniffi_phantom_core_fn_method_phantomstream_close(
+/* disconnect() -> async void. Closes this multiplexed stream. */
+uint64_t uniffi_phantom_core_fn_method_phantomstream_disconnect(
     void                    *ptr);
 
 /* recv() -> async Vec<u8>. */
@@ -551,7 +552,7 @@ uint64_t uniffi_phantom_core_fn_func_connect_pinned_with_resumption(
  *    returns `uint16_t`; higher-level bindings invoke them at load
  *    time to detect ABI drift.
  *
- *  - The shape (UniFFI 0.29, contract 26) is current as of phantom_core
+ *  - The shape (UniFFI 0.29, contract 29) is current as of phantom_core
  *    0.2.0. If you bump the UniFFI dependency, regenerate this header.
  * ==================================================================== */
 

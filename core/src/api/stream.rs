@@ -74,7 +74,12 @@ impl PhantomStream {
         }
     }
 
-    pub async fn close(&self) -> Result<(), CoreError> {
+    /// Close this stream; the peer will see EOF on its read half.
+    ///
+    /// Named `disconnect` rather than `close` for the same reason as
+    /// `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
+    /// `AutoCloseable.close()` on every object.
+    pub async fn disconnect(&self) -> Result<(), CoreError> {
         self.tx
             .send(SessionCommand::CloseStream {
                 stream_id: self.stream_id,

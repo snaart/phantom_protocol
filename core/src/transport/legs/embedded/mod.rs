@@ -756,7 +756,7 @@ mod tests {
             .await
             .expect("server task within 5s")
             .expect("server task joined");
-        session.close().await.expect("close session");
+        session.disconnect().await.expect("close session");
 
         // Negative assertion: plaintext like "early-data" / "after-handshake"
         // must never appear in the bytes the client emitted on the wire.

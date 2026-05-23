@@ -336,14 +336,14 @@ void uniffi_phantom_core_fn_free_phantomsession(void*_Nonnull ptr, RustCallStatu
 void*_Nonnull uniffi_phantom_core_fn_constructor_phantomsession_connect(RustBuffer peer_addr, RustCallStatus *_Nonnull out_status
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_CLOSE
-#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_CLOSE
-uint64_t uniffi_phantom_core_fn_method_phantomsession_close(void*_Nonnull ptr
-);
-#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_CONNECTION_STATE
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_CONNECTION_STATE
 RustBuffer uniffi_phantom_core_fn_method_phantomsession_connection_state(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_DISCONNECT
+#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_DISCONNECT
+uint64_t uniffi_phantom_core_fn_method_phantomsession_disconnect(void*_Nonnull ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_EARLY_DATA_ACCEPTED
@@ -416,9 +416,9 @@ void*_Nonnull uniffi_phantom_core_fn_clone_phantomstream(void*_Nonnull ptr, Rust
 void uniffi_phantom_core_fn_free_phantomstream(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_CLOSE
-#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_CLOSE
-uint64_t uniffi_phantom_core_fn_method_phantomstream_close(void*_Nonnull ptr
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_DISCONNECT
+#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_DISCONNECT
+uint64_t uniffi_phantom_core_fn_method_phantomstream_disconnect(void*_Nonnull ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_RECV
@@ -797,15 +797,15 @@ uint16_t uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes
     
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_CLOSE
-#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_CLOSE
-uint16_t uniffi_phantom_core_checksum_method_phantomsession_close(void
-    
-);
-#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_CONNECTION_STATE
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_CONNECTION_STATE
 uint16_t uniffi_phantom_core_checksum_method_phantomsession_connection_state(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_DISCONNECT
+#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_DISCONNECT
+uint16_t uniffi_phantom_core_checksum_method_phantomsession_disconnect(void
     
 );
 #endif
@@ -881,9 +881,9 @@ uint16_t uniffi_phantom_core_checksum_method_phantomsession_set_state(void
     
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSTREAM_CLOSE
-#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSTREAM_CLOSE
-uint16_t uniffi_phantom_core_checksum_method_phantomstream_close(void
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSTREAM_DISCONNECT
+#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSTREAM_DISCONNECT
+uint16_t uniffi_phantom_core_checksum_method_phantomstream_disconnect(void
     
 );
 #endif
