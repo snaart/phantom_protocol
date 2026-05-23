@@ -57,6 +57,16 @@ pub mod wasm_runtime;
 #[cfg(target_arch = "wasm32")]
 pub use wasm_runtime::WasmRuntime;
 
+// Phase 3.1 scaffold — see `embedded_runtime.rs` for what this is and is not
+// good for. Gated on `embedded` + `std` for now; pure-no_std support is a
+// follow-up that also has to refactor the `Runtime` trait off
+// `std::time::{Instant, SystemTime}`.
+#[cfg(all(feature = "embedded", feature = "std"))]
+pub mod embedded_runtime;
+
+#[cfg(all(feature = "embedded", feature = "std"))]
+pub use embedded_runtime::EmbeddedRuntime;
+
 /// Boxed, owned, `Send` future of unit output — the shape `Runtime::spawn`
 /// and `Runtime::sleep` work in.
 ///
