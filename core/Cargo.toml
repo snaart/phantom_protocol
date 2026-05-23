@@ -83,6 +83,24 @@ embedded = ["dep:embedded-io-async", "dep:async-lock"]
 # the `std` feature and all the std-bound optional deps it gates.
 no-std = []
 
+# FIPS 140-3 posture (Phase 5.5). **SCAFFOLD ONLY** — the primitive swap
+# itself is not yet implemented; enabling this feature today fails the
+# build with a clear compile_error in `core/src/lib.rs` pointing at the
+# follow-up PR. The roadmap, tracked in `docs/compliance/fips-readiness.md`:
+#
+#   - X25519 → ECDH-P-256 (or PQ-only mode)
+#   - `ring` AES-GCM → `aws-lc-rs` (FIPS-validated module)
+#   - drop ChaCha20-Poly1305 (not FIPS-approved)
+#   - blake3 → HKDF-SHA256 everywhere blake3 is currently used as a KDF
+#   - RNG via `aws-lc-rs::rand` (SP 800-90A CTR_DRBG) instead of getrandom
+#   - wire `crypto::self_tests::run_post()` into a startup hook
+#
+# Implies `std`. No new deps are added by this scaffold; the swaps land
+# as a dedicated follow-up PR. The flag exists now so downstream tooling
+# (Bazel selectors, embedder build matrices) can pin it in advance and
+# the audit trail shows when the surface was reserved.
+fips = ["std"]
+
 # OpenTelemetry pipeline (Phase 8). Off by default; the `core` library exposes
 # OTel `Counter` / `Histogram` / `UpDownCounter` instruments to the embedder
 # when this is on. The library never installs a `MeterProvider` /
