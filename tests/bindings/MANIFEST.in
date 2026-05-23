@@ -1,0 +1,10 @@
+# Source-distribution manifest for the phantom_core Python wheel.
+#
+# Per-platform native libraries are included if they happen to be staged
+# next to phantom_core.py at build time (e.g. via `cp
+# target/release/libphantom_core.{dylib,so} tests/bindings/`). They are
+# NOT redistributable across platforms — each wheel must be built on the
+# target OS / arch.
+include libphantom_core.dylib
+include libphantom_core.so
+include libphantom_core.dll
