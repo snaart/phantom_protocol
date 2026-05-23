@@ -789,8 +789,6 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
-
-
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -821,8 +819,6 @@ fun uniffi_phantom_core_checksum_method_phantomlistener_accept(
 fun uniffi_phantom_core_checksum_method_phantomlistener_is_shutting_down(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomlistener_local_addr(
-): Short
-fun uniffi_phantom_core_checksum_method_phantomlistener_metrics_prometheus_text(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomlistener_shutdown(
 ): Short
@@ -940,8 +936,6 @@ fun uniffi_phantom_core_fn_method_phantomlistener_accept(`ptr`: Pointer,
 fun uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
 fun uniffi_phantom_core_fn_method_phantomlistener_local_addr(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-fun uniffi_phantom_core_fn_method_phantomlistener_metrics_prometheus_text(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_phantom_core_fn_method_phantomlistener_shutdown(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1147,9 +1141,6 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_core_checksum_method_phantomlistener_local_addr() != 18579.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_phantom_core_checksum_method_phantomlistener_metrics_prometheus_text() != 11863.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_core_checksum_method_phantomlistener_shutdown() != 32103.toShort()) {
@@ -2046,14 +2037,6 @@ public interface PhantomListenerInterface {
     fun `localAddr`(): kotlin.String
     
     /**
-     * Return the listener's metrics rendered in Prometheus text
-     * exposition format (Phase 4.5). Suitable for serving from a
-     * `/metrics` HTTP endpoint — the SDK does not bundle an HTTP
-     * server, downstream applications wire one up.
-     */
-    fun `metricsPrometheusText`(): kotlin.String
-    
-    /**
      * Signal graceful shutdown (Phase 4.6).
      *
      * Sets the `shutting_down` flag and wakes any `accept()` call currently
@@ -2211,24 +2194,6 @@ open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
     callWithPointer {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_phantom_core_fn_method_phantomlistener_local_addr(
-        it, _status)
-}
-    }
-    )
-    }
-    
-
-    
-    /**
-     * Return the listener's metrics rendered in Prometheus text
-     * exposition format (Phase 4.5). Suitable for serving from a
-     * `/metrics` HTTP endpoint — the SDK does not bundle an HTTP
-     * server, downstream applications wire one up.
-     */override fun `metricsPrometheusText`(): kotlin.String {
-            return FfiConverterString.lift(
-    callWithPointer {
-    uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_phantom_core_fn_method_phantomlistener_metrics_prometheus_text(
         it, _status)
 }
     }

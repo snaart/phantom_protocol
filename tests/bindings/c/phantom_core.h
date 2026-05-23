@@ -314,11 +314,6 @@ PhantomRustBuffer uniffi_phantom_core_fn_method_phantomlistener_local_addr(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
-/* metrics_prometheus_text() -> string (sync). */
-PhantomRustBuffer uniffi_phantom_core_fn_method_phantomlistener_metrics_prometheus_text(
-    void                    *ptr,
-    PhantomRustCallStatus   *call_status);
-
 /* shutdown() -> async void. */
 uint64_t uniffi_phantom_core_fn_method_phantomlistener_shutdown(
     void                    *ptr);
