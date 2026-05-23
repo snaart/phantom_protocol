@@ -75,6 +75,24 @@ roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
   `PhantomSession::resumption_hint()` now returns `Option<ResumptionHint>`
   and is on the UniFFI surface — it was previously a Rust-only
   `Option<([u8; 32], [u8; 32])>` tuple defined outside the export block.
+- CI: `.github/workflows/bindings.yml` `drift` job now runs
+  `tests/bindings/check_versions.sh`, asserting that every binding
+  manifest (`pyproject.toml`, `phantom_core.pc.in`) reports the same
+  version as the source-of-truth `core/Cargo.toml`. Catches release-time
+  version skew before it ships to PyPI / pkg-config consumers. `server`
+  and `cli` Cargo manifests are checked too.
+- Tests: real-TCP 0-RTT coverage —
+  `core/tests/tcp_integration.rs::tcp_integration_zero_rtt_resumption_round_trip`
+  exercises the full FFI sequence (`connect_pinned` →
+  `resumption_hint()` → `connect_pinned_with_resumption(..., hint,
+  early_data)`) over loopback, asserting both 32-byte hint fields and
+  echo round-trips on both connections.
+- Tests: Python loopback (`tests/run_test.py`) now runs a phase-2 0-RTT
+  scenario — polls for the resumption hint, opens a second connection
+  through `connect_pinned_with_resumption` carrying a 22-byte
+  early-data payload, and verifies `early_data_accepted()` returns a
+  concrete `Some(...)` (`None` would mean the FFI silently fell back to
+  1-RTT, the regression worth catching).
 - Governance: `LICENSE` (Apache-2.0), `README.md`, `CHANGELOG.md`,
   `SECURITY.md`, `CONTRIBUTING.md`.
 - Toolchain: `rust-toolchain.toml` (stable), `.rustfmt.toml`, `.clippy.toml`.
@@ -122,6 +140,19 @@ roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
   `Vec<u8>`, eliminating the per-packet plaintext clone in the recv
   hot path. The public `recv()` still returns `Vec<u8>` (single
   `Bytes::to_vec` at the FFI boundary).
+- Bindings regen (post-Phase-8 sweep): Python, Swift, and Kotlin
+  auto-generated bindings plus the hand-curated
+  `tests/bindings/c/phantom_core.h` were re-synced to the post-OTel
+  cdylib. The now-deleted `metrics_prometheus_text` was the last
+  residual symbol — Python `import phantom_core` would `dlsym`-fail
+  at import time against the new lib until the regen.
+- Tests: integration tests in `core/tests/tcp_integration.rs` no longer
+  hard-code ports. They bind to `127.0.0.1:0` and read `local_addr()`,
+  eliminating CI port collisions and TIME_WAIT lockout on rerun.
+- Tests: `tcp_integration_zero_rtt_resumption_round_trip` replaces the
+  fixed `sleep(300 ms)` between handshake and `resumption_hint()` with
+  a bounded poll (5 s deadline) — kills both the slow-runner flake and
+  the wasted latency on fast runners.
 
 ### Security
 - Phase 1.1: cookie comparison in `process_client_hello` now uses
@@ -152,6 +183,11 @@ roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
 - Audit-friendly lints: `#![warn(clippy::unwrap_used, expect_used,
   panic, unreachable, todo, unimplemented, missing_safety_doc)]` in
   lib root. Surfaces remaining sites as TODOs without breaking CI.
+- Supply chain: `tests/bindings/kotlin/run_kotlin_test.sh` now
+  SHA-256-verifies the kotlinc + JNA + coroutines downloads against
+  pinned hashes before unpacking / putting them on the classpath. A
+  transient MITM on GitHub Releases or Maven Central can no longer
+  swap in a tampered compiler / jar between download and execution.
 
 ## [0.2.0]
 
