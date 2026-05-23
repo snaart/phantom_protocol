@@ -29,6 +29,7 @@ std = [
     "dep:uniffi",
     "dep:argon2",
     "dep:crossbeam-queue",
+    "dep:crossbeam-utils",
     "dep:lz4_flex",
     "dep:alkahest",
     "dep:base64",
@@ -81,6 +82,20 @@ embedded = ["dep:embedded-io-async", "dep:async-lock"]
 # bare-metal compilation additionally requires `--no-default-features` to drop
 # the `std` feature and all the std-bound optional deps it gates.
 no-std = []
+
+# OpenTelemetry pipeline (Phase 8). Off by default; the `core` library exposes
+# OTel `Counter` / `Histogram` / `UpDownCounter` instruments to the embedder
+# when this is on. The library never installs a `MeterProvider` /
+# `TracerProvider` — that's the embedder's job (see `server/src/telemetry.rs`).
+# Implies `std`; mutually compatible with `compression-zstd`. Pulls
+# `opentelemetry` + `opentelemetry_sdk` + `tracing-opentelemetry` so
+# `tracing` spans bridge into OTel traces.
+telemetry-otel = [
+    "std",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+]
 
 [dependencies]
 # --- Async & Runtime (std-only) ---
@@ -155,6 +170,16 @@ uniffi = { version = "0.29", optional = true, features = ["tokio", "cli"] }
 zeroize = { version = "1.8.2", optional = true, features = ["derive"] }
 argon2 = { version = "0.5.3", optional = true }
 crossbeam-queue = { version = "0.3.12", optional = true }
+crossbeam-utils = { version = "0.8", optional = true }  # CachePadded for observability hot-path atomics
+
+# --- OpenTelemetry (optional, behind the `telemetry-otel` feature, Phase 8) ---
+# Library-side: only the API + SDK crates. The OTLP exporter and any tonic
+# transport live in `server/` (or any embedder), keeping the core library
+# transport-runtime-agnostic and matching the existing "core defines, server
+# wires" boundary used for HTTP metrics today.
+opentelemetry = { version = "0.28", optional = true, default-features = false, features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.28", optional = true, default-features = false, features = ["metrics", "trace", "rt-tokio"] }
+tracing-opentelemetry = { version = "0.29", optional = true, default-features = false, features = ["tracing-log"] }
 hmac = { version = "0.12.1", optional = true }
 dashmap = { version = "6.1.0", optional = true }
 
@@ -244,6 +269,10 @@ harness = false
 
 [[bench]]
 name = "protocol_comparison"
+harness = false
+
+[[bench]]
+name = "observability_bench"
 harness = false
 
 # NOTE: `[profile.release]` lives in the workspace root `Cargo.toml`. Declaring
