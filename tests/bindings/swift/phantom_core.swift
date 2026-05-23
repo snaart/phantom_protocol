@@ -769,14 +769,6 @@ public protocol PhantomListenerProtocol: AnyObject, Sendable {
     func localAddr()  -> String
     
     /**
-     * Return the listener's metrics rendered in Prometheus text
-     * exposition format (Phase 4.5). Suitable for serving from a
-     * `/metrics` HTTP endpoint — the SDK does not bundle an HTTP
-     * server, downstream applications wire one up.
-     */
-    func metricsPrometheusText()  -> String
-    
-    /**
      * Signal graceful shutdown (Phase 4.6).
      *
      * Sets the `shutting_down` flag and wakes any `accept()` call currently
@@ -906,19 +898,6 @@ open func isShuttingDown() -> Bool  {
 open func localAddr() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_phantom_core_fn_method_phantomlistener_local_addr(self.uniffiClonePointer(),$0
-    )
-})
-}
-    
-    /**
-     * Return the listener's metrics rendered in Prometheus text
-     * exposition format (Phase 4.5). Suitable for serving from a
-     * `/metrics` HTTP endpoint — the SDK does not bundle an HTTP
-     * server, downstream applications wire one up.
-     */
-open func metricsPrometheusText() -> String  {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomlistener_metrics_prometheus_text(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -2603,9 +2582,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_core_checksum_method_phantomlistener_local_addr() != 18579) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_phantom_core_checksum_method_phantomlistener_metrics_prometheus_text() != 11863) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_core_checksum_method_phantomlistener_shutdown() != 32103) {

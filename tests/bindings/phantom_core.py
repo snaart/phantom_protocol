@@ -477,8 +477,6 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomlistener_local_addr() != 18579:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomlistener_metrics_prometheus_text() != 11863:
-        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomlistener_shutdown() != 32103:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes() != 27980:
@@ -684,11 +682,6 @@ _UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_local_addr.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_local_addr.restype = _UniffiRustBuffer
-_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_metrics_prometheus_text.argtypes = (
-    ctypes.c_void_p,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_metrics_prometheus_text.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_shutdown.argtypes = (
     ctypes.c_void_p,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1118,9 +1111,6 @@ _UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_is_shutting_down.
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_local_addr.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_local_addr.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_metrics_prometheus_text.argtypes = (
-)
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_metrics_prometheus_text.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_shutdown.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_shutdown.restype = ctypes.c_uint16
@@ -2327,15 +2317,6 @@ class PhantomListenerProtocol(typing.Protocol):
         """
 
         raise NotImplementedError
-    def metrics_prometheus_text(self, ):
-        """
-        Return the listener's metrics rendered in Prometheus text
-        exposition format (Phase 4.5). Suitable for serving from a
-        `/metrics` HTTP endpoint — the SDK does not bundle an HTTP
-        server, downstream applications wire one up.
-        """
-
-        raise NotImplementedError
     def shutdown(self, ):
         """
         Signal graceful shutdown (Phase 4.6).
@@ -2450,22 +2431,6 @@ _UniffiConverterTypeCoreError,
 
         return _UniffiConverterString.lift(
             _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_local_addr,self._uniffi_clone_pointer(),)
-        )
-
-
-
-
-
-    def metrics_prometheus_text(self, ) -> "str":
-        """
-        Return the listener's metrics rendered in Prometheus text
-        exposition format (Phase 4.5). Suitable for serving from a
-        `/metrics` HTTP endpoint — the SDK does not bundle an HTTP
-        server, downstream applications wire one up.
-        """
-
-        return _UniffiConverterString.lift(
-            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_metrics_prometheus_text,self._uniffi_clone_pointer(),)
         )
 
 
