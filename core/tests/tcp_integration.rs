@@ -150,12 +150,20 @@ async fn tcp_integration_zero_rtt_resumption_round_trip() {
         .expect("c1 recv");
     assert_eq!(r1, b"ping-1");
 
-    // Let the handshake fully settle so the inner session publishes the hint.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let hint = s1
-        .resumption_hint()
-        .await
-        .expect("a completed handshake yields a resumption hint");
+    // Poll until the inner session publishes the resumption hint — replaces a
+    // brittle `sleep(300ms)` that flakes on slow runners and wastes latency on
+    // fast ones. Bounded by an outer timeout so a stuck handshake fails the
+    // test instead of hanging the suite.
+    let hint = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(h) = s1.resumption_hint().await {
+                return h;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resumption hint did not arrive within 5s");
     assert_eq!(hint.session_id.len(), 32, "session_id is 32 bytes");
     assert_eq!(
         hint.resumption_secret.len(),
