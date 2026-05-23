@@ -19,13 +19,12 @@ use tokio::time::timeout;
 #[tokio::test]
 #[ignore]
 async fn tcp_integration_pinned_and_encrypted() {
-    // Use a fixed port; the test is `#[ignore]` so port collisions only affect
-    // local runs and are easily fixed by changing the constant.
-    const ADDR: &str = "127.0.0.1:39711";
-
-    let listener = PhantomListener::bind(ADDR.to_string())
+    // Bind to an OS-chosen loopback port. Parallel runs and TIME_WAIT
+    // remnants from previous runs no longer collide on a hard-coded port.
+    let listener = PhantomListener::bind("127.0.0.1:0".to_string())
         .await
         .expect("bind listener");
+    let addr = listener.local_addr();
     let server_key_bytes = listener.verifying_key_bytes();
     let expected_key =
         HybridVerifyingKey::from_bytes(&server_key_bytes).expect("deserialize verifying key");
@@ -46,9 +45,9 @@ async fn tcp_integration_pinned_and_encrypted() {
     });
 
     // Client side: connect with the pinned server key.
-    let tcp = TcpStream::connect(ADDR).await.expect("tcp connect");
+    let tcp = TcpStream::connect(&addr).await.expect("tcp connect");
     let transport = TcpSessionTransport::new(tcp);
-    let client = PhantomSession::connect_with_transport(ADDR, transport, expected_key);
+    let client = PhantomSession::connect_with_transport(&addr, transport, expected_key);
 
     // Send our message.
     client
@@ -73,11 +72,10 @@ async fn tcp_integration_pinned_and_encrypted() {
 async fn tcp_integration_wrong_pinned_key_rejected() {
     use phantom_core::api::ConnectionState;
 
-    const ADDR: &str = "127.0.0.1:39712";
-
-    let listener = PhantomListener::bind(ADDR.to_string())
+    let listener = PhantomListener::bind("127.0.0.1:0".to_string())
         .await
         .expect("bind listener");
+    let addr = listener.local_addr();
     let _real_key_bytes = listener.verifying_key_bytes();
 
     // Generate a completely unrelated server key as the "wrong" pin.
@@ -93,10 +91,10 @@ async fn tcp_integration_wrong_pinned_key_rejected() {
         let _ = timeout(Duration::from_secs(3), listener.accept()).await;
     });
 
-    let tcp = TcpStream::connect(ADDR).await.expect("tcp connect");
+    let tcp = TcpStream::connect(&addr).await.expect("tcp connect");
     let transport = TcpSessionTransport::new(tcp);
     let client = PhantomSession::connect_with_transport(
-        ADDR,
+        &addr,
         transport,
         attacker_pk, // <- WRONG pinned key
     );
@@ -122,11 +120,15 @@ async fn tcp_integration_wrong_pinned_key_rejected() {
 async fn tcp_integration_zero_rtt_resumption_round_trip() {
     use phantom_core::api::session::{connect_pinned, connect_pinned_with_resumption};
 
-    const HOST: &str = "127.0.0.1";
-    const PORT: u16 = 39713;
-    let addr = format!("{HOST}:{PORT}");
-
-    let listener = PhantomListener::bind(addr).await.expect("bind listener");
+    let listener = PhantomListener::bind("127.0.0.1:0".to_string())
+        .await
+        .expect("bind listener");
+    let local = listener.local_addr();
+    let (host, port_str) = local
+        .rsplit_once(':')
+        .expect("local_addr is host:port");
+    let host = host.to_string();
+    let port: u16 = port_str.parse().expect("port parses");
     let pinned = listener.verifying_key_bytes();
 
     // Server: accept two connections, echo one message on each.
@@ -140,7 +142,7 @@ async fn tcp_integration_zero_rtt_resumption_round_trip() {
     });
 
     // ── Connection 1: plain pinned connect — harvest the resumption hint ──
-    let s1 = connect_pinned(HOST.to_string(), PORT, pinned.clone())
+    let s1 = connect_pinned(host.clone(), port, pinned.clone())
         .await
         .expect("connect_pinned");
     s1.send(b"ping-1".to_vec()).await.expect("c1 send");
@@ -173,8 +175,8 @@ async fn tcp_integration_zero_rtt_resumption_round_trip() {
 
     // ── Connection 2: 0-RTT resumption carrying early-data ──
     let s2 = connect_pinned_with_resumption(
-        HOST.to_string(),
-        PORT,
+        host,
+        port,
         pinned,
         hint,
         b"zero-rtt-early-data".to_vec(),
