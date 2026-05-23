@@ -67,7 +67,7 @@ let session = try await PhantomCore.connectPinned(
 )
 try await session.send(data: "hello".data(using: .utf8)!)
 let reply = try await session.recv()
-await session.close()
+await session.disconnect()
 ```
 
 **App Transport Security note.** iOS ATS blocks non-TLS connections by default.
@@ -135,7 +135,7 @@ val session = PhantomCoreKt.connectPinned(
 )
 session.send("hello".encodeToByteArray())
 val reply = session.recv()
-session.close()
+session.disconnect()
 ```
 
 **Network Security Config.** Add `res/xml/network_security_config.xml`; reference

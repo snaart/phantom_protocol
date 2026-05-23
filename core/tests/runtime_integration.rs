@@ -78,7 +78,7 @@ async fn runtime_substitution_drives_session_and_listener() {
         let req = session.recv().await.expect("recv");
         session.send(req).await.expect("echo");
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let _ = session.close().await;
+        let _ = session.disconnect().await;
     });
 
     // Client uses its own counting runtime.
@@ -99,7 +99,7 @@ async fn runtime_substitution_drives_session_and_listener() {
     assert_eq!(echo, b"ping");
 
     server_handle.await.expect("server task");
-    session.close().await.expect("close");
+    session.disconnect().await.expect("close");
 
     // The whole point of this test: both runtimes saw spawn calls. The
     // listener runtime spawned the data pump for the accepted session;

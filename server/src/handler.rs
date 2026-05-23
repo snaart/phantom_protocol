@@ -53,7 +53,7 @@ pub async fn run_echo_handler(session: Arc<PhantomSession>) {
 
     // Best-effort close on the way out — the session may already be
     // closed if the peer initiated the teardown.
-    let _ = session.close().await;
+    let _ = session.disconnect().await;
     tracing::info!(session_id = %id, "session closed");
 }
 

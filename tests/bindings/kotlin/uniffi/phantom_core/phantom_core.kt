@@ -828,9 +828,9 @@ fun uniffi_phantom_core_checksum_method_phantomlistener_shutdown(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes(
 ): Short
-fun uniffi_phantom_core_checksum_method_phantomsession_close(
-): Short
 fun uniffi_phantom_core_checksum_method_phantomsession_connection_state(
+): Short
+fun uniffi_phantom_core_checksum_method_phantomsession_disconnect(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted(
 ): Short
@@ -856,7 +856,7 @@ fun uniffi_phantom_core_checksum_method_phantomsession_send(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomsession_set_state(
 ): Short
-fun uniffi_phantom_core_checksum_method_phantomstream_close(
+fun uniffi_phantom_core_checksum_method_phantomstream_disconnect(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomstream_recv(
 ): Short
@@ -953,10 +953,10 @@ fun uniffi_phantom_core_fn_free_phantomsession(`ptr`: Pointer,uniffi_out_err: Un
 ): Unit
 fun uniffi_phantom_core_fn_constructor_phantomsession_connect(`peerAddr`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
-fun uniffi_phantom_core_fn_method_phantomsession_close(`ptr`: Pointer,
-): Long
 fun uniffi_phantom_core_fn_method_phantomsession_connection_state(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_phantom_core_fn_method_phantomsession_disconnect(`ptr`: Pointer,
+): Long
 fun uniffi_phantom_core_fn_method_phantomsession_early_data_accepted(`ptr`: Pointer,
 ): Long
 fun uniffi_phantom_core_fn_method_phantomsession_flush_queue(`ptr`: Pointer,
@@ -985,7 +985,7 @@ fun uniffi_phantom_core_fn_clone_phantomstream(`ptr`: Pointer,uniffi_out_err: Un
 ): Pointer
 fun uniffi_phantom_core_fn_free_phantomstream(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-fun uniffi_phantom_core_fn_method_phantomstream_close(`ptr`: Pointer,
+fun uniffi_phantom_core_fn_method_phantomstream_disconnect(`ptr`: Pointer,
 ): Long
 fun uniffi_phantom_core_fn_method_phantomstream_recv(`ptr`: Pointer,
 ): Long
@@ -1158,10 +1158,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes() != 27980.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_core_checksum_method_phantomsession_close() != 2539.toShort()) {
+    if (lib.uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 58300.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 58300.toShort()) {
+    if (lib.uniffi_phantom_core_checksum_method_phantomsession_disconnect() != 18611.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted() != 23395.toShort()) {
@@ -1200,7 +1200,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_core_checksum_method_phantomsession_set_state() != 24535.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_core_checksum_method_phantomstream_close() != 59562.toShort()) {
+    if (lib.uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 13449.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_core_checksum_method_phantomstream_recv() != 59636.toShort()) {
@@ -2444,14 +2444,18 @@ public object FfiConverterTypePhantomListener: FfiConverter<PhantomListener, Poi
 public interface PhantomSessionInterface {
     
     /**
-     * Close the session.
-     */
-    suspend fun `close`()
-    
-    /**
      * Get the current connection state (lock-free).
      */
     fun `connectionState`(): ConnectionState
+    
+    /**
+     * Send the graceful close frame and shut the session down.
+     *
+     * Named `disconnect` rather than `close` because UniFFI's Kotlin
+     * generator unconditionally adds `AutoCloseable.close()` to every
+     * object, and a Rust-side `close` here would conflict with it.
+     */
+    suspend fun `disconnect`()
     
     /**
      * The 0-RTT verdict for this session (wire V3, Phase 4.1).
@@ -2646,14 +2650,33 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
 
     
     /**
-     * Close the session.
+     * Get the current connection state (lock-free).
+     */override fun `connectionState`(): ConnectionState {
+            return FfiConverterTypeConnectionState.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_phantom_core_fn_method_phantomsession_connection_state(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Send the graceful close frame and shut the session down.
+     *
+     * Named `disconnect` rather than `close` because UniFFI's Kotlin
+     * generator unconditionally adds `AutoCloseable.close()` to every
+     * object, and a Rust-side `close` here would conflict with it.
      */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
-    override suspend fun `close`() {
+    override suspend fun `disconnect`() {
         return uniffiRustCallAsync(
         callWithPointer { thisPtr ->
-            UniffiLib.INSTANCE.uniffi_phantom_core_fn_method_phantomsession_close(
+            UniffiLib.INSTANCE.uniffi_phantom_core_fn_method_phantomsession_disconnect(
                 thisPtr,
                 
             )
@@ -2668,21 +2691,6 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
         CoreException.ErrorHandler,
     )
     }
-
-    
-    /**
-     * Get the current connection state (lock-free).
-     */override fun `connectionState`(): ConnectionState {
-            return FfiConverterTypeConnectionState.lift(
-    callWithPointer {
-    uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_phantom_core_fn_method_phantomsession_connection_state(
-        it, _status)
-}
-    }
-    )
-    }
-    
 
     
     /**
@@ -3099,7 +3107,14 @@ public object FfiConverterTypePhantomSession: FfiConverter<PhantomSession, Point
 
 public interface PhantomStreamInterface {
     
-    suspend fun `close`()
+    /**
+     * Close this stream; the peer will see EOF on its read half.
+     *
+     * Named `disconnect` rather than `close` for the same reason as
+     * `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
+     * `AutoCloseable.close()` on every object.
+     */
+    suspend fun `disconnect`()
     
     suspend fun `recv`(): kotlin.ByteArray
     
@@ -3195,12 +3210,19 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
     }
 
     
+    /**
+     * Close this stream; the peer will see EOF on its read half.
+     *
+     * Named `disconnect` rather than `close` for the same reason as
+     * `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
+     * `AutoCloseable.close()` on every object.
+     */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
-    override suspend fun `close`() {
+    override suspend fun `disconnect`() {
         return uniffiRustCallAsync(
         callWithPointer { thisPtr ->
-            UniffiLib.INSTANCE.uniffi_phantom_core_fn_method_phantomstream_close(
+            UniffiLib.INSTANCE.uniffi_phantom_core_fn_method_phantomstream_disconnect(
                 thisPtr,
                 
             )

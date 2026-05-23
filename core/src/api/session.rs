@@ -1626,8 +1626,12 @@ impl PhantomSession {
             })
     }
 
-    /// Close the session.
-    pub async fn close(&self) -> Result<(), CoreError> {
+    /// Send the graceful close frame and shut the session down.
+    ///
+    /// Named `disconnect` rather than `close` because UniFFI's Kotlin
+    /// generator unconditionally adds `AutoCloseable.close()` to every
+    /// object, and a Rust-side `close` here would conflict with it.
+    pub async fn disconnect(&self) -> Result<(), CoreError> {
         self.set_state(ConnectionState::Closed);
         let _ = self.cmd_tx.send(SessionCommand::Close).await;
         Ok(())
@@ -1870,7 +1874,7 @@ mod tests {
     #[tokio::test]
     async fn test_phantom_session_close() {
         let session = PhantomSession::connect("example.com:443".to_string());
-        session.close().await.unwrap();
+        session.disconnect().await.unwrap();
         assert_eq!(session.connection_state(), ConnectionState::Closed);
         assert!(!session.is_data_ready());
     }
@@ -2063,7 +2067,7 @@ mod tests {
         assert_eq!(reply, b"server-reply");
 
         server_handle.await.unwrap();
-        session.close().await.unwrap();
+        session.disconnect().await.unwrap();
     }
 
     // ────────────────────────────────────────────────────────────────────

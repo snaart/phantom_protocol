@@ -1027,14 +1027,18 @@ public func FfiConverterTypePhantomListener_lower(_ value: PhantomListener) -> U
 public protocol PhantomSessionProtocol: AnyObject, Sendable {
     
     /**
-     * Close the session.
-     */
-    func close() async throws 
-    
-    /**
      * Get the current connection state (lock-free).
      */
     func connectionState()  -> ConnectionState
+    
+    /**
+     * Send the graceful close frame and shut the session down.
+     *
+     * Named `disconnect` rather than `close` because UniFFI's Kotlin
+     * generator unconditionally adds `AutoCloseable.close()` to every
+     * object, and a Rust-side `close` here would conflict with it.
+     */
+    func disconnect() async throws 
     
     /**
      * The 0-RTT verdict for this session (wire V3, Phase 4.1).
@@ -1210,13 +1214,27 @@ public static func connect(peerAddr: String) -> PhantomSession  {
 
     
     /**
-     * Close the session.
+     * Get the current connection state (lock-free).
      */
-open func close()async throws   {
+open func connectionState() -> ConnectionState  {
+    return try!  FfiConverterTypeConnectionState_lift(try! rustCall() {
+    uniffi_phantom_core_fn_method_phantomsession_connection_state(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Send the graceful close frame and shut the session down.
+     *
+     * Named `disconnect` rather than `close` because UniFFI's Kotlin
+     * generator unconditionally adds `AutoCloseable.close()` to every
+     * object, and a Rust-side `close` here would conflict with it.
+     */
+open func disconnect()async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomsession_close(
+                uniffi_phantom_core_fn_method_phantomsession_disconnect(
                     self.uniffiClonePointer()
                     
                 )
@@ -1227,16 +1245,6 @@ open func close()async throws   {
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeCoreError_lift
         )
-}
-    
-    /**
-     * Get the current connection state (lock-free).
-     */
-open func connectionState() -> ConnectionState  {
-    return try!  FfiConverterTypeConnectionState_lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_connection_state(self.uniffiClonePointer(),$0
-    )
-})
 }
     
     /**
@@ -1512,7 +1520,14 @@ public func FfiConverterTypePhantomSession_lower(_ value: PhantomSession) -> Uns
 
 public protocol PhantomStreamProtocol: AnyObject, Sendable {
     
-    func close() async throws 
+    /**
+     * Close this stream; the peer will see EOF on its read half.
+     *
+     * Named `disconnect` rather than `close` for the same reason as
+     * `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
+     * `AutoCloseable.close()` on every object.
+     */
+    func disconnect() async throws 
     
     func recv() async throws  -> Data
     
@@ -1575,11 +1590,18 @@ open class PhantomStream: PhantomStreamProtocol, @unchecked Sendable {
     
 
     
-open func close()async throws   {
+    /**
+     * Close this stream; the peer will see EOF on its read half.
+     *
+     * Named `disconnect` rather than `close` for the same reason as
+     * `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
+     * `AutoCloseable.close()` on every object.
+     */
+open func disconnect()async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomstream_close(
+                uniffi_phantom_core_fn_method_phantomstream_disconnect(
                     self.uniffiClonePointer()
                     
                 )
@@ -2592,10 +2614,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes() != 27980) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_close() != 2539) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 58300) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 58300) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_disconnect() != 18611) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted() != 23395) {
@@ -2634,7 +2656,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_core_checksum_method_phantomsession_set_state() != 24535) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomstream_close() != 59562) {
+    if (uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 13449) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_core_checksum_method_phantomstream_recv() != 59636) {
