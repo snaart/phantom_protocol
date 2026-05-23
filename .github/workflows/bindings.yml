@@ -1,0 +1,117 @@
+name: bindings
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  drift:
+    name: bindings drift
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: bindings-drift
+      - name: Regenerate Swift / Kotlin / Python bindings
+        run: |
+          tests/bindings/generate_swift.sh
+          tests/bindings/generate_kotlin.sh
+          tests/bindings/generate_python.sh
+      - name: Verify the C header carries every API symbol
+        run: |
+          C_OUT="$(tests/bindings/generate_c.sh --release --skip-build 2>&1)"
+          echo "$C_OUT"
+          MISSING="$(echo "$C_OUT" \
+            | sed -n '/in dylib but NOT mentioned/,/mentioned in header but NOT/p' \
+            | grep -oE 'uniffi_phantom_core_fn_[A-Za-z0-9_]+' \
+            | sort -u || true)"
+          if [ -n "$MISSING" ]; then
+            echo "::error::tests/bindings/c/phantom_core.h is missing API symbols:"
+            echo "$MISSING"
+            exit 1
+          fi
+      - name: Fail if committed bindings drifted
+        run: git diff --exit-code -- tests/bindings/
+
+  python:
+    name: Python binding loopback
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: bindings-python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build cdylib + regenerate the Python binding
+        run: tests/bindings/generate_python.sh
+      - name: Stage the native library next to the binding
+        run: cp target/release/libphantom_core.so tests/bindings/
+      - name: Run the loopback smoke test
+        run: python3 tests/run_test.py
+
+  swift:
+    name: Swift binding loopback
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: bindings-swift
+      - name: Build cdylib + regenerate the Swift binding
+        run: tests/bindings/generate_swift.sh
+      - name: Compile + run the loopback smoke test
+        run: tests/bindings/swift/run_swift_test.sh
+
+  kotlin:
+    name: Kotlin binding compile-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: bindings-kotlin
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Build cdylib + regenerate the Kotlin binding
+        run: tests/bindings/generate_kotlin.sh
+      - name: Compile-check via the harness
+        run: tests/bindings/kotlin/run_kotlin_test.sh
+
+  c:
+    name: C consumer compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: bindings-c
+      - name: Build the cdylib
+        run: cargo build --release --manifest-path core/Cargo.toml
+      - name: Compile + run the C consumer
+        run: |
+          cc -I tests/bindings/c \
+             -L target/release -lphantom_core \
+             tests/bindings/c/consumer_smoke.c \
+             -o /tmp/phantom_c_smoke
+          LD_LIBRARY_PATH=target/release /tmp/phantom_c_smoke
