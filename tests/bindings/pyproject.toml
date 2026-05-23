@@ -1,0 +1,47 @@
+# Python wheel for the phantom_core UniFFI binding.
+#
+# This produces a pure-Python wheel containing `phantom_core.py`; the
+# native `libphantom_core.{dylib,so,dll}` is NOT auto-bundled — it must
+# be staged next to the module before publishing or sitting next to it
+# inside `site-packages/` after install. UniFFI's `_uniffi_load_indirect`
+# expects the library at `os.path.dirname(__file__)`.
+#
+# Build a wheel:
+#     cargo build --release --manifest-path ../../core/Cargo.toml
+#     ./generate_python.sh
+#     python -m build --wheel
+#
+# Publishing is intentionally manual (see PACKAGING.md). For a true
+# per-platform PyPI release use cibuildwheel or maturin around this
+# config — the bundled native lib is platform-specific.
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phantom-core"
+version = "0.2.0"
+description = "Phantom Core — post-quantum-secure L4/L6 transport (Python binding)"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Phantom Core developers" }]
+keywords = ["post-quantum", "cryptography", "transport", "uniffi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Internet",
+    "Topic :: Security :: Cryptography",
+]
+
+[project.urls]
+Repository = "https://github.com/SNAcorp/phantom-core"
+
+[tool.setuptools]
+py-modules = ["phantom_core"]
