@@ -12,15 +12,18 @@
 //! The core transmits only `Vec<u8>` / `Bytes`.
 //! Serialization (JSON, Protobuf, etc.) is the user's responsibility.
 
-// Security-friendly lints. Initially `warn` (not `deny`) so the codebase can
-// drift toward zero panics without breaking existing call sites. A follow-up
-// PR (Production Readiness, Phase 1.3) will tighten these to `deny` and audit
-// the remaining sites.
+// Security-friendly lints. Now `deny` (was `warn` until the codebase drove the
+// remaining unannotated sites to zero). Every surviving panic-shaped call in
+// production code carries an inline `// PANIC-SAFETY:` comment and a narrow
+// `#[allow(clippy::unwrap_used)]` / `#[allow(clippy::expect_used)]` at the
+// statement scope; the canonical inventory lives in `docs/security/panic-sites.md`.
+// Tests opt in to `expect_used` for readable failure diagnostics. Phase 1.3
+// (Production Readiness) — closed.
 //
 // `clippy::indexing_slicing` is deliberately omitted at this stage — it fires
 // on every constant-bounded array index and would generate too much noise.
 // It is tracked as a separate phase 1.13 item (bounds-check audit).
-#![warn(
+#![deny(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
@@ -28,6 +31,26 @@
     clippy::todo,
     clippy::unimplemented,
     clippy::missing_safety_doc
+)]
+// Tests use `expect()` / `unwrap()` / `panic!()` freely so failures surface as
+// readable diagnostics rather than swallowed `Result`s. The `deny` above only
+// governs the production code path; this `cfg_attr(test, allow(...))` flips
+// the same lints back to permissive for `cargo test` builds.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::missing_safety_doc,
+        // Same rationale: tests call `.unwrap()` on `Result` / `Option`
+        // routinely; the disallowed-methods list in `.clippy.toml` is
+        // for production code, not the test harness.
+        clippy::disallowed_methods
+    )
 )]
 // Deny `unsafe` by default at the crate root. The two modules that genuinely
 // require `unsafe` (libc GSO/recvmmsg syscalls in `transport::udp_transport`,
