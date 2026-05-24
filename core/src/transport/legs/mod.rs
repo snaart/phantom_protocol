@@ -17,6 +17,17 @@ pub mod websocket;
 #[cfg(all(feature = "std", target_arch = "wasm32"))]
 pub use websocket::WebSocketLeg;
 
+// Section B / B3 — WASI Preview 2 TCP leg. Same `cfg` gate as
+// `runtime::wasi_runtime`: only built when the `wasi-leg` feature is
+// active AND the build target is a WASI triple
+// (`cfg(target_os = "wasi")`). Mutual exclusion with `wasm32-unknown-
+// unknown` is enforced in `core/src/lib.rs`.
+#[cfg(all(feature = "wasi-leg", target_os = "wasi"))]
+pub mod wasi;
+
+#[cfg(all(feature = "wasi-leg", target_os = "wasi"))]
+pub use wasi::WasiLeg;
+
 // `EmbeddedLeg` — `SessionTransport` over `embedded-io-async` byte streams,
 // behind the `embedded` feature. Compiles on any target (host included) so the
 // tests run there. Phase 3.4. no_std-clean, so it is NOT gated behind `std`.
