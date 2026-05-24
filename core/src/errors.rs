@@ -74,6 +74,22 @@ pub enum CoreError {
     /// feature configurations.
     #[cfg_attr(feature = "std", error("cipher suite unavailable: {0}"))]
     CipherSuiteUnavailable(String),
+
+    /// FIPS 140-3 §7.7 power-on self-test failed at process start.
+    /// Surfaced by [`crate::api::PhantomListener::bind`] /
+    /// [`crate::api::PhantomSession::connect_with_transport`] under
+    /// `--features fips` when
+    /// [`crate::crypto::self_tests::ensure_post_passed`] returns an
+    /// error — refusing to stand up a session / listener over broken
+    /// primitives.
+    ///
+    /// Gated on `fips`. The payload is a `String` (not the typed
+    /// `SelfTestError`) so the variant stays UniFFI-exportable — the
+    /// `Debug` rendering of `SelfTestError` is sufficient diagnostic
+    /// signal for a fatal POST failure.
+    #[cfg(feature = "fips")]
+    #[error("FIPS POST self-test failed: {0}")]
+    FipsSelfTestFailure(String),
 }
 
 // --- Converters for internal errors ---

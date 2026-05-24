@@ -25,6 +25,79 @@ use crate::crypto::hybrid_kem::HybridSecretKey;
 use crate::crypto::hybrid_sign::HybridSigningKey;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use std::sync::OnceLock;
+
+/// Process-global cache for [`run_post`]'s result. A7 — the fips
+/// bootstrap (`PhantomListener::bind*` / `PhantomSession::connect*`)
+/// calls [`ensure_post_passed`] which lazily runs the POST exactly
+/// once per process and caches the verdict. Subsequent calls return
+/// the cached `Result` without re-running the test battery.
+///
+/// Production only — `cfg(test)` builds re-run on every call so the
+/// `FORCE_POST_FAIL` fault-injection switch is observable. The
+/// `dead_code` suppression covers the test build.
+#[cfg_attr(test, allow(dead_code))]
+static POST_RESULT: OnceLock<Result<(), SelfTestError>> = OnceLock::new();
+
+/// Test-only fault-injection switch. When `true`, [`ensure_post_passed`]
+/// pretends the AEAD self-test failed (regardless of what the actual
+/// POST would have returned) — used by integration tests covering the
+/// `bind`/`connect` reject path. Production builds compile without
+/// this field at all.
+#[cfg(test)]
+static FORCE_POST_FAIL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Process-global single-shot wrapper around [`run_post`]. The first
+/// call runs the POST and caches the verdict; subsequent calls return
+/// the cached verdict. Designed for the fips bootstrap path
+/// (`PhantomListener::bind*`, `PhantomSession::connect*`) which calls
+/// this before doing any cryptographic work — a failure short-circuits
+/// to [`crate::CoreError::FipsSelfTestFailure`] instead of standing up
+/// a listener / session over broken primitives.
+///
+/// Production cost: amortised to zero after the first call.
+///
+/// Under `cfg(test)` the POST is **re-run on every call** so a test
+/// can flip [`FORCE_POST_FAIL`] and observe the new verdict without
+/// having to reset a process-global cache (`OnceLock::take` is
+/// MSRV 1.81 — too new for this crate). The cache is exercised by
+/// production builds, not by tests.
+pub fn ensure_post_passed() -> Result<(), SelfTestError> {
+    #[cfg(test)]
+    {
+        if FORCE_POST_FAIL.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SelfTestError::Aead {
+                algorithm: "AES-256-GCM",
+                stage: AeadStage::Decrypt,
+            });
+        }
+        return run_post();
+    }
+    #[cfg(not(test))]
+    {
+        POST_RESULT.get_or_init(run_post).clone()
+    }
+}
+
+/// Test-only — flip the [`FORCE_POST_FAIL`] switch. Tests that flip
+/// it MUST `set_force_post_fail(false)` again in their teardown to
+/// avoid poisoning sibling tests in the same binary.
+#[cfg(test)]
+pub fn set_force_post_fail(enable: bool) {
+    FORCE_POST_FAIL.store(enable, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Test-only — shared serial guard for every test that touches
+/// [`FORCE_POST_FAIL`]. Tests in sibling modules (e.g. the bind
+/// reject-path test in `api::listener::tests`) acquire this mutex
+/// for the duration of their fault injection so parallel runners
+/// do not interleave flips.
+#[cfg(test)]
+pub fn tests_serial_guard() -> &'static std::sync::Mutex<()> {
+    static G: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    G.get_or_init(|| std::sync::Mutex::new(()))
+}
 
 /// Stage at which a per-algorithm self-test failed. Lets the caller log
 /// "AES-GCM encrypt failed" vs "AES-GCM decrypt mismatch" instead of an
@@ -296,5 +369,34 @@ mod tests {
         for _ in 0..3 {
             run_post().unwrap();
         }
+    }
+
+    /// A7 — `ensure_post_passed()` runs the POST and returns its
+    /// result. On a clean build, `Ok(())`.
+    #[test]
+    fn ensure_post_passed_succeeds_on_clean_build() {
+        let _guard = tests_serial_guard().lock().unwrap();
+        set_force_post_fail(false);
+        assert!(ensure_post_passed().is_ok());
+    }
+
+    /// A7 — `FORCE_POST_FAIL` flips `ensure_post_passed` to return
+    /// the fault-injected error variant. Used by the
+    /// `listener::bind*` / `session::connect*` reject-path tests.
+    #[test]
+    fn force_post_fail_returns_error_via_ensure_post_passed() {
+        let _guard = tests_serial_guard().lock().unwrap();
+        set_force_post_fail(true);
+        let result = ensure_post_passed();
+        set_force_post_fail(false);
+        match result {
+            Err(SelfTestError::Aead {
+                algorithm: "AES-256-GCM",
+                stage: AeadStage::Decrypt,
+            }) => {}
+            other => panic!("expected fault-injected AEAD Decrypt failure, got {other:?}"),
+        }
+        // Cleared; next call should succeed again.
+        assert!(ensure_post_passed().is_ok());
     }
 }
