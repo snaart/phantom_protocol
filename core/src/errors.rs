@@ -66,6 +66,14 @@ pub enum CoreError {
     /// metric signal (`replay_rejected_total`).
     #[cfg_attr(feature = "std", error("replay protection rejected packet: {0}"))]
     ReplayDetected(String),
+
+    /// A requested cipher suite is not available in the current build.
+    /// Emitted under `--features fips` when a caller asks for a
+    /// non-FIPS-approved primitive (today: `ChaCha20-Poly1305`). The
+    /// variant is always compiled so error matching stays stable across
+    /// feature configurations.
+    #[cfg_attr(feature = "std", error("cipher suite unavailable: {0}"))]
+    CipherSuiteUnavailable(String),
 }
 
 // --- Converters for internal errors ---
@@ -116,6 +124,7 @@ impl core::fmt::Display for CoreError {
             Self::ConnectionClosed => write!(f, "Connection closed"),
             Self::Timeout => write!(f, "Timeout"),
             Self::ReplayDetected(s) => write!(f, "replay protection rejected packet: {s}"),
+            Self::CipherSuiteUnavailable(s) => write!(f, "cipher suite unavailable: {s}"),
         }
     }
 }
