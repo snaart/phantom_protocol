@@ -1675,6 +1675,14 @@ pub async fn connect_pinned(
     port: u16,
     pinned_key: Vec<u8>,
 ) -> Result<Arc<PhantomSession>, CoreError> {
+    // A7 — fips bootstrap POST gate (same policy as
+    // `PhantomListener::bind_inner`). A failure here aborts the
+    // connect before any socket is opened or key material is
+    // touched.
+    #[cfg(feature = "fips")]
+    crate::crypto::self_tests::ensure_post_passed()
+        .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
+
     // Decode the server's hybrid verifying key. A malformed blob is a
     // crypto-layer problem (wrong length, wrong encoding) rather than a
     // network failure — surface it as `CryptoError`.
@@ -1723,6 +1731,12 @@ pub async fn connect_pinned_with_resumption(
     hint: ResumptionHint,
     early_data: Vec<u8>,
 ) -> Result<Arc<PhantomSession>, CoreError> {
+    // A7 — fips bootstrap POST gate (same policy as
+    // `connect_pinned`).
+    #[cfg(feature = "fips")]
+    crate::crypto::self_tests::ensure_post_passed()
+        .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
+
     // Server-key pinning stays mandatory (security invariant 1): a
     // malformed blob is a crypto-layer problem, surfaced as `CryptoError`.
     let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
