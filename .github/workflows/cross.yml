@@ -69,15 +69,21 @@ jobs:
           - target: wasm32-unknown-unknown
             runner: ubuntu-latest
             install_target: true
-          # wasm32-wasi remains allow_failure: true — needs a WasiLeg +
-          # WasiRuntime (mio does not support WASI; no tokio-wasi shim yet).
-          # Scope, rationale, and step-by-step path forward documented in
-          # docs/operations/wasi.md. Flip allow_failure once Step 4 there
-          # is complete.
-          - target: wasm32-wasi
+          # wasm32-wasip2 (Preview 2) — hard gate as of B6. The
+          # `wasi-leg` Cargo feature pulls in `wasi 0.14` (WIT-bindgen
+          # bindings for Preview 2) and the matching `WasiLeg` /
+          # `WasiRuntime` modules. The library compiles end-to-end
+          # without bindings (UniFFI's exported-symbol metadata is
+          # incompatible with `wasm-component-ld`); the `--no-default-
+          # features` flag drops bindings here. The host integration
+          # test that round-trips a payload through `wasmtime` lives in
+          # `core/tests/wasi_integration.rs` (`#[ignore]`-gated) and
+          # is exercised by the dedicated `wasi-integration` job at
+          # the bottom of this matrix.
+          - target: wasm32-wasip2
             runner: ubuntu-latest
             install_target: true
-            allow_failure: true
+            cargo_args: "--no-default-features --features std,wasi-leg"
           # ── Embedded smoke (Phase 3.4 + 3.6) — bare-metal-green as of
           #    722c6cb via the no_std subset. Hard gate. Note the
           #    `cargo_args` matrix field: thumbv7em requires
@@ -110,3 +116,31 @@ jobs:
             cargo check --manifest-path core/Cargo.toml --lib --target ${{ matrix.target }} ${{ matrix.cargo_args }}
           fi
         shell: bash
+
+  # B6 — host-side integration test that boots the `phantom-wasi-guest`
+  # fixture under `wasmtime` and round-trips a payload through
+  # `WasiLeg` against a native length-prefix echo server. Runs the
+  # `#[ignore]`-gated `core/tests/wasi_integration.rs` on a runner
+  # with a pinned `wasmtime` install.
+  wasi-integration:
+    name: wasi-leg integration (wasmtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: wasi-integration
+      - name: Install wasmtime
+        # Pinned via the official installer script. The wasmtime CLI
+        # provides the Preview 2 socket implementations the
+        # `wasi-guest` fixture calls into.
+        run: |
+          curl -sSf https://wasmtime.dev/install.sh | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: cargo test --test wasi_integration -- --ignored
+        run: cargo test --manifest-path core/Cargo.toml --test wasi_integration -- --ignored
