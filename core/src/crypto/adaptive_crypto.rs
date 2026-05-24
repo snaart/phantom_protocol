@@ -6,9 +6,18 @@
 //!
 //! На устройствах без HW AES ChaCha20 в 3-4x быстрее.
 //! На устройствах с HW AES AES-GCM в ~1.3x быстрее ChaCha20.
+//!
+//! Under `--features fips` the AEAD backend swaps to `aws-lc-rs`
+//! (FIPS-validated AWS-LC). The Rust API surface is identical to
+//! `ring::aead`, so the rest of this module is untouched. The cipher
+//! suite enum keeps `ChaCha20Poly1305` (wire-format stability) but the
+//! negotiation/build paths reject it under `fips` — see A3.
 
 use crate::errors::CoreError;
+#[cfg(not(feature = "fips"))]
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
+#[cfg(feature = "fips")]
+use aws_lc_rs::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -432,6 +441,22 @@ mod tests {
         let b = CryptoSession::with_suite_peer(&secret, CipherSuite::Aes256Gcm).unwrap();
 
         let msg = b"Hello, PQ AES world!";
+        let ct = a.encrypt(&[], msg).unwrap();
+        let pt = b.decrypt(&[], &ct).unwrap();
+        assert_eq!(&pt, msg);
+    }
+
+    /// Round-trip AES-256-GCM through the FIPS backend (`aws-lc-rs`).
+    /// Identical to [`round_trip_aes`] but explicit about which backend
+    /// is exercised — runs only when the `fips` feature is active.
+    #[cfg(feature = "fips")]
+    #[test]
+    fn round_trip_aes_aws_lc_rs() {
+        let secret = [0xCEu8; 32];
+        let a = CryptoSession::with_suite(&secret, CipherSuite::Aes256Gcm).unwrap();
+        let b = CryptoSession::with_suite_peer(&secret, CipherSuite::Aes256Gcm).unwrap();
+
+        let msg = b"Hello, FIPS-mode AES world!";
         let ct = a.encrypt(&[], msg).unwrap();
         let pt = b.decrypt(&[], &ct).unwrap();
         assert_eq!(&pt, msg);

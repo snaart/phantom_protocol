@@ -72,7 +72,11 @@
 // ChaCha20-Poly1305, CTR_DRBG RNG, POST hook) has not landed yet. Fail
 // the build loudly if a consumer enables the feature today rather than
 // silently shipping a non-FIPS binary that pretends to be FIPS.
-#[cfg(feature = "fips")]
+// During the FIPS primitive-swap rollout (commits A2–A7 of the plan),
+// pass `--cfg fips_rollout_in_progress` via RUSTFLAGS to bypass this
+// scaffold and exercise the in-flight fips code paths. The cfg flag is
+// removed alongside this scaffold in A8.
+#[cfg(all(feature = "fips", not(fips_rollout_in_progress)))]
 compile_error!(
     "The `fips` Cargo feature is a scaffold only — the FIPS 140-3 primitive \
      swap (ring → aws-lc-rs, X25519 → ECDH-P-256, blake3 → HKDF-SHA256, \
