@@ -99,7 +99,11 @@
 //!
 //! See `tests::CounterRng` below for a tiny in-tree example.
 
+#[cfg(not(feature = "fips"))]
 use getrandom::getrandom;
+
+#[cfg(feature = "fips")]
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
 /// Source of cryptographically secure random bytes.
 ///
@@ -158,6 +162,7 @@ impl OsRng {
     }
 }
 
+#[cfg(not(feature = "fips"))]
 impl RngProvider for OsRng {
     fn fill_bytes(&self, dest: &mut [u8]) {
         // `getrandom` is configured to call the platform CSPRNG on every
@@ -172,6 +177,27 @@ impl RngProvider for OsRng {
         // as good entropy.
         #[allow(clippy::expect_used)]
         getrandom(dest).expect("OS RNG (getrandom) failed");
+    }
+}
+
+/// `--features fips` impl: delegates to `aws_lc_rs::rand::SystemRandom`,
+/// which under AWS-LC-FIPS is a CTR_DRBG (NIST SP 800-90A § 10.2.1)
+/// seeded from the OS CSPRNG. This is the FIPS 140-3 approved RNG
+/// substrate that pairs with the rest of the primitive swap (AES-256-
+/// GCM, ECDH-P-256, HKDF-SHA256). The construction is wrapped in a
+/// fresh `SystemRandom` per call — the type is zero-sized and the
+/// underlying DRBG state lives inside AWS-LC's process-global module.
+#[cfg(feature = "fips")]
+impl RngProvider for OsRng {
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        let rng = SystemRandom::new();
+        // PANIC-SAFETY: a fips `OsRng` failure means AWS-LC's CTR_DRBG
+        // itself returned an error (entropy source unavailable or the
+        // FIPS module is in a self-test-failed state) — a condition
+        // unrecoverable at this layer. Same loud-fail policy as the
+        // default `getrandom` impl above.
+        #[allow(clippy::expect_used)]
+        rng.fill(dest).expect("AWS-LC CTR_DRBG fill failed");
     }
 }
 
@@ -273,5 +299,29 @@ mod tests {
         // And the `Arc<dyn …>` shape compiles too.
         use std::sync::Arc;
         let _shared: Arc<dyn RngProvider> = Arc::new(OsRng::new());
+    }
+
+    /// fips-only: pull a 64-byte block and confirm it is neither
+    /// all-zero nor a constant byte pattern. Smokes the AWS-LC
+    /// CTR_DRBG → `OsRng` wiring.
+    #[cfg(feature = "fips")]
+    #[test]
+    fn fips_os_rng_64_byte_block_has_entropy() {
+        let rng = OsRng::new();
+        let mut buf = [0u8; 64];
+        rng.fill_bytes(&mut buf);
+        // All-zero from a CSPRNG is astronomically unlikely (2^-512).
+        assert!(buf.iter().any(|&b| b != 0), "fips OsRng returned all-zero");
+        // Reject any single-byte fill pattern (all bytes identical).
+        let first = buf[0];
+        assert!(
+            buf.iter().any(|&b| b != first),
+            "fips OsRng returned a constant byte pattern ({:#x} repeated)",
+            first
+        );
+        // Two consecutive draws must differ.
+        let mut buf2 = [0u8; 64];
+        rng.fill_bytes(&mut buf2);
+        assert_ne!(buf, buf2, "fips OsRng repeated a 64-byte block");
     }
 }
