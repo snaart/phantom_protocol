@@ -67,6 +67,19 @@ pub mod embedded_runtime;
 #[cfg(all(feature = "embedded", feature = "std"))]
 pub use embedded_runtime::EmbeddedRuntime;
 
+// Section B / B2 — WASI Preview 2 runtime. Available only when the
+// `wasi-leg` feature is enabled AND the build target is a WASI triple
+// (`wasm32-wasi*`) — `cfg(target_os = "wasi")` matches all of
+// `wasm32-wasi`, `wasm32-wasip1`, `wasm32-wasip2`. Host builds and
+// `wasm32-unknown-unknown` never see this module; the `compile_error!`
+// in `core/src/lib.rs` rejects `--features wasi-leg` on the browser
+// target.
+#[cfg(all(feature = "wasi-leg", target_os = "wasi"))]
+pub mod wasi_runtime;
+
+#[cfg(all(feature = "wasi-leg", target_os = "wasi"))]
+pub use wasi_runtime::WasiRuntime;
+
 /// Boxed, owned, `Send` future of unit output — the shape `Runtime::spawn`
 /// and `Runtime::sleep` work in.
 ///
