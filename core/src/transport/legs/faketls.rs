@@ -115,9 +115,15 @@ fn derive_outer_keys(
     seed.extend_from_slice(&version.to_be_bytes());
     seed.extend_from_slice(sni.as_bytes());
 
-    let key_c2s = blake3::derive_key("phantom-faketls-c2s-v1", &seed);
-    let key_s2c = blake3::derive_key("phantom-faketls-s2c-v1", &seed);
-    let pfx = blake3::derive_key("phantom-faketls-pfx-v1", &seed);
+    // A5 — `crypto::kdf::derive_key_32` dispatches to `blake3::derive_key`
+    // by default and HKDF-SHA256 under `--features fips`. FakeTLS is
+    // anti-DPI obfuscation only (the inner Phantom session provides the
+    // real confidentiality + auth), but consistency with the rest of
+    // the codebase under fips removes a non-approved primitive from the
+    // FIPS surface.
+    let key_c2s = crate::crypto::kdf::derive_key_32("phantom-faketls-c2s-v1", &seed);
+    let key_s2c = crate::crypto::kdf::derive_key_32("phantom-faketls-s2c-v1", &seed);
+    let pfx = crate::crypto::kdf::derive_key_32("phantom-faketls-pfx-v1", &seed);
 
     let mut nonce_prefix = [0u8; 4];
     nonce_prefix.copy_from_slice(&pfx[..4]);
@@ -127,8 +133,8 @@ fn derive_outer_keys(
     } else {
         (key_c2s, key_s2c)
     };
-    // `UnboundKey::new(&AES_256_GCM, key)` only fails if the slice length is
-    // wrong — `blake3::derive_key` always emits exactly 32 bytes and
+    // `UnboundKey::new(&AES_256_GCM, key)` only fails if the slice length
+    // is wrong — `derive_key_32` always emits exactly 32 bytes and
     // `AES_256_GCM.key_len()` is 32, so this is structurally infallible.
     // Surface it as a typed error anyway so the function stays total.
     let send_unbound = UnboundKey::new(&aead::AES_256_GCM, &send_bytes)

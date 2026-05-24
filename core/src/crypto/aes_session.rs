@@ -46,8 +46,11 @@ impl AesSession {
     }
 
     fn build(shared_secret: &[u8; 32], swap: bool) -> Result<Self, crate::CoreError> {
-        let key_a = blake3::derive_key("phantom-aes-send-v1", shared_secret);
-        let key_b = blake3::derive_key("phantom-aes-recv-v1", shared_secret);
+        // A5 — `crypto::kdf::derive_key_32` cfg-dispatches between
+        // `blake3::derive_key` (default) and HKDF-SHA256 (`--features
+        // fips`). API shape and 32-byte output are identical.
+        let key_a = crate::crypto::kdf::derive_key_32("phantom-aes-send-v1", shared_secret);
+        let key_b = crate::crypto::kdf::derive_key_32("phantom-aes-recv-v1", shared_secret);
 
         let (send_bytes, recv_bytes) = if swap { (key_b, key_a) } else { (key_a, key_b) };
 
@@ -56,7 +59,8 @@ impl AesSession {
         let recv_unbound = UnboundKey::new(&AES_256_GCM, &recv_bytes)
             .map_err(|_| crate::CoreError::CryptoError("Invalid key".into()))?;
 
-        let prefix_bytes = blake3::derive_key("phantom-nonce-pfx-v1", shared_secret);
+        let prefix_bytes =
+            crate::crypto::kdf::derive_key_32("phantom-nonce-pfx-v1", shared_secret);
         let mut nonce_prefix = [0u8; 4];
         nonce_prefix.copy_from_slice(&prefix_bytes[..4]);
 

@@ -9,6 +9,38 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
 
+/// 32-byte key derivation that matches `blake3::derive_key`'s API
+/// shape (label string + IKM bytes → `[u8; 32]`) and dispatches per
+/// the active build:
+///
+/// - Default: `blake3::derive_key(label, ikm)` — pure-Rust, infallible.
+/// - `--features fips`: `HKDF-SHA256` with empty salt, `info = label
+///   bytes`. FIPS 140-3 §C-approved (SP 800-108) so the same
+///   call-sites stay valid under the fips swap (A5).
+///
+/// PANIC-SAFETY: HKDF-SHA256 `expand` only errors when the requested
+/// output length exceeds 255 * HashLen (255 * 32 = 8160 bytes for
+/// SHA-256). 32 bytes is well within that ceiling, so the
+/// `expect_used` is statically safe.
+#[inline]
+pub fn derive_key_32(label: &str, ikm: &[u8]) -> [u8; 32] {
+    #[cfg(not(feature = "fips"))]
+    {
+        blake3::derive_key(label, ikm)
+    }
+    #[cfg(feature = "fips")]
+    {
+        let hk = Hkdf::<Sha256>::new(None, ikm);
+        let mut out = [0u8; 32];
+        #[allow(clippy::expect_used)]
+        // PANIC-SAFETY: 32 bytes is far below HKDF-SHA256's 255 *
+        // HashLen output ceiling.
+        hk.expand(label.as_bytes(), &mut out)
+            .expect("HKDF-SHA256 expand: 32 bytes is within the SHA-256 output bound");
+        out
+    }
+}
+
 /// HKDF `info` label for the 0-RTT early-data AEAD key.
 const EARLY_DATA_KEY_INFO: &[u8] = b"phantom-early-data-key-v3";
 /// HKDF `info` label for the 0-RTT early-data AEAD nonce.
@@ -99,5 +131,38 @@ mod tests {
             &nonce[..],
             "key prefix must not equal the nonce"
         );
+    }
+
+    #[test]
+    fn derive_key_32_is_deterministic() {
+        let a = derive_key_32("phantom-self-test", b"some-ikm-bytes");
+        let b = derive_key_32("phantom-self-test", b"some-ikm-bytes");
+        assert_eq!(a, b, "derive_key_32 must be deterministic across calls");
+    }
+
+    #[test]
+    fn derive_key_32_label_changes_output() {
+        let a = derive_key_32("phantom-label-a", b"ikm");
+        let b = derive_key_32("phantom-label-b", b"ikm");
+        assert_ne!(a, b, "different labels must produce different keys");
+    }
+
+    /// fips-only KAT: locks the HKDF-SHA256 construction used by
+    /// `derive_key_32`. A mismatch on a clean build means the
+    /// underlying `hkdf` / `sha2` crates changed behavior or that
+    /// the cfg dispatch in `derive_key_32` is broken.
+    #[cfg(feature = "fips")]
+    #[test]
+    fn derive_key_32_fips_kat() {
+        let out = derive_key_32("phantom-rekey-v1", &[0x11u8; 32]);
+        // KAT computed from `Hkdf::<Sha256>::new(None, &[0x11; 32])`
+        // then `expand(b"phantom-rekey-v1", &mut [0u8; 32])`. Matches
+        // the bytes baked into `crypto::self_tests::test_hkdf_sha256`.
+        const KAT: [u8; 32] = [
+            0x41, 0x90, 0x72, 0xe4, 0xca, 0x1b, 0xa9, 0xca, 0xdc, 0x1b, 0x02, 0xd3, 0x75, 0xb0,
+            0xf8, 0x84, 0x70, 0xa7, 0x0f, 0xe9, 0x57, 0x13, 0x1d, 0x7b, 0x5b, 0x35, 0xe5, 0x74,
+            0x14, 0x34, 0xe4, 0x10,
+        ];
+        assert_eq!(out, KAT, "derive_key_32 fips path must match HKDF-SHA256 KAT");
     }
 }
