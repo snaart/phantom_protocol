@@ -156,7 +156,11 @@ pub mod test_harness;
 pub use config::PhantomConfig;
 pub use errors::CoreError;
 
-// UniFFI scaffolding is std-bound (the `uniffi` crate pulls `std`). Gated so
-// the bare-metal build does not see it.
-#[cfg(feature = "std")]
+// UniFFI scaffolding. Gated on the `bindings` feature so the WASI
+// guest build (which sets `--features wasi-leg` without `bindings`)
+// skips it — UniFFI's exported-symbol metadata is incompatible with
+// `wasm-component-ld`, the wasm32-wasip2 linker. Default builds keep
+// `bindings` active, so the native FFI consumers (Swift / Kotlin /
+// Python / C bindings) see the historical surface unchanged.
+#[cfg(feature = "bindings")]
 uniffi::setup_scaffolding!();

@@ -51,10 +51,10 @@ mod tokio_runtime;
 
 pub use tokio_runtime::TokioRuntime;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub mod wasm_runtime;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub use wasm_runtime::WasmRuntime;
 
 // Phase 3.1 scaffold — see `embedded_runtime.rs` for what this is and is not

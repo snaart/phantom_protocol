@@ -5,7 +5,16 @@ edition = "2021"
 description = "Phantom Universal Transport Core SDK — post-quantum secure L4/L6 network framework"
 
 [features]
-default = ["compression-zstd", "std"]
+default = ["compression-zstd", "std", "bindings"]
+
+# UniFFI bindings surface. Pulled in by `default` so the historical
+# native-FFI consumers (Swift / Kotlin / Python / C bindings under
+# `tests/bindings/`) compile unchanged. Split out from `std` because
+# UniFFI's exported-symbol metadata is incompatible with
+# `wasm-component-ld` (the wasm32-wasip2 linker); the WASI guest in
+# `core/tests/fixtures/wasi-guest/` therefore opts out of `default`
+# and explicitly enables `["std", "wasi-leg"]` only.
+bindings = ["std", "dep:uniffi"]
 
 # `std` (Phase 3.6): the standard "everything on" build. Pulls every std-bound
 # optional dep into the graph and unlocks all top-level modules (`api`, `runtime`,
@@ -26,7 +35,6 @@ std = [
     "dep:env_logger",
     "dep:tracing",
     "dep:time",
-    "dep:uniffi",
     "dep:argon2",
     "dep:crossbeam-queue",
     "dep:crossbeam-utils",
@@ -242,11 +250,11 @@ kcp-tokio = { version = "0.3", optional = true }
 # free from a build-size standpoint.
 socket2 = { version = "0.6", optional = true }
 
-# ─── WASM-only dependencies (Phase 3.3) ───────────────────────────────────
-# Pulled in only for `wasm32-*` builds. Non-WASM hosts never see these
-# crates in their dependency graph, so the production server build is
-# unaffected.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+# ─── Browser-WASM-only dependencies (Phase 3.3) ───────────────────────────
+# Pulled in only for `wasm32-unknown-unknown` builds (the browser target).
+# Non-WASM hosts and WASI targets (wasm32-wasi*) never see these crates in
+# their dependency graph.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
@@ -260,16 +268,17 @@ web-sys = { version = "0.3", features = [
     "MessageEvent",
     "WebSocket",
 ] }
-# Phase 3.8 partial: enable getrandom's "js" feature for wasm32 so it
-# falls back to `crypto.getRandomValues` rather than emitting a
-# compile_error!. Non-wasm targets ignore this — it's a no-op there.
+# Phase 3.8 partial: enable getrandom's "js" feature for wasm32-unknown-
+# unknown so it falls back to `crypto.getRandomValues` rather than
+# emitting a compile_error!. Non-wasm targets and WASI targets ignore
+# this — it's a no-op there.
 getrandom = { version = "0.2", features = ["js"] }
-# Force-enable the `wasm_js` feature on getrandom 0.4 for wasm32.
-# getrandom 0.4 is pulled in transitively by `ml-dsa → crypto-common 0.2` and
-# `uniffi → tempfile`. For `wasm32-unknown-unknown` it auto-selects the wasm
-# path but requires the `wasm_js` Cargo feature (not a --cfg rustflag) to
-# compile in the js-sys/wasm-bindgen backend. Adding it here as a forced direct
-# dep activates the feature for the whole transitive tree on this target.
+# Force-enable the `wasm_js` feature on getrandom 0.4 for wasm32-unknown-
+# unknown. getrandom 0.4 is pulled in transitively by `ml-dsa →
+# crypto-common 0.2` and `uniffi → tempfile`. The wasm path requires the
+# `wasm_js` Cargo feature (not a --cfg rustflag) to compile in the
+# js-sys/wasm-bindgen backend. WASI builds get the default getrandom path
+# (which uses WASI's `random_get`).
 getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 # ─── WASI-only dependencies (Section B — wasi-leg) ────────────────────────

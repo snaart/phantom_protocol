@@ -15,7 +15,7 @@ use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
 
-#[derive(uniffi::Object)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct PhantomListener {
     listener: Mutex<TcpListener>,
     handshake_server: Arc<HandshakeServer>,
@@ -166,9 +166,9 @@ impl PhantomListener {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 impl PhantomListener {
-    #[uniffi::constructor]
+    #[cfg_attr(feature = "bindings", uniffi::constructor)]
     #[tracing::instrument(name = "phantom.listener.bind", skip_all, fields(addr = %addr))]
     pub async fn bind(addr: String) -> Result<Arc<Self>, CoreError> {
         Self::bind_inner(addr, Arc::new(TokioRuntime), None).await
@@ -281,13 +281,13 @@ impl PhantomListener {
 /// `Arc<PhantomSession>` (itself a `uniffi::Object`) from a method,
 /// the same known-good pattern `accept()` used before V3. `take_*`
 /// is take-once so a ≤16 KiB blob is moved out, not cloned.
-#[derive(uniffi::Object)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct AcceptOutcome {
     session: Arc<PhantomSession>,
     early_data: parking_lot::Mutex<Option<Vec<u8>>>,
 }
 
-#[uniffi::export]
+#[cfg_attr(feature = "bindings", uniffi::export)]
 impl AcceptOutcome {
     /// The accepted, fully-established session.
     pub fn session(&self) -> Arc<PhantomSession> {

@@ -11,10 +11,10 @@ pub mod kcp;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod tcp;
 
-#[cfg(all(feature = "std", target_arch = "wasm32"))]
+#[cfg(all(feature = "std", target_arch = "wasm32", target_os = "unknown"))]
 pub mod websocket;
 
-#[cfg(all(feature = "std", target_arch = "wasm32"))]
+#[cfg(all(feature = "std", target_arch = "wasm32", target_os = "unknown"))]
 pub use websocket::WebSocketLeg;
 
 // Section B / B3 — WASI Preview 2 TCP leg. Same `cfg` gate as
