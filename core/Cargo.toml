@@ -307,10 +307,3 @@ harness = false
 [lib]
 name = "phantom_core"
 crate-type = ["lib", "cdylib"]
-
-# `fips_rollout_in_progress` is a transient `--cfg` escape hatch used by
-# the FIPS primitive-swap rollout (commits A2–A7) so contributors can
-# exercise `--features fips` builds before the scaffold `compile_error!`
-# in `core/src/lib.rs` is removed in A8. Removed alongside the scaffold.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fips_rollout_in_progress)'] }

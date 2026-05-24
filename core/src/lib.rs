@@ -66,23 +66,21 @@
 // default) is unchanged.
 #![cfg_attr(not(feature = "std"), no_std)]
 
-// Phase 5.5 — `fips` feature scaffold. The flag exists in `Cargo.toml` so
-// downstream tooling can pin it in advance, but the primitive-swap PR
-// (X25519 → ECDH-P-256, ring → aws-lc-rs, blake3 → HKDF-SHA256, drop
-// ChaCha20-Poly1305, CTR_DRBG RNG, POST hook) has not landed yet. Fail
-// the build loudly if a consumer enables the feature today rather than
-// silently shipping a non-FIPS binary that pretends to be FIPS.
-// During the FIPS primitive-swap rollout (commits A2–A7 of the plan),
-// pass `--cfg fips_rollout_in_progress` via RUSTFLAGS to bypass this
-// scaffold and exercise the in-flight fips code paths. The cfg flag is
-// removed alongside this scaffold in A8.
-#[cfg(all(feature = "fips", not(fips_rollout_in_progress)))]
+// Phase 5.5 / A8 — the FIPS 140-3 primitive swap (X25519 → ECDH-P-256,
+// ring → aws-lc-rs, blake3 → HKDF-SHA256, drop ChaCha20-Poly1305,
+// CTR_DRBG RNG, POST hook) is **shipped**. `--features fips` now
+// builds and serves a FIPS-substrate Phantom Core. The scaffold
+// `compile_error!` from commit `d4d121b` is gone; the only
+// remaining build-time gate enforces mutual exclusion with `no-std`,
+// since `aws-lc-rs` requires libc + dlopen / OpenSSL ABI and cannot
+// run on bare-metal.
+#[cfg(all(feature = "fips", feature = "no-std"))]
 compile_error!(
-    "The `fips` Cargo feature is a scaffold only — the FIPS 140-3 primitive \
-     swap (ring → aws-lc-rs, X25519 → ECDH-P-256, blake3 → HKDF-SHA256, \
-     drop ChaCha20-Poly1305, CTR_DRBG RNG) has not yet landed. See \
-     `docs/compliance/fips-readiness.md` for current status. Build without \
-     `--features fips` until the follow-up PR ships."
+    "Cargo features `fips` and `no-std` are mutually exclusive — \
+     `aws-lc-rs` (the FIPS-validated substrate) needs libc / dlopen \
+     and does not build for bare-metal targets. Build either with \
+     `--features fips` (FIPS posture, requires std) or with \
+     `--features embedded,no-std` (no_std posture, default crypto)."
 );
 
 #[cfg(not(feature = "std"))]
