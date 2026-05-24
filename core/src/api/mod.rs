@@ -6,9 +6,13 @@
 //! - [`listener::PhantomListener`] — Server socket listener (native only)
 //! - [`tcp_transport::TcpSessionTransport`] — Length-prefixed framing over TCP (native only)
 //!
-//! On `wasm32-*` targets the TCP-based building blocks are absent; use
-//! [`crate::transport::legs::WebSocketLeg`] as the `SessionTransport`
-//! implementation instead.
+//! On `wasm32-unknown-unknown` (browser) targets the TCP-based building
+//! blocks are absent; use [`crate::transport::legs::WebSocketLeg`] as
+//! the `SessionTransport` implementation. On `wasm32-wasi*` targets
+//! with `--features wasi-leg`, use
+//! [`crate::transport::legs::wasi::WasiLeg`] (paired with
+//! [`crate::runtime::wasi_runtime::WasiRuntime`]) for a TCP-shaped
+//! transport over WASI Preview 2 sockets.
 
 pub mod session;
 pub mod stream;
