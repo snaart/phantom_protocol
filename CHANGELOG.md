@@ -13,6 +13,57 @@ the foundation and security-hardening phases of the production-readiness
 roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
 132; the new ten cover the documented security invariants directly.
 
+### Security — FIPS 140-3 primitive swap (commits `613473a`..`5dd39c7`)
+
+**`cargo build --features fips` is now a shipped configuration.** The
+scaffold `compile_error!` from commit `d4d121b` is removed; enabling
+the feature pulls in `aws-lc-rs` (AWS-LC-FIPS) and swaps every
+non-FIPS-approved primitive call site:
+
+- **AEAD** — AES-256-GCM via `aws_lc_rs::aead`. ChaCha20-Poly1305 is
+  rejected at handshake (`negotiate_cipher`) and at
+  `CryptoSession::with_suite` with `CoreError::CipherSuiteUnavailable`.
+  The wire-format `CipherSuite` enum variant is preserved.
+- **Classical KEM** — X25519 → ECDH-P-256 via `aws_lc_rs::agreement`.
+  The classical public key on the wire grows from 32 bytes to 65 bytes
+  (uncompressed SEC1).
+- **KDF** — every `blake3::derive_key` call routes through the new
+  `crypto::kdf::derive_key_32` shim, which uses `HKDF-SHA256` under
+  fips (label-compatible API).
+- **RNG** — `RngProvider for OsRng` swaps to
+  `aws_lc_rs::rand::SystemRandom` (CTR_DRBG, SP 800-90A § 10.2.1).
+- **POST** — `crypto::self_tests::ensure_post_passed` is invoked
+  from `PhantomListener::bind*` and the UniFFI `connect_pinned*`
+  paths before any cryptographic work. Failure surfaces as
+  `CoreError::FipsSelfTestFailure(String)`.
+
+**Wire-format break** — fips ↔ non-fips peers cannot interoperate.
+The new `PROTOCOL_VARIANT` constant
+(`phantom-default-1` vs `phantom-fips-1`) is baked into the signed
+handshake transcript **and** carried in cleartext on every
+`ClientHello`. A mismatched-mode connect fails with
+`HandshakeError::ProtocolVariantMismatch` before any KEM/sign work,
+and the transcript binding catches any MITM attempt to rewrite the
+cleartext field.
+
+**Build constraints** — `fips` implies `std` and is mutually exclusive
+with `no-std` (compile_error in `core/src/lib.rs`). `aws-lc-rs`
+requires libc + dlopen / OpenSSL ABI and does not target wasm32 or
+bare-metal. macOS hosts may need `brew install pkg-config openssl@3`
+for the first build.
+
+**CI** — new `fips-feature` job in `.github/workflows/ci.yml`
+(cargo test/clippy + cavp + the no-std-conflict assertion) and a
+new `x86_64-unknown-linux-gnu (--features fips)` row in
+`.github/workflows/cross.yml`.
+
+Test count under `--features fips`: 244 lib tests + 3 ignored TCP
+integration tests (all green). Detailed primitive table and the
+remaining documentation work for a real CMVP submission are in
+`docs/compliance/fips-readiness.md`.
+
+
+
 ### Phase 8 — OpenTelemetry refactor (Observability)
 
 **Breaking changes for embedders:**
