@@ -101,14 +101,24 @@ impl HybridSecretKey {
         // exactly one path.
         #[cfg(not(feature = "fips"))]
         let (classical_sk, classical_pk_bytes) = {
-            let sk = StaticSecret::random_from_rng(&mut rng);
+            let sk = StaticSecret::random_from_rng(rng);
             let pk = X25519PublicKey::from(&sk);
             (sk, *pk.as_bytes())
         };
         #[cfg(feature = "fips")]
         let (classical_sk, classical_pk_bytes) = {
+            // PANIC-SAFETY: `PrivateKey::generate` only fails when the
+            // underlying AWS-LC random source is broken — same failure
+            // mode as `getrandom` on the default build, where we also
+            // panic via `OsRng`. `compute_public_key` derives a
+            // P-256 public from a fresh, just-generated valid private,
+            // which cannot fail. A failure here means the FIPS module
+            // is in a non-recoverable state; loud panic is the correct
+            // surface for the embedder.
+            #[allow(clippy::expect_used)]
             let sk = PrivateKey::generate(&ECDH_P256)
                 .expect("aws-lc-rs ECDH-P-256 generate must succeed");
+            #[allow(clippy::expect_used)]
             let pk = sk
                 .compute_public_key()
                 .expect("aws-lc-rs ECDH-P-256 compute_public_key must succeed");
@@ -149,7 +159,7 @@ impl HybridSecretKey {
             // fails before the closure runs.
             agree(
                 &self.classical_sk,
-                &peer,
+                peer,
                 anyhow::anyhow!("aws-lc-rs ECDH-P-256 agree failed (peer key parse)"),
                 |km| -> Result<[u8; 32], anyhow::Error> {
                     // ECDH-P-256 shared secret is the 32-byte X coordinate.
@@ -209,7 +219,7 @@ impl HybridKeyPackage {
         // 1. Classical ECDH: fresh ephemeral on the sender side.
         #[cfg(not(feature = "fips"))]
         let (eph_pk_bytes, classical_shared) = {
-            let eph_sk = StaticSecret::random_from_rng(&mut rng);
+            let eph_sk = StaticSecret::random_from_rng(rng);
             let eph_pk = X25519PublicKey::from(&eph_sk);
             let peer = X25519PublicKey::from(self.classical_pk);
             let shared = eph_sk.diffie_hellman(&peer);
@@ -228,7 +238,7 @@ impl HybridKeyPackage {
             let peer = UnparsedPublicKey::new(&ECDH_P256, &self.classical_pk[..]);
             let shared = agreement::agree_ephemeral(
                 eph_sk,
-                &peer,
+                peer,
                 anyhow::anyhow!("aws-lc-rs ECDH-P-256 agree_ephemeral failed (peer parse)"),
                 |km| -> Result<[u8; 32], anyhow::Error> {
                     let mut o = [0u8; 32];
