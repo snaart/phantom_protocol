@@ -251,8 +251,11 @@ impl CryptoSession {
         let send_label = format!("{}send-v1", ctx);
         let recv_label = format!("{}recv-v1", ctx);
 
-        let key_a = blake3::derive_key(&send_label, shared_secret);
-        let key_b = blake3::derive_key(&recv_label, shared_secret);
+        // A5 — `crypto::kdf::derive_key_32` cfg-dispatches between
+        // `blake3::derive_key` (default) and HKDF-SHA256 (fips). The
+        // 32-byte output and label-string API are identical.
+        let key_a = crate::crypto::kdf::derive_key_32(&send_label, shared_secret);
+        let key_b = crate::crypto::kdf::derive_key_32(&recv_label, shared_secret);
 
         let (send_bytes, recv_bytes) = if swap { (key_b, key_a) } else { (key_a, key_b) };
 
@@ -262,7 +265,8 @@ impl CryptoSession {
         let recv_unbound = UnboundKey::new(algo, &recv_bytes)
             .map_err(|_| CoreError::CryptoError("Failed to create recv key".into()))?;
 
-        let prefix_bytes = blake3::derive_key("phantom-nonce-pfx-v1", shared_secret);
+        let prefix_bytes =
+            crate::crypto::kdf::derive_key_32("phantom-nonce-pfx-v1", shared_secret);
         let mut nonce_prefix = [0u8; 4];
         nonce_prefix.copy_from_slice(&prefix_bytes[..4]);
 
