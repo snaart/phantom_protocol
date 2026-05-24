@@ -76,7 +76,7 @@ pub fn ensure_post_passed() -> Result<(), SelfTestError> {
     }
     #[cfg(not(test))]
     {
-        POST_RESULT.get_or_init(run_post).clone()
+        *POST_RESULT.get_or_init(run_post)
     }
 }
 

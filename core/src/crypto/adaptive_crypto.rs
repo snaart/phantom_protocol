@@ -146,12 +146,13 @@ pub fn negotiate_cipher(
     {
         let _ = server_caps;
         if client_preferred.contains(&CipherSuite::Aes256Gcm) {
-            return Ok(CipherSuite::Aes256Gcm);
+            Ok(CipherSuite::Aes256Gcm)
+        } else {
+            Err(CoreError::CipherSuiteUnavailable(
+                "no FIPS-approved cipher suite in client offer (only AES-256-GCM is approved under fips)"
+                    .into(),
+            ))
         }
-        return Err(CoreError::CipherSuiteUnavailable(
-            "no FIPS-approved cipher suite in client offer (only AES-256-GCM is approved under fips)"
-                .into(),
-        ));
     }
     #[cfg(not(feature = "fips"))]
     {
