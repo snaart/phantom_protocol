@@ -5,7 +5,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
-#[derive(uniffi::Object)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct PhantomStream {
     stream_id: u32,
     /// Channel to send data to the session to be packaged and sent
@@ -24,7 +24,7 @@ impl PhantomStream {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 impl PhantomStream {
     pub fn stream_id(&self) -> u32 {
         self.stream_id

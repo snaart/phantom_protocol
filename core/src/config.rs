@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-#[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+#[derive(Debug, Clone)]
 pub struct PhantomConfig {
     /// Interval between keep-alive pings
     pub keepalive_interval: Duration,
