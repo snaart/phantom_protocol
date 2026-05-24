@@ -32,6 +32,22 @@ use std::sync::Arc;
 pub const EARLY_DATA_MAX_LEN: usize = 16 * 1024;
 
 /// Handshake processing stages
+/// Compile-time protocol-variant tag, baked into every `ClientHello`
+/// (cleartext field) **and** the signed handshake transcript. Peers
+/// reject mismatched variants up front with
+/// [`HandshakeError::ProtocolVariantMismatch`]; even an attacker who
+/// rewrites the cleartext field cannot escape detection because the
+/// transcript signature is computed over the build's own variant.
+///
+/// A4 — the `--features fips` build advertises `phantom-fips-1` so a
+/// fips client and a non-fips server (or vice versa) fail loudly at
+/// handshake time rather than producing a silently-wrong shared
+/// secret across mismatched primitive sets.
+#[cfg(not(feature = "fips"))]
+pub const PROTOCOL_VARIANT: &[u8] = b"phantom-default-1";
+#[cfg(feature = "fips")]
+pub const PROTOCOL_VARIANT: &[u8] = b"phantom-fips-1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeStage {
     /// Initial state, no messages exchanged
@@ -61,6 +77,12 @@ pub struct ClientHello {
     pub pow_solution: Option<PoWSolution>,
     /// Optional session ID for 0-RTT resumption
     pub resume_session_id: Option<[u8; 32]>,
+    /// Cleartext copy of [`PROTOCOL_VARIANT`]. Lets the server reject
+    /// a mismatched-mode client up front (before signature
+    /// verification); the same value is bound into the handshake
+    /// transcript so an attacker rewriting this field on the wire is
+    /// still caught by the signature check.
+    pub protocol_variant: Vec<u8>,
 }
 
 /// V3 ClientHello — carries 0-RTT early-data alongside the base
@@ -180,6 +202,11 @@ pub enum HelloRetryRequestEnvelope {
 /// Handshake transcript for signing (V1 / V2 path).
 #[derive(BorshSerialize)]
 struct HandshakeTranscript<'a> {
+    /// Build-side [`PROTOCOL_VARIANT`] tag — see the constant's doc
+    /// comment. Both peers MUST plumb the same byte string for the
+    /// signature to verify; a cross-mode (fips ↔ non-fips) attempt
+    /// fails the client-side signature check.
+    protocol_variant: &'a [u8],
     client_hello: &'a ClientHello,
     server_key_package: &'a HybridKeyPackage,
     ciphertext: &'a HybridCiphertext,
@@ -193,6 +220,9 @@ struct HandshakeTranscript<'a> {
 /// or stripped early-data blob breaks the client-side signature check.
 #[derive(BorshSerialize)]
 struct HandshakeTranscriptV3<'a> {
+    /// Build-side [`PROTOCOL_VARIANT`] tag — same role as in the
+    /// V1/V2 transcript.
+    protocol_variant: &'a [u8],
     client_hello: &'a ClientHelloV3,
     server_key_package: &'a HybridKeyPackage,
     ciphertext: &'a HybridCiphertext,
@@ -365,6 +395,20 @@ impl HandshakeServer {
         // load counter reflects attempts (including the rejected ones).
         self.record_handshake();
 
+        // A4 — protocol-variant gate. Fail loud (before any KEM /
+        // signature work) if the client and server disagree on the
+        // build-side `PROTOCOL_VARIANT` tag. The transcript also
+        // binds this constant, so an MITM rewrite of the cleartext
+        // field is caught on the client's signature check; this
+        // explicit field gives operators a clean diagnostic instead
+        // of "Signature check failed".
+        if client_hello.protocol_variant != PROTOCOL_VARIANT {
+            return HandshakeResponse::Fail(HandshakeError::ProtocolVariantMismatch {
+                expected: PROTOCOL_VARIANT.to_vec(),
+                received: client_hello.protocol_variant.clone(),
+            });
+        }
+
         // 1. Version negotiation (Phase 1.8).
         //
         // Two wire formats are currently defined: V1 (stable) and V2
@@ -430,8 +474,9 @@ impl HandshakeServer {
         let session_id_bytes = derive_session_id(&shared_secret, &client_hello.nonce);
         let session_id = SessionId::from_bytes(session_id_bytes);
 
-        // 5. Sign Transcript
+        // 5. Sign Transcript (includes PROTOCOL_VARIANT — see constant doc)
         let transcript = HandshakeTranscript {
+            protocol_variant: PROTOCOL_VARIANT,
             client_hello,
             server_key_package: &ephemeral_kem_public,
             ciphertext: &ciphertext,
@@ -497,6 +542,15 @@ impl HandshakeServer {
         self.record_handshake();
         let client_hello = &ch3.base;
 
+        // A4 — protocol-variant gate (same as V1/V2 path; see comment
+        // in `process_client_hello`).
+        if client_hello.protocol_variant != PROTOCOL_VARIANT {
+            return HandshakeResponse::Fail(HandshakeError::ProtocolVariantMismatch {
+                expected: PROTOCOL_VARIANT.to_vec(),
+                received: client_hello.protocol_variant.clone(),
+            });
+        }
+
         // The V3 envelope already routed us here; the inner version
         // byte must agree (defense-in-depth — it is transcript-bound).
         if client_hello.version != 3 {
@@ -547,8 +601,10 @@ impl HandshakeServer {
 
         // V3 transcript — covers the WHOLE `ClientHelloV3`, including the
         // early-data ciphertext, so a tampered or stripped blob breaks
-        // the client-side signature check.
+        // the client-side signature check. PROTOCOL_VARIANT is bound
+        // here as well (see constant doc).
         let transcript = HandshakeTranscriptV3 {
+            protocol_variant: PROTOCOL_VARIANT,
             client_hello: ch3,
             server_key_package: &ephemeral_kem_public,
             ciphertext: &ciphertext,
@@ -820,6 +876,7 @@ impl HandshakeClient {
             cookie: None,
             pow_solution: None,
             resume_session_id: None,
+            protocol_variant: PROTOCOL_VARIANT.to_vec(),
         }
     }
 
@@ -841,6 +898,7 @@ impl HandshakeClient {
             cookie: None,
             pow_solution: None,
             resume_session_id: Some(resume_session_id),
+            protocol_variant: PROTOCOL_VARIANT.to_vec(),
         }
     }
 
@@ -871,6 +929,7 @@ impl HandshakeClient {
             cookie: None,
             pow_solution: None,
             resume_session_id: Some(resume_session_id),
+            protocol_variant: PROTOCOL_VARIANT.to_vec(),
         };
         let sealed = early_data
             .and_then(|pt| seal_early_data(resumption_secret, &self.nonce, &resume_session_id, pt));
@@ -900,8 +959,10 @@ impl HandshakeClient {
             }
         }
 
-        // 2. Verify Signature
+        // 2. Verify Signature (binds PROTOCOL_VARIANT — a fips↔non-fips
+        // mismatch fails this check rather than landing a wrong secret)
         let transcript = HandshakeTranscript {
+            protocol_variant: PROTOCOL_VARIANT,
             client_hello,
             server_key_package: &server_hello.server_key_package,
             ciphertext: &server_hello.ciphertext,
@@ -983,8 +1044,9 @@ impl HandshakeClient {
             }
         }
 
-        // 2. Verify Signature over the V3 transcript.
+        // 2. Verify Signature over the V3 transcript (binds PROTOCOL_VARIANT).
         let transcript = HandshakeTranscriptV3 {
+            protocol_variant: PROTOCOL_VARIANT,
             client_hello,
             server_key_package: &base.server_key_package,
             ciphertext: &base.ciphertext,
@@ -1243,6 +1305,14 @@ pub enum HandshakeError {
     ClockBackwards,
     #[error("internal handshake error: {0}")]
     InternalError(String),
+    /// The peer advertised a build-side [`PROTOCOL_VARIANT`] that does
+    /// not match this build's. Today: a fips client meeting a non-fips
+    /// server, or vice versa.
+    #[error("protocol variant mismatch (expected {expected:?}, received {received:?})")]
+    ProtocolVariantMismatch {
+        expected: Vec<u8>,
+        received: Vec<u8>,
+    },
 }
 
 impl From<HandshakeError> for CoreError {
@@ -1254,6 +1324,62 @@ impl From<HandshakeError> for CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A4 — a `ClientHello` advertising a foreign `PROTOCOL_VARIANT`
+    /// (simulating a fips/non-fips cross-mode connect) is rejected by
+    /// the server with [`HandshakeError::ProtocolVariantMismatch`]
+    /// before any KEM / signature work is done.
+    #[tokio::test]
+    async fn protocol_variant_mismatch_rejected() {
+        let server = HandshakeServer::new().expect("HandshakeServer::new");
+        let client = HandshakeClient::new().expect("HandshakeClient::new");
+        let client_ip = "127.0.0.1".parse().expect("parse client_ip");
+
+        let mut hello = client.create_client_hello();
+        // Pretend the peer was compiled with a different feature set.
+        hello.protocol_variant = b"phantom-some-other-mode-1".to_vec();
+
+        let response = server.process_client_hello(&hello, 0, client_ip);
+        match response {
+            HandshakeResponse::Fail(HandshakeError::ProtocolVariantMismatch {
+                expected,
+                received,
+            }) => {
+                assert_eq!(expected, PROTOCOL_VARIANT);
+                assert_eq!(received, b"phantom-some-other-mode-1");
+            }
+            other => panic!("expected ProtocolVariantMismatch, got {other:?}"),
+        }
+    }
+
+    /// Tampering with the cleartext `protocol_variant` to match the
+    /// server's value (an MITM bypass attempt) is caught by the
+    /// transcript signature: the transcript still binds the *real*
+    /// build-side `PROTOCOL_VARIANT` on each side, so a mixed-mode
+    /// signature does not verify. This test exercises the matching
+    /// path on the same build (cannot actually run mixed-mode in a
+    /// single binary) — we just confirm a normal handshake works
+    /// with the variant intact.
+    #[tokio::test]
+    async fn handshake_succeeds_with_matching_protocol_variant() {
+        let server = HandshakeServer::new().expect("HandshakeServer::new");
+        let client = HandshakeClient::new().expect("HandshakeClient::new");
+        let client_ip = "127.0.0.1".parse().expect("parse client_ip");
+        let hello = client.create_client_hello();
+        assert_eq!(hello.protocol_variant, PROTOCOL_VARIANT);
+        // First round: server demands cookie.
+        let response = server.process_client_hello(&hello, 0, client_ip);
+        let cookie = match response {
+            HandshakeResponse::Retry(r) => r.cookie.expect("cookie"),
+            other => panic!("expected retry, got {other:?}"),
+        };
+        let mut hello_retry = hello.clone();
+        hello_retry.cookie = Some(cookie);
+        match server.process_client_hello(&hello_retry, 0, client_ip) {
+            HandshakeResponse::Success(_, _) => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn test_unified_handshake() {

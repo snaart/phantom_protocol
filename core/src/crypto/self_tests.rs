@@ -92,10 +92,17 @@ pub enum SelfTestError {
 /// cryptographic module). Designed to be called once at process start.
 ///
 /// Cost: a single hybrid KEM keygen + encap/decap + a single hybrid
-/// signature gen + sign + verify, plus two AEAD round-trips and one HKDF
-/// expansion. Around 1-5 ms on a modern host; FIPS-mandated regardless.
+/// signature gen + sign + verify, plus one or two AEAD round-trips
+/// and one HKDF expansion. Around 1-5 ms on a modern host;
+/// FIPS-mandated regardless.
+///
+/// Under `--features fips` only the FIPS-approved AEAD (AES-256-GCM)
+/// is exercised; `CryptoSession::with_suite` rejects ChaCha20-Poly1305
+/// in that configuration, and the POST refuses to run a primitive the
+/// production build cannot use.
 pub fn run_post() -> Result<(), SelfTestError> {
     test_aead(CipherSuite::Aes256Gcm, "AES-256-GCM")?;
+    #[cfg(not(feature = "fips"))]
     test_aead(CipherSuite::ChaCha20Poly1305, "ChaCha20-Poly1305")?;
     test_hkdf_sha256()?;
     test_hybrid_kem()?;
@@ -255,6 +262,9 @@ mod tests {
     #[test]
     fn aead_test_passes_for_both_suites() {
         test_aead(CipherSuite::Aes256Gcm, "AES-256-GCM").unwrap();
+        // ChaCha20-Poly1305 is rejected under `--features fips`
+        // (A3); only exercise it on non-fips builds.
+        #[cfg(not(feature = "fips"))]
         test_aead(CipherSuite::ChaCha20Poly1305, "ChaCha20-Poly1305").unwrap();
     }
 
