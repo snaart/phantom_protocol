@@ -101,6 +101,16 @@ no-std = []
 # the audit trail shows when the surface was reserved.
 fips = ["std"]
 
+# WasiLeg transport + WasiRuntime for `wasm32-wasi*` targets (Section B
+# of the pre-1.0 deferred-followups plan). Pulls in the `wasi` crate
+# (>= 0.14, Preview 2 stable) only on `cfg(target_os = "wasi")`, so
+# enabling this feature on non-WASI hosts is a no-op at the dep level.
+# Mutually exclusive with `wasm32-unknown-unknown` (browser) — the
+# `wasi` crate's WIT bindings do not target the browser; a
+# `compile_error!` in `core/src/lib.rs` rejects the combination
+# explicitly.
+wasi-leg = ["std", "dep:wasi"]
+
 # OpenTelemetry pipeline (Phase 8). Off by default; the `core` library exposes
 # OTel `Counter` / `Histogram` / `UpDownCounter` instruments to the embedder
 # when this is on. The library never installs a `MeterProvider` /
@@ -261,6 +271,15 @@ getrandom = { version = "0.2", features = ["js"] }
 # compile in the js-sys/wasm-bindgen backend. Adding it here as a forced direct
 # dep activates the feature for the whole transitive tree on this target.
 getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+# ─── WASI-only dependencies (Section B — wasi-leg) ────────────────────────
+# WASI Preview 2 bindings for the WasiLeg transport + WasiRuntime. Lives
+# under `cfg(target_os = "wasi")` so it is pulled in only when the
+# `wasi-leg` Cargo feature is active AND the build target is a WASI
+# triple (wasm32-wasi, wasm32-wasip1, wasm32-wasip2). Non-WASI builds
+# (including wasm32-unknown-unknown) never see this crate in their graph.
+[target.'cfg(target_os = "wasi")'.dependencies]
+wasi = { version = "0.14", optional = true }
 
 [dev-dependencies]
 blake3 = "1.5"
