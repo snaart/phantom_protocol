@@ -26,17 +26,23 @@ small and reviewed.
 | 6 | `core/src/transport/legs/faketls.rs` | 650-660 | `FakeTlsLeg::default() -> Self::new().expect(...)` | `FakeTlsLeg::new` only fails if the underlying AES key init returns an error. The seed → key derivation is deterministic over fixed inputs and never returns errors with the current `ring` API. The `Default` impl exists for ergonomic test/setup use; callers in production paths use `FakeTlsLeg::new()` directly and propagate the error. Documented with `///` doc rather than `// PANIC-SAFETY:` because the panicking call is the entire body of the `Default::default` impl, not a buried sub-expression. |
 | 7 | `core/src/crypto/rng.rs` | 162-175 | `getrandom(dest).expect("OS RNG (getrandom) failed")` | `getrandom` only fails when the OS CSPRNG itself is broken or unavailable — an unrecoverable condition at this layer. Panicking loudly is preferable to silently producing zeros or propagating a partially-filled buffer that the caller would treat as good entropy. (Added Phase 3.8 with the `RngProvider` trait extraction.) |
 | 8 | `core/src/crypto/kdf.rs` | 42-56 | `hk.expand(EARLY_DATA_{KEY,NONCE}_INFO, ...).expect(...)` (×2) | `Hkdf::expand` only fails when the requested output length exceeds 255 × HashLen (= 8160 bytes for SHA-256). The two outputs here are 32 bytes (AEAD key) and 12 bytes (AEAD nonce), both compile-time constants far below the ceiling. (Added Phase 4.1 alongside the V3 0-RTT early-data keying.) |
+| 9 | `core/src/runtime/wasi_runtime.rs` | 83-110 | `self.inner.tasks.lock().expect("WasiRuntime task queue mutex poisoned")` (in `drive`) | The mutex is `std::sync::Mutex` over the private `tasks: Vec<TaskSlot>` field of `WasiInner`. Only ever held briefly inside `drive`, `spawn`, and `tasks_pending`. A poison would mean a panic occurred inside one of those calls — by which point the runtime state is unrecoverable. (Added Section B / B2 alongside the `wasi-leg` feature; mirrors the `EmbeddedRuntime` mutex pattern.) |
+| 10 | `core/src/runtime/wasi_runtime.rs` | 133-141 | same `.expect(...)` in `tasks_pending` | Same `tasks` mutex as Site 9; query-only path. |
+| 11 | `core/src/runtime/wasi_runtime.rs` | 144-160 | same `.expect(...)` in `spawn` | Same `tasks` mutex as Site 9; write path that pushes a `TaskSlot`. |
+| 12 | `core/src/transport/legs/wasi.rs` | 149-168 | `self.output.lock().expect("WasiLeg output mutex poisoned")` (in `send_bytes`) | The mutex is `std::sync::Mutex<OutputStream>` over a private field of `WasiLeg`, constructed once in `connect()` and never replaced. Only held by `send_bytes`. A poison would only arise from a panic inside an earlier `send_bytes` call — the underlying WASI `OutputStream` is then in an indeterminate state and not recoverable. (Section B / B3.) |
+| 13 | `core/src/transport/legs/wasi.rs` | 170-196 | `self.read.lock().expect("WasiLeg read mutex poisoned")` (in `recv_bytes`) | Same shape as Site 12; mutex covers `(InputStream, BytesMut)` so the per-direction accumulator's lifetime tracks the reader's. Only held by `recv_bytes`. |
 
 ## Unsafe Blocks
 
-The crate is `#![deny(unsafe_code)]` at the root (`core/src/lib.rs:39`). Two
+The crate is `#![deny(unsafe_code)]` at the root (`core/src/lib.rs:39`). Three
 modules opt in with module-level `#![allow(unsafe_code)]` plus per-block
 `// SAFETY:` comments:
 
 | Module | Why `unsafe` |
 | --- | --- |
 | `core/src/transport/udp_transport.rs` | libc GSO / `recvmmsg` / `sendmmsg` syscalls — must construct `mmsghdr` via `MaybeUninit::zeroed()` and call FFI with raw fd. Each block has a SAFETY line explaining lifetime, ownership, and validity invariants. Native (`cfg(not(target_arch = "wasm32"))`) only. |
-| `core/src/transport/legs/websocket.rs` | wasm-bindgen-generated JS-boundary glue (`#[wasm_bindgen]` extern blocks). `wasm32-*` target only. |
+| `core/src/transport/legs/websocket.rs` | wasm-bindgen-generated JS-boundary glue (`#[wasm_bindgen]` extern blocks). `wasm32-*` browser target only (`cfg(all(target_arch = "wasm32", target_os = "unknown"))`). |
+| `core/src/transport/legs/wasi.rs` | `unsafe impl Send` + `unsafe impl Sync` for `WasiLeg`. The WIT-bindgen `Resource<TcpSocket>` / `Resource<InputStream>` / `Resource<OutputStream>` types hide an opaque numeric host handle and are `!Send + !Sync` by default. The internal `std::sync::Mutex` wrappers enforce single-accessor discipline; the unsafe impl is the contract that any cross-thread access goes through that mutex. WASI Preview 2 today provides no thread primitive, so the contract is vacuously satisfied — the explicit `unsafe impl` (plus the SAFETY block in the file) keeps the argument auditable if a future WASI threading proposal stabilizes. `cfg(all(feature = "wasi-leg", target_os = "wasi"))` only. |
 
 The pre-Phase-5.1 opt-in `core/src/crypto/keys.rs` was deleted when the crate
 moved off `pqcrypto-internals` (see commit `7c7bde7`). The pure-Rust RustCrypto

@@ -13,7 +13,7 @@ the foundation and security-hardening phases of the production-readiness
 roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
 132; the new ten cover the documented security invariants directly.
 
-### Added — `wasi-leg` Cargo feature (commits `9b31266`..`e41b583`)
+### Added — `wasi-leg` Cargo feature (commits `f4828c2`..`307b43e`)
 
 **`cargo build --target wasm32-wasip2 --features wasi-leg` is now a
 shipped configuration.** Phantom Core embedders can run inside any
@@ -47,6 +47,17 @@ UniFFI's exported-symbol metadata is incompatible with
 `#[uniffi::*]` attribute in `core/src/{api/*,errors,config,lib,
 bin/uniffi-bindgen}` was wrapped in `#[cfg_attr(feature =
 "bindings", …)]`.
+
+**Breaking for `--no-default-features --features std` consumers.**
+Default builds are unaffected (`default = ["compression-zstd", "std",
+"bindings"]`), and so is anything that opts into `default-features`.
+But a consumer pinning
+`phantom_core = { default-features = false, features = ["std"] }`
+used to get the UniFFI scaffolding for free via `std`; after this
+PR they must explicitly add `bindings`:
+`features = ["std", "bindings"]`. Pre-1.0 SemVer permits this, but
+the call-out is here so embedders pinning `std`-only do not see a
+silent removal of the `uniffi::Object` / `uniffi::Record` derives.
 
 **Cargo target-cfg refinement** — `core/Cargo.toml`'s
 `[target.'cfg(target_arch = "wasm32")']` block (the

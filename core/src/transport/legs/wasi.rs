@@ -28,15 +28,13 @@
 //! same gate as [`crate::runtime::WasiRuntime`].
 
 // SAFETY OPT-IN — the WIT-bindgen-generated `TcpSocket` /
-// `InputStream` / `OutputStream` resources are not auto-`Send`/`Sync`
-// because they wrap an opaque numeric handle (`Resource<T>`) whose
-// ownership semantics are not visible to the compiler. On WASI
-// Preview 2 the host runtime is single-task per instance — there are
-// no real threads to share a handle across — so the `Mutex` wrappers
-// inside `WasiLeg` provide all the synchronisation that is actually
-// needed. The `unsafe impl Send / Sync` blocks below assert that
-// invariant explicitly; they are the only `unsafe` opt-in in this
-// module.
+// `InputStream` / `OutputStream` resources wrap an opaque numeric
+// host handle (`Resource<T>`) and are `!Send + !Sync` by default
+// because the compiler cannot see the resource ownership semantics.
+// This module's `unsafe impl Send / Sync for WasiLeg` blocks override
+// that conservative bound; see the SAFETY block on the impls for the
+// soundness argument. Tracked as the third entry in
+// `docs/security/panic-sites.md`'s Unsafe Blocks table.
 #![allow(unsafe_code)]
 
 use std::net::SocketAddr;
@@ -51,8 +49,8 @@ use wasi::sockets::network::{
 use wasi::sockets::tcp::{InputStream, OutputStream, TcpSocket};
 use wasi::sockets::tcp_create_socket::create_tcp_socket;
 
-use crate::api::session::SessionTransport;
 use crate::errors::CoreError;
+use crate::transport::session_transport::SessionTransport;
 
 /// Same cap as `TcpSessionTransport::MAX_FRAME_BYTES`. Rejects an
 /// attacker-controlled length prefix that would otherwise drive
@@ -81,11 +79,30 @@ pub struct WasiLeg {
     _socket: TcpSocket,
 }
 
-// SAFETY: the WIT-bindgen `TcpSocket` / `InputStream` / `OutputStream`
-// resources hide a numeric host handle. Each handle is unique to a
-// single resource; we move (never share) ownership across threads (of
-// which the WASI instance has none anyway). The `Mutex` wrappers
-// provide the actual synchronisation point.
+// SAFETY: WIT-bindgen `TcpSocket` / `InputStream` / `OutputStream`
+// each wrap an opaque numeric host handle (`Resource<T>`). The
+// `std::sync::Mutex` wrappers below are the only access path for the
+// handles after construction — every read and every write goes
+// through a `lock()`-guarded section. That single-accessor discipline
+// is what makes sending the handles across threads sound: at most one
+// thread holds the lock at any moment, so the handle is never
+// concurrently observed in two places.
+//
+// `WasiLeg` itself is the unit we mark `Send`/`Sync`. The argument
+// stands independently of WASI Preview 2's current single-task host
+// model: even if `wasi-threads` / `wasi-shared-everything-threads`
+// stabilizes and an embedder enables threading inside a WASI
+// instance, the mutex contract continues to hold. The `unsafe impl`
+// blocks are the contract that *this code* never hands the raw
+// handle to a second thread without going through the mutex; the
+// `Resource<T>` types are private, so no external code can break
+// that.
+//
+// One caveat: dropping a `Resource<T>` invokes the host's `resource-
+// drop` which is itself a WIT call. We rely on `std::sync::Mutex`'s
+// `Sync` bound to ensure no concurrent drop + access races; the
+// inner field's drop order (`output, read, _socket`) preserves the
+// WIT parent-after-children invariant.
 unsafe impl Send for WasiLeg {}
 unsafe impl Sync for WasiLeg {}
 
@@ -141,10 +158,7 @@ impl SessionTransport for WasiLeg {
         // method; a poison would only arise from a panic inside an
         // earlier `send_bytes` call, an unrecoverable state.
         #[allow(clippy::expect_used)]
-        let out = self
-            .output
-            .lock()
-            .expect("WasiLeg output mutex poisoned");
+        let out = self.output.lock().expect("WasiLeg output mutex poisoned");
         let len = (data.len() as u32).to_be_bytes();
         out.blocking_write_and_flush(&len)
             .map_err(|e| CoreError::NetworkError(format!("write length: {:?}", e)))?;
@@ -155,10 +169,7 @@ impl SessionTransport for WasiLeg {
 
     async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
         #[allow(clippy::expect_used)]
-        let mut guard = self
-            .read
-            .lock()
-            .expect("WasiLeg read mutex poisoned");
+        let mut guard = self.read.lock().expect("WasiLeg read mutex poisoned");
         let (input, accum) = &mut *guard;
 
         // Read the 4-byte big-endian length prefix.

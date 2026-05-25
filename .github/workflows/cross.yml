@@ -117,11 +117,28 @@ jobs:
           fi
         shell: bash
 
-  # B6 — host-side integration test that boots the `phantom-wasi-guest`
-  # fixture under `wasmtime` and round-trips a payload through
-  # `WasiLeg` against a native length-prefix echo server. Runs the
-  # `#[ignore]`-gated `core/tests/wasi_integration.rs` on a runner
-  # with a pinned `wasmtime` install.
+  # B6/B7 — wasi-leg coverage that needs a real WASI runtime.
+  #
+  # Two host-side integration tests live in
+  # `core/tests/wasi_integration.rs`:
+  #  - B5 byte-pipe round-trip (`block_on`-driven inside the guest);
+  #  - B7 runtime+leg composition (`WasiRuntime::drive`-driven —
+  #    closes the original review gap that the two pieces shipped
+  #    without joint test coverage).
+  # Both spawn the `phantom-wasi-guest` fixture under `wasmtime`.
+  #
+  # The in-tree `#[cfg(test)]` unit tests inside `wasi_runtime.rs`
+  # and `wasi.rs` are gated on `cfg(all(feature = "wasi-leg",
+  # target_os = "wasi"))` and therefore only compile under
+  # `cargo test --target wasm32-wasip2 --features wasi-leg --lib`.
+  # That command transitively pulls dev-dependencies (`criterion`,
+  # `proptest`, `uniffi`-test-helpers) that are not wasi-compatible
+  # at the source-of-truth crate level (e.g. `rusty-fork` /
+  # `wait-timeout` from proptest's `fork` feature). Until those
+  # upstream crates gain wasi support or get target-gated, the
+  # unit tests are exercised on the host build (`cargo test --lib`
+  # in `ci.yml`) for the cross-target pieces and by the integration
+  # tests above for the wasi-specific behaviour.
   wasi-integration:
     name: wasi-leg integration (wasmtime)
     runs-on: ubuntu-latest

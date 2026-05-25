@@ -195,6 +195,28 @@ impl SpawnHandleInner for WasiSpawnHandle {
 
 // ─── Sleep future ────────────────────────────────────────────────────────
 
+/// Deadline-polling sleep future. `poll` ignores its `Context` and
+/// checks `Instant::now() >= deadline` on every invocation, returning
+/// `Pending` otherwise.
+///
+/// **This future is coupled to [`WasiRuntime::drive`].** It does NOT
+/// subscribe to a `wasi:clocks/monotonic-clock` Pollable and so
+/// nothing will wake the task automatically — the only thing that
+/// makes a `WasiSleep` progress is the next `drive()` call. Used
+/// under any other executor (e.g. `futures::executor::block_on`
+/// without an outer polling loop) it will block forever.
+///
+/// The expected drive shape is:
+/// ```ignore
+/// while rt.tasks_pending() > 0 {
+///     rt.drive();
+///     rt.poll_until_progress(Duration::from_millis(100));
+/// }
+/// ```
+/// `poll_until_progress`'s timeout becomes the effective sleep
+/// granularity (~100 ms here); production embedders that care about
+/// sleep precision should either tighten that timeout or replace
+/// `WasiSleep` with a Pollable-subscribing variant.
 struct WasiSleep {
     deadline: Instant,
 }
