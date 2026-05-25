@@ -1,18 +1,29 @@
 //! Host-side integration tests for the WASI-leg surface
-//! (Section B / B5 of the pre-1.0 deferred-followups plan).
+//! (Section B / B5 + B7 of the pre-1.0 deferred-followups plan).
 //!
-//! The test:
-//!  1. Builds the `phantom-wasi-guest` fixture (a WASI Preview 2
-//!     binary that uses `phantom_core::transport::legs::wasi::
-//!     WasiLeg`) via `cargo build --target wasm32-wasip2`.
-//!  2. Stands up a native length-prefix-aware TCP echo server on a
-//!     loopback OS-chosen port.
-//!  3. Spawns `wasmtime run` with the guest, plumbing the chosen
-//!     port via `PHANTOM_PORT` env, and grants the guest the
-//!     `inherit-network` socket capability.
-//!  4. Asserts the guest exits with status 0 (the guest itself
-//!     asserts byte-equality between sent and echoed payload and
-//!     exits 2 on mismatch).
+//! Two `#[ignore]`-gated tests, both using the same
+//! `phantom-wasi-guest` fixture:
+//!  1. `wasi_guest_round_trips_payload_through_wasmtime` —
+//!     default mode (`futures::executor::block_on` inside the guest)
+//!     exercises `WasiLeg::connect / send / recv` standalone.
+//!  2. `wasi_guest_round_trips_payload_via_runtime_through_wasmtime` —
+//!     `PHANTOM_MODE=runtime` exercises the
+//!     `WasiRuntime::spawn` + `drive` + `poll_until_progress`
+//!     composition with `WasiLeg`. Added in B7 to close the
+//!     review-time gap that the two pieces were never tested
+//!     together.
+//!
+//! Both:
+//!  - build the `phantom-wasi-guest` fixture via `cargo build
+//!    --target wasm32-wasip2` (with the same toolchain that
+//!    compiled this test binary — see `env!("CARGO")` use);
+//!  - stand up a native length-prefix-aware TCP echo server on a
+//!    loopback OS-chosen port;
+//!  - spawn `wasmtime run` with the guest, plumbing the chosen port
+//!    via `PHANTOM_PORT` and granting the `inherit-network`
+//!    socket capability;
+//!  - assert the guest exits with status 0 and that the expected
+//!    `OK:` marker appears in stderr.
 //!
 //! `#[ignore]`-gated: requires `wasmtime` on PATH (≥ 25) and a
 //! `wasm32-wasip2` rustup target installed. CONTRIBUTING.md
@@ -37,8 +48,13 @@ fn guest_wasm() -> PathBuf {
 
 /// Build the wasi guest. Idempotent — re-runs are fast no-ops if
 /// nothing changed. Aborts the test on build failure.
+///
+/// Uses `env!("CARGO")` (the cargo that built this test) so the
+/// guest is compiled with the same toolchain. Falls back to bare
+/// `cargo` if the env var is somehow unset (cargo always sets it).
 fn build_guest() {
-    let out = Command::new("cargo")
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let out = Command::new(&cargo)
         .args([
             "build",
             "--manifest-path",
@@ -76,65 +92,93 @@ fn echo_once(mut stream: std::net::TcpStream) {
     let _ = stream.flush();
 }
 
-#[test]
-#[ignore]
-fn wasi_guest_round_trips_payload_through_wasmtime() {
-    // Step 1: build the guest. Skip the rest if wasm32-wasip2 isn't
-    // installed — surface that as a clear test skip rather than a
-    // confusing compile error.
-    let installed = Command::new("rustup")
+/// Returns `true` if both `wasm32-wasip2` is installed via rustup and
+/// `wasmtime` is on PATH. Print a `SKIP:` reason and return false
+/// otherwise — the tests treat that as a clear skip rather than a
+/// confusing compile / spawn error.
+fn wasi_runtime_available() -> bool {
+    let target_installed = Command::new("rustup")
         .args(["target", "list", "--installed"])
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("wasm32-wasip2"))
         .unwrap_or(false);
-    if !installed {
+    if !target_installed {
         eprintln!(
             "SKIP: wasm32-wasip2 target not installed (run `rustup target add wasm32-wasip2`)"
         );
-        return;
+        return false;
     }
     if Command::new("wasmtime").arg("--version").output().is_err() {
         eprintln!("SKIP: wasmtime not on PATH (install via `brew install wasmtime` or equivalent)");
+        return false;
+    }
+    true
+}
+
+/// Shared test body: build the guest, spin up an echo server on a
+/// loopback OS-chosen port, run the guest under `wasmtime` with
+/// `PHANTOM_PORT` set (and `PHANTOM_MODE` when non-empty), assert
+/// the guest exits 0 and prints `expected_marker` to stderr.
+fn run_guest_round_trip(mode: &str, expected_marker: &str) {
+    if !wasi_runtime_available() {
         return;
     }
     build_guest();
 
-    // Step 2: native echo server on loopback.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind echo server");
     let port = listener.local_addr().expect("local_addr").port();
     let server_thread = thread::spawn(move || {
-        // Accept exactly one connection; the guest sends one frame
-        // and exits.
         let (stream, _) = listener.accept().expect("accept");
         echo_once(stream);
     });
 
-    // Step 3: spawn wasmtime with the guest.
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "-S".into(),
+        "inherit-network".into(),
+        "--env".into(),
+        format!("PHANTOM_PORT={port}"),
+    ];
+    if !mode.is_empty() {
+        args.push("--env".into());
+        args.push(format!("PHANTOM_MODE={mode}"));
+    }
+
     let out = Command::new("wasmtime")
-        .args([
-            "run",
-            "-S",
-            "inherit-network",
-            "--env",
-            &format!("PHANTOM_PORT={port}"),
-        ])
+        .args(&args)
         .arg(guest_wasm())
         .output()
         .expect("spawn wasmtime");
 
-    // Step 4: assert success.
     let _ = server_thread.join();
     assert!(
         out.status.success(),
-        "wasi guest exited with non-zero status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        "wasi guest (mode={mode:?}) exited with non-zero status: {:?}\nstdout:\n{}\nstderr:\n{}",
         out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("OK: round-tripped"),
-        "expected success marker in guest stderr; got:\n{stderr}"
+        stderr.contains(expected_marker),
+        "expected marker {expected_marker:?} in guest stderr (mode={mode:?}); got:\n{stderr}"
     );
+}
+
+/// B5 — proves `WasiLeg::connect / send / recv` work via
+/// `futures::executor::block_on` (the simplest possible driver).
+#[test]
+#[ignore]
+fn wasi_guest_round_trips_payload_through_wasmtime() {
+    run_guest_round_trip("", "OK: round-tripped");
+}
+
+/// B7 — proves the `WasiRuntime` + `WasiLeg` composition works
+/// end-to-end. Closes the review gap that the two pieces shipped
+/// without any integration coverage of their joint use.
+#[test]
+#[ignore]
+fn wasi_guest_round_trips_payload_via_runtime_through_wasmtime() {
+    run_guest_round_trip("runtime", "OK: runtime-driven round-trip");
 }
