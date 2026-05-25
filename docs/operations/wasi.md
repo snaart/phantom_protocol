@@ -1,6 +1,6 @@
 # wasm32-wasi (Preview 2) — shipped
 
-`wasm32-wasip2` is a hard CI gate (since commits `9b31266`..`e41b583`). This page
+`wasm32-wasip2` is a hard CI gate (since commits `f4828c2`..`307b43e`). This page
 is the quickstart for embedders running Phantom Core inside a WASI
 Preview 2 host (Wasmtime, WasmEdge, Spin, wasmCloud, Cloudflare
 Workers WASI sandbox).
@@ -9,12 +9,24 @@ Workers WASI sandbox).
 
 ```toml
 # Cargo.toml of a WASI guest using phantom_core
+[package]
+name = "my-wasi-guest"
+version = "0.1.0"
+edition = "2021"
+
 [dependencies]
 phantom_core = { version = "0.2", default-features = false, features = ["std", "wasi-leg"] }
+futures = { version = "0.3", default-features = false, features = ["executor"] }
 
-[lib]
-crate-type = ["cdylib"]
+[[bin]]
+name = "my-wasi-guest"
+path = "src/main.rs"
 ```
+
+The `[[bin]]` form is what `wasmtime run …wasm` expects. A `[lib]
+crate-type = ["cdylib"]` setup produces a shared library with no
+entry point — useful for `jco`-style component-model imports, but
+not for the simple `fn main()` quickstart below.
 
 ```rust
 use std::net::SocketAddr;
