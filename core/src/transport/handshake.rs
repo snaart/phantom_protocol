@@ -1352,6 +1352,46 @@ mod tests {
         }
     }
 
+    /// A4 — V3 (0-RTT) path of the protocol-variant gate. A
+    /// `ClientHelloV3` advertising a foreign `PROTOCOL_VARIANT` is
+    /// rejected by `process_client_hello_v3` with
+    /// [`HandshakeError::ProtocolVariantMismatch`] before any
+    /// KEM / signature / early-data work is done.
+    ///
+    /// Parallels [`protocol_variant_mismatch_rejected`] (V1/V2 path).
+    /// The two paths share the same constant + transcript binding but
+    /// dispatch through different `process_client_hello_*` entry
+    /// points, so we lock the gate explicitly on both.
+    #[tokio::test]
+    async fn protocol_variant_mismatch_rejected_v3() {
+        let server = HandshakeServer::new().expect("HandshakeServer::new");
+        let client = HandshakeClient::new().expect("HandshakeClient::new");
+        let client_ip = "127.0.0.1".parse().expect("parse client_ip");
+
+        // Build a V3 ClientHello (any resume secret / id will do; the
+        // gate fires before either is touched).
+        let resume_session_id = [0u8; 32];
+        let resumption_secret = [0u8; 32];
+        let mut ch3 = client.create_client_hello_v3(resume_session_id, &resumption_secret, None);
+        assert_eq!(ch3.base.protocol_variant, PROTOCOL_VARIANT);
+
+        // Pretend the peer was compiled with a different feature set
+        // (cross-mode connect attempt).
+        ch3.base.protocol_variant = b"phantom-some-other-mode-1".to_vec();
+
+        let response = server.process_client_hello_v3(&ch3, 0, client_ip);
+        match response {
+            HandshakeResponse::Fail(HandshakeError::ProtocolVariantMismatch {
+                expected,
+                received,
+            }) => {
+                assert_eq!(expected, PROTOCOL_VARIANT);
+                assert_eq!(received, b"phantom-some-other-mode-1");
+            }
+            other => panic!("expected ProtocolVariantMismatch on V3 path, got {other:?}"),
+        }
+    }
+
     /// Tampering with the cleartext `protocol_variant` to match the
     /// server's value (an MITM bypass attempt) is caught by the
     /// transcript signature: the transcript still binds the *real*
