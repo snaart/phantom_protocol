@@ -32,19 +32,42 @@ non-FIPS-approved primitive call site:
   fips (label-compatible API).
 - **RNG** — `RngProvider for OsRng` swaps to
   `aws_lc_rs::rand::SystemRandom` (CTR_DRBG, SP 800-90A § 10.2.1).
-- **POST** — `crypto::self_tests::ensure_post_passed` is invoked
-  from `PhantomListener::bind*` and the UniFFI `connect_pinned*`
-  paths before any cryptographic work. Failure surfaces as
-  `CoreError::FipsSelfTestFailure(String)`.
+- **POST** — `crypto::self_tests::ensure_post_passed` is invoked from
+  every Phantom Core entry point that performs cryptographic work
+  before serving traffic: `PhantomListener::bind*`,
+  `PhantomSession::connect_with_transport*`,
+  `PhantomSession::connect_with_resumption`, and the UniFFI
+  `connect_pinned*` paths. Failure surfaces as
+  `CoreError::FipsSelfTestFailure(String)` on the fallible paths
+  (listener bind, `connect_with_resumption`, `connect_pinned*`) and as
+  a `ConnectionState::Failed` transition with the error in the log on
+  the infallible paths (`connect_with_transport*`, which return `Self`
+  by API contract).
 
-**Wire-format break** — fips ↔ non-fips peers cannot interoperate.
-The new `PROTOCOL_VARIANT` constant
-(`phantom-default-1` vs `phantom-fips-1`) is baked into the signed
-handshake transcript **and** carried in cleartext on every
-`ClientHello`. A mismatched-mode connect fails with
-`HandshakeError::ProtocolVariantMismatch` before any KEM/sign work,
-and the transcript binding catches any MITM attempt to rewrite the
-cleartext field.
+**Wire-format break (V1/V2 ClientHello)** — adding the
+`protocol_variant: Vec<u8>` field to `ClientHello` is a positional
+wire-format change. Because borsh is strict about trailing bytes,
+the impact is **bidirectional and generation-wide**, not just
+fips ↔ non-fips:
+
+- A pre-PR client cannot connect to a post-PR server (server
+  expects the new field, fails to deserialize the envelope).
+- A post-PR client cannot connect to a pre-PR server (server has
+  no slot for the trailer, deserialize errors on extra bytes).
+- A fips peer cannot connect to a non-fips peer of the same build
+  generation (the cleartext field mismatches up front, and the
+  signed transcript binds the build-side `PROTOCOL_VARIANT`).
+
+In short: **both peers must be on a post-PR build, and both must
+share the same `PROTOCOL_VARIANT`** (`phantom-default-1` for the
+default build, `phantom-fips-1` under `--features fips`). The
+`PROTOCOL_VARIANT` constant is baked into the signed handshake
+transcript on both the V1/V2 and V3 (0-RTT) paths, so an MITM
+rewriting the cleartext field is still caught by the
+signature-verify check. Pre-1.0 callers should treat this as a
+hard generation bump and rebuild both ends together; see
+`docs/migration/v2-to-v3.md` for the V3 envelope migration and the
+"FIPS variant" subsection there for the cross-mode policy.
 
 **Build constraints** — `fips` implies `std` and is mutually exclusive
 with `no-std` (compile_error in `core/src/lib.rs`). `aws-lc-rs`
