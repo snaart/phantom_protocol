@@ -41,13 +41,30 @@ pub const AEAD_OVERHEAD: usize = 16;
 /// mode.
 pub const AEAD_MAX_INVOCATIONS: u64 = 1u64 << 48;
 
-/// Supported cipher suites
+/// Supported cipher suites.
+///
+/// The wire byte for each variant is stable across feature configurations —
+/// `Aes256Gcm = 1`, `ChaCha20Poly1305 = 2` — so a peer's `CipherSuite`
+/// offer round-trips through `to_byte` / `from_byte` regardless of which
+/// build the peer is running. Under `--features fips` only `Aes256Gcm`
+/// is actually selectable; `ChaCha20Poly1305` is reserved for
+/// wire-format stability and is rejected at `negotiate_cipher` /
+/// `CryptoSession::with_suite{_peer}` with
+/// `CoreError::CipherSuiteUnavailable`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CipherSuite {
-    /// AES-256-GCM — optimal on HW-accelerated platforms
+    /// AES-256-GCM — optimal on HW-accelerated platforms.
+    /// FIPS-approved; the only suite selectable under `--features fips`.
     Aes256Gcm = 1,
-    /// ChaCha20-Poly1305 — optimal on SW-only platforms (IoT, old ARM)
+    /// ChaCha20-Poly1305 — optimal on SW-only platforms (IoT, old ARM).
+    ///
+    /// **Reserved for wire-format stability under `--features fips`.**
+    /// The variant remains in the enum so a peer's offer can still be
+    /// parsed and a clear `CipherSuiteUnavailable` error returned;
+    /// construction via `CryptoSession::with_suite{_peer}` and selection
+    /// in `negotiate_cipher` are explicitly rejected under fips. Not
+    /// FIPS-approved (RFC 7539 / 8439 — outside FIPS 140-3 Annex A).
     ChaCha20Poly1305 = 2,
 }
 
