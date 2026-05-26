@@ -237,7 +237,13 @@ socket2 = { version = "0.6", optional = true }
 # AWS-LC C library + bindgen pipeline does not target wasm32. macOS
 # hosts may need `brew install pkg-config openssl@3` for the first
 # build (see CONTRIBUTING.md).
-aws-lc-rs = { version = "1.17", optional = true, default-features = false, features = ["aws-lc-sys", "fips"] }
+#
+# Feature selection: `default-features = false` + `features = ["fips"]`.
+# In aws-lc-rs 1.17, the `fips` feature is mutually exclusive with the
+# default `aws-lc-sys` backend — it activates `dep:aws-lc-fips-sys`
+# (AWS-LC-FIPS 3.0.x) as the sole backend. Listing both `aws-lc-sys`
+# and `fips` would attempt to enable both backends and bloat the link.
+aws-lc-rs = { version = "1.17", optional = true, default-features = false, features = ["fips"] }
 
 # ─── WASM-only dependencies (Phase 3.3) ───────────────────────────────────
 # Pulled in only for `wasm32-*` builds. Non-WASM hosts never see these
