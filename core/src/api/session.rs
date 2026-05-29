@@ -43,7 +43,8 @@ fn new_session_id() -> String {
 ///
 /// The session is usable from the moment it's created — sends are queued
 /// until the handshake completes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ConnectionState {
     /// Connection initiated, handshake pending
@@ -104,7 +105,8 @@ impl ConnectionState {
 /// server it was negotiated against: the `resumption_secret` is
 /// server-pinned, and reusing a hint across servers is a configuration
 /// bug.
-#[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+#[derive(Debug, Clone)]
 pub struct ResumptionHint {
     /// The negotiated session id (32 bytes).
     pub session_id: Vec<u8>,
@@ -136,7 +138,7 @@ pub use crate::transport::session_transport::SessionTransport;
 ///
 /// The session progresses through states:
 /// `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
-#[derive(uniffi::Object)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct PhantomSession {
     /// Session identifier
     id: String,
@@ -1484,13 +1486,13 @@ async fn plaintext_into_router(
     recv_tx.send(bytes).await.is_ok()
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 impl PhantomSession {
     /// Create a new session — returns instantly.
     ///
     /// Handshake is not started until a transport is provided.
     /// Use `connect_with_transport()` for full integration.
-    #[uniffi::constructor]
+    #[cfg_attr(feature = "bindings", uniffi::constructor)]
     pub fn connect(peer_addr: String) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (_recv_tx, recv_rx) = mpsc::channel(256);
@@ -1700,7 +1702,7 @@ impl std::fmt::Debug for PhantomSession {
 // "wasm32"))`, mirroring `crate::api::tcp_transport`. Wasm consumers use
 // the in-tree `WebSocketLeg` instead.
 #[cfg(not(target_arch = "wasm32"))]
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 pub async fn connect_pinned(
     host: String,
     port: u16,
@@ -1754,7 +1756,7 @@ pub async fn connect_pinned(
 /// Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
 /// behind `cfg(not(target_arch = "wasm32"))`.
 #[cfg(not(target_arch = "wasm32"))]
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 pub async fn connect_pinned_with_resumption(
     host: String,
     port: u16,
