@@ -9,6 +9,7 @@ use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, Notify, Semaphore};
 
 const MAX_PENDING_PACKETS: usize = 1024;
@@ -39,6 +40,117 @@ struct PendingData {
     sent_at: Option<tokio::time::Instant>,
     #[allow(dead_code)]
     retries: u32,
+}
+
+/// RFC 6298 retransmission-timeout estimator (per stream). Replaces a fixed
+/// retransmit timer with one that tracks measured RTT (SRTT / RTTVAR) and backs
+/// off exponentially on consecutive timeouts.
+#[derive(Debug)]
+struct RtoEstimator {
+    /// Smoothed RTT; `None` until the first measurement.
+    srtt: Option<Duration>,
+    /// RTT variation estimate.
+    rttvar: Duration,
+    /// Number of consecutive timeouts (RTO is doubled `backoff_shift` times).
+    backoff_shift: u32,
+}
+
+impl RtoEstimator {
+    /// RFC 6298 (2.1): RTO before the first measurement.
+    const INITIAL_RTO: Duration = Duration::from_secs(1);
+    /// Floor — RFC's 1s minimum is too conservative for a low-latency transport.
+    const MIN_RTO: Duration = Duration::from_millis(200);
+    /// Ceiling, so a stalled path can't push the timer arbitrarily high.
+    const MAX_RTO: Duration = Duration::from_secs(60);
+    /// Clock-granularity term `G` in RFC 6298 (2.3).
+    const GRANULARITY: Duration = Duration::from_millis(1);
+    /// Cap on the backoff doubling (2^6 = 64×).
+    const MAX_BACKOFF_SHIFT: u32 = 6;
+
+    fn new() -> Self {
+        Self {
+            srtt: None,
+            rttvar: Duration::ZERO,
+            backoff_shift: 0,
+        }
+    }
+
+    /// Feed a fresh (non-retransmitted, per Karn) RTT measurement.
+    fn on_rtt_sample(&mut self, r: Duration) {
+        match self.srtt {
+            None => {
+                // RFC 6298 (2.2): first measurement.
+                self.srtt = Some(r);
+                self.rttvar = r / 2;
+            }
+            Some(srtt) => {
+                // RFC 6298 (2.3): RTTVAR = (1-1/4)·RTTVAR + 1/4·|SRTT-R|;
+                //                 SRTT  = (1-1/8)·SRTT  + 1/8·R.
+                let diff = if srtt > r { srtt - r } else { r - srtt };
+                self.rttvar = (self.rttvar * 3 + diff) / 4;
+                self.srtt = Some((srtt * 7 + r) / 8);
+            }
+        }
+        // A fresh measurement clears any accumulated backoff.
+        self.backoff_shift = 0;
+    }
+
+    /// Current RTO, honoring backoff and the floor / ceiling.
+    fn rto(&self) -> Duration {
+        // RFC 6298 (2.2)/(2.3): RTO = SRTT + max(G, K·RTTVAR), K = 4.
+        let base = match self.srtt {
+            None => Self::INITIAL_RTO,
+            Some(srtt) => srtt + std::cmp::max(Self::GRANULARITY, self.rttvar * 4),
+        };
+        // Exponential backoff (RFC 6298 (5.5)); saturate to MAX_RTO on overflow.
+        let scaled = base
+            .checked_mul(1u32 << self.backoff_shift)
+            .unwrap_or(Self::MAX_RTO);
+        scaled.clamp(Self::MIN_RTO, Self::MAX_RTO)
+    }
+
+    /// On a retransmission timeout: double the RTO (RFC 6298 (5.5)).
+    fn on_timeout(&mut self) {
+        self.backoff_shift = (self.backoff_shift + 1).min(Self::MAX_BACKOFF_SHIFT);
+    }
+}
+
+#[cfg(test)]
+mod rto_tests {
+    use super::RtoEstimator;
+    use std::time::Duration;
+
+    #[test]
+    fn follows_rfc6298_srtt_rttvar() {
+        let mut est = RtoEstimator::new();
+        // No samples yet → initial 1s.
+        assert_eq!(est.rto(), Duration::from_secs(1));
+        // First sample R=100ms: SRTT=100, RTTVAR=50, RTO = 100 + 4*50 = 300ms.
+        est.on_rtt_sample(Duration::from_millis(100));
+        assert_eq!(est.rto(), Duration::from_millis(300));
+        // A steady stream of identical samples drives RTTVAR→0, so RTO→SRTT,
+        // floored at MIN_RTO (200ms).
+        for _ in 0..50 {
+            est.on_rtt_sample(Duration::from_millis(100));
+        }
+        assert_eq!(est.rto(), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn backoff_doubles_and_fresh_sample_resets() {
+        let mut est = RtoEstimator::new();
+        est.on_rtt_sample(Duration::from_millis(100)); // RTO = 300ms
+        assert_eq!(est.rto(), Duration::from_millis(300));
+        est.on_timeout();
+        assert_eq!(est.rto(), Duration::from_millis(600));
+        est.on_timeout();
+        assert_eq!(est.rto(), Duration::from_millis(1200));
+        // A fresh measurement clears the backoff. This is a *second* sample, so
+        // RTTVAR shrinks 50ms → 37.5ms and RTO = 100 + 4*37.5 = 250ms. The key
+        // check is that backoff is gone: with shift still at 2 it would be 1000ms.
+        est.on_rtt_sample(Duration::from_millis(100));
+        assert_eq!(est.rto(), Duration::from_millis(250));
+    }
 }
 
 /// Stream - multiplexed data channel within a session
@@ -82,6 +194,10 @@ pub struct Stream {
     /// emitted `WINDOW_UPDATE`. Used to decide when to send the
     /// next update (avoid flooding the wire with tiny updates).
     bytes_since_last_update: AtomicU32,
+    /// RFC 6298 retransmission-timeout estimator. A plain (sync) mutex: it is
+    /// updated only from the serial ACK path and read by `poll_send`, and the
+    /// guard is never held across an `.await`.
+    rto: std::sync::Mutex<RtoEstimator>,
 }
 
 impl Stream {
@@ -104,7 +220,37 @@ impl Stream {
             peer_send_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
             local_recv_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
             bytes_since_last_update: AtomicU32::new(0),
+            rto: std::sync::Mutex::new(RtoEstimator::new()),
         }
+    }
+
+    // ── RFC 6298 retransmission timeout ──
+
+    /// Current retransmission timeout. A poisoned lock is recovered by taking
+    /// the inner value — the RTO is a heuristic, not a correctness invariant.
+    fn current_rto(&self) -> Duration {
+        match self.rto.lock() {
+            Ok(g) => g.rto(),
+            Err(poisoned) => poisoned.into_inner().rto(),
+        }
+    }
+
+    /// Feed a fresh RTT measurement into the RTO estimator.
+    fn record_rtt_sample(&self, rtt: Duration) {
+        let mut g = match self.rto.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        g.on_rtt_sample(rtt);
+    }
+
+    /// Tell the RTO estimator a segment timed out (exponential backoff).
+    fn note_rto_timeout(&self) {
+        let mut g = match self.rto.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        g.on_timeout();
     }
 
     /// Get stream ID
@@ -251,7 +397,8 @@ impl Stream {
 
         let mut buffer = self.send_buffer.lock().await;
         let now = tokio::time::Instant::now();
-        let timeout = std::time::Duration::from_millis(500);
+        // Adaptive RFC 6298 timeout (was a fixed 500ms).
+        let timeout = self.current_rto();
 
         // Find reliable data not yet sent or needing retransmission
         for pending in buffer.iter_mut() {
@@ -262,6 +409,8 @@ impl Stream {
                 if now.duration_since(sent_at) >= timeout {
                     pending.sent_at = Some(now);
                     pending.retries += 1;
+                    // Back the RTO off exponentially for the next attempt.
+                    self.note_rto_timeout();
                     return Some((pending.sequence, pending.data.clone(), true));
                 }
             }
@@ -278,14 +427,23 @@ impl Stream {
 
         // Find the packet and get its sent_at time
         if let Some(pos) = buffer.iter().position(|p| p.sequence == sequence) {
-            let pending = &buffer[pos];
-            if let Some(sent_at) = pending.sent_at {
-                result = Some((sent_at, pending.data.len() as u64));
-            }
+            let sent_at = buffer[pos].sent_at;
+            let retries = buffer[pos].retries;
+            let size = buffer[pos].data.len() as u64;
             buffer.remove(pos);
 
             // Released space, add permit back
             self.send_semaphore.add_permits(1);
+
+            if let Some(sent_at) = sent_at {
+                result = Some((sent_at, size));
+                // Karn's algorithm: only sample RTT from segments that were not
+                // retransmitted — an ACK for a resent sequence is ambiguous.
+                if retries == 0 {
+                    let rtt = tokio::time::Instant::now().duration_since(sent_at);
+                    self.record_rtt_sample(rtt);
+                }
+            }
         }
 
         result
@@ -463,12 +621,13 @@ mod tests {
         // Immediate poll should be None
         assert!(stream.poll_send().await.is_none());
 
-        // Advance time by 400ms (less than timeout)
+        // Advance 400ms — still under the initial 1s RTO (RFC 6298 (2.1):
+        // no RTT samples yet, so the timer sits at the 1-second default).
         tokio::time::advance(std::time::Duration::from_millis(400)).await;
         assert!(stream.poll_send().await.is_none());
 
-        // Advance time past 500ms
-        tokio::time::advance(std::time::Duration::from_millis(150)).await;
+        // Advance past the 1s initial RTO (total ~1.1s).
+        tokio::time::advance(std::time::Duration::from_millis(700)).await;
 
         // Now it should retransmit
         let (seq2, data2, is_reliable2) = stream.poll_send().await.unwrap();
