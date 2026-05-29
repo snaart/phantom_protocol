@@ -906,7 +906,15 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
     snapshot.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
     for (_priority, stream_id, stream) in snapshot {
-        while let Some(seg) = stream.poll_send().await {
+        loop {
+            // Bytes of new data the congestion window currently permits.
+            // Recomputed each iteration: every send grows inflight, so the
+            // budget shrinks and the drain stops once the window is full.
+            let snap = crypto_session.bandwidth_snapshot();
+            let budget = snap.cwnd_bytes.saturating_sub(snap.inflight_bytes);
+            let Some(seg) = stream.poll_send(budget).await else {
+                break;
+            };
             // A retransmission means the prior send was lost — tell congestion
             // control so BBR enters FastRecovery and the pacing rate backs off.
             if seg.retransmit {
@@ -2269,6 +2277,37 @@ mod tests {
             client.bbr_state(),
             BbrState::FastRecovery,
             "a retransmit must be reported to BBR as a loss"
+        );
+    }
+
+    /// New data must not be transmitted while inflight already exceeds the
+    /// congestion window — the drain holds it back until ACKs free the window.
+    #[tokio::test]
+    async fn drain_withholds_new_data_when_inflight_exceeds_cwnd() {
+        let sid = fixed_session_id();
+        let (client, _server) = paired_v2_sessions(sid);
+
+        // Drive inflight far above any plausible initial cwnd, so the window
+        // has no room for new data.
+        client.on_packet_sent(100_000_000);
+        let inflight_before = client.bandwidth_snapshot().inflight_bytes;
+
+        let stream = Arc::new(TransportStream::new(1));
+        stream.send_reliable(Bytes::from("new-data")).await;
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(1u32, stream);
+
+        let (client_t, _server_t) = ChannelTransport::pair();
+        let transport = Arc::new(client_t);
+
+        drain_streams_priority_ordered(&transport, &client, sid, &streams).await;
+
+        // No new segment was transmitted — inflight is unchanged (a send would
+        // have grown it via on_packet_sent).
+        assert_eq!(
+            client.bandwidth_snapshot().inflight_bytes,
+            inflight_before,
+            "no new data should be sent when inflight >= cwnd"
         );
     }
 
