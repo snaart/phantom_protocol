@@ -2227,7 +2227,7 @@ mod tests {
             .await
             .expect(
                 "reliable payload never arrived within 3s — the dropped data frame was not \
-                 retransmitted (loss recovery not yet implemented)",
+                 retransmitted (loss-recovery regression)",
             )
             .unwrap();
             let plain = decrypt_incoming(&server_session, &data_frame);
