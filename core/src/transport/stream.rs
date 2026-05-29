@@ -402,8 +402,14 @@ impl Stream {
     }
 
     /// Get the next segment to (re)transmit, or `None` if nothing is due.
-    pub async fn poll_send(&self) -> Option<OutboundSegment> {
-        // First check unreliable buffer (fire and forget)
+    ///
+    /// `cwnd_budget` is how many bytes of *new* data the congestion window
+    /// currently permits. Retransmissions ignore it — loss recovery must always
+    /// proceed — but a first transmission is withheld (`None`) when it would
+    /// exceed the budget, so the next drain resumes once ACKs free the window.
+    /// Pass `u64::MAX` to disable the limit.
+    pub async fn poll_send(&self, cwnd_budget: u64) -> Option<OutboundSegment> {
+        // Unreliable data is fire-and-forget and not congestion-controlled.
         if let Some((seq, data)) = self.unreliable_buffer.lock().await.pop_front() {
             return Some(OutboundSegment {
                 seq,
@@ -418,17 +424,9 @@ impl Stream {
         // Adaptive RFC 6298 timeout (was a fixed 500ms).
         let timeout = self.current_rto();
 
-        // Find reliable data not yet sent or needing retransmission
+        // Pass 1: a timed-out segment (retransmission) — always allowed.
         for pending in buffer.iter_mut() {
-            if pending.sent_at.is_none() {
-                pending.sent_at = Some(now);
-                return Some(OutboundSegment {
-                    seq: pending.sequence,
-                    data: pending.data.clone(),
-                    reliable: true,
-                    retransmit: false,
-                });
-            } else if let Some(sent_at) = pending.sent_at {
+            if let Some(sent_at) = pending.sent_at {
                 if now.duration_since(sent_at) >= timeout {
                     pending.sent_at = Some(now);
                     pending.retries += 1;
@@ -441,6 +439,23 @@ impl Stream {
                         retransmit: true,
                     });
                 }
+            }
+        }
+
+        // Pass 2: the next unsent segment, if it fits the congestion window.
+        // In-order: if the head unsent segment doesn't fit, stop (don't skip).
+        for pending in buffer.iter_mut() {
+            if pending.sent_at.is_none() {
+                if pending.data.len() as u64 > cwnd_budget {
+                    return None; // window full — wait for ACKs to free it
+                }
+                pending.sent_at = Some(now);
+                return Some(OutboundSegment {
+                    seq: pending.sequence,
+                    data: pending.data.clone(),
+                    reliable: true,
+                    retransmit: false,
+                });
             }
         }
 
@@ -620,19 +635,19 @@ mod tests {
         assert_eq!(stream.pending_send_count().await, 2);
 
         // Poll send twice, the second should be None because it's already sent and hasn't timed out
-        let seg = stream.poll_send().await.unwrap();
+        let seg = stream.poll_send(u64::MAX).await.unwrap();
         assert_eq!(seg.seq, 0);
         assert_eq!(seg.data, Bytes::from("hello"));
         assert!(seg.reliable);
         assert!(!seg.retransmit);
 
-        let seg2 = stream.poll_send().await.unwrap();
+        let seg2 = stream.poll_send(u64::MAX).await.unwrap();
         assert_eq!(seg2.seq, 1);
         assert_eq!(seg2.data, Bytes::from("world"));
         assert!(seg2.reliable);
         assert!(!seg2.retransmit);
 
-        assert!(stream.poll_send().await.is_none());
+        assert!(stream.poll_send(u64::MAX).await.is_none());
     }
 
     #[tokio::test]
@@ -644,24 +659,24 @@ mod tests {
         stream.send_reliable(Bytes::from("hello")).await;
 
         // First send — not a retransmission.
-        let seg = stream.poll_send().await.unwrap();
+        let seg = stream.poll_send(u64::MAX).await.unwrap();
         assert_eq!(seg.seq, 0);
         assert!(seg.reliable);
         assert!(!seg.retransmit);
 
         // Immediate poll should be None
-        assert!(stream.poll_send().await.is_none());
+        assert!(stream.poll_send(u64::MAX).await.is_none());
 
         // Advance 400ms — still under the initial 1s RTO (RFC 6298 (2.1):
         // no RTT samples yet, so the timer sits at the 1-second default).
         tokio::time::advance(std::time::Duration::from_millis(400)).await;
-        assert!(stream.poll_send().await.is_none());
+        assert!(stream.poll_send(u64::MAX).await.is_none());
 
         // Advance past the 1s initial RTO (total ~1.1s).
         tokio::time::advance(std::time::Duration::from_millis(700)).await;
 
         // Now it should retransmit — flagged as a retransmission.
-        let seg2 = stream.poll_send().await.unwrap();
+        let seg2 = stream.poll_send(u64::MAX).await.unwrap();
         assert_eq!(seg2.seq, 0);
         assert_eq!(seg2.data, Bytes::from("hello"));
         assert!(seg2.reliable);
@@ -672,7 +687,26 @@ mod tests {
         assert!(acked.is_some());
 
         // Poll again - queue is empty
-        assert!(stream.poll_send().await.is_none());
+        assert!(stream.poll_send(u64::MAX).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn poll_send_respects_the_cwnd_budget() {
+        let stream = Stream::new(1);
+        stream.send_reliable(Bytes::from("0123456789")).await; // 10 bytes
+        stream.send_reliable(Bytes::from("abcde")).await; // 5 bytes
+
+        // Budget of 10 admits the 10-byte head segment.
+        let seg = stream.poll_send(10).await.unwrap();
+        assert_eq!(seg.data.len(), 10);
+        assert!(!seg.retransmit);
+
+        // Budget of 4 is too small for the next (5-byte) segment → withheld.
+        assert!(stream.poll_send(4).await.is_none());
+
+        // A budget of 5 now admits it.
+        let seg2 = stream.poll_send(5).await.unwrap();
+        assert_eq!(seg2.data, Bytes::from("abcde"));
     }
 
     #[tokio::test]
