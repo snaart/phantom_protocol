@@ -115,7 +115,7 @@ fn derive_outer_keys(
     seed.extend_from_slice(&version.to_be_bytes());
     seed.extend_from_slice(sni.as_bytes());
 
-    // A5 — `crypto::kdf::derive_key_32` dispatches to `blake3::derive_key`
+    // `crypto::kdf::derive_key_32` dispatches to `blake3::derive_key`
     // by default and HKDF-SHA256 under `--features fips`. FakeTLS is
     // anti-DPI obfuscation only (the inner Phantom session provides the
     // real confidentiality + auth), but consistency with the rest of

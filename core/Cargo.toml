@@ -83,22 +83,19 @@ embedded = ["dep:embedded-io-async", "dep:async-lock"]
 # the `std` feature and all the std-bound optional deps it gates.
 no-std = []
 
-# FIPS 140-3 posture (Phase 5.5 → primitive-swap rollout in progress).
-# Pulls in `aws-lc-rs` (FIPS-validated AWS-LC bindings) as the substrate
-# for the primitive swap. While the rollout is in flight the build still
-# fails with a `compile_error!` in `core/src/lib.rs` until every commit
-# in the FIPS-primitive-swap series lands; the scaffold is removed by
-# commit A8. Roadmap, tracked in `docs/compliance/fips-readiness.md`:
+# FIPS 140-3 posture. Pulls in `aws-lc-rs` (FIPS-validated AWS-LC
+# bindings) as the substrate for the FIPS-approved primitive set:
 #
-#   - X25519 → ECDH-P-256 (A4)
-#   - `ring` AES-GCM → `aws-lc-rs` (A2)
-#   - drop ChaCha20-Poly1305 (A3)
-#   - blake3 → HKDF-SHA256 everywhere blake3 is currently used as a KDF (A5)
-#   - RNG via `aws-lc-rs::rand` (SP 800-90A CTR_DRBG) instead of getrandom (A6)
-#   - wire `crypto::self_tests::run_post()` into a startup hook (A7)
+#   - classical KEM half: X25519 → ECDH-P-256
+#   - AEAD: `ring` AES-GCM → `aws-lc-rs`
+#   - ChaCha20-Poly1305 dropped (not FIPS-approved)
+#   - KDF: blake3 → HKDF-SHA256 everywhere blake3 is used as a KDF
+#   - RNG: `aws-lc-rs::rand` (SP 800-90A CTR_DRBG) instead of getrandom
+#   - `crypto::self_tests::run_post()` wired into the bind/connect bootstrap
 #
-# Implies `std`; mutually exclusive with `no-std` (enforced in lib.rs from
-# A8 onwards). Native-only — `aws-lc-rs` does not support wasm32 targets.
+# Implies `std`; mutually exclusive with `no-std` (enforced by a
+# `compile_error!` in `core/src/lib.rs`). Native-only — `aws-lc-rs`
+# does not support wasm32 targets. See `docs/compliance/fips-readiness.md`.
 fips = ["std", "dep:aws-lc-rs"]
 
 # OpenTelemetry pipeline (Phase 8). Off by default; the `core` library exposes
