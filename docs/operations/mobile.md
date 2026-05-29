@@ -3,6 +3,11 @@
 Reference patterns for embedding a Phantom Core client in native iOS (Swift) and Android (Kotlin)
 apps via UniFFI bindings.
 
+> **Size budgeting:** concrete per-slice / per-ABI numbers and the
+> XCFramework / AAR aggregated totals live in
+> [`binary-sizes.md` §Tables 6 and 1](binary-sizes.md) — useful before
+> integrating the library into an existing App Store / Play Store bundle.
+
 ## iOS (Swift)
 
 **Build setup.** Compile three slices then assemble an XCFramework:

@@ -137,11 +137,18 @@ IndexedDB helper; use `web_sys::IdbDatabase` / `IdbObjectStore` directly.
 Phantom's wasm32 build pulls in ml-kem (FIPS 203), ml-dsa (FIPS 204), ring
 AES-256-GCM, and ChaCha20-Poly1305 unconditionally.
 
-**Measuring** (TBD — the wasm32 build was unblocked in Phase 3.5):
+**Concrete numbers** for the cdylib output (raw and after `wasm-opt -Oz`)
+live in [`binary-sizes.md` §Table 7](binary-sizes.md) — refreshed by
+[`scripts/measure-binary-sizes.sh`](../../scripts/measure-binary-sizes.sh).
+
+**Manual one-shot measurement**:
 
 ```sh
-wasm-pack build --release --target web -- --manifest-path phantom-wasm-client/Cargo.toml
-wc -c phantom-wasm-client/pkg/phantom_wasm_client_bg.wasm
+cargo build --release --target wasm32-unknown-unknown --manifest-path core/Cargo.toml
+wc -c target/wasm32-unknown-unknown/release/phantom_core.wasm
+# Optional: shrink with binaryen
+wasm-opt -Oz target/wasm32-unknown-unknown/release/phantom_core.wasm \
+    -o /tmp/phantom_core.opt.wasm && wc -c /tmp/phantom_core.opt.wasm
 ```
 
 **Shrinking options:**
