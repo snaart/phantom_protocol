@@ -251,6 +251,16 @@ impl PhantomSession {
         resumption_hint: ([u8; 32], [u8; 32]),
         early_data: Vec<u8>,
     ) -> Result<Self, CoreError> {
+        // fips bootstrap POST gate. `connect_with_resumption`
+        // returns `Result`, so unlike the infallible `connect_with_transport*`
+        // entry points we can surface the POST failure directly to the
+        // caller (mirrors the `PhantomListener::bind*` and
+        // `connect_pinned*` convention). The same POST is also checked
+        // in `background_task` as a defense-in-depth backstop.
+        #[cfg(feature = "fips")]
+        crate::crypto::self_tests::ensure_post_passed()
+            .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
+
         if early_data.len() > EARLY_DATA_MAX_LEN {
             return Err(CoreError::ValidationError(format!(
                 "early_data is {} bytes, exceeds the {}-byte 0-RTT cap",
@@ -427,6 +437,27 @@ impl PhantomSession {
         resumption_request: Option<([u8; 32], [u8; 32], Vec<u8>)>,
     ) {
         log::info!("PhantomSession: starting handshake with {}", peer);
+
+        // fips bootstrap POST gate, mirroring the listener and
+        // `connect_pinned*` paths: the synchronous Rust-only entry
+        // points (`connect_with_transport*` / `connect_with_resumption`)
+        // also need to honor FIPS 140-3 §7.7 before any cryptographic
+        // work. Cached `OnceLock` makes the second+ call an atomic
+        // read; the first call runs the full POST battery.
+        //
+        // On failure we cannot return a `CoreError` (the entry points
+        // are infallible by API contract) — instead we transition the
+        // state machine to `Failed` and bail, matching the existing
+        // handshake-failure shape. The error string lands in the log.
+        #[cfg(feature = "fips")]
+        if let Err(e) = crate::crypto::self_tests::ensure_post_passed() {
+            log::error!(
+                "PhantomSession: FIPS POST self-test failed; refusing to handshake: {:?}",
+                e
+            );
+            state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
+            return;
+        }
 
         // ── Stage 1 & 2: Hybrid Handshake (V12, or V3 0-RTT) ──
         let (crypto_session, ed_accepted) = match run_client_handshake(
@@ -1675,6 +1706,14 @@ pub async fn connect_pinned(
     port: u16,
     pinned_key: Vec<u8>,
 ) -> Result<Arc<PhantomSession>, CoreError> {
+    // fips bootstrap POST gate (same policy as
+    // `PhantomListener::bind_inner`). A failure here aborts the
+    // connect before any socket is opened or key material is
+    // touched.
+    #[cfg(feature = "fips")]
+    crate::crypto::self_tests::ensure_post_passed()
+        .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
+
     // Decode the server's hybrid verifying key. A malformed blob is a
     // crypto-layer problem (wrong length, wrong encoding) rather than a
     // network failure — surface it as `CryptoError`.
@@ -1723,6 +1762,12 @@ pub async fn connect_pinned_with_resumption(
     hint: ResumptionHint,
     early_data: Vec<u8>,
 ) -> Result<Arc<PhantomSession>, CoreError> {
+    // fips bootstrap POST gate (same policy as
+    // `connect_pinned`).
+    #[cfg(feature = "fips")]
+    crate::crypto::self_tests::ensure_post_passed()
+        .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
+
     // Server-key pinning stays mandatory (security invariant 1): a
     // malformed blob is a crypto-layer problem, surfaced as `CryptoError`.
     let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)

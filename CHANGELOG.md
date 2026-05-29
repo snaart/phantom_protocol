@@ -13,6 +13,80 @@ the foundation and security-hardening phases of the production-readiness
 roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
 132; the new ten cover the documented security invariants directly.
 
+### Security — FIPS 140-3 primitive swap (commits `613473a`..`5dd39c7`)
+
+**`cargo build --features fips` is now a shipped configuration.** The
+scaffold `compile_error!` from commit `d4d121b` is removed; enabling
+the feature pulls in `aws-lc-rs` (AWS-LC-FIPS) and swaps every
+non-FIPS-approved primitive call site:
+
+- **AEAD** — AES-256-GCM via `aws_lc_rs::aead`. ChaCha20-Poly1305 is
+  rejected at handshake (`negotiate_cipher`) and at
+  `CryptoSession::with_suite` with `CoreError::CipherSuiteUnavailable`.
+  The wire-format `CipherSuite` enum variant is preserved.
+- **Classical KEM** — X25519 → ECDH-P-256 via `aws_lc_rs::agreement`.
+  The classical public key on the wire grows from 32 bytes to 65 bytes
+  (uncompressed SEC1).
+- **KDF** — every `blake3::derive_key` call routes through the new
+  `crypto::kdf::derive_key_32` shim, which uses `HKDF-SHA256` under
+  fips (label-compatible API).
+- **RNG** — `RngProvider for OsRng` swaps to
+  `aws_lc_rs::rand::SystemRandom` (CTR_DRBG, SP 800-90A § 10.2.1).
+- **POST** — `crypto::self_tests::ensure_post_passed` is invoked from
+  every Phantom Core entry point that performs cryptographic work
+  before serving traffic: `PhantomListener::bind*`,
+  `PhantomSession::connect_with_transport*`,
+  `PhantomSession::connect_with_resumption`, and the UniFFI
+  `connect_pinned*` paths. Failure surfaces as
+  `CoreError::FipsSelfTestFailure(String)` on the fallible paths
+  (listener bind, `connect_with_resumption`, `connect_pinned*`) and as
+  a `ConnectionState::Failed` transition with the error in the log on
+  the infallible paths (`connect_with_transport*`, which return `Self`
+  by API contract).
+
+**Wire-format break (V1/V2 ClientHello)** — adding the
+`protocol_variant: Vec<u8>` field to `ClientHello` is a positional
+wire-format change. Because borsh is strict about trailing bytes,
+the impact is **bidirectional and generation-wide**, not just
+fips ↔ non-fips:
+
+- A pre-PR client cannot connect to a post-PR server (server
+  expects the new field, fails to deserialize the envelope).
+- A post-PR client cannot connect to a pre-PR server (server has
+  no slot for the trailer, deserialize errors on extra bytes).
+- A fips peer cannot connect to a non-fips peer of the same build
+  generation (the cleartext field mismatches up front, and the
+  signed transcript binds the build-side `PROTOCOL_VARIANT`).
+
+In short: **both peers must be on a post-PR build, and both must
+share the same `PROTOCOL_VARIANT`** (`phantom-default-1` for the
+default build, `phantom-fips-1` under `--features fips`). The
+`PROTOCOL_VARIANT` constant is baked into the signed handshake
+transcript on both the V1/V2 and V3 (0-RTT) paths, so an MITM
+rewriting the cleartext field is still caught by the
+signature-verify check. Pre-1.0 callers should treat this as a
+hard generation bump and rebuild both ends together; see
+`docs/migration/v2-to-v3.md` for the V3 envelope migration and the
+"FIPS variant" subsection there for the cross-mode policy.
+
+**Build constraints** — `fips` implies `std` and is mutually exclusive
+with `no-std` (compile_error in `core/src/lib.rs`). `aws-lc-rs`
+requires libc + dlopen / OpenSSL ABI and does not target wasm32 or
+bare-metal. macOS hosts may need `brew install pkg-config openssl@3`
+for the first build.
+
+**CI** — new `fips-feature` job in `.github/workflows/ci.yml`
+(cargo test/clippy + cavp + the no-std-conflict assertion) and a
+new `x86_64-unknown-linux-gnu (--features fips)` row in
+`.github/workflows/cross.yml`.
+
+Test count under `--features fips`: 244 lib tests + 3 ignored TCP
+integration tests (all green). Detailed primitive table and the
+remaining documentation work for a real CMVP submission are in
+`docs/compliance/fips-readiness.md`.
+
+
+
 ### Phase 8 — OpenTelemetry refactor (Observability)
 
 **Breaking changes for embedders:**
@@ -75,6 +149,24 @@ roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
   `PhantomSession::resumption_hint()` now returns `Option<ResumptionHint>`
   and is on the UniFFI surface — it was previously a Rust-only
   `Option<([u8; 32], [u8; 32])>` tuple defined outside the export block.
+- CI: `.github/workflows/bindings.yml` `drift` job now runs
+  `tests/bindings/check_versions.sh`, asserting that every binding
+  manifest (`pyproject.toml`, `phantom_core.pc.in`) reports the same
+  version as the source-of-truth `core/Cargo.toml`. Catches release-time
+  version skew before it ships to PyPI / pkg-config consumers. `server`
+  and `cli` Cargo manifests are checked too.
+- Tests: real-TCP 0-RTT coverage —
+  `core/tests/tcp_integration.rs::tcp_integration_zero_rtt_resumption_round_trip`
+  exercises the full FFI sequence (`connect_pinned` →
+  `resumption_hint()` → `connect_pinned_with_resumption(..., hint,
+  early_data)`) over loopback, asserting both 32-byte hint fields and
+  echo round-trips on both connections.
+- Tests: Python loopback (`tests/run_test.py`) now runs a phase-2 0-RTT
+  scenario — polls for the resumption hint, opens a second connection
+  through `connect_pinned_with_resumption` carrying a 22-byte
+  early-data payload, and verifies `early_data_accepted()` returns a
+  concrete `Some(...)` (`None` would mean the FFI silently fell back to
+  1-RTT, the regression worth catching).
 - Governance: `LICENSE` (Apache-2.0), `README.md`, `CHANGELOG.md`,
   `SECURITY.md`, `CONTRIBUTING.md`.
 - Toolchain: `rust-toolchain.toml` (stable), `.rustfmt.toml`, `.clippy.toml`.
@@ -122,6 +214,19 @@ roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
   `Vec<u8>`, eliminating the per-packet plaintext clone in the recv
   hot path. The public `recv()` still returns `Vec<u8>` (single
   `Bytes::to_vec` at the FFI boundary).
+- Bindings regen (post-Phase-8 sweep): Python, Swift, and Kotlin
+  auto-generated bindings plus the hand-curated
+  `tests/bindings/c/phantom_core.h` were re-synced to the post-OTel
+  cdylib. The now-deleted `metrics_prometheus_text` was the last
+  residual symbol — Python `import phantom_core` would `dlsym`-fail
+  at import time against the new lib until the regen.
+- Tests: integration tests in `core/tests/tcp_integration.rs` no longer
+  hard-code ports. They bind to `127.0.0.1:0` and read `local_addr()`,
+  eliminating CI port collisions and TIME_WAIT lockout on rerun.
+- Tests: `tcp_integration_zero_rtt_resumption_round_trip` replaces the
+  fixed `sleep(300 ms)` between handshake and `resumption_hint()` with
+  a bounded poll (5 s deadline) — kills both the slow-runner flake and
+  the wasted latency on fast runners.
 
 ### Security
 - Phase 1.1: cookie comparison in `process_client_hello` now uses
@@ -152,6 +257,11 @@ roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
 - Audit-friendly lints: `#![warn(clippy::unwrap_used, expect_used,
   panic, unreachable, todo, unimplemented, missing_safety_doc)]` in
   lib root. Surfaces remaining sites as TODOs without breaking CI.
+- Supply chain: `tests/bindings/kotlin/run_kotlin_test.sh` now
+  SHA-256-verifies the kotlinc + JNA + coroutines downloads against
+  pinned hashes before unpacking / putting them on the classpath. A
+  transient MITM on GitHub Releases or Maven Central can no longer
+  swap in a tampered compiler / jar between download and execution.
 
 ## [0.2.0]
 

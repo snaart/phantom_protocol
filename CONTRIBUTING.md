@@ -19,6 +19,23 @@ Loopback integration tests are gated and run with `-- --ignored`:
 cargo test --manifest-path core/Cargo.toml --test tcp_integration -- --ignored
 ```
 
+### Pre-commit hooks (optional)
+
+A `.pre-commit-config.yaml` at the repo root wires up [`pre-commit`](https://pre-commit.com)
+to run `cargo fmt --check`, `cargo clippy --lib`, `tests/bindings/check_versions.sh`,
+and standard hygiene hooks (whitespace, EOL, large-file guard) on every
+local commit. Install once:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+Skip on a specific commit with `git commit --no-verify`. The CI workflow
+runs the same checks (plus heavier `cargo deny` / `cargo audit` /
+full-cross-target gates), so the local hook is an early-feedback layer,
+not a replacement.
+
 ## Style
 
 - Rust 2021 edition.
