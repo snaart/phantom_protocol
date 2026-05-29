@@ -23,7 +23,7 @@ env:
 
 jobs:
   compile-check:
-    name: cargo check (${{ matrix.target }})
+    name: cargo check (${{ matrix.matrix_label || matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -33,6 +33,16 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             install_target: false
+          # FIPS build (A9). `aws-lc-rs` is best-supported on
+          # x86_64-unknown-linux-gnu; macOS / Windows can be added
+          # later if a downstream cares. Needs cmake + a C
+          # toolchain — install via the matrix `prep` step below.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            install_target: false
+            cargo_args: "--features fips"
+            matrix_label: "x86_64-unknown-linux-gnu (--features fips)"
+            apt_install: cmake
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             install_target: true
@@ -106,7 +116,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
-          key: ${{ matrix.target }}
+          key: ${{ matrix.matrix_label || matrix.target }}
+      - name: Install apt packages
+        if: matrix.apt_install
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt_install }}
       - name: cargo check (lib)
         continue-on-error: ${{ matrix.allow_failure == true }}
         run: |

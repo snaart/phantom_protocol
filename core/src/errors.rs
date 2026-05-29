@@ -67,6 +67,30 @@ pub enum CoreError {
     /// metric signal (`replay_rejected_total`).
     #[cfg_attr(feature = "std", error("replay protection rejected packet: {0}"))]
     ReplayDetected(String),
+
+    /// A requested cipher suite is not available in the current build.
+    /// Emitted under `--features fips` when a caller asks for a
+    /// non-FIPS-approved primitive (today: `ChaCha20-Poly1305`). The
+    /// variant is always compiled so error matching stays stable across
+    /// feature configurations.
+    #[cfg_attr(feature = "std", error("cipher suite unavailable: {0}"))]
+    CipherSuiteUnavailable(String),
+
+    /// FIPS 140-3 §7.7 power-on self-test failed at process start.
+    /// Surfaced by [`crate::api::PhantomListener::bind`] /
+    /// [`crate::api::PhantomSession::connect_with_transport`] under
+    /// `--features fips` when
+    /// [`crate::crypto::self_tests::ensure_post_passed`] returns an
+    /// error — refusing to stand up a session / listener over broken
+    /// primitives.
+    ///
+    /// Gated on `fips`. The payload is a `String` (not the typed
+    /// `SelfTestError`) so the variant stays UniFFI-exportable — the
+    /// `Debug` rendering of `SelfTestError` is sufficient diagnostic
+    /// signal for a fatal POST failure.
+    #[cfg(feature = "fips")]
+    #[error("FIPS POST self-test failed: {0}")]
+    FipsSelfTestFailure(String),
 }
 
 // --- Converters for internal errors ---
@@ -117,6 +141,7 @@ impl core::fmt::Display for CoreError {
             Self::ConnectionClosed => write!(f, "Connection closed"),
             Self::Timeout => write!(f, "Timeout"),
             Self::ReplayDetected(s) => write!(f, "replay protection rejected packet: {s}"),
+            Self::CipherSuiteUnavailable(s) => write!(f, "cipher suite unavailable: {s}"),
         }
     }
 }

@@ -102,10 +102,23 @@ pub(super) struct EmbeddedSpawnHandle {
 }
 
 impl SpawnHandleInner for EmbeddedSpawnHandle {
+    /// Best-effort cooperative cancellation. **Observed only on the
+    /// next poll wake.**
+    ///
+    /// Sets the shared abort flag; the wrapping `AbortableFuture`
+    /// observes it on its next `poll` and returns `Poll::Ready(())`.
+    /// Until something wakes the task (an awaited timer, channel send,
+    /// or external event), the OS thread driving the future stays
+    /// parked inside `block_on`. Per-future parker threads created by
+    /// `SleepFuture::poll` are NOT cancelled — they keep their
+    /// original `thread::sleep` and then fire a now-useless wake.
+    ///
+    /// In other words: `abort` flips a flag, it does not interrupt.
+    /// This is acceptable for the scaffold's intended use (host-side
+    /// integration tests, demonstrating cancel-safety contracts) but
+    /// is one reason production embedders should ship an
+    /// `EmbassyRuntime` / `RticRuntime` instead of using this impl.
     fn abort(&self) {
-        // Cooperative cancellation: flip the flag. The wrapping
-        // `AbortableFuture` checks it on each poll and returns
-        // `Poll::Ready(())` early.
         self.aborted
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
