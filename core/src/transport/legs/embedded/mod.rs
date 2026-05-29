@@ -12,8 +12,8 @@
 //! a generic `impl<R, W>` cannot satisfy `SessionTransport`'s `+ Send` future
 //! bound (un-expressible in stable Rust without `return_type_notation`). With
 //! concrete `R`/`W` the compiler sees the HAL's actual future and proves
-//! `Send` directly. A small `macro_rules!` helper will land alongside to
-//! generate the per-pair impl in one line.
+//! `Send` directly. The `impl_embedded_session_transport!` macro
+//! generates the per-pair impl in one line.
 //!
 //! Behind the `embedded` cargo feature. no_std + alloc-clean — this module
 //! only depends on `core`/`alloc`, `bytes`, `async_lock`, and `embedded-io-
