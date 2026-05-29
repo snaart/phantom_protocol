@@ -9,12 +9,12 @@ This is **not** a Security Policy document yet — that lives under
 
 ## Status (2026-05-24)
 
-The **`--features fips` primitive swap is shipped** — see "Section A"
-of `docs/superpowers/plans/2026-05-24-pre-1.0-deferred-followups-detailed.md`
-for the per-commit rollout. Every primitive gap below now has an
-"implemented (commit `<sha>`)" entry. The remaining FIPS work
-(`fips-security-policy.md`, `key-management.md`, etc.) is documentation +
-the eventual CMVP submission, not code.
+The **`--features fips` primitive swap is shipped** — see the
+`fips`-tagged commits in the history for the per-commit rollout.
+Every primitive gap below now has an "implemented (commit `<sha>`)"
+entry. The remaining FIPS work (`fips-security-policy.md`,
+`key-management.md`, etc.) is documentation + the eventual CMVP
+submission, not code.
 
 ---
 
