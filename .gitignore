@@ -3,6 +3,9 @@
 debug
 target
 Cargo.lock
+# Binary crates MUST track their lockfiles for reproducible/auditable release artifacts
+!server/Cargo.lock
+!cli/Cargo.lock
 .idea
 output.md
 test_output.txt
