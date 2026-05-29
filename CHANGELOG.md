@@ -83,6 +83,78 @@ Out of scope (follow-up):
 
 Detailed quickstart in `docs/operations/wasi.md`.
 
+### Security — FIPS 140-3 primitive swap (commits `613473a`..`5dd39c7`)
+
+**`cargo build --features fips` is now a shipped configuration.** The
+scaffold `compile_error!` from commit `d4d121b` is removed; enabling
+the feature pulls in `aws-lc-rs` (AWS-LC-FIPS) and swaps every
+non-FIPS-approved primitive call site:
+
+- **AEAD** — AES-256-GCM via `aws_lc_rs::aead`. ChaCha20-Poly1305 is
+  rejected at handshake (`negotiate_cipher`) and at
+  `CryptoSession::with_suite` with `CoreError::CipherSuiteUnavailable`.
+  The wire-format `CipherSuite` enum variant is preserved.
+- **Classical KEM** — X25519 → ECDH-P-256 via `aws_lc_rs::agreement`.
+  The classical public key on the wire grows from 32 bytes to 65 bytes
+  (uncompressed SEC1).
+- **KDF** — every `blake3::derive_key` call routes through the new
+  `crypto::kdf::derive_key_32` shim, which uses `HKDF-SHA256` under
+  fips (label-compatible API).
+- **RNG** — `RngProvider for OsRng` swaps to
+  `aws_lc_rs::rand::SystemRandom` (CTR_DRBG, SP 800-90A § 10.2.1).
+- **POST** — `crypto::self_tests::ensure_post_passed` is invoked from
+  every Phantom Core entry point that performs cryptographic work
+  before serving traffic: `PhantomListener::bind*`,
+  `PhantomSession::connect_with_transport*`,
+  `PhantomSession::connect_with_resumption`, and the UniFFI
+  `connect_pinned*` paths. Failure surfaces as
+  `CoreError::FipsSelfTestFailure(String)` on the fallible paths
+  (listener bind, `connect_with_resumption`, `connect_pinned*`) and as
+  a `ConnectionState::Failed` transition with the error in the log on
+  the infallible paths (`connect_with_transport*`, which return `Self`
+  by API contract).
+
+**Wire-format break (V1/V2 ClientHello)** — adding the
+`protocol_variant: Vec<u8>` field to `ClientHello` is a positional
+wire-format change. Because borsh is strict about trailing bytes,
+the impact is **bidirectional and generation-wide**, not just
+fips ↔ non-fips:
+
+- A pre-PR client cannot connect to a post-PR server (server
+  expects the new field, fails to deserialize the envelope).
+- A post-PR client cannot connect to a pre-PR server (server has
+  no slot for the trailer, deserialize errors on extra bytes).
+- A fips peer cannot connect to a non-fips peer of the same build
+  generation (the cleartext field mismatches up front, and the
+  signed transcript binds the build-side `PROTOCOL_VARIANT`).
+
+In short: **both peers must be on a post-PR build, and both must
+share the same `PROTOCOL_VARIANT`** (`phantom-default-1` for the
+default build, `phantom-fips-1` under `--features fips`). The
+`PROTOCOL_VARIANT` constant is baked into the signed handshake
+transcript on both the V1/V2 and V3 (0-RTT) paths, so an MITM
+rewriting the cleartext field is still caught by the
+signature-verify check. Pre-1.0 callers should treat this as a
+hard generation bump and rebuild both ends together; see
+`docs/migration/v2-to-v3.md` for the V3 envelope migration and the
+"FIPS variant" subsection there for the cross-mode policy.
+
+**Build constraints** — `fips` implies `std` and is mutually exclusive
+with `no-std` (compile_error in `core/src/lib.rs`). `aws-lc-rs`
+requires libc + dlopen / OpenSSL ABI and does not target wasm32 or
+bare-metal. macOS hosts may need `brew install pkg-config openssl@3`
+for the first build.
+
+**CI** — new `fips-feature` job in `.github/workflows/ci.yml`
+(cargo test/clippy + cavp + the no-std-conflict assertion) and a
+new `x86_64-unknown-linux-gnu (--features fips)` row in
+`.github/workflows/cross.yml`.
+
+Test count under `--features fips`: 244 lib tests + 3 ignored TCP
+integration tests (all green). Detailed primitive table and the
+remaining documentation work for a real CMVP submission are in
+`docs/compliance/fips-readiness.md`.
+
 
 ### Phase 8 — OpenTelemetry refactor (Observability)
 

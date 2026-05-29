@@ -91,23 +91,20 @@ embedded = ["dep:embedded-io-async", "dep:async-lock"]
 # the `std` feature and all the std-bound optional deps it gates.
 no-std = []
 
-# FIPS 140-3 posture (Phase 5.5). **SCAFFOLD ONLY** — the primitive swap
-# itself is not yet implemented; enabling this feature today fails the
-# build with a clear compile_error in `core/src/lib.rs` pointing at the
-# follow-up PR. The roadmap, tracked in `docs/compliance/fips-readiness.md`:
+# FIPS 140-3 posture. Pulls in `aws-lc-rs` (FIPS-validated AWS-LC
+# bindings) as the substrate for the FIPS-approved primitive set:
 #
-#   - X25519 → ECDH-P-256 (or PQ-only mode)
-#   - `ring` AES-GCM → `aws-lc-rs` (FIPS-validated module)
-#   - drop ChaCha20-Poly1305 (not FIPS-approved)
-#   - blake3 → HKDF-SHA256 everywhere blake3 is currently used as a KDF
-#   - RNG via `aws-lc-rs::rand` (SP 800-90A CTR_DRBG) instead of getrandom
-#   - wire `crypto::self_tests::run_post()` into a startup hook
+#   - classical KEM half: X25519 → ECDH-P-256
+#   - AEAD: `ring` AES-GCM → `aws-lc-rs`
+#   - ChaCha20-Poly1305 dropped (not FIPS-approved)
+#   - KDF: blake3 → HKDF-SHA256 everywhere blake3 is used as a KDF
+#   - RNG: `aws-lc-rs::rand` (SP 800-90A CTR_DRBG) instead of getrandom
+#   - `crypto::self_tests::run_post()` wired into the bind/connect bootstrap
 #
-# Implies `std`. No new deps are added by this scaffold; the swaps land
-# as a dedicated follow-up PR. The flag exists now so downstream tooling
-# (Bazel selectors, embedder build matrices) can pin it in advance and
-# the audit trail shows when the surface was reserved.
-fips = ["std"]
+# Implies `std`; mutually exclusive with `no-std` (enforced by a
+# `compile_error!` in `core/src/lib.rs`). Native-only — `aws-lc-rs`
+# does not support wasm32 targets. See `docs/compliance/fips-readiness.md`.
+fips = ["std", "dep:aws-lc-rs"]
 
 # WasiLeg transport + WasiRuntime for `wasm32-wasi*` targets (Section B
 # of the pre-1.0 deferred-followups plan). Pulls in the `wasi` crate
@@ -249,6 +246,19 @@ kcp-tokio = { version = "0.3", optional = true }
 # multi-accept). Already in the transitive tree via tokio so this is
 # free from a build-size standpoint.
 socket2 = { version = "0.6", optional = true }
+# `aws-lc-rs` is the FIPS-validated substrate behind the `fips` Cargo
+# feature (AES-256-GCM, ECDH-P-256, HKDF-SHA256, CTR_DRBG). Pinned to
+# 1.x, declared only in this native-only target block because the
+# AWS-LC C library + bindgen pipeline does not target wasm32. macOS
+# hosts may need `brew install pkg-config openssl@3` for the first
+# build (see CONTRIBUTING.md).
+#
+# Feature selection: `default-features = false` + `features = ["fips"]`.
+# In aws-lc-rs 1.17, the `fips` feature is mutually exclusive with the
+# default `aws-lc-sys` backend — it activates `dep:aws-lc-fips-sys`
+# (AWS-LC-FIPS 3.0.x) as the sole backend. Listing both `aws-lc-sys`
+# and `fips` would attempt to enable both backends and bloat the link.
+aws-lc-rs = { version = "1.17", optional = true, default-features = false, features = ["fips"] }
 
 # ─── Browser-WASM-only dependencies (Phase 3.3) ───────────────────────────
 # Pulled in only for `wasm32-unknown-unknown` builds (the browser target).
