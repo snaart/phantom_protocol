@@ -507,8 +507,6 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomsession_send() != 35674:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_set_state() != 24535:
-        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 13449:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomstream_recv() != 59636:
@@ -766,12 +764,6 @@ _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_send.argtypes = (
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_send.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_set_state.argtypes = (
-    ctypes.c_void_p,
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_set_state.restype = None
 _UniffiLib.uniffi_phantom_core_fn_clone_phantomstream.argtypes = (
     ctypes.c_void_p,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1156,9 +1148,6 @@ _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_resumption_hint.re
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_send.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_send.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_set_state.argtypes = (
-)
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_set_state.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_disconnect.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_disconnect.restype = ctypes.c_uint16
@@ -1903,6 +1892,29 @@ class CoreError:  # type: ignore
         def __repr__(self):
             return "CoreError.ReplayDetected({})".format(str(self))
     _UniffiTempCoreError.ReplayDetected = ReplayDetected # type: ignore
+    class CipherSuiteUnavailable(_UniffiTempCoreError):
+        """
+        A requested cipher suite is not available in the current build.
+        Emitted under `--features fips` when a caller asks for a
+        non-FIPS-approved primitive (today: `ChaCha20-Poly1305`). The
+        variant is always compiled so error matching stays stable across
+        feature configurations.
+        """
+
+        def __init__(self, *values):
+            if len(values) != 1:
+                raise TypeError(f"Expected 1 arguments, found {len(values)}")
+            if not isinstance(values[0], str):
+                raise TypeError(f"unexpected type for tuple element 0 - expected 'str', got '{type(values[0])}'")
+            super().__init__(", ".join(map(repr, values)))
+            self._values = values
+
+        def __getitem__(self, index):
+            return self._values[index]
+
+        def __repr__(self):
+            return "CoreError.CipherSuiteUnavailable({})".format(str(self))
+    _UniffiTempCoreError.CipherSuiteUnavailable = CipherSuiteUnavailable # type: ignore
 
 CoreError = _UniffiTempCoreError # type: ignore
 del _UniffiTempCoreError
@@ -1972,6 +1984,10 @@ class _UniffiConverterTypeCoreError(_UniffiConverterRustBuffer):
             return CoreError.ReplayDetected(
                 _UniffiConverterString.read(buf),
             )
+        if variant == 17:
+            return CoreError.CipherSuiteUnavailable(
+                _UniffiConverterString.read(buf),
+            )
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -2020,6 +2036,9 @@ class _UniffiConverterTypeCoreError(_UniffiConverterRustBuffer):
         if isinstance(value, CoreError.ReplayDetected):
             _UniffiConverterString.check_lower(value._values[0])
             return
+        if isinstance(value, CoreError.CipherSuiteUnavailable):
+            _UniffiConverterString.check_lower(value._values[0])
+            return
 
     @staticmethod
     def write(value, buf):
@@ -2066,6 +2085,9 @@ class _UniffiConverterTypeCoreError(_UniffiConverterRustBuffer):
             buf.write_i32(15)
         if isinstance(value, CoreError.ReplayDetected):
             buf.write_i32(16)
+            _UniffiConverterString.write(value._values[0], buf)
+        if isinstance(value, CoreError.CipherSuiteUnavailable):
+            buf.write_i32(17)
             _UniffiConverterString.write(value._values[0], buf)
 
 
@@ -2628,12 +2650,6 @@ class PhantomSessionProtocol(typing.Protocol):
         """
 
         raise NotImplementedError
-    def set_state(self, new_state: "ConnectionState"):
-        """
-        Transition to a new connection state.
-        """
-
-        raise NotImplementedError
 # PhantomSession is a Rust-only trait - it's a wrapper around a Rust implementation.
 class PhantomSession():
     """
@@ -2965,21 +2981,6 @@ _UniffiConverterTypeCoreError,
 _UniffiConverterTypeCoreError,
 
         )
-
-
-
-
-    def set_state(self, new_state: "ConnectionState") -> None:
-        """
-        Transition to a new connection state.
-        """
-
-        _UniffiConverterTypeConnectionState.check_lower(new_state)
-        
-        _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_set_state,self._uniffi_clone_pointer(),
-        _UniffiConverterTypeConnectionState.lower(new_state))
-
-
 
 
 
