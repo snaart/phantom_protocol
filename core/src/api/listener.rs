@@ -90,6 +90,16 @@ impl PhantomListener {
         runtime: Arc<dyn Runtime>,
         signing_key: Option<HybridSigningKey>,
     ) -> Result<Arc<Self>, CoreError> {
+        // Under `--features fips`, run the FIPS 140-3 §7.7 POST
+        // before standing up the listener. A failure short-circuits
+        // here with `CoreError::FipsSelfTestFailure` rather than
+        // serving traffic over broken primitives. Cached after the
+        // first call so subsequent binds in the same process pay
+        // only an atomic read.
+        #[cfg(feature = "fips")]
+        crate::crypto::self_tests::ensure_post_passed()
+            .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
+
         let listener = Self::bind_with_optional_reuseport(&addr).await?;
         let local_addr = listener
             .local_addr()
@@ -388,6 +398,12 @@ mod tests {
     /// production embedders that persist a key file rely on.
     #[tokio::test]
     async fn bind_with_signing_key_pins_verifying_identity() {
+        // Serialise vs. the fips fault-injection test that flips
+        // POST_RESULT. Harmless overhead on non-fips builds.
+        let _guard = crate::crypto::self_tests::tests_serial_guard()
+            .lock()
+            .unwrap();
+        crate::crypto::self_tests::set_force_post_fail(false);
         let (signing_key, verifying_key) = HybridSigningKey::generate();
         let expected_vk_bytes = verifying_key.to_bytes();
 
@@ -408,6 +424,10 @@ mod tests {
     /// identity the on-disk key encodes.
     #[tokio::test]
     async fn bind_with_signing_key_round_trips_via_bytes() {
+        let _guard = crate::crypto::self_tests::tests_serial_guard()
+            .lock()
+            .unwrap();
+        crate::crypto::self_tests::set_force_post_fail(false);
         let (orig_signing_key, orig_verifying_key) = HybridSigningKey::generate();
         let on_disk = orig_signing_key.to_bytes();
         // `HybridSigningKey` is not `Clone`; reload from bytes as a
@@ -431,6 +451,10 @@ mod tests {
     /// verifying key. Pins the back-compat guarantee.
     #[tokio::test]
     async fn bind_still_generates_fresh_key_per_call() {
+        let _guard = crate::crypto::self_tests::tests_serial_guard()
+            .lock()
+            .unwrap();
+        crate::crypto::self_tests::set_force_post_fail(false);
         let l1 = PhantomListener::bind("127.0.0.1:0".to_string())
             .await
             .expect("first bind should succeed");
@@ -442,5 +466,29 @@ mod tests {
             l2.verifying_key_bytes(),
             "two independent binds must produce distinct verifying keys"
         );
+    }
+
+    /// Under `--features fips`, a POST failure short-circuits
+    /// `bind*` with `CoreError::FipsSelfTestFailure`. Uses the
+    /// `set_force_post_fail` test seam to inject the failure.
+    #[cfg(feature = "fips")]
+    #[tokio::test]
+    async fn fips_post_failure_aborts_bind() {
+        // Serialise with sibling fault-injection tests via the same
+        // mutex they use.
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().unwrap();
+        crate::crypto::self_tests::set_force_post_fail(true);
+        let result = PhantomListener::bind("127.0.0.1:0".to_string()).await;
+        crate::crypto::self_tests::set_force_post_fail(false);
+        match result {
+            Err(CoreError::FipsSelfTestFailure(msg)) => {
+                assert!(
+                    msg.contains("AES-256-GCM") || msg.contains("Aead"),
+                    "expected message to mention the injected AEAD failure; got {msg}"
+                );
+            }
+            Ok(_) => panic!("expected FipsSelfTestFailure, got Ok"),
+            Err(other) => panic!("expected FipsSelfTestFailure, got {other:?}"),
+        }
     }
 }

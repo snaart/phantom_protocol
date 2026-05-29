@@ -1,0 +1,66 @@
+# Pre-commit hooks for phantom_core_rust (Phase 0.5).
+#
+# Optional local gate that mirrors the cheapest CI checks. Install once with:
+#
+#     pip install pre-commit
+#     pre-commit install
+#
+# After that every `git commit` runs these hooks. They are designed to be
+# fast (sub-second for the standard hooks, a few seconds for cargo fmt /
+# clippy on incremental builds). Heavy checks (`cargo deny`, `cargo audit`,
+# `cargo test`) stay in CI — running them on every commit would be too
+# coarse.
+#
+# Skip a single commit's hooks with `git commit --no-verify` when you
+# know what you are doing (e.g. work-in-progress branches).
+
+repos:
+  # ── Standard hygiene hooks (whitespace, EOL, large files, merge marks) ──
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        # Don't touch the auto-generated bindings — they get regenerated
+        # by `generate_*.sh` and a whitespace tweak here would just drift
+        # back next CI run.
+        exclude: ^tests/bindings/(phantom_core\.py|swift/phantom_core\.swift|swift/phantom_coreFFI\.h|kotlin/uniffi/phantom_core/phantom_core\.kt)$
+      - id: end-of-file-fixer
+        exclude: ^tests/bindings/(phantom_core\.py|swift/phantom_core\.swift|swift/phantom_coreFFI\.h|kotlin/uniffi/phantom_core/phantom_core\.kt)$
+      - id: check-yaml
+        # GitHub Actions workflows use multi-document anchors and YAML that
+        # tripped strict parsers; allow them.
+        args: [--allow-multiple-documents]
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        # 500 KB — catches accidental binary check-ins (.dylib next to
+        # bindings, fuzz corpora, screenshots). Override per-file with
+        # `git add -f`.
+        args: [--maxkb=500]
+
+  # ── Rust formatting + lint gate ─────────────────────────────────────────
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --manifest-path core/Cargo.toml --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy-lib
+        name: cargo clippy --lib (default features)
+        entry: cargo clippy --manifest-path core/Cargo.toml --lib -- -D warnings
+        language: system
+        types: [rust]
+        # Cargo does its own change detection; clippy on the whole lib is
+        # cheap on an incremental build and any change to one Rust file
+        # can break a lint two files over, so we don't pass filenames.
+        pass_filenames: false
+
+      # ── Binding manifest version sync (Phase 8.1) ─────────────────────
+      - id: check-binding-versions
+        name: bindings — manifest version sync
+        entry: tests/bindings/check_versions.sh
+        language: system
+        # Only fire when something touches a manifest the script reads.
+        files: ^(core/Cargo\.toml|server/Cargo\.toml|cli/Cargo\.toml|tests/bindings/pyproject\.toml|tests/bindings/c/phantom_core\.pc\.in)$
+        pass_filenames: false

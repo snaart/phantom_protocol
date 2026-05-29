@@ -6,9 +6,18 @@
 //!
 //! На устройствах без HW AES ChaCha20 в 3-4x быстрее.
 //! На устройствах с HW AES AES-GCM в ~1.3x быстрее ChaCha20.
+//!
+//! Under `--features fips` the AEAD backend swaps to `aws-lc-rs`
+//! (FIPS-validated AWS-LC). The Rust API surface is identical to
+//! `ring::aead`, so the rest of this module is untouched. The cipher
+//! suite enum keeps `ChaCha20Poly1305` (wire-format stability) but the
+//! negotiation/build paths reject it under `fips`.
 
 use crate::errors::CoreError;
+#[cfg(not(feature = "fips"))]
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
+#[cfg(feature = "fips")]
+use aws_lc_rs::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -32,13 +41,30 @@ pub const AEAD_OVERHEAD: usize = 16;
 /// mode.
 pub const AEAD_MAX_INVOCATIONS: u64 = 1u64 << 48;
 
-/// Supported cipher suites
+/// Supported cipher suites.
+///
+/// The wire byte for each variant is stable across feature configurations —
+/// `Aes256Gcm = 1`, `ChaCha20Poly1305 = 2` — so a peer's `CipherSuite`
+/// offer round-trips through `to_byte` / `from_byte` regardless of which
+/// build the peer is running. Under `--features fips` only `Aes256Gcm`
+/// is actually selectable; `ChaCha20Poly1305` is reserved for
+/// wire-format stability and is rejected at `negotiate_cipher` /
+/// `CryptoSession::with_suite{_peer}` with
+/// `CoreError::CipherSuiteUnavailable`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CipherSuite {
-    /// AES-256-GCM — optimal on HW-accelerated platforms
+    /// AES-256-GCM — optimal on HW-accelerated platforms.
+    /// FIPS-approved; the only suite selectable under `--features fips`.
     Aes256Gcm = 1,
-    /// ChaCha20-Poly1305 — optimal on SW-only platforms (IoT, old ARM)
+    /// ChaCha20-Poly1305 — optimal on SW-only platforms (IoT, old ARM).
+    ///
+    /// **Reserved for wire-format stability under `--features fips`.**
+    /// The variant remains in the enum so a peer's offer can still be
+    /// parsed and a clear `CipherSuiteUnavailable` error returned;
+    /// construction via `CryptoSession::with_suite{_peer}` and selection
+    /// in `negotiate_cipher` are explicitly rejected under fips. Not
+    /// FIPS-approved (RFC 7539 / 8439 — outside FIPS 140-3 Annex A).
     ChaCha20Poly1305 = 2,
 }
 
@@ -100,28 +126,64 @@ impl HwCaps {
         false // MIPS, RISC-V, ARM32 without crypto extension → no HW AES
     }
 
-    /// Recommend best cipher for this hardware
+    /// Recommend best cipher for this hardware.
+    ///
+    /// Under `--features fips` the only FIPS-approved AEAD on the wire
+    /// is `Aes256Gcm`, so we pin the recommendation regardless of
+    /// hardware capability — software AES is still allowed; only the
+    /// cipher choice is restricted.
     pub fn recommended_cipher(&self) -> CipherSuite {
-        if self.has_hw_aes {
+        #[cfg(feature = "fips")]
+        {
+            let _ = self.has_hw_aes;
             CipherSuite::Aes256Gcm
-        } else {
-            CipherSuite::ChaCha20Poly1305
+        }
+        #[cfg(not(feature = "fips"))]
+        {
+            if self.has_hw_aes {
+                CipherSuite::Aes256Gcm
+            } else {
+                CipherSuite::ChaCha20Poly1305
+            }
         }
     }
 }
 
-/// Negotiate best cipher suite between client and server
-pub fn negotiate_cipher(client_preferred: &[CipherSuite], server_caps: &HwCaps) -> CipherSuite {
-    let server_pref = server_caps.recommended_cipher();
-    // If server's preference is in client's list, use it
-    if client_preferred.contains(&server_pref) {
-        return server_pref;
+/// Negotiate best cipher suite between client and server.
+///
+/// Returns `Err(CoreError::CipherSuiteUnavailable)` under `--features
+/// fips` when the client does not offer a FIPS-approved suite
+/// (today: `Aes256Gcm`). On non-fips builds this never fails; the
+/// return type is `Result` so the API shape is feature-stable.
+pub fn negotiate_cipher(
+    client_preferred: &[CipherSuite],
+    server_caps: &HwCaps,
+) -> Result<CipherSuite, CoreError> {
+    #[cfg(feature = "fips")]
+    {
+        let _ = server_caps;
+        if client_preferred.contains(&CipherSuite::Aes256Gcm) {
+            Ok(CipherSuite::Aes256Gcm)
+        } else {
+            Err(CoreError::CipherSuiteUnavailable(
+                "no FIPS-approved cipher suite in client offer (only AES-256-GCM is approved under fips)"
+                    .into(),
+            ))
+        }
     }
-    // Otherwise use client's first choice
-    client_preferred
-        .first()
-        .copied()
-        .unwrap_or(CipherSuite::ChaCha20Poly1305)
+    #[cfg(not(feature = "fips"))]
+    {
+        let server_pref = server_caps.recommended_cipher();
+        // If server's preference is in client's list, use it
+        if client_preferred.contains(&server_pref) {
+            return Ok(server_pref);
+        }
+        // Otherwise use client's first choice
+        Ok(client_preferred
+            .first()
+            .copied()
+            .unwrap_or(CipherSuite::ChaCha20Poly1305))
+    }
 }
 
 /// Unified crypto session — works with any supported cipher suite.
@@ -160,16 +222,43 @@ impl CryptoSession {
 
     /// Create with explicit cipher suite (for negotiation scenarios).
     /// Initiator side.
+    ///
+    /// Under `--features fips`, requesting [`CipherSuite::ChaCha20Poly1305`]
+    /// returns [`CoreError::CipherSuiteUnavailable`] — the wire-format
+    /// variant is preserved (enum stable across feature configurations)
+    /// but the primitive is not FIPS-approved.
     pub fn with_suite(shared_secret: &[u8; 32], suite: CipherSuite) -> Result<Self, CoreError> {
+        Self::guard_suite_under_fips(suite)?;
         Self::build(shared_secret, suite, false)
     }
 
     /// Create with explicit cipher suite. Peer side.
+    ///
+    /// Mirrors the `fips` guard of [`with_suite`].
     pub fn with_suite_peer(
         shared_secret: &[u8; 32],
         suite: CipherSuite,
     ) -> Result<Self, CoreError> {
+        Self::guard_suite_under_fips(suite)?;
         Self::build(shared_secret, suite, true)
+    }
+
+    #[inline]
+    fn guard_suite_under_fips(suite: CipherSuite) -> Result<(), CoreError> {
+        #[cfg(feature = "fips")]
+        {
+            if suite == CipherSuite::ChaCha20Poly1305 {
+                return Err(CoreError::CipherSuiteUnavailable(
+                    "ChaCha20-Poly1305 is not FIPS-approved; only AES-256-GCM is permitted under --features fips"
+                        .into(),
+                ));
+            }
+        }
+        #[cfg(not(feature = "fips"))]
+        {
+            let _ = suite;
+        }
+        Ok(())
     }
 
     fn build(shared_secret: &[u8; 32], suite: CipherSuite, swap: bool) -> Result<Self, CoreError> {
@@ -180,8 +269,11 @@ impl CryptoSession {
         let send_label = format!("{}send-v1", ctx);
         let recv_label = format!("{}recv-v1", ctx);
 
-        let key_a = blake3::derive_key(&send_label, shared_secret);
-        let key_b = blake3::derive_key(&recv_label, shared_secret);
+        // `crypto::kdf::derive_key_32` cfg-dispatches between
+        // `blake3::derive_key` (default) and HKDF-SHA256 (fips). The
+        // 32-byte output and label-string API are identical.
+        let key_a = crate::crypto::kdf::derive_key_32(&send_label, shared_secret);
+        let key_b = crate::crypto::kdf::derive_key_32(&recv_label, shared_secret);
 
         let (send_bytes, recv_bytes) = if swap { (key_b, key_a) } else { (key_a, key_b) };
 
@@ -191,7 +283,8 @@ impl CryptoSession {
         let recv_unbound = UnboundKey::new(algo, &recv_bytes)
             .map_err(|_| CoreError::CryptoError("Failed to create recv key".into()))?;
 
-        let prefix_bytes = blake3::derive_key("phantom-nonce-pfx-v1", shared_secret);
+        let prefix_bytes =
+            crate::crypto::kdf::derive_key_32("phantom-nonce-pfx-v1", shared_secret);
         let mut nonce_prefix = [0u8; 4];
         nonce_prefix.copy_from_slice(&prefix_bytes[..4]);
 
@@ -437,6 +530,25 @@ mod tests {
         assert_eq!(&pt, msg);
     }
 
+    /// Round-trip AES-256-GCM through the FIPS backend (`aws-lc-rs`).
+    /// Identical to [`round_trip_aes`] but explicit about which backend
+    /// is exercised — runs only when the `fips` feature is active.
+    #[cfg(feature = "fips")]
+    #[test]
+    fn round_trip_aes_aws_lc_rs() {
+        let secret = [0xCEu8; 32];
+        let a = CryptoSession::with_suite(&secret, CipherSuite::Aes256Gcm).unwrap();
+        let b = CryptoSession::with_suite_peer(&secret, CipherSuite::Aes256Gcm).unwrap();
+
+        let msg = b"Hello, FIPS-mode AES world!";
+        let ct = a.encrypt(&[], msg).unwrap();
+        let pt = b.decrypt(&[], &ct).unwrap();
+        assert_eq!(&pt, msg);
+    }
+
+    // ChaCha20-Poly1305 is rejected under `--features fips`; only run
+    // the positive round-trip on non-fips builds.
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn round_trip_chacha() {
         let secret = [0xCDu8; 32];
@@ -447,6 +559,26 @@ mod tests {
         let ct = a.encrypt(&[], msg).unwrap();
         let pt = b.decrypt(&[], &ct).unwrap();
         assert_eq!(&pt, msg);
+    }
+
+    /// Under fips, requesting ChaCha20-Poly1305 fails fast with
+    /// `CoreError::CipherSuiteUnavailable`.
+    #[cfg(feature = "fips")]
+    #[test]
+    fn chacha_rejected_under_fips() {
+        let secret = [0xCDu8; 32];
+
+        match CryptoSession::with_suite(&secret, CipherSuite::ChaCha20Poly1305) {
+            Err(CoreError::CipherSuiteUnavailable(_)) => {}
+            Err(e) => panic!("expected CipherSuiteUnavailable, got {e:?}"),
+            Ok(_) => panic!("expected error, got ok"),
+        }
+
+        match CryptoSession::with_suite_peer(&secret, CipherSuite::ChaCha20Poly1305) {
+            Err(CoreError::CipherSuiteUnavailable(_)) => {}
+            Err(e) => panic!("expected CipherSuiteUnavailable, got {e:?}"),
+            Ok(_) => panic!("expected error, got ok"),
+        }
     }
 
     #[test]
@@ -490,6 +622,7 @@ mod tests {
         assert_eq!(pt, data);
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn negotiation() {
         let server_aes = HwCaps { has_hw_aes: true };
@@ -499,21 +632,48 @@ mod tests {
         let result = negotiate_cipher(
             &[CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305],
             &server_aes,
-        );
+        )
+        .unwrap();
         assert_eq!(result, CipherSuite::Aes256Gcm);
 
         // Client prefers both, server no AES → ChaCha20
         let result = negotiate_cipher(
             &[CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305],
             &server_no_aes,
-        );
+        )
+        .unwrap();
         assert_eq!(result, CipherSuite::ChaCha20Poly1305);
 
         // Client only ChaCha, server has AES → ChaCha (client's preference)
-        let result = negotiate_cipher(&[CipherSuite::ChaCha20Poly1305], &server_aes);
+        let result = negotiate_cipher(&[CipherSuite::ChaCha20Poly1305], &server_aes).unwrap();
         assert_eq!(result, CipherSuite::ChaCha20Poly1305);
     }
 
+    /// Under fips, a ChaCha-only client offer is rejected.
+    #[cfg(feature = "fips")]
+    #[test]
+    fn negotiation_rejects_chacha_only_under_fips() {
+        let server_aes = HwCaps { has_hw_aes: true };
+
+        // Mixed: AES present → succeeds with AES regardless of order.
+        let suite = negotiate_cipher(
+            &[CipherSuite::ChaCha20Poly1305, CipherSuite::Aes256Gcm],
+            &server_aes,
+        )
+        .unwrap();
+        assert_eq!(suite, CipherSuite::Aes256Gcm);
+
+        // ChaCha-only offer: rejected.
+        let err = negotiate_cipher(&[CipherSuite::ChaCha20Poly1305], &server_aes).unwrap_err();
+        assert!(
+            matches!(err, CoreError::CipherSuiteUnavailable(_)),
+            "expected CipherSuiteUnavailable, got {err:?}"
+        );
+    }
+
+    // Skip the dual-suite throughput sweep under `fips` — only one
+    // suite (`Aes256Gcm`) is permitted in that configuration.
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn throughput_comparison() {
         use std::time::Instant;
