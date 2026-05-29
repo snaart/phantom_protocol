@@ -1,0 +1,31 @@
+# Minimal WASI Preview 2 guest used by `core/tests/wasi_integration.rs`
+# (B5) to exercise `WasiLeg::connect` + `send_bytes` + `recv_bytes` end-
+# to-end inside a real `wasmtime` host.
+#
+# Lives in its own `[workspace]` so the host workspace's
+# `--target` resolution does not try to build this crate for non-WASI
+# targets (it cannot link there — `wasi` crate is WASI-only).
+#
+# The wasi guest dep on `phantom_core` is `--features wasi-leg`; the
+# `core/tests/wasi_integration.rs` driver invokes `cargo build`
+# explicitly with the right target + feature combination.
+
+[package]
+name = "phantom-wasi-guest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "phantom-wasi-guest"
+path = "src/main.rs"
+
+[dependencies]
+phantom_core = { path = "../../../", default-features = false, features = ["std", "wasi-leg"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+
+# Standalone workspace so the host workspace member resolver does not
+# try to add this crate to its set (which would fail on non-WASI
+# targets).
+[workspace]

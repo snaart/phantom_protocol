@@ -83,6 +83,24 @@ compile_error!(
      `--features embedded,no-std` (no_std posture, default crypto)."
 );
 
+// B1 — the `wasi-leg` Cargo feature lives at the WASI target (the
+// `wasi` crate's WIT bindings are only available there). Enabling it
+// on `wasm32-unknown-unknown` (the browser target with WebSocketLeg /
+// WasmRuntime) is a misconfiguration; fail the build loudly with a
+// pointer at the recipe.
+#[cfg(all(
+    feature = "wasi-leg",
+    target_arch = "wasm32",
+    not(target_os = "wasi")
+))]
+compile_error!(
+    "The `wasi-leg` Cargo feature is only supported on WASI targets \
+     (wasm32-wasi, wasm32-wasip1, wasm32-wasip2). For \
+     wasm32-unknown-unknown (browser) builds use the default feature \
+     set, which exposes the `WebSocketLeg` + `WasmRuntime` surface \
+     instead."
+);
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
@@ -140,7 +158,11 @@ pub mod test_harness;
 pub use config::PhantomConfig;
 pub use errors::CoreError;
 
-// UniFFI scaffolding is std-bound (the `uniffi` crate pulls `std`). Gated so
-// the bare-metal build does not see it.
-#[cfg(feature = "std")]
+// UniFFI scaffolding. Gated on the `bindings` feature so the WASI
+// guest build (which sets `--features wasi-leg` without `bindings`)
+// skips it — UniFFI's exported-symbol metadata is incompatible with
+// `wasm-component-ld`, the wasm32-wasip2 linker. Default builds keep
+// `bindings` active, so the native FFI consumers (Swift / Kotlin /
+// Python / C bindings) see the historical surface unchanged.
+#[cfg(feature = "bindings")]
 uniffi::setup_scaffolding!();
