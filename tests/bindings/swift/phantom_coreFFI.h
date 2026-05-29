@@ -396,11 +396,6 @@ uint64_t uniffi_phantom_core_fn_method_phantomsession_resumption_hint(void*_Nonn
 uint64_t uniffi_phantom_core_fn_method_phantomsession_send(void*_Nonnull ptr, RustBuffer data
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_SET_STATE
-#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_SET_STATE
-void uniffi_phantom_core_fn_method_phantomsession_set_state(void*_Nonnull ptr, RustBuffer new_state, RustCallStatus *_Nonnull out_status
-);
-#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CLONE_PHANTOMSTREAM
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CLONE_PHANTOMSTREAM
 void*_Nonnull uniffi_phantom_core_fn_clone_phantomstream(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -861,12 +856,6 @@ uint16_t uniffi_phantom_core_checksum_method_phantomsession_resumption_hint(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_SEND
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_SEND
 uint16_t uniffi_phantom_core_checksum_method_phantomsession_send(void
-    
-);
-#endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_SET_STATE
-#define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_CHECKSUM_METHOD_PHANTOMSESSION_SET_STATE
-uint16_t uniffi_phantom_core_checksum_method_phantomsession_set_state(void
     
 );
 #endif

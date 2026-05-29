@@ -46,6 +46,7 @@ fn new_session_id() -> String {
 #[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ConnectionState {
     /// Connection initiated, handshake pending
     Connecting = 0,
@@ -107,6 +108,7 @@ impl ConnectionState {
 /// bug.
 #[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ResumptionHint {
     /// The negotiated session id (32 bytes).
     pub session_id: Vec<u8>,
@@ -1486,6 +1488,18 @@ async fn plaintext_into_router(
     recv_tx.send(bytes).await.is_ok()
 }
 
+// Internal-only methods — deliberately NOT on the `#[uniffi::export]` surface.
+// `set_state` mutates the connection state machine; a foreign caller forcing
+// `Connected` mid-handshake would make `is_data_ready()` lie and let `send()`
+// bypass the queue, or `Closed` without tearing down the pump.
+impl PhantomSession {
+    /// Transition to a new connection state. Crate-internal: driven by the
+    /// handshake task and teardown only.
+    pub(crate) fn set_state(&self, new_state: ConnectionState) {
+        self.state.store(new_state as u8, Ordering::Relaxed);
+    }
+}
+
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 impl PhantomSession {
     /// Create a new session — returns instantly.
@@ -1573,11 +1587,6 @@ impl PhantomSession {
     /// Get the current connection state (lock-free).
     pub fn connection_state(&self) -> ConnectionState {
         ConnectionState::from_u8(self.state.load(Ordering::Relaxed))
-    }
-
-    /// Transition to a new connection state.
-    pub fn set_state(&self, new_state: ConnectionState) {
-        self.state.store(new_state as u8, Ordering::Relaxed);
     }
 
     /// Whether the session is ready for data transmission.

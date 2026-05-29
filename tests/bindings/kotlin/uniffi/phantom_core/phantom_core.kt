@@ -787,8 +787,6 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
-
-
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -849,8 +847,6 @@ fun uniffi_phantom_core_checksum_method_phantomsession_recv(
 fun uniffi_phantom_core_checksum_method_phantomsession_resumption_hint(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomsession_send(
-): Short
-fun uniffi_phantom_core_checksum_method_phantomsession_set_state(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomstream_disconnect(
 ): Short
@@ -973,8 +969,6 @@ fun uniffi_phantom_core_fn_method_phantomsession_resumption_hint(`ptr`: Pointer,
 ): Long
 fun uniffi_phantom_core_fn_method_phantomsession_send(`ptr`: Pointer,`data`: RustBuffer.ByValue,
 ): Long
-fun uniffi_phantom_core_fn_method_phantomsession_set_state(`ptr`: Pointer,`newState`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
 fun uniffi_phantom_core_fn_clone_phantomstream(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
 fun uniffi_phantom_core_fn_free_phantomstream(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -1186,9 +1180,6 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_core_checksum_method_phantomsession_send() != 35674.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_phantom_core_checksum_method_phantomsession_set_state() != 24535.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 13449.toShort()) {
@@ -2507,11 +2498,6 @@ public interface PhantomSessionInterface {
      */
     suspend fun `send`(`data`: kotlin.ByteArray)
     
-    /**
-     * Transition to a new connection state.
-     */
-    fun `setState`(`newState`: ConnectionState)
-    
     companion object
 }
 
@@ -2903,20 +2889,6 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
         CoreException.ErrorHandler,
     )
     }
-
-    
-    /**
-     * Transition to a new connection state.
-     */override fun `setState`(`newState`: ConnectionState)
-        = 
-    callWithPointer {
-    uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_phantom_core_fn_method_phantomsession_set_state(
-        it, FfiConverterTypeConnectionState.lower(`newState`),_status)
-}
-    }
-    
-    
 
     
 
@@ -3678,6 +3650,21 @@ sealed class CoreException: kotlin.Exception() {
             get() = "v1=${ v1 }"
     }
     
+    /**
+     * A requested cipher suite is not available in the current build.
+     * Emitted under `--features fips` when a caller asks for a
+     * non-FIPS-approved primitive (today: `ChaCha20-Poly1305`). The
+     * variant is always compiled so error matching stays stable across
+     * feature configurations.
+     */
+    class CipherSuiteUnavailable(
+        
+        val v1: kotlin.String
+        ) : CoreException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<CoreException> {
         override fun lift(error_buf: RustBuffer.ByValue): CoreException = FfiConverterTypeCoreError.lift(error_buf)
@@ -3732,6 +3719,9 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
             14 -> CoreException.ConnectionClosed()
             15 -> CoreException.Timeout()
             16 -> CoreException.ReplayDetected(
+                FfiConverterString.read(buf),
+                )
+            17 -> CoreException.CipherSuiteUnavailable(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
@@ -3816,6 +3806,11 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
                 4UL
                 + FfiConverterString.allocationSize(value.v1)
             )
+            is CoreException.CipherSuiteUnavailable -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
         }
     }
 
@@ -3894,6 +3889,11 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
             }
             is CoreException.ReplayDetected -> {
                 buf.putInt(16)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is CoreException.CipherSuiteUnavailable -> {
+                buf.putInt(17)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
