@@ -599,6 +599,12 @@ impl Session {
         self.bandwidth_estimator.lock().on_loss(bytes);
     }
 
+    /// Current BBR congestion-control state. Observability / test hook — lets
+    /// callers confirm a loss drove the estimator into `FastRecovery`.
+    pub fn bbr_state(&self) -> crate::transport::bandwidth_estimator::BbrState {
+        self.bandwidth_estimator.lock().state()
+    }
+
     /// Read a snapshot of the bandwidth / pacing estimator. Cheap; held
     /// over a single mutex lock.
     pub fn bandwidth_snapshot(&self) -> BandwidthSnapshot {

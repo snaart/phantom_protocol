@@ -907,8 +907,13 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
     snapshot.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
     for (_priority, stream_id, stream) in snapshot {
-        while let Some((seq, payload, is_reliable)) = stream.poll_send().await {
-            let base = if is_reliable {
+        while let Some(seg) = stream.poll_send().await {
+            // A retransmission means the prior send was lost — tell congestion
+            // control so BBR enters FastRecovery and the pacing rate backs off.
+            if seg.retransmit {
+                crypto_session.on_packet_lost(seg.data.len() as u64);
+            }
+            let base = if seg.reliable {
                 PacketFlags::RELIABLE
             } else {
                 PacketFlags::UNRELIABLE
@@ -918,8 +923,8 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
                 crypto_session,
                 session_id,
                 stream_id as TransportStreamId,
-                seq,
-                &payload,
+                seg.seq,
+                &seg.data,
                 base,
             )
             .await
@@ -2233,6 +2238,39 @@ mod tests {
 
         server_handle.await.unwrap();
         session.disconnect().await.unwrap();
+    }
+
+    /// A retransmission (RTO expiry) must be reported to congestion control as
+    /// a loss, driving BBR into FastRecovery — proves the drain → on_packet_lost
+    /// wiring, not just that the retransmit happens.
+    #[tokio::test]
+    async fn drain_reports_a_retransmit_as_loss_to_bbr() {
+        use crate::transport::bandwidth_estimator::BbrState;
+
+        tokio::time::pause();
+        let sid = fixed_session_id();
+        let (client, _server) = paired_v2_sessions(sid);
+
+        let stream = Arc::new(TransportStream::new(1));
+        stream.send_reliable(Bytes::from("payload")).await;
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(1u32, stream);
+
+        let (client_t, _server_t) = ChannelTransport::pair();
+        let transport = Arc::new(client_t);
+
+        // First drain: the initial transmission — not a loss.
+        drain_streams_priority_ordered(&transport, &client, sid, &streams).await;
+        assert_ne!(client.bbr_state(), BbrState::FastRecovery);
+
+        // The RTO expires; the next drain retransmits and must report the loss.
+        tokio::time::advance(std::time::Duration::from_millis(1100)).await;
+        drain_streams_priority_ordered(&transport, &client, sid, &streams).await;
+        assert_eq!(
+            client.bbr_state(),
+            BbrState::FastRecovery,
+            "a retransmit must be reported to BBR as a loss"
+        );
     }
 
     // ────────────────────────────────────────────────────────────────────

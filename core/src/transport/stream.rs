@@ -42,6 +42,20 @@ struct PendingData {
     retries: u32,
 }
 
+/// One segment handed back by [`Stream::poll_send`] for transmission.
+#[derive(Debug, Clone)]
+pub struct OutboundSegment {
+    /// Sequence number of the segment.
+    pub seq: SequenceNumber,
+    /// Payload bytes.
+    pub data: Bytes,
+    /// Whether the segment is on the reliable (ACK-tracked) path.
+    pub reliable: bool,
+    /// True when this is a retransmission (the RTO expired) rather than a first
+    /// transmission — the caller reports it to congestion control as a loss.
+    pub retransmit: bool,
+}
+
 /// RFC 6298 retransmission-timeout estimator (per stream). Replaces a fixed
 /// retransmit timer with one that tracks measured RTT (SRTT / RTTVAR) and backs
 /// off exponentially on consecutive timeouts.
@@ -387,12 +401,16 @@ impl Stream {
         seq
     }
 
-    /// Get next data chunk to send
-    /// Returns: (SequenceNumber, Bytes, is_reliable)
-    pub async fn poll_send(&self) -> Option<(SequenceNumber, Bytes, bool)> {
+    /// Get the next segment to (re)transmit, or `None` if nothing is due.
+    pub async fn poll_send(&self) -> Option<OutboundSegment> {
         // First check unreliable buffer (fire and forget)
         if let Some((seq, data)) = self.unreliable_buffer.lock().await.pop_front() {
-            return Some((seq, data, false));
+            return Some(OutboundSegment {
+                seq,
+                data,
+                reliable: false,
+                retransmit: false,
+            });
         }
 
         let mut buffer = self.send_buffer.lock().await;
@@ -404,14 +422,24 @@ impl Stream {
         for pending in buffer.iter_mut() {
             if pending.sent_at.is_none() {
                 pending.sent_at = Some(now);
-                return Some((pending.sequence, pending.data.clone(), true));
+                return Some(OutboundSegment {
+                    seq: pending.sequence,
+                    data: pending.data.clone(),
+                    reliable: true,
+                    retransmit: false,
+                });
             } else if let Some(sent_at) = pending.sent_at {
                 if now.duration_since(sent_at) >= timeout {
                     pending.sent_at = Some(now);
                     pending.retries += 1;
                     // Back the RTO off exponentially for the next attempt.
                     self.note_rto_timeout();
-                    return Some((pending.sequence, pending.data.clone(), true));
+                    return Some(OutboundSegment {
+                        seq: pending.sequence,
+                        data: pending.data.clone(),
+                        reliable: true,
+                        retransmit: true,
+                    });
                 }
             }
         }
@@ -592,15 +620,17 @@ mod tests {
         assert_eq!(stream.pending_send_count().await, 2);
 
         // Poll send twice, the second should be None because it's already sent and hasn't timed out
-        let (seq, data, is_reliable) = stream.poll_send().await.unwrap();
-        assert_eq!(seq, 0);
-        assert_eq!(data, Bytes::from("hello"));
-        assert!(is_reliable);
+        let seg = stream.poll_send().await.unwrap();
+        assert_eq!(seg.seq, 0);
+        assert_eq!(seg.data, Bytes::from("hello"));
+        assert!(seg.reliable);
+        assert!(!seg.retransmit);
 
-        let (seq2, data2, is_reliable2) = stream.poll_send().await.unwrap();
-        assert_eq!(seq2, 1);
-        assert_eq!(data2, Bytes::from("world"));
-        assert!(is_reliable2);
+        let seg2 = stream.poll_send().await.unwrap();
+        assert_eq!(seg2.seq, 1);
+        assert_eq!(seg2.data, Bytes::from("world"));
+        assert!(seg2.reliable);
+        assert!(!seg2.retransmit);
 
         assert!(stream.poll_send().await.is_none());
     }
@@ -613,10 +643,11 @@ mod tests {
 
         stream.send_reliable(Bytes::from("hello")).await;
 
-        // First send
-        let (seq, _, is_reliable) = stream.poll_send().await.unwrap();
-        assert_eq!(seq, 0);
-        assert!(is_reliable);
+        // First send — not a retransmission.
+        let seg = stream.poll_send().await.unwrap();
+        assert_eq!(seg.seq, 0);
+        assert!(seg.reliable);
+        assert!(!seg.retransmit);
 
         // Immediate poll should be None
         assert!(stream.poll_send().await.is_none());
@@ -629,11 +660,12 @@ mod tests {
         // Advance past the 1s initial RTO (total ~1.1s).
         tokio::time::advance(std::time::Duration::from_millis(700)).await;
 
-        // Now it should retransmit
-        let (seq2, data2, is_reliable2) = stream.poll_send().await.unwrap();
-        assert_eq!(seq2, 0);
-        assert_eq!(data2, Bytes::from("hello"));
-        assert!(is_reliable2);
+        // Now it should retransmit — flagged as a retransmission.
+        let seg2 = stream.poll_send().await.unwrap();
+        assert_eq!(seg2.seq, 0);
+        assert_eq!(seg2.data, Bytes::from("hello"));
+        assert!(seg2.reliable);
+        assert!(seg2.retransmit);
 
         // Ack it
         let acked = stream.ack(0).await;
