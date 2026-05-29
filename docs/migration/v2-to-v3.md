@@ -131,6 +131,42 @@ early-data.
   to a cookie/PoW 1-RTT handshake. Capture a fresh `resumption_hint()`
   from each completed session.
 
+## FIPS variant (`PROTOCOL_VARIANT`)
+
+The same V3 envelope ships with a **build-side variant tag** —
+`PROTOCOL_VARIANT` — that is **(a)** carried cleartext on every
+`ClientHello` and **(b)** bound into the signed handshake transcript
+on both the V1/V2 and V3 paths.
+
+| Build | `PROTOCOL_VARIANT` |
+| --- | --- |
+| Default (`cargo build`) | `b"phantom-default-1"` |
+| FIPS (`cargo build --features fips`) | `b"phantom-fips-1"` |
+
+Peers with mismatched variants cannot interoperate. Cross-mode
+connects fail loudly with `HandshakeError::ProtocolVariantMismatch`
+on the cleartext gate; the transcript binding catches any MITM that
+rewrites the cleartext field to match the server's variant (the
+client's signature verify fails because the client signed with its
+own variant).
+
+Operationally this means:
+
+- **A fips client cannot connect to a non-fips server** — the
+  underlying primitive sets are different (ECDH-P-256 vs X25519,
+  HKDF-SHA-256 vs blake3-derive-key, AES-only vs AES+ChaCha) and the
+  derived secrets would not match even if the cleartext check were
+  bypassed.
+- **A non-fips client cannot connect to a fips server** — same.
+- **Both ends of a deployment must be rebuilt with the same feature
+  flag.** Treat `--features fips` as a separate distribution channel
+  with its own wire-format pinning.
+
+The `ClientHello.protocol_variant` field is `Vec<u8>` (not a fixed
+enum) so future builds can carry additional tags without another
+positional wire-format break — adding a new variant just changes the
+constant value.
+
 ## References
 
 - `docs/protocol/PROTOCOL.md` §12 — V3 wire-format spec.

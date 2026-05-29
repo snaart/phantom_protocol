@@ -110,6 +110,44 @@ jobs:
       - run: cargo test --manifest-path core/Cargo.toml --test observability_otel --features telemetry-otel
       - run: cargo clippy --manifest-path core/Cargo.toml --lib --features telemetry-otel -- -D warnings
 
+  fips-feature:
+    name: cargo test + clippy (--features fips)
+    runs-on: ubuntu-latest
+    # `aws-lc-rs` is best-supported on Linux. macOS / Windows are
+    # documented (CONTRIBUTING.md: `brew install pkg-config openssl@3`)
+    # but the CI runner of record is ubuntu-latest.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      # aws-lc-rs needs cmake + a C toolchain. ubuntu-latest already
+      # ships gcc; install cmake explicitly.
+      - run: sudo apt-get update && sudo apt-get install -y cmake
+      - run: cargo test --manifest-path core/Cargo.toml --lib --features fips
+      - run: cargo test --manifest-path core/Cargo.toml --test cavp --features fips
+      - run: cargo clippy --manifest-path core/Cargo.toml --lib --features fips -- -D warnings
+      # Confirm the fips × no-std conflict guard fires loudly rather
+      # than silently producing a broken binary.
+      - name: assert fips + no-std is rejected
+        run: |
+          set +e
+          out=$(cargo check --manifest-path core/Cargo.toml --features fips,no-std 2>&1)
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::fips + no-std build unexpectedly succeeded — the compile_error guard in core/src/lib.rs is broken"
+            exit 1
+          fi
+          echo "$out" | grep -q "mutually exclusive" || {
+            echo "::error::fips + no-std build failed, but not with the expected mutual-exclusion message:"
+            echo "$out"
+            exit 1
+          }
+
   cli-check:
     name: cli compiles against core
     runs-on: ubuntu-latest
