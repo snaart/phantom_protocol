@@ -2126,6 +2126,113 @@ mod tests {
         session.disconnect().await.unwrap();
     }
 
+    /// Reliable delivery: a RELIABLE application send must survive a dropped data frame.
+    ///
+    /// The client runs over a `LossyTransport`; once the handshake completes we
+    /// arm a drop of the next frame (the data frame) and send a reliable
+    /// payload. The first transmission is lost, so the server only ever sees
+    /// the payload if it is retransmitted. Until loss recovery is wired into the
+    /// data pump this MUST fail (the server times out waiting for a frame that
+    /// is never resent) — that is the point of the test.
+    ///
+    /// `#[ignore]`d while RED so the branch's default `cargo test` stays green;
+    /// the loss-recovery implementation commit removes the attribute. Run it
+    /// today with `--ignored` to watch it fail (the target it pins).
+    #[tokio::test]
+    #[ignore = "RED until loss recovery (RTO + retransmit) is wired into the data pump"]
+    async fn reliable_send_survives_a_dropped_data_frame() {
+        use crate::test_harness::fault_transport::{FaultControl, LossyTransport};
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        let faults = FaultControl::new();
+        let lossy_client = LossyTransport::new(client_transport, faults.clone());
+
+        let server_hs = HandshakeServer::new().unwrap();
+        let server_pinned_key = server_hs.verifying_key().clone();
+
+        let session = PhantomSession::connect_with_transport(
+            "test-server:9000",
+            lossy_client,
+            server_pinned_key,
+        );
+
+        let server_handle = tokio::spawn(async move {
+            let client_ip = "127.0.0.1".parse().unwrap();
+            let client_hello_bytes = server_transport.recv_bytes().await.unwrap();
+            let client_hello =
+                match borsh::from_slice::<ClientHelloEnvelope>(&client_hello_bytes).unwrap() {
+                    ClientHelloEnvelope::V12(ch) => ch,
+                    ClientHelloEnvelope::V3(_) => {
+                        panic!("test responder expects a V12 ClientHello")
+                    }
+                };
+
+            // Drive the handshake to completion (may take one cookie/PoW retry).
+            let server_session = loop {
+                match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+                    HandshakeResponse::Retry(retry) => {
+                        let retry_bytes =
+                            borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry)).unwrap();
+                        server_transport.send_bytes(&retry_bytes).await.unwrap();
+                        let next_bytes = server_transport.recv_bytes().await.unwrap();
+                        let next_hello = match borsh::from_slice::<ClientHelloEnvelope>(&next_bytes)
+                            .unwrap()
+                        {
+                            ClientHelloEnvelope::V12(ch) => ch,
+                            ClientHelloEnvelope::V3(_) => panic!("expects V12 ClientHello"),
+                        };
+                        match server_hs.process_client_hello(&next_hello, 0, client_ip) {
+                            HandshakeResponse::Success(server_hello, session) => {
+                                let b =
+                                    borsh::to_vec(&ServerHelloEnvelope::V12(server_hello)).unwrap();
+                                server_transport.send_bytes(&b).await.unwrap();
+                                break session;
+                            }
+                            _ => panic!("expected success after retry"),
+                        }
+                    }
+                    HandshakeResponse::Success(server_hello, session) => {
+                        let b = borsh::to_vec(&ServerHelloEnvelope::V12(server_hello)).unwrap();
+                        server_transport.send_bytes(&b).await.unwrap();
+                        break session;
+                    }
+                    HandshakeResponse::SuccessV3(..) => {
+                        panic!("V12 process_client_hello must not return SuccessV3")
+                    }
+                    HandshakeResponse::Fail(e) => panic!("handshake failed: {:?}", e),
+                }
+            };
+
+            // The reliable data frame was dropped on first transmission; it can
+            // only arrive via retransmission. Time-bounded so a missing
+            // retransmit fails loudly instead of hanging the test forever.
+            let data_frame = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                server_transport.recv_bytes(),
+            )
+            .await
+            .expect(
+                "reliable payload never arrived within 3s — the dropped data frame was not \
+                 retransmitted (loss recovery not yet implemented)",
+            )
+            .unwrap();
+            let plain = decrypt_incoming(&server_session, &data_frame);
+            assert_eq!(plain, b"reliable-payload");
+        });
+
+        // Wait for the handshake to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(session.connection_state(), ConnectionState::Connected);
+
+        // Arm a single drop, then send: the next frame on the wire (the data
+        // frame) is silently lost.
+        faults.arm_drop_next(1);
+        session.send(b"reliable-payload".to_vec()).await.unwrap();
+
+        server_handle.await.unwrap();
+        session.disconnect().await.unwrap();
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // V2 wire-routing tests (Phase 4.2 / 2.5 follow-up — data-pump V2)
     // ────────────────────────────────────────────────────────────────────
