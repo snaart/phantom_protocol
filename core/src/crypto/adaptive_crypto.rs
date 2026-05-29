@@ -11,7 +11,7 @@
 //! (FIPS-validated AWS-LC). The Rust API surface is identical to
 //! `ring::aead`, so the rest of this module is untouched. The cipher
 //! suite enum keeps `ChaCha20Poly1305` (wire-format stability) but the
-//! negotiation/build paths reject it under `fips` — see A3.
+//! negotiation/build paths reject it under `fips`.
 
 use crate::errors::CoreError;
 #[cfg(not(feature = "fips"))]
@@ -269,7 +269,7 @@ impl CryptoSession {
         let send_label = format!("{}send-v1", ctx);
         let recv_label = format!("{}recv-v1", ctx);
 
-        // A5 — `crypto::kdf::derive_key_32` cfg-dispatches between
+        // `crypto::kdf::derive_key_32` cfg-dispatches between
         // `blake3::derive_key` (default) and HKDF-SHA256 (fips). The
         // 32-byte output and label-string API are identical.
         let key_a = crate::crypto::kdf::derive_key_32(&send_label, shared_secret);

@@ -27,7 +27,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use std::sync::OnceLock;
 
-/// Process-global cache for [`run_post`]'s result. A7 — the fips
+/// Process-global cache for [`run_post`]'s result. The fips
 /// bootstrap (`PhantomListener::bind*` / `PhantomSession::connect*`)
 /// calls [`ensure_post_passed`] which lazily runs the POST exactly
 /// once per process and caches the verdict. Subsequent calls return
@@ -335,8 +335,8 @@ mod tests {
     #[test]
     fn aead_test_passes_for_both_suites() {
         test_aead(CipherSuite::Aes256Gcm, "AES-256-GCM").unwrap();
-        // ChaCha20-Poly1305 is rejected under `--features fips`
-        // (A3); only exercise it on non-fips builds.
+        // ChaCha20-Poly1305 is rejected under `--features fips`;
+        // only exercise it on non-fips builds.
         #[cfg(not(feature = "fips"))]
         test_aead(CipherSuite::ChaCha20Poly1305, "ChaCha20-Poly1305").unwrap();
     }
@@ -371,7 +371,7 @@ mod tests {
         }
     }
 
-    /// A7 — `ensure_post_passed()` runs the POST and returns its
+    /// `ensure_post_passed()` runs the POST and returns its
     /// result. On a clean build, `Ok(())`.
     #[test]
     fn ensure_post_passed_succeeds_on_clean_build() {
@@ -380,7 +380,7 @@ mod tests {
         assert!(ensure_post_passed().is_ok());
     }
 
-    /// A7 — `FORCE_POST_FAIL` flips `ensure_post_passed` to return
+    /// `FORCE_POST_FAIL` flips `ensure_post_passed` to return
     /// the fault-injected error variant. Used by the
     /// `listener::bind*` / `session::connect*` reject-path tests.
     #[test]

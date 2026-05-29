@@ -5,7 +5,7 @@
 //! `ml-kem` crate's FIPS-203 ML-KEM-768. Same algorithm at the math level,
 //! but the byte encoding follows FIPS 203.
 //!
-//! A4 — under `--features fips`, the classical half swaps from X25519
+//! Under `--features fips`, the classical half swaps from X25519
 //! to ECDH-P-256 via `aws-lc-rs`. The classical public-key length on
 //! the wire grows from 32 bytes (X25519) to 65 bytes (uncompressed
 //! SEC1 P-256). Cross-mode interop (fips ↔ non-fips) is **not

@@ -16,7 +16,7 @@ use sha2::Sha256;
 /// - Default: `blake3::derive_key(label, ikm)` — pure-Rust, infallible.
 /// - `--features fips`: `HKDF-SHA256` with empty salt, `info = label
 ///   bytes`. FIPS 140-3 §C-approved (SP 800-108) so the same
-///   call-sites stay valid under the fips swap (A5).
+///   call-sites stay valid under the fips swap.
 ///
 /// PANIC-SAFETY: HKDF-SHA256 `expand` only errors when the requested
 /// output length exceeds 255 * HashLen (255 * 32 = 8160 bytes for
