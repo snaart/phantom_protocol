@@ -81,6 +81,22 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  audit-binaries:
+    name: cargo audit (server + cli lockfiles)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - run: cargo install cargo-audit --locked
+      # The deployed `server`/`cli` binaries carry their own committed
+      # lockfiles. The root `audit` job above does not see them, so
+      # scan them explicitly — release artifacts build from these trees.
+      - run: cargo audit -f server/Cargo.lock
+      - run: cargo audit -f cli/Cargo.lock
+
   embedded-feature:
     name: cargo test + clippy (--features embedded)
     runs-on: ubuntu-latest
