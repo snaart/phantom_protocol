@@ -13,6 +13,76 @@ the foundation and security-hardening phases of the production-readiness
 roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
 132; the new ten cover the documented security invariants directly.
 
+### Added — `wasi-leg` Cargo feature (commits `f6c0c0a`..`255be95`)
+
+**`cargo build --target wasm32-wasip2 --features wasi-leg` is now a
+shipped configuration.** Phantom Core embedders can run inside any
+WASI Preview 2 host (Wasmtime, WasmEdge, Spin, wasmCloud, Cloudflare
+Workers WASI sandbox).
+
+New surface:
+- **`phantom_core::transport::legs::wasi::WasiLeg`** — length-prefix-
+  framed `SessionTransport` over `wasi:sockets/tcp`. Client-only
+  for now; `connect(SocketAddr)` wraps the Preview 2 socket-create +
+  start_connect + poll + finish_connect dance. Same 4-byte
+  big-endian framing as `TcpSessionTransport`.
+- **`phantom_core::runtime::wasi_runtime::WasiRuntime`** — single-
+  task `Runtime` impl. `drive()` polls every spawned future once;
+  `poll_until_progress(max_wait)` blocks on `wasi:io/poll::poll`
+  with a `subscribe_duration` watchdog so the drive loop always
+  makes eventual progress. `SpawnHandle::abort` toggles an
+  `AtomicBool` the wrapping future checks.
+
+Both modules are gated on `cfg(all(feature = "wasi-leg", target_os
+= "wasi"))`. A `compile_error!` in `core/src/lib.rs` rejects the
+`wasi-leg + wasm32-unknown-unknown` combination (browser target —
+use `WebSocketLeg` + `WasmRuntime` instead).
+
+**Cargo feature split** — UniFFI scaffolding moved from the `std`
+feature into a new `bindings` Cargo feature (default-on, so native
+embedders see the historical surface unchanged). WASI guests opt out
+via `--no-default-features --features std,wasi-leg` because
+UniFFI's exported-symbol metadata is incompatible with
+`wasm-component-ld`, the wasm32-wasip2 linker. Every
+`#[uniffi::*]` attribute in `core/src/{api/*,errors,config,lib,
+bin/uniffi-bindgen}` was wrapped in `#[cfg_attr(feature =
+"bindings", …)]`.
+
+**Breaking for `--no-default-features --features std` consumers.**
+Default builds are unaffected (`default = ["compression-zstd", "std",
+"bindings"]`), and so is anything that opts into `default-features`.
+But a consumer pinning
+`phantom_core = { default-features = false, features = ["std"] }`
+used to get the UniFFI scaffolding for free via `std`; after this
+PR they must explicitly add `bindings`:
+`features = ["std", "bindings"]`. Pre-1.0 SemVer permits this, but
+the call-out is here so embedders pinning `std`-only do not see a
+silent removal of the `uniffi::Object` / `uniffi::Record` derives.
+
+**Cargo target-cfg refinement** — `core/Cargo.toml`'s
+`[target.'cfg(target_arch = "wasm32")']` block (the
+browser-WASM-only deps: `wasm-bindgen`, `web-sys`, `js-sys`,
+`getrandom = { features = ["js"] }`) narrows to
+`cfg(all(target_arch = "wasm32", target_os = "unknown"))` so WASI
+builds skip them entirely.
+
+**CI** — `wasm32-wasi` (legacy alias) `allow_failure: true` row in
+`.github/workflows/cross.yml` is replaced with a hard-gated
+`wasm32-wasip2` matrix entry. New `wasi-integration` job installs
+`wasmtime` and runs the `#[ignore]`-gated
+`core/tests/wasi_integration.rs` host driver, which spawns the
+`phantom-wasi-guest` fixture under `wasmtime` and verifies a
+round-trip through `WasiLeg`. The 12-target cross-compile matrix
+now has zero `allow_failure: true` rows.
+
+Out of scope (follow-up):
+- Server-side `accept` for `WasiLeg` (running `phantom-server` as a
+  WASI guest is explicitly deferred per the plan's Decision Point 3).
+- Full `PhantomSession` over `WasiLeg` (the B5 host test exercises
+  the byte pipe, not the handshake).
+
+Detailed quickstart in `docs/operations/wasi.md`.
+
 ### Security — FIPS 140-3 primitive swap (commits `613473a`..`5dd39c7`)
 
 **`cargo build --features fips` is now a shipped configuration.** The
@@ -84,7 +154,6 @@ Test count under `--features fips`: 244 lib tests + 3 ignored TCP
 integration tests (all green). Detailed primitive table and the
 remaining documentation work for a real CMVP submission are in
 `docs/compliance/fips-readiness.md`.
-
 
 
 ### Phase 8 — OpenTelemetry refactor (Observability)

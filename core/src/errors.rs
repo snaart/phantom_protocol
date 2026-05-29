@@ -12,7 +12,8 @@ use alloc::string::String;
 use thiserror::Error;
 
 /// Universal Core Error Enum compatible with FFI exports
-#[cfg_attr(feature = "std", derive(Error, uniffi::Error))]
+#[cfg_attr(feature = "std", derive(Error))]
+#[cfg_attr(feature = "bindings", derive(uniffi::Error))]
 #[derive(Debug)]
 pub enum CoreError {
     #[cfg_attr(feature = "std", error("Network I/O Error: {0}"))]
