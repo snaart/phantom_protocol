@@ -2,6 +2,9 @@ use std::time::Duration;
 
 #[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 #[derive(Debug, Clone)]
+// New tunables must not break downstream construction. Build via `mobile()` /
+// `server()` / `iot()` / `default()` then mutate the public fields.
+#[non_exhaustive]
 pub struct PhantomConfig {
     /// Interval between keep-alive pings
     pub keepalive_interval: Duration,

@@ -1104,11 +1104,6 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      */
     func send(data: Data) async throws 
     
-    /**
-     * Transition to a new connection state.
-     */
-    func setState(newState: ConnectionState) 
-    
 }
 /**
  * Client-first session — instant `connect()`, non-blocking `send()`.
@@ -1427,16 +1422,6 @@ open func send(data: Data)async throws   {
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeCoreError_lift
         )
-}
-    
-    /**
-     * Transition to a new connection state.
-     */
-open func setState(newState: ConnectionState)  {try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_set_state(self.uniffiClonePointer(),
-        FfiConverterTypeConnectionState_lower(newState),$0
-    )
-}
 }
     
 
@@ -2203,6 +2188,15 @@ public enum CoreError: Swift.Error {
      */
     case ReplayDetected(String
     )
+    /**
+     * A requested cipher suite is not available in the current build.
+     * Emitted under `--features fips` when a caller asks for a
+     * non-FIPS-approved primitive (today: `ChaCha20-Poly1305`). The
+     * variant is always compiled so error matching stays stable across
+     * feature configurations.
+     */
+    case CipherSuiteUnavailable(String
+    )
 }
 
 
@@ -2257,6 +2251,9 @@ public struct FfiConverterTypeCoreError: FfiConverterRustBuffer {
         case 14: return .ConnectionClosed
         case 15: return .Timeout
         case 16: return .ReplayDetected(
+            try FfiConverterString.read(from: &buf)
+            )
+        case 17: return .CipherSuiteUnavailable(
             try FfiConverterString.read(from: &buf)
             )
 
@@ -2344,6 +2341,11 @@ public struct FfiConverterTypeCoreError: FfiConverterRustBuffer {
         
         case let .ReplayDetected(v1):
             writeInt(&buf, Int32(16))
+            FfiConverterString.write(v1, into: &buf)
+            
+        
+        case let .CipherSuiteUnavailable(v1):
+            writeInt(&buf, Int32(17))
             FfiConverterString.write(v1, into: &buf)
             
         }
@@ -2627,9 +2629,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_core_checksum_method_phantomsession_send() != 35674) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_phantom_core_checksum_method_phantomsession_set_state() != 24535) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 13449) {

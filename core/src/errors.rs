@@ -15,6 +15,9 @@ use thiserror::Error;
 #[cfg_attr(feature = "std", derive(Error))]
 #[cfg_attr(feature = "bindings", derive(uniffi::Error))]
 #[derive(Debug)]
+// Adding a variant must not be a SemVer-major break for downstream `match`es
+// (FIPS / migration / flow-control errors are expected to land post-1.0).
+#[non_exhaustive]
 pub enum CoreError {
     #[cfg_attr(feature = "std", error("Network I/O Error: {0}"))]
     NetworkError(String),

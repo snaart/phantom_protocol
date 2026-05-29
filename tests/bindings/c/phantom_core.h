@@ -408,12 +408,6 @@ uint64_t uniffi_phantom_core_fn_method_phantomsession_send(
     void                    *ptr,
     PhantomRustBuffer        data);
 
-/* set_state(state: ConnectionState) -> void (sync). */
-void uniffi_phantom_core_fn_method_phantomsession_set_state(
-    void                    *ptr,
-    PhantomRustBuffer        new_state,
-    PhantomRustCallStatus   *call_status);
-
 /* --------------------------- PhantomStream -------------------------- */
 
 void *uniffi_phantom_core_fn_clone_phantomstream(
