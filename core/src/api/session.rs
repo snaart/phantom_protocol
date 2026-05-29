@@ -658,6 +658,17 @@ async fn run_data_pump<T: SessionTransport>(
     next_app_seq: Arc<AtomicU32>,
     runtime: Arc<dyn Runtime>,
 ) {
+    // ── Raw-app session stream (reserved id 1) ──
+    // The connectionless `send()` / `recv()` surface is multiplexed onto one
+    // reserved stream so it gets the same reliable-delivery machinery as
+    // explicitly-opened streams: `drain_streams_priority_ordered` (re)transmits
+    // its buffered segments on the poll tick / outbound-ready notify, and
+    // inbound ACKs for id 1 clear them via `Stream::ack`. The demultiplexer
+    // hands out ids 2+, so this never collides with a user-opened stream.
+    const RAW_APP_STREAM_ID: u32 = 1;
+    let raw_stream = Arc::new(Stream::new(RAW_APP_STREAM_ID as TransportStreamId));
+    streams.insert(RAW_APP_STREAM_ID, raw_stream.clone());
+
     // ── Flush queued early-data sends as encrypted packets ──
     {
         let mut queue = send_queue.lock().await;
@@ -802,19 +813,16 @@ async fn run_data_pump<T: SessionTransport>(
             cmd_opt = cmd_rx.recv() => {
                 match cmd_opt {
                     Some(SessionCommand::Send(data)) => {
-                        let seq = next_app_seq.fetch_add(1, Ordering::Relaxed);
-                        if !send_app_data(
-                            &transport,
-                            &crypto_session,
-                            session_id,
-                            1,
-                            seq,
-                            &data,
-                            PacketFlags::RELIABLE,
-                        ).await {
-                            log::error!("PhantomSession: SessionCommand::Send failed");
-                            break;
+                        // Route through the raw-app stream so the payload is
+                        // buffered for retransmit until ACKed (drained by
+                        // `drain_streams_priority_ordered`), instead of being
+                        // fired once and forgotten on the wire.
+                        for chunk in data.chunks(TRANSPORT_MTU) {
+                            raw_stream
+                                .send_reliable(Bytes::copy_from_slice(chunk))
+                                .await;
                         }
+                        crypto_session.notify_outbound_ready();
                     }
                     Some(SessionCommand::SendStreamReliable { stream_id, data }) => {
                         if let Some(stream) = streams.get(&stream_id) {
@@ -2130,16 +2138,10 @@ mod tests {
     ///
     /// The client runs over a `LossyTransport`; once the handshake completes we
     /// arm a drop of the next frame (the data frame) and send a reliable
-    /// payload. The first transmission is lost, so the server only ever sees
-    /// the payload if it is retransmitted. Until loss recovery is wired into the
-    /// data pump this MUST fail (the server times out waiting for a frame that
-    /// is never resent) — that is the point of the test.
-    ///
-    /// `#[ignore]`d while RED so the branch's default `cargo test` stays green;
-    /// the loss-recovery implementation commit removes the attribute. Run it
-    /// today with `--ignored` to watch it fail (the target it pins).
+    /// payload. The first transmission is lost, so the server only sees the
+    /// payload because the raw-app stream buffers it and the data pump
+    /// retransmits the timed-out segment.
     #[tokio::test]
-    #[ignore = "RED until loss recovery (RTO + retransmit) is wired into the data pump"]
     async fn reliable_send_survives_a_dropped_data_frame() {
         use crate::test_harness::fault_transport::{FaultControl, LossyTransport};
 

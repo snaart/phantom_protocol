@@ -61,7 +61,7 @@ impl StreamDemultiplexer {
         let mux = Self {
             streams: DashMap::new(),
             control_tx,
-            next_stream_id: AtomicU32::new(1), // 0 is reserved for control
+            next_stream_id: AtomicU32::new(2), // 0 = control, 1 = raw-app session channel
         };
         (mux, control_rx)
     }
