@@ -48,6 +48,12 @@ pub const PROTOCOL_VARIANT: &[u8] = b"phantom-default-1";
 #[cfg(feature = "fips")]
 pub const PROTOCOL_VARIANT: &[u8] = b"phantom-fips-1";
 
+/// The sole protocol version carried in `ClientHello.version` and bound into the
+/// handshake transcript. Pinned to one value — the protocol is not negotiated
+/// (pre-1.0, no users). It is a tamper-check anchor and a hook for a future,
+/// deliberate version increment.
+pub const PROTOCOL_VERSION: u8 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeStage {
     /// Initial state, no messages exchanged
