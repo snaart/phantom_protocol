@@ -669,27 +669,26 @@ async fn run_data_pump<T: SessionTransport>(
     let raw_stream = Arc::new(Stream::new(RAW_APP_STREAM_ID as TransportStreamId));
     streams.insert(RAW_APP_STREAM_ID, raw_stream.clone());
 
-    // ── Flush queued early-data sends as encrypted packets ──
+    // ── Flush queued early-data onto the raw-app stream ──
+    // Routed through the stream (not a one-shot direct send) so queued
+    // pre-handshake data is buffered for retransmit just like post-handshake
+    // sends — a dropped early-data frame is recovered, not lost.
     {
         let mut queue = send_queue.lock().await;
         let count = queue.len();
         for msg in queue.drain(..) {
-            if !send_app_data(
-                &transport,
-                &crypto_session,
-                session_id,
-                1, // raw-app stream_id
-                next_app_seq.fetch_add(1, Ordering::Relaxed),
-                &msg,
-                PacketFlags::RELIABLE,
-            )
-            .await
-            {
-                log::error!("PhantomSession: failed to flush queued message");
+            for chunk in msg.chunks(TRANSPORT_MTU) {
+                raw_stream
+                    .send_reliable(Bytes::copy_from_slice(chunk))
+                    .await;
             }
         }
         if count > 0 {
-            log::info!("PhantomSession: flushed {} queued messages", count);
+            log::info!(
+                "PhantomSession: queued {} early-data message(s) onto the raw-app stream",
+                count
+            );
+            crypto_session.notify_outbound_ready();
         }
     }
 
