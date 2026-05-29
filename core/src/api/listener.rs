@@ -90,7 +90,7 @@ impl PhantomListener {
         runtime: Arc<dyn Runtime>,
         signing_key: Option<HybridSigningKey>,
     ) -> Result<Arc<Self>, CoreError> {
-        // A7 — under `--features fips`, run the FIPS 140-3 §7.7 POST
+        // Under `--features fips`, run the FIPS 140-3 §7.7 POST
         // before standing up the listener. A failure short-circuits
         // here with `CoreError::FipsSelfTestFailure` rather than
         // serving traffic over broken primitives. Cached after the
@@ -468,7 +468,7 @@ mod tests {
         );
     }
 
-    /// A7 — under `--features fips`, a POST failure short-circuits
+    /// Under `--features fips`, a POST failure short-circuits
     /// `bind*` with `CoreError::FipsSelfTestFailure`. Uses the
     /// `set_force_post_fail` test seam to inject the failure.
     #[cfg(feature = "fips")]

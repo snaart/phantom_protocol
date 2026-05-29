@@ -46,7 +46,7 @@ impl AesSession {
     }
 
     fn build(shared_secret: &[u8; 32], swap: bool) -> Result<Self, crate::CoreError> {
-        // A5 — `crypto::kdf::derive_key_32` cfg-dispatches between
+        // `crypto::kdf::derive_key_32` cfg-dispatches between
         // `blake3::derive_key` (default) and HKDF-SHA256 (`--features
         // fips`). API shape and 32-byte output are identical.
         let key_a = crate::crypto::kdf::derive_key_32("phantom-aes-send-v1", shared_secret);

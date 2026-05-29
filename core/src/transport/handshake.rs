@@ -39,7 +39,7 @@ pub const EARLY_DATA_MAX_LEN: usize = 16 * 1024;
 /// rewrites the cleartext field cannot escape detection because the
 /// transcript signature is computed over the build's own variant.
 ///
-/// A4 — the `--features fips` build advertises `phantom-fips-1` so a
+/// The `--features fips` build advertises `phantom-fips-1` so a
 /// fips client and a non-fips server (or vice versa) fail loudly at
 /// handshake time rather than producing a silently-wrong shared
 /// secret across mismatched primitive sets.
@@ -231,9 +231,9 @@ struct HandshakeTranscriptV3<'a> {
 }
 
 /// Hash a borsh-serializable transcript. Generic over the transcript
-/// type so the V1/V2 and V3 paths share one implementation; the V12
-/// transcript bytes are byte-identical to pre-V3 builds (same struct,
-/// same borsh layout).
+/// type so the V1/V2 and V3 paths share one implementation. Both
+/// transcript structs lead with the `protocol_variant` tag, so the
+/// hash binds the build-side variant on every path.
 fn compute_transcript_hash<T: BorshSerialize>(transcript: &T) -> Result<[u8; 32], HandshakeError> {
     let mut hasher = Sha256::new();
     let bytes =
@@ -395,7 +395,7 @@ impl HandshakeServer {
         // load counter reflects attempts (including the rejected ones).
         self.record_handshake();
 
-        // A4 — protocol-variant gate. Fail loud (before any KEM /
+        // Protocol-variant gate. Fail loud (before any KEM /
         // signature work) if the client and server disagree on the
         // build-side `PROTOCOL_VARIANT` tag. The transcript also
         // binds this constant, so an MITM rewrite of the cleartext
@@ -542,7 +542,7 @@ impl HandshakeServer {
         self.record_handshake();
         let client_hello = &ch3.base;
 
-        // A4 — protocol-variant gate (same as V1/V2 path; see comment
+        // Protocol-variant gate (same as V1/V2 path; see comment
         // in `process_client_hello`).
         if client_hello.protocol_variant != PROTOCOL_VARIANT {
             return HandshakeResponse::Fail(HandshakeError::ProtocolVariantMismatch {
@@ -1325,7 +1325,7 @@ impl From<HandshakeError> for CoreError {
 mod tests {
     use super::*;
 
-    /// A4 — a `ClientHello` advertising a foreign `PROTOCOL_VARIANT`
+    /// A `ClientHello` advertising a foreign `PROTOCOL_VARIANT`
     /// (simulating a fips/non-fips cross-mode connect) is rejected by
     /// the server with [`HandshakeError::ProtocolVariantMismatch`]
     /// before any KEM / signature work is done.
@@ -1352,7 +1352,7 @@ mod tests {
         }
     }
 
-    /// A4 — V3 (0-RTT) path of the protocol-variant gate. A
+    /// V3 (0-RTT) path of the protocol-variant gate. A
     /// `ClientHelloV3` advertising a foreign `PROTOCOL_VARIANT` is
     /// rejected by `process_client_hello_v3` with
     /// [`HandshakeError::ProtocolVariantMismatch`] before any

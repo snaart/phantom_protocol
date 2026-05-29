@@ -251,7 +251,7 @@ impl PhantomSession {
         resumption_hint: ([u8; 32], [u8; 32]),
         early_data: Vec<u8>,
     ) -> Result<Self, CoreError> {
-        // A7 — fips bootstrap POST gate. `connect_with_resumption`
+        // fips bootstrap POST gate. `connect_with_resumption`
         // returns `Result`, so unlike the infallible `connect_with_transport*`
         // entry points we can surface the POST failure directly to the
         // caller (mirrors the `PhantomListener::bind*` and
@@ -438,9 +438,9 @@ impl PhantomSession {
     ) {
         log::info!("PhantomSession: starting handshake with {}", peer);
 
-        // A7 — fips bootstrap POST gate. Closes the gap called out in
-        // the FIPS primitive-swap rollout: the synchronous Rust-only
-        // entry points (`connect_with_transport*` / `connect_with_resumption`)
+        // fips bootstrap POST gate, mirroring the listener and
+        // `connect_pinned*` paths: the synchronous Rust-only entry
+        // points (`connect_with_transport*` / `connect_with_resumption`)
         // also need to honor FIPS 140-3 §7.7 before any cryptographic
         // work. Cached `OnceLock` makes the second+ call an atomic
         // read; the first call runs the full POST battery.
@@ -1706,7 +1706,7 @@ pub async fn connect_pinned(
     port: u16,
     pinned_key: Vec<u8>,
 ) -> Result<Arc<PhantomSession>, CoreError> {
-    // A7 — fips bootstrap POST gate (same policy as
+    // fips bootstrap POST gate (same policy as
     // `PhantomListener::bind_inner`). A failure here aborts the
     // connect before any socket is opened or key material is
     // touched.
@@ -1762,7 +1762,7 @@ pub async fn connect_pinned_with_resumption(
     hint: ResumptionHint,
     early_data: Vec<u8>,
 ) -> Result<Arc<PhantomSession>, CoreError> {
-    // A7 — fips bootstrap POST gate (same policy as
+    // fips bootstrap POST gate (same policy as
     // `connect_pinned`).
     #[cfg(feature = "fips")]
     crate::crypto::self_tests::ensure_post_passed()
