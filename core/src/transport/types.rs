@@ -63,6 +63,11 @@ pub type StreamId = u16;
 /// Per-stream sequence number
 pub type SequenceNumber = u32;
 
+/// The sole on-wire packet-header version byte. Pinned — the wire format is not
+/// negotiated (pre-1.0, no users); a decoder rejects anything else. It exists as
+/// a tamper-check anchor and a hook for a future, deliberate version increment.
+pub const WIRE_VERSION: u8 = 1;
+
 /// Packet flags bitfield
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[alkahest(Formula, SerializeRef, Deserialize)]
