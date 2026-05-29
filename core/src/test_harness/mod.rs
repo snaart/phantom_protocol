@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Fault-injecting `SessionTransport` wrapper (drops/…) used by loss-recovery tests.
+pub mod fault_transport;
+
 /// Network condition simulator for testing
 #[derive(Clone)]
 pub struct NetworkSimulator {
