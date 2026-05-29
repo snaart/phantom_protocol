@@ -12,7 +12,7 @@ This release pulls phantom_core from its 0.2.0 pre-1.0 baseline through
 the foundation and security-hardening phases. Test count grew from 122 to
 132; the new ten cover the documented security invariants directly.
 
-### Added — `wasi-leg` Cargo feature (commits `f4828c2`..`307b43e`)
+### Added — `wasi-leg` Cargo feature (commits `f6c0c0a`..`255be95`)
 
 **`cargo build --target wasm32-wasip2 --features wasi-leg` is now a
 shipped configuration.** Phantom Core embedders can run inside any

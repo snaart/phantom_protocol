@@ -1,6 +1,6 @@
 # wasm32-wasi (Preview 2) — shipped
 
-`wasm32-wasip2` is a hard CI gate (since commits `f4828c2`..`307b43e`). This page
+`wasm32-wasip2` is a hard CI gate (since commits `f6c0c0a`..`255be95`). This page
 is the quickstart for embedders running Phantom Core inside a WASI
 Preview 2 host (Wasmtime, WasmEdge, Spin, wasmCloud, Cloudflare
 Workers WASI sandbox).
