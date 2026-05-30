@@ -52,12 +52,7 @@ pub fn wrap_coalesced_packet(
     bundle: Vec<u8>,
 ) -> PhantomPacket {
     let flag_bits = flags_extra | PacketFlags::COALESCED;
-    let header = PacketHeader::new(
-        session_id,
-        stream_id,
-        sequence,
-        PacketFlags::new(flag_bits),
-    );
+    let header = PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits));
     PhantomPacket::new(header, bundle)
 }
 
@@ -139,13 +134,7 @@ pub fn drain_coalescer_to_packets(
 ) -> Vec<PhantomPacket> {
     let mut out = Vec::new();
     while let Some(bundle) = coalescer.flush() {
-        let pkt = wrap_coalesced_packet(
-            session_id,
-            stream_id,
-            *next_sequence,
-            flags_extra,
-            bundle,
-        );
+        let pkt = wrap_coalesced_packet(session_id, stream_id, *next_sequence, flags_extra, bundle);
         *next_sequence = next_sequence.wrapping_add(1);
         out.push(pkt);
     }
@@ -172,13 +161,7 @@ mod tests {
 
     #[test]
     fn wrap_or_s_in_extra_flags() {
-        let v = wrap_coalesced_packet(
-            fixed_session_id(),
-            7,
-            1,
-            PacketFlags::ENCRYPTED,
-            vec![],
-        );
+        let v = wrap_coalesced_packet(fixed_session_id(), 7, 1, PacketFlags::ENCRYPTED, vec![]);
         let v2 = &v;
         assert!(v2.header.flags.contains(PacketFlags::COALESCED));
         assert!(v2.header.flags.contains(PacketFlags::ENCRYPTED));

@@ -118,8 +118,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
                     PacketHeader::new(session_id, 1, seq, flags)
                 },
                 |header| {
-                    let encrypted =
-                        server_session.encrypt_packet(&header, &data).unwrap();
+                    let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
                     black_box(encrypted)
                 },
                 BatchSize::SmallInput,
@@ -137,8 +136,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
                     (header, encrypted)
                 },
                 |(header, encrypted)| {
-                    let decrypted =
-                        client_session.decrypt_packet(&header, &encrypted).unwrap();
+                    let decrypted = client_session.decrypt_packet(&header, &encrypted).unwrap();
                     black_box(decrypted)
                 },
                 BatchSize::SmallInput,
@@ -152,10 +150,8 @@ fn phantom_throughput_bench(c: &mut Criterion) {
                     PacketHeader::new(session_id, 3, seq, flags)
                 },
                 |header| {
-                    let encrypted =
-                        server_session.encrypt_packet(&header, &data).unwrap();
-                    let decrypted =
-                        client_session.decrypt_packet(&header, &encrypted).unwrap();
+                    let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
+                    let decrypted = client_session.decrypt_packet(&header, &encrypted).unwrap();
                     black_box(decrypted)
                 },
                 BatchSize::SmallInput,
@@ -374,10 +370,8 @@ fn encryption_bench(c: &mut Criterion) {
                     PacketHeader::new(session_id, 1, seq, flags)
                 },
                 |header| {
-                    let encrypted =
-                        server_session.encrypt_packet(&header, &data).unwrap();
-                    let decrypted =
-                        client_session.decrypt_packet(&header, &encrypted).unwrap();
+                    let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
+                    let decrypted = client_session.decrypt_packet(&header, &encrypted).unwrap();
                     black_box(decrypted)
                 },
                 BatchSize::SmallInput,

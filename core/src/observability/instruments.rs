@@ -45,22 +45,63 @@ mod otel_off {
             Self
         }
 
-        #[inline(always)] pub(crate) fn record_handshake_duration(&self, _duration_s: f64, _outcome: HandshakeOutcome, _leg: crate::transport::types::LegType, _cipher: AeadAlgorithm, _version: ProtocolVersion) {}
-        #[inline(always)] pub(crate) fn record_path_validation_duration(&self, _duration_s: f64, _path_id: u8, _outcome: PathValidationOutcome) {}
-        #[inline(always)] pub(crate) fn record_resumption(&self, _mode: ResumptionMode, _accepted: bool) {}
-        #[inline(always)] pub(crate) fn record_replay_rejected(&self, _reason: ReplayReason) {}
-        #[inline(always)] pub(crate) fn record_aead_failure(&self, _leg: crate::transport::types::LegType, _algorithm: AeadAlgorithm) {}
-        #[inline(always)] pub(crate) fn record_unencrypted_dropped(&self, _leg: crate::transport::types::LegType) {}
-        #[inline(always)] pub(crate) fn record_path_migration(&self, _from: u8, _to: u8) {}
-        #[inline(always)] pub(crate) fn record_cookie(&self, _outcome: CookieOutcome) {}
-        #[inline(always)] pub(crate) fn record_pow(&self, _outcome: PowOutcome, _difficulty: u8) {}
-        #[inline(always)] pub(crate) fn record_early_data(&self, _outcome: EarlyDataOutcome) {}
-        #[inline(always)] pub(crate) fn record_rekey(&self, _direction: Direction) {}
-        #[inline(always)] pub(crate) fn record_fallback(&self, _from_leg: crate::transport::types::LegType, _to_leg: crate::transport::types::LegType, _reason: FallbackReason) {}
-        #[inline(always)] pub(crate) fn session_opened(&self, _leg: crate::transport::types::LegType) {}
-        #[inline(always)] pub(crate) fn session_closed(&self, _leg: crate::transport::types::LegType) {}
-        #[inline(always)] pub(crate) fn stream_opened(&self) {}
-        #[inline(always)] pub(crate) fn stream_closed(&self) {}
+        #[inline(always)]
+        pub(crate) fn record_handshake_duration(
+            &self,
+            _duration_s: f64,
+            _outcome: HandshakeOutcome,
+            _leg: crate::transport::types::LegType,
+            _cipher: AeadAlgorithm,
+            _version: ProtocolVersion,
+        ) {
+        }
+        #[inline(always)]
+        pub(crate) fn record_path_validation_duration(
+            &self,
+            _duration_s: f64,
+            _path_id: u8,
+            _outcome: PathValidationOutcome,
+        ) {
+        }
+        #[inline(always)]
+        pub(crate) fn record_resumption(&self, _mode: ResumptionMode, _accepted: bool) {}
+        #[inline(always)]
+        pub(crate) fn record_replay_rejected(&self, _reason: ReplayReason) {}
+        #[inline(always)]
+        pub(crate) fn record_aead_failure(
+            &self,
+            _leg: crate::transport::types::LegType,
+            _algorithm: AeadAlgorithm,
+        ) {
+        }
+        #[inline(always)]
+        pub(crate) fn record_unencrypted_dropped(&self, _leg: crate::transport::types::LegType) {}
+        #[inline(always)]
+        pub(crate) fn record_path_migration(&self, _from: u8, _to: u8) {}
+        #[inline(always)]
+        pub(crate) fn record_cookie(&self, _outcome: CookieOutcome) {}
+        #[inline(always)]
+        pub(crate) fn record_pow(&self, _outcome: PowOutcome, _difficulty: u8) {}
+        #[inline(always)]
+        pub(crate) fn record_early_data(&self, _outcome: EarlyDataOutcome) {}
+        #[inline(always)]
+        pub(crate) fn record_rekey(&self, _direction: Direction) {}
+        #[inline(always)]
+        pub(crate) fn record_fallback(
+            &self,
+            _from_leg: crate::transport::types::LegType,
+            _to_leg: crate::transport::types::LegType,
+            _reason: FallbackReason,
+        ) {
+        }
+        #[inline(always)]
+        pub(crate) fn session_opened(&self, _leg: crate::transport::types::LegType) {}
+        #[inline(always)]
+        pub(crate) fn session_closed(&self, _leg: crate::transport::types::LegType) {}
+        #[inline(always)]
+        pub(crate) fn stream_opened(&self) {}
+        #[inline(always)]
+        pub(crate) fn stream_closed(&self) {}
     }
 }
 
