@@ -208,11 +208,18 @@ impl fmt::Debug for PacketFlags {
     }
 }
 
-/// Packet header — 45 bytes on the wire.
+/// Packet header — 45 bytes on the wire (the AEAD AAD).
 ///
-/// Layout (in alkahest serialisation order = wire-byte order):
-/// - version: u8 — pinned [`WIRE_VERSION`]; leads the wire bytes and is
-///   validated before the rest of the header is trusted.
+/// The fields below are in **declaration** order; the on-wire byte order is
+/// different. `alkahest` emits a struct's fields in reverse declaration order,
+/// integers little-endian, and byte arrays reversed — so `path_id` is the first
+/// wire byte and `version` the last. The exact offsets are frozen by
+/// `core/tests/wire_vectors/packet_header.bin` and documented in
+/// `docs/protocol/PROTOCOL.md` § 4.2. Tamper resistance does not depend on byte
+/// position: the whole 45-byte header is the AEAD AAD, so flipping any byte
+/// (`version` included) fails decryption.
+/// - version: u8 — pinned [`WIRE_VERSION`]; the recv path drops a frame whose
+///   `version != WIRE_VERSION` after deserialising the packet.
 /// - session_id: [u8; 32] — 256-bit session identifier (salt)
 /// - stream_id: u16 — stream within session (0 = control)
 /// - sequence: u32 — per-stream sequence number
@@ -225,8 +232,9 @@ impl fmt::Debug for PacketFlags {
 #[alkahest(Formula, SerializeRef, Deserialize)]
 #[repr(C)]
 pub struct PacketHeader {
-    /// On-wire packet-format version. Pinned to [`WIRE_VERSION`]; serialised
-    /// first so it leads the wire bytes and the AEAD AAD.
+    /// On-wire packet-format version. Pinned to [`WIRE_VERSION`]. Declared
+    /// first, but alkahest emits it as the **last** of the 45 header bytes
+    /// (reverse field order); it is part of the AEAD AAD wherever it lands.
     pub version: u8,
     /// 256-bit session identifier, used as encryption salt
     pub session_id: SessionId,

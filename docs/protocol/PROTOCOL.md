@@ -9,8 +9,9 @@ migration path. The one surviving version byte is a tamper-check anchor and a
 hook for a future, deliberate bump.
 
 Audit-friendly format: every field has its Rust source-of-truth pinned with
-`file:line`. The Rust types are the canonical wire definition; this doc
-narrates them.
+`file:line`. The canonical wire bytes are the byte-frozen vectors in
+`core/tests/wire_vectors/` (§ 11) — the Rust types produce them and this doc
+narrates the grammar; all three are checked against each other in CI.
 
 ---
 
@@ -22,7 +23,7 @@ that sees any other value drops the frame (packets) or rejects the handshake
 
 | Constant | Value | Source | Where it lives on the wire |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `1` | `core/src/transport/types.rs:69` | leading `PacketHeader.version` byte |
+| `WIRE_VERSION` | `1` | `core/src/transport/types.rs:69` | `PacketHeader.version` byte (last byte of the 45-byte header — § 4.2) |
 | `PROTOCOL_VERSION` | `1` | `core/src/transport/handshake.rs:55` | `ClientHello.version`, transcript-bound |
 
 Both are constants pinned to `1`. They exist so that:
@@ -117,7 +118,7 @@ pub struct PhantomPacket {
 }
 ```
 
-Source: `core/src/transport/types.rs:299-311`. There is no enum wrapper — the
+Source: `core/src/transport/types.rs:307-319`. There is no enum wrapper — the
 recv path deserializes a bare `PhantomPacket` directly and **drops** any frame
 whose `header.version != WIRE_VERSION` (`api/session.rs:679-687`). An
 unparseable frame is dropped, never panicked on.
@@ -132,14 +133,16 @@ frame this build emits; a decoder ignores its contents.
 
 ### 4.2 `PacketHeader` (45 bytes)
 
-Field order = alkahest serialisation order = wire-byte order. The `version`
-byte is serialised **first** so it leads both the wire bytes and the AEAD AAD,
-and is validated before the rest of the header is trusted.
+The Rust **declaration** order is below; the **wire** order is not the same.
+`alkahest` (the zero-copy codec used for packets) emits a struct's fields in
+**reverse declaration order**, encodes integers little-endian, and stores
+fixed-size byte arrays **reversed**. `#[repr(C)]` governs the in-memory layout
+only — it does not describe the wire bytes.
 
 ```rust
 #[repr(C)]
 pub struct PacketHeader {
-    pub version: u8,             // pinned WIRE_VERSION; leads the bytes + AAD
+    pub version: u8,             // pinned WIRE_VERSION
     pub session_id: SessionId,   // [u8; 32]
     pub stream_id: StreamId,     // u16  (0 = control stream)
     pub sequence: SequenceNumber,// u32  (per-stream)
@@ -150,31 +153,36 @@ pub struct PacketHeader {
 }
 ```
 
-Source: `core/src/transport/types.rs:227-246`. `PacketHeader::SIZE = 45`
-(`types.rs:250`), pinned by the round-trip test in
-`core/tests/check_alkahest.rs:16` and
-`types.rs::packet_header_serializes_to_45_bytes`.
+Source: `core/src/transport/types.rs:234-253`. `PacketHeader::SIZE = 45`
+(`types.rs:258`), pinned by `core/tests/check_alkahest.rs:16`,
+`types.rs::packet_header_serializes_to_45_bytes`, and the byte-frozen vector
+`core/tests/wire_vectors/packet_header.bin` (§ 11).
 
-Field widths and order (the load-bearing contract — the serialised header is
+Actual wire byte layout (the load-bearing contract — the serialised header is
 the AEAD AAD, so any layout drift silently breaks interop):
 
-| Field | Width | Notes |
-| --- | --- | --- |
-| `version` | 1 | `= WIRE_VERSION`; first on the wire |
-| `session_id` | 32 | 256-bit id (§ 4.4) |
-| `stream_id` | 2 | stream within session; 0 = control |
-| `sequence` | 4 | per-stream monotonic sequence |
-| `flags` | 2 | `PacketFlags` u16 (§ 4.3) |
-| `ack_delay` | 2 | microseconds |
-| `epoch` | 1 | rekey generation |
-| `path_id` | 1 | multi-path leg id |
-| **total** | **45** | |
+| Offset | Field | Width | Encoding |
+| --- | --- | --- | --- |
+| 0 | `path_id` | 1 | u8 |
+| 1 | `epoch` | 1 | u8 |
+| 2 | `ack_delay` | 2 | u16 little-endian |
+| 4 | `flags` | 2 | u16 little-endian (§ 4.3) |
+| 6 | `sequence` | 4 | u32 little-endian |
+| 10 | `stream_id` | 2 | u16 little-endian |
+| 12 | `session_id` | 32 | 32 bytes, **reversed** (alkahest array order) |
+| 44 | `version` | 1 | u8, `= WIRE_VERSION` |
+| **total** | | **45** | |
 
-Integer fields use alkahest's fixed-width little-endian encoding for the header
-serialisation. Endianness that **is** explicitly pinned by this spec is the
-big-endian conversion of `stream_id` and `sequence` inside the AEAD nonce
-(§ 5) — that is independent of the header's own serialisation and must not
-drift.
+So the pinned `version` byte is the **last** byte of the header, not the first;
+the receive path deserialises the whole `PhantomPacket`, then drops the frame if
+`header.version != WIRE_VERSION` (`api/session.rs`). Position does not weaken the
+tamper check: the full 45-byte header is the AEAD AAD, so flipping *any* byte —
+`version` included — fails decryption (§ 5). An independent (non-Rust) decoder
+that reproduces this layout is `tests/wire_vectors_decode.py`.
+
+A second endianness, **independent** of this header serialisation, is pinned by
+§ 5: the big-endian conversion of `stream_id` and `sequence` inside the AEAD
+nonce. That must not drift either.
 
 ### 4.3 `PacketFlags` (u16 bitfield)
 
@@ -643,3 +651,46 @@ this spec as follows:
 
 Removing or weakening any of these requires a deliberate `WIRE_VERSION` /
 `PROTOCOL_VERSION` bump (§ 1) and a corresponding update to `SECURITY.md`.
+
+---
+
+## 11. Wire test vectors
+
+The on-wire bytes are frozen byte-for-byte in `core/tests/wire_vectors/*.bin`
+and asserted in both directions (`serialize(value) == fixture` and
+`deserialize(fixture) == value`) by `core/tests/wire_vectors.rs` (the packet and
+handshake messages) and `transport::handshake::tests::transcript_hash_wire_vector`
+(the signed transcript hash). This is the only test that pins the *bytes* rather
+than driving Rust types ↔ Rust types, so a layout / endianness / discriminant
+regression in `alkahest` or `borsh` fails CI instead of silently breaking
+interop. `tests/wire_vectors_decode.py` is an independent (non-Rust) decoder
+over the same fixtures — cross-implementation evidence that the grammar is real.
+
+| Fixture | Codec | Type |
+| --- | --- | --- |
+| `packet_header.bin` | alkahest | `PacketHeader` (§ 4.2) |
+| `phantom_packet_data.bin` / `_ack.bin` / `_extensions.bin` | alkahest | `PhantomPacket` (§ 4.1) |
+| `client_hello_minimal.bin` / `client_hello_full.bin` | borsh | `ClientHello` (§ 6.2) |
+| `server_hello.bin` / `server_hello_rejected.bin` | borsh | `ServerHello` (§ 6.3) |
+| `hello_retry_request_cookie.bin` / `_pow.bin` | borsh | `HelloRetryRequest` (§ 6.4) |
+| `hybrid_key_package.bin` / `hybrid_ciphertext.bin` | borsh | KEM material (§ 6.2/6.3) |
+| `hybrid_verifying_key.bin` / `hybrid_signature.bin` | borsh | signature material (§ 6.3) |
+| `pow_challenge.bin` / `pow_solution.bin` | borsh | DoS-gate fields (§ 6.5) |
+| `transcript_hash.bin` | SHA-256 | `HandshakeTranscript` hash (§ 6.5) |
+
+The handshake fixtures use deterministic *filler* of the real field lengths, not
+valid KEM/signature material — this freezes the serialization container.
+Validating the ML-KEM / ML-DSA encodings themselves against published NIST KATs
+is tracked separately. The vectors are scoped to the default (non-fips) build;
+the fips build is a distinct wire (different `PROTOCOL_VARIANT`, 65-byte
+classical key) and would need its own set.
+
+The serialization crates `alkahest` and `borsh` are pinned to exact `=` versions
+in `core/Cargo.toml` so a minor bump cannot silently shift these bytes. An
+**intentional** wire change is landed by bumping `WIRE_VERSION` /
+`PROTOCOL_VERSION` and regenerating:
+
+```sh
+PHANTOM_REGEN_WIRE_VECTORS=1 cargo test --manifest-path core/Cargo.toml --lib
+PHANTOM_REGEN_WIRE_VECTORS=1 cargo test --manifest-path core/Cargo.toml --test wire_vectors
+```
