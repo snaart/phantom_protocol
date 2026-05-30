@@ -463,7 +463,7 @@ def _uniffi_check_contract_api_version(lib):
 def _uniffi_check_api_checksums(lib):
     if lib.uniffi_phantom_core_checksum_func_connect_pinned() != 59015:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_func_connect_pinned_with_resumption() != 31650:
+    if lib.uniffi_phantom_core_checksum_func_connect_pinned_with_resumption() != 47866:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data() != 16642:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -485,7 +485,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomsession_disconnect() != 18611:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted() != 23395:
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted() != 3077:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomsession_flush_queue() != 41158:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -503,7 +503,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomsession_recv() != 61516:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_resumption_hint() != 36484:
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_resumption_hint() != 18816:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomsession_send() != 35674:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1482,8 +1482,7 @@ class _UniffiConverterTypePhantomConfig(_UniffiConverterRustBuffer):
 
 class ResumptionHint:
     """
-    0-RTT resumption material extracted from a completed session
-    (wire V3, Phase 4.1).
+    0-RTT resumption material extracted from a completed session.
 
     Produced by [`PhantomSession::resumption_hint`] after a handshake
     completes, and fed back into [`connect_pinned_with_resumption`] to
@@ -2556,17 +2555,14 @@ class PhantomSessionProtocol(typing.Protocol):
         raise NotImplementedError
     def early_data_accepted(self, ):
         """
-        The 0-RTT verdict for this session (wire V3, Phase 4.1).
+        The 0-RTT verdict for this session.
 
-        - `None` — still handshaking, the handshake failed, or this was
-        a plain V1/V2 handshake (no 0-RTT attempted, or a V3 attempt
-        fell back to V2 because the server replied `Unsupported`).
-        The caller must send any intended early-data over the normal
-        channel.
+        - `None` — still handshaking, the handshake failed, or the client sent
+        no early-data on this connect.
         - `Some(true)` — the server consumed the 0-RTT early-data.
-        - `Some(false)` — a V3 handshake where the server rejected the
-        early-data (stale/unknown ticket, oversized blob, or AEAD
-        failure). The caller must re-send that payload normally.
+        - `Some(false)` — the client sent early-data and the server rejected it
+        (stale/unknown ticket, oversized blob, or AEAD failure). The caller
+        must re-send that payload over the normal channel.
         """
 
         raise NotImplementedError
@@ -2626,8 +2622,7 @@ class PhantomSessionProtocol(typing.Protocol):
         raise NotImplementedError
     def resumption_hint(self, ):
         """
-        Extract a [`ResumptionHint`] for a future 0-RTT reconnect
-        (wire V3, Phase 4.1).
+        Extract a [`ResumptionHint`] for a future 0-RTT reconnect.
 
         Returns `Some` after a successful handshake; `None` while still
         handshaking, after a failure, or before the inner session has
@@ -2751,17 +2746,14 @@ _UniffiConverterTypeCoreError,
 
     async def early_data_accepted(self, ) -> "typing.Optional[bool]":
         """
-        The 0-RTT verdict for this session (wire V3, Phase 4.1).
+        The 0-RTT verdict for this session.
 
-        - `None` — still handshaking, the handshake failed, or this was
-        a plain V1/V2 handshake (no 0-RTT attempted, or a V3 attempt
-        fell back to V2 because the server replied `Unsupported`).
-        The caller must send any intended early-data over the normal
-        channel.
+        - `None` — still handshaking, the handshake failed, or the client sent
+        no early-data on this connect.
         - `Some(true)` — the server consumed the 0-RTT early-data.
-        - `Some(false)` — a V3 handshake where the server rejected the
-        early-data (stale/unknown ticket, oversized blob, or AEAD
-        failure). The caller must re-send that payload normally.
+        - `Some(false)` — the client sent early-data and the server rejected it
+        (stale/unknown ticket, oversized blob, or AEAD failure). The caller
+        must re-send that payload over the normal channel.
         """
 
         return await _uniffi_rust_call_async(
@@ -2922,8 +2914,7 @@ _UniffiConverterTypeCoreError,
 
     async def resumption_hint(self, ) -> "typing.Optional[ResumptionHint]":
         """
-        Extract a [`ResumptionHint`] for a future 0-RTT reconnect
-        (wire V3, Phase 4.1).
+        Extract a [`ResumptionHint`] for a future 0-RTT reconnect.
 
         Returns `Some` after a successful handshake; `None` while still
         handshaking, after a failure, or before the inner session has
@@ -3277,19 +3268,18 @@ _UniffiConverterTypeCoreError,
 async def connect_pinned_with_resumption(host: "str",port: "int",pinned_key: "bytes",hint: "ResumptionHint",early_data: "bytes") -> "PhantomSession":
 
     """
-    Connect to a pinned server with a **0-RTT resumption attempt**
-    (wire V3, Phase 4.1) — the resumption-aware analogue of
-    [`connect_pinned`].
+    Connect to a pinned server with a **0-RTT resumption attempt** — the
+    resumption-aware analogue of [`connect_pinned`].
 
     `hint` is a [`ResumptionHint`] from a prior session's
     [`PhantomSession::resumption_hint`]; both of its fields must be
     exactly 32 bytes or the call fails with `ValidationError` before any
-    socket is opened. `early_data` (≤ 16 KiB) is sealed into the V3
+    socket is opened. `early_data` (≤ 16 KiB) is sealed into the resuming
     ClientHello so it reaches the server on the very first flight.
 
-    If the server does not speak V3 the handshake transparently falls
-    back to 1-RTT and `early_data` is *not* delivered 0-RTT — the caller
-    checks [`PhantomSession::early_data_accepted`] and re-sends over the
+    Acceptance is best-effort: when the server does not consume the early-data
+    (stale/unknown ticket or AEAD failure) the handshake completes 1-RTT — the
+    caller checks [`PhantomSession::early_data_accepted`] and re-sends over the
     normal channel when it is not `Some(true)`.
 
     Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives

@@ -26,7 +26,7 @@ fn labeled_api_is_no_op_but_atomics_still_update() {
         HandshakeOutcome::Success,
         LegType::Tcp,
         AeadAlgorithm::Aes256Gcm,
-        ProtocolVersion::V12,
+        ProtocolVersion::Current,
     );
     obs.record_replay_rejected(ReplayReason::Duplicate);
     obs.record_aead_failure(LegType::Tcp, AeadAlgorithm::Aes256Gcm);
