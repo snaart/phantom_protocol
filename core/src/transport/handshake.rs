@@ -1033,6 +1033,88 @@ impl From<HandshakeError> for CoreError {
 mod tests {
     use super::*;
 
+    /// Byte-exact freeze of the handshake transcript hash (Phase 6).
+    ///
+    /// Pins `SHA256(borsh(HandshakeTranscript))` over a fully-deterministic
+    /// `ClientHello` + server fields. Unlike the public wire-codec vectors in
+    /// `core/tests/wire_vectors.rs`, this exercises the *real* private
+    /// `HandshakeTranscript` and `compute_transcript_hash`, so a reorder of the
+    /// transcript fields or any change to the hash construction — the signing
+    /// input, Invariants 7 & 10 — fails here. The crypto material is
+    /// deterministic filler of the real field lengths; the hash needs no live
+    /// keys. Default (non-fips) build only (the fips transcript embeds a
+    /// different `PROTOCOL_VARIANT` and 65-byte classical key).
+    ///
+    /// Regenerate alongside the wire vectors with
+    /// `PHANTOM_REGEN_WIRE_VECTORS=1 cargo test --manifest-path core/Cargo.toml --lib`.
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn transcript_hash_wire_vector() {
+        fn pat(seed: u8, n: usize) -> Vec<u8> {
+            (0..n).map(|i| seed.wrapping_add(i as u8)).collect()
+        }
+        fn arr32(seed: u8) -> [u8; 32] {
+            pat(seed, 32).try_into().expect("pat(seed, 32) is 32 bytes")
+        }
+
+        // Same deterministic filler as the `client_hello_full` / `server_hello`
+        // vectors so the three freezes describe one consistent handshake.
+        let key_package = HybridKeyPackage {
+            classical_pk: arr32(0x10),
+            ml_kem_pk: pat(0x20, 1184),
+        };
+        let verify_key = HybridVerifyingKey {
+            ed25519_pk: arr32(0x50),
+            ml_dsa_pk: pat(0x60, 1952),
+        };
+        let client_hello = ClientHello {
+            client_key_package: key_package.clone(),
+            client_verify_key: verify_key.clone(),
+            nonce: arr32(0xA0),
+            version: PROTOCOL_VERSION,
+            cookie: Some(arr32(0xB0)),
+            pow_solution: Some(PoWSolution {
+                nonce: arr32(0x90),
+                solution: 0x0123_4567_89AB_CDEF,
+            }),
+            resume_session_id: Some(arr32(0xC0)),
+            protocol_variant: PROTOCOL_VARIANT.to_vec(),
+            early_data: Some(pat(0xD0, 48)),
+        };
+        let ciphertext = HybridCiphertext {
+            classical_pk: arr32(0x30),
+            ml_kem_ct: pat(0x40, 1088),
+        };
+        let session_id = arr32(0xE0);
+
+        let transcript = HandshakeTranscript {
+            protocol_variant: PROTOCOL_VARIANT,
+            client_hello: &client_hello,
+            server_key_package: &key_package,
+            ciphertext: &ciphertext,
+            server_verify_key: &verify_key,
+            session_id: &session_id,
+        };
+        let hash = compute_transcript_hash(&transcript).expect("transcript hash");
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/wire_vectors/transcript_hash.bin");
+        if std::env::var_os("PHANTOM_REGEN_WIRE_VECTORS").is_some() {
+            std::fs::create_dir_all(path.parent().expect("fixtures dir parent"))
+                .expect("create wire_vectors dir");
+            std::fs::write(&path, hash).expect("write transcript_hash.bin");
+            return;
+        }
+        let expected = std::fs::read(&path)
+            .expect("read transcript_hash.bin; regenerate with PHANTOM_REGEN_WIRE_VECTORS=1");
+        assert_eq!(
+            hash.as_slice(),
+            expected.as_slice(),
+            "handshake transcript hash changed — the signing input (Invariants 7 & 10) is \
+             wire-breaking. If intentional, bump PROTOCOL_VERSION and regenerate."
+        );
+    }
+
     /// A `ClientHello` advertising a foreign `PROTOCOL_VARIANT`
     /// (simulating a fips/non-fips cross-mode connect) is rejected by
     /// the server with [`HandshakeError::ProtocolVariantMismatch`]
