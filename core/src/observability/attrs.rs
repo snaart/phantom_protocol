@@ -68,18 +68,20 @@ impl HandshakeOutcome {
     }
 }
 
-/// Wire version negotiated during the handshake.
+/// Wire-protocol version label for handshake metrics. Pinned — the protocol
+/// is not negotiated (one wire version), so this is always `Current`. The
+/// variant is kept (rather than dropping the metric attribute) so dashboards
+/// retain a stable `version` dimension across a future, deliberate bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolVersion {
-    V12,
-    V3,
+    /// The sole, pinned wire protocol.
+    Current,
 }
 
 impl ProtocolVersion {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::V12 => "v12",
-            Self::V3 => "v3",
+            Self::Current => "v1",
         }
     }
 }
@@ -245,7 +247,6 @@ mod tests {
 
     #[test]
     fn protocol_version_strings() {
-        assert_eq!(ProtocolVersion::V12.as_str(), "v12");
-        assert_eq!(ProtocolVersion::V3.as_str(), "v3");
+        assert_eq!(ProtocolVersion::Current.as_str(), "v1");
     }
 }

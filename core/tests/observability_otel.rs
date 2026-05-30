@@ -25,14 +25,14 @@ fn full_labeled_event_surface_does_not_panic() {
         HandshakeOutcome::Success,
         LegType::Tcp,
         AeadAlgorithm::Aes256Gcm,
-        ProtocolVersion::V12,
+        ProtocolVersion::Current,
     );
     obs.record_handshake(
         Duration::from_millis(35),
         HandshakeOutcome::Failure,
         LegType::Kcp,
         AeadAlgorithm::ChaCha20Poly1305,
-        ProtocolVersion::V3,
+        ProtocolVersion::Current,
     );
 
     obs.record_resumption(ResumptionMode::ZeroRtt, true);
