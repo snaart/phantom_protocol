@@ -19,14 +19,15 @@ Kotlin, C); native WASM target; bare-metal `EmbeddedLeg` for no_std.
   signatures. Both halves must verify. Pure-Rust RustCrypto primitives — no C
   bindings in the crypto path, compiles on every target including wasm32 and
   `thumbv7em-none-eabihf`.
-- **0-RTT resumption** — opt-in V3 handshake envelope carries AEAD-sealed
-  early-data (≤ 16 KiB), one-shot anti-replay via a consumed `SessionCache`
-  ticket, automatic 1-RTT fallback when the server doesn't speak V3.
-- **Mid-session rekey** — HKDF ratchet, V2 `REKEY` flag + per-packet `epoch`.
+- **0-RTT resumption** — AEAD-sealed early-data (≤ 16 KiB) folded into the
+  single `ClientHello`, one-shot anti-replay via a consumed `SessionCache`
+  ticket, best-effort fallback to a 1-RTT handshake when the ticket is
+  unknown / expired or the blob fails to open.
+- **Mid-session rekey** — HKDF ratchet, `REKEY` flag + per-packet `epoch`.
 - **Multi-path** — TCP / KCP-over-UDP / FakeTLS-over-TCP / WebSocket / EmbeddedLeg.
   Constant-time path validation, per-path RTT/loss tracking, round-robin or
   low-latency scheduling.
-- **Multi-stream** — strict-priority scheduler, V2 `WINDOW_UPDATE` per-stream
+- **Multi-stream** — strict-priority scheduler, `WINDOW_UPDATE` per-stream
   flow control, BBRv2-inspired pacing (Startup / Drain / ProbeBW / ProbeRTT /
   FastRecovery).
 - **DoS-resistant handshake** — stateless HMAC-SHA-256 cookie (hourly-rotated
@@ -144,22 +145,28 @@ RustCrypto FIPS-203 / FIPS-204 implementations. The crate compiles on
 
 The formal architecture spec is
 [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md);
-the wire protocol (incl. V3 0-RTT in §12) is
+the unified wire protocol (incl. 0-RTT) is
 [`docs/protocol/PROTOCOL.md`](docs/protocol/PROTOCOL.md). Per-subsystem
 security invariants are catalogued in
 [`docs/security/threat-model.md`](docs/security/threat-model.md).
 
 ## Transport features
 
-- **Wire formats V1, V2, V3.** V2 is the default for application-data packets
-  (`epoch`, `REKEY`, `PATH_VALIDATION`, `COALESCED`, `WINDOW_UPDATE` flags); V3
-  is a handshake-envelope-only bump that carries AEAD-sealed 0-RTT early-data and
-  finalizes a V2-wire session. Borsh-framed handshake envelope with a 1-byte
-  version discriminant; a V3-unaware server returns `Unsupported` and the client
-  transparently falls back to V2.
+- **Single unified wire protocol.** One `PacketHeader` (45 bytes, with a
+  pinned `version` byte = `WIRE_VERSION`) wrapped in a bare `PhantomPacket`
+  (`header` + `payload` + TLV-headroom `extensions`) — no `VersionedPacket`
+  enum, no per-session wire-version negotiation. `epoch`, `REKEY`,
+  `PATH_VALIDATION`, `COALESCED`, `WINDOW_UPDATE` flags live in the one header;
+  the recv path deserializes `PhantomPacket` directly and drops any frame whose
+  `header.version` differs. Handshake messages are bare borsh structs (no
+  envelopes): one `ClientHello` (with the optional 0-RTT `early_data` blob folded
+  in), one `ServerHello`, one `HelloRetryRequest`, one signed
+  `HandshakeTranscript` leading with `protocol_variant`. The pinned
+  `PROTOCOL_VERSION` / `WIRE_VERSION` bytes are tamper-check anchors and a hook
+  for a future deliberate bump.
 - **Multi-path validation.** `PathRegistry` + constant-time challenge/response.
   Path 0 pre-validated; secondary paths transition `Unvalidated → Validating →
-  Validated`. V2 recv pump auto-echoes responses.
+  Validated`. The recv pump auto-echoes responses.
 - **FakeTLS leg.** Anti-DPI obfuscation only — per-direction blake3-derived keys,
   per-record counter nonces. The inner Phantom session provides real authenticated
   confidentiality.
@@ -173,7 +180,7 @@ Reference numbers on **Apple M1 Pro (8P + 2E, 16 GiB), macOS 26.0, rustc 1.93.0,
 | Path | Number | Notes |
 | --- | --- | --- |
 | Hybrid PQ handshake (pinned) | **1.06 ms** / ~945 conn/s/core | full production path; ~7,500 cold handshakes/s aggregate on 8P cores |
-| AEAD encrypt, 64 KiB | **4.67 GiB/s/core** (13.1 µs) | `encrypt_packet_v2` with header-AAD + replay window |
+| AEAD encrypt, 64 KiB | **4.67 GiB/s/core** (13.1 µs) | `encrypt_packet` with header-AAD + replay window |
 | AEAD decrypt, 16 KiB | **4.68 GiB/s/core** | same path |
 | 1 MiB round-trip | **391.5 µs** → **5.0 GiB/s** | encrypt + decrypt |
 | Raw AES-256-GCM (`ring`) | **5,514 MiB/s** at 64 KiB | bare cipher, no framing |
@@ -315,8 +322,9 @@ Full threat model, mitigations, and disclosure policy are in
   mid-session rekey (epoch saturates at `u8::MAX`, never wraps).
 - **Replay rejection happens _after_ AEAD verify** — RFC 4303 §3.4.3
   sliding-window bitmap, per-stream.
-- **Downgrade resistance** — wire-format version is signed under the handshake
-  transcript; stripped-`ENCRYPTED` post-handshake packets are dropped.
+- **Downgrade resistance** — the pinned protocol version and `protocol_variant`
+  are signed under the handshake transcript; stripped-`ENCRYPTED` post-handshake
+  packets are dropped.
 - **0-RTT anti-replay** — `SessionCache::try_resume` consumes the resumption
   ticket on first lookup; oversized / expired / AEAD-failing early-data is
   best-effort and never fatal to the handshake.
@@ -363,11 +371,14 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 ## Status & limitations
 
 - **Pre-1.0 (`0.2.0`).** Wire format may break between minors; SemVer applies
-  once 1.0 ships. The three migration guides for prior wire bumps are in
+  once 1.0 ships. The current wire protocol is a single pinned version — the
+  former V1/V2/V3 axes were collapsed pre-1.0 (no users, no negotiation, no
+  fallback). Migration notes for prior wire shapes are in
   [`docs/migration/`](docs/migration/).
-- **261 / 261 tests passing** (220 unit + 24 negative-security + 5 proptest +
-  3 fuzz + 1 alkahest + 1 runtime-integration + 5 CAVP). Plus 5
-  `#[ignore]`-gated loopback integration tests. 0 workspace warnings,
+- **Negative-security suite: 20 always-on tests** in
+  `core/tests/security_invariants.rs`, pinning every documented invariant.
+  Plus the proptest, fuzz, alkahest, runtime-integration, and CAVP suites,
+  and 5 `#[ignore]`-gated loopback integration tests. 0 workspace warnings,
   0 clippy warnings.
 - **All 8 production-readiness phases (0–7) closed code-side.** Deferred with
   rationale: external CMVP / CC lab validation (Phase 5.7 — procurement, not
@@ -390,7 +401,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 - **Architecture:** [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md);
   contributor workflow in [CONTRIBUTING.md](CONTRIBUTING.md)
 - **Wire protocol:** [`docs/protocol/PROTOCOL.md`](docs/protocol/PROTOCOL.md)
-  (V3 0-RTT in §12)
+  (the single unified protocol, incl. 0-RTT)
 - **Security:** [`SECURITY.md`](SECURITY.md),
   [`docs/security/threat-model.md`](docs/security/threat-model.md),
   [`docs/security/incident-response.md`](docs/security/incident-response.md),
@@ -403,8 +414,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 - **Operations:** [`docs/operations/`](docs/operations/) —
   `perf-tuning.md`, `deployment.md`, `docker.md`, `systemd.md`,
   `kubernetes.md` (+ `helm/`), `mobile.md`, `wasm.md`, `wasi.md`
-- **Policy:** [`docs/policy/versioning.md`](docs/policy/versioning.md),
-  [`docs/migration/`](docs/migration/) (`v1-to-v2.md`, `v2-to-v3.md`)
+- **Policy:** [`docs/policy/versioning.md`](docs/policy/versioning.md)
 - **Roadmap:** [`docs/PROGRESS.md`](docs/PROGRESS.md),
   [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md)
 - **Performance:** [`BENCHMARKS.md`](BENCHMARKS.md)

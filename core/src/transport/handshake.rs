@@ -24,7 +24,7 @@ use crate::transport::session_cache::SessionCache;
 use crate::transport::types::{SchedulerMode, SessionId};
 use std::sync::Arc;
 
-/// Maximum 0-RTT early-data plaintext, in bytes (wire V3, Phase 4.1).
+/// Maximum 0-RTT early-data plaintext, in bytes.
 /// The client constructor rejects a larger payload; the server drops
 /// an oversized blob and continues as a normal 1-RTT handshake. Caps
 /// the work an unauthenticated peer can force before the handshake
@@ -48,6 +48,12 @@ pub const PROTOCOL_VARIANT: &[u8] = b"phantom-default-1";
 #[cfg(feature = "fips")]
 pub const PROTOCOL_VARIANT: &[u8] = b"phantom-fips-1";
 
+/// The sole protocol version carried in `ClientHello.version` and bound into the
+/// handshake transcript. Pinned to one value — the protocol is not negotiated
+/// (pre-1.0, no users). It is a tamper-check anchor and a hook for a future,
+/// deliberate version increment.
+pub const PROTOCOL_VERSION: u8 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeStage {
     /// Initial state, no messages exchanged
@@ -60,7 +66,12 @@ pub enum HandshakeStage {
     Failed,
 }
 
-/// Client hello message (initiates handshake)
+/// Client hello message (initiates handshake).
+///
+/// Carries the client's hybrid key material, the pinned [`PROTOCOL_VERSION`]
+/// (transcript-bound), the DoS-gate fields (cookie / PoW), an optional
+/// resumption id, the build-side [`PROTOCOL_VARIANT`] tag, and an optional
+/// AEAD-sealed 0-RTT `early_data` blob.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct ClientHello {
     /// hybrid public key for key exchange
@@ -69,7 +80,9 @@ pub struct ClientHello {
     pub client_verify_key: HybridVerifyingKey,
     /// Random nonce (32 bytes) for replay protection
     pub nonce: [u8; 32],
-    /// Protocol version
+    /// Protocol version. Pinned to [`PROTOCOL_VERSION`] and bound into the
+    /// signed handshake transcript; the server rejects any other value with
+    /// [`HandshakeError::UnsupportedVersion`].
     pub version: u8,
     /// Stateless generic cookie to prove IP ownership
     pub cookie: Option<[u8; 32]>,
@@ -83,33 +96,30 @@ pub struct ClientHello {
     /// transcript so an attacker rewriting this field on the wire is
     /// still caught by the signature check.
     pub protocol_variant: Vec<u8>,
-}
-
-/// V3 ClientHello — carries 0-RTT early-data alongside the base
-/// V1/V2 fields (wire V3, Phase 4.1).
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
-pub struct ClientHelloV3 {
-    /// The V1/V2 `ClientHello` fields. `base.version` is `3` for a V3
-    /// envelope, and `base.resume_session_id` carries the ticket id
-    /// the early-data is keyed against.
-    pub base: ClientHello,
-    /// AEAD-sealed early-data blob — AES-256-GCM under a key both
+    /// Optional AEAD-sealed 0-RTT early-data — AES-256-GCM under a key both
     /// peers derive from the prior session's `resumption_secret` via
-    /// `crypto::kdf::derive_early_data_keying`. `None` means a V3
-    /// client that isn't sending 0-RTT data on this connect.
+    /// [`derive_early_data_keying`]. `None` means no 0-RTT data on this
+    /// connect. The whole `ClientHello` (this field included) is covered by
+    /// the transcript signature, so a tampered or stripped blob breaks the
+    /// server's signature check (Invariant 7).
     pub early_data: Option<Vec<u8>>,
 }
 
 /// Server response to ClientHello
+//
+// Intentionally large — the `Success` variant carries a full `Session`.
+// Boxing it would add a heap allocation on every successful handshake
+// (the hot path); the type is internal and lives only on the handshake
+// stack, so the size is acceptable. Same rationale as the
+// `result_large_err` allow on the gate/finalize helpers below.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum HandshakeResponse {
-    /// Success: Continue with ServerHello and Session
-    Success(ServerHello, Session),
-    /// V3 success: `ServerHelloV3` + `Session` + the decrypted 0-RTT
-    /// early-data plaintext (`None` when the client sent no early-data
-    /// or it was rejected — `ServerHelloV3.early_data_accepted`
+    /// Success: the `ServerHello` to send back, the established `Session`,
+    /// and the decrypted 0-RTT early-data plaintext (`None` when the client
+    /// sent none or it was rejected — `ServerHello.early_data_accepted`
     /// carries the verdict the client sees).
-    SuccessV3(ServerHelloV3, Session, Option<Vec<u8>>),
+    Success(ServerHello, Session, Option<Vec<u8>>),
     /// Retry: Demand PoW or Cookie
     Retry(HelloRetryRequest),
     /// Fail: Handshake aborted
@@ -136,76 +146,25 @@ pub struct ServerHello {
     pub signature: HybridSignature,
     /// Session ID assigned by server
     pub session_id: [u8; 32],
-}
-
-/// V3 ServerHello — the base `ServerHello` plus the 0-RTT verdict.
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
-pub struct ServerHelloV3 {
-    /// The base `ServerHello` fields.
-    pub base: ServerHello,
-    /// `true` iff the server decrypted and accepted the client's
-    /// early-data. `false` when there was none, the resumption
-    /// ticket was unknown/expired, the blob exceeded the size cap,
-    /// or AEAD decryption failed — in every `false` case the
-    /// handshake still completes as a normal 1-RTT exchange.
+    /// `true` iff the server decrypted and accepted the client's 0-RTT
+    /// early-data. `false` when there was none, the resumption ticket was
+    /// unknown/expired, the blob exceeded the size cap, or AEAD decryption
+    /// failed — in every `false` case the handshake still completes as a
+    /// normal 1-RTT exchange.
     pub early_data_accepted: bool,
 }
 
-// ── Version-prefixed handshake envelopes (wire V3, Phase 4.1) ────────────
-//
-// Every handshake message now travels inside a borsh enum. Borsh writes a
-// 1-byte discriminant ahead of the body, so a receiver dispatches off that
-// prefix instead of guessing the struct shape. From this point every wire
-// bump adds an enum arm and stays cleanly forward-decodable.
-//
-// Introducing the envelope is a one-time pre-1.0 wire break for *every*
-// version (the discriminant byte shifts the layout) — accepted on the same
-// footing as the `ml-kem` primitive swap. See `docs/protocol/PROTOCOL.md`
-// §12.
-
-/// Versioned wire envelope for the `ClientHello` message. The `V12` arm
-/// carries the V1/V2 `ClientHello` (its inner `version` byte distinguishes
-/// 1 vs 2). The `V3` arm carries `ClientHelloV3` for 0-RTT early-data.
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
-pub enum ClientHelloEnvelope {
-    /// V1 / V2 `ClientHello`.
-    V12(ClientHello),
-    /// V3 `ClientHello` with optional 0-RTT early-data.
-    V3(ClientHelloV3),
-}
-
-/// Versioned wire envelope for the `ServerHello` message. The `Unsupported`
-/// arm is a transcript-free, pre-session reply telling a client "I do not
-/// speak the envelope variant you sent" — the client then falls back to V2.
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
-pub enum ServerHelloEnvelope {
-    /// V1 / V2 `ServerHello`.
-    V12(ServerHello),
-    /// V3 `ServerHello` with the 0-RTT accept/reject verdict.
-    V3(ServerHelloV3),
-    /// The server does not speak the envelope variant the client sent
-    /// (e.g. a V12-only handshake path received a V3 ClientHello).
-    /// Transcript-free and pre-session — the client falls back to a
-    /// plain V2 handshake on receipt.
-    Unsupported,
-}
-
-/// Versioned wire envelope for the `HelloRetryRequest` message. Retry
-/// carries no version-specific data; the envelope exists only so every
-/// handshake frame shares the uniform 1-byte prefix.
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
-pub enum HelloRetryRequestEnvelope {
-    /// V1 / V2 `HelloRetryRequest`.
-    V12(HelloRetryRequest),
-}
-
-/// Handshake transcript for signing (V1 / V2 path).
+/// Handshake transcript for signing.
+///
+/// Embeds the whole `ClientHello` by reference — including the optional
+/// 0-RTT `early_data` ciphertext — so the server's signature covers it and a
+/// tampered or stripped blob breaks the client-side signature check
+/// (Invariant 7). The transcript leads with the build-side
+/// [`PROTOCOL_VARIANT`] tag, so a cross-mode (fips ↔ non-fips) attempt fails
+/// the signature check rather than landing a wrong shared secret. Both peers
+/// MUST plumb the same byte string for the signature to verify.
 #[derive(BorshSerialize)]
 struct HandshakeTranscript<'a> {
-    /// Build-side [`PROTOCOL_VARIANT`] tag — see the constant's doc
-    /// comment. Both peers MUST plumb the same byte string for the
-    /// signature to verify; a cross-mode (fips ↔ non-fips) attempt
-    /// fails the client-side signature check.
     protocol_variant: &'a [u8],
     client_hello: &'a ClientHello,
     server_key_package: &'a HybridKeyPackage,
@@ -214,26 +173,8 @@ struct HandshakeTranscript<'a> {
     session_id: &'a [u8; 32],
 }
 
-/// Handshake transcript for signing (V3 path). Identical to
-/// [`HandshakeTranscript`] except it embeds the full `ClientHelloV3`,
-/// so the signature covers the early-data ciphertext too — a tampered
-/// or stripped early-data blob breaks the client-side signature check.
-#[derive(BorshSerialize)]
-struct HandshakeTranscriptV3<'a> {
-    /// Build-side [`PROTOCOL_VARIANT`] tag — same role as in the
-    /// V1/V2 transcript.
-    protocol_variant: &'a [u8],
-    client_hello: &'a ClientHelloV3,
-    server_key_package: &'a HybridKeyPackage,
-    ciphertext: &'a HybridCiphertext,
-    server_verify_key: &'a HybridVerifyingKey,
-    session_id: &'a [u8; 32],
-}
-
-/// Hash a borsh-serializable transcript. Generic over the transcript
-/// type so the V1/V2 and V3 paths share one implementation. Both
-/// transcript structs lead with the `protocol_variant` tag, so the
-/// hash binds the build-side variant on every path.
+/// Hash a borsh-serializable transcript. The transcript leads with the
+/// `protocol_variant` tag, so the hash binds the build-side variant.
 fn compute_transcript_hash<T: BorshSerialize>(transcript: &T) -> Result<[u8; 32], HandshakeError> {
     let mut hasher = Sha256::new();
     let bytes =
@@ -383,6 +324,7 @@ impl HandshakeServer {
             has_cookie = client_hello.cookie.is_some(),
             has_pow = client_hello.pow_solution.is_some(),
             resume = client_hello.resume_session_id.is_some(),
+            has_early_data = client_hello.early_data.is_some(),
         ),
     )]
     pub fn process_client_hello(
@@ -391,17 +333,16 @@ impl HandshakeServer {
         difficulty: u8,
         client_ip: IpAddr,
     ) -> HandshakeResponse {
-        // Phase 1.14: tally this call before any work is done, so the
-        // load counter reflects attempts (including the rejected ones).
+        // Tally this call before any work is done, so the load counter
+        // reflects attempts (including the rejected ones).
         self.record_handshake();
 
-        // Protocol-variant gate. Fail loud (before any KEM /
-        // signature work) if the client and server disagree on the
-        // build-side `PROTOCOL_VARIANT` tag. The transcript also
-        // binds this constant, so an MITM rewrite of the cleartext
-        // field is caught on the client's signature check; this
-        // explicit field gives operators a clean diagnostic instead
-        // of "Signature check failed".
+        // Protocol-variant gate. Fail loud (before any KEM / signature work)
+        // if the client and server disagree on the build-side
+        // `PROTOCOL_VARIANT` tag. The transcript also binds this constant, so
+        // an MITM rewrite of the cleartext field is caught on the client's
+        // signature check; this explicit field gives operators a clean
+        // diagnostic instead of "Signature check failed" (Invariant 10).
         if client_hello.protocol_variant != PROTOCOL_VARIANT {
             return HandshakeResponse::Fail(HandshakeError::ProtocolVariantMismatch {
                 expected: PROTOCOL_VARIANT.to_vec(),
@@ -409,56 +350,63 @@ impl HandshakeServer {
             });
         }
 
-        // 1. Version negotiation (Phase 1.8).
-        //
-        // Two wire formats are currently defined: V1 (stable) and V2
-        // (rekey + multi-path + coalescing — see PROTOCOL.md § 11).
-        // Downgrade resistance: `client_hello.version` is borsh-serialized
-        // into the `HandshakeTranscript` that the server signs, so a
-        // network attacker rewriting the byte forces a transcript-signature
-        // mismatch on the client side. The server simply accepts what the
-        // client offers and binds it into the signature.
-        //
-        // V3+ rejection here keeps the surface narrow.
-        if !matches!(client_hello.version, 1 | 2) {
+        // Version pin. The protocol is not negotiated — `version` is a
+        // tamper-check anchor pinned to `PROTOCOL_VERSION` and borsh-serialized
+        // into the signed transcript, so a network rewrite forces a
+        // client-side signature mismatch. Anything else is rejected up front
+        // (Invariant 7).
+        if client_hello.version != PROTOCOL_VERSION {
             return HandshakeResponse::Fail(HandshakeError::UnsupportedVersion);
         }
 
-        // Phase 4.1 — 0-RTT resumption fast path (V12 path).
+        // 0-RTT resumption fast path.
         //
-        // If the client offered a `resume_session_id` AND the server's
-        // cache holds a still-valid ticket for it, treat the client as
-        // already-vetted: skip the cookie/PoW DoS gate. This is safe
-        // because the resume_session_id is bound to a per-(server,
-        // client) shared secret from a past handshake — only the
-        // legitimate prior client could hold it.
+        // If the client offered a `resume_session_id` AND the cache holds a
+        // still-valid ticket for it, treat the client as already-vetted: skip
+        // the cookie/PoW DoS gate. This is safe because the resume_session_id
+        // is bound to a per-(server, client) shared secret from a past
+        // handshake — only the legitimate prior client could hold it. We keep
+        // the returned `(rid, resumption_secret)` to key best-effort
+        // early-data decryption below.
         //
-        // `try_resume` is **one-shot**: it consumes the ticket here. A
-        // V12 resume therefore burns the resume credit for the
-        // cookie/PoW bypass; on handshake success a fresh ticket is
-        // minted below, so the credit "rolls over". A replayed
-        // ClientHello finds no ticket and falls back to the normal
-        // cookie/PoW gate. The KEM round-trip still runs, so forward
-        // secrecy is preserved by the fresh X25519+ML-KEM secret.
-        //
-        // The V3 path (`process_client_hello_v3`) additionally uses the
-        // returned secret to decrypt early-data — see that method.
-        let cookie_pow_bypass = if let Some(rid) = client_hello.resume_session_id {
-            self.session_cache.lock().try_resume(&rid).is_some()
-        } else {
-            false
-        };
+        // `try_resume` is **one-shot**: it consumes the ticket here. On
+        // handshake success a fresh ticket is minted, so the credit "rolls
+        // over". A replayed ClientHello finds no ticket and falls back to the
+        // normal cookie/PoW gate (Invariant 9). The KEM round-trip still runs,
+        // so forward secrecy is preserved by the fresh X25519+ML-KEM secret.
+        let resumed: Option<([u8; 32], [u8; 32])> =
+            client_hello.resume_session_id.and_then(|rid| {
+                self.session_cache
+                    .lock()
+                    .try_resume(&rid)
+                    .map(|(secret, _suite)| (rid, secret))
+            });
+        let cookie_pow_bypass = resumed.is_some();
 
-        // 2. Stateless Checks (Cookie & PoW) — shared with the V3 path.
+        // Stateless DoS checks (Cookie & PoW).
         if let Err(resp) =
             self.cookie_pow_gate(client_hello, difficulty, client_ip, cookie_pow_bypass)
         {
             return resp;
         }
 
-        // 3. Hybrid Key Exchange
-        let result = client_hello.client_key_package.encapsulate();
-        let (shared_secret, ciphertext) = match result {
+        // Best-effort 0-RTT early-data decryption. Only attempted when the
+        // client both presented a valid ticket AND carried a sealed blob; any
+        // failure (unknown/expired ticket, oversized blob, AEAD failure)
+        // leaves `early_data_accepted = false` and completes a normal 1-RTT
+        // handshake (Invariant 9). Forward secrecy of the post-handshake
+        // session is preserved by the fresh hybrid KEM regardless.
+        let early_data_plaintext: Option<Vec<u8>> = match (&resumed, &client_hello.early_data) {
+            (Some((rid, resumption_secret)), Some(blob)) => {
+                decrypt_early_data(resumption_secret, &client_hello.nonce, rid, blob)
+            }
+            _ => None,
+        };
+        let early_data_accepted = early_data_plaintext.is_some();
+
+        // Hybrid Key Exchange (PFS preserved — a fresh KEM secret even on the
+        // 0-RTT path).
+        let (shared_secret, ciphertext) = match client_hello.client_key_package.encapsulate() {
             Ok(res) => res,
             Err(e) => return HandshakeResponse::Fail(HandshakeError::KemFailed(e.to_string())),
         };
@@ -470,11 +418,12 @@ impl HandshakeServer {
         // current protocol does not perform a second KEM round trip using it.
         let (_ephemeral_kem_secret, ephemeral_kem_public) = HybridSecretKey::generate();
 
-        // 4. Session Derivation
         let session_id_bytes = derive_session_id(&shared_secret, &client_hello.nonce);
         let session_id = SessionId::from_bytes(session_id_bytes);
 
-        // 5. Sign Transcript (includes PROTOCOL_VARIANT — see constant doc)
+        // Sign the transcript. It embeds the WHOLE `ClientHello` (early-data
+        // ciphertext included) plus `PROTOCOL_VARIANT` — a tampered or stripped
+        // blob breaks the client-side signature check (Invariants 7, 10).
         let transcript = HandshakeTranscript {
             protocol_variant: PROTOCOL_VARIANT,
             client_hello,
@@ -495,156 +444,23 @@ impl HandshakeServer {
             server_verify_key: self.verifying_key.clone(),
             signature,
             session_id: session_id_bytes,
-        };
-
-        // 6. Build + wire the Session, derive the resumption secret,
-        // stash a ticket — shared with the V3 path. V1/V2 packets ride
-        // the version the client offered.
-        let session = match self.finalize_session(
-            &shared_secret,
-            session_id,
-            session_id_bytes,
-            client_hello.version,
-        ) {
-            Ok(s) => s,
-            Err(resp) => return resp,
-        };
-
-        HandshakeResponse::Success(server_hello, session)
-    }
-
-    /// V3 handshake — same flow as [`process_client_hello`] plus 0-RTT
-    /// early-data: a resuming client may carry an AEAD-sealed payload
-    /// inside `ClientHelloV3`, which the server decrypts here using a
-    /// key derived from the prior session's `resumption_secret`.
-    ///
-    /// Early-data is **best-effort**: an unknown/expired ticket, an
-    /// oversized blob, or an AEAD failure all leave `early_data` as
-    /// `None` and `early_data_accepted` as `false` — the handshake
-    /// still completes as a normal 1-RTT exchange. Forward secrecy of
-    /// the post-handshake session is preserved by the fresh hybrid KEM
-    /// regardless.
-    #[tracing::instrument(
-        name = "phantom.handshake.process_client_hello_v3",
-        skip_all,
-        fields(
-            client_ip = %client_ip,
-            difficulty = difficulty,
-            has_early_data = ch3.early_data.is_some(),
-        ),
-    )]
-    pub fn process_client_hello_v3(
-        &self,
-        ch3: &ClientHelloV3,
-        difficulty: u8,
-        client_ip: IpAddr,
-    ) -> HandshakeResponse {
-        self.record_handshake();
-        let client_hello = &ch3.base;
-
-        // Protocol-variant gate (same as V1/V2 path; see comment
-        // in `process_client_hello`).
-        if client_hello.protocol_variant != PROTOCOL_VARIANT {
-            return HandshakeResponse::Fail(HandshakeError::ProtocolVariantMismatch {
-                expected: PROTOCOL_VARIANT.to_vec(),
-                received: client_hello.protocol_variant.clone(),
-            });
-        }
-
-        // The V3 envelope already routed us here; the inner version
-        // byte must agree (defense-in-depth — it is transcript-bound).
-        if client_hello.version != 3 {
-            return HandshakeResponse::Fail(HandshakeError::UnsupportedVersion);
-        }
-
-        // Resume fast-path. Unlike the V12 path we keep the raw
-        // `resumption_secret` (and the `resume_session_id`) so we can
-        // derive the early-data key. `try_resume` is one-shot — the
-        // ticket is consumed here.
-        let resumed: Option<([u8; 32], [u8; 32])> =
-            if let Some(rid) = client_hello.resume_session_id {
-                self.session_cache
-                    .lock()
-                    .try_resume(&rid)
-                    .map(|(secret, _suite)| (rid, secret))
-            } else {
-                None
-            };
-        let cookie_pow_bypass = resumed.is_some();
-
-        if let Err(resp) =
-            self.cookie_pow_gate(client_hello, difficulty, client_ip, cookie_pow_bypass)
-        {
-            return resp;
-        }
-
-        // Best-effort early-data decryption. Only attempted when the
-        // client both offered a blob AND presented a valid ticket.
-        let early_data_plaintext: Option<Vec<u8>> = match (&resumed, &ch3.early_data) {
-            (Some((rid, resumption_secret)), Some(blob)) => {
-                decrypt_early_data(resumption_secret, &client_hello.nonce, rid, blob)
-            }
-            _ => None,
-        };
-        let early_data_accepted = early_data_plaintext.is_some();
-
-        // Hybrid Key Exchange (PFS preserved — a fresh KEM secret even
-        // on the 0-RTT path).
-        let (shared_secret, ciphertext) = match client_hello.client_key_package.encapsulate() {
-            Ok(res) => res,
-            Err(e) => return HandshakeResponse::Fail(HandshakeError::KemFailed(e.to_string())),
-        };
-        let (_ephemeral_kem_secret, ephemeral_kem_public) = HybridSecretKey::generate();
-
-        let session_id_bytes = derive_session_id(&shared_secret, &client_hello.nonce);
-        let session_id = SessionId::from_bytes(session_id_bytes);
-
-        // V3 transcript — covers the WHOLE `ClientHelloV3`, including the
-        // early-data ciphertext, so a tampered or stripped blob breaks
-        // the client-side signature check. PROTOCOL_VARIANT is bound
-        // here as well (see constant doc).
-        let transcript = HandshakeTranscriptV3 {
-            protocol_variant: PROTOCOL_VARIANT,
-            client_hello: ch3,
-            server_key_package: &ephemeral_kem_public,
-            ciphertext: &ciphertext,
-            server_verify_key: &self.verifying_key,
-            session_id: &session_id_bytes,
-        };
-        let transcript_hash = match compute_transcript_hash(&transcript) {
-            Ok(h) => h,
-            Err(e) => return HandshakeResponse::Fail(e),
-        };
-        let signature = self.signing_key.sign(&transcript_hash);
-
-        let base = ServerHello {
-            server_key_package: ephemeral_kem_public,
-            ciphertext,
-            server_verify_key: self.verifying_key.clone(),
-            signature,
-            session_id: session_id_bytes,
-        };
-
-        // V3 handshake → V2 packet format: early-data is consumed at
-        // handshake time, so no new packet header is needed and the
-        // data pump routes V2 packets as usual.
-        let session = match self.finalize_session(&shared_secret, session_id, session_id_bytes, 2) {
-            Ok(s) => s,
-            Err(resp) => return resp,
-        };
-
-        let server_hello_v3 = ServerHelloV3 {
-            base,
             early_data_accepted,
         };
-        HandshakeResponse::SuccessV3(server_hello_v3, session, early_data_plaintext)
+
+        // Build + wire the Session, derive the resumption secret, and stash a
+        // fresh one-shot ticket for a future resume / 0-RTT.
+        let session = match self.finalize_session(&shared_secret, session_id, session_id_bytes) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+
+        HandshakeResponse::Success(server_hello, session, early_data_plaintext)
     }
 
     /// The cookie / Proof-of-Work DoS gate. Returns `Err(response)` —
     /// a ready-to-send `Retry` or `Fail` — when the client must not
     /// yet proceed; `Ok(())` when it has cleared the gate (or `bypass`
-    /// was set by a valid one-shot resumption ticket). Shared by the
-    /// V12 and V3 server paths.
+    /// was set by a valid one-shot resumption ticket).
     // `HandshakeResponse` is intentionally large — boxing it would add a
     // heap allocation on every call, penalising the hot non-error path.
     // The type is internal and lives only on the handshake stack, so the
@@ -737,23 +553,14 @@ impl HandshakeServer {
     }
 
     /// Build the post-handshake `Session` from the negotiated
-    /// `shared_secret`: derive the AEAD `CryptoState`, set the
-    /// packet-routing wire version, derive + install the resumption
-    /// secret, and stash a resumption ticket in the cache. Shared by
-    /// the V12 and V3 server paths.
-    ///
-    /// `packet_wire_version` is what the data pump uses to pick the V1
-    /// vs V2 packet codec — `client_hello.version` for the V12 path,
-    /// `2` for the V3 path (V3 is a handshake-only bump; early-data is
-    /// consumed at handshake time and the session then routes V2
-    /// packets).
+    /// `shared_secret`: derive the AEAD `CryptoState`, derive + install the
+    /// resumption secret, and stash a resumption ticket in the cache.
     #[allow(clippy::result_large_err)]
     fn finalize_session(
         &self,
         shared_secret: &[u8; 32],
         session_id: SessionId,
         session_id_bytes: [u8; 32],
-        packet_wire_version: u8,
     ) -> Result<Session, HandshakeResponse> {
         let crypto = CryptoState::new(shared_secret, true)
             .map_err(|e| HandshakeResponse::Fail(HandshakeError::KemFailed(e.to_string())))?;
@@ -767,11 +574,10 @@ impl HandshakeServer {
             *shared_secret,
             true,
         );
-        session.set_wire_version(packet_wire_version);
 
         // Derive resumption secret and stash a one-shot ticket so a
         // future ClientHello carrying this session id can skip
-        // cookie/PoW and (on the V3 path) carry 0-RTT early-data.
+        // cookie/PoW and carry 0-RTT early-data.
         let mut resumption_secret = [0u8; 32];
         let hk = hkdf::Hkdf::<Sha256>::new(None, shared_secret);
         if hk
@@ -848,97 +654,71 @@ impl HandshakeClient {
         })
     }
 
-    /// Default `ClientHello` offers wire-format **V2**. V2 has been
-    /// negotiable since Phase 1.8 (server accepts {1, 2}); the data
-    /// pump V2-routes since the 4.2 / 2.5 closeout commit.
-    /// Downgrade resistance comes from the transcript signature over
-    /// `client_hello.version` — see `docs/migration/v1-to-v2.md`.
+    /// Build the default `ClientHello` — pinned [`PROTOCOL_VERSION`], no
+    /// resumption, no 0-RTT early-data. Downgrade resistance comes from the
+    /// transcript signature, which binds both `version` and the build-side
+    /// [`PROTOCOL_VARIANT`]; a network rewrite of either aborts the handshake
+    /// at the client-side signature check.
     pub fn create_client_hello(&self) -> ClientHello {
-        self.create_client_hello_with_version(2)
-    }
-
-    /// Like [`create_client_hello`](Self::create_client_hello) but offers
-    /// a specific wire-format version. Accepted values: `1` (V1, the
-    /// safe default) and `2` (V2 — widened flags, rekey epoch in
-    /// header, path id). Rust-only; not on the UniFFI surface because
-    /// most callers stay on the default.
-    ///
-    /// The wire version is signed under the handshake transcript, so a
-    /// network-level rewrite of this byte aborts the handshake at the
-    /// client-side signature verification step (Phase 1.8 downgrade
-    /// resistance).
-    pub fn create_client_hello_with_version(&self, version: u8) -> ClientHello {
         ClientHello {
             client_key_package: self.kem_public.clone(),
             client_verify_key: self.verifying_key.clone(),
             nonce: self.nonce,
-            version,
+            version: PROTOCOL_VERSION,
             cookie: None,
             pow_solution: None,
             resume_session_id: None,
             protocol_variant: PROTOCOL_VARIANT.to_vec(),
+            early_data: None,
         }
     }
 
-    /// Build a `ClientHello` carrying a `resume_session_id`. The
-    /// server will check its session cache; if the id is known and
-    /// the ticket is still valid, cookie/PoW are bypassed (Phase
-    /// 4.1). The `resumption_secret` half of the hint is held by the
-    /// caller and used for any application-layer 0-RTT data.
+    /// Build a `ClientHello` that resumes a prior session, optionally carrying
+    /// 0-RTT `early_data`.
+    ///
+    /// `resume_session_id` and `resumption_secret` are the two halves of a
+    /// prior session's `Session::resumption_hint()`. The server checks its
+    /// session cache; a known, still-valid ticket bypasses the cookie/PoW DoS
+    /// gate. When `early_data` is `Some`, it is sealed (AES-256-GCM) under a
+    /// key derived from `(resumption_secret, self.nonce)` and placed in
+    /// `ClientHello.early_data`; the server decrypts it with the matching key
+    /// (best-effort — see [`HandshakeServer::process_client_hello`]). The
+    /// whole hello, early-data included, is transcript-bound (Invariant 7).
+    ///
+    /// The caller MUST ensure `early_data.len() <= EARLY_DATA_MAX_LEN`;
+    /// `PhantomSession::connect_with_resumption` enforces this and returns an
+    /// error for oversized payloads.
     pub fn create_client_hello_with_resume(
-        &self,
-        version: u8,
-        resume_session_id: [u8; 32],
-    ) -> ClientHello {
-        ClientHello {
-            client_key_package: self.kem_public.clone(),
-            client_verify_key: self.verifying_key.clone(),
-            nonce: self.nonce,
-            version,
-            cookie: None,
-            pow_solution: None,
-            resume_session_id: Some(resume_session_id),
-            protocol_variant: PROTOCOL_VARIANT.to_vec(),
-        }
-    }
-
-    /// Build a **V3** `ClientHello` carrying optional 0-RTT early-data
-    /// (wire V3, Phase 4.1).
-    ///
-    /// `resume_session_id` and `resumption_secret` are the two halves
-    /// of a prior session's `Session::resumption_hint()`. When
-    /// `early_data` is `Some`, it is sealed (AES-256-GCM) under a key
-    /// derived from `(resumption_secret, self.nonce)` and embedded in
-    /// the returned `ClientHelloV3`; the server decrypts it with the
-    /// matching key.
-    ///
-    /// The caller MUST ensure `early_data.len() <= EARLY_DATA_MAX_LEN`
-    /// — `PhantomSession::connect_with_resumption` enforces this and
-    /// returns an error for oversized payloads.
-    pub fn create_client_hello_v3(
         &self,
         resume_session_id: [u8; 32],
         resumption_secret: &[u8; 32],
         early_data: Option<&[u8]>,
-    ) -> ClientHelloV3 {
-        let base = ClientHello {
+    ) -> ClientHello {
+        let sealed = early_data
+            .and_then(|pt| seal_early_data(resumption_secret, &self.nonce, &resume_session_id, pt));
+        ClientHello {
             client_key_package: self.kem_public.clone(),
             client_verify_key: self.verifying_key.clone(),
             nonce: self.nonce,
-            version: 3,
+            version: PROTOCOL_VERSION,
             cookie: None,
             pow_solution: None,
             resume_session_id: Some(resume_session_id),
             protocol_variant: PROTOCOL_VARIANT.to_vec(),
-        };
-        let sealed = early_data
-            .and_then(|pt| seal_early_data(resumption_secret, &self.nonce, &resume_session_id, pt));
-        ClientHelloV3 {
-            base,
             early_data: sealed,
         }
     }
 
+    /// Verify a `ServerHello` against the `ClientHello` we sent and establish
+    /// the client-side `Session`.
+    ///
+    /// Pinning is mandatory in production — `expected_server_key` is
+    /// `Some(&key)` (Invariant 1). The signature is checked over the whole
+    /// transcript, which embeds the entire `ClientHello` (early-data
+    /// ciphertext included) and the build-side `PROTOCOL_VARIANT` (Invariants
+    /// 7, 10). Returns the established `Session` and the 0-RTT verdict:
+    /// `Some(true/false)` when the client sent early-data (accepted / rejected
+    /// per `server_hello.early_data_accepted`), `None` when it sent none.
     #[tracing::instrument(
         name = "phantom.handshake.process_server_hello",
         skip_all,
@@ -951,16 +731,19 @@ impl HandshakeClient {
         client_hello: &ClientHello,
         server_hello: &ServerHello,
         expected_server_key: Option<&HybridVerifyingKey>,
-    ) -> Result<Session, HandshakeError> {
-        // 1. Verify Identity
+    ) -> Result<(Session, Option<bool>), HandshakeError> {
+        // 1. Verify Identity (server pinning — Invariant 1).
         if let Some(expected) = expected_server_key {
             if expected != &server_hello.server_verify_key {
                 return Err(HandshakeError::ServerIdentityMismatch);
             }
         }
 
-        // 2. Verify Signature (binds PROTOCOL_VARIANT — a fips↔non-fips
-        // mismatch fails this check rather than landing a wrong secret)
+        // 2. Verify Signature over the transcript. It binds the whole
+        // ClientHello (incl. early-data) and PROTOCOL_VARIANT — a fips↔non-fips
+        // mismatch, a downgraded `version`, or a tampered/stripped early-data
+        // blob fails this check rather than landing a wrong secret (Invariants
+        // 7, 10).
         let transcript = HandshakeTranscript {
             protocol_variant: PROTOCOL_VARIANT,
             client_hello,
@@ -996,13 +779,8 @@ impl HandshakeClient {
             shared_secret,
             false,
         );
-        // Phase 1.8: the wire version the client offered is exactly the
-        // one the server bound into the transcript signature; a
-        // network downgrade would have failed signature verification
-        // above. Setting it here keeps both ends in sync.
-        session.set_wire_version(client_hello.version);
 
-        // 5. Derive resumption secret
+        // 5. Derive resumption secret (seeds the NEXT resume / 0-RTT).
         let mut resumption_secret = [0u8; 32];
         let hk = hkdf::Hkdf::<Sha256>::new(None, &shared_secret);
         if hk
@@ -1013,84 +791,15 @@ impl HandshakeClient {
         }
 
         *self.stage.write() = HandshakeStage::Established;
-        Ok(session)
-    }
 
-    /// V3 counterpart of [`process_server_hello`] (wire V3, Phase 4.1).
-    ///
-    /// Verifies the server's signature over the V3 transcript (which
-    /// covers the whole `ClientHelloV3`, early-data included) and
-    /// returns the established `Session` together with the server's
-    /// 0-RTT verdict — `ServerHelloV3.early_data_accepted`. A `false`
-    /// verdict means the server did not consume the early-data; the
-    /// caller must re-send that payload over the normal channel.
-    #[tracing::instrument(
-        name = "phantom.handshake.process_server_hello_v3",
-        skip_all,
-        fields(pinned = expected_server_key.is_some()),
-    )]
-    pub fn process_server_hello_v3(
-        &self,
-        client_hello: &ClientHelloV3,
-        server_hello: &ServerHelloV3,
-        expected_server_key: Option<&HybridVerifyingKey>,
-    ) -> Result<(Session, bool), HandshakeError> {
-        let base = &server_hello.base;
-
-        // 1. Verify Identity
-        if let Some(expected) = expected_server_key {
-            if expected != &base.server_verify_key {
-                return Err(HandshakeError::ServerIdentityMismatch);
-            }
-        }
-
-        // 2. Verify Signature over the V3 transcript (binds PROTOCOL_VARIANT).
-        let transcript = HandshakeTranscriptV3 {
-            protocol_variant: PROTOCOL_VARIANT,
-            client_hello,
-            server_key_package: &base.server_key_package,
-            ciphertext: &base.ciphertext,
-            server_verify_key: &base.server_verify_key,
-            session_id: &base.session_id,
-        };
-        let transcript_hash = compute_transcript_hash(&transcript)?;
-        base.server_verify_key
-            .verify(&transcript_hash, &base.signature)
-            .map_err(|e| HandshakeError::KemFailed(format!("Signature check failed: {:?}", e)))?;
-
-        // 3. Decapsulate
-        let shared_secret = self
-            .kem_secret
-            .decapsulate(&base.ciphertext)
-            .map_err(|e| HandshakeError::KemFailed(e.to_string()))?;
-
-        // 4. Create Session
-        let session_id = SessionId::from_bytes(base.session_id);
-        let crypto = CryptoState::new(&shared_secret, false)
-            .map_err(|e| HandshakeError::KemFailed(e.to_string()))?;
-        let session = Session::from_derived(
-            session_id,
-            crypto,
-            SchedulerMode::LowLatency,
-            shared_secret,
-            false,
-        );
-        // V3 is a handshake-only bump — the session routes V2 packets,
-        // matching the server's `finalize_session(.., 2)`.
-        session.set_wire_version(2);
-
-        // 5. Derive resumption secret (seeds the NEXT 0-RTT).
-        let mut resumption_secret = [0u8; 32];
-        let hk = hkdf::Hkdf::<Sha256>::new(None, &shared_secret);
-        if hk
-            .expand(b"phantom-resumption-secret-v1", &mut resumption_secret)
-            .is_ok()
-        {
-            session.set_resumption_secret(resumption_secret);
-        }
-
-        *self.stage.write() = HandshakeStage::Established;
-        Ok((session, server_hello.early_data_accepted))
+        // 0-RTT verdict: only meaningful when the client actually sent
+        // early-data on this connect (`None` otherwise — resolved decision 1 /
+        // Invariant 9).
+        let early_data_verdict = client_hello
+            .early_data
+            .as_ref()
+            .map(|_| server_hello.early_data_accepted);
+        Ok((session, early_data_verdict))
     }
 
     /// Queue a plaintext payload to be sent as early-data once the secure
@@ -1126,7 +835,7 @@ fn derive_session_id(shared_secret: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Best-effort decryption of a V3 early-data blob (wire V3, Phase 4.1).
+/// Best-effort decryption of a 0-RTT early-data blob.
 ///
 /// Both peers derive the AEAD `(key, nonce)` from the prior session's
 /// `resumption_secret` and *this* connect's `client_nonce` via
@@ -1160,9 +869,8 @@ fn decrypt_early_data(
     aead.decrypt_with_nonce(nonce, &aad, sealed).ok()
 }
 
-/// Seal a V3 early-data plaintext for transport inside a
-/// `ClientHelloV3` (wire V3, Phase 4.1). Mirror of
-/// [`decrypt_early_data`].
+/// Seal a 0-RTT early-data plaintext for transport inside a
+/// `ClientHello.early_data`. Mirror of [`decrypt_early_data`].
 ///
 /// The client is the *initiator* of the one-directional early-data
 /// channel — `with_suite` (no key swap) so its `send_key` matches the
@@ -1325,6 +1033,88 @@ impl From<HandshakeError> for CoreError {
 mod tests {
     use super::*;
 
+    /// Byte-exact freeze of the handshake transcript hash (Phase 6).
+    ///
+    /// Pins `SHA256(borsh(HandshakeTranscript))` over a fully-deterministic
+    /// `ClientHello` + server fields. Unlike the public wire-codec vectors in
+    /// `core/tests/wire_vectors.rs`, this exercises the *real* private
+    /// `HandshakeTranscript` and `compute_transcript_hash`, so a reorder of the
+    /// transcript fields or any change to the hash construction — the signing
+    /// input, Invariants 7 & 10 — fails here. The crypto material is
+    /// deterministic filler of the real field lengths; the hash needs no live
+    /// keys. Default (non-fips) build only (the fips transcript embeds a
+    /// different `PROTOCOL_VARIANT` and 65-byte classical key).
+    ///
+    /// Regenerate alongside the wire vectors with
+    /// `PHANTOM_REGEN_WIRE_VECTORS=1 cargo test --manifest-path core/Cargo.toml --lib`.
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn transcript_hash_wire_vector() {
+        fn pat(seed: u8, n: usize) -> Vec<u8> {
+            (0..n).map(|i| seed.wrapping_add(i as u8)).collect()
+        }
+        fn arr32(seed: u8) -> [u8; 32] {
+            pat(seed, 32).try_into().expect("pat(seed, 32) is 32 bytes")
+        }
+
+        // Same deterministic filler as the `client_hello_full` / `server_hello`
+        // vectors so the three freezes describe one consistent handshake.
+        let key_package = HybridKeyPackage {
+            classical_pk: arr32(0x10),
+            ml_kem_pk: pat(0x20, 1184),
+        };
+        let verify_key = HybridVerifyingKey {
+            ed25519_pk: arr32(0x50),
+            ml_dsa_pk: pat(0x60, 1952),
+        };
+        let client_hello = ClientHello {
+            client_key_package: key_package.clone(),
+            client_verify_key: verify_key.clone(),
+            nonce: arr32(0xA0),
+            version: PROTOCOL_VERSION,
+            cookie: Some(arr32(0xB0)),
+            pow_solution: Some(PoWSolution {
+                nonce: arr32(0x90),
+                solution: 0x0123_4567_89AB_CDEF,
+            }),
+            resume_session_id: Some(arr32(0xC0)),
+            protocol_variant: PROTOCOL_VARIANT.to_vec(),
+            early_data: Some(pat(0xD0, 48)),
+        };
+        let ciphertext = HybridCiphertext {
+            classical_pk: arr32(0x30),
+            ml_kem_ct: pat(0x40, 1088),
+        };
+        let session_id = arr32(0xE0);
+
+        let transcript = HandshakeTranscript {
+            protocol_variant: PROTOCOL_VARIANT,
+            client_hello: &client_hello,
+            server_key_package: &key_package,
+            ciphertext: &ciphertext,
+            server_verify_key: &verify_key,
+            session_id: &session_id,
+        };
+        let hash = compute_transcript_hash(&transcript).expect("transcript hash");
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/wire_vectors/transcript_hash.bin");
+        if std::env::var_os("PHANTOM_REGEN_WIRE_VECTORS").is_some() {
+            std::fs::create_dir_all(path.parent().expect("fixtures dir parent"))
+                .expect("create wire_vectors dir");
+            std::fs::write(&path, hash).expect("write transcript_hash.bin");
+            return;
+        }
+        let expected = std::fs::read(&path)
+            .expect("read transcript_hash.bin; regenerate with PHANTOM_REGEN_WIRE_VECTORS=1");
+        assert_eq!(
+            hash.as_slice(),
+            expected.as_slice(),
+            "handshake transcript hash changed — the signing input (Invariants 7 & 10) is \
+             wire-breaking. If intentional, bump PROTOCOL_VERSION and regenerate."
+        );
+    }
+
     /// A `ClientHello` advertising a foreign `PROTOCOL_VARIANT`
     /// (simulating a fips/non-fips cross-mode connect) is rejected by
     /// the server with [`HandshakeError::ProtocolVariantMismatch`]
@@ -1352,46 +1142,6 @@ mod tests {
         }
     }
 
-    /// V3 (0-RTT) path of the protocol-variant gate. A
-    /// `ClientHelloV3` advertising a foreign `PROTOCOL_VARIANT` is
-    /// rejected by `process_client_hello_v3` with
-    /// [`HandshakeError::ProtocolVariantMismatch`] before any
-    /// KEM / signature / early-data work is done.
-    ///
-    /// Parallels [`protocol_variant_mismatch_rejected`] (V1/V2 path).
-    /// The two paths share the same constant + transcript binding but
-    /// dispatch through different `process_client_hello_*` entry
-    /// points, so we lock the gate explicitly on both.
-    #[tokio::test]
-    async fn protocol_variant_mismatch_rejected_v3() {
-        let server = HandshakeServer::new().expect("HandshakeServer::new");
-        let client = HandshakeClient::new().expect("HandshakeClient::new");
-        let client_ip = "127.0.0.1".parse().expect("parse client_ip");
-
-        // Build a V3 ClientHello (any resume secret / id will do; the
-        // gate fires before either is touched).
-        let resume_session_id = [0u8; 32];
-        let resumption_secret = [0u8; 32];
-        let mut ch3 = client.create_client_hello_v3(resume_session_id, &resumption_secret, None);
-        assert_eq!(ch3.base.protocol_variant, PROTOCOL_VARIANT);
-
-        // Pretend the peer was compiled with a different feature set
-        // (cross-mode connect attempt).
-        ch3.base.protocol_variant = b"phantom-some-other-mode-1".to_vec();
-
-        let response = server.process_client_hello_v3(&ch3, 0, client_ip);
-        match response {
-            HandshakeResponse::Fail(HandshakeError::ProtocolVariantMismatch {
-                expected,
-                received,
-            }) => {
-                assert_eq!(expected, PROTOCOL_VARIANT);
-                assert_eq!(received, b"phantom-some-other-mode-1");
-            }
-            other => panic!("expected ProtocolVariantMismatch on V3 path, got {other:?}"),
-        }
-    }
-
     /// Tampering with the cleartext `protocol_variant` to match the
     /// server's value (an MITM bypass attempt) is caught by the
     /// transcript signature: the transcript still binds the *real*
@@ -1416,7 +1166,7 @@ mod tests {
         let mut hello_retry = hello.clone();
         hello_retry.cookie = Some(cookie);
         match server.process_client_hello(&hello_retry, 0, client_ip) {
-            HandshakeResponse::Success(_, _) => {}
+            HandshakeResponse::Success(..) => {}
             other => panic!("expected success, got {other:?}"),
         }
     }
@@ -1443,7 +1193,7 @@ mod tests {
         let response = server.process_client_hello(&hello_retry, 0, client_ip);
 
         let (server_hello, _server_session) = match response {
-            HandshakeResponse::Success(h, s) => (h, s),
+            HandshakeResponse::Success(h, s, _) => (h, s),
             _ => panic!("Expected success"),
         };
 
@@ -1473,10 +1223,10 @@ mod tests {
         hello_retry.cookie = Some(cookie);
         let (server_hello, server_session) =
             match server.process_client_hello(&hello_retry, 0, client_ip) {
-                HandshakeResponse::Success(h, s) => (h, s),
+                HandshakeResponse::Success(h, s, _) => (h, s),
                 _ => panic!("expected success"),
             };
-        let client_session = client
+        let (client_session, _) = client
             .process_server_hello(&hello_retry, &server_hello, Some(server.verifying_key()))
             .unwrap();
 
@@ -1510,22 +1260,20 @@ mod tests {
         hello_retry.cookie = Some(cookie);
         let (_first_server_hello, first_server_session) =
             match server.process_client_hello(&hello_retry, 0, client_ip) {
-                HandshakeResponse::Success(h, s) => (h, s),
+                HandshakeResponse::Success(h, s, _) => (h, s),
                 _ => panic!("expected success"),
             };
-        let (resume_id, _resume_secret) = first_server_session.resumption_hint().unwrap();
+        let (resume_id, resume_secret) = first_server_session.resumption_hint().unwrap();
 
         // Second client offers the resume_session_id WITHOUT a cookie.
         // Server should accept immediately (no Retry).
         let second_client = HandshakeClient::new().unwrap();
-        let resume_hello = second_client.create_client_hello_with_resume(2, resume_id);
+        let resume_hello =
+            second_client.create_client_hello_with_resume(resume_id, &resume_secret, None);
         match server.process_client_hello(&resume_hello, 0, client_ip) {
-            HandshakeResponse::Success(_, _) => {} // expected
+            HandshakeResponse::Success(..) => {} // expected
             HandshakeResponse::Retry(_) => {
                 panic!("resume_session_id should bypass cookie/PoW gate")
-            }
-            HandshakeResponse::SuccessV3(..) => {
-                panic!("V12 process_client_hello must not return SuccessV3")
             }
             HandshakeResponse::Fail(e) => panic!("unexpected failure: {:?}", e),
         }
@@ -1542,7 +1290,7 @@ mod tests {
 
         // An id the server has never seen.
         let bogus_id = [0xFFu8; 32];
-        let hello = client.create_client_hello_with_resume(2, bogus_id);
+        let hello = client.create_client_hello_with_resume(bogus_id, &[0u8; 32], None);
         match server.process_client_hello(&hello, 0, client_ip) {
             HandshakeResponse::Retry(_) => {} // expected — normal cookie flow
             other => panic!(
@@ -1552,11 +1300,11 @@ mod tests {
         }
     }
 
-    // ── Wire V3 / 0-RTT early-data (Phase 4.1) ──
+    // ── 0-RTT early-data ──
 
-    /// Drive a full V12 handshake and return the resumption hint the
-    /// server minted for it — the `(session_id, resumption_secret)`
-    /// a V3 client needs.
+    /// Drive a full handshake and return the resumption hint the server
+    /// minted for it — the `(session_id, resumption_secret)` a resuming
+    /// client needs.
     fn first_handshake_for_hint(
         server: &HandshakeServer,
         client_ip: std::net::IpAddr,
@@ -1570,97 +1318,52 @@ mod tests {
         let mut retry = hello.clone();
         retry.cookie = Some(cookie);
         match server.process_client_hello(&retry, 0, client_ip) {
-            HandshakeResponse::Success(_, session) => session.resumption_hint().unwrap(),
+            HandshakeResponse::Success(_, session, _) => session.resumption_hint().unwrap(),
             _ => panic!("expected success"),
         }
     }
 
-    #[test]
-    fn envelope_roundtrip_v12_and_v3() {
-        let client = HandshakeClient::new().unwrap();
-
-        // ClientHelloEnvelope::V12 round-trips.
-        let v12 = ClientHelloEnvelope::V12(client.create_client_hello());
-        let bytes = borsh::to_vec(&v12).unwrap();
-        assert!(matches!(
-            borsh::from_slice::<ClientHelloEnvelope>(&bytes).unwrap(),
-            ClientHelloEnvelope::V12(_)
-        ));
-
-        // ClientHelloEnvelope::V3 round-trips, early-data preserved.
-        let v3 = ClientHelloEnvelope::V3(client.create_client_hello_v3(
-            [7u8; 32],
-            &[9u8; 32],
-            Some(b"early"),
-        ));
-        let bytes = borsh::to_vec(&v3).unwrap();
-        match borsh::from_slice::<ClientHelloEnvelope>(&bytes).unwrap() {
-            ClientHelloEnvelope::V3(ch3) => {
-                assert_eq!(ch3.base.version, 3);
-                assert!(ch3.early_data.is_some(), "sealed blob preserved");
-            }
-            ClientHelloEnvelope::V12(_) => panic!("expected V3"),
-        }
-
-        // ServerHelloEnvelope::Unsupported is a 1-byte wire token.
-        let bytes = borsh::to_vec(&ServerHelloEnvelope::Unsupported).unwrap();
-        assert!(matches!(
-            borsh::from_slice::<ServerHelloEnvelope>(&bytes).unwrap(),
-            ServerHelloEnvelope::Unsupported
-        ));
-    }
-
-    #[test]
-    fn unknown_envelope_discriminant_errors_not_panics() {
-        // `ClientHelloEnvelope` has discriminants 0 (V12) and 1 (V3).
-        // An out-of-range discriminant must produce a clean `Err`, not
-        // a panic — this is what makes future version bumps decode
-        // cleanly off the 1-byte prefix.
-        let bogus = [99u8, 0, 0, 0, 0, 0, 0, 0];
-        assert!(borsh::from_slice::<ClientHelloEnvelope>(&bogus).is_err());
-        assert!(borsh::from_slice::<ServerHelloEnvelope>(&bogus).is_err());
-    }
-
     #[tokio::test]
-    async fn v3_early_data_round_trip() {
+    async fn early_data_round_trip() {
         let server = HandshakeServer::new().unwrap();
         let client_ip = "127.0.0.1".parse().unwrap();
         let (resume_id, resume_secret) = first_handshake_for_hint(&server, client_ip);
 
-        // Second connect: V3 with a 0-RTT early-data payload.
+        // Second connect: resume + a 0-RTT early-data payload folded into the
+        // single ClientHello.
         let client = HandshakeClient::new().unwrap();
         let early_payload = b"zero-rtt application bytes";
-        let ch3 = client.create_client_hello_v3(resume_id, &resume_secret, Some(early_payload));
+        let hello =
+            client.create_client_hello_with_resume(resume_id, &resume_secret, Some(early_payload));
 
-        match server.process_client_hello_v3(&ch3, 0, client_ip) {
-            HandshakeResponse::SuccessV3(sh3, _session, early_data) => {
-                assert!(sh3.early_data_accepted, "server accepted the early-data");
+        match server.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Success(sh, _session, early_data) => {
+                assert!(sh.early_data_accepted, "server accepted the early-data");
                 assert_eq!(
                     early_data.as_deref(),
                     Some(&early_payload[..]),
                     "server decrypted the exact payload the client sealed"
                 );
-                // The client verifies the V3 ServerHello and learns the
-                // same verdict.
+                // The client verifies the ServerHello and learns the same
+                // verdict.
                 let (_session, accepted) = client
-                    .process_server_hello_v3(&ch3, &sh3, Some(server.verifying_key()))
-                    .expect("client verifies the V3 ServerHello");
-                assert!(accepted, "client sees early_data_accepted == true");
+                    .process_server_hello(&hello, &sh, Some(server.verifying_key()))
+                    .expect("client verifies the ServerHello");
+                assert_eq!(accepted, Some(true), "client sees early-data accepted");
             }
             other => panic!(
-                "expected SuccessV3, got {}",
+                "expected Success with accepted early-data, got {}",
                 match other {
                     HandshakeResponse::Retry(_) => "Retry",
-                    HandshakeResponse::Success(..) => "Success",
                     HandshakeResponse::Fail(_) => "Fail",
-                    HandshakeResponse::SuccessV3(..) => unreachable!(),
+                    HandshakeResponse::Success(..) => unreachable!(),
                 }
             ),
         }
     }
 
     #[tokio::test]
-    async fn v3_oversized_early_data_rejected_but_handshake_succeeds() {
+    async fn oversized_early_data_rejected_but_handshake_succeeds() {
         let server = HandshakeServer::new().unwrap();
         let client_ip = "127.0.0.1".parse().unwrap();
         let (resume_id, resume_secret) = first_handshake_for_hint(&server, client_ip);
@@ -1668,11 +1371,11 @@ mod tests {
         // A blob whose sealed length exceeds EARLY_DATA_MAX_LEN + tag.
         let huge = vec![0u8; EARLY_DATA_MAX_LEN + 1];
         let client = HandshakeClient::new().unwrap();
-        let ch3 = client.create_client_hello_v3(resume_id, &resume_secret, Some(&huge));
+        let hello = client.create_client_hello_with_resume(resume_id, &resume_secret, Some(&huge));
 
-        match server.process_client_hello_v3(&ch3, 0, client_ip) {
-            HandshakeResponse::SuccessV3(sh3, _session, early_data) => {
-                assert!(!sh3.early_data_accepted, "oversized blob rejected");
+        match server.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Success(sh, _session, early_data) => {
+                assert!(!sh.early_data_accepted, "oversized blob rejected");
                 assert!(early_data.is_none(), "no plaintext surfaces");
             }
             _ => panic!("handshake must still succeed as 1-RTT"),
@@ -1680,20 +1383,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v3_corrupted_early_data_rejected_but_handshake_succeeds() {
+    async fn corrupted_early_data_rejected_but_handshake_succeeds() {
         let server = HandshakeServer::new().unwrap();
         let client_ip = "127.0.0.1".parse().unwrap();
         let (resume_id, resume_secret) = first_handshake_for_hint(&server, client_ip);
 
-        // Build a V3 ClientHello, then replace the sealed blob with
+        // Build a resume ClientHello, then replace the sealed blob with
         // in-range garbage — AEAD verification must fail.
         let client = HandshakeClient::new().unwrap();
-        let mut ch3 = client.create_client_hello_v3(resume_id, &resume_secret, None);
-        ch3.early_data = Some(vec![0xFFu8; 128]);
+        let mut hello = client.create_client_hello_with_resume(resume_id, &resume_secret, None);
+        hello.early_data = Some(vec![0xFFu8; 128]);
 
-        match server.process_client_hello_v3(&ch3, 0, client_ip) {
-            HandshakeResponse::SuccessV3(sh3, _session, early_data) => {
-                assert!(!sh3.early_data_accepted, "AEAD failure → rejected");
+        match server.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Success(sh, _session, early_data) => {
+                assert!(!sh.early_data_accepted, "AEAD failure → rejected");
                 assert!(early_data.is_none());
             }
             _ => panic!("handshake must still succeed as 1-RTT"),
@@ -1701,17 +1404,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v3_unknown_ticket_falls_back_to_cookie_retry() {
-        // A V3 ClientHello whose resume_session_id the server has never
-        // seen gets no cookie/PoW bypass — and with no cookie attached,
-        // the server demands one via Retry.
+    async fn unknown_ticket_with_early_data_falls_back_to_cookie_retry() {
+        // A ClientHello whose resume_session_id the server has never seen
+        // gets no cookie/PoW bypass — and with no cookie attached, the server
+        // demands one via Retry. The undecryptable early-data is ignored.
         let server = HandshakeServer::new().unwrap();
         let client_ip = "127.0.0.1".parse().unwrap();
         let client = HandshakeClient::new().unwrap();
-        let ch3 = client.create_client_hello_v3([0xAB; 32], &[0xCD; 32], Some(b"hi"));
+        let hello = client.create_client_hello_with_resume([0xAB; 32], &[0xCD; 32], Some(b"hi"));
         assert!(
             matches!(
-                server.process_client_hello_v3(&ch3, 0, client_ip),
+                server.process_client_hello(&hello, 0, client_ip),
                 HandshakeResponse::Retry(_)
             ),
             "unknown ticket → no bypass → cookie Retry"

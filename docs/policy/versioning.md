@@ -1,19 +1,26 @@
 # Versioning Policy
 
-Phantom Core has **three independent version axes** that consumers need to
-reason about separately. This document defines what each one promises.
+Phantom Core has **two independent, live version axes** that consumers need to
+reason about separately, plus a single **pinned wire-format constant** that is
+not (today) a negotiated axis. This document defines what each one promises.
 
 ---
 
-## 1. The three axes
+## 1. The axes
 
 | Axis | Identifier | Lives in | Bump triggers |
 | --- | --- | --- | --- |
 | Public Rust API | `phantom_core` crate version | `core/Cargo.toml :: [package].version` | Any signature change in a `pub` item, per SemVer |
-| Wire format | `VersionedPacket::Vn` discriminant | `core/src/transport/types.rs` | Any non-additive change to the on-the-wire bytes |
-| FFI ABI | `phantom_core.UDL` + `uniffi-bindgen` output | `core/src/lib.rs :: uniffi::setup_scaffolding!()` and the bindings under `tests/bindings/` | Any change to a UniFFI-exported type / method / record / enum |
+| FFI ABI | `uniffi::setup_scaffolding!()` output + the bindings under `tests/bindings/` | `core/src/lib.rs` and `tests/bindings/` | Any change to a UniFFI-exported type / method / record / enum |
 
-A single commit can move zero, one, two, or all three axes. Each axis has its
+And one pinned constant that is **not** an evolving axis (see §3):
+
+| Constant | Identifier | Lives in | Value |
+| --- | --- | --- | --- |
+| Wire-format version | `WIRE_VERSION` (packet-header byte) | `core/src/transport/types.rs` | `1` |
+| Protocol version | `PROTOCOL_VERSION` (`ClientHello.version`) | `core/src/transport/handshake.rs` | `1` |
+
+A single commit can move zero, one, or both of the live axes. Each axis has its
 own changelog entry (see `CHANGELOG.md`).
 
 ---
@@ -27,10 +34,10 @@ Pre-1.0: minor versions may break.
   break.
 - `0.x → 1.0`: marks API stability. After 1.0, strict SemVer applies.
 
-The `cargo-semver-checks` CI job (run via `.github/workflows/`, planned) is
-the automated guardrail. Manual review remains authoritative because
-SemVer is a contract about *intent*, not just signatures (e.g. behavioural
-changes that match the same signature are still breaking).
+The `cargo-semver-checks` CI job (`.github/workflows/release.yml`) is the
+automated guardrail. Manual review remains authoritative because SemVer is a
+contract about *intent*, not just signatures (e.g. behavioural changes that
+match the same signature are still breaking).
 
 ### What counts as a public API break
 
@@ -38,8 +45,7 @@ changes that match the same signature are still breaking).
 - Removing or renaming a `pub` item.
 - Narrowing a generic's trait bounds.
 - Changing visibility from `pub` to `pub(crate)`.
-- Adding a non-default-having variant to an enum that is documented as
-  `non_exhaustive = false`.
+- Adding a variant to an enum that is *not* `#[non_exhaustive]`.
 
 ### What is *not* a break
 
@@ -51,95 +57,107 @@ changes that match the same signature are still breaking).
 
 ---
 
-## 3. Wire format (`VersionedPacket::Vn`)
+## 3. Wire format (single pinned version)
 
-Wire-format compatibility is **independent** from the Rust API version.
-Two `phantom_core` builds at different crate versions can interoperate if
-and only if they share at least one `VersionedPacket` variant.
+The wire format is **one protocol with one pinned version byte**. There is no
+`VersionedPacket` enum, no per-session `wire_version` negotiation, and no
+in-protocol fallback. Pre-1.0 there are no deployed peers to stay compatible
+with, so there is nothing to negotiate against.
 
-### Bump triggers
+Two constants pin the format:
 
-A V2 bump is required for **any** of the following:
+- `WIRE_VERSION = 1` — the leading byte of every `PacketHeader`
+  (`transport/types.rs`). It leads the serialised bytes and the AEAD AAD.
+- `PROTOCOL_VERSION = 1` — `ClientHello.version` (`transport/handshake.rs`),
+  bound into the signed handshake transcript.
 
-- New byte added to the on-wire `PacketHeader`.
-- Width change on an existing header field (`stream_id: u16 → u32`).
-- New flag bit in `PacketFlags` (all 8 V1 bits are used).
-- Change to the AEAD nonce derivation function.
-- Change to any KDF label string (`"phantom-transport-key"`, etc.).
-- Change to the borsh field order of `ClientHello` / `ServerHello`.
-- Change to the cookie or PoW HMAC inputs.
+Both are **tamper-check anchors**, not negotiated sets:
 
-### Bump non-triggers (safe to add in V1)
+- A decoder that receives a `PhantomPacket` whose `header.version != WIRE_VERSION`
+  **drops the frame** (`api/session.rs`, the recv pump). It never tries an
+  alternate parse.
+- The handshake server rejects a `ClientHello` whose `version != PROTOCOL_VERSION`
+  with `UnsupportedVersion`. The version byte is transcript-signed, so a
+  cleartext rewrite also fails the signature check.
 
-- New variants of `CompressionAlgo` that ride inside an existing flag.
-- New optional fields placed inside the reserved `extensions: Vec<u8>` field
-  of `PhantomPacketV1` (consumed if known, ignored if not — provided the
-  ignored case is a documented contract).
-- Implementation changes that don't alter bytes on the wire (e.g.
-  Phase 1.10 cookie-bucket size change kept HMAC output length identical).
+> `PROTOCOL_VARIANT` (`b"phantom-default-1"` / `b"phantom-fips-1"`) is an
+> **orthogonal build-variant tag**, not a version axis. It is the leading
+> transcript field and lets a server reject a cross-mode (fips ↔ non-fips)
+> peer before any KEM/signature work. The unified-protocol collapse does not
+> change it.
 
-### V1 → V2 process
+### Adding bytes without a version bump
 
-1. Add `VersionedPacket::V2(PhantomPacketV2)` *alongside* V1 — both
-   variants must coexist for at least one minor release cycle.
-2. Receivers continue to accept V1 frames; senders may opt into V2 via a
-   `PhantomConfig` flag.
-3. After the deprecation window, V1 acceptance can be removed (followed by
-   a major version bump of the crate).
+The single `PhantomPacket { header, payload, extensions }` carries an
+`extensions: Vec<u8>` TLV field as forward-compatible headroom. Amendments that
+fit inside `extensions` (packet-number / SACK fields, new TLV records) do **not**
+touch `WIRE_VERSION` — a peer that does not know a record deserialises it as an
+empty/ignored `Vec`, provided the ignored case is a documented contract. The
+same applies to new `PacketFlags` bits (`0x1000 .. 0x8000` are reserved) that
+ride inside an existing field, and to implementation changes that leave the
+on-wire bytes byte-identical.
 
-When V2 lands, this document gets a sibling `docs/protocol/PROTOCOL_V2.md`
-and a migration guide under `docs/migration/`.
+### Bumping the pinned version (a deliberate, breaking change)
+
+A change to any of the following requires bumping `WIRE_VERSION` /
+`PROTOCOL_VERSION`:
+
+- A new byte added to (or width change on) the on-wire `PacketHeader`.
+- A change to the AEAD nonce derivation (`nonce_prefix || epoch || stream_id ||
+  sequence || path_id`).
+- A change to any KDF label string (e.g. `"phantom-rekey-v1"`).
+- A change to the borsh field order of `ClientHello` / `ServerHello` /
+  `HelloRetryRequest`.
+- A change to the cookie or PoW inputs.
+
+Because there is no negotiation, such a bump is a **coordinated, breaking
+change**: every peer must move to the new constant at once. Pre-1.0 there are no
+peers to keep on the old value, so the bump ships as a single hard cut (a crate
+**major** version bump, plus a migration note under `docs/migration/`). The
+constant exists precisely so a future deliberate bump has a single, signed,
+tamper-checked anchor to move — not so that multiple versions coexist on the
+wire.
 
 ---
 
 ## 4. FFI / UniFFI ABI
 
-The FFI surface is what the `tests/bindings/phantom_core.py` (and future
-Swift / Kotlin / C bindings) actually link against. Its compatibility
-contract is **stricter than** the Rust API:
+The FFI surface is what `tests/bindings/{phantom_core.py, swift/, kotlin/, c/}`
+actually link against. Its compatibility contract is **stricter than** the Rust
+API:
 
-- Adding a new method or record field is **not** safe — bindings
-  regenerated against a newer `phantom_core` may not link against an
-  older library.
+- Adding a new method or record field is **not** safe — bindings regenerated
+  against a newer `phantom_core` may not link against an older library.
 - Renaming any UniFFI-exported type / method / variant breaks all bindings.
 - Removing an export is always a break.
 
 Practice:
 
-- Every UniFFI-affecting change touches `tests/bindings/CHANGELOG.md`
-  (planned). Until that file exists, the global `CHANGELOG.md` carries
-  these entries with an `FFI:` prefix.
-- Regenerate bindings as part of the same commit that changes a
-  UniFFI-exported item:
-
-```bash
-cargo run --manifest-path core/Cargo.toml --bin uniffi-bindgen -- \
-    generate \
-    --library target/debug/libphantom_core.dylib \
-    --language python \
-    --out-dir tests/bindings/
-```
-
-(The exact command will be wrapped in a `justfile` recipe when Phase 7.4
-release pipeline lands.)
+- Every UniFFI-affecting change carries a CHANGELOG entry with an `FFI:` prefix.
+- Regenerate bindings as part of the same commit that changes a UniFFI-exported
+  item, via the per-language scripts under `tests/bindings/`
+  (`generate_python.sh`, `generate_swift.sh`, `generate_kotlin.sh`,
+  `generate_c.sh`). CI's `bindings.yml::drift` job regenerates all four and
+  fails on any uncommitted diff.
 
 ---
 
 ## 5. Cargo features vs. version bumps
 
-Feature flags (`pqc-standard`, `compression-zstd`, future `fips`,
-future `wasm`) are not versioned independently. A feature toggle:
+Feature flags (`compression-zstd`, `std`, `bindings`, `embedded`, `no-std`,
+`telemetry-otel`, `fips`, `wasi-leg`) are not versioned independently. A feature
+toggle:
 
 - Adding a feature: SemVer-minor (additive).
-- Removing a feature: SemVer-major (breaking — consumers can declare
-  reliance on a feature).
+- Removing a feature: SemVer-major (breaking — consumers can declare reliance on
+  a feature).
 - Renaming a feature: SemVer-major.
-- Changing what a feature enables (transitively): treat as breaking
-  unless the change is purely additive at the feature's exported API.
+- Changing what a feature enables (transitively): treat as breaking unless the
+  change is purely additive at the feature's exported API.
 
 Default features are part of the API contract: changing the default set
-is breaking (consumers may have implicitly relied on the included
-dependency).
+(`["compression-zstd", "std", "bindings"]`) is breaking, since consumers may
+have implicitly relied on the included dependency.
 
 ---
 
@@ -147,61 +165,83 @@ dependency).
 
 Currently **Rust 1.75 stable**. Declared in:
 
-- `core/Cargo.toml :: [package].rust-version` (planned).
 - `.clippy.toml :: msrv` (already present).
+- `core/Cargo.toml :: [package].rust-version` (planned).
 
-MSRV bumps are themselves SemVer-minor for `0.x` releases and SemVer-major
-once we hit 1.0. The CI matrix in `.github/workflows/cross.yml` includes a
-dedicated 1.75 job alongside the stable job; failures on 1.75-only mean
-the MSRV needs to be raised in the same commit that introduced the
-incompatibility.
+MSRV bumps are themselves SemVer-minor for `0.x` releases and SemVer-major once
+we hit 1.0. CI enforces 1.75 separately via `dtolnay/rust-toolchain@1.75`;
+failures on 1.75-only mean the MSRV must be raised in the same commit that
+introduced the incompatibility.
+
+Note that the sibling `cli/` crate uses `edition = "2024"` and so builds only on
+recent stable, not under the 1.75 gate — the MSRV promise covers the
+`phantom_core` library, not the admin tooling.
 
 ---
 
-## 7. Deprecation policy
+## 7. PQC and cryptographic dependency updates
+
+`ml-kem` and `ml-dsa` (the FIPS-203 / FIPS-204 RustCrypto crates) are
+unconditional dependencies (`ml-kem = "0.2"`, `ml-dsa = "0.1.0"`). A bump of a
+cryptographic dependency is treated as a potential **wire-format change**:
+if the upgrade alters the serialised key-package / ciphertext / signature bytes
+or the KAT vectors, it is a coordinated `WIRE_VERSION` / `PROTOCOL_VERSION` bump
+(§3), not a routine dependency patch. Run `core/tests/cavp.rs` after any such
+bump to catch a silent vector drift, and update `docs/compliance/` if the FIPS
+posture moves.
+
+---
+
+## 8. Deprecation policy
 
 Public items marked `#[deprecated]`:
 
 - Remain functional for at least one minor release cycle before removal.
 - Carry a `note = "..."` pointing to the replacement.
-- Are scheduled for removal in a `// REMOVE-IN: 0.X.0` comment so a
-  release-time sweep can find them.
+- Are scheduled for removal in a `// REMOVE-IN: 0.X.0` comment so a release-time
+  sweep can find them.
 
-The same applies to FFI exports (deprecation is signalled in the bindings'
-own CHANGELOG).
+The same applies to FFI exports (the deprecation is called out in the CHANGELOG
+`FFI:` entry). The wire format has no deprecation window — it is a single pinned
+version, so a wire change is a hard cut (§3) rather than a coexist-then-remove
+migration.
 
 ---
 
-## 8. Where each change lands
+## 9. Where each change lands
 
-| Change type | Crate version | Wire format | FFI ABI | CHANGELOG entry |
+| Change type | Crate version | Wire constant | FFI ABI | CHANGELOG entry |
 | --- | --- | --- | --- | --- |
 | Refactor with no API change | patch | — | — | optional |
 | New `pub fn` / `pub struct` | minor | — | possibly minor | `Added:` |
 | Breaking `pub fn` signature | major (post-1.0) / minor (pre-1.0) | — | major-break | `Changed (breaking):` |
-| Wire format extension via `extensions` | patch | — | — | `Added:` |
-| Wire format breaking change | major | V → V+1 | possibly | `Changed (wire-breaking):` |
+| Wire amendment via `extensions` / reserved flag | patch | — | — | `Added:` |
+| Wire-format change (header / nonce / KDF label / handshake layout) | major | `WIRE_VERSION` / `PROTOCOL_VERSION` +1 | possibly | `Changed (wire-breaking):` |
 | Feature added | minor | — | possibly | `Added:` |
 | Feature removed | major | — | possibly | `Removed:` |
+| PQC / crypto dep bump (bytes unchanged) | patch / minor | — | — | `Changed:` dep → x.y |
+| PQC / crypto dep bump (bytes changed) | major | +1 | possibly | `Changed (wire-breaking):` |
 | MSRV bump | minor (pre-1.0) / major (post-1.0) | — | — | `Changed:` MSRV → x.y |
 | Bugfix (no contract change) | patch | — | — | `Fixed:` |
 | Security fix (no contract change) | patch | — | — | `Security:` |
 
 ---
 
-## 9. Tooling
+## 10. Tooling
 
-- `cargo-semver-checks`: scheduled CI job to detect SemVer-breaking
-  changes from `main`. Runs against the latest published version.
-- `git tag` policy: `vX.Y.Z` on the commit that produced the
-  corresponding `Cargo.toml` version. Tags are GPG-signed once Phase 7.4
-  release pipeline lands.
+- `cargo-semver-checks`: `.github/workflows/release.yml` runs it PR-triggered to
+  detect SemVer-breaking changes from the latest published version.
+- `git tag` policy: `vX.Y.Z` on the commit that produced the corresponding
+  `Cargo.toml` version; the tag-triggered release pipeline builds cross-target
+  artifacts with SLSA-3 build-provenance attestation.
 
 ---
 
-## 10. Future evolution of this document
+## 11. Future evolution of this document
 
-When V2 wire format ships, sections 3 and 8 get amended to describe the
-transition window. When `phantom_core` reaches 1.0, sections 2 and 5
-tighten their pre-1.0 leniencies and the document gains a "1.0 stability
-promise" section.
+When `phantom_core` reaches 1.0, sections 2 and 5 tighten their pre-1.0
+leniencies and the document gains a "1.0 stability promise" section. If a
+deliberate `WIRE_VERSION` / `PROTOCOL_VERSION` bump is ever scheduled, §3 and §9
+gain the specifics of that hard cut (the new packet layout and the
+`docs/migration/` note); the wire stays a single pinned version on either side
+of the cut, not a negotiated set.
