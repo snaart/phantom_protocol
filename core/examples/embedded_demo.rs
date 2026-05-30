@@ -25,8 +25,7 @@ use phantom_core::transport::handshake::{ClientHello, HandshakeResponse, Handsha
 use phantom_core::transport::legs::embedded::EmbeddedLeg;
 use phantom_core::transport::session::Session;
 use phantom_core::transport::types::{
-    PacketFlags, PacketFlagsV2, PacketHeader, PacketHeaderV2, PhantomPacketV1, PhantomPacketV2,
-    SessionId, StreamId, VersionedPacket,
+    PacketFlagsV2, PacketHeaderV2, PhantomPacketV2, SessionId, StreamId, VersionedPacket,
 };
 use phantom_core::CoreError;
 use tokio::sync::{Mutex as TokioMutex, Notify};
@@ -166,19 +165,16 @@ impl SessionTransport for DemoLeg {
     }
 }
 
-// ── Server-side encrypt/decrypt helpers (wire-version-aware) ───────────────
+// ── Server-side encrypt/decrypt helpers ────────────────────────────────────
 
 fn decrypt_incoming(sess: &Session, bytes: &[u8]) -> Vec<u8> {
     let versioned = alkahest::deserialize::<VersionedPacket, VersionedPacket>(bytes)
         .expect("deserialize VersionedPacket");
-    match versioned {
-        VersionedPacket::V1(p) => sess
-            .decrypt_packet(&p.header, &p.payload)
-            .expect("decrypt V1"),
-        VersionedPacket::V2(p) => sess
-            .decrypt_packet_v2(&p.header, &p.payload)
-            .expect("decrypt V2"),
-    }
+    let p = match versioned {
+        VersionedPacket::V2(p) => p,
+        VersionedPacket::V1(_) => panic!("unified protocol emits V2 packets only"),
+    };
+    sess.decrypt_packet(&p.header, &p.payload).expect("decrypt")
 }
 
 fn encrypt_outgoing(
@@ -188,21 +184,11 @@ fn encrypt_outgoing(
     seq: u32,
     payload: &[u8],
 ) -> Vec<u8> {
+    let flags = PacketFlagsV2::new(PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED);
+    let header = PacketHeaderV2::new(sid, stream, seq, flags).with_epoch(sess.current_epoch());
+    let ct = sess.encrypt_packet(&header, payload).expect("encrypt");
+    let packet = PhantomPacketV2::new(header, ct).into_versioned();
     let mut buf = Vec::new();
-    let packet = if sess.wire_version() == 2 {
-        let flags = PacketFlagsV2::new(PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED);
-        let header = PacketHeaderV2::new(sid, stream, seq, flags).with_epoch(sess.current_epoch());
-        let ct = sess
-            .encrypt_packet_v2(&header, payload)
-            .expect("encrypt V2");
-        PhantomPacketV2::new(header, ct).into_versioned()
-    } else {
-        let mut flags = PacketFlags::new(PacketFlags::RELIABLE);
-        flags.set(PacketFlags::ENCRYPTED);
-        let header = PacketHeader::new(sid, stream, seq, flags);
-        let ct = sess.encrypt_packet(&header, payload).expect("encrypt V1");
-        PhantomPacketV1::new(header, ct).into_versioned()
-    };
     let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
     buf[..size].to_vec()
 }
