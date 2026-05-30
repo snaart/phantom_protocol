@@ -89,6 +89,28 @@ cannot interoperate with a post-collapse peer. Rebuild both ends together.
   V1-vs-V2 cross-version distinctness test fold into single canonical
   tests now that the dual format is gone.
 
+### Added — byte-exact wire-format vectors
+
+- `core/tests/wire_vectors/*.bin` freeze the on-wire bytes of the unified
+  protocol byte-for-byte: the `PacketHeader` / `PhantomPacket` (alkahest),
+  the `ClientHello` / `ServerHello` / `HelloRetryRequest` and their crypto
+  sub-structs (borsh), and the signed `HandshakeTranscript` hash. The
+  always-on `core/tests/wire_vectors.rs` and the lib unit test
+  `transport::handshake::tests::transcript_hash_wire_vector` assert
+  `encode == fixture` and `decode(fixture) == value`; both now gate CI. This
+  is the first test in the repo that pins the *bytes* rather than driving Rust
+  types ↔ Rust types, so an `alkahest` / `borsh` layout regression fails CI
+  instead of silently breaking interop.
+- `tests/wire_vectors_decode.py` — an independent, non-Rust decoder over the
+  same fixtures (cross-implementation interop evidence).
+- `alkahest` and `borsh` are now pinned to exact `=` versions in
+  `core/Cargo.toml`; a minor bump can shift the serialized bytes and is treated
+  as a deliberate wire change.
+- `docs/protocol/PROTOCOL.md` § 4.2 corrected to the **actual** alkahest byte
+  layout (fields in reverse declaration order, integers little-endian, byte
+  arrays reversed — the pinned `version` byte is the last header byte, not the
+  first) and gains a § 11 test-vector catalog.
+
 ### Added — `wasi-leg` Cargo feature (commits `f6c0c0a`..`255be95`)
 
 **`cargo build --target wasm32-wasip2 --features wasi-leg` is now a
