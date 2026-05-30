@@ -37,9 +37,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 #[cfg(feature = "fips")]
 use aws_lc_rs::{
-    agreement::{
-        self, agree, EphemeralPrivateKey, PrivateKey, UnparsedPublicKey, ECDH_P256,
-    },
+    agreement::{self, agree, EphemeralPrivateKey, PrivateKey, UnparsedPublicKey, ECDH_P256},
     rand::SystemRandom,
 };
 

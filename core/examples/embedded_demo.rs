@@ -220,8 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .expect("recv ClientHello timed out")
             .expect("recv ClientHello");
-        let mut client_hello =
-            borsh::from_slice::<ClientHello>(&raw).expect("parse ClientHello");
+        let mut client_hello = borsh::from_slice::<ClientHello>(&raw).expect("parse ClientHello");
 
         // The DoS gate may demand a stateless cookie / PoW on first contact;
         // the client transparently re-sends on `HelloRetryRequest`.

@@ -944,13 +944,8 @@ async fn send_app_data<T: SessionTransport>(
 ) -> bool {
     // Always OR in ENCRYPTED for application data.
     let flag_bits = base_flags | PacketFlags::ENCRYPTED;
-    let header = PacketHeader::new(
-        session_id,
-        stream_id,
-        sequence,
-        PacketFlags::new(flag_bits),
-    )
-    .with_epoch(crypto_session.current_epoch());
+    let header = PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
+        .with_epoch(crypto_session.current_epoch());
     let ciphertext = match crypto_session.encrypt_packet(&header, payload) {
         Ok(c) => c,
         Err(e) => {
@@ -983,13 +978,8 @@ async fn send_window_update<T: SessionTransport>(
     new_window: u32,
 ) -> bool {
     let flag_bits = PacketFlags::ENCRYPTED | PacketFlags::WINDOW_UPDATE;
-    let header = PacketHeader::new(
-        session_id,
-        stream_id,
-        sequence,
-        PacketFlags::new(flag_bits),
-    )
-    .with_epoch(crypto_session.current_epoch());
+    let header = PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
+        .with_epoch(crypto_session.current_epoch());
     let payload = new_window.to_be_bytes();
     let ciphertext = match crypto_session.encrypt_packet(&header, &payload) {
         Ok(c) => c,
@@ -1750,13 +1740,9 @@ mod tests {
         payload: &[u8],
     ) -> Vec<u8> {
         let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
-        let header = PacketHeader::new(
-            session_id,
-            stream_id,
-            sequence,
-            PacketFlags::new(flag_bits),
-        )
-        .with_epoch(server_session.current_epoch());
+        let header =
+            PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
+                .with_epoch(server_session.current_epoch());
         let ct = server_session
             .encrypt_packet(&header, payload)
             .expect("encrypt reply");
@@ -2049,13 +2035,9 @@ mod tests {
         payload: &[u8],
     ) -> Vec<u8> {
         let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
-        let header = PacketHeader::new(
-            session_id,
-            stream_id,
-            sequence,
-            PacketFlags::new(flag_bits),
-        )
-        .with_epoch(client_session.current_epoch());
+        let header =
+            PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
+                .with_epoch(client_session.current_epoch());
         let ciphertext = client_session
             .encrypt_packet(&header, payload)
             .expect("encrypt_packet");
@@ -2527,10 +2509,7 @@ mod tests {
         // Decrypt the echo on the original (client) side — server-side
         // ciphertext authenticates the round-trip.
         let echo_v2 = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&echo_bytes).unwrap();
-        assert!(echo_v2
-            .header
-            .flags
-            .contains(PacketFlags::PATH_VALIDATION));
+        assert!(echo_v2.header.flags.contains(PacketFlags::PATH_VALIDATION));
         assert_eq!(echo_v2.header.path_id, path_id);
 
         // Sequence space advanced by exactly one (we sent one echo).
@@ -2570,7 +2549,9 @@ mod tests {
             HandshakeResponse::Retry(r) => r,
             _ => panic!("expected Retry"),
         };
-        s1.send_bytes(&borsh::to_vec(&retry).unwrap()).await.unwrap();
+        s1.send_bytes(&borsh::to_vec(&retry).unwrap())
+            .await
+            .unwrap();
         let next = s1.recv_bytes().await.unwrap();
         let ch2 = borsh::from_slice::<ClientHello>(&next).unwrap();
         match server_hs.process_client_hello(&ch2, 0, client_ip) {
@@ -2593,8 +2574,7 @@ mod tests {
         // `resumption_hint()` now yields the UniFFI `ResumptionHint`
         // record, so rebuild the tuple from its 32-byte fields.
         let hint = (
-            <[u8; 32]>::try_from(hint.session_id.as_slice())
-                .expect("session_id is 32 bytes"),
+            <[u8; 32]>::try_from(hint.session_id.as_slice()).expect("session_id is 32 bytes"),
             <[u8; 32]>::try_from(hint.resumption_secret.as_slice())
                 .expect("resumption_secret is 32 bytes"),
         );
@@ -2624,7 +2604,9 @@ mod tests {
                 assert!(sh.early_data_accepted);
                 s2.send_bytes(&borsh::to_vec(&sh).unwrap()).await.unwrap();
             }
-            _ => panic!("expected Success with accepted early-data — the resumption ticket is fresh"),
+            _ => {
+                panic!("expected Success with accepted early-data — the resumption ticket is fresh")
+            }
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2673,5 +2655,4 @@ mod tests {
             "expected ValidationError, got {err:?}"
         );
     }
-
 }

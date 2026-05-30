@@ -188,7 +188,7 @@ fn compute_transcript_hash<T: BorshSerialize>(transcript: &T) -> Result<[u8; 32]
 /// Holds the server's long-lived signing key (via [`HybridSigningKey`], which
 /// itself zeroes on drop) and a *master* secret from which the actually-used
 /// per-hour PoW/cookie secret is derived on each call (see
-/// [`derive_session_secret_for_hour`]). On drop the master is zeroed via the
+/// `derive_session_secret_for_hour`). On drop the master is zeroed via the
 /// derived `ZeroizeOnDrop`.
 ///
 /// Rotation (Phase 1.11): the master itself rotates only on process restart,
@@ -813,7 +813,7 @@ impl HandshakeClient {
         self.early_data.write().push(data);
     }
 
-    /// Drain the queued early-data buffer. See [`queue_early_data`] — the
+    /// Drain the queued early-data buffer. See [`Self::queue_early_data`] — the
     /// production `send_queue` path is currently used instead; this hook is
     /// reserved for 0-RTT.
     #[allow(dead_code)]

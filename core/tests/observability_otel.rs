@@ -44,11 +44,7 @@ fn full_labeled_event_surface_does_not_panic() {
     obs.record_aead_failure(LegType::Tcp, AeadAlgorithm::Aes256Gcm);
     obs.record_unencrypted_dropped(LegType::FakeTls);
     obs.record_path_migration(0, 1);
-    obs.record_path_validation(
-        Duration::from_millis(8),
-        1,
-        PathValidationOutcome::Success,
-    );
+    obs.record_path_validation(Duration::from_millis(8), 1, PathValidationOutcome::Success);
 
     obs.record_cookie(CookieOutcome::Issued);
     obs.record_cookie(CookieOutcome::ValidatedOk);
