@@ -234,7 +234,7 @@ impl CryptoSession {
 
     /// Create with explicit cipher suite. Peer side.
     ///
-    /// Mirrors the `fips` guard of [`with_suite`].
+    /// Mirrors the `fips` guard of [`Self::with_suite`].
     pub fn with_suite_peer(
         shared_secret: &[u8; 32],
         suite: CipherSuite,
@@ -435,7 +435,7 @@ impl CryptoSession {
         Ok(buf)
     }
 
-    /// Decrypt with an explicit caller-supplied nonce. Unlike [`decrypt`],
+    /// Decrypt with an explicit caller-supplied nonce. Unlike [`Self::decrypt`],
     /// a tag-check failure does NOT advance the internal counter — only
     /// the bounded telemetry counter increments.
     #[inline]
