@@ -15,7 +15,7 @@ use std::time::Duration;
 use phantom_core::crypto::hybrid_kem::HybridSecretKey;
 use phantom_core::crypto::hybrid_sign::HybridSigningKey;
 use phantom_core::transport::handshake::{HandshakeClient, HandshakeResponse, HandshakeServer};
-use phantom_core::transport::types::{PacketFlagsV2, PacketHeaderV2};
+use phantom_core::transport::types::{PacketFlags, PacketHeader};
 
 // ============================================================================
 // PHANTOM PQC BENCHMARKS
@@ -47,7 +47,7 @@ fn phantom_handshake_bench(c: &mut Criterion) {
 
             let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
             let (server_hello, _) = match result {
-                HandshakeResponse::Success(h, s) => (h, s),
+                HandshakeResponse::Success(h, s, _) => (h, s),
                 _ => panic!("Expected success, got {:?}", result),
             };
             let _ = client
@@ -84,23 +84,23 @@ fn phantom_throughput_bench(c: &mut Criterion) {
 
     let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
     let (server_hello, server_session) = match result {
-        HandshakeResponse::Success(h, s) => (h, s),
+        HandshakeResponse::Success(h, s, _) => (h, s),
         _ => panic!("Expected success"),
     };
-    let client_session = client
+    let (client_session, _) = client
         .process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk))
         .unwrap();
 
     // Different payload sizes.
     //
-    // V2 wire format (`encrypt_packet_v2` / `decrypt_packet_v2`) — header-
+    // V2 wire format (`encrypt_packet` / `decrypt_packet`) — header-
     // derived AEAD nonce, so a sender/receiver pair cannot desync. Each
     // iteration uses a fresh `header.sequence` from atomic counters that
     // are hoisted outside the payload-size loop, so the sequence never
     // collides with one that the per-stream replay window has already
     // accepted on a previous payload-size iteration.
     let session_id = *server_session.id();
-    let flags = PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE);
+    let flags = PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE);
     let encrypt_seq = AtomicU32::new(1);
     let decrypt_seq = AtomicU32::new(1);
     let roundtrip_seq = AtomicU32::new(1);
@@ -115,11 +115,11 @@ fn phantom_throughput_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = encrypt_seq.fetch_add(1, Ordering::Relaxed);
-                    PacketHeaderV2::new(session_id, 1, seq, flags)
+                    PacketHeader::new(session_id, 1, seq, flags)
                 },
                 |header| {
                     let encrypted =
-                        server_session.encrypt_packet_v2(&header, &data).unwrap();
+                        server_session.encrypt_packet(&header, &data).unwrap();
                     black_box(encrypted)
                 },
                 BatchSize::SmallInput,
@@ -130,15 +130,15 @@ fn phantom_throughput_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = decrypt_seq.fetch_add(1, Ordering::Relaxed);
-                    let header = PacketHeaderV2::new(session_id, 2, seq, flags);
+                    let header = PacketHeader::new(session_id, 2, seq, flags);
                     let encrypted = server_session
-                        .encrypt_packet_v2(&header, &data)
+                        .encrypt_packet(&header, &data)
                         .expect("encrypt setup");
                     (header, encrypted)
                 },
                 |(header, encrypted)| {
                     let decrypted =
-                        client_session.decrypt_packet_v2(&header, &encrypted).unwrap();
+                        client_session.decrypt_packet(&header, &encrypted).unwrap();
                     black_box(decrypted)
                 },
                 BatchSize::SmallInput,
@@ -149,13 +149,13 @@ fn phantom_throughput_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = roundtrip_seq.fetch_add(1, Ordering::Relaxed);
-                    PacketHeaderV2::new(session_id, 3, seq, flags)
+                    PacketHeader::new(session_id, 3, seq, flags)
                 },
                 |header| {
                     let encrypted =
-                        server_session.encrypt_packet_v2(&header, &data).unwrap();
+                        server_session.encrypt_packet(&header, &data).unwrap();
                     let decrypted =
-                        client_session.decrypt_packet_v2(&header, &encrypted).unwrap();
+                        client_session.decrypt_packet(&header, &encrypted).unwrap();
                     black_box(decrypted)
                 },
                 BatchSize::SmallInput,
@@ -347,10 +347,10 @@ fn encryption_bench(c: &mut Criterion) {
 
     let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
     let (server_hello, server_session) = match result {
-        HandshakeResponse::Success(h, s) => (h, s),
+        HandshakeResponse::Success(h, s, _) => (h, s),
         _ => panic!("Expected success"),
     };
-    let client_session = client
+    let (client_session, _) = client
         .process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk))
         .unwrap();
 
@@ -360,7 +360,7 @@ fn encryption_bench(c: &mut Criterion) {
     // payload-size iterations and never collides with a previously-accepted
     // sequence on the same stream.
     let session_id = *server_session.id();
-    let flags = PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE);
+    let flags = PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE);
     let seq_counter = AtomicU32::new(1);
 
     for size in [64, 256, 1024, 4096, 16384, 65536, 262144, 1048576].iter() {
@@ -371,13 +371,13 @@ fn encryption_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = seq_counter.fetch_add(1, Ordering::Relaxed);
-                    PacketHeaderV2::new(session_id, 1, seq, flags)
+                    PacketHeader::new(session_id, 1, seq, flags)
                 },
                 |header| {
                     let encrypted =
-                        server_session.encrypt_packet_v2(&header, &data).unwrap();
+                        server_session.encrypt_packet(&header, &data).unwrap();
                     let decrypted =
-                        client_session.decrypt_packet_v2(&header, &encrypted).unwrap();
+                        client_session.decrypt_packet(&header, &encrypted).unwrap();
                     black_box(decrypted)
                 },
                 BatchSize::SmallInput,

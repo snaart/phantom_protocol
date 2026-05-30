@@ -24,8 +24,7 @@ use phantom_core::transport::handshake::{
 use phantom_core::transport::path::PathStateKind;
 use phantom_core::transport::session::{CryptoState, Session};
 use phantom_core::transport::types::{
-    PacketFlags, PacketFlagsV2, PacketHeader, PacketHeaderV2, PhantomPacketV1, PhantomPacketV2,
-    SchedulerMode, SessionId, VersionedPacket,
+    PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -42,36 +41,12 @@ fn make_session_pair(shared: [u8; 32]) -> (Session, Session) {
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
-/// AEAD authenticity: flipping a single ciphertext byte must cause decrypt to
-/// fail. This is what protects post-handshake traffic from tampering.
-#[test]
-fn tampered_ciphertext_is_rejected() {
-    let (client, server) = make_session_pair([0xA1u8; 32]);
-    let header = PacketHeader::new(
-        *server.id(),
-        7, // stream_id
-        1, // sequence
-        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
-    );
-
-    let mut ct = client
-        .encrypt_packet(&header, b"the quick brown fox")
-        .expect("encrypt");
-    // Flip exactly one bit in the ciphertext body (not the auth tag).
-    ct[0] ^= 0x01;
-
-    let result = server.decrypt_packet(&header, &ct);
-    assert!(
-        result.is_err(),
-        "AEAD must reject a bit-flipped ciphertext; instead got Ok({:?})",
-        result.as_ref().ok().map(|v| v.len())
-    );
-}
-
 /// AAD binding: even with intact ciphertext, mutating the header (which is
 /// fed into the AEAD as AAD) must cause decryption to fail. This is the
 /// invariant that prevents an attacker from rewriting `stream_id`, `flags`,
 /// or `sequence` on the wire while keeping the encrypted payload intact.
+/// (Companion to `tampered_epoch_or_path_id_is_rejected`, which covers the
+/// `epoch` / `path_id` header fields.)
 #[test]
 fn tampered_header_is_rejected_via_aad() {
     let (client, server) = make_session_pair([0xB2u8; 32]);
@@ -87,12 +62,10 @@ fn tampered_header_is_rejected_via_aad() {
         .expect("encrypt");
 
     // Server tries to decrypt with a different header (stream_id changed).
-    let tampered_header = PacketHeader::new(
-        *server.id(),
-        8, // changed: 7 -> 8
-        1,
-        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
-    );
+    let tampered_header = PacketHeader {
+        stream_id: 8, // changed: 7 -> 8
+        ..real_header
+    };
 
     let result = server.decrypt_packet(&tampered_header, &ct);
     assert!(
@@ -108,7 +81,7 @@ fn tampered_header_is_rejected_via_aad() {
 fn malformed_versioned_packet_fails_to_parse_not_panic() {
     // A short, non-alkahest-compatible byte stream.
     let garbage: Vec<u8> = (0u8..32).collect();
-    let result = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&garbage);
+    let result = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&garbage);
     assert!(
         result.is_err(),
         "Parser must reject random bytes with Err, not panic or accept"
@@ -116,7 +89,7 @@ fn malformed_versioned_packet_fails_to_parse_not_panic() {
 
     // Empty input.
     let empty: Vec<u8> = Vec::new();
-    let result = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&empty);
+    let result = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&empty);
     assert!(result.is_err(), "Parser must reject empty input");
 }
 
@@ -159,11 +132,11 @@ fn server_identity_mismatch_aborts_handshake() {
             let mut hello_retry = client_hello.clone();
             hello_retry.cookie = retry.cookie;
             match real_server.process_client_hello(&hello_retry, 0, client_ip) {
-                HandshakeResponse::Success(sh, _) => sh,
+                HandshakeResponse::Success(sh, _, _) => sh,
                 other => panic!("unexpected after retry: {:?}", other),
             }
         }
-        HandshakeResponse::Success(sh, _) => sh,
+        HandshakeResponse::Success(sh, _, _) => sh,
         other => panic!("unexpected first response: {:?}", other),
     };
 
@@ -238,7 +211,7 @@ fn signing_keypair_generation_is_non_deterministic() {
 }
 
 /// Encrypt → decrypt round-trip property: payload survives intact and the
-/// `ENCRYPTED` flag is the only protection mode the API path will accept.
+/// ciphertext does not leak the plaintext.
 #[test]
 fn encrypted_packet_round_trip_preserves_payload() {
     let (client, server) = make_session_pair([0xD4u8; 32]);
@@ -259,74 +232,26 @@ fn encrypted_packet_round_trip_preserves_payload() {
     assert_eq!(&pt, payload);
 }
 
-/// Sliding-window replay protection (Phase 1.4) — re-feeding an
-/// already-decrypted ciphertext with the same `(stream_id, sequence)` must
-/// fail with `CoreError::ReplayDetected`, and the per-session counter must
-/// increment.
+/// AEAD authenticity: flipping a single ciphertext byte must cause decrypt to
+/// fail. This is what protects post-handshake traffic from tampering.
 #[test]
-fn replay_window_rejects_duplicate_sequence() {
-    use phantom_core::CoreError;
-
-    let (client, server) = make_session_pair([0xE5u8; 32]);
-    let header = PacketHeader::new(
-        *server.id(),
-        3,
-        17,
-        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
-    );
-
-    let ct = client
-        .encrypt_packet(&header, b"some-payload")
-        .expect("encrypt");
-
-    // First decrypt accepted.
-    let _ = server.decrypt_packet(&header, &ct).expect("first decrypt");
-    assert_eq!(server.replay_rejected_total(), 0);
-
-    // The same ciphertext is, by the AEAD strict-counter invariant, no longer
-    // decryptable (recv_counter has advanced) — so we re-encrypt a *new*
-    // ciphertext with the same (stream_id, sequence) header to isolate the
-    // window check from the AEAD-counter check.
-    let ct2 = client
-        .encrypt_packet(&header, b"some-payload")
-        .expect("re-encrypt");
-    let result = server.decrypt_packet(&header, &ct2);
-    match result {
-        Err(CoreError::ReplayDetected(_)) => { /* expected */ }
-        other => panic!(
-            "expected ReplayDetected on duplicate sequence, got {:?}",
-            other.as_ref().map(|_| "Ok(...)").unwrap_or("Err(<other>)")
-        ),
-    }
-    assert_eq!(
-        server.replay_rejected_total(),
-        1,
-        "replay_rejected_total counter must increment on duplicate"
-    );
-}
-
-// ── V2 wire format negative tests ──────────────────────────────────────────
-
-/// Same authenticity property as `tampered_ciphertext_is_rejected` but for
-/// the V2 wire path.
-#[test]
-fn v2_tampered_ciphertext_is_rejected() {
+fn tampered_ciphertext_is_rejected() {
     let (client, server) = make_session_pair([0xF1u8; 32]);
-    let header = PacketHeaderV2::new(
+    let header = PacketHeader::new(
         *server.id(),
         7,
         1,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     )
     .with_epoch(2)
     .with_path_id(3);
 
     let mut ct = client
-        .encrypt_packet_v2(&header, b"v2 payload")
+        .encrypt_packet(&header, b"v2 payload")
         .expect("encrypt v2");
     ct[0] ^= 0x01;
 
-    let result = server.decrypt_packet_v2(&header, &ct);
+    let result = server.decrypt_packet(&header, &ct);
     assert!(
         result.is_err(),
         "V2 AEAD must reject bit-flipped ciphertext; got {:?}",
@@ -334,94 +259,65 @@ fn v2_tampered_ciphertext_is_rejected() {
     );
 }
 
-/// The V2 header's `epoch` and `path_id` are AAD-bound. Flipping either
-/// after encryption must invalidate the tag.
+/// The header's `epoch` and `path_id` are AAD-bound. Flipping either after
+/// encryption must invalidate the tag.
 #[test]
-fn v2_tampered_epoch_or_path_id_is_rejected() {
+fn tampered_epoch_or_path_id_is_rejected() {
     let (client, server) = make_session_pair([0xF2u8; 32]);
-    let real_header = PacketHeaderV2::new(
-        *server.id(),
-        7,
-        1,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
-    )
-    .with_epoch(5)
-    .with_path_id(0);
-    let ct = client
-        .encrypt_packet_v2(&real_header, b"epoch-bound payload")
-        .expect("encrypt");
-
-    // Mutate epoch.
-    let tampered_epoch = PacketHeaderV2 {
-        epoch: 6,
-        ..real_header
-    };
-    assert!(server.decrypt_packet_v2(&tampered_epoch, &ct).is_err());
-
-    // Re-encrypt fresh so the AEAD recv counter aligns, then mutate path_id.
-    let ct2 = client
-        .encrypt_packet_v2(&real_header, b"path-bound payload")
-        .expect("re-encrypt");
-    let tampered_path = PacketHeaderV2 {
-        path_id: 7,
-        ..real_header
-    };
-    assert!(server.decrypt_packet_v2(&tampered_path, &ct2).is_err());
-}
-
-/// Cross-version isolation: a ciphertext produced by `encrypt_packet` (V1
-/// header AAD) cannot be authenticated by `decrypt_packet_v2` against a
-/// "matching" V2 header. The AAD bytes differ because V1 and V2 headers
-/// have different serialisations — the AEAD tag mismatch is the witness.
-#[test]
-fn v1_ciphertext_does_not_decrypt_as_v2() {
-    let (client, server) = make_session_pair([0xF3u8; 32]);
-    let v1_header = PacketHeader::new(
+    let real_header = PacketHeader::new(
         *server.id(),
         7,
         1,
         PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
-    );
+    )
+    .with_epoch(5)
+    .with_path_id(0);
     let ct = client
-        .encrypt_packet(&v1_header, b"v1 payload")
-        .expect("encrypt v1");
+        .encrypt_packet(&real_header, b"epoch-bound payload")
+        .expect("encrypt");
 
-    // Construct a "would-be-equivalent" V2 header.
-    let v2_header = PacketHeaderV2::new(
-        *server.id(),
-        7,
-        1,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
-    );
-    let result = server.decrypt_packet_v2(&v2_header, &ct);
-    assert!(
-        result.is_err(),
-        "V1 ciphertext must not authenticate as V2 (different AAD)"
-    );
+    // Mutate epoch.
+    let tampered_epoch = PacketHeader {
+        epoch: 6,
+        ..real_header
+    };
+    assert!(server.decrypt_packet(&tampered_epoch, &ct).is_err());
+
+    // Re-encrypt fresh so the AEAD recv counter aligns, then mutate path_id.
+    let ct2 = client
+        .encrypt_packet(&real_header, b"path-bound payload")
+        .expect("re-encrypt");
+    let tampered_path = PacketHeader {
+        path_id: 7,
+        ..real_header
+    };
+    assert!(server.decrypt_packet(&tampered_path, &ct2).is_err());
 }
 
-/// V2 replay window: same property as the V1 test, exercised through
-/// `decrypt_packet_v2`. The per-stream window is shared between V1 and V2
-/// paths (replay identity is `(stream_id, sequence)`, not version).
+/// Replay window: re-feeding a fresh ciphertext that reuses an
+/// already-accepted `(stream_id, sequence)` must fail with
+/// `CoreError::ReplayDetected`, and the per-session counter must increment.
+/// The window keys on `(stream_id, sequence)` only — independent of epoch /
+/// path_id.
 #[test]
-fn v2_replay_window_rejects_duplicate_sequence() {
+fn replay_window_rejects_duplicate_sequence() {
     use phantom_core::CoreError;
 
     let (client, server) = make_session_pair([0xF4u8; 32]);
-    let header = PacketHeaderV2::new(
+    let header = PacketHeader::new(
         *server.id(),
         3,
         17,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
-    let ct1 = client.encrypt_packet_v2(&header, b"payload").expect("e1");
+    let ct1 = client.encrypt_packet(&header, b"payload").expect("e1");
     server
-        .decrypt_packet_v2(&header, &ct1)
+        .decrypt_packet(&header, &ct1)
         .expect("first decrypt");
     assert_eq!(server.replay_rejected_total(), 0);
 
-    let ct2 = client.encrypt_packet_v2(&header, b"payload").expect("e2");
-    match server.decrypt_packet_v2(&header, &ct2) {
+    let ct2 = client.encrypt_packet(&header, b"payload").expect("e2");
+    match server.decrypt_packet(&header, &ct2) {
         Err(CoreError::ReplayDetected(_)) => { /* expected */ }
         other => panic!(
             "expected ReplayDetected on V2 duplicate, got {:?}",
@@ -431,44 +327,43 @@ fn v2_replay_window_rejects_duplicate_sequence() {
     assert_eq!(server.replay_rejected_total(), 1);
 }
 
-/// V2 nonce-from-header property — a tampered packet that fails AEAD
+/// Nonce-from-header property — a tampered packet that fails AEAD
 /// verification must NOT desync the receiver from the sender. The next
 /// legitimate packet must still decrypt cleanly.
 ///
-/// This is the V2 architectural fix relative to V1: V1's recv_counter
-/// advances on every decrypt attempt (success or failure), so a single
-/// dropped / mutated packet permanently breaks the session. V2 derives
-/// the nonce from the authenticated `header.sequence`, so failed
-/// decrypts are stateless from the AEAD's perspective.
+/// The AEAD nonce is derived from the authenticated `header.sequence` rather
+/// than an internal monotonic counter, so a failed decrypt is stateless from
+/// the AEAD's perspective — a single dropped / mutated packet does not break
+/// the session.
 #[test]
-fn v2_failed_decrypt_does_not_desync_session() {
+fn failed_decrypt_does_not_desync_session() {
     let (client, server) = make_session_pair([0x20u8; 32]);
 
     // Sender encrypts packet #1.
-    let h1 = PacketHeaderV2::new(
+    let h1 = PacketHeader::new(
         *server.id(),
         1,
         1,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
-    let ct1 = client.encrypt_packet_v2(&h1, b"first").expect("encrypt 1");
+    let ct1 = client.encrypt_packet(&h1, b"first").expect("encrypt 1");
 
     // Bad packet arrives in between — flipped tag byte.
     let mut tampered = ct1.clone();
     let n = tampered.len();
     tampered[n - 1] ^= 0x80;
-    assert!(server.decrypt_packet_v2(&h1, &tampered).is_err());
+    assert!(server.decrypt_packet(&h1, &tampered).is_err());
 
     // The original ct1 (same header, same payload) must still decrypt —
     // in V1 this would fail because the recv_counter desynchronised; in
     // V2 the nonce is reconstructible from h1 alone.
-    let pt1 = server.decrypt_packet_v2(&h1, &ct1).expect("decrypt 1");
+    let pt1 = server.decrypt_packet(&h1, &ct1).expect("decrypt 1");
     assert_eq!(pt1, b"first");
 
     // And a subsequent packet at sequence 2 also goes through.
-    let h2 = PacketHeaderV2 { sequence: 2, ..h1 };
-    let ct2 = client.encrypt_packet_v2(&h2, b"second").expect("encrypt 2");
-    let pt2 = server.decrypt_packet_v2(&h2, &ct2).expect("decrypt 2");
+    let h2 = PacketHeader { sequence: 2, ..h1 };
+    let ct2 = client.encrypt_packet(&h2, b"second").expect("encrypt 2");
+    let pt2 = server.decrypt_packet(&h2, &ct2).expect("decrypt 2");
     assert_eq!(pt2, b"second");
 }
 
@@ -481,14 +376,14 @@ fn rekey_changes_keys_and_breaks_old_ciphertexts() {
     assert_eq!(client.current_epoch(), 0);
     assert_eq!(server.current_epoch(), 0);
 
-    let header = PacketHeaderV2::new(
+    let header = PacketHeader::new(
         *server.id(),
         1,
         100,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
     let ct_epoch0 = client
-        .encrypt_packet_v2(&header, b"pre-rekey payload")
+        .encrypt_packet(&header, b"pre-rekey payload")
         .expect("encrypt e0");
 
     // Lock-step rekey on both ends.
@@ -500,27 +395,27 @@ fn rekey_changes_keys_and_breaks_old_ciphertexts() {
     assert_eq!(server.current_epoch(), 1);
 
     // The OLD ciphertext must NOT authenticate under the new keys.
-    let header_epoch1 = PacketHeaderV2 { epoch: 1, ..header };
+    let header_epoch1 = PacketHeader { epoch: 1, ..header };
     assert!(
         server
-            .decrypt_packet_v2(&header_epoch1, &ct_epoch0)
+            .decrypt_packet(&header_epoch1, &ct_epoch0)
             .is_err(),
         "post-rekey CryptoState must reject pre-rekey ciphertext"
     );
 
     // A fresh encrypt under the new epoch round-trips successfully.
-    let header_v1_e1 = PacketHeaderV2::new(
+    let header_v1_e1 = PacketHeader::new(
         *server.id(),
         1,
         101,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     )
     .with_epoch(1);
     let ct_epoch1 = client
-        .encrypt_packet_v2(&header_v1_e1, b"post-rekey payload")
+        .encrypt_packet(&header_v1_e1, b"post-rekey payload")
         .expect("encrypt e1");
     let pt = server
-        .decrypt_packet_v2(&header_v1_e1, &ct_epoch1)
+        .decrypt_packet(&header_v1_e1, &ct_epoch1)
         .expect("decrypt e1");
     assert_eq!(pt, b"post-rekey payload");
 }
@@ -612,51 +507,28 @@ fn unchallenged_path_cannot_be_completed() {
     assert_eq!(server.path_state(9), None);
 }
 
-/// `VersionedPacket::V2` survives serialize + deserialize with all V2-only
-/// fields preserved.
+/// A `PhantomPacket` survives serialize + deserialize with the pinned wire
+/// version and all header fields preserved.
 #[test]
-fn versioned_packet_v2_roundtrip_preserves_fields() {
-    let header = PacketHeaderV2::new(
+fn packet_roundtrip_preserves_fields() {
+    let header = PacketHeader::new(
         SessionId::from_bytes([9u8; 32]),
         99,
         2025,
-        PacketFlagsV2::new(
-            PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED | PacketFlagsV2::REKEY,
+        PacketFlags::new(
+            PacketFlags::RELIABLE | PacketFlags::ENCRYPTED | PacketFlags::REKEY,
         ),
     )
     .with_epoch(11)
     .with_path_id(2);
-    let packet = PhantomPacketV2::new(header, vec![0xDE, 0xAD]).into_versioned();
+    let packet = PhantomPacket::new(header, vec![0xDE, 0xAD]);
     let mut buf = Vec::new();
-    let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
-    let decoded = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&buf[..size])
-        .expect("v2 roundtrip");
-    assert_eq!(decoded.wire_version(), 2);
-    let v2 = decoded.into_v2().expect("v2 inner");
-    assert_eq!(v2.header.epoch, 11);
-    assert_eq!(v2.header.path_id, 2);
-    assert!(v2.header.flags.contains(PacketFlagsV2::REKEY));
-}
-
-/// The wire format embeds `PhantomPacketV1` inside a `VersionedPacket` enum;
-/// V1-only roundtrips must preserve every header bit.
-#[test]
-fn versioned_packet_v1_roundtrip_preserves_header() {
-    let header = PacketHeader::new(
-        SessionId::from_bytes([7u8; 32]),
-        99,
-        2025,
-        PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::ENCRYPTED),
-    );
-    let packet = PhantomPacketV1::new(header, vec![1, 2, 3, 4, 5]).into_versioned();
-    let mut buf = Vec::new();
-    let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
-    let decoded = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&buf[..size])
-        .expect("round-trip decode");
-    let v1 = decoded.into_v1().expect("v1");
-    assert_eq!(v1.header.stream_id, 99);
-    assert_eq!(v1.header.sequence, 2025);
-    assert!(v1.header.flags.contains(PacketFlags::ENCRYPTED));
-    assert!(v1.header.flags.contains(PacketFlags::RELIABLE));
-    assert_eq!(v1.payload, &[1, 2, 3, 4, 5]);
+    let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
+    let decoded = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf[..size])
+        .expect("roundtrip");
+    assert_eq!(decoded.header.version, WIRE_VERSION);
+    assert_eq!(decoded.header.epoch, 11);
+    assert_eq!(decoded.header.path_id, 2);
+    assert!(decoded.header.flags.contains(PacketFlags::REKEY));
+    assert_eq!(decoded.payload, vec![0xDE, 0xAD]);
 }

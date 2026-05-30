@@ -197,8 +197,10 @@ build cannot interoperate with a default build:
 - Removing X25519 (PQ-only variant) cuts off classical compatibility.
 
 Any future `fips` feature changes (e.g. dropping ChaCha20-Poly1305 or
-X25519) remain wire-incompatible between `fips` and non-`fips` builds
-and should be reflected in `VersionedPacket` or a negotiation extension.
+X25519) remain wire-incompatible between `fips` and non-`fips` builds; the
+build-side `PROTOCOL_VARIANT` tag (`phantom-fips-1` vs `phantom-default-1`)
+already isolates the two at the handshake, and a deliberate `WIRE_VERSION` /
+`PROTOCOL_VERSION` bump would carry any further break.
 
 ---
 

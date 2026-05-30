@@ -1,6 +1,5 @@
-use borsh::BorshDeserialize;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use phantom_core::transport::handshake::{ClientHelloEnvelope, HandshakeClient, HandshakeServer};
+use phantom_core::transport::handshake::{ClientHello, HandshakeClient, HandshakeServer};
 use phantom_core::transport::reputation::ReputationTracker;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -12,11 +11,10 @@ fn bench_syn_flood(c: &mut Criterion) {
     let server = Arc::new(HandshakeServer::new().unwrap());
     let reputation = Arc::new(ReputationTracker::new());
 
-    // Create a legitimate-looking ClientHello payload (wire V3:
-    // version-prefixed envelope).
+    // Create a legitimate-looking ClientHello payload.
     let client = HandshakeClient::new().expect("HandshakeClient::new");
     let original_hello = client.create_client_hello();
-    let payload = borsh::to_vec(&ClientHelloEnvelope::V12(original_hello)).unwrap();
+    let payload = borsh::to_vec(&original_hello).unwrap();
 
     // Bench: Parsing + Reputation + Cookie generation
     group.throughput(Throughput::Bytes(payload.len() as u64));
@@ -31,8 +29,7 @@ fn bench_syn_flood(c: &mut Criterion) {
                 // In a real scenario we'd skip, but for bench we want to see parsing cost if it passed padding
             }
 
-            if let Ok(ClientHelloEnvelope::V12(ch)) = ClientHelloEnvelope::try_from_slice(&payload)
-            {
+            if let Ok(ch) = borsh::from_slice::<ClientHello>(&payload) {
                 // Check reputation
                 let diff = reputation.calculate_difficulty(ip, false);
                 reputation.record_violation(ip);

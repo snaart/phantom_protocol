@@ -1,16 +1,14 @@
 #![no_main]
-//! Fuzz target: `VersionedPacket` alkahest deserialization.
+//! Fuzz target: `PhantomPacket` alkahest deserialization.
 //!
 //! Invariant: the data-plane receive loop calls
-//! `alkahest::deserialize::<VersionedPacket, VersionedPacket>(bytes)` on every
+//! `alkahest::deserialize::<PhantomPacket, PhantomPacket>(bytes)` on every
 //! inbound frame. Random bytes must produce `Err`, never panic.
 
 use libfuzzer_sys::fuzz_target;
-use phantom_core::transport::types::VersionedPacket;
+use phantom_core::transport::types::PhantomPacket;
 
 fuzz_target!(|data: &[u8]| {
-    if let Ok(versioned) = alkahest::deserialize::<VersionedPacket, VersionedPacket>(data) {
-        // Walking into V1 should also be panic-free.
-        let _ = versioned.into_v1();
-    }
+    // Random bytes must deserialize to `Err`, never panic.
+    let _ = alkahest::deserialize::<PhantomPacket, PhantomPacket>(data);
 });

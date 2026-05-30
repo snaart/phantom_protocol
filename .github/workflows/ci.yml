@@ -49,6 +49,12 @@ jobs:
         with:
           workspaces: "."
       - run: cargo test --manifest-path core/Cargo.toml --lib
+      # Byte-exact wire-format freeze. Always-on integration test; gates any
+      # accidental on-wire byte change. The lib run above already covers the
+      # transcript-hash vector (transport::handshake::tests).
+      - run: cargo test --manifest-path core/Cargo.toml --test wire_vectors
+      # Independent (non-Rust) decoder over the same fixtures — cross-impl interop.
+      - run: python3 tests/wire_vectors_decode.py
 
   doc:
     name: cargo doc

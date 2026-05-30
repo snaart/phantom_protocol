@@ -1,7 +1,7 @@
 //! Stream Demultiplexer
 //!
 //! Routes incoming packets to their target streams based on `stream_id`
-//! extracted from `PhantomPacketV1` headers. Replaces the old smoltcp-based
+//! extracted from `PhantomPacket` headers. Replaces the old smoltcp-based
 //! multiplexer with a lightweight, zero-copy routing table.
 
 use crate::transport::types::SequenceNumber;
@@ -61,7 +61,7 @@ impl StreamDemultiplexer {
         let mux = Self {
             streams: DashMap::new(),
             control_tx,
-            next_stream_id: AtomicU32::new(1), // 0 is reserved for control
+            next_stream_id: AtomicU32::new(2), // 0 = control, 1 = raw-app session channel
         };
         (mux, control_rx)
     }

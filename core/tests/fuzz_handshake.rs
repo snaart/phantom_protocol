@@ -4,7 +4,7 @@
 //! state transitions and parsing logic.
 
 use phantom_core::transport::handshake::{
-    ClientHelloEnvelope, HandshakeClient, HandshakeResponse, HandshakeServer,
+    ClientHello, HandshakeClient, HandshakeResponse, HandshakeServer,
 };
 use rand::Rng;
 
@@ -20,11 +20,9 @@ fn fuzz_process_client_hello() {
         let mut bytes = vec![0u8; 1024];
         rng.fill(&mut bytes[..]);
 
-        // Attempt to deserialize random bytes as a ClientHello envelope
-        if let Ok(ClientHelloEnvelope::V12(hello)) =
-            borsh::from_slice::<ClientHelloEnvelope>(&bytes)
-        {
-            // This should return Success, Retry, or Fail, but never panic
+        // Attempt to deserialize random bytes as a ClientHello.
+        if let Ok(hello) = borsh::from_slice::<ClientHello>(&bytes) {
+            // This should return Success, Retry, or Fail, but never panic.
             let _ = server.process_client_hello(&hello, 0, client_ip);
         }
     }
@@ -41,9 +39,8 @@ fn fuzz_garbage_input_to_server() {
         let mut bytes = vec![0u8; len];
         rng.fill(&mut bytes[..]);
 
-        // Handshake protocol logic usually involves Borsh deserialization first
-        let res = borsh::from_slice::<ClientHelloEnvelope>(&bytes);
-        if let Ok(ClientHelloEnvelope::V12(hello)) = res {
+        // Handshake protocol logic involves borsh deserialization first.
+        if let Ok(hello) = borsh::from_slice::<ClientHello>(&bytes) {
             let _ = server.process_client_hello(&hello, 5, client_ip);
         }
     }
@@ -58,8 +55,7 @@ fn test_valid_handshake_flow() {
     // 1. Client creates Hello
     let hello = client.create_client_hello();
 
-    // 2. Server processes (should demand cookie/pow if difficulty > 0, but here 0)
-    // Actually our server implementation currently always demands a cookie if it's missing.
+    // 2. Server processes (demands a cookie when one is missing).
     let response = server.process_client_hello(&hello, 0, client_ip);
 
     match response {
@@ -72,7 +68,7 @@ fn test_valid_handshake_flow() {
 
             let response2 = server.process_client_hello(&hello_retry, 0, client_ip);
             match response2 {
-                HandshakeResponse::Success(server_hello, _) => {
+                HandshakeResponse::Success(server_hello, _, _) => {
                     // 4. Client processes server hello
                     client
                         .process_server_hello(
@@ -85,13 +81,10 @@ fn test_valid_handshake_flow() {
                 _ => panic!("Expected success on second try"),
             }
         }
-        HandshakeResponse::Success(server_hello, _) => {
+        HandshakeResponse::Success(server_hello, _, _) => {
             client
                 .process_server_hello(&hello, &server_hello, Some(server.verifying_key()))
                 .expect("Handshake failed");
-        }
-        HandshakeResponse::SuccessV3(..) => {
-            panic!("V12 process_client_hello must not return SuccessV3")
         }
         HandshakeResponse::Fail(e) => panic!("Handshake failed: {:?}", e),
     }

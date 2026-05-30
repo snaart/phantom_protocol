@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Let the data pump drain.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = session.close().await;
+        let _ = session.disconnect().await;
     });
 
     // ── 3. Client connects, pinning the server key ────────────────────────
@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     server_handle.await?;
-    client_session.close().await?;
+    client_session.disconnect().await?;
     println!("▶ demo complete");
     Ok(())
 }

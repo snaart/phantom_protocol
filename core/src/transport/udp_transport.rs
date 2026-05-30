@@ -24,11 +24,7 @@ use super::buffer_pool::BufferPool;
 use super::pacer::Pacer;
 use crate::crypto::aes_session::AesSession;
 use crate::transport::bandwidth_estimator;
-use crate::transport::handshake::{
-    ClientHelloEnvelope, HandshakeResponse, HandshakeServer, HelloRetryRequestEnvelope,
-    ServerHelloEnvelope,
-};
-use borsh::BorshDeserialize;
+use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{self, Result as IoResult};
@@ -214,22 +210,14 @@ impl UdpHandshakeListener {
                 continue;
             }
 
-            // Attempt to decode the ClientHello envelope (wire V3:
-            // version-prefixed). This UDP listener is a V1/V2-only demo
-            // path. A `V3` ClientHello decodes fine but the V3 0-RTT
-            // flow is not implemented here — we reply with the
-            // transcript-free `Unsupported` so the client falls back
-            // to V2. The TCP `PhantomListener` is the V3-capable path.
-            let client_hello = match ClientHelloEnvelope::try_from_slice(&buf[..len]) {
-                Ok(ClientHelloEnvelope::V12(ch)) => ch,
-                Ok(ClientHelloEnvelope::V3(_)) => {
-                    if let Ok(encoded) = borsh::to_vec(&ServerHelloEnvelope::Unsupported) {
-                        let _ = self.socket.send_to(&encoded, addr).await;
-                    }
-                    continue;
-                }
+            // Decode the ClientHello. An unknown / future layout surfaces as
+            // a borsh parse error and is dropped silently. The unified server
+            // path handles cookie/PoW, resume, and best-effort 0-RTT
+            // early-data; this is a demonstration listener that simply replies.
+            let client_hello = match borsh::from_slice::<ClientHello>(&buf[..len]) {
+                Ok(ch) => ch,
                 Err(_) => {
-                    // Not a valid ClientHello envelope, drop silently
+                    // Not a valid ClientHello, drop silently
                     continue;
                 }
             };
@@ -238,22 +226,17 @@ impl UdpHandshakeListener {
             match server.process_client_hello(&client_hello, difficulty, addr.ip()) {
                 HandshakeResponse::Retry(retry_req) => {
                     // Server demands PoW or Cookie, send Retry (stateless) and forget
-                    if let Ok(encoded) = borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry_req)) {
+                    if let Ok(encoded) = borsh::to_vec(&retry_req) {
                         let _ = self.socket.send_to(&encoded, addr).await;
                     }
                 }
-                HandshakeResponse::Success(server_hello, _session) => {
+                HandshakeResponse::Success(server_hello, _session, _early_data) => {
                     // Handshake Success, send ServerHello
-                    if let Ok(encoded) = borsh::to_vec(&ServerHelloEnvelope::V12(server_hello)) {
+                    if let Ok(encoded) = borsh::to_vec(&server_hello) {
                         let _ = self.socket.send_to(&encoded, addr).await;
                     }
                     // Transition connection to established state...
                 }
-                // `process_client_hello` (the V12 entry point) never
-                // returns `SuccessV3` — that comes only from
-                // `process_client_hello_v3`, which this listener does
-                // not call. The arm exists solely for exhaustiveness.
-                HandshakeResponse::SuccessV3(..) => {}
                 HandshakeResponse::Fail(_) => {
                     // Handshake error, drop silently
                 }

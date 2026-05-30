@@ -16,7 +16,7 @@ use std::time::Duration;
 use phantom_core::crypto::hybrid_kem::HybridSecretKey;
 use phantom_core::crypto::hybrid_sign::HybridSigningKey;
 use phantom_core::transport::handshake::{HandshakeClient, HandshakeResponse, HandshakeServer};
-use phantom_core::transport::types::{PacketFlagsV2, PacketHeaderV2};
+use phantom_core::transport::types::{PacketFlags, PacketHeader};
 
 /// Benchmark PQC key generation
 fn bench_pqc_keygen(c: &mut Criterion) {
@@ -116,7 +116,7 @@ fn bench_handshake(c: &mut Criterion) {
 
             let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
             let (server_hello, _server_session) = match result {
-                HandshakeResponse::Success(h, s) => (h, s),
+                HandshakeResponse::Success(h, s, _) => (h, s),
                 _ => panic!("Expected success"),
             };
             let _client_session = client
@@ -150,7 +150,7 @@ fn bench_handshake(c: &mut Criterion) {
 
             let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
             let (server_hello, _server_session) = match result {
-                HandshakeResponse::Success(h, s) => (h, s),
+                HandshakeResponse::Success(h, s, _) => (h, s),
                 _ => panic!("Expected success"),
             };
             let _client_session = client
@@ -188,16 +188,16 @@ fn bench_encryption(c: &mut Criterion) {
 
     let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
     let (server_hello, server_session) = match result {
-        HandshakeResponse::Success(h, s) => (h, s),
+        HandshakeResponse::Success(h, s, _) => (h, s),
         _ => panic!("Expected success"),
     };
-    let client_session = client
+    let (client_session, _) = client
         .process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk))
         .unwrap();
 
     // Benchmark different payload sizes.
     //
-    // V2 wire format (`encrypt_packet_v2` / `decrypt_packet_v2`) derives the
+    // V2 wire format (`encrypt_packet` / `decrypt_packet`) derives the
     // AEAD nonce from the authenticated header fields rather than an internal
     // monotonic counter, so a sender/receiver pair cannot desync. To stay
     // clear of the per-stream sliding-window replay guard, each iteration
@@ -205,7 +205,7 @@ fn bench_encryption(c: &mut Criterion) {
     // hoisted outside the payload-size loop (so it never resets and never
     // collides with a previously-accepted sequence on the same stream).
     let session_id = *server_session.id();
-    let flags = PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE);
+    let flags = PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE);
     let encrypt_seq = AtomicU32::new(1);
     let decrypt_seq = AtomicU32::new(1);
 
@@ -220,10 +220,10 @@ fn bench_encryption(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = encrypt_seq.fetch_add(1, Ordering::Relaxed);
-                    PacketHeaderV2::new(session_id, 1, seq, flags)
+                    PacketHeader::new(session_id, 1, seq, flags)
                 },
                 |header| {
-                    let encrypted = server_session.encrypt_packet_v2(&header, &data);
+                    let encrypted = server_session.encrypt_packet(&header, &data);
                     black_box(encrypted)
                 },
                 BatchSize::SmallInput,
@@ -236,14 +236,14 @@ fn bench_encryption(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = decrypt_seq.fetch_add(1, Ordering::Relaxed);
-                    let header = PacketHeaderV2::new(session_id, 2, seq, flags);
+                    let header = PacketHeader::new(session_id, 2, seq, flags);
                     let encrypted = server_session
-                        .encrypt_packet_v2(&header, &data)
+                        .encrypt_packet(&header, &data)
                         .expect("encrypt setup");
                     (header, encrypted)
                 },
                 |(header, encrypted)| {
-                    let decrypted = client_session.decrypt_packet_v2(&header, &encrypted);
+                    let decrypted = client_session.decrypt_packet(&header, &encrypted);
                     black_box(decrypted)
                 },
                 BatchSize::SmallInput,
@@ -279,10 +279,10 @@ fn bench_throughput(c: &mut Criterion) {
 
     let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
     let (server_hello, server_session) = match result {
-        HandshakeResponse::Success(h, s) => (h, s),
+        HandshakeResponse::Success(h, s, _) => (h, s),
         _ => panic!("Expected success"),
     };
-    let client_session = client
+    let (client_session, _) = client
         .process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk))
         .unwrap();
 
@@ -290,22 +290,22 @@ fn bench_throughput(c: &mut Criterion) {
     let data = vec![0xAB; 1024 * 1024];
     group.throughput(Throughput::Bytes(data.len() as u64 * 2)); // encrypt + decrypt
 
-    // Switched to V2 (`encrypt_packet_v2` / `decrypt_packet_v2`) so the AEAD
+    // Switched to V2 (`encrypt_packet` / `decrypt_packet`) so the AEAD
     // nonce is header-derived and a sender/receiver pair cannot desync. Each
     // iteration bumps `header.sequence` to dodge the per-stream replay window.
     let session_id = *server_session.id();
-    let flags = PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE);
+    let flags = PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE);
     let seq_counter = AtomicU32::new(1);
 
     group.bench_function("1MB_roundtrip", |b| {
         b.iter_batched(
             || {
                 let seq = seq_counter.fetch_add(1, Ordering::Relaxed);
-                PacketHeaderV2::new(session_id, 1, seq, flags)
+                PacketHeader::new(session_id, 1, seq, flags)
             },
             |header| {
-                let encrypted = server_session.encrypt_packet_v2(&header, &data).unwrap();
-                let decrypted = client_session.decrypt_packet_v2(&header, &encrypted).unwrap();
+                let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
+                let decrypted = client_session.decrypt_packet(&header, &encrypted).unwrap();
                 black_box(decrypted)
             },
             BatchSize::PerIteration,
