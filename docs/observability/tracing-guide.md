@@ -38,10 +38,8 @@ ratio-based dropping for failure traces.
 | `phantom.listener.bind` | `api::listener` | `addr` | Listener construction |
 | `phantom.listener.accept` | `api::listener` | — | Per accepted connection |
 | `phantom.listener.shutdown` | `api::listener` | — | Graceful shutdown |
-| `phantom.handshake.process_client_hello` | `transport::handshake` | `client_ip`, `difficulty`, `has_cookie`, `has_pow`, `resume` | V1/V2 server-side handshake |
-| `phantom.handshake.process_client_hello_v3` | `transport::handshake` | `client_ip`, `difficulty`, `has_cookie`, `has_pow`, `resume`, `early_data_len` | V3 0-RTT server-side handshake |
-| `phantom.handshake.process_server_hello` | `transport::handshake` | `pinned` | V1/V2 client-side handshake |
-| `phantom.handshake.process_server_hello_v3` | `transport::handshake` | `pinned` | V3 client-side handshake |
+| `phantom.handshake.process_client_hello` | `transport::handshake` | `client_ip`, `difficulty`, `has_cookie`, `has_pow`, `resume`, `has_early_data` | Server-side handshake (incl. 0-RTT early-data) |
+| `phantom.handshake.process_server_hello` | `transport::handshake` | `pinned` | Client-side handshake |
 | `phantom.session.rekey` | `transport::session` | — | Per-direction traffic-key rotation |
 | `phantom.path.begin_validation` | `transport::session` | `path_id` | PATH_VALIDATION challenge issued |
 | `phantom.path.complete_validation` | `transport::session` | `path_id` | PATH_VALIDATION response checked |

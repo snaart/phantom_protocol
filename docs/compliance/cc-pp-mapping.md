@@ -109,25 +109,25 @@ is passed to `connect_with_transport` as a required parameter
 public API. Clients obtain the pin via `PhantomListener::verifying_key_bytes()`
 distributed out-of-band.
 
-### 0-RTT Extension (V3 handshake envelope)
+### 0-RTT Extension (folded into `ClientHello.early_data`)
 
 ```
 Client (has prior resumption_hint)              Server
   |                                               |
-  |-- ClientHelloV3 (base + AEAD-sealed early_data) -->
+  |-- ClientHello (AEAD-sealed early_data) ----->
   |                                               |-- try_resume (one-shot)
   |                                               |-- decrypt early_data
-  |<-- ServerHelloV3 (base + early_data_accepted) |
+  |<-- ServerHello (early_data_accepted) ---------|
 ```
 
 `SessionCache::try_resume` (`transport/session_cache.rs:132`) consumes
-the ticket on first call — replayed V3 hellos find no ticket and fall back
-to 1-RTT + cookie/PoW gate. See `session_cache.rs:215-233` for the
+the ticket on first call — a replayed ClientHello finds no ticket and falls
+back to 1-RTT + cookie/PoW gate. See `session_cache.rs:215-233` for the
 one-shot anti-replay test.
 
 ### Session Data (post-handshake)
 
-All application data is wrapped in `VersionedPacket::{V1, V2}` frames:
+All application data is wrapped in a single `PhantomPacket` frame:
 
 - Every outbound packet has `PacketFlags::ENCRYPTED` set
   (`api/session.rs:906`).
@@ -175,7 +175,7 @@ the session from the wire:
 |-----|-------|---------------|--------|-----------------|
 | FCS_CKM.1.1 | Keygen — asymmetric (signing) | `crypto/hybrid_sign.rs:47-70` — `HybridSigningKey::generate` produces Ed25519 + ML-DSA-65 keypair via `OsRng`. `crypto/rng.rs:150` provides the `RngProvider` abstraction. | ✅ | Ed25519 (FIPS 186-5). ML-DSA-65 (FIPS 204). Both halves generated independently and stored in `HybridSigningKey`. |
 | FCS_CKM.1.2 | Keygen — asymmetric (KEM / key establishment) | `crypto/hybrid_kem.rs:47` — ephemeral X25519 secret + ML-KEM-768 decapsulation key per handshake. | 🔄 | X25519 is not FIPS-approved. FIPS build (Phase 5.1) must replace with ECDH P-256. ML-KEM-768 is FIPS 203. |
-| FCS_CKM.2.1 | Key establishment — hybrid KEM | `transport/handshake.rs:340-453` — `process_client_hello` / `process_client_hello_v3`: server encapsulates into client's ML-KEM-768 public key; X25519 DH runs in parallel; combined shared secret via HKDF (`kdf.rs`). | 🔄 | Both KEM legs must succeed. X25519 gap (see above). Evidence: `core/tests/security_invariants.rs:48` (`tampered_ciphertext_is_rejected`). |
+| FCS_CKM.2.1 | Key establishment — hybrid KEM | `transport/handshake.rs` — `process_client_hello`: server encapsulates into client's ML-KEM-768 public key; X25519 DH runs in parallel; combined shared secret via HKDF (`kdf.rs`). | 🔄 | Both KEM legs must succeed. X25519 gap (see above). Evidence: `core/tests/security_invariants.rs:48` (`tampered_ciphertext_is_rejected`). |
 | FCS_CKM.3.1 | Key distribution (server public key) | `api/listener.rs` — `PhantomListener::verifying_key_bytes()` exposes the public verifying key bytes for out-of-band distribution to clients. Private key never leaves the process. | ✅ | `key-management.md §1` documents the distribution responsibility. |
 | FCS_CKM.4.1 | Key destruction / zeroization | `crypto/hybrid_sign.rs:39` — `#[derive(ZeroizeOnDrop)]` on `HybridSigningKey`. `transport/session.rs` — `CryptoState` zeroed on drop. `transport/handshake.rs` — client nonce + server master secret zeroed on drop. | ✅ | `key-management.md` §Storage classes table. All heap-resident secrets zeroed; ring `LessSafeKey` interior noted as partial (ring does not expose its interior for zeroize — documented gap). |
 
@@ -284,7 +284,7 @@ the client's IP address protection. Phantom's position:
 | ALC_DVS.1 | Identification of Security Measures in the Development Environment | `docs/security/incident-response.md` — triage timeline, severity buckets, embargo / disclosure flow. `.github/workflows/` — CI gates enforced on every PR. | Lab will want a written development-security policy; `incident-response.md` covers the incident side but not the development-process side. |
 | ALC_CMC.1 | CM Capabilities | Git commit history on `main`. SLSA-3 build provenance: `.github/workflows/release.yml:122-123` (`actions/attest-build-provenance@v2`). Verify: `gh attestation verify --owner <org> <artifact>` or `cosign verify-blob-attestation`. | SLSA-3 attestation (Phase 7.4, commit `fb89465`) is strong supply-chain evidence. |
 | ALC_CMS.1 | CM Scope | All source files under `core/` tracked in git. `cargo deny check` (`deny.toml`) enforces license and yanked-crate policy on every CI run. | Dependency version pinning via `Cargo.lock`. |
-| ATE_FUN.1 | Functional Testing | `core/tests/security_invariants.rs` — 24 formal negative-security tests (always-on, not `#[ignore]`). `core/tests/property.rs` — proptest harness (AEAD round-trip, AAD-mismatch, replay window). `core/tests/cavp.rs` — 5 CAVP-style KAT vectors. `core/tests/tcp_integration.rs` + `kcp_integration.rs` — loopback end-to-end (run with `-- --ignored`). | Lab will execute the test suite independently. The 24 security invariant tests are the primary ATE_FUN evidence. |
+| ATE_FUN.1 | Functional Testing | `core/tests/security_invariants.rs` — 20 formal negative-security tests (always-on, not `#[ignore]`). `core/tests/property.rs` — proptest harness (AEAD round-trip, AAD-mismatch, replay window). `core/tests/cavp.rs` — 5 CAVP-style KAT vectors. `core/tests/tcp_integration.rs` + `kcp_integration.rs` — loopback end-to-end (run with `-- --ignored`). | Lab will execute the test suite independently. The 20 security invariant tests are the primary ATE_FUN evidence. |
 | ATE_COV.1 | Analysis of Coverage | `cargo llvm-cov` with branch coverage (`--lcov --output-path lcov.info`). Coverage workflow: `.github/workflows/coverage.yml`. | Coverage percentage and specific branch coverage for security-critical paths (crypto/, security/) should be documented in the ST. |
 | ATE_IND.1 | Independent Testing — Conformance | The lab will independently run `cargo test --manifest-path core/Cargo.toml --test security_invariants` and the property tests. The CAVP vectors in `core/tests/cavp.rs` are independently verifiable against NIST-published vectors. | None beyond providing the source and build instructions. |
 | AVA_VAN.1 | Vulnerability Survey | `docs/security/threat-model.md` — STRIDE + LINDDUN analysis, trust-boundary diagram, mitigation-to-file:line traceability. Five libfuzzer fuzz targets in `fuzz/` (four need nightly: `fuzz_aead_decrypt`, `fuzz_client_hello`, `fuzz_packet_parse`, `fuzz_server_hello`; one stable: `fuzz_embedded_framing`). | No public CVE history to date. Lab will conduct independent vulnerability analysis. |
@@ -302,7 +302,7 @@ the client's IP address protection. Phantom's position:
 |---|-----|-----|---------------------|-------|
 | G-1 | FCS_CKM.1.2 | X25519 classical KEM leg is not FIPS-approved. No FIPS KEM uses X25519. | `fips` feature: replace with ECDH P-256 (sub-option `fips-hybrid`) or drop the classical leg and rely on ML-KEM-768 alone. See `fips-readiness.md §2`. | 5.1 |
 | G-2 | FCS_COP.1(2) | ChaCha20-Poly1305 is not FIPS-approved. Currently in `CipherSuite` as a hardware-fallback cipher. | Remove from `CipherSuite` enum when `--features fips` is active. Reference: `crypto/adaptive_crypto.rs:41-55`. | 5.1 |
-| G-3 | FCS_CKM.2.1 | Combined KEM shared-secret derivation uses X25519 in both legs. Wire-incompatible change when X25519 is removed. | Coordinate with Phase 4 wire-format bump. `VersionedPacket` variant may need to be tied to the `fips` feature toggle. `fips-readiness.md §7`. | 5.1 |
+| G-3 | FCS_CKM.2.1 | Combined KEM shared-secret derivation uses X25519 in both legs. Wire-incompatible change when X25519 is removed. | Coordinate with a deliberate `WIRE_VERSION` / `PROTOCOL_VERSION` bump; the build-side `PROTOCOL_VARIANT` tag already isolates fips ↔ non-fips peers at the handshake. `fips-readiness.md §7`. | 5.1 |
 
 ### RNG / DRBG Gaps
 
