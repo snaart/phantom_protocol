@@ -12,11 +12,11 @@
 //!
 //! ## Layout
 //!
-//! - [`atomics`] — lock-free hot-path counters (`HotPathAtomics`).
+//! - `atomics` — lock-free hot-path counters (`HotPathAtomics`).
 //! - [`config`] — [`ObservabilityConfig`] (namespace, histogram buckets).
-//! - [`instruments`] — OTel instrument holder; ZST no-op when the feature
+//! - `instruments` — OTel instrument holder; ZST no-op when the feature
 //!   is off.
-//! - [`bridge`] — registers `ObservableCounter` callbacks over the atomics.
+//! - `bridge` — registers `ObservableCounter` callbacks over the atomics.
 //! - [`attrs`] — typed attribute-value enums (the cardinality contract).
 //! - [`snapshot`] — [`MetricsSnapshot`], a cold-path read for FFI / debug.
 

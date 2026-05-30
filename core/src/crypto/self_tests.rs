@@ -52,13 +52,13 @@ static FORCE_POST_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// the cached verdict. Designed for the fips bootstrap path
 /// (`PhantomListener::bind*`, `PhantomSession::connect*`) which calls
 /// this before doing any cryptographic work — a failure short-circuits
-/// to [`crate::CoreError::FipsSelfTestFailure`] instead of standing up
+/// to `CoreError::FipsSelfTestFailure` instead of standing up
 /// a listener / session over broken primitives.
 ///
 /// Production cost: amortised to zero after the first call.
 ///
 /// Under `cfg(test)` the POST is **re-run on every call** so a test
-/// can flip [`FORCE_POST_FAIL`] and observe the new verdict without
+/// can flip `FORCE_POST_FAIL` and observe the new verdict without
 /// having to reset a process-global cache (`OnceLock::take` is
 /// MSRV 1.81 — too new for this crate). The cache is exercised by
 /// production builds, not by tests.
