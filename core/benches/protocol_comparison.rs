@@ -15,7 +15,7 @@ use std::time::Duration;
 use phantom_core::crypto::hybrid_kem::HybridSecretKey;
 use phantom_core::crypto::hybrid_sign::HybridSigningKey;
 use phantom_core::transport::handshake::{HandshakeClient, HandshakeResponse, HandshakeServer};
-use phantom_core::transport::types::{PacketFlagsV2, PacketHeaderV2};
+use phantom_core::transport::types::{PacketFlags, PacketHeader};
 
 // ============================================================================
 // PHANTOM PQC BENCHMARKS
@@ -100,7 +100,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
     // collides with one that the per-stream replay window has already
     // accepted on a previous payload-size iteration.
     let session_id = *server_session.id();
-    let flags = PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE);
+    let flags = PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE);
     let encrypt_seq = AtomicU32::new(1);
     let decrypt_seq = AtomicU32::new(1);
     let roundtrip_seq = AtomicU32::new(1);
@@ -115,7 +115,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = encrypt_seq.fetch_add(1, Ordering::Relaxed);
-                    PacketHeaderV2::new(session_id, 1, seq, flags)
+                    PacketHeader::new(session_id, 1, seq, flags)
                 },
                 |header| {
                     let encrypted =
@@ -130,7 +130,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = decrypt_seq.fetch_add(1, Ordering::Relaxed);
-                    let header = PacketHeaderV2::new(session_id, 2, seq, flags);
+                    let header = PacketHeader::new(session_id, 2, seq, flags);
                     let encrypted = server_session
                         .encrypt_packet(&header, &data)
                         .expect("encrypt setup");
@@ -149,7 +149,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = roundtrip_seq.fetch_add(1, Ordering::Relaxed);
-                    PacketHeaderV2::new(session_id, 3, seq, flags)
+                    PacketHeader::new(session_id, 3, seq, flags)
                 },
                 |header| {
                     let encrypted =
@@ -360,7 +360,7 @@ fn encryption_bench(c: &mut Criterion) {
     // payload-size iterations and never collides with a previously-accepted
     // sequence on the same stream.
     let session_id = *server_session.id();
-    let flags = PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE);
+    let flags = PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE);
     let seq_counter = AtomicU32::new(1);
 
     for size in [64, 256, 1024, 4096, 16384, 65536, 262144, 1048576].iter() {
@@ -371,7 +371,7 @@ fn encryption_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = seq_counter.fetch_add(1, Ordering::Relaxed);
-                    PacketHeaderV2::new(session_id, 1, seq, flags)
+                    PacketHeader::new(session_id, 1, seq, flags)
                 },
                 |header| {
                     let encrypted =

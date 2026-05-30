@@ -18,9 +18,7 @@
 
 use phantom_core::crypto::adaptive_crypto::{CipherSuite, CryptoSession};
 use phantom_core::security::ReplayWindow;
-use phantom_core::transport::types::{
-    PacketFlags, PacketHeader, PhantomPacketV1, SessionId, VersionedPacket,
-};
+use phantom_core::transport::types::{PacketFlags, PacketHeader, PhantomPacket, SessionId, WIRE_VERSION};
 use proptest::prelude::*;
 
 // ── AEAD round-trip ────────────────────────────────────────────────────────
@@ -104,14 +102,16 @@ proptest! {
 // ── Wire format round-trip ─────────────────────────────────────────────────
 
 proptest! {
-    /// Any PhantomPacketV1 with arbitrary header field values must round-trip
+    /// Any PhantomPacket with arbitrary header field values must round-trip
     /// through alkahest serialize + deserialize with every bit preserved.
     #[test]
     fn wire_round_trip_preserves_fields(
         sid_bytes in proptest::array::uniform32(any::<u8>()),
         stream_id in any::<u16>(),
         sequence in any::<u32>(),
-        flags_bits in any::<u8>(),
+        flags_bits in any::<u16>(),
+        epoch in any::<u8>(),
+        path_id in any::<u8>(),
         payload in proptest::collection::vec(any::<u8>(), 0..4096),
     ) {
         let header = PacketHeader::new(
@@ -119,20 +119,24 @@ proptest! {
             stream_id,
             sequence,
             PacketFlags::new(flags_bits),
-        );
-        let packet = PhantomPacketV1::new(header, payload.clone()).into_versioned();
+        )
+        .with_epoch(epoch)
+        .with_path_id(path_id);
+        let packet = PhantomPacket::new(header, payload.clone());
 
         let mut buf = Vec::new();
         let (size, _) =
-            alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+            alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
         let decoded =
-            alkahest::deserialize::<VersionedPacket, VersionedPacket>(&buf[..size])
+            alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf[..size])
                 .expect("round-trip decode must succeed");
-        let v1 = decoded.into_v1().expect("v1 variant");
 
-        prop_assert_eq!(v1.header.stream_id, stream_id);
-        prop_assert_eq!(v1.header.sequence, sequence);
-        prop_assert_eq!(v1.header.flags.0, flags_bits);
-        prop_assert_eq!(v1.payload, payload);
+        prop_assert_eq!(decoded.header.version, WIRE_VERSION);
+        prop_assert_eq!(decoded.header.stream_id, stream_id);
+        prop_assert_eq!(decoded.header.sequence, sequence);
+        prop_assert_eq!(decoded.header.flags.0, flags_bits);
+        prop_assert_eq!(decoded.header.epoch, epoch);
+        prop_assert_eq!(decoded.header.path_id, path_id);
+        prop_assert_eq!(decoded.payload, payload);
     }
 }

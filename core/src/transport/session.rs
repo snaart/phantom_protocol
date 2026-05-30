@@ -14,7 +14,7 @@ use crate::transport::{
     scheduler::Scheduler,
     stream::Stream,
     types::{
-        ControlMessage, PacketHeader, PacketHeaderV2, PhantomPacket, SchedulerMode, SessionId,
+        ControlMessage, PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId,
         StreamId,
     },
 };
@@ -134,7 +134,7 @@ pub struct Session {
     traffic_secret: RwLock<[u8; 32]>,
     /// Rekey generation counter. Starts at 0 at session establishment; each
     /// successful `rekey()` increments it. Wire-emitted in
-    /// `PacketHeaderV2.epoch` so the peer can match the right key.
+    /// `PacketHeader.epoch` so the peer can match the right key.
     epoch: AtomicU8,
     /// Which side of the handshake we are. Carried into every
     /// `CryptoState::new(...)` re-derivation so the per-direction keys are
@@ -163,7 +163,7 @@ pub struct Session {
     /// for metrics/telemetry.
     replay_rejected_total: AtomicU64,
     /// Per-path validation state (Phase 4.2). Each `path_id` referenced in a
-    /// `PacketHeaderV2.path_id` must transit through `Unvalidated →
+    /// `PacketHeader.path_id` must transit through `Unvalidated →
     /// Validating → Validated` (via a challenge-response round trip)
     /// before the data pump treats it as authoritative. Defaults to a
     /// pre-populated entry for `path_id = 0` (the implicit single-path)
@@ -346,7 +346,7 @@ impl Session {
 
     /// Current rekey generation (Phase 1.5). Starts at 0; each successful
     /// [`rekey`](Self::rekey) increments by one. Carried on the wire in
-    /// `PacketHeaderV2.epoch` so the peer can match the right derived key.
+    /// `PacketHeader.epoch` so the peer can match the right derived key.
     pub fn current_epoch(&self) -> u8 {
         self.epoch.load(Ordering::Relaxed)
     }
@@ -374,7 +374,7 @@ impl Session {
     ///
     /// Wire signalling: callers that want the peer to follow this rekey
     /// emit a V2 packet whose header carries the new epoch (and optionally
-    /// the `PacketFlagsV2::REKEY` flag). Receivers respond by calling
+    /// the `PacketFlags::REKEY` flag). Receivers respond by calling
     /// `rekey()` themselves once they see the bump — keeping both ends in
     /// lockstep.
     #[tracing::instrument(name = "phantom.session.rekey", skip_all)]
@@ -440,7 +440,7 @@ impl Session {
 
     /// Register a new path id and immediately issue a 32-byte
     /// PATH_CHALLENGE for it. Returns the challenge bytes; the caller
-    /// must transmit them in a V2 packet with `PacketFlagsV2::PATH_VALIDATION`
+    /// must transmit them in a V2 packet with `PacketFlags::PATH_VALIDATION`
     /// set on the new path. Subsequent calls on an already-Validating
     /// path re-issue a fresh challenge.
     ///
@@ -557,7 +557,7 @@ impl Session {
     /// packet replayed across paths (Phase 4.2 multi-path). Together the
     /// 12-byte nonce is unique for every `seal_in_place_*` invocation
     /// under the given key.
-    fn build_packet_nonce(prefix: [u8; 4], header: &PacketHeaderV2) -> [u8; 12] {
+    fn build_packet_nonce(prefix: [u8; 4], header: &PacketHeader) -> [u8; 12] {
         let mut n = [0u8; 12];
         n[..4].copy_from_slice(&prefix);
         n[4] = header.epoch;
@@ -576,13 +576,13 @@ impl Session {
     /// mutation invalidates the tag.
     pub fn encrypt_packet(
         &self,
-        header: &PacketHeaderV2,
+        header: &PacketHeader,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CoreError> {
         let crypto = self.crypto.load();
         let nonce = Self::build_packet_nonce(crypto.nonce_prefix(), header);
         let mut header_bytes = Vec::new();
-        alkahest::serialize_to_vec::<PacketHeaderV2, _>(header, &mut header_bytes);
+        alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
         crypto.encrypt_with_nonce(nonce, &header_bytes, plaintext)
     }
 
@@ -597,13 +597,13 @@ impl Session {
     /// packets.
     pub fn decrypt_packet(
         &self,
-        header: &PacketHeaderV2,
+        header: &PacketHeader,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CoreError> {
         let crypto = self.crypto.load();
         let nonce = Self::build_packet_nonce(crypto.nonce_prefix(), header);
         let mut header_bytes = Vec::new();
-        alkahest::serialize_to_vec::<PacketHeaderV2, _>(header, &mut header_bytes);
+        alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
         let plaintext = crypto.decrypt_with_nonce(nonce, &header_bytes, ciphertext)?;
 
         // Sliding-window guard. ReplayWindow keys on `(stream_id, sequence)`
@@ -633,7 +633,12 @@ impl Session {
         payload: Vec<u8>,
     ) -> PhantomPacket {
         let seq = self.control_sequence.fetch_add(1, Ordering::SeqCst);
-        let header = PacketHeader::control(self.id, seq);
+        let header = PacketHeader::new(
+            self.id,
+            0, // control stream
+            seq,
+            PacketFlags::new(PacketFlags::CONTROL | PacketFlags::RELIABLE),
+        );
         // Note: Real implementation would also encrypt control packet
         PhantomPacket::new(header, payload)
     }

@@ -3,7 +3,7 @@
 //! Tracks the per-path lifecycle from "newly observed" through
 //! "validated" so the session can refuse to send application data over
 //! an unverified path. Each path is identified by the 1-byte
-//! `path_id` field in `PacketHeaderV2` (Phase 3.3 / Phase 4.2 wire
+//! `path_id` field in `PacketHeader` (Phase 3.3 / Phase 4.2 wire
 //! addition).
 //!
 //! ## Validation protocol
