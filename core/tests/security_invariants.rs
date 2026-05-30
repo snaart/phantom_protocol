@@ -311,9 +311,7 @@ fn replay_window_rejects_duplicate_sequence() {
         PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
     let ct1 = client.encrypt_packet(&header, b"payload").expect("e1");
-    server
-        .decrypt_packet(&header, &ct1)
-        .expect("first decrypt");
+    server.decrypt_packet(&header, &ct1).expect("first decrypt");
     assert_eq!(server.replay_rejected_total(), 0);
 
     let ct2 = client.encrypt_packet(&header, b"payload").expect("e2");
@@ -397,9 +395,7 @@ fn rekey_changes_keys_and_breaks_old_ciphertexts() {
     // The OLD ciphertext must NOT authenticate under the new keys.
     let header_epoch1 = PacketHeader { epoch: 1, ..header };
     assert!(
-        server
-            .decrypt_packet(&header_epoch1, &ct_epoch0)
-            .is_err(),
+        server.decrypt_packet(&header_epoch1, &ct_epoch0).is_err(),
         "post-rekey CryptoState must reject pre-rekey ciphertext"
     );
 
@@ -515,17 +511,15 @@ fn packet_roundtrip_preserves_fields() {
         SessionId::from_bytes([9u8; 32]),
         99,
         2025,
-        PacketFlags::new(
-            PacketFlags::RELIABLE | PacketFlags::ENCRYPTED | PacketFlags::REKEY,
-        ),
+        PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::ENCRYPTED | PacketFlags::REKEY),
     )
     .with_epoch(11)
     .with_path_id(2);
     let packet = PhantomPacket::new(header, vec![0xDE, 0xAD]);
     let mut buf = Vec::new();
     let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
-    let decoded = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf[..size])
-        .expect("roundtrip");
+    let decoded =
+        alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf[..size]).expect("roundtrip");
     assert_eq!(decoded.header.version, WIRE_VERSION);
     assert_eq!(decoded.header.epoch, 11);
     assert_eq!(decoded.header.path_id, 2);

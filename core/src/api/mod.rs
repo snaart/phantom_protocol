@@ -7,11 +7,11 @@
 //! - [`tcp_transport::TcpSessionTransport`] — Length-prefixed framing over TCP (native only)
 //!
 //! On `wasm32-unknown-unknown` (browser) targets the TCP-based building
-//! blocks are absent; use [`crate::transport::legs::WebSocketLeg`] as
+//! blocks are absent; use `WebSocketLeg` as
 //! the `SessionTransport` implementation. On `wasm32-wasi*` targets
 //! with `--features wasi-leg`, use
-//! [`crate::transport::legs::wasi::WasiLeg`] (paired with
-//! [`crate::runtime::wasi_runtime::WasiRuntime`]) for a TCP-shaped
+//! `WasiLeg` (paired with
+//! `WasiRuntime`) for a TCP-shaped
 //! transport over WASI Preview 2 sockets.
 
 pub mod session;

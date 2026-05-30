@@ -13,5 +13,8 @@ fn test_header_size() {
         PacketHeader::SIZE,
         "serialized header must equal PacketHeader::SIZE"
     );
-    assert_eq!(size, 45, "the unified packet header is 45 bytes on the wire");
+    assert_eq!(
+        size, 45,
+        "the unified packet header is 45 bytes on the wire"
+    );
 }

@@ -45,21 +45,20 @@ static POST_RESULT: OnceLock<Result<(), SelfTestError>> = OnceLock::new();
 /// `bind`/`connect` reject path. Production builds compile without
 /// this field at all.
 #[cfg(test)]
-static FORCE_POST_FAIL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static FORCE_POST_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Process-global single-shot wrapper around [`run_post`]. The first
 /// call runs the POST and caches the verdict; subsequent calls return
 /// the cached verdict. Designed for the fips bootstrap path
 /// (`PhantomListener::bind*`, `PhantomSession::connect*`) which calls
 /// this before doing any cryptographic work — a failure short-circuits
-/// to [`crate::CoreError::FipsSelfTestFailure`] instead of standing up
+/// to `CoreError::FipsSelfTestFailure` instead of standing up
 /// a listener / session over broken primitives.
 ///
 /// Production cost: amortised to zero after the first call.
 ///
 /// Under `cfg(test)` the POST is **re-run on every call** so a test
-/// can flip [`FORCE_POST_FAIL`] and observe the new verdict without
+/// can flip `FORCE_POST_FAIL` and observe the new verdict without
 /// having to reset a process-global cache (`OnceLock::take` is
 /// MSRV 1.81 — too new for this crate). The cache is exercised by
 /// production builds, not by tests.
@@ -195,23 +194,23 @@ fn test_aead(suite: CipherSuite, name: &'static str) -> Result<(), SelfTestError
     let aad = b"phantom-self-test-aad";
     let plaintext = b"phantom-core self-test payload";
 
-    let local = CryptoSession::with_suite(&shared_secret, suite).map_err(|_| {
-        SelfTestError::Aead {
+    let local =
+        CryptoSession::with_suite(&shared_secret, suite).map_err(|_| SelfTestError::Aead {
             algorithm: name,
             stage: AeadStage::Init,
-        }
-    })?;
-    let peer = CryptoSession::with_suite_peer(&shared_secret, suite).map_err(|_| {
-        SelfTestError::Aead {
+        })?;
+    let peer =
+        CryptoSession::with_suite_peer(&shared_secret, suite).map_err(|_| SelfTestError::Aead {
             algorithm: name,
             stage: AeadStage::Init,
-        }
-    })?;
+        })?;
 
-    let ciphertext = local.encrypt(aad, plaintext).map_err(|_| SelfTestError::Aead {
-        algorithm: name,
-        stage: AeadStage::Encrypt,
-    })?;
+    let ciphertext = local
+        .encrypt(aad, plaintext)
+        .map_err(|_| SelfTestError::Aead {
+            algorithm: name,
+            stage: AeadStage::Encrypt,
+        })?;
 
     let recovered = peer
         .decrypt(aad, &ciphertext)
@@ -265,11 +264,9 @@ fn test_hkdf_sha256() -> Result<(), SelfTestError> {
 /// for ML-KEM-768 plus the classical X25519 half of the hybrid.
 fn test_hybrid_kem() -> Result<(), SelfTestError> {
     let (sk, pk) = HybridSecretKey::generate();
-    let (ss_encap, ct) = pk
-        .encapsulate()
-        .map_err(|_| SelfTestError::HybridKem {
-            stage: KemStage::Encapsulate,
-        })?;
+    let (ss_encap, ct) = pk.encapsulate().map_err(|_| SelfTestError::HybridKem {
+        stage: KemStage::Encapsulate,
+    })?;
     let ss_decap = sk.decapsulate(&ct).map_err(|_| SelfTestError::HybridKem {
         stage: KemStage::Decapsulate,
     })?;

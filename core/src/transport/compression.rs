@@ -76,7 +76,7 @@ impl CompressionStats {
 
 /// Adaptive compressor with auto-probe.
 ///
-/// Frame format for compressed data: [algo:1][data:N]
+/// Frame format for compressed data: `[algo:1][data:N]`
 /// If compression is skipped, raw data is returned with algo=0.
 pub struct AdaptiveCompressor {
     algo: CompressionAlgo,

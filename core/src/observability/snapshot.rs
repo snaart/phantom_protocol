@@ -138,7 +138,6 @@ impl MetricsSnapshot {
             uptime_secs: h.uptime_secs(),
         }
     }
-
 }
 
 fn avg(sum: u64, count: u64) -> u64 {

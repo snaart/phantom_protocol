@@ -178,8 +178,8 @@ impl FrameReader {
         }
     }
 
-    /// Read a single frame: reads [len:4], then reads [encrypted_payload], decrypts in-place.
-    /// Returns decrypted plaintext as Vec<u8>.
+    /// Read a single frame: reads `[len:4]`, then reads `[encrypted_payload]`, decrypts in-place.
+    /// Returns decrypted plaintext as `Vec<u8>`.
     #[inline]
     pub async fn read_frame(
         &mut self,

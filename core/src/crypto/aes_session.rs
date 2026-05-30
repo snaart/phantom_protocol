@@ -59,8 +59,7 @@ impl AesSession {
         let recv_unbound = UnboundKey::new(&AES_256_GCM, &recv_bytes)
             .map_err(|_| crate::CoreError::CryptoError("Invalid key".into()))?;
 
-        let prefix_bytes =
-            crate::crypto::kdf::derive_key_32("phantom-nonce-pfx-v1", shared_secret);
+        let prefix_bytes = crate::crypto::kdf::derive_key_32("phantom-nonce-pfx-v1", shared_secret);
         let mut nonce_prefix = [0u8; 4];
         nonce_prefix.copy_from_slice(&prefix_bytes[..4]);
 

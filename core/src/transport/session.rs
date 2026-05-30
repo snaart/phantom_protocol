@@ -528,7 +528,7 @@ impl Session {
 
     /// Shared handle to the outbound-ready notify. The API-layer data
     /// pump awaits this via `Notify::notified()`; any task with the
-    /// handle can wake it instantly via [`notify_outbound_ready`].
+    /// handle can wake it instantly via [`Self::notify_outbound_ready`].
     pub fn send_notifier(&self) -> Arc<tokio::sync::Notify> {
         self.send_notify.clone()
     }
