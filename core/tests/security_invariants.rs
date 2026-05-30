@@ -24,8 +24,7 @@ use phantom_core::transport::handshake::{
 use phantom_core::transport::path::PathStateKind;
 use phantom_core::transport::session::{CryptoState, Session};
 use phantom_core::transport::types::{
-    PacketFlags, PacketFlagsV2, PacketHeader, PacketHeaderV2, PhantomPacketV1, PhantomPacketV2,
-    SchedulerMode, SessionId, VersionedPacket,
+    PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -51,11 +50,11 @@ fn make_session_pair(shared: [u8; 32]) -> (Session, Session) {
 #[test]
 fn tampered_header_is_rejected_via_aad() {
     let (client, server) = make_session_pair([0xB2u8; 32]);
-    let real_header = PacketHeaderV2::new(
+    let real_header = PacketHeader::new(
         *server.id(),
         7,
         1,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
 
     let ct = client
@@ -63,7 +62,7 @@ fn tampered_header_is_rejected_via_aad() {
         .expect("encrypt");
 
     // Server tries to decrypt with a different header (stream_id changed).
-    let tampered_header = PacketHeaderV2 {
+    let tampered_header = PacketHeader {
         stream_id: 8, // changed: 7 -> 8
         ..real_header
     };
@@ -82,7 +81,7 @@ fn tampered_header_is_rejected_via_aad() {
 fn malformed_versioned_packet_fails_to_parse_not_panic() {
     // A short, non-alkahest-compatible byte stream.
     let garbage: Vec<u8> = (0u8..32).collect();
-    let result = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&garbage);
+    let result = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&garbage);
     assert!(
         result.is_err(),
         "Parser must reject random bytes with Err, not panic or accept"
@@ -90,7 +89,7 @@ fn malformed_versioned_packet_fails_to_parse_not_panic() {
 
     // Empty input.
     let empty: Vec<u8> = Vec::new();
-    let result = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&empty);
+    let result = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&empty);
     assert!(result.is_err(), "Parser must reject empty input");
 }
 
@@ -217,11 +216,11 @@ fn signing_keypair_generation_is_non_deterministic() {
 fn encrypted_packet_round_trip_preserves_payload() {
     let (client, server) = make_session_pair([0xD4u8; 32]);
     let payload = b"production-ready transport payload";
-    let header = PacketHeaderV2::new(
+    let header = PacketHeader::new(
         *server.id(),
         2,
         42,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
     let ct = client.encrypt_packet(&header, payload).expect("encrypt");
     assert_ne!(
@@ -238,11 +237,11 @@ fn encrypted_packet_round_trip_preserves_payload() {
 #[test]
 fn tampered_ciphertext_is_rejected() {
     let (client, server) = make_session_pair([0xF1u8; 32]);
-    let header = PacketHeaderV2::new(
+    let header = PacketHeader::new(
         *server.id(),
         7,
         1,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     )
     .with_epoch(2)
     .with_path_id(3);
@@ -265,11 +264,11 @@ fn tampered_ciphertext_is_rejected() {
 #[test]
 fn tampered_epoch_or_path_id_is_rejected() {
     let (client, server) = make_session_pair([0xF2u8; 32]);
-    let real_header = PacketHeaderV2::new(
+    let real_header = PacketHeader::new(
         *server.id(),
         7,
         1,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     )
     .with_epoch(5)
     .with_path_id(0);
@@ -278,7 +277,7 @@ fn tampered_epoch_or_path_id_is_rejected() {
         .expect("encrypt");
 
     // Mutate epoch.
-    let tampered_epoch = PacketHeaderV2 {
+    let tampered_epoch = PacketHeader {
         epoch: 6,
         ..real_header
     };
@@ -288,7 +287,7 @@ fn tampered_epoch_or_path_id_is_rejected() {
     let ct2 = client
         .encrypt_packet(&real_header, b"path-bound payload")
         .expect("re-encrypt");
-    let tampered_path = PacketHeaderV2 {
+    let tampered_path = PacketHeader {
         path_id: 7,
         ..real_header
     };
@@ -305,11 +304,11 @@ fn replay_window_rejects_duplicate_sequence() {
     use phantom_core::CoreError;
 
     let (client, server) = make_session_pair([0xF4u8; 32]);
-    let header = PacketHeaderV2::new(
+    let header = PacketHeader::new(
         *server.id(),
         3,
         17,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
     let ct1 = client.encrypt_packet(&header, b"payload").expect("e1");
     server
@@ -341,11 +340,11 @@ fn failed_decrypt_does_not_desync_session() {
     let (client, server) = make_session_pair([0x20u8; 32]);
 
     // Sender encrypts packet #1.
-    let h1 = PacketHeaderV2::new(
+    let h1 = PacketHeader::new(
         *server.id(),
         1,
         1,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
     let ct1 = client.encrypt_packet(&h1, b"first").expect("encrypt 1");
 
@@ -362,7 +361,7 @@ fn failed_decrypt_does_not_desync_session() {
     assert_eq!(pt1, b"first");
 
     // And a subsequent packet at sequence 2 also goes through.
-    let h2 = PacketHeaderV2 { sequence: 2, ..h1 };
+    let h2 = PacketHeader { sequence: 2, ..h1 };
     let ct2 = client.encrypt_packet(&h2, b"second").expect("encrypt 2");
     let pt2 = server.decrypt_packet(&h2, &ct2).expect("decrypt 2");
     assert_eq!(pt2, b"second");
@@ -377,11 +376,11 @@ fn rekey_changes_keys_and_breaks_old_ciphertexts() {
     assert_eq!(client.current_epoch(), 0);
     assert_eq!(server.current_epoch(), 0);
 
-    let header = PacketHeaderV2::new(
+    let header = PacketHeader::new(
         *server.id(),
         1,
         100,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
     let ct_epoch0 = client
         .encrypt_packet(&header, b"pre-rekey payload")
@@ -396,7 +395,7 @@ fn rekey_changes_keys_and_breaks_old_ciphertexts() {
     assert_eq!(server.current_epoch(), 1);
 
     // The OLD ciphertext must NOT authenticate under the new keys.
-    let header_epoch1 = PacketHeaderV2 { epoch: 1, ..header };
+    let header_epoch1 = PacketHeader { epoch: 1, ..header };
     assert!(
         server
             .decrypt_packet(&header_epoch1, &ct_epoch0)
@@ -405,11 +404,11 @@ fn rekey_changes_keys_and_breaks_old_ciphertexts() {
     );
 
     // A fresh encrypt under the new epoch round-trips successfully.
-    let header_v1_e1 = PacketHeaderV2::new(
+    let header_v1_e1 = PacketHeader::new(
         *server.id(),
         1,
         101,
-        PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED | PacketFlagsV2::RELIABLE),
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     )
     .with_epoch(1);
     let ct_epoch1 = client
@@ -508,51 +507,28 @@ fn unchallenged_path_cannot_be_completed() {
     assert_eq!(server.path_state(9), None);
 }
 
-/// `VersionedPacket::V2` survives serialize + deserialize with all V2-only
-/// fields preserved.
+/// A `PhantomPacket` survives serialize + deserialize with the pinned wire
+/// version and all header fields preserved.
 #[test]
-fn versioned_packet_v2_roundtrip_preserves_fields() {
-    let header = PacketHeaderV2::new(
+fn packet_roundtrip_preserves_fields() {
+    let header = PacketHeader::new(
         SessionId::from_bytes([9u8; 32]),
         99,
         2025,
-        PacketFlagsV2::new(
-            PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED | PacketFlagsV2::REKEY,
+        PacketFlags::new(
+            PacketFlags::RELIABLE | PacketFlags::ENCRYPTED | PacketFlags::REKEY,
         ),
     )
     .with_epoch(11)
     .with_path_id(2);
-    let packet = PhantomPacketV2::new(header, vec![0xDE, 0xAD]).into_versioned();
+    let packet = PhantomPacket::new(header, vec![0xDE, 0xAD]);
     let mut buf = Vec::new();
-    let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
-    let decoded = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&buf[..size])
-        .expect("v2 roundtrip");
-    assert_eq!(decoded.wire_version(), 2);
-    let v2 = decoded.into_v2().expect("v2 inner");
-    assert_eq!(v2.header.epoch, 11);
-    assert_eq!(v2.header.path_id, 2);
-    assert!(v2.header.flags.contains(PacketFlagsV2::REKEY));
-}
-
-/// The wire format embeds `PhantomPacketV1` inside a `VersionedPacket` enum;
-/// V1-only roundtrips must preserve every header bit.
-#[test]
-fn versioned_packet_v1_roundtrip_preserves_header() {
-    let header = PacketHeader::new(
-        SessionId::from_bytes([7u8; 32]),
-        99,
-        2025,
-        PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::ENCRYPTED),
-    );
-    let packet = PhantomPacketV1::new(header, vec![1, 2, 3, 4, 5]).into_versioned();
-    let mut buf = Vec::new();
-    let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
-    let decoded = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&buf[..size])
-        .expect("round-trip decode");
-    let v1 = decoded.into_v1().expect("v1");
-    assert_eq!(v1.header.stream_id, 99);
-    assert_eq!(v1.header.sequence, 2025);
-    assert!(v1.header.flags.contains(PacketFlags::ENCRYPTED));
-    assert!(v1.header.flags.contains(PacketFlags::RELIABLE));
-    assert_eq!(v1.payload, &[1, 2, 3, 4, 5]);
+    let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
+    let decoded = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf[..size])
+        .expect("roundtrip");
+    assert_eq!(decoded.header.version, WIRE_VERSION);
+    assert_eq!(decoded.header.epoch, 11);
+    assert_eq!(decoded.header.path_id, 2);
+    assert!(decoded.header.flags.contains(PacketFlags::REKEY));
+    assert_eq!(decoded.payload, vec![0xDE, 0xAD]);
 }

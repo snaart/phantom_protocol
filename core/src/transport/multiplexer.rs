@@ -1,7 +1,7 @@
 //! Stream Demultiplexer
 //!
 //! Routes incoming packets to their target streams based on `stream_id`
-//! extracted from `PhantomPacketV1` headers. Replaces the old smoltcp-based
+//! extracted from `PhantomPacket` headers. Replaces the old smoltcp-based
 //! multiplexer with a lightweight, zero-copy routing table.
 
 use crate::transport::types::SequenceNumber;

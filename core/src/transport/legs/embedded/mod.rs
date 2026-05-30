@@ -478,8 +478,7 @@ mod tests {
     use crate::api::session::{ConnectionState, PhantomSession};
     use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
     use crate::transport::types::{
-        PacketFlagsV2, PacketHeaderV2, PhantomPacketV2, SessionId, StreamId as TransportStreamId,
-        VersionedPacket,
+        PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
     };
 
     /// Decrypt an incoming encrypted frame on the test server side.
@@ -489,14 +488,10 @@ mod tests {
         server_session: &crate::transport::session::Session,
         bytes: &[u8],
     ) -> Vec<u8> {
-        let versioned = alkahest::deserialize::<VersionedPacket, VersionedPacket>(bytes)
-            .expect("deserialize VersionedPacket");
-        let pkt = match versioned {
-            VersionedPacket::V2(pkt) => pkt,
-            VersionedPacket::V1(_) => panic!("unified protocol emits V2 packets only"),
-        };
+        let pkt = alkahest::deserialize::<PhantomPacket, PhantomPacket>(bytes)
+            .expect("deserialize PhantomPacket");
         assert!(
-            pkt.header.flags.contains(PacketFlagsV2::ENCRYPTED),
+            pkt.header.flags.contains(PacketFlags::ENCRYPTED),
             "expected ENCRYPTED flag on application data"
         );
         server_session
@@ -514,20 +509,20 @@ mod tests {
         sequence: u32,
         payload: &[u8],
     ) -> Vec<u8> {
-        let flag_bits = PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED;
-        let header = PacketHeaderV2::new(
+        let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
+        let header = PacketHeader::new(
             session_id,
             stream_id,
             sequence,
-            PacketFlagsV2::new(flag_bits),
+            PacketFlags::new(flag_bits),
         )
         .with_epoch(server_session.current_epoch());
         let ct = server_session
             .encrypt_packet(&header, payload)
             .expect("encrypt reply");
-        let packet = PhantomPacketV2::new(header, ct).into_versioned();
+        let packet = PhantomPacket::new(header, ct);
         let mut buf = Vec::new();
-        let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+        let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
         buf[..size].to_vec()
     }
 

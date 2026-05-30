@@ -25,7 +25,7 @@ use phantom_core::transport::handshake::{ClientHello, HandshakeResponse, Handsha
 use phantom_core::transport::legs::embedded::EmbeddedLeg;
 use phantom_core::transport::session::Session;
 use phantom_core::transport::types::{
-    PacketFlagsV2, PacketHeaderV2, PhantomPacketV2, SessionId, StreamId, VersionedPacket,
+    PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId,
 };
 use phantom_core::CoreError;
 use tokio::sync::{Mutex as TokioMutex, Notify};
@@ -168,12 +168,8 @@ impl SessionTransport for DemoLeg {
 // ── Server-side encrypt/decrypt helpers ────────────────────────────────────
 
 fn decrypt_incoming(sess: &Session, bytes: &[u8]) -> Vec<u8> {
-    let versioned = alkahest::deserialize::<VersionedPacket, VersionedPacket>(bytes)
-        .expect("deserialize VersionedPacket");
-    let p = match versioned {
-        VersionedPacket::V2(p) => p,
-        VersionedPacket::V1(_) => panic!("unified protocol emits V2 packets only"),
-    };
+    let p = alkahest::deserialize::<PhantomPacket, PhantomPacket>(bytes)
+        .expect("deserialize PhantomPacket");
     sess.decrypt_packet(&p.header, &p.payload).expect("decrypt")
 }
 
@@ -184,12 +180,12 @@ fn encrypt_outgoing(
     seq: u32,
     payload: &[u8],
 ) -> Vec<u8> {
-    let flags = PacketFlagsV2::new(PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED);
-    let header = PacketHeaderV2::new(sid, stream, seq, flags).with_epoch(sess.current_epoch());
+    let flags = PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::ENCRYPTED);
+    let header = PacketHeader::new(sid, stream, seq, flags).with_epoch(sess.current_epoch());
     let ct = sess.encrypt_packet(&header, payload).expect("encrypt");
-    let packet = PhantomPacketV2::new(header, ct).into_versioned();
+    let packet = PhantomPacket::new(header, ct);
     let mut buf = Vec::new();
-    let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+    let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
     buf[..size].to_vec()
 }
 
