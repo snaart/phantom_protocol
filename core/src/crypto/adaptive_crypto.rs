@@ -14,10 +14,10 @@
 //! negotiation/build paths reject it under `fips`.
 
 use crate::errors::CoreError;
-#[cfg(not(feature = "fips"))]
-use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
 #[cfg(feature = "fips")]
 use aws_lc_rs::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
+#[cfg(not(feature = "fips"))]
+use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -234,7 +234,7 @@ impl CryptoSession {
 
     /// Create with explicit cipher suite. Peer side.
     ///
-    /// Mirrors the `fips` guard of [`with_suite`].
+    /// Mirrors the `fips` guard of [`Self::with_suite`].
     pub fn with_suite_peer(
         shared_secret: &[u8; 32],
         suite: CipherSuite,
@@ -283,8 +283,7 @@ impl CryptoSession {
         let recv_unbound = UnboundKey::new(algo, &recv_bytes)
             .map_err(|_| CoreError::CryptoError("Failed to create recv key".into()))?;
 
-        let prefix_bytes =
-            crate::crypto::kdf::derive_key_32("phantom-nonce-pfx-v1", shared_secret);
+        let prefix_bytes = crate::crypto::kdf::derive_key_32("phantom-nonce-pfx-v1", shared_secret);
         let mut nonce_prefix = [0u8; 4];
         nonce_prefix.copy_from_slice(&prefix_bytes[..4]);
 
@@ -436,7 +435,7 @@ impl CryptoSession {
         Ok(buf)
     }
 
-    /// Decrypt with an explicit caller-supplied nonce. Unlike [`decrypt`],
+    /// Decrypt with an explicit caller-supplied nonce. Unlike [`Self::decrypt`],
     /// a tag-check failure does NOT advance the internal counter — only
     /// the bounded telemetry counter increments.
     #[inline]

@@ -17,7 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned (not @stable): rustfmt's default style is version-sensitive, so a
+      # stable bump can flip this red with no code change. Pin to the toolchain
+      # the tree is formatted against and bump deliberately. (test/clippy stay on
+      # @stable so they keep catching new lints.)
+      - uses: dtolnay/rust-toolchain@1.93.0
         with:
           components: rustfmt
       - run: cargo fmt --manifest-path core/Cargo.toml --check
@@ -61,7 +65,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned for the same reason as the fmt job: rustdoc's `-D warnings` set is
+      # version-sensitive, so a stable bump can introduce new lints and flip this
+      # red with no code change. Pin and bump deliberately.
+      - uses: dtolnay/rust-toolchain@1.93.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."

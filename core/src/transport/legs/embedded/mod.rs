@@ -510,13 +510,9 @@ mod tests {
         payload: &[u8],
     ) -> Vec<u8> {
         let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
-        let header = PacketHeader::new(
-            session_id,
-            stream_id,
-            sequence,
-            PacketFlags::new(flag_bits),
-        )
-        .with_epoch(server_session.current_epoch());
+        let header =
+            PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
+                .with_epoch(server_session.current_epoch());
         let ct = server_session
             .encrypt_packet(&header, payload)
             .expect("encrypt reply");
