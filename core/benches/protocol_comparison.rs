@@ -93,7 +93,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
 
     // Different payload sizes.
     //
-    // V2 wire format (`encrypt_packet_v2` / `decrypt_packet_v2`) — header-
+    // V2 wire format (`encrypt_packet` / `decrypt_packet`) — header-
     // derived AEAD nonce, so a sender/receiver pair cannot desync. Each
     // iteration uses a fresh `header.sequence` from atomic counters that
     // are hoisted outside the payload-size loop, so the sequence never
@@ -119,7 +119,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
                 },
                 |header| {
                     let encrypted =
-                        server_session.encrypt_packet_v2(&header, &data).unwrap();
+                        server_session.encrypt_packet(&header, &data).unwrap();
                     black_box(encrypted)
                 },
                 BatchSize::SmallInput,
@@ -132,13 +132,13 @@ fn phantom_throughput_bench(c: &mut Criterion) {
                     let seq = decrypt_seq.fetch_add(1, Ordering::Relaxed);
                     let header = PacketHeaderV2::new(session_id, 2, seq, flags);
                     let encrypted = server_session
-                        .encrypt_packet_v2(&header, &data)
+                        .encrypt_packet(&header, &data)
                         .expect("encrypt setup");
                     (header, encrypted)
                 },
                 |(header, encrypted)| {
                     let decrypted =
-                        client_session.decrypt_packet_v2(&header, &encrypted).unwrap();
+                        client_session.decrypt_packet(&header, &encrypted).unwrap();
                     black_box(decrypted)
                 },
                 BatchSize::SmallInput,
@@ -153,9 +153,9 @@ fn phantom_throughput_bench(c: &mut Criterion) {
                 },
                 |header| {
                     let encrypted =
-                        server_session.encrypt_packet_v2(&header, &data).unwrap();
+                        server_session.encrypt_packet(&header, &data).unwrap();
                     let decrypted =
-                        client_session.decrypt_packet_v2(&header, &encrypted).unwrap();
+                        client_session.decrypt_packet(&header, &encrypted).unwrap();
                     black_box(decrypted)
                 },
                 BatchSize::SmallInput,
@@ -375,9 +375,9 @@ fn encryption_bench(c: &mut Criterion) {
                 },
                 |header| {
                     let encrypted =
-                        server_session.encrypt_packet_v2(&header, &data).unwrap();
+                        server_session.encrypt_packet(&header, &data).unwrap();
                     let decrypted =
-                        client_session.decrypt_packet_v2(&header, &encrypted).unwrap();
+                        client_session.decrypt_packet(&header, &encrypted).unwrap();
                     black_box(decrypted)
                 },
                 BatchSize::SmallInput,
