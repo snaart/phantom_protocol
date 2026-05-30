@@ -163,6 +163,9 @@ mod tests {
             0xf8, 0x84, 0x70, 0xa7, 0x0f, 0xe9, 0x57, 0x13, 0x1d, 0x7b, 0x5b, 0x35, 0xe5, 0x74,
             0x14, 0x34, 0xe4, 0x10,
         ];
-        assert_eq!(out, KAT, "derive_key_32 fips path must match HKDF-SHA256 KAT");
+        assert_eq!(
+            out, KAT,
+            "derive_key_32 fips path must match HKDF-SHA256 KAT"
+        );
     }
 }

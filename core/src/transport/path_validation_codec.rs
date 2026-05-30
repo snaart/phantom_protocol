@@ -238,8 +238,8 @@ mod tests {
         let outgoing = build_path_validation_packet(session_id, path_id, 0, challenge);
         let mut buf = Vec::new();
         let (n, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&outgoing, &mut buf);
-        let v2 = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf[..n])
-            .expect("deserialize");
+        let v2 =
+            alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf[..n]).expect("deserialize");
         let parsed = parse_path_validation(&v2)
             .expect("ok")
             .expect("flag matched");
@@ -251,8 +251,8 @@ mod tests {
         let response = build_path_validation_packet(session_id, path_id, 0, parsed.payload);
         let mut buf2 = Vec::new();
         let (m, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&response, &mut buf2);
-        let v2_echoed = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf2[..m])
-            .expect("deserialize");
+        let v2_echoed =
+            alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf2[..m]).expect("deserialize");
         let echoed_parsed = parse_path_validation(&v2_echoed)
             .expect("ok")
             .expect("flag matched");

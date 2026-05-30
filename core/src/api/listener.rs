@@ -2,9 +2,9 @@ use crate::api::session::{PhantomSession, SessionTransport};
 use crate::api::tcp_transport::TcpSessionTransport;
 use crate::crypto::hybrid_sign::HybridSigningKey;
 use crate::errors::CoreError;
+use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
-use crate::observability::{Observability, ObservabilityConfig};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -455,7 +455,9 @@ mod tests {
     async fn fips_post_failure_aborts_bind() {
         // Serialise with sibling fault-injection tests via the same
         // mutex they use.
-        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().unwrap();
+        let _guard = crate::crypto::self_tests::tests_serial_guard()
+            .lock()
+            .unwrap();
         crate::crypto::self_tests::set_force_post_fail(true);
         let result = PhantomListener::bind("127.0.0.1:0".to_string()).await;
         crate::crypto::self_tests::set_force_post_fail(false);

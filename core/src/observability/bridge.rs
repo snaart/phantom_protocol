@@ -40,7 +40,10 @@ mod otel_on {
     /// strong `Arc<HotPathAtomics>` so the atomics outlive every
     /// collection cycle even if the `Observability` handle on the public
     /// side is dropped.
-    pub(crate) fn register_observables(atomics: &Arc<HotPathAtomics>, config: &ObservabilityConfig) {
+    pub(crate) fn register_observables(
+        atomics: &Arc<HotPathAtomics>,
+        config: &ObservabilityConfig,
+    ) {
         let meter = opentelemetry::global::meter("phantom_core");
         let ns = config.namespace.as_ref();
 
