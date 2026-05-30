@@ -116,7 +116,7 @@ fn bench_handshake(c: &mut Criterion) {
 
             let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
             let (server_hello, _server_session) = match result {
-                HandshakeResponse::Success(h, s) => (h, s),
+                HandshakeResponse::Success(h, s, _) => (h, s),
                 _ => panic!("Expected success"),
             };
             let _client_session = client
@@ -150,7 +150,7 @@ fn bench_handshake(c: &mut Criterion) {
 
             let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
             let (server_hello, _server_session) = match result {
-                HandshakeResponse::Success(h, s) => (h, s),
+                HandshakeResponse::Success(h, s, _) => (h, s),
                 _ => panic!("Expected success"),
             };
             let _client_session = client
@@ -188,10 +188,10 @@ fn bench_encryption(c: &mut Criterion) {
 
     let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
     let (server_hello, server_session) = match result {
-        HandshakeResponse::Success(h, s) => (h, s),
+        HandshakeResponse::Success(h, s, _) => (h, s),
         _ => panic!("Expected success"),
     };
-    let client_session = client
+    let (client_session, _) = client
         .process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk))
         .unwrap();
 
@@ -279,10 +279,10 @@ fn bench_throughput(c: &mut Criterion) {
 
     let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
     let (server_hello, server_session) = match result {
-        HandshakeResponse::Success(h, s) => (h, s),
+        HandshakeResponse::Success(h, s, _) => (h, s),
         _ => panic!("Expected success"),
     };
-    let client_session = client
+    let (client_session, _) = client
         .process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk))
         .unwrap();
 

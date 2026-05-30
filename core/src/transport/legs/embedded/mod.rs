@@ -476,10 +476,7 @@ mod tests {
     // at zero so parallel agents in adjacent modules can't conflict.
 
     use crate::api::session::{ConnectionState, PhantomSession};
-    use crate::transport::handshake::{
-        ClientHelloEnvelope, HandshakeResponse, HandshakeServer, HelloRetryRequestEnvelope,
-        ServerHelloEnvelope,
-    };
+    use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
     use crate::transport::types::{
         PacketFlags, PacketFlagsV2, PacketHeader, PacketHeaderV2, PhantomPacketV1, PhantomPacketV2,
         SessionId, StreamId as TransportStreamId, VersionedPacket,
@@ -634,22 +631,16 @@ mod tests {
                     .await
                     .expect("recv ClientHello within 5s")
                     .expect("recv ClientHello frame");
-            let client_hello = match borsh::from_slice::<ClientHelloEnvelope>(&client_hello_bytes)
-                .expect("deserialize ClientHelloEnvelope")
-            {
-                ClientHelloEnvelope::V12(ch) => ch,
-                ClientHelloEnvelope::V3(_) => {
-                    panic!("test responder expects a V12 ClientHello")
-                }
-            };
+            let client_hello = borsh::from_slice::<ClientHello>(&client_hello_bytes)
+                .expect("deserialize ClientHello");
 
             // 2. Process — may retry with a cookie/PoW challenge.
             let server_session = loop {
                 let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
                 match response {
                     HandshakeResponse::Retry(retry) => {
-                        let retry_bytes = borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry))
-                            .expect("serialize HelloRetryRequest");
+                        let retry_bytes =
+                            borsh::to_vec(&retry).expect("serialize HelloRetryRequest");
                         tokio::time::timeout(
                             Duration::from_secs(5),
                             server_leg.send_frame(&retry_bytes),
@@ -663,20 +654,13 @@ mod tests {
                                 .await
                                 .expect("recv retried ClientHello within 5s")
                                 .expect("recv retried ClientHello frame");
-                        let next_hello = match borsh::from_slice::<ClientHelloEnvelope>(&next_bytes)
-                            .expect("deserialize retried envelope")
-                        {
-                            ClientHelloEnvelope::V12(ch) => ch,
-                            ClientHelloEnvelope::V3(_) => {
-                                panic!("test responder expects a V12 ClientHello")
-                            }
-                        };
+                        let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
+                            .expect("deserialize retried ClientHello");
                         let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
                         match resp2 {
-                            HandshakeResponse::Success(server_hello, session) => {
+                            HandshakeResponse::Success(server_hello, session, _) => {
                                 let server_hello_bytes =
-                                    borsh::to_vec(&ServerHelloEnvelope::V12(server_hello))
-                                        .expect("serialize ServerHello");
+                                    borsh::to_vec(&server_hello).expect("serialize ServerHello");
                                 tokio::time::timeout(
                                     Duration::from_secs(5),
                                     server_leg.send_frame(&server_hello_bytes),
@@ -689,10 +673,9 @@ mod tests {
                             other => panic!("expected success after retry, got {other:?}"),
                         }
                     }
-                    HandshakeResponse::Success(server_hello, session) => {
+                    HandshakeResponse::Success(server_hello, session, _) => {
                         let server_hello_bytes =
-                            borsh::to_vec(&ServerHelloEnvelope::V12(server_hello))
-                                .expect("serialize ServerHello");
+                            borsh::to_vec(&server_hello).expect("serialize ServerHello");
                         tokio::time::timeout(
                             Duration::from_secs(5),
                             server_leg.send_frame(&server_hello_bytes),
@@ -701,9 +684,6 @@ mod tests {
                         .expect("send ServerHello within 5s")
                         .expect("send ServerHello frame");
                         break session;
-                    }
-                    HandshakeResponse::SuccessV3(..) => {
-                        panic!("V12 process_client_hello must not return SuccessV3")
                     }
                     HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
                 }
