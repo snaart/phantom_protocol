@@ -8,8 +8,7 @@ use crate::crypto::hybrid_sign::HybridVerifyingKey;
 use crate::errors::CoreError;
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{
-    ClientHelloEnvelope, HandshakeClient, HelloRetryRequestEnvelope, ServerHelloEnvelope,
-    EARLY_DATA_MAX_LEN,
+    HandshakeClient, HelloRetryRequest, ServerHello, EARLY_DATA_MAX_LEN,
 };
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::packet_coalescer_codec::unwrap_coalesced_v2_packet;
@@ -89,8 +88,7 @@ impl ConnectionState {
 
 // ─── Resumption Hint ────────────────────────────────────────────────────────
 
-/// 0-RTT resumption material extracted from a completed session
-/// (wire V3, Phase 4.1).
+/// 0-RTT resumption material extracted from a completed session.
 ///
 /// Produced by [`PhantomSession::resumption_hint`] after a handshake
 /// completes, and fed back into [`connect_pinned_with_resumption`] to
@@ -168,11 +166,10 @@ pub struct PhantomSession {
     /// for Phase 4.1 0-RTT clients. `None` while still handshaking
     /// or after a failure.
     inner_session: Arc<Mutex<Option<Arc<Session>>>>,
-    /// 0-RTT verdict (wire V3, Phase 4.1). `None` while handshaking,
-    /// after a failure, or after a plain V1/V2 handshake (no 0-RTT
-    /// attempted). `Some(true)` the server consumed the early-data;
-    /// `Some(false)` a V3 handshake where the server rejected it (or
-    /// the client offered none). Exposed via `early_data_accepted()`.
+    /// 0-RTT verdict. `None` while handshaking, after a failure, or when the
+    /// client sent no early-data on this connect. `Some(true)` — the server
+    /// consumed the early-data; `Some(false)` — the client sent early-data and
+    /// the server rejected it. Exposed via `early_data_accepted()`.
     early_data_accepted: Arc<Mutex<Option<bool>>>,
 }
 
@@ -232,20 +229,19 @@ impl PhantomSession {
         Self::spawn_client(peer_addr, transport, expected_server_key, runtime, None)
     }
 
-    /// Connect with a **0-RTT resumption attempt** (wire V3, Phase 4.1).
+    /// Connect with a **0-RTT resumption attempt**.
     ///
     /// `resumption_hint` is the `(session_id, resumption_secret)` tuple
     /// from a prior session's [`PhantomSession::resumption_hint`].
-    /// `early_data` (≤ [`EARLY_DATA_MAX_LEN`] bytes) is sealed and
-    /// carried inside the V3 ClientHello so it reaches the server on
-    /// the very first flight — saving a round-trip versus 1-RTT.
+    /// `early_data` (≤ [`EARLY_DATA_MAX_LEN`] bytes) is sealed and carried
+    /// inside the resuming ClientHello so it reaches the server on the very
+    /// first flight — saving a round-trip versus 1-RTT.
     ///
-    /// If the server does not speak V3 it replies `Unsupported` and
-    /// the client transparently falls back to a plain V2 handshake;
-    /// in that case the `early_data` is **not** sent 0-RTT and
-    /// [`early_data_accepted`](Self::early_data_accepted) returns
-    /// `None` — the caller must send that payload over the normal
-    /// channel. Returns `Err` only when `early_data` exceeds the cap.
+    /// Acceptance is best-effort: a stale/unknown ticket or an AEAD failure
+    /// leaves [`early_data_accepted`](Self::early_data_accepted) at
+    /// `Some(false)` and the handshake completes as a normal 1-RTT exchange —
+    /// the caller must then send that payload over the normal channel.
+    /// Returns `Err` only when `early_data` exceeds the cap.
     ///
     /// Runs on the default [`TokioRuntime`].
     pub fn connect_with_resumption<T: SessionTransport>(
@@ -284,8 +280,8 @@ impl PhantomSession {
 
     /// Shared constructor body for [`connect_with_transport_with_runtime`]
     /// and [`connect_with_resumption`]. `resumption_request` is `None`
-    /// for a plain V1/V2 handshake, `Some((id, secret, early_data))` to
-    /// attempt a V3 0-RTT handshake.
+    /// for a plain handshake, `Some((id, secret, early_data))` to attempt a
+    /// 0-RTT resumption.
     fn spawn_client<T: SessionTransport>(
         peer_addr: &str,
         transport: T,
@@ -463,7 +459,7 @@ impl PhantomSession {
             return;
         }
 
-        // ── Stage 1 & 2: Hybrid Handshake (V12, or V3 0-RTT) ──
+        // ── Stage 1 & 2: Hybrid Handshake (optionally 0-RTT resumption) ──
         let (crypto_session, ed_accepted) = match run_client_handshake(
             &transport,
             &expected_server_key,
@@ -514,20 +510,18 @@ impl PhantomSession {
 
 /// Drive the client side of the Phantom handshake to completion.
 ///
-/// When `resumption` is `Some((resume_id, resume_secret, early_data))`
-/// this attempts a **V3 0-RTT handshake** — the `early_data` rides
-/// sealed inside the ClientHello so it reaches the server on the first
-/// flight. If the server replies `ServerHelloEnvelope::Unsupported`
-/// (it does not speak V3) the function transparently falls back to a
-/// plain V2 handshake, reusing the same `HandshakeClient`; the
-/// early-data is then NOT sent 0-RTT.
+/// When `resumption` is `Some((resume_id, resume_secret, early_data))` the
+/// first-flight `ClientHello` carries the resume id and, when `early_data` is
+/// non-empty, a sealed 0-RTT blob folded into `ClientHello.early_data` — so it
+/// reaches the server on the first flight. A cookie/PoW `HelloRetryRequest` is
+/// answered in-loop, reusing the same hello (the early-data blob rides along).
 ///
-/// Returns the established `Session` and the 0-RTT verdict:
-/// - `Some(true)`  — V3 handshake, the server consumed the early-data
-/// - `Some(false)` — V3 handshake, the server rejected it (stale
-///   ticket / oversized / AEAD failure) or the client offered none
-/// - `None`        — a V2 handshake (no 0-RTT was attempted, or the
-///   V3 attempt fell back via `Unsupported`)
+/// Returns the established `Session` and the 0-RTT verdict (resolved
+/// decision 1):
+/// - `Some(true)`  — the client sent early-data and the server consumed it
+/// - `Some(false)` — the client sent early-data and the server rejected it
+///   (stale ticket / oversized / AEAD failure)
+/// - `None`        — the client sent no early-data on this connect
 async fn run_client_handshake<T: SessionTransport>(
     transport: &T,
     expected_server_key: &HybridVerifyingKey,
@@ -535,87 +529,37 @@ async fn run_client_handshake<T: SessionTransport>(
 ) -> Result<(Session, Option<bool>), CoreError> {
     let handshake = HandshakeClient::new()?;
 
-    // ── V3 0-RTT attempt ──
-    if let Some((resume_id, resume_secret, early_data)) = &resumption {
-        // Empty early-data → resume without a 0-RTT payload (still a
-        // V3 handshake, but no sealed blob).
-        let ed: Option<&[u8]> = if early_data.is_empty() {
-            None
-        } else {
-            Some(early_data.as_slice())
-        };
-        let mut ch3 = handshake.create_client_hello_v3(*resume_id, resume_secret, ed);
-        loop {
-            let bytes = borsh::to_vec(&ClientHelloEnvelope::V3(ch3.clone())).map_err(|e| {
-                CoreError::SerializationError(format!("ClientHelloV3 encode failed: {}", e))
-            })?;
-            transport.send_bytes(&bytes).await?;
-            let resp = transport.recv_bytes().await?;
-
-            // The response is a `ServerHelloEnvelope` (V3 / Unsupported)
-            // or a `HelloRetryRequestEnvelope` (stale-ticket cookie
-            // demand). Parse ServerHelloEnvelope first — a retry blob
-            // does not parse cleanly as one.
-            if let Ok(env) = borsh::from_slice::<ServerHelloEnvelope>(&resp) {
-                match env {
-                    ServerHelloEnvelope::V3(sh3) => {
-                        let (session, accepted) = handshake.process_server_hello_v3(
-                            &ch3,
-                            &sh3,
-                            Some(expected_server_key),
-                        )?;
-                        return Ok((session, Some(accepted)));
-                    }
-                    ServerHelloEnvelope::Unsupported => {
-                        // Server does not speak V3 — drop out of the V3
-                        // loop and fall through to the V2 handshake
-                        // below, reusing the same `HandshakeClient`.
-                        log::info!(
-                            "PhantomSession: server replied Unsupported to V3 — falling back to V2"
-                        );
-                        break;
-                    }
-                    ServerHelloEnvelope::V12(_) => {
-                        return Err(CoreError::HandshakeError(
-                            "server replied a V12 ServerHello to a V3 ClientHello".into(),
-                        ));
-                    }
-                }
-            } else if let Ok(HelloRetryRequestEnvelope::V12(retry)) =
-                borsh::from_slice::<HelloRetryRequestEnvelope>(&resp)
-            {
-                // Stale / unknown ticket → the server fell back to the
-                // cookie/PoW gate. Fill the demand into the V3
-                // ClientHello's base and re-send.
-                log::info!("PhantomSession: V3 ClientHello got HelloRetryRequest, retrying...");
-                ch3.base.cookie = retry.cookie;
-                if let Some(challenge) = retry.challenge {
-                    ch3.base.pow_solution = Some(challenge.solve());
-                }
-                continue;
+    // Build the first-flight ClientHello. A resumption request folds the
+    // resume id and (optionally) a sealed 0-RTT early-data blob into the
+    // single hello; otherwise it is a plain hello.
+    let mut hello = match &resumption {
+        Some((resume_id, resume_secret, early_data)) => {
+            let ed: Option<&[u8]> = if early_data.is_empty() {
+                None
             } else {
-                return Err(CoreError::HandshakeError(
-                    "invalid server response to V3 ClientHello".into(),
-                ));
-            }
+                Some(early_data.as_slice())
+            };
+            handshake.create_client_hello_with_resume(*resume_id, resume_secret, ed)
         }
-    }
+        None => handshake.create_client_hello(),
+    };
 
-    // ── V2 handshake (default path, or V3 → Unsupported fallback) ──
-    let mut hello = handshake.create_client_hello();
     loop {
-        let bytes = borsh::to_vec(&ClientHelloEnvelope::V12(hello.clone())).map_err(|e| {
+        let bytes = borsh::to_vec(&hello).map_err(|e| {
             CoreError::SerializationError(format!("ClientHello encode failed: {}", e))
         })?;
         transport.send_bytes(&bytes).await?;
         let resp = transport.recv_bytes().await?;
 
-        if let Ok(ServerHelloEnvelope::V12(sh)) = borsh::from_slice::<ServerHelloEnvelope>(&resp) {
-            let session = handshake.process_server_hello(&hello, &sh, Some(expected_server_key))?;
-            return Ok((session, None));
-        } else if let Ok(HelloRetryRequestEnvelope::V12(retry)) =
-            borsh::from_slice::<HelloRetryRequestEnvelope>(&resp)
-        {
+        // The reply is either a `ServerHello` (success) or a
+        // `HelloRetryRequest` (cookie/PoW demand). Try the success shape
+        // first — a retry blob is far too small to deserialize as a
+        // ServerHello, so the disambiguation is unambiguous.
+        if let Ok(sh) = borsh::from_slice::<ServerHello>(&resp) {
+            let (session, accepted) =
+                handshake.process_server_hello(&hello, &sh, Some(expected_server_key))?;
+            return Ok((session, accepted));
+        } else if let Ok(retry) = borsh::from_slice::<HelloRetryRequest>(&resp) {
             log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
             hello.cookie = retry.cookie;
             if let Some(challenge) = retry.challenge {
@@ -952,10 +896,9 @@ async fn send_app_data<T: SessionTransport>(
     payload: &[u8],
     base_flags: u8,
 ) -> bool {
-    // Phase 4.2 / 2.5 follow-up: route by the post-handshake-negotiated
-    // wire version. `wire_version()` is set by both peers during the
-    // handshake (Phase 1.8); it is `1` by default and `2` when both
-    // sides offered V2 in their `ClientHello.version`.
+    // Route by the post-handshake packet codec. `wire_version()` is set to
+    // `2` by both peers' handshake (the protocol version is pinned and
+    // orthogonal); the dual codec is collapsed in a later phase.
     if crypto_session.wire_version() == 2 {
         send_app_data_v2(
             transport,
@@ -1650,23 +1593,19 @@ impl PhantomSession {
         self.peer_addr.clone()
     }
 
-    /// The 0-RTT verdict for this session (wire V3, Phase 4.1).
+    /// The 0-RTT verdict for this session.
     ///
-    /// - `None` — still handshaking, the handshake failed, or this was
-    ///   a plain V1/V2 handshake (no 0-RTT attempted, or a V3 attempt
-    ///   fell back to V2 because the server replied `Unsupported`).
-    ///   The caller must send any intended early-data over the normal
-    ///   channel.
+    /// - `None` — still handshaking, the handshake failed, or the client sent
+    ///   no early-data on this connect.
     /// - `Some(true)` — the server consumed the 0-RTT early-data.
-    /// - `Some(false)` — a V3 handshake where the server rejected the
-    ///   early-data (stale/unknown ticket, oversized blob, or AEAD
-    ///   failure). The caller must re-send that payload normally.
+    /// - `Some(false)` — the client sent early-data and the server rejected it
+    ///   (stale/unknown ticket, oversized blob, or AEAD failure). The caller
+    ///   must re-send that payload over the normal channel.
     pub async fn early_data_accepted(&self) -> Option<bool> {
         *self.early_data_accepted.lock().await
     }
 
-    /// Extract a [`ResumptionHint`] for a future 0-RTT reconnect
-    /// (wire V3, Phase 4.1).
+    /// Extract a [`ResumptionHint`] for a future 0-RTT reconnect.
     ///
     /// Returns `Some` after a successful handshake; `None` while still
     /// handshaking, after a failure, or before the inner session has
@@ -1767,19 +1706,18 @@ pub async fn connect_pinned(
     Ok(Arc::new(session))
 }
 
-/// Connect to a pinned server with a **0-RTT resumption attempt**
-/// (wire V3, Phase 4.1) — the resumption-aware analogue of
-/// [`connect_pinned`].
+/// Connect to a pinned server with a **0-RTT resumption attempt** — the
+/// resumption-aware analogue of [`connect_pinned`].
 ///
 /// `hint` is a [`ResumptionHint`] from a prior session's
 /// [`PhantomSession::resumption_hint`]; both of its fields must be
 /// exactly 32 bytes or the call fails with `ValidationError` before any
-/// socket is opened. `early_data` (≤ 16 KiB) is sealed into the V3
+/// socket is opened. `early_data` (≤ 16 KiB) is sealed into the resuming
 /// ClientHello so it reaches the server on the very first flight.
 ///
-/// If the server does not speak V3 the handshake transparently falls
-/// back to 1-RTT and `early_data` is *not* delivered 0-RTT — the caller
-/// checks [`PhantomSession::early_data_accepted`] and re-sends over the
+/// Acceptance is best-effort: when the server does not consume the early-data
+/// (stale/unknown ticket or AEAD failure) the handshake completes 1-RTT — the
+/// caller checks [`PhantomSession::early_data_accepted`] and re-sends over the
 /// normal channel when it is not `Some(true)`.
 ///
 /// Native-only, like [`connect_pinned`]: `TcpSessionTransport` lives
@@ -1843,10 +1781,7 @@ pub async fn connect_pinned_with_resumption(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::handshake::{
-        ClientHelloEnvelope, HandshakeResponse, HandshakeServer, HelloRetryRequestEnvelope,
-        ServerHelloEnvelope,
-    };
+    use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
 
     // ── Mock transport for testing ──
 
@@ -2048,39 +1983,24 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let client_ip = "127.0.0.1".parse().unwrap();
 
-            // 1. Receive client hello. This responder only handles the
-            // V12 envelope (the default client offers V2); a V3
-            // ClientHello would be a test bug.
+            // 1. Receive the (bare borsh) ClientHello.
             let client_hello_bytes = server_transport.recv_bytes().await.unwrap();
-            let client_hello = match borsh::from_slice::<ClientHelloEnvelope>(&client_hello_bytes)
-                .unwrap()
-            {
-                ClientHelloEnvelope::V12(ch) => ch,
-                ClientHelloEnvelope::V3(_) => panic!("test responder expects a V12 ClientHello"),
-            };
+            let client_hello = borsh::from_slice::<ClientHello>(&client_hello_bytes).unwrap();
 
             // 2. Process — may retry with cookie/PoW.
             let server_session = loop {
                 let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
                 match response {
                     HandshakeResponse::Retry(retry) => {
-                        let retry_bytes =
-                            borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry)).unwrap();
+                        let retry_bytes = borsh::to_vec(&retry).unwrap();
                         server_transport.send_bytes(&retry_bytes).await.unwrap();
                         // Receive retried client hello
                         let next_bytes = server_transport.recv_bytes().await.unwrap();
-                        let next_hello =
-                            match borsh::from_slice::<ClientHelloEnvelope>(&next_bytes).unwrap() {
-                                ClientHelloEnvelope::V12(ch) => ch,
-                                ClientHelloEnvelope::V3(_) => {
-                                    panic!("test responder expects a V12 ClientHello")
-                                }
-                            };
+                        let next_hello = borsh::from_slice::<ClientHello>(&next_bytes).unwrap();
                         let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
                         match resp2 {
-                            HandshakeResponse::Success(server_hello, session) => {
-                                let server_hello_bytes =
-                                    borsh::to_vec(&ServerHelloEnvelope::V12(server_hello)).unwrap();
+                            HandshakeResponse::Success(server_hello, session, _) => {
+                                let server_hello_bytes = borsh::to_vec(&server_hello).unwrap();
                                 server_transport
                                     .send_bytes(&server_hello_bytes)
                                     .await
@@ -2090,17 +2010,13 @@ mod tests {
                             _ => panic!("Expected success after retry"),
                         }
                     }
-                    HandshakeResponse::Success(server_hello, session) => {
-                        let server_hello_bytes =
-                            borsh::to_vec(&ServerHelloEnvelope::V12(server_hello)).unwrap();
+                    HandshakeResponse::Success(server_hello, session, _) => {
+                        let server_hello_bytes = borsh::to_vec(&server_hello).unwrap();
                         server_transport
                             .send_bytes(&server_hello_bytes)
                             .await
                             .unwrap();
                         break session;
-                    }
-                    HandshakeResponse::SuccessV3(..) => {
-                        panic!("V12 process_client_hello must not return SuccessV3")
                     }
                     HandshakeResponse::Fail(e) => panic!("handshake failed: {:?}", e),
                 }
@@ -2173,45 +2089,29 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let client_ip = "127.0.0.1".parse().unwrap();
             let client_hello_bytes = server_transport.recv_bytes().await.unwrap();
-            let client_hello =
-                match borsh::from_slice::<ClientHelloEnvelope>(&client_hello_bytes).unwrap() {
-                    ClientHelloEnvelope::V12(ch) => ch,
-                    ClientHelloEnvelope::V3(_) => {
-                        panic!("test responder expects a V12 ClientHello")
-                    }
-                };
+            let client_hello = borsh::from_slice::<ClientHello>(&client_hello_bytes).unwrap();
 
             // Drive the handshake to completion (may take one cookie/PoW retry).
             let server_session = loop {
                 match server_hs.process_client_hello(&client_hello, 0, client_ip) {
                     HandshakeResponse::Retry(retry) => {
-                        let retry_bytes =
-                            borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry)).unwrap();
+                        let retry_bytes = borsh::to_vec(&retry).unwrap();
                         server_transport.send_bytes(&retry_bytes).await.unwrap();
                         let next_bytes = server_transport.recv_bytes().await.unwrap();
-                        let next_hello = match borsh::from_slice::<ClientHelloEnvelope>(&next_bytes)
-                            .unwrap()
-                        {
-                            ClientHelloEnvelope::V12(ch) => ch,
-                            ClientHelloEnvelope::V3(_) => panic!("expects V12 ClientHello"),
-                        };
+                        let next_hello = borsh::from_slice::<ClientHello>(&next_bytes).unwrap();
                         match server_hs.process_client_hello(&next_hello, 0, client_ip) {
-                            HandshakeResponse::Success(server_hello, session) => {
-                                let b =
-                                    borsh::to_vec(&ServerHelloEnvelope::V12(server_hello)).unwrap();
+                            HandshakeResponse::Success(server_hello, session, _) => {
+                                let b = borsh::to_vec(&server_hello).unwrap();
                                 server_transport.send_bytes(&b).await.unwrap();
                                 break session;
                             }
                             _ => panic!("expected success after retry"),
                         }
                     }
-                    HandshakeResponse::Success(server_hello, session) => {
-                        let b = borsh::to_vec(&ServerHelloEnvelope::V12(server_hello)).unwrap();
+                    HandshakeResponse::Success(server_hello, session, _) => {
+                        let b = borsh::to_vec(&server_hello).unwrap();
                         server_transport.send_bytes(&b).await.unwrap();
                         break session;
-                    }
-                    HandshakeResponse::SuccessV3(..) => {
-                        panic!("V12 process_client_hello must not return SuccessV3")
                     }
                     HandshakeResponse::Fail(e) => panic!("handshake failed: {:?}", e),
                 }
@@ -2858,15 +2758,14 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Wire V3 — 0-RTT early-data (Phase 4.1)
+    // 0-RTT early-data
     // ────────────────────────────────────────────────────────────────────
 
-    /// Full 0-RTT round-trip over `ChannelTransport`: a priming V12
-    /// handshake populates the server cache and yields a resumption
-    /// hint; a second connect via `connect_with_resumption` carries
-    /// application early-data inside the V3 ClientHello, which the
-    /// server decrypts and surfaces. The client learns the verdict
-    /// via `early_data_accepted()`.
+    /// Full 0-RTT round-trip over `ChannelTransport`: a priming handshake
+    /// populates the server cache and yields a resumption hint; a second
+    /// connect via `connect_with_resumption` carries application early-data
+    /// sealed inside the resuming ClientHello, which the server decrypts and
+    /// surfaces. The client learns the verdict via `early_data_accepted()`.
     ///
     /// The server side runs inline (not a spawned task) so its
     /// `ChannelTransport` halves stay alive in scope — dropping them
@@ -2880,33 +2779,23 @@ mod tests {
         let server_pinned_key = server_hs.verifying_key().clone();
         let client_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
 
-        // ── Phase 1: prime — a normal V12 handshake fills the cache ──
+        // ── Step 1: prime — a normal handshake fills the cache ──
         let (c1, s1) = ChannelTransport::pair();
         let phase1_session =
             PhantomSession::connect_with_transport("test:9000", c1, server_pinned_key.clone());
 
         let hello_bytes = s1.recv_bytes().await.unwrap();
-        let ch = match borsh::from_slice::<ClientHelloEnvelope>(&hello_bytes).unwrap() {
-            ClientHelloEnvelope::V12(ch) => ch,
-            ClientHelloEnvelope::V3(_) => panic!("phase 1 expects a V12 ClientHello"),
-        };
+        let ch = borsh::from_slice::<ClientHello>(&hello_bytes).unwrap();
         let retry = match server_hs.process_client_hello(&ch, 0, client_ip) {
             HandshakeResponse::Retry(r) => r,
             _ => panic!("expected Retry"),
         };
-        s1.send_bytes(&borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry)).unwrap())
-            .await
-            .unwrap();
+        s1.send_bytes(&borsh::to_vec(&retry).unwrap()).await.unwrap();
         let next = s1.recv_bytes().await.unwrap();
-        let ch2 = match borsh::from_slice::<ClientHelloEnvelope>(&next).unwrap() {
-            ClientHelloEnvelope::V12(ch) => ch,
-            ClientHelloEnvelope::V3(_) => panic!("phase 1 retry expects V12"),
-        };
+        let ch2 = borsh::from_slice::<ClientHello>(&next).unwrap();
         match server_hs.process_client_hello(&ch2, 0, client_ip) {
-            HandshakeResponse::Success(sh, _session) => {
-                s1.send_bytes(&borsh::to_vec(&ServerHelloEnvelope::V12(sh)).unwrap())
-                    .await
-                    .unwrap();
+            HandshakeResponse::Success(sh, _session, _) => {
+                s1.send_bytes(&borsh::to_vec(&sh).unwrap()).await.unwrap();
             }
             _ => panic!("expected Success"),
         }
@@ -2930,7 +2819,7 @@ mod tests {
                 .expect("resumption_secret is 32 bytes"),
         );
 
-        // ── Phase 2: resume — V3 ClientHello carries the early-data ──
+        // ── Step 2: resume — the ClientHello carries sealed early-data ──
         let early_payload = b"zero-rtt application bytes".to_vec();
         let (c2, s2) = ChannelTransport::pair();
         let phase2_session = PhantomSession::connect_with_resumption(
@@ -2943,20 +2832,19 @@ mod tests {
         .expect("early_data is within the size cap");
 
         let hello_bytes = s2.recv_bytes().await.unwrap();
-        let ch3 = match borsh::from_slice::<ClientHelloEnvelope>(&hello_bytes).unwrap() {
-            ClientHelloEnvelope::V3(ch3) => ch3,
-            ClientHelloEnvelope::V12(_) => panic!("phase 2 expects a V3 ClientHello"),
-        };
-        match server_hs.process_client_hello_v3(&ch3, 0, client_ip) {
-            HandshakeResponse::SuccessV3(sh3, _session, early_data) => {
+        let ch3 = borsh::from_slice::<ClientHello>(&hello_bytes).unwrap();
+        assert!(
+            ch3.early_data.is_some(),
+            "phase 2 hello carries sealed 0-RTT early-data"
+        );
+        match server_hs.process_client_hello(&ch3, 0, client_ip) {
+            HandshakeResponse::Success(sh, _session, early_data) => {
                 // The server decrypted exactly what the client sealed.
                 assert_eq!(early_data.as_deref(), Some(&early_payload[..]));
-                assert!(sh3.early_data_accepted);
-                s2.send_bytes(&borsh::to_vec(&ServerHelloEnvelope::V3(sh3)).unwrap())
-                    .await
-                    .unwrap();
+                assert!(sh.early_data_accepted);
+                s2.send_bytes(&borsh::to_vec(&sh).unwrap()).await.unwrap();
             }
-            _ => panic!("expected SuccessV3 — the resumption ticket is fresh"),
+            _ => panic!("expected Success with accepted early-data — the resumption ticket is fresh"),
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -3006,83 +2894,4 @@ mod tests {
         );
     }
 
-    /// A V3 client whose server does not speak V3 receives
-    /// `ServerHelloEnvelope::Unsupported` and transparently falls back
-    /// to a plain V2 handshake. The handshake still completes;
-    /// `early_data_accepted()` is `None` (no 0-RTT happened).
-    #[tokio::test]
-    async fn v3_client_falls_back_to_v2_on_unsupported() {
-        let server_hs = HandshakeServer::new().unwrap();
-        let server_pinned_key = server_hs.verifying_key().clone();
-        let client_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-
-        // The hint is fabricated — the server replies `Unsupported`
-        // before ever looking at the resumption ticket.
-        let fake_hint = ([0u8; 32], [0u8; 32]);
-        let (c, s) = ChannelTransport::pair();
-        let session = PhantomSession::connect_with_resumption(
-            "test:9000",
-            c,
-            server_pinned_key,
-            fake_hint,
-            b"early-data-that-will-not-be-sent".to_vec(),
-        )
-        .unwrap();
-
-        // 1. The first flight is a V3 ClientHello — reply Unsupported.
-        let hello_bytes = s.recv_bytes().await.unwrap();
-        assert!(
-            matches!(
-                borsh::from_slice::<ClientHelloEnvelope>(&hello_bytes).unwrap(),
-                ClientHelloEnvelope::V3(_)
-            ),
-            "client's first flight must be a V3 ClientHello"
-        );
-        s.send_bytes(&borsh::to_vec(&ServerHelloEnvelope::Unsupported).unwrap())
-            .await
-            .unwrap();
-
-        // 2. The client must fall back to a V2 ClientHello — drive the
-        //    normal cookie/PoW V12 dance to completion.
-        let v2_bytes = s.recv_bytes().await.unwrap();
-        let ch = match borsh::from_slice::<ClientHelloEnvelope>(&v2_bytes).unwrap() {
-            ClientHelloEnvelope::V12(ch) => ch,
-            ClientHelloEnvelope::V3(_) => panic!("client should have fallen back to V12"),
-        };
-        let retry = match server_hs.process_client_hello(&ch, 0, client_ip) {
-            HandshakeResponse::Retry(r) => r,
-            _ => panic!("expected Retry on the V2 fallback"),
-        };
-        s.send_bytes(&borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry)).unwrap())
-            .await
-            .unwrap();
-        let next = s.recv_bytes().await.unwrap();
-        let ch2 = match borsh::from_slice::<ClientHelloEnvelope>(&next).unwrap() {
-            ClientHelloEnvelope::V12(ch) => ch,
-            ClientHelloEnvelope::V3(_) => panic!("expected a V12 retry"),
-        };
-        match server_hs.process_client_hello(&ch2, 0, client_ip) {
-            HandshakeResponse::Success(sh, _session) => {
-                s.send_bytes(&borsh::to_vec(&ServerHelloEnvelope::V12(sh)).unwrap())
-                    .await
-                    .unwrap();
-            }
-            _ => panic!("expected Success on the V2 fallback"),
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert_eq!(
-            session.connection_state(),
-            ConnectionState::Connected,
-            "the V3 → V2 fallback handshake must complete"
-        );
-        assert_eq!(
-            session.early_data_accepted().await,
-            None,
-            "fell back to V2 — there is no 0-RTT verdict"
-        );
-
-        // Keep the server transport alive until the assertions run.
-        drop(s);
-    }
 }
