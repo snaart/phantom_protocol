@@ -152,7 +152,7 @@ security invariants are catalogued in
 
 ## Transport features
 
-- **Single unified wire protocol.** One `PacketHeader` (45 bytes, leading
+- **Single unified wire protocol.** One `PacketHeader` (45 bytes, with a
   pinned `version` byte = `WIRE_VERSION`) wrapped in a bare `PhantomPacket`
   (`header` + `payload` + TLV-headroom `extensions`) — no `VersionedPacket`
   enum, no per-session wire-version negotiation. `epoch`, `REKEY`,

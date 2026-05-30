@@ -24,10 +24,12 @@ anchor (and a hook for a future deliberate bump).
 Collapsed:
 - **Data packets** — the dual V1/V2 format (`VersionedPacket::{V1, V2}`
   + `PacketHeader` / `PacketHeaderV2`) folds into one 45-byte
-  `PacketHeader` whose leading `version: u8` field is pinned to
-  `WIRE_VERSION = 1`. Wire order matches the alkahest field order:
-  `version, session_id, stream_id, sequence, flags, ack_delay, epoch,
-  path_id`. The single `PacketFlags` (`u16`) carries every flag that was
+  `PacketHeader` whose `version: u8` field is pinned to `WIRE_VERSION = 1`.
+  The header carries `version, session_id, stream_id, sequence, flags,
+  ack_delay, epoch, path_id`; on the wire alkahest emits them in reverse
+  declaration order (so the pinned `version` byte is the last of the 45
+  header bytes) — see `docs/protocol/PROTOCOL.md` § 4.2 for the exact
+  offsets. The single `PacketFlags` (`u16`) carries every flag that was
   previously split across `PacketFlags` / `PacketFlagsV2` (`RELIABLE`,
   `ACK`, `FIN`, `UNRELIABLE`, `PRIORITY`, `ENCRYPTED`, `COMPRESSED`,
   `CONTROL`, `REKEY`, `PATH_VALIDATION`, `COALESCED`, `WINDOW_UPDATE`;
