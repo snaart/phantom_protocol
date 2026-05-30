@@ -488,7 +488,7 @@
 
 **Что нужно достроить:**
 - `VirtualSocket` должен parallel-keep-alive все доступные legs.
-- Per-packet path selection (по health + RTT + loss); пометить leg-id в `PacketHeader.path_id` (новое поле через bump VersionedPacket → V2).
+- Per-packet path selection (по health + RTT + loss); пометить leg-id в `PacketHeader.path_id` (уже поле единого `PacketHeader`).
 - Path validation: при появлении нового path (другой IP/leg) — challenge-response (random 32-byte) до полного switch.
 - Mobility / migration: session ID stable, IP/leg меняется. Это эквивалент QUIC connection migration (RFC 9000 § 9). Сервер реджектит migration без path validation.
 - Per-path congestion state (packet number space — каждый path считает loss/RTT отдельно, плюс global stream layer).
@@ -548,7 +548,7 @@
 | Подсистема | Файлы | Effort |
 |---|---|---|
 | 0-RTT resumption | `core/src/transport/session_cache.rs`, `core/src/transport/handshake.rs`, `core/src/api/session.rs` | L |
-| Multi-path failover | `core/src/transport/virtual_socket.rs`, `core/src/transport/scheduler.rs`, `core/src/transport/fallback.rs`, `core/src/transport/types.rs` (V2) | XL |
+| Multi-path failover | `core/src/transport/virtual_socket.rs`, `core/src/transport/scheduler.rs`, `core/src/transport/fallback.rs`, `core/src/transport/types.rs` | XL |
 | Connection migration | `core/src/transport/migration.rs` (new) | L |
 | Stream priority scheduling | `core/src/transport/stream.rs`, `core/src/api/session.rs` | M |
 | Per-stream flow control | `core/src/transport/stream.rs`, new wire frame | M |
@@ -671,7 +671,7 @@
 
 ### 6.2 Protocol specification
 - `docs/protocol/PROTOCOL.md`:
-  - Wire format: every field of `VersionedPacket`, `PhantomPacketV1`, `PacketHeader`, `ClientHello`, `ServerHello` with byte offset and width.
+  - Wire format: every field of `PhantomPacket`, `PacketHeader`, `ClientHello`, `ServerHello` with byte offset and width.
   - State machine: handshake stages (Initial → ClassicalReady → PqcReady → Established / Failed).
   - Handshake message flow (ASCII diagram).
   - AEAD construction: nonce = `nonce_prefix[4] || counter[8]`, AAD = serialized PacketHeader.
@@ -692,7 +692,7 @@
 - `fuzz/` directory с `cargo-fuzz init`. Targets:
   - `fuzz_targets/fuzz_client_hello.rs` — fuzz `borsh::from_slice::<ClientHello>(input)` + `process_client_hello`.
   - `fuzz_targets/fuzz_server_hello.rs` — fuzz client side.
-  - `fuzz_targets/fuzz_packet_parse.rs` — fuzz `alkahest::deserialize::<VersionedPacket, _>(input)`.
+  - `fuzz_targets/fuzz_packet_parse.rs` — fuzz `alkahest::deserialize::<PhantomPacket, _>(input)`.
   - `fuzz_targets/fuzz_aead_decrypt.rs` — fuzz `Session::decrypt_packet` with random AAD + ciphertext.
   - `fuzz_targets/fuzz_faketls_record.rs` — fuzz FakeTLS record parsing (`legs/faketls.rs:669-689`).
   - `fuzz_targets/fuzz_tcp_framing.rs` — fuzz length-prefix parsing.
@@ -796,7 +796,7 @@
 ### 7.3 Versioning policy
 - `docs/policy/versioning.md`:
   - Public Rust API: SemVer strict.
-  - Wire format: independent `VersionedPacket::V1`, V2, ... — bumped on breaking change.
+  - Wire format: single `PhantomPacket` with a pinned `WIRE_VERSION` header byte — bumped deliberately on a breaking change.
   - FFI ABI: track separately в `tests/bindings/CHANGELOG.md`.
 - `cargo-semver-checks` в CI: detect breaking changes pre-merge.
 
@@ -965,7 +965,7 @@ Phase 0  ────►  Phase 1  ──┐
 | `core/src/api/tcp_transport.rs` | TCP framing (Phase 2.1 BufferPool) |
 | `core/src/transport/handshake.rs` | Hybrid handshake — большая часть Phase 1 |
 | `core/src/transport/session.rs` | Session + CryptoState (Phase 1.2 Zeroize) |
-| `core/src/transport/types.rs` | Wire format (Phase 1.8 versioning, Phase 4.2 V2) |
+| `core/src/transport/types.rs` | Wire format — single `PhantomPacket`, pinned `WIRE_VERSION` |
 | `core/src/transport/buffer_pool.rs` | Готов, не подключён (Phase 2.1) |
 | `core/src/transport/pacer.rs` | Готов, не подключён (Phase 2.6) |
 | `core/src/transport/packet_coalescer.rs` | Готов, не подключён (Phase 2.5) |

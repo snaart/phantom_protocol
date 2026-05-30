@@ -211,7 +211,7 @@ A clean release build on a 2024-era server with hardware AES acceleration
 | Metric | Reference (single thread) |
 | --- | --- |
 | AES-256-GCM raw (`ring`, ≥16 KiB payload) | ~5.5 GiB/s (M1 Pro) / ~3–5 GiB/s (x86_64 AES-NI) |
-| AES-256-GCM practical (`encrypt_packet_v2` with header-AAD + replay) | ~4.7 GiB/s at 64 KiB |
+| AES-256-GCM practical (`encrypt_packet` with header-AAD + replay) | ~4.7 GiB/s at 64 KiB |
 | ChaCha20-Poly1305 encrypt | ~1.55 GiB/s (software-only; faster than AES on ARM cores without AES extensions) |
 | Phantom hybrid PQ handshake (pinned, production path) | ~1.06 ms → ~945 conn/sec/core |
 | End-to-end TCP loopback throughput (single stream) | 1–4 GiB/s (NIC / socket bound, not crypto) |
