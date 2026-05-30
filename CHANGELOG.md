@@ -13,6 +13,82 @@ the foundation and security-hardening phases of the production-readiness
 roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
 132; the new ten cover the documented security invariants directly.
 
+### Changed — unified wire protocol (WIRE-BREAKING)
+
+**The three independent version axes are collapsed into one wire
+protocol.** Pre-1.0 there are no deployed peers, so there is nothing to
+negotiate, fall back to, or migrate; the redundant dual-format machinery
+is gone and a single 1-byte version survives as a pinned tamper-check
+anchor (and a hook for a future deliberate bump).
+
+Collapsed:
+- **Data packets** — the dual V1/V2 format (`VersionedPacket::{V1, V2}`
+  + `PacketHeader` / `PacketHeaderV2`) folds into one 45-byte
+  `PacketHeader` whose leading `version: u8` field is pinned to
+  `WIRE_VERSION = 1`. Wire order matches the alkahest field order:
+  `version, session_id, stream_id, sequence, flags, ack_delay, epoch,
+  path_id`. The single `PacketFlags` (`u16`) carries every flag that was
+  previously split across `PacketFlags` / `PacketFlagsV2` (`RELIABLE`,
+  `ACK`, `FIN`, `UNRELIABLE`, `PRIORITY`, `ENCRYPTED`, `COMPRESSED`,
+  `CONTROL`, `REKEY`, `PATH_VALIDATION`, `COALESCED`, `WINDOW_UPDATE`;
+  `0x1000`..`0x8000` reserved).
+- **Handshake envelopes** — the V1/V2/V3 borsh envelope dispatch
+  (`ClientHelloEnvelope`, `ServerHelloEnvelope`,
+  `HelloRetryRequestEnvelope`, with the 1-byte discriminant and the
+  `Unsupported` V3→V2 fallback arm) folds into bare borsh structs: one
+  `ClientHello`, one `ServerHello`, one `HelloRetryRequest`. The client
+  distinguishes a `ServerHello` from a `HelloRetryRequest` by
+  deserialization (size), not a discriminant.
+- **Per-session wire-version negotiation** — removed. The format is
+  pinned, not negotiated; the recv path deserializes `PhantomPacket`
+  directly and drops any frame whose `header.version != WIRE_VERSION`.
+
+**0-RTT early-data is now a field of the single `ClientHello`**
+(`early_data: Option<Vec<u8>>`) rather than a separate V3 envelope arm.
+One `HandshakeTranscript` signs the whole `ClientHello` — the AEAD-sealed
+early-data ciphertext included — and leads with `protocol_variant`. There
+is one `process_client_hello` and one `process_server_hello`
+(`-> (Session, Option<bool>)`, the `Option<bool>` being the 0-RTT verdict,
+`None` when no early-data was sent). Semantics are unchanged: best-effort
+(unknown / expired ticket, oversized `> 16 KiB`, or AEAD failure leaves
+`early_data_accepted = false` and completes a 1-RTT handshake), one-shot
+(the resumption ticket is consumed once), and the fresh hybrid KEM
+preserves forward secrecy on the 0-RTT path.
+
+`PROTOCOL_VERSION` (the `ClientHello.version` byte, `transport/handshake.rs`)
+and `WIRE_VERSION` (the packet-header byte, `transport/types.rs`) are both
+pinned to `1`. `PROTOCOL_VARIANT` (`phantom-default-1` / `phantom-fips-1`)
+is an orthogonal build-variant tag and is unaffected by this collapse.
+
+**Observability** — the `ProtocolVersion` metric-label enum collapses to a
+single pinned variant (`ProtocolVersion::Current`, label value `"v1"`); the
+`version` dimension is retained for a future deliberate bump but no longer
+takes more than one value.
+
+**Impact.** This is a hard, pre-1.0 wire break in every direction: any peer
+on a prior build (dual-format data packets, enveloped handshake, V3 0-RTT)
+cannot interoperate with a post-collapse peer. Rebuild both ends together.
+
+### Removed — dual-format wire machinery
+
+- `VersionedPacket` enum (`{V1, V2}`) — the wire is now a bare
+  `PhantomPacket { header: PacketHeader, payload: Vec<u8>, extensions:
+  Vec<u8> }`. The `extensions` field is TLV headroom.
+- `PacketHeaderV2` / `PacketFlagsV2` — folded into the single
+  `PacketHeader` / `PacketFlags`.
+- `ClientHelloEnvelope`, `ServerHelloEnvelope` (incl. the `Unsupported`
+  fallback arm), `HelloRetryRequestEnvelope`, and the 1-byte version
+  discriminant on every handshake message.
+- `ClientHelloV3` / `ServerHelloV3` / `HandshakeTranscriptV3` and the
+  separate `process_client_hello_v3` / `process_server_hello_v3` paths —
+  0-RTT is now the single `ClientHello.early_data` field on the one
+  handshake path.
+- Per-session wire-version negotiation / fallback logic.
+- Negative-security suite trims from 24 to 20 always-on tests in
+  `core/tests/security_invariants.rs`: the V1/V2 twin tests and the
+  V1-vs-V2 cross-version distinctness test fold into single canonical
+  tests now that the dual format is gone.
+
 ### Added — `wasi-leg` Cargo feature (commits `f6c0c0a`..`255be95`)
 
 **`cargo build --target wasm32-wasip2 --features wasi-leg` is now a
@@ -131,13 +207,12 @@ fips ↔ non-fips:
 In short: **both peers must be on a post-PR build, and both must
 share the same `PROTOCOL_VARIANT`** (`phantom-default-1` for the
 default build, `phantom-fips-1` under `--features fips`). The
-`PROTOCOL_VARIANT` constant is baked into the signed handshake
-transcript on both the V1/V2 and V3 (0-RTT) paths, so an MITM
-rewriting the cleartext field is still caught by the
-signature-verify check. Pre-1.0 callers should treat this as a
-hard generation bump and rebuild both ends together; see
-`docs/migration/v2-to-v3.md` for the V3 envelope migration and the
-"FIPS variant" subsection there for the cross-mode policy.
+`PROTOCOL_VARIANT` constant is the leading field of the signed
+handshake transcript, so an MITM rewriting the cleartext field is
+still caught by the signature-verify check. Pre-1.0 callers should
+treat this as a hard generation bump and rebuild both ends together;
+see `docs/protocol/PROTOCOL.md` §6.7 for the cross-mode
+(`PROTOCOL_VARIANT`) interop policy.
 
 **Build constraints** — `fips` implies `std` and is mutually exclusive
 with `no-std` (compile_error in `core/src/lib.rs`). `aws-lc-rs`

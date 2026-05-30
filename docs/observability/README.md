@@ -18,8 +18,9 @@ Two pillars, OTel-native:
   `Histogram`s with exemplar correlation to traces.
 
 - **Traces** — `phantom.*` spans on listener bind/accept, handshake
-  variants (V1/V2/V3 client and server sides), session rekey, path
-  validation. Span fields carry `client_ip`, `version`, `outcome`,
+  (client and server sides), session rekey, path
+  validation. Span fields carry `client_ip`, `version` (single pinned
+  `v1`), `outcome`,
   `cipher_suite`, etc. Bridged into the embedder's
   `tracing_subscriber::Registry` via `tracing-opentelemetry`.
 
