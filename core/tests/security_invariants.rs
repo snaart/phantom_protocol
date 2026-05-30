@@ -159,11 +159,11 @@ fn server_identity_mismatch_aborts_handshake() {
             let mut hello_retry = client_hello.clone();
             hello_retry.cookie = retry.cookie;
             match real_server.process_client_hello(&hello_retry, 0, client_ip) {
-                HandshakeResponse::Success(sh, _) => sh,
+                HandshakeResponse::Success(sh, _, _) => sh,
                 other => panic!("unexpected after retry: {:?}", other),
             }
         }
-        HandshakeResponse::Success(sh, _) => sh,
+        HandshakeResponse::Success(sh, _, _) => sh,
         other => panic!("unexpected first response: {:?}", other),
     };
 

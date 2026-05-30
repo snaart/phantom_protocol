@@ -21,10 +21,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use embedded_io_async::{Read, Write};
 use phantom_core::api::session::{ConnectionState, PhantomSession, SessionTransport};
-use phantom_core::transport::handshake::{
-    ClientHelloEnvelope, HandshakeResponse, HandshakeServer, HelloRetryRequestEnvelope,
-    ServerHelloEnvelope,
-};
+use phantom_core::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
 use phantom_core::transport::legs::embedded::EmbeddedLeg;
 use phantom_core::transport::session::Session;
 use phantom_core::transport::types::{
@@ -241,20 +238,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .expect("recv ClientHello timed out")
             .expect("recv ClientHello");
-        let mut client_hello = match borsh::from_slice::<ClientHelloEnvelope>(&raw)
-            .expect("parse ClientHelloEnvelope")
-        {
-            ClientHelloEnvelope::V12(ch) => ch,
-            ClientHelloEnvelope::V3(_) => panic!("demo expects V12 client hello"),
-        };
+        let mut client_hello =
+            borsh::from_slice::<ClientHello>(&raw).expect("parse ClientHello");
 
         // The DoS gate may demand a stateless cookie / PoW on first contact;
         // the client transparently re-sends on `HelloRetryRequest`.
         let server_session = loop {
             match server_hs.process_client_hello(&client_hello, 0, client_ip) {
-                HandshakeResponse::Success(server_hello, session) => {
-                    let bytes = borsh::to_vec(&ServerHelloEnvelope::V12(server_hello))
-                        .expect("serialize ServerHello");
+                HandshakeResponse::Success(server_hello, session, _) => {
+                    let bytes = borsh::to_vec(&server_hello).expect("serialize ServerHello");
                     timeout(IO_TIMEOUT, server_leg.send_frame(&bytes))
                         .await
                         .expect("send ServerHello timed out")
@@ -262,8 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break session;
                 }
                 HandshakeResponse::Retry(retry) => {
-                    let bytes = borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry))
-                        .expect("serialize HelloRetryRequest");
+                    let bytes = borsh::to_vec(&retry).expect("serialize HelloRetryRequest");
                     timeout(IO_TIMEOUT, server_leg.send_frame(&bytes))
                         .await
                         .expect("send retry timed out")
@@ -272,15 +263,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await
                         .expect("recv retried hello timed out")
                         .expect("recv retried hello");
-                    client_hello = match borsh::from_slice::<ClientHelloEnvelope>(&next)
-                        .expect("parse retried envelope")
-                    {
-                        ClientHelloEnvelope::V12(ch) => ch,
-                        ClientHelloEnvelope::V3(_) => panic!("expected V12 on retry"),
-                    };
+                    client_hello =
+                        borsh::from_slice::<ClientHello>(&next).expect("parse retried ClientHello");
                     continue;
                 }
-                HandshakeResponse::SuccessV3(..) => panic!("V12 path returned SuccessV3"),
                 HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
             }
         };
@@ -358,9 +344,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     timeout(IO_TIMEOUT, server_handle)
         .await
         .expect("server task timed out")?;
-    timeout(IO_TIMEOUT, session.close())
+    timeout(IO_TIMEOUT, session.disconnect())
         .await
-        .expect("close timed out")?;
+        .expect("disconnect timed out")?;
     println!("Demo complete.");
     Ok(())
 }

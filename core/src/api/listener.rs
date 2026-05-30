@@ -3,10 +3,7 @@ use crate::api::tcp_transport::TcpSessionTransport;
 use crate::crypto::hybrid_sign::HybridSigningKey;
 use crate::errors::CoreError;
 use crate::runtime::{Runtime, TokioRuntime};
-use crate::transport::handshake::{
-    ClientHelloEnvelope, HandshakeResponse, HandshakeServer, HelloRetryRequestEnvelope,
-    ServerHelloEnvelope,
-};
+use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
 use crate::observability::{Observability, ObservabilityConfig};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -330,9 +327,8 @@ impl AcceptOutcome {
 /// Drive the server side of the Phantom hybrid PQC handshake on a freshly
 /// accepted transport, handling the optional cookie / PoW retry round.
 ///
-/// Returns the established `Session` plus any decrypted 0-RTT
-/// early-data (`Some` only on a V3 handshake where the client carried
-/// a valid early-data blob).
+/// Returns the established `Session` plus any decrypted 0-RTT early-data
+/// (`Some` only when the client carried a valid early-data blob).
 async fn drive_server_handshake(
     transport: &TcpSessionTransport,
     hs: &HandshakeServer,
@@ -340,41 +336,24 @@ async fn drive_server_handshake(
 ) -> Result<(crate::transport::session::Session, Option<Vec<u8>>), CoreError> {
     loop {
         let hello_bytes = transport.recv_bytes().await?;
-        // Wire V3: hello messages are version-prefixed envelopes.
-        // `V12` and `V3` dispatch to their respective server paths; an
-        // unknown / future discriminant surfaces as a borsh parse error.
-        let envelope = borsh::from_slice::<ClientHelloEnvelope>(&hello_bytes)
+        let client_hello = borsh::from_slice::<ClientHello>(&hello_bytes)
             .map_err(|e| CoreError::NetworkError(format!("ClientHello parse failed: {}", e)))?;
 
-        // Adaptive PoW difficulty (Phase 1.14): under load the listener
-        // automatically requires more proof-of-work from each new client.
-        // At idle (<100 handshakes/min) this stays at 0 and PoW is skipped
-        // entirely.
+        // Adaptive PoW difficulty: under load the listener automatically
+        // requires more proof-of-work from each new client. At idle
+        // (<100 handshakes/min) this stays at 0 and PoW is skipped entirely.
         let difficulty = hs.adaptive_difficulty();
-        let response = match &envelope {
-            ClientHelloEnvelope::V12(ch) => hs.process_client_hello(ch, difficulty, client_ip),
-            ClientHelloEnvelope::V3(ch3) => hs.process_client_hello_v3(ch3, difficulty, client_ip),
-        };
-        match response {
+        match hs.process_client_hello(&client_hello, difficulty, client_ip) {
             HandshakeResponse::Retry(retry) => {
-                let bytes = borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry))
+                let bytes = borsh::to_vec(&retry)
                     .map_err(|e| CoreError::NetworkError(format!("Retry encode failed: {}", e)))?;
                 transport.send_bytes(&bytes).await?;
                 // Loop back and read the retried hello.
             }
-            HandshakeResponse::Success(server_hello, session) => {
-                let bytes =
-                    borsh::to_vec(&ServerHelloEnvelope::V12(server_hello)).map_err(|e| {
-                        CoreError::NetworkError(format!("ServerHello encode failed: {}", e))
-                    })?;
-                transport.send_bytes(&bytes).await?;
-                return Ok((session, None));
-            }
-            HandshakeResponse::SuccessV3(server_hello_v3, session, early_data) => {
-                let bytes =
-                    borsh::to_vec(&ServerHelloEnvelope::V3(server_hello_v3)).map_err(|e| {
-                        CoreError::NetworkError(format!("ServerHelloV3 encode failed: {}", e))
-                    })?;
+            HandshakeResponse::Success(server_hello, session, early_data) => {
+                let bytes = borsh::to_vec(&server_hello).map_err(|e| {
+                    CoreError::NetworkError(format!("ServerHello encode failed: {}", e))
+                })?;
                 transport.send_bytes(&bytes).await?;
                 return Ok((session, early_data));
             }

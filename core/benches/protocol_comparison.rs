@@ -47,7 +47,7 @@ fn phantom_handshake_bench(c: &mut Criterion) {
 
             let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
             let (server_hello, _) = match result {
-                HandshakeResponse::Success(h, s) => (h, s),
+                HandshakeResponse::Success(h, s, _) => (h, s),
                 _ => panic!("Expected success, got {:?}", result),
             };
             let _ = client
@@ -84,10 +84,10 @@ fn phantom_throughput_bench(c: &mut Criterion) {
 
     let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
     let (server_hello, server_session) = match result {
-        HandshakeResponse::Success(h, s) => (h, s),
+        HandshakeResponse::Success(h, s, _) => (h, s),
         _ => panic!("Expected success"),
     };
-    let client_session = client
+    let (client_session, _) = client
         .process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk))
         .unwrap();
 
@@ -347,10 +347,10 @@ fn encryption_bench(c: &mut Criterion) {
 
     let result = server.process_client_hello(&client_hello_retry, 0, client_ip);
     let (server_hello, server_session) = match result {
-        HandshakeResponse::Success(h, s) => (h, s),
+        HandshakeResponse::Success(h, s, _) => (h, s),
         _ => panic!("Expected success"),
     };
-    let client_session = client
+    let (client_session, _) = client
         .process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk))
         .unwrap();
 
