@@ -553,14 +553,8 @@ impl HandshakeServer {
     }
 
     /// Build the post-handshake `Session` from the negotiated
-    /// `shared_secret`: derive the AEAD `CryptoState`, route the packet
-    /// codec, derive + install the resumption secret, and stash a
-    /// resumption ticket in the cache.
-    ///
-    /// The protocol version is pinned (`PROTOCOL_VERSION`) and orthogonal to
-    /// the on-wire packet codec, which the data pump still selects via
-    /// `Session::wire_version()` — set to `2` here until the wire-types
-    /// collapse removes the dual codec.
+    /// `shared_secret`: derive the AEAD `CryptoState`, derive + install the
+    /// resumption secret, and stash a resumption ticket in the cache.
     #[allow(clippy::result_large_err)]
     fn finalize_session(
         &self,
@@ -580,7 +574,6 @@ impl HandshakeServer {
             *shared_secret,
             true,
         );
-        session.set_wire_version(2);
 
         // Derive resumption secret and stash a one-shot ticket so a
         // future ClientHello carrying this session id can skip
@@ -786,9 +779,6 @@ impl HandshakeClient {
             shared_secret,
             false,
         );
-        // The protocol version is pinned and orthogonal to the on-wire packet
-        // codec; route the same codec the server's `finalize_session` chose.
-        session.set_wire_version(2);
 
         // 5. Derive resumption secret (seeds the NEXT resume / 0-RTT).
         let mut resumption_secret = [0u8; 32];

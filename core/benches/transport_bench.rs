@@ -197,7 +197,7 @@ fn bench_encryption(c: &mut Criterion) {
 
     // Benchmark different payload sizes.
     //
-    // V2 wire format (`encrypt_packet_v2` / `decrypt_packet_v2`) derives the
+    // V2 wire format (`encrypt_packet` / `decrypt_packet`) derives the
     // AEAD nonce from the authenticated header fields rather than an internal
     // monotonic counter, so a sender/receiver pair cannot desync. To stay
     // clear of the per-stream sliding-window replay guard, each iteration
@@ -223,7 +223,7 @@ fn bench_encryption(c: &mut Criterion) {
                     PacketHeaderV2::new(session_id, 1, seq, flags)
                 },
                 |header| {
-                    let encrypted = server_session.encrypt_packet_v2(&header, &data);
+                    let encrypted = server_session.encrypt_packet(&header, &data);
                     black_box(encrypted)
                 },
                 BatchSize::SmallInput,
@@ -238,12 +238,12 @@ fn bench_encryption(c: &mut Criterion) {
                     let seq = decrypt_seq.fetch_add(1, Ordering::Relaxed);
                     let header = PacketHeaderV2::new(session_id, 2, seq, flags);
                     let encrypted = server_session
-                        .encrypt_packet_v2(&header, &data)
+                        .encrypt_packet(&header, &data)
                         .expect("encrypt setup");
                     (header, encrypted)
                 },
                 |(header, encrypted)| {
-                    let decrypted = client_session.decrypt_packet_v2(&header, &encrypted);
+                    let decrypted = client_session.decrypt_packet(&header, &encrypted);
                     black_box(decrypted)
                 },
                 BatchSize::SmallInput,
@@ -290,7 +290,7 @@ fn bench_throughput(c: &mut Criterion) {
     let data = vec![0xAB; 1024 * 1024];
     group.throughput(Throughput::Bytes(data.len() as u64 * 2)); // encrypt + decrypt
 
-    // Switched to V2 (`encrypt_packet_v2` / `decrypt_packet_v2`) so the AEAD
+    // Switched to V2 (`encrypt_packet` / `decrypt_packet`) so the AEAD
     // nonce is header-derived and a sender/receiver pair cannot desync. Each
     // iteration bumps `header.sequence` to dodge the per-stream replay window.
     let session_id = *server_session.id();
@@ -304,8 +304,8 @@ fn bench_throughput(c: &mut Criterion) {
                 PacketHeaderV2::new(session_id, 1, seq, flags)
             },
             |header| {
-                let encrypted = server_session.encrypt_packet_v2(&header, &data).unwrap();
-                let decrypted = client_session.decrypt_packet_v2(&header, &encrypted).unwrap();
+                let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
+                let decrypted = client_session.decrypt_packet(&header, &encrypted).unwrap();
                 black_box(decrypted)
             },
             BatchSize::PerIteration,

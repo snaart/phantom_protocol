@@ -478,12 +478,12 @@ mod tests {
     use crate::api::session::{ConnectionState, PhantomSession};
     use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
     use crate::transport::types::{
-        PacketFlags, PacketFlagsV2, PacketHeader, PacketHeaderV2, PhantomPacketV1, PhantomPacketV2,
-        SessionId, StreamId as TransportStreamId, VersionedPacket,
+        PacketFlagsV2, PacketHeaderV2, PhantomPacketV2, SessionId, StreamId as TransportStreamId,
+        VersionedPacket,
     };
 
     /// Decrypt an incoming encrypted frame on the test server side.
-    /// Wire-version-aware (V1 or V2). Local duplicate of the helper in
+    /// Local duplicate of the helper in
     /// `api::session::tests` — see module comment above.
     fn decrypt_incoming_local(
         server_session: &crate::transport::session::Session,
@@ -491,30 +491,21 @@ mod tests {
     ) -> Vec<u8> {
         let versioned = alkahest::deserialize::<VersionedPacket, VersionedPacket>(bytes)
             .expect("deserialize VersionedPacket");
-        match versioned {
-            VersionedPacket::V1(pkt) => {
-                assert!(
-                    pkt.header.flags.contains(PacketFlags::ENCRYPTED),
-                    "expected ENCRYPTED flag on V1 application data"
-                );
-                server_session
-                    .decrypt_packet(&pkt.header, &pkt.payload)
-                    .expect("decrypt V1 application data")
-            }
-            VersionedPacket::V2(pkt) => {
-                assert!(
-                    pkt.header.flags.contains(PacketFlagsV2::ENCRYPTED),
-                    "expected ENCRYPTED flag on V2 application data"
-                );
-                server_session
-                    .decrypt_packet_v2(&pkt.header, &pkt.payload)
-                    .expect("decrypt V2 application data")
-            }
-        }
+        let pkt = match versioned {
+            VersionedPacket::V2(pkt) => pkt,
+            VersionedPacket::V1(_) => panic!("unified protocol emits V2 packets only"),
+        };
+        assert!(
+            pkt.header.flags.contains(PacketFlagsV2::ENCRYPTED),
+            "expected ENCRYPTED flag on application data"
+        );
+        server_session
+            .decrypt_packet(&pkt.header, &pkt.payload)
+            .expect("decrypt application data")
     }
 
     /// Build an encrypted reply frame from the test server side.
-    /// Wire-version-aware. Local duplicate of the helper in
+    /// Local duplicate of the helper in
     /// `api::session::tests` — see module comment above.
     fn encrypt_outgoing_local(
         server_session: &crate::transport::session::Session,
@@ -523,34 +514,21 @@ mod tests {
         sequence: u32,
         payload: &[u8],
     ) -> Vec<u8> {
-        if server_session.wire_version() == 2 {
-            let flag_bits = PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED;
-            let header = PacketHeaderV2::new(
-                session_id,
-                stream_id,
-                sequence,
-                PacketFlagsV2::new(flag_bits),
-            )
-            .with_epoch(server_session.current_epoch());
-            let ct = server_session
-                .encrypt_packet_v2(&header, payload)
-                .expect("encrypt V2 reply");
-            let packet = PhantomPacketV2::new(header, ct).into_versioned();
-            let mut buf = Vec::new();
-            let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
-            buf[..size].to_vec()
-        } else {
-            let mut flags = PacketFlags::new(PacketFlags::RELIABLE);
-            flags.set(PacketFlags::ENCRYPTED);
-            let header = PacketHeader::new(session_id, stream_id, sequence, flags);
-            let ct = server_session
-                .encrypt_packet(&header, payload)
-                .expect("encrypt V1 reply");
-            let packet = PhantomPacketV1::new(header, ct).into_versioned();
-            let mut buf = Vec::new();
-            let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
-            buf[..size].to_vec()
-        }
+        let flag_bits = PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED;
+        let header = PacketHeaderV2::new(
+            session_id,
+            stream_id,
+            sequence,
+            PacketFlagsV2::new(flag_bits),
+        )
+        .with_epoch(server_session.current_epoch());
+        let ct = server_session
+            .encrypt_packet(&header, payload)
+            .expect("encrypt reply");
+        let packet = PhantomPacketV2::new(header, ct).into_versioned();
+        let mut buf = Vec::new();
+        let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+        buf[..size].to_vec()
     }
 
     /// `MockWriter` wrapper that tees every byte through to a side recorder

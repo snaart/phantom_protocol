@@ -16,8 +16,8 @@ use crate::transport::path_validation_codec::build_path_validation_packet;
 use crate::transport::session::Session;
 use crate::transport::stream::Stream;
 use crate::transport::types::{
-    PacketFlags, PacketFlagsV2, PacketHeader, PacketHeaderV2, PhantomPacketV1, PhantomPacketV2,
-    SessionId, StreamId as TransportStreamId, VersionedPacket,
+    PacketFlags, PacketFlagsV2, PacketHeaderV2, PhantomPacketV2, SessionId,
+    StreamId as TransportStreamId, VersionedPacket,
 };
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -679,21 +679,8 @@ async fn run_data_pump<T: SessionTransport>(
                 Err(_) => continue,
             };
             match versioned {
-                VersionedPacket::V1(packet) => {
-                    handle_v1_packet(
-                        packet,
-                        session_id,
-                        &crypto_recv,
-                        &streams_recv,
-                        &demux_recv,
-                        &transport_send_ack,
-                        &recv_tx_for_task,
-                        &mut ack_buf,
-                    )
-                    .await;
-                }
                 VersionedPacket::V2(packet) => {
-                    handle_v2_packet(
+                    handle_packet(
                         packet,
                         session_id,
                         &crypto_recv,
@@ -708,6 +695,10 @@ async fn run_data_pump<T: SessionTransport>(
                     )
                     .await;
                 }
+                // The legacy V1 packet codec is retired — the unified protocol
+                // emits only the packet carried in the `V2` arm. An unexpected
+                // V1 frame (no legitimate peer produces one) is dropped.
+                VersionedPacket::V1(_) => continue,
             }
         }
         // Signal the main loop that the recv task has exited so it can
@@ -821,8 +812,6 @@ async fn run_data_pump<T: SessionTransport>(
     state.store(ConnectionState::Closed as u8, Ordering::Relaxed);
 }
 
-/// Encrypt `payload` and emit a single `PhantomPacketV1` over the transport.
-/// Returns `false` on a transport or crypto error so the caller can react.
 /// Drain every stream with pending data, scheduling them in strict
 /// priority order (higher `Stream::priority()` wins). Streams of equal
 /// priority are drained in stream-id order (deterministic so tests
@@ -887,81 +876,6 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
     }
 }
 
-async fn send_app_data<T: SessionTransport>(
-    transport: &Arc<T>,
-    crypto_session: &Arc<Session>,
-    session_id: SessionId,
-    stream_id: TransportStreamId,
-    sequence: u32,
-    payload: &[u8],
-    base_flags: u8,
-) -> bool {
-    // Route by the post-handshake packet codec. `wire_version()` is set to
-    // `2` by both peers' handshake (the protocol version is pinned and
-    // orthogonal); the dual codec is collapsed in a later phase.
-    if crypto_session.wire_version() == 2 {
-        send_app_data_v2(
-            transport,
-            crypto_session,
-            session_id,
-            stream_id,
-            sequence,
-            payload,
-            base_flags,
-        )
-        .await
-    } else {
-        send_app_data_v1(
-            transport,
-            crypto_session,
-            session_id,
-            stream_id,
-            sequence,
-            payload,
-            base_flags,
-        )
-        .await
-    }
-}
-
-async fn send_app_data_v1<T: SessionTransport>(
-    transport: &Arc<T>,
-    crypto_session: &Arc<Session>,
-    session_id: SessionId,
-    stream_id: TransportStreamId,
-    sequence: u32,
-    payload: &[u8],
-    base_flags: u8,
-) -> bool {
-    let mut flags = PacketFlags::new(base_flags);
-    flags.set(PacketFlags::ENCRYPTED);
-    let header = PacketHeader::new(session_id, stream_id, sequence, flags);
-    let ciphertext = match crypto_session.encrypt_packet(&header, payload) {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("PhantomSession: encrypt_packet failed: {}", e);
-            return false;
-        }
-    };
-    let packet = PhantomPacketV1::new(header, ciphertext).into_versioned();
-    // Phase 2.3: pre-size the serialization buffer so alkahest does a single
-    // allocation rather than incrementally growing through power-of-two
-    // realloc-and-copy cycles. Header is 41 wire bytes + alkahest envelope
-    // overhead (a few bytes) + payload + AEAD tag (16 bytes).
-    let mut buf: Vec<u8> = Vec::with_capacity(payload.len() + 64);
-    let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
-    // Phase 4.4 — pace the send through the BBR-driven Pacer. Default
-    // is `Pacer::unlimited` (always allows), so this is a no-op until
-    // CC kicks in via `on_packet_acked` setting a finite rate.
-    pace_send(crypto_session, size as u64).await;
-    if let Err(e) = transport.send_bytes(&buf[..size]).await {
-        log::error!("PhantomSession: transport send failed: {}", e);
-        return false;
-    }
-    crypto_session.on_packet_sent(size as u64);
-    true
-}
-
 /// Build a `DeliverySample` from a successful Stream ack callback and
 /// feed it into the session's BBR estimator (Phase 4.4). The BBR loop
 /// internally re-sets the pacer rate via `Session::on_packet_acked`,
@@ -1018,9 +932,9 @@ async fn pace_send(crypto_session: &Arc<Session>, bytes: u64) {
 
 /// V2 send. Builds `PhantomPacketV2` with `PacketFlagsV2::ENCRYPTED` and
 /// the negotiated rekey epoch; AEAD nonce derives from the header
-/// (`Session::encrypt_packet_v2`), so a failed peer decrypt no longer
+/// (`Session::encrypt_packet`), so a failed peer decrypt no longer
 /// desyncs the local counter.
-async fn send_app_data_v2<T: SessionTransport>(
+async fn send_app_data<T: SessionTransport>(
     transport: &Arc<T>,
     crypto_session: &Arc<Session>,
     session_id: SessionId,
@@ -1040,10 +954,10 @@ async fn send_app_data_v2<T: SessionTransport>(
         PacketFlagsV2::new(flag_bits),
     )
     .with_epoch(crypto_session.current_epoch());
-    let ciphertext = match crypto_session.encrypt_packet_v2(&header, payload) {
+    let ciphertext = match crypto_session.encrypt_packet(&header, payload) {
         Ok(c) => c,
         Err(e) => {
-            log::error!("PhantomSession: encrypt_packet_v2 failed: {}", e);
+            log::error!("PhantomSession: encrypt_packet failed: {}", e);
             return false;
         }
     };
@@ -1063,7 +977,7 @@ async fn send_app_data_v2<T: SessionTransport>(
 /// Emit a V2 WINDOW_UPDATE packet announcing `new_window` bytes of
 /// receive capacity for `stream_id`. Encrypted under the current
 /// session epoch (Phase 4.3 flow control).
-async fn send_window_update_v2<T: SessionTransport>(
+async fn send_window_update<T: SessionTransport>(
     transport: &Arc<T>,
     crypto_session: &Arc<Session>,
     session_id: SessionId,
@@ -1080,7 +994,7 @@ async fn send_window_update_v2<T: SessionTransport>(
     )
     .with_epoch(crypto_session.current_epoch());
     let payload = new_window.to_be_bytes();
-    let ciphertext = match crypto_session.encrypt_packet_v2(&header, &payload) {
+    let ciphertext = match crypto_session.encrypt_packet(&header, &payload) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: WINDOW_UPDATE encrypt failed: {}", e);
@@ -1100,7 +1014,7 @@ async fn send_window_update_v2<T: SessionTransport>(
 /// Emit a V2 PATH_VALIDATION packet on `path_id` carrying the given
 /// 32-byte challenge or response payload. Encrypted under the current
 /// session epoch.
-async fn send_path_validation_v2<T: SessionTransport>(
+async fn send_path_validation<T: SessionTransport>(
     transport: &Arc<T>,
     crypto_session: &Arc<Session>,
     session_id: SessionId,
@@ -1119,7 +1033,7 @@ async fn send_path_validation_v2<T: SessionTransport>(
     v2.header.flags = PacketFlagsV2::new(flag_bits);
     v2.header.epoch = crypto_session.current_epoch();
     let plaintext = std::mem::take(&mut v2.payload);
-    let ciphertext = match crypto_session.encrypt_packet_v2(&v2.header, &plaintext) {
+    let ciphertext = match crypto_session.encrypt_packet(&v2.header, &plaintext) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: PATH_VALIDATION encrypt failed: {}", e);
@@ -1137,89 +1051,18 @@ async fn send_path_validation_v2<T: SessionTransport>(
     true
 }
 
-/// Recv-side handler for a V1 packet. Decrypts (if marked), short-
-/// circuits ACKs, sends an ACK for reliable packets, fans the
-/// plaintext out through the demux and the session-wide recv channel.
-#[allow(clippy::too_many_arguments)]
-async fn handle_v1_packet<T: SessionTransport>(
-    packet: PhantomPacketV1,
-    session_id: SessionId,
-    crypto_recv: &Arc<Session>,
-    streams_recv: &Arc<DashMap<u32, Arc<Stream>>>,
-    demux_recv: &Arc<StreamDemultiplexer>,
-    transport_send_ack: &Arc<T>,
-    recv_tx: &mpsc::Sender<Bytes>,
-    ack_buf: &mut Vec<u8>,
-) {
-    let stream_id: u32 = packet.header.stream_id.into();
-
-    if packet.header.flags.is_ack() {
-        if let Some(stream) = streams_recv.get(&stream_id) {
-            if let Some((sent_at, bytes)) = stream.ack(packet.header.sequence).await {
-                feed_bbr_on_ack(crypto_recv, sent_at, bytes, 0);
-            }
-        }
-        demux_recv
-            .route_ack_async(stream_id, packet.header.sequence)
-            .await;
-        if packet.header.flags.is_fin() {
-            demux_recv.route_close_async(stream_id).await;
-        }
-        return;
-    }
-
-    // Non-ACK data packet: decrypt the payload if marked encrypted.
-    let plaintext: Vec<u8> = if packet.header.flags.contains(PacketFlags::ENCRYPTED) {
-        match crypto_recv.decrypt_packet(&packet.header, &packet.payload) {
-            Ok(pt) => pt,
-            Err(e) => {
-                log::warn!("PhantomSession: decrypt failed (dropping packet): {}", e);
-                return;
-            }
-        }
-    } else if !packet.payload.is_empty() {
-        // Reject unencrypted application data post-handshake to defeat
-        // a stripped-flag downgrade attempt.
-        log::warn!("PhantomSession: dropping unencrypted post-handshake data packet");
-        return;
-    } else {
-        Vec::new()
-    };
-
-    if packet.header.flags.is_reliable() {
-        let ack_header = PacketHeader::new(
-            session_id,
-            stream_id as TransportStreamId,
-            packet.header.sequence,
-            PacketFlags::new(PacketFlags::ACK),
-        );
-        let ack_packet = PhantomPacketV1::new(ack_header, Vec::new()).into_versioned();
-        ack_buf.clear();
-        let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&ack_packet, ack_buf);
-        let _ = transport_send_ack.send_bytes(&ack_buf[..size]).await;
-    }
-
-    if !plaintext.is_empty() {
-        let bytes = Bytes::from(plaintext);
-        demux_recv.route_data_async(stream_id, bytes.clone()).await;
-        let _ = recv_tx.send(bytes).await;
-    }
-
-    if packet.header.flags.is_fin() {
-        demux_recv.route_close_async(stream_id).await;
-    }
-}
-
-/// Recv-side handler for a V2 packet. Same shape as V1 plus:
-/// - V2 header carries epoch + path_id; decrypt uses `decrypt_packet_v2`.
+/// Recv-side handler for a packet:
+/// - ACK → feed BBR + route to the stream / demux.
+/// - decrypt (REQUIRED on application data — a non-empty unencrypted
+///   post-handshake packet is a downgrade indicator and is dropped).
 /// - PATH_VALIDATION flag → drive the path registry: verify against an
 ///   outstanding challenge if one exists, otherwise echo the payload
 ///   back as a response.
+/// - WINDOW_UPDATE flag → apply the peer's announced flow-control window.
 /// - COALESCED flag → split the decrypted bundle into sub-payloads and
-///   route each through the demux as an independent application
-///   chunk.
+///   route each through the demux as an independent application chunk.
 #[allow(clippy::too_many_arguments)]
-async fn handle_v2_packet<T: SessionTransport>(
+async fn handle_packet<T: SessionTransport>(
     packet: PhantomPacketV2,
     session_id: SessionId,
     crypto_recv: &Arc<Session>,
@@ -1258,7 +1101,7 @@ async fn handle_v2_packet<T: SessionTransport>(
     // data — a non-empty unencrypted V2 application-data packet is a
     // downgrade indicator and is dropped (same posture as V1).
     let plaintext: Vec<u8> = if packet.header.flags.contains(PacketFlagsV2::ENCRYPTED) {
-        match crypto_recv.decrypt_packet_v2(&packet.header, &packet.payload) {
+        match crypto_recv.decrypt_packet(&packet.header, &packet.payload) {
             Ok(pt) => pt,
             Err(e) => {
                 log::warn!("PhantomSession: V2 decrypt failed (dropping packet): {}", e);
@@ -1327,7 +1170,7 @@ async fn handle_v2_packet<T: SessionTransport>(
                 // own pending challenge.
                 let seq = *path_validation_seq;
                 *path_validation_seq = path_validation_seq.wrapping_add(1);
-                let _ = send_path_validation_v2(
+                let _ = send_path_validation(
                     transport_for_path,
                     crypto_recv,
                     session_id,
@@ -1418,7 +1261,7 @@ async fn handle_v2_packet<T: SessionTransport>(
     if let Some(new_window) = window_update_to_emit {
         let seq = *window_update_seq;
         *window_update_seq = window_update_seq.wrapping_add(1);
-        let _ = send_window_update_v2(
+        let _ = send_window_update(
             transport_send_ack,
             crypto_recv,
             session_id,
@@ -1890,40 +1733,27 @@ mod tests {
         assert!(!session.is_data_ready());
     }
 
-    /// Helper: decrypt an incoming encrypted frame on the test server
-    /// side. Wire-version-aware — handles both V1 and V2 packets so
-    /// the test still works after the V2-default flip.
+    /// Helper: decrypt an incoming encrypted frame on the test server side.
     fn decrypt_incoming(
         server_session: &crate::transport::session::Session,
         bytes: &[u8],
     ) -> Vec<u8> {
         let versioned = alkahest::deserialize::<VersionedPacket, VersionedPacket>(bytes)
             .expect("deserialize VersionedPacket");
-        match versioned {
-            VersionedPacket::V1(pkt) => {
-                assert!(
-                    pkt.header.flags.contains(PacketFlags::ENCRYPTED),
-                    "expected ENCRYPTED flag on V1 application data"
-                );
-                server_session
-                    .decrypt_packet(&pkt.header, &pkt.payload)
-                    .expect("decrypt V1 application data")
-            }
-            VersionedPacket::V2(pkt) => {
-                assert!(
-                    pkt.header.flags.contains(PacketFlagsV2::ENCRYPTED),
-                    "expected ENCRYPTED flag on V2 application data"
-                );
-                server_session
-                    .decrypt_packet_v2(&pkt.header, &pkt.payload)
-                    .expect("decrypt V2 application data")
-            }
-        }
+        let pkt = match versioned {
+            VersionedPacket::V2(pkt) => pkt,
+            VersionedPacket::V1(_) => panic!("unified protocol emits V2 packets only"),
+        };
+        assert!(
+            pkt.header.flags.contains(PacketFlagsV2::ENCRYPTED),
+            "expected ENCRYPTED flag on application data"
+        );
+        server_session
+            .decrypt_packet(&pkt.header, &pkt.payload)
+            .expect("decrypt application data")
     }
 
-    /// Helper: build an encrypted reply frame from the test server
-    /// side. Wire-version-aware — emits V1 or V2 based on the
-    /// negotiated `wire_version()`.
+    /// Helper: build an encrypted reply frame from the test server side.
     fn encrypt_outgoing(
         server_session: &crate::transport::session::Session,
         session_id: SessionId,
@@ -1931,34 +1761,21 @@ mod tests {
         sequence: u32,
         payload: &[u8],
     ) -> Vec<u8> {
-        if server_session.wire_version() == 2 {
-            let flag_bits = PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED;
-            let header = PacketHeaderV2::new(
-                session_id,
-                stream_id,
-                sequence,
-                PacketFlagsV2::new(flag_bits),
-            )
-            .with_epoch(server_session.current_epoch());
-            let ct = server_session
-                .encrypt_packet_v2(&header, payload)
-                .expect("encrypt V2 reply");
-            let packet = PhantomPacketV2::new(header, ct).into_versioned();
-            let mut buf = Vec::new();
-            let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
-            buf[..size].to_vec()
-        } else {
-            let mut flags = PacketFlags::new(PacketFlags::RELIABLE);
-            flags.set(PacketFlags::ENCRYPTED);
-            let header = PacketHeader::new(session_id, stream_id, sequence, flags);
-            let ct = server_session
-                .encrypt_packet(&header, payload)
-                .expect("encrypt V1 reply");
-            let packet = PhantomPacketV1::new(header, ct).into_versioned();
-            let mut buf = Vec::new();
-            let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
-            buf[..size].to_vec()
-        }
+        let flag_bits = PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED;
+        let header = PacketHeaderV2::new(
+            session_id,
+            stream_id,
+            sequence,
+            PacketFlagsV2::new(flag_bits),
+        )
+        .with_epoch(server_session.current_epoch());
+        let ct = server_session
+            .encrypt_packet(&header, payload)
+            .expect("encrypt reply");
+        let packet = PhantomPacketV2::new(header, ct).into_versioned();
+        let mut buf = Vec::new();
+        let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
+        buf[..size].to_vec()
     }
 
     /// Integration test: Client handshake via ChannelTransport with a
@@ -2156,7 +1973,7 @@ mod tests {
 
         tokio::time::pause();
         let sid = fixed_session_id();
-        let (client, _server) = paired_v2_sessions(sid);
+        let (client, _server) = paired_sessions(sid);
 
         let stream = Arc::new(TransportStream::new(1));
         stream.send_reliable(Bytes::from("payload")).await;
@@ -2185,7 +2002,7 @@ mod tests {
     #[tokio::test]
     async fn drain_withholds_new_data_when_inflight_exceeds_cwnd() {
         let sid = fixed_session_id();
-        let (client, _server) = paired_v2_sessions(sid);
+        let (client, _server) = paired_sessions(sid);
 
         // Drive inflight far above any plausible initial cwnd, so the window
         // has no room for new data.
@@ -2221,14 +2038,11 @@ mod tests {
 
     /// Build two `InnerSession` instances that share a 32-byte secret —
     /// one as the "client" (peer_side=false), one as the "server"
-    /// (peer_side=true) — and force them onto wire_version=2. Mirrors
-    /// the role split after a real handshake.
-    fn paired_v2_sessions(session_id: SessionId) -> (Arc<InnerSession>, Arc<InnerSession>) {
+    /// (peer_side=true). Mirrors the role split after a real handshake.
+    fn paired_sessions(session_id: SessionId) -> (Arc<InnerSession>, Arc<InnerSession>) {
         let secret = [0x11u8; 32];
         let client = Arc::new(InnerSession::new(session_id, &secret, false).unwrap());
         let server = Arc::new(InnerSession::new(session_id, &secret, true).unwrap());
-        client.set_wire_version(2);
-        server.set_wire_version(2);
         (client, server)
     }
 
@@ -2238,8 +2052,8 @@ mod tests {
 
     /// Encrypt a V2 application-data packet from the client side at
     /// `stream_id` / `sequence`. The returned bytes are alkahest-
-    /// serialised and ready to feed into `handle_v2_packet`.
-    fn build_v2_app_frame(
+    /// serialised and ready to feed into `handle_packet`.
+    fn build_app_frame(
         client_session: &InnerSession,
         session_id: SessionId,
         stream_id: TransportStreamId,
@@ -2255,8 +2069,8 @@ mod tests {
         )
         .with_epoch(client_session.current_epoch());
         let ciphertext = client_session
-            .encrypt_packet_v2(&header, payload)
-            .expect("encrypt_packet_v2");
+            .encrypt_packet(&header, payload)
+            .expect("encrypt_packet");
         let packet = PhantomPacketV2::new(header, ciphertext).into_versioned();
         let mut buf = Vec::new();
         let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
@@ -2266,14 +2080,14 @@ mod tests {
     #[tokio::test]
     async fn v2_recv_routes_encrypted_app_data_through_recv_channel() {
         let session_id = fixed_session_id();
-        let (client_session, server_session) = paired_v2_sessions(session_id);
+        let (client_session, server_session) = paired_sessions(session_id);
 
         // Encrypt a V2 application-data packet on the client side.
         let stream_id: TransportStreamId = 1;
-        let frame = build_v2_app_frame(&client_session, session_id, stream_id, 0, b"hello-v2");
+        let frame = build_app_frame(&client_session, session_id, stream_id, 0, b"hello-v2");
 
         // Receive on the server side: deserialize then drive
-        // handle_v2_packet, which is the recv-path entry point.
+        // handle_packet, which is the recv-path entry point.
         let versioned = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&frame).unwrap();
         let v2 = match versioned {
             VersionedPacket::V2(p) => p,
@@ -2293,7 +2107,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
         let mut window_update_seq: u32 = 0;
-        handle_v2_packet(
+        handle_packet(
             v2,
             session_id,
             &server_session,
@@ -2320,7 +2134,7 @@ mod tests {
         // ENCRYPTED flag but with a non-empty plaintext-looking payload
         // must be dropped, mirroring the V1 invariant.
         let session_id = fixed_session_id();
-        let (_, server_session) = paired_v2_sessions(session_id);
+        let (_, server_session) = paired_sessions(session_id);
 
         let stream_id: TransportStreamId = 2;
         let bad_header = PacketHeaderV2::new(
@@ -2344,7 +2158,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
         let mut window_update_seq: u32 = 0;
-        handle_v2_packet(
+        handle_packet(
             bad_packet,
             session_id,
             &server_session,
@@ -2373,7 +2187,7 @@ mod tests {
         use crate::transport::packet_coalescer::{CoalescerConfig, PacketCoalescer};
 
         let session_id = fixed_session_id();
-        let (client_session, server_session) = paired_v2_sessions(session_id);
+        let (client_session, server_session) = paired_sessions(session_id);
 
         // Build a COALESCED bundle of three sub-payloads.
         let mut coalescer = PacketCoalescer::new(CoalescerConfig::default());
@@ -2389,7 +2203,7 @@ mod tests {
         let header = PacketHeaderV2::new(session_id, stream_id, 0, PacketFlagsV2::new(flag_bits))
             .with_epoch(client_session.current_epoch());
         let ciphertext = client_session
-            .encrypt_packet_v2(&header, &bundle)
+            .encrypt_packet(&header, &bundle)
             .expect("encrypt bundle");
         let v2 = PhantomPacketV2::new(header, ciphertext);
 
@@ -2406,7 +2220,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
         let mut window_update_seq: u32 = 0;
-        handle_v2_packet(
+        handle_packet(
             v2,
             session_id,
             &server_session,
@@ -2440,7 +2254,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let session_id = fixed_session_id();
-        let (client_session, _server_session) = paired_v2_sessions(session_id);
+        let (client_session, _server_session) = paired_sessions(session_id);
 
         // The default Pacer is `unlimited` — track it before/after.
         assert!(!client_session.pacer().is_enabled());
@@ -2489,9 +2303,9 @@ mod tests {
         use crate::transport::stream::INITIAL_STREAM_WINDOW;
 
         let session_id = fixed_session_id();
-        let (client_session, server_session) = paired_v2_sessions(session_id);
+        let (client_session, server_session) = paired_sessions(session_id);
 
-        // Register a stream on the server side so handle_v2_packet
+        // Register a stream on the server side so handle_packet
         // can record the bytes-consumed accounting. The stream id
         // matches the packet header.
         let stream_id: TransportStreamId = 9;
@@ -2512,9 +2326,9 @@ mod tests {
         // Build a single large app-data packet that crosses the
         // server's half-window threshold in one shot.
         let big = vec![0u8; (INITIAL_STREAM_WINDOW / 2 + 1) as usize];
-        let frame = build_v2_app_frame(&client_session, session_id, stream_id, 0, &big);
+        let frame = build_app_frame(&client_session, session_id, stream_id, 0, &big);
 
-        // Server processes the packet via handle_v2_packet. We
+        // Server processes the packet via handle_packet. We
         // capture its outbound transport so we can intercept the
         // WINDOW_UPDATE it emits.
         let versioned = alkahest::deserialize::<VersionedPacket, VersionedPacket>(&frame).unwrap();
@@ -2537,7 +2351,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
         let mut window_update_seq: u32 = 0;
-        handle_v2_packet(
+        handle_packet(
             v2,
             session_id,
             &server_session,
@@ -2570,7 +2384,7 @@ mod tests {
             if pv2.header.flags.contains(PacketFlagsV2::WINDOW_UPDATE) {
                 // Decrypt the payload to read the new window.
                 let pt = client_session
-                    .decrypt_packet_v2(&pv2.header, &pv2.payload)
+                    .decrypt_packet(&pv2.header, &pv2.payload)
                     .expect("decrypt WINDOW_UPDATE");
                 assert_eq!(pt.len(), 4);
                 announced = Some(u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]));
@@ -2599,7 +2413,7 @@ mod tests {
         // Build a real Session (any crypto state — we only inspect
         // send order, not ciphertext) and an Arc<Stream> per stream.
         let session_id = fixed_session_id();
-        let (client_session, _server_session) = paired_v2_sessions(session_id);
+        let (client_session, _server_session) = paired_sessions(session_id);
 
         // Capture every outbound packet by stuffing into a channel-
         // backed transport whose tx end we can drain after.
@@ -2650,7 +2464,7 @@ mod tests {
             // Decrypt under the SERVER role so the per-direction key
             // matches the client-side encrypt.
             let plaintext = _server_session
-                .decrypt_packet_v2(&v2.header, &v2.payload)
+                .decrypt_packet(&v2.header, &v2.payload)
                 .expect("decrypt");
             let tag: &'static str = match &plaintext[..] {
                 b"H0" => "H0",
@@ -2684,7 +2498,7 @@ mod tests {
         // PATH_VALIDATION packet on a new path id and must echo the
         // 32-byte payload back via the transport.
         let session_id = fixed_session_id();
-        let (client_session, server_session) = paired_v2_sessions(session_id);
+        let (client_session, server_session) = paired_sessions(session_id);
 
         // Build a PATH_VALIDATION packet with ENCRYPTED + path_id=7.
         let path_id: u8 = 7;
@@ -2694,7 +2508,7 @@ mod tests {
             .with_epoch(client_session.current_epoch())
             .with_path_id(path_id);
         let ciphertext = client_session
-            .encrypt_packet_v2(&header, &payload)
+            .encrypt_packet(&header, &payload)
             .expect("encrypt challenge");
         let v2 = PhantomPacketV2::new(header, ciphertext);
 
@@ -2715,7 +2529,7 @@ mod tests {
         let mut path_validation_seq: u32 = 100;
         let mut window_update_seq: u32 = 0;
 
-        handle_v2_packet(
+        handle_packet(
             v2,
             session_id,
             &server_session,

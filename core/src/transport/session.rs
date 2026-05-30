@@ -81,25 +81,10 @@ impl CryptoState {
         })
     }
 
-    /// Encrypt data
-    pub fn encrypt(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CoreError> {
-        self.session
-            .encrypt(aad, plaintext)
-            .map_err(|e| CoreError::CryptoError(e.to_string()))
-    }
-
-    /// Decrypt data
-    pub fn decrypt(&self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CoreError> {
-        self.session
-            .decrypt(aad, ciphertext)
-            .map_err(|e| CoreError::CryptoError(e.to_string()))
-    }
-
-    /// V2-path encrypt: caller supplies the 12-byte nonce explicitly. Used
-    /// by `Session::encrypt_packet_v2`, which constructs the nonce from the
-    /// authenticated `(epoch, stream_id, sequence)` of the V2 header — this
-    /// removes the V1 dependency on an internal monotonic counter and lets
-    /// the receiver survive failed decrypts without desyncing.
+    /// Encrypt with a caller-supplied 12-byte nonce. Used by
+    /// `Session::encrypt_packet`, which constructs the nonce from the
+    /// authenticated `(epoch, stream_id, sequence, path_id)` of the packet
+    /// header — so the receiver survives failed decrypts without desyncing.
     pub fn encrypt_with_nonce(
         &self,
         nonce: [u8; 12],
@@ -185,11 +170,6 @@ pub struct Session {
     /// in the `Validated` state so legacy single-leg sessions keep
     /// working without any explicit setup.
     path_registry: Arc<PathRegistry>,
-    /// Negotiated wire-format version (Phase 1.8). 1 = V1, 2 = V2. Set at
-    /// handshake completion from the `ClientHello.version` (which is
-    /// transcript-bound, defeating wire-level downgrade). Used by the
-    /// data pump to pick `encrypt_packet` (V1) vs `encrypt_packet_v2`.
-    wire_version: AtomicU8,
     /// Outbound rate-limiter (Phase 2.6). Defaults to
     /// [`Pacer::unlimited`] so the historical no-pacing behavior is
     /// unchanged unless the caller explicitly sets a rate via
@@ -241,7 +221,6 @@ impl Session {
             replay_windows: DashMap::new(),
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
-            wire_version: AtomicU8::new(1),
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
@@ -280,7 +259,6 @@ impl Session {
             replay_windows: DashMap::new(),
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
-            wire_version: AtomicU8::new(1),
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
@@ -314,7 +292,6 @@ impl Session {
             replay_windows: DashMap::new(),
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
-            wire_version: AtomicU8::new(1),
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
@@ -358,56 +335,6 @@ impl Session {
     /// Get number of active streams
     pub fn stream_count(&self) -> u32 {
         self.streams.read().len() as u32
-    }
-
-    /// Encrypt a packet payload
-    pub fn encrypt_packet(
-        &self,
-        header: &PacketHeader,
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, CoreError> {
-        let mut header_bytes = Vec::new();
-        alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
-        self.crypto.load().encrypt(&header_bytes, plaintext)
-    }
-
-    /// Decrypt a packet payload.
-    ///
-    /// **Replay protection (defense in depth).** The AEAD layer already
-    /// cryptographically prevents replay: each `decrypt` call advances the
-    /// per-direction `recv_counter`, and a replayed ciphertext was sealed
-    /// against an earlier counter — the derived nonce no longer matches,
-    /// AEAD authentication fails. On top of that, this function consults
-    /// a per-stream sliding-window replay table keyed on `header.sequence`
-    /// (which is authenticated by the AEAD AAD), giving operators an
-    /// observable `ReplayDetected` error and a `replay_rejected_total`
-    /// counter for telemetry.
-    ///
-    /// The window check runs **after** successful AEAD verification so we
-    /// never key off un-authenticated sequence numbers.
-    pub fn decrypt_packet(
-        &self,
-        header: &PacketHeader,
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, CoreError> {
-        let mut header_bytes = Vec::new();
-        alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
-        let plaintext = self.crypto.load().decrypt(&header_bytes, ciphertext)?;
-
-        // Sliding-window replay check. Lazily create the per-stream window.
-        let window_entry = self
-            .replay_windows
-            .entry(header.stream_id)
-            .or_insert_with(|| Mutex::new(ReplayWindow::new()));
-        let accepted = window_entry.lock().accept(header.sequence);
-        if !accepted {
-            self.replay_rejected_total.fetch_add(1, Ordering::Relaxed);
-            return Err(CoreError::ReplayDetected(format!(
-                "stream {} sequence {} already seen (within window) or beyond window",
-                header.stream_id, header.sequence
-            )));
-        }
-        Ok(plaintext)
     }
 
     /// Total number of replayed packets rejected by the sliding-window check
@@ -541,27 +468,6 @@ impl Session {
         self.path_registry.mark_seen(path_id);
     }
 
-    // ── Wire-format version negotiation (Phase 1.8) ───────────────────
-
-    /// Negotiated wire-format version. `1` = V1 (default), `2` = V2.
-    /// Lock-free atomic read; safe to call per-packet.
-    pub fn wire_version(&self) -> u8 {
-        self.wire_version.load(Ordering::Acquire)
-    }
-
-    /// Set the negotiated wire-format version. Called by the handshake
-    /// once the peer's offered version has been authenticated (it lives
-    /// inside `ClientHello`, which the transcript signature covers).
-    ///
-    /// Refuses unknown versions silently — the handshake layer rejects
-    /// them earlier with `HandshakeError::UnsupportedVersion`, so reaching
-    /// here with `version > 2` would mean a logic bug upstream.
-    pub fn set_wire_version(&self, version: u8) {
-        if matches!(version, 1 | 2) {
-            self.wire_version.store(version, Ordering::Release);
-        }
-    }
-
     // ── Pacer / BandwidthEstimator (Phase 2.6) ─────────────────────────
 
     /// Shared handle to this session's outbound rate-limiter. Cheap to
@@ -634,7 +540,7 @@ impl Session {
         self.send_notify.notify_one();
     }
 
-    /// Build the V2 AEAD nonce from the authenticated header fields.
+    /// Build the AEAD nonce from the authenticated header fields.
     ///
     /// Layout (12 bytes total):
     /// ```text
@@ -651,7 +557,7 @@ impl Session {
     /// packet replayed across paths (Phase 4.2 multi-path). Together the
     /// 12-byte nonce is unique for every `seal_in_place_*` invocation
     /// under the given key.
-    fn build_v2_nonce(prefix: [u8; 4], header: &PacketHeaderV2) -> [u8; 12] {
+    fn build_packet_nonce(prefix: [u8; 4], header: &PacketHeaderV2) -> [u8; 12] {
         let mut n = [0u8; 12];
         n[..4].copy_from_slice(&prefix);
         n[4] = header.epoch;
@@ -661,49 +567,47 @@ impl Session {
         n
     }
 
-    /// Encrypt a V2 packet payload (wire format V2).
+    /// Encrypt a packet payload.
     ///
     /// The AEAD nonce is derived from the authenticated `(epoch, stream_id,
-    /// sequence, path_id)` fields of the V2 header rather than from an
-    /// internal monotonic counter — this is the key behavioural difference
-    /// versus the V1 path. The AAD is the alkahest-serialised
-    /// `PacketHeaderV2`, so any wire-level mutation invalidates the tag.
-    ///
-    /// A V1 ciphertext cannot be replayed against `decrypt_packet_v2`: the
-    /// header layouts differ in serialised length and content, so the AAD
-    /// bytes are distinct even for "the same" stream/sequence combination.
-    pub fn encrypt_packet_v2(
+    /// sequence, path_id)` fields of the packet header rather than from an
+    /// internal monotonic counter, so a failed peer decrypt never desyncs the
+    /// receiver. The AAD is the alkahest-serialised header, so any wire-level
+    /// mutation invalidates the tag.
+    pub fn encrypt_packet(
         &self,
         header: &PacketHeaderV2,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CoreError> {
         let crypto = self.crypto.load();
-        let nonce = Self::build_v2_nonce(crypto.nonce_prefix(), header);
+        let nonce = Self::build_packet_nonce(crypto.nonce_prefix(), header);
         let mut header_bytes = Vec::new();
         alkahest::serialize_to_vec::<PacketHeaderV2, _>(header, &mut header_bytes);
         crypto.encrypt_with_nonce(nonce, &header_bytes, plaintext)
     }
 
-    /// Decrypt a V2 packet payload (wire format V2). Performs AEAD verify
-    /// + per-stream sliding-window replay rejection.
+    /// Decrypt a packet payload. Performs AEAD verify + per-stream
+    /// sliding-window replay rejection (the window check runs **after** a
+    /// successful AEAD open — Invariant 4 — so we never key off
+    /// un-authenticated sequence numbers).
     ///
-    /// Unlike the V1 path, a failed decrypt does NOT desync future
-    /// decrypts: the AEAD nonce is derived from this packet's authenticated
-    /// header fields, so the receiver state stays in lock-step with the
-    /// sender regardless of intervening bad packets.
-    pub fn decrypt_packet_v2(
+    /// A failed decrypt does NOT desync future decrypts: the AEAD nonce is
+    /// derived from this packet's authenticated header fields, so the receiver
+    /// stays in lock-step with the sender regardless of intervening bad
+    /// packets.
+    pub fn decrypt_packet(
         &self,
         header: &PacketHeaderV2,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CoreError> {
         let crypto = self.crypto.load();
-        let nonce = Self::build_v2_nonce(crypto.nonce_prefix(), header);
+        let nonce = Self::build_packet_nonce(crypto.nonce_prefix(), header);
         let mut header_bytes = Vec::new();
         alkahest::serialize_to_vec::<PacketHeaderV2, _>(header, &mut header_bytes);
         let plaintext = crypto.decrypt_with_nonce(nonce, &header_bytes, ciphertext)?;
 
         // Sliding-window guard. ReplayWindow keys on `(stream_id, sequence)`
-        // only — the V2 `epoch` / `path_id` fields do NOT contribute to the
+        // only — the `epoch` / `path_id` fields do NOT contribute to the
         // replay identity because replay is a property of "is this sequence
         // a duplicate", independent of which path it arrived over or which
         // rekey generation produced it.
@@ -715,7 +619,7 @@ impl Session {
         if !accepted {
             self.replay_rejected_total.fetch_add(1, Ordering::Relaxed);
             return Err(CoreError::ReplayDetected(format!(
-                "stream {} sequence {} (V2) already seen or beyond window",
+                "stream {} sequence {} already seen or beyond window",
                 header.stream_id, header.sequence
             )));
         }
