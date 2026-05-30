@@ -7,9 +7,9 @@
 //!
 //! ## Frame layout
 //!
-//! A PATH_VALIDATION frame is a V2 `PhantomPacketV2` with:
+//! A PATH_VALIDATION frame is a V2 `PhantomPacket` with:
 //!
-//! - `header.flags` ⊇ [`PacketFlagsV2::PATH_VALIDATION`]
+//! - `header.flags` ⊇ [`PacketFlags::PATH_VALIDATION`]
 //! - `header.path_id` = the path the validation is for
 //! - `header.stream_id` = 0 (control stream)
 //! - `header.sequence` = caller-chosen (typically a small monotonic
@@ -38,8 +38,7 @@
 
 use crate::transport::path::PATH_CHALLENGE_LEN;
 use crate::transport::types::{
-    PacketFlagsV2, PacketHeaderV2, PhantomPacketV2, SequenceNumber, SessionId, StreamId,
-    VersionedPacket,
+    PacketFlags, PacketHeader, PhantomPacket, SequenceNumber, SessionId, StreamId,
 };
 
 /// Whether a frame carries an outgoing challenge or an echoed
@@ -63,16 +62,16 @@ pub fn build_path_validation_packet(
     path_id: u8,
     sequence: SequenceNumber,
     payload: [u8; PATH_CHALLENGE_LEN],
-) -> VersionedPacket {
+) -> PhantomPacket {
     let stream_id: StreamId = 0;
-    let header = PacketHeaderV2::new(
+    let header = PacketHeader::new(
         session_id,
         stream_id,
         sequence,
-        PacketFlagsV2::new(PacketFlagsV2::PATH_VALIDATION),
+        PacketFlags::new(PacketFlags::PATH_VALIDATION),
     )
     .with_path_id(path_id);
-    PhantomPacketV2::new(header, payload.to_vec()).into_versioned()
+    PhantomPacket::new(header, payload.to_vec())
 }
 
 /// A parsed incoming PATH_VALIDATION frame, with all fields the
@@ -93,9 +92,9 @@ pub struct ParsedPathValidation {
 /// - `Err(...)` when the PATH_VALIDATION flag is set but the payload
 ///   length is wrong.
 pub fn parse_path_validation(
-    packet: &PhantomPacketV2,
+    packet: &PhantomPacket,
 ) -> Result<Option<ParsedPathValidation>, PathValidationParseError> {
-    if !packet.header.flags.contains(PacketFlagsV2::PATH_VALIDATION) {
+    if !packet.header.flags.contains(PacketFlags::PATH_VALIDATION) {
         return Ok(None);
     }
     if packet.payload.len() != PATH_CHALLENGE_LEN {
@@ -143,10 +142,9 @@ mod tests {
     #[test]
     fn build_round_trip_preserves_path_id_and_payload() {
         let payload = [0xAA; PATH_CHALLENGE_LEN];
-        let v = build_path_validation_packet(fixed_session_id(), 7, 42, payload);
-        let v2 = v.as_v2().expect("built as V2");
+        let v2 = build_path_validation_packet(fixed_session_id(), 7, 42, payload);
         assert_eq!(v2.header.path_id, 7);
-        assert!(v2.header.flags.contains(PacketFlagsV2::PATH_VALIDATION));
+        assert!(v2.header.flags.contains(PacketFlags::PATH_VALIDATION));
         assert_eq!(v2.header.stream_id, 0u16);
         assert_eq!(v2.header.sequence, 42u32);
         assert_eq!(v2.payload, payload.to_vec());
@@ -155,8 +153,7 @@ mod tests {
     #[test]
     fn parse_path_validation_returns_payload_on_match() {
         let payload = [0xCC; PATH_CHALLENGE_LEN];
-        let v = build_path_validation_packet(fixed_session_id(), 3, 1, payload);
-        let v2 = v.into_v2().unwrap();
+        let v2 = build_path_validation_packet(fixed_session_id(), 3, 1, payload);
         let parsed = parse_path_validation(&v2).expect("ok").expect("some");
         assert_eq!(parsed.path_id, 3);
         assert_eq!(parsed.payload, payload);
@@ -164,26 +161,26 @@ mod tests {
 
     #[test]
     fn parse_returns_none_when_flag_missing() {
-        let header = PacketHeaderV2::new(
+        let header = PacketHeader::new(
             fixed_session_id(),
             0u16,
             0u32,
-            PacketFlagsV2::new(PacketFlagsV2::ENCRYPTED), // not PATH_VALIDATION
+            PacketFlags::new(PacketFlags::ENCRYPTED), // not PATH_VALIDATION
         );
-        let p = PhantomPacketV2::new(header, vec![0u8; PATH_CHALLENGE_LEN]);
+        let p = PhantomPacket::new(header, vec![0u8; PATH_CHALLENGE_LEN]);
         let parsed = parse_path_validation(&p).expect("no error");
         assert!(parsed.is_none());
     }
 
     #[test]
     fn parse_errors_on_wrong_payload_length() {
-        let header = PacketHeaderV2::new(
+        let header = PacketHeader::new(
             fixed_session_id(),
             0u16,
             0u32,
-            PacketFlagsV2::new(PacketFlagsV2::PATH_VALIDATION),
+            PacketFlags::new(PacketFlags::PATH_VALIDATION),
         );
-        let p = PhantomPacketV2::new(header, vec![0u8; 16]); // wrong length
+        let p = PhantomPacket::new(header, vec![0u8; 16]); // wrong length
         let err = parse_path_validation(&p).expect_err("err");
         assert_eq!(
             err,
@@ -202,8 +199,8 @@ mod tests {
 
         let mut buf_a = Vec::new();
         let mut buf_b = Vec::new();
-        let _ = alkahest::serialize_to_vec::<VersionedPacket, _>(&a, &mut buf_a);
-        let _ = alkahest::serialize_to_vec::<VersionedPacket, _>(&b, &mut buf_b);
+        let _ = alkahest::serialize_to_vec::<PhantomPacket, _>(&a, &mut buf_a);
+        let _ = alkahest::serialize_to_vec::<PhantomPacket, _>(&b, &mut buf_b);
         assert_eq!(buf_a, buf_b);
     }
 
@@ -240,11 +237,9 @@ mod tests {
         // and parse on side B.
         let outgoing = build_path_validation_packet(session_id, path_id, 0, challenge);
         let mut buf = Vec::new();
-        let (n, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&outgoing, &mut buf);
-        let parsed_packet: VersionedPacket =
-            alkahest::deserialize::<VersionedPacket, VersionedPacket>(&buf[..n])
-                .expect("deserialize");
-        let v2 = parsed_packet.into_v2().expect("v2");
+        let (n, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&outgoing, &mut buf);
+        let v2 = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf[..n])
+            .expect("deserialize");
         let parsed = parse_path_validation(&v2)
             .expect("ok")
             .expect("flag matched");
@@ -255,11 +250,9 @@ mod tests {
         // entry to do that — it just mirrors whatever it saw.)
         let response = build_path_validation_packet(session_id, path_id, 0, parsed.payload);
         let mut buf2 = Vec::new();
-        let (m, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&response, &mut buf2);
-        let echoed: VersionedPacket =
-            alkahest::deserialize::<VersionedPacket, VersionedPacket>(&buf2[..m])
-                .expect("deserialize");
-        let v2_echoed = echoed.into_v2().expect("v2");
+        let (m, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&response, &mut buf2);
+        let v2_echoed = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf2[..m])
+            .expect("deserialize");
         let echoed_parsed = parse_path_validation(&v2_echoed)
             .expect("ok")
             .expect("flag matched");
@@ -285,8 +278,7 @@ mod tests {
         // Build a corrupt response: same path/header, flipped bytes.
         let mut tampered = challenge;
         tampered[7] ^= 0xFF;
-        let pkt = build_path_validation_packet(fixed_session_id(), 2, 0, tampered);
-        let v2 = pkt.into_v2().unwrap();
+        let v2 = build_path_validation_packet(fixed_session_id(), 2, 0, tampered);
         let parsed = parse_path_validation(&v2).unwrap().unwrap();
 
         assert!(!validator.verify_response(parsed.path_id, &parsed.payload));

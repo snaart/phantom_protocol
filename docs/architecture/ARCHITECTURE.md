@@ -87,8 +87,8 @@ spawn run_data_pump(crypto_session, ...)         spawn run_data_pump(server_sess
                                                   via PhantomSession::from_accepted_server_session
     ↓                                                 ↓
 
-    ──── encrypted PhantomPacketV1 frames ────────────►
-    ◄─── encrypted PhantomPacketV1 frames ─────────────
+    ──── encrypted PhantomPacket frames ──────────────►
+    ◄─── encrypted PhantomPacket frames ───────────────
 ```
 
 ### The shared data pump (`api/session.rs::run_data_pump`)
@@ -124,7 +124,7 @@ handles both directions of data after the handshake derives the
 | `HandshakeClient` | Per-connection ephemeral state — KEM key pair, signing key pair, nonce. `ZeroizeOnDrop`. |
 | `Stream` | Per-stream send/recv buffers, sequence counters, reliability machinery |
 | `Scheduler` | Multi-leg path selection (currently placeholder for future Phase 4.2 migration) |
-| `PacketHeader` / `PhantomPacketV1` / `VersionedPacket` | Wire types |
+| `PacketHeader` / `PhantomPacket` | Wire types |
 | `legs/{tcp,kcp,faketls}` | `TransportLeg` trait impls |
 | `BufferPool`, `Pacer`, `PacketCoalescer`, `BandwidthEstimator` | Performance infrastructure — most not yet wired in (Phase 2.1, 2.4, 2.5, 2.6) |
 
@@ -241,12 +241,12 @@ allocator reuses the memory.
 ## 7. Wire framing
 
 For TCP-based legs (`TcpSessionTransport`, `legs/tcp.rs`), every
-`PhantomPacketV1` is wrapped in a 4-byte big-endian length prefix on the
+`PhantomPacket` is wrapped in a 4-byte big-endian length prefix on the
 TCP byte stream:
 
 ```
-[len: u32 BE][alkahest-encoded VersionedPacket]
-[len: u32 BE][alkahest-encoded VersionedPacket]
+[len: u32 BE][alkahest-encoded PhantomPacket]
+[len: u32 BE][alkahest-encoded PhantomPacket]
 ...
 ```
 
@@ -325,8 +325,8 @@ Hot paths still on the deferred list:
 
 ## 11. Roadmap for evolution
 
-The architecture sketched here is the V1 baseline. The major moves in
-the eight-phase production-readiness plan:
+The architecture sketched here is the single-protocol baseline. The major
+moves in the eight-phase production-readiness plan:
 
 - **Phase 3**: introduce a `Runtime` trait between the API layer and
   the tokio types, so WASM / embedded backends can drop into the same
@@ -334,8 +334,8 @@ the eight-phase production-readiness plan:
   `TokioRuntime` as the default impl; call-site migration is in
   progress.
 - **Phase 4**: turn `Scheduler` from a placeholder into a real
-  multi-path / migration policy (V2 wire format is in place with
-  `header.path_id`; scheduler integration is the next step).
+  multi-path / migration policy (`PacketHeader.path_id` is in place;
+  scheduler integration is the next step).
 - **Phase 5**: gate the crypto layer behind `fips` feature so it can be
   built with ML-KEM / ML-DSA / aws-lc-rs primitives.
 - **Phase 4.5**: insert `tracing` instrumentation and `metrics`

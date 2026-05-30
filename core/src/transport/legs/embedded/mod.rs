@@ -476,48 +476,31 @@ mod tests {
     // at zero so parallel agents in adjacent modules can't conflict.
 
     use crate::api::session::{ConnectionState, PhantomSession};
-    use crate::transport::handshake::{
-        ClientHelloEnvelope, HandshakeResponse, HandshakeServer, HelloRetryRequestEnvelope,
-        ServerHelloEnvelope,
-    };
+    use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
     use crate::transport::types::{
-        PacketFlags, PacketFlagsV2, PacketHeader, PacketHeaderV2, PhantomPacketV1, PhantomPacketV2,
-        SessionId, StreamId as TransportStreamId, VersionedPacket,
+        PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
     };
 
     /// Decrypt an incoming encrypted frame on the test server side.
-    /// Wire-version-aware (V1 or V2). Local duplicate of the helper in
+    /// Local duplicate of the helper in
     /// `api::session::tests` — see module comment above.
     fn decrypt_incoming_local(
         server_session: &crate::transport::session::Session,
         bytes: &[u8],
     ) -> Vec<u8> {
-        let versioned = alkahest::deserialize::<VersionedPacket, VersionedPacket>(bytes)
-            .expect("deserialize VersionedPacket");
-        match versioned {
-            VersionedPacket::V1(pkt) => {
-                assert!(
-                    pkt.header.flags.contains(PacketFlags::ENCRYPTED),
-                    "expected ENCRYPTED flag on V1 application data"
-                );
-                server_session
-                    .decrypt_packet(&pkt.header, &pkt.payload)
-                    .expect("decrypt V1 application data")
-            }
-            VersionedPacket::V2(pkt) => {
-                assert!(
-                    pkt.header.flags.contains(PacketFlagsV2::ENCRYPTED),
-                    "expected ENCRYPTED flag on V2 application data"
-                );
-                server_session
-                    .decrypt_packet_v2(&pkt.header, &pkt.payload)
-                    .expect("decrypt V2 application data")
-            }
-        }
+        let pkt = alkahest::deserialize::<PhantomPacket, PhantomPacket>(bytes)
+            .expect("deserialize PhantomPacket");
+        assert!(
+            pkt.header.flags.contains(PacketFlags::ENCRYPTED),
+            "expected ENCRYPTED flag on application data"
+        );
+        server_session
+            .decrypt_packet(&pkt.header, &pkt.payload)
+            .expect("decrypt application data")
     }
 
     /// Build an encrypted reply frame from the test server side.
-    /// Wire-version-aware. Local duplicate of the helper in
+    /// Local duplicate of the helper in
     /// `api::session::tests` — see module comment above.
     fn encrypt_outgoing_local(
         server_session: &crate::transport::session::Session,
@@ -526,34 +509,21 @@ mod tests {
         sequence: u32,
         payload: &[u8],
     ) -> Vec<u8> {
-        if server_session.wire_version() == 2 {
-            let flag_bits = PacketFlagsV2::RELIABLE | PacketFlagsV2::ENCRYPTED;
-            let header = PacketHeaderV2::new(
-                session_id,
-                stream_id,
-                sequence,
-                PacketFlagsV2::new(flag_bits),
-            )
-            .with_epoch(server_session.current_epoch());
-            let ct = server_session
-                .encrypt_packet_v2(&header, payload)
-                .expect("encrypt V2 reply");
-            let packet = PhantomPacketV2::new(header, ct).into_versioned();
-            let mut buf = Vec::new();
-            let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
-            buf[..size].to_vec()
-        } else {
-            let mut flags = PacketFlags::new(PacketFlags::RELIABLE);
-            flags.set(PacketFlags::ENCRYPTED);
-            let header = PacketHeader::new(session_id, stream_id, sequence, flags);
-            let ct = server_session
-                .encrypt_packet(&header, payload)
-                .expect("encrypt V1 reply");
-            let packet = PhantomPacketV1::new(header, ct).into_versioned();
-            let mut buf = Vec::new();
-            let (size, _) = alkahest::serialize_to_vec::<VersionedPacket, _>(&packet, &mut buf);
-            buf[..size].to_vec()
-        }
+        let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
+        let header = PacketHeader::new(
+            session_id,
+            stream_id,
+            sequence,
+            PacketFlags::new(flag_bits),
+        )
+        .with_epoch(server_session.current_epoch());
+        let ct = server_session
+            .encrypt_packet(&header, payload)
+            .expect("encrypt reply");
+        let packet = PhantomPacket::new(header, ct);
+        let mut buf = Vec::new();
+        let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
+        buf[..size].to_vec()
     }
 
     /// `MockWriter` wrapper that tees every byte through to a side recorder
@@ -634,22 +604,16 @@ mod tests {
                     .await
                     .expect("recv ClientHello within 5s")
                     .expect("recv ClientHello frame");
-            let client_hello = match borsh::from_slice::<ClientHelloEnvelope>(&client_hello_bytes)
-                .expect("deserialize ClientHelloEnvelope")
-            {
-                ClientHelloEnvelope::V12(ch) => ch,
-                ClientHelloEnvelope::V3(_) => {
-                    panic!("test responder expects a V12 ClientHello")
-                }
-            };
+            let client_hello = borsh::from_slice::<ClientHello>(&client_hello_bytes)
+                .expect("deserialize ClientHello");
 
             // 2. Process — may retry with a cookie/PoW challenge.
             let server_session = loop {
                 let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
                 match response {
                     HandshakeResponse::Retry(retry) => {
-                        let retry_bytes = borsh::to_vec(&HelloRetryRequestEnvelope::V12(retry))
-                            .expect("serialize HelloRetryRequest");
+                        let retry_bytes =
+                            borsh::to_vec(&retry).expect("serialize HelloRetryRequest");
                         tokio::time::timeout(
                             Duration::from_secs(5),
                             server_leg.send_frame(&retry_bytes),
@@ -663,20 +627,13 @@ mod tests {
                                 .await
                                 .expect("recv retried ClientHello within 5s")
                                 .expect("recv retried ClientHello frame");
-                        let next_hello = match borsh::from_slice::<ClientHelloEnvelope>(&next_bytes)
-                            .expect("deserialize retried envelope")
-                        {
-                            ClientHelloEnvelope::V12(ch) => ch,
-                            ClientHelloEnvelope::V3(_) => {
-                                panic!("test responder expects a V12 ClientHello")
-                            }
-                        };
+                        let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
+                            .expect("deserialize retried ClientHello");
                         let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
                         match resp2 {
-                            HandshakeResponse::Success(server_hello, session) => {
+                            HandshakeResponse::Success(server_hello, session, _) => {
                                 let server_hello_bytes =
-                                    borsh::to_vec(&ServerHelloEnvelope::V12(server_hello))
-                                        .expect("serialize ServerHello");
+                                    borsh::to_vec(&server_hello).expect("serialize ServerHello");
                                 tokio::time::timeout(
                                     Duration::from_secs(5),
                                     server_leg.send_frame(&server_hello_bytes),
@@ -689,10 +646,9 @@ mod tests {
                             other => panic!("expected success after retry, got {other:?}"),
                         }
                     }
-                    HandshakeResponse::Success(server_hello, session) => {
+                    HandshakeResponse::Success(server_hello, session, _) => {
                         let server_hello_bytes =
-                            borsh::to_vec(&ServerHelloEnvelope::V12(server_hello))
-                                .expect("serialize ServerHello");
+                            borsh::to_vec(&server_hello).expect("serialize ServerHello");
                         tokio::time::timeout(
                             Duration::from_secs(5),
                             server_leg.send_frame(&server_hello_bytes),
@@ -701,9 +657,6 @@ mod tests {
                         .expect("send ServerHello within 5s")
                         .expect("send ServerHello frame");
                         break session;
-                    }
-                    HandshakeResponse::SuccessV3(..) => {
-                        panic!("V12 process_client_hello must not return SuccessV3")
                     }
                     HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
                 }

@@ -373,9 +373,7 @@ exactly as today.
 on:
 
 - `HandshakeServer::process_client_hello`
-- `HandshakeServer::process_client_hello_v3`
 - `HandshakeClient::process_server_hello`
-- `HandshakeClient::process_server_hello_v3`
 - `Session::rekey`
 - `Session::begin_path_validation` / `complete_path_validation`
 - `PhantomListener::accept`
