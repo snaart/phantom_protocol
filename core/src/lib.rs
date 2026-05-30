@@ -90,11 +90,7 @@ compile_error!(
 // on `wasm32-unknown-unknown` (the browser target with WebSocketLeg /
 // WasmRuntime) is a misconfiguration; fail the build loudly with a
 // pointer at the recipe.
-#[cfg(all(
-    feature = "wasi-leg",
-    target_arch = "wasm32",
-    not(target_os = "wasi")
-))]
+#[cfg(all(feature = "wasi-leg", target_arch = "wasm32", not(target_os = "wasi")))]
 compile_error!(
     "The `wasi-leg` Cargo feature is only supported on WASI targets \
      (wasm32-wasi, wasm32-wasip1, wasm32-wasip2). For \

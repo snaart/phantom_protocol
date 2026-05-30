@@ -229,10 +229,17 @@ fn first_diff(a: &[u8], b: &[u8]) -> String {
     let n = a.len().min(b.len());
     for i in 0..n {
         if a[i] != b[i] {
-            return format!("first diff at byte {i}: got 0x{:02x}, fixture 0x{:02x}", a[i], b[i]);
+            return format!(
+                "first diff at byte {i}: got 0x{:02x}, fixture 0x{:02x}",
+                a[i], b[i]
+            );
         }
     }
-    format!("identical for first {n} bytes; lengths differ ({} vs {})", a.len(), b.len())
+    format!(
+        "identical for first {n} bytes; lengths differ ({} vs {})",
+        a.len(),
+        b.len()
+    )
 }
 
 /// Assert `actual` equals the committed fixture `name`, or (re)write it when
@@ -273,8 +280,8 @@ fn vector_packet_header() {
         PacketHeader::SIZE
     );
     let frozen = freeze("packet_header.bin", &bytes);
-    let decoded = alkahest::deserialize::<PacketHeader, PacketHeader>(&frozen)
-        .expect("decode packet header");
+    let decoded =
+        alkahest::deserialize::<PacketHeader, PacketHeader>(&frozen).expect("decode packet header");
     assert_eq!(decoded, h);
     assert_eq!(decoded.version, WIRE_VERSION);
     assert_eq!(decoded.stream_id, 7);
@@ -287,8 +294,8 @@ fn vector_packet_header() {
 fn vector_phantom_packet_data() {
     let p = sample_packet_data();
     let frozen = freeze("phantom_packet_data.bin", &ser_packet(&p));
-    let decoded = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&frozen)
-        .expect("decode data packet");
+    let decoded =
+        alkahest::deserialize::<PhantomPacket, PhantomPacket>(&frozen).expect("decode data packet");
     assert_eq!(decoded, p);
     assert_eq!(decoded.payload, pat(0x11, 64));
     assert!(decoded.extensions.is_empty());
@@ -298,8 +305,8 @@ fn vector_phantom_packet_data() {
 fn vector_phantom_packet_ack() {
     let p = sample_packet_ack();
     let frozen = freeze("phantom_packet_ack.bin", &ser_packet(&p));
-    let decoded = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&frozen)
-        .expect("decode ack packet");
+    let decoded =
+        alkahest::deserialize::<PhantomPacket, PhantomPacket>(&frozen).expect("decode ack packet");
     assert_eq!(decoded, p);
     assert!(decoded.header.flags.is_ack());
     assert!(decoded.payload.is_empty());
@@ -309,10 +316,13 @@ fn vector_phantom_packet_ack() {
 fn vector_phantom_packet_extensions() {
     let p = sample_packet_ext();
     let frozen = freeze("phantom_packet_extensions.bin", &ser_packet(&p));
-    let decoded = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&frozen)
-        .expect("decode ext packet");
+    let decoded =
+        alkahest::deserialize::<PhantomPacket, PhantomPacket>(&frozen).expect("decode ext packet");
     assert_eq!(decoded, p);
-    assert_eq!(decoded.extensions, vec![0xFF, 0x01, 0x00, 0x04, b't', b'e', b's', b't']);
+    assert_eq!(
+        decoded.extensions,
+        vec![0xFF, 0x01, 0x00, 0x04, b't', b'e', b's', b't']
+    );
 }
 
 // ─── handshake vectors (borsh) ──────────────────────────────────────────────
@@ -321,10 +331,7 @@ fn vector_phantom_packet_extensions() {
 // canonical-re-encode (borsh has exactly one encoding per value) plus field
 // spot-checks.
 
-fn roundtrip_borsh<T: borsh::BorshSerialize + borsh::BorshDeserialize>(
-    name: &str,
-    value: &T,
-) -> T {
+fn roundtrip_borsh<T: borsh::BorshSerialize + borsh::BorshDeserialize>(name: &str, value: &T) -> T {
     let frozen = freeze(name, &ser_borsh(value));
     let decoded: T = borsh::from_slice(&frozen).expect("borsh decode");
     assert_eq!(

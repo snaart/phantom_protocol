@@ -247,9 +247,7 @@ impl Observability {
     pub fn record_fallback(&self, from_leg: LegType, to_leg: LegType, reason: FallbackReason) {
         self.instruments.record_fallback(from_leg, to_leg, reason);
     }
-
 }
-
 
 #[cfg(test)]
 mod tests {

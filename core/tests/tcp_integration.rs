@@ -124,9 +124,7 @@ async fn tcp_integration_zero_rtt_resumption_round_trip() {
         .await
         .expect("bind listener");
     let local = listener.local_addr();
-    let (host, port_str) = local
-        .rsplit_once(':')
-        .expect("local_addr is host:port");
+    let (host, port_str) = local.rsplit_once(':').expect("local_addr is host:port");
     let host = host.to_string();
     let port: u16 = port_str.parse().expect("port parses");
     let pinned = listener.verifying_key_bytes();
@@ -174,15 +172,10 @@ async fn tcp_integration_zero_rtt_resumption_round_trip() {
     );
 
     // ── Connection 2: 0-RTT resumption carrying early-data ──
-    let s2 = connect_pinned_with_resumption(
-        host,
-        port,
-        pinned,
-        hint,
-        b"zero-rtt-early-data".to_vec(),
-    )
-    .await
-    .expect("connect_pinned_with_resumption");
+    let s2 =
+        connect_pinned_with_resumption(host, port, pinned, hint, b"zero-rtt-early-data".to_vec())
+            .await
+            .expect("connect_pinned_with_resumption");
     s2.send(b"ping-2".to_vec()).await.expect("c2 send");
     let r2 = timeout(Duration::from_secs(5), s2.recv())
         .await

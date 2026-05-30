@@ -18,7 +18,9 @@
 
 use phantom_core::crypto::adaptive_crypto::{CipherSuite, CryptoSession};
 use phantom_core::security::ReplayWindow;
-use phantom_core::transport::types::{PacketFlags, PacketHeader, PhantomPacket, SessionId, WIRE_VERSION};
+use phantom_core::transport::types::{
+    PacketFlags, PacketHeader, PhantomPacket, SessionId, WIRE_VERSION,
+};
 use proptest::prelude::*;
 
 // ── AEAD round-trip ────────────────────────────────────────────────────────
