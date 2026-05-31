@@ -97,7 +97,7 @@ Both client and server, after their respective handshakes, spawn the same
 `run_data_pump` function. It owns:
 
 - A **receive task** spawned via `tokio::spawn`, looping
-  `transport.recv_bytes() → alkahest::deserialize → decrypt → route`.
+  `transport.recv_bytes() → PhantomPacket::from_wire → decrypt → route`.
 - A **main select! loop** in the calling task that picks among:
   - `poll_interval.tick()` every 10 ms — sweeps all streams for queued
     sends. (Event-driven replacement is Phase 2.4.)
@@ -136,8 +136,7 @@ when reasoning about confidentiality + integrity:
 
 ```rust
 pub fn encrypt_packet(&self, header: &PacketHeader, plaintext: &[u8]) -> Result<Vec<u8>, CoreError> {
-    let mut header_bytes = Vec::new();
-    alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
+    let header_bytes = header.to_wire(); // 45-byte big-endian image = AAD
     self.crypto.encrypt(&header_bytes, plaintext)
 }
 ```
@@ -188,7 +187,7 @@ This layer has the only two `#[allow(unsafe_code)]` modules in the crate
               │                                      │    ▼
               │  select! {                           │  ┌────────────────────────┐
               │    poll_interval.tick() => ...       │  │ transport.recv_bytes() │
-              │    cmd_rx.recv() => ...              │  │ alkahest::deserialize  │
+              │    cmd_rx.recv() => ...              │  │ PhantomPacket::from_wire│
               │    recv_handle => break;             │  │ AEAD decrypt + replay  │
               │  }                                   │  │ demux + recv_tx        │
               │                                      │  └────────────────────────┘
@@ -245,14 +244,14 @@ For TCP-based legs (`TcpSessionTransport`, `legs/tcp.rs`), every
 TCP byte stream:
 
 ```
-[len: u32 BE][alkahest-encoded PhantomPacket]
-[len: u32 BE][alkahest-encoded PhantomPacket]
+[len: u32 BE][PhantomPacket::to_wire image]
+[len: u32 BE][PhantomPacket::to_wire image]
 ...
 ```
 
 Maximum frame size: `MAX_FRAME_BYTES = 16 MiB`
 (`core/src/api/tcp_transport.rs:21`). Frames larger than the cap are
-rejected at the framing layer before alkahest sees them.
+rejected at the framing layer before the packet is parsed.
 
 KCP-based legs reuse KCP's own segmentation; FakeTLS wraps frames in
 fake TLS 1.3 records.
