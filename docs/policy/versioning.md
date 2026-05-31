@@ -17,7 +17,7 @@ And one pinned constant that is **not** an evolving axis (see §3):
 
 | Constant | Identifier | Lives in | Value |
 | --- | --- | --- | --- |
-| Wire-format version | `WIRE_VERSION` (packet-header byte) | `core/src/transport/types.rs` | `1` |
+| Wire-format version | `WIRE_VERSION` (packet-header byte) | `core/src/transport/types.rs` | `2` |
 | Protocol version | `PROTOCOL_VERSION` (`ClientHello.version`) | `core/src/transport/handshake.rs` | `1` |
 
 A single commit can move zero, one, or both of the live axes. Each axis has its
@@ -66,7 +66,9 @@ with, so there is nothing to negotiate against.
 
 Two constants pin the format:
 
-- `WIRE_VERSION = 1` — the leading byte of every `PacketHeader`
+- `WIRE_VERSION = 2` — the leading byte of every `PacketHeader` (bumped from
+  `1` when the packet codec moved off `alkahest` to the hand-rolled big-endian
+  layout; see `docs/protocol/PROTOCOL.md` § 4.2)
   (`transport/types.rs`). It leads the serialised bytes and the AEAD AAD.
 - `PROTOCOL_VERSION = 1` — `ClientHello.version` (`transport/handshake.rs`),
   bound into the signed handshake transcript.
