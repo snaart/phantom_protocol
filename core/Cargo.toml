@@ -39,7 +39,6 @@ std = [
     "dep:crossbeam-queue",
     "dep:crossbeam-utils",
     "dep:lz4_flex",
-    "dep:alkahest",
     "dep:base64",
     "dep:once_cell",
     "dep:anyhow",
@@ -152,14 +151,14 @@ async-trait = { version = "0.1", optional = true }
 # `std::io::Read`-style integration.
 bytes = { version = "1", default-features = false, features = ["serde"] }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
-# Wire-stability pin (Phase 6). `alkahest` encodes the on-wire packet
-# header + `PhantomPacket`; `borsh` encodes the handshake messages. The exact
-# serialized bytes are frozen by `core/tests/wire_vectors.rs` (and the transcript
-# hash by `transport::handshake::tests::transcript_hash_wire_vector`). A patch/
-# minor bump to either crate can silently shift those bytes and break interop
-# with no `WIRE_VERSION` change, so both are pinned to exact versions — bump them
-# only as a deliberate wire change, paired with a vector regeneration.
-alkahest = { version = "=0.3.0", optional = true, features = ["derive"] }
+# Wire-stability pin. `borsh` encodes the handshake messages (the packet header
+# + `PhantomPacket` use a hand-rolled big-endian codec, `PacketHeader::to_wire`,
+# so they have no serialization dependency). The exact serialized bytes are
+# frozen by `core/tests/wire_vectors.rs` (and the transcript hash by
+# `transport::handshake::tests::transcript_hash_wire_vector`). A patch/minor bump
+# to `borsh` can silently shift the handshake bytes and break interop with no
+# `WIRE_VERSION` change, so it is pinned to an exact version — bump it only as a
+# deliberate wire change, paired with a vector regeneration.
 borsh = { version = "=1.6.0", default-features = false, optional = true, features = ["derive"] }
 hex = { version = "0.4", default-features = false, optional = true, features = ["alloc"] }
 base64 = { version = "0.22", default-features = false, optional = true, features = ["alloc"] }

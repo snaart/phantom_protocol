@@ -6,9 +6,6 @@
 //! - PacketHeader, PacketFlags
 //! - PhantomPacket (the single on-wire data packet)
 
-#![allow(unused_assignments)]
-
-use alkahest::alkahest;
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::fmt;
 
@@ -17,7 +14,6 @@ use std::fmt;
 /// Used as salt for encryption and session persistence across IP changes.
 /// Post-quantum safe size (32 bytes = 256 bits).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[alkahest(Formula, SerializeRef, Deserialize)]
 pub struct SessionId(pub [u8; 32]);
 
 impl SessionId {
@@ -64,13 +60,35 @@ pub type StreamId = u16;
 pub type SequenceNumber = u32;
 
 /// The sole on-wire packet-header version byte. Pinned — the wire format is not
-/// negotiated (pre-1.0, no users); a decoder rejects anything else. It exists as
-/// a tamper-check anchor and a hook for a future, deliberate version increment.
-pub const WIRE_VERSION: u8 = 1;
+/// negotiated (pre-1.0, no users); a decoder rejects anything else. Incremented
+/// to `2` when the packet layout moved from `alkahest` to the explicit
+/// big-endian codec ([`PacketHeader::to_wire`] / [`PacketHeader::from_wire`]).
+pub const WIRE_VERSION: u8 = 2;
+
+/// Error decoding a packet header / packet from its on-wire bytes.
+///
+/// The explicit codec ([`PacketHeader::from_wire`] / [`PhantomPacket::from_wire`])
+/// has exactly one failure mode: the buffer is shorter than the structure it
+/// declares (a header underrun, or a length prefix that runs past the end of the
+/// buffer). A malformed frame is dropped, never a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireError {
+    /// The buffer is shorter than the declared structure.
+    Truncated,
+}
+
+impl fmt::Display for WireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WireError::Truncated => write!(f, "truncated packet"),
+        }
+    }
+}
+
+impl std::error::Error for WireError {}
 
 /// Packet flags bitfield (16-bit).
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-#[alkahest(Formula, SerializeRef, Deserialize)]
 pub struct PacketFlags(pub u16);
 
 impl PacketFlags {
@@ -210,31 +228,30 @@ impl fmt::Debug for PacketFlags {
 
 /// Packet header — 45 bytes on the wire (the AEAD AAD).
 ///
-/// The fields below are in **declaration** order; the on-wire byte order is
-/// different. `alkahest` emits a struct's fields in reverse declaration order,
-/// integers little-endian, and byte arrays reversed — so `path_id` is the first
-/// wire byte and `version` the last. The exact offsets are frozen by
-/// `core/tests/wire_vectors/packet_header.bin` and documented in
-/// `docs/protocol/PROTOCOL.md` § 4.2. Tamper resistance does not depend on byte
-/// position: the whole 45-byte header is the AEAD AAD, so flipping any byte
-/// (`version` included) fails decryption.
-/// - version: u8 — pinned [`WIRE_VERSION`]; the recv path drops a frame whose
-///   `version != WIRE_VERSION` after deserialising the packet.
-/// - session_id: [u8; 32] — 256-bit session identifier (salt)
-/// - stream_id: u16 — stream within session (0 = control)
-/// - sequence: u32 — per-stream sequence number
-/// - flags: u16 — packet flags
-/// - ack_delay: u16 — delay before ACK was sent, microseconds
-/// - epoch: u8 — rekey generation (0 at session establishment; bumps on each
-///   in-band rekey signal). Receiver derives the corresponding AEAD key.
-/// - path_id: u8 — which leg / path this packet was sent over. 0 = default.
+/// Serialised by [`PacketHeader::to_wire`] as an explicit, fixed **big-endian**
+/// (network byte order) image, `version` first — declaration order == wire
+/// order, no reordering, no reversed arrays:
+///
+/// ```text
+/// off  0  version    u8      (= WIRE_VERSION)
+/// off  1  session_id [u8;32]
+/// off 33  stream_id  u16 be
+/// off 35  sequence   u32 be
+/// off 39  flags      u16 be
+/// off 41  ack_delay  u16 be
+/// off 43  epoch      u8
+/// off 44  path_id    u8
+/// ```
+///
+/// The whole 45-byte image is the AEAD AAD, so flipping any byte (`version`
+/// included) fails decryption. The recv path additionally drops a frame whose
+/// `version != WIRE_VERSION`. Frozen by `core/tests/wire_vectors/packet_header.bin`;
+/// grammar in `docs/protocol/PROTOCOL.md` § 4.2.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[alkahest(Formula, SerializeRef, Deserialize)]
 #[repr(C)]
 pub struct PacketHeader {
-    /// On-wire packet-format version. Pinned to [`WIRE_VERSION`]. Declared
-    /// first, but alkahest emits it as the **last** of the 45 header bytes
-    /// (reverse field order); it is part of the AEAD AAD wherever it lands.
+    /// On-wire packet-format version. Pinned to [`WIRE_VERSION`]; the first wire
+    /// byte (see [`PacketHeader::to_wire`]).
     pub version: u8,
     /// 256-bit session identifier, used as encryption salt
     pub session_id: SessionId,
@@ -288,6 +305,42 @@ impl PacketHeader {
         self.path_id = path_id;
         self
     }
+
+    /// Serialise to the fixed 45 on-wire bytes (big-endian, `version` first).
+    /// This image is the AEAD AAD.
+    pub fn to_wire(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0] = self.version;
+        b[1..33].copy_from_slice(&self.session_id.0);
+        b[33..35].copy_from_slice(&self.stream_id.to_be_bytes());
+        b[35..39].copy_from_slice(&self.sequence.to_be_bytes());
+        b[39..41].copy_from_slice(&self.flags.0.to_be_bytes());
+        b[41..43].copy_from_slice(&self.ack_delay.to_be_bytes());
+        b[43] = self.epoch;
+        b[44] = self.path_id;
+        b
+    }
+
+    /// Parse a header from the first [`Self::SIZE`] bytes of `bytes`. Does not
+    /// validate `version` — the recv path gates on it separately so the same
+    /// parser serves both the version check and the codecs.
+    pub fn from_wire(bytes: &[u8]) -> Result<Self, WireError> {
+        if bytes.len() < Self::SIZE {
+            return Err(WireError::Truncated);
+        }
+        let mut session_id = [0u8; 32];
+        session_id.copy_from_slice(&bytes[1..33]);
+        Ok(Self {
+            version: bytes[0],
+            session_id: SessionId(session_id),
+            stream_id: u16::from_be_bytes([bytes[33], bytes[34]]),
+            sequence: u32::from_be_bytes([bytes[35], bytes[36], bytes[37], bytes[38]]),
+            flags: PacketFlags(u16::from_be_bytes([bytes[39], bytes[40]])),
+            ack_delay: u16::from_be_bytes([bytes[41], bytes[42]]),
+            epoch: bytes[43],
+            path_id: bytes[44],
+        })
+    }
 }
 
 impl fmt::Debug for PacketHeader {
@@ -304,9 +357,32 @@ impl fmt::Debug for PacketHeader {
     }
 }
 
+/// Read a `u32`-big-endian length prefix at `*pos`, then that many bytes,
+/// advancing `pos` past both. Bounds-checked (and overflow-safe on 32-bit
+/// targets) so a hostile length prefix yields [`WireError::Truncated`], never an
+/// out-of-bounds access.
+fn read_length_prefixed(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>, WireError> {
+    let start = *pos;
+    let len_end = start.checked_add(4).ok_or(WireError::Truncated)?;
+    if len_end > bytes.len() {
+        return Err(WireError::Truncated);
+    }
+    let len = u32::from_be_bytes([
+        bytes[start],
+        bytes[start + 1],
+        bytes[start + 2],
+        bytes[start + 3],
+    ]) as usize;
+    let data_end = len_end.checked_add(len).ok_or(WireError::Truncated)?;
+    if data_end > bytes.len() {
+        return Err(WireError::Truncated);
+    }
+    *pos = data_end;
+    Ok(bytes[len_end..data_end].to_vec())
+}
+
 /// Full packet with header and payload — the single on-wire data packet.
 #[derive(Clone, PartialEq, Eq)]
-#[alkahest(Formula, SerializeRef, Deserialize)]
 pub struct PhantomPacket {
     /// Packet header (45 bytes)
     pub header: PacketHeader,
@@ -342,9 +418,35 @@ impl PhantomPacket {
         }
     }
 
-    /// Total wire size including extensions
+    /// Total wire size including extensions and the two `u32` length prefixes.
     pub fn wire_size(&self) -> usize {
-        PacketHeader::SIZE + self.payload.len() + self.extensions.len()
+        PacketHeader::SIZE + 8 + self.payload.len() + self.extensions.len()
+    }
+
+    /// Serialise to the on-wire bytes:
+    /// `header(45) || payload_len:u32be || payload || ext_len:u32be || extensions`.
+    pub fn to_wire(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(self.wire_size());
+        b.extend_from_slice(&self.header.to_wire());
+        b.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
+        b.extend_from_slice(&self.payload);
+        b.extend_from_slice(&(self.extensions.len() as u32).to_be_bytes());
+        b.extend_from_slice(&self.extensions);
+        b
+    }
+
+    /// Parse a packet from its on-wire bytes — the inverse of [`Self::to_wire`].
+    /// Any bytes past `extensions` are ignored (forward-compatibility headroom).
+    pub fn from_wire(bytes: &[u8]) -> Result<Self, WireError> {
+        let header = PacketHeader::from_wire(bytes)?;
+        let mut pos = PacketHeader::SIZE;
+        let payload = read_length_prefixed(bytes, &mut pos)?;
+        let extensions = read_length_prefixed(bytes, &mut pos)?;
+        Ok(Self {
+            header,
+            payload,
+            extensions,
+        })
     }
 }
 
@@ -482,13 +584,15 @@ mod tests {
             1,
             PacketFlags::new(PacketFlags::ENCRYPTED),
         );
-        let mut buf = Vec::new();
-        let (size, _) = alkahest::serialize_to_vec::<PacketHeader, _>(&header, &mut buf);
+        let bytes = header.to_wire();
         assert_eq!(
-            size,
+            bytes.len(),
             PacketHeader::SIZE,
             "the serialised header (= AEAD AAD) must be exactly 45 bytes"
         );
+        // version-first, big-endian: the pinned version is the leading byte.
+        assert_eq!(bytes[0], WIRE_VERSION);
+        assert_eq!(PacketHeader::from_wire(&bytes).expect("roundtrip"), header);
     }
 
     #[test]
@@ -516,10 +620,9 @@ mod tests {
         .with_path_id(1);
         let packet = PhantomPacket::new(header, vec![0xCA, 0xFE, 0xBA, 0xBE]);
 
-        let mut bytes = Vec::new();
-        let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut bytes);
-        let decoded = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&bytes[..size])
-            .expect("roundtrip");
+        let bytes = packet.to_wire();
+        let decoded = PhantomPacket::from_wire(&bytes).expect("roundtrip");
+        assert_eq!(decoded, packet);
         assert_eq!(decoded.header.version, WIRE_VERSION);
         assert_eq!(decoded.header.stream_id, 7);
         assert_eq!(decoded.header.sequence, 42);
@@ -544,10 +647,8 @@ mod tests {
         );
         packet.extensions = vec![0xFF, 0x01, 0x00, 0x04, b't', b'e', b's', b't'];
 
-        let mut bytes = Vec::new();
-        let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut bytes);
-        let deser = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&bytes[..size])
-            .expect("deserialize failed");
+        let bytes = packet.to_wire();
+        let deser = PhantomPacket::from_wire(&bytes).expect("deserialize failed");
         assert_eq!(
             deser.extensions,
             vec![0xFF, 0x01, 0x00, 0x04, b't', b'e', b's', b't']

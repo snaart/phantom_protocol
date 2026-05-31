@@ -4,17 +4,19 @@ use phantom_core::transport::types::*;
 fn test_header_size() {
     let header = PacketHeader::new(SessionId([0; 32]), 1, 2, PacketFlags::new(0));
 
-    let mut buf = Vec::new();
-    let (size, _) = alkahest::serialize_to_vec::<PacketHeader, _>(&header, &mut buf);
-
     // The serialized header is the AEAD AAD; pin it to the frozen 45-byte layout.
+    let bytes = header.to_wire();
     assert_eq!(
-        size,
+        bytes.len(),
         PacketHeader::SIZE,
         "serialized header must equal PacketHeader::SIZE"
     );
     assert_eq!(
-        size, 45,
+        bytes.len(),
+        45,
         "the unified packet header is 45 bytes on the wire"
     );
+    // version-first, big-endian, lossless round-trip.
+    assert_eq!(bytes[0], WIRE_VERSION);
+    assert_eq!(PacketHeader::from_wire(&bytes).expect("round-trip"), header);
 }

@@ -17,7 +17,7 @@ cargo install cargo-fuzz
 | --- | --- | --- |
 | `fuzz_client_hello` | `borsh::from_slice::<ClientHello>(bytes)` | server-side handshake parser must never panic |
 | `fuzz_server_hello` | `borsh::from_slice::<ServerHello>(bytes)` | client-side handshake parser must never panic |
-| `fuzz_packet_parse` | `alkahest::deserialize::<PhantomPacket, PhantomPacket>` | data-plane wire-format parser must never panic |
+| `fuzz_packet_parse` | `PhantomPacket::from_wire` | data-plane wire-format parser must never panic |
 | `fuzz_aead_decrypt` | `Session::decrypt_packet(header, ct)` | AEAD decrypt must always return `Result`, never panic |
 
 ## Run a target locally (short)

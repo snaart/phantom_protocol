@@ -3,8 +3,9 @@
 These `*.bin` files are the canonical on-wire bytes of the Phantom Core
 protocol, frozen byte-for-byte. They are the only place the repo pins the
 **bytes**: every other protocol test drives Rust types ↔ Rust types, so a
-layout / endianness / discriminant regression in `alkahest` (packets) or
-`borsh` (handshake messages) would move both ends together and pass silently.
+layout / endianness / discriminant regression in the hand-rolled packet codec
+(`PacketHeader::to_wire`) or in `borsh` (handshake messages) would move both ends
+together and pass silently.
 
 ## What asserts them
 
@@ -14,9 +15,10 @@ layout / endianness / discriminant regression in `alkahest` (packets) or
 | `transport::handshake::tests::transcript_hash_wire_vector` (lib unit test) | `transcript_hash.bin` — the real `compute_transcript_hash` over the private transcript |
 | `tests/wire_vectors_decode.py` | an independent, non-Rust decoder over the same fixtures (cross-implementation evidence) |
 
-The Rust tests are always-on (not `#[ignore]`) and gated in CI. `alkahest` and
-`borsh` are pinned to exact `=` versions in `core/Cargo.toml`, so a minor bump
-cannot silently shift these bytes.
+The Rust tests are always-on (not `#[ignore]`) and gated in CI. The packets use a
+hand-rolled big-endian codec (no serialization dependency); `borsh` (handshake)
+is pinned to an exact `=` version in `core/Cargo.toml`, so a minor bump cannot
+silently shift the handshake bytes.
 
 ## Scope
 
@@ -35,9 +37,9 @@ cannot silently shift these bytes.
 widths, endianness). Two non-obvious points, both reproduced by the Python
 decoder:
 
-- **alkahest** (packets) emits struct fields in *reverse declaration order*,
-  integers little-endian, and byte arrays *reversed*. The pinned `version` byte
-  is therefore the **last** byte of the 45-byte header, not the first.
+- **packets** use a hand-rolled **big-endian** codec: `version` first, integers
+  network byte order, byte arrays as-is, and the body is
+  `header(45) || payload_len:u32be || payload || ext_len:u32be || extensions`.
 - **borsh** (handshake) is canonical little-endian: fixed arrays raw, `Vec`
   length-prefixed with a `u32`, `Option` a 1-byte tag, `bool` a 1-byte value.
 

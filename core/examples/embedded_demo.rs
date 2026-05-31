@@ -168,8 +168,7 @@ impl SessionTransport for DemoLeg {
 // ── Server-side encrypt/decrypt helpers ────────────────────────────────────
 
 fn decrypt_incoming(sess: &Session, bytes: &[u8]) -> Vec<u8> {
-    let p = alkahest::deserialize::<PhantomPacket, PhantomPacket>(bytes)
-        .expect("deserialize PhantomPacket");
+    let p = PhantomPacket::from_wire(bytes).expect("deserialize PhantomPacket");
     sess.decrypt_packet(&p.header, &p.payload).expect("decrypt")
 }
 
@@ -184,9 +183,7 @@ fn encrypt_outgoing(
     let header = PacketHeader::new(sid, stream, seq, flags).with_epoch(sess.current_epoch());
     let ct = sess.encrypt_packet(&header, payload).expect("encrypt");
     let packet = PhantomPacket::new(header, ct);
-    let mut buf = Vec::new();
-    let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
-    buf[..size].to_vec()
+    packet.to_wire()
 }
 
 #[tokio::main(flavor = "current_thread")]
