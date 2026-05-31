@@ -75,7 +75,7 @@ accept loses at most one socket; clients reconnect.
 ```rust
 loop {
     let data = match transport_recv.recv_bytes().await { ... };
-    // ...alkahest deserialize, decrypt, route...
+    // ...PhantomPacket::from_wire, decrypt, route...
 }
 ```
 

@@ -24,12 +24,12 @@ anchor (and a hook for a future deliberate bump).
 Collapsed:
 - **Data packets** — the dual V1/V2 format (`VersionedPacket::{V1, V2}`
   + `PacketHeader` / `PacketHeaderV2`) folds into one 45-byte
-  `PacketHeader` whose `version: u8` field is pinned to `WIRE_VERSION = 1`.
-  The header carries `version, session_id, stream_id, sequence, flags,
-  ack_delay, epoch, path_id`; on the wire alkahest emits them in reverse
-  declaration order (so the pinned `version` byte is the last of the 45
-  header bytes) — see `docs/protocol/PROTOCOL.md` § 4.2 for the exact
-  offsets. The single `PacketFlags` (`u16`) carries every flag that was
+  `PacketHeader` whose `version: u8` field is pinned to `WIRE_VERSION = 2`.
+  The header is serialised by `PacketHeader::to_wire` as an explicit
+  big-endian image, `version` first: `version, session_id, stream_id,
+  sequence, flags, ack_delay, epoch, path_id` — see
+  `docs/protocol/PROTOCOL.md` § 4.2 for the exact offsets. The single
+  `PacketFlags` (`u16`) carries every flag that was
   previously split across `PacketFlags` / `PacketFlagsV2` (`RELIABLE`,
   `ACK`, `FIN`, `UNRELIABLE`, `PRIORITY`, `ENCRYPTED`, `COMPRESSED`,
   `CONTROL`, `REKEY`, `PATH_VALIDATION`, `COALESCED`, `WINDOW_UPDATE`;
@@ -91,27 +91,37 @@ cannot interoperate with a post-collapse peer. Rebuild both ends together.
   V1-vs-V2 cross-version distinctness test fold into single canonical
   tests now that the dual format is gone.
 
+### Changed — packet codec moved off `alkahest` (WIRE-BREAKING)
+
+- The packet header + `PhantomPacket` are now serialised by a **hand-rolled
+  big-endian codec** (`PacketHeader::to_wire` / `from_wire`,
+  `PhantomPacket::to_wire` / `from_wire`) instead of `alkahest`. The layout is
+  explicit, network-byte-order, `version`-first, with byte arrays stored as-is —
+  trivially reimplementable in any language. `WIRE_VERSION` bumps `1` → `2`;
+  `PROTOCOL_VERSION` (the borsh handshake) is unchanged.
+- The **`alkahest` dependency is removed** entirely. `borsh` stays for the
+  handshake messages (it has a canonical published spec and a derive for the
+  complex nested structs) and remains pinned to an exact `=` version.
+- `from_wire` is bounds-checked and overflow-safe on 32-bit targets — a hostile
+  length prefix is dropped, never an out-of-bounds read.
+
 ### Added — byte-exact wire-format vectors
 
-- `core/tests/wire_vectors/*.bin` freeze the on-wire bytes of the unified
-  protocol byte-for-byte: the `PacketHeader` / `PhantomPacket` (alkahest),
-  the `ClientHello` / `ServerHello` / `HelloRetryRequest` and their crypto
+- `core/tests/wire_vectors/*.bin` freeze the on-wire bytes byte-for-byte: the
+  `PacketHeader` / `PhantomPacket` (hand-rolled big-endian codec), the
+  `ClientHello` / `ServerHello` / `HelloRetryRequest` and their crypto
   sub-structs (borsh), and the signed `HandshakeTranscript` hash. The
   always-on `core/tests/wire_vectors.rs` and the lib unit test
   `transport::handshake::tests::transcript_hash_wire_vector` assert
   `encode == fixture` and `decode(fixture) == value`; both now gate CI. This
   is the first test in the repo that pins the *bytes* rather than driving Rust
-  types ↔ Rust types, so an `alkahest` / `borsh` layout regression fails CI
+  types ↔ Rust types, so a packet-codec or `borsh` layout regression fails CI
   instead of silently breaking interop.
-- `tests/wire_vectors_decode.py` — an independent, non-Rust decoder over the
-  same fixtures (cross-implementation interop evidence).
-- `alkahest` and `borsh` are now pinned to exact `=` versions in
-  `core/Cargo.toml`; a minor bump can shift the serialized bytes and is treated
-  as a deliberate wire change.
-- `docs/protocol/PROTOCOL.md` § 4.2 corrected to the **actual** alkahest byte
-  layout (fields in reverse declaration order, integers little-endian, byte
-  arrays reversed — the pinned `version` byte is the last header byte, not the
-  first) and gains a § 11 test-vector catalog.
+- `tests/wire_vectors_decode.py` — an independent, non-Rust decoder + encoder
+  over the same fixtures (cross-implementation interop evidence).
+- `docs/protocol/PROTOCOL.md` § 4.2 documents the explicit big-endian header
+  layout (offsets, widths, network byte order — `version` first) and gains a
+  § 11 test-vector catalog.
 
 ### Added — `wasi-leg` Cargo feature (commits `f6c0c0a`..`255be95`)
 
