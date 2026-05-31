@@ -79,9 +79,9 @@ fn tampered_header_is_rejected_via_aad() {
 /// by sending random bytes.
 #[test]
 fn malformed_versioned_packet_fails_to_parse_not_panic() {
-    // A short, non-alkahest-compatible byte stream.
+    // A short byte stream (< the 45-byte header): must be rejected, not parsed.
     let garbage: Vec<u8> = (0u8..32).collect();
-    let result = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&garbage);
+    let result = PhantomPacket::from_wire(&garbage);
     assert!(
         result.is_err(),
         "Parser must reject random bytes with Err, not panic or accept"
@@ -89,7 +89,7 @@ fn malformed_versioned_packet_fails_to_parse_not_panic() {
 
     // Empty input.
     let empty: Vec<u8> = Vec::new();
-    let result = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&empty);
+    let result = PhantomPacket::from_wire(&empty);
     assert!(result.is_err(), "Parser must reject empty input");
 }
 
@@ -516,10 +516,8 @@ fn packet_roundtrip_preserves_fields() {
     .with_epoch(11)
     .with_path_id(2);
     let packet = PhantomPacket::new(header, vec![0xDE, 0xAD]);
-    let mut buf = Vec::new();
-    let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
-    let decoded =
-        alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf[..size]).expect("roundtrip");
+    let buf = packet.to_wire();
+    let decoded = PhantomPacket::from_wire(&buf).expect("roundtrip");
     assert_eq!(decoded.header.version, WIRE_VERSION);
     assert_eq!(decoded.header.epoch, 11);
     assert_eq!(decoded.header.path_id, 2);

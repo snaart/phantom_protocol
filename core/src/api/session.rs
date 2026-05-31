@@ -676,7 +676,7 @@ async fn run_data_pump<T: SessionTransport>(
 
             // A malformed / unparseable frame (no legitimate peer produces
             // one) is dropped — never a panic.
-            let packet = match alkahest::deserialize::<PhantomPacket, PhantomPacket>(&data) {
+            let packet = match PhantomPacket::from_wire(&data) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -954,9 +954,8 @@ async fn send_app_data<T: SessionTransport>(
         }
     };
     let packet = PhantomPacket::new(header, ciphertext);
-    // 45-byte header; 64-byte envelope headroom covers it plus length prefixes.
-    let mut buf: Vec<u8> = Vec::with_capacity(payload.len() + 64);
-    let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
+    let buf = packet.to_wire();
+    let size = buf.len();
     pace_send(crypto_session, size as u64).await;
     if let Err(e) = transport.send_bytes(&buf[..size]).await {
         log::error!("PhantomSession: transport send failed (V2): {}", e);
@@ -989,9 +988,8 @@ async fn send_window_update<T: SessionTransport>(
         }
     };
     let packet = PhantomPacket::new(header, ciphertext);
-    let mut buf: Vec<u8> = Vec::with_capacity(64);
-    let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
-    if let Err(e) = transport.send_bytes(&buf[..size]).await {
+    let buf = packet.to_wire();
+    if let Err(e) = transport.send_bytes(&buf).await {
         log::error!("PhantomSession: WINDOW_UPDATE send failed: {}", e);
         return false;
     }
@@ -1024,9 +1022,8 @@ async fn send_path_validation<T: SessionTransport>(
         }
     };
     packet.payload = ciphertext;
-    let mut buf: Vec<u8> = Vec::with_capacity(crate::transport::path::PATH_CHALLENGE_LEN + 64);
-    let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
-    if let Err(e) = transport.send_bytes(&buf[..size]).await {
+    let buf = packet.to_wire();
+    if let Err(e) = transport.send_bytes(&buf).await {
         log::error!("PhantomSession: PATH_VALIDATION send failed: {}", e);
         return false;
     }
@@ -1216,7 +1213,8 @@ async fn handle_packet<T: SessionTransport>(
         .with_path_id(path_id);
         let ack_packet = PhantomPacket::new(ack_header, Vec::new());
         ack_buf.clear();
-        let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&ack_packet, ack_buf);
+        ack_buf.extend_from_slice(&ack_packet.to_wire());
+        let size = ack_buf.len();
         let _ = transport_send_ack.send_bytes(&ack_buf[..size]).await;
     }
 
@@ -1720,8 +1718,7 @@ mod tests {
         server_session: &crate::transport::session::Session,
         bytes: &[u8],
     ) -> Vec<u8> {
-        let pkt = alkahest::deserialize::<PhantomPacket, PhantomPacket>(bytes)
-            .expect("deserialize PhantomPacket");
+        let pkt = PhantomPacket::from_wire(bytes).expect("deserialize PhantomPacket");
         assert!(
             pkt.header.flags.contains(PacketFlags::ENCRYPTED),
             "expected ENCRYPTED flag on application data"
@@ -1747,9 +1744,7 @@ mod tests {
             .encrypt_packet(&header, payload)
             .expect("encrypt reply");
         let packet = PhantomPacket::new(header, ct);
-        let mut buf = Vec::new();
-        let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
-        buf[..size].to_vec()
+        packet.to_wire()
     }
 
     /// Integration test: Client handshake via ChannelTransport with a
@@ -2025,8 +2020,8 @@ mod tests {
     }
 
     /// Encrypt a V2 application-data packet from the client side at
-    /// `stream_id` / `sequence`. The returned bytes are alkahest-
-    /// serialised and ready to feed into `handle_packet`.
+    /// `stream_id` / `sequence`. The returned bytes are wire-serialised
+    /// ([`PhantomPacket::to_wire`]) and ready to feed into `handle_packet`.
     fn build_app_frame(
         client_session: &InnerSession,
         session_id: SessionId,
@@ -2042,9 +2037,7 @@ mod tests {
             .encrypt_packet(&header, payload)
             .expect("encrypt_packet");
         let packet = PhantomPacket::new(header, ciphertext);
-        let mut buf = Vec::new();
-        let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
-        buf[..size].to_vec()
+        packet.to_wire()
     }
 
     #[tokio::test]
@@ -2058,7 +2051,7 @@ mod tests {
 
         // Receive on the server side: deserialize then drive
         // handle_packet, which is the recv-path entry point.
-        let v2 = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&frame).unwrap();
+        let v2 = PhantomPacket::from_wire(&frame).unwrap();
 
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
@@ -2297,7 +2290,7 @@ mod tests {
         // Server processes the packet via handle_packet. We
         // capture its outbound transport so we can intercept the
         // WINDOW_UPDATE it emits.
-        let v2 = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&frame).unwrap();
+        let v2 = PhantomPacket::from_wire(&frame).unwrap();
 
         let (demux, _ctrl) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
@@ -2338,7 +2331,7 @@ mod tests {
                 .await
                 .expect("expected an outbound frame")
                 .expect("channel open");
-            let pv2 = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&frame).unwrap();
+            let pv2 = PhantomPacket::from_wire(&frame).unwrap();
             if pv2.header.flags.contains(PacketFlags::WINDOW_UPDATE) {
                 // Decrypt the payload to read the new window.
                 let pt = client_session
@@ -2413,7 +2406,7 @@ mod tests {
                 Some(b) => b,
                 None => break,
             };
-            let v2 = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&bytes).unwrap();
+            let v2 = PhantomPacket::from_wire(&bytes).unwrap();
             // Decrypt under the SERVER role so the per-direction key
             // matches the client-side encrypt.
             let plaintext = _server_session
@@ -2508,7 +2501,7 @@ mod tests {
 
         // Decrypt the echo on the original (client) side — server-side
         // ciphertext authenticates the round-trip.
-        let echo_v2 = alkahest::deserialize::<PhantomPacket, PhantomPacket>(&echo_bytes).unwrap();
+        let echo_v2 = PhantomPacket::from_wire(&echo_bytes).unwrap();
         assert!(echo_v2.header.flags.contains(PacketFlags::PATH_VALIDATION));
         assert_eq!(echo_v2.header.path_id, path_id);
 
