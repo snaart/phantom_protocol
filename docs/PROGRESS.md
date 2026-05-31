@@ -9,11 +9,11 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **261 / 261** (220 unit + 20 negative-security + 5 proptest + 3 fuzz + 1 alkahest + 1 runtime-integration + 5 cavp; +2 tcp_integration `#[ignore]`) — `+5` unit from Phase 3.8 `crypto::rng` (RngProvider trait + OsRng + 5 KAT/object-safety tests) |
+| Tests passing | **261 / 261** (220 unit + 20 negative-security + 5 proptest + 3 fuzz + 1 wire + 1 runtime-integration + 5 cavp; +2 tcp_integration `#[ignore]`) — `+5` unit from Phase 3.8 `crypto::rng` (RngProvider trait + OsRng + 5 KAT/object-safety tests) |
 | **Phase 1 / Phase 2 closed** | ✅ all 14 + 13 sub-items either ✅ or ⏭️ with rationale |
 | Atomic commits since `e4067b6` baseline | **52+** |
 | `#[allow(unsafe_code)]` opt-ins outside the deny-by-default | **1** (was 2 — `crypto/keys.rs` deleted in Phase 5.1) |
-| Wire format | **single unified protocol** — one `PhantomPacket` with a pinned `WIRE_VERSION = 1` header byte; bare borsh handshake structs (`ClientHello` / `ServerHello` / `HelloRetryRequest`, no envelopes) with a pinned `PROTOCOL_VERSION = 1`. 0-RTT early-data folds into `ClientHello.early_data`; the whole `ClientHello` (early-data ciphertext included) is transcript-signed, leading with `PROTOCOL_VARIANT`. No negotiation, no fallback (pre-1.0, no users) |
+| Wire format | **single unified protocol** — one `PhantomPacket` with a pinned `WIRE_VERSION = 2` header byte; bare borsh handshake structs (`ClientHello` / `ServerHello` / `HelloRetryRequest`, no envelopes) with a pinned `PROTOCOL_VERSION = 1`. 0-RTT early-data folds into `ClientHello.early_data`; the whole `ClientHello` (early-data ciphertext included) is transcript-signed, leading with `PROTOCOL_VARIANT`. No negotiation, no fallback (pre-1.0, no users) |
 | Mid-session rekey | **available** — `Session::rekey()` + `PacketFlags::REKEY` + `header.epoch` |
 | Codecs landed | `transport::path_validation_codec` + `transport::packet_coalescer_codec`; `run_data_pump` handles PATH_VALIDATION (auto-echo) and COALESCED (split-and-fan-out) |
 | Metrics | **OpenTelemetry** (`phantom_core::observability`) — lock-free hot-path atomics (≤ 2.5 ns/call on M1), labeled OTel `Counter` / `Histogram` (base-2 exponential) / `UpDownCounter` / `ObservableCounter` instruments under the `phantom.*` namespace, OTLP/gRPC push (Phase 8). The Phase 4.5 hand-rolled Prometheus text endpoint has been removed |

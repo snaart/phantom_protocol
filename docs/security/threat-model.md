@@ -133,7 +133,7 @@ process is a weaker boundary (we trust the caller and the OS).
 | Threat | Mitigation | Code |
 | --- | --- | --- |
 | Bit-flip in ciphertext | AEAD tag check fails → packet dropped | `core/src/crypto/adaptive_crypto.rs:255-260` |
-| Mutation of header on the wire | Header is serialized via alkahest and used as AEAD AAD; any mutation invalidates the tag | `core/src/transport/session.rs:227-258` |
+| Mutation of header on the wire | Header is serialized via `PacketHeader::to_wire` (45-byte big-endian image) and used as AEAD AAD; any mutation invalidates the tag | `core/src/transport/session.rs` |
 | Tampering with handshake messages | Transcript signature covers every field of `ClientHello`/`ServerHello` | `core/src/transport/handshake.rs:201-204, 320-326` |
 | Sequence-number mutation (replay or skip) | After AEAD verify, `Session::decrypt_packet` consults a per-stream `ReplayWindow` and rejects duplicates / out-of-window-old | `core/src/transport/session.rs:251-270`, `core/src/security/replay_window.rs` |
 
