@@ -269,7 +269,7 @@
 **Проблема:** `core/src/api/session.rs:420,560` — `Vec::new()` per ACK / per send.
 
 - Использовать `smallvec::SmallVec<[u8; 256]>` или просто `[u8; 256]` (большинство пакетов ≤ MTU=1300, малые ACK помещаются в 64 байта).
-- `alkahest::serialize_to_vec` → `serialize_to_slice` (если alkahest поддерживает; иначе wrapper).
+- Малые пакеты: писать `PacketHeader::to_wire` в стековый буфер на горячем пути (кодек уже ручной big-endian, без аллокаций для заголовка).
 - Бенч `core/benches/transport_bench.rs` показывает baseline; добавить bench именно на small-packet serialization.
 
 ### 2.4 Event-driven send loop вместо polling
@@ -692,7 +692,7 @@
 - `fuzz/` directory с `cargo-fuzz init`. Targets:
   - `fuzz_targets/fuzz_client_hello.rs` — fuzz `borsh::from_slice::<ClientHello>(input)` + `process_client_hello`.
   - `fuzz_targets/fuzz_server_hello.rs` — fuzz client side.
-  - `fuzz_targets/fuzz_packet_parse.rs` — fuzz `alkahest::deserialize::<PhantomPacket, _>(input)`.
+  - `fuzz_targets/fuzz_packet_parse.rs` — fuzz `PhantomPacket::from_wire(input)`.
   - `fuzz_targets/fuzz_aead_decrypt.rs` — fuzz `Session::decrypt_packet` with random AAD + ciphertext.
   - `fuzz_targets/fuzz_faketls_record.rs` — fuzz FakeTLS record parsing (`legs/faketls.rs:669-689`).
   - `fuzz_targets/fuzz_tcp_framing.rs` — fuzz length-prefix parsing.
@@ -704,7 +704,7 @@
 - `core/tests/property/` directory:
   - AEAD round-trip: `forall (key, nonce, aad, plaintext): decrypt(encrypt(plaintext, key, nonce, aad), key, nonce, aad) == Ok(plaintext)`.
   - Handshake: `forall (client_seed, server_seed): handshake(client, server) -> client.session.shared_secret == server.session.shared_secret`.
-  - Wire-format round-trip: `forall packet: alkahest::deserialize(alkahest::serialize(packet)) == Ok(packet)`.
+  - Wire-format round-trip: `forall packet: PhantomPacket::from_wire(packet.to_wire()) == Ok(packet)`.
   - Replay window: `forall stream of nonces: replay-protected.accept(...).count == count_after_dedup(stream)`.
 - Run 100K iterations per property; failures saved to corpus.
 

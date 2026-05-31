@@ -572,8 +572,8 @@ impl Session {
     /// The AEAD nonce is derived from the authenticated `(epoch, stream_id,
     /// sequence, path_id)` fields of the packet header rather than from an
     /// internal monotonic counter, so a failed peer decrypt never desyncs the
-    /// receiver. The AAD is the alkahest-serialised header, so any wire-level
-    /// mutation invalidates the tag.
+    /// receiver. The AAD is the 45-byte wire image of the header
+    /// ([`PacketHeader::to_wire`]), so any wire-level mutation invalidates the tag.
     pub fn encrypt_packet(
         &self,
         header: &PacketHeader,
@@ -581,8 +581,7 @@ impl Session {
     ) -> Result<Vec<u8>, CoreError> {
         let crypto = self.crypto.load();
         let nonce = Self::build_packet_nonce(crypto.nonce_prefix(), header);
-        let mut header_bytes = Vec::new();
-        alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
+        let header_bytes = header.to_wire();
         crypto.encrypt_with_nonce(nonce, &header_bytes, plaintext)
     }
 
@@ -602,8 +601,7 @@ impl Session {
     ) -> Result<Vec<u8>, CoreError> {
         let crypto = self.crypto.load();
         let nonce = Self::build_packet_nonce(crypto.nonce_prefix(), header);
-        let mut header_bytes = Vec::new();
-        alkahest::serialize_to_vec::<PacketHeader, _>(header, &mut header_bytes);
+        let header_bytes = header.to_wire();
         let plaintext = crypto.decrypt_with_nonce(nonce, &header_bytes, ciphertext)?;
 
         // Sliding-window guard. ReplayWindow keys on `(stream_id, sequence)`

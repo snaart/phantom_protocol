@@ -16,11 +16,10 @@ What it covers:
     byte-for-byte (encode/decode parity in a second language), and every field
     is checked against the spec's deterministic filler.
 
-  * **alkahest packet header** (the 45-byte AEAD AAD) — decoded from alkahest's
-    actual layout: fields in *reverse declaration order*, integers little-endian,
-    and byte arrays stored reversed. The variable-length `PhantomPacket` body is
-    validated partially (header + payload framing), since alkahest's zero-copy
-    offset table is an implementation detail, not a documented wire contract.
+  * **packet header + `PhantomPacket`** — the hand-rolled big-endian codec:
+    `version` first, integers network byte order, byte arrays as-is, and the body
+    is `header(45) || payload_len:u32be || payload || ext_len:u32be || extensions`.
+    Fully decoded **and** re-encoded, same as the borsh structs.
 
 Run: ``python3 tests/wire_vectors_decode.py`` (stdlib only; exits non-zero on
 any mismatch). Regenerate the fixtures from Rust with
@@ -44,7 +43,7 @@ ML_DSA_SIG_LEN = 3309
 CLASSICAL_PK_LEN = 32
 PROTOCOL_VARIANT = b"phantom-default-1"
 PROTOCOL_VERSION = 1
-WIRE_VERSION = 1
+WIRE_VERSION = 2
 
 
 def pat(seed: int, n: int) -> bytes:
@@ -261,36 +260,73 @@ def enc_hrr(w: BorshWriter, v):
     w.option(v["cookie"], w.fixed)
 
 
-# ─── alkahest packet-header codec (the 45-byte AEAD AAD) ────────────────────
+# ─── packet codec: hand-rolled, big-endian, version-first ───────────────────
 #
-# alkahest serialises struct fields in REVERSE declaration order, integers
-# little-endian, and byte arrays reversed. Declaration order is
-# (version, session_id, stream_id, sequence, flags, ack_delay, epoch, path_id),
-# so the 45 wire bytes are, in order:
-#   [0]    path_id  : u8
-#   [1]    epoch    : u8
-#   [2:4]  ack_delay: u16 LE
-#   [4:6]  flags    : u16 LE
-#   [6:10] sequence : u32 LE
-#   [10:12]stream_id: u16 LE
-#   [12:44]session_id: 32 bytes, stored reversed
-#   [44]   version  : u8
+# PacketHeader (45 bytes), declaration order == wire order:
+#   [0]     version    u8   (= WIRE_VERSION)
+#   [1:33]  session_id [u8;32]
+#   [33:35] stream_id  u16 be
+#   [35:39] sequence   u32 be
+#   [39:41] flags      u16 be
+#   [41:43] ack_delay  u16 be
+#   [43]    epoch      u8
+#   [44]    path_id    u8
+# PhantomPacket: header || payload_len:u32be || payload || ext_len:u32be || ext.
 
 HEADER_SIZE = 45
 
 
 def dec_packet_header(b: bytes):
-    check(len(b) == HEADER_SIZE, f"header must be {HEADER_SIZE} bytes, got {len(b)}")
+    check(len(b) >= HEADER_SIZE, f"header needs {HEADER_SIZE} bytes, got {len(b)}")
     return {
-        "path_id": b[0],
-        "epoch": b[1],
-        "ack_delay": struct.unpack("<H", b[2:4])[0],
-        "flags": struct.unpack("<H", b[4:6])[0],
-        "sequence": struct.unpack("<I", b[6:10])[0],
-        "stream_id": struct.unpack("<H", b[10:12])[0],
-        "session_id": b[12:44][::-1],  # stored reversed
-        "version": b[44],
+        "version": b[0],
+        "session_id": bytes(b[1:33]),
+        "stream_id": struct.unpack(">H", b[33:35])[0],
+        "sequence": struct.unpack(">I", b[35:39])[0],
+        "flags": struct.unpack(">H", b[39:41])[0],
+        "ack_delay": struct.unpack(">H", b[41:43])[0],
+        "epoch": b[43],
+        "path_id": b[44],
     }
+
+
+def enc_packet_header(h) -> bytes:
+    return (
+        bytes([h["version"]])
+        + h["session_id"]
+        + struct.pack(">H", h["stream_id"])
+        + struct.pack(">I", h["sequence"])
+        + struct.pack(">H", h["flags"])
+        + struct.pack(">H", h["ack_delay"])
+        + bytes([h["epoch"], h["path_id"]])
+    )
+
+
+def dec_phantom_packet(b: bytes):
+    header = dec_packet_header(b)
+    pos = HEADER_SIZE
+    payload_len = struct.unpack(">I", b[pos : pos + 4])[0]
+    pos += 4
+    payload = bytes(b[pos : pos + payload_len])
+    check(len(payload) == payload_len, "payload underrun")
+    pos += payload_len
+    ext_len = struct.unpack(">I", b[pos : pos + 4])[0]
+    pos += 4
+    extensions = bytes(b[pos : pos + ext_len])
+    check(len(extensions) == ext_len, "extensions underrun")
+    pos += ext_len
+    check(pos == len(b), f"trailing bytes: consumed {pos}/{len(b)}")
+    return {"header": header, "payload": payload, "extensions": extensions}
+
+
+def enc_phantom_packet(p) -> bytes:
+    return (
+        enc_packet_header(p["header"])
+        + struct.pack(">I", len(p["payload"]))
+        + p["payload"]
+        + struct.pack(">I", len(p["extensions"]))
+        + p["extensions"]
+    )
 
 
 # ─── per-vector checks ──────────────────────────────────────────────────────
@@ -417,55 +453,47 @@ def hello_retry_request_pow():
 
 @vector
 def packet_header():
-    h = dec_packet_header(load("packet_header.bin"))
-    check(h["version"] == WIRE_VERSION, "header version pin (byte 44)")
-    check(h["path_id"] == 1, "header path_id (byte 0)")
-    check(h["epoch"] == 3, "header epoch (byte 1)")
-    check(h["ack_delay"] == 0, "header ack_delay")
-    check(h["flags"] == 0x0021, "header flags ENCRYPTED|RELIABLE")
-    check(h["sequence"] == 42, "header sequence")
+    raw = load("packet_header.bin")
+    check(len(raw) == HEADER_SIZE, f"header must be {HEADER_SIZE} bytes")
+    h = dec_packet_header(raw)
+    check(h["version"] == WIRE_VERSION, "header version pin (byte 0)")
+    check(h["session_id"] == arr32(0x01), "header session_id (as-is, byte 1)")
     check(h["stream_id"] == 7, "header stream_id")
-    check(h["session_id"] == arr32(0x01), "header session_id (reversed on wire)")
+    check(h["sequence"] == 42, "header sequence")
+    check(h["flags"] == 0x0021, "header flags ENCRYPTED|RELIABLE")
+    check(h["ack_delay"] == 0, "header ack_delay")
+    check(h["epoch"] == 3, "header epoch")
+    check(h["path_id"] == 1, "header path_id")
+    check(enc_packet_header(h) == raw, "header re-encode != fixture")
 
 
-def _packet_partial(name: str, payload: bytes, ext: bytes):
-    """Decode the trailing 45-byte header and validate the payload framing.
-
-    The alkahest variable-length body uses a zero-copy offset table that is an
-    implementation detail; we validate the header (the AEAD AAD) fully and the
-    payload bytes (stored reversed at the front) — partial but independent.
-    """
+def _packet_roundtrip(name: str, payload: bytes, ext: bytes):
     raw = load(name)
-    # 45-byte header + 16-byte (4×u32) Vec reference table + reversed var data.
-    expected_len = HEADER_SIZE + 16 + len(payload) + len(ext)
-    check(len(raw) == expected_len, f"{name}: length {len(raw)} != expected {expected_len}")
-    h = dec_packet_header(raw[-HEADER_SIZE:])
-    check(h["version"] == WIRE_VERSION, f"{name} header version")
-    if payload:
-        check(raw[: len(payload)][::-1] == payload, f"{name}: payload (reversed) at offset 0")
-    return h
+    p = dec_phantom_packet(raw)
+    check(p["payload"] == payload, f"{name}: payload")
+    check(p["extensions"] == ext, f"{name}: extensions")
+    check(p["header"]["version"] == WIRE_VERSION, f"{name}: header version")
+    check(enc_phantom_packet(p) == raw, f"{name}: re-encode != fixture")
+    return p
 
 
 @vector
 def phantom_packet_data():
-    h = _packet_partial("phantom_packet_data.bin", pat(0x11, 64), b"")
-    check(h["flags"] & 0x0020 != 0 and h["flags"] & 0x0001 != 0, "data packet ENCRYPTED|RELIABLE")
+    p = _packet_roundtrip("phantom_packet_data.bin", pat(0x11, 64), b"")
+    fl = p["header"]["flags"]
+    check(fl & 0x0020 != 0 and fl & 0x0001 != 0, "data packet ENCRYPTED|RELIABLE")
 
 
 @vector
 def phantom_packet_ack():
-    h = _packet_partial("phantom_packet_ack.bin", b"", b"")
-    check(h["flags"] == 0x0002, "ack packet flags == ACK only")
+    p = _packet_roundtrip("phantom_packet_ack.bin", b"", b"")
+    check(p["header"]["flags"] == 0x0002, "ack packet flags == ACK only")
 
 
 @vector
 def phantom_packet_extensions():
     ext = bytes([0xFF, 0x01, 0x00, 0x04]) + b"test"
-    h = _packet_partial("phantom_packet_extensions.bin", pat(0x11, 16), ext)
-    raw = load("phantom_packet_extensions.bin")
-    # extensions are stored reversed immediately after the payload.
-    check(raw[16:24][::-1] == ext, "ext packet: extensions (reversed) after payload")
-    check(h["version"] == WIRE_VERSION, "ext packet header version")
+    _packet_roundtrip("phantom_packet_extensions.bin", pat(0x11, 16), ext)
 
 
 def main() -> int:
@@ -477,7 +505,9 @@ def main() -> int:
             fn()
             print(f"  ok    {fn.__name__}")
             passed += 1
-        except Failure as e:
+        except (Failure, struct.error, IndexError, ValueError) as e:
+            # struct.error / IndexError surface from a corrupt length prefix that
+            # overruns the buffer — still a clean per-vector FAIL, not a traceback.
             print(f"  FAIL  {fn.__name__}: {e}")
             failed += 1
     print(f"\n{passed} passed, {failed} failed (independent decode of {VECTORS_DIR.name}/)")
