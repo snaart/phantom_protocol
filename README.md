@@ -377,7 +377,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   [`docs/migration/`](docs/migration/).
 - **Negative-security suite: 20 always-on tests** in
   `core/tests/security_invariants.rs`, pinning every documented invariant.
-  Plus the proptest, fuzz, alkahest, runtime-integration, and CAVP suites,
+  Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
   and 5 `#[ignore]`-gated loopback integration tests. 0 workspace warnings,
   0 clippy warnings.
 - **All 8 production-readiness phases (0–7) closed code-side.** Deferred with

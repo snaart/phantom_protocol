@@ -10,8 +10,8 @@
 //! - AEAD AAD binding: with the same key but different AAD, decrypt fails.
 //! - `ReplayWindow.accept`: a strictly increasing sequence is always accepted,
 //!   and a duplicate is always rejected.
-//! - Wire format round-trip: any `PhantomPacketV1` survives serialize +
-//!   deserialize via alkahest with all fields preserved.
+//! - Wire format round-trip: any `PhantomPacket` survives `to_wire` /
+//!   `from_wire` with all fields preserved.
 //!
 //! Defaults to 1024 cases per property; turn the dial via
 //! `PROPTEST_CASES=10000 cargo test --test property`.
@@ -105,7 +105,7 @@ proptest! {
 
 proptest! {
     /// Any PhantomPacket with arbitrary header field values must round-trip
-    /// through alkahest serialize + deserialize with every bit preserved.
+    /// through `to_wire` / `from_wire` with every bit preserved.
     #[test]
     fn wire_round_trip_preserves_fields(
         sid_bytes in proptest::array::uniform32(any::<u8>()),
@@ -126,12 +126,9 @@ proptest! {
         .with_path_id(path_id);
         let packet = PhantomPacket::new(header, payload.clone());
 
-        let mut buf = Vec::new();
-        let (size, _) =
-            alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
+        let buf = packet.to_wire();
         let decoded =
-            alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf[..size])
-                .expect("round-trip decode must succeed");
+            PhantomPacket::from_wire(&buf).expect("round-trip decode must succeed");
 
         prop_assert_eq!(decoded.header.version, WIRE_VERSION);
         prop_assert_eq!(decoded.header.stream_id, stream_id);

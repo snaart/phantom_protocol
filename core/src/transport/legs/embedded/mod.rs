@@ -489,8 +489,7 @@ mod tests {
         server_session: &crate::transport::session::Session,
         bytes: &[u8],
     ) -> Vec<u8> {
-        let pkt = alkahest::deserialize::<PhantomPacket, PhantomPacket>(bytes)
-            .expect("deserialize PhantomPacket");
+        let pkt = PhantomPacket::from_wire(bytes).expect("deserialize PhantomPacket");
         assert!(
             pkt.header.flags.contains(PacketFlags::ENCRYPTED),
             "expected ENCRYPTED flag on application data"
@@ -518,9 +517,7 @@ mod tests {
             .encrypt_packet(&header, payload)
             .expect("encrypt reply");
         let packet = PhantomPacket::new(header, ct);
-        let mut buf = Vec::new();
-        let (size, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&packet, &mut buf);
-        buf[..size].to_vec()
+        packet.to_wire()
     }
 
     /// `MockWriter` wrapper that tees every byte through to a side recorder

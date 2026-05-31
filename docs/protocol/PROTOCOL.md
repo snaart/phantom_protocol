@@ -23,10 +23,12 @@ that sees any other value drops the frame (packets) or rejects the handshake
 
 | Constant | Value | Source | Where it lives on the wire |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `1` | `core/src/transport/types.rs:69` | `PacketHeader.version` byte (last byte of the 45-byte header — § 4.2) |
+| `WIRE_VERSION` | `2` | `core/src/transport/types.rs` | `PacketHeader.version` byte (first byte of the 45-byte header — § 4.2) |
 | `PROTOCOL_VERSION` | `1` | `core/src/transport/handshake.rs:55` | `ClientHello.version`, transcript-bound |
 
-Both are constants pinned to `1`. They exist so that:
+`WIRE_VERSION` is `2` (incremented when the packet codec moved from `alkahest`
+to the explicit big-endian layout in § 4.2); `PROTOCOL_VERSION` is `1` (the borsh
+handshake is unchanged). They exist so that:
 
 - a tampered frame / hello that flips the byte is rejected up front
   (`PacketHeader.version != WIRE_VERSION` → drop; `ClientHello.version !=
@@ -118,10 +120,25 @@ pub struct PhantomPacket {
 }
 ```
 
-Source: `core/src/transport/types.rs:307-319`. There is no enum wrapper — the
-recv path deserializes a bare `PhantomPacket` directly and **drops** any frame
-whose `header.version != WIRE_VERSION` (`api/session.rs:679-687`). An
-unparseable frame is dropped, never panicked on.
+Source: `core/src/transport/types.rs`. There is no enum wrapper — the recv path
+deserializes a bare `PhantomPacket` directly (`PhantomPacket::from_wire`) and
+**drops** any frame whose `header.version != WIRE_VERSION`
+(`api/session.rs:679-687`). An unparseable frame is dropped, never panicked on.
+
+The packet is serialised by `PhantomPacket::to_wire` as an explicit,
+length-prefixed image — no serialization library:
+
+```text
+header        45 bytes (§ 4.2)
+payload_len   u32 big-endian
+payload       payload_len bytes
+ext_len       u32 big-endian
+extensions    ext_len bytes
+```
+
+`from_wire` is bounds-checked (and overflow-safe on 32-bit targets), so a hostile
+length prefix yields a drop, never an out-of-bounds read. Any bytes after
+`extensions` are ignored (forward-compatibility headroom).
 
 `payload` is the AEAD ciphertext when `PacketFlags::ENCRYPTED` is set,
 otherwise raw bytes (control / ACK / path-validation). The AAD is the
@@ -133,11 +150,9 @@ frame this build emits; a decoder ignores its contents.
 
 ### 4.2 `PacketHeader` (45 bytes)
 
-The Rust **declaration** order is below; the **wire** order is not the same.
-`alkahest` (the zero-copy codec used for packets) emits a struct's fields in
-**reverse declaration order**, encodes integers little-endian, and stores
-fixed-size byte arrays **reversed**. `#[repr(C)]` governs the in-memory layout
-only — it does not describe the wire bytes.
+Serialised by `PacketHeader::to_wire` as an explicit, fixed **big-endian**
+(network byte order) image — no serialization library, declaration order == wire
+order, `version` first, byte arrays as-is:
 
 ```rust
 #[repr(C)]
@@ -153,36 +168,31 @@ pub struct PacketHeader {
 }
 ```
 
-Source: `core/src/transport/types.rs:234-253`. `PacketHeader::SIZE = 45`
-(`types.rs:258`), pinned by `core/tests/check_alkahest.rs:16`,
-`types.rs::packet_header_serializes_to_45_bytes`, and the byte-frozen vector
-`core/tests/wire_vectors/packet_header.bin` (§ 11).
+Source: `core/src/transport/types.rs`. `PacketHeader::SIZE = 45`, pinned by
+`core/tests/check_wire.rs`, `types.rs::packet_header_serializes_to_45_bytes`, and
+the byte-frozen vector `core/tests/wire_vectors/packet_header.bin` (§ 11).
 
-Actual wire byte layout (the load-bearing contract — the serialised header is
-the AEAD AAD, so any layout drift silently breaks interop):
+Wire byte layout (the load-bearing contract — this image is the AEAD AAD, so any
+layout drift silently breaks interop):
 
 | Offset | Field | Width | Encoding |
 | --- | --- | --- | --- |
-| 0 | `path_id` | 1 | u8 |
-| 1 | `epoch` | 1 | u8 |
-| 2 | `ack_delay` | 2 | u16 little-endian |
-| 4 | `flags` | 2 | u16 little-endian (§ 4.3) |
-| 6 | `sequence` | 4 | u32 little-endian |
-| 10 | `stream_id` | 2 | u16 little-endian |
-| 12 | `session_id` | 32 | 32 bytes, **reversed** (alkahest array order) |
-| 44 | `version` | 1 | u8, `= WIRE_VERSION` |
+| 0 | `version` | 1 | u8, `= WIRE_VERSION` |
+| 1 | `session_id` | 32 | 32 bytes, as-is |
+| 33 | `stream_id` | 2 | u16 big-endian |
+| 35 | `sequence` | 4 | u32 big-endian |
+| 39 | `flags` | 2 | u16 big-endian (§ 4.3) |
+| 41 | `ack_delay` | 2 | u16 big-endian |
+| 43 | `epoch` | 1 | u8 |
+| 44 | `path_id` | 1 | u8 |
 | **total** | | **45** | |
 
-So the pinned `version` byte is the **last** byte of the header, not the first;
-the receive path deserialises the whole `PhantomPacket`, then drops the frame if
-`header.version != WIRE_VERSION` (`api/session.rs`). Position does not weaken the
-tamper check: the full 45-byte header is the AEAD AAD, so flipping *any* byte —
-`version` included — fails decryption (§ 5). An independent (non-Rust) decoder
-that reproduces this layout is `tests/wire_vectors_decode.py`.
-
-A second endianness, **independent** of this header serialisation, is pinned by
-§ 5: the big-endian conversion of `stream_id` and `sequence` inside the AEAD
-nonce. That must not drift either.
+The pinned `version` byte leads the header. The full 45-byte image is the AEAD
+AAD, so flipping *any* byte — `version` included — fails decryption (§ 5); the
+recv path additionally drops a frame whose `version != WIRE_VERSION`. The same
+big-endian convention is used for the `stream_id` / `sequence` bytes that feed
+the AEAD nonce (§ 5). An independent (non-Rust) decoder + encoder that reproduces
+this layout exactly is `tests/wire_vectors_decode.py`.
 
 ### 4.3 `PacketFlags` (u16 bitfield)
 
@@ -595,8 +605,9 @@ Wire-visible errors fall into:
   `HandshakeError::ProtocolVariantMismatch`.
 - **Version / parse failure**: `header.version != WIRE_VERSION` (dropped),
   `ClientHello.version != PROTOCOL_VERSION` (`HandshakeError::UnsupportedVersion`),
-  or borsh/alkahest deserialisation error
-  (`CoreError::SerializationError(_)` / `HandshakeError::SerializationError`).
+  or a borsh / `PhantomPacket::from_wire` parse error
+  (`CoreError::SerializationError(_)` / `HandshakeError::SerializationError` /
+  `WireError::Truncated`).
 - **Liveness failure**: connection closed / I/O error
   (`CoreError::NetworkError(_)` / `CoreError::ConnectionClosed`).
 - **Replay**: post-AEAD sliding-window rejection (`CoreError::ReplayDetected(_)`).
@@ -662,14 +673,15 @@ and asserted in both directions (`serialize(value) == fixture` and
 handshake messages) and `transport::handshake::tests::transcript_hash_wire_vector`
 (the signed transcript hash). This is the only test that pins the *bytes* rather
 than driving Rust types ↔ Rust types, so a layout / endianness / discriminant
-regression in `alkahest` or `borsh` fails CI instead of silently breaking
-interop. `tests/wire_vectors_decode.py` is an independent (non-Rust) decoder
-over the same fixtures — cross-implementation evidence that the grammar is real.
+regression in the packet codec or in `borsh` fails CI instead of silently
+breaking interop. `tests/wire_vectors_decode.py` is an independent (non-Rust)
+decoder + encoder over the same fixtures — cross-implementation evidence that the
+grammar is real.
 
 | Fixture | Codec | Type |
 | --- | --- | --- |
-| `packet_header.bin` | alkahest | `PacketHeader` (§ 4.2) |
-| `phantom_packet_data.bin` / `_ack.bin` / `_extensions.bin` | alkahest | `PhantomPacket` (§ 4.1) |
+| `packet_header.bin` | hand-rolled big-endian | `PacketHeader` (§ 4.2) |
+| `phantom_packet_data.bin` / `_ack.bin` / `_extensions.bin` | hand-rolled big-endian | `PhantomPacket` (§ 4.1) |
 | `client_hello_minimal.bin` / `client_hello_full.bin` | borsh | `ClientHello` (§ 6.2) |
 | `server_hello.bin` / `server_hello_rejected.bin` | borsh | `ServerHello` (§ 6.3) |
 | `hello_retry_request_cookie.bin` / `_pow.bin` | borsh | `HelloRetryRequest` (§ 6.4) |
@@ -685,10 +697,10 @@ is tracked separately. The vectors are scoped to the default (non-fips) build;
 the fips build is a distinct wire (different `PROTOCOL_VARIANT`, 65-byte
 classical key) and would need its own set.
 
-The serialization crates `alkahest` and `borsh` are pinned to exact `=` versions
-in `core/Cargo.toml` so a minor bump cannot silently shift these bytes. An
-**intentional** wire change is landed by bumping `WIRE_VERSION` /
-`PROTOCOL_VERSION` and regenerating:
+The packets use a hand-rolled big-endian codec (no serialization dependency);
+the handshake uses `borsh`, pinned to an exact `=` version in `core/Cargo.toml`
+so a minor bump cannot silently shift those bytes. An **intentional** wire change
+is landed by bumping `WIRE_VERSION` / `PROTOCOL_VERSION` and regenerating:
 
 ```sh
 PHANTOM_REGEN_WIRE_VECTORS=1 cargo test --manifest-path core/Cargo.toml --lib

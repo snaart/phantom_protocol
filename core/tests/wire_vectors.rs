@@ -2,9 +2,10 @@
 //!
 //! Every other protocol test drives Rust types ↔ Rust types (in-proc or
 //! loopback), so both ends move together: a layout, endianness, or
-//! discriminant regression in `alkahest` (packets) or `borsh` (handshake
-//! messages) passes silently. These vectors are the only test in the repo that
-//! pins the *bytes*. Each case asserts two directions:
+//! discriminant regression in the hand-rolled packet codec
+//! ([`PacketHeader::to_wire`]) or in `borsh` (handshake messages) passes
+//! silently. These vectors are the only test in the repo that pins the
+//! *bytes*. Each case asserts two directions:
 //!
 //!   * **encode** — `serialize(value) == fixture`, and
 //!   * **decode** — `deserialize(fixture)` reconstructs the same value
@@ -194,20 +195,14 @@ fn sample_packet_ext() -> PhantomPacket {
     p
 }
 
-// ─── alkahest / borsh encoders ──────────────────────────────────────────────
+// ─── wire / borsh encoders ───────────────────────────────────────────────────
 
 fn ser_header(h: &PacketHeader) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let (n, _) = alkahest::serialize_to_vec::<PacketHeader, _>(h, &mut buf);
-    buf.truncate(n);
-    buf
+    h.to_wire().to_vec()
 }
 
 fn ser_packet(p: &PhantomPacket) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let (n, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(p, &mut buf);
-    buf.truncate(n);
-    buf
+    p.to_wire()
 }
 
 fn ser_borsh<T: borsh::BorshSerialize>(v: &T) -> Vec<u8> {
@@ -267,7 +262,7 @@ fn freeze(name: &str, actual: &[u8]) -> Vec<u8> {
     expected
 }
 
-// ─── packet vectors (alkahest) ──────────────────────────────────────────────
+// ─── packet vectors (hand-rolled big-endian codec) ──────────────────────────
 
 #[test]
 fn vector_packet_header() {
@@ -280,8 +275,7 @@ fn vector_packet_header() {
         PacketHeader::SIZE
     );
     let frozen = freeze("packet_header.bin", &bytes);
-    let decoded =
-        alkahest::deserialize::<PacketHeader, PacketHeader>(&frozen).expect("decode packet header");
+    let decoded = PacketHeader::from_wire(&frozen).expect("decode packet header");
     assert_eq!(decoded, h);
     assert_eq!(decoded.version, WIRE_VERSION);
     assert_eq!(decoded.stream_id, 7);
@@ -294,8 +288,7 @@ fn vector_packet_header() {
 fn vector_phantom_packet_data() {
     let p = sample_packet_data();
     let frozen = freeze("phantom_packet_data.bin", &ser_packet(&p));
-    let decoded =
-        alkahest::deserialize::<PhantomPacket, PhantomPacket>(&frozen).expect("decode data packet");
+    let decoded = PhantomPacket::from_wire(&frozen).expect("decode data packet");
     assert_eq!(decoded, p);
     assert_eq!(decoded.payload, pat(0x11, 64));
     assert!(decoded.extensions.is_empty());
@@ -305,8 +298,7 @@ fn vector_phantom_packet_data() {
 fn vector_phantom_packet_ack() {
     let p = sample_packet_ack();
     let frozen = freeze("phantom_packet_ack.bin", &ser_packet(&p));
-    let decoded =
-        alkahest::deserialize::<PhantomPacket, PhantomPacket>(&frozen).expect("decode ack packet");
+    let decoded = PhantomPacket::from_wire(&frozen).expect("decode ack packet");
     assert_eq!(decoded, p);
     assert!(decoded.header.flags.is_ack());
     assert!(decoded.payload.is_empty());
@@ -316,8 +308,7 @@ fn vector_phantom_packet_ack() {
 fn vector_phantom_packet_extensions() {
     let p = sample_packet_ext();
     let frozen = freeze("phantom_packet_extensions.bin", &ser_packet(&p));
-    let decoded =
-        alkahest::deserialize::<PhantomPacket, PhantomPacket>(&frozen).expect("decode ext packet");
+    let decoded = PhantomPacket::from_wire(&frozen).expect("decode ext packet");
     assert_eq!(decoded, p);
     assert_eq!(
         decoded.extensions,
