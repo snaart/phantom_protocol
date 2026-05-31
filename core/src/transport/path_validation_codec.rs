@@ -197,10 +197,8 @@ mod tests {
         let a = build_path_validation_packet(fixed_session_id(), 1, 5, payload);
         let b = build_path_validation_packet(fixed_session_id(), 1, 5, payload);
 
-        let mut buf_a = Vec::new();
-        let mut buf_b = Vec::new();
-        let _ = alkahest::serialize_to_vec::<PhantomPacket, _>(&a, &mut buf_a);
-        let _ = alkahest::serialize_to_vec::<PhantomPacket, _>(&b, &mut buf_b);
+        let buf_a = a.to_wire();
+        let buf_b = b.to_wire();
         assert_eq!(buf_a, buf_b);
     }
 
@@ -236,10 +234,8 @@ mod tests {
         // the network. We then immediately "receive" it as raw bytes
         // and parse on side B.
         let outgoing = build_path_validation_packet(session_id, path_id, 0, challenge);
-        let mut buf = Vec::new();
-        let (n, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&outgoing, &mut buf);
-        let v2 =
-            alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf[..n]).expect("deserialize");
+        let buf = outgoing.to_wire();
+        let v2 = PhantomPacket::from_wire(&buf).expect("deserialize");
         let parsed = parse_path_validation(&v2)
             .expect("ok")
             .expect("flag matched");
@@ -249,10 +245,8 @@ mod tests {
         // Side B echoes the payload back. (It doesn't need a registry
         // entry to do that — it just mirrors whatever it saw.)
         let response = build_path_validation_packet(session_id, path_id, 0, parsed.payload);
-        let mut buf2 = Vec::new();
-        let (m, _) = alkahest::serialize_to_vec::<PhantomPacket, _>(&response, &mut buf2);
-        let v2_echoed =
-            alkahest::deserialize::<PhantomPacket, PhantomPacket>(&buf2[..m]).expect("deserialize");
+        let buf2 = response.to_wire();
+        let v2_echoed = PhantomPacket::from_wire(&buf2).expect("deserialize");
         let echoed_parsed = parse_path_validation(&v2_echoed)
             .expect("ok")
             .expect("flag matched");
