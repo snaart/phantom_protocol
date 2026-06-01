@@ -28,6 +28,10 @@ futures = "0.3"
 opentelemetry = { version = "0.28", features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "0.28", features = ["metrics", "trace", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.28", default-features = false, features = [
-    "grpc-tonic", "metrics", "trace",
+    # `gzip-tonic` is load-bearing: telemetry.rs calls `.with_compression(Gzip)`
+    # on both exporters, and without this feature that fails at startup with
+    # "Metrics exporter feature 'gzip-tonic' is required ...", taking the whole
+    # server down before it binds.
+    "grpc-tonic", "metrics", "trace", "gzip-tonic",
 ] }
 tracing-opentelemetry = "0.29"
