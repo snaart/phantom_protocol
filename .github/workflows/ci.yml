@@ -209,6 +209,23 @@ jobs:
           workspaces: "."
       - run: cargo check --manifest-path cli/Cargo.toml
 
+  server-check:
+    name: server compiles + tests against core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      # The reference server is a deployed artifact; keep it building + linting
+      # against the current core. `--all-targets` also compiles its unit tests
+      # (the admission-control limiter), which the test run then executes.
+      - run: cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path server/Cargo.toml
+
   integration:
     name: tcp + kcp loopback integration
     runs-on: ubuntu-latest
