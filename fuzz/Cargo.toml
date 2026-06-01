@@ -54,3 +54,17 @@ path = "fuzz_targets/fuzz_embedded_framing.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_hello_retry"
+path = "fuzz_targets/fuzz_hello_retry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_path_validation"
+path = "fuzz_targets/fuzz_path_validation.rs"
+test = false
+doc = false
+bench = false

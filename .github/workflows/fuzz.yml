@@ -1,0 +1,81 @@
+name: Fuzz
+
+on:
+  pull_request:
+    branches: [main]
+    # Only when something a harness exercises (or the fuzz setup itself) changes.
+    paths:
+      - 'core/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  schedule:
+    # Daily long run, ~03:17 UTC (off-peak; odd minute dodges the top-of-hour
+    # scheduler stampede). Scheduled runs fire on the default branch.
+    - cron: '17 3 * * *'
+
+# cargo-fuzz injects its own RUSTFLAGS (sanitizer-coverage + ASan). Do NOT set a
+# repo-wide `-D warnings` here — it would be appended to the instrumented build
+# and can spuriously fail it.
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: cargo-fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    # Hard ceiling: cargo-fuzz install + instrumented build + the run. The
+    # per-run budget below is at most 600s; 30m leaves ample headroom.
+    timeout-minutes: 30
+    strategy:
+      # One red target must not cancel the others — each is an independent
+      # parser we want signal on.
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_client_hello
+          - fuzz_server_hello
+          - fuzz_hello_retry
+          - fuzz_packet_parse
+          - fuzz_path_validation
+          - fuzz_aead_decrypt
+          - fuzz_embedded_framing
+    steps:
+      - uses: actions/checkout@v4
+      # libFuzzer instrumentation + the ASan runtime require nightly. The
+      # x86_64-linux nightly ships `rustc-nightly_rt.asan`, so the default
+      # `-Zsanitizer=address` build links here (unlike macOS/aarch64).
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz"
+          key: fuzz-${{ matrix.target }}
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # Copy the committed seeds into the (otherwise empty) corpus dir so the
+      # parsers' success paths are reachable from input one.
+      - name: Seed corpus
+        run: bash fuzz/seed-corpus.sh ${{ matrix.target }}
+      # 60s smoke on PRs (catch a freshly-introduced panic); 600s on the nightly
+      # cron to dig deeper. rss limit guards against an OOM false-positive.
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            SECS=600
+          else
+            SECS=60
+          fi
+          echo "::notice::fuzzing ${{ matrix.target }} for ${SECS}s"
+          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+            -max_total_time="$SECS" -rss_limit_mb=4096
+      # On a crash, libFuzzer drops the reproducing input here — keep it so the
+      # failure is reproducible off the runner.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
