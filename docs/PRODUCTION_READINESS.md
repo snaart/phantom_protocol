@@ -835,7 +835,9 @@ module-by-module without re-touching the Phase 3.6 gating infrastructure.
   - Profiling tips (perf, flamegraph).
 
 ### 7.8 Migration guides
-- `docs/migration/` для каждого breaking-change release.
+- Migration notes recorded in `CHANGELOG.md` per breaking-change release (the
+  per-version `docs/migration/` dir was removed when the three version axes
+  collapsed into one wire protocol).
 - Wire-version compatibility matrix.
 
 ### Deliverables Phase 7
