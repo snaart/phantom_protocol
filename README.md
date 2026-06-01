@@ -17,8 +17,9 @@ Kotlin, C); native WASM target; bare-metal `EmbeddedLeg` for no_std.
 
 - **Hybrid post-quantum handshake** — X25519 + ML-KEM-768 KEM, Ed25519 + ML-DSA-65
   signatures. Both halves must verify. Pure-Rust RustCrypto primitives — no C
-  bindings in the crypto path, compiles on every target including wasm32 and
-  `thumbv7em-none-eabihf`.
+  bindings in the crypto path, so the full handshake compiles on native, mobile,
+  and `wasm32`. (Bare-metal `thumbv7em` is `std`-gated to the framing transport
+  only — see [Status & limitations](#status--limitations).)
 - **0-RTT resumption** — AEAD-sealed early-data (≤ 16 KiB) folded into the
   single `ClientHello`, one-shot anti-replay via a consumed `SessionCache`
   ticket, best-effort fallback to a 1-RTT handshake when the ticket is
@@ -301,14 +302,22 @@ Regen: `tests/bindings/{generate_swift,generate_kotlin,generate_c}.sh`.
 
 ### Embedded (`embedded` feature, default off)
 
+On bare-metal `thumbv7em-none-eabihf` Phantom Core ships the **framing transport
+only** — `EmbeddedLeg` and its length-prefix codec. The PQ handshake,
+`PhantomSession`, the crypto primitives, and `TokioRuntime` are `std`-gated and
+**not** built there; a bare-metal embedder brings its own crypto/handshake driver
+and runs it over the leg. PQ-on-bare-metal is descoped for 1.0 (see
+[Status & limitations](#status--limitations)).
+
 `EmbeddedLeg<R, W, const N: usize>` wraps any `embedded-io-async = 0.6` byte
 stream (UART, USB-CDC, …) with 4-byte BE length-prefix framing — the same wire
 shape as `TcpSessionTransport`. Pure-Rust, no_std + alloc, target-arch-agnostic
 (builds on host x86_64 for unit tests _and_ on bare-metal `thumbv7em-none-eabihf`).
 Per-`(R, W)` `SessionTransport` impl via the `impl_embedded_session_transport!`
 macro. `RngProvider` trait injects a hardware RNG when `getrandom` isn't
-available. Runnable reference:
-[`core/examples/embedded_demo.rs`](core/examples/embedded_demo.rs).
+available. [`core/examples/embedded_demo.rs`](core/examples/embedded_demo.rs) runs
+the full session over a mock byte stream **on a host** (std), demonstrating the
+leg — not a bare-metal handshake.
 
 ## Security
 
@@ -396,6 +405,15 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 - **7 fuzz harnesses**, run in CI (`.github/workflows/fuzz.yml`: 60 s per target
   per PR, 600 s nightly). Fuzzing needs nightly; only `fuzz_embedded_framing`'s
   body also compiles on stable.
+- **Embedded is framing-only on bare-metal.** The `thumbv7em-none-eabihf` build
+  (`--no-default-features --features embedded,no-std`) ships `EmbeddedLeg` + its
+  length-prefix framing; the PQ crypto, handshake, and `PhantomSession` are
+  `std`-gated out. **PQ-on-bare-metal is descoped for 1.0** — the RustCrypto
+  primitives need `alloc` plus entropy/heap the embedder supplies, and a real
+  bare-metal handshake (no-std crypto, an Embassy/RTIC runtime, a QEMU-hosted
+  handshake test) is a separate sub-project. Bare-metal embedders run their own
+  crypto over the leg. The hard `thumbv7em` CI gate is `cargo check --lib` — it
+  proves the framing compiles, not that a session runs.
 
 ## Documentation
 
