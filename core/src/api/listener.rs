@@ -2,9 +2,11 @@ use crate::api::session::{PhantomSession, SessionTransport};
 use crate::api::tcp_transport::TcpSessionTransport;
 use crate::crypto::hybrid_sign::HybridSigningKey;
 use crate::errors::CoreError;
+use crate::observability::attrs::{AeadAlgorithm, HandshakeOutcome, ProtocolVersion};
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+use crate::transport::types::LegType;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -231,21 +233,35 @@ impl PhantomListener {
             match drive_server_handshake(&transport, &self.handshake_server, peer.ip()).await {
                 Ok(pair) => pair,
                 Err(e) => {
-                    self.observability.record_handshake_failure();
+                    self.observability.record_handshake(
+                        started.elapsed(),
+                        HandshakeOutcome::Failure,
+                        LegType::Tcp,
+                        AeadAlgorithm::Aes256Gcm,
+                        ProtocolVersion::Current,
+                    );
                     return Err(e);
                 }
             };
-        let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        self.observability.record_handshake_success(elapsed_ns);
-        // Reference server accepts over TCP today; tighten when WebSocket /
-        // KCP variants land.
-        self.observability
-            .session_opened(crate::transport::types::LegType::Tcp);
+        // Reference server accepts over TCP today; the negotiated AEAD is
+        // AES-256-GCM by default (ChaCha20-Poly1305 is rejected under fips and
+        // not selected by the default policy).
+        self.observability.record_handshake(
+            started.elapsed(),
+            HandshakeOutcome::Success,
+            LegType::Tcp,
+            AeadAlgorithm::Aes256Gcm,
+            ProtocolVersion::Current,
+        );
+        // The data pump now owns the session-active gauge lifecycle (opened at
+        // pump start, closed at teardown) — so the gauge goes up *and* down. We
+        // no longer call `session_opened` here, which had kept it monotonic.
         let session = PhantomSession::from_accepted_server_session_with_runtime(
             peer.to_string(),
             transport,
             Arc::new(server_session),
             self.runtime.clone(),
+            self.observability.clone(),
         );
         Ok(AcceptOutcome::new(session, early_data))
     }

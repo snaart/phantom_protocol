@@ -91,7 +91,6 @@ Indicative starting points — tune to your traffic profile and SLO.
 | P99 handshake latency | `histogram_quantile(0.99, sum by (le) (rate(phantom_handshake_duration_seconds_bucket[5m]))) > 0.5` | medium |
 | Active sessions saturation | `phantom_session_active >= 0.9 * <provisioned-max>` | warn — scale up |
 | Replay rejections rising | `rate(phantom_security_replay_rejected_total[10m]) > 1/s` | medium — possible attack or clock skew |
-| Telemetry export failing | `rate(phantom_telemetry_export_failures_total[5m]) > 0` | low — fix collector reachability |
 
 ## Attributes that are **traces-only** (not metric labels)
 
