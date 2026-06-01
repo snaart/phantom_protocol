@@ -265,7 +265,7 @@ impl PhantomListener {
             self.runtime.clone(),
             self.observability.clone(),
         );
-        Ok(AcceptOutcome::new(session, early_data))
+        Ok(AcceptOutcome::new(session, early_data, peer))
     }
 
     /// Signal graceful shutdown (Phase 4.6).
@@ -310,6 +310,7 @@ impl PhantomListener {
 pub struct AcceptOutcome {
     session: Arc<PhantomSession>,
     early_data: parking_lot::Mutex<Option<Vec<u8>>>,
+    peer_addr: SocketAddr,
 }
 
 #[cfg_attr(feature = "bindings", uniffi::export)]
@@ -334,11 +335,23 @@ impl AcceptOutcome {
 }
 
 impl AcceptOutcome {
-    pub(crate) fn new(session: Arc<PhantomSession>, early_data: Option<Vec<u8>>) -> Arc<Self> {
+    pub(crate) fn new(
+        session: Arc<PhantomSession>,
+        early_data: Option<Vec<u8>>,
+        peer_addr: SocketAddr,
+    ) -> Arc<Self> {
         Arc::new(Self {
             session,
             early_data: parking_lot::Mutex::new(early_data),
+            peer_addr,
         })
+    }
+
+    /// The remote socket address this session was accepted from. Rust-only
+    /// (kept off the UniFFI surface, which avoids `SocketAddr`); embedders use
+    /// it for per-peer admission control / connection accounting.
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
     }
 }
 
