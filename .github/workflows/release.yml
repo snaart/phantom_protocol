@@ -38,12 +38,13 @@ jobs:
         with:
           workspaces: "."
       - uses: obi1kenobi/cargo-semver-checks-action@v2
+        # The crate is not yet published to crates.io, so there is no baseline
+        # to diff the public API against — the action errors with "not found in
+        # registry". Keep the check visible but non-blocking during pre-1.0
+        # iteration; it becomes a hard gate once the first version ships.
+        continue-on-error: true
         with:
           manifest-path: core/Cargo.toml
-          # If the crate has never been published, cargo-semver-checks
-          # cannot fetch a baseline. Treat that as a non-blocking
-          # warning rather than a hard failure during pre-1.0
-          # iteration.
           release-type: minor
 
   # ── Pre-release sanity ────────────────────────────────────────────
