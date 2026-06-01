@@ -492,6 +492,20 @@ impl Stream {
         result
     }
 
+    /// Reset a still-buffered reliable segment's send timestamp so the next
+    /// [`poll_send`](Self::poll_send) re-offers it immediately (as an unsent
+    /// segment) rather than waiting a full RTO for the retransmit pass. Used
+    /// when a send attempt failed *after* `poll_send` had already stamped
+    /// `sent_at` — the bytes never reached the wire, so the segment must not be
+    /// treated as in-flight. No-op if the segment was already acknowledged and
+    /// removed.
+    pub async fn mark_unsent(&self, sequence: SequenceNumber) {
+        let mut buffer = self.send_buffer.lock().await;
+        if let Some(pending) = buffer.iter_mut().find(|p| p.sequence == sequence) {
+            pending.sent_at = None;
+        }
+    }
+
     /// Handle received data
     ///
     /// Data is buffered until it can be delivered in order.
@@ -687,6 +701,39 @@ mod tests {
         assert!(acked.is_some());
 
         // Poll again - queue is empty
+        assert!(stream.poll_send(u64::MAX).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_unsent_re_offers_without_waiting_rto() {
+        // Time is paused, so nothing ever crosses the RTO — any re-offer here is
+        // due to `mark_unsent`, not the retransmit timer.
+        tokio::time::pause();
+        let stream = Stream::new(1);
+        stream.send_reliable(Bytes::from("hello")).await;
+
+        // First poll stamps `sent_at`; an immediate re-poll yields nothing
+        // (treated as in-flight, not yet timed out).
+        let seg = stream.poll_send(u64::MAX).await.unwrap();
+        assert_eq!(seg.seq, 0);
+        assert!(!seg.retransmit);
+        assert!(stream.poll_send(u64::MAX).await.is_none());
+
+        // Simulate a send that failed *after* `poll_send` stamped the segment:
+        // clear `sent_at` so it is no longer considered in-flight.
+        stream.mark_unsent(0).await;
+
+        // It is re-offered immediately — without advancing past the RTO — and as
+        // a fresh send (Pass 2), not a retransmission.
+        let seg2 = stream.poll_send(u64::MAX).await.unwrap();
+        assert_eq!(seg2.seq, 0);
+        assert_eq!(seg2.data, Bytes::from("hello"));
+        assert!(seg2.reliable);
+        assert!(!seg2.retransmit);
+
+        // `mark_unsent` on an already-acked (removed) segment is a no-op.
+        assert!(stream.ack(0).await.is_some());
+        stream.mark_unsent(0).await; // no panic, no effect
         assert!(stream.poll_send(u64::MAX).await.is_none());
     }
 

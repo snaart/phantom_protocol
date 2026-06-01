@@ -957,6 +957,14 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
             .await
             {
                 log::error!("PhantomSession: priority-ordered drain send failed");
+                // `poll_send` already stamped `sent_at` on this reliable
+                // segment, but the bytes never reached the wire. Clear it so the
+                // next drain re-offers it immediately instead of stalling a full
+                // RTO before the retransmit pass. Unreliable segments were
+                // removed by `poll_send` (fire-and-forget) — nothing to reset.
+                if seg.reliable {
+                    stream.mark_unsent(seg.seq).await;
+                }
                 break;
             }
         }
