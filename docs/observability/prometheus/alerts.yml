@@ -120,21 +120,6 @@ groups:
             Investigate CPU saturation, RNG starvation, or aggressive PoW
             difficulty.
 
-      - alert: PhantomTelemetryExportFailing
-        # Phantom Core observes its own export failures via
-        # `phantom.telemetry.export_failures`. Non-zero rate means the
-        # OTel Collector / SaaS backend is congested or unreachable.
-        expr: rate(phantom_telemetry_export_failures_total[10m]) > 0
-        for: 10m
-        labels:
-          severity: warning
-          team: ops
-        annotations:
-          summary: "Phantom OTel exporter dropping batches"
-          description: |
-            Exporter has dropped {{ $value | humanize }} batches/s for
-            10 minutes. Inspect collector logs and backend reachability.
-
   - name: phantom_health
     interval: 30s
     rules:
