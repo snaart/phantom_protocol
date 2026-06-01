@@ -4,14 +4,16 @@ Post-quantum-secure L4/L6 universal transport framework in Rust.
 
 Phantom Core gives applications an authenticated, confidential, post-quantum-secure
 byte pipe. It pairs a hybrid classical-plus-PQ handshake (X25519 + ML-KEM-768 KEM,
-Ed25519 + ML-DSA-65 signatures — FIPS 203 / FIPS 204, pure Rust) with a multi-path
-transport (TCP / KCP-over-UDP / FakeTLS-over-TCP / WebSocket / embedded byte
-streams) and adaptive fallback. Cross-language bindings via UniFFI (Python, Swift,
-Kotlin, C); native WASM target; bare-metal `EmbeddedLeg` for no_std.
+Ed25519 + ML-DSA-65 signatures — FIPS 203 / FIPS 204, pure Rust) with a
+transport layer (TCP / WebSocket for sessions today; WASI / embedded byte-stream
+framing; KCP / FakeTLS / multipath as experimental legs) and adaptive fallback.
+Cross-language bindings via UniFFI (Python, Swift, Kotlin, C); native WASM
+target; bare-metal `EmbeddedLeg` for no_std.
 
-> **Pre-1.0 (`0.2.0`).** Wire format may break between minors; SemVer kicks in at
-> 1.0. **261 / 261** tests passing, 0 workspace warnings, 0 `unsafe` outside one
-> audited opt-in, MSRV Rust 1.75. See [Status & limitations](#status--limitations).
+> **Pre-1.0 (`0.3.0`).** Wire format may break between minors; SemVer kicks in at
+> 1.0. 0 workspace warnings, 0 `unsafe` outside three audited opt-ins, MSRV Rust
+> 1.75, CI green across the full cross-target matrix. See
+> [Status & limitations](#status--limitations).
 
 ## Highlights
 
@@ -25,9 +27,13 @@ Kotlin, C); native WASM target; bare-metal `EmbeddedLeg` for no_std.
   ticket, best-effort fallback to a 1-RTT handshake when the ticket is
   unknown / expired or the blob fails to open.
 - **Mid-session rekey** — HKDF ratchet, `REKEY` flag + per-packet `epoch`.
-- **Multi-path** — TCP / KCP-over-UDP / FakeTLS-over-TCP / WebSocket / EmbeddedLeg.
-  Constant-time path validation, per-path RTT/loss tracking, round-robin or
-  low-latency scheduling.
+- **Transports** — `PhantomSession` runs an authenticated session over **TCP**
+  and **WebSocket** today (plus WASI and Embedded as framing legs). The
+  KCP-over-UDP and FakeTLS-over-TCP legs, and the multipath scheduler
+  (constant-time path validation, per-path RTT/loss tracking, round-robin /
+  low-latency selection), are implemented as `TransportLeg`s but **not yet wired
+  to the session data plane** — experimental, out of 1.0 scope (see
+  [Status & limitations](#status--limitations)).
 - **Multi-stream** — strict-priority scheduler, `WINDOW_UPDATE` per-stream
   flow control, BBRv2-inspired pacing (Startup / Drain / ProbeBW / ProbeRTT /
   FastRecovery).
@@ -41,9 +47,9 @@ Kotlin, C); native WASM target; bare-metal `EmbeddedLeg` for no_std.
   self-hosted via OTel Collector). Pre-built Grafana dashboard + Prometheus
   alert rules in `docs/observability/`.
 - **SLSA-3 build provenance** — OIDC attestation on every release artifact.
-- **Cross-platform** — 11 hard CI gates (Linux x4, macOS x2, iOS x2, Windows x2,
-  wasm32-unknown-unknown, thumbv7em-none-eabihf). Only `wasm32-wasi` is
-  `allow_failure`.
+- **Cross-platform** — every CI target is a hard gate (Linux x4, macOS x2,
+  iOS x2, Windows x2, wasm32-unknown-unknown, wasm32-wasip2,
+  thumbv7em-none-eabihf); **no `allow_failure` rows**.
 
 ## Quick start
 
@@ -96,7 +102,7 @@ let session = phantom_core::api::session::connect_pinned(
 session.send(b"ping".to_vec()).await?;
 let reply = session.recv().await?;
 
-// ── Or, explicit transport (lets you swap KCP / FakeTLS / WebSocket) ──────
+// ── Or, explicit transport (TCP / WebSocket today; WASI / Embedded framing) ─
 let stream    = TcpStream::connect(&server_addr).await?;
 let transport = TcpSessionTransport::new(stream);
 let key       = HybridVerifyingKey::from_bytes(&pinned_key)?;
@@ -229,7 +235,7 @@ non-root `phantom` UID 65532, EXPOSE 4242 + 9090, signing-key volume at
 and TCP healthcheck.
 
 ```bash
-docker build -t phantom-server:0.2.0 .
+docker build -t phantom-server:0.3.0 .
 docker compose up -d
 ```
 
@@ -237,7 +243,7 @@ docker compose up -d
 
 Production-shape chart at
 [`docs/operations/helm/phantom-core/`](docs/operations/helm/phantom-core/).
-`appVersion: 0.2.0`, ClusterIP service on `4242` (metrics on `9090`), 3 replicas,
+`appVersion: 0.3.0`, ClusterIP service on `4242`, 3 replicas,
 `tcpSocket` liveness / readiness. Raw manifests + walkthrough in
 [`docs/operations/kubernetes.md`](docs/operations/kubernetes.md).
 
@@ -286,7 +292,7 @@ cargo run --manifest-path cli/Cargo.toml -- version
 | `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` | hard gate |
 | `wasm32-unknown-unknown` | hard gate (Phase 3.3 / 3.5) |
 | `thumbv7em-none-eabihf` | hard gate (Phase 3.6; `--no-default-features --features embedded,no-std`) |
-| `wasm32-wasi` | `allow_failure: true` — deferred, see [`docs/operations/wasi.md`](docs/operations/wasi.md) |
+| `wasm32-wasip2` | hard gate (compile + host round-trip; WASI is client-side framing-only — see [`docs/operations/wasi.md`](docs/operations/wasi.md)) |
 
 ### Language bindings (`tests/bindings/`)
 
@@ -379,11 +385,19 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 
 ## Status & limitations
 
-- **Pre-1.0 (`0.2.0`).** Wire format may break between minors; SemVer applies
+- **Pre-1.0 (`0.3.0`).** Wire format may break between minors; SemVer applies
   once 1.0 ships. The current wire protocol is a single pinned version — the
   former V1/V2/V3 axes were collapsed pre-1.0 (no users, no negotiation, no
-  fallback). Migration notes for prior wire shapes are in
-  [`docs/migration/`](docs/migration/).
+  fallback), so there are no cross-version migration guides.
+- **KCP / FakeTLS / multipath are experimental.** `PhantomSession` runs an
+  authenticated session over TCP and WebSocket (and WASI / Embedded as framing
+  legs). The `KcpLeg` / `FakeTlsLeg` and the multipath `Scheduler` are
+  implemented as `TransportLeg`s but are **not yet wired into the session data
+  plane** — there is no `TransportLeg → SessionTransport` adapter and the pump
+  uses a single fixed transport. Treat them as out of 1.0 scope.
+- **Mobile connection migration (Wi-Fi ↔ LTE) is not yet supported.** The
+  path-validation primitives are internal-only; on a network change, reconnect
+  (use 0-RTT resumption via `connect_pinned_with_resumption` to minimise cost).
 - **Negative-security suite: 20 always-on tests** in
   `core/tests/security_invariants.rs`, pinning every documented invariant.
   Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
@@ -392,7 +406,8 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 - **All 8 production-readiness phases (0–7) closed code-side.** Deferred with
   rationale: external CMVP / CC lab validation (Phase 5.7 — procurement, not
   code), ProVerif / Tamarin formal verification (Phase 6.10 — separate research
-  engagement), `wasm32-wasi` (pending a `WasiLeg` + `WasiRuntime`).
+  engagement). `wasm32-wasip2` shipped as a hard gate (`WasiLeg` + `WasiRuntime`,
+  client-side framing-only).
 - **`PhantomListener::bind()` generates a fresh signing key per process** —
   identities don't survive restart. Pin-stable production deployments must use
   `bind_with_signing_key()` with a key loaded from disk (`phantom-cli keygen`

@@ -28,7 +28,7 @@ cd tests/bindings
 cargo build --release --manifest-path ../../core/Cargo.toml
 ./generate_python.sh
 cp ../../target/release/libphantom_core.{dylib,so} . 2>/dev/null || true
-python -m build --wheel        # produces dist/phantom_core-0.2.0-*.whl
+python -m build --wheel        # produces dist/phantom_core-0.3.0-*.whl
 twine upload dist/*.whl        # manual — needs PyPI credentials
 ```
 
@@ -96,7 +96,7 @@ to a GitHub Release.
 
 ## A note on pre-1.0 versioning
 
-`phantom-core` is at version **0.2.0** — every binding artifact carries the
+`phantom-core` is at version **0.3.0** — every binding artifact carries the
 same version. The `core/Cargo.toml` version is the single source of truth;
 when it bumps, update each binding's manifest in lock step:
 

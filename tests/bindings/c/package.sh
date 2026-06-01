@@ -26,7 +26,7 @@ cargo build --release --manifest-path "${REPO_ROOT}/core/Cargo.toml"
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
-VERSION="0.2.0"
+VERSION="0.3.0"
 BUNDLE="phantom_core-c-${VERSION}-${OS}-${ARCH}"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "${STAGE}"' EXIT
