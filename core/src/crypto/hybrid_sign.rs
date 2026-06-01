@@ -100,6 +100,27 @@ impl HybridSigningKey {
         (signing_key, verifying_key)
     }
 
+    /// FIPS 140-3 §7.10 pairwise-consistency test for a freshly-generated
+    /// **long-term** hybrid signing identity: sign a fixed message with this
+    /// secret key and verify it against `verifying_key`. Returns `Err` iff the
+    /// keypair cannot validate its own signature — i.e. the RNG or a signing
+    /// primitive was faulted and the key must not be used.
+    ///
+    /// Call this **only** at persisted / long-lived-identity generation sites
+    /// (CLI keygen, server identity load-or-create, `PhantomListener::bind`).
+    /// It is deliberately **not** run inside [`generate`](Self::generate) /
+    /// [`generate_with_provider`](Self::generate_with_provider): those mint the
+    /// client's *ephemeral* per-handshake signing key, and a sign+verify there
+    /// would add ~40% to every client handshake. The requirement targets
+    /// long-term keypairs, not per-connection ephemerals.
+    pub fn pairwise_consistency_check(
+        &self,
+        verifying_key: &HybridVerifyingKey,
+    ) -> Result<(), HybridSignError> {
+        let msg: &[u8] = b"phantom-core keygen pairwise-consistency test";
+        verifying_key.verify(msg, &self.sign(msg))
+    }
+
     /// Sign with both algorithms. Both signatures are returned in the
     /// `HybridSignature`; verification on the peer side requires both to
     /// be valid.
@@ -288,6 +309,18 @@ mod tests {
 
         let wrong = b"Wrong message";
         assert!(verifying_key.verify(wrong, &signature).is_err());
+    }
+
+    #[test]
+    fn pairwise_consistency_check_passes_for_a_matched_keypair_and_fails_for_a_mismatch() {
+        let (sk, vk) = HybridSigningKey::generate();
+        // A correctly-generated keypair passes its own PCT.
+        assert!(sk.pairwise_consistency_check(&vk).is_ok());
+
+        // A signing key checked against a DIFFERENT public key fails — exactly
+        // the fault-injected-keygen signal the long-term-identity sites rely on.
+        let (_other_sk, other_vk) = HybridSigningKey::generate();
+        assert!(sk.pairwise_consistency_check(&other_vk).is_err());
     }
 
     #[test]

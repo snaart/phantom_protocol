@@ -502,7 +502,8 @@ impl PhantomSession {
         resumption_request: Option<([u8; 32], [u8; 32], Vec<u8>)>,
         observability: Arc<Observability>,
     ) {
-        log::info!("PhantomSession: starting handshake with {}", peer);
+        // DEBUG: the peer address is correlatable; keep it off default logs.
+        log::debug!("PhantomSession: starting handshake with {}", peer);
 
         // fips bootstrap POST gate, mirroring the listener and
         // `connect_pinned*` paths: the synchronous Rust-only entry
@@ -554,7 +555,7 @@ impl PhantomSession {
 
         let session_id = *crypto_session.id();
         state.store(ConnectionState::Connected as u8, Ordering::Relaxed);
-        log::info!("PhantomSession: fully connected to {}", peer);
+        log::debug!("PhantomSession: fully connected to {}", peer);
 
         let next_app_seq = Arc::new(AtomicU32::new(1));
         // Wrap the (post-handshake) transport so every data-plane send/recv is

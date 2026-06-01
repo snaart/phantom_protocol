@@ -225,7 +225,18 @@ pub struct HandshakeServer {
 
 impl HandshakeServer {
     pub fn new() -> Result<Self, HandshakeError> {
-        let (signing_key, _verifying_key) = HybridSigningKey::generate();
+        // `bind()` without a persisted key mints the server's long-lived identity
+        // here — run the FIPS pairwise-consistency check on it (this is a
+        // per-process identity, not a per-handshake key, so the cost is paid
+        // once at startup).
+        let (signing_key, verifying_key) = HybridSigningKey::generate();
+        signing_key
+            .pairwise_consistency_check(&verifying_key)
+            .map_err(|e| {
+                HandshakeError::RngError(format!(
+                    "server signing identity failed its pairwise-consistency test: {e:?}"
+                ))
+            })?;
         Self::with_signing_key(signing_key)
     }
 
@@ -318,8 +329,10 @@ impl HandshakeServer {
     #[tracing::instrument(
         name = "phantom.handshake.process_client_hello",
         skip_all,
+        // No `client_ip` field: this span is always-on in the library, and the
+        // peer IP is correlatable PII. The DoS gate already has the IP in-band;
+        // it does not need to leak into every handshake trace.
         fields(
-            client_ip = %client_ip,
             difficulty = difficulty,
             has_cookie = client_hello.cookie.is_some(),
             has_pow = client_hello.pow_solution.is_some(),
