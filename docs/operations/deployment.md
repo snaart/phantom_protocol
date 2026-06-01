@@ -57,6 +57,9 @@ The relevant runtime-visible knobs are:
 - [ ] Server time synchronized via NTP — cookie / PoW bucketing
       depends on monotonic wall clock.
 - [ ] File descriptor limit raised (≥65535) on the server host.
+- [ ] `PHANTOM_MAX_SESSIONS` set **below** `LimitNOFILE` and within the memory
+      budget; `PHANTOM_MAX_SESSIONS_PER_IP` set for the expected client mix
+      (see *Session caps & resource limits* below).
 - [ ] sysctl tuning applied (see `systemd.md`).
 - [ ] CI build of the wrapper binary completes for all target
       platforms.
@@ -65,6 +68,32 @@ The relevant runtime-visible knobs are:
       → `PhantomListener::shutdown()`).
 - [ ] Logs ship to a durable backend (journald → vector → Loki, or
       docker JSON → fluent-bit → Elastic, etc.).
+
+## Session caps & resource limits
+
+The reference server bounds load with two admission-control knobs (CLI flags or
+env vars):
+
+| Setting | Env | Default | Purpose |
+| --- | --- | --- | --- |
+| `--max-sessions` | `PHANTOM_MAX_SESSIONS` | `1024` | Global concurrent-session ceiling. At the cap the accept loop stops accepting — new connections queue in the OS backlog (`somaxconn` / `tcp_max_syn_backlog`) until a session closes. Backpressure, not a hard drop. `0` = unbounded. |
+| `--max-sessions-per-ip` | `PHANTOM_MAX_SESSIONS_PER_IP` | `64` | Per-source-IP concurrent-session ceiling. A peer already at the cap has further connections rejected (closed right after the handshake), so one source cannot monopolise the global pool. `0` disables. |
+
+**Size `PHANTOM_MAX_SESSIONS` against two limits:**
+
+- **File descriptors.** Each session holds ~1 fd. Keep
+  `PHANTOM_MAX_SESSIONS` comfortably below `LimitNOFILE` (`systemd.md` sets
+  `65535`) so the listen socket, OTLP exporter connection, and transient
+  accept churn have headroom — e.g. `max_sessions ≈ LimitNOFILE − 1000`.
+- **Memory.** Budget ~512 KiB per session (send/recv buffers + crypto state).
+  The Kubernetes guide's `~1000 sessions → 512 MiB limit` line is exactly this:
+  `PHANTOM_MAX_SESSIONS × 512 KiB` should fit the pod/host memory limit with
+  headroom.
+
+The per-IP cap is a *session-count* cap, not a handshake-rate limit — an
+abusive IP can still trigger (cheap, PoW/cookie-gated) handshakes that are then
+rejected. Pre-handshake per-IP rate limiting belongs at the edge (LB / nftables
+`ct count` / a reverse proxy).
 
 ## Monitoring
 
