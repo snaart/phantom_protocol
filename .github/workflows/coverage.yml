@@ -17,7 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain (llvm-tools-preview)
-        uses: dtolnay/rust-toolchain@stable
+        # Branch coverage (`cargo llvm-cov --branch`) needs the nightly-only
+        # `-Z coverage-options=branch`, so this job runs on nightly.
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
