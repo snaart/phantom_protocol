@@ -148,6 +148,13 @@ serialised `PacketHeader` bytes (§ 5).
 (packet-number / SACK fields) without a layout change. It is empty in every
 frame this build emits; a decoder ignores its contents.
 
+> **Security note.** `extensions` is **not** covered by the AEAD AAD (the AAD is
+> exactly the 45-byte `PacketHeader` image — § 5), so its bytes are
+> attacker-malleable. A future TLV reader must therefore treat `extensions` as
+> untrusted input and either authenticate it separately or restrict it to
+> values that are safe when forged. For 1.0 it is reserved and never
+> interpreted, which is why no reader exists yet.
+
 ### 4.2 `PacketHeader` (45 bytes)
 
 Serialised by `PacketHeader::to_wire` as an explicit, fixed **big-endian**

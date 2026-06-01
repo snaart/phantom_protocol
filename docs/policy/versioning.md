@@ -115,7 +115,7 @@ A change to any of the following requires bumping `WIRE_VERSION` /
 Because there is no negotiation, such a bump is a **coordinated, breaking
 change**: every peer must move to the new constant at once. Pre-1.0 there are no
 peers to keep on the old value, so the bump ships as a single hard cut (a crate
-**major** version bump, plus a migration note under `docs/migration/`). The
+**major** version bump, plus a migration note in `CHANGELOG.md`). The
 constant exists precisely so a future deliberate bump has a single, signed,
 tamper-checked anchor to move — not so that multiple versions coexist on the
 wire.
@@ -245,5 +245,5 @@ When `phantom_core` reaches 1.0, sections 2 and 5 tighten their pre-1.0
 leniencies and the document gains a "1.0 stability promise" section. If a
 deliberate `WIRE_VERSION` / `PROTOCOL_VERSION` bump is ever scheduled, §3 and §9
 gain the specifics of that hard cut (the new packet layout and the
-`docs/migration/` note); the wire stays a single pinned version on either side
+`CHANGELOG.md` migration note); the wire stays a single pinned version on either side
 of the cut, not a negotiated set.
