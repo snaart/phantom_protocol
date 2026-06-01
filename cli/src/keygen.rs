@@ -14,6 +14,13 @@ pub struct Args {
 pub fn run(args: Args) -> Result<()> {
     // Generate a fresh hybrid signing key (Ed25519 + ML-DSA-65) via OS RNG.
     let (signing_key, verifying_key) = HybridSigningKey::generate();
+    // FIPS pairwise-consistency check before persisting a long-term identity:
+    // never write a key to disk that can't verify its own signature.
+    signing_key
+        .pairwise_consistency_check(&verifying_key)
+        .map_err(|e| {
+            anyhow::anyhow!("generated key failed its pairwise-consistency test: {e:?}")
+        })?;
 
     // Serialize as 64 bytes: ed25519_seed[32] || ml_dsa_seed[32].
     // This compact form is documented in HybridSigningKey::to_bytes().

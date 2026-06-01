@@ -42,6 +42,11 @@ pub fn load_or_create(path: &Path) -> Result<HybridSigningKey> {
             "no signing key on disk — generating a fresh one"
         );
         let (key, vk) = HybridSigningKey::generate();
+        // FIPS pairwise-consistency check before persisting the long-term
+        // identity — never write a key that can't verify its own signature.
+        key.pairwise_consistency_check(&vk).map_err(|e| {
+            anyhow::anyhow!("generated signing key failed its pairwise-consistency test: {e:?}")
+        })?;
         let bytes = key.to_bytes();
 
         if let Some(parent) = path.parent() {
