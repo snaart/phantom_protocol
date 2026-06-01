@@ -1054,7 +1054,7 @@ async fn send_app_data<T: SessionTransport>(
     let size = buf.len();
     pace_send(crypto_session, size as u64).await;
     if let Err(e) = transport.send_bytes(&buf[..size]).await {
-        log::error!("PhantomSession: transport send failed (V2): {}", e);
+        log::error!("PhantomSession: transport send failed: {}", e);
         return false;
     }
     crypto_session.on_packet_sent(size as u64);
