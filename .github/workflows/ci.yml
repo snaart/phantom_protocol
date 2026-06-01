@@ -195,3 +195,25 @@ jobs:
         with:
           workspaces: "."
       - run: cargo check --manifest-path cli/Cargo.toml
+
+  integration:
+    name: tcp + kcp loopback integration
+    runs-on: ubuntu-latest
+    # Outer guard: even if an in-test deadlock-timeout somehow fails to fire,
+    # GitHub kills the job rather than burning a 6-hour runner.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      # Real-network loopback gates that previously had no automated coverage:
+      #   - TCP: server-key pinning (positive + negative) and on-the-wire AES-GCM
+      #     (the test sniffs raw bytes and asserts plaintext never appears),
+      #     plus a 0-RTT resumption round-trip.
+      #   - KCP-over-UDP: echo, length-prefix framing, concurrent streams.
+      # Both files are `#[ignore]`-gated so they stay out of the default
+      # `cargo test`; this dedicated job runs them with --ignored (mirroring the
+      # wasi_integration job). Each KCP test carries an in-test 20s deadlock guard.
+      - run: cargo test --manifest-path core/Cargo.toml --test tcp_integration --test kcp_integration -- --ignored

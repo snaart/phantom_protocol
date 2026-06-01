@@ -393,8 +393,9 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   is the reference OTLP/gRPC wiring.
 - **MSRV: Rust 1.75.** `cli/` uses edition 2024 and builds on stable but not
   on the 1.75 gate.
-- **4 of 5 fuzz harnesses** still need nightly; `fuzz_embedded_framing` builds
-  on stable.
+- **7 fuzz harnesses**, run in CI (`.github/workflows/fuzz.yml`: 60 s per target
+  per PR, 600 s nightly). Fuzzing needs nightly; only `fuzz_embedded_framing`'s
+  body also compiles on stable.
 
 ## Documentation
 
