@@ -54,7 +54,9 @@ jobs:
           # ── macOS / iOS ──────────────────────────────────────────────────
           - target: x86_64-apple-darwin
             runner: macos-latest
-            install_target: false
+            # macos-latest runners are aarch64, so the x86_64 std is not the
+            # host target and must be installed explicitly.
+            install_target: true
           - target: aarch64-apple-darwin
             runner: macos-latest
             install_target: false

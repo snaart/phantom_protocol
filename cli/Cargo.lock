@@ -1313,6 +1313,7 @@ dependencies = [
  "hmac",
  "js-sys",
  "kcp-tokio",
+ "libc",
  "log",
  "lz4_flex",
  "ml-dsa",
