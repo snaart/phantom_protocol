@@ -271,7 +271,6 @@ FFI even on no-OTel builds.
 | `phantom.pacer.rate` | ObservableGauge | `By/s` | `path_id` | BBR pacer output |
 | `phantom.bandwidth.estimate` | ObservableGauge | `By/s` | `path_id`, `direction` | Bandwidth estimator output |
 | `phantom.buffer_pool.allocations` | Counter | `{allocation}` | `outcome` (`hit_thread_local`/`hit_global`/`miss_new`) | Pool efficiency |
-| `phantom.telemetry.export_failures` | Counter | `{export}` | `pillar` (`metrics`/`traces`), `kind` | Self-observability for OTLP issues |
 
 ### Resource attributes (set by embedder, frozen at startup)
 
