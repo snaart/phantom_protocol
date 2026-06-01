@@ -1,10 +1,14 @@
 //! CAVP-style known-answer-tests for Phantom Core's FIPS-approved primitives.
 //!
-//! Each test pins one primitive against a published reference vector (or, where
-//! the public Phantom surface does not expose seeded keygen, a deterministic
-//! end-to-end round-trip that proves the wiring is consistent with itself).
-//! The intent is the same as a NIST CAVP submission: prove a regression in any
-//! of these primitives shows up as a hard red here.
+//! Each test pins one primitive against a published reference vector (or, for
+//! the PQ primitives exercised through Phantom's *hybrid* wrappers, a
+//! deterministic end-to-end round-trip). The intent is the same as a NIST CAVP
+//! submission: prove a regression in any of these primitives shows up as a hard
+//! red here.
+//!
+//! The byte-exact **external** NIST ACVP KATs for the raw ML-KEM-768 / ML-DSA-65
+//! primitives (which catch a crate-encoding regression a self-referential
+//! round-trip cannot) live in `core/tests/nist_kat.rs`.
 //!
 //! Phase 5.4 MVP closure — `docs/PROGRESS.md`.
 
@@ -24,15 +28,13 @@ use sha2::{Digest, Sha256};
 
 // ─── ML-KEM-768 (FIPS 203) ────────────────────────────────────────────────
 
-/// Source: FIPS 203 §7.2 / §7.3 (ML-KEM.Encaps / ML-KEM.Decaps). The
-/// `ml-kem 0.2` crate does not expose `generate_deterministic` /
-/// `encapsulate_deterministic` on the default feature set (those live behind
-/// the `deterministic` feature flag, which `phantom_core` does not enable), so
-/// we cannot byte-match a NIST PQC KAT response file from the public surface.
-/// We instead drive a seeded `StdRng` (ChaCha-based CSPRNG, `CryptoRngCore`)
-/// through the standard `KemCore::generate` + `Encapsulate` + `Decapsulate`
-/// path and assert the encap side and the decap side recover the same shared
-/// secret — the FIPS 203 correctness invariant.
+/// Source: FIPS 203 §7.2 / §7.3 (ML-KEM.Encaps / ML-KEM.Decaps). The byte-exact
+/// NIST ACVP KAT for the raw primitive lives in `core/tests/nist_kat.rs` (which
+/// enables `ml-kem`'s `deterministic` feature). This test instead drives a
+/// seeded `StdRng` (ChaCha-based CSPRNG, `CryptoRngCore`) through the standard
+/// `KemCore::generate` + `Encapsulate` + `Decapsulate` path and asserts the
+/// encap and decap sides recover the same shared secret — the FIPS 203
+/// correctness invariant — and exercises Phantom's hybrid combiner end-to-end.
 ///
 /// The same primitive sits inside `HybridSecretKey` (the X25519 + ML-KEM-768
 /// hybrid that `crypto::hybrid_kem` builds the handshake on), and we also
