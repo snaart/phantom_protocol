@@ -59,6 +59,9 @@ jobs:
       - run: cargo test --manifest-path core/Cargo.toml --test wire_vectors
       # Independent (non-Rust) decoder over the same fixtures — cross-impl interop.
       - run: python3 tests/wire_vectors_decode.py
+      # Real NIST ACVP KAT vectors for ML-KEM-768 / ML-DSA-65 — catches a PQ
+      # crate-encoding regression that a self-referential round-trip cannot.
+      - run: cargo test --manifest-path core/Cargo.toml --test nist_kat
 
   doc:
     name: cargo doc
@@ -158,6 +161,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y cmake
       - run: cargo test --manifest-path core/Cargo.toml --lib --features fips
       - run: cargo test --manifest-path core/Cargo.toml --test cavp --features fips
+      - run: cargo test --manifest-path core/Cargo.toml --test nist_kat --features fips
       - run: cargo clippy --manifest-path core/Cargo.toml --lib --features fips -- -D warnings
       # Confirm the fips × no-std conflict guard fires loudly rather
       # than silently producing a broken binary.
