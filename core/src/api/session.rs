@@ -6,6 +6,8 @@
 
 use crate::crypto::hybrid_sign::HybridVerifyingKey;
 use crate::errors::CoreError;
+use crate::observability::attrs::{AeadAlgorithm, ReplayReason};
+use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{
     HandshakeClient, HelloRetryRequest, ServerHello, EARLY_DATA_MAX_LEN,
@@ -16,7 +18,7 @@ use crate::transport::path_validation_codec::build_path_validation_packet;
 use crate::transport::session::Session;
 use crate::transport::stream::Stream;
 use crate::transport::types::{
-    PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
+    LegType, PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
     WIRE_VERSION,
 };
 use bytes::Bytes;
@@ -122,6 +124,46 @@ pub struct ResumptionHint {
 // `phantom_core::api::SessionTransport` path stay stable.
 pub use crate::transport::session_transport::SessionTransport;
 
+/// Transport decorator that records `record_send` / `record_recv` on the
+/// session's [`Observability`] for every frame that crosses the wire — so the
+/// data-plane packet/byte counters reflect a real run without threading the
+/// handle through every send site. Wraps the concrete `SessionTransport` just
+/// before the data pump takes over, so handshake bytes are not counted as
+/// data-plane packets (they have their own handshake metric).
+struct ObservedTransport<T> {
+    inner: T,
+    observability: Arc<Observability>,
+    leg: LegType,
+}
+
+impl<T> ObservedTransport<T> {
+    fn new(inner: T, observability: Arc<Observability>, leg: LegType) -> Self {
+        Self {
+            inner,
+            observability,
+            leg,
+        }
+    }
+}
+
+impl<T: SessionTransport> SessionTransport for ObservedTransport<T> {
+    async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError> {
+        let result = self.inner.send_bytes(data).await;
+        if result.is_ok() {
+            self.observability.record_send(data.len(), self.leg);
+        }
+        result
+    }
+
+    async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
+        let result = self.inner.recv_bytes().await;
+        if let Ok(ref bytes) = result {
+            self.observability.record_recv(bytes.len(), self.leg);
+        }
+        result
+    }
+}
+
 // ─── Session ────────────────────────────────────────────────────────────────
 
 /// Client-first session — instant `connect()`, non-blocking `send()`.
@@ -171,6 +213,12 @@ pub struct PhantomSession {
     /// consumed the early-data; `Some(false)` — the client sent early-data and
     /// the server rejected it. Exposed via `early_data_accepted()`.
     early_data_accepted: Arc<Mutex<Option<bool>>>,
+    /// Session observability handle. Server-accepted sessions share the
+    /// `PhantomListener`'s instance (so its `snapshot()` aggregates every
+    /// session it accepted); client sessions get their own. The data pump
+    /// records send/recv, the security drops, and the session lifecycle
+    /// (open/close) against it. A ZST no-op when `telemetry-otel` is off.
+    observability: Arc<Observability>,
 }
 
 /// Commands for the background session task
@@ -301,6 +349,9 @@ impl PhantomSession {
         let streams = Arc::new(DashMap::new());
         let inner_session: Arc<Mutex<Option<Arc<Session>>>> = Arc::new(Mutex::new(None));
         let early_data_accepted: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        // Client sessions have no listener, so they own their observability
+        // instance (its `snapshot()` reflects just this connection).
+        let observability = Observability::new(ObservabilityConfig::default());
 
         let session = Self {
             id: new_session_id(),
@@ -314,6 +365,7 @@ impl PhantomSession {
             streams: streams.clone(),
             inner_session: inner_session.clone(),
             early_data_accepted: early_data_accepted.clone(),
+            observability: observability.clone(),
         };
 
         // Spawn the background handshake + data pump task on the supplied
@@ -336,6 +388,7 @@ impl PhantomSession {
             inner_session,
             early_data_accepted,
             resumption_request,
+            observability,
         )));
 
         session
@@ -360,6 +413,7 @@ impl PhantomSession {
             transport,
             server_session,
             Arc::new(TokioRuntime),
+            Observability::new(ObservabilityConfig::default()),
         )
     }
 
@@ -369,6 +423,7 @@ impl PhantomSession {
         transport: T,
         server_session: Arc<Session>,
         runtime: Arc<dyn Runtime>,
+        observability: Arc<Observability>,
     ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (recv_tx, recv_rx) = mpsc::channel(256);
@@ -396,15 +451,23 @@ impl PhantomSession {
             // Server side: 0-RTT early-data is delivered via
             // `AcceptOutcome`, not this client-facing field.
             early_data_accepted: Arc::new(Mutex::new(None)),
+            // Shares the listener's instance so its `snapshot()` aggregates
+            // every accepted session.
+            observability: observability.clone(),
         });
 
         let session_id = *server_session.id();
         let next_app_seq = Arc::new(AtomicU32::new(1));
         let runtime_for_pump = runtime.clone();
+        let observed = Arc::new(ObservedTransport::new(
+            transport,
+            observability.clone(),
+            LegType::Tcp,
+        ));
         let _detached = runtime.spawn(Box::pin(run_data_pump(
             server_session,
             session_id,
-            Arc::new(transport),
+            observed,
             state,
             send_queue,
             cmd_rx,
@@ -413,6 +476,8 @@ impl PhantomSession {
             streams,
             next_app_seq,
             runtime_for_pump,
+            observability,
+            LegType::Tcp,
         )));
 
         session
@@ -435,6 +500,7 @@ impl PhantomSession {
         inner_session: Arc<Mutex<Option<Arc<Session>>>>,
         early_data_accepted: Arc<Mutex<Option<bool>>>,
         resumption_request: Option<([u8; 32], [u8; 32], Vec<u8>)>,
+        observability: Arc<Observability>,
     ) {
         log::info!("PhantomSession: starting handshake with {}", peer);
 
@@ -491,10 +557,18 @@ impl PhantomSession {
         log::info!("PhantomSession: fully connected to {}", peer);
 
         let next_app_seq = Arc::new(AtomicU32::new(1));
+        // Wrap the (post-handshake) transport so every data-plane send/recv is
+        // recorded. The connectionless API rides TCP today (KCP / FakeTLS legs
+        // are not session-wired yet), so the leg label is fixed to TCP.
+        let observed = Arc::new(ObservedTransport::new(
+            transport,
+            observability.clone(),
+            LegType::Tcp,
+        ));
         run_data_pump(
             crypto_session,
             session_id,
-            Arc::new(transport),
+            observed,
             state,
             send_queue,
             cmd_rx,
@@ -503,6 +577,8 @@ impl PhantomSession {
             streams,
             next_app_seq,
             runtime,
+            observability,
+            LegType::Tcp,
         )
         .await;
     }
@@ -601,7 +677,14 @@ async fn run_data_pump<T: SessionTransport>(
     streams: Arc<DashMap<u32, Arc<Stream>>>,
     next_app_seq: Arc<AtomicU32>,
     runtime: Arc<dyn Runtime>,
+    observability: Arc<Observability>,
+    leg: LegType,
 ) {
+    // Session is now established and active — bump the active-session gauge.
+    // The matching `session_closed` at teardown (below) lets the gauge fall,
+    // so it tracks live sessions instead of growing monotonically.
+    observability.session_opened(leg);
+
     // ── Raw-app session stream (reserved id 1) ──
     // The connectionless `send()` / `recv()` surface is multiplexed onto one
     // reserved stream so it gets the same reliable-delivery machinery as
@@ -643,6 +726,7 @@ async fn run_data_pump<T: SessionTransport>(
     let demux_recv = demux.clone();
     let streams_recv = streams.clone();
     let recv_tx_for_task = recv_tx.clone();
+    let observability_recv = observability.clone();
     // Completion signal for the receive task. `SpawnHandle` from the
     // runtime trait does not expose a `Future` for `.await` directly
     // (different runtimes provide different join futures), so we wire a
@@ -697,6 +781,8 @@ async fn run_data_pump<T: SessionTransport>(
                 &mut ack_buf,
                 &mut path_validation_seq,
                 &mut window_update_seq,
+                &observability_recv,
+                leg,
             )
             .await;
         }
@@ -809,6 +895,8 @@ async fn run_data_pump<T: SessionTransport>(
     // handle. Goes through the runtime-agnostic `SpawnHandle::abort`.
     recv_handle.abort();
     state.store(ConnectionState::Closed as u8, Ordering::Relaxed);
+    // Session torn down — drop the active-session gauge back down.
+    observability.session_closed(leg);
 }
 
 /// Drain every stream with pending data, scheduling them in strict
@@ -1053,6 +1141,8 @@ async fn handle_packet<T: SessionTransport>(
     ack_buf: &mut Vec<u8>,
     path_validation_seq: &mut u32,
     window_update_seq: &mut u32,
+    observability: &Observability,
+    leg: LegType,
 ) {
     let stream_id: u32 = packet.header.stream_id.into();
     let path_id = packet.header.path_id;
@@ -1083,11 +1173,24 @@ async fn handle_packet<T: SessionTransport>(
         match crypto_recv.decrypt_packet(&packet.header, &packet.payload) {
             Ok(pt) => pt,
             Err(e) => {
+                // Distinguish the two drop reasons for the security metrics: a
+                // post-AEAD sliding-window replay reject vs an AEAD-verify
+                // failure (Invariant 4 — replay is checked after AEAD opens).
+                // decrypt_packet doesn't surface old-vs-duplicate, so record the
+                // representative `Duplicate` reason.
+                if matches!(e, CoreError::ReplayDetected(_)) {
+                    observability.record_replay_rejected(ReplayReason::Duplicate);
+                } else {
+                    observability.record_aead_failure(leg, AeadAlgorithm::Aes256Gcm);
+                }
                 log::warn!("PhantomSession: V2 decrypt failed (dropping packet): {}", e);
                 return;
             }
         }
     } else if !packet.payload.is_empty() {
+        // Stripped-flag downgrade defense (Invariant 2): a non-empty unencrypted
+        // post-handshake application packet is dropped.
+        observability.record_unencrypted_dropped(leg);
         log::warn!(
             "PhantomSession: dropping unencrypted V2 post-handshake data packet (downgrade?)"
         );
@@ -1284,6 +1387,14 @@ impl PhantomSession {
     pub(crate) fn set_state(&self, new_state: ConnectionState) {
         self.state.store(new_state as u8, Ordering::Relaxed);
     }
+
+    /// Session observability handle (Rust-only — `Observability` is not a
+    /// UniFFI type). For a server-accepted session this is the
+    /// `PhantomListener`'s shared instance; for a client it is the session's
+    /// own. Read `.snapshot()` for the lock-free metric counters.
+    pub fn observability(&self) -> Arc<Observability> {
+        self.observability.clone()
+    }
 }
 
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
@@ -1311,6 +1422,9 @@ impl PhantomSession {
             streams,
             inner_session: Arc::new(Mutex::new(None)),
             early_data_accepted: Arc::new(Mutex::new(None)),
+            // Placeholder session (no transport / pump yet); a no-op holder
+            // until `connect_with_transport` spawns the real pump.
+            observability: Observability::new(ObservabilityConfig::default()),
         })
     }
 
@@ -2066,6 +2180,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
         let mut window_update_seq: u32 = 0;
+        let obs = Observability::new(ObservabilityConfig::default());
         handle_packet(
             v2,
             session_id,
@@ -2078,6 +2193,8 @@ mod tests {
             &mut ack_buf,
             &mut path_validation_seq,
             &mut window_update_seq,
+            &obs,
+            LegType::Tcp,
         )
         .await;
 
@@ -2117,6 +2234,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
         let mut window_update_seq: u32 = 0;
+        let obs = Observability::new(ObservabilityConfig::default());
         handle_packet(
             bad_packet,
             session_id,
@@ -2129,6 +2247,8 @@ mod tests {
             &mut ack_buf,
             &mut path_validation_seq,
             &mut window_update_seq,
+            &obs,
+            LegType::Tcp,
         )
         .await;
 
@@ -2179,6 +2299,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
         let mut window_update_seq: u32 = 0;
+        let obs = Observability::new(ObservabilityConfig::default());
         handle_packet(
             v2,
             session_id,
@@ -2191,6 +2312,8 @@ mod tests {
             &mut ack_buf,
             &mut path_validation_seq,
             &mut window_update_seq,
+            &obs,
+            LegType::Tcp,
         )
         .await;
 
@@ -2306,6 +2429,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
         let mut window_update_seq: u32 = 0;
+        let obs = Observability::new(ObservabilityConfig::default());
         handle_packet(
             v2,
             session_id,
@@ -2318,6 +2442,8 @@ mod tests {
             &mut ack_buf,
             &mut path_validation_seq,
             &mut window_update_seq,
+            &obs,
+            LegType::Tcp,
         )
         .await;
 
@@ -2474,6 +2600,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 100;
         let mut window_update_seq: u32 = 0;
+        let obs = Observability::new(ObservabilityConfig::default());
 
         handle_packet(
             v2,
@@ -2487,6 +2614,8 @@ mod tests {
             &mut ack_buf,
             &mut path_validation_seq,
             &mut window_update_seq,
+            &obs,
+            LegType::Tcp,
         )
         .await;
 

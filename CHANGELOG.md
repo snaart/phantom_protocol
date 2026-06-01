@@ -123,6 +123,33 @@ cannot interoperate with a post-collapse peer. Rebuild both ends together.
   layout (offsets, widths, network byte order — `version` first) and gains a
   § 11 test-vector catalog.
 
+### Changed — observability wired into the production data path
+
+- The OpenTelemetry metrics are now driven by real traffic instead of staying
+  flat until an embedder hand-called the `record_*` API. The data pump records
+  every data-plane `send` / `recv` (via a transparent `SessionTransport`
+  decorator), the recv path records the security drops
+  (`replay_rejected` / `aead_failed` / `unencrypted_dropped`), and the
+  server handshake is recorded with its full attribute set
+  (`outcome` / `leg` / `cipher_suite` / `version`).
+- **The active-session gauge now goes up *and* down.** It is opened when a
+  session's data pump starts and closed at teardown, so it tracks live sessions
+  instead of growing monotonically — fixing a Helm HPA / autoscaler signal that
+  previously latched after warm-up. The listener no longer double-counts the
+  open.
+- New Rust-only accessor `PhantomSession::observability() -> Arc<Observability>`
+  (and the existing `PhantomListener::observability()`) expose the live
+  `snapshot()` counters. Server-accepted sessions share the listener's instance;
+  client sessions own their own.
+- `examples/observability-demo` now drives a real `PhantomListener` ↔
+  `PhantomSession` exchange (it previously emitted synthetic `record_*` calls).
+- Removed the documented-but-never-emitted `phantom.telemetry.export_failures`
+  metric from the metrics catalog, OTLP guide, and Prometheus alerts: the
+  library never installs the exporter, so export health belongs to the OTel
+  SDK / Collector, not Phantom Core.
+- New always-on integration test `core/tests/observability_e2e.rs` gates the
+  wiring (a real session must populate the counters and return the gauge to 0).
+
 ### Added — `wasi-leg` Cargo feature (commits `f6c0c0a`..`255be95`)
 
 **`cargo build --target wasm32-wasip2 --features wasi-leg` is now a
