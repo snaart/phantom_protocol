@@ -113,6 +113,21 @@ rejected. Pre-handshake per-IP rate limiting belongs at the edge (LB / nftables
   channel is gzip-compressed; the `gzip-tonic` exporter feature is required for
   the server to start (a CI startup smoke test guards this).
 
+## Logging & privacy
+
+Default (INFO/WARN/ERROR) logs carry **no raw per-connection PII**. The peer
+address and the 32-byte `SessionId` are personally-correlatable, so the
+reference server logs them only at DEBUG (`RUST_LOG=phantom_server=debug`); the
+library's always-on handshake span no longer carries `client_ip` either.
+Aggregate health (sessions active, handshake outcomes) comes from the OTel
+metrics, whose cardinality contract also excludes `peer_ip` / `session_id`.
+
+The one default-level line that includes a source IP is the **per-IP admission
+reject** (`per-IP session cap reached`, at WARN) — an abuse signal where the
+source is operationally necessary for response (legitimate-interest basis). If
+even that must be redacted, run with `PHANTOM_MAX_SESSIONS_PER_IP=0` (disables
+the cap and its log) and rate-limit at the edge instead.
+
 ## Monitoring
 
 Phase 4.5 exposes `phantom_*` Prometheus metrics. The starter

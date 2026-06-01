@@ -52,7 +52,7 @@ impl TcpLeg {
         // Disable Nagle's algorithm for lower latency
         stream.set_nodelay(true)?;
 
-        log::info!("TCP connected to {} (RTT {}ms)", addr, rtt);
+        log::debug!("TCP connected to {} (RTT {}ms)", addr, rtt);
 
         Ok(Self {
             stream: Mutex::new(Some(stream)),

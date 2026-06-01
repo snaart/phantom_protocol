@@ -10,9 +10,11 @@
 //! - Receive a frame, send it back unchanged.
 //! - Exit cleanly on `CoreError::ConnectionClosed` or any
 //!   `NetworkError` that surfaces from a peer-closed socket.
-//! - Log per-message events at DEBUG and connection-level events at
-//!   INFO (so a production deployment can route INFO to stdout and
-//!   keep DEBUG behind `RUST_LOG=phantom_server=debug`).
+//! - **Privacy posture:** per-connection identifiers (the peer address and the
+//!   32-byte `SessionId`) are personally-correlatable, so they are logged only
+//!   at DEBUG (`RUST_LOG=phantom_server=debug`). Default INFO/WARN/ERROR output
+//!   carries no raw PII — aggregate session counts come from the OTel
+//!   `session.active` gauge, not per-connection log lines.
 
 use phantom_core::api::session::PhantomSession;
 use phantom_core::CoreError;
@@ -21,7 +23,9 @@ use std::sync::Arc;
 pub async fn run_echo_handler(session: Arc<PhantomSession>) {
     let peer = session.peer_addr();
     let id = session.id();
-    tracing::info!(peer = %peer, session_id = %id, "session connected");
+    // DEBUG: peer address + session id are correlatable (PII), so keep them off
+    // the default log stream.
+    tracing::debug!(peer = %peer, session_id = %id, "session connected");
 
     loop {
         match session.recv().await {
@@ -33,19 +37,21 @@ pub async fn run_echo_handler(session: Arc<PhantomSession>) {
                 );
                 if let Err(e) = session.send(bytes).await {
                     if is_peer_close(&e) {
-                        tracing::info!(session_id = %id, "peer closed during send");
+                        tracing::debug!(session_id = %id, "peer closed during send");
                     } else {
-                        tracing::error!(session_id = %id, error = %e, "send failed");
+                        // Errors stay visible at WARN, but without the
+                        // correlatable session id (that is at DEBUG above).
+                        tracing::warn!(error = %e, "session send failed");
                     }
                     break;
                 }
             }
             Err(e) if is_peer_close(&e) => {
-                tracing::info!(session_id = %id, "peer closed");
+                tracing::debug!(session_id = %id, "peer closed");
                 break;
             }
             Err(e) => {
-                tracing::error!(session_id = %id, error = %e, "recv failed");
+                tracing::warn!(error = %e, "session recv failed");
                 break;
             }
         }
@@ -54,7 +60,7 @@ pub async fn run_echo_handler(session: Arc<PhantomSession>) {
     // Best-effort close on the way out — the session may already be
     // closed if the peer initiated the teardown.
     let _ = session.disconnect().await;
-    tracing::info!(session_id = %id, "session closed");
+    tracing::debug!(session_id = %id, "session closed");
 }
 
 /// `CoreError` does not distinguish "peer closed cleanly" from

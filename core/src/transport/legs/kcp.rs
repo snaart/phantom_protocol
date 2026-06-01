@@ -122,7 +122,7 @@ impl KcpLeg {
 
         let rtt = start.elapsed().as_millis() as u32;
 
-        log::info!(
+        log::debug!(
             "KCP connected to {} (RTT {}ms, mode {:?})",
             addr,
             rtt,
