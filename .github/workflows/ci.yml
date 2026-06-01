@@ -90,11 +90,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          arguments: --manifest-path core/Cargo.toml
+          # Use the action's dedicated `manifest-path` input — passing
+          # `--manifest-path` inside `arguments` collides with the flag the
+          # action already injects ("cannot be used multiple times"). Scan every
+          # feature's dependency graph (fips / telemetry-otel / embedded), not
+          # just the default set.
+          manifest-path: core/Cargo.toml
+          arguments: --all-features
 
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    # The repo's default workflow token is read-only; rustsec/audit-check posts
+    # its findings as a check-run, which needs `checks: write`. Without this the
+    # job fails with "Resource not accessible by integration" even when the
+    # audit itself is clean.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2

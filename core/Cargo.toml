@@ -3,6 +3,7 @@ name = "phantom_core"
 version = "0.2.0"
 edition = "2021"
 description = "Phantom Universal Transport Core SDK — post-quantum secure L4/L6 network framework"
+license = "Apache-2.0"
 
 [features]
 default = ["compression-zstd", "std", "bindings"]
@@ -268,6 +269,15 @@ socket2 = { version = "0.6", optional = true }
 # (AWS-LC-FIPS 3.0.x) as the sole backend. Listing both `aws-lc-sys`
 # and `fips` would attempt to enable both backends and bloat the link.
 aws-lc-rs = { version = "1.17", optional = true, default-features = false, features = ["fips"] }
+
+# ─── Linux-only dependencies ──────────────────────────────────────────────
+# `libc` backs the Linux UDP fast paths in `transport/udp_transport` — the
+# `SO_MAX_PACING_RATE` pacing offload (`setsockopt`) and the `sendmmsg` batch
+# send — all gated on `cfg(target_os = "linux")`. Declared in a Linux-only
+# target block so the direct dependency edge matches the only place the code
+# names `libc::`; macOS / Windows / wasm / WASI builds never pull it here.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 # ─── Browser-WASM-only dependencies (Phase 3.3) ───────────────────────────
 # Pulled in only for `wasm32-unknown-unknown` builds (the browser target).

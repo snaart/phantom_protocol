@@ -111,9 +111,13 @@ jobs:
       - name: Build the cdylib
         run: cargo build --release --manifest-path core/Cargo.toml
       - name: Compile + run the C consumer
+        # The source/object must precede `-lphantom_core`: GNU ld resolves
+        # symbols left-to-right and drops a library's symbols if nothing seen so
+        # far needs them. With the library first, every `uniffi_phantom_core_*`
+        # reference in consumer_smoke.c is reported undefined.
         run: |
           cc -I tests/bindings/c \
-             -L target/release -lphantom_core \
              tests/bindings/c/consumer_smoke.c \
+             -L target/release -lphantom_core \
              -o /tmp/phantom_c_smoke
           LD_LIBRARY_PATH=target/release /tmp/phantom_c_smoke
