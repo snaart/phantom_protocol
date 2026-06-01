@@ -145,8 +145,10 @@ service:
 ## Operational tips
 
 - **Lossy queues.** OTel batch processors drop telemetry rather than block.
-  Watch `phantom.telemetry.export_failures` in the application's own
-  metrics stream (also exported via OTLP) — non-zero means the Collector
+  The library never installs the exporter, so export health is owned by the
+  SDK/Collector, not Phantom Core: watch the OTel SDK's own
+  `otel_sdk_exporter_metric_data_points` / `..._span` failure counters and the
+  Collector's `otelcol_exporter_send_failed_*` — non-zero means the Collector
   / backend is congested or unreachable.
 - **Sampling for cost.** Default trace ratio is 1%. For incident
   investigation flip `OTEL_TRACES_SAMPLER=always_on` per-instance; failure
