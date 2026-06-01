@@ -405,8 +405,18 @@
   - `tracing` / `metrics` (Phase 4).
 - Каждая фича: separate CI job, проверка билда + минимальный smoke-test.
 
-### 3.6 No_std + alloc для embedded
-**Проблема:** `pqcrypto-*` требует std. `tokio` весь требует std. `zstd` C-bindings.
+### 3.6 No_std + alloc для embedded — **DESCOPED for 1.0 (framing-only on bare-metal)**
+**Decision:** running the PQ handshake on bare-metal `thumbv7em` is a multi-month
+sub-project (no-std crypto, an Embassy/RTIC runtime, a QEMU-hosted handshake test),
+not a 1.0 blocker. For 1.0, embedded is **framing-only**: `thumbv7em` ships
+`EmbeddedLeg` + its length-prefix codec, and a bare-metal embedder brings its own
+crypto/handshake driver over the leg. The README, the `Status & limitations`
+section, and the embedded section now say so; the PQ-on-bare-metal claim is gone.
+The build plan below is retained as the future-widening recipe if it is ever
+picked up — promoting modules out of the `std`-gated region can land
+module-by-module without re-touching the Phase 3.6 gating infrastructure.
+
+**Проблема (build path, not pursued for 1.0):** `pqcrypto-*` требует std. `tokio` весь требует std. `zstd` C-bindings.
 
 - `pqcrypto-*` → `ml-kem` crate (no_std + alloc support) для embedded path.
 - Замена `tokio::sync::Mutex` на `embassy-sync::Mutex` или `spin::Mutex` под `embedded` feature.
@@ -783,7 +793,7 @@
 - `core/examples/wasm_client/` — WASM-bundled пример, npm пакет.
 - `core/examples/mobile_ios/` — Swift example using `PhantomSession`.
 - `core/examples/mobile_android/` — Kotlin example.
-- `core/examples/embedded/` — `thumbv7em` example (LED-blink + Phantom-secured uplink).
+- `core/examples/embedded_demo.rs` — `EmbeddedLeg` framing over a mock byte stream, **run on a host** (the full PQ session is std-only; a `thumbv7em` "Phantom-secured uplink" is descoped — see §3.6).
 - Каждый example в README + комментарии в коде.
 
 ### 7.2 Deployment guides
