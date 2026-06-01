@@ -147,7 +147,11 @@ impl UdpTransport {
     ///
     /// # Arguments
     /// * `rate_bps` — desired pacing rate in **bytes per second**
-    pub fn set_pacing_rate(&self, _rate_bps: u64) -> IoResult<()> {
+    pub fn set_pacing_rate(&self, rate_bps: u64) -> IoResult<()> {
+        // Pacing offload (`SO_MAX_PACING_RATE`) is Linux-only; the rate is
+        // unused on other platforms.
+        #[cfg(not(target_os = "linux"))]
+        let _ = rate_bps;
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
@@ -297,7 +301,7 @@ async fn platform_send_batch(
 
     let sent = tokio::task::spawn_blocking(move || sendmmsg_batch(fd, &addr, &owned))
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+        .map_err(io::Error::other)??;
 
     Ok(sent)
 }
