@@ -26,7 +26,10 @@ fuzz_target!(|data: &[u8]| {
         Ok(c) => c,
         Err(_) => return,
     };
-    let session = Session::from_derived(id, crypto, SchedulerMode::LowLatency);
+    // `from_derived` seeds the rekey chain with the master `traffic_secret`
+    // (here the same `shared` the crypto state derived from) and records the
+    // handshake side (`is_server = true`, matching `CryptoState::new(.., true)`).
+    let session = Session::from_derived(id, crypto, SchedulerMode::LowLatency, shared, true);
 
     // Synthesize a header from the first 4 bytes (stream_id) and 4 bytes of
     // sequence, with deterministic flags. The rest is treated as ciphertext.
