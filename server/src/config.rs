@@ -58,4 +58,19 @@ pub struct Config {
     /// Tracing filter (default: info,phantom_core=debug).
     #[arg(long, env = "RUST_LOG", default_value = "info,phantom_core=debug")]
     pub log_filter: String,
+
+    /// Maximum number of concurrent sessions. Once this many are active the
+    /// accept loop stops accepting (new connections queue in the OS backlog)
+    /// until a session closes — backpressure, not a hard drop. Size it against
+    /// `LimitNOFILE` and per-session memory (~512 KiB) — see
+    /// `docs/operations/deployment.md`. `0` means unbounded (not recommended).
+    #[arg(long, env = "PHANTOM_MAX_SESSIONS", default_value = "1024")]
+    pub max_sessions: usize,
+
+    /// Maximum concurrent sessions from a single source IP. A peer already at
+    /// this many active sessions has further connections rejected (closed right
+    /// after the handshake) so one source cannot monopolise the global pool.
+    /// `0` disables the per-IP cap.
+    #[arg(long, env = "PHANTOM_MAX_SESSIONS_PER_IP", default_value = "64")]
+    pub max_sessions_per_ip: usize,
 }
