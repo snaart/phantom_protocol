@@ -225,6 +225,31 @@ jobs:
       # (the admission-control limiter), which the test run then executes.
       - run: cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path server/Cargo.toml
+      # Startup smoke: the unit tests don't exercise `main()`, so a runtime
+      # startup regression (e.g. a missing OTLP feature, a broken self-test)
+      # would ship silently. Boot the binary against a DEAD OTLP collector,
+      # assert it runs the POST, binds, and exits cleanly on SIGTERM.
+      - name: server startup smoke (dead OTLP collector)
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path server/Cargo.toml --bin phantom-server
+          BIN=server/target/debug/phantom-server
+          RUST_LOG=info "$BIN" --bind 127.0.0.1:14242 \
+            --otlp-endpoint http://127.0.0.1:1 \
+            --signing-key-file "$(mktemp -u)" >/tmp/srv.log 2>&1 &
+          PID=$!
+          for i in $(seq 1 30); do
+            (exec 3<>/dev/tcp/127.0.0.1/14242) 2>/dev/null && { exec 3>&-; break; }
+            kill -0 "$PID" 2>/dev/null || { echo "::error::server died on startup"; cat /tmp/srv.log; exit 1; }
+            sleep 0.5
+          done
+          (exec 3<>/dev/tcp/127.0.0.1/14242) 2>/dev/null || { echo "::error::server never bound"; cat /tmp/srv.log; kill "$PID" 2>/dev/null||true; exit 1; }; exec 3>&-
+          grep -q "power-on self-test passed" /tmp/srv.log || { echo "::error::POST did not run"; cat /tmp/srv.log; kill "$PID" 2>/dev/null||true; exit 1; }
+          kill -TERM "$PID"
+          for i in $(seq 1 20); do kill -0 "$PID" 2>/dev/null || break; sleep 0.5; done
+          if kill -0 "$PID" 2>/dev/null; then echo "::error::no clean SIGTERM exit"; kill -9 "$PID"; exit 1; fi
+          wait "$PID" || true
+          echo "server startup smoke OK"
 
   integration:
     name: tcp + kcp loopback integration

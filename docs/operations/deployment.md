@@ -95,6 +95,24 @@ abusive IP can still trigger (cheap, PoW/cookie-gated) handshakes that are then
 rejected. Pre-handshake per-IP rate limiting belongs at the edge (LB / nftables
 `ct count` / a reverse proxy).
 
+## Startup, health & telemetry resilience
+
+- **Power-on self-test gates the bind.** Before opening the listen socket the
+  server runs `crypto::self_tests::run_post()` — AES-256-GCM round-trip,
+  hybrid-KEM and hybrid-sign pairwise consistency, and a HKDF KAT. If any
+  primitive is wedged the server logs the failure and exits **without binding**.
+  Consequently a `tcpSocket` probe on the app port is a genuine *readiness*
+  signal for the crypto path (the port only opens after POST passes), not merely
+  "the process is up". Use `tcpSocket` as the **liveness** probe too — there is
+  no separate HTTP health port (the SDK ships no HTTP server).
+- **An unreachable OTLP collector does NOT block startup.** The OTLP/gRPC
+  exporters lazily connect, so the server binds and serves traffic even with the
+  collector down; telemetry is buffered/dropped per the SDK's batch policy and
+  resumes when the collector returns. (Watch the OTel SDK / Collector's own
+  export-failure counters — see `docs/observability/otlp-setup.md`.) The gRPC
+  channel is gzip-compressed; the `gzip-tonic` exporter feature is required for
+  the server to start (a CI startup smoke test guards this).
+
 ## Monitoring
 
 Phase 4.5 exposes `phantom_*` Prometheus metrics. The starter
