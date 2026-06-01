@@ -14,6 +14,12 @@ jobs:
   coverage:
     name: cargo llvm-cov (lines + branches)
     runs-on: ubuntu-latest
+    # The repo's rust-toolchain.toml pins `channel = "stable"`, which otherwise
+    # overrides the nightly install below and makes `-Z coverage-options=branch`
+    # fail ("only accepted on the nightly compiler"). RUSTUP_TOOLCHAIN outranks
+    # rust-toolchain.toml, so it forces every cargo/rustc call onto nightly.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain (llvm-tools-preview)
