@@ -127,6 +127,17 @@ async fn main() -> Result<()> {
         "phantom-server starting"
     );
 
+    // Power-on self-test BEFORE binding (readiness gate): exercise the AEAD /
+    // hybrid-KEM / hybrid-sign / KDF primitives and refuse to bind if any is
+    // wedged. Because the listen socket only opens after this passes, a
+    // `tcpSocket` readiness probe that observes the bound port is a genuine
+    // crypto-path readiness signal — not just "the process is up". (On a
+    // `--features fips` build the bind/connect paths run this anyway; doing it
+    // here makes it explicit and unconditional for the default build too.)
+    phantom_core::crypto::self_tests::run_post()
+        .map_err(|e| anyhow::anyhow!("power-on self-test (POST) failed: {e:?}"))?;
+    tracing::info!("power-on self-test passed");
+
     // Generate or load the long-lived signing key BEFORE binding the
     // listener — if the key file is unreadable we'd rather fail loudly
     // here than after we're already accepting connections.
