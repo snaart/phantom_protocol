@@ -62,6 +62,10 @@ jobs:
       # Real NIST ACVP KAT vectors for ML-KEM-768 / ML-DSA-65 — catches a PQ
       # crate-encoding regression that a self-referential round-trip cannot.
       - run: cargo test --manifest-path core/Cargo.toml --test nist_kat
+      # End-to-end observability wiring: a real TCP session must populate the
+      # handshake/packet/byte metrics and drive the active-session gauge up AND
+      # back down. Runs on the default (no-otel) atomics path.
+      - run: cargo test --manifest-path core/Cargo.toml --test observability_e2e
 
   doc:
     name: cargo doc
