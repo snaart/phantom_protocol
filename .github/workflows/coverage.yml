@@ -12,26 +12,16 @@ env:
 
 jobs:
   coverage:
-    name: cargo llvm-cov (lines + branches)
+    name: cargo llvm-cov (line coverage)
     runs-on: ubuntu-latest
-    # Informational job: it soft-uploads to Codecov and does not gate merges.
-    # The whole suite passes under instrumentation, but `llvm-cov export` itself
-    # currently SIGSEGVs on nightly while merging the profile across the many
-    # object files (an upstream LLVM tooling bug, not our code). Don't let that
-    # crash block the repo; the line/branch numbers remain a best-effort signal.
-    continue-on-error: true
-    # The repo's rust-toolchain.toml pins `channel = "stable"`, which otherwise
-    # overrides the nightly install below and makes `-Z coverage-options=branch`
-    # fail ("only accepted on the nightly compiler"). RUSTUP_TOOLCHAIN outranks
-    # rust-toolchain.toml, so it forces every cargo/rustc call onto nightly.
-    env:
-      RUSTUP_TOOLCHAIN: nightly
+    # Line coverage on stable. Branch coverage needs nightly's
+    # `-Z coverage-options=branch`, and on the nightly LLVM `llvm-cov export`
+    # crashes (upstream LLVM bug) while merging the profile across this crate's
+    # object set — so we stay on stable's mature llvm-cov and report lines only.
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain (llvm-tools-preview)
-        # Branch coverage (`cargo llvm-cov --branch`) needs the nightly-only
-        # `-Z coverage-options=branch`, so this job runs on nightly.
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
@@ -47,7 +37,6 @@ jobs:
           cargo llvm-cov \
               --manifest-path core/Cargo.toml \
               --lib --tests \
-              --branch \
               --lcov \
               --output-path lcov.info
       - name: Coverage summary
@@ -55,7 +44,6 @@ jobs:
           cargo llvm-cov \
               --manifest-path core/Cargo.toml \
               --lib --tests \
-              --branch \
               --summary-only
       - name: Upload to Codecov
         # Soft-fail: a missing CODECOV_TOKEN should not break CI.
