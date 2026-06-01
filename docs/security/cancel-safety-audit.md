@@ -1,4 +1,14 @@
-# Async cancel-safety audit (Phase 2.13)
+# Async cancel-safety audit (Phase 2.13; re-run 2026-06-01)
+
+> **Re-run note (2026-06-01).** The original audit was signed off at Phase 2.13
+> and scheduled a re-run "after Phase 4.4." That landed, and the data pump was
+> materially rewritten — B1-A loss recovery (route `send()` through a per-stream
+> reliable buffer + BBR-paced drain) and B7 observability (a `session_opened` /
+> `session_closed` gauge + `ObservedTransport`). The `run_data_pump` main-loop
+> section below is rewritten for the current 4-arm `select!`; the headline
+> concern raised for the re-run — a `pace_send` sleep stranding already-dequeued
+> data on cancel — was **resolved by the same B1-A refactor that introduced
+> pacing** (see that section). Verdict stands: ✅ cancel-safe, no code change.
 
 A `select!` arm that fires before its sibling completes effectively
 **cancels** the unfinished future. If that future was carrying
@@ -19,31 +29,72 @@ scenario.
 
 ## Inventory
 
-### `api/session.rs::run_data_pump` main loop
+### `api/session.rs::run_data_pump` main loop (current, 4-arm)
 
 ```rust
 tokio::select! {
-    _ = poll_interval.tick() => { /* sweep streams, send queued */ }
-    cmd_opt = cmd_rx.recv() => { /* application command */ }
-    _ = &mut recv_done_rx => { /* recv task ended */ }
+    _ = poll_interval.tick()       => { drain_streams_priority_ordered(..).await }
+    _ = send_notify.notified()     => { drain_streams_priority_ordered(..).await }  // fast-wake
+    cmd_opt = cmd_rx.recv()        => { match cmd { Send | SendStream* | CloseStream | Close } }
+    _ = &mut recv_done_rx          => { /* recv task ended -> break */ }
 }
 ```
 
-- `tokio::time::Interval::tick()`: **cancel-safe.** From the tokio docs,
-  `Interval::tick` is cancel-safe; dropping the future before completion
-  is equivalent to never having called it (it does not advance any
-  internal timer).
-- `tokio::sync::mpsc::Receiver::recv()`: **cancel-safe.** Documented
-  guarantee — a dropped `recv` future does not consume a queued message.
-- `tokio::sync::oneshot::Receiver` (via `&mut recv_done_rx`):
-  **cancel-safe.** Polling a oneshot does not consume the value until
-  `.send()` has put one in; dropping the awaiter never loses data.
-- Inner work inside `poll_interval.tick()` arm: synchronous after
-  `poll_send().await` per-stream. Each `poll_send` is on a per-stream
-  `Mutex` held briefly — no inner `select!`, no interleaving with the
-  main loop's cancellation.
+**Primitive cancel-safety (the four arms):**
+- `tokio::time::Interval::tick()`: **cancel-safe** — dropping the future does not
+  advance the timer.
+- `tokio::sync::Notify::notified()`: created fresh each iteration (not pinned).
+  This is safe here because `Session::notify_outbound_ready()` calls `notify_one`,
+  whose **stored permit** survives across loop iterations — a notification raised
+  while the pump is busy in another arm is observed by the next iteration's fresh
+  `notified()`. The rare register-then-drop window can at worst *delay* a wake, and
+  the 10 ms `poll_interval.tick()` is an explicit fallback that drains regardless,
+  so a missed notification costs ≤ 10 ms of latency, never data.
+- `tokio::sync::mpsc::Receiver::recv()`: **cancel-safe** — a dropped `recv` does not
+  consume a queued message.
+- `tokio::sync::oneshot::Receiver` (`&mut recv_done_rx`): **cancel-safe** — polling
+  does not consume the value.
 
-**Verdict:** ✅ cancel-safe.
+**The arm *bodies* contain `.await`s — is that a strand risk?** A `select!` arm,
+once chosen, runs its body to completion *unless the whole task is cancelled*. The
+bodies do await (`drain_streams...`, `raw_stream.send_reliable`, and — in the
+`CloseStream` arm — `send_app_data` for the FIN). So the question is **whether the
+pump task can be cancelled mid-body**, and **what is lost if it is**.
+
+1. **The pump is never aborted mid-`await` in normal operation.** Both spawn sites
+   detach the handle (`let _detached = runtime.spawn(run_data_pump ...)` on the
+   server; the client awaits it inside an equally-detached `background_task`). There
+   is **no `Drop for PhantomSession`**, and the only `.abort()` in the module is the
+   pump aborting *its own* recv subtask during teardown (`recv_handle.abort()`). The
+   pump exits exclusively through the loop `break` (a graceful `SessionCommand::Close`
+   from `disconnect()`, the `None` channel-closed arm, or `recv_done`). The *only* way
+   an arm body is cancelled is the **runtime/process being torn down**, where losing
+   in-flight bytes is expected and harmless.
+
+2. **Even under that teardown cancel, reliable data is not stranded** — this is what
+   resolves the re-run's headline concern. The concern was: `SessionCommand::Send →
+   send_app_data → pace_send().await` consumes the payload from the mpsc channel and
+   then sleeps, so an abort during the sleep silently drops a payload the channel had
+   already handed out. **B1-A removed that path.** The `Send` arm now copies the
+   payload into the per-stream **reliable send buffer** (`raw_stream.send_reliable`)
+   and returns; `pace_send` no longer runs in the command arm at all. The actual paced
+   transmission happens later in `drain_streams_priority_ordered → Stream::poll_send →
+   send_app_data → pace_send`, and `poll_send` **retains** the segment (it iterates
+   `send_buffer` with `iter_mut`, sets `sent_at`, and returns a *clone* — it removes
+   nothing; only `Stream::ack()` removes a segment). So a cancel during `pace_send`
+   leaves the reliable segment in the buffer; it is re-offered on the next drain (after
+   RTO). The payload is decoupled from the channel before any sleep — pacing happens on
+   buffered, retained data, exactly the "restructure so pacing happens before the value
+   leaves the channel" the re-run asked for.
+   - *Unreliable* data (`poll_send`'s `unreliable_buffer.pop_front()`) **is** removed
+     before `send_app_data`, so a teardown cancel drops it — which is the fire-and-
+     forget contract, and only at teardown.
+   - The `CloseStream` arm awaits `send_app_data` for a FIN; a teardown cancel there
+     drops a control FIN on a stream already being torn down — benign.
+
+**Verdict:** ✅ cancel-safe. The pump is non-cancellable in normal operation, and the
+B1-A reliable-buffer decoupling means even teardown cancellation cannot strand
+acknowledged-delivery data.
 
 ### `api/listener.rs::accept`
 
@@ -84,6 +135,11 @@ loop {
   cleanly. A `recv_handle.abort()` from the outer loop cancels at the
   `.await` point — at worst we lose one in-flight packet, equivalent
   to a network drop.
+- B7 added per-packet observability inside `handle_packet` (the
+  `record_send`/`record_recv`/`record_*_dropped` calls). These are
+  synchronous, infallible atomic adds with no `.await`, so an abort at the
+  `recv_bytes().await` point cannot interrupt a half-finished metric update;
+  a dropped in-flight packet simply isn't recorded.
 
 **Verdict:** ✅ cancel-safe. Abort behaviour is a clean equivalent
 of "transport closed mid-packet".
@@ -116,18 +172,19 @@ connection in a state where the next handshake attempt will reset.
 
 **Verdict:** ✅ cancel-safe.
 
-### `transport/stream.rs::poll_send` (line 152)
+### `transport/stream.rs::poll_send` (current — non-blocking)
 
-```rust
-tokio::time::timeout(Duration::from_millis(500), self.send_notifier.notified())
-```
+The fixed-500 ms-timer `poll_send` the original audit described is gone (B1-A
+replaced it with an RFC 6298 RTO + a BBR congestion window). `poll_send` is now a
+**non-blocking** poll: it briefly locks `unreliable_buffer` then `send_buffer`
+(`Mutex::lock().await`, released before return), scans for a timed-out segment
+(retransmit) or the next in-window unsent segment, and returns `Option` immediately
+— no inner notifier/timeout await. `send_reliable`'s backpressure is a
+`tokio::sync::Semaphore::acquire().await`, which is cancel-safe (a dropped acquire
+does not consume a permit; `permit.forget()` runs only after a successful acquire).
 
-`tokio::time::timeout` is cancel-safe per docs. If the parent task is
-cancelled mid-timeout, the inner `notified()` future is dropped — but
-because notifications are level-triggered through the `Notify` API,
-a subsequent `notified()` call observes the notification.
-
-**Verdict:** ✅ cancel-safe.
+**Verdict:** ✅ cancel-safe. No `.await` holds a buffer lock; the only blocking await
+(`Semaphore::acquire`) is cancel-safe.
 
 ---
 
@@ -142,31 +199,44 @@ Inventory of `&mut`-held locks across `.await`:
 
 | Site | Lock | Holds across await | Risk |
 | --- | --- | --- | --- |
-| `api/session.rs::run_data_pump` send_queue drain | tokio Mutex | yes — drain loop | Low: drain is O(queue depth) — was already the design |
-| `api/tcp_transport.rs::send_bytes` | tokio Mutex (writer) | yes — write + flush | Low: serialises sends, which is the intended semantics |
+| `api/session.rs::drain_streams_priority_ordered` | DashMap (`streams`) | **no** — snapshotted into a `Vec` before any `.await` (so no shard lock is held across `poll_send`/`send_app_data`) | None (good) |
+| `transport/stream.rs::poll_send` | tokio Mutex (`unreliable_buffer`, `send_buffer`) | brief — scan + mark `sent_at`, released before `send_app_data` runs | None |
+| `transport/stream.rs::send_reliable` | tokio Semaphore + tokio Mutex (`send_buffer`) | acquire is cancel-safe; the buffer lock is a single `push_back` | None |
+| `api/tcp_transport.rs::send_bytes` | tokio Mutex (writer) | yes — write + flush | Low: serialises sends, the intended semantics |
 | `api/tcp_transport.rs::recv_bytes` | tokio Mutex (reader) | yes — length + body read | Low: reads are sequential by construction |
-| `transport/stream.rs::send_reliable` | tokio Mutex (send_buffer) | brief — single push_back | None |
 | `api/listener.rs::accept` | tokio Mutex (listener) | held only over `accept()` itself; released before handshake | None (good) |
 
-No locks discovered that risk deadlock under cancellation.
+No locks discovered that risk deadlock under cancellation. Note the drain path
+deliberately snapshots `streams` (a `DashMap`) into a sorted `Vec` *before* awaiting
+any send, so no DashMap shard lock is ever held across `send_app_data`'s
+`pace_send`/`send_bytes` awaits.
 
 ---
 
 ## Findings
 
-- **Zero cancel-safety bugs identified.** Every `select!` is over
-  cancel-safe primitives; every long-held lock is on a tokio Mutex
-  which releases on Drop.
-- The `accept()` race (TCP socket accepted at the OS layer but
-  dropped on shutdown) is documented as acceptable: clients retry,
-  and the listener's `shutting_down` flag prevents subsequent
-  `accept()` calls from blocking on the listener Mutex.
+- **Zero cancel-safety bugs identified (re-confirmed post-Phase-4.4).** Every
+  `select!` is over cancel-safe primitives; every long-held lock is on a tokio
+  Mutex/Semaphore that releases on Drop; no DashMap shard lock is held across an
+  await.
+- **The re-run's headline concern is resolved, not merely tolerated.** B1-A's
+  reliable-buffer decoupling means `pace_send` operates on data already copied into
+  the per-stream retransmit buffer, so a cancel during pacing cannot strand a
+  payload the command channel had handed out. (And the pump is, in any case, never
+  aborted mid-`await` outside runtime teardown.)
+- The `accept()` race (TCP socket accepted at the OS layer but dropped on shutdown)
+  remains acceptable: clients retry, and the listener's shutdown flag prevents
+  subsequent `accept()` calls from blocking.
 
 ## Sign-off
 
-- Auditor: _automated review at the commit that introduces this file_
-- Method: pattern match against `tokio::select!`, manual review of
-  every `Mutex::lock().await` site in `core/src/api/` and
-  `core/src/transport/`.
-- Audit will be re-run after Phase 4.4 (BBRv2 congestion control)
-  introduces new background tasks.
+- Auditor: _automated review; original at the commit that introduced this file,
+  re-run 2026-06-01._
+- Method: pattern match against `tokio::select!`, manual review of every
+  `Mutex::lock().await` / `Semaphore::acquire().await` site in `core/src/api/` and
+  `core/src/transport/`, plus a control-flow trace of the data pump's spawn/abort
+  topology (detached spawn, no `Drop`, single self-`abort` of the recv subtask).
+- **Re-run trigger (Phase 4.4 — BBR congestion control + B1-A loss recovery + B7
+  observability) discharged.** Re-run again if a future change either (a) gives the
+  pump task an externally-held abort handle, or (b) calls `pace_send`/any sleep
+  *before* a payload is copied into a retained (reliable) buffer.
