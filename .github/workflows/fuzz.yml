@@ -60,6 +60,13 @@ jobs:
         run: bash fuzz/seed-corpus.sh ${{ matrix.target }}
       # 60s smoke on PRs (catch a freshly-introduced panic); 600s on the nightly
       # cron to dig deeper. rss limit guards against an OOM false-positive.
+      #
+      # `--target x86_64-unknown-linux-gnu` is load-bearing: cargo-fuzz defaults
+      # the build target to its OWN host triple, and taiki-e/install-action ships
+      # the musl prebuilt — so without this flag it builds for
+      # x86_64-unknown-linux-musl, whose crt-static is incompatible with the
+      # sanitizer and whose nightly std/ASan runtime isn't installed. Pin the gnu
+      # target the runner actually has.
       - name: Fuzz ${{ matrix.target }}
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
@@ -68,7 +75,7 @@ jobs:
             SECS=60
           fi
           echo "::notice::fuzzing ${{ matrix.target }} for ${SECS}s"
-          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "${{ matrix.target }}" -- \
             -max_total_time="$SECS" -rss_limit_mb=4096
       # On a crash, libFuzzer drops the reproducing input here — keep it so the
       # failure is reproducible off the runner.
