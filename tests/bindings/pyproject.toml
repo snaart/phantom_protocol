@@ -21,7 +21,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "phantom-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "Phantom Core — post-quantum-secure L4/L6 transport (Python binding)"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }

@@ -8,10 +8,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
-This release pulls phantom_core from its 0.2.0 pre-1.0 baseline through
-the foundation and security-hardening phases of the production-readiness
-roadmap (`docs/PRODUCTION_READINESS.md`). Test count grew from 122 to
-132; the new ten cover the documented security invariants directly.
+## [0.3.0] - 2026-06-01
+
+This release takes phantom_core from its 0.2.0 pre-1.0 baseline through the
+foundation, security-hardening, and production-readiness phases of the roadmap
+(`docs/PRODUCTION_READINESS.md`): the unified single wire protocol (WIRE-BREAKING
+— hence the `0.3.0` minor bump), byte-exact wire-format + NIST ACVP KAT vectors,
+the observability data-path wiring, FIPS 140-3 substrate, and a now-green
+cross-target CI. The wire format changed since 0.2.0, so peers must upgrade
+together (no negotiation pre-1.0).
 
 ### Changed — unified wire protocol (WIRE-BREAKING)
 

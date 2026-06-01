@@ -196,10 +196,15 @@ trust model. Rotating the signing key requires an app update.
 TTL: **1 hour** (server `SessionCache` default). Check saved timestamp before
 reuse; expired hints fall back to 1-RTT automatically.
 
-**Connection migration (Wi-Fi ↔ LTE).** Phantom's path validation and per-path
-scheduler handle interface changes without a re-handshake. Register for
-`NWPathMonitor` (iOS) / `ConnectivityManager.NetworkCallback` (Android) and
-call `begin_path_validation` when the active interface changes.
+**Connection migration (Wi-Fi ↔ LTE) — not yet supported in 1.0.** Live
+interface migration is future work: the path-validation primitives exist only on
+the internal `transport::Session`, not on `PhantomSession` or the UniFFI surface,
+and the data pump holds a single fixed transport with no rebind seam. On a
+network change, **reconnect** — register for `NWPathMonitor` (iOS) /
+`ConnectivityManager.NetworkCallback` (Android), then open a fresh session.
+Minimise the cost with **0-RTT resumption**: harvest a `ResumptionHint` after the
+first connect and reconnect via `connect_pinned_with_resumption`, which folds the
+first request into the new `ClientHello`.
 
 ## Performance considerations
 

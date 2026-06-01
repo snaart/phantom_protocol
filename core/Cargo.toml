@@ -1,6 +1,6 @@
 [package]
 name = "phantom_core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Phantom Universal Transport Core SDK — post-quantum secure L4/L6 network framework"
 license = "Apache-2.0"
