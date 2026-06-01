@@ -163,8 +163,10 @@ impl PhantomListener {
                 .listen(1024)
                 .map_err(|e| CoreError::NetworkError(format!("listen: {}", e)))?;
             let std_listener: std::net::TcpListener = socket.into();
-            return TcpListener::from_std(std_listener)
-                .map_err(|e| CoreError::NetworkError(format!("from_std: {}", e)));
+            // Tail expression of the `cfg(linux)` block (which is the whole
+            // function body after cfg-stripping on Linux) — no `return` needed.
+            TcpListener::from_std(std_listener)
+                .map_err(|e| CoreError::NetworkError(format!("from_std: {}", e)))
         }
         #[cfg(not(target_os = "linux"))]
         {

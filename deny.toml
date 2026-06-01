@@ -6,7 +6,19 @@ all-features = true
 
 [advisories]
 yanked = "deny"
-ignore = []
+ignore = [
+    # rustls-pemfile is unmaintained (repo archived Aug 2025). Pulled in only
+    # transitively via the rustls TLS stack; there is no safe upgrade (the crate
+    # is now a thin wrapper around rustls-pki-types' PEM parser). No
+    # code-execution risk; tracked for migration to rustls-pki-types' PemObject.
+    "RUSTSEC-2025-0134",
+    # `rand` unsoundness fires only in a narrow scenario: a custom `log` logger
+    # that calls `rand::rng()` and triggers a reseed mid-log. Phantom Core uses
+    # `rand` only as a dev-dependency and transitively; the production RNG path
+    # is OsRng/getrandom, and we never draw randomness from inside a logger, so
+    # the aliasing UB is unreachable here.
+    "RUSTSEC-2026-0097",
+]
 
 [licenses]
 allow = [
@@ -21,6 +33,9 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "OpenSSL",
+    # webpki-roots ships Mozilla's CA-certificate *data* bundle under this
+    # permissive data-sharing license. It covers the trust-root data, not code.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.92
 exceptions = [
