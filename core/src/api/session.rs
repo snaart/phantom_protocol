@@ -23,7 +23,7 @@ use crate::transport::types::{
 };
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
@@ -457,7 +457,6 @@ impl PhantomSession {
         });
 
         let session_id = *server_session.id();
-        let next_app_seq = Arc::new(AtomicU32::new(1));
         let runtime_for_pump = runtime.clone();
         let observed = Arc::new(ObservedTransport::new(
             transport,
@@ -474,7 +473,6 @@ impl PhantomSession {
             recv_tx,
             demux,
             streams,
-            next_app_seq,
             runtime_for_pump,
             observability,
             LegType::Tcp,
@@ -582,7 +580,6 @@ impl PhantomSession {
         state.store(ConnectionState::Connected as u8, Ordering::Relaxed);
         log::debug!("PhantomSession: fully connected to {}", peer);
 
-        let next_app_seq = Arc::new(AtomicU32::new(1));
         // Wrap the (post-handshake) transport so every data-plane send/recv is
         // recorded. The connectionless API rides TCP today (KCP / FakeTLS legs
         // are not session-wired yet), so the leg label is fixed to TCP.
@@ -601,7 +598,6 @@ impl PhantomSession {
             recv_tx,
             demux,
             streams,
-            next_app_seq,
             runtime,
             observability,
             LegType::Tcp,
@@ -718,7 +714,6 @@ async fn run_data_pump<T: SessionTransport>(
     recv_tx: mpsc::Sender<Bytes>,
     demux: Arc<StreamDemultiplexer>,
     streams: Arc<DashMap<u32, Arc<Stream>>>,
-    next_app_seq: Arc<AtomicU32>,
     runtime: Arc<dyn Runtime>,
     observability: Arc<Observability>,
     leg: LegType,
@@ -762,13 +757,70 @@ async fn run_data_pump<T: SessionTransport>(
         }
     }
 
-    // ── Receive task: deserialize, decrypt, route to streams / recv_tx ──
+    // ── Receive-delivery decoupling ──
+    // The reader task hands decrypted application data to a dedicated delivery
+    // task over an UNBOUNDED channel and never blocks on app delivery, so a slow
+    // `recv()` consumer cannot head-of-line-stall inbound ACK / WINDOW_UPDATE /
+    // control processing. The delivery task does the app-paced `recv_tx.send()`
+    // and credits the flow-control window on *real* consumption; enforced
+    // send-side flow control (`Stream::poll_send`) bounds the in-flight backlog
+    // to ~one window, and `undelivered_bytes` + `RECV_DELIVERY_HARD_CAP` guard
+    // against a peer that ignores flow control.
+    let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+    let undelivered_bytes = Arc::new(AtomicU64::new(0));
+    {
+        let recv_tx_deliver = recv_tx; // move the session recv channel here
+        let demux_deliver = demux.clone();
+        let streams_deliver = streams.clone();
+        let crypto_deliver = crypto_session.clone();
+        let undelivered_deliver = undelivered_bytes.clone();
+        runtime.spawn(Box::pin(async move {
+            while let Some((stream_id, bytes)) = deliver_rx.recv().await {
+                let len = bytes.len() as u64;
+                // Best-effort, non-blocking notification to the (vestigial) demux.
+                demux_deliver.route_data(stream_id, bytes.clone());
+                // Account the item the instant it leaves the UNBOUNDED delivery
+                // queue (which the reader's HARD_CAP guards) — BEFORE the
+                // app-paced `recv_tx.send()` below, which can block for a long
+                // time on a slow consumer. Decrementing (and crediting) only
+                // after a successful send would (a) keep this item counted
+                // against the cap while it sits in the bounded recv pipeline,
+                // inflating `undelivered_bytes`, and (b) leak the count entirely
+                // if the send then fails. The byte is now in the bounded
+                // recv-channel pipeline (capacity-limited, its own backpressure),
+                // so it no longer belongs to the unbounded backlog.
+                undelivered_deliver.fetch_sub(len, Ordering::AcqRel);
+                // Credit the flow-control window: the item has been pulled into
+                // the app-delivery pipeline (matching the inline ACK's "accepted
+                // into my in-memory delivery queue" semantics). The pull rate is
+                // still paced by `recv_tx.send()` completing below, so credit
+                // tracks app consumption (one item of look-ahead) — backpressure
+                // is preserved. Wake the send loop to flush the WINDOW_UPDATE
+                // (emitted there, under rekey ownership, so it is epoch-safe).
+                if let Some(stream) = streams_deliver.get(&stream_id) {
+                    if let Some(credit) = stream.record_app_consumed(len as u32) {
+                        stream.stage_window_update_credit(credit);
+                        crypto_deliver.notify_outbound_ready();
+                    }
+                }
+                // Real, app-paced delivery to the session recv channel. A closed
+                // channel means the consumer is gone → session ending; stop. The
+                // item was already removed from the backlog accounting above, so
+                // breaking here leaks nothing.
+                if recv_tx_deliver.send(bytes).await.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    // ── Receive (reader) task: deserialize, decrypt, hand off to delivery ──
     let transport_recv = transport.clone();
     let transport_send_ack = transport.clone();
     let crypto_recv = crypto_session.clone();
     let demux_recv = demux.clone();
     let streams_recv = streams.clone();
-    let recv_tx_for_task = recv_tx.clone();
+    let undelivered_reader = undelivered_bytes.clone();
     let observability_recv = observability.clone();
     // Completion signal for the receive task. `SpawnHandle` from the
     // runtime trait does not expose a `Future` for `.await` directly
@@ -792,10 +844,26 @@ async fn run_data_pump<T: SessionTransport>(
         // challenges. Wraps via `wrapping_add` — sequence space is the
         // session's overall stream-0 control space.
         let mut path_validation_seq: u32 = 0;
-        // Monotonic sequence space for outbound WINDOW_UPDATE control
-        // packets emitted by the recv path (Phase 4.3).
-        let mut window_update_seq: u32 = 0;
+        // Buffering ceiling: the delivery queue is unbounded so the reader
+        // never blocks, but a peer that ignores flow control could flood it.
+        // Compliant senders are bounded by ~one window per stream (enforced
+        // `poll_send`), far below this cap; crossing it means the peer is
+        // misbehaving, so we tear the session down rather than buffer without
+        // limit. 4 MiB tolerates many streams × the 64 KiB window with margin.
+        const RECV_DELIVERY_HARD_CAP: u64 = 4 * 1024 * 1024;
         loop {
+            // Flow-control / anti-flood gate: if the app-delivery backlog
+            // has blown past the cap, the peer is not honouring the window —
+            // close instead of growing the in-memory queue unboundedly. Cheap
+            // pre-check, before any AEAD work.
+            if undelivered_reader.load(Ordering::Acquire) > RECV_DELIVERY_HARD_CAP {
+                log::warn!(
+                    "PhantomSession: receive backlog {} B exceeds cap — peer ignoring flow \
+                     control; closing session",
+                    undelivered_reader.load(Ordering::Acquire)
+                );
+                break;
+            }
             let data = match transport_recv.recv_bytes().await {
                 Ok(b) => b,
                 Err(_) => break,
@@ -820,23 +888,24 @@ async fn run_data_pump<T: SessionTransport>(
                 &demux_recv,
                 &transport_send_ack,
                 &transport_for_path,
-                &recv_tx_for_task,
+                &deliver_tx,
+                &undelivered_reader,
                 &mut ack_buf,
                 &mut path_validation_seq,
-                &mut window_update_seq,
                 &observability_recv,
                 leg,
             )
             .await;
         }
+        // Reader exiting → drop `deliver_tx` so the delivery task drains any
+        // queued items and then sees the channel closed and exits.
+        drop(deliver_tx);
         // Signal the main loop that the recv task has exited so it can
         // also unwind. `send` returns `Err(())` if the receiver was
         // already dropped — that case is harmless, the main loop has
         // already shut down.
         let _ = recv_done_tx.send(());
     }));
-
-    drop(recv_tx); // drop the parent clone so the channel closes when recv_handle exits
 
     // MTU for transport packets
     const TRANSPORT_MTU: usize = 1300;
@@ -850,10 +919,21 @@ async fn run_data_pump<T: SessionTransport>(
     // the notifier yet.
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(10));
     let send_notify = crypto_session.send_notifier();
+    // Outbound WINDOW_UPDATE control packets are emitted on the send loop — the
+    // single writer that also owns the rekey lock — so the encrypted control
+    // frame is always sealed under a consistent epoch. The delivery task only
+    // stages the relative credit (`Stream::stage_window_update_credit`) and
+    // wakes us; the wire sequence is drawn from the stream's own send-sequence
+    // space inside `flush_pending_window_updates` (no private counter, so it
+    // can never collide with application data on the AEAD nonce).
 
     loop {
         tokio::select! {
             _ = poll_interval.tick() => {
+                flush_pending_window_updates(
+                    &transport, &crypto_session, session_id, &streams,
+                )
+                .await;
                 drain_streams_priority_ordered(
                     &transport,
                     &crypto_session,
@@ -863,7 +943,12 @@ async fn run_data_pump<T: SessionTransport>(
                 .await;
             }
             _ = send_notify.notified() => {
-                // Same drain logic as the tick arm — fast-wake path.
+                // Same drain logic as the tick arm — fast-wake path. Also flush
+                // any flow-control credit the delivery task staged.
+                flush_pending_window_updates(
+                    &transport, &crypto_session, session_id, &streams,
+                )
+                .await;
                 drain_streams_priority_ordered(
                     &transport,
                     &crypto_session,
@@ -903,7 +988,10 @@ async fn run_data_pump<T: SessionTransport>(
                     Some(SessionCommand::CloseStream { stream_id }) => {
                         if let Some(stream) = streams.get(&stream_id) {
                             stream.finish().await;
-                            let seq = next_app_seq.fetch_add(1, Ordering::Relaxed);
+                            // Same per-stream sequence space as the stream's data
+                            // (and its WINDOW_UPDATEs) so this bare FIN cannot
+                            // collide on the AEAD nonce / replay window.
+                            let seq = stream.next_send_sequence();
                             let _ = send_app_data(
                                 &transport,
                                 &crypto_session,
@@ -940,6 +1028,57 @@ async fn run_data_pump<T: SessionTransport>(
     state.store(ConnectionState::Closed as u8, Ordering::Relaxed);
     // Session torn down — drop the active-session gauge back down.
     observability.session_closed(leg);
+}
+
+/// Emit any flow-control credit the receive **delivery** task staged.
+///
+/// The delivery task credits the window on real app consumption and stages the
+/// relative credit via `Stream::stage_window_update_credit` + a send-loop wake;
+/// the send loop (this, the single rekey owner) actually encrypts and sends the
+/// `WINDOW_UPDATE`, so the control frame is always sealed under a consistent
+/// epoch. The staged credits are snapshotted out of the `DashMap` first so no
+/// shard lock is held across the `.await` (which would deadlock the delivery /
+/// reader tasks that also touch `streams`).
+async fn flush_pending_window_updates<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    streams: &Arc<DashMap<u32, Arc<Stream>>>,
+) {
+    let pending: Vec<(u32, u32, Arc<Stream>)> = streams
+        .iter()
+        .filter_map(|e| {
+            e.value()
+                .take_pending_window_update()
+                .map(|c| (*e.key(), c, e.value().clone()))
+        })
+        .collect();
+    for (stream_id, credit, stream) in pending {
+        // Draw the control-frame sequence from the SAME per-stream outbound
+        // space as application data (`Stream::next_send_sequence`) so a
+        // WINDOW_UPDATE never collides with a data packet on (stream_id,
+        // sequence) — a collision would reuse an AEAD nonce within the epoch and
+        // be dropped by the peer's replay window, silently starving flow control.
+        let seq = stream.next_send_sequence();
+        if !send_window_update(
+            transport,
+            crypto_session,
+            session_id,
+            stream_id as TransportStreamId,
+            seq,
+            credit,
+        )
+        .await
+        {
+            // The send failed (transient transport hiccup): re-stage the credit
+            // so the next send-loop pass — the 10 ms tick at the latest — retries
+            // it. Dropping it silently would under-credit the peer and could
+            // eventually stall the sender. Credits accumulate, so a retry simply
+            // folds back in; a permanently dead transport tears the session down
+            // via the reader, which ends this loop.
+            stream.stage_window_update_credit(credit);
+        }
+    }
 }
 
 /// Drain every stream with pending data, scheduling them in strict
@@ -1215,10 +1354,13 @@ async fn handle_packet<T: SessionTransport>(
     demux_recv: &Arc<StreamDemultiplexer>,
     transport_send_ack: &Arc<T>,
     transport_for_path: &Arc<T>,
-    recv_tx: &mpsc::Sender<Bytes>,
+    // The reader hands decrypted application data to the delivery task via
+    // this unbounded channel instead of blocking on `recv_tx`/the demux — so a
+    // slow `recv()` consumer can never head-of-line-stall inbound ACK/control.
+    deliver_tx: &mpsc::UnboundedSender<(u32, Bytes)>,
+    undelivered_bytes: &AtomicU64,
     ack_buf: &mut Vec<u8>,
     path_validation_seq: &mut u32,
-    window_update_seq: &mut u32,
     observability: &Observability,
     leg: LegType,
 ) {
@@ -1235,11 +1377,12 @@ async fn handle_packet<T: SessionTransport>(
                 feed_bbr_on_ack(crypto_recv, sent_at, bytes, packet.header.ack_delay as u64);
             }
         }
-        demux_recv
-            .route_ack_async(stream_id, packet.header.sequence)
-            .await;
+        // Best-effort, non-blocking: the demux/PhantomStream path is
+        // vestigial; routing the ACK/close notification to it must never block
+        // the reader's ACK/control pipeline.
+        demux_recv.route_ack(stream_id, packet.header.sequence);
         if packet.header.flags.contains(PacketFlags::FIN) {
-            demux_recv.route_close_async(stream_id).await;
+            demux_recv.route_close(stream_id);
         }
         return;
     }
@@ -1282,8 +1425,8 @@ async fn handle_packet<T: SessionTransport>(
     };
 
     // WINDOW_UPDATE dispatch (Phase 4.3 flow control). Payload is a
-    // big-endian u32 carrying the peer's new absolute send-window
-    // for this stream_id.
+    // big-endian u32 carrying relative flow-control credit — the bytes the
+    // peer's application just consumed, which we ADD to our send window.
     if packet.header.flags.contains(PacketFlags::WINDOW_UPDATE) {
         if plaintext.len() != 4 {
             log::warn!(
@@ -1292,10 +1435,13 @@ async fn handle_packet<T: SessionTransport>(
             );
             return;
         }
-        let new_window =
-            u32::from_be_bytes([plaintext[0], plaintext[1], plaintext[2], plaintext[3]]);
+        let credit = u32::from_be_bytes([plaintext[0], plaintext[1], plaintext[2], plaintext[3]]);
         if let Some(stream) = streams_recv.get(&stream_id) {
-            stream.apply_peer_window_update(new_window);
+            // Relative-credit flow control — add the granted credit, then
+            // wake the send loop so a window-blocked sender resumes immediately
+            // instead of waiting a full poll tick.
+            stream.apply_peer_window_update(credit);
+            crypto_recv.notify_outbound_ready();
         }
         return;
     }
@@ -1349,11 +1495,11 @@ async fn handle_packet<T: SessionTransport>(
     }
 
     // COALESCED dispatch (Phase 2.5): split the decrypted bundle into
-    // sub-payloads and route each one through the demux as an
-    // application chunk on the outer header's stream_id.
+    // sub-payloads and hand each, IN ORDER, to the single FIFO delivery task.
+    // The delivery task drains them in this order, so the bundle's internal
+    // ordering (and its order relative to later frames) is preserved —
+    // the reader never blocks on application delivery.
     if packet.header.flags.contains(PacketFlags::COALESCED) {
-        // Reconstruct a temporary V2 packet whose payload IS the
-        // decrypted bundle so the codec can parse it.
         let inner_for_codec = PhantomPacket {
             header: packet.header,
             payload: plaintext,
@@ -1365,27 +1511,34 @@ async fn handle_packet<T: SessionTransport>(
                     if sub.is_empty() {
                         continue;
                     }
-                    let bytes = Bytes::from(sub);
-                    demux_recv.route_data_async(stream_id, bytes.clone()).await;
-                    let _ = recv_tx.send(bytes).await;
+                    // Count toward the backlog only once the item is actually
+                    // enqueued. If the delivery task has exited (consumer gone,
+                    // `deliver_rx` dropped) the send fails and we must not inflate
+                    // `undelivered_bytes` for data that was discarded.
+                    let len = sub.len() as u64;
+                    if deliver_tx.send((stream_id, Bytes::from(sub))).is_ok() {
+                        undelivered_bytes.fetch_add(len, Ordering::AcqRel);
+                    }
                 }
             }
             Ok(None) => {
-                // COALESCED flag was set but the codec disagreed —
-                // treat as a malformed bundle. Drop.
                 log::warn!("PhantomSession: COALESCED flag set but bundle didn't parse");
             }
             Err(e) => {
                 log::warn!("PhantomSession: COALESCED parse error: {}", e);
             }
         }
-        // Bundles do not auto-ACK at the outer level — sub-packets
-        // are not independently sequenced and the outer sequence has
-        // already been consumed by the replay window.
+        // Bundles do not auto-ACK at the outer level — sub-packets are not
+        // independently sequenced and the outer sequence has already been
+        // consumed by the replay window.
         return;
     }
 
-    // Reliable application data → emit an ACK.
+    // Reliable application data → emit an ACK **inline in the reader**. ACKs are
+    // unencrypted (no epoch/key dependency, so no rekey-lock needed) and must
+    // stay prompt even when the app consumer is slow — that is the whole point
+    // of decoupling delivery from the reader. The ACK means "received,
+    // decrypted, replay-passed, and accepted into my in-memory delivery queue."
     if packet.header.flags.contains(PacketFlags::RELIABLE) {
         let ack_flag_bits = PacketFlags::ACK;
         let ack_header = PacketHeader::new(
@@ -1403,60 +1556,22 @@ async fn handle_packet<T: SessionTransport>(
         let _ = transport_send_ack.send_bytes(&ack_buf[..size]).await;
     }
 
-    // Track bytes received for the stream's flow-control accounting
-    // (Phase 4.3). The pump treats "received and routed to the recv
-    // channel" as consumed — slow consumers experience some over-
-    // budget queueing on the FFI receive channel, but the wire-level
-    // window stays in lockstep with the pump's view.
-    let consumed_bytes = plaintext.len() as u32;
-    let window_update_to_emit = if consumed_bytes > 0 {
-        if let Some(stream) = streams_recv.get(&stream_id) {
-            stream.record_app_consumed(consumed_bytes)
-        } else {
-            None
+    // Hand the decrypted application data to the delivery task: unbounded +
+    // non-blocking, so the reader never stalls on a slow `recv()` consumer. The
+    // delivery task drains the app-paced `recv_tx.send()` and credits the
+    // flow-control window. `undelivered_bytes` is the backlog counter the
+    // reader's HARD_CAP gate watches — counted only on a successful enqueue, so
+    // a dead delivery task (consumer gone) can't inflate it for discarded data.
+    if !plaintext.is_empty() {
+        let len = plaintext.len() as u64;
+        if deliver_tx.send((stream_id, Bytes::from(plaintext))).is_ok() {
+            undelivered_bytes.fetch_add(len, Ordering::AcqRel);
         }
-    } else {
-        None
-    };
-
-    if !plaintext_into_router(plaintext, stream_id, demux_recv, recv_tx).await {
-        return;
-    }
-
-    if let Some(new_window) = window_update_to_emit {
-        let seq = *window_update_seq;
-        *window_update_seq = window_update_seq.wrapping_add(1);
-        let _ = send_window_update(
-            transport_send_ack,
-            crypto_recv,
-            session_id,
-            stream_id as TransportStreamId,
-            seq,
-            new_window,
-        )
-        .await;
     }
 
     if packet.header.flags.contains(PacketFlags::FIN) {
-        demux_recv.route_close_async(stream_id).await;
+        demux_recv.route_close(stream_id);
     }
-}
-
-/// Fan a single plaintext into the demux + session-recv channel. Returns
-/// `false` only when the channel is closed (so the caller can decide to
-/// break out of its loop).
-async fn plaintext_into_router(
-    plaintext: Vec<u8>,
-    stream_id: u32,
-    demux: &Arc<StreamDemultiplexer>,
-    recv_tx: &mpsc::Sender<Bytes>,
-) -> bool {
-    if plaintext.is_empty() {
-        return true;
-    }
-    let bytes = Bytes::from(plaintext);
-    demux.route_data_async(stream_id, bytes.clone()).await;
-    recv_tx.send(bytes).await.is_ok()
 }
 
 // Internal-only methods — deliberately NOT on the `#[uniffi::export]` surface.
@@ -2310,7 +2425,8 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (recv_tx, mut recv_rx) = mpsc::channel::<Bytes>(4);
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
         let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
             tx: ack_a,
@@ -2319,7 +2435,6 @@ mod tests {
 
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
-        let mut window_update_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
         handle_packet(
             v2,
@@ -2329,19 +2444,24 @@ mod tests {
             &demux,
             &transport_send,
             &transport_send,
-            &recv_tx,
+            &deliver_tx,
+            &undelivered,
             &mut ack_buf,
             &mut path_validation_seq,
-            &mut window_update_seq,
             &obs,
             LegType::Tcp,
         )
         .await;
 
-        // The decrypted plaintext must have been routed through the
-        // session-recv channel.
-        let received = recv_rx.recv().await.expect("recv on session channel");
+        // The decrypted plaintext must have been handed to the delivery task,
+        // tagged with its stream id, and counted toward the undelivered backlog.
+        let (sid, received) = deliver_rx.recv().await.expect("delivery hand-off");
+        assert_eq!(sid, stream_id as u32);
         assert_eq!(&received[..], b"hello-v2");
+        assert_eq!(
+            undelivered.load(Ordering::Acquire),
+            b"hello-v2".len() as u64
+        );
     }
 
     #[tokio::test]
@@ -2364,7 +2484,8 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (recv_tx, mut recv_rx) = mpsc::channel::<Bytes>(4);
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
         let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
             tx: ack_a,
@@ -2373,7 +2494,6 @@ mod tests {
 
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
-        let mut window_update_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
         handle_packet(
             bad_packet,
@@ -2383,22 +2503,22 @@ mod tests {
             &demux,
             &transport_send,
             &transport_send,
-            &recv_tx,
+            &deliver_tx,
+            &undelivered,
             &mut ack_buf,
             &mut path_validation_seq,
-            &mut window_update_seq,
             &obs,
             LegType::Tcp,
         )
         .await;
 
-        // Nothing should have made it through the recv channel.
-        let try_recv =
-            tokio::time::timeout(std::time::Duration::from_millis(50), recv_rx.recv()).await;
+        // Nothing should have been handed to the delivery task, and the backlog
+        // counter must stay at zero (the packet was dropped before hand-off).
         assert!(
-            try_recv.is_err(),
-            "unencrypted post-handshake payload must NOT be routed"
+            deliver_rx.try_recv().is_err(),
+            "unencrypted post-handshake payload must NOT be handed off for delivery"
         );
+        assert_eq!(undelivered.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
@@ -2429,7 +2549,8 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (recv_tx, mut recv_rx) = mpsc::channel::<Bytes>(4);
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
         let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
             tx: ack_a,
@@ -2438,7 +2559,6 @@ mod tests {
 
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 0;
-        let mut window_update_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
         handle_packet(
             v2,
@@ -2448,21 +2568,185 @@ mod tests {
             &demux,
             &transport_send,
             &transport_send,
-            &recv_tx,
+            &deliver_tx,
+            &undelivered,
             &mut ack_buf,
             &mut path_validation_seq,
-            &mut window_update_seq,
             &obs,
             LegType::Tcp,
         )
         .await;
 
-        let a = recv_rx.recv().await.expect("alpha");
-        let b = recv_rx.recv().await.expect("bravo");
-        let c = recv_rx.recv().await.expect("charlie");
+        // Each sub-payload is handed off IN ORDER through the single FIFO
+        // delivery channel, every one tagged with the outer stream id, and the
+        // total counted toward the undelivered backlog.
+        let (sa, a) = deliver_rx.recv().await.expect("alpha");
+        let (sb, b) = deliver_rx.recv().await.expect("bravo");
+        let (sc, c) = deliver_rx.recv().await.expect("charlie");
+        assert_eq!(
+            (sa, sb, sc),
+            (stream_id as u32, stream_id as u32, stream_id as u32)
+        );
         assert_eq!(&a[..], b"alpha");
         assert_eq!(&b[..], b"bravo");
         assert_eq!(&c[..], b"charlie");
+        assert_eq!(undelivered.load(Ordering::Acquire), (5 + 5 + 7) as u64);
+    }
+
+    /// Ordering across a COALESCED bundle followed by a normal frame: the single
+    /// FIFO delivery channel must hand the bundle's `[A, B, C]` AND the later
+    /// `D` to the consumer in exactly `A, B, C, D` — decoupling delivery from
+    /// the reader must not reorder application bytes.
+    #[tokio::test]
+    async fn delivery_preserves_order_across_coalesced_then_normal_frame() {
+        use crate::transport::packet_coalescer::{CoalescerConfig, PacketCoalescer};
+
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        // Frame 1: COALESCED [A, B, C] at sequence 0.
+        let mut coalescer = PacketCoalescer::new(CoalescerConfig::default());
+        coalescer.push(b"A");
+        coalescer.push(b"B");
+        coalescer.push(b"C");
+        let bundle = coalescer.flush().expect("bundle");
+        let flag_bits = PacketFlags::ENCRYPTED | PacketFlags::COALESCED;
+        let h1 = PacketHeader::new(session_id, stream_id, 0, PacketFlags::new(flag_bits))
+            .with_epoch(client_session.current_epoch());
+        let ct1 = client_session
+            .encrypt_packet(&h1, &bundle)
+            .expect("encrypt bundle");
+        let coalesced = PhantomPacket::new(h1, ct1);
+
+        // Frame 2: a normal RELIABLE "D" at sequence 1.
+        let d_wire = build_app_frame(&client_session, session_id, stream_id, 1, b"D");
+        let normal = PhantomPacket::from_wire(&d_wire).unwrap();
+
+        let (demux, _ctrl) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(8);
+        let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let mut ack_buf = Vec::with_capacity(256);
+        let mut pv_seq: u32 = 0;
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        for pkt in [coalesced, normal] {
+            handle_packet(
+                pkt,
+                session_id,
+                &server_session,
+                &streams,
+                &demux,
+                &transport_send,
+                &transport_send,
+                &deliver_tx,
+                &undelivered,
+                &mut ack_buf,
+                &mut pv_seq,
+                &obs,
+                LegType::Tcp,
+            )
+            .await;
+        }
+
+        // Drain the FIFO delivery channel — order must be exactly A, B, C, D.
+        let mut got: Vec<Bytes> = Vec::new();
+        while let Ok((_sid, b)) = deliver_rx.try_recv() {
+            got.push(b);
+        }
+        let seen: Vec<&[u8]> = got.iter().map(|b| &b[..]).collect();
+        assert_eq!(seen, vec![&b"A"[..], b"B", b"C", b"D"]);
+    }
+
+    /// A peer that ignores flow control and floods application data faster than
+    /// the app drains must NOT grow the receive backlog without bound: once the
+    /// undelivered backlog crosses the reader's hard cap, the session is torn
+    /// down (state → `Closed`) instead of buffering unboundedly. The app here
+    /// never calls `recv()`, so the delivery channel fills and the reader's
+    /// pre-decrypt cap gate fires.
+    #[tokio::test]
+    async fn peer_ignoring_flow_control_trips_delivery_hard_cap_and_closes_session() {
+        let session_id = fixed_session_id();
+        let (client_inner, server_inner) = paired_sessions(session_id);
+        let (client_t, server_t) = ChannelTransport::pair();
+        let client_t = Arc::new(client_t);
+
+        // Full server-side session with a running pump; the app NEVER drains it.
+        let server = PhantomSession::from_accepted_server_session(
+            "flooder".to_string(),
+            server_t,
+            server_inner,
+        );
+
+        // Drain and discard everything the server sends back (ACKs / control)
+        // so the server reader never blocks on the back channel — a real
+        // flooding peer likewise keeps emptying its socket. Without this the
+        // reader would wedge on its own ACK send and the cap could never trip.
+        let drain_t = client_t.clone();
+        let drainer = tokio::spawn(async move { while drain_t.recv_bytes().await.is_ok() {} });
+
+        // Malicious client: flood valid RELIABLE app packets with unique
+        // monotonic sequences (so none are replay-dropped) and never honor a
+        // WINDOW_UPDATE — i.e. ignore flow control entirely.
+        let payload = vec![0xABu8; 64 * 1024];
+        let mut seq: u32 = 0;
+        let mut torn_down = false;
+        for _ in 0..4000 {
+            if server.connection_state() == ConnectionState::Closed {
+                torn_down = true;
+                break;
+            }
+            let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
+            let header = PacketHeader::new(session_id, 1, seq, PacketFlags::new(flag_bits))
+                .with_epoch(client_inner.current_epoch());
+            let ct = client_inner
+                .encrypt_packet(&header, &payload)
+                .expect("encrypt");
+            // Bound the send so a torn-down (or wedged) transport can't hang the
+            // test: a closed channel or a stalled reader both mean the flood is
+            // no longer absorbed — i.e. the session is being torn down.
+            let wire = PhantomPacket::new(header, ct).to_wire();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client_t.send_bytes(&wire),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                _ => {
+                    torn_down = true;
+                    break;
+                }
+            }
+            seq = seq.wrapping_add(1);
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            torn_down,
+            "a peer flooding past the delivery hard cap must get its session torn down"
+        );
+
+        // Definitive: the session ends up Closed.
+        let mut closed = false;
+        for _ in 0..200 {
+            if server.connection_state() == ConnectionState::Closed {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        drainer.abort();
+        assert!(
+            closed,
+            "session state must be Closed after the hard cap trips"
+        );
     }
 
     /// Phase 4.4 — BBR ACK feedback drives the pacer rate. Build a
@@ -2515,11 +2799,12 @@ mod tests {
         assert_eq!(client_session.pacer().rate(), snap.pacing_rate_bps);
     }
 
-    /// Phase 4.3 — WINDOW_UPDATE round-trip. After the receive side
-    /// has crossed the half-window threshold, it emits a V2
-    /// WINDOW_UPDATE packet announcing its absolute window. The
-    /// sender-side `Stream::apply_peer_window_update` lifts its
-    /// `peer_send_window` to that value.
+    /// Phase 4.3 — WINDOW_UPDATE round-trip under the relative-credit model.
+    /// The receive **delivery** task credits the flow-control window on real
+    /// app consumption and stages the credit; the **send loop** flushes it as a
+    /// single encrypted WINDOW_UPDATE via `flush_pending_window_updates`. The
+    /// sender then ADDS the relative credit to its `peer_send_window` — it does
+    /// not overwrite it with an absolute value.
     #[tokio::test]
     async fn flow_control_window_update_round_trip() {
         use crate::transport::stream::INITIAL_STREAM_WINDOW;
@@ -2527,37 +2812,30 @@ mod tests {
         let session_id = fixed_session_id();
         let (client_session, server_session) = paired_sessions(session_id);
 
-        // Register a stream on the server side so handle_packet
-        // can record the bytes-consumed accounting. The stream id
-        // matches the packet header.
         let stream_id: TransportStreamId = 9;
         let server_streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        server_streams.insert(stream_id as u32, Arc::new(TransportStream::new(stream_id)));
+        let server_stream = Arc::new(TransportStream::new(stream_id));
+        server_streams.insert(stream_id as u32, server_stream.clone());
 
-        // Client also has a Stream so we can apply the inbound update.
+        // Client also has a Stream so we can apply the inbound credit.
         let client_stream = Arc::new(TransportStream::new(stream_id));
-        let client_streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        client_streams.insert(stream_id as u32, client_stream.clone());
 
-        // Pre-drain client's peer_send_window so the WINDOW_UPDATE
-        // has a real effect to assert against.
+        // Pre-drain the client's peer_send_window so the credit has a real
+        // effect to assert against.
         let drain = INITIAL_STREAM_WINDOW - 1000;
         assert!(client_stream.try_consume_send_window(drain));
         assert_eq!(client_stream.peer_send_window(), 1000);
 
-        // Build a single large app-data packet that crosses the
-        // server's half-window threshold in one shot.
-        let big = vec![0u8; (INITIAL_STREAM_WINDOW / 2 + 1) as usize];
-        let frame = build_app_frame(&client_session, session_id, stream_id, 0, &big);
+        // The delivery task credits the window on real consumption: model one
+        // drain that crosses the half-window threshold and stage the credit
+        // exactly as `run_data_pump`'s delivery task does.
+        let consumed = INITIAL_STREAM_WINDOW / 2 + 1;
+        let credit = server_stream
+            .record_app_consumed(consumed)
+            .expect("threshold crossed → credit granted");
+        server_stream.stage_window_update_credit(credit);
 
-        // Server processes the packet via handle_packet. We
-        // capture its outbound transport so we can intercept the
-        // WINDOW_UPDATE it emits.
-        let v2 = PhantomPacket::from_wire(&frame).unwrap();
-
-        let (demux, _ctrl) = StreamDemultiplexer::new(16);
-        let demux = Arc::new(demux);
-        let (recv_tx, mut _recv_rx) = mpsc::channel::<Bytes>(4);
+        // The send loop flushes the staged credit as a single WINDOW_UPDATE.
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(4);
         let (back_tx, back_rx) = mpsc::channel::<Vec<u8>>(4);
         let server_outbound: Arc<ChannelTransport> = Arc::new(ChannelTransport {
@@ -2565,61 +2843,55 @@ mod tests {
             rx: Mutex::new(back_rx),
         });
         let _keep = back_tx;
-
-        let mut ack_buf = Vec::with_capacity(256);
-        let mut path_validation_seq: u32 = 0;
-        let mut window_update_seq: u32 = 0;
-        let obs = Observability::new(ObservabilityConfig::default());
-        handle_packet(
-            v2,
-            session_id,
+        flush_pending_window_updates(
+            &server_outbound,
             &server_session,
+            session_id,
             &server_streams,
-            &demux,
-            &server_outbound,
-            &server_outbound,
-            &recv_tx,
-            &mut ack_buf,
-            &mut path_validation_seq,
-            &mut window_update_seq,
-            &obs,
-            LegType::Tcp,
         )
         .await;
 
-        // The server's recv path should have crossed the threshold
-        // and emitted exactly one WINDOW_UPDATE. (There will be an
-        // ACK first because the inbound was RELIABLE.) Pull frames
-        // until we find the WINDOW_UPDATE.
-        let mut announced: Option<u32> = None;
-        for _ in 0..3 {
-            let frame = tokio::time::timeout(std::time::Duration::from_millis(100), out_rx.recv())
-                .await
-                .expect("expected an outbound frame")
-                .expect("channel open");
-            let pv2 = PhantomPacket::from_wire(&frame).unwrap();
-            if pv2.header.flags.contains(PacketFlags::WINDOW_UPDATE) {
-                // Decrypt the payload to read the new window.
-                let pt = client_session
-                    .decrypt_packet(&pv2.header, &pv2.payload)
-                    .expect("decrypt WINDOW_UPDATE");
-                assert_eq!(pt.len(), 4);
-                announced = Some(u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]));
-                break;
-            }
-        }
-        let announced = announced.expect("WINDOW_UPDATE must have been emitted");
+        // Exactly one WINDOW_UPDATE was emitted; decrypt it and read the credit.
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(100), out_rx.recv())
+            .await
+            .expect("expected a WINDOW_UPDATE frame")
+            .expect("channel open");
+        let pv2 = PhantomPacket::from_wire(&frame).unwrap();
+        assert!(pv2.header.flags.contains(PacketFlags::WINDOW_UPDATE));
+        // The control frame's sequence comes from the stream's own send space —
+        // distinct from any data packet so the AEAD nonce never repeats.
+        let pt = client_session
+            .decrypt_packet(&pv2.header, &pv2.payload)
+            .expect("decrypt WINDOW_UPDATE");
+        assert_eq!(pt.len(), 4);
+        let announced = u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]);
+        assert_eq!(
+            announced, credit,
+            "WINDOW_UPDATE carries the relative credit (bytes consumed since last update)"
+        );
+        // Exactly one frame was emitted — nothing else is queued on the wire.
+        assert!(
+            out_rx.try_recv().is_err(),
+            "exactly one WINDOW_UPDATE must be emitted"
+        );
 
-        // Apply the update on the client side; peer_send_window
-        // jumps to the announced value (it's larger than the
-        // current 1000).
+        // The staged slot is now empty — a second flush emits nothing.
+        flush_pending_window_updates(
+            &server_outbound,
+            &server_session,
+            session_id,
+            &server_streams,
+        )
+        .await;
+        assert!(
+            out_rx.try_recv().is_err(),
+            "no spurious second WINDOW_UPDATE after the credit was already flushed"
+        );
+
+        // Apply the relative credit on the client side: peer_send_window ADDS it
+        // to the current 1000 (it does not jump to an absolute value).
         client_stream.apply_peer_window_update(announced);
-        assert_eq!(client_stream.peer_send_window(), announced);
-        // Sanity: announced window is the receiver-side replenished
-        // total — at least the initial window's size.
-        assert!(announced >= INITIAL_STREAM_WINDOW);
-        // Exactly one WINDOW_UPDATE was emitted.
-        assert_eq!(window_update_seq, 1);
+        assert_eq!(client_stream.peer_send_window(), 1000 + credit);
     }
 
     /// Phase 4.3 — priority scheduler ordering. Two streams enqueue
@@ -2727,7 +2999,8 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (recv_tx, _recv_rx) = mpsc::channel::<Bytes>(4);
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
         // Server's outbound transport — captures the echo back.
         let (echo_tx, mut echo_rx) = mpsc::channel::<Vec<u8>>(4);
         let (back_tx, back_rx) = mpsc::channel::<Vec<u8>>(4);
@@ -2739,7 +3012,6 @@ mod tests {
 
         let mut ack_buf = Vec::with_capacity(256);
         let mut path_validation_seq: u32 = 100;
-        let mut window_update_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
 
         handle_packet(
@@ -2750,10 +3022,10 @@ mod tests {
             &demux,
             &transport_send,
             &transport_send,
-            &recv_tx,
+            &deliver_tx,
+            &undelivered,
             &mut ack_buf,
             &mut path_validation_seq,
-            &mut window_update_seq,
             &obs,
             LegType::Tcp,
         )
