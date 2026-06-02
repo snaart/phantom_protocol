@@ -15,7 +15,8 @@ data:
   #
   # Example:
   #   PHANTOM_BIND_ADDR: "0.0.0.0:{{ .Values.service.port }}"
-  #   PHANTOM_METRICS_ADDR: "0.0.0.0:{{ .Values.service.metricsPort }}"
   PHANTOM_BIND_PORT: {{ .Values.service.port | quote }}
-  PHANTOM_METRICS_PORT: {{ .Values.service.metricsPort | quote }}
+  # Telemetry is pushed over OTLP/gRPC to a Collector — there is no inbound
+  # metrics port. The OTEL_* push config is rendered into the Deployment's
+  # container env from the `telemetry` values block, not from this ConfigMap.
   PHANTOM_SIGNING_KEY_PATH: {{ printf "%s/%s" .Values.signingKey.mountPath .Values.signingKey.fileName | quote }}
