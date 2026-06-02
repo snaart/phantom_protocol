@@ -268,3 +268,110 @@ async fn tcp_soak_drives_automatic_rekey_end_to_end() {
 
     server_handle.await.expect("server task");
 }
+
+/// C3 — 0-RTT rejection retransmission contract. When the server rejects a
+/// client's 0-RTT early-data, that data must NOT be lost: the client re-sends it
+/// over the established 1-RTT session. We force a deterministic rejection via the
+/// one-shot resumption ticket — the same hint is resumed twice: the first use is
+/// accepted (consuming the ticket), the second finds no ticket and rejects, so
+/// its early-data has to arrive as ordinary 1-RTT application data instead.
+#[tokio::test]
+#[ignore]
+async fn tcp_zero_rtt_rejection_retransmits_early_data_over_1rtt() {
+    use phantom_core::api::session::{connect_pinned, connect_pinned_with_resumption};
+
+    let listener = PhantomListener::bind("127.0.0.1:0".to_string())
+        .await
+        .expect("bind listener");
+    let local = listener.local_addr();
+    let (host, port_str) = local.rsplit_once(':').expect("local_addr is host:port");
+    let host = host.to_string();
+    let port: u16 = port_str.parse().expect("port parses");
+    let pinned = listener.verifying_key_bytes();
+
+    let server_handle = tokio::spawn(async move {
+        // Connection 1 (plain): warm-up so the client can harvest a ticket.
+        {
+            let session = listener.accept().await.expect("accept 1").session();
+            assert_eq!(session.recv().await.expect("recv 1"), b"warmup");
+        }
+        // Connection 2 (resume, accepted): early-data is consumed as 0-RTT.
+        {
+            let outcome = listener.accept().await.expect("accept 2");
+            assert_eq!(
+                outcome.take_early_data().as_deref(),
+                Some(&b"first-0rtt"[..]),
+                "a valid one-shot ticket must accept the 0-RTT early-data server-side"
+            );
+        }
+        // Connection 3 (resume the SAME, now-consumed ticket → rejected): the
+        // early-data must NOT be a 0-RTT take; it must arrive re-sent as 1-RTT.
+        {
+            let outcome = listener.accept().await.expect("accept 3");
+            assert!(
+                outcome.take_early_data().is_none(),
+                "a consumed ticket must reject 0-RTT (no server-side early-data take)"
+            );
+            let session = outcome.session();
+            let got = session
+                .recv()
+                .await
+                .expect("recv 3 — rejected early-data must be re-sent over 1-RTT");
+            assert_eq!(
+                got, b"second-0rtt-rejected",
+                "the rejected 0-RTT payload must arrive losslessly over the 1-RTT session"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    // conn1: plain connect, harvest a resumption hint.
+    let c1 = connect_pinned(host.clone(), port, pinned.clone())
+        .await
+        .expect("connect_pinned c1");
+    c1.send(b"warmup".to_vec()).await.expect("c1 send");
+    let hint = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(h) = c1.resumption_hint().await {
+                return h;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resumption hint did not arrive");
+
+    // conn2: resume with the hint → accepted (consumes the ticket).
+    let _c2 = connect_pinned_with_resumption(
+        host.clone(),
+        port,
+        pinned.clone(),
+        hint.clone(),
+        b"first-0rtt".to_vec(),
+    )
+    .await
+    .expect("connect_pinned_with_resumption c2");
+
+    // conn3: reuse the SAME (now-consumed) ticket → 0-RTT rejected.
+    let c3 =
+        connect_pinned_with_resumption(host, port, pinned, hint, b"second-0rtt-rejected".to_vec())
+            .await
+            .expect("connect_pinned_with_resumption c3");
+
+    // The client-visible verdict must be rejection.
+    let mut verdict = None;
+    for _ in 0..200 {
+        verdict = c3.early_data_accepted().await;
+        if verdict.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        verdict,
+        Some(false),
+        "reusing a one-shot ticket must reject the 0-RTT early-data"
+    );
+
+    server_handle.await.expect("server task");
+}
