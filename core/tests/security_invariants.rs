@@ -16,6 +16,7 @@
 //!     synthetic counter-bump and yields `NonceExhausted`.
 //!   - Cookie tampering yields a `Retry` (not `Success`) on the server side.
 
+use bytes::Bytes;
 use phantom_core::crypto::adaptive_crypto::{CipherSuite, CryptoSession};
 use phantom_core::crypto::hybrid_sign::HybridSigningKey;
 use phantom_core::transport::handshake::{
@@ -23,9 +24,11 @@ use phantom_core::transport::handshake::{
 };
 use phantom_core::transport::path::PathStateKind;
 use phantom_core::transport::session::{CryptoState, Session, MAX_REKEY_CATCHUP};
+use phantom_core::transport::stream::{Stream, INITIAL_STREAM_WINDOW};
 use phantom_core::transport::types::{
     PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
 };
+use std::time::Duration;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -737,4 +740,108 @@ fn packet_roundtrip_preserves_fields() {
     assert_eq!(decoded.header.path_id, 2);
     assert!(decoded.header.flags.contains(PacketFlags::REKEY));
     assert_eq!(decoded.payload, vec![0xDE, 0xAD]);
+}
+
+// ── Flow-control enforcement invariants (receive-backpressure decoupling) ────
+//
+// With backpressure decoupled from the recv reader, the SEND side is where flow
+// control is actually enforced: `Stream::poll_send` admits new data only within
+// `min(congestion_window, peer_flow_control_window)`, while retransmissions must
+// bypass both so loss recovery can never be starved by a closed window. These
+// two tests pin those properties so a future change can't silently let a stream
+// outrun a slow peer (unbounded receiver memory) or wedge loss recovery.
+
+/// New (first-transmission) data is admitted only within the advertised
+/// flow-control window AND the congestion window — `min` of the two. A segment
+/// that does not fit is withheld and, crucially, does NOT debit the window (so
+/// the credit is not leaked while the segment waits).
+#[tokio::test]
+async fn flow_control_bounds_new_data_to_the_advertised_window() {
+    // ── Flow-control window bound ──
+    let s = Stream::new(1);
+    // Drain the peer's advertised window down to a known small amount.
+    assert!(s.try_consume_send_window(INITIAL_STREAM_WINDOW - 100));
+    assert_eq!(s.peer_send_window(), 100);
+
+    // Two new-data segments queued: the first fits the 100-byte window, the
+    // second does not. The congestion budget is unbounded so ONLY the
+    // flow-control window can gate us here.
+    s.send_reliable(Bytes::from(vec![0u8; 60])).await; // seq 0
+    s.send_reliable(Bytes::from(vec![0u8; 60])).await; // seq 1
+
+    let first = s
+        .poll_send(u64::MAX)
+        .await
+        .expect("first segment fits the window");
+    assert!(!first.retransmit);
+    assert_eq!(first.data.len(), 60);
+    assert_eq!(s.peer_send_window(), 40, "window debited by the sent bytes");
+
+    // The second 60-byte segment exceeds the remaining 40-byte window → withheld.
+    assert!(
+        s.poll_send(u64::MAX).await.is_none(),
+        "new data exceeding the flow-control window must be withheld"
+    );
+    assert_eq!(
+        s.peer_send_window(),
+        40,
+        "a withheld segment must NOT debit the window (no credit leak)"
+    );
+
+    // ── Congestion window bound ──
+    let s2 = Stream::new(2);
+    s2.send_reliable(Bytes::from(vec![0u8; 100])).await;
+    // cwnd budget smaller than the segment → withheld by congestion control,
+    // BEFORE the flow-control window is even consulted.
+    assert!(
+        s2.poll_send(50).await.is_none(),
+        "new data exceeding the congestion window must be withheld"
+    );
+    assert_eq!(
+        s2.peer_send_window(),
+        INITIAL_STREAM_WINDOW,
+        "a cwnd-blocked segment must not debit the flow-control window"
+    );
+}
+
+/// Retransmissions bypass BOTH the congestion window and the flow-control
+/// window: a timed-out segment is re-offered even when `cwnd_budget == 0` and
+/// the peer's window is fully closed — loss recovery must always proceed, and
+/// the retransmit must not debit the (already-accounted) window again.
+#[tokio::test]
+async fn retransmissions_bypass_congestion_and_flow_control_windows() {
+    tokio::time::pause();
+    let s = Stream::new(1);
+    s.send_reliable(Bytes::from(vec![0u8; 200])).await; // seq 0
+
+    // First transmission debits the window (200 bytes) under an unbounded cwnd.
+    let first = s.poll_send(u64::MAX).await.expect("first transmission");
+    assert!(!first.retransmit);
+    assert_eq!(first.data.len(), 200);
+    assert_eq!(s.peer_send_window(), INITIAL_STREAM_WINDOW - 200);
+
+    // Slam BOTH budgets shut: drain the flow-control window to zero …
+    assert!(s.try_consume_send_window(s.peer_send_window()));
+    assert_eq!(s.peer_send_window(), 0);
+    // … and an immediate re-poll (cwnd 0, window 0) yields nothing — the
+    // segment is in-flight, not yet timed out.
+    assert!(s.poll_send(0).await.is_none());
+
+    // Advance past the initial 1s RTO so the unacked segment is due to retransmit.
+    tokio::time::advance(Duration::from_millis(1100)).await;
+
+    // The retransmit is produced despite cwnd == 0 AND window == 0 (Karn: the
+    // bytes were accounted on first send; loss recovery must always proceed).
+    let rtx = s
+        .poll_send(0)
+        .await
+        .expect("retransmission must bypass both the congestion and flow-control windows");
+    assert!(rtx.retransmit, "must be flagged as a retransmission");
+    assert_eq!(rtx.seq, first.seq);
+    assert_eq!(rtx.data.len(), 200);
+    assert_eq!(
+        s.peer_send_window(),
+        0,
+        "a retransmission must not debit the flow-control window again"
+    );
 }
