@@ -525,11 +525,11 @@ In-tree, committed alongside the code:
   - mTLS on OTLP/gRPC (tonic config example)
 - `docs/observability/tracing-guide.md` — span inventory, propagation,
   sampling tuning.
-- `docs/observability/grafana/` — REPLACES `docs/operations/grafana/`.
+- `docs/observability/grafana/` — REPLACED the removed `docs/operations/grafana/`.
   Dashboards updated to consume Prometheus-exporter-translated OTel names.
   Add a Tempo panel for span drill-down. Exemplar markers on the handshake
   latency graph.
-- `docs/observability/prometheus/alerts.yml` — REPLACES
+- `docs/observability/prometheus/alerts.yml` — REPLACED the removed
   `docs/operations/prometheus/alerts.yml`. Rewritten under new naming.
 - `docs/observability/otel-collector/otel-collector-config.yaml` —
   production-ready Collector config with `tail_sampling` processor for

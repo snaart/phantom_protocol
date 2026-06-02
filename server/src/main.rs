@@ -3,15 +3,19 @@
 //! Boot sequence:
 //!
 //! 1. Parse CLI / env into [`config::Config`].
-//! 2. Initialize tracing (JSON or pretty per `--log-json`).
-//! 3. Load-or-create the long-lived [`HybridSigningKey`].
-//! 4. Log the verifying-key hex (operator captures this for client pinning).
-//! 5. Bind the Phantom listener.
-//! 6. Optionally bind the /metrics HTTP listener.
-//! 7. Install SIGTERM / SIGINT handlers.
-//! 8. Run the accept loop until shutdown is signaled.
-//! 9. On shutdown: stop accepting, give in-flight tasks a short drain
-//!    window, then exit 0.
+//! 2. Install the OpenTelemetry pipeline — an OTLP/gRPC exporter that *pushes*
+//!    metrics + traces to a Collector (`--otlp-endpoint` /
+//!    `OTEL_EXPORTER_OTLP_ENDPOINT`). There is no inbound `/metrics` port.
+//! 3. Initialize tracing (JSON or pretty per `--log-json`), bridged into OTel.
+//! 4. Run the power-on self-test (`run_post`) as a crypto-path readiness gate
+//!    and refuse to boot if any primitive fails.
+//! 5. Load-or-create the long-lived [`HybridSigningKey`].
+//! 6. Log the verifying-key hex (operator captures this for client pinning).
+//! 7. Bind the Phantom listener.
+//! 8. Install SIGTERM / SIGINT handlers.
+//! 9. Run the accept loop until shutdown is signaled.
+//! 10. On shutdown: stop accepting, give in-flight tasks a short drain
+//!     window, then exit 0.
 
 mod config;
 mod handler;

@@ -19,18 +19,31 @@ To forward the port locally for testing:
     svc/{{ include "phantom-core.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
 
 ---------------------------------------------------------------------------
-Metrics endpoint
+Telemetry (OpenTelemetry push)
 ---------------------------------------------------------------------------
 
-Prometheus metrics (PhantomListener::metrics_prometheus_text()) are exposed at:
+The Phantom Core server opens no inbound metrics port — there is no /metrics
+endpoint to scrape. Built with the telemetry-otel feature, it PUSHES metrics
+and traces over OTLP/gRPC to an OpenTelemetry Collector:
 
-  http://{{ include "phantom-core.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.metricsPort }}/metrics
+  phantom-server --OTLP/gRPC push--> OTel Collector --> Prometheus / Tempo / SaaS
 
-To verify:
+Point the server at your Collector via the chart's `telemetry` values — the
+Deployment renders them into the container's OTEL_* env. An empty otlpEndpoint
+leaves the exporter uninstalled (telemetry off). E.g.:
 
-  kubectl port-forward -n {{ .Release.Namespace }} \
-    svc/{{ include "phantom-core.fullname" . }} {{ .Values.service.metricsPort }}:{{ .Values.service.metricsPort }}
-  curl http://localhost:{{ .Values.service.metricsPort }}/metrics | grep phantom_active_sessions
+  --set 'telemetry.otlpEndpoint=http://otel-collector.{{ .Release.Namespace }}.svc.cluster.local:4317'
+
+Other knobs (telemetry values → env): telemetry.serviceName (OTEL_SERVICE_NAME),
+telemetry.tracesSamplerArg (OTEL_TRACES_SAMPLER_ARG, head-sampling ratio), and
+telemetry.otlpHeaders (OTEL_EXPORTER_OTLP_HEADERS, auth headers for SaaS backends).
+
+To land metrics in Prometheus, run a Collector with an otlp receiver plus a
+prometheus exporter (or remote_write), and have Prometheus scrape the
+COLLECTOR — never the phantom pods. To verify the server is pushing, watch the
+Collector's own debug/logging exporter or query Prometheus for, e.g.:
+
+  phantom_session_active{leg="tcp"}
 
 ---------------------------------------------------------------------------
 Signing key
@@ -62,6 +75,9 @@ Or re-install with:
 Further reading
 ---------------------------------------------------------------------------
 
-  docs/operations/kubernetes.md  — underlying patterns and rationale
-  docs/operations/docker.md      — container image and graceful shutdown wiring
-  docs/operations/perf-tuning.md — resource sizing and throughput benchmarks
+  docs/operations/kubernetes.md          — underlying patterns and rationale
+  docs/operations/docker.md              — container image and graceful shutdown wiring
+  docs/operations/perf-tuning.md         — resource sizing and throughput benchmarks
+  docs/observability/otlp-setup.md       — Collector + backend wiring (OTLP push)
+  docs/observability/metrics-catalog.md  — every instrument, name, and label
+  docs/observability/grafana/            — dashboard + Prometheus alert rules
