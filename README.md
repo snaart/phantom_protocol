@@ -403,11 +403,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   mid-session rekey. Dup-ACK fast-retransmit and selective ACK (SACK) are
   **deferred post-1.0** — they need security-sensitive packet-number / ACK-range
   fields in the AAD-covered header, i.e. a deliberate `WIRE_VERSION` bump.
-- **Receive backpressure is whole-session, not per-stream.** A consumer that
-  stops draining `recv()` backpressures the session (correct, no data loss) but
-  can head-of-line-delay the other direction's control traffic; per-stream,
-  consumption-driven flow control is a planned refinement.
-- **Negative-security suite: 26 always-on tests** in
+- **Negative-security suite: 28 always-on tests** in
   `core/tests/security_invariants.rs`, pinning every documented invariant.
   Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
   and 5 `#[ignore]`-gated loopback integration tests. 0 workspace warnings,
