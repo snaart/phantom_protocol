@@ -543,8 +543,8 @@ module-by-module without re-touching the Phase 3.6 gating infrastructure.
   - OpenTelemetry (OTel SDK + OTLP exporter) — гибкая распределённая trace pipeline.
   - JSON-line logs (для shipping в Loki/Elastic).
 - **Operational dashboards**:
-  - Grafana dashboard JSON (commit в `docs/operations/grafana/`).
-  - Prometheus alert rules (`docs/operations/prometheus/alerts.yml`).
+  - Grafana dashboard JSON (`docs/observability/grafana/phantom-otel-dashboard.json`).
+  - Prometheus alert rules (`docs/observability/prometheus/alerts.yml`).
 - **Health endpoints**:
   - `pub fn health(&self) -> HealthStatus` на `PhantomListener` (active sessions count, handshake error rate).
   - Optional HTTP `/health` endpoint в example app.
@@ -823,8 +823,8 @@ module-by-module without re-touching the Phase 3.6 gating infrastructure.
 - CVE process: GitHub Security Advisories.
 
 ### 7.6 Operational dashboards & alerts
-- `docs/operations/grafana/phantom-dashboard.json` — Grafana dashboard (sessions, handshakes, throughput, latency, errors).
-- `docs/operations/prometheus/alerts.yml` — alerts: handshake failure rate, AEAD failure rate, migration rate spike.
+- `docs/observability/grafana/phantom-otel-dashboard.json` — Grafana dashboard (sessions, handshakes, throughput, latency, errors), under the OTel-translated metric names.
+- `docs/observability/prometheus/alerts.yml` — alerts: handshake failure rate, AEAD failure rate, migration rate spike.
 - Reference deployment patterns.
 
 ### 7.7 Performance tuning guide
@@ -848,7 +848,7 @@ module-by-module without re-touching the Phase 3.6 gating infrastructure.
 | Versioning policy + cargo-semver-checks | `docs/policy/`, CI |
 | Release pipeline | GitHub Actions, cargo-release |
 | Incident response playbook | `docs/security/incident-response.md` |
-| Grafana dashboards, Prometheus alerts | `docs/operations/grafana/`, `docs/operations/prometheus/` |
+| Grafana dashboards, Prometheus alerts | `docs/observability/grafana/`, `docs/observability/prometheus/` |
 | Performance tuning guide | `docs/operations/perf-tuning.md` |
 
 ---
