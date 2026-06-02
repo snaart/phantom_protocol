@@ -454,8 +454,6 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   `perf-tuning.md`, `deployment.md`, `docker.md`, `systemd.md`,
   `kubernetes.md` (+ `helm/`), `mobile.md`, `wasm.md`, `wasi.md`
 - **Policy:** [`docs/policy/versioning.md`](docs/policy/versioning.md)
-- **Roadmap:** [`docs/PROGRESS.md`](docs/PROGRESS.md),
-  [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md)
 - **Performance:** [`BENCHMARKS.md`](BENCHMARKS.md)
 - **Change log:** [`CHANGELOG.md`](CHANGELOG.md)
 
