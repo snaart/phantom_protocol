@@ -32,9 +32,29 @@ handshake is unchanged). They exist so that:
 
 - a tampered frame / hello that flips the byte is rejected up front
   (`PacketHeader.version != WIRE_VERSION` → drop; `ClientHello.version !=
-  PROTOCOL_VERSION` → `HandshakeError::UnsupportedVersion`), and
+  PROTOCOL_VERSION` → the server returns a typed `ServerReject`, see below), and
 - a future protocol revision can deliberately increment one or both, gated by
   a code change rather than runtime negotiation.
+
+**Unsupported-version signal (`ServerReject`).** When a `ClientHello.version`
+is not `PROTOCOL_VERSION`, the server does not drop silently — it replies with a
+small typed `ServerReject` frame *before* any KEM / signature work:
+
+| Offset | Field | Size | Notes |
+|---|---|---|---|
+| 0 | `marker` | 4 | `= b"PRJ1"` (`SERVER_REJECT_MARKER`); lets the client tell a reject from a `ServerHello` / `HelloRetryRequest` on its trial-deserialization path |
+| 4 | `code` | 1 | reject reason; `1 = REJECT_UNSUPPORTED_VERSION` |
+| 5 | `supported_version` | 1 | the `PROTOCOL_VERSION` this server speaks |
+
+The client surfaces this as a hard error reporting both versions and **does not
+auto-downgrade** to `supported_version` — an attacker-injected reject must not
+be able to force a protocol downgrade, and the version is transcript-bound
+(Invariant 7). A newer client thus learns *what* the old server speaks (an
+actionable diagnostic) without weakening downgrade resistance. The contract is
+symmetric: a future server meeting an older client whose `version` it no longer
+accepts uses the same frame. `ServerReject` is an additive handshake message —
+it does not alter the `ServerHello` / `HelloRetryRequest` / `PhantomPacket`
+layouts, so the frozen wire vectors are unaffected.
 
 `PROTOCOL_VARIANT` is an **orthogonal build-variant tag**, not a version. It
 distinguishes the default build from the FIPS build and is unchanged by the
@@ -318,11 +338,12 @@ attacker learns nothing from the shape of the failure (§ 8).
 
 ## 6. Handshake
 
-The handshake is three bare borsh structs — no envelope, no per-message
-version discriminant. The client distinguishes a `ServerHello` from a
-`HelloRetryRequest` purely by deserialisation: a `ServerHello` is thousands of
-bytes (it carries KEM ciphertext + hybrid signature + verifying key), a
-`HelloRetryRequest` is tiny.
+The handshake messages are bare borsh structs — no envelope, no per-message
+version discriminant. The client distinguishes the server's reply purely by
+trial-deserialisation: a `ServerHello` is thousands of bytes (it carries KEM
+ciphertext + hybrid signature + verifying key); a `HelloRetryRequest` is tiny; a
+`ServerReject` (§6.10) is a fixed 6 bytes led by the `b"PRJ1"` marker. The sizes
+and the marker make the three unambiguous.
 
 ### 6.1 State machine
 
@@ -351,10 +372,12 @@ bytes (it carries KEM ciphertext + hybrid signature + verifying key), a
 `HandshakeStage` (`Initial → ClassicalReady → Established | Failed`,
 `handshake.rs:57-67`) supports optimistic start. `process_client_hello`
 returns `HandshakeResponse::{Success(ServerHello, Session, Option<Vec<u8>>),
-Retry(HelloRetryRequest), Fail(HandshakeError)}` — the `Option<Vec<u8>>` is the
-decrypted 0-RTT early-data plaintext, or `None`. `process_server_hello` returns
-`(Session, Option<bool>)` — the second element is the 0-RTT verdict (`None`
-when the client sent no early-data).
+Retry(HelloRetryRequest), Reject(ServerReject), Fail(HandshakeError)}` — the
+`Option<Vec<u8>>` is the decrypted 0-RTT early-data plaintext, or `None`; the
+`Reject` arm carries the typed unsupported-version signal of §6.10 (the listener
+serialises it back before closing). `process_server_hello` returns `(Session,
+Option<bool>)` — the second element is the 0-RTT verdict (`None` when the client
+sent no early-data).
 
 ### 6.2 `ClientHello` (borsh)
 
@@ -582,6 +605,31 @@ Adaptive difficulty (`HandshakeServer::adaptive_difficulty`,
 | 500–1999 | 8 | ~256 |
 | 2000–9999 | 12 | ~4096 |
 | 10000+ | 16 | ~65536 |
+
+### 6.10 `ServerReject` (borsh) — unsupported-version signal
+
+```rust
+pub struct ServerReject {
+    pub marker:            [u8; 4],   // = b"PRJ1" (SERVER_REJECT_MARKER)
+    pub code:              u8,        // 1 = REJECT_UNSUPPORTED_VERSION
+    pub supported_version: u8,        // the PROTOCOL_VERSION the server speaks
+}
+```
+
+Source: `core/src/transport/handshake.rs`. A fixed 6 bytes. Returned by
+`process_client_hello` as `HandshakeResponse::Reject(..)` when
+`ClientHello.version != PROTOCOL_VERSION`, and serialised back to the client by
+the listener (and the UDP demo path) *before* the connection closes — the one
+case where the server speaks after an unacceptable hello instead of dropping
+silently.
+
+The client identifies it by the marker on its trial-deserialisation path and
+surfaces a hard error naming both versions. It deliberately does **not**
+auto-downgrade to `supported_version`: the version is bound into the signed
+transcript (§6.5, Invariant 7), so honouring an attacker-injected reject would
+be a downgrade oracle. The frame is purely diagnostic. Because it is an
+*additive* message — never sent on the success path and shaped unlike the other
+three messages — it leaves the frozen wire vectors (§11) untouched.
 
 ---
 
