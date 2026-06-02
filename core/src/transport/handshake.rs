@@ -54,6 +54,55 @@ pub const PROTOCOL_VARIANT: &[u8] = b"phantom-fips-1";
 /// deliberate version increment.
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// Marker leading a [`ServerReject`] frame. The client disambiguates the three
+/// possible server replies by trial-deserialization; the marker (plus the
+/// fixed, tiny size of a reject vs. the multi-KiB `ServerHello`) makes a reject
+/// unmistakable and immune to a false-positive parse as a `HelloRetryRequest`.
+pub const SERVER_REJECT_MARKER: [u8; 4] = *b"PRJ1";
+
+/// [`ServerReject::code`]: the client's `ClientHello.version` is one this server
+/// does not speak. `supported_version` carries the version it *does* speak.
+pub const REJECT_UNSUPPORTED_VERSION: u8 = 1;
+
+/// Typed handshake rejection the server returns *instead of* silently dropping
+/// the connection when it structurally cannot satisfy a `ClientHello` — today,
+/// an unknown `version`. It gives a forward/backward-incompatible peer an
+/// actionable signal (the version the server speaks) rather than a bare
+/// connection reset.
+///
+/// **Downgrade safety.** The client surfaces a reject as a hard error and does
+/// **not** auto-retry at the advertised version. Auto-downgrading on an
+/// attacker-injected reject would defeat the transcript-bound downgrade
+/// resistance of Invariant 7 (the version is signed into the transcript). The
+/// reject is diagnostic only; protocol selection stays pinned.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServerReject {
+    /// Always [`SERVER_REJECT_MARKER`]; lets the client identify the frame.
+    pub marker: [u8; 4],
+    /// Reject reason — see [`REJECT_UNSUPPORTED_VERSION`].
+    pub code: u8,
+    /// The `PROTOCOL_VERSION` this server speaks.
+    pub supported_version: u8,
+}
+
+impl ServerReject {
+    /// Build the unsupported-version reject advertising this build's
+    /// [`PROTOCOL_VERSION`].
+    pub fn unsupported_version() -> Self {
+        Self {
+            marker: SERVER_REJECT_MARKER,
+            code: REJECT_UNSUPPORTED_VERSION,
+            supported_version: PROTOCOL_VERSION,
+        }
+    }
+
+    /// True iff the frame carries the reject marker — the client's guard
+    /// against treating a same-sized non-reject blob as a reject.
+    pub fn has_marker(&self) -> bool {
+        self.marker == SERVER_REJECT_MARKER
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeStage {
     /// Initial state, no messages exchanged
@@ -122,6 +171,11 @@ pub enum HandshakeResponse {
     Success(ServerHello, Session, Option<Vec<u8>>),
     /// Retry: Demand PoW or Cookie
     Retry(HelloRetryRequest),
+    /// Reject: the server structurally cannot speak this `ClientHello` (e.g. an
+    /// unknown `version`). Unlike `Fail`, the listener serialises the carried
+    /// [`ServerReject`] back to the client before closing, so the peer gets a
+    /// typed downgrade signal instead of a bare connection error.
+    Reject(ServerReject),
     /// Fail: Handshake aborted
     Fail(HandshakeError),
 }
@@ -367,9 +421,13 @@ impl HandshakeServer {
         // tamper-check anchor pinned to `PROTOCOL_VERSION` and borsh-serialized
         // into the signed transcript, so a network rewrite forces a
         // client-side signature mismatch. Anything else is rejected up front
-        // (Invariant 7).
+        // (Invariant 7). Instead of dropping silently we hand back a typed
+        // `ServerReject` advertising the version we speak, so a future client
+        // degrades gracefully (H9 forward-compat) — the client treats it as a
+        // hard error and does NOT auto-downgrade, preserving Invariant 7's
+        // transcript-bound downgrade resistance.
         if client_hello.version != PROTOCOL_VERSION {
-            return HandshakeResponse::Fail(HandshakeError::UnsupportedVersion);
+            return HandshakeResponse::Reject(ServerReject::unsupported_version());
         }
 
         // 0-RTT resumption fast path.
@@ -1155,6 +1213,58 @@ mod tests {
         }
     }
 
+    /// H9 forward-compat: a `ClientHello` advertising a `version` the server
+    /// does not speak is answered with a typed [`HandshakeResponse::Reject`]
+    /// (carrying the server's supported version), not a silent drop / generic
+    /// `Fail`. The reject is produced before any KEM / signature work.
+    #[tokio::test]
+    async fn unsupported_version_yields_typed_reject() {
+        let server = HandshakeServer::new().expect("HandshakeServer::new");
+        let client = HandshakeClient::new().expect("HandshakeClient::new");
+        let client_ip = "127.0.0.1".parse().expect("parse client_ip");
+
+        let mut hello = client.create_client_hello();
+        // A future client speaking a version this build doesn't know.
+        hello.version = PROTOCOL_VERSION.wrapping_add(7);
+
+        match server.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Reject(reject) => {
+                assert!(reject.has_marker(), "reject must carry the marker");
+                assert_eq!(reject.code, REJECT_UNSUPPORTED_VERSION);
+                assert_eq!(reject.supported_version, PROTOCOL_VERSION);
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// The reject frame survives a borsh round-trip and is shape-distinct from
+    /// a `HelloRetryRequest` (the client's trial-deserialization order relies
+    /// on this — a reject must not be mistaken for a retry, nor vice versa).
+    #[test]
+    fn server_reject_roundtrips_and_is_shape_distinct() {
+        let reject = ServerReject::unsupported_version();
+        let bytes = borsh::to_vec(&reject).expect("encode reject");
+        let decoded: ServerReject = borsh::from_slice(&bytes).expect("decode reject");
+        assert_eq!(decoded, reject);
+        assert!(decoded.has_marker());
+
+        // A (None, None) HelloRetryRequest must not decode as a reject…
+        let hrr = HelloRetryRequest {
+            challenge: None,
+            cookie: None,
+        };
+        let hrr_bytes = borsh::to_vec(&hrr).expect("encode hrr");
+        assert!(
+            borsh::from_slice::<ServerReject>(&hrr_bytes).is_err(),
+            "a HelloRetryRequest must not parse as a ServerReject"
+        );
+        // …and a reject must not decode as a HelloRetryRequest.
+        assert!(
+            borsh::from_slice::<HelloRetryRequest>(&bytes).is_err(),
+            "a ServerReject must not parse as a HelloRetryRequest"
+        );
+    }
+
     /// Tampering with the cleartext `protocol_variant` to match the
     /// server's value (an MITM bypass attempt) is caught by the
     /// transcript signature: the transcript still binds the *real*
@@ -1288,6 +1398,7 @@ mod tests {
             HandshakeResponse::Retry(_) => {
                 panic!("resume_session_id should bypass cookie/PoW gate")
             }
+            HandshakeResponse::Reject(r) => panic!("unexpected reject: {:?}", r),
             HandshakeResponse::Fail(e) => panic!("unexpected failure: {:?}", e),
         }
     }
@@ -1368,6 +1479,7 @@ mod tests {
                 "expected Success with accepted early-data, got {}",
                 match other {
                     HandshakeResponse::Retry(_) => "Retry",
+                    HandshakeResponse::Reject(_) => "Reject",
                     HandshakeResponse::Fail(_) => "Fail",
                     HandshakeResponse::Success(..) => unreachable!(),
                 }
