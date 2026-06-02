@@ -483,6 +483,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 58300:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_current_epoch() != 35997:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomsession_disconnect() != 18611:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted() != 3077:
@@ -506,6 +508,8 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_phantom_core_checksum_method_phantomsession_resumption_hint() != 18816:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomsession_send() != 35674:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_core_checksum_method_phantomsession_set_rekey_threshold() != 11165:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 13449:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -710,6 +714,10 @@ _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state.argtype
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_current_epoch.argtypes = (
+    ctypes.c_void_p,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_current_epoch.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_disconnect.argtypes = (
     ctypes.c_void_p,
 )
@@ -764,6 +772,11 @@ _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_send.argtypes = (
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_send.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold.argtypes = (
+    ctypes.c_void_p,
+    ctypes.c_uint64,
+)
+_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_core_fn_clone_phantomstream.argtypes = (
     ctypes.c_void_p,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1112,6 +1125,9 @@ _UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_byt
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_connection_state.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_connection_state.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_current_epoch.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_current_epoch.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_disconnect.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_disconnect.restype = ctypes.c_uint16
@@ -1148,6 +1164,9 @@ _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_resumption_hint.re
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_send.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_send.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_set_rekey_threshold.argtypes = (
+)
+_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_set_rekey_threshold.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_disconnect.argtypes = (
 )
 _UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_disconnect.restype = ctypes.c_uint16
@@ -1217,6 +1236,19 @@ class _UniffiConverterUInt32(_UniffiConverterPrimitiveInt):
     @staticmethod
     def write(value, buf):
         buf.write_u32(value)
+
+class _UniffiConverterUInt64(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u64"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**64
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u64()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u64(value)
 
 class _UniffiConverterBool:
     @classmethod
@@ -2091,6 +2123,33 @@ class _UniffiConverterTypeCoreError(_UniffiConverterRustBuffer):
 
 
 
+class _UniffiConverterOptionalUInt8(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiConverterUInt8.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiConverterUInt8.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiConverterUInt8.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+
+
 class _UniffiConverterOptionalBool(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -2543,6 +2602,14 @@ class PhantomSessionProtocol(typing.Protocol):
         """
 
         raise NotImplementedError
+    def current_epoch(self, ):
+        """
+        Current rekey epoch of the established session (`None` while still
+        connecting). Rust-only — used by soak / integration tests to confirm
+        that automatic mid-session rekey (C1) advanced the epoch.
+        """
+
+        raise NotImplementedError
     def disconnect(self, ):
         """
         Send the graceful close frame and shut the session down.
@@ -2645,6 +2712,16 @@ class PhantomSessionProtocol(typing.Protocol):
         """
 
         raise NotImplementedError
+    def set_rekey_threshold(self, n: "int"):
+        """
+        Override the automatic-rekey send-invocation high-watermark on the
+        established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
+        the session is still connecting. Rust-only — primarily for soak/load
+        harnesses that need to exercise mid-session rekey without sending `2^47`
+        packets.
+        """
+
+        raise NotImplementedError
 # PhantomSession is a Rust-only trait - it's a wrapper around a Rust implementation.
 class PhantomSession():
     """
@@ -2713,6 +2790,31 @@ class PhantomSession():
             _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state,self._uniffi_clone_pointer(),)
         )
 
+
+
+
+    async def current_epoch(self, ) -> "typing.Optional[int]":
+        """
+        Current rekey epoch of the established session (`None` while still
+        connecting). Rust-only — used by soak / integration tests to confirm
+        that automatic mid-session rekey (C1) advanced the epoch.
+        """
+
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_current_epoch(
+                self._uniffi_clone_pointer(), 
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer,
+            # lift function
+            _UniffiConverterOptionalUInt8.lift,
+            
+    # Error FFI converter
+
+    None,
+
+        )
 
 
 
@@ -2970,6 +3072,36 @@ _UniffiConverterTypeCoreError,
             
     # Error FFI converter
 _UniffiConverterTypeCoreError,
+
+        )
+
+
+
+    async def set_rekey_threshold(self, n: "int") -> "bool":
+        """
+        Override the automatic-rekey send-invocation high-watermark on the
+        established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
+        the session is still connecting. Rust-only — primarily for soak/load
+        harnesses that need to exercise mid-session rekey without sending `2^47`
+        packets.
+        """
+
+        _UniffiConverterUInt64.check_lower(n)
+        
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold(
+                self._uniffi_clone_pointer(), 
+        _UniffiConverterUInt64.lower(n)
+            ),
+            _UniffiLib.ffi_phantom_core_rust_future_poll_i8,
+            _UniffiLib.ffi_phantom_core_rust_future_complete_i8,
+            _UniffiLib.ffi_phantom_core_rust_future_free_i8,
+            # lift function
+            _UniffiConverterBool.lift,
+            
+    # Error FFI converter
+
+    None,
 
         )
 

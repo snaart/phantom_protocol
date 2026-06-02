@@ -145,7 +145,7 @@ impl StreamDemultiplexer {
         }
     }
 
-    /// Route a stream-closure signal **without blocking** (see [`route_ack`]).
+    /// Route a stream-closure signal **without blocking** (see [`Self::route_ack`]).
     pub fn route_close(&self, stream_id: u32) -> bool {
         if stream_id == 0 {
             return false;

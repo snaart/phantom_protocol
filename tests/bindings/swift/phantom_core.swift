@@ -448,6 +448,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
+    typealias FfiType = UInt64
+    typealias SwiftType = UInt64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -1011,6 +1027,13 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
     func connectionState()  -> ConnectionState
     
     /**
+     * Current rekey epoch of the established session (`None` while still
+     * connecting). Rust-only — used by soak / integration tests to confirm
+     * that automatic mid-session rekey (C1) advanced the epoch.
+     */
+    func currentEpoch() async  -> UInt8?
+    
+    /**
      * Send the graceful close frame and shut the session down.
      *
      * Named `disconnect` rather than `close` because UniFFI's Kotlin
@@ -1099,6 +1122,15 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      * - If still handshaking: queues the data for auto-flush later
      */
     func send(data: Data) async throws 
+    
+    /**
+     * Override the automatic-rekey send-invocation high-watermark on the
+     * established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
+     * the session is still connecting. Rust-only — primarily for soak/load
+     * harnesses that need to exercise mid-session rekey without sending `2^47`
+     * packets.
+     */
+    func setRekeyThreshold(n: UInt64) async  -> Bool
     
 }
 /**
@@ -1191,6 +1223,29 @@ open func connectionState() -> ConnectionState  {
     uniffi_phantom_core_fn_method_phantomsession_connection_state(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+    /**
+     * Current rekey epoch of the established session (`None` while still
+     * connecting). Rust-only — used by soak / integration tests to confirm
+     * that automatic mid-session rekey (C1) advanced the epoch.
+     */
+open func currentEpoch()async  -> UInt8?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_core_fn_method_phantomsession_current_epoch(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_phantom_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_phantom_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_phantom_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionUInt8.lift,
+            errorHandler: nil
+            
+        )
 }
     
     /**
@@ -1413,6 +1468,31 @@ open func send(data: Data)async throws   {
             freeFunc: ffi_phantom_core_rust_future_free_void,
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Override the automatic-rekey send-invocation high-watermark on the
+     * established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
+     * the session is still connecting. Rust-only — primarily for soak/load
+     * harnesses that need to exercise mid-session rekey without sending `2^47`
+     * packets.
+     */
+open func setRekeyThreshold(n: UInt64)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold(
+                    self.uniffiClonePointer(),
+                    FfiConverterUInt64.lower(n)
+                )
+            },
+            pollFunc: ffi_phantom_core_rust_future_poll_i8,
+            completeFunc: ffi_phantom_core_rust_future_complete_i8,
+            freeFunc: ffi_phantom_core_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
         )
 }
     
@@ -2376,6 +2456,30 @@ extension CoreError: Foundation.LocalizedError {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt8: FfiConverterRustBuffer {
+    typealias SwiftType = UInt8?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt8.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt8.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionBool: FfiConverterRustBuffer {
     typealias SwiftType = Bool?
 
@@ -2585,6 +2689,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 58300) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_phantom_core_checksum_method_phantomsession_current_epoch() != 35997) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_phantom_core_checksum_method_phantomsession_disconnect() != 18611) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2619,6 +2726,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_core_checksum_method_phantomsession_send() != 35674) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_core_checksum_method_phantomsession_set_rekey_threshold() != 11165) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 13449) {
