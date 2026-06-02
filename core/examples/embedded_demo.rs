@@ -245,6 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         borsh::from_slice::<ClientHello>(&next).expect("parse retried ClientHello");
                     continue;
                 }
+                HandshakeResponse::Reject(r) => panic!("unexpected reject: {r:?}"),
                 HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
             }
         };
