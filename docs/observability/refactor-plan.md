@@ -4,7 +4,7 @@
 > steps landed on `feature/otel-observability` (commits `e59a1f1`..`5675ecc`
 > + this final sweep). This document remains the single source of truth for
 > the Phase 8 observability refactor — see §12 for the per-commit SHA table
-> and `docs/PROGRESS.md` Phase 8.x for the canonical summary.
+> and the tracked documentation in this directory for the canonical summary.
 
 **Start date:** 2026-05-19
 **Tracking:** the **Atomic-Commit Rollout** section at the bottom is the live
@@ -687,4 +687,3 @@ history; the rows are not edited retroactively).
 - `tracing-opentelemetry` docs: <https://docs.rs/tracing-opentelemetry/>
 - Current Phantom Core metrics module (to be deleted): `core/src/transport/metrics.rs`
 - Current Phantom Core Prometheus endpoint (to be deleted): `server/src/metrics_http.rs`
-- Phase 4.5 reference: `docs/PROGRESS.md` row "Telemetry"

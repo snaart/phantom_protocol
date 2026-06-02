@@ -238,7 +238,7 @@ Source: `core/src/transport/types.rs:74-107`.
 | `0x0100` | `REKEY` | Sender rekeyed; receiver trial-decrypts at `header.epoch` and commits the ratchet on AEAD success (§ 5) |
 | `0x0200` | `PATH_VALIDATION` | Payload is a 32-byte challenge / response (multi-path) |
 | `0x0400` | `COALESCED` | Payload bundles inner packets as `[count: u16][len1: u16][p1]…` |
-| `0x0800` | `WINDOW_UPDATE` | Payload is a big-endian `u32` absolute receive window (per-stream flow control) |
+| `0x0800` | `WINDOW_UPDATE` | Payload is a big-endian `u32` relative flow-control credit (per-stream; the receiver grants the sender an additional `u32` bytes that is added to the sender's send window, saturating at `MAX_SEND_WINDOW`) |
 | `0x1000` … `0x8000` | _reserved_ | Future amendments |
 
 `ENCRYPTED` is the post-handshake invariant flag — the API layer sets it on
