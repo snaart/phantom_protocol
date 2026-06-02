@@ -388,6 +388,20 @@ async fn drive_server_handshake(
                 transport.send_bytes(&bytes).await?;
                 return Ok((session, early_data));
             }
+            HandshakeResponse::Reject(reject) => {
+                // Forward-compat (H9): the client spoke a version we can't
+                // satisfy. Hand back a typed reject so it gets an actionable
+                // signal — the version we DO speak — instead of a silent drop,
+                // then close. Best-effort: if the send fails the client just
+                // sees the close, same as before.
+                if let Ok(bytes) = borsh::to_vec(&reject) {
+                    let _ = transport.send_bytes(&bytes).await;
+                }
+                return Err(CoreError::InternalError(format!(
+                    "handshake rejected: unsupported client version (server speaks v{})",
+                    reject.supported_version
+                )));
+            }
             HandshakeResponse::Fail(e) => {
                 return Err(CoreError::InternalError(format!(
                     "handshake rejected: {}",

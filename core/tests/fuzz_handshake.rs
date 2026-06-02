@@ -86,6 +86,7 @@ fn test_valid_handshake_flow() {
                 .process_server_hello(&hello, &server_hello, Some(server.verifying_key()))
                 .expect("Handshake failed");
         }
+        HandshakeResponse::Reject(r) => panic!("unexpected reject: {:?}", r),
         HandshakeResponse::Fail(e) => panic!("Handshake failed: {:?}", e),
     }
 }
