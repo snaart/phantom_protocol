@@ -235,7 +235,7 @@ Source: `core/src/transport/types.rs:74-107`.
 | `0x0020` | `ENCRYPTED` | Payload is AEAD ciphertext |
 | `0x0040` | `COMPRESSED` | Payload is compressed (`AdaptiveCompressor`) |
 | `0x0080` | `CONTROL` | Handshake / migration control message |
-| `0x0100` | `REKEY` | Sender rekeyed; receiver `ratchet_to_epoch(header.epoch)` before decrypt (§ 5) |
+| `0x0100` | `REKEY` | Sender rekeyed; receiver trial-decrypts at `header.epoch` and commits the ratchet on AEAD success (§ 5) |
 | `0x0200` | `PATH_VALIDATION` | Payload is a 32-byte challenge / response (multi-path) |
 | `0x0400` | `COALESCED` | Payload bundles inner packets as `[count: u16][len1: u16][p1]…` |
 | `0x0800` | `WINDOW_UPDATE` | Payload is a big-endian `u32` absolute receive window (per-stream flow control) |
@@ -312,8 +312,7 @@ AEAD verify, so the receiver never keys off an unauthenticated sequence number.
 for nonce derivation) reaching this ceiling yields `CryptoError::NonceExhausted`.
 This is a defensive ceiling well below any practical AEAD safety boundary.
 
-**Mid-session rekey (Invariant 5).** `Session::rekey()`
-(`transport/session.rs:381-412`):
+**Mid-session rekey (Invariant 5).** `Session::rekey()`:
 
 1. `next_secret = HKDF-Expand(current_traffic_secret, "phantom-rekey-v1", 32)`.
 2. Build a fresh `CryptoState` from `next_secret` with the same `is_server`
@@ -324,11 +323,30 @@ This is a defensive ceiling well below any practical AEAD safety boundary.
 5. Increment `epoch` (u8, **saturates** at `u8::MAX` — long-lived sessions
    reconnect rather than wrap to 0).
 
-Wire signalling: the sender emits a packet whose header carries the new
-`epoch` and the `PacketFlags::REKEY` flag; the receiver calls
-`ratchet_to_epoch(header.epoch)` (`transport/session.rs:418-425`), walking the
-HKDF chain forward until its local epoch matches before decrypting the body.
-The `"phantom-rekey-v1"` label is a wire-format constant.
+Every epoch transition is serialised by a per-session rekey mutex, so the
+concurrent send-loop and receive-task of the data pump can never let the
+installed key depth diverge from the `epoch` counter.
+
+**Automatic rekey (C1).** The data pump triggers a rekey on the send path once
+a direction's AEAD invocation count crosses a soft high-watermark
+(`REKEY_SOFT_LIMIT`, default `2^48 / 2`), well below the hard
+`AEAD_MAX_INVOCATIONS = 2^48` ceiling — so a long-lived session rotates keys
+automatically instead of failing with `NonceExhausted`. Production sessions
+essentially never reach it; it is a correctness backstop.
+
+Wire signalling: the sender emits a packet whose header carries the new `epoch`
+and the `PacketFlags::REKEY` flag. The receiver follows via
+`Session::decrypt_packet_accepting_rekey`: if `header.epoch` is ahead of its
+local epoch (by up to `MAX_REKEY_CATCHUP = 16` steps, which absorbs the small
+divergence when both directions rekey at slightly different cadences), it
+derives the candidate key that many HKDF steps forward and **trial-decrypts**;
+it commits the ratchet **only on AEAD success**. Because `header.epoch` is not
+authenticated until the AEAD tag verifies, a forged epoch bump fails the trial,
+commits nothing, and cannot desync the session — and the step bound caps the
+HKDF work an attacker can force per spoofed packet. A packet more than
+`MAX_REKEY_CATCHUP` ahead, or behind the current epoch, is dropped; over a
+reliable transport the sender retransmits at the then-current epoch, so no data
+is lost. The `"phantom-rekey-v1"` label is a wire-format constant.
 
 The single opaque "decrypt failed" surface is deliberate: AEAD-tag mismatch,
 wrong key, wrong AAD, and wrong sequence all manifest identically so a network
