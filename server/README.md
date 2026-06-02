@@ -12,8 +12,8 @@ the post-quantum handshake, and dispatches each accepted session to an
 application handler. The default handler is a trivial echo
 (`src/handler.rs`). **Replace `handler::run_echo_handler` with your own
 application logic when shipping a real service** — the rest of the
-plumbing (signing-key persistence, signal handling, /metrics, drain on
-SIGTERM) you keep as-is.
+plumbing (signing-key persistence, signal handling, OpenTelemetry export,
+drain on SIGTERM) you keep as-is.
 
 ## Quick start
 
@@ -22,7 +22,7 @@ cd server
 cargo run --release -- \
     --bind 0.0.0.0:4242 \
     --signing-key-file ./dev-signing.key \
-    --metrics-bind 0.0.0.0:9090
+    --otlp-endpoint http://localhost:4317
 ```
 
 On first run the server generates a fresh `HybridSigningKey` (Ed25519 +
@@ -38,11 +38,15 @@ when both are set (clap default).
 
 | CLI flag              | Env var                     | Default                            | Purpose                                                    |
 | --------------------- | --------------------------- | ---------------------------------- | ---------------------------------------------------------- |
-| `--bind`              | `PHANTOM_BIND`              | `0.0.0.0:4242`                     | TCP bind address for the Phantom transport.                |
-| `--signing-key-file`  | `PHANTOM_SIGNING_KEY_FILE`  | `/etc/phantom-server/signing.key`  | On-disk path for the long-lived hybrid signing key.        |
-| `--metrics-bind`      | `PHANTOM_METRICS_BIND`      | *(unset → metrics disabled)*       | Address for the Prometheus `/metrics` HTTP endpoint.       |
-| `--log-json`          | `PHANTOM_LOG_JSON`          | `false` (pretty)                   | Emit structured JSON logs.                                 |
-| `--log-filter`        | `RUST_LOG`                  | `info,phantom_core=debug`          | `tracing-subscriber` `EnvFilter` directive.                |
+| `--bind`                   | `PHANTOM_BIND`                 | `0.0.0.0:4242`                    | TCP bind address for the Phantom transport.                          |
+| `--signing-key-file`       | `PHANTOM_SIGNING_KEY_FILE`     | `/etc/phantom-server/signing.key` | On-disk path for the long-lived hybrid signing key.                  |
+| `--otlp-endpoint`          | `OTEL_EXPORTER_OTLP_ENDPOINT`  | `http://localhost:4317`           | OTLP/gRPC endpoint for OpenTelemetry metrics + traces export.        |
+| `--otel-service-name`      | `OTEL_SERVICE_NAME`            | `phantom-server`                  | `service.name` reported via the OTel Resource.                       |
+| `--otel-trace-sample-ratio`| `OTEL_TRACES_SAMPLER_ARG`      | `0.01`                            | Trace sampling ratio (0.0–1.0); `0` disables trace export.           |
+| `--max-sessions`           | `PHANTOM_MAX_SESSIONS`         | `1024`                            | Global concurrent-session cap (backpressure, not drop); `0` = unbounded. |
+| `--max-sessions-per-ip`    | `PHANTOM_MAX_SESSIONS_PER_IP`  | `64`                              | Per-source-IP concurrent-session cap; `0` disables it.               |
+| `--log-json`               | `PHANTOM_LOG_JSON`             | `false` (pretty)                  | Emit structured JSON logs.                                           |
+| `--log-filter`             | `RUST_LOG`                     | `info,phantom_core=debug`         | `tracing-subscriber` `EnvFilter` directive.                          |
 
 ## Verifying-key pinning
 
@@ -91,27 +95,9 @@ the server treats SIGTERM as the canonical drain signal) and by
 Kubernetes `terminationGracePeriodSeconds`. Tune
 `SHUTDOWN_DRAIN_GRACE` if your application handler holds longer.
 
-## /metrics endpoint
+## OpenTelemetry (OTel) metrics and traces export
 
-When `--metrics-bind` is set, the server exposes a Prometheus text
-exposition endpoint:
-
-```
-$ curl -s http://127.0.0.1:9090/metrics | head
-# HELP phantom_handshakes_total ...
-# TYPE phantom_handshakes_total counter
-phantom_handshakes_total{result="success"} 42
-...
-```
-
-Content-Type is `text/plain; version=0.0.4; charset=utf-8`. The body is
-whatever `PhantomListener::metrics_prometheus_text()` returns — see
-`core/src/transport/metrics.rs`.
-
-The endpoint is intentionally TLS-less and has no auth — it is meant for
-an internal scrape network (sidecar / kube-internal Service /
-`127.0.0.1`-only bind). Terminate TLS at an ingress / sidecar if you
-need to expose it publicly.
+When `--otlp-endpoint` is set (default `http://localhost:4317`), the server pushes OpenTelemetry metrics and traces to the configured OTLP/gRPC collector endpoint. There is no inbound Prometheus scrape endpoint — the server uses an outbound OTLP push model suitable for Datadog, Honeycomb, Grafana Cloud, or a local OTel Collector. Configure authentication via the `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer ...` environment variable if the endpoint requires it, and set `--otel-trace-sample-ratio 0` to disable trace export entirely.
 
 ## Deployment pointers
 

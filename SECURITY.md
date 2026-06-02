@@ -37,9 +37,9 @@ will live in `docs/security/threat-model.md` (in preparation). At a glance:
 | Operation | Primitive | FIPS-approved? |
 | --- | --- | --- |
 | Classical KEM | X25519 | No (no FIPS-approved KEM that uses X25519) |
-| Post-quantum KEM | Kyber768 (`pqcrypto-kyber`) | No — ML-KEM-768 (FIPS 203) is the approved variant; migration planned |
+| Post-quantum KEM | ML-KEM-768 (`ml-kem` RustCrypto) | Yes (FIPS 203) |
 | Classical signature | Ed25519 (`ed25519-dalek`) | Yes (FIPS 186-5) |
-| Post-quantum signature | Dilithium3 (`pqcrypto-dilithium`) | No — ML-DSA-65 (FIPS 204) is the approved variant; migration planned |
+| Post-quantum signature | ML-DSA-65 (`ml-dsa` RustCrypto) | Yes (FIPS 204) |
 | Symmetric AEAD | AES-256-GCM (`ring`) | Yes (when built against a FIPS-validated cryptographic module) |
 | Symmetric AEAD (fallback) | ChaCha20-Poly1305 (`ring`) | No |
 | Hash / KDF | HKDF-SHA-256, blake3 KDF | SHA-256 yes; blake3 no |

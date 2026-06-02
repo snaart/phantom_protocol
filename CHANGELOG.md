@@ -79,8 +79,8 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 ## [0.3.0] - 2026-06-01
 
 This release takes phantom_core from its 0.2.0 pre-1.0 baseline through the
-foundation, security-hardening, and production-readiness phases of the roadmap
-(`docs/PRODUCTION_READINESS.md`): the unified single wire protocol (WIRE-BREAKING
+foundation, security-hardening, and production-readiness phases of the roadmap:
+the unified single wire protocol (WIRE-BREAKING
 — hence the `0.3.0` minor bump), byte-exact wire-format + NIST ACVP KAT vectors,
 the observability data-path wiring, FIPS 140-3 substrate, and a now-green
 cross-target CI. The wire format changed since 0.2.0, so peers must upgrade
@@ -464,8 +464,7 @@ remaining documentation work for a real CMVP submission are in
 - Phase 1.7: `CryptoSession::send_invocations()` / `recv_invocations()`
   observability accessors. `AEAD_MAX_INVOCATIONS = 1 << 48` ceiling
   with `CryptoError::NonceExhausted` failure mode.
-- Phase 0 / 7: `docs/PRODUCTION_READINESS.md` — full eight-phase
-  roadmap with file:line traceability.
+- Phase 0 / 7: Full eight-phase roadmap for production readiness tracking.
 
 ### Changed
 - FFI: renamed `PhantomSession::close()` and `PhantomStream::close()` to

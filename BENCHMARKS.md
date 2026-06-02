@@ -74,7 +74,7 @@ target on the recv/send hot paths.
 `cargo bench --manifest-path core/Cargo.toml --bench transport_bench`
 
 Exercises: PQ keygen, PQ encap/decap/sign/verify, full client+server
-handshake, `encrypt_packet_v2` / `decrypt_packet_v2` round-trip across
+handshake, `encrypt_packet` / `decrypt_packet` round-trip across
 the canonical payload sizes, and a 1 MiB encrypt+decrypt round-trip.
 
 ### PQ primitives (per-operation, single-thread)
@@ -103,14 +103,14 @@ ML-KEM-768 dominates `hybrid_kem_keygen`; ML-DSA-65 dominates the
 aggregate**. 0-RTT resumption bypasses the handshake entirely (ticket
 lookup is microseconds — order ~10⁵ resumptions/sec/core).
 
-### Application-data encrypt/decrypt (`encrypt_packet_v2` / `decrypt_packet_v2`)
+### Application-data encrypt/decrypt (`encrypt_packet` / `decrypt_packet`)
 
 This is the full crate path including header-derived AEAD nonce, header-AAD
 binding, and per-stream sliding-window replay check on the decrypt side —
-NOT the raw `ring` AEAD measured above. Switched from V1 to V2 in the
-bench harness to dodge the V1 internal-counter-desync issue that
-previously broke the back-to-back bench iter pattern (see "Bench
-history" below).
+NOT the raw `ring` AEAD measured above. The wire format is pinned to
+WIRE_VERSION=2 with nonces derived from authenticated header fields;
+each iteration uses a fresh PacketHeader with incremented sequence to
+dodge the sliding-window replay guard.
 
 | Payload | Encrypt time | Encrypt thrpt   | Decrypt time | Decrypt thrpt |
 | ------- | ------------ | --------------- | ------------ | ------------- |
@@ -121,7 +121,7 @@ history" below).
 | 16 KiB  |      3.37 µs |      4.53 GiB/s |      3.26 µs |    4.68 GiB/s |
 | 64 KiB  |      13.1 µs |  **4.67 GiB/s** |      14.6 µs |    4.18 GiB/s |
 
-Peak `encrypt_packet_v2` throughput is **~4.7 GiB/s per core at 64 KiB**,
+Peak `encrypt_packet` throughput is **~4.7 GiB/s per core at 64 KiB**,
 slightly below the raw `ring` ceiling (`~5.5 GiB/s`) because of the
 header-AAD + sequence-derived-nonce work. Decrypt peaks at ~4.7 GiB/s at
 16 KiB. On 8 perf cores: **~37 GiB/s aggregate AEAD ceiling** (~300 Gbps).
@@ -140,17 +140,18 @@ above, scaled by ~16× and amortising fixed overhead.
 
 ### Bench history
 
-The encrypt/decrypt rows above use **V2 wire format
-(`encrypt_packet_v2` / `decrypt_packet_v2`)**. Earlier snapshots used V1,
-which derives the AEAD nonce from an internal `send_counter` /
-`recv_counter` per `Session`. Re-using a fixed `PacketHeader` across
+The encryption/decryption benchmarks use WIRE_VERSION=2 pinned format
+(`encrypt_packet` / `decrypt_packet`) with nonces derived from
+authenticated header fields. Historical versions (pre-0.3.0) used V1
+format with internal counter-derived nonces, which could desync under
+back-to-back iterations; the current format avoids this. Re-using a fixed `PacketHeader` across
 iterations made the V1 throughput bench desync the counter on the
 sender vs the receiver and panic with `ReplayDetected` (1 MiB
 round-trip) or with `CryptoError("Decryption / authentication failed")`
 (decrypt-only on protocol_comparison). The decrypt-only row in
 transport_bench did not panic only because it omitted `.unwrap()`, so it
 silently measured the AEAD-verify failure path. V2 derives the nonce
-from the authenticated header fields, so a fresh `PacketHeaderV2` with
+from the authenticated header fields, so a fresh `PacketHeader` with
 an incremented sequence per iteration round-trips cleanly. See
 `core/benches/transport_bench.rs` and
 `core/benches/protocol_comparison.rs`.
@@ -160,7 +161,7 @@ an incremented sequence per iteration round-trips cleanly. See
 `cargo bench --manifest-path core/Cargo.toml --bench syn_flood_bench`
 
 Measures the per-packet cost of the listener's DoS gate: parse the
-incoming `ClientHelloEnvelope::V12`, run reputation tracker
+incoming `ClientHello`, run reputation tracker
 (`ReputationTracker::record`), issue a stateless cookie.
 
 | Operation                                           | Time    | Events/sec/core |
@@ -205,9 +206,9 @@ floor on the pool itself.
 `cargo bench --manifest-path core/Cargo.toml --bench protocol_comparison`
 
 Cross-validation against `transport_bench` — separate compilation unit,
-independent timing. All groups use V2 wire format
-(`encrypt_packet_v2` / `decrypt_packet_v2`) with a per-iter
-header.sequence bump to avoid the V1 desync issue.
+independent timing. All groups use WIRE_VERSION=2 pinned format
+(`encrypt_packet` / `decrypt_packet`) with a per-iter
+header.sequence bump to ensure nonce uniqueness.
 
 | Bench                                          | Time                  | Notes                          |
 | ---------------------------------------------- | --------------------- | ------------------------------ |

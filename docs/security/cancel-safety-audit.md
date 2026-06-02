@@ -144,6 +144,33 @@ loop {
 **Verdict:** ✅ cancel-safe. Abort behaviour is a clean equivalent
 of "transport closed mid-packet".
 
+### Delivery task (`run_data_pump` spawned at line 777)
+
+```rust
+loop {
+    let (stream_id, bytes) = match deliver_rx.recv().await { ... };
+    // ...demux / per-stream / crypto bookkeeping (synchronous)...
+    recv_tx_deliver.send(bytes).await ...;
+    // ...window credit...
+}
+```
+
+This task drains the unbounded `deliver_rx` channel into which the inner recv
+task hands decrypted application data, paces delivery at the application's
+consumption rate, and credits the per-stream flow-control window.
+
+- `deliver_rx.recv().await` (line 778): **cancel-safe** — a dropped `recv` does
+  not consume a queued message; the next poll observes it.
+- The demux / per-stream lookup / crypto bookkeeping between the two awaits are
+  **synchronous** — no `.await`, so an abort cannot interrupt a half-finished
+  update.
+- `recv_tx_deliver.send(bytes).await` (line 810): **cancel-safe** — a dropped
+  `send` does not lose the item; the value stays owned by the future and is
+  re-offered on the next poll (or dropped wholesale with the task at teardown).
+
+**Verdict:** ✅ cancel-safe. Both awaits are over cancel-safe mpsc primitives;
+the synchronous bookkeeping between them cannot be torn mid-update.
+
 ### `api/session.rs::background_task` handshake loop
 
 ```rust
@@ -235,7 +262,8 @@ any send, so no DashMap shard lock is ever held across `send_app_data`'s
 - Method: pattern match against `tokio::select!`, manual review of every
   `Mutex::lock().await` / `Semaphore::acquire().await` site in `core/src/api/` and
   `core/src/transport/`, plus a control-flow trace of the data pump's spawn/abort
-  topology (detached spawn, no `Drop`, single self-`abort` of the recv subtask).
+  topology (detached spawn, no `Drop`, single self-`abort` of the recv subtask),
+  covering both the inner recv task and the spawned delivery task.
 - **Re-run trigger (Phase 4.4 — BBR congestion control + B1-A loss recovery + B7
   observability) discharged.** Re-run again if a future change either (a) gives the
   pump task an externally-held abort handle, or (b) calls `pace_send`/any sleep
