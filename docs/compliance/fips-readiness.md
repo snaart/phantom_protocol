@@ -25,7 +25,7 @@ submission, not code.
 | Classical KEM | X25519 (`x25519-dalek`) | ECDH P-256 via `aws-lc-rs::agreement` | ✅ A4 (commit `67ef976`). Wire-incompatible across modes; gated by `PROTOCOL_VARIANT`. |
 | Post-quantum KEM | ML-KEM-768 (`ml-kem = 0.2`, FIPS 203 RustCrypto pure-Rust) | identical | ✅ Phase 5.1, commit `7c7bde7`. CAVP vectors in `core/tests/cavp.rs`. |
 | Classical signature | Ed25519 (`ed25519-dalek`) | identical | ✅ FIPS 186-5 approves EdDSA(Ed25519) out of the box. |
-| Post-quantum signature | ML-DSA-65 (`ml-dsa = =0.1.0-rc.11`, FIPS 204 RustCrypto pure-Rust) | identical | ✅ Phase 5.1, commit `7c7bde7`. CAVP vectors in `core/tests/cavp.rs`. |
+| Post-quantum signature | ML-DSA-65 (`ml-dsa = 0.1.0`, FIPS 204 RustCrypto pure-Rust) | identical | ✅ Phase 5.1, commit `7c7bde7`. CAVP vectors in `core/tests/cavp.rs`. |
 | Symmetric AEAD | AES-256-GCM via `ring` | AES-256-GCM via `aws-lc-rs::aead` (AWS-LC-FIPS) | ✅ A2 (commit `d691573`). Identical API surface; backend swap only. |
 | Symmetric AEAD (alt) | ChaCha20-Poly1305 | rejected at handshake with `CoreError::CipherSuiteUnavailable` | ✅ A3 (commit `cd79cbd`). Enum variant stays for wire-format stability. |
 | Hash | SHA-256 (`sha2`) | identical | ✅ FIPS 180-4. |

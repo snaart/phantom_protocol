@@ -75,7 +75,7 @@ The documented security invariants in [`SECURITY.md`](SECURITY.md) and
 
 - New public functions need at least one positive and one negative test.
 - Security invariants must be covered by tests in `core/tests/` (especially
-  `tcp_integration.rs` and the upcoming `security_invariants.rs`).
+  `tcp_integration.rs` and the `security_invariants.rs` suite (28 always-on tests)).
 - Concurrency-sensitive code should have a loom test where practical.
 
 ## Commit messages

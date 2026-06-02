@@ -86,8 +86,6 @@ A crash uploads the reproducing input as a build artifact
 hosted on [OSS-Fuzz](https://google.github.io/oss-fuzz/) once the project is
 public — it provides 24/7 fuzzing infrastructure free for open source.
 
-OSS-Fuzz integration is planned as a follow-up (Phase 6.4).
-
 ## Reproducing a crash
 
 When the fuzzer finds a crash it writes the input to

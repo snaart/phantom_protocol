@@ -148,10 +148,10 @@ for a real-time secure transport.
 
 | Threat | Mitigation | Code |
 | --- | --- | --- |
-| Plaintext leak on the wire | AEAD encryption (post-handshake invariant `PacketFlags::ENCRYPTED`); unencrypted post-handshake packets dropped | `core/src/api/session.rs:431-437` |
+| Plaintext leak on the wire | AEAD encryption (post-handshake invariant `PacketFlags::ENCRYPTED`); unencrypted post-handshake packets dropped | `core/src/api/session.rs:1415-1422` |
 | Plaintext leak via error message | Error variants carry only the error class, not the payload; no `format!("{:?}", plaintext)` anywhere | grep `format!.*plaintext\|payload` in `core/src/` → 0 results |
-| Memory disclosure of keys after session close | `ZeroizeOnDrop` on every key-bearing struct | `core/src/transport/session.rs:36-49`, `core/src/transport/handshake.rs:122-149` |
-| Timing leak on cookie comparison | `subtle::ConstantTimeEq::ct_eq` — never branches on cookie content | `core/src/transport/handshake.rs:160-167` |
+| Memory disclosure of keys after session close | `ZeroizeOnDrop` on every key-bearing struct | `core/src/transport/session.rs:75` (`CryptoState`), `core/src/transport/handshake.rs:253` (`HandshakeServer`), `core/src/transport/handshake.rs:686` (`HandshakeClient`) |
+| Timing leak on cookie comparison | `subtle::ConstantTimeEq::ct_eq` — never branches on cookie content | `core/src/transport/handshake.rs:1065` |
 | DPI fingerprinting | FakeTLS outer obfuscation (anti-DPI only; not for real confidentiality) | `core/src/transport/legs/faketls.rs` |
 
 ### D — Denial of service
@@ -211,7 +211,8 @@ and the specialist docs in this directory. Cross-reference quick map:
   sender about which path is active. Documented; the existing
   `expected_server_key` pinning still prevents impersonation.
 - No protection against side-channel cryptanalysis of the AEAD itself.
-  Rely on ring / dalek / pqcrypto upstream constant-time properties.
+  Rely on ring / dalek / RustCrypto (`ml-kem`, `ml-dsa`) upstream
+  constant-time properties.
 - Endpoint compromise sweeps away the entire model.
 
 ---

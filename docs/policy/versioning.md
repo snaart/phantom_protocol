@@ -179,7 +179,7 @@ have implicitly relied on the included dependency.
 Currently **Rust 1.75 stable**. Declared in:
 
 - `.clippy.toml :: msrv` (already present).
-- `core/Cargo.toml :: [package].rust-version` (planned).
+- `core/Cargo.toml :: [package].rust-version` (already present).
 
 MSRV bumps are themselves SemVer-minor for `0.x` releases and SemVer-major once
 we hit 1.0. CI enforces 1.75 separately via `dtolnay/rust-toolchain@1.75`;
@@ -195,7 +195,7 @@ recent stable, not under the 1.75 gate — the MSRV promise covers the
 ## 7. PQC and cryptographic dependency updates
 
 `ml-kem` and `ml-dsa` (the FIPS-203 / FIPS-204 RustCrypto crates) are
-unconditional dependencies (`ml-kem = "0.2"`, `ml-dsa = "0.1.0"`). A bump of a
+optional dependencies, enabled by default via the `std` feature (`ml-kem = "0.2"`, `ml-dsa = "0.1.0"`). A bump of a
 cryptographic dependency is treated as a potential **wire-format change**:
 if the upgrade alters the serialised key-package / ciphertext / signature bytes
 or the KAT vectors, it is a coordinated `WIRE_VERSION` / `PROTOCOL_VERSION` bump

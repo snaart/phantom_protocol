@@ -4,9 +4,7 @@ FIPS 140-3 requires a cryptographic module to run **known-answer tests
 (KATs)** at startup ("power-on self-tests" / POST) and **pairwise
 consistency tests (PCTs)** whenever a new key pair is generated.
 
-This document describes the self-test plan for Phantom Core and tracks the
-status of each test. Most are **not yet implemented** — they are gated by
-the `fips` feature (Phase 5).
+This document describes the self-test implementation for Phantom Core. **Power-on self-tests (POST) are implemented** in `core/src/crypto/self_tests.rs` (Phase 5.5) and are wired into PhantomListener::bind and PhantomSession::connect under the `fips` feature. Pairwise consistency tests (PCTs) are in-progress.
 
 ## Test types
 
@@ -91,8 +89,8 @@ material immediately. Caller is responsible for re-attempting keygen
 
 | Phase | Status | Deliverable |
 | --- | --- | --- |
-| Phase 5.4 | ⏳ | CAVP vectors under `tests/cavp/`. |
-| Phase 5.5 | ⏳ | `core/src/crypto/self_tests.rs` + `phantom_core::fips::run_self_tests()` API. |
+| Phase 5.4 | ✅ | CAVP vectors under `core/tests/cavp/`. (Implemented with ML-KEM-768, ML-DSA-65, AES-256-GCM, SHA-256, HMAC-SHA-256, HKDF-SHA-256, Ed25519 test vectors.) |
+| Phase 5.5 | ✅ | `core/src/crypto/self_tests.rs` + `ensure_post_passed()` API. (Implemented and wired into PhantomListener::bind and PhantomSession::connect under `fips` feature.) |
 | Phase 5.5 | ⏳ | PCTs wired into all four keygen functions. |
 | Phase 5.5 | ⏳ | CI job that runs `cargo test --features fips self_tests` on every PR. |
 
