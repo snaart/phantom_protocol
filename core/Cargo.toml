@@ -2,8 +2,13 @@
 name = "phantom_core"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.75"
 description = "Phantom Universal Transport Core SDK — post-quantum secure L4/L6 network framework"
 license = "Apache-2.0"
+repository = "https://github.com/snaart/phantom_protocol"
+documentation = "https://docs.rs/phantom_core"
+keywords = ["post-quantum", "transport", "cryptography", "networking", "ml-kem"]
+categories = ["network-programming", "cryptography", "no-std"]
 
 [features]
 default = ["compression-zstd", "std", "bindings"]
