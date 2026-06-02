@@ -22,7 +22,7 @@ use phantom_core::transport::handshake::{
     HandshakeClient, HandshakeError, HandshakeResponse, HandshakeServer,
 };
 use phantom_core::transport::path::PathStateKind;
-use phantom_core::transport::session::{CryptoState, Session};
+use phantom_core::transport::session::{CryptoState, Session, MAX_REKEY_CATCHUP};
 use phantom_core::transport::types::{
     PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
 };
@@ -443,6 +443,220 @@ fn rekey_saturates_at_u8_max() {
     // The 256th rekey must fail rather than wrap to 0.
     assert!(server.rekey().is_err());
     assert_eq!(server.current_epoch(), u8::MAX, "epoch must not wrap");
+}
+
+/// C1: `decrypt_packet_accepting_rekey` follows a single *authenticated* forward
+/// rekey step. The sender rekeys to epoch 1 and encrypts there; the receiver,
+/// still at epoch 0, trial-decrypts under the next key, succeeds, and commits
+/// the ratchet — ending at epoch 1 with the plaintext intact.
+#[test]
+fn accepting_decrypt_follows_one_authentic_rekey_step() {
+    let (client, server) = make_session_pair([0x20u8; 32]);
+    assert_eq!(server.current_epoch(), 0);
+
+    // Sender rekeys ahead of the receiver.
+    assert_eq!(client.rekey().expect("client rekey"), 1);
+    let header = PacketHeader::new(
+        *server.id(),
+        1,
+        7,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::REKEY),
+    )
+    .with_epoch(1);
+    let ct = client
+        .encrypt_packet(&header, b"first post-rekey")
+        .expect("encrypt e1");
+
+    // Receiver is still at epoch 0; the accepting decrypt ratchets it forward.
+    let pt = server
+        .decrypt_packet_accepting_rekey(&header, &ct)
+        .expect("accepting decrypt follows the bump");
+    assert_eq!(pt, b"first post-rekey");
+    assert_eq!(server.current_epoch(), 1, "receiver committed the ratchet");
+}
+
+/// C1 security: a *forged* epoch bump (correct +1 epoch in the header, but
+/// ciphertext that does not authenticate under the next key) is rejected and
+/// MUST NOT commit the ratchet — otherwise an attacker could desync the session
+/// by spoofing an epoch. After the rejection a legitimate same-epoch packet
+/// still decrypts.
+#[test]
+fn accepting_decrypt_rejects_forged_bump_without_desync() {
+    let (client, server) = make_session_pair([0x21u8; 32]);
+
+    // Attacker forges a +1-epoch header but supplies garbage ciphertext.
+    let forged = PacketHeader::new(
+        *server.id(),
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::REKEY),
+    )
+    .with_epoch(1);
+    let garbage = vec![0xABu8; 64];
+    assert!(
+        server
+            .decrypt_packet_accepting_rekey(&forged, &garbage)
+            .is_err(),
+        "a forged epoch bump must fail the AEAD trial"
+    );
+    assert_eq!(
+        server.current_epoch(),
+        0,
+        "a failed trial decrypt must NOT advance the epoch (no desync)"
+    );
+
+    // The session is intact: a genuine epoch-0 packet still round-trips.
+    let header = PacketHeader::new(*server.id(), 1, 2, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let ct = client
+        .encrypt_packet(&header, b"still in sync")
+        .expect("encrypt e0");
+    let pt = server
+        .decrypt_packet_accepting_rekey(&header, &ct)
+        .expect("same-epoch decrypt still works");
+    assert_eq!(pt, b"still in sync");
+}
+
+/// C1: a *bounded* multi-epoch catch-up (within [`MAX_REKEY_CATCHUP`]) with a
+/// genuinely valid ciphertext is followed — the receiver derives the chain
+/// forward and commits all the steps at once. This absorbs the small epoch
+/// divergence that arises when both directions rekey at slightly different
+/// cadences.
+#[test]
+fn accepting_decrypt_follows_bounded_multi_step_catchup() {
+    let (client, server) = make_session_pair([0x22u8; 32]);
+    client.ratchet_to_epoch(3).expect("client to 3");
+    let header = PacketHeader::new(
+        *server.id(),
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::REKEY),
+    )
+    .with_epoch(3);
+    let ct = client
+        .encrypt_packet(&header, b"three ahead")
+        .expect("encrypt e3");
+
+    // Receiver at epoch 0 catches up 3 steps because the ciphertext authenticates.
+    let pt = server
+        .decrypt_packet_accepting_rekey(&header, &ct)
+        .expect("bounded multi-step catch-up follows a valid jump");
+    assert_eq!(pt, b"three ahead");
+    assert_eq!(server.current_epoch(), 3, "receiver caught up to epoch 3");
+}
+
+/// C1 security: a jump *beyond* [`MAX_REKEY_CATCHUP`] is rejected outright even
+/// with a valid ciphertext — this caps the HKDF work an attacker can force per
+/// spoofed packet. A legitimate gap is never this large; over a reliable
+/// transport the sender retransmits at the current epoch.
+#[test]
+fn accepting_decrypt_rejects_jump_beyond_catchup_bound() {
+    let (client, server) = make_session_pair([0x24u8; 32]);
+    let target = MAX_REKEY_CATCHUP + 1;
+    client.ratchet_to_epoch(target).expect("client far ahead");
+    let header = PacketHeader::new(
+        *server.id(),
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::REKEY),
+    )
+    .with_epoch(target);
+    let ct = client
+        .encrypt_packet(&header, b"too far")
+        .expect("encrypt far");
+
+    assert!(
+        server.decrypt_packet_accepting_rekey(&header, &ct).is_err(),
+        "a jump beyond MAX_REKEY_CATCHUP must be rejected"
+    );
+    assert_eq!(
+        server.current_epoch(),
+        0,
+        "no ratchet on an over-bound jump"
+    );
+}
+
+/// C1: the automatic-rekey trigger predicate flips once the send direction
+/// crosses the configurable high-watermark, and an actual `rekey()` clears it
+/// (the counter resets under the fresh key).
+#[test]
+fn send_needs_rekey_fires_at_threshold_and_clears_on_rekey() {
+    let (client, _server) = make_session_pair([0x23u8; 32]);
+    client.set_rekey_threshold(4);
+    assert!(
+        !client.send_needs_rekey(),
+        "fresh session is below threshold"
+    );
+
+    let header = PacketHeader::new(*client.id(), 1, 0, PacketFlags::new(PacketFlags::ENCRYPTED));
+    for i in 0..4u32 {
+        let h = PacketHeader {
+            sequence: i,
+            ..header
+        };
+        client.encrypt_packet(&h, b"x").expect("encrypt");
+    }
+    assert!(
+        client.send_needs_rekey(),
+        "after {} sends the trigger must fire",
+        client.send_invocations()
+    );
+
+    assert_eq!(client.rekey().expect("rekey"), 1);
+    assert!(
+        !client.send_needs_rekey(),
+        "rekey resets the send counter under the new key, clearing the trigger"
+    );
+}
+
+/// C1 concurrency: the data pump drives the send loop and the receive task
+/// concurrently over one `Arc<Session>`, so a send-side `rekey()` can race a
+/// receive-side ratchet. Every transition must be atomic — the installed key
+/// depth and the epoch counter must never diverge. We hammer `rekey()` from
+/// many threads and then prove the final key is exactly `epoch` HKDF steps deep
+/// by round-tripping a packet against a peer ratcheted to the same epoch. With
+/// a non-atomic (read-epoch / derive / bump-relative) transition this wedges:
+/// the epoch overshoots the key depth and the round-trip fails.
+#[test]
+fn concurrent_rekeys_keep_epoch_and_key_in_lockstep() {
+    use std::sync::Arc;
+
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 20; // 160 total < u8::MAX, so none saturate
+
+    let (client, server) = make_session_pair([0x30u8; 32]);
+    let client = Arc::new(client);
+
+    let mut handles = Vec::new();
+    for _ in 0..THREADS {
+        let c = Arc::clone(&client);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..PER_THREAD {
+                c.rekey().expect("concurrent rekey");
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("rekey thread");
+    }
+
+    let epoch = client.current_epoch();
+    assert_eq!(
+        epoch as usize,
+        THREADS * PER_THREAD,
+        "every concurrent rekey must advance the epoch exactly once (no lost/double bumps)"
+    );
+
+    // Prove key-depth == epoch: a peer ratcheted to the same epoch must decrypt.
+    server.ratchet_to_epoch(epoch).expect("server catch up");
+    let header = PacketHeader::new(*client.id(), 1, 1, PacketFlags::new(PacketFlags::ENCRYPTED))
+        .with_epoch(epoch);
+    let ct = client
+        .encrypt_packet(&header, b"post-race payload")
+        .expect("encrypt at final epoch");
+    let pt = server
+        .decrypt_packet(&header, &ct)
+        .expect("installed key depth must equal the epoch counter");
+    assert_eq!(pt, b"post-race payload");
 }
 
 // ── Multi-path / migration (Phase 4.2) ────────────────────────────────────

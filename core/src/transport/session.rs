@@ -3,7 +3,7 @@
 //! Virtual association that persists across IP changes.
 //! Manages streams, encryption state, and multi-path scheduling.
 
-use crate::crypto::adaptive_crypto::CryptoSession;
+use crate::crypto::adaptive_crypto::{CryptoSession, AEAD_MAX_INVOCATIONS};
 use crate::errors::CoreError;
 use crate::security::ReplayWindow;
 use crate::transport::{
@@ -42,6 +42,29 @@ pub enum SessionState {
     /// Session is closed
     Closed,
 }
+
+/// Soft high-watermark for automatic mid-session rekey (C1). Once a direction's
+/// AEAD invocation count crosses this, the data pump rotates to a fresh key
+/// *before* the hard [`AEAD_MAX_INVOCATIONS`] ceiling (Invariant 8) so a
+/// long-lived session ratchets keys instead of failing with `NonceExhausted`.
+///
+/// Default is half the ceiling — `2^47` invocations — which leaves a `2^47`
+/// headroom for in-flight packets from the old epoch. It is far larger than any
+/// realistic session lifetime, so production sessions essentially never hit it;
+/// it is a correctness backstop. Tests lower it via
+/// [`Session::set_rekey_threshold`] to exercise the path.
+pub const REKEY_SOFT_LIMIT: u64 = AEAD_MAX_INVOCATIONS / 2;
+
+/// How many epochs the receive path will catch up in one packet when accepting
+/// an authenticated forward rekey (C1). A small bound caps the HKDF work an
+/// attacker can force per spoofed packet (each step is a trial that commits
+/// nothing unless AEAD verifies) while comfortably absorbing the small epoch
+/// divergence that arises when both directions rekey at slightly different
+/// cadences. A gap larger than this is rejected; over a reliable transport the
+/// sender retransmits at the then-current epoch, so no data is lost. In
+/// practice (production `REKEY_SOFT_LIMIT` of `2^47`) the gap is essentially
+/// always 0 or 1.
+pub const MAX_REKEY_CATCHUP: u8 = 16;
 
 /// Crypto state for session encryption.
 ///
@@ -112,6 +135,13 @@ impl CryptoState {
     pub fn nonce_prefix(&self) -> [u8; 4] {
         self.session.nonce_prefix()
     }
+
+    /// Per-direction send-side AEAD invocation count for this epoch. Resets to
+    /// 0 on rekey (a fresh `CryptoState` is installed). Drives the C1
+    /// automatic-rekey trigger.
+    pub fn send_invocations(&self) -> u64 {
+        self.session.send_invocations()
+    }
 }
 
 /// Session - virtual association between two endpoints
@@ -136,6 +166,16 @@ pub struct Session {
     /// successful `rekey()` increments it. Wire-emitted in
     /// `PacketHeader.epoch` so the peer can match the right key.
     epoch: AtomicU8,
+    /// Send-side AEAD-invocation high-watermark that triggers an automatic
+    /// mid-session rekey (C1). Defaults to [`REKEY_SOFT_LIMIT`]; tests/embedders
+    /// lower it via [`set_rekey_threshold`](Self::set_rekey_threshold).
+    rekey_after: AtomicU64,
+    /// Serialises every epoch transition (C1). The data pump runs the send loop
+    /// and the receive task concurrently over one `Arc<Session>`, so a send-side
+    /// `rekey()` can race a receive-side ratchet. Both hold this mutex across
+    /// their derive→install→epoch-bump so the installed key depth and the epoch
+    /// counter never diverge (the bug would otherwise wedge the session).
+    rekey_lock: Mutex<()>,
     /// Which side of the handshake we are. Carried into every
     /// `CryptoState::new(...)` re-derivation so the per-direction keys are
     /// laid out the same way they were at session establishment.
@@ -210,6 +250,8 @@ impl Session {
             crypto: ArcSwap::new(Arc::new(crypto)),
             traffic_secret: RwLock::new(*shared_secret),
             epoch: AtomicU8::new(0),
+            rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
+            rekey_lock: Mutex::new(()),
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -248,6 +290,8 @@ impl Session {
             crypto: ArcSwap::new(Arc::new(crypto)),
             traffic_secret: RwLock::new(traffic_secret),
             epoch: AtomicU8::new(0),
+            rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
+            rekey_lock: Mutex::new(()),
             is_server,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -281,6 +325,8 @@ impl Session {
             crypto: ArcSwap::new(Arc::new(crypto)),
             traffic_secret: RwLock::new(*resumption_secret),
             epoch: AtomicU8::new(0),
+            rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
+            rekey_lock: Mutex::new(()),
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -379,36 +425,201 @@ impl Session {
     /// lockstep.
     #[tracing::instrument(name = "phantom.session.rekey", skip_all)]
     pub fn rekey(&self) -> Result<u8, CoreError> {
+        // Serialise the whole transition (C1): the send loop and the receive
+        // task share this `Session`, so derive+install+epoch-bump must be atomic
+        // w.r.t. a concurrent receive-side ratchet, or the installed key depth
+        // and the epoch counter diverge and wedge the session.
+        let _rekey = self.rekey_lock.lock();
         let current_epoch = self.epoch.load(Ordering::Relaxed);
         if current_epoch == u8::MAX {
             return Err(CoreError::CryptoError(
                 "session epoch saturated (u8::MAX); reconnect required".into(),
             ));
         }
+        let (next_secret, new_crypto) = self.derive_forward_crypto(1)?;
+        self.commit_forward_crypto(1, next_secret, new_crypto);
+        Ok(current_epoch + 1)
+    }
+
+    /// Derive the next epoch's traffic secret + [`CryptoState`] from the current
+    /// secret WITHOUT installing them. The HKDF chain step is
+    /// `HKDF-Expand(current, "phantom-rekey-v1", 32)` (Invariant 5 — the label is
+    /// load-bearing; it must match the committing path in `rekey`). Returns the
+    /// derived secret and a fresh per-direction AEAD state under it.
+    ///
+    /// This is the non-committing half used by the receive path to verify a
+    /// claimed-next-epoch packet (trial decrypt) before trusting the epoch bump,
+    /// so a forged, unauthenticated `header.epoch` cannot desync the session.
+    ///
+    /// `steps` ≥ 1 applies the chain that many times (the receive path may need
+    /// to catch up several epochs when both directions rekey at slightly
+    /// different cadences). Intermediate secrets are zeroed as the walk
+    /// proceeds; only the final-epoch secret is returned for the caller to
+    /// commit.
+    fn derive_forward_crypto(&self, steps: u8) -> Result<([u8; 32], CryptoState), CoreError> {
+        use zeroize::Zeroizing;
+        debug_assert!(steps >= 1, "derive_forward_crypto needs at least one step");
+        // `Zeroizing` so every intermediate secret — and the working copy of the
+        // current secret — is wiped on *every* exit path, including the early
+        // `?` returns (an attacker can force this derivation merely by setting
+        // `header.epoch`, so the candidate is genuinely sensitive).
+        let mut secret: Zeroizing<[u8; 32]> = Zeroizing::new(*self.traffic_secret.read());
+        for _ in 0..steps {
+            let mut next: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
+            let hk = hkdf::Hkdf::<sha2::Sha256>::from_prk(&*secret)
+                .map_err(|_| CoreError::KeyDerivationError)?;
+            // Invariant 5 — the `phantom-rekey-v1` label is load-bearing and must
+            // match the committing path in `rekey`.
+            hk.expand(b"phantom-rekey-v1", &mut *next)
+                .map_err(|_| CoreError::KeyDerivationError)?;
+            secret = next; // previous-step secret drops → zeroed
+        }
+        let new_crypto = CryptoState::new(&secret, self.is_server)?;
+        // Copy the bytes out for the caller; the `Zeroizing` working copy is
+        // wiped when it drops here. The caller is responsible for the returned
+        // secret (committed into `traffic_secret`, or zeroed on a failed trial).
+        Ok((*secret, new_crypto))
+    }
+
+    /// Install a [`derive_forward_crypto`](Self::derive_forward_crypto)d epoch:
+    /// swap in the new `CryptoState` via the lock-free `ArcSwap`, zero+replace
+    /// the traffic secret under the write lock, and saturatingly advance the
+    /// epoch by `steps` (Invariant 5 — epoch never wraps). The caller MUST have
+    /// authenticated the transition (a successful trial decrypt, or its own
+    /// send-side rekey) — this routine verifies nothing itself.
+    fn commit_forward_crypto(&self, steps: u8, final_secret: [u8; 32], new_crypto: CryptoState) {
         let mut current = self.traffic_secret.write();
-
-        // HKDF chain step. We use `HKDF-Expand` over the current traffic
-        // secret as the PRK with a distinct info string per generation —
-        // any rekey-related primitive label change would be a wire-breaking
-        // change tracked under the V2 KDF label inventory.
-        let mut next_secret = [0u8; 32];
-        let hk = hkdf::Hkdf::<sha2::Sha256>::from_prk(&*current)
-            .map_err(|_| CoreError::KeyDerivationError)?;
-        hk.expand(b"phantom-rekey-v1", &mut next_secret)
-            .map_err(|_| CoreError::KeyDerivationError)?;
-
-        // Build new per-direction AEAD state under the new secret.
-        let new_crypto = CryptoState::new(&next_secret, self.is_server)?;
+        // Install the new AEAD state, then the new epoch (SeqCst) so the wire
+        // header the send path stamps matches the key it encrypts under.
         self.crypto.store(Arc::new(new_crypto));
-
-        // Zero the old secret before overwriting it so the previous-epoch
-        // key material does not survive in memory.
+        // Zero the old secret before overwriting it so the previous-epoch key
+        // material does not survive in memory.
         current.zeroize();
-        *current = next_secret;
+        *current = final_secret;
+        let cur = self.epoch.load(Ordering::Relaxed);
+        self.epoch
+            .store(cur.saturating_add(steps), Ordering::SeqCst);
+    }
 
-        let new_epoch = current_epoch + 1;
-        self.epoch.store(new_epoch, Ordering::SeqCst);
-        Ok(new_epoch)
+    /// Send-side AEAD invocation count for the current epoch (resets to 0 on
+    /// each rekey). Drives [`send_needs_rekey`](Self::send_needs_rekey).
+    pub fn send_invocations(&self) -> u64 {
+        self.crypto.load().send_invocations()
+    }
+
+    /// The send-invocation high-watermark at which the pump auto-rekeys.
+    pub fn rekey_threshold(&self) -> u64 {
+        self.rekey_after.load(Ordering::Relaxed)
+    }
+
+    /// Override the auto-rekey high-watermark (default [`REKEY_SOFT_LIMIT`]).
+    /// Clamped to `>= 1`. Rust-only — primarily for tests/soak harnesses that
+    /// need to exercise mid-session rekey without sending `2^47` packets.
+    pub fn set_rekey_threshold(&self, n: u64) {
+        self.rekey_after.store(n.max(1), Ordering::Relaxed);
+    }
+
+    /// True once the send direction has crossed the rekey high-watermark and the
+    /// epoch has room to advance. The data pump checks this before each
+    /// application send and, when set, rekeys + flags the packet `REKEY` so the
+    /// peer follows via the authenticated epoch bump.
+    pub fn send_needs_rekey(&self) -> bool {
+        self.current_epoch() < u8::MAX
+            && self.send_invocations() >= self.rekey_after.load(Ordering::Relaxed)
+    }
+
+    /// Decrypt a packet, transparently following an **authenticated** forward
+    /// rekey of up to [`MAX_REKEY_CATCHUP`] epochs (C1).
+    ///
+    /// - `header.epoch == current`: ordinary [`decrypt_packet`](Self::decrypt_packet).
+    /// - `current < header.epoch <= current + MAX_REKEY_CATCHUP`: derive the
+    ///   candidate key that many epochs ahead and *trial*-decrypt. Only on AEAD
+    ///   success — i.e. once the epoch bump is proven authentic — is the rekey
+    ///   committed and the replay window consulted (Invariant 4 ordering
+    ///   preserved). A forged `header.epoch` fails the AEAD open, nothing is
+    ///   committed, and the session does not desync. The bound caps an attacker
+    ///   to at most `MAX_REKEY_CATCHUP` HKDF steps per spoofed packet.
+    /// - anything else (behind current, more than `MAX_REKEY_CATCHUP` ahead, or
+    ///   epoch saturated): rejected. Over a reliable transport the sender
+    ///   retransmits at the then-current epoch, so no data is lost.
+    pub fn decrypt_packet_accepting_rekey(
+        &self,
+        header: &PacketHeader,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, CoreError> {
+        // Fast paths that need no epoch transition (no lock).
+        let cur = self.current_epoch();
+        if header.epoch == cur {
+            return self.decrypt_packet(header, ciphertext);
+        }
+        if header.epoch < cur {
+            return Err(CoreError::CryptoError(format!(
+                "packet epoch {} is behind the current epoch {}",
+                header.epoch, cur
+            )));
+        }
+
+        // A forward ratchet mutates the epoch + key, so it must be serialised
+        // against a concurrent send-side `rekey()` (C1 — both tasks share this
+        // `Session`). Hold the rekey lock across the re-check, derive, trial
+        // decrypt, and commit so the installed key depth and the epoch stay in
+        // lockstep.
+        let _rekey = self.rekey_lock.lock();
+        // Re-read under the lock: a concurrent rekey may have already advanced us.
+        let cur = self.current_epoch();
+        if header.epoch == cur {
+            drop(_rekey);
+            return self.decrypt_packet(header, ciphertext);
+        }
+        if header.epoch < cur {
+            return Err(CoreError::CryptoError(format!(
+                "packet epoch {} is behind the current epoch {}",
+                header.epoch, cur
+            )));
+        }
+        let steps = header.epoch - cur; // > 0, both u8 → no underflow
+        if steps > MAX_REKEY_CATCHUP {
+            return Err(CoreError::CryptoError(format!(
+                "packet epoch {} is more than {} epochs ahead of current {}",
+                header.epoch, MAX_REKEY_CATCHUP, cur
+            )));
+        }
+
+        // Candidate key `steps` epochs ahead — derived but NOT installed.
+        let (mut final_secret, final_crypto) = self.derive_forward_crypto(steps)?;
+        let nonce = Self::build_packet_nonce(final_crypto.nonce_prefix(), header);
+        let header_bytes = header.to_wire();
+        // AEAD gate: a forged epoch bump fails here and we return without
+        // committing — the live epoch is untouched. Zero the (valid, sensitive)
+        // candidate secret we are not going to install.
+        let plaintext = match final_crypto.decrypt_with_nonce(nonce, &header_bytes, ciphertext) {
+            Ok(pt) => pt,
+            Err(e) => {
+                final_secret.zeroize();
+                return Err(e);
+            }
+        };
+
+        // Authentic forward rekey — commit (still under the rekey lock; `cur` was
+        // read under it, so `cur + steps == header.epoch` is the absolute, race-
+        // free target), then drop the lock and apply the replay window AFTER the
+        // AEAD open (Invariant 4 — the window is per-(stream,sequence) and
+        // epoch-independent, so it needs no rekey serialisation).
+        self.commit_forward_crypto(steps, final_secret, final_crypto);
+        drop(_rekey);
+        let window_entry = self
+            .replay_windows
+            .entry(header.stream_id)
+            .or_insert_with(|| Mutex::new(ReplayWindow::new()));
+        let accepted = window_entry.lock().accept(header.sequence);
+        if !accepted {
+            self.replay_rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(CoreError::ReplayDetected(format!(
+                "stream {} sequence {} already seen or beyond window",
+                header.stream_id, header.sequence
+            )));
+        }
+        Ok(plaintext)
     }
 
     /// Advance to a specific target epoch by repeatedly applying the rekey
