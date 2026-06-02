@@ -17,14 +17,13 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Allow inbound traffic on the app port and metrics port.
+    # Allow inbound traffic on the transport port only — there is no metrics
+    # port to admit (telemetry is pushed outbound via OTLP, see egress below).
     # Restrict source via networkPolicy.ingressFrom (namespace / pod selectors).
     # An empty ingressFrom list permits traffic from any source within the cluster;
     # set at least a namespaceSelector in production to limit exposure.
     - ports:
         - port: {{ .Values.service.port }}
-          protocol: TCP
-        - port: {{ .Values.service.metricsPort }}
           protocol: TCP
       {{- if .Values.networkPolicy.ingressFrom }}
       from:
@@ -37,6 +36,13 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
+    {{- if .Values.networkPolicy.otlpEgressPort }}
+    # OTLP/gRPC export to the OpenTelemetry Collector. Required for telemetry to
+    # leave the pod; scope the destination via networkPolicy.egressTo in production.
+    - ports:
+        - port: {{ .Values.networkPolicy.otlpEgressPort }}
+          protocol: TCP
+    {{- end }}
     {{- if .Values.networkPolicy.egressTo }}
     # Additional egress rules for downstream services your binary dials.
     - {{- toYaml .Values.networkPolicy.egressTo | nindent 6 }}

@@ -5,11 +5,13 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "phantom-core.labels" . | nindent 4 }}
-  annotations:
-    # Uncomment to enable annotation-based Prometheus scraping (alternative to ServiceMonitor):
-    # prometheus.io/scrape: "true"
-    # prometheus.io/port: {{ .Values.service.metricsPort | quote }}
-    # prometheus.io/path: "/metrics"
+  # Phantom Core exposes no inbound metrics port. It emits OpenTelemetry metrics
+  # and traces and PUSHES them over OTLP/gRPC to an OpenTelemetry Collector
+  # (configure via OTEL_EXPORTER_OTLP_ENDPOINT). Do not add prometheus.io/scrape
+  # annotations here — there is no /metrics endpoint to scrape. To land metrics in
+  # Prometheus, run a Collector with an otlp receiver + prometheus exporter and have
+  # Prometheus scrape the Collector, never the phantom pods. See
+  # docs/observability/metrics-catalog.md and docs/observability/otlp-setup.md.
 spec:
   type: {{ .Values.service.type }}
   selector:
@@ -18,8 +20,4 @@ spec:
     - name: phantom
       port: {{ .Values.service.port }}
       targetPort: phantom
-      protocol: TCP
-    - name: metrics
-      port: {{ .Values.service.metricsPort }}
-      targetPort: metrics
       protocol: TCP

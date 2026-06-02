@@ -63,7 +63,8 @@ The relevant runtime-visible knobs are:
 - [ ] sysctl tuning applied (see `systemd.md`).
 - [ ] CI build of the wrapper binary completes for all target
       platforms.
-- [ ] If exposing `/metrics`, scrape rule added to Prometheus.
+- [ ] OTLP collector endpoint configured (`--otlp-endpoint` /
+      `OTEL_EXPORTER_OTLP_ENDPOINT`) and reachable from the server pods/hosts.
 - [ ] Graceful-shutdown signal handler wired in the wrapper (`SIGTERM`
       → `PhantomListener::shutdown()`).
 - [ ] Logs ship to a durable backend (journald → vector → Loki, or
@@ -130,20 +131,41 @@ the cap and its log) and rate-limit at the edge instead.
 
 ## Monitoring
 
-Phase 4.5 exposes `phantom_*` Prometheus metrics. The starter
-dashboard lives at `docs/operations/grafana/phantom-dashboard.json`
-and the alert rules at `docs/operations/prometheus/alerts.yml`.
+Phantom Core emits OpenTelemetry metrics + traces; the library opens **no**
+inbound port and serves no `/metrics` endpoint. The reference server
+(`phantom-server`, built with the `telemetry-otel` feature) installs an
+OTLP/gRPC exporter and **pushes** to an OpenTelemetry Collector. Point it at the
+collector with `--otlp-endpoint` / `OTEL_EXPORTER_OTLP_ENDPOINT` (e.g.
+`http://otel-collector:4317`); `--otel-service-name` / `OTEL_SERVICE_NAME` and
+`OTEL_TRACES_SAMPLER_ARG` (head-sampling ratio) tune the export, and
+`OTEL_EXPORTER_OTLP_HEADERS` carries auth headers for SaaS backends.
 
-Key alerting signals:
+Data flow:
+
+```
+phantom-server  --OTLP/gRPC push-->  OTel Collector  -->  backend
+```
+
+The collector fans out to the backend of your choice — Prometheus (via the
+collector's `prometheusexporter` or `remote_write`), Tempo / Jaeger for traces,
+or Datadog / Honeycomb / Grafana Cloud directly. To land metrics in Prometheus,
+run a collector with an `otlp` receiver plus a `prometheus` exporter and have
+Prometheus scrape the **collector** — never the phantom pods. The starter
+dashboard lives at `docs/observability/grafana/phantom-otel-dashboard.json`,
+the alert rules at `docs/observability/prometheus/alerts.yml`, and the full
+instrument catalog at `docs/observability/metrics-catalog.md`. OTLP backend
+recipes are in `docs/observability/otlp-setup.md`.
+
+Prometheus names follow the OTel dot→underscore translation. Key alerting
+signals:
 
 | Signal | Reaction |
 | --- | --- |
-| `phantom_handshake_failures_total` rate spike | Investigate — could be misconfigured clients or active scan. |
-| `phantom_replay_rejected_total` rate spike | Investigate — replay window saturated either by network reorder or by adversary. |
-| `phantom_unencrypted_dropped_total` > 0 | Active downgrade attempt — page on-call. |
-| `phantom_aead_decrypt_failed_total` rate spike | Tampering or corruption — page on-call. |
-| `phantom_active_sessions` near process limit | Scale horizontally. |
-| `phantom_handshake_latency_seconds_bucket{le="1"}` p95 > 1s | Investigate CPU / RNG / adaptive-PoW saturation. |
+| `phantom_handshake_duration_seconds` failure/spike | Investigate — could be misconfigured clients or active scan. |
+| `phantom_security_aead_failed_total` rate spike | Tampering or corruption — page on-call. |
+| `phantom_session_active` (label: `leg`) near process limit | Scale horizontally. |
+| `phantom_session_packets_total` / `phantom_session_io_bytes_total` flatlining | Traffic stall — investigate the leg. |
+| `phantom_handshake_duration_seconds` p95 > 1s | Investigate CPU / RNG / adaptive-PoW saturation. |
 
 ## Capacity planning
 

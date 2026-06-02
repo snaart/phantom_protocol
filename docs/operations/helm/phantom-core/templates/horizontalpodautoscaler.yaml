@@ -1,7 +1,10 @@
 {{- if .Values.autoscaling.enabled -}}
 # HPA using an external metric sourced from Prometheus via prometheus-adapter or KEDA.
-# phantom_active_sessions is emitted by PhantomListener::metrics_prometheus_text().
-# Prerequisites: prometheus-adapter OR KEDA must be installed and configured.
+# phantom_session_active is pushed by phantom-server over OTLP/gRPC to an OpenTelemetry
+# Collector, exported to Prometheus, then surfaced to Kubernetes through
+# prometheus-adapter (or KEDA). The phantom pods expose no scrape endpoint.
+# Prerequisites: an OTel Collector with an otlp receiver + prometheus exporter, plus
+# prometheus-adapter OR KEDA, must be installed and configured.
 # See README.md "HPA prerequisites" for setup instructions.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -18,7 +21,7 @@ spec:
   minReplicas: {{ .Values.autoscaling.minReplicas }}
   maxReplicas: {{ .Values.autoscaling.maxReplicas }}
   metrics:
-    # External metric: phantom_active_sessions aggregated across all pods.
+    # External metric: phantom_session_active aggregated across all pods.
     # This requires prometheus-adapter to be configured with a custom metric rule
     # mapping the Prometheus query to the external metric name below.
     # Alternatively, replace with a KEDA ScaledObject (see kubernetes.md example).

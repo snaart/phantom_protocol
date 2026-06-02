@@ -7,7 +7,8 @@ Ed25519 + ML-DSA-65); this chart deploys the server-side wrapper binary that cal
 
 The chart implements all patterns described in `docs/operations/kubernetes.md`:
 Deployment (not StatefulSet), `maxUnavailable: 0` rolling strategy, PDB, Secret-only
-key storage, HPA on `phantom_active_sessions`, and NetworkPolicy.
+key storage, HPA on `phantom_session_active` (sourced through the OTel Collector →
+Prometheus chain — the pods expose no scrape port), and NetworkPolicy.
 
 ---
 
@@ -68,7 +69,9 @@ you have a backup of the key material.
 | `image.tag` | Chart appVersion (`0.2.0`) | Pin to a digest in production |
 | `replicaCount` | `3` | Overridden by HPA when enabled |
 | `service.port` | `4242` | TCP port the server binary binds (matches the canonical port used in `kubernetes.md` + the `phantom-server` binary default) |
-| `service.metricsPort` | `9090` | Prometheus metrics port |
+| `telemetry.otlpEndpoint` | `""` | OTLP/gRPC Collector endpoint, rendered to the Deployment's `OTEL_EXPORTER_OTLP_ENDPOINT` (e.g. `http://otel-collector:4317`); empty = exporter uninstalled. The pods open no inbound telemetry port |
+| `telemetry.serviceName` | `"phantom-server"` | `OTEL_SERVICE_NAME` reported on every metric + span |
+| `telemetry.tracesSamplerArg` | `"0.05"` | `OTEL_TRACES_SAMPLER_ARG` head-sampling ratio |
 | `signingKey.existingSecret` | `""` | **MUST set in production** |
 | `pdb.enabled` | `true` | Keeps at least one pod Ready at all times |
 | `autoscaling.enabled` | `false` | Requires prometheus-adapter or KEDA |
@@ -123,12 +126,19 @@ Do not commit unsealed key bytes to version control.
 ## HPA prerequisites
 
 `autoscaling.enabled=true` generates an `autoscaling/v2` HPA with an External
-metric (`phantom_active_sessions`). This requires one of:
+metric (`phantom_session_active`). The pods expose no `/metrics` port — the
+metric reaches Kubernetes through the push pipeline: `phantom-server` pushes
+OTLP/gRPC to an OpenTelemetry Collector, the Collector's `prometheusexporter`
+(or remote_write) lands it in Prometheus, and one of the following surfaces it
+to the autoscaler:
 
 - **prometheus-adapter**: configure a custom metric rule mapping the Prometheus
-  query `sum(phantom_active_sessions)` to the external metric name.
+  query `sum(phantom_session_active)` to the external metric name.
 - **KEDA**: deploy a `ScaledObject` instead (see `docs/operations/kubernetes.md`
-  for a KEDA ScaledObject example driven on `phantom_active_sessions`).
+  for a KEDA ScaledObject example driven on `phantom_session_active`).
+
+Set `telemetry.otlpEndpoint` so the pods have a Collector to push to; never
+point Prometheus at the phantom pods directly.
 
 The scale threshold default is `800` sessions per pod, leaving 20% headroom
 below the ~1000-session-per-pod memory budget.
@@ -141,3 +151,7 @@ below the ~1000-session-per-pod memory budget.
 - `docs/operations/docker.md` — container image build and graceful shutdown wiring
 - `docs/operations/perf-tuning.md` — resource sizing and throughput benchmarks
 - `docs/operations/deployment.md` — index of all deployment surfaces
+- `docs/observability/metrics-catalog.md` — canonical metric catalog (names, types, labels)
+- `docs/observability/otlp-setup.md` — Collector + backend wiring for the OTLP push pipeline
+- `docs/observability/grafana/phantom-otel-dashboard.json` — canonical dashboard
+- `docs/observability/prometheus/alerts.yml` — canonical alert rules
