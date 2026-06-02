@@ -398,7 +398,16 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 - **Mobile connection migration (Wi-Fi ↔ LTE) is not yet supported.** The
   path-validation primitives are internal-only; on a network change, reconnect
   (use 0-RTT resumption via `connect_pinned_with_resumption` to minimise cost).
-- **Negative-security suite: 20 always-on tests** in
+- **Loss recovery is timeout-based (no SACK).** Reliable delivery ships with
+  RFC-6298 RTO + retransmission + a BBR-style congestion window and automatic
+  mid-session rekey. Dup-ACK fast-retransmit and selective ACK (SACK) are
+  **deferred post-1.0** — they need security-sensitive packet-number / ACK-range
+  fields in the AAD-covered header, i.e. a deliberate `WIRE_VERSION` bump.
+- **Receive backpressure is whole-session, not per-stream.** A consumer that
+  stops draining `recv()` backpressures the session (correct, no data loss) but
+  can head-of-line-delay the other direction's control traffic; per-stream,
+  consumption-driven flow control is a planned refinement.
+- **Negative-security suite: 26 always-on tests** in
   `core/tests/security_invariants.rs`, pinning every documented invariant.
   Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
   and 5 `#[ignore]`-gated loopback integration tests. 0 workspace warnings,
