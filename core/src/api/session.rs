@@ -10,7 +10,7 @@ use crate::observability::attrs::{AeadAlgorithm, ReplayReason};
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{
-    HandshakeClient, HelloRetryRequest, ServerHello, EARLY_DATA_MAX_LEN,
+    HandshakeClient, HelloRetryRequest, ServerHello, ServerReject, EARLY_DATA_MAX_LEN,
 };
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::packet_coalescer_codec::unwrap_coalesced_packet;
@@ -628,14 +628,31 @@ async fn run_client_handshake<T: SessionTransport>(
         transport.send_bytes(&bytes).await?;
         let resp = transport.recv_bytes().await?;
 
-        // The reply is either a `ServerHello` (success) or a
-        // `HelloRetryRequest` (cookie/PoW demand). Try the success shape
-        // first — a retry blob is far too small to deserialize as a
+        // The reply is one of three shapes: a `ServerHello` (success), a
+        // `HelloRetryRequest` (cookie/PoW demand), or a `ServerReject` (the
+        // server cannot speak our version). Try the success shape first — a
+        // retry/reject blob is far too small to deserialize as a multi-KiB
         // ServerHello, so the disambiguation is unambiguous.
         if let Ok(sh) = borsh::from_slice::<ServerHello>(&resp) {
             let (session, accepted) =
                 handshake.process_server_hello(&hello, &sh, Some(expected_server_key))?;
             return Ok((session, accepted));
+        } else if let Ok(reject) = borsh::from_slice::<ServerReject>(&resp) {
+            // The marker guard keeps a same-sized non-reject blob from being
+            // mistaken for a reject. We surface this as a hard error and do
+            // NOT auto-downgrade to `reject.supported_version` — a forced
+            // downgrade on an injected reject would defeat the transcript-bound
+            // version pin (Invariant 7).
+            if reject.has_marker() {
+                return Err(CoreError::HandshakeError(format!(
+                    "server rejected the handshake: unsupported protocol version \
+                     (client speaks v{}, server speaks v{})",
+                    hello.version, reject.supported_version
+                )));
+            }
+            return Err(CoreError::HandshakeError(
+                "invalid ServerHello, Retry, or Reject received".into(),
+            ));
         } else if let Ok(retry) = borsh::from_slice::<HelloRetryRequest>(&resp) {
             log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
             hello.cookie = retry.cookie;
@@ -646,7 +663,7 @@ async fn run_client_handshake<T: SessionTransport>(
             continue;
         } else {
             return Err(CoreError::HandshakeError(
-                "invalid ServerHello or Retry received".into(),
+                "invalid ServerHello, Retry, or Reject received".into(),
             ));
         }
     }
@@ -1775,6 +1792,36 @@ mod tests {
 
     // ── Tests ──
 
+    /// H9 forward-compat (client side): when the server answers a `ClientHello`
+    /// with a typed `ServerReject` (the version isn't one it speaks), the client
+    /// surfaces a clear version-mismatch error instead of hanging or returning a
+    /// generic failure — and crucially does NOT auto-downgrade.
+    #[tokio::test]
+    async fn client_surfaces_server_reject_as_version_error() {
+        use crate::transport::handshake::ServerReject;
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        // The reject path errors before any key verification, so any key works.
+        let (_sk, expected_vk) = crate::crypto::hybrid_sign::HybridSigningKey::generate();
+
+        let server = tokio::spawn(async move {
+            // Consume the ClientHello, then reply with the typed reject.
+            let _hello = server_transport.recv_bytes().await.unwrap();
+            let reject = borsh::to_vec(&ServerReject::unsupported_version()).unwrap();
+            server_transport.send_bytes(&reject).await.unwrap();
+        });
+
+        let result = run_client_handshake(&client_transport, &expected_vk, None).await;
+        server.await.unwrap();
+
+        let err = result.expect_err("client must surface the reject as an error");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unsupported protocol version"),
+            "expected a version-mismatch error, got: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn test_phantom_session_instant_connect() {
         let session = PhantomSession::connect("example.com:443".to_string());
@@ -1927,6 +1974,7 @@ mod tests {
                             .unwrap();
                         break session;
                     }
+                    HandshakeResponse::Reject(r) => panic!("unexpected reject: {:?}", r),
                     HandshakeResponse::Fail(e) => panic!("handshake failed: {:?}", e),
                 }
             };
@@ -2022,6 +2070,7 @@ mod tests {
                         server_transport.send_bytes(&b).await.unwrap();
                         break session;
                     }
+                    HandshakeResponse::Reject(r) => panic!("unexpected reject: {:?}", r),
                     HandshakeResponse::Fail(e) => panic!("handshake failed: {:?}", e),
                 }
             };

@@ -8,6 +8,20 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+### Added
+
+- **Graceful unsupported-version signal.** When a `ClientHello.version` is one
+  the server does not speak, the server now replies with a small typed
+  `ServerReject` frame (a `b"PRJ1"`-marked 6-byte message carrying the version
+  it *does* speak) before closing, instead of dropping the connection silently.
+  The client surfaces this as a clear version-mismatch error and does **not**
+  auto-downgrade — the version stays transcript-bound, so an injected reject
+  cannot force a downgrade. This makes an old-server ↔ newer-client encounter
+  degrade with an actionable diagnostic. `ServerReject` is an additive handshake
+  message; existing `ServerHello` / `HelloRetryRequest` / `PhantomPacket`
+  layouts and the frozen wire vectors are unchanged. See
+  `docs/protocol/PROTOCOL.md` §6.10.
+
 ## [0.3.0] - 2026-06-01
 
 This release takes phantom_core from its 0.2.0 pre-1.0 baseline through the

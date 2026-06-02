@@ -651,6 +651,7 @@ mod tests {
                         .expect("send ServerHello frame");
                         break session;
                     }
+                    HandshakeResponse::Reject(r) => panic!("unexpected reject: {r:?}"),
                     HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
                 }
             };

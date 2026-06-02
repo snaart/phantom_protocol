@@ -241,6 +241,13 @@ impl UdpHandshakeListener {
                     }
                     // Transition connection to established state...
                 }
+                HandshakeResponse::Reject(reject) => {
+                    // Unsupported version (H9): send the typed reject so the
+                    // client gets an actionable signal, then forget.
+                    if let Ok(encoded) = borsh::to_vec(&reject) {
+                        let _ = self.socket.send_to(&encoded, addr).await;
+                    }
+                }
                 HandshakeResponse::Fail(_) => {
                     // Handshake error, drop silently
                 }
