@@ -32,7 +32,7 @@ These fire at the point of the event.
 
 | OTel name | Type | Unit | Attributes |
 |-----------|------|------|------------|
-| `phantom.handshake.duration` | Histogram (explicit latency buckets) | `s` | `outcome` (success/failure), `leg`, `cipher_suite` (aes-256-gcm/chacha20-poly1305), `version` (v12/v3) |
+| `phantom.handshake.duration` | Histogram (explicit latency buckets) | `s` | `outcome` (success/failure), `leg`, `cipher_suite` (aes-256-gcm/chacha20-poly1305), `version` (v1) |
 | `phantom.handshake.resumptions` | Counter | `{resumption}` | `mode` (1rtt/0rtt), `accepted` (bool) |
 | `phantom.session.early_data` | Counter | `{attempt}` | `outcome` (accepted / rejected_unknown_ticket / rejected_oversized / rejected_aead / rejected_replay) |
 | `phantom.session.rekey` | Counter | `{rekey}` | `direction` (send/recv) |
@@ -54,7 +54,7 @@ These fire at the point of the event.
 | OTel name | Type | Unit | Attributes |
 |-----------|------|------|------------|
 | `phantom.path.migrations` | Counter | `{migration}` | `from_path`, `to_path` |
-| `phantom.path.validation.duration` | Histogram (base-2 exponential) | `s` | `path_id`, `outcome` (success/failure) |
+| `phantom.path.validation.duration` | Histogram (explicit latency buckets) | `s` | `path_id`, `outcome` (success/failure) |
 | `phantom.transport.fallback` | Counter | `{fallback}` | `from_leg`, `to_leg`, `reason` (loss_threshold/rtt_threshold/path_failure/explicit) |
 
 ## Resource attributes (set by the embedder)
@@ -62,7 +62,7 @@ These fire at the point of the event.
 | Attribute | Source | Example |
 |-----------|--------|---------|
 | `service.name` | embedder builder | `phantom-server` |
-| `service.version` | `CARGO_PKG_VERSION` | `0.2.0` |
+| `service.version` | `CARGO_PKG_VERSION` | `0.3.0` |
 | `service.instance.id` | hostname or UUID | `phantom-server-abc123` |
 | `phantom.role` | embedder | `server` / `client` |
 | `host.name`, `os.type`, `process.pid`, `process.runtime.name` | auto-detected | — |

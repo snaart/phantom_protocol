@@ -359,7 +359,7 @@ Full threat model, mitigations, and disclosure policy are in
   validation: X25519 (needs an approved-only ECDH-P-256 path), AES-256-GCM via
   `ring` (needs an `aws-lc-rs`-backed module), ChaCha20-Poly1305 + blake3 (must
   be gated out in FIPS mode), DRBG (needs SP 800-90A), §7.7 power-on self-tests
-  (not yet implemented). A `fips` Cargo feature is planned. Full gap analysis:
+  (not yet implemented). A `fips` Cargo feature is shipped (`--features fips`). Full gap analysis:
   [`docs/compliance/fips-readiness.md`](docs/compliance/fips-readiness.md).
   CAVP-style known-answer tests always-on in
   [`core/tests/cavp.rs`](core/tests/cavp.rs).
@@ -406,7 +406,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 - **Negative-security suite: 28 always-on tests** in
   `core/tests/security_invariants.rs`, pinning every documented invariant.
   Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
-  and 5 `#[ignore]`-gated loopback integration tests. 0 workspace warnings,
+  and 13 `#[ignore]`-gated integration tests (8 TCP, 3 KCP, 2 WASI). 0 workspace warnings,
   0 clippy warnings.
 - **All 8 production-readiness phases (0–7) closed code-side.** Deferred with
   rationale: external CMVP / CC lab validation (Phase 5.7 — procurement, not

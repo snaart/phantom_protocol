@@ -93,18 +93,15 @@ spawn run_data_pump(crypto_session, ...)         spawn run_data_pump(server_sess
 
 ### The shared data pump (`api/session.rs::run_data_pump`)
 
-Both client and server, after their respective handshakes, spawn the same
-`run_data_pump` function. It owns:
+Both client and server, after their respective handshakes, spawn the same `run_data_pump` function, which owns three tasks:
 
-- A **receive task** spawned via `tokio::spawn`, looping
-  `transport.recv_bytes() → PhantomPacket::from_wire → decrypt → route`.
+- A **delivery task** that drains an unbounded `deliver_rx` channel, handles the app-paced `recv_tx.send()`, and credits the flow-control window. This decoupling lets the reader emit inline ACKs without blocking on slow consumers.
+- A **receive (reader) task** looping `transport.recv_bytes() → PhantomPacket::from_wire → decrypt → handle_packet()`, which emits inline ACKs for reliable packets and hands application data to the unbounded `deliver_tx` channel without ever blocking on the consumer.
 - A **main select! loop** in the calling task that picks among:
-  - `poll_interval.tick()` every 10 ms — sweeps all streams for queued
-    sends. (Event-driven replacement is Phase 2.4.)
-  - `cmd_rx.recv()` — application-level `SessionCommand`s (Send,
-    SendStreamReliable, etc.).
-  - `&mut recv_handle` — exit when the receive task ends (transport
-    closed).
+  - `poll_interval.tick()` every 10 ms — sweeps all streams for queued sends and flushes pending WINDOW_UPDATEs.
+  - `send_notify.notified()` — wakes immediately on outbound-ready notification (event-driven fast path, Phase 2.4+).
+  - `cmd_rx.recv()` — application-level `SessionCommand`s (Send, SendStreamReliable, etc.).
+  - `recv_done_rx` — exit when the receive task ends (transport closed).
 
 The asymmetry between client and server stops here: the same pump
 handles both directions of data after the handshake derives the
@@ -156,11 +153,8 @@ verification.
 | `adaptive_crypto` | `CryptoSession`, `CipherSuite`, `HwCaps` | Per-direction AEAD with counter-derived nonce; HW auto-selection |
 | `aes_session` | `AesSession` | Earlier AEAD reference design; still used in places |
 | `pow` | `PoWChallenge`, `PoWSolution` | Proof-of-work for handshake DoS resistance |
-| `keys` | `KyberSecretKey`, `DilithiumSecretKey` wrappers | `Drop` zeroizes the opaque pqcrypto bytes via `ptr::write_volatile` |
 
-This layer has the only two `#[allow(unsafe_code)]` modules in the crate
-(`keys.rs` for pqcrypto byte zeroing and the unrelated
-`transport/udp_transport.rs` for libc GSO syscalls).
+The crate has `#[allow(unsafe_code)]` in three modules: `transport/udp_transport.rs` for libc GSO syscalls, `transport/legs/wasi.rs` for WASI syscalls, and `transport/legs/websocket.rs` for wasm-bindgen JS-boundary glue. The previous `crypto/keys.rs` (pqcrypto byte zeroing via `ptr::write_volatile`) was deleted in Phase 5.1; ml-dsa and ml-kem now provide native `ZeroizeOnDrop` (hybrid_sign and hybrid_kem modules).
 
 ---
 
@@ -179,26 +173,32 @@ This layer has the only two `#[allow(unsafe_code)]` modules in the crate
                     │                      │
                     │ cmd_tx               │ recv_rx
                     ▼                      ▲
-              ┌─────────────────────────────────────┐
-              │  tokio::spawn(run_data_pump)         │
-              │                                      │
-              │  let recv_handle = tokio::spawn(     │  ──┐ inner receive task
-              │     decrypt + route loop);           │    │ (loop until transport closed)
-              │                                      │    ▼
-              │  select! {                           │  ┌────────────────────────┐
-              │    poll_interval.tick() => ...       │  │ transport.recv_bytes() │
-              │    cmd_rx.recv() => ...              │  │ PhantomPacket::from_wire│
-              │    recv_handle => break;             │  │ AEAD decrypt + replay  │
-              │  }                                   │  │ demux + recv_tx        │
-              │                                      │  └────────────────────────┘
-              └──────────────────────────────────────┘
+              ┌─────────────────────────────────────────────────────────────────────┐
+              │ run_data_pump  (the calling / select! task)                         │
+              │                                                                     │
+              │ spawns DELIVERY task:                                               │
+              │   deliver_rx.recv()                                                 │
+              │     → undelivered_bytes -= n                                        │
+              │     → record_app_consumed → stage WINDOW_UPDATE credit              │
+              │   → recv_tx.send().await        (app-paced; the backpressure point) │
+              │                                                                     │
+              │ spawns READER task  (never blocks on the app consumer):             │
+              │   transport.recv_bytes() → PhantomPacket::from_wire                 │
+              │     → AEAD decrypt + per-stream replay check                        │
+              │     → inline ACK for RELIABLE (unencrypted; no rekey dep)           │
+              │     → deliver_tx.send()   [unbounded queue, never blocks]           │
+              │     → route_close on FIN                                            │
+              │                                                                     │
+              │ loop select! { poll_interval.tick() | send_notify.notified()        │
+              │                | cmd_rx.recv() | recv_done_rx => break }            │
+              └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**Task topology per session: 2 spawned tasks.**
+**Task topology per session: 3 spawned tasks.**
 
-- The outer task (`run_data_pump`) drives the send path and the
-  application command channel.
-- The inner task (`recv_handle`) drives the receive path.
+- The main task (`run_data_pump`) drives the send path and application command channel via the `select!` loop.
+- The delivery task handles the app-paced `recv_tx.send()` and flow-control window crediting from the unbounded `deliver_rx` queue.
+- The reader task drives the receive path: decrypt, emit inline ACKs, and hand off data to `deliver_tx` without blocking.
 
 They communicate through `mpsc` channels (one for commands client→pump,
 one for decrypted payloads pump→app) and through `Arc<...>` shared
@@ -211,7 +211,8 @@ state.
 - `AtomicU8` / `AtomicU32` / `AtomicU64` — for lock-free flags and
   counters.
 - `dashmap::DashMap` — for the per-stream map (lock-free concurrent map).
-- `tokio::sync::mpsc` — async channels (cmd, recv).
+- `tokio::sync::mpsc` (bounded) — async channels for commands (cmd_rx/cmd_tx) and bounded app recv (recv_tx/recv_rx).
+- `tokio::sync::mpsc::unbounded_channel` — for receive-delivery decoupling (`deliver_tx`/`deliver_rx`), allowing the reader to hand off data without blocking on app consumption.
 
 **Lock-free fast path.** Phase 2.7 dropped the `RwLock` around
 `CryptoState`, so encrypt/decrypt now reads through a plain `&CryptoState`
@@ -276,7 +277,7 @@ lib target; test/bench scaffolding is exempt).
 
 | Module | Why it's hot | What we did |
 | --- | --- | --- |
-| `api/session.rs::run_data_pump` (recv) | Every inbound packet | Bytes-based channel (Phase 2.2); ACK buffer hoisted out of loop (Phase 2.3) |
+| `api/session.rs::run_data_pump` (recv) | Every inbound packet | Unbounded delivery queue decoupling (Phase 2.2, prevent reader blocking on slow consumers); inline ACK emission in reader (Phase 2.3); ACK buffer hoisted (Phase 2.3); per-stream WINDOW_UPDATE sequence (Phase 4.3); inline FIN sequence (Phase 4.3) |
 | `api/session.rs::send_app_data` | Every outbound packet | `Vec::with_capacity(payload + 64)` to avoid realloc (Phase 2.3) |
 | `transport/session.rs::encrypt/decrypt_packet` | Per packet | Lock-free `&CryptoState` (Phase 2.7) |
 | `transport/udp_transport.rs` | UDP fast paths | GSO / `sendmmsg` on Linux (pre-existing) |

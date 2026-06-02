@@ -21,7 +21,7 @@ first-class generators for Kotlin, Swift, Python, and Ruby; pure-C is
 |---|---|
 | `cbindgen` (Rust→C header generator that walks the AST) | Produces ~70 lines of constants — `WINDOW_BITS`, `AEAD_OVERHEAD`, `EARLY_DATA_MAX_LEN`, etc. It cannot see through `setup_scaffolding!()`'s proc-macro expansion, so it emits **zero function declarations**. We extracted the constants and re-include them in `phantom_core.h`. |
 | `uniffi-bindgen-cs` / `uniffi-bindgen-c` | The C# generator targets a different ABI (P/Invoke marshalling); no actively-maintained pure-C UniFFI generator exists for 0.29. |
-| Hand-curate from the dylib's exported symbol table | The chosen approach. `nm -gU` on `libphantom_core.dylib` lists all 123 `extern "C"` symbols UniFFI emits. We catalogue each one with its calling-convention contract. |
+| Hand-curate from the dylib's exported symbol table | The chosen approach. `nm -gU` on `libphantom_core.dylib` lists all 129 `extern "C"` symbols UniFFI emits. We catalogue each one with its calling-convention contract. |
 
 The header is therefore generated from the dylib + the published UniFFI
 0.29 calling convention; see `../generate_c.sh` for the procedure.
@@ -135,14 +135,14 @@ limits — please read before committing to a C-side integration:
    injection, and `CoreError` variant introspection are not on the
    FFI surface.
 3. **Stale on UniFFI bump.** Contract version 29 is current as of
-   phantom_core 0.2.0. If you upgrade UniFFI, re-run
+   phantom_core 0.3.0. If you upgrade UniFFI, re-run
    `tests/bindings/generate_c.sh` and reconcile changes.
 4. **Integer-typed futures.** Only the `_pointer`, `_rust_buffer`,
    `_void`, and `_u8` variants of the future-poll family are declared
    in the header. The rest (`u16`/`i16`/`u32`/`i32`/`u64`/`i64`/`f32`/`f64`)
    are present in the dylib and follow the identical pattern — re-declare
    on demand.
-5. **Checksums.** All 30 `uniffi_phantom_core_checksum_*` symbols are
+5. **Checksums.** All 32 `uniffi_phantom_core_checksum_*` symbols are
    exported but not declared. Higher-level bindings call them at load
    time; for C callers they are optional. Signature is
    `uint16_t uniffi_phantom_core_checksum_<name>(void);`.

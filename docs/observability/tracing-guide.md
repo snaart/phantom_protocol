@@ -38,7 +38,7 @@ ratio-based dropping for failure traces.
 | `phantom.listener.bind` | `api::listener` | `addr` | Listener construction |
 | `phantom.listener.accept` | `api::listener` | — | Per accepted connection |
 | `phantom.listener.shutdown` | `api::listener` | — | Graceful shutdown |
-| `phantom.handshake.process_client_hello` | `transport::handshake` | `client_ip`, `difficulty`, `has_cookie`, `has_pow`, `resume`, `has_early_data` | Server-side handshake (incl. 0-RTT early-data) |
+| `phantom.handshake.process_client_hello` | `transport::handshake` | `difficulty`, `has_cookie`, `has_pow`, `resume`, `has_early_data` | Server-side handshake (incl. 0-RTT early-data) |
 | `phantom.handshake.process_server_hello` | `transport::handshake` | `pinned` | Client-side handshake |
 | `phantom.session.rekey` | `transport::session` | — | Per-direction traffic-key rotation |
 | `phantom.path.begin_validation` | `transport::session` | `path_id` | PATH_VALIDATION challenge issued |

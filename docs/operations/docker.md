@@ -40,10 +40,10 @@ ENTRYPOINT ["/usr/local/bin/phantom-server"]
 ## Build and run
 
 ```sh
-docker build -t phantom-server:0.2.0 .
+docker build -t phantom-server:0.3.0 .
 docker run --rm -p 4242:4242 \
     -e RUST_LOG=info,phantom_core=debug \
-    --name phantom phantom-server:0.2.0
+    --name phantom phantom-server:0.3.0
 ```
 
 For aarch64 hosts, prefix `--platform linux/arm64` and use `rust:1.79-slim`
@@ -69,12 +69,12 @@ on the corresponding architecture.
 - **Memory limits.** Each session keeps a small `BytesMut` accumulator
   (typically <16 KiB) plus per-stream buffers. Budget ~64 KiB per
   active session as a working estimate.
-- **Health check.** Expose a `/health` endpoint in your wrapper binary
-  and wire it to Docker's `HEALTHCHECK`:
+- **Health check.** Phantom Core opens no HTTP server, so there is no `/health` endpoint. Instead, implement a TCP connectivity check against the listen port (default 4242). Docker's `HEALTHCHECK` can use a custom script or nc:
   ```dockerfile
   HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
-      CMD curl -fs http://localhost:8080/health || exit 1
+      CMD nc -z localhost 4242 || exit 1
   ```
+  The bind succeeds only after the power-on self-test passes, making an open socket on 4242 a genuine readiness signal.
 
 ## Image size
 
@@ -106,7 +106,7 @@ Then point Docker at the JSON driver in `docker-compose.yml`:
 ```yaml
 services:
   phantom:
-    image: phantom-server:0.2.0
+    image: phantom-server:0.3.0
     logging:
       driver: json-file
       options:
@@ -148,7 +148,7 @@ In `docker-compose.yml`, point the server at a Collector sidecar:
 ```yaml
 services:
   phantom:
-    image: phantom-server:0.2.0
+    image: phantom-server:0.3.0
     environment:
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
       OTEL_SERVICE_NAME: "phantom-server"

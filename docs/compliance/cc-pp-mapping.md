@@ -204,7 +204,7 @@ the session from the wire:
 | SFR | Title | Implementation | Status | Notes / Evidence |
 |-----|-------|---------------|--------|-----------------|
 | FCS_TLSC_EXT.1 | TLS Client | Phantom does not implement TLS. It implements its own post-quantum session protocol. | N/A | The Phantom protocol is the trusted channel (see `FTP_DIT.1` below). Evaluators should treat §3 of `docs/protocol/PROTOCOL.md` as the protocol specification in lieu of a TLS profile claim. The `legs/faketls.rs` leg presents a TLS 1.3 ClientHello to deep-packet inspection but the *inner* session is Phantom, not TLS. |
-| FCS_HTTPS_EXT.1 | HTTPS for management | Phantom does not expose an HTTPS management interface. The WebSocket leg (`legs/websocket.rs`) carries the Phantom session; it is not an independent HTTPS service. | N/A | `docs/protocol/PROTOCOL.md §11` and `docs/operations/wasm.md` describe the WebSocket transport. Metrics exposition (`transport/metrics.rs:369` `to_prometheus_text()`) is a library function — the embedder mounts it on an HTTP server. The HTTP server is OE. |
+| FCS_HTTPS_EXT.1 | HTTPS for management | Phantom does not expose an HTTPS management interface. The WebSocket leg (`legs/websocket.rs`) carries the Phantom session; it is not an independent HTTPS service. | N/A | `docs/protocol/PROTOCOL.md §11` and `docs/operations/wasm.md` describe the WebSocket transport. Metrics exposition is now via the observability module (Phase 8); the library provides `MetricsSnapshot` and OTel instruments, and the embedder integrates with collectors. The HTTP server is OE. |
 | FCS_STO_EXT.1 | Key storage | `key-management.md §Storage at rest`: Phantom Core does not persist any key material. All key bytes exist only in process memory. Long-term server signing key (`HybridSigningKey`) is heap-resident; ephemeral KEM keys are dropped after handshake. | 🔄 | Platform key-store integration (iOS Keychain, Android Keystore) is OE responsibility. A future `SigningKeyBackend` trait is planned but not on the current roadmap. Evaluators must confirm the embedder's key-storage posture. |
 
 ---
@@ -225,7 +225,7 @@ the session from the wire:
 | FPT_SKP_EXT.1.1 | Protection of TSF data in transit | AEAD on every packet (FTP_ITC.1.1 above). No raw key bytes cross the `SessionTransport` interface after handshake. | ✅ | `api/session.rs:906-912` — encrypt path. `api/session.rs:1141` — decrypt path with flag check. |
 | FPT_SKP_EXT.1.2 | Protection of TSF data at rest | Key material is not persisted (see FCS_STO_EXT.1). Zeroize-on-drop on all in-memory secrets. | 🔄 | Partial — ring `LessSafeKey` interior is opaque, input bytes are zeroed but ring does not guarantee interior zeroization. Documented in `key-management.md §Storage classes table`. |
 | FPT_TST_EXT.1.1 | TSF self-test | CAVP-style known-answer tests are implemented for all approved primitives: `core/tests/cavp.rs`. Power-on self-tests (POST) are planned in Phase 5.5 at `core/src/crypto/self_tests.rs`. | 🔄 | KAT vectors present and always-on in CI. Formal POST invoked-at-startup mechanism not yet implemented. `self-tests.md` has the Phase 5.5 plan. |
-| FPT_AEX_EXT.1 | Anti-exploitation features | `#![deny(unsafe_code)]` at crate root (`core/src/lib.rs:38`). Single remaining `unsafe` opt-in: `transport/udp_transport.rs` (libc GSO / `recvmmsg`). MSRV 1.75 enforced in CI. Fuzz harnesses: `fuzz/` (five targets). | ✅ | Unsafe discipline enforced at `core/src/lib.rs:38` (`#![deny(unsafe_code)]`); contributor lint policy in `CONTRIBUTING.md`. |
+| FPT_AEX_EXT.1 | Anti-exploitation features | `#![deny(unsafe_code)]` at crate root (`core/src/lib.rs:64`). Single remaining `unsafe` opt-in: `transport/udp_transport.rs` (libc GSO / `recvmmsg`). MSRV 1.75 enforced in CI. Fuzz harnesses: `fuzz/` (five targets). | ✅ | Unsafe discipline enforced at `core/src/lib.rs:64` (`#![deny(unsafe_code)]`); contributor lint policy in `CONTRIBUTING.md`. |
 
 ---
 
@@ -317,7 +317,7 @@ the client's IP address protection. Phantom's position:
 | # | SFR | Gap | Resolution |
 |---|-----|-----|-----------|
 | G-7 | FCS_TLSC_EXT.1 | Phantom is not TLS. The VPN Client PP assumes TLS for channel protection. | Document as an explicit protocol deviation in the Security Target. Reference `docs/protocol/PROTOCOL.md` as the authoritative spec. The evaluator must accept FTP_ITC.1 satisfaction via the Phantom protocol in lieu of TLS. NIAP has accepted custom protocols for equivalent trusted-channel claims in prior evaluations. |
-| G-8 | FCS_HTTPS_EXT.1 | No HTTPS management plane. Metrics exposition (`transport/metrics.rs:369`) is a library function; the embedder provides the HTTP server. | ST must scope the metrics HTTP server as an OE responsibility. No code change. |
+| G-8 | FCS_HTTPS_EXT.1 | No HTTPS management plane. Metrics exposition is now via the observability module's OTel integration (Phase 8); the embedder provides the HTTP/OTLP infrastructure. No code change required to the library. |
 | G-9 | FIA_X509_EXT.1 | Phantom uses pinned hybrid public keys (`HybridVerifyingKey`), not X.509 PKI. | Not a code gap. Document the pinned-key model as the authentication mechanism in the ST (`transport/handshake.rs:866-930`). |
 | G-10 | FPR_ANO_EXT.1 | Transport IP header is not anonymised. Routing overlay is OE. | Document OE obligation in ST. No code change. |
 
