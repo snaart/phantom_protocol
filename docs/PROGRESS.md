@@ -9,7 +9,7 @@ phase table.
 
 | Metric | Value |
 | --- | --- |
-| Tests passing | **261 / 261** (220 unit + 20 negative-security + 5 proptest + 3 fuzz + 1 wire + 1 runtime-integration + 5 cavp; +2 tcp_integration `#[ignore]`) — `+5` unit from Phase 3.8 `crypto::rng` (RngProvider trait + OsRng + 5 KAT/object-safety tests) |
+| Tests passing | **261 / 261** (248 unit + 26 negative-security + 5 proptest + 3 fuzz + 1 wire + 1 runtime-integration + 5 cavp; +2 tcp_integration `#[ignore]`) — `+5` unit from Phase 3.8 `crypto::rng` (RngProvider trait + OsRng + 5 KAT/object-safety tests) |
 | **Phase 1 / Phase 2 closed** | ✅ all 14 + 13 sub-items either ✅ or ⏭️ with rationale |
 | Atomic commits since `e4067b6` baseline | **52+** |
 | `#[allow(unsafe_code)]` opt-ins outside the deny-by-default | **1** (was 2 — `crypto/keys.rs` deleted in Phase 5.1) |
@@ -179,7 +179,7 @@ items (2.1, 2.4, 2.5, 2.6) remain.
 | 6.7 | `cargo miri` CI job | ✅ | _this commit_ | `.github/workflows/miri.yml`; runs `cargo +nightly miri test` weekly + on each PR over the synchronous subset (replay_window, adaptive_crypto, transport::types) with strict-provenance + symbolic alignment checks |
 | 6.8 | Formal negative-security tests | ✅ | `8d69521` | `core/tests/security_invariants.rs` — 10 tests |
 | 6.9 | Coverage measurement (`cargo-llvm-cov`) | ✅ | _this commit_ | `.github/workflows/coverage.yml`; generates lcov.info with branch coverage; soft-uploads to Codecov when `CODECOV_TOKEN` secret present |
-| 6.10 | Formal verification (ProVerif / Tamarin) | ⏭️ | — | **Optional / audit-driven.** Requires specialized symbolic-analysis tooling (ProVerif or Tamarin Prover) plus an analyst comfortable in applied-pi calculus. Not a code task — a separate research engagement. Phantom Core's design (transcript-bound handshake, constant-time replay window, sigstore-backed builds, 20 negative-security tests, threat model in `docs/security/threat-model.md`) provides the input artifacts; the analysis is downstream. Will revisit if/when a specific audit demands it. |
+| 6.10 | Formal verification (ProVerif / Tamarin) | ⏭️ | — | **Optional / audit-driven.** Requires specialized symbolic-analysis tooling (ProVerif or Tamarin Prover) plus an analyst comfortable in applied-pi calculus. Not a code task — a separate research engagement. Phantom Core's design (transcript-bound handshake, constant-time replay window, sigstore-backed builds, 26 negative-security tests, threat model in `docs/security/threat-model.md`) provides the input artifacts; the analysis is downstream. Will revisit if/when a specific audit demands it. |
 | 6.11 | Inline `SAFETY` / `PANIC-SAFETY` comments | ✅ | _this commit_ | All 6 remaining production panic sites annotated in-line (`stream.rs` semaphore + recv_buf, `fragmentation.rs` x2, `legs/faketls.rs` x2) with `// PANIC-SAFETY:` comments + narrow `#[allow(...)]` annotations. New `docs/security/panic-sites.md` enumerates each site with its invariant and an adversarial review checklist. |
 
 **Phase 6 verdict:** **all code-side items closed.** ✅ 6.1, 6.2, 6.3, 6.4, 6.5, 6.7, 6.8, 6.9, 6.11. ⏭️ 6.6 (loom — current concurrency surface doesn't warrant permutation testing; will revisit if a non-trivial bespoke lock-free algorithm lands), 6.10 (formal verification — specialized research engagement, audit-driven).
