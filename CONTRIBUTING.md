@@ -80,8 +80,8 @@ The documented security invariants in [`SECURITY.md`](SECURITY.md) and
 
 ## Commit messages
 
-Use imperative mood. Reference the relevant phase or task from
-`docs/PRODUCTION_READINESS.md` when applicable.
+Use imperative mood. Keep the subject line concise and explain the *why* in
+the body; note any user-visible change in `CHANGELOG.md`.
 
 ## License
 
