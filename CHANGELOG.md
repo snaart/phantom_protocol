@@ -22,6 +22,25 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   layouts and the frozen wire vectors are unchanged. See
   `docs/protocol/PROTOCOL.md` §6.10.
 
+- **Automatic mid-session rekey.** A long-lived session now rotates its AEAD
+  keys automatically once a direction's invocation count crosses a soft
+  high-watermark (well below the `2^48` `NonceExhausted` ceiling), instead of
+  eventually erroring. The sender flags the rekey and the receiver follows by
+  trial-decrypting the new epoch and committing the ratchet only on AEAD
+  success — a forged epoch bump cannot desync the session, and every epoch
+  transition is serialised so the concurrent send/receive pump tasks keep the
+  installed key and the epoch counter in lockstep. See PROTOCOL.md §5.
+
+### Fixed
+
+- **Congestion-window inflight leak.** The send path credited the full on-wire
+  packet size to the in-flight byte counter while the ACK/loss paths only
+  debited the payload length, leaking ~69 bytes (header + length prefixes +
+  AEAD tag) of phantom in-flight per packet. On a long-lived session this
+  silently exhausted the BBR congestion window after a few dozen packets and
+  stalled all further sends. Send accounting now uses the payload length, so
+  inflight balances exactly against the ACK and loss paths.
+
 ## [0.3.0] - 2026-06-01
 
 This release takes phantom_core from its 0.2.0 pre-1.0 baseline through the
