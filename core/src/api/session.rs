@@ -526,6 +526,14 @@ impl PhantomSession {
             return;
         }
 
+        // Retain a copy of any 0-RTT early-data so it can be losslessly
+        // re-sent over the established session if the server rejects it (C3 —
+        // the rejection-retransmission contract). `run_client_handshake`
+        // consumes `resumption_request`, so clone the blob first.
+        let pending_early_data: Option<Vec<u8>> = resumption_request
+            .as_ref()
+            .and_then(|(_, _, ed)| (!ed.is_empty()).then(|| ed.clone()));
+
         // ── Stage 1 & 2: Hybrid Handshake (optionally 0-RTT resumption) ──
         let (crypto_session, ed_accepted) = match run_client_handshake(
             &transport,
@@ -552,6 +560,23 @@ impl PhantomSession {
             *guard = Some(crypto_session.clone());
         }
         *early_data_accepted.lock().await = ed_accepted;
+
+        // C3 — 0-RTT rejection retransmission contract. If we sent early-data
+        // and the server rejected it (`Some(false)`), it never reached the
+        // application layer, so re-send it losslessly over the now-established
+        // 1-RTT session. Prepend it to the pre-handshake send queue (drained
+        // first by the pump onto the reliable raw-app stream) so it lands
+        // *ahead* of anything the app queued while connecting — preserving the
+        // order in which the bytes were originally offered. `Some(true)` (the
+        // server consumed it) and `None` (none sent) need no action.
+        if ed_accepted == Some(false) {
+            if let Some(ed) = pending_early_data {
+                send_queue.lock().await.insert(0, ed);
+                log::debug!(
+                    "PhantomSession: 0-RTT early-data rejected; re-queued for 1-RTT delivery"
+                );
+            }
+        }
 
         let session_id = *crypto_session.id();
         state.store(ConnectionState::Connected as u8, Ordering::Relaxed);

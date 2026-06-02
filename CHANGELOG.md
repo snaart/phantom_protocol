@@ -22,6 +22,14 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   layouts and the frozen wire vectors are unchanged. See
   `docs/protocol/PROTOCOL.md` §6.10.
 
+- **0-RTT rejection is now lossless.** When the server rejects a client's 0-RTT
+  early-data (unknown/expired/replayed ticket, oversized blob, or AEAD failure),
+  the client re-sends that data over the established 1-RTT session instead of
+  dropping it — prepended ahead of anything queued while connecting, preserving
+  order. `early_data_accepted()` still reports the verdict. Forward secrecy is
+  preserved (the re-send rides the fresh session keys). Closes the 0-RTT
+  rejection-retransmission contract.
+
 - **Automatic mid-session rekey.** A long-lived session now rotates its AEAD
   keys automatically once a direction's invocation count crosses a soft
   high-watermark (well below the `2^48` `NonceExhausted` ceiling), instead of
