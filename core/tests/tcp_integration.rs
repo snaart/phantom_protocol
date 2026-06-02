@@ -375,3 +375,239 @@ async fn tcp_zero_rtt_rejection_retransmits_early_data_over_1rtt() {
 
     server_handle.await.expect("server task");
 }
+
+/// Bidirectional bulk transfer with both peers draining: exercises ENFORCED
+/// flow control in BOTH directions at once. Each side crosses the half-window
+/// threshold many times (emitting WINDOW_UPDATE control frames) WHILE also
+/// sending its own application data on the same stream/direction. The whole
+/// transfer must complete (no flow-control deadlock) and arrive byte-exact (no
+/// loss, no reordering). This is the headline correctness test for the
+/// receive-backpressure decoupling: a slow or busy peer must never wedge the
+/// session, and the flow-control control frames must not collide with data on
+/// the AEAD nonce / replay-window sequence space.
+#[tokio::test]
+#[ignore]
+async fn tcp_bidirectional_bulk_transfer_completes_byte_exact() {
+    use std::sync::Arc;
+
+    const TOTAL: usize = 512 * 1024; // many 64 KiB windows in each direction
+    const CHUNK: usize = 8 * 1024;
+
+    // Distinct, position-dependent payloads so the assertion catches loss,
+    // truncation, duplication, and reordering — not just length.
+    fn payload(seed: u64, n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| ((i as u64).wrapping_mul(31).wrapping_add(seed) % 251) as u8)
+            .collect()
+    }
+    let to_server = payload(7, TOTAL);
+    let to_client = payload(200, TOTAL);
+
+    let listener = PhantomListener::bind("127.0.0.1:0".to_string())
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr();
+    let key =
+        HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).expect("deserialize key");
+
+    let to_client_srv = to_client.clone();
+    let to_server_expected = to_server.clone();
+    let server_handle = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        let s_send = session.clone();
+        let sender = tokio::spawn(async move {
+            for chunk in to_client_srv.chunks(CHUNK) {
+                s_send.send(chunk.to_vec()).await.expect("server send");
+            }
+        });
+        let mut got = Vec::with_capacity(TOTAL);
+        while got.len() < TOTAL {
+            let part = timeout(Duration::from_secs(30), session.recv())
+                .await
+                .expect("server recv timed out — flow-control deadlock?")
+                .expect("server recv");
+            got.extend_from_slice(&part);
+        }
+        sender.await.expect("server sender task");
+        assert_eq!(got.len(), TOTAL, "server received exactly TOTAL bytes");
+        assert!(
+            got == to_server_expected,
+            "server byte stream must match exactly (no loss/reorder)"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let tcp = TcpStream::connect(&addr).await.expect("tcp connect");
+    let transport = TcpSessionTransport::new(tcp);
+    let client = Arc::new(PhantomSession::connect_with_transport(
+        &addr, transport, key,
+    ));
+
+    let c_send = client.clone();
+    let to_server_cl = to_server.clone();
+    let sender = tokio::spawn(async move {
+        for chunk in to_server_cl.chunks(CHUNK) {
+            c_send.send(chunk.to_vec()).await.expect("client send");
+        }
+    });
+    let mut got = Vec::with_capacity(TOTAL);
+    while got.len() < TOTAL {
+        let part = timeout(Duration::from_secs(30), client.recv())
+            .await
+            .expect("client recv timed out — flow-control deadlock?")
+            .expect("client recv");
+        got.extend_from_slice(&part);
+    }
+    sender.await.expect("client sender task");
+    assert_eq!(got.len(), TOTAL, "client received exactly TOTAL bytes");
+    assert!(
+        got == to_client,
+        "client byte stream must match exactly (no loss/reorder)"
+    );
+
+    server_handle.await.expect("server task");
+}
+
+/// Head-of-line isolation: a peer that stops draining its `recv()` must NOT
+/// stall the OTHER direction. Here the server NEVER reads what the client sends
+/// (so its receive backlog fills), yet the server keeps pushing its own large
+/// stream to the client — and the client must receive ALL of it promptly,
+/// because the server's reader keeps processing the client's ACKs even while
+/// its own application delivery is parked. On the pre-decoupling code the
+/// server reader head-of-line-stalls on the undrained delivery and the
+/// server→client transfer wedges, timing this test out.
+#[tokio::test]
+#[ignore]
+async fn tcp_blocked_consumer_does_not_stall_the_other_direction() {
+    use std::sync::Arc;
+
+    const SERVER_TO_CLIENT: usize = 512 * 1024; // spans many congestion-window rounds
+    const CLIENT_FLOOD: usize = 1024 * 1024; // enough to fill the server backlog on old code
+    const CHUNK: usize = 8 * 1024;
+
+    fn payload(seed: u64, n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| ((i as u64).wrapping_mul(31).wrapping_add(seed) % 251) as u8)
+            .collect()
+    }
+    let s2c = payload(11, SERVER_TO_CLIENT);
+    let s2c_expected = s2c.clone();
+
+    let listener = PhantomListener::bind("127.0.0.1:0".to_string())
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr();
+    let key =
+        HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).expect("deserialize key");
+
+    let server_handle = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        // Push the whole server→client stream, then hold the session open.
+        // We deliberately NEVER call session.recv(): the client's inbound data
+        // piles up in our receive-delivery backlog.
+        for chunk in s2c.chunks(CHUNK) {
+            session.send(chunk.to_vec()).await.expect("server send");
+        }
+        // Stay alive until the client has drained everything (and a bit more so
+        // the reverse flood keeps the reader busy throughout).
+        tokio::time::sleep(Duration::from_secs(8)).await;
+    });
+
+    let tcp = TcpStream::connect(&addr).await.expect("tcp connect");
+    let transport = TcpSessionTransport::new(tcp);
+    let client = Arc::new(PhantomSession::connect_with_transport(
+        &addr, transport, key,
+    ));
+
+    // Reverse flood: keep the client→server direction busy. The server never
+    // drains, so enforced flow control will throttle us — that is expected; the
+    // point is that this backlog must not stall the server→client direction.
+    let c_send = client.clone();
+    let flood = tokio::spawn(async move {
+        let burst = payload(99, CLIENT_FLOOD);
+        for chunk in burst.chunks(CHUNK) {
+            // Once flow control closes the window the send will block; bail out
+            // after a bounded wait instead of hanging the task.
+            if tokio::time::timeout(Duration::from_secs(5), c_send.send(chunk.to_vec()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // The client must receive the ENTIRE server→client stream, byte-exact,
+    // within a bounded time — even though the reverse direction is backed up.
+    let mut got = Vec::with_capacity(SERVER_TO_CLIENT);
+    while got.len() < SERVER_TO_CLIENT {
+        let part = timeout(Duration::from_secs(20), client.recv())
+            .await
+            .expect("client recv timed out — head-of-line stall regression")
+            .expect("client recv");
+        got.extend_from_slice(&part);
+    }
+    assert_eq!(got.len(), SERVER_TO_CLIENT);
+    assert!(
+        got == s2c_expected,
+        "server→client stream must arrive byte-exact despite a blocked reverse consumer"
+    );
+
+    flood.abort();
+    let _ = flood.await;
+    let _ = server_handle.await;
+}
+
+/// Clean teardown on peer close: when the remote drops the connection, the
+/// local reader exits, the delivery task drains and stops, and `recv()` returns
+/// a transport error promptly instead of hanging — no panic, no wedged task.
+#[tokio::test]
+#[ignore]
+async fn tcp_peer_close_tears_down_session_cleanly() {
+    let listener = PhantomListener::bind("127.0.0.1:0".to_string())
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr();
+    let key =
+        HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).expect("deserialize key");
+
+    let server_handle = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        let msg = session.recv().await.expect("server recv");
+        assert_eq!(msg, b"hello");
+        session.send(b"ack".to_vec()).await.expect("server send");
+        // Let the ACK flush to the wire and reach the client BEFORE we close —
+        // otherwise the peer-close can race ahead of the reply and the client's
+        // first recv() would observe the closure instead of the "ack".
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Drop the session (and, at task end, the listener) → close the socket.
+        drop(session);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    });
+
+    let tcp = TcpStream::connect(&addr).await.expect("tcp connect");
+    let transport = TcpSessionTransport::new(tcp);
+    let client = PhantomSession::connect_with_transport(&addr, transport, key);
+
+    client.send(b"hello".to_vec()).await.expect("client send");
+    let reply = timeout(Duration::from_secs(5), client.recv())
+        .await
+        .expect("client recv timeout")
+        .expect("client recv");
+    assert_eq!(reply, b"ack");
+
+    // After the peer closes, the next recv() must return (an error/closure)
+    // promptly — it must not hang waiting on a dead transport.
+    let after = timeout(Duration::from_secs(5), client.recv())
+        .await
+        .expect("recv() must not hang after peer close");
+    assert!(
+        after.is_err(),
+        "recv() after peer close must surface a closed-session error, got: {after:?}"
+    );
+
+    // disconnect() is clean and idempotent even after the transport is gone.
+    client.disconnect().await.expect("clean disconnect");
+
+    server_handle.await.expect("server task");
+}

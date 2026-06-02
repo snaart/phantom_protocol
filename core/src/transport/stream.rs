@@ -19,6 +19,14 @@ const MAX_PENDING_PACKETS: usize = 1024;
 /// the peer. 64 KiB matches QUIC's stream initial-window default.
 pub const INITIAL_STREAM_WINDOW: u32 = 64 * 1024;
 
+/// Hard ceiling on the credit-based send window. `WINDOW_UPDATE` frames add
+/// *relative* credit; this caps the accumulated window so a peer that floods
+/// inflated credits cannot overflow the counter. A compliant peer never grants
+/// more than ~one [`INITIAL_STREAM_WINDOW`] of outstanding credit, so the cap is
+/// only a misbehaving-peer guard (the receiver's own delivery HARD_CAP is the
+/// real bound on buffering).
+pub const MAX_SEND_WINDOW: u32 = 8 * INITIAL_STREAM_WINDOW;
+
 /// Stream state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
@@ -208,6 +216,13 @@ pub struct Stream {
     /// emitted `WINDOW_UPDATE`. Used to decide when to send the
     /// next update (avoid flooding the wire with tiny updates).
     bytes_since_last_update: AtomicU32,
+    /// Pending **relative** flow-control credit to advertise in a
+    /// `WINDOW_UPDATE`, staged by the receive **delivery** task (which credits
+    /// the window on *real* app consumption) and flushed by the **send loop** —
+    /// the single writer that also owns rekey, so the encrypted control frame is
+    /// sealed under a consistent epoch. Credits accumulate additively, so
+    /// several grants between two flushes are never lost. `0` = nothing pending.
+    pending_window_update: AtomicU32,
     /// RFC 6298 retransmission-timeout estimator. A plain (sync) mutex: it is
     /// updated only from the serial ACK path and read by `poll_send`, and the
     /// guard is never held across an `.await`.
@@ -234,6 +249,7 @@ impl Stream {
             peer_send_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
             local_recv_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
             bytes_since_last_update: AtomicU32::new(0),
+            pending_window_update: AtomicU32::new(0),
             rto: std::sync::Mutex::new(RtoEstimator::new()),
         }
     }
@@ -316,20 +332,32 @@ impl Stream {
         }
     }
 
-    /// Process an inbound `WINDOW_UPDATE` from the peer. The payload
-    /// is the new ABSOLUTE window size (not a delta). We accept
-    /// monotonic increases only — a smaller value than the current
-    /// window is ignored (it would be a regression).
-    pub fn apply_peer_window_update(&self, new_window: u32) {
+    /// Process an inbound `WINDOW_UPDATE` from the peer. The payload is a
+    /// **relative credit** — the number of bytes the peer's application just
+    /// consumed and is therefore newly willing to receive. We *add* it to the
+    /// send window (saturating at [`MAX_SEND_WINDOW`] so a misbehaving peer's
+    /// inflated credit cannot overflow the counter).
+    ///
+    /// Relative credit (vs. an absolute window) is what makes flow control
+    /// correct for a session of any length: the sender's window is
+    /// `initial + Σ credit_granted − Σ bytes_sent` = `initial + consumed −
+    /// sent`, so the receiver's outstanding (unconsumed) bytes `sent − consumed`
+    /// are bounded by `initial`. An absolute u32 window could not express this
+    /// for sessions exceeding 4 GiB and over-committed the receiver's buffer.
+    pub fn apply_peer_window_update(&self, credit: u32) {
         let mut cur = self.peer_send_window.load(Ordering::Acquire);
-        while new_window > cur {
+        loop {
+            let next = cur.saturating_add(credit).min(MAX_SEND_WINDOW);
+            if next == cur {
+                return; // already at the cap; nothing to add
+            }
             match self.peer_send_window.compare_exchange_weak(
                 cur,
-                new_window,
+                next,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => return,
                 Err(actual) => cur = actual,
             }
         }
@@ -340,21 +368,62 @@ impl Stream {
         self.local_recv_window.load(Ordering::Acquire)
     }
 
-    /// Record that the application has consumed `n` bytes from this
-    /// stream's recv buffer. Returns `Some(new_window)` if a
-    /// `WINDOW_UPDATE` should be emitted (the unreported delta has
-    /// crossed half the initial window — a common heuristic that
-    /// trades update frequency vs. peer stalls).
+    /// Record that the application has actually consumed `n` bytes from this
+    /// stream (called by the receive *delivery* task on real drainage, not
+    /// on routing). Accumulates the consumed bytes and, once the unreported
+    /// total crosses half the initial window, returns `Some(credit)` — the
+    /// **relative credit** to advertise in a `WINDOW_UPDATE` (the peer *adds*
+    /// it to its send window). The half-window threshold trades update frequency
+    /// against peer stalls.
     pub fn record_app_consumed(&self, n: u32) -> Option<u32> {
-        // Replenish the local recv window.
-        self.local_recv_window.fetch_add(n, Ordering::AcqRel);
         let pending = self.bytes_since_last_update.fetch_add(n, Ordering::AcqRel) + n;
         let threshold = INITIAL_STREAM_WINDOW / 2;
         if pending >= threshold {
-            self.bytes_since_last_update.store(0, Ordering::Release);
-            Some(self.local_recv_window.load(Ordering::Acquire))
+            // Grant exactly the bytes we accumulated since the last update and
+            // reset the accumulator. Use a CAS-free `fetch_sub` of the granted
+            // amount rather than `store(0)` so a concurrent consume isn't lost.
+            self.bytes_since_last_update
+                .fetch_sub(pending, Ordering::AcqRel);
+            // Keep the (now informational) local_recv_window in step for stats.
+            self.local_recv_window.fetch_add(pending, Ordering::AcqRel);
+            Some(pending)
         } else {
             None
+        }
+    }
+
+    /// Stage relative flow-control credit to be flushed by the send loop.
+    /// Called by the receive delivery task after it credits real app
+    /// consumption. Credits **accumulate additively** (saturating at
+    /// `u32::MAX`) rather than overwriting, so several grants landing between
+    /// two send-loop flushes are summed instead of lost — the send loop is the
+    /// single emitter (epoch-safe), and it may run arbitrarily after a grant.
+    pub fn stage_window_update_credit(&self, credit: u32) {
+        let mut cur = self.pending_window_update.load(Ordering::Acquire);
+        loop {
+            let next = cur.saturating_add(credit);
+            if next == cur {
+                return; // nothing to add (zero credit, or already saturated)
+            }
+            match self.pending_window_update.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Take all staged credit (swaps the slot back to `0`). The send loop calls
+    /// this each drain pass and emits one `WINDOW_UPDATE` carrying the summed
+    /// credit if `Some`.
+    pub fn take_pending_window_update(&self) -> Option<u32> {
+        match self.pending_window_update.swap(0, Ordering::AcqRel) {
+            0 => None,
+            w => Some(w),
         }
     }
 
@@ -387,6 +456,21 @@ impl Stream {
         self.send_buffer.lock().await.push_back(pending);
 
         seq
+    }
+
+    /// Reserve the next outbound sequence number from this stream's send space.
+    ///
+    /// Control frames that are emitted directly on a data stream (e.g.
+    /// `WINDOW_UPDATE`, a bare `FIN`) MUST draw their sequence from here rather
+    /// than a private counter: the AEAD nonce is `(epoch, stream_id, sequence,
+    /// path_id)` and the receiver's replay window is keyed on `(stream_id,
+    /// sequence)`, so a control frame sharing a `(stream_id, sequence)` with a
+    /// data packet in the same epoch would reuse a nonce **and** be dropped as a
+    /// replay. Sharing one monotonic space keeps every packet on the stream
+    /// unique. Control frames are unreliable, so the resulting gap in the data
+    /// sequence is harmless (no ACK is expected, nothing waits to reassemble it).
+    pub fn next_send_sequence(&self) -> SequenceNumber {
+        self.send_sequence.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Queue data for unreliable sending
@@ -442,12 +526,27 @@ impl Stream {
             }
         }
 
-        // Pass 2: the next unsent segment, if it fits the congestion window.
-        // In-order: if the head unsent segment doesn't fit, stop (don't skip).
+        // Pass 2: the next unsent segment, if it fits BOTH the congestion window
+        // AND the peer's advertised flow-control window. In-order: if the head
+        // unsent segment doesn't fit, stop (don't skip). Retransmissions (Pass 1)
+        // bypass both budgets — those bytes were already accounted on first send
+        // (Karn), and loss recovery must always proceed.
         for pending in buffer.iter_mut() {
             if pending.sent_at.is_none() {
-                if pending.data.len() as u64 > cwnd_budget {
-                    return None; // window full — wait for ACKs to free it
+                let len = pending.data.len() as u64;
+                if len > cwnd_budget {
+                    return None; // congestion window full — wait for ACKs to free it
+                }
+                // Flow-control enforcement: consume the peer's advertised
+                // receive window. If it is exhausted, withhold the segment and
+                // wait for a `WINDOW_UPDATE` — this is what propagates a slow
+                // peer-side consumer back to us as real backpressure (the
+                // receive delivery task only credits the window on actual app
+                // consumption). `try_consume_send_window` is an atomic CAS; on
+                // success the window is debited and we WILL send (no later check
+                // can fail), so the debit never leaks.
+                if !self.try_consume_send_window(len as u32) {
+                    return None; // peer flow-control window closed — wait for WINDOW_UPDATE
                 }
                 pending.sent_at = Some(now);
                 return Some(OutboundSegment {
@@ -842,23 +941,25 @@ mod tests {
     }
 
     #[test]
-    fn apply_peer_window_update_only_grows() {
+    fn apply_peer_window_update_adds_relative_credit() {
         let s = Stream::new(1);
         // Drain to 100 bytes.
         assert!(s.try_consume_send_window(INITIAL_STREAM_WINDOW - 100));
         assert_eq!(s.peer_send_window(), 100);
 
-        // Replenish to a larger value than the current.
-        s.apply_peer_window_update(INITIAL_STREAM_WINDOW);
-        assert_eq!(s.peer_send_window(), INITIAL_STREAM_WINDOW);
-
-        // A smaller value is ignored (window is monotonic).
+        // A WINDOW_UPDATE is a relative credit: it ADDS to the window.
+        s.apply_peer_window_update(1000);
+        assert_eq!(s.peer_send_window(), 1100);
         s.apply_peer_window_update(50);
-        assert_eq!(s.peer_send_window(), INITIAL_STREAM_WINDOW);
+        assert_eq!(s.peer_send_window(), 1150);
+
+        // Saturates at the hard cap (misbehaving-peer guard).
+        s.apply_peer_window_update(u32::MAX);
+        assert_eq!(s.peer_send_window(), MAX_SEND_WINDOW);
     }
 
     #[test]
-    fn record_app_consumed_emits_only_after_threshold() {
+    fn record_app_consumed_grants_relative_credit_after_threshold() {
         let s = Stream::new(1);
         let threshold = INITIAL_STREAM_WINDOW / 2;
 
@@ -866,15 +967,66 @@ mod tests {
         assert!(s.record_app_consumed(100).is_none());
         assert!(s.record_app_consumed(200).is_none());
 
-        // Drain across the half-window threshold → expect an update.
-        let pending = s.record_app_consumed(threshold);
-        assert!(pending.is_some(), "should emit WINDOW_UPDATE");
-        // The announced window equals the new local_recv_window
-        // (post-replenish).
-        assert_eq!(pending.unwrap(), INITIAL_STREAM_WINDOW + 300 + threshold,);
+        // Drain across the half-window threshold → emit a credit equal to the
+        // accumulated consumption (300 + threshold), NOT an absolute window.
+        let credit = s.record_app_consumed(threshold);
+        assert_eq!(
+            credit,
+            Some(300 + threshold),
+            "WINDOW_UPDATE carries the relative credit (bytes consumed since last update)"
+        );
 
-        // Counter resets after emitting — small further drains do not
-        // re-emit immediately.
+        // Counter resets after emitting — small further drains do not re-emit.
         assert!(s.record_app_consumed(10).is_none());
+    }
+
+    #[test]
+    fn relative_credit_round_trip_bounds_outstanding_to_one_window() {
+        // Model: receiver grants credit == consumed; sender's window =
+        // initial + Σcredit − Σsent, so outstanding (sent − consumed) ≤ initial.
+        let sender = Stream::new(1);
+        let receiver = Stream::new(1);
+        let threshold = INITIAL_STREAM_WINDOW / 2;
+
+        // Sender fills the initial window exactly.
+        assert!(sender.try_consume_send_window(INITIAL_STREAM_WINDOW));
+        assert_eq!(sender.peer_send_window(), 0, "initial window exhausted");
+
+        // Receiver consumes one threshold's worth → grants that much credit.
+        let credit = receiver
+            .record_app_consumed(threshold)
+            .expect("threshold crossed");
+        sender.apply_peer_window_update(credit);
+        assert_eq!(
+            sender.peer_send_window(),
+            threshold,
+            "sender may now send exactly the bytes the receiver consumed"
+        );
+    }
+
+    #[test]
+    fn staged_window_update_credit_accumulates_until_taken() {
+        let s = Stream::new(1);
+        assert_eq!(s.take_pending_window_update(), None);
+
+        // Two grants staged before a single flush must SUM, not overwrite: the
+        // send loop (sole emitter) may run arbitrarily late after a credit is
+        // staged, so back-to-back grants would otherwise lose all but the last
+        // — a permanent credit leak that shrinks the peer's window over time.
+        s.stage_window_update_credit(1000);
+        s.stage_window_update_credit(2500);
+        assert_eq!(s.take_pending_window_update(), Some(3500));
+
+        // The slot resets to empty once taken.
+        assert_eq!(s.take_pending_window_update(), None);
+
+        // Accumulation saturates instead of wrapping past u32::MAX.
+        s.stage_window_update_credit(u32::MAX);
+        s.stage_window_update_credit(10);
+        assert_eq!(s.take_pending_window_update(), Some(u32::MAX));
+
+        // Zero credit is a no-op (no spurious WINDOW_UPDATE).
+        s.stage_window_update_credit(0);
+        assert_eq!(s.take_pending_window_update(), None);
     }
 }

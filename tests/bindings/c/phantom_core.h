@@ -355,6 +355,11 @@ PhantomRustBuffer uniffi_phantom_core_fn_method_phantomsession_connection_state(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
+/* current_epoch() -> async Option<u8>. Some(epoch) once established;
+ * advances when automatic mid-session rekey bumps the epoch. */
+uint64_t uniffi_phantom_core_fn_method_phantomsession_current_epoch(
+    void                    *ptr);
+
 /* early_data_accepted() -> Option<bool>. None for non-V3 handshakes. */
 PhantomRustBuffer uniffi_phantom_core_fn_method_phantomsession_early_data_accepted(
     void                    *ptr,
@@ -407,6 +412,13 @@ uint64_t uniffi_phantom_core_fn_method_phantomsession_resumption_hint(
 uint64_t uniffi_phantom_core_fn_method_phantomsession_send(
     void                    *ptr,
     PhantomRustBuffer        data);
+
+/* set_rekey_threshold(threshold: u64) -> async bool. Lowers the
+ * per-direction AEAD-invocation count that triggers automatic rekey;
+ * returns false if the session is not yet established. */
+uint64_t uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold(
+    void                    *ptr,
+    uint64_t                 threshold);
 
 /* --------------------------- PhantomStream -------------------------- */
 

@@ -130,6 +130,33 @@ impl StreamDemultiplexer {
         }
     }
 
+    /// Route an ACK signal to a stream **without blocking**. Returns
+    /// `false` if the stream is unknown or its buffer is full — the recv pump
+    /// uses this on its never-block path, where a vestigial/absent stream
+    /// consumer must not stall inbound ACK/control processing.
+    pub fn route_ack(&self, stream_id: u32, seq: SequenceNumber) -> bool {
+        if stream_id == 0 {
+            return false;
+        }
+        if let Some(sender) = self.streams.get(&stream_id) {
+            sender.try_send(StreamMessage::Ack(seq)).is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// Route a stream-closure signal **without blocking** (see [`Self::route_ack`]).
+    pub fn route_close(&self, stream_id: u32) -> bool {
+        if stream_id == 0 {
+            return false;
+        }
+        if let Some(sender) = self.streams.get(&stream_id) {
+            sender.try_send(StreamMessage::Close).is_ok()
+        } else {
+            false
+        }
+    }
+
     /// Route an ACK signal to a stream asynchronously.
     pub async fn route_ack_async(&self, stream_id: u32, seq: SequenceNumber) -> bool {
         if stream_id == 0 {
