@@ -18,8 +18,8 @@ small and reviewed.
 
 | # | File | Line range | Call | Invariant |
 | --- | --- | --- | --- | --- |
-| 1 | `core/src/transport/stream.rs` | 204-216 | `send_semaphore.acquire().await.expect("Semaphore closed")` | `Semaphore::acquire` only errors after `close()`. `send_semaphore` is private to `Stream`, constructed once in `new()`, and never closed anywhere in the crate. Structurally unreachable. |
-| 2 | `core/src/transport/stream.rs` | 322-338 | `recv_buf.remove(pos).unwrap()` | `pos` is the value just returned by `recv_buf.iter().position(...)`, so the element exists. `recv_buf` is locked across the read+remove, so no other task can drain it in between. |
+| 1 | `core/src/transport/stream.rs` | 440-444 | `send_semaphore.acquire().await.expect("Semaphore closed")` | `Semaphore::acquire` only errors after `close()`. `send_semaphore` is private to `Stream`, constructed once in `new()`, and never closed anywhere in the crate. Structurally unreachable. |
+| 2 | `core/src/transport/stream.rs` | 640-646 | `recv_buf.remove(pos).unwrap()` | `pos` is the value just returned by `recv_buf.iter().position(...)`, so the element exists. `recv_buf` is locked across the read+remove, so no other task can drain it in between. |
 | 3 | `core/src/transport/fragmentation.rs` | 59-64 | `self.assemblies.remove(&key).unwrap()` | The `is_complete` branch above just inserted the entry under `key` via `entry(key).or_insert_with(...)`; the function holds `&mut self`, so nothing else can remove it before this line. |
 | 4 | `core/src/transport/fragmentation.rs` | 75-80 | `state.chunks.get(&i).unwrap()` | The preceding loop returned `None` early if any chunk `i` in `0..total_chunks` was missing. Reaching this loop proves every index is present. |
 | 5 | `core/src/transport/legs/faketls.rs` | 594-602 | `self.send_key.seal_in_place_append_tag(nonce, aad, &mut in_out).unwrap()` | ring's `seal_in_place_append_tag` only fails when input length + tag exceeds AES-GCM's NIST SP 800-38D invocation limit (~2^36 bytes). Phantom records are MTU-bounded (≤ 1300 + framing). Cannot occur in practice. |

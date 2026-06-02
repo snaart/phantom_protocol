@@ -14,7 +14,7 @@ Two pillars, OTel-native:
   `PHANTOM_TELEMETRY_NAMESPACE`). Hot-path packet / byte counters via
   lock-free atomics with `ObservableCounter` callbacks; security signals,
   cookie/PoW gate, rekey, fallback, early-data outcomes as labeled
-  `Counter`s; handshake / path-validation latency as exponential-base-2
+  `Counter`s; handshake / path-validation latency as explicit-boundary
   `Histogram`s with exemplar correlation to traces.
 
 - **Traces** — `phantom.*` spans on listener bind/accept, handshake
