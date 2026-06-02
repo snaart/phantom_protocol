@@ -185,3 +185,86 @@ async fn tcp_integration_zero_rtt_resumption_round_trip() {
 
     let _ = server_handle.await;
 }
+
+/// H6 + C1 soak: a long-lived session must rotate keys automatically (C1)
+/// rather than march toward the AEAD invocation ceiling. We lower both ends'
+/// rekey high-watermark to a handful of packets and run a synchronous
+/// request/response soak of many messages. Every echo must round-trip intact
+/// *across* the rekey boundaries (the receiver follows the authenticated epoch
+/// bump via `decrypt_packet_accepting_rekey`), and both epochs must have
+/// advanced well past 0 by the end — proof that live rekey fired end-to-end
+/// through the real data pump.
+///
+/// Synchronous (send-then-recv per message) over a single in-order TCP leg, so
+/// the receiver always sees `epoch == current` or `current + 1` — never a
+/// divergent jump.
+#[tokio::test]
+#[ignore]
+async fn tcp_soak_drives_automatic_rekey_end_to_end() {
+    const MESSAGES: usize = 300;
+    const REKEY_EVERY: u64 = 8;
+
+    let listener = PhantomListener::bind("127.0.0.1:0".to_string())
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr();
+    let server_key_bytes = listener.verifying_key_bytes();
+    let expected_key =
+        HybridVerifyingKey::from_bytes(&server_key_bytes).expect("deserialize verifying key");
+
+    // Server: accept, lower the rekey threshold, echo every message back.
+    let server_handle = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        assert!(
+            session.set_rekey_threshold(REKEY_EVERY).await,
+            "server session should be established at accept()"
+        );
+        for _ in 0..MESSAGES {
+            let msg = session.recv().await.expect("server recv");
+            session.send(msg).await.expect("server echo");
+        }
+        // The server echoes, so its own send counter crosses the threshold and
+        // it rekeys too.
+        let epoch = session.current_epoch().await.unwrap_or(0);
+        assert!(epoch > 0, "server epoch must advance via echo-driven rekey");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    // Client: connect, wait for establishment, lower the threshold.
+    let tcp = TcpStream::connect(&addr).await.expect("tcp connect");
+    let transport = TcpSessionTransport::new(tcp);
+    let client = PhantomSession::connect_with_transport(&addr, transport, expected_key);
+
+    let mut armed = false;
+    for _ in 0..100 {
+        if client.set_rekey_threshold(REKEY_EVERY).await {
+            armed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(armed, "client session never became established");
+
+    // Synchronous soak: each message must survive the rekeys it straddles.
+    for i in 0..MESSAGES {
+        let payload = format!("soak-message-{i:05}").into_bytes();
+        client.send(payload.clone()).await.expect("client send");
+        let reply = timeout(Duration::from_secs(5), client.recv())
+            .await
+            .unwrap_or_else(|_| panic!("client recv timed out on message {i}"))
+            .expect("client recv");
+        assert_eq!(
+            reply, payload,
+            "echo {i} must round-trip intact across rekeys"
+        );
+    }
+
+    let client_epoch = client.current_epoch().await.unwrap_or(0);
+    // MESSAGES / REKEY_EVERY ≈ 37 expected rotations; assert we advanced a lot.
+    assert!(
+        client_epoch > 5,
+        "client epoch must advance via automatic rekey across the soak (got {client_epoch})"
+    );
+
+    server_handle.await.expect("server task");
+}

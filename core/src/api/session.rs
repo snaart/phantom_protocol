@@ -1057,7 +1057,25 @@ async fn send_app_data<T: SessionTransport>(
     base_flags: u16,
 ) -> bool {
     // Always OR in ENCRYPTED for application data.
-    let flag_bits = base_flags | PacketFlags::ENCRYPTED;
+    let mut flag_bits = base_flags | PacketFlags::ENCRYPTED;
+    // Mid-session rekey (C1): if the send direction has crossed the AEAD
+    // high-watermark, rotate to a fresh key BEFORE stamping this header so it
+    // carries the new epoch + the REKEY flag. The peer follows on the
+    // authenticated epoch bump (it trial-decrypts under the next key). This
+    // keeps a long-lived session below the hard AEAD ceiling (Invariant 8)
+    // instead of failing with NonceExhausted.
+    if crypto_session.send_needs_rekey() {
+        match crypto_session.rekey() {
+            Ok(_) => flag_bits |= PacketFlags::REKEY,
+            Err(e) => {
+                // Epoch saturated (u8::MAX): can't rotate further. Surface as a
+                // failed send so the caller re-offers; the session is expected
+                // to reconnect rather than wrap.
+                log::error!("PhantomSession: mid-session rekey failed: {}", e);
+                return false;
+            }
+        }
+    }
     let header = PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
         .with_epoch(crypto_session.current_epoch());
     let ciphertext = match crypto_session.encrypt_packet(&header, payload) {
@@ -1070,12 +1088,21 @@ async fn send_app_data<T: SessionTransport>(
     let packet = PhantomPacket::new(header, ciphertext);
     let buf = packet.to_wire();
     let size = buf.len();
+    // Pacing is a wire-rate limiter, so it consumes the full on-wire size.
     pace_send(crypto_session, size as u64).await;
     if let Err(e) = transport.send_bytes(&buf[..size]).await {
         log::error!("PhantomSession: transport send failed: {}", e);
         return false;
     }
-    crypto_session.on_packet_sent(size as u64);
+    // Inflight/cwnd accounting MUST use the same unit the ACK and loss paths
+    // settle in. `Stream::ack` returns and `on_packet_lost` subtracts the
+    // segment's *payload* length (`seg.data.len()`), so the send side has to add
+    // the payload length too — adding the full wire size here leaked ~69 bytes
+    // (header + length prefixes + AEAD tag) of phantom inflight per packet,
+    // which silently exhausted the congestion window after a few dozen packets
+    // and stalled long-lived sessions. (Bandwidth/BDP derive from acked bytes,
+    // so they stay in the same payload unit.)
+    crypto_session.on_packet_sent(payload.len() as u64);
     true
 }
 
@@ -1196,7 +1223,11 @@ async fn handle_packet<T: SessionTransport>(
     // data — a non-empty unencrypted V2 application-data packet is a
     // downgrade indicator and is dropped (same posture as V1).
     let plaintext: Vec<u8> = if packet.header.flags.contains(PacketFlags::ENCRYPTED) {
-        match crypto_recv.decrypt_packet(&packet.header, &packet.payload) {
+        // Accept a single authenticated forward rekey step (C1): if this
+        // packet's epoch is one ahead, the peer rekeyed — trial-decrypt under
+        // the next key and only commit the ratchet on AEAD success, so a forged
+        // epoch can't desync us. Same-epoch packets take the ordinary path.
+        match crypto_recv.decrypt_packet_accepting_rekey(&packet.header, &packet.payload) {
             Ok(pt) => pt,
             Err(e) => {
                 // Distinguish the two drop reasons for the security metrics: a
@@ -1588,6 +1619,32 @@ impl PhantomSession {
                 session_id: session_id.to_vec(),
                 resumption_secret: resumption_secret.to_vec(),
             })
+    }
+
+    /// Current rekey epoch of the established session (`None` while still
+    /// connecting). Rust-only — used by soak / integration tests to confirm
+    /// that automatic mid-session rekey (C1) advanced the epoch.
+    pub async fn current_epoch(&self) -> Option<u8> {
+        self.inner_session
+            .lock()
+            .await
+            .as_ref()
+            .map(|s| s.current_epoch())
+    }
+
+    /// Override the automatic-rekey send-invocation high-watermark on the
+    /// established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
+    /// the session is still connecting. Rust-only — primarily for soak/load
+    /// harnesses that need to exercise mid-session rekey without sending `2^47`
+    /// packets.
+    pub async fn set_rekey_threshold(&self, n: u64) -> bool {
+        match self.inner_session.lock().await.as_ref() {
+            Some(s) => {
+                s.set_rekey_threshold(n);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Send the graceful close frame and shut the session down.
