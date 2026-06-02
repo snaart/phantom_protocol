@@ -39,7 +39,34 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   transition is serialised so the concurrent send/receive pump tasks keep the
   installed key and the epoch counter in lockstep. See PROTOCOL.md §5.
 
+- **Receive backpressure decoupled from control traffic; enforced flow
+  control.** The post-handshake receive path now splits the wire reader from
+  application delivery: the reader decrypts, replay-checks, ACKs inline, and
+  hands payloads to a dedicated delivery task over an unbounded queue, so a slow
+  or stalled `recv()` consumer can no longer head-of-line-stall inbound ACK /
+  `WINDOW_UPDATE` / control processing for the other direction. Flow control is
+  now actually enforced on the send side — new data is admitted only within
+  `min(congestion_window, peer_flow_control_window)` while retransmissions
+  bypass both (Karn) — and the window is replenished by **relative credit**
+  granted on real consumption (robust for sessions of any length, unlike an
+  absolute `u32` window). A delivery-backlog hard cap tears down a peer that
+  ignores flow control instead of buffering without bound.
+
 ### Fixed
+
+- **Flow-control control frames could collide with data on the AEAD nonce.**
+  `WINDOW_UPDATE` (and a bare `FIN`) drew their packet sequence from a separate
+  counter than application data on the same stream/direction. Because the AEAD
+  nonce is `(epoch, stream_id, sequence, path_id)`, a control frame sharing a
+  `(stream_id, sequence)` with a data packet in the same epoch reused a nonce
+  **and** was dropped by the receiver's replay window — which, once flow control
+  became enforced, deadlocked a sustained bidirectional bulk transfer. All
+  packets emitted on a stream now draw from one monotonic per-stream sequence
+  space (`Stream::next_send_sequence`), so `(stream_id, sequence)` is never
+  reused within an epoch. Relatedly, staged flow-control credit now accumulates
+  additively (so back-to-back grants between send-loop flushes are summed, not
+  overwritten) and the receive-backlog byte counter is accounted exactly as
+  items enter and leave the delivery queue.
 
 - **Congestion-window inflight leak.** The send path credited the full on-wire
   packet size to the in-flight byte counter while the ACK/loss paths only
