@@ -176,19 +176,55 @@ Loki / Elastic / CloudWatch:
 
 ## Monitoring
 
-If your wrapper binary exposes `metrics_prometheus_text()` over HTTP
-on a separate port (e.g. 9090), wire it into Prometheus via a static
-scrape config:
+Phantom Core emits OpenTelemetry metrics + traces and opens **no** inbound
+port — there is no `/metrics` endpoint to scrape. The reference
+`phantom-server` (built with the `telemetry-otel` feature) installs an
+OTLP/gRPC exporter and **pushes** metrics + traces to an OpenTelemetry
+Collector. Configure the push target via environment in the unit file
+(every flag has an env fallback):
+
+```ini
+# ── Telemetry (OTLP push) ──────────────────────────────────
+Environment="OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317"
+Environment="OTEL_SERVICE_NAME=phantom-server"
+Environment="OTEL_TRACES_SAMPLER_ARG=0.1"
+# For SaaS backends that need auth headers:
+# Environment="OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer <token>"
+```
+
+The equivalent CLI flags are `--otlp-endpoint` and `--otel-service-name`.
+
+The data flows:
+
+```
+phantom-server  ──OTLP/gRPC push──▶  OTel Collector  ──▶  backend
+```
+
+To land metrics in Prometheus, run a Collector with an `otlp` receiver
+and a `prometheus` exporter (or `remote_write`), and point Prometheus at
+the **Collector** — never at the phantom hosts:
 
 ```yaml
 scrape_configs:
-  - job_name: phantom
+  - job_name: otel-collector
     static_configs:
-      - targets: ['phantom-1.example.com:9090', 'phantom-2.example.com:9090']
+      - targets: ['otel-collector.example.com:8889']
 ```
 
-Use the Grafana dashboard template under
-`docs/operations/grafana/phantom-dashboard.json` for a starter view.
+Traces flow through the same Collector to Tempo / Jaeger; Datadog,
+Honeycomb, and Grafana Cloud can be targeted directly via their OTLP
+endpoints. After the OTel dot-to-underscore translation, the headline
+Prometheus series are `phantom_session_active` (UpDownCounter, label
+`leg`), `phantom_session_packets_total`, `phantom_session_io_bytes_total`,
+`phantom_security_aead_failed_total`, and the
+`phantom_handshake_duration_seconds` histogram.
+
+Use the dashboard, alert rules, and full metric catalog under
+`docs/observability/` for a starter view:
+
+- `docs/observability/metrics-catalog.md` — every instrument.
+- `docs/observability/grafana/phantom-otel-dashboard.json` — dashboard.
+- `docs/observability/prometheus/alerts.yml` — alert rules.
 
 ## See also
 
