@@ -114,45 +114,67 @@ services:
         max-file: "3"
 ```
 
-## Metrics endpoint
+## Telemetry (OpenTelemetry)
 
-`PhantomListener::metrics_prometheus_text()` (Phase 4.5) exposes a
-Prometheus-text-format snapshot. The SDK doesn't bundle an HTTP server;
-wire one in your binary (typically `hyper` + a one-line handler) and
-expose it on a separate port:
+Phantom Core emits OpenTelemetry metrics + traces (Phase 8). The library
+opens **no** inbound port — there is no `/metrics` endpoint to scrape. The
+reference server (`phantom-server`, built with the `telemetry-otel` Cargo
+feature) installs an OTLP/gRPC exporter and **pushes** metrics + traces to
+an OpenTelemetry Collector:
 
-```dockerfile
-EXPOSE 9090/tcp  # metrics
+```
+phantom-server  ──OTLP/gRPC push──▶  OTel Collector  ──▶  backend
 ```
 
-Sample bind block in your wrapper:
+The Collector fans the data out to your backends: Prometheus (via the
+Collector's `prometheusexporter` or `remote_write`), Tempo / Jaeger for
+traces, or a SaaS backend (Datadog / Honeycomb / Grafana Cloud) directly.
+To land metrics in Prometheus, run a Collector with an `otlp` receiver plus
+a `prometheus` exporter and have Prometheus scrape the **Collector** — never
+the Phantom containers.
 
-```rust
-let listener = phantom_core::api::PhantomListener::bind("0.0.0.0:4242".into()).await?;
-let listener_for_metrics = listener.clone();
-tokio::spawn(async move {
-    let make = hyper::service::make_service_fn(|_| {
-        let l = listener_for_metrics.clone();
-        async move {
-            Ok::<_, hyper::Error>(hyper::service::service_fn(move |_req| {
-                let body = l.metrics_prometheus_text();
-                async move {
-                    Ok::<_, hyper::Error>(
-                        hyper::Response::builder()
-                            .header("content-type", "text/plain; version=0.0.4")
-                            .body(hyper::Body::from(body))
-                            .unwrap(),
-                    )
-                }
-            }))
-        }
-    });
-    hyper::Server::bind(&"0.0.0.0:9090".parse().unwrap())
-        .serve(make)
-        .await
-        .unwrap();
-});
+Configure the exporter via flags (each has an env fallback, ideal for
+container env):
+
+| Flag | Env | Purpose |
+|------|-----|---------|
+| `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector address, e.g. `http://otel-collector:4317` |
+| `--otel-service-name` | `OTEL_SERVICE_NAME` | `service.name` resource attribute |
+| | `OTEL_TRACES_SAMPLER_ARG` | Head-sampling ratio |
+| | `OTEL_EXPORTER_OTLP_HEADERS` | Auth headers for SaaS backends |
+
+In `docker-compose.yml`, point the server at a Collector sidecar:
+
+```yaml
+services:
+  phantom:
+    image: phantom-server:0.2.0
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_SERVICE_NAME: "phantom-server"
+      OTEL_TRACES_SAMPLER_ARG: "0.1"
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    # otlp receiver (4317) + prometheus exporter; Prometheus scrapes THIS service
 ```
+
+After OTel's dot→underscore name translation, the key Prometheus series are:
+
+| Metric | Prometheus name |
+|--------|-----------------|
+| Active sessions | `phantom_session_active` (UpDownCounter, label `leg`) |
+| Packets | `phantom_session_packets_total` |
+| Bytes | `phantom_session_io_bytes_total` |
+| AEAD failures | `phantom_security_aead_failed_total` |
+| Handshake latency | `phantom_handshake_duration_seconds` (histogram) |
+
+The full instrument catalog, the reference Grafana dashboard, and alert rules
+live under `docs/observability/`:
+
+- `docs/observability/metrics-catalog.md`
+- `docs/observability/grafana/phantom-otel-dashboard.json`
+- `docs/observability/prometheus/alerts.yml`
 
 ## Graceful shutdown
 

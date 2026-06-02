@@ -38,7 +38,6 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - {name: phantom, containerPort: 4242, protocol: TCP}
-            - {name: metrics,  containerPort: 9090, protocol: TCP}
           livenessProbe:
             tcpSocket: {port: phantom}
             initialDelaySeconds: 5
@@ -58,6 +57,10 @@ spec:
             capabilities: {drop: ["ALL"]}
           env:
             - {name: RUST_LOG, value: "info,phantom_core=info"}
+            # phantom-server pushes OTLP/gRPC to an OpenTelemetry Collector; it opens no metrics port.
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.monitoring.svc:4317"}
+            - {name: OTEL_SERVICE_NAME,           value: "phantom-core"}
+            - {name: OTEL_TRACES_SAMPLER_ARG,     value: "0.1"}   # head-sampling ratio
           volumeMounts:
             - {name: signing-key, mountPath: /etc/phantom/keys, readOnly: true}
             - {name: tmp,         mountPath: /tmp}
@@ -78,7 +81,6 @@ spec:
     app: phantom-core
   ports:
     - {name: phantom, port: 4242, targetPort: phantom, protocol: TCP}
-    - {name: metrics,  port: 9090, targetPort: metrics,  protocol: TCP}
 ```
 
 ## Health checks
@@ -89,9 +91,10 @@ spec:
 **Readiness probe.** Also `tcpSocket` on `4242`. Pod is removed from Service endpoints until the
 probe passes, preventing traffic from reaching a pod still starting or actively draining.
 
-**Metrics probe.** If your wrapper exposes `metrics_prometheus_text()` over HTTP on `9090`
-(in-process `hyper` — see `docker.md`), you may add a secondary `httpGet` readiness probe there.
-The `tcpSocket` probe on `4242` is sufficient for baseline liveness.
+**Telemetry note.** `phantom-server` exposes no HTTP/metrics port — it pushes OpenTelemetry
+metrics and traces to a Collector over OTLP/gRPC (see "Monitoring and logging" below). The
+`tcpSocket` probe on `4242` is sufficient for baseline liveness; there is no metrics endpoint to
+probe.
 
 ## Resource requests and limits
 
@@ -141,7 +144,9 @@ connections while Kubernetes routes new traffic to surviving pods.
 
 ## HorizontalPodAutoscaler
 
-Scale on `phantom_active_sessions` (direct) or `phantom_handshake_latency_seconds_bucket{le="0.5"}` as a leading indicator.
+Scale on `phantom_session_active` (direct) or `phantom_handshake_duration_seconds_bucket{le="0.5"}`
+as a leading indicator. These metrics reach Prometheus through the OTLP-push chain
+(phantom-server → Collector → Prometheus), not a pod-local scrape — see "Monitoring and logging".
 
 ```yaml
 apiVersion: keda.sh/v1alpha1
@@ -156,12 +161,14 @@ spec:
     - type: prometheus
       metadata:
         serverAddress: http://prometheus.monitoring.svc:9090
-        metricName: phantom_active_sessions
+        metricName: phantom_session_active
         threshold: "800"   # scale before hitting ~1000-session-per-pod budget
-        query: sum(phantom_active_sessions)
+        query: sum(phantom_session_active)
 ```
 
-Requires KEDA or `prometheus-adapter`. Metric names come from `PhantomListener::metrics_prometheus_text()`.
+Requires KEDA or `prometheus-adapter` reading from the Prometheus instance fed by the Collector.
+Metric names follow the OTel dot→underscore translation; the full catalog is in
+`docs/observability/metrics-catalog.md`.
 
 ## NetworkPolicy
 
@@ -175,16 +182,18 @@ spec:
     matchLabels: {app: phantom-core}
   policyTypes: [Ingress, Egress]
   ingress:
-    - ports: [{port: 4242, protocol: TCP}, {port: 9090, protocol: TCP}]
+    - ports: [{port: 4242, protocol: TCP}]
       from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-system   # adjust to your ingress NS
   egress:
     - ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]   # DNS
+    - ports: [{port: 4317, protocol: TCP}]                            # OTLP/gRPC push to the Collector
 ```
 
-Extend `egress` with downstream service ports your binary dials.
+Extend `egress` with downstream service ports your binary dials. The OTLP egress rule lets
+phantom-server reach the OpenTelemetry Collector — without it, no metrics or traces are exported.
 
 ## Rolling updates
 
@@ -203,10 +212,24 @@ per-pod `SO_REUSEPORT` at cluster scale.
 
 ## Monitoring and logging
 
-**Metrics.** `PhantomListener::metrics_prometheus_text()` returns a Prometheus text snapshot
-(SDK ships no HTTP server — wire one in your wrapper via `hyper`, see `docker.md`). Add a
-`ServiceMonitor` for Prometheus Operator on port `metrics`, path `/metrics`. Use
-`docs/operations/grafana/phantom-dashboard.json` as a starter Grafana dashboard.
+**Metrics and traces.** Phantom Core emits OpenTelemetry metrics and traces; the library opens no
+inbound port and there is no `/metrics` endpoint to scrape. `phantom-server` (built with the
+`telemetry-otel` feature) installs an OTLP/gRPC exporter and **pushes** to an OpenTelemetry
+Collector — configured via the env vars in the Deployment manifest
+(`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_TRACES_SAMPLER_ARG`; add
+`OTEL_EXPORTER_OTLP_HEADERS` for SaaS auth). The flow is:
+
+```
+phantom-server  --OTLP/gRPC push-->  OTel Collector  -->  backend
+```
+
+Run a Collector with an `otlp` receiver and a `prometheus` exporter (or `remote_write`); your
+**Prometheus scrapes the Collector**, never the phantom pods. Traces fan out to Tempo or Jaeger;
+or point the Collector straight at Datadog / Honeycomb / Grafana Cloud. Do **not** add a
+`ServiceMonitor` or `prometheus.io/scrape` annotation against the phantom Service — there is
+nothing to scrape there. Use `docs/observability/grafana/phantom-otel-dashboard.json` as a
+starter dashboard, `docs/observability/prometheus/alerts.yml` for alert rules, and
+`docs/observability/metrics-catalog.md` for the full instrument catalog.
 
 **Logs.** The library emits `tracing` spans. Configure JSON output with
 `tracing_subscriber::fmt().json()` in your binary (see `docker.md`). Ship pod stdout/stderr to

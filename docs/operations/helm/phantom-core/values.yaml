@@ -39,9 +39,10 @@ service:
   # docs/operations/kubernetes.md so the chart + raw-manifest examples
   # stay in lockstep. Operators override via --set service.port=…
   port: 4242
-  # Prometheus metrics port. The wrapper binary must expose
-  # PhantomListener::metrics_prometheus_text() here (e.g. via hyper).
-  metricsPort: 9090
+  # There is no metrics port. Phantom Core opens NO inbound metrics endpoint —
+  # telemetry is PUSHED via OTLP/gRPC to an OpenTelemetry Collector (see the
+  # `telemetry` section below). The old :9090 /metrics listener was removed in
+  # Phase 8.
 
 # ---------------------------------------------------------------------------
 # Resource budgets
@@ -159,9 +160,45 @@ signingKey:
 # Environment variables passed to the container
 # ---------------------------------------------------------------------------
 # Override RUST_LOG or add PHANTOM_BIND_PORT etc. as required by your wrapper binary.
+# Telemetry is configured separately via the `telemetry` section below, which the
+# chart renders into OTEL_* env vars on the container.
 env:
   - name: RUST_LOG
     value: "info,phantom_core=info"
+
+# ---------------------------------------------------------------------------
+# Telemetry (OpenTelemetry, push-based)
+# ---------------------------------------------------------------------------
+# phantom-server (built with the telemetry-otel Cargo feature) emits OpenTelemetry
+# metrics + traces and PUSHES them over OTLP/gRPC to an OpenTelemetry Collector.
+# The pod opens NO inbound metrics endpoint and is never scraped. Data flow:
+#
+#   phantom-server  --OTLP/gRPC push-->  OTel Collector  -->  backend
+#
+# To land metrics in Prometheus, run a Collector with an `otlp` receiver and a
+# `prometheus` exporter (or remote_write), and have Prometheus scrape the
+# COLLECTOR — never the phantom pods. Traces flow to Tempo/Jaeger; SaaS backends
+# (Datadog/Honeycomb/Grafana Cloud) can be targeted directly from the Collector.
+# Canonical references:
+#   metrics catalog: docs/observability/metrics-catalog.md
+#   dashboard:       docs/observability/grafana/phantom-otel-dashboard.json
+#   alerts:          docs/observability/prometheus/alerts.yml
+telemetry:
+  # OTLP/gRPC endpoint of the OpenTelemetry Collector. Rendered to the server's
+  # --otlp-endpoint flag / OTEL_EXPORTER_OTLP_ENDPOINT env var. Empty = telemetry
+  # disabled (the server runs without an exporter).
+  # MUST set in production via: --set telemetry.otlpEndpoint=http://otel-collector:4317
+  otlpEndpoint: ""
+  # Logical service name reported on every metric + span (OTEL_SERVICE_NAME /
+  # --otel-service-name). Override per environment (e.g. phantom-prod).
+  serviceName: "phantom-server"
+  # Head-sampling ratio for traces (OTEL_TRACES_SAMPLER_ARG). 0.0 = no traces,
+  # 1.0 = every span. 0.05 keeps trace volume manageable in production.
+  tracesSamplerArg: "0.05"
+  # Extra OTLP headers for authenticated SaaS backends, rendered to
+  # OTEL_EXPORTER_OTLP_HEADERS. Empty for an in-cluster Collector.
+  # Example: "api-key=$(TOKEN)" — prefer a Secret-backed env var over inline values.
+  otlpHeaders: ""
 
 # ---------------------------------------------------------------------------
 # Extra volumes / volume mounts
@@ -191,17 +228,22 @@ pdb:
 # HorizontalPodAutoscaler
 # ---------------------------------------------------------------------------
 # Disabled by default; enable only after deploying prometheus-adapter or KEDA.
-# phantom_active_sessions is emitted by PhantomListener::metrics_prometheus_text().
-# Scale threshold of 800 leaves 20% headroom below the ~1000-session-per-pod budget.
+# phantom_session_active reaches Prometheus through the push chain:
+#   phantom-server --OTLP/gRPC--> Collector --(prometheus exporter)--> Prometheus
+# The HPA then reads it via prometheus-adapter (or a KEDA ScaledObject) — there is
+# no pod-local /metrics scrape. Scale threshold of 800 leaves 20% headroom below
+# the ~1000-session-per-pod budget.
 autoscaling:
   enabled: false
   minReplicas: 2
   maxReplicas: 10
-  # Metric name from PhantomListener::metrics_prometheus_text()
-  targetMetric: phantom_active_sessions
+  # Prometheus metric name (OTel phantom.session.active, dot->underscore translated).
+  # UpDownCounter with a `leg` label; see docs/observability/metrics-catalog.md.
+  targetMetric: phantom_session_active
   # Sessions per pod before a scale-out is triggered
   targetValue: "800"
-  # Prometheus server URL; required for the external metric query.
+  # Prometheus server URL; required for the external metric query. This is the
+  # Prometheus that scrapes the OTel Collector, not the phantom pods.
   # Used by the HPA's external metric source or a KEDA ScaledObject.
   prometheusAddress: "http://prometheus.monitoring.svc:9090"
 
@@ -214,14 +256,21 @@ autoscaling:
 networkPolicy:
   enabled: false
   # Ingress: list of namespaceSelector / podSelector blocks allowed to reach
-  # the app port and metrics port. Empty = deny all ingress (except DNS).
+  # the app port. (There is no metrics port — telemetry is push-only over OTLP.)
+  # Empty = deny all ingress (except DNS).
   # Example:
   #   ingressFrom:
   #     - namespaceSelector:
   #         matchLabels:
   #           kubernetes.io/metadata.name: ingress-system
   ingressFrom: []
-  # Egress: additional CIDRs / podSelectors your binary dials out to.
+  # OTLP/gRPC egress port to the OpenTelemetry Collector. When set (and the
+  # NetworkPolicy is enabled), an egress rule is added so telemetry can be
+  # pushed out. Empty/0 = no dedicated OTLP egress rule (use egressTo instead).
+  # Standard OTLP/gRPC is 4317. Pair with egressTo to scope the destination.
+  otlpEgressPort: 4317
+  # Egress: additional CIDRs / podSelectors your binary dials out to. Use this to
+  # scope the OTLP egress (above) to the Collector's namespace/pod in production.
   # DNS (53/UDP+TCP) is always included.
   egressTo: []
 
@@ -266,12 +315,10 @@ affinity: {}
 # Pod annotations / labels (extra, beyond chart-managed ones)
 # ---------------------------------------------------------------------------
 podAnnotations: {}
-# Example: inject Prometheus scrape annotations if you use annotation-based
-# discovery instead of a ServiceMonitor:
-# podAnnotations:
-#   prometheus.io/scrape: "true"
-#   prometheus.io/port: "9090"
-#   prometheus.io/path: "/metrics"
+# Do NOT add prometheus.io/scrape annotations here — the pods expose no /metrics
+# endpoint and must never be scraped. Telemetry is pushed via OTLP/gRPC to an
+# OpenTelemetry Collector (see the `telemetry` section), and Prometheus scrapes
+# the Collector instead. See docs/observability/ for the full pipeline.
 
 podLabels: {}
 
