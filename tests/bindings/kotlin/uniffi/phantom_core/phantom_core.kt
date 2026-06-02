@@ -787,6 +787,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -824,6 +828,8 @@ fun uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomsession_connection_state(
 ): Short
+fun uniffi_phantom_core_checksum_method_phantomsession_current_epoch(
+): Short
 fun uniffi_phantom_core_checksum_method_phantomsession_disconnect(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted(
@@ -847,6 +853,8 @@ fun uniffi_phantom_core_checksum_method_phantomsession_recv(
 fun uniffi_phantom_core_checksum_method_phantomsession_resumption_hint(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomsession_send(
+): Short
+fun uniffi_phantom_core_checksum_method_phantomsession_set_rekey_threshold(
 ): Short
 fun uniffi_phantom_core_checksum_method_phantomstream_disconnect(
 ): Short
@@ -945,6 +953,8 @@ fun uniffi_phantom_core_fn_constructor_phantomsession_connect(`peerAddr`: RustBu
 ): Pointer
 fun uniffi_phantom_core_fn_method_phantomsession_connection_state(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_phantom_core_fn_method_phantomsession_current_epoch(`ptr`: Pointer,
+): Long
 fun uniffi_phantom_core_fn_method_phantomsession_disconnect(`ptr`: Pointer,
 ): Long
 fun uniffi_phantom_core_fn_method_phantomsession_early_data_accepted(`ptr`: Pointer,
@@ -968,6 +978,8 @@ fun uniffi_phantom_core_fn_method_phantomsession_recv(`ptr`: Pointer,
 fun uniffi_phantom_core_fn_method_phantomsession_resumption_hint(`ptr`: Pointer,
 ): Long
 fun uniffi_phantom_core_fn_method_phantomsession_send(`ptr`: Pointer,`data`: RustBuffer.ByValue,
+): Long
+fun uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold(`ptr`: Pointer,`n`: Long,
 ): Long
 fun uniffi_phantom_core_fn_clone_phantomstream(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
@@ -1146,6 +1158,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 58300.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_phantom_core_checksum_method_phantomsession_current_epoch() != 35997.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_phantom_core_checksum_method_phantomsession_disconnect() != 18611.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1180,6 +1195,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_core_checksum_method_phantomsession_send() != 35674.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_core_checksum_method_phantomsession_set_rekey_threshold() != 11165.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 13449.toShort()) {
@@ -1452,6 +1470,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 
     override fun write(value: UInt, buf: ByteBuffer) {
         buf.putInt(value.toInt())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterULong: FfiConverter<ULong, Long> {
+    override fun lift(value: Long): ULong {
+        return value.toULong()
+    }
+
+    override fun read(buf: ByteBuffer): ULong {
+        return lift(buf.getLong())
+    }
+
+    override fun lower(value: ULong): Long {
+        return value.toLong()
+    }
+
+    override fun allocationSize(value: ULong) = 8UL
+
+    override fun write(value: ULong, buf: ByteBuffer) {
+        buf.putLong(value.toLong())
     }
 }
 
@@ -2405,6 +2446,13 @@ public interface PhantomSessionInterface {
     fun `connectionState`(): ConnectionState
     
     /**
+     * Current rekey epoch of the established session (`None` while still
+     * connecting). Rust-only — used by soak / integration tests to confirm
+     * that automatic mid-session rekey (C1) advanced the epoch.
+     */
+    suspend fun `currentEpoch`(): kotlin.UByte?
+    
+    /**
      * Send the graceful close frame and shut the session down.
      *
      * Named `disconnect` rather than `close` because UniFFI's Kotlin
@@ -2493,6 +2541,15 @@ public interface PhantomSessionInterface {
      * - If still handshaking: queues the data for auto-flush later
      */
     suspend fun `send`(`data`: kotlin.ByteArray)
+    
+    /**
+     * Override the automatic-rekey send-invocation high-watermark on the
+     * established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
+     * the session is still connecting. Rust-only — primarily for soak/load
+     * harnesses that need to exercise mid-session rekey without sending `2^47`
+     * packets.
+     */
+    suspend fun `setRekeyThreshold`(`n`: kotlin.ULong): kotlin.Boolean
     
     companion object
 }
@@ -2609,6 +2666,31 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
     )
     }
     
+
+    
+    /**
+     * Current rekey epoch of the established session (`None` while still
+     * connecting). Rust-only — used by soak / integration tests to confirm
+     * that automatic mid-session rekey (C1) advanced the epoch.
+     */
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `currentEpoch`() : kotlin.UByte? {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_phantom_core_fn_method_phantomsession_current_epoch(
+                thisPtr,
+                
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterOptionalUByte.lift(it) },
+        // Error FFI converter
+        UniffiNullRustCallStatusErrorHandler,
+    )
+    }
 
     
     /**
@@ -2879,6 +2961,33 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
         
         // Error FFI converter
         CoreException.ErrorHandler,
+    )
+    }
+
+    
+    /**
+     * Override the automatic-rekey send-invocation high-watermark on the
+     * established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
+     * the session is still connecting. Rust-only — primarily for soak/load
+     * harnesses that need to exercise mid-session rekey without sending `2^47`
+     * packets.
+     */
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `setRekeyThreshold`(`n`: kotlin.ULong) : kotlin.Boolean {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold(
+                thisPtr,
+                FfiConverterULong.lower(`n`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_poll_i8(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_complete_i8(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_phantom_core_rust_future_free_i8(future) },
+        // lift function
+        { FfiConverterBoolean.lift(it) },
+        // Error FFI converter
+        UniffiNullRustCallStatusErrorHandler,
     )
     }
 
@@ -3891,6 +4000,38 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalUByte: FfiConverterRustBuffer<kotlin.UByte?> {
+    override fun read(buf: ByteBuffer): kotlin.UByte? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUByte.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UByte?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUByte.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UByte?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUByte.write(value, buf)
+        }
+    }
 }
 
 
