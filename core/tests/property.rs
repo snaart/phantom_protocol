@@ -18,10 +18,33 @@
 
 use phantom_core::crypto::adaptive_crypto::{CipherSuite, CryptoSession};
 use phantom_core::security::ReplayWindow;
+use phantom_core::transport::session::{CryptoState, Session, MAX_REKEY_CATCHUP};
 use phantom_core::transport::types::{
-    PacketFlags, PacketHeader, PhantomPacket, SessionId, WIRE_VERSION,
+    PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
 };
 use proptest::prelude::*;
+
+/// Build a paired (client, server) `Session` from a shared secret — the same
+/// deterministic HKDF orientation both ends derive at handshake.
+fn session_pair(secret: [u8; 32]) -> (Session, Session) {
+    let id = SessionId::from_bytes([0x5Au8; 32]);
+    (
+        Session::from_derived(
+            id,
+            CryptoState::new(&secret, false).expect("client crypto"),
+            SchedulerMode::LowLatency,
+            secret,
+            false,
+        ),
+        Session::from_derived(
+            id,
+            CryptoState::new(&secret, true).expect("server crypto"),
+            SchedulerMode::LowLatency,
+            secret,
+            true,
+        ),
+    )
+}
 
 // ── AEAD round-trip ────────────────────────────────────────────────────────
 
@@ -137,5 +160,100 @@ proptest! {
         prop_assert_eq!(decoded.header.epoch, epoch);
         prop_assert_eq!(decoded.header.path_id, path_id);
         prop_assert_eq!(decoded.payload, payload);
+    }
+
+    /// The `extensions` TLV headroom also round-trips byte-for-byte alongside
+    /// the payload (both length-prefixed sections must be recovered).
+    #[test]
+    fn wire_round_trip_preserves_payload_and_extensions(
+        sequence in any::<u32>(),
+        payload in proptest::collection::vec(any::<u8>(), 0..1024),
+        extensions in proptest::collection::vec(any::<u8>(), 0..512),
+    ) {
+        let header = PacketHeader::new(
+            SessionId::from_bytes([0x11u8; 32]),
+            3,
+            sequence,
+            PacketFlags::new(PacketFlags::ENCRYPTED),
+        );
+        let mut packet = PhantomPacket::new(header, payload.clone());
+        packet.extensions = extensions.clone();
+
+        let buf = packet.to_wire();
+        let decoded = PhantomPacket::from_wire(&buf).expect("round-trip decode");
+        prop_assert_eq!(decoded.payload, payload);
+        prop_assert_eq!(decoded.extensions, extensions);
+    }
+
+    /// Robustness: `from_wire` on ARBITRARY bytes must return `Ok`/`Err`, never
+    /// panic or read out of bounds. This is the always-on companion to the
+    /// `fuzz_packet_parse` cargo-fuzz target — a malicious peer sending garbage
+    /// must not crash the receive loop.
+    #[test]
+    fn from_wire_never_panics_on_arbitrary_bytes(
+        buf in proptest::collection::vec(any::<u8>(), 0..8192),
+    ) {
+        // Whatever the verdict, the only property under test is "no panic".
+        let _ = PhantomPacket::from_wire(&buf);
+    }
+}
+
+// ── Mid-session rekey (C1) ─────────────────────────────────────────────────
+
+proptest! {
+    /// For ANY number of lock-step rekeys, both ends derive the same epoch key:
+    /// the HKDF rekey chain is deterministic, so a packet encrypted after `n`
+    /// rekeys decrypts on a peer that rekeyed `n` times. Catches any divergence
+    /// in the `derive_forward_crypto` chain across the epoch range.
+    #[test]
+    fn rekey_chains_stay_in_lockstep(
+        secret in proptest::array::uniform32(any::<u8>()),
+        n in 0u8..40,
+    ) {
+        let (client, server) = session_pair(secret);
+        for _ in 0..n {
+            client.rekey().expect("client rekey");
+            server.rekey().expect("server rekey");
+        }
+        prop_assert_eq!(client.current_epoch(), n);
+        prop_assert_eq!(server.current_epoch(), n);
+
+        let header = PacketHeader::new(
+            *server.id(),
+            1,
+            1,
+            PacketFlags::new(PacketFlags::ENCRYPTED),
+        )
+        .with_epoch(n);
+        let ct = client.encrypt_packet(&header, b"chain").expect("encrypt");
+        let pt = server.decrypt_packet(&header, &ct).expect("decrypt at matched epoch");
+        prop_assert_eq!(pt, b"chain".to_vec());
+    }
+
+    /// For any forward gap within `MAX_REKEY_CATCHUP`, the receiver follows an
+    /// authentic rekey via `decrypt_packet_accepting_rekey`: it trial-decrypts
+    /// the candidate key `steps` epochs ahead, succeeds, and commits the ratchet.
+    #[test]
+    fn accepting_decrypt_follows_any_bounded_forward_step(
+        secret in proptest::array::uniform32(any::<u8>()),
+        steps in 1u8..=MAX_REKEY_CATCHUP,
+    ) {
+        let (client, server) = session_pair(secret);
+        for _ in 0..steps {
+            client.rekey().expect("client rekey");
+        }
+        let header = PacketHeader::new(
+            *server.id(),
+            1,
+            1,
+            PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::REKEY),
+        )
+        .with_epoch(steps);
+        let ct = client.encrypt_packet(&header, b"forward").expect("encrypt");
+        let pt = server
+            .decrypt_packet_accepting_rekey(&header, &ct)
+            .expect("accepting decrypt follows a bounded forward step");
+        prop_assert_eq!(pt, b"forward".to_vec());
+        prop_assert_eq!(server.current_epoch(), steps);
     }
 }
