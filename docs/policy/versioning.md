@@ -91,13 +91,24 @@ Both are **tamper-check anchors**, not negotiated sets:
 ### Adding bytes without a version bump
 
 The single `PhantomPacket { header, payload, extensions }` carries an
-`extensions: Vec<u8>` TLV field as forward-compatible headroom. Amendments that
-fit inside `extensions` (packet-number / SACK fields, new TLV records) do **not**
-touch `WIRE_VERSION` — a peer that does not know a record deserialises it as an
-empty/ignored `Vec`, provided the ignored case is a documented contract. The
-same applies to new `PacketFlags` bits (`0x1000 .. 0x8000` are reserved) that
-ride inside an existing field, and to implementation changes that leave the
-on-wire bytes byte-identical.
+`extensions: Vec<u8>` TLV field as forward-compatible headroom. New **forge-safe**
+TLV records can ride inside `extensions` without touching `WIRE_VERSION` — a peer
+that does not know a record deserialises it as an empty/ignored `Vec` (the
+ignored-on-read case is a documented contract; reserved and empty for 1.0).
+
+**Crucially, `extensions` is _not_ covered by the AEAD AAD** (the AAD is the
+45-byte header only — see `PROTOCOL.md` § 4.1 / § 5), so its bytes are
+attacker-malleable on the wire. Only values that are *safe when forged* may go
+there. Security-sensitive amendments — anything an attacker could abuse by
+flipping it, e.g. **packet-number / SACK / ACK-range fields** that steer
+retransmission and congestion control — must instead live in the AAD-covered
+header, which is a deliberate `WIRE_VERSION` bump (see SACK in the deferred-work
+notes). Do not put them in `extensions`.
+
+The same no-bump latitude applies to new `PacketFlags` bits (`0x1000 .. 0x8000`
+are reserved) — but note the flags **are** AAD-covered (they live in the header),
+so unlike `extensions` they are integrity-protected — and to implementation
+changes that leave the on-wire bytes byte-identical.
 
 ### Bumping the pinned version (a deliberate, breaking change)
 
@@ -217,7 +228,8 @@ migration.
 | Refactor with no API change | patch | — | — | optional |
 | New `pub fn` / `pub struct` | minor | — | possibly minor | `Added:` |
 | Breaking `pub fn` signature | major (post-1.0) / minor (pre-1.0) | — | major-break | `Changed (breaking):` |
-| Wire amendment via `extensions` / reserved flag | patch | — | — | `Added:` |
+| Wire amendment via a **forge-safe** `extensions` TLV / reserved flag bit | patch | — | — | `Added:` |
+| Security-sensitive wire field (packet-number / SACK / ACK-range) | major | `WIRE_VERSION` +1 | — | `Changed (wire-breaking):` |
 | Wire-format change (header / nonce / KDF label / handshake layout) | major | `WIRE_VERSION` / `PROTOCOL_VERSION` +1 | possibly | `Changed (wire-breaking):` |
 | Feature added | minor | — | possibly | `Added:` |
 | Feature removed | major | — | possibly | `Removed:` |
