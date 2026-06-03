@@ -1207,6 +1207,38 @@ async fn pace_send(crypto_session: &Arc<Session>, bytes: u64) {
     }
 }
 
+/// C1: decide whether a rekey is needed before stamping a packet for
+/// `(stream_id, sequence)` and, if so, perform it. A rekey fires when either the
+/// direction-wide AEAD high-watermark ([`Session::send_needs_rekey`]) or this
+/// stream's sequence watermark ([`Session::stream_seq_needs_rekey`]) is crossed
+/// — the latter prevents a per-stream `u32` sequence from wrapping within one
+/// epoch and reusing the AEAD nonce `(epoch, stream_id, sequence, path_id)`
+/// under a fixed key (Invariant 8).
+///
+/// Returns the extra flag bits to OR into the header (`PacketFlags::REKEY` on a
+/// successful rotation, `0` when no rekey was needed), or `None` if a rekey was
+/// required but failed (epoch saturated at `u8::MAX`) — the caller MUST fail the
+/// send so the session reconnects rather than reusing a nonce.
+fn rekey_before_stamp(
+    crypto_session: &Arc<Session>,
+    stream_id: TransportStreamId,
+    sequence: u32,
+) -> Option<u16> {
+    if crypto_session.send_needs_rekey()
+        || crypto_session.stream_seq_needs_rekey(stream_id, sequence)
+    {
+        match crypto_session.rekey() {
+            Ok(_) => Some(PacketFlags::REKEY),
+            Err(e) => {
+                log::error!("PhantomSession: mid-session rekey failed: {}", e);
+                None
+            }
+        }
+    } else {
+        Some(0)
+    }
+}
+
 /// V2 send. Builds `PhantomPacket` with `PacketFlags::ENCRYPTED` and
 /// the negotiated rekey epoch; AEAD nonce derives from the header
 /// (`Session::encrypt_packet`), so a failed peer decrypt no longer
@@ -1222,23 +1254,17 @@ async fn send_app_data<T: SessionTransport>(
 ) -> bool {
     // Always OR in ENCRYPTED for application data.
     let mut flag_bits = base_flags | PacketFlags::ENCRYPTED;
-    // Mid-session rekey (C1): if the send direction has crossed the AEAD
-    // high-watermark, rotate to a fresh key BEFORE stamping this header so it
-    // carries the new epoch + the REKEY flag. The peer follows on the
-    // authenticated epoch bump (it trial-decrypts under the next key). This
-    // keeps a long-lived session below the hard AEAD ceiling (Invariant 8)
-    // instead of failing with NonceExhausted.
-    if crypto_session.send_needs_rekey() {
-        match crypto_session.rekey() {
-            Ok(_) => flag_bits |= PacketFlags::REKEY,
-            Err(e) => {
-                // Epoch saturated (u8::MAX): can't rotate further. Surface as a
-                // failed send so the caller re-offers; the session is expected
-                // to reconnect rather than wrap.
-                log::error!("PhantomSession: mid-session rekey failed: {}", e);
-                return false;
-            }
-        }
+    // Mid-session rekey (C1): rotate to a fresh key BEFORE stamping this header
+    // when either the direction-wide AEAD high-watermark or this stream's
+    // sequence watermark is crossed, so the header carries the new epoch (+ the
+    // REKEY flag) and no per-stream sequence can wrap within an epoch and reuse a
+    // nonce (Invariant 8). The peer follows on the authenticated epoch bump (it
+    // trial-decrypts under the next key).
+    match rekey_before_stamp(crypto_session, stream_id, sequence) {
+        Some(extra) => flag_bits |= extra,
+        // Epoch saturated (u8::MAX): can't rotate further. Surface as a failed
+        // send so the caller re-offers; the session reconnects rather than wrap.
+        None => return false,
     }
     let header = PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
         .with_epoch(crypto_session.current_epoch());
@@ -1281,7 +1307,13 @@ async fn send_window_update<T: SessionTransport>(
     sequence: u32,
     new_window: u32,
 ) -> bool {
-    let flag_bits = PacketFlags::ENCRYPTED | PacketFlags::WINDOW_UPDATE;
+    let mut flag_bits = PacketFlags::ENCRYPTED | PacketFlags::WINDOW_UPDATE;
+    // WINDOW_UPDATE shares the per-stream sequence space with application data,
+    // so it must obey the same C1 rekey discipline before stamping (Invariant 8).
+    match rekey_before_stamp(crypto_session, stream_id, sequence) {
+        Some(extra) => flag_bits |= extra,
+        None => return false,
+    }
     let header = PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
         .with_epoch(crypto_session.current_epoch());
     let payload = new_window.to_be_bytes();
