@@ -228,7 +228,7 @@ Source: `core/src/transport/types.rs:74-107`.
 | Bit | Constant | Meaning |
 | --- | --- | --- |
 | `0x0001` | `RELIABLE` | Requires ACK; retransmitted on timeout |
-| `0x0002` | `ACK` | This packet is an ACK (empty payload, unencrypted) |
+| `0x0002` | `ACK` | This packet is an authenticated ACK (`ENCRYPTED`; AEAD payload = acked seq) |
 | `0x0004` | `FIN` | Stream finished |
 | `0x0008` | `UNRELIABLE` | Fire-and-forget |
 | `0x0010` | `PRIORITY` | Voice/video frame priority hint |
@@ -244,8 +244,15 @@ Source: `core/src/transport/types.rs:74-107`.
 `ENCRYPTED` is the post-handshake invariant flag — the API layer sets it on
 every application-data packet, and the receive loop drops any non-empty
 unencrypted application-data packet as a stripped-flag downgrade attempt
-(Invariant 2; `api/session.rs`). ACK packets carry only `ACK`, an empty
-payload, and are short-circuited before the decrypt path.
+(Invariant 2; `api/session.rs`). ACK packets are **authenticated control frames**
+(H1): they carry `ENCRYPTED | ACK`, their AEAD payload is the 4-byte big-endian
+acked data sequence, and the receiver acts on them **only after AEAD verify** —
+so a forged or plaintext ACK can neither retire a pending segment, restore a
+flow-control permit, poison the BBR estimator, nor close a stream. Every inbound
+frame is additionally bound to the negotiated `session_id` before any processing.
+An ACK's own `header.sequence` is drawn from the acker's per-stream send counter
+(shared with its data/`WINDOW_UPDATE` sends) so the AEAD nonce never collides, and
+it obeys the §5 rekey discipline.
 
 ### 4.4 `SessionId`
 
