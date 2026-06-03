@@ -71,6 +71,20 @@ Discipline:
 Compliance: ✅ class A satisfied. (The early-exit is on `difficulty`, a
 public server policy parameter; not on a secret.)
 
+### PoW challenge-integrity MAC (Class A) — CRYPTO-2/HS-04
+
+`core/src/crypto/pow.rs:60` — `PoWChallenge::verify` compares the embedded
+24-byte challenge MAC (keyed by the server's per-hour secret) against the
+recomputed value. The submitted challenge bytes are attacker-controllable, so
+this is Class A.
+
+Discipline:
+- `self.nonce[8..32].ct_eq(&mac.as_bytes()[0..24])` via `subtle::ConstantTimeEq`
+  (was a short-circuiting `!=` before the CRYPTO-2/HS-04 fix, which leaked how
+  many leading MAC bytes a guess matched).
+
+Compliance: ✅ class A satisfied (since CRYPTO-2/HS-04).
+
 ### Server-identity pinning (Class C)
 
 `core/src/transport/handshake.rs:476-479` — `process_server_hello` compares

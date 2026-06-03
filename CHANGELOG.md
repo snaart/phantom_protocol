@@ -71,6 +71,23 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   unchanged. Pinned by `security_invariants.rs::{flipped_early_data_accepted_bit_fails_signature,
   binderless_resume_does_not_burn_ticket, failed_resume_handshake_leaves_ticket_usable}`.
 
+- **H3 (high): client PoW difficulty cap + bounded solver — fixed.** The client
+  solved whatever PoW difficulty an *unauthenticated* `HelloRetryRequest`
+  demanded, in an unbounded loop — so a MITM (or malicious server) could inject
+  `difficulty = 255` and pin a client CPU core indefinitely (~2^255 hashes),
+  pre-authentication. The client now rejects any difficulty above
+  `MAX_CLIENT_POW_DIFFICULTY = 24` (strictly above the server's max legitimate
+  tier) **before** solving, and `PoWChallenge::solve` is iteration-bounded
+  (`MAX_SOLVE_ITERATIONS = 2^32`), returning a typed error rather than looping.
+  `PoWChallenge::solve` now returns `Result<PoWSolution, PowError>` (a pre-1.0
+  Rust-API change). No wire change.
+
+- **CRYPTO-2 / HS-04 (low): constant-time PoW/cookie MAC compare — fixed.**
+  `PoWChallenge::verify` compared the server-keyed challenge MAC with a
+  short-circuiting `!=`, leaking via timing how many leading MAC bytes an
+  attacker guessed. It now uses `subtle::ConstantTimeEq`, matching the cookie /
+  path-validation compares. (Folded into the H3 `crypto/pow.rs` change.)
+
 ### Added
 
 - **Graceful unsupported-version signal.** When a `ClientHello.version` is one
