@@ -26,6 +26,23 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `seq_watermark_fails_closed_at_epoch_saturation`) and a `property.rs` invariant
   (`no_nonce_repeats_across_forced_rekeys`). See PROTOCOL.md §5.
 
+- **H1 (high): forged unauthenticated ACK/FIN injection — fixed.** ACK/FIN frames
+  were processed *before* the AEAD gate and trusted the plaintext `header.sequence`,
+  and the receive path never checked `header.session_id`, so an on-path attacker
+  could inject forged ACKs to silently drop never-acknowledged reliable segments
+  (data loss/truncation), restore flow-control permits, poison the BBR estimator,
+  or tear down streams with `ACK|FIN` — all without breaking the AEAD on
+  application data (Invariant 2). ACKs are now **authenticated `ENCRYPTED | ACK`
+  control frames**: the acked data sequence travels in the AEAD payload (4 bytes,
+  big-endian), the handler acts on it only after AEAD verify, and every inbound
+  frame is dropped unless its `header.session_id` matches the negotiated session.
+  The ACK's own `header.sequence` is drawn from the acker's per-stream send counter
+  (shared with its data/`WINDOW_UPDATE` sends) so the AEAD nonce never collides, and
+  it obeys the C1 rekey discipline. No `PhantomPacket`/header layout change (only
+  ACK flags + payload), so frozen wire vectors are unchanged. Pinned by
+  `api::session::tests::{forged_plaintext_ack_does_not_retire_pending_segment,
+  authenticated_ack_retires_pending_segment, ack_with_wrong_session_id_is_dropped}`.
+
 ### Added
 
 - **Graceful unsupported-version signal.** When a `ClientHello.version` is one
