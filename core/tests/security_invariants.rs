@@ -845,3 +845,100 @@ async fn retransmissions_bypass_congestion_and_flow_control_windows() {
         "a retransmission must not debit the flow-control window again"
     );
 }
+
+// ── C1: per-stream sequence nonce-reuse (Invariant 8) ───────────────────────
+
+/// **C1 (critical).** The AEAD nonce is `(epoch, stream_id, sequence, path_id)`.
+/// `sequence` is a per-stream `u32` that wraps at `2^32`, while the only
+/// pre-existing rekey trigger keys off the *direction-wide* invocation counter
+/// (`REKEY_SOFT_LIMIT = 2^47`). A single hot stream therefore wraps its
+/// sequence — repeating a nonce under a fixed key (the Forbidden Attack) — long
+/// before any rekey fires. The fix forces a rekey once a stream's sequence
+/// advances past a per-stream watermark within the current epoch.
+///
+/// We drive the exact send-side decision (`send_needs_rekey ||
+/// stream_seq_needs_rekey` then `rekey`) with the direction-wide trigger
+/// disabled and a tiny injected watermark, and assert that **no epoch's
+/// per-stream sequence span ever exceeds the watermark**. Scaled to the real
+/// `W = 2^31` against the `2^32` wrap, that is exactly "no stream can traverse
+/// the full sequence space within one epoch", so the nonce never repeats.
+#[test]
+fn single_stream_seq_watermark_forces_rekey_before_wrap() {
+    let (client, _server) = make_session_pair([0x5Au8; 32]);
+    // Isolate the per-stream trigger: push the direction-wide AEAD trigger out
+    // of reach so ONLY the sequence watermark can fire a rekey.
+    client.set_rekey_threshold(u64::MAX);
+    const W: u32 = 8;
+    client.set_seq_rekey_watermark(W);
+
+    let stream: u16 = 1;
+    let mut spans: std::collections::BTreeMap<u8, (u32, u32)> = std::collections::BTreeMap::new();
+    let mut seen: std::collections::HashSet<(u8, u16, u32)> = std::collections::HashSet::new();
+
+    for seq in 0u32..(4 * W + 3) {
+        // Exact production decision — mirrors `send_app_data`.
+        if client.send_needs_rekey() || client.stream_seq_needs_rekey(stream, seq) {
+            client
+                .rekey()
+                .expect("rekey must succeed within the epoch budget");
+        }
+        let epoch = client.current_epoch();
+        assert!(
+            seen.insert((epoch, stream, seq)),
+            "nonce tuple (epoch={epoch}, stream={stream}, seq={seq}) repeated"
+        );
+        let e = spans.entry(epoch).or_insert((seq, seq));
+        e.0 = e.0.min(seq);
+        e.1 = e.1.max(seq);
+    }
+
+    assert!(
+        spans.len() >= 2,
+        "the sequence watermark never forced a rekey"
+    );
+    for (epoch, (lo, hi)) in &spans {
+        assert!(
+            hi - lo <= W,
+            "epoch {epoch} spans {} sequences, exceeding watermark {W} — a wider epoch could wrap",
+            hi - lo
+        );
+    }
+}
+
+/// **C1 fail-closed.** Once the `u8` epoch saturates at `u8::MAX`, no further
+/// rekey is possible. The per-stream watermark must then surface a hard error
+/// from `rekey()` (which `send_app_data` turns into a failed send → session
+/// reconnect) rather than letting the sequence wrap and silently reuse a nonce.
+#[test]
+fn seq_watermark_fails_closed_at_epoch_saturation() {
+    let (client, _server) = make_session_pair([0x77u8; 32]);
+    client.set_rekey_threshold(u64::MAX);
+    client.set_seq_rekey_watermark(4);
+
+    let stream: u16 = 1;
+    let mut seq = 0u32;
+    let mut rekeys = 0u32;
+    loop {
+        if client.send_needs_rekey() || client.stream_seq_needs_rekey(stream, seq) {
+            match client.rekey() {
+                Ok(_) => rekeys += 1,
+                Err(_) => break, // fail-closed: epoch saturated, no nonce reuse
+            }
+        }
+        seq += 1;
+        assert!(
+            seq < 1_000_000,
+            "must fail closed at saturation, not loop forever"
+        );
+    }
+    assert_eq!(
+        client.current_epoch(),
+        u8::MAX,
+        "must fail closed exactly when the epoch saturates"
+    );
+    assert_eq!(
+        rekeys,
+        u8::MAX as u32,
+        "should perform 255 successful rekeys before the epoch saturates"
+    );
+}

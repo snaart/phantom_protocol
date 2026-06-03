@@ -8,6 +8,24 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+### Security
+
+- **C1 (critical): AES-GCM nonce reuse from per-stream sequence wrap — fixed.**
+  The AEAD nonce is `(epoch, stream_id, sequence, path_id)` where `sequence` is a
+  per-stream `u32`. The only mid-session rekey trigger keyed off the
+  *direction-wide* invocation counter (`REKEY_SOFT_LIMIT = 2^47`), so a single
+  high-throughput stream could wrap its `u32` sequence (≈`2^32` packets) and
+  repeat a `(key, nonce)` pair — the catastrophic GCM nonce-reuse / Forbidden
+  Attack condition — long before any rekey fired. The send path now also forces a
+  rekey once any stream's sequence advances past a per-stream watermark
+  (`SEQ_REKEY_WATERMARK = 2^31`) within the current epoch, bounding each stream's
+  per-epoch sequence span to half the wrap distance; if the `u8` epoch saturates,
+  the send fails closed (reconnect) rather than wrap. No wire-format change
+  (`WIRE_VERSION` stays 2; frozen wire vectors unchanged). Pinned by
+  `security_invariants.rs` (`single_stream_seq_watermark_forces_rekey_before_wrap`,
+  `seq_watermark_fails_closed_at_epoch_saturation`) and a `property.rs` invariant
+  (`no_nonce_repeats_across_forced_rekeys`). See PROTOCOL.md §5.
+
 ### Added
 
 - **Graceful unsupported-version signal.** When a `ClientHello.version` is one

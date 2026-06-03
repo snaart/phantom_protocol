@@ -294,10 +294,21 @@ Receiver:  ciphertext, header →  AEAD-decrypt(key  = recv_key,
 Source: `Session::encrypt_packet` / `decrypt_packet`
 (`transport/session.rs:577-627`).
 
-**Uniqueness.** Senders never reuse `(stream_id, sequence)` within an epoch,
-`epoch` distinguishes rekey generations, and `path_id` distinguishes the same
-logical packet across multi-path legs. The full 12 bytes are therefore unique
-per encryption under a given key.
+**Uniqueness (Invariant 8).** `sequence` is a **per-stream `u32`** that wraps at
+`2^32`; `epoch` distinguishes rekey generations; `path_id` distinguishes the same
+logical packet across multi-path legs. Uniqueness of `(epoch, stream_id, sequence,
+path_id)` under a given key therefore requires that **no single stream's `sequence`
+wraps within one epoch** — otherwise a stream that emits `2^32` packets without a
+rekey would repeat the nonce (catastrophic AES-GCM nonce reuse / the Forbidden
+Attack). The send path enforces this directly: it forces a rekey (epoch bump +
+fresh nonce prefix) once any stream's `sequence` advances past
+`SEQ_REKEY_WATERMARK = 2^31` within the current epoch (see *Automatic rekey*
+below), so a stream's per-epoch sequence span is bounded to `2^31` — half the
+wrap distance. The `epoch` is `u8` and **saturates** (never wraps), so once the
+budget of 255 rekeys is exhausted the session fails closed and reconnects rather
+than reuse a `(epoch, sequence)` pair. The `2^48` direction-wide invocation
+ceiling below is a secondary backstop, not the primary nonce-uniqueness
+guarantee.
 
 **Replay window runs after AEAD verify (Invariant 4).** After a successful
 AEAD open, the receiver consults a per-stream sliding-window bitmap
@@ -327,12 +338,26 @@ Every epoch transition is serialised by a per-session rekey mutex, so the
 concurrent send-loop and receive-task of the data pump can never let the
 installed key depth diverge from the `epoch` counter.
 
-**Automatic rekey (C1).** The data pump triggers a rekey on the send path once
-a direction's AEAD invocation count crosses a soft high-watermark
-(`REKEY_SOFT_LIMIT`, default `2^48 / 2`), well below the hard
-`AEAD_MAX_INVOCATIONS = 2^48` ceiling — so a long-lived session rotates keys
-automatically instead of failing with `NonceExhausted`. Production sessions
-essentially never reach it; it is a correctness backstop.
+**Automatic rekey (C1).** The data pump triggers a rekey on the send path, *before
+stamping a packet's header*, when **either** of two thresholds is crossed:
+
+1. **Per-stream sequence watermark (primary nonce-uniqueness guarantee).** Once
+   any stream's `sequence` advances `SEQ_REKEY_WATERMARK = 2^31` past where that
+   stream entered the current epoch (`Session::stream_seq_needs_rekey`), a rekey
+   is forced so the per-stream `u32` can never wrap within one epoch. The
+   per-stream `(epoch, base_sequence)` checkpoint is rebased lazily on the first
+   send after an epoch change. This is what closes C1: a single high-throughput
+   stream (which advances the *direction-wide* counter only ~`2^32`, far below
+   threshold 2) would otherwise wrap its sequence and reuse a nonce.
+2. **Direction-wide invocation watermark (secondary backstop).** Once a
+   direction's AEAD invocation count crosses `REKEY_SOFT_LIMIT` (default
+   `2^48 / 2`), well below the hard `AEAD_MAX_INVOCATIONS = 2^48` ceiling.
+
+If a rekey is required but the `epoch` has saturated (`u8::MAX`), the send **fails
+closed** — the packet is not stamped, the send is reported as failed, and the
+session is expected to reconnect rather than reuse a nonce. Both data
+(`send_app_data`) and `WINDOW_UPDATE` (`send_window_update`) packets, which share
+the per-stream sequence space, obey this discipline.
 
 Wire signalling: the sender emits a packet whose header carries the new `epoch`
 and the `PacketFlags::REKEY` flag. The receiver follows via
