@@ -52,7 +52,7 @@ pub const PROTOCOL_VARIANT: &[u8] = b"phantom-fips-1";
 /// handshake transcript. Pinned to one value — the protocol is not negotiated
 /// (pre-1.0, no users). It is a tamper-check anchor and a hook for a future,
 /// deliberate version increment.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Marker leading a [`ServerReject`] frame. The client disambiguates the three
 /// possible server replies by trial-deserialization; the marker (plus the
@@ -139,6 +139,16 @@ pub struct ClientHello {
     pub pow_solution: Option<PoWSolution>,
     /// Optional session ID for 0-RTT resumption
     pub resume_session_id: Option<[u8; 32]>,
+    /// Resumption proof-of-possession binder (HS-03). Present iff
+    /// `resume_session_id` is — a keyed PRF over `resumption_secret ||
+    /// resume_session_id || nonce` (see `derive_resumption_binder`). The server
+    /// verifies it (constant-time) against the cached ticket's secret *before*
+    /// consuming the one-shot ticket, so a passive observer that copied the
+    /// cleartext `resume_session_id` cannot burn a victim's ticket. Bound into
+    /// the transcript (the whole `ClientHello` is signed), so it is also
+    /// tamper-evident. Placed after `resume_session_id` and before
+    /// `protocol_variant` — borsh field order is wire-load-bearing.
+    pub resumption_binder: Option<[u8; 32]>,
     /// Cleartext copy of [`PROTOCOL_VARIANT`]. Lets the server reject
     /// a mismatched-mode client up front (before signature
     /// verification); the same value is bound into the handshake
@@ -225,6 +235,11 @@ struct HandshakeTranscript<'a> {
     ciphertext: &'a HybridCiphertext,
     server_verify_key: &'a HybridVerifyingKey,
     session_id: &'a [u8; 32],
+    /// The server's 0-RTT verdict (H2). Signing it stops an on-path attacker
+    /// from flipping `ServerHello.early_data_accepted` to make the client
+    /// duplicate or silently drop early-data (Invariant 9). Placed LAST so
+    /// `protocol_variant` stays the leading transcript field (Invariant 10).
+    early_data_accepted: bool,
 }
 
 /// Hash a borsh-serializable transcript. The transcript leads with the
@@ -235,6 +250,39 @@ fn compute_transcript_hash<T: BorshSerialize>(transcript: &T) -> Result<[u8; 32]
         borsh::to_vec(transcript).map_err(|e| HandshakeError::SerializationError(e.to_string()))?;
     hasher.update(&bytes);
     Ok(hasher.finalize().into())
+}
+
+/// A resumption ticket that the resume fast-path has eagerly consumed after a
+/// successful binder check (HS-03 / ZERORTT-2). Carries everything needed to
+/// re-insert the ticket **unchanged** (preserving its original lifetime) if a
+/// later handshake step fails, so a corrupted resuming `ClientHello` cannot burn
+/// a victim's one-shot ticket.
+struct ConsumedTicket {
+    rid: [u8; 32],
+    secret: [u8; 32],
+    suite: CipherSuite,
+    created_at: std::time::Instant,
+    expires_at: std::time::Instant,
+}
+
+/// Derive the HS-03 resumption proof-of-possession binder: a keyed PRF over
+/// `resumption_secret || resume_session_id || client_nonce` via
+/// [`crate::crypto::kdf::derive_key_32`] (blake3 on default builds, HKDF-SHA256
+/// under `--features fips`). Binding the per-connect `client_nonce` makes the
+/// binder connect-specific; keying it on the secret means only a client that
+/// actually holds `resumption_secret` — not a passive observer of the cleartext
+/// `resume_session_id` — can produce a value the server will accept.
+fn derive_resumption_binder(
+    resumption_secret: &[u8; 32],
+    resume_session_id: &[u8; 32],
+    client_nonce: &[u8; 32],
+) -> [u8; 32] {
+    // The IKM holds the resumption secret; wipe it on every exit path.
+    let mut ikm = zeroize::Zeroizing::new([0u8; 96]);
+    ikm[..32].copy_from_slice(resumption_secret);
+    ikm[32..64].copy_from_slice(resume_session_id);
+    ikm[64..].copy_from_slice(client_nonce);
+    crate::crypto::kdf::derive_key_32("phantom-resume-binder-v1", &*ikm)
 }
 
 /// Handshake Server State Machine
@@ -430,35 +478,57 @@ impl HandshakeServer {
             return HandshakeResponse::Reject(ServerReject::unsupported_version());
         }
 
-        // 0-RTT resumption fast path.
+        // 0-RTT resumption fast path with proof-of-possession (HS-03 + ZERORTT-2).
         //
         // If the client offered a `resume_session_id` AND the cache holds a
-        // still-valid ticket for it, treat the client as already-vetted: skip
-        // the cookie/PoW DoS gate. This is safe because the resume_session_id
-        // is bound to a per-(server, client) shared secret from a past
-        // handshake — only the legitimate prior client could hold it. We keep
-        // the returned `(rid, resumption_secret)` to key best-effort
-        // early-data decryption below.
+        // still-valid ticket, a valid resume lets the client skip the cookie/PoW
+        // DoS gate and (with a sealed blob) deliver 0-RTT early-data.
         //
-        // `try_resume` is **one-shot**: it consumes the ticket here. On
-        // handshake success a fresh ticket is minted, so the credit "rolls
-        // over". A replayed ClientHello finds no ticket and falls back to the
-        // normal cookie/PoW gate (Invariant 9). The KEM round-trip still runs,
-        // so forward secrecy is preserved by the fresh X25519+ML-KEM secret.
-        let resumed: Option<([u8; 32], [u8; 32])> =
-            client_hello.resume_session_id.and_then(|rid| {
-                self.session_cache
-                    .lock()
-                    .try_resume(&rid)
-                    .map(|(secret, _suite)| (rid, secret))
-            });
+        // Before trusting the resume we require proof the client holds the
+        // ticket's `resumption_secret` — a `resumption_binder` MAC (HS-03). We
+        // PEEK the ticket (no consume) to recompute the expected binder and
+        // compare it constant-time; a missing/mismatched binder (e.g. a passive
+        // observer that only copied the cleartext `resume_session_id`) means NO
+        // resume — the ticket is left untouched and the client falls through to
+        // the normal cookie/PoW gate.
+        //
+        // On a valid binder we CONSUME the ticket eagerly (one-shot anti-replay,
+        // Invariant 9); `remove` returns `true` for exactly one of two racing
+        // duplicate resumes, so the same early-data can't be accepted twice. The
+        // consumed ticket is carried in `resumed` and re-inserted unchanged on
+        // any later handshake failure (ZERORTT-2), so a corrupted resuming
+        // `ClientHello` cannot burn a victim's ticket. The KEM round-trip still
+        // runs, so forward secrecy is preserved by the fresh X25519+ML-KEM secret.
+        let resumed: Option<ConsumedTicket> = client_hello.resume_session_id.and_then(|rid| {
+            let (secret, suite, created_at, expires_at) = self.session_cache.lock().peek(&rid)?;
+            // Proof-of-possession: only a holder of `resumption_secret` can
+            // produce a binder that matches. `None` binder ⇒ no resume.
+            let expected = derive_resumption_binder(&secret, &rid, &client_hello.nonce);
+            let presented = client_hello.resumption_binder?;
+            if !bool::from(presented.ct_eq(&expected)) {
+                return None;
+            }
+            // Binder verified — consume now (race-free via `remove`'s bool).
+            if !self.session_cache.lock().remove(&rid) {
+                return None; // a concurrent resume already consumed it
+            }
+            Some(ConsumedTicket {
+                rid,
+                secret,
+                suite,
+                created_at,
+                expires_at,
+            })
+        });
         let cookie_pow_bypass = resumed.is_some();
 
-        // Stateless DoS checks (Cookie & PoW).
+        // Stateless DoS checks (Cookie & PoW). On the bypass path the gate
+        // returns Ok; a rare infra error there is still post-consume, so hand the
+        // ticket back if it fails (ZERORTT-2).
         if let Err(resp) =
             self.cookie_pow_gate(client_hello, difficulty, client_ip, cookie_pow_bypass)
         {
-            return resp;
+            return self.fail_and_reinsert(&resumed, resp);
         }
 
         // Best-effort 0-RTT early-data decryption. Only attempted when the
@@ -468,8 +538,8 @@ impl HandshakeServer {
         // handshake (Invariant 9). Forward secrecy of the post-handshake
         // session is preserved by the fresh hybrid KEM regardless.
         let early_data_plaintext: Option<Vec<u8>> = match (&resumed, &client_hello.early_data) {
-            (Some((rid, resumption_secret)), Some(blob)) => {
-                decrypt_early_data(resumption_secret, &client_hello.nonce, rid, blob)
+            (Some(t), Some(blob)) => {
+                decrypt_early_data(&t.secret, &client_hello.nonce, &t.rid, blob)
             }
             _ => None,
         };
@@ -479,7 +549,12 @@ impl HandshakeServer {
         // 0-RTT path).
         let (shared_secret, ciphertext) = match client_hello.client_key_package.encapsulate() {
             Ok(res) => res,
-            Err(e) => return HandshakeResponse::Fail(HandshakeError::KemFailed(e.to_string())),
+            Err(e) => {
+                return self.fail_and_reinsert(
+                    &resumed,
+                    HandshakeResponse::Fail(HandshakeError::KemFailed(e.to_string())),
+                );
+            }
         };
 
         // Generate a per-session ephemeral hybrid KEM keypair. The public half
@@ -502,10 +577,11 @@ impl HandshakeServer {
             ciphertext: &ciphertext,
             server_verify_key: &self.verifying_key,
             session_id: &session_id_bytes,
+            early_data_accepted,
         };
         let transcript_hash = match compute_transcript_hash(&transcript) {
             Ok(h) => h,
-            Err(e) => return HandshakeResponse::Fail(e),
+            Err(e) => return self.fail_and_reinsert(&resumed, HandshakeResponse::Fail(e)),
         };
         let signature = self.signing_key.sign(&transcript_hash);
 
@@ -522,7 +598,7 @@ impl HandshakeServer {
         // fresh one-shot ticket for a future resume / 0-RTT.
         let session = match self.finalize_session(&shared_secret, session_id, session_id_bytes) {
             Ok(s) => s,
-            Err(resp) => return resp,
+            Err(resp) => return self.fail_and_reinsert(&resumed, resp),
         };
 
         HandshakeResponse::Success(server_hello, session, early_data_plaintext)
@@ -665,6 +741,30 @@ impl HandshakeServer {
         Ok(session)
     }
 
+    /// Re-insert a ticket consumed by a resume attempt that then failed
+    /// (ZERORTT-2), preserving its original lifetime, and return the failure
+    /// response unchanged. A no-op when `resumed` is `None`. This keeps a
+    /// corrupted/forged resuming `ClientHello` from burning a victim's one-shot
+    /// ticket: the ticket is consumed eagerly (race-free) after the binder check,
+    /// and handed back here on every post-consume failure path.
+    #[allow(clippy::result_large_err)]
+    fn fail_and_reinsert(
+        &self,
+        resumed: &Option<ConsumedTicket>,
+        resp: HandshakeResponse,
+    ) -> HandshakeResponse {
+        if let Some(t) = resumed {
+            self.session_cache.lock().reinsert_with_expiry(
+                t.rid,
+                &t.secret,
+                t.suite,
+                t.created_at,
+                t.expires_at,
+            );
+        }
+        resp
+    }
+
     pub fn verifying_key(&self) -> &HybridVerifyingKey {
         &self.verifying_key
     }
@@ -739,6 +839,7 @@ impl HandshakeClient {
             cookie: None,
             pow_solution: None,
             resume_session_id: None,
+            resumption_binder: None,
             protocol_variant: PROTOCOL_VARIANT.to_vec(),
             early_data: None,
         }
@@ -767,6 +868,10 @@ impl HandshakeClient {
     ) -> ClientHello {
         let sealed = early_data
             .and_then(|pt| seal_early_data(resumption_secret, &self.nonce, &resume_session_id, pt));
+        // HS-03: prove possession of `resumption_secret` so a passive observer of
+        // the cleartext `resume_session_id` cannot consume the server's ticket.
+        let resumption_binder =
+            derive_resumption_binder(resumption_secret, &resume_session_id, &self.nonce);
         ClientHello {
             client_key_package: self.kem_public.clone(),
             client_verify_key: self.verifying_key.clone(),
@@ -775,6 +880,7 @@ impl HandshakeClient {
             cookie: None,
             pow_solution: None,
             resume_session_id: Some(resume_session_id),
+            resumption_binder: Some(resumption_binder),
             protocol_variant: PROTOCOL_VARIANT.to_vec(),
             early_data: sealed,
         }
@@ -822,6 +928,9 @@ impl HandshakeClient {
             ciphertext: &server_hello.ciphertext,
             server_verify_key: &server_hello.server_verify_key,
             session_id: &server_hello.session_id,
+            // H2: recompute with the RECEIVED verdict — a flipped bit makes this
+            // hash diverge from what the server signed, so verify() below fails.
+            early_data_accepted: server_hello.early_data_accepted,
         };
         let transcript_hash = compute_transcript_hash(&transcript)?;
         server_hello
@@ -1149,6 +1258,7 @@ mod tests {
                 solution: 0x0123_4567_89AB_CDEF,
             }),
             resume_session_id: Some(arr32(0xC0)),
+            resumption_binder: Some(arr32(0xC8)),
             protocol_variant: PROTOCOL_VARIANT.to_vec(),
             early_data: Some(pat(0xD0, 48)),
         };
@@ -1165,6 +1275,7 @@ mod tests {
             ciphertext: &ciphertext,
             server_verify_key: &verify_key,
             session_id: &session_id,
+            early_data_accepted: true,
         };
         let hash = compute_transcript_hash(&transcript).expect("transcript hash");
 

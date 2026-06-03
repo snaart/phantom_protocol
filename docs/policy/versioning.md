@@ -18,7 +18,7 @@ And one pinned constant that is **not** an evolving axis (see §3):
 | Constant | Identifier | Lives in | Value |
 | --- | --- | --- | --- |
 | Wire-format version | `WIRE_VERSION` (packet-header byte) | `core/src/transport/types.rs` | `2` |
-| Protocol version | `PROTOCOL_VERSION` (`ClientHello.version`) | `core/src/transport/handshake.rs` | `1` |
+| Protocol version | `PROTOCOL_VERSION` (`ClientHello.version`) | `core/src/transport/handshake.rs` | `2` |
 
 A single commit can move zero, one, or both of the live axes. Each axis has its
 own changelog entry (see `CHANGELOG.md`).
@@ -70,8 +70,10 @@ Two constants pin the format:
   `1` when the packet codec moved off `alkahest` to the hand-rolled big-endian
   layout; see `docs/protocol/PROTOCOL.md` § 4.2)
   (`transport/types.rs`). It leads the serialised bytes and the AEAD AAD.
-- `PROTOCOL_VERSION = 1` — `ClientHello.version` (`transport/handshake.rs`),
-  bound into the signed handshake transcript.
+- `PROTOCOL_VERSION = 2` — `ClientHello.version` (`transport/handshake.rs`),
+  bound into the signed handshake transcript (bumped `1 → 2` when the transcript
+  began covering the 0-RTT verdict `early_data_accepted` and `ClientHello` gained
+  the `resumption_binder` proof-of-possession field; v1 ↔ v2 cannot interoperate).
 
 Both are **tamper-check anchors**, not negotiated sets:
 

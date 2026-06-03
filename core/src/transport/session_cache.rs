@@ -155,10 +155,70 @@ impl SessionCache {
         Some((secret, suite))
     }
 
-    /// Remove a specific ticket
-    pub fn remove(&mut self, session_id: &SessionId) {
-        self.tickets.remove(session_id);
+    /// Look up a still-valid ticket **without consuming it** (HS-03). Expired
+    /// tickets are removed and `None` returned. The returned
+    /// `created_at`/`expires_at` let the caller re-insert the ticket unchanged
+    /// via [`reinsert_with_expiry`](Self::reinsert_with_expiry) if a resume that
+    /// passed the binder check later fails (ZERORTT-2) — without extending the
+    /// lifetime. Actual consumption is a separate explicit [`remove`](Self::remove)
+    /// once the resume's proof-of-possession (binder) has been verified.
+    pub fn peek(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Option<([u8; 32], CipherSuite, Instant, Instant)> {
+        let ticket = self.tickets.get(session_id)?;
+        if !ticket.is_valid() {
+            self.remove(session_id);
+            return None;
+        }
+        Some((
+            ticket.resumption_secret,
+            ticket.cipher_suite,
+            ticket.created_at,
+            ticket.expires_at,
+        ))
+    }
+
+    /// Re-insert a ticket that a resume attempt consumed but then failed to
+    /// complete (ZERORTT-2 — e.g. a corrupted KEM ciphertext aborts the
+    /// handshake after the ticket was removed). Restores the ticket with its
+    /// **original** timestamps so the lifetime is not extended, and refuses to
+    /// resurrect an already-expired ticket. Mirrors [`store`](Self::store)'s
+    /// eviction + LRU bookkeeping so `evict_oldest` stays consistent.
+    pub fn reinsert_with_expiry(
+        &mut self,
+        session_id: SessionId,
+        resumption_secret: &[u8; 32],
+        cipher_suite: CipherSuite,
+        created_at: Instant,
+        expires_at: Instant,
+    ) {
+        // Never resurrect a ticket that expired in the meantime.
+        if Instant::now() >= expires_at {
+            return;
+        }
+        if self.tickets.len() >= self.max_entries {
+            self.evict_oldest();
+        }
+        let ticket = ResumptionTicket {
+            resumption_secret: *resumption_secret,
+            cipher_suite,
+            created_at,
+            expires_at,
+        };
+        self.tickets.insert(session_id, ticket);
+        self.lru_order.retain(|id| id != &session_id);
+        self.lru_order.push(session_id);
+    }
+
+    /// Remove a specific ticket. Returns `true` iff a ticket was actually
+    /// present — the resume path uses this to make eager consumption race-free:
+    /// of two concurrent resumes of the same id, exactly one observes `true`
+    /// and proceeds, so the same 0-RTT early-data cannot be accepted twice.
+    pub fn remove(&mut self, session_id: &SessionId) -> bool {
+        let existed = self.tickets.remove(session_id).is_some();
         self.lru_order.retain(|id| id != session_id);
+        existed
     }
 
     /// Evict oldest ticket (LRU)
@@ -276,5 +336,54 @@ mod tests {
         // Wait for expiry
         std::thread::sleep(Duration::from_millis(5));
         assert!(cache.try_resume(&id).is_none());
+    }
+
+    #[test]
+    fn peek_does_not_consume_but_returns_secret_and_timestamps() {
+        // HS-03: the binder check peeks the ticket WITHOUT consuming it, so a
+        // resume that fails its proof-of-possession leaves the ticket intact.
+        let mut cache = SessionCache::new();
+        let id = [0xABu8; 32];
+        let secret = [0xCDu8; 32];
+        cache.store(id, &secret, CipherSuite::Aes256Gcm);
+
+        let (s, suite, created, expires) = cache.peek(&id).expect("ticket present");
+        assert_eq!(s, secret);
+        assert_eq!(suite, CipherSuite::Aes256Gcm);
+        assert!(expires > created);
+        // Peek did NOT consume — still there, still peekable, still resumable.
+        assert_eq!(cache.len(), 1, "peek must not consume the ticket");
+        assert!(cache.peek(&id).is_some());
+        assert!(cache.try_resume(&id).is_some());
+    }
+
+    #[test]
+    fn reinsert_preserves_expiry_and_refuses_expired() {
+        // ZERORTT-2: a resume consumed the ticket but the handshake then failed;
+        // re-insert restores it with its ORIGINAL timestamps (no lifetime
+        // extension), and never resurrects an already-expired ticket.
+        let mut cache = SessionCache::new();
+        let id = [0x01u8; 32];
+        let secret = [0x02u8; 32];
+        cache.store(id, &secret, CipherSuite::Aes256Gcm);
+        let (s, suite, created, expires) = cache.peek(&id).expect("present");
+
+        // Consume (as the resume path does), then re-insert on failure.
+        cache.remove(&id);
+        assert_eq!(cache.len(), 0);
+        cache.reinsert_with_expiry(id, &s, suite, created, expires);
+        let (_, _, c2, e2) = cache.peek(&id).expect("re-inserted");
+        assert_eq!(
+            (c2, e2),
+            (created, expires),
+            "timestamps preserved, lifetime not extended"
+        );
+
+        // An already-expired ticket is not resurrected.
+        let past_created = created - Duration::from_secs(7200);
+        let past_expires = created - Duration::from_secs(3600);
+        cache.remove(&id);
+        cache.reinsert_with_expiry(id, &s, suite, past_created, past_expires);
+        assert_eq!(cache.len(), 0, "expired ticket must not be resurrected");
     }
 }

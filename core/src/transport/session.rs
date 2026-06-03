@@ -931,6 +931,12 @@ impl Session {
         *guard = Some(secret);
     }
 
+    /// The resumption secret for 0-RTT, if one has been installed. Rust-only —
+    /// the FFI surface exposes this via `PhantomSession::resumption_hint()`.
+    pub fn resumption_secret(&self) -> Option<[u8; 32]> {
+        *self.resumption_secret.read()
+    }
+
     /// Check if session can be resumed (has resumption secret)
     pub fn can_resume(&self) -> bool {
         self.resumption_secret.read().is_some()
