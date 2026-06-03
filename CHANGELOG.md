@@ -88,6 +88,35 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   attacker guessed. It now uses `subtle::ConstantTimeEq`, matching the cookie /
   path-validation compares. (Folded into the H3 `crypto/pow.rs` change.)
 
+- **H4 / DOS-1 (high): slowloris — in-library handshake timeout + decoupled
+  accept loop — fixed.** `PhantomListener` drove each handshake inline in
+  `accept()` with no timeout, so a peer that opened a connection and stalled (or
+  dribbled bytes) hung the handshake — forever for FFI embedders, up to the
+  reference server's 30s `accept()` timeout — and the serial accept loop meant
+  one stalled connection blocked all other clients. Now a background acceptor
+  task owns the socket and drives each handshake in its **own task bounded by a
+  10s in-library deadline** (via the `Runtime` clock, so `bind_with_runtime` and
+  wasm/embedded runtimes are honored); `accept()` returns the next *completed*
+  session from a bounded queue. A stalled/slow/failed handshake therefore never
+  blocks accepting or returning other clients. Concurrent in-flight handshakes
+  are bounded by a dedicated semaphore (`MAX_INFLIGHT_HANDSHAKES = 256`, distinct
+  from any established-session cap). `accept()`'s signature and the
+  `ConnectionClosed`-on-shutdown contract are unchanged (no FFI break); a
+  handshake failure is now dropped server-side (logged + recorded) rather than
+  surfaced as an `accept()` error.
+
+- **DOS-4 (low): cap server-side cookie/PoW Retry rounds.** A peer that keeps
+  triggering `Retry` without satisfying the gate is dropped after
+  `MAX_SERVER_RETRY_ROUNDS = 2` rather than occupying the handshake indefinitely.
+
+- **HS-02 (medium): cap client HelloRetryRequest rounds + bound the client
+  handshake.** A MITM answering every `ClientHello` with a fresh cheap
+  `HelloRetryRequest` could loop the client forever. The client now caps retries
+  at `MAX_CLIENT_RETRY_ROUNDS = 3` and wraps the whole handshake in a 10s
+  deadline (via the `Runtime` clock), so a silent or stalling server can no
+  longer hang `connect`. Pinned by `client_handshake_caps_retry_rounds` and the
+  `tcp_integration_stalled_peer_does_not_block_accept` integration test.
+
 ### Added
 
 - **Graceful unsupported-version signal.** When a `ClientHello.version` is one

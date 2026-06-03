@@ -4,37 +4,74 @@ use crate::crypto::hybrid_sign::HybridSigningKey;
 use crate::errors::CoreError;
 use crate::observability::attrs::{AeadAlgorithm, HandshakeOutcome, ProtocolVersion};
 use crate::observability::{Observability, ObservabilityConfig};
-use crate::runtime::{Runtime, TokioRuntime};
+use crate::runtime::{Runtime, SpawnHandle, TokioRuntime};
 use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
 use crate::transport::types::LegType;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
+
+/// In-library overall deadline for one server-side handshake (H4/DOS-1). A
+/// stalled or byte-trickling peer can no longer hang `accept()`: the handshake
+/// is abandoned with `CoreError::Timeout` past this budget. A full hybrid
+/// X25519+ML-KEM-768 / Ed25519+ML-DSA-65 handshake completes in single-digit ms
+/// on a real link, so 10s comfortably absorbs mobile/satellite RTT + a cookie/PoW
+/// round while still bounding a slowloris. Routed through the `Runtime` clock so
+/// a custom `bind_with_runtime` runtime (incl. tests) is honored.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Max cookie/PoW `Retry` rounds the server drives for one connection (DOS-4).
+/// One cookie round + one PoW round is the legitimate maximum; a peer that keeps
+/// triggering `Retry` without ever satisfying the gate is dropped rather than
+/// allowed to occupy the handshake indefinitely.
+const MAX_SERVER_RETRY_ROUNDS: u32 = 2;
+
+/// Max concurrent in-flight (accepted-but-not-yet-established) handshakes the
+/// listener drives at once (H4 decouple) — a dedicated bound distinct from any
+/// established-session cap the embedder applies. Also the depth of the
+/// completed-handshake hand-off queue, so at most ~2× this many sessions buffer
+/// before the listener back-pressures to not accepting new TCP.
+const MAX_INFLIGHT_HANDSHAKES: usize = 256;
 
 #[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct PhantomListener {
-    listener: Mutex<TcpListener>,
+    /// Listening socket, owned by the background acceptor task (H4 decouple).
+    /// `tokio::net::TcpListener::accept` takes `&self`, so an `Arc` (no mutex)
+    /// suffices — only the single acceptor task accepts.
+    listener: Arc<TcpListener>,
     handshake_server: Arc<HandshakeServer>,
     /// The local socket address the listener is actually bound to.
     /// Cached so callers can read it without acquiring the listener mutex.
     /// Useful when `bind("0.0.0.0:0")` is used and the OS chose the port.
     local_addr: SocketAddr,
     /// Graceful-shutdown signal (Phase 4.6). `shutdown()` flips
-    /// `shutting_down` and wakes all `accept()` calls currently parked
-    /// on the listener so they can unwind cleanly.
-    shutting_down: AtomicBool,
+    /// `shutting_down` and wakes the acceptor + any `accept()` calls so they
+    /// unwind cleanly. `Arc` so the background acceptor task shares it.
+    shutting_down: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
-    /// Async runtime used for spawning accepted-session data pumps
-    /// (Phase 3.1). Defaults to [`TokioRuntime`] via [`bind`]; callers
-    /// that need a non-tokio runtime use [`bind_with_runtime`].
+    /// Async runtime used for spawning the acceptor, per-connection handshake
+    /// tasks, and accepted-session data pumps (Phase 3.1). Defaults to
+    /// [`TokioRuntime`] via [`bind`]; [`bind_with_runtime`] overrides it.
     runtime: Arc<dyn Runtime>,
     /// Listener-wide observability (Phase 8 — OTel refactor). Wraps the
     /// lock-free hot-path atomics and (when the `telemetry-otel` feature is
     /// on) the OTel instrument holders. Exposed via [`observability`].
     observability: Arc<Observability>,
+    /// Bounds concurrent in-flight handshakes (H4 decouple) — see
+    /// [`MAX_INFLIGHT_HANDSHAKES`]. Distinct from any established-session cap.
+    inflight: Arc<Semaphore>,
+    /// Completed-handshake hand-off: the background acceptor pushes each
+    /// established [`AcceptOutcome`] here and `accept()` drains it, so a slow or
+    /// stalled handshake never blocks accepting (or `accept()`-ing) others.
+    /// Bounded, so a non-draining embedder back-pressures to not accepting TCP.
+    accepted_tx: mpsc::Sender<Arc<AcceptOutcome>>,
+    accepted_rx: Mutex<mpsc::Receiver<Arc<AcceptOutcome>>>,
+    /// The background acceptor task — lazily started on the first `accept()`,
+    /// aborted on `Drop`. `Mutex<Option<_>>` makes the start one-shot.
+    acceptor: parking_lot::Mutex<Option<SpawnHandle>>,
 }
 
 // Rust-only constructors that take a non-UniFFI type (`Arc<dyn Runtime>`).
@@ -108,14 +145,19 @@ impl PhantomListener {
             None => HandshakeServer::new(),
         }
         .map_err(|e| CoreError::InternalError(e.to_string()))?;
+        let (accepted_tx, accepted_rx) = mpsc::channel(MAX_INFLIGHT_HANDSHAKES);
         Ok(Arc::new(Self {
-            listener: Mutex::new(listener),
+            listener: Arc::new(listener),
             handshake_server: Arc::new(hs),
             local_addr,
-            shutting_down: AtomicBool::new(false),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             runtime,
             observability: Observability::new(ObservabilityConfig::default()),
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
+            accepted_tx,
+            accepted_rx: Mutex::new(accepted_rx),
+            acceptor: parking_lot::Mutex::new(None),
         }))
     }
 
@@ -213,59 +255,44 @@ impl PhantomListener {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(CoreError::ConnectionClosed);
         }
-        let listener_guard = self.listener.lock().await;
+        // Decoupled accept (H4): a background acceptor task owns the socket and
+        // drives each handshake in its own deadline-bounded task, pushing the
+        // established session here. `accept()` just returns the next completed
+        // one — so a slow or stalled peer's handshake never blocks accepting (or
+        // returning) other clients. Lazily start the acceptor on first use.
+        self.ensure_acceptor();
+        let mut rx = self.accepted_rx.lock().await;
         let shutdown_fut = self.shutdown_notify.notified();
         tokio::pin!(shutdown_fut);
-        let (stream, peer) = tokio::select! {
-            result = listener_guard.accept() => {
-                result.map_err(|e| CoreError::NetworkError(e.to_string()))?
-            }
-            _ = &mut shutdown_fut => {
-                return Err(CoreError::ConnectionClosed);
-            }
-        };
-        // Release the listener lock before driving the handshake, so other
-        // tasks can call accept again concurrently.
-        drop(listener_guard);
-        let transport = TcpSessionTransport::new(stream);
-        // Phase 4.5 metrics: time the full handshake from accept to
-        // session-installed; account success vs failure separately.
-        let started = Instant::now();
-        let (server_session, early_data) =
-            match drive_server_handshake(&transport, &self.handshake_server, peer.ip()).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    self.observability.record_handshake(
-                        started.elapsed(),
-                        HandshakeOutcome::Failure,
-                        LegType::Tcp,
-                        AeadAlgorithm::Aes256Gcm,
-                        ProtocolVersion::Current,
-                    );
-                    return Err(e);
-                }
-            };
-        // Reference server accepts over TCP today; the negotiated AEAD is
-        // AES-256-GCM by default (ChaCha20-Poly1305 is rejected under fips and
-        // not selected by the default policy).
-        self.observability.record_handshake(
-            started.elapsed(),
-            HandshakeOutcome::Success,
-            LegType::Tcp,
-            AeadAlgorithm::Aes256Gcm,
-            ProtocolVersion::Current,
-        );
-        // The data pump now owns the session-active gauge lifecycle (opened at
-        // pump start, closed at teardown) — so the gauge goes up *and* down. We
-        // no longer call `session_opened` here, which had kept it monotonic.
-        let session = PhantomSession::from_accepted_server_session_with_runtime(
-            peer.to_string(),
-            transport,
-            Arc::new(server_session),
+        tokio::select! {
+            biased;
+            _ = &mut shutdown_fut => Err(CoreError::ConnectionClosed),
+            item = rx.recv() => item.ok_or(CoreError::ConnectionClosed),
+        }
+    }
+
+    /// Lazily spawn the single background acceptor task (idempotent). It owns the
+    /// listening socket; for each inbound connection it acquires an in-flight
+    /// permit (bounding concurrent handshakes) and spawns a deadline-bounded
+    /// handshake task whose established [`AcceptOutcome`] is pushed to
+    /// `accepted_tx`. This decoupling is the H4 fix — the serial accept loop no
+    /// longer blocks on any one handshake.
+    fn ensure_acceptor(&self) {
+        let mut guard = self.acceptor.lock();
+        if guard.is_some() {
+            return;
+        }
+        let handle = self.runtime.spawn(Box::pin(run_acceptor(
+            self.listener.clone(),
+            self.handshake_server.clone(),
+            self.inflight.clone(),
+            self.accepted_tx.clone(),
+            self.shutting_down.clone(),
+            self.shutdown_notify.clone(),
             self.runtime.clone(),
             self.observability.clone(),
-        );
-        Ok(AcceptOutcome::new(session, early_data, peer))
+        )));
+        *guard = Some(handle);
     }
 
     /// Signal graceful shutdown (Phase 4.6).
@@ -279,6 +306,10 @@ impl PhantomListener {
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();
+        // Stop the background acceptor promptly (idempotent; `Drop` also aborts).
+        if let Some(handle) = self.acceptor.lock().as_ref() {
+            handle.abort();
+        }
     }
 
     /// Whether `shutdown()` has been called.
@@ -365,6 +396,7 @@ async fn drive_server_handshake(
     hs: &HandshakeServer,
     client_ip: IpAddr,
 ) -> Result<(crate::transport::session::Session, Option<Vec<u8>>), CoreError> {
+    let mut retry_rounds: u32 = 0;
     loop {
         let hello_bytes = transport.recv_bytes().await?;
         let client_hello = borsh::from_slice::<ClientHello>(&hello_bytes)
@@ -376,6 +408,15 @@ async fn drive_server_handshake(
         let difficulty = hs.adaptive_difficulty();
         match hs.process_client_hello(&client_hello, difficulty, client_ip) {
             HandshakeResponse::Retry(retry) => {
+                // DOS-4: bound the Retry rounds so a peer that keeps triggering
+                // Retry without satisfying the cookie/PoW gate can't occupy the
+                // handshake indefinitely.
+                retry_rounds += 1;
+                if retry_rounds > MAX_SERVER_RETRY_ROUNDS {
+                    return Err(CoreError::HandshakeError(format!(
+                        "client exceeded {MAX_SERVER_RETRY_ROUNDS} cookie/PoW retry rounds"
+                    )));
+                }
                 let bytes = borsh::to_vec(&retry)
                     .map_err(|e| CoreError::NetworkError(format!("Retry encode failed: {}", e)))?;
                 transport.send_bytes(&bytes).await?;
@@ -408,6 +449,118 @@ async fn drive_server_handshake(
                     e
                 )));
             }
+        }
+    }
+}
+
+/// Background acceptor loop (H4 decouple). Owns the listening socket; for each
+/// inbound connection it bounds concurrency via `inflight`, then spawns a
+/// deadline-bounded handshake task that pushes the established [`AcceptOutcome`]
+/// to `accepted_tx`. A slow/stalled/failed handshake therefore never blocks
+/// accepting other connections, and failed handshakes are dropped (logged +
+/// recorded) rather than surfaced to `accept()`.
+#[allow(clippy::too_many_arguments)]
+async fn run_acceptor(
+    listener: Arc<TcpListener>,
+    hs: Arc<HandshakeServer>,
+    inflight: Arc<Semaphore>,
+    accepted_tx: mpsc::Sender<Arc<AcceptOutcome>>,
+    shutting_down: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
+    runtime: Arc<dyn Runtime>,
+    observability: Arc<Observability>,
+) {
+    loop {
+        if shutting_down.load(Ordering::Acquire) {
+            break;
+        }
+        let shutdown_fut = shutdown_notify.notified();
+        tokio::pin!(shutdown_fut);
+        let (stream, peer) = tokio::select! {
+            biased;
+            _ = &mut shutdown_fut => break,
+            res = listener.accept() => match res {
+                Ok(pair) => pair,
+                Err(e) => {
+                    log::warn!("PhantomListener: accept failed: {}", e);
+                    continue;
+                }
+            },
+        };
+        // Bound concurrent in-flight handshakes. The permit is held for the
+        // handshake's lifetime AND until its result is queued, so a non-draining
+        // embedder back-pressures all the way to not accepting new TCP.
+        let permit = match inflight.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break, // semaphore closed — listener going away
+        };
+        let hs = hs.clone();
+        let accepted_tx = accepted_tx.clone();
+        let task_runtime = runtime.clone();
+        let observability = observability.clone();
+        // Drive THIS handshake in its own task so a stall never blocks the loop.
+        runtime.spawn(Box::pin(async move {
+            let _permit = permit; // released when this task ends
+            let transport = TcpSessionTransport::new(stream);
+            let started = Instant::now();
+            // (A) In-library handshake deadline via the Runtime clock — a stalled
+            // or byte-trickling peer is abandoned, never hanging a task forever.
+            // Scoped so the borrow of `transport` ends before it is moved into
+            // the session below.
+            let result = {
+                let hs_fut = drive_server_handshake(&transport, &hs, peer.ip());
+                let deadline = task_runtime.sleep(HANDSHAKE_DEADLINE);
+                tokio::pin!(hs_fut);
+                tokio::select! {
+                    r = &mut hs_fut => r,
+                    _ = deadline => Err(CoreError::Timeout),
+                }
+            };
+            match result {
+                Ok((server_session, early_data)) => {
+                    observability.record_handshake(
+                        started.elapsed(),
+                        HandshakeOutcome::Success,
+                        LegType::Tcp,
+                        AeadAlgorithm::Aes256Gcm,
+                        ProtocolVersion::Current,
+                    );
+                    let session = PhantomSession::from_accepted_server_session_with_runtime(
+                        peer.to_string(),
+                        transport,
+                        Arc::new(server_session),
+                        task_runtime.clone(),
+                        observability.clone(),
+                    );
+                    let outcome = AcceptOutcome::new(session, early_data, peer);
+                    // Bounded hand-off; a send error means the listener was dropped.
+                    let _ = accepted_tx.send(outcome).await;
+                }
+                Err(e) => {
+                    observability.record_handshake(
+                        started.elapsed(),
+                        HandshakeOutcome::Failure,
+                        LegType::Tcp,
+                        AeadAlgorithm::Aes256Gcm,
+                        ProtocolVersion::Current,
+                    );
+                    // Dropped, not surfaced to accept(): DoS noise from a bad/
+                    // stalled peer must not block the embedder's accept loop.
+                    log::debug!("PhantomListener: server handshake failed: {}", e);
+                }
+            }
+        }));
+    }
+}
+
+impl Drop for PhantomListener {
+    /// Stop the background acceptor when the listener is dropped, so it does not
+    /// outlive its owner accepting connections into a queue no one drains.
+    fn drop(&mut self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
+        if let Some(handle) = self.acceptor.lock().take() {
+            handle.abort();
         }
     }
 }
