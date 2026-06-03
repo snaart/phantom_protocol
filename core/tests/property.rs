@@ -257,3 +257,52 @@ proptest! {
         prop_assert_eq!(server.current_epoch(), steps);
     }
 }
+
+proptest! {
+    /// C1 (Invariant 8): for any per-stream sequence watermark and send count,
+    /// driving the production send-side rekey decision over a single stream must
+    /// keep every epoch's per-stream sequence span at or below the watermark — so
+    /// the per-stream `u32` can never wrap within one epoch and repeat the AEAD
+    /// nonce `(epoch, stream_id, sequence, path_id)`. The direction-wide trigger
+    /// is disabled so the per-stream watermark is the sole rekey driver; a rekey
+    /// that fails (epoch saturated) fails closed (stop emitting) rather than wrap.
+    #[test]
+    fn no_nonce_repeats_across_forced_rekeys(
+        secret in any::<[u8; 32]>(),
+        watermark in 1u32..=64,
+        sends in 1u32..2000,
+        stream in any::<u16>(),
+    ) {
+        let (client, _server) = session_pair(secret);
+        client.set_rekey_threshold(u64::MAX);
+        client.set_seq_rekey_watermark(watermark);
+
+        let mut spans: std::collections::BTreeMap<u8, (u32, u32)> = std::collections::BTreeMap::new();
+        let mut seen: std::collections::HashSet<(u8, u16, u32)> = std::collections::HashSet::new();
+
+        for seq in 0u32..sends {
+            if client.send_needs_rekey() || client.stream_seq_needs_rekey(stream, seq) {
+                if client.rekey().is_err() {
+                    break; // fail closed at epoch saturation — never wrap
+                }
+            }
+            let epoch = client.current_epoch();
+            prop_assert!(
+                seen.insert((epoch, stream, seq)),
+                "nonce tuple (epoch={}, stream={}, seq={}) repeated",
+                epoch, stream, seq
+            );
+            let e = spans.entry(epoch).or_insert((seq, seq));
+            e.0 = e.0.min(seq);
+            e.1 = e.1.max(seq);
+        }
+
+        for (epoch, (lo, hi)) in &spans {
+            prop_assert!(
+                hi - lo <= watermark,
+                "epoch {} spans {} sequences > watermark {}",
+                epoch, hi - lo, watermark
+            );
+        }
+    }
+}
