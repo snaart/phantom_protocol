@@ -42,7 +42,7 @@ ML_DSA_PK_LEN = 1952
 ML_DSA_SIG_LEN = 3309
 CLASSICAL_PK_LEN = 32
 PROTOCOL_VARIANT = b"phantom-default-1"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2  # bumped 1->2: H2 transcript-signs early_data_accepted + HS-03 adds resumption_binder
 WIRE_VERSION = 2
 
 
@@ -211,6 +211,7 @@ def dec_client_hello(r: BorshReader):
         "cookie": r.option(lambda: r.fixed(32)),
         "pow_solution": r.option(lambda: dec_pow_solution(r)),
         "resume_session_id": r.option(lambda: r.fixed(32)),
+        "resumption_binder": r.option(lambda: r.fixed(32)),
         "protocol_variant": r.vec_u8(),
         "early_data": r.option(lambda: r.vec_u8()),
     }
@@ -224,6 +225,7 @@ def enc_client_hello(w: BorshWriter, v):
     w.option(v["cookie"], w.fixed)
     w.option(v["pow_solution"], lambda s: enc_pow_solution(w, s))
     w.option(v["resume_session_id"], w.fixed)
+    w.option(v["resumption_binder"], w.fixed)
     w.vec_u8(v["protocol_variant"])
     w.option(v["early_data"], w.vec_u8)
 
