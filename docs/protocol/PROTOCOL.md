@@ -24,11 +24,14 @@ that sees any other value drops the frame (packets) or rejects the handshake
 | Constant | Value | Source | Where it lives on the wire |
 | --- | --- | --- | --- |
 | `WIRE_VERSION` | `2` | `core/src/transport/types.rs` | `PacketHeader.version` byte (first byte of the 45-byte header — § 4.2) |
-| `PROTOCOL_VERSION` | `1` | `core/src/transport/handshake.rs:55` | `ClientHello.version`, transcript-bound |
+| `PROTOCOL_VERSION` | `2` | `core/src/transport/handshake.rs:55` | `ClientHello.version`, transcript-bound |
 
 `WIRE_VERSION` is `2` (incremented when the packet codec moved from `alkahest`
-to the explicit big-endian layout in § 4.2); `PROTOCOL_VERSION` is `1` (the borsh
-handshake is unchanged). They exist so that:
+to the explicit big-endian layout in § 4.2); `PROTOCOL_VERSION` is `2` (bumped
+`1 → 2` when the signed transcript began covering the 0-RTT verdict
+`early_data_accepted` (H2) and `ClientHello` gained the `resumption_binder`
+proof-of-possession field (HS-03); a v1 ↔ v2 handshake cannot interoperate
+because the signed transcript content differs). They exist so that:
 
 - a tampered frame / hello that flips the byte is rejected up front
   (`PacketHeader.version != WIRE_VERSION` → drop; `ClientHello.version !=
@@ -440,10 +443,21 @@ pub struct ClientHello {
     pub cookie:             Option<[u8; 32]>,    // echoed from HelloRetryRequest
     pub pow_solution:       Option<PoWSolution>, // proof-of-work
     pub resume_session_id:  Option<[u8; 32]>,    // 0-RTT resumption ticket id
+    pub resumption_binder:  Option<[u8; 32]>,    // HS-03 proof-of-possession over the ticket secret
     pub protocol_variant:   Vec<u8>,             // build-variant tag (§6.7), transcript-bound
     pub early_data:         Option<Vec<u8>>,     // AEAD-sealed 0-RTT blob, or None (§6.6)
 }
 ```
+
+`resumption_binder` (HS-03) is present iff `resume_session_id` is: it is a keyed
+PRF `derive_key_32("phantom-resume-binder-v1", resumption_secret ‖
+resume_session_id ‖ nonce)`. The server verifies it **constant-time against the
+cached ticket's secret before consuming the one-shot ticket**, so a passive
+observer that copied the cleartext `resume_session_id` cannot burn a victim's
+ticket. The ticket is consumed eagerly (race-free) and re-inserted with its
+original expiry if the handshake later fails (ZERORTT-2). Field order
+(`resume_session_id` → `resumption_binder` → `protocol_variant`) is borsh
+wire-load-bearing.
 
 Source: `core/src/transport/handshake.rs:75-106`.
 

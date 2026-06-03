@@ -126,6 +126,7 @@ fn sample_client_hello_minimal() -> ClientHello {
         cookie: None,
         pow_solution: None,
         resume_session_id: None,
+        resumption_binder: None,
         protocol_variant: PROTOCOL_VARIANT.to_vec(),
         early_data: None,
     }
@@ -140,6 +141,7 @@ fn sample_client_hello_full() -> ClientHello {
         cookie: Some(arr32(0xB0)),
         pow_solution: Some(sample_pow_solution()),
         resume_session_id: Some(arr32(0xC0)),
+        resumption_binder: Some(arr32(0xC8)),
         protocol_variant: PROTOCOL_VARIANT.to_vec(),
         early_data: Some(pat(0xD0, 48)),
     }

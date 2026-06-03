@@ -18,9 +18,9 @@
 
 use bytes::Bytes;
 use phantom_core::crypto::adaptive_crypto::{CipherSuite, CryptoSession};
-use phantom_core::crypto::hybrid_sign::HybridSigningKey;
+use phantom_core::crypto::hybrid_sign::{HybridSigningKey, HybridVerifyingKey};
 use phantom_core::transport::handshake::{
-    HandshakeClient, HandshakeError, HandshakeResponse, HandshakeServer,
+    ClientHello, HandshakeClient, HandshakeError, HandshakeResponse, HandshakeServer, ServerHello,
 };
 use phantom_core::transport::path::PathStateKind;
 use phantom_core::transport::session::{CryptoState, Session, MAX_REKEY_CATCHUP};
@@ -940,5 +940,192 @@ fn seq_watermark_fails_closed_at_epoch_saturation() {
         rekeys,
         u8::MAX as u32,
         "should perform 255 successful rekeys before the epoch saturates"
+    );
+}
+
+// ── Auth cluster: H2 (transcript-signed 0-RTT verdict) ──────────────────────
+
+/// Drive a fresh `ClientHello` through the server to a `ServerHello`,
+/// transparently answering the single cookie `Retry` the DoS gate issues.
+/// Returns the **effective** `ClientHello` the server actually signed over
+/// (the retried one, carrying the cookie) alongside the `ServerHello`, so the
+/// caller verifies the signature against the matching transcript input.
+fn drive_handshake_to_success(
+    server: &HandshakeServer,
+    client_hello: &ClientHello,
+    client_ip: std::net::IpAddr,
+) -> (ClientHello, ServerHello) {
+    match server.process_client_hello(client_hello, 0, client_ip) {
+        HandshakeResponse::Success(sh, _, _) => (client_hello.clone(), sh),
+        HandshakeResponse::Retry(retry) => {
+            let mut retried = client_hello.clone();
+            retried.cookie = retry.cookie;
+            match server.process_client_hello(&retried, 0, client_ip) {
+                HandshakeResponse::Success(sh, _, _) => (retried, sh),
+                other => panic!("unexpected response after cookie retry: {:?}", other),
+            }
+        }
+        other => panic!("unexpected first handshake response: {:?}", other),
+    }
+}
+
+/// **H2 (Invariant 9).** `ServerHello.early_data_accepted` is the server's 0-RTT
+/// verdict. It MUST be covered by the signed handshake transcript: an on-path
+/// attacker who flips the bit (leaving signature/ciphertext/session_id intact)
+/// must break the client's signature check, not slip a forged verdict through —
+/// a forged verdict would let the attacker duplicate or silently black-hole
+/// 0-RTT early-data.
+#[test]
+fn flipped_early_data_accepted_bit_fails_signature() {
+    let server = HandshakeServer::new().expect("server");
+    let server_pk = server.verifying_key().clone();
+    let client = HandshakeClient::new().expect("client");
+    let hello = client.create_client_hello();
+    let ip = "127.0.0.1".parse().expect("ip");
+    let (effective_hello, sh) = drive_handshake_to_success(&server, &hello, ip);
+
+    // Honest verdict verifies (positive control).
+    assert!(
+        client
+            .process_server_hello(&effective_hello, &sh, Some(&server_pk))
+            .is_ok(),
+        "an untampered ServerHello must verify"
+    );
+
+    // Flip the verdict; signature/ciphertext/session_id are left intact.
+    let mut tampered = sh.clone();
+    tampered.early_data_accepted = !tampered.early_data_accepted;
+    assert!(
+        matches!(
+            client.process_server_hello(&effective_hello, &tampered, Some(&server_pk)),
+            Err(HandshakeError::KemFailed(_))
+        ),
+        "flipping early_data_accepted must fail the transcript signature check"
+    );
+}
+
+// ── Auth cluster: HS-03 (resumption PoP binder) + ZERORTT-2 (consume-on-success)
+
+/// Drive a first full handshake so the server mints a resumption ticket; return
+/// the `(resume_session_id, resumption_secret)` the client would later resume
+/// with (the two halves of `Session::resumption_hint()`).
+fn first_handshake_mint_ticket(
+    server: &HandshakeServer,
+    client: &HandshakeClient,
+    server_pk: &HybridVerifyingKey,
+    ip: std::net::IpAddr,
+) -> ([u8; 32], [u8; 32]) {
+    let hello = client.create_client_hello();
+    let (effective, sh) = drive_handshake_to_success(server, &hello, ip);
+    let (session, _) = client
+        .process_server_hello(&effective, &sh, Some(server_pk))
+        .expect("client establishes session");
+    let secret = session
+        .resumption_secret()
+        .expect("resumption secret installed");
+    (sh.session_id, secret)
+}
+
+/// **HS-03 (Invariant 9).** A resume must carry a `resumption_binder` proving
+/// possession of the prior session's `resumption_secret`. A passive observer
+/// that copied only the cleartext `resume_session_id` cannot forge it, so a
+/// binderless (or wrong-binder) resume must NOT consume the victim's one-shot
+/// ticket — it falls back to the normal cookie/PoW gate, ticket intact.
+#[test]
+fn binderless_resume_does_not_burn_ticket() {
+    let server = HandshakeServer::new().expect("server");
+    let server_pk = server.verifying_key().clone();
+    let ip = "127.0.0.1".parse().expect("ip");
+    let client1 = HandshakeClient::new().expect("client1");
+    let (rid, secret) = first_handshake_mint_ticket(&server, &client1, &server_pk, ip);
+    assert_eq!(
+        server.session_cache_len(),
+        1,
+        "first handshake mints a ticket"
+    );
+
+    // Observer: right rid, NO binder (cannot compute it without `secret`).
+    let client2 = HandshakeClient::new().expect("client2");
+    let mut forged = client2.create_client_hello_with_resume(rid, &secret, None);
+    forged.resumption_binder = None;
+    match server.process_client_hello(&forged, 0, ip) {
+        HandshakeResponse::Retry(_) => {} // fell back to the DoS gate — correct
+        other => panic!("a binderless resume must not bypass the gate: {:?}", other),
+    }
+    assert_eq!(
+        server.session_cache_len(),
+        1,
+        "a binderless resume must NOT consume the ticket"
+    );
+
+    // Also: a WRONG binder (attacker guesses) must not burn it either.
+    let mut wrong = client2.create_client_hello_with_resume(rid, &secret, None);
+    wrong.resumption_binder = Some([0xAB; 32]);
+    let _ = server.process_client_hello(&wrong, 0, ip);
+    assert_eq!(
+        server.session_cache_len(),
+        1,
+        "a wrong-binder resume must NOT consume the ticket"
+    );
+
+    // A legitimate resume (correct binder, proving possession of `secret`)
+    // bypasses the gate and consumes the ticket.
+    let client3 = HandshakeClient::new().expect("client3");
+    let valid = client3.create_client_hello_with_resume(rid, &secret, None);
+    match server.process_client_hello(&valid, 0, ip) {
+        HandshakeResponse::Success(..) => {} // bypass ⇒ binder verified + consumed
+        other => panic!("a valid resume should succeed: {:?}", other),
+    }
+    // One-shot (Invariant 9): replaying the SAME resume no longer bypasses the
+    // gate — the ticket for `rid` was consumed (a successful resume mints a
+    // fresh ticket under a NEW id, so this `rid` is gone for good).
+    match server.process_client_hello(&valid, 0, ip) {
+        HandshakeResponse::Retry(_) => {}
+        other => panic!(
+            "a replayed resume must not resume again (one-shot): {:?}",
+            other
+        ),
+    }
+}
+
+/// **ZERORTT-2 (Invariant 9).** The ticket is consumed eagerly after the binder
+/// check, but a handshake step that fails AFTER consumption (here: a corrupted
+/// KEM key package fails `encapsulate()`) must re-insert the ticket — a
+/// corrupted resuming `ClientHello` must not burn a victim's one-shot ticket.
+#[test]
+fn failed_resume_handshake_leaves_ticket_usable() {
+    let server = HandshakeServer::new().expect("server");
+    let server_pk = server.verifying_key().clone();
+    let ip = "127.0.0.1".parse().expect("ip");
+    let client1 = HandshakeClient::new().expect("client1");
+    let (rid, secret) = first_handshake_mint_ticket(&server, &client1, &server_pk, ip);
+    assert_eq!(server.session_cache_len(), 1);
+
+    // Valid binder (over secret/rid/nonce), but corrupt the ML-KEM public so
+    // encapsulate() fails after the ticket is consumed.
+    let client2 = HandshakeClient::new().expect("client2");
+    let mut hello = client2.create_client_hello_with_resume(rid, &secret, None);
+    hello.client_key_package.ml_kem_pk.truncate(1); // wrong length → KEM decode fails
+    match server.process_client_hello(&hello, 0, ip) {
+        HandshakeResponse::Fail(HandshakeError::KemFailed(_)) => {}
+        other => panic!("a corrupted-KEM resume should fail: {:?}", other),
+    }
+    assert_eq!(
+        server.session_cache_len(),
+        1,
+        "a resume that fails after consume must re-insert the ticket (not burn it)"
+    );
+
+    // And the re-inserted ticket is still usable by a clean resume afterwards
+    // (Success with difficulty=0 and no cookie can only happen via the resume
+    // bypass — so this proves the ticket survived the failed attempt).
+    let client3 = HandshakeClient::new().expect("client3");
+    let valid = client3.create_client_hello_with_resume(rid, &secret, None);
+    assert!(
+        matches!(
+            server.process_client_hello(&valid, 0, ip),
+            HandshakeResponse::Success(..)
+        ),
+        "the re-inserted ticket must be usable by a clean resume"
     );
 }

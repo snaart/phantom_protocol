@@ -43,6 +43,34 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `api::session::tests::{forged_plaintext_ack_does_not_retire_pending_segment,
   authenticated_ack_retires_pending_segment, ack_with_wrong_session_id_is_dropped}`.
 
+- **H2 (high): 0-RTT verdict `early_data_accepted` now transcript-signed — fixed.**
+  `ServerHello.early_data_accepted` was not covered by the signed handshake
+  transcript, so an on-path attacker could flip it (signature still verified):
+  `true→false` made the client re-send already-delivered early-data over the
+  1-RTT session (duplication/replay of non-idempotent requests), `false→true`
+  silently black-holed rejected early-data while reporting success (Invariant 9).
+  The verdict is now the final field of the signed `HandshakeTranscript`, so a
+  flipped bit fails the client's signature check.
+
+- **HS-03 (low) + ZERORTT-2 (low): resumption ticket-burning DoS — fixed.**
+  A resume now carries a `resumption_binder` proof-of-possession (a keyed PRF
+  over `resumption_secret ‖ resume_session_id ‖ nonce`, label
+  `phantom-resume-binder-v1`) that the server verifies **constant-time before**
+  consuming the one-shot ticket — a passive observer that copied only the
+  cleartext `resume_session_id` can no longer burn a victim's ticket (HS-03). The
+  ticket is consumed eagerly (race-free, so a duplicate resume can't double-accept
+  early-data) and **re-inserted with its original expiry on any post-consume
+  handshake failure** (e.g. a corrupted KEM ciphertext), so a malformed resuming
+  `ClientHello` can no longer burn the ticket either (ZERORTT-2).
+
+- **Wire: `PROTOCOL_VERSION` 1 → 2 (breaking handshake interop).** H2 and HS-03
+  both change the signed transcript / `ClientHello` layout, so v1 and v2 peers
+  cannot interoperate. `WIRE_VERSION` is unchanged (the `PhantomPacket` codec is
+  untouched). Frozen `client_hello_*.bin` + `transcript_hash.bin` regenerated and
+  re-verified byte-exact by the independent Python decoder; `server_hello*.bin`
+  unchanged. Pinned by `security_invariants.rs::{flipped_early_data_accepted_bit_fails_signature,
+  binderless_resume_does_not_burn_ticket, failed_resume_handshake_leaves_ticket_usable}`.
+
 ### Added
 
 - **Graceful unsupported-version signal.** When a `ClientHello.version` is one
