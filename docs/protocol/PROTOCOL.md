@@ -657,7 +657,15 @@ A valid one-shot resumption ticket (§ 6.6) bypasses the cookie/PoW gate.
 solution such that the blake3-based hash of `(challenge.nonce || client_ip ||
 solution)` has at least `difficulty` leading zero bits. The challenge is
 regenerated deterministically from the rotating per-hour secret — stateless
-server-side, accepting the current or previous hour's derivation.
+server-side, accepting the current or previous hour's derivation. The
+challenge-integrity MAC is compared in constant time (`subtle::ConstantTimeEq`,
+CRYPTO-2/HS-04).
+
+**Client difficulty cap (H3).** `HelloRetryRequest` is unauthenticated, so the
+client rejects any `difficulty > MAX_CLIENT_POW_DIFFICULTY = 24` (strictly above
+the server's max legitimate tier) **before** solving, and `solve` is bounded to
+`MAX_SOLVE_ITERATIONS = 2^32` — an injected `difficulty = 255` yields a handshake
+error instead of pinning a CPU core forever.
 
 Adaptive difficulty (`HandshakeServer::adaptive_difficulty`,
 `handshake.rs:301-310`):
