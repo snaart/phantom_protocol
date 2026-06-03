@@ -533,13 +533,24 @@ impl PhantomSession {
             .and_then(|(_, _, ed)| (!ed.is_empty()).then(|| ed.clone()));
 
         // ── Stage 1 & 2: Hybrid Handshake (optionally 0-RTT resumption) ──
-        let (crypto_session, ed_accepted) = match run_client_handshake(
-            &transport,
-            &expected_server_key,
-            resumption_request,
-        )
-        .await
-        {
+        // HS-02: bound the whole client handshake by a wall-clock deadline so a
+        // silent or stalling server can't hang the connect indefinitely. The
+        // TIMER is `runtime.sleep` (NOT raw tokio::time) so it stays correct
+        // under WasmRuntime/EmbeddedRuntime; `select!` is just the combinator.
+        const CLIENT_HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+        // Scoped so the handshake future's borrow of `transport` ends before
+        // `transport` is moved into the data pump below.
+        let handshake_result = {
+            let handshake_fut =
+                run_client_handshake(&transport, &expected_server_key, resumption_request);
+            let handshake_timeout = runtime.sleep(CLIENT_HANDSHAKE_DEADLINE);
+            tokio::pin!(handshake_fut);
+            tokio::select! {
+                r = &mut handshake_fut => r,
+                _ = handshake_timeout => Err(CoreError::Timeout),
+            }
+        };
+        let (crypto_session, ed_accepted) = match handshake_result {
             Ok((session, accepted)) => (Arc::new(session), accepted),
             Err(e) => {
                 log::error!("PhantomSession: handshake failed: {}", e);
@@ -642,6 +653,13 @@ async fn run_client_handshake<T: SessionTransport>(
         None => handshake.create_client_hello(),
     };
 
+    // HS-02: cap the number of HelloRetryRequest rounds. The legitimate flow
+    // needs at most one cookie round + one PoW round; a bound of 3 leaves slack
+    // for a benign reorder. Without it, a MITM answering every ClientHello with
+    // a fresh cheap HelloRetryRequest could loop the client forever.
+    const MAX_CLIENT_RETRY_ROUNDS: u32 = 3;
+    let mut retry_rounds: u32 = 0;
+
     loop {
         let bytes = borsh::to_vec(&hello).map_err(|e| {
             CoreError::SerializationError(format!("ClientHello encode failed: {}", e))
@@ -675,6 +693,12 @@ async fn run_client_handshake<T: SessionTransport>(
                 "invalid ServerHello, Retry, or Reject received".into(),
             ));
         } else if let Ok(retry) = borsh::from_slice::<HelloRetryRequest>(&resp) {
+            retry_rounds += 1;
+            if retry_rounds > MAX_CLIENT_RETRY_ROUNDS {
+                return Err(CoreError::HandshakeError(format!(
+                    "server demanded more than {MAX_CLIENT_RETRY_ROUNDS} HelloRetryRequest rounds"
+                )));
+            }
             log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
             hello.cookie = retry.cookie;
             if let Some(challenge) = retry.challenge {
@@ -2110,6 +2134,44 @@ mod tests {
         assert!(
             msg.contains("unsupported protocol version"),
             "expected a version-mismatch error, got: {msg}"
+        );
+    }
+
+    /// **HS-02.** A MITM that answers every `ClientHello` with a fresh cheap
+    /// `HelloRetryRequest` must NOT loop the client forever — `run_client_handshake`
+    /// caps the retry rounds and returns an error. (Pre-fix this test would hang.)
+    #[tokio::test]
+    async fn client_handshake_caps_retry_rounds() {
+        use crate::transport::handshake::HelloRetryRequest;
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        let (_sk, expected_vk) = crate::crypto::hybrid_sign::HybridSigningKey::generate();
+
+        // Malicious server: answer EVERY ClientHello with a fresh, cheap
+        // HelloRetryRequest (no cookie, no PoW) — never converging.
+        let server = tokio::spawn(async move {
+            loop {
+                if server_transport.recv_bytes().await.is_err() {
+                    break;
+                }
+                let retry = borsh::to_vec(&HelloRetryRequest {
+                    challenge: None,
+                    cookie: None,
+                })
+                .expect("encode retry");
+                if server_transport.send_bytes(&retry).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let result = run_client_handshake(&client_transport, &expected_vk, None).await;
+        drop(client_transport); // close the channel so the server task ends
+        let _ = server.await;
+
+        assert!(
+            matches!(result, Err(CoreError::HandshakeError(_))),
+            "client must error after the retry-round cap, not loop forever; got {result:?}"
         );
     }
 

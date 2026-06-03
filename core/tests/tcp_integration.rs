@@ -611,3 +611,51 @@ async fn tcp_peer_close_tears_down_session_cleanly() {
 
     server_handle.await.expect("server task");
 }
+
+/// **H4 decouple.** A stalled peer (raw TCP that never sends a `ClientHello`)
+/// must NOT block `accept()` from returning a well-behaved client: the handshake
+/// is driven off the accept loop in its own deadline-bounded task. Pre-decouple,
+/// the serial accept path would drive the staller's handshake inline and block
+/// (until the embedder's 30s timeout, or forever).
+#[tokio::test]
+#[ignore]
+async fn tcp_integration_stalled_peer_does_not_block_accept() {
+    let listener = PhantomListener::bind("127.0.0.1:0".to_string())
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr();
+    let expected_key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).expect("vk");
+
+    // Stalled peer FIRST: open a raw TCP connection and send nothing.
+    let staller = TcpStream::connect(&addr).await.expect("staller connect");
+    // Let the background acceptor pick up the staller and spawn its (doomed)
+    // handshake task before the well-behaved client arrives.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Well-behaved client SECOND.
+    let tcp = TcpStream::connect(&addr).await.expect("tcp connect");
+    let transport = TcpSessionTransport::new(tcp);
+    let client = PhantomSession::connect_with_transport(&addr, transport, expected_key);
+
+    // accept() must return the good client's session promptly — not block on the
+    // staller (whose handshake never completes within the in-library deadline,
+    // let alone this 5s assertion window).
+    let outcome = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("accept must not block on the stalled peer")
+        .expect("accept returns the well-behaved session");
+    let server_session = outcome.session();
+
+    // Confirm it is a live, established session via a real round-trip.
+    client
+        .send(b"ping-past-staller".to_vec())
+        .await
+        .expect("client send");
+    let got = timeout(Duration::from_secs(5), server_session.recv())
+        .await
+        .expect("server recv timeout")
+        .expect("server recv");
+    assert_eq!(got, b"ping-past-staller");
+
+    drop(staller);
+}
