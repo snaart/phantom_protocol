@@ -1368,9 +1368,13 @@ async fn send_path_validation<T: SessionTransport>(
 }
 
 /// Recv-side handler for a packet:
-/// - ACK → feed BBR + route to the stream / demux.
+/// - session-id guard → drop any frame not stamped with the negotiated
+///   session id before touching any state (H1).
 /// - decrypt (REQUIRED on application data — a non-empty unencrypted
 ///   post-handshake packet is a downgrade indicator and is dropped).
+/// - ACK (now `ENCRYPTED | ACK`, post-decrypt) → read the authenticated
+///   4-byte acked sequence from the payload, feed BBR + route to the
+///   stream / demux. Forged/plaintext ACKs cannot reach this path (H1).
 /// - PATH_VALIDATION flag → drive the path registry: verify against an
 ///   outstanding challenge if one exists, otherwise echo the payload
 ///   back as a response.
@@ -1399,25 +1403,23 @@ async fn handle_packet<T: SessionTransport>(
     let stream_id: u32 = packet.header.stream_id.into();
     let path_id = packet.header.path_id;
 
+    // Bind every inbound frame to the negotiated session (H1). A frame stamped
+    // with a different session id is dropped before any state mutation, so
+    // cross-session / off-path control injection (forged ACK/FIN) can never
+    // reach the stream table, BBR, or the path registry. Application data also
+    // binds session_id through the AEAD AAD; this guard extends the same
+    // protection to the non-AEAD header inspection that follows.
+    if packet.header.session_id != session_id {
+        return;
+    }
+
     // Mark path activity even before decrypt (the path id is plaintext
     // header bytes; this is just a liveness signal for the sweep).
     crypto_recv.mark_path_seen(path_id);
 
-    if packet.header.flags.contains(PacketFlags::ACK) {
-        if let Some(stream) = streams_recv.get(&stream_id) {
-            if let Some((sent_at, bytes)) = stream.ack(packet.header.sequence).await {
-                feed_bbr_on_ack(crypto_recv, sent_at, bytes, packet.header.ack_delay as u64);
-            }
-        }
-        // Best-effort, non-blocking: the demux/PhantomStream path is
-        // vestigial; routing the ACK/close notification to it must never block
-        // the reader's ACK/control pipeline.
-        demux_recv.route_ack(stream_id, packet.header.sequence);
-        if packet.header.flags.contains(PacketFlags::FIN) {
-            demux_recv.route_close(stream_id);
-        }
-        return;
-    }
+    // NOTE: ACK/FIN are NO LONGER processed here, pre-decrypt. They are
+    // authenticated `ENCRYPTED | ACK` control frames now (H1) and are handled
+    // *after* the AEAD gate below — see the ACK branch following the decrypt.
 
     // Decrypt if marked. V2 sessions REQUIRE ENCRYPTED on application
     // data — a non-empty unencrypted V2 application-data packet is a
@@ -1455,6 +1457,37 @@ async fn handle_packet<T: SessionTransport>(
     } else {
         Vec::new()
     };
+
+    // Authenticated ACK (H1). ACKs are `ENCRYPTED | ACK` control frames whose
+    // AEAD payload carries the acked data sequence as 4 big-endian bytes. We act
+    // on the ACK only *after* AEAD verify, which authenticates the header
+    // (including `session_id` and `ack_delay`) and the acked-seq payload — so a
+    // forged or stripped-flag ACK (dropped above by the downgrade defense, or
+    // failing this length check) can neither retire a pending segment, restore a
+    // flow-control permit, poison BBR, nor close a stream.
+    if packet.header.flags.contains(PacketFlags::ACK) {
+        if plaintext.len() != 4 {
+            log::warn!(
+                "PhantomSession: ACK payload length {} (expected 4)",
+                plaintext.len()
+            );
+            return;
+        }
+        let acked_seq =
+            u32::from_be_bytes([plaintext[0], plaintext[1], plaintext[2], plaintext[3]]);
+        if let Some(stream) = streams_recv.get(&stream_id) {
+            if let Some((sent_at, bytes)) = stream.ack(acked_seq).await {
+                feed_bbr_on_ack(crypto_recv, sent_at, bytes, packet.header.ack_delay as u64);
+            }
+        }
+        // Best-effort, non-blocking: the demux/PhantomStream path is vestigial;
+        // routing the ACK/close notification to it must never block the reader.
+        demux_recv.route_ack(stream_id, acked_seq);
+        if packet.header.flags.contains(PacketFlags::FIN) {
+            demux_recv.route_close(stream_id);
+        }
+        return;
+    }
 
     // WINDOW_UPDATE dispatch (Phase 4.3 flow control). Payload is a
     // big-endian u32 carrying relative flow-control credit — the bytes the
@@ -1566,26 +1599,48 @@ async fn handle_packet<T: SessionTransport>(
         return;
     }
 
-    // Reliable application data → emit an ACK **inline in the reader**. ACKs are
-    // unencrypted (no epoch/key dependency, so no rekey-lock needed) and must
-    // stay prompt even when the app consumer is slow — that is the whole point
-    // of decoupling delivery from the reader. The ACK means "received,
-    // decrypted, replay-passed, and accepted into my in-memory delivery queue."
+    // Reliable application data → emit an authenticated ACK **inline in the
+    // reader** (H1). The ACK is an `ENCRYPTED | ACK` control frame whose AEAD
+    // payload carries the acked data sequence (4 big-endian bytes); the peer
+    // acts on it only after AEAD verify, so it cannot be forged off-path. The
+    // ACK's own `header.sequence` is drawn from this side's per-stream send
+    // counter — shared with our data/window-update sends on the same stream — so
+    // `(epoch, stream_id, sequence, path_id)` is unique and never collides with
+    // our outbound data (the nonce-reuse trap). It obeys the C1 rekey discipline
+    // and stays prompt even when the app consumer is slow (encrypt is a lock-free
+    // ArcSwap load). "ACK" means "received, decrypted, replay-passed, accepted."
     if packet.header.flags.contains(PacketFlags::RELIABLE) {
-        let ack_flag_bits = PacketFlags::ACK;
+        let local = streams_recv
+            .entry(stream_id)
+            .or_insert_with(|| Arc::new(Stream::new(stream_id as TransportStreamId)))
+            .clone();
+        let ack_seq = local.next_send_sequence();
+        let mut ack_flag_bits = PacketFlags::ENCRYPTED | PacketFlags::ACK;
+        match rekey_before_stamp(crypto_recv, stream_id as TransportStreamId, ack_seq) {
+            Some(extra) => ack_flag_bits |= extra,
+            // Epoch saturated — drop this ACK rather than reuse a nonce; the
+            // sender retransmits and the session is expected to reconnect.
+            None => return,
+        }
         let ack_header = PacketHeader::new(
             session_id,
             stream_id as TransportStreamId,
-            packet.header.sequence,
+            ack_seq,
             PacketFlags::new(ack_flag_bits),
         )
         .with_epoch(crypto_recv.current_epoch())
         .with_path_id(path_id);
-        let ack_packet = PhantomPacket::new(ack_header, Vec::new());
-        ack_buf.clear();
-        ack_buf.extend_from_slice(&ack_packet.to_wire());
-        let size = ack_buf.len();
-        let _ = transport_send_ack.send_bytes(&ack_buf[..size]).await;
+        let ack_payload = packet.header.sequence.to_be_bytes();
+        match crypto_recv.encrypt_packet(&ack_header, &ack_payload) {
+            Ok(ct) => {
+                let ack_packet = PhantomPacket::new(ack_header, ct);
+                ack_buf.clear();
+                ack_buf.extend_from_slice(&ack_packet.to_wire());
+                let size = ack_buf.len();
+                let _ = transport_send_ack.send_bytes(&ack_buf[..size]).await;
+            }
+            Err(e) => log::error!("PhantomSession: ACK encrypt failed: {}", e),
+        }
     }
 
     // Hand the decrypted application data to the delivery task: unbounded +
@@ -2493,6 +2548,190 @@ mod tests {
         assert_eq!(
             undelivered.load(Ordering::Acquire),
             b"hello-v2".len() as u64
+        );
+    }
+
+    /// Build an `ENCRYPTED | ACK` frame (H1) from `acker_session` acknowledging
+    /// `acked_seq` on `stream_id`, with its own header sequence `ack_header_seq`
+    /// (drawn from the acker's send space, distinct from the acked data
+    /// sequence). Wire-serialised, ready for `handle_packet`.
+    fn build_encrypted_ack(
+        acker_session: &InnerSession,
+        session_id: SessionId,
+        stream_id: TransportStreamId,
+        ack_header_seq: u32,
+        acked_seq: u32,
+    ) -> Vec<u8> {
+        let flag_bits = PacketFlags::ENCRYPTED | PacketFlags::ACK;
+        let header = PacketHeader::new(
+            session_id,
+            stream_id,
+            ack_header_seq,
+            PacketFlags::new(flag_bits),
+        )
+        .with_epoch(acker_session.current_epoch());
+        let ct = acker_session
+            .encrypt_packet(&header, &acked_seq.to_be_bytes())
+            .expect("encrypt ack");
+        PhantomPacket::new(header, ct).to_wire()
+    }
+
+    /// Drive a single inbound packet through `handle_packet` against
+    /// `server_session` with throwaway delivery/transport/observability wiring.
+    async fn run_recv(
+        pkt: PhantomPacket,
+        session_id: SessionId,
+        server_session: &Arc<InnerSession>,
+        streams: &Arc<DashMap<u32, Arc<TransportStream>>>,
+    ) {
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
+        let transport: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let mut ack_buf = Vec::with_capacity(64);
+        let mut path_validation_seq: u32 = 0;
+        let obs = Observability::new(ObservabilityConfig::default());
+        handle_packet(
+            pkt,
+            session_id,
+            server_session,
+            streams,
+            &demux,
+            &transport,
+            &transport,
+            &deliver_tx,
+            &undelivered,
+            &mut ack_buf,
+            &mut path_validation_seq,
+            &obs,
+            LegType::Tcp,
+        )
+        .await;
+    }
+
+    /// Stage a stream with one in-flight reliable segment; returns the stream,
+    /// the shared streams map, and the segment's sequence number.
+    async fn staged_pending_segment() -> (
+        Arc<TransportStream>,
+        Arc<DashMap<u32, Arc<TransportStream>>>,
+        u32,
+    ) {
+        let stream_id: TransportStreamId = 1;
+        let stream = Arc::new(TransportStream::new(stream_id));
+        let seq = stream
+            .send_reliable(Bytes::from_static(b"reliable-payload"))
+            .await;
+        let _ = stream.poll_send(u64::MAX).await.expect("segment in-flight");
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(stream_id as u32, stream.clone());
+        (stream, streams, seq)
+    }
+
+    /// **H1 (Invariant 2).** A forged *unauthenticated* ACK — whether bare
+    /// (`ACK` flag, empty payload) or carrying a plaintext 4-byte acked-seq —
+    /// must NOT retire a pending reliable segment. Pre-fix, the ACK branch ran
+    /// before the AEAD gate and trusted `header.sequence`, so an off-path
+    /// attacker could silently drop never-acknowledged segments.
+    #[tokio::test]
+    async fn forged_plaintext_ack_does_not_retire_pending_segment() {
+        let session_id = fixed_session_id();
+        let (_client, server_session) = paired_sessions(session_id);
+        let (stream, streams, seq) = staged_pending_segment().await;
+        let stream_id: TransportStreamId = 1;
+
+        // Variant 1: bare ACK, no ENCRYPTED, empty payload, guessed sequence.
+        run_recv(
+            PhantomPacket::new(
+                PacketHeader::new(
+                    session_id,
+                    stream_id,
+                    seq,
+                    PacketFlags::new(PacketFlags::ACK),
+                ),
+                Vec::new(),
+            ),
+            session_id,
+            &server_session,
+            &streams,
+        )
+        .await;
+        // Variant 2: ACK with a plaintext 4-byte acked-seq, no ENCRYPTED.
+        run_recv(
+            PhantomPacket::new(
+                PacketHeader::new(
+                    session_id,
+                    stream_id,
+                    999,
+                    PacketFlags::new(PacketFlags::ACK),
+                ),
+                seq.to_be_bytes().to_vec(),
+            ),
+            session_id,
+            &server_session,
+            &streams,
+        )
+        .await;
+
+        assert!(
+            stream.ack(seq).await.is_some(),
+            "a forged unauthenticated ACK must not retire the pending reliable segment"
+        );
+    }
+
+    /// **H1 positive control.** A genuine `ENCRYPTED | ACK` frame from the peer,
+    /// whose AEAD payload carries the acked data sequence, retires the matching
+    /// pending segment after AEAD verify. The ACK's own `header.sequence`
+    /// (`ack_header_seq`) is deliberately different from the acked sequence to
+    /// prove the handler reads the authenticated payload, not the header.
+    #[tokio::test]
+    async fn authenticated_ack_retires_pending_segment() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let (stream, streams, seq) = staged_pending_segment().await;
+        let stream_id: TransportStreamId = 1;
+
+        let ack_header_seq = seq.wrapping_add(54_321);
+        let frame =
+            build_encrypted_ack(&client_session, session_id, stream_id, ack_header_seq, seq);
+        let ack_pkt = PhantomPacket::from_wire(&frame).expect("parse ack");
+        run_recv(ack_pkt, session_id, &server_session, &streams).await;
+
+        assert!(
+            stream.ack(seq).await.is_none(),
+            "an authenticated ACK must retire the acked pending segment"
+        );
+    }
+
+    /// **H1 session binding.** A frame whose `header.session_id` does not match
+    /// the negotiated session must be dropped by the per-frame guard before any
+    /// state mutation — pre-fix the ACK was processed with no session check.
+    #[tokio::test]
+    async fn ack_with_wrong_session_id_is_dropped() {
+        let session_id = fixed_session_id();
+        let (_client, server_session) = paired_sessions(session_id);
+        let (stream, streams, seq) = staged_pending_segment().await;
+        let stream_id: TransportStreamId = 1;
+
+        let wrong_id = SessionId::from_bytes([0x11; 32]);
+        run_recv(
+            PhantomPacket::new(
+                PacketHeader::new(wrong_id, stream_id, seq, PacketFlags::new(PacketFlags::ACK)),
+                Vec::new(),
+            ),
+            session_id,
+            &server_session,
+            &streams,
+        )
+        .await;
+
+        assert!(
+            stream.ack(seq).await.is_some(),
+            "an ACK for a different session id must not retire the segment"
         );
     }
 
