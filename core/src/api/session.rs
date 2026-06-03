@@ -678,8 +678,15 @@ async fn run_client_handshake<T: SessionTransport>(
             log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
             hello.cookie = retry.cookie;
             if let Some(challenge) = retry.challenge {
+                // H3: cap the accepted difficulty and bound the solver, so an
+                // injected/malicious HelloRetryRequest (e.g. difficulty 255)
+                // surfaces a handshake error instead of pinning a CPU core.
                 log::info!("PhantomSession: Solving PoW challenge...");
-                hello.pow_solution = Some(challenge.solve());
+                hello.pow_solution = Some(
+                    challenge
+                        .solve_capped(crate::crypto::pow::MAX_CLIENT_POW_DIFFICULTY)
+                        .map_err(|e| CoreError::HandshakeError(e.to_string()))?,
+                );
             }
             continue;
         } else {

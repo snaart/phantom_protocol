@@ -1,6 +1,42 @@
 use blake3::Hasher;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
+use subtle::ConstantTimeEq;
+
+/// Client-side cap on the PoW difficulty it will attempt to solve (H3). An
+/// unauthenticated `HelloRetryRequest` carries `difficulty` verbatim; without a
+/// cap an injected `difficulty = 255` would make the client spin ~2^255 hashes
+/// forever. 24 sits strictly above every difficulty an honest server issues
+/// (load-tier max 16, `ReputationTracker::MAX_DIFFICULTY` 20, the frozen
+/// `difficulty: 20` wire vector) yet is a sub-second solve (~2^24 hashes).
+pub const MAX_CLIENT_POW_DIFFICULTY: u8 = 24;
+
+/// Hard iteration bound for [`PoWChallenge::solve`] (H3) — `2^32`, ~2^8 expected
+/// attempts of headroom over the worst in-cap difficulty (`2^24`), so a
+/// legitimate solve effectively never spuriously fails while an infeasible one
+/// still terminates.
+pub const MAX_SOLVE_ITERATIONS: u64 = 1u64 << (MAX_CLIENT_POW_DIFFICULTY as u32 + 8);
+
+/// Error from the bounded / capped PoW solver (H3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PowError {
+    /// Difficulty above the client's [`MAX_CLIENT_POW_DIFFICULTY`].
+    DifficultyTooHigh { demanded: u8, cap: u8 },
+    /// `solve` exhausted [`MAX_SOLVE_ITERATIONS`] without a solution.
+    Exhausted,
+}
+
+impl core::fmt::Display for PowError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PowError::DifficultyTooHigh { demanded, cap } => write!(
+                f,
+                "server demanded PoW difficulty {demanded} exceeding client cap {cap}"
+            ),
+            PowError::Exhausted => write!(f, "PoW solve exhausted the iteration bound"),
+        }
+    }
+}
 
 /// Proof-of-Work Challenge
 #[derive(BorshSerialize, BorshDeserialize, SerdeSerialize, SerdeDeserialize, Debug, Clone)]
@@ -57,7 +93,10 @@ impl PoWChallenge {
         hasher.update(client_id);
         let mac = hasher.finalize();
 
-        if self.nonce[8..32] != mac.as_bytes()[0..24] {
+        // CRYPTO-2/HS-04: constant-time compare of the server-keyed challenge
+        // MAC, matching the cookie/path-validation paths — a short-circuiting
+        // `!=` would leak how many leading MAC bytes an attacker guessed.
+        if !bool::from(self.nonce[8..32].ct_eq(&mac.as_bytes()[0..24])) {
             return false;
         }
 
@@ -79,21 +118,42 @@ impl PoWChallenge {
         check_leading_zeros(&hash, self.difficulty)
     }
 
-    pub fn solve(&self) -> PoWSolution {
-        let mut solution = 0u64;
+    /// Solve at the challenge's difficulty, bounded by [`MAX_SOLVE_ITERATIONS`]
+    /// (H3) so an infeasible difficulty fails closed instead of looping forever.
+    pub fn solve(&self) -> Result<PoWSolution, PowError> {
+        self.solve_with_bound(MAX_SOLVE_ITERATIONS)
+    }
 
-        loop {
+    /// Like [`solve`](Self::solve) but rejects a difficulty above
+    /// `max_difficulty` BEFORE doing any work (H3). The client passes
+    /// [`MAX_CLIENT_POW_DIFFICULTY`] so an injected high-difficulty
+    /// `HelloRetryRequest` cannot pin a CPU core.
+    pub fn solve_capped(&self, max_difficulty: u8) -> Result<PoWSolution, PowError> {
+        if self.difficulty > max_difficulty {
+            return Err(PowError::DifficultyTooHigh {
+                demanded: self.difficulty,
+                cap: max_difficulty,
+            });
+        }
+        self.solve()
+    }
+
+    /// Iteration-bounded solve core: returns `Exhausted` if no solution is found
+    /// within `max_iters`. `solve` delegates here with [`MAX_SOLVE_ITERATIONS`];
+    /// tests pass a small bound to exercise the fail-closed path without running
+    /// billions of hashes. (`difficulty == 0` succeeds at `solution == 0`,
+    /// preserving the no-PoW-demanded semantics.)
+    fn solve_with_bound(&self, max_iters: u64) -> Result<PoWSolution, PowError> {
+        for solution in 0..max_iters {
             let hash = compute_blake3_hash(&self.nonce, solution);
-
             if check_leading_zeros(&hash, self.difficulty) {
-                return PoWSolution {
+                return Ok(PoWSolution {
                     nonce: self.nonce,
                     solution,
-                };
+                });
             }
-
-            solution += 1;
         }
+        Err(PowError::Exhausted)
     }
 }
 fn compute_blake3_hash(nonce: &[u8; 32], solution: u64) -> [u8; 32] {
@@ -126,7 +186,7 @@ mod tests {
         let client_id = b"127.0.0.1";
 
         let challenge = PoWChallenge::new_stateless(8, client_id, &secret);
-        let solution = challenge.solve();
+        let solution = challenge.solve().expect("difficulty 8 is solvable");
 
         assert!(challenge.verify(&solution, client_id, &secret));
     }
@@ -139,7 +199,7 @@ mod tests {
         let mut challenge = PoWChallenge::new_stateless(8, client_id, &secret);
         challenge.nonce[10] ^= 0xFF; // Corrupt MAC
 
-        let solution = challenge.solve();
+        let solution = challenge.solve().expect("difficulty 8 is solvable");
         assert!(!challenge.verify(&solution, client_id, &secret));
     }
 
@@ -150,8 +210,62 @@ mod tests {
         let other_client = b"192.168.1.1";
 
         let challenge = PoWChallenge::new_stateless(8, client_id, &secret);
-        let solution = challenge.solve();
+        let solution = challenge.solve().expect("difficulty 8 is solvable");
 
         assert!(!challenge.verify(&solution, other_client, &secret));
+    }
+
+    /// **H3.** The client must refuse to brute-force a server-chosen difficulty
+    /// above its cap (an injected `HelloRetryRequest` with difficulty 255 would
+    /// otherwise pin a CPU core forever) — it returns an error instead.
+    #[test]
+    fn solve_capped_rejects_oversized_difficulty() {
+        let challenge = PoWChallenge {
+            nonce: [7u8; 32],
+            difficulty: 255,
+        };
+        match challenge.solve_capped(MAX_CLIENT_POW_DIFFICULTY) {
+            Err(PowError::DifficultyTooHigh { demanded, cap }) => {
+                assert_eq!(demanded, 255);
+                assert_eq!(cap, MAX_CLIENT_POW_DIFFICULTY);
+            }
+            other => panic!("expected DifficultyTooHigh, got {:?}", other),
+        }
+    }
+
+    /// A realistic difficulty within the cap still solves and verifies.
+    #[test]
+    fn solve_capped_accepts_within_cap() {
+        let secret = [9u8; 32];
+        let client_id = b"127.0.0.1";
+        let challenge = PoWChallenge::new_stateless(8, client_id, &secret);
+        assert!(challenge.difficulty <= MAX_CLIENT_POW_DIFFICULTY);
+        let solution = challenge
+            .solve_capped(MAX_CLIENT_POW_DIFFICULTY)
+            .expect("difficulty 8 is solvable");
+        assert!(challenge.verify(&solution, client_id, &secret));
+    }
+
+    /// **H3.** `solve` is iteration-bounded: an infeasible difficulty terminates
+    /// with `Exhausted` instead of looping forever.
+    #[test]
+    fn solve_is_bounded_and_fails_closed() {
+        let challenge = PoWChallenge {
+            nonce: [3u8; 32],
+            difficulty: 250,
+        };
+        assert!(matches!(
+            challenge.solve_with_bound(1_000),
+            Err(PowError::Exhausted)
+        ));
+    }
+
+    /// The client cap must admit the server's maximum legitimate difficulty
+    /// (server tier max 16, `ReputationTracker::MAX_DIFFICULTY` 20, and the
+    /// frozen `difficulty: 20` wire vector) — otherwise an honest server's PoW
+    /// would be self-rejected.
+    #[test]
+    fn max_client_pow_difficulty_admits_the_server_max() {
+        assert!(MAX_CLIENT_POW_DIFFICULTY >= 20);
     }
 }
