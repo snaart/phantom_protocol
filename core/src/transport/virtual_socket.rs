@@ -249,7 +249,8 @@ impl VirtualSocket {
                         // `data[39..41]` LE (the big-endian flags field) as
                         // ack_delay — both wrong. `from_wire` reads the header off
                         // the front and ignores the payload.
-                        if let Ok(header) = crate::transport::types::PacketHeader::from_wire(&data) {
+                        if let Ok(header) = crate::transport::types::PacketHeader::from_wire(&data)
+                        {
                             if header
                                 .flags
                                 .contains(crate::transport::types::PacketFlags::ACK)
