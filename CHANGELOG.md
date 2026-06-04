@@ -160,6 +160,27 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   wire change. Pinned by `reputation::tests::*` and
   `handshake::tests::reputation_wiring_escalates_and_resets_per_ip`.
 
+- **INFOLEAK-1 (low): `ResumptionHint` Debug leaked the secret — fixed.**
+  `ResumptionHint` (a UniFFI-exported type that crosses the FFI boundary) derived
+  `Debug`, printing its 32-byte `resumption_secret` — so a mobile/FFI consumer
+  logging it with `{:?}` would emit the live 0-RTT key material. It now has a
+  hand-written redacting `Debug` (`resumption_secret: "REDACTED"`), mirroring
+  `HybridSigningKey`/`HybridSecretKey`. ABI-safe (UniFFI needs no `Debug`). Pinned
+  by `resumption_hint_debug_redacts_secret`.
+
+- **CRYPTO-3 (low): zeroize transient key material.** The combined hybrid-KEM
+  HKDF input (`[ecc, pq].concat()`) and the per-direction AEAD key locals
+  (`combine_secrets`, `CryptoSession::build`, `AesSession::build`) were dropped
+  without zeroizing — only the long-term key structs were `ZeroizeOnDrop`. They
+  are now wrapped in `zeroize::Zeroizing` so each transient is wiped on every exit
+  path (the public `nonce_prefix` is left plain).
+
+- **CRYPTO-4 (low): strict Ed25519 verification.** The Ed25519 half of the hybrid
+  signature used the lenient `verify`; it now uses `verify_strict`, which rejects
+  non-canonical / malleable signatures and low-order public keys (we only ever
+  produce canonical signatures, so no legitimate signature is rejected). Removes
+  signature malleability as a class.
+
 ### Removed
 
 - **`HalfOpenSlots` (DOS-3).** The unused `transport::half_open::HalfOpenSlots`

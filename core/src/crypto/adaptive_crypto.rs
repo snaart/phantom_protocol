@@ -272,15 +272,24 @@ impl CryptoSession {
         // `crypto::kdf::derive_key_32` cfg-dispatches between
         // `blake3::derive_key` (default) and HKDF-SHA256 (fips). The
         // 32-byte output and label-string API are identical.
-        let key_a = crate::crypto::kdf::derive_key_32(&send_label, shared_secret);
-        let key_b = crate::crypto::kdf::derive_key_32(&recv_label, shared_secret);
+        // CRYPTO-3: the per-direction AEAD key bytes are wiped on every exit
+        // path once copied into ring's opaque `UnboundKey` (the public
+        // `nonce_prefix` below is not secret and stays plain).
+        let key_a = zeroize::Zeroizing::new(crate::crypto::kdf::derive_key_32(
+            &send_label,
+            shared_secret,
+        ));
+        let key_b = zeroize::Zeroizing::new(crate::crypto::kdf::derive_key_32(
+            &recv_label,
+            shared_secret,
+        ));
 
         let (send_bytes, recv_bytes) = if swap { (key_b, key_a) } else { (key_a, key_b) };
 
         let algo = suite.algorithm();
-        let send_unbound = UnboundKey::new(algo, &send_bytes)
+        let send_unbound = UnboundKey::new(algo, &*send_bytes)
             .map_err(|_| CoreError::CryptoError("Failed to create send key".into()))?;
-        let recv_unbound = UnboundKey::new(algo, &recv_bytes)
+        let recv_unbound = UnboundKey::new(algo, &*recv_bytes)
             .map_err(|_| CoreError::CryptoError("Failed to create recv key".into()))?;
 
         let prefix_bytes = crate::crypto::kdf::derive_key_32("phantom-nonce-pfx-v1", shared_secret);
