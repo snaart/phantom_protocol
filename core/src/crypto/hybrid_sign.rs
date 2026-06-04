@@ -10,8 +10,7 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::{
-    Signature as Ed25519Signature, Signer as Ed25519Signer, SigningKey,
-    Verifier as Ed25519Verifier, VerifyingKey,
+    Signature as Ed25519Signature, Signer as Ed25519Signer, SigningKey, VerifyingKey,
 };
 use ml_dsa::Signature as MlDsaSignature;
 use ml_dsa::SigningKey as MlDsaSigningKey;
@@ -201,8 +200,12 @@ impl HybridVerifyingKey {
         let ed25519_pk = VerifyingKey::from_bytes(&self.ed25519_pk)
             .map_err(|_| HybridSignError::InvalidPublicKey)?;
         let ed25519_sig = Ed25519Signature::from_bytes(&signature.ed25519_sig);
+        // CRYPTO-4: `verify_strict` rejects non-canonical / malleable signatures
+        // and low-order ("weak") public keys, which the lenient `verify` accepts.
+        // We only ever produce canonical signatures, so this never rejects a
+        // legitimate one; it just removes signature-malleability as a class.
         ed25519_pk
-            .verify(message, &ed25519_sig)
+            .verify_strict(message, &ed25519_sig)
             .map_err(|_| HybridSignError::Ed25519VerificationFailed)?;
 
         // ML-DSA-65 (FIPS 204)
