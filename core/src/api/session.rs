@@ -122,7 +122,7 @@ pub struct ResumptionHint {
 // dependency-light module that can compile in a `no_std + alloc` build. It is
 // re-exported here so `crate::api::session::SessionTransport` and the public
 // `phantom_core::api::SessionTransport` path stay stable.
-pub use crate::transport::session_transport::SessionTransport;
+pub use crate::transport::session_transport::{FramePhase, SessionTransport};
 
 /// Transport decorator that records `record_send` / `record_recv` on the
 /// session's [`Observability`] for every frame that crosses the wire — so the
@@ -458,6 +458,10 @@ impl PhantomSession {
 
         let session_id = *server_session.id();
         let runtime_for_pump = runtime.clone();
+        // WIRE-001: the server handshake is complete — raise the receive frame
+        // cap from the tight unauthenticated handshake limit to the steady-state
+        // application limit before the data pump takes over.
+        transport.set_frame_phase(FramePhase::Established);
         let observed = Arc::new(ObservedTransport::new(
             transport,
             observability.clone(),
@@ -594,6 +598,9 @@ impl PhantomSession {
         // Wrap the (post-handshake) transport so every data-plane send/recv is
         // recorded. The connectionless API rides TCP today (KCP / FakeTLS legs
         // are not session-wired yet), so the leg label is fixed to TCP.
+        // WIRE-001: the handshake is done — raise the frame cap from the tight
+        // unauthenticated handshake limit to the steady-state application limit.
+        transport.set_frame_phase(FramePhase::Established);
         let observed = Arc::new(ObservedTransport::new(
             transport,
             observability.clone(),

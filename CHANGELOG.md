@@ -117,6 +117,31 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   longer hang `connect`. Pinned by `client_handshake_caps_retry_rounds` and the
   `tcp_integration_stalled_peer_does_not_block_accept` integration test.
 
+- **WIRE-001 (medium): length-prefix memory amplification — fixed.** The
+  length-prefixed receive path pre-allocated and zeroed the full *declared* frame
+  length before reading the body, so a peer could send the 4 bytes `0x01000000`
+  (declaring 16 MiB) and stall, forcing a ~16 MiB commit per connection — a
+  ~4,000,000× amplification reachable pre-authentication on the very first frame.
+  The receive path now reads **incrementally in ≤64 KiB chunks** (a stalled peer
+  commits at most one chunk, not the declared length) and applies a **phase-gated
+  cap**: a tight 64 KiB during the unauthenticated handshake (a `ClientHello`,
+  even with a 16 KiB 0-RTT blob, is well under it), raised to 4 MiB once the
+  session is established (down from 16 MiB) via a new defaulted
+  `SessionTransport::set_frame_phase` called at the handshake → data-pump
+  boundary. Applies to `TcpSessionTransport` and the WASI leg.
+
+- **LEGS-003 (medium): sticky recv accumulator — fixed.** The persistent recv
+  accumulator never shrank, so a single large frame pinned its buffer for the
+  connection's life. It is now reset to baseline (`RECV_BUF_INITIAL_CAPACITY`)
+  after any frame larger than 256 KiB. Pinned by
+  `tcp_transport::tests::{handshake_phase_rejects_oversized_frame,
+  established_phase_accepts_large_frame_and_resets_accumulator}`.
+
+- **LEGS-002 (medium): KCP leg pre-allocation — fixed.** The KCP leg allocated
+  the full declared length (up to 10 MiB) before reading the body and had no read
+  timeout. It now reads incrementally, caps frames at 4 MiB, and bounds the read
+  with a 30s timeout (terminal for the leg on expiry).
+
 ### Added
 
 - **Graceful unsupported-version signal.** When a `ClientHello.version` is one
