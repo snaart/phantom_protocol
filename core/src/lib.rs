@@ -132,10 +132,6 @@ pub mod crypto;
 // sub-modules opt into `std` from within `transport/mod.rs`.
 pub mod transport;
 
-// Networks module (transport trait, pipeline, engine, tls) — std-only.
-#[cfg(feature = "std")]
-pub mod networks;
-
 // Async runtime abstraction (Phase 3.1). `TokioRuntime` is the default
 // implementation; the trait surface is in place for follow-up commits
 // that introduce WASM / embedded backends.

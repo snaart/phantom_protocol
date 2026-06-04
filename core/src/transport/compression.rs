@@ -38,6 +38,14 @@ impl CompressionAlgo {
 /// Minimum payload size worth compressing
 const MIN_COMPRESS_SIZE: usize = 64;
 
+/// Default upper bound on decompressed output (16 MiB — matches the
+/// established-session frame cap in `TcpSessionTransport`). Decompression is an
+/// asymmetric operation: a few KiB of crafted LZ4/Zstd can expand to gigabytes
+/// (a "decompression bomb"). [`AdaptiveCompressor::decompress`] enforces this
+/// cap unconditionally; callers that need a different bound use
+/// [`AdaptiveCompressor::decompress_with_limit`].
+pub const MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
+
 /// Compression statistics for auto-probe
 #[derive(Debug, Clone)]
 pub struct CompressionStats {
@@ -179,15 +187,33 @@ impl AdaptiveCompressor {
         }
     }
 
-    /// Decompress data given the algorithm byte.
+    /// Decompress data given the algorithm byte, bounding the output to
+    /// [`MAX_DECOMPRESSED_LEN`]. An input that would expand beyond the cap is
+    /// rejected with [`CompressionError::OutputTooLarge`] rather than allocated.
     pub fn decompress(algo_byte: u8, data: &[u8]) -> Result<Vec<u8>, CompressionError> {
+        Self::decompress_with_limit(algo_byte, data, MAX_DECOMPRESSED_LEN)
+    }
+
+    /// Decompress with a caller-chosen output cap. `max_output` is the largest
+    /// plaintext the caller is willing to materialise; the decoders refuse to
+    /// allocate or emit beyond it, so a decompression bomb cannot exhaust memory.
+    pub fn decompress_with_limit(
+        algo_byte: u8,
+        data: &[u8],
+        max_output: usize,
+    ) -> Result<Vec<u8>, CompressionError> {
         let algo = CompressionAlgo::from_byte(algo_byte)
             .ok_or(CompressionError::UnknownAlgorithm(algo_byte))?;
         match algo {
-            CompressionAlgo::None => Ok(data.to_vec()),
-            CompressionAlgo::Lz4 => Self::decompress_lz4(data),
+            CompressionAlgo::None => {
+                if data.len() > max_output {
+                    return Err(CompressionError::OutputTooLarge { limit: max_output });
+                }
+                Ok(data.to_vec())
+            }
+            CompressionAlgo::Lz4 => Self::decompress_lz4(data, max_output),
             #[cfg(feature = "compression-zstd")]
-            CompressionAlgo::Zstd1 => Self::decompress_zstd(data),
+            CompressionAlgo::Zstd1 => Self::decompress_zstd(data, max_output),
             // Without `compression-zstd`, we cannot decode Zstd payloads.
             // Surface the failure as a typed error rather than fabricating
             // garbage plaintext.
@@ -215,7 +241,19 @@ impl AdaptiveCompressor {
         lz4_flex::compress_prepend_size(data)
     }
 
-    fn decompress_lz4(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
+    fn decompress_lz4(data: &[u8], max_output: usize) -> Result<Vec<u8>, CompressionError> {
+        // `compress_prepend_size` writes the uncompressed length as a
+        // little-endian u32 prefix and `decompress_size_prepended` trusts it to
+        // pre-allocate the whole output. Reject an oversized declared length
+        // BEFORE that allocation happens — otherwise 8 bytes on the wire could
+        // force a multi-GiB `Vec` reservation (decompression-bomb guard).
+        if data.len() >= 4 {
+            let declared =
+                u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if declared > max_output {
+                return Err(CompressionError::OutputTooLarge { limit: max_output });
+            }
+        }
         lz4_flex::decompress_size_prepended(data)
             .map_err(|e| CompressionError::DecompressFailed(format!("LZ4: {}", e)))
     }
@@ -228,9 +266,26 @@ impl AdaptiveCompressor {
     }
 
     #[cfg(feature = "compression-zstd")]
-    fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
-        zstd::decode_all(data)
-            .map_err(|e| CompressionError::DecompressFailed(format!("Zstd: {}", e)))
+    fn decompress_zstd(data: &[u8], max_output: usize) -> Result<Vec<u8>, CompressionError> {
+        use std::io::Read;
+        // Zstd frames may declare no content size, so we cannot pre-check a
+        // header the way LZ4 lets us. Instead, stream-decode through a reader
+        // capped at `max_output + 1`: if the decoder produces that many bytes
+        // the frame exceeds the cap and we fail closed before the `Vec` can
+        // grow without bound.
+        let mut decoder = zstd::stream::read::Decoder::new(data)
+            .map_err(|e| CompressionError::DecompressFailed(format!("Zstd: {}", e)))?;
+        let mut out = Vec::new();
+        let cap_plus_one = (max_output as u64).saturating_add(1);
+        decoder
+            .by_ref()
+            .take(cap_plus_one)
+            .read_to_end(&mut out)
+            .map_err(|e| CompressionError::DecompressFailed(format!("Zstd: {}", e)))?;
+        if out.len() > max_output {
+            return Err(CompressionError::OutputTooLarge { limit: max_output });
+        }
+        Ok(out)
     }
 }
 
@@ -239,6 +294,11 @@ impl AdaptiveCompressor {
 pub enum CompressionError {
     UnknownAlgorithm(u8),
     DecompressFailed(String),
+    /// The decompressed output reached the configured cap. Guards against a
+    /// decompression bomb (a tiny ciphertext that expands to gigabytes).
+    OutputTooLarge {
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for CompressionError {
@@ -246,6 +306,9 @@ impl std::fmt::Display for CompressionError {
         match self {
             Self::UnknownAlgorithm(b) => write!(f, "Unknown compression algorithm: 0x{:02x}", b),
             Self::DecompressFailed(msg) => write!(f, "Decompression failed: {}", msg),
+            Self::OutputTooLarge { limit } => {
+                write!(f, "Decompressed output exceeds the {}-byte cap", limit)
+            }
         }
     }
 }
@@ -329,6 +392,51 @@ mod tests {
         // After probe_samples, should be disabled
         assert!(c.disabled_by_probe);
         assert_eq!(c.algorithm(), CompressionAlgo::None);
+    }
+
+    #[test]
+    fn lz4_decompress_rejects_oversized_declared_size() {
+        // Craft an LZ4 size-prepended frame whose declared output length is
+        // absurd (~3 GiB). The guard must reject it from the LE size prefix
+        // alone, before `decompress_size_prepended` tries to allocate it.
+        let mut bomb = Vec::new();
+        bomb.extend_from_slice(&u32::to_le_bytes(0xC000_0000)); // declared ≈ 3 GiB
+        bomb.extend_from_slice(&[0u8; 16]); // arbitrary (never reached)
+        let err = AdaptiveCompressor::decompress(CompressionAlgo::Lz4.to_byte(), &bomb)
+            .expect_err("oversized declared size must be rejected");
+        assert!(
+            matches!(err, CompressionError::OutputTooLarge { .. }),
+            "expected OutputTooLarge, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn lz4_decompress_with_limit_rejects_overlimit_output() {
+        // A genuinely compressible 4 KiB payload decodes fine under a generous
+        // cap, but a tight 100-byte cap rejects it via the declared-size guard.
+        let mut c = AdaptiveCompressor::lz4();
+        let data = vec![7u8; 4096];
+        let (algo, compressed) = c.compress(&data);
+        assert!(AdaptiveCompressor::decompress(algo, &compressed).is_ok());
+        let err = AdaptiveCompressor::decompress_with_limit(algo, &compressed, 100)
+            .expect_err("4 KiB output must exceed a 100-byte cap");
+        assert!(matches!(err, CompressionError::OutputTooLarge { limit: 100 }));
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn zstd_decompress_with_limit_rejects_overlimit_output() {
+        // Zstd carries no peekable content-size guarantee, so the cap is
+        // enforced by the bounded streaming read. A 4 KiB payload under a
+        // 100-byte cap must fail closed mid-stream.
+        let mut c = AdaptiveCompressor::zstd(1);
+        let data = vec![9u8; 4096];
+        let (algo, compressed) = c.compress(&data);
+        assert_eq!(algo, CompressionAlgo::Zstd1.to_byte());
+        assert!(AdaptiveCompressor::decompress(algo, &compressed).is_ok());
+        let err = AdaptiveCompressor::decompress_with_limit(algo, &compressed, 100)
+            .expect_err("4 KiB output must exceed a 100-byte cap");
+        assert!(matches!(err, CompressionError::OutputTooLarge { limit: 100 }));
     }
 
     #[test]
