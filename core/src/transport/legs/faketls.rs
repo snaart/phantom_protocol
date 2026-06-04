@@ -850,7 +850,9 @@ mod tests {
         let leg = FakeTlsLeg::new().expect("FakeTlsLeg::new");
         // sealed = data + 1 (inner content-type) + 16 (AES-GCM tag). The largest
         // payload that still fits u16::MAX (65_535) is 65_518; one more overflows.
-        let ok = leg.wrap_as_tls_record(&vec![0u8; 65_518]).expect("boundary payload fits");
+        let ok = leg
+            .wrap_as_tls_record(&vec![0u8; 65_518])
+            .expect("boundary payload fits");
         assert_eq!(ok.len(), 5 + u16::MAX as usize);
         let err = leg
             .wrap_as_tls_record(&vec![0u8; 65_519])
