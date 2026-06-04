@@ -1262,14 +1262,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "kcp-tokio"
-version = "0.3.7"
+name = "kcp-core"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92e798ae12cc4e285761bda618015e10e1c2befb136a53c818dcbd7633fe8f09"
+checksum = "221e2bf29726eee64dccbd92148fa2ee4f17679a799c279b49602bd8fc877d51"
+dependencies = [
+ "bytes",
+ "tracing",
+]
+
+[[package]]
+name = "kcp-tokio"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7b592e48339b61c69a74f3dd6d1b1ab44651df3fd288c51660f6ae138a10eef"
 dependencies = [
  "bytes",
  "crossbeam-queue",
  "dashmap",
+ "kcp-core",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
