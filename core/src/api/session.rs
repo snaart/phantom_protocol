@@ -107,13 +107,29 @@ impl ConnectionState {
 /// server-pinned, and reusing a hint across servers is a configuration
 /// bug.
 #[cfg_attr(feature = "bindings", derive(uniffi::Record))]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ResumptionHint {
     /// The negotiated session id (32 bytes).
     pub session_id: Vec<u8>,
     /// The resumption secret (32 bytes) — sensitive; treat like a key.
     pub resumption_secret: Vec<u8>,
+}
+
+// INFOLEAK-1: hand-written redacting `Debug` (not derived) so a mobile/FFI
+// consumer that logs the hint with `{:?}` cannot leak the 0-RTT `resumption_secret`
+// — the one secret-bearing type that crosses the FFI boundary. Mirrors the
+// REDACTED `Debug` on `HybridSigningKey` / `HybridSecretKey`.
+impl std::fmt::Debug for ResumptionHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResumptionHint")
+            .field(
+                "session_id",
+                &format_args!("<{} bytes>", self.session_id.len()),
+            )
+            .field("resumption_secret", &"REDACTED")
+            .finish()
+    }
 }
 
 // ─── Transport Abstraction ──────────────────────────────────────────────────
@@ -2179,6 +2195,29 @@ mod tests {
         assert!(
             matches!(result, Err(CoreError::HandshakeError(_))),
             "client must error after the retry-round cap, not loop forever; got {result:?}"
+        );
+    }
+
+    /// **INFOLEAK-1.** `ResumptionHint`'s `Debug` must redact the 0-RTT
+    /// `resumption_secret` — a mobile/FFI consumer logging it with `{:?}` must
+    /// not leak the key material.
+    #[test]
+    fn resumption_hint_debug_redacts_secret() {
+        let hint = ResumptionHint {
+            session_id: vec![0xAB; 32],
+            resumption_secret: vec![0xCD; 32],
+        };
+        let dbg = format!("{hint:?}");
+        assert!(dbg.contains("REDACTED"), "secret must be redacted: {dbg}");
+        // No representation of the secret bytes (0xCD) leaks — neither hex nor
+        // the decimal the derived Debug would have printed for a Vec<u8>.
+        assert!(
+            !dbg.contains("205"),
+            "no decimal secret bytes in Debug: {dbg}"
+        );
+        assert!(
+            !dbg.to_lowercase().contains("cd, cd"),
+            "no hex secret bytes: {dbg}"
         );
     }
 

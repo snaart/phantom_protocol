@@ -49,14 +49,22 @@ impl AesSession {
         // `crypto::kdf::derive_key_32` cfg-dispatches between
         // `blake3::derive_key` (default) and HKDF-SHA256 (`--features
         // fips`). API shape and 32-byte output are identical.
-        let key_a = crate::crypto::kdf::derive_key_32("phantom-aes-send-v1", shared_secret);
-        let key_b = crate::crypto::kdf::derive_key_32("phantom-aes-recv-v1", shared_secret);
+        // CRYPTO-3: wipe the per-direction AEAD key bytes on every exit path
+        // once copied into ring's opaque `UnboundKey`.
+        let key_a = zeroize::Zeroizing::new(crate::crypto::kdf::derive_key_32(
+            "phantom-aes-send-v1",
+            shared_secret,
+        ));
+        let key_b = zeroize::Zeroizing::new(crate::crypto::kdf::derive_key_32(
+            "phantom-aes-recv-v1",
+            shared_secret,
+        ));
 
         let (send_bytes, recv_bytes) = if swap { (key_b, key_a) } else { (key_a, key_b) };
 
-        let send_unbound = UnboundKey::new(&AES_256_GCM, &send_bytes)
+        let send_unbound = UnboundKey::new(&AES_256_GCM, &*send_bytes)
             .map_err(|_| crate::CoreError::CryptoError("Invalid key".into()))?;
-        let recv_unbound = UnboundKey::new(&AES_256_GCM, &recv_bytes)
+        let recv_unbound = UnboundKey::new(&AES_256_GCM, &*recv_bytes)
             .map_err(|_| crate::CoreError::CryptoError("Invalid key".into()))?;
 
         let prefix_bytes = crate::crypto::kdf::derive_key_32("phantom-nonce-pfx-v1", shared_secret);

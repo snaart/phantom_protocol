@@ -184,7 +184,11 @@ impl HybridSecretKey {
         ecc_secret: &[u8],
         pq_secret: &[u8],
     ) -> Result<[u8; 32], anyhow::Error> {
-        let hkdf = Hkdf::<Sha256>::new(None, &[ecc_secret, pq_secret].concat());
+        // CRYPTO-3: the combined IKM holds both raw classical and ML-KEM shared
+        // secrets — wipe it on every exit path rather than leaving it in freed
+        // memory.
+        let ikm = zeroize::Zeroizing::new([ecc_secret, pq_secret].concat());
+        let hkdf = Hkdf::<Sha256>::new(None, &ikm);
         let mut okm = [0u8; 32];
         hkdf.expand(COMBINE_LABEL, &mut okm)
             .map_err(|_| anyhow::anyhow!("HKDF expansion failed"))?;
