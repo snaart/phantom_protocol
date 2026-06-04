@@ -75,7 +75,7 @@ bare `PhantomPacket`; the handshake messages are bare borsh structs.
 | Classical KEM | X25519 | ECDH-P-256 | `x25519-dalek` / `aws-lc-rs` |
 | Post-quantum KEM | ML-KEM-768 (FIPS 203) | ML-KEM-768 (FIPS 203) | `ml-kem = 0.2` (RustCrypto pure-Rust) |
 | Classical signature | Ed25519 | Ed25519 | `ed25519-dalek` |
-| Post-quantum signature | ML-DSA-65 (FIPS 204) | ML-DSA-65 (FIPS 204) | `ml-dsa = =0.1.0-rc.11` (RustCrypto pure-Rust) |
+| Post-quantum signature | ML-DSA-65 (FIPS 204) | ML-DSA-65 (FIPS 204) | `ml-dsa = 0.1.0` (RustCrypto pure-Rust) |
 | AEAD | AES-256-GCM or ChaCha20-Poly1305 | AES-256-GCM only | `ring` / `aws-lc-rs` |
 | Hash | SHA-256 | SHA-256 | `sha2` / `aws-lc-rs` |
 | KDF context | blake3 keyed-derivation | HKDF-SHA-256 | `blake3` / `hkdf` |

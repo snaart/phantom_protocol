@@ -16,8 +16,8 @@ pub mod session_transport;
 // ── std-bound modules ──────────────────────────────────────────────────
 // Everything below pulls `tokio`, `parking_lot`, `dashmap`, `arc-swap`,
 // `std::sync::*`, `std::time::Instant`, raw sockets, or a std-bound crypto dep
-// (`ring`, `ml-kem`, `ml-dsa`, `x25519-dalek`, `ed25519-dalek`,
-// `chacha20poly1305`). Gated behind `std`.
+// (`ring`, `ml-kem`, `ml-dsa`, `x25519-dalek`, `ed25519-dalek`).
+// Gated behind `std`.
 #[cfg(feature = "std")]
 pub mod api;
 #[cfg(feature = "std")]

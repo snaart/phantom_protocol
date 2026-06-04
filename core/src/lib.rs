@@ -123,7 +123,7 @@ pub mod security;
 pub mod validation;
 
 // Crypto module (hybrid KEM, hybrid sign) — std-only: pulls `ring`,
-// `x25519-dalek`, `ed25519-dalek`, `ml-kem`, `ml-dsa`, `chacha20poly1305`.
+// `x25519-dalek`, `ed25519-dalek`, `ml-kem`, `ml-dsa`.
 #[cfg(feature = "std")]
 pub mod crypto;
 
