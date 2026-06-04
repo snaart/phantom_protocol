@@ -175,7 +175,7 @@ anyhow = { version = "1", optional = true }
 thiserror = { version = "1", optional = true }
 log = { version = "0.4", optional = true }
 env_logger = { version = "0.11", optional = true }
-rand = { version = "0.8", optional = true }
+rand = { version = "0.10", optional = true }
 once_cell = { version = "1.18", optional = true }
 subtle = { version = "2.5", default-features = false, optional = true }  # Constant-time equality for secrets (cookies, tokens)
 tracing = { version = "0.1", optional = true }  # Structured spans / events for observability (Phase 4.5)
@@ -325,7 +325,7 @@ wasi = { version = "0.14", optional = true }
 [dev-dependencies]
 blake3 = "1.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand = "0.8"
+rand = "0.10"
 uniffi = { version = "0.29", features = ["bindgen-tests"] }
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tokio-test = "0.4"
