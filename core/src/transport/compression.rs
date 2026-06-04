@@ -248,8 +248,7 @@ impl AdaptiveCompressor {
         // BEFORE that allocation happens — otherwise 8 bytes on the wire could
         // force a multi-GiB `Vec` reservation (decompression-bomb guard).
         if data.len() >= 4 {
-            let declared =
-                u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            let declared = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
             if declared > max_output {
                 return Err(CompressionError::OutputTooLarge { limit: max_output });
             }
@@ -420,7 +419,10 @@ mod tests {
         assert!(AdaptiveCompressor::decompress(algo, &compressed).is_ok());
         let err = AdaptiveCompressor::decompress_with_limit(algo, &compressed, 100)
             .expect_err("4 KiB output must exceed a 100-byte cap");
-        assert!(matches!(err, CompressionError::OutputTooLarge { limit: 100 }));
+        assert!(matches!(
+            err,
+            CompressionError::OutputTooLarge { limit: 100 }
+        ));
     }
 
     #[cfg(feature = "compression-zstd")]
@@ -436,7 +438,10 @@ mod tests {
         assert!(AdaptiveCompressor::decompress(algo, &compressed).is_ok());
         let err = AdaptiveCompressor::decompress_with_limit(algo, &compressed, 100)
             .expect_err("4 KiB output must exceed a 100-byte cap");
-        assert!(matches!(err, CompressionError::OutputTooLarge { limit: 100 }));
+        assert!(matches!(
+            err,
+            CompressionError::OutputTooLarge { limit: 100 }
+        ));
     }
 
     #[test]
