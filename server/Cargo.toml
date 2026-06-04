@@ -34,7 +34,7 @@ futures = "0.3"
 # installs `MeterProvider` / `TracerProvider` and the OTLP exporter before
 # any handshake records anything.
 opentelemetry = { version = "0.28", features = ["metrics", "trace"] }
-opentelemetry_sdk = { version = "0.28", features = ["metrics", "trace", "rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "trace", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.28", default-features = false, features = [
     # `gzip-tonic` is load-bearing: telemetry.rs calls `.with_compression(Gzip)`
     # on both exporters, and without this feature that fails at startup with
