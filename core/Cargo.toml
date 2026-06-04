@@ -168,7 +168,7 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # to `borsh` can silently shift the handshake bytes and break interop with no
 # `WIRE_VERSION` change, so it is pinned to an exact version — bump it only as a
 # deliberate wire change, paired with a vector regeneration.
-borsh = { version = "=1.6.0", default-features = false, optional = true, features = ["derive"] }
+borsh = { version = "=1.6.1", default-features = false, optional = true, features = ["derive"] }
 hex = { version = "0.4", default-features = false, optional = true, features = ["alloc"] }
 base64 = { version = "0.22", default-features = false, optional = true, features = ["alloc"] }
 anyhow = { version = "1", optional = true }
@@ -201,7 +201,7 @@ hkdf = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 blake3 = { version = "1.5", optional = true }
 getrandom = { version = "0.2", optional = true }
-bitflags = { version = "2.4", optional = true }
+bitflags = { version = "2.12", optional = true }
 parking_lot = { version = "0.12", optional = true }  # Fast mutex for buffer pool
 arc-swap = { version = "1", optional = true }        # Lock-free atomic swap for the CryptoState rekey path (Phase 1.5)
 lz4_flex = { version = "0.11.6", optional = true }   # Fastest pure-Rust LZ4 (safe, no C bindings); >=0.11.6 floor avoids yanked 0.11.5 (RUSTSEC-2026-0041)
@@ -231,7 +231,7 @@ opentelemetry = { version = "0.28", optional = true, default-features = false, f
 opentelemetry_sdk = { version = "0.28", optional = true, default-features = false, features = ["metrics", "trace", "rt-tokio"] }
 tracing-opentelemetry = { version = "0.29", optional = true, default-features = false, features = ["tracing-log"] }
 hmac = { version = "0.12.1", optional = true }
-dashmap = { version = "6.1.0", optional = true }
+dashmap = { version = "6.2.1", optional = true }
 
 # --- Embedded transport (optional, behind the `embedded` feature) ---
 # Pure-Rust, no_std + alloc. `embedded-io-async` 0.6 is the byte-stream trait
