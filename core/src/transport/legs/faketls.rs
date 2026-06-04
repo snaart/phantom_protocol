@@ -585,7 +585,26 @@ impl FakeTlsLeg {
     /// Each call increments `send_counter` so the (key, nonce) pair is unique
     /// per record — the previous implementation reused `[0u8; 12]` and was
     /// vulnerable to the Forbidden Attack on AES-GCM.
-    fn wrap_as_tls_record(&self, data: &[u8]) -> Vec<u8> {
+    fn wrap_as_tls_record(&self, data: &[u8]) -> io::Result<Vec<u8>> {
+        // faketls-2: the outer TLS record carries its body length in a u16
+        // field. The sealed body is `data + 1` (inner content-type byte) plus
+        // the AEAD tag. Reject anything whose sealed length would exceed
+        // `u16::MAX` BEFORE sealing, so an oversized payload can never silently
+        // truncate the length field into a corrupt record (and we skip a wasted
+        // seal). Invariant 3 is untouched — the per-record `send_counter` nonce
+        // and direction-keyed `send_key` below are exactly as before.
+        let tag_len = self.send_key.algorithm().tag_len();
+        let framed_len = data.len().saturating_add(1).saturating_add(tag_len);
+        if framed_len > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "faketls record body would be {framed_len} bytes, exceeding the {}-byte u16 length field",
+                    u16::MAX
+                ),
+            ));
+        }
+
         // TLS 1.3 framing: inner plaintext + TLS1.3 AppData type (0x17)
         let mut inner_plaintext = Vec::with_capacity(data.len() + 1);
         inner_plaintext.extend_from_slice(data);
@@ -597,25 +616,22 @@ impl FakeTlsLeg {
         let nonce = self.make_nonce(counter);
 
         let aad = aead::Aad::empty();
-        // PANIC-SAFETY: ring's `seal_in_place_append_tag` only fails when the
-        // input length plus tag overflows the AEAD invocation limit (~2^36
-        // bytes for AES-GCM, per NIST SP 800-38D). Phantom records are MTU-
-        // bounded (≤ 1300 + framing) and any reasonable application payload
-        // is many orders of magnitude below that ceiling.
-        #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+        // A seal failure here means ring rejected the input (e.g. the AEAD
+        // invocation ceiling); surface it rather than panicking.
         self.send_key
             .seal_in_place_append_tag(nonce, aad, &mut in_out)
-            .unwrap();
+            .map_err(|_| io::Error::other("faketls AEAD seal failed"))?;
 
         let mut record = Vec::with_capacity(5 + in_out.len());
 
-        // Outer TLS record header (Legacy Application Data)
+        // Outer TLS record header (Legacy Application Data). `in_out.len()` is
+        // ≤ u16::MAX by the guard above, so the cast cannot truncate.
         record.push(TlsContentType::ApplicationData as u8);
         record.extend_from_slice(&self.config.version.to_be_bytes());
         record.extend_from_slice(&(in_out.len() as u16).to_be_bytes());
         record.extend_from_slice(&in_out);
 
-        record
+        Ok(record)
     }
 
     /// Unwrap TLS Application Data record.
@@ -680,7 +696,7 @@ impl TransportLeg for FakeTlsLeg {
             return Err(io::Error::other("Handshake not finished"));
         }
 
-        let record = self.wrap_as_tls_record(&data);
+        let record = self.wrap_as_tls_record(&data)?;
 
         let mut stream_guard = self.stream.lock().await;
         let stream = stream_guard
@@ -819,11 +835,27 @@ mod tests {
     fn test_wrap_tls_record() {
         let leg = FakeTlsLeg::new().expect("FakeTlsLeg::new");
         let data = b"test payload";
-        let record = leg.wrap_as_tls_record(data);
+        let record = leg.wrap_as_tls_record(data).expect("wrap_as_tls_record");
 
         assert_eq!(record[0], TlsContentType::ApplicationData as u8);
         // data len + 1 for inner content type + 16 for auth tag
         assert_eq!(record.len(), 5 + data.len() + 1 + 16);
+    }
+
+    /// faketls-2: a payload whose sealed length would overflow the u16 TLS
+    /// record-length field must be rejected with `InvalidData`, never silently
+    /// truncated into a corrupt record.
+    #[test]
+    fn oversized_record_payload_is_rejected_not_truncated() {
+        let leg = FakeTlsLeg::new().expect("FakeTlsLeg::new");
+        // sealed = data + 1 (inner content-type) + 16 (AES-GCM tag). The largest
+        // payload that still fits u16::MAX (65_535) is 65_518; one more overflows.
+        let ok = leg.wrap_as_tls_record(&vec![0u8; 65_518]).expect("boundary payload fits");
+        assert_eq!(ok.len(), 5 + u16::MAX as usize);
+        let err = leg
+            .wrap_as_tls_record(&vec![0u8; 65_519])
+            .expect_err("oversized payload must be rejected, not truncated");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -876,7 +908,7 @@ mod tests {
             b"third record (a bit longer to vary length)",
         ];
         for pt in plaintexts {
-            let mut record = client.wrap_as_tls_record(pt);
+            let mut record = client.wrap_as_tls_record(pt).expect("wrap_as_tls_record");
             let recovered_len = server.unwrap_tls_record(&mut record).unwrap().len();
             assert_eq!(&record[5..5 + recovered_len], *pt);
         }
@@ -888,8 +920,8 @@ mod tests {
     fn test_nonce_advances_per_record() {
         let leg =
             FakeTlsLeg::with_config(FakeTlsConfig::default()).expect("FakeTlsLeg::with_config");
-        let r1 = leg.wrap_as_tls_record(b"identical");
-        let r2 = leg.wrap_as_tls_record(b"identical");
+        let r1 = leg.wrap_as_tls_record(b"identical").expect("wrap r1");
+        let r2 = leg.wrap_as_tls_record(b"identical").expect("wrap r2");
         assert_ne!(
             r1, r2,
             "counter must advance — identical plaintext must not produce identical ciphertext"

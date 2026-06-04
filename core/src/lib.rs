@@ -53,8 +53,9 @@
     )
 )]
 // Deny `unsafe` by default at the crate root. The three modules that genuinely
-// require `unsafe` (libc GSO/recvmmsg syscalls in `transport::udp_transport`,
-// native-only; wasm-bindgen-generated JS-boundary glue in
+// require `unsafe` (a single `libc::setsockopt(SO_MAX_PACING_RATE)` call in
+// `transport::udp_transport`, native-only — the dead `sendmmsg` GSO path was
+// removed; wasm-bindgen-generated JS-boundary glue in
 // `transport::legs::websocket`, wasm32-only; `unsafe impl Send/Sync for
 // WasiLeg` over WIT-bindgen `Resource<T>` socket handles in
 // `transport::legs::wasi`, WASI-only) opt back in with a module-level
