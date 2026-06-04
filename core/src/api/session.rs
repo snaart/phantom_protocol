@@ -1613,6 +1613,27 @@ async fn handle_packet<T: SessionTransport>(
         }
     }
 
+    // PATH-001 (Invariant 6): application data is delivered only on a Validated
+    // path. Path 0 is pre-validated at session establishment; any other path_id
+    // must complete a PATH_VALIDATION challenge/response first. The control
+    // frames (ACK / WINDOW_UPDATE / PATH_VALIDATION) were handled above and
+    // returned; this gates the app-data delivery branches below. It runs AFTER
+    // AEAD verify, so it never acts on an attacker-chosen plaintext path_id that
+    // fails decryption.
+    if !matches!(
+        crypto_recv.path_state(path_id),
+        Some(crate::transport::path::PathStateKind::Validated)
+    ) {
+        // Track a first-seen path id so a future challenge/response can promote
+        // it; drop the data until then.
+        crypto_recv.register_unvalidated_path(path_id);
+        log::warn!(
+            "PhantomSession: dropping application data on non-validated path_id {}",
+            path_id
+        );
+        return;
+    }
+
     // COALESCED dispatch (Phase 2.5): split the decrypted bundle into
     // sub-payloads and hand each, IN ORDER, to the single FIFO delivery task.
     // The delivery task drains them in this order, so the bundle's internal
@@ -2059,6 +2080,17 @@ pub async fn connect_pinned_with_resumption(
                 hint.resumption_secret.len()
             ))
         })?;
+
+    // APIFFI-03: reject oversized early-data BEFORE opening a socket, so a caller
+    // bug (or oversized blob) never wastes a TCP connection establishment. The
+    // inner `connect_with_resumption` enforces the same cap as defense-in-depth.
+    if early_data.len() > EARLY_DATA_MAX_LEN {
+        return Err(CoreError::ValidationError(format!(
+            "early_data is {} bytes, exceeds the {}-byte 0-RTT cap",
+            early_data.len(),
+            EARLY_DATA_MAX_LEN
+        )));
+    }
 
     let addr = format!("{}:{}", host, port);
     let stream = tokio::net::TcpStream::connect(&addr)
@@ -2664,6 +2696,121 @@ mod tests {
             undelivered.load(Ordering::Acquire),
             b"hello-v2".len() as u64
         );
+    }
+
+    /// Like [`build_app_frame`] but stamps a caller-chosen `path_id` so the
+    /// receive-side path gate (PATH-001) can be exercised.
+    fn build_app_frame_on_path(
+        client_session: &InnerSession,
+        session_id: SessionId,
+        stream_id: TransportStreamId,
+        sequence: u32,
+        path_id: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
+        let header =
+            PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
+                .with_epoch(client_session.current_epoch())
+                .with_path_id(path_id);
+        let ciphertext = client_session
+            .encrypt_packet(&header, payload)
+            .expect("encrypt_packet");
+        PhantomPacket::new(header, ciphertext).to_wire()
+    }
+
+    #[tokio::test]
+    async fn app_data_on_non_validated_path_is_dropped() {
+        // PATH-001 (Invariant 6): application data is delivered only on a
+        // Validated path. Path 0 is pre-validated; any other path_id must
+        // complete a PATH_VALIDATION challenge first. A frame on an unvalidated
+        // path is dropped (even though it decrypts cleanly) and the path is
+        // registered Unvalidated so a later challenge can promote it.
+        use crate::transport::path::PathStateKind;
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        let bad = build_app_frame_on_path(
+            &client_session,
+            session_id,
+            stream_id,
+            0,
+            7, // never validated on the receiver
+            b"on-bad-path",
+        );
+        let bad = PhantomPacket::from_wire(&bad).unwrap();
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
+        let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let mut ack_buf = Vec::with_capacity(256);
+        let mut path_validation_seq: u32 = 0;
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        handle_packet(
+            bad,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &transport_send,
+            &transport_send,
+            &deliver_tx,
+            &undelivered,
+            &mut ack_buf,
+            &mut path_validation_seq,
+            &obs,
+            LegType::Tcp,
+        )
+        .await;
+
+        assert!(
+            deliver_rx.try_recv().is_err(),
+            "application data on a non-validated path must be dropped"
+        );
+        assert_eq!(
+            undelivered.load(Ordering::Acquire),
+            0,
+            "dropped data must not count toward the backlog"
+        );
+        assert_eq!(
+            server_session.path_state(7),
+            Some(PathStateKind::Unvalidated),
+            "the unseen path id must be registered for a later challenge"
+        );
+
+        // Positive control: the SAME stream on the pre-validated path 0 IS
+        // delivered, proving the gate only blocks non-validated paths.
+        let good =
+            build_app_frame_on_path(&client_session, session_id, stream_id, 1, 0, b"on-good-path");
+        let good = PhantomPacket::from_wire(&good).unwrap();
+        handle_packet(
+            good,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &transport_send,
+            &transport_send,
+            &deliver_tx,
+            &undelivered,
+            &mut ack_buf,
+            &mut path_validation_seq,
+            &obs,
+            LegType::Tcp,
+        )
+        .await;
+        let (sid, received) = deliver_rx.recv().await.expect("path-0 delivery");
+        assert_eq!(sid, stream_id as u32);
+        assert_eq!(&received[..], b"on-good-path");
     }
 
     /// Build an `ENCRYPTED | ACK` frame (H1) from `acker_session` acknowledging

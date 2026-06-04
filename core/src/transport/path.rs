@@ -220,10 +220,20 @@ impl PathRegistry {
             }
             PathStateKind::Validated | PathStateKind::Failed => return None,
         }
+        // PATH-003: hold the pending-challenge lock across the decision so a
+        // re-issue on a path that already has a challenge in flight returns that
+        // SAME challenge (idempotent) instead of clobbering it — otherwise a late
+        // but valid response to the original challenge would no longer match and
+        // would push the path to `Failed`.
+        let mut pending = path.pending_challenge.lock();
+        if let Some(existing) = *pending {
+            return Some(existing);
+        }
         // Use the thread-local CSPRNG; `getrandom`-failure fallback is
         // already covered upstream in the API layer's session-id helper.
         let challenge: [u8; PATH_CHALLENGE_LEN] = rand::random();
-        *path.pending_challenge.lock() = Some(challenge);
+        *pending = Some(challenge);
+        drop(pending);
         path.set_state(PathStateKind::Validating);
         Some(challenge)
     }
@@ -320,6 +330,22 @@ mod tests {
         let challenge = r.issue_challenge(1).expect("challenge issued");
         assert_eq!(challenge.len(), PATH_CHALLENGE_LEN);
         assert_eq!(r.state(1), Some(PathStateKind::Validating));
+    }
+
+    #[test]
+    fn reissue_on_validating_path_returns_same_challenge() {
+        // PATH-003: a second issue_challenge while one is already in flight must
+        // return the SAME challenge, not mint+install a fresh one (which would
+        // invalidate a legitimate response to the original and push the path to
+        // Failed). Idempotency across the Unvalidated/Validating window.
+        let r = PathRegistry::new();
+        r.register(1);
+        let first = r.issue_challenge(1).expect("first challenge");
+        let second = r.issue_challenge(1).expect("re-issue returns existing");
+        assert_eq!(first, second, "re-issue must not clobber the in-flight challenge");
+        // The original challenge still verifies (it was never overwritten).
+        assert!(r.verify_response(1, &first));
+        assert_eq!(r.state(1), Some(PathStateKind::Validated));
     }
 
     #[test]
