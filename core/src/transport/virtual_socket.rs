@@ -59,8 +59,10 @@ pub struct VirtualSocket {
     /// Sharing a single estimator across LTE and Wi-Fi is mathematically incorrect
     /// since RTT, BDP, and loss patterns differ significantly per path.
     estimators: Arc<Mutex<HashMap<LegType, bandwidth_estimator::BandwidthEstimator>>>,
-    /// Whether socket is closed
-    closed: std::sync::atomic::AtomicBool,
+    /// Whether socket is closed. `Arc` so the per-leg recv tasks share the
+    /// SAME flag as `close()` — cloning the bool's value (LEGS-004) gave each
+    /// task a private copy that `close()` could never signal.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl VirtualSocket {
@@ -80,7 +82,7 @@ impl VirtualSocket {
             recv_tx,
             recv_rx: Mutex::new(recv_rx),
             estimators: Arc::new(Mutex::new(HashMap::new())),
-            closed: std::sync::atomic::AtomicBool::new(false),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -217,10 +219,9 @@ impl VirtualSocket {
         let scheduler = self.scheduler.clone();
         let estimators = self.estimators.clone();
         let fallback = self.fallback.clone();
-        // Clone the AtomicBool into an Arc so we can move it into the spawned task
-        let closed = Arc::new(std::sync::atomic::AtomicBool::new(
-            self.closed.load(std::sync::atomic::Ordering::Relaxed),
-        ));
+        // Share the SAME close flag with the task (LEGS-004): clone the `Arc`,
+        // not the bool's value, so `close()` actually stops this recv loop.
+        let closed = self.closed.clone();
 
         tokio::spawn(async move {
             loop {
@@ -241,21 +242,24 @@ impl VirtualSocket {
                         // Detect ACKs for BBR feedback; update the leg-specific estimator.
                         // Each leg maintains independent BBR state so that different network
                         // paths (LTE, Wi-Fi, TCP) don't corrupt each other's bandwidth estimate.
-                        if data.len() >= crate::transport::types::PacketHeader::SIZE {
-                            let flags = data[38]; // flags byte is always at offset 38
-                            if (flags & 0b0000_0010) != 0 {
-                                // PacketFlags::ACK
+                        // LEGS-005: parse the canonical 45-byte big-endian header
+                        // via `PacketHeader::from_wire` instead of magic byte
+                        // offsets / little-endian reads. The previous code read
+                        // `data[38]` (the sequence LSB) as the flags byte and
+                        // `data[39..41]` LE (the big-endian flags field) as
+                        // ack_delay — both wrong. `from_wire` reads the header off
+                        // the front and ignores the payload.
+                        if let Ok(header) = crate::transport::types::PacketHeader::from_wire(&data) {
+                            if header
+                                .flags
+                                .contains(crate::transport::types::PacketFlags::ACK)
+                            {
                                 let mut ests: tokio::sync::MutexGuard<
                                     '_,
                                     HashMap<LegType, bandwidth_estimator::BandwidthEstimator>,
                                 > = estimators.lock().await;
                                 let est = ests.entry(leg_type).or_default();
-                                // Read ack_delay from packet header (bytes 39..41, little-endian u16)
-                                let ack_delay_us = if data.len() >= 41 {
-                                    u16::from_le_bytes([data[39], data[40]]) as u64
-                                } else {
-                                    0
-                                };
+                                let ack_delay_us = header.ack_delay as u64;
                                 let sample = bandwidth_estimator::DeliverySample {
                                     delivered_bytes: 0,
                                     sent_at: Instant::now()
@@ -373,5 +377,43 @@ mod tests {
         assert!(!socket.is_closed());
         assert_eq!(socket.current_mode(), TransportMode::Turbo);
         assert!(socket.available_legs().await.is_empty());
+    }
+
+    /// LEGS-004: `close()` flips the shared flag the per-leg recv tasks observe.
+    /// (The recv loop captures `self.closed.clone()` — the SAME `Arc` — so this
+    /// store is visible to it; the old code cloned the bool's value and the
+    /// task never saw `close()`.)
+    #[tokio::test]
+    async fn close_signals_the_shared_flag() {
+        let socket = VirtualSocket::with_defaults();
+        assert!(!socket.is_closed());
+        socket.close().await.expect("close");
+        assert!(socket.is_closed());
+    }
+
+    /// LEGS-005: the recv loop's BBR ACK detection decodes the header through
+    /// the canonical big-endian `PacketHeader::from_wire`, not magic byte
+    /// offsets. This pins the contract that decode relies on.
+    #[test]
+    fn ack_header_decodes_via_canonical_codec() {
+        use crate::transport::types::{PacketFlags, PacketHeader, PhantomPacket, SessionId};
+        let mut header = PacketHeader::new(
+            SessionId::from_bytes([0x55; 32]),
+            3,
+            7,
+            PacketFlags::new(PacketFlags::ACK),
+        );
+        header.ack_delay = 1234;
+        let wire = PhantomPacket::new(header, Vec::new()).to_wire();
+
+        let parsed = PacketHeader::from_wire(&wire).expect("header parses");
+        assert!(parsed.flags.contains(PacketFlags::ACK));
+        assert_eq!(parsed.ack_delay, 1234);
+
+        // Regression guard: byte 38 is the LSB of the big-endian u32 `sequence`
+        // (= 7), which the old code misread as the "flags byte". The flags field
+        // actually lives at bytes 39..41 (big-endian) — exactly what `from_wire`
+        // now reads.
+        assert_eq!(wire[38], 7);
     }
 }
