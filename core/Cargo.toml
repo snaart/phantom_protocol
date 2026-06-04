@@ -193,7 +193,7 @@ ring = { version = "0.17", optional = true }  # HW-accelerated AES-GCM (ARM64 AE
 # `deterministic` exposes `generate_deterministic` / `encapsulate_deterministic`
 # (additive API; no change to the production random path). Used by the NIST KAT
 # test (`core/tests/nist_kat.rs`) to byte-match published FIPS-203 vectors.
-ml-kem = { version = "0.2", optional = true, features = ["deterministic"] }
+ml-kem = { version = "0.3", optional = true, features = ["deterministic"] }
 ml-dsa = { version = "0.1.0", optional = true }   # stable release; a release candidate must not ship in a 1.0
 # `signature` traits are re-exported via `ml_dsa::{Signer, Verifier}` from
 # the version ml-dsa pins (3.x); we do not need a direct dependency here.
