@@ -52,14 +52,24 @@ use wasi::sockets::tcp_create_socket::create_tcp_socket;
 use crate::errors::CoreError;
 use crate::transport::session_transport::SessionTransport;
 
-/// Same cap as `TcpSessionTransport::MAX_FRAME_BYTES`. Rejects an
-/// attacker-controlled length prefix that would otherwise drive
-/// unbounded `BytesMut` growth.
-const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+/// Hard frame cap (WIRE-001). Matches `TcpSessionTransport`'s steady-state cap;
+/// rejects an attacker-controlled length prefix that would otherwise drive
+/// unbounded `BytesMut` growth. (WasiLeg is a client-only leg, so it has no
+/// unauthenticated-server-accept phase to gate more tightly.)
+const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 
 /// Initial recv-accumulator capacity. Sized to a generous MTU so
 /// the steady-state path never reallocates after the first frame.
 const RECV_BUF_INITIAL_CAPACITY: usize = 64 * 1024;
+
+/// Incremental-read chunk: the accumulator grows by at most this per read, so a
+/// peer that DECLARES a large frame but stalls cannot make us pre-commit the
+/// full declared length (WIRE-001).
+const RECV_CHUNK: usize = 64 * 1024;
+
+/// After a frame larger than `RECV_BUF_INITIAL_CAPACITY * SHRINK_SLACK_MULT`,
+/// reset the accumulator to baseline (LEGS-003).
+const SHRINK_SLACK_MULT: usize = 4;
 
 /// Length-prefix-framed `SessionTransport` over a WASI Preview 2
 /// `TcpSocket`. Holds the connected (input, output) stream pair
@@ -183,12 +193,24 @@ impl SessionTransport for WasiLeg {
             )));
         }
 
+        // Incremental read (WIRE-001): grow by at most RECV_CHUNK per read, so a
+        // peer that declares a large frame but stalls cannot make us pre-commit
+        // the full declared length.
         accum.clear();
-        accum.reserve(len);
-        accum.resize(len, 0);
-        read_exact(input, &mut accum[..])?;
+        let mut filled = 0usize;
+        while filled < len {
+            let chunk = (len - filled).min(RECV_CHUNK);
+            accum.resize(filled + chunk, 0);
+            read_exact(input, &mut accum[filled..filled + chunk])?;
+            filled += chunk;
+        }
 
         let frame = accum.split_to(len).freeze();
+        // LEGS-003: reset the accumulator to baseline after a large frame so one
+        // big frame does not pin a large buffer for the connection's life.
+        if len > RECV_BUF_INITIAL_CAPACITY * SHRINK_SLACK_MULT {
+            *accum = BytesMut::with_capacity(RECV_BUF_INITIAL_CAPACITY);
+        }
         Ok(frame)
     }
 }

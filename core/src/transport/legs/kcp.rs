@@ -248,28 +248,46 @@ impl TransportLeg for KcpLeg {
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "No stream"))?;
 
-        // Read length prefix
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
+        // LEGS-002: frame cap (4 MiB, down from 10), incremental read (no
+        // pre-commit of the declared length), and an overall read timeout so a
+        // peer that declares a frame then stalls cannot pin the leg. The timeout
+        // is terminal for the leg (a partial read leaves the reliable stream
+        // desynced) — the data pump tears down on the error.
+        const KCP_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+        const KCP_RECV_CHUNK: usize = 64 * 1024;
+        let read_timeout = std::time::Duration::from_secs(30);
 
-        // Sanity check
-        if len > 10 * 1024 * 1024 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Message too large",
-            ));
-        }
-
-        // Read data
-        let mut data = vec![0u8; len];
-        stream.read_exact(&mut data).await?;
+        let read_fut = async {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len > KCP_MAX_FRAME_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Message too large",
+                ));
+            }
+            // Grow by at most KCP_RECV_CHUNK per read — a 4-byte prefix never
+            // commits the full declared length before the body arrives.
+            let mut data: Vec<u8> = Vec::with_capacity(len.min(KCP_RECV_CHUNK));
+            let mut filled = 0usize;
+            while filled < len {
+                let chunk = (len - filled).min(KCP_RECV_CHUNK);
+                data.resize(filled + chunk, 0);
+                stream.read_exact(&mut data[filled..filled + chunk]).await?;
+                filled += chunk;
+            }
+            Ok::<Vec<u8>, io::Error>(data)
+        };
+        let data = tokio::time::timeout(read_timeout, read_fut)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "KCP read timed out"))??;
 
         // Update bytes counter
         self.bytes_received
-            .fetch_add(len as u32 + 4, Ordering::Relaxed);
+            .fetch_add(data.len() as u32 + 4, Ordering::Relaxed);
 
-        log::trace!("KCP recv {} bytes", len);
+        log::trace!("KCP recv {} bytes", data.len());
         Ok(Bytes::from(data))
     }
 
