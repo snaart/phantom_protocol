@@ -241,7 +241,7 @@ dashmap = { version = "6.1.0", optional = true }
 # and would need a link-time `critical-section` impl. `async-lock` >= 3.4
 # bumped its MSRV to 1.85, so it is capped at `< 3.4` to hold the crate MSRV of
 # 1.75 — relax this cap once the crate MSRV moves.
-embedded-io-async = { version = "0.6", optional = true }
+embedded-io-async = { version = "0.7", optional = true }
 async-lock = { version = ">=3, <3.4", optional = true, default-features = false }
 
 [build-dependencies]
