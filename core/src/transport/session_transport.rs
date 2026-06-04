@@ -24,6 +24,20 @@
 use crate::errors::CoreError;
 use bytes::Bytes;
 
+/// Lifecycle phase of a [`SessionTransport`], used to bound the receive frame
+/// size differently before vs. after the handshake (WIRE-001). During the
+/// unauthenticated handshake a peer can open a connection and declare a large
+/// frame; capping the receive size tightly there bounds the memory a single
+/// unauthenticated peer can make the server buffer. After establishment the cap
+/// rises to the steady-state application limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramePhase {
+    /// Pre-establishment: only small handshake messages are expected.
+    Handshake,
+    /// Post-establishment: full-size application frames are allowed.
+    Established,
+}
+
 /// Async transport trait for PhantomSession.
 ///
 /// Abstractions over UDP, TCP, FakeTLS, etc.
@@ -49,4 +63,12 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// a refcounted view over an opaque buffer; subsequent `clone()`s
     /// are cheap.
     fn recv_bytes(&self) -> impl core::future::Future<Output = Result<Bytes, CoreError>> + Send;
+
+    /// Move the transport to a new [`FramePhase`], adjusting the receive
+    /// frame-size cap (WIRE-001). Default no-op — transports that do not
+    /// length-prefix / buffer, or are inherently bounded, need not implement it.
+    /// Called once by the session machinery at the handshake → data-pump
+    /// boundary. Adding this defaulted method is source-compatible for every
+    /// existing impl.
+    fn set_frame_phase(&self, _phase: FramePhase) {}
 }
