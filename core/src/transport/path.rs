@@ -349,7 +349,10 @@ mod tests {
         r.register(1);
         let first = r.issue_challenge(1).expect("first challenge");
         let second = r.issue_challenge(1).expect("re-issue returns existing");
-        assert_eq!(first, second, "re-issue must not clobber the in-flight challenge");
+        assert_eq!(
+            first, second,
+            "re-issue must not clobber the in-flight challenge"
+        );
         // The original challenge still verifies (it was never overwritten).
         assert!(r.verify_response(1, &first));
         assert_eq!(r.state(1), Some(PathStateKind::Validated));
