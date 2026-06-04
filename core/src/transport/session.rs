@@ -724,6 +724,17 @@ impl Session {
         self.path_registry.issue_challenge(path_id)
     }
 
+    /// Register `path_id` as `Unvalidated` if the session has never observed it
+    /// (PATH-001). Used by the receive-side gate to start tracking a fresh path
+    /// id seen on inbound (AEAD-authenticated) data, so a later
+    /// challenge/response can promote it to `Validated`. Idempotent — never
+    /// resets an already-known path (e.g. the pre-validated path 0).
+    pub(crate) fn register_unvalidated_path(&self, path_id: u8) {
+        if self.path_registry.state(path_id).is_none() {
+            self.path_registry.register(path_id);
+        }
+    }
+
     /// Verify a peer's `PATH_VALIDATION` response. Returns `true` if
     /// the response matches the in-flight challenge (path is now
     /// `Validated`). Returns `false` otherwise — the path may have

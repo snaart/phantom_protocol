@@ -181,6 +181,36 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   produce canonical signatures, so no legitimate signature is rejected). Removes
   signature malleability as a class.
 
+- **PATH-001 (low): application data is delivered only on a Validated path —
+  enforced.** The receive path decrypted and delivered every authenticated
+  application frame regardless of its header `path_id`, so a peer could send data
+  on a path that had never completed a `PATH_VALIDATION` challenge/response
+  (Invariant 6 was a documented-but-unwired defense for the data plane). The
+  data-pump now gates delivery on `path_state(path_id) == Validated` **after** the
+  AEAD verify (so it never acts on an attacker-chosen plaintext `path_id` that
+  fails decryption); path 0 is pre-validated at session establishment, so normal
+  single-path traffic is unaffected. A frame on a non-validated path is dropped
+  (not counted toward the backlog) and the path id is registered `Unvalidated` so
+  a subsequent challenge can promote it. Pinned by
+  `api::session::tests::app_data_on_non_validated_path_is_dropped`. No wire change.
+
+- **PATH-003 (low): path-challenge issuance is now idempotent.** `issue_challenge`
+  minted and installed a fresh challenge on every call, so a re-issue while one
+  was already in flight (e.g. a retransmitted trigger) clobbered the pending
+  challenge — a legitimate response to the *original* would then no longer match
+  and would push the path to `Failed`. It now holds the pending-challenge lock
+  across the decision and returns the existing challenge unchanged when one is
+  already outstanding. Pinned by
+  `transport::path::tests::reissue_on_validating_path_returns_same_challenge`.
+
+- **APIFFI-03 (info): reject oversized 0-RTT early-data before opening a socket.**
+  The FFI `connect_pinned_with_resumption` entry point forwarded `early_data` of
+  any size and only hit the `EARLY_DATA_MAX_LEN` (16 KiB) cap deep inside the
+  handshake, after a TCP connection had already been established. The cap is now
+  checked up front (before `TcpStream::connect`), so a caller bug or oversized
+  blob fails fast with a `ValidationError` instead of wasting a connection; the
+  inner `connect_with_resumption` keeps the same cap as defense-in-depth.
+
 ### Removed
 
 - **`HalfOpenSlots` (DOS-3).** The unused `transport::half_open::HalfOpenSlots`
