@@ -30,7 +30,7 @@ impl ReputationEntry {
 /// abusive sources (DOS-2). A clean / new IP contributes 0 (so well-behaved
 /// clients are never penalized); an IP that accrues handshake violations within
 /// the sliding window pays an escalating difficulty, capped at
-/// [`MAX_DIFFICULTY`]. The map is bounded (see [`with_capacity`]).
+/// `MAX_DIFFICULTY`. The map is bounded (see [`Self::with_capacity`]).
 pub struct ReputationTracker {
     entries: DashMap<IpAddr, ReputationEntry>,
     max_entries: usize,

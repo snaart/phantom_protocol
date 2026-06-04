@@ -197,6 +197,7 @@ mod tests {
         let (client, server) = tcp_pair().await;
         server.set_frame_phase(FramePhase::Established);
         let payload = vec![7u8; 1024 * 1024]; // 1 MiB, within the 4 MiB cap
+
         // Drive send and recv CONCURRENTLY. A 1 MiB `write_all` does not complete
         // until the peer starts draining (the kernel socket buffer is far
         // smaller than 1 MiB once it is contended — e.g. when the parallel test

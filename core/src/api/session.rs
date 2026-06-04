@@ -2789,8 +2789,14 @@ mod tests {
 
         // Positive control: the SAME stream on the pre-validated path 0 IS
         // delivered, proving the gate only blocks non-validated paths.
-        let good =
-            build_app_frame_on_path(&client_session, session_id, stream_id, 1, 0, b"on-good-path");
+        let good = build_app_frame_on_path(
+            &client_session,
+            session_id,
+            stream_id,
+            1,
+            0,
+            b"on-good-path",
+        );
         let good = PhantomPacket::from_wire(&good).unwrap();
         handle_packet(
             good,
