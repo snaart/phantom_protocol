@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/snaart/phantom_protocol/security/advisories/new
+    about: >-
+      Do not open a public issue for security vulnerabilities. Use the private
+      security advisory flow — see SECURITY.md for the disclosure policy and
+      90-day embargo SLA.

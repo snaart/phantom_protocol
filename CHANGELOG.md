@@ -260,6 +260,18 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   direction-keyed `send_key` are untouched. Pinned by
   `oversized_record_payload_is_rejected_not_truncated`.
 
+- **Supply-chain / CI hardening.** Every GitHub Actions `uses:` is now pinned to
+  a full commit SHA (with the human-readable tag in a trailing comment) so a
+  retagged or compromised action can no longer change what CI runs; all seven
+  workflows default `GITHUB_TOKEN` to least privilege (`permissions: contents:
+  read`, with jobs opting into narrower scopes where needed) and add a
+  `concurrency` group (PR runs cancel superseded runs; `main` and release runs
+  never cancel mid-flight). Dependabot now keeps the SHA pins and Cargo
+  dependencies fresh across the workspace and every sibling crate, and a
+  `CODEOWNERS` file auto-requests review on the security-sensitive crypto /
+  transport paths. Added the standard community-health files (Code of Conduct,
+  issue/PR templates, `.editorconfig`).
+
 ### Removed
 
 - **Dead GSO `sendmmsg` batch-send path + `GsoBatchResult` (UNSAFE-2).** The
