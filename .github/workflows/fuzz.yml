@@ -19,6 +19,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least-privilege default for GITHUB_TOKEN.
+permissions:
+  contents: read
+
+# Cancel superseded in-progress runs on PR branches; never cancel a scheduled
+# (default-branch) run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   fuzz:
     name: cargo-fuzz ${{ matrix.target }}
@@ -40,18 +50,18 @@ jobs:
           - fuzz_aead_decrypt
           - fuzz_embedded_framing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       # libFuzzer instrumentation + the ASan runtime require nightly. The
       # x86_64-linux nightly ships `rustc-nightly_rt.asan`, so the default
       # `-Zsanitizer=address` build links here (unlike macOS/aarch64).
       - name: Install nightly
-        uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "fuzz"
           key: fuzz-${{ matrix.target }}
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@cde8c9e634f4a17bc06b61413ac0ef75450eac46 # v2
         with:
           tool: cargo-fuzz
       # Copy the committed seeds into the (otherwise empty) corpus dir so the
@@ -81,7 +91,7 @@ jobs:
       # failure is reproducible off the runner.
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/

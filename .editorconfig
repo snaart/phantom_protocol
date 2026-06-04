@@ -1,0 +1,27 @@
+# EditorConfig — https://editorconfig.org
+# Mirrors .rustfmt.toml (Unix newlines, 100 col) and the repo's conventions.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Rust: rustfmt owns formatting; 4-space, max_width = 100.
+[*.rs]
+max_line_length = 100
+
+# YAML / TOML / JSON use 2-space indentation.
+[*.{yml,yaml,toml,json}]
+indent_size = 2
+
+# Markdown: trailing whitespace is significant (two spaces = hard line break).
+[*.md]
+trim_trailing_whitespace = false
+
+# Makefiles require literal tabs.
+[Makefile]
+indent_style = tab
