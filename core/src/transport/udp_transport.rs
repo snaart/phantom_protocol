@@ -3,21 +3,20 @@
 //! Zero-copy, batched UDP I/O for maximum throughput.
 //! Uses ring AES-256-GCM with in-place encryption.
 //!
-//! ## GSO (Generic Segmentation Offload)
-//!
-//! On Linux, `send_batch_gso` uses `sendmmsg(2)` to hand the kernel multiple
-//! datagrams in a single syscall, dramatically reducing per-packet overhead.
-//! On other platforms, a userspace fallback iterates.
-//!
 //! ## Paced Sending
 //!
 //! `PacedSender` wraps `UdpTransport` + `Pacer` to enforce a rate limit
 //! set by the `BandwidthEstimator`. Prevents burst-induced congestion.
+//! On Linux, `set_pacing_rate` can additionally offload pacing to the kernel
+//! via `SO_MAX_PACING_RATE` (with the `fq` qdisc).
 
 // This module opts back in to `unsafe` (denied at the crate root in lib.rs).
-// The `unsafe` blocks here are required to call `libc::sendmmsg` /
-// `libc::recvmmsg` and to allocate `libc::mmsghdr` via `MaybeUninit::zeroed`.
-// Every block must carry a `// SAFETY:` comment.
+// The single remaining `unsafe` block is the `libc::setsockopt` call in
+// `set_pacing_rate` (Linux `SO_MAX_PACING_RATE`). The previous dead
+// `sendmmsg(2)` GSO-batch path — the only user of `libc::sendmmsg` /
+// `libc::mmsghdr` / `MaybeUninit::zeroed` — was removed in the unsafe
+// hygiene pass (it had no callers; UNSAFE-2). Every block must carry a
+// `// SAFETY:` comment.
 #![allow(unsafe_code)]
 
 use super::buffer_pool::BufferPool;
@@ -108,30 +107,7 @@ impl UdpTransport {
         Ok(total)
     }
 
-    /// GSO-accelerated batch send.
-    ///
-    /// On **Linux**: encrypts all packets, then uses `sendmmsg(2)` to deliver
-    /// them to the kernel in a single syscall (up to 64 datagrams at once).
-    ///
-    /// On **other platforms**: falls back to sequential sends.
-    pub async fn send_batch_gso(&self, packets: &[&[u8]]) -> IoResult<GsoBatchResult> {
-        // Encrypt all packets first
-        let mut encrypted: Vec<Vec<u8>> = Vec::with_capacity(packets.len());
-        for pkt in packets {
-            let ct = self.session.encrypt(&[], pkt).map_err(io::Error::other)?;
-            encrypted.push(ct);
-        }
-
-        let sent = platform_send_batch(&self.socket, &self.peer_addr, &encrypted).await?;
-
-        Ok(GsoBatchResult {
-            packets_sent: sent,
-            packets_total: packets.len(),
-            used_gso: cfg!(target_os = "linux"),
-        })
-    }
-
-    /// Get a reference to the underlying socket (for GSO/raw operations).
+    /// Get a reference to the underlying socket (for raw operations).
     pub fn socket(&self) -> &Arc<UdpSocket> {
         &self.socket
     }
@@ -261,133 +237,6 @@ impl UdpHandshakeListener {
     }
 }
 
-/// Result of a GSO batch send
-#[derive(Debug, Clone, Copy)]
-pub struct GsoBatchResult {
-    /// Number of packets successfully sent
-    pub packets_sent: usize,
-    /// Total number of packets attempted
-    pub packets_total: usize,
-    /// Whether the kernel GSO path was used
-    pub used_gso: bool,
-}
-
-impl GsoBatchResult {
-    /// Whether all packets were sent
-    pub fn all_sent(&self) -> bool {
-        self.packets_sent == self.packets_total
-    }
-}
-
-// ─── Platform-specific batch send ───────────────────────────────────────────
-
-/// Linux: use sendmmsg for true kernel-level batching
-#[cfg(target_os = "linux")]
-async fn platform_send_batch(
-    socket: &Arc<UdpSocket>,
-    peer_addr: &SocketAddr,
-    datagrams: &[Vec<u8>],
-) -> IoResult<usize> {
-    use std::os::unix::io::AsRawFd;
-
-    // sendmmsg is a blocking syscall — run in spawn_blocking to avoid
-    // blocking the tokio runtime
-    let fd = socket.as_ref().as_raw_fd();
-    let addr: std::net::SocketAddrV4 = match peer_addr {
-        SocketAddr::V4(v4) => *v4,
-        SocketAddr::V6(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "GSO sendmmsg only supports IPv4 in this implementation",
-            ));
-        }
-    };
-
-    // Clone datagrams for the blocking closure
-    let owned: Vec<Vec<u8>> = datagrams.to_vec();
-
-    let sent = tokio::task::spawn_blocking(move || sendmmsg_batch(fd, &addr, &owned))
-        .await
-        .map_err(io::Error::other)??;
-
-    Ok(sent)
-}
-
-/// Linux sendmmsg implementation
-#[cfg(target_os = "linux")]
-fn sendmmsg_batch(
-    fd: i32,
-    addr: &std::net::SocketAddrV4,
-    datagrams: &[Vec<u8>],
-) -> IoResult<usize> {
-    use std::mem::MaybeUninit;
-
-    let max_batch = datagrams.len().min(64); // sendmmsg limit per call
-
-    // Build sockaddr_in
-    let sin = libc::sockaddr_in {
-        sin_family: libc::AF_INET as u16,
-        sin_port: addr.port().to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: u32::from_ne_bytes(addr.ip().octets()),
-        },
-        sin_zero: [0; 8],
-    };
-
-    // Build iov + mmsghdr arrays
-    let mut iovs: Vec<libc::iovec> = datagrams[..max_batch]
-        .iter()
-        .map(|d| libc::iovec {
-            iov_base: d.as_ptr() as *mut _,
-            iov_len: d.len(),
-        })
-        .collect();
-
-    let mut msgs: Vec<libc::mmsghdr> = iovs
-        .iter_mut()
-        .map(|iov| {
-            // SAFETY: `libc::mmsghdr` is `#[repr(C)]` with primitive integer
-            // and raw-pointer fields. The all-zero bit pattern is a valid
-            // (though uninitialized-by-protocol) instance: every field is
-            // populated below before the struct is read by the kernel.
-            let mut hdr: libc::mmsghdr = unsafe { MaybeUninit::zeroed().assume_init() };
-            hdr.msg_hdr.msg_name = &sin as *const _ as *mut _;
-            hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
-            hdr.msg_hdr.msg_iov = iov as *mut _;
-            hdr.msg_hdr.msg_iovlen = 1;
-            hdr
-        })
-        .collect();
-
-    // SAFETY: `fd` is owned by `self.socket` and remains valid for the duration
-    // of this call. `msgs` is a `Vec<libc::mmsghdr>` of `msgs.len()` initialized
-    // entries (populated above) — `as_mut_ptr()` is valid for that range. The
-    // kernel reads through each `msg_hdr.msg_iov` which points to the `iov_base`
-    // of a `datagrams[i]` byte slice, also alive for the duration of this call.
-    let ret = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), msgs.len() as u32, 0) };
-
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(ret as usize)
-    }
-}
-
-/// Non-Linux: sequential fallback
-#[cfg(not(target_os = "linux"))]
-async fn platform_send_batch(
-    socket: &Arc<UdpSocket>,
-    peer_addr: &SocketAddr,
-    datagrams: &[Vec<u8>],
-) -> IoResult<usize> {
-    let mut sent = 0;
-    for dgram in datagrams {
-        socket.send_to(dgram, peer_addr).await?;
-        sent += 1;
-    }
-    Ok(sent)
-}
-
 // ─── Paced Sender ───────────────────────────────────────────────────────────
 
 /// Rate-limited UDP sender — integrates `Pacer` + `UdpTransport`.
@@ -506,23 +355,6 @@ mod tests {
     async fn test_udp_transport_create() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         assert_eq!(transport.buffer_stats().pool_size, 16);
-    }
-
-    #[tokio::test]
-    async fn test_gso_batch_result() {
-        let result = GsoBatchResult {
-            packets_sent: 10,
-            packets_total: 10,
-            used_gso: false,
-        };
-        assert!(result.all_sent());
-
-        let partial = GsoBatchResult {
-            packets_sent: 5,
-            packets_total: 10,
-            used_gso: false,
-        };
-        assert!(!partial.all_sent());
     }
 
     #[tokio::test]

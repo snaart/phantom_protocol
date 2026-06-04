@@ -90,13 +90,25 @@ pub struct WasiLeg {
 }
 
 // SAFETY: WIT-bindgen `TcpSocket` / `InputStream` / `OutputStream`
-// each wrap an opaque numeric host handle (`Resource<T>`). The
-// `std::sync::Mutex` wrappers below are the only access path for the
-// handles after construction — every read and every write goes
-// through a `lock()`-guarded section. That single-accessor discipline
-// is what makes sending the handles across threads sound: at most one
-// thread holds the lock at any moment, so the handle is never
-// concurrently observed in two places.
+// each wrap an opaque numeric host handle (`Resource<T>`). The two
+// *stream* handles live behind `std::sync::Mutex` wrappers (`output`,
+// `read`), which are the only access path for them after construction
+// — every read and every write goes through a `lock()`-guarded
+// section. That single-accessor discipline is what makes sending the
+// stream handles across threads sound: at most one thread holds the
+// lock at any moment, so a handle is never concurrently observed in
+// two places.
+//
+// `_socket` is the deliberate carve-out: it is NOT behind a mutex
+// because it is never dereferenced through a shared `&self` — no method
+// on `WasiLeg` reads or mutates it. It exists solely to keep the host
+// socket fd (and therefore the derived streams) alive for the leg's
+// lifetime. Its only access is the implicit `resource-drop` WIT call
+// when `WasiLeg` is dropped, which runs with unique ownership of the
+// field (the drop glue holds `&mut`-equivalent exclusive access), so it
+// cannot race a concurrent read — there are no concurrent reads of it at
+// all. A bare `Resource<T>` with exactly one accessor, the destructor,
+// needs no interior synchronization to be `Send`/`Sync`-sound.
 //
 // `WasiLeg` itself is the unit we mark `Send`/`Sync`. The argument
 // stands independently of WASI Preview 2's current single-task host

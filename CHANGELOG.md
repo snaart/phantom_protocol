@@ -248,7 +248,31 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   fips`. The seam owns the inventoried getrandom-failure panic contract, so no
   fresh `unwrap`/`expect` is introduced at the call site.
 
+- **faketls-2 (low): FakeTLS record length-overflow guard + no-panic seal.**
+  `FakeTlsLeg::wrap_as_tls_record` cast the sealed body length to `u16` for the
+  outer TLS record-length field without checking it fits, so a payload larger
+  than ~64 KiB would silently truncate the length into a corrupt record; and the
+  AEAD seal used `.unwrap()`. It now rejects any payload whose sealed length
+  (`data + 1 inner-type byte + AEAD tag`) would exceed `u16::MAX` with
+  `io::ErrorKind::InvalidData` **before** sealing, and propagates a seal failure
+  with `?` instead of panicking (the function now returns `io::Result<Vec<u8>>`).
+  Invariant 3 is preserved unchanged — the per-record `send_counter` nonce and
+  direction-keyed `send_key` are untouched. Pinned by
+  `oversized_record_payload_is_rejected_not_truncated`.
+
 ### Removed
+
+- **Dead GSO `sendmmsg` batch-send path + `GsoBatchResult` (UNSAFE-2).** The
+  `UdpTransport::send_batch_gso` / `platform_send_batch` / `sendmmsg_batch`
+  chain and the `GsoBatchResult` type were `pub` but had no callers anywhere in
+  the crate, benches, or examples — dead code that was also the *only* user of
+  `unsafe { libc::sendmmsg }` and `MaybeUninit::<libc::mmsghdr>::zeroed()`, the
+  most intricate hand-written `unsafe` in the tree. All of it is deleted, so the
+  one remaining `unsafe` block in `transport::udp_transport` is the trivially
+  sound `libc::setsockopt(SO_MAX_PACING_RATE)` in `set_pacing_rate`. (The
+  module-level comment and the crate-root audit-lens are updated; the stale
+  `recvmmsg` references — there was never a `recvmmsg` call — are removed.)
+  Removing the `pub GsoBatchResult` is a pre-1.0 public-surface removal.
 
 - **`chacha20poly1305` crate dependency (SUPPLY-02).** The standalone
   `chacha20poly1305` crate was a declared dependency but never imported — the
@@ -348,6 +372,26 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   ignores flow control instead of buffering without bound.
 
 ### Fixed
+
+- **LEGS-004: `VirtualSocket::close()` now actually stops the per-leg recv
+  tasks.** The recv loop captured a *fresh* `Arc<AtomicBool>` initialised from a
+  snapshot of `self.closed`, not a clone of the shared flag — so `close()`
+  setting `self.closed` could never signal a running recv task, which leaked
+  until its leg errored. The flag is now a single shared `Arc<AtomicBool>` the
+  loop clones, so `close()` stops it. Pinned by `close_signals_the_shared_flag`.
+
+- **LEGS-005: `VirtualSocket` BBR ACK detection read the wrong header bytes.**
+  The recv loop decoded the packet header with magic offsets — `data[38]` as the
+  "flags byte" and `data[39..41]` as a *little-endian* `ack_delay` — but the
+  canonical 45-byte header is **big-endian** with `flags` at `[39..41]` and
+  `ack_delay` at `[41..43]`; offset 38 is the LSB of the `sequence` field. So
+  every ACK feedback sample was mis-parsed. It now decodes via the canonical
+  `PacketHeader::from_wire`. Pinned by `ack_header_decodes_via_canonical_codec`.
+
+- **UNSAFE-1: tightened the `WasiLeg` `unsafe impl Send/Sync` SAFETY rationale**
+  to explicitly carve out the non-`Mutex` `_socket` field (accessed only by its
+  destructor under unique ownership, never through a shared `&self`), so the
+  single-accessor argument is complete. Documentation only.
 
 - **Flow-control control frames could collide with data on the AEAD nonce.**
   `WINDOW_UPDATE` (and a bare `FIN`) drew their packet sequence from a separate
