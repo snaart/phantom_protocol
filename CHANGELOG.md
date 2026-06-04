@@ -211,7 +211,54 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   blob fails fast with a `ValidationError` instead of wasting a connection; the
   inner `connect_with_resumption` keeps the same cap as defense-in-depth.
 
+- **COMP-01 (low): decompression-bomb cap on `AdaptiveCompressor`.** The
+  public `decompress` helper trusted the input to bound its own output — LZ4's
+  size-prefix and Zstd's frame were decoded to whatever length they declared, so
+  a few crafted bytes could expand to gigabytes and exhaust memory. Decompression
+  is now capped at `MAX_DECOMPRESSED_LEN` (16 MiB): the LZ4 path rejects an
+  oversized declared length from the little-endian size prefix *before*
+  allocating, and the Zstd path stream-decodes through a reader bounded at the
+  cap and fails closed if the frame exceeds it. A new `OutputTooLarge` error
+  variant and a `decompress_with_limit(algo, data, max_output)` entry point let
+  callers pick a tighter bound. Pinned by
+  `transport::compression::tests::{lz4_decompress_rejects_oversized_declared_size,
+  lz4_decompress_with_limit_rejects_overlimit_output,
+  zstd_decompress_with_limit_rejects_overlimit_output}`.
+
+- **COMP-02 (low): bounded `FragmentAssembler`.** The UDP fragment reassembler
+  accepted any fragment unconditionally: a `total_chunks` up to 65 535, an
+  out-of-range `chunk_index`, a `payload` larger than the datagram MTU (the
+  field is borsh-decoded, so not implicitly capped), and an unbounded number of
+  distinct `(session_id, packet_id)` keys — each a way to pin memory without
+  ever completing a packet. `process_chunk` now drops malformed/abusive
+  fragments (`total_chunks` zero or `> MAX_TOTAL_CHUNKS`, `chunk_index` out of
+  range, `payload > MAX_UDP_PAYLOAD`) and caps concurrent in-flight assemblies
+  at `MAX_CONCURRENT_ASSEMBLIES` (256, evicting the stalest on overflow). The
+  worst-case resident memory is now bounded (≈ 64 MiB) instead of unbounded.
+  Pinned by `transport::fragmentation::tests::*`. Both `AdaptiveCompressor` and
+  `FragmentAssembler` are public-but-unwired helpers; these are defense-in-depth
+  hardenings of the public surface.
+
 ### Removed
+
+- **`networks/` layer.** The entire `core/src/networks/` module —
+  `engine.rs` (a `NetworkEngine` that forwarded **plaintext** between a transport
+  and a pipeline), `pipeline.rs`, `transport.rs`, `tls.rs`, and the orphaned
+  `serialization.rs` / `compression.rs` files — is deleted. It was compiled and
+  `pub` but **entirely unwired** (no code outside the module referenced it), a
+  half-built parallel stack to the real `transport::` layer. Most importantly it
+  carried a **certificate-pinning weakening**: `networks/tls.rs` fell back to
+  system WebPKI roots (no pinning) whenever `cfg!(debug_assertions)` was set — a
+  posture that silently disables pinning in every non-`--release` build (dev,
+  `cargo test`, many integration setups). Deleting the layer removes that
+  footgun entirely. With it gone, the `rustls`, `tokio-rustls`, `rustls-pemfile`,
+  and `webpki-roots` dependencies are dropped from `core/Cargo.toml` (they had no
+  other users — the FakeTLS leg uses its own AEAD, not rustls), shrinking the
+  native dependency and attack surface. This also makes the planned
+  `rustls-pemfile → rustls-pki-types` migration (SUPPLY-05) moot. Removing
+  `pub mod networks` is a pre-1.0 public-surface removal.
+
+- **`HalfOpenSlots` (DOS-3).** The unused `transport::half_open::HalfOpenSlots`
 
 - **`HalfOpenSlots` (DOS-3).** The unused `transport::half_open::HalfOpenSlots`
   SYN-flood scaffolding is deleted — it was dead code (a TTL slot store, the
