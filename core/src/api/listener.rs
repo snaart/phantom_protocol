@@ -402,10 +402,14 @@ async fn drive_server_handshake(
         let client_hello = borsh::from_slice::<ClientHello>(&hello_bytes)
             .map_err(|e| CoreError::NetworkError(format!("ClientHello parse failed: {}", e)))?;
 
-        // Adaptive PoW difficulty: under load the listener automatically
-        // requires more proof-of-work from each new client. At idle
-        // (<100 handshakes/min) this stays at 0 and PoW is skipped entirely.
-        let difficulty = hs.adaptive_difficulty();
+        // Adaptive PoW difficulty: the global load tier (idle => 0) raised to the
+        // per-IP reputation escalation (DOS-2). A clean IP / ticket holder adds
+        // nothing; an IP with recent handshake violations pays escalating PoW
+        // even when the server is idle, so an abusive source is singled out.
+        let has_ticket = client_hello.resume_session_id.is_some();
+        let difficulty = hs
+            .adaptive_difficulty()
+            .max(hs.reputation_difficulty(client_ip, has_ticket));
         match hs.process_client_hello(&client_hello, difficulty, client_ip) {
             HandshakeResponse::Retry(retry) => {
                 // DOS-4: bound the Retry rounds so a peer that keeps triggering
@@ -413,6 +417,8 @@ async fn drive_server_handshake(
                 // handshake indefinitely.
                 retry_rounds += 1;
                 if retry_rounds > MAX_SERVER_RETRY_ROUNDS {
+                    // A peer that never satisfies the gate is a genuine violation.
+                    hs.record_violation(client_ip);
                     return Err(CoreError::HandshakeError(format!(
                         "client exceeded {MAX_SERVER_RETRY_ROUNDS} cookie/PoW retry rounds"
                     )));
@@ -427,6 +433,8 @@ async fn drive_server_handshake(
                     CoreError::NetworkError(format!("ServerHello encode failed: {}", e))
                 })?;
                 transport.send_bytes(&bytes).await?;
+                // DOS-2: a successful handshake clears this IP's escalation.
+                hs.reset_violations(client_ip);
                 return Ok((session, early_data));
             }
             HandshakeResponse::Reject(reject) => {
@@ -438,12 +446,16 @@ async fn drive_server_handshake(
                 if let Ok(bytes) = borsh::to_vec(&reject) {
                     let _ = transport.send_bytes(&bytes).await;
                 }
+                // DOS-2: a structurally-unspeakable hello (e.g. wrong version /
+                // build-variant) is a genuine protocol violation.
+                hs.record_violation(client_ip);
                 return Err(CoreError::InternalError(format!(
                     "handshake rejected: unsupported client version (server speaks v{})",
                     reject.supported_version
                 )));
             }
             HandshakeResponse::Fail(e) => {
+                hs.record_violation(client_ip);
                 return Err(CoreError::InternalError(format!(
                     "handshake rejected: {}",
                     e
@@ -470,6 +482,7 @@ async fn run_acceptor(
     runtime: Arc<dyn Runtime>,
     observability: Arc<Observability>,
 ) {
+    let mut accept_count: u64 = 0;
     loop {
         if shutting_down.load(Ordering::Acquire) {
             break;
@@ -487,6 +500,12 @@ async fn run_acceptor(
                 }
             },
         };
+        // DOS-2: periodically drop expired reputation entries so the bounded map
+        // stays small under churn (the cap already prevents unbounded growth).
+        accept_count = accept_count.wrapping_add(1);
+        if accept_count % 256 == 0 {
+            hs.gc_reputation();
+        }
         // Bound concurrent in-flight handshakes. The permit is held for the
         // handshake's lifetime AND until its result is queued, so a non-draining
         // embedder back-pressures all the way to not accepting new TCP.
