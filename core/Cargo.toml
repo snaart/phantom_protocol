@@ -22,6 +22,14 @@ default = ["compression-zstd", "std", "bindings"]
 # and explicitly enables `["std", "wasi-leg"]` only.
 bindings = ["std", "dep:uniffi"]
 
+# `uniffi-cli` (SUPPLY-01): the codegen-only surface. Adds uniffi's `cli`
+# feature (which drags in `clap` / `cargo_metadata` / `tempfile`) and is the
+# `required-features` for the `uniffi-bindgen` binary. Kept OUT of `bindings`
+# so a normal lib / server / mobile build links the FFI scaffolding WITHOUT the
+# build-time CLI dependency tree. The `tests/bindings/generate_*.sh` scripts
+# enable it when they regenerate the language bindings.
+uniffi-cli = ["bindings", "uniffi/cli"]
+
 # `std` (Phase 3.6): the standard "everything on" build. Pulls every std-bound
 # optional dep into the graph and unlocks all top-level modules (`api`, `runtime`,
 # `transport/legs/{tcp,kcp,faketls,websocket}`, `networks`, `config`, `validation`,
@@ -55,7 +63,6 @@ std = [
     "dep:ed25519-dalek",
     "dep:ml-kem",
     "dep:ml-dsa",
-    "dep:chacha20poly1305",
     "dep:log",
     "dep:hmac",
     "dep:borsh",
@@ -176,8 +183,7 @@ tracing = { version = "0.1", optional = true }  # Structured spans / events for 
 # --- Crypto (std-only) ---
 x25519-dalek = { version = "2", optional = true, features = ["static_secrets", "zeroize"] }
 ed25519-dalek = { version = "2", optional = true, features = ["zeroize", "rand_core"] }
-chacha20poly1305 = { version = "0.10", optional = true }
-ring = { version = "0.17", optional = true }  # HW-accelerated AES-GCM (ARM64 AES intrinsics / x86 AES-NI)
+ring = { version = "0.17", optional = true }  # HW-accelerated AES-GCM (ARM64 AES intrinsics / x86 AES-NI) + ChaCha20-Poly1305
 # Phase 5.1: switched from `pqcrypto-kyber` / `pqcrypto-dilithium` (which
 # wrap NIST PQC round-3 C reference impls and require libc) to the
 # RustCrypto pure-Rust FIPS-203 / FIPS-204 implementations. These compile
@@ -210,7 +216,7 @@ zstd = { version = "0.13", optional = true }
 time = { version = "0.3", optional = true }
 
 # --- FFI ---
-uniffi = { version = "0.29", optional = true, features = ["tokio", "cli"] }
+uniffi = { version = "0.29", optional = true, features = ["tokio"] }
 zeroize = { version = "1.8.2", optional = true, features = ["derive"] }
 argon2 = { version = "0.5.3", optional = true }
 crossbeam-queue = { version = "0.3.12", optional = true }
@@ -325,6 +331,15 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tokio-test = "0.4"
 proptest = "1"  # property-based testing harness
 serde_json = "1"  # parse the committed NIST ACVP KAT vectors (core/tests/nist_kat.rs)
+
+# UniFFI codegen entry point. Gated on `uniffi-cli` (SUPPLY-01) so a default
+# `cargo build` skips it entirely — the binary needs uniffi's `cli` feature for
+# `uniffi_bindgen_main`, and that feature (clap / cargo_metadata / tempfile)
+# must not leak into the runtime library / server / mobile artifacts.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["uniffi-cli"]
 
 [[bench]]
 name = "transport_bench"

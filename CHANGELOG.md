@@ -239,7 +239,31 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `FragmentAssembler` are public-but-unwired helpers; these are defense-in-depth
   hardenings of the public surface.
 
+- **SUPPLY-04b (info): path-validation challenge now drawn from the CSPRNG seam.**
+  `PathRegistry::issue_challenge` minted its 32-byte challenge with
+  `rand::random()` (a non-cryptographic thread RNG by configuration). A path
+  challenge is security-sensitive — it gates application data onto a new path
+  (Invariant 6) — so it now draws from the `crypto::rng::OsRng` seam, which is
+  `getrandom` on default builds and the aws-lc-rs CTR_DRBG under `--features
+  fips`. The seam owns the inventoried getrandom-failure panic contract, so no
+  fresh `unwrap`/`expect` is introduced at the call site.
+
 ### Removed
+
+- **`chacha20poly1305` crate dependency (SUPPLY-02).** The standalone
+  `chacha20poly1305` crate was a declared dependency but never imported — the
+  ChaCha20-Poly1305 AEAD is provided by `ring` (and `aws-lc-rs` under fips) via
+  their `CHACHA20_POLY1305` constants. Dropped from `core/Cargo.toml`. The
+  `CipherSuite::ChaCha20Poly1305` wire enum value (2) is **kept** for wire-format
+  stability; only the redundant crate is removed.
+
+- **`PhantomListener::ensure_acceptor` from the FFI surface.** The internal
+  lazy-init helper added with the H4 accept-decoupling sat inside the
+  `#[uniffi::export]` impl block, so UniFFI 0.29 exported it into every language
+  binding even though it is a private `fn` with no business in the public API.
+  It is moved to a non-exported `impl` block; behaviour is unchanged (`accept()`
+  still calls it). This also re-aligns the committed Swift/Kotlin/Python/C
+  bindings with the generated output (an earlier commit had left them drifted).
 
 - **`networks/` layer.** The entire `core/src/networks/` module —
   `engine.rs` (a `NetworkEngine` that forwarded **plaintext** between a transport
@@ -259,12 +283,25 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `pub mod networks` is a pre-1.0 public-surface removal.
 
 - **`HalfOpenSlots` (DOS-3).** The unused `transport::half_open::HalfOpenSlots`
-
-- **`HalfOpenSlots` (DOS-3).** The unused `transport::half_open::HalfOpenSlots`
   SYN-flood scaffolding is deleted — it was dead code (a TTL slot store, the
   wrong primitive for the TCP path), and the concurrent-handshake cap is now
   provided by the listener's in-flight-handshake semaphore (H4/DOS-1). Removing
   `pub mod half_open` is a pre-1.0 public-surface removal.
+
+### Changed
+
+- **Split the UniFFI codegen CLI off the runtime library (SUPPLY-01).** The
+  `uniffi` dependency previously carried the `cli` feature unconditionally, so
+  every default library / server / mobile build pulled `clap` (and its tree)
+  purely to support the `uniffi-bindgen` codegen binary that only the
+  `tests/bindings/generate_*.sh` scripts ever run. The `cli` feature now lives
+  behind a new opt-in `uniffi-cli` Cargo feature, and the `uniffi-bindgen`
+  binary declares `required-features = ["uniffi-cli"]` so a default `cargo build`
+  skips it entirely. `clap` no longer appears in the default dependency tree.
+  The reference server's `phantom_core` dependency switches to
+  `default-features = false` (it embeds the Rust API and never generates FFI),
+  dropping the UniFFI scaffolding from the server build too. The generated
+  bindings are byte-identical (verified by regenerating all four languages).
 
 ### Added
 
