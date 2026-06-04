@@ -9,7 +9,7 @@ UNIFFI_BINDGEN="${REPO_ROOT}/target/release/uniffi-bindgen"
 CDYLIB="${REPO_ROOT}/target/release/libphantom_core.dylib"
 OUT_DIR="${REPO_ROOT}/tests/bindings/kotlin"
 
-cargo build --release --manifest-path "${REPO_ROOT}/core/Cargo.toml"
+cargo build --release --manifest-path "${REPO_ROOT}/core/Cargo.toml" --features uniffi-cli
 
 # Pick up the cdylib for the current platform
 if [[ ! -f "${CDYLIB}" ]]; then

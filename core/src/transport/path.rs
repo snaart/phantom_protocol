@@ -49,6 +49,8 @@ use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use subtle::ConstantTimeEq;
 
+use crate::crypto::rng::{OsRng, RngProvider};
+
 /// Width of a path-validation challenge / response, in bytes.
 pub const PATH_CHALLENGE_LEN: usize = 32;
 
@@ -229,9 +231,14 @@ impl PathRegistry {
         if let Some(existing) = *pending {
             return Some(existing);
         }
-        // Use the thread-local CSPRNG; `getrandom`-failure fallback is
-        // already covered upstream in the API layer's session-id helper.
-        let challenge: [u8; PATH_CHALLENGE_LEN] = rand::random();
+        // Draw the challenge from the `OsRng` seam (SUPPLY-04b). Under
+        // `--features fips` this routes through aws-lc-rs's CTR_DRBG; otherwise
+        // `getrandom`. The seam owns the inventoried getrandom-failure
+        // PANIC-SAFETY contract, so we add no fresh `unwrap`/`expect` here. A
+        // server-issued path challenge is security-sensitive (Invariant 6), so
+        // it must come from the CSPRNG, not a non-cryptographic source.
+        let mut challenge = [0u8; PATH_CHALLENGE_LEN];
+        OsRng.fill_bytes(&mut challenge);
         *pending = Some(challenge);
         drop(pending);
         path.set_state(PathStateKind::Validating);

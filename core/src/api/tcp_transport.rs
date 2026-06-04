@@ -197,8 +197,15 @@ mod tests {
         let (client, server) = tcp_pair().await;
         server.set_frame_phase(FramePhase::Established);
         let payload = vec![7u8; 1024 * 1024]; // 1 MiB, within the 4 MiB cap
-        client.send_bytes(&payload).await.expect("send 1 MiB");
-        let got = server.recv_bytes().await.expect("recv 1 MiB");
+        // Drive send and recv CONCURRENTLY. A 1 MiB `write_all` does not complete
+        // until the peer starts draining (the kernel socket buffer is far
+        // smaller than 1 MiB once it is contended — e.g. when the parallel test
+        // suite saturates loopback), so doing send-then-recv sequentially on one
+        // task deadlocks on TCP flow control. `join!` lets the reader drain while
+        // the writer fills.
+        let (send_res, recv_res) = tokio::join!(client.send_bytes(&payload), server.recv_bytes());
+        send_res.expect("send 1 MiB");
+        let got = recv_res.expect("recv 1 MiB");
         assert_eq!(got.len(), payload.len());
         assert_eq!(&got[..8], &payload[..8]);
         let cap = server.accum_capacity().await;

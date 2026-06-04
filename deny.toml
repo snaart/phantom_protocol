@@ -8,10 +8,11 @@ all-features = true
 yanked = "deny"
 ignore = [
     # `rand` unsoundness fires only in a narrow scenario: a custom `log` logger
-    # that calls `rand::rng()` and triggers a reseed mid-log. Phantom Core uses
-    # `rand` only as a dev-dependency and transitively; the production RNG path
-    # is OsRng/getrandom, and we never draw randomness from inside a logger, so
-    # the aliasing UB is unreachable here.
+    # that calls `rand::rng()` and triggers a reseed mid-log. `rand` IS a runtime
+    # dependency here (e.g. session-id and path-challenge generation), pinned at
+    # the patched 0.8.x; but every production draw is a direct `rand::random()` /
+    # thread-rng call, never from inside a `log` logger, so the aliasing UB is
+    # unreachable on our code paths. The CSPRNG itself is OsRng/getrandom.
     "RUSTSEC-2026-0097",
 ]
 

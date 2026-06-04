@@ -271,30 +271,6 @@ impl PhantomListener {
         }
     }
 
-    /// Lazily spawn the single background acceptor task (idempotent). It owns the
-    /// listening socket; for each inbound connection it acquires an in-flight
-    /// permit (bounding concurrent handshakes) and spawns a deadline-bounded
-    /// handshake task whose established [`AcceptOutcome`] is pushed to
-    /// `accepted_tx`. This decoupling is the H4 fix — the serial accept loop no
-    /// longer blocks on any one handshake.
-    fn ensure_acceptor(&self) {
-        let mut guard = self.acceptor.lock();
-        if guard.is_some() {
-            return;
-        }
-        let handle = self.runtime.spawn(Box::pin(run_acceptor(
-            self.listener.clone(),
-            self.handshake_server.clone(),
-            self.inflight.clone(),
-            self.accepted_tx.clone(),
-            self.shutting_down.clone(),
-            self.shutdown_notify.clone(),
-            self.runtime.clone(),
-            self.observability.clone(),
-        )));
-        *guard = Some(handle);
-    }
-
     /// Signal graceful shutdown (Phase 4.6).
     ///
     /// Sets the `shutting_down` flag and wakes any `accept()` call currently
@@ -326,6 +302,36 @@ impl PhantomListener {
     /// to share the listener's counter set.
     pub fn observability(&self) -> Arc<Observability> {
         self.observability.clone()
+    }
+
+    /// Lazily spawn the single background acceptor task (idempotent). It owns the
+    /// listening socket; for each inbound connection it acquires an in-flight
+    /// permit (bounding concurrent handshakes) and spawns a deadline-bounded
+    /// handshake task whose established [`AcceptOutcome`] is pushed to
+    /// `accepted_tx`. This decoupling is the H4 fix — the serial accept loop no
+    /// longer blocks on any one handshake.
+    ///
+    /// Deliberately lives in this NON-`#[uniffi::export]` block: it is an
+    /// internal lazy-init helper driven by `accept()`, not part of the public
+    /// FFI surface. UniFFI 0.29 exports every method of an `#[uniffi::export]`
+    /// impl block regardless of Rust visibility, so keeping it here is what
+    /// keeps it out of the generated bindings.
+    fn ensure_acceptor(&self) {
+        let mut guard = self.acceptor.lock();
+        if guard.is_some() {
+            return;
+        }
+        let handle = self.runtime.spawn(Box::pin(run_acceptor(
+            self.listener.clone(),
+            self.handshake_server.clone(),
+            self.inflight.clone(),
+            self.accepted_tx.clone(),
+            self.shutting_down.clone(),
+            self.shutdown_notify.clone(),
+            self.runtime.clone(),
+            self.observability.clone(),
+        )));
+        *guard = Some(handle);
     }
 }
 

@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-cargo build --release --manifest-path "${REPO_ROOT}/core/Cargo.toml"
+cargo build --release --manifest-path "${REPO_ROOT}/core/Cargo.toml" --features uniffi-cli
 
 # Detect dylib path (macOS: .dylib, Linux: .so)
 DYLIB="${REPO_ROOT}/target/release/libphantom_core.dylib"
@@ -23,6 +23,7 @@ fi
 mkdir -p "${SCRIPT_DIR}/swift"
 
 cargo run --release --manifest-path "${REPO_ROOT}/core/Cargo.toml" \
+    --features uniffi-cli \
     --bin uniffi-bindgen -- generate \
     --library "${DYLIB}" \
     --language swift \
