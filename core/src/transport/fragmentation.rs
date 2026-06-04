@@ -80,8 +80,7 @@ impl FragmentAssembler {
         // dropping the most-abandoned partial (typically an attacker's spray or
         // a dead transfer) rather than letting the table grow without limit or
         // permanently locking out fresh packets.
-        if !self.assemblies.contains_key(&key)
-            && self.assemblies.len() >= MAX_CONCURRENT_ASSEMBLIES
+        if !self.assemblies.contains_key(&key) && self.assemblies.len() >= MAX_CONCURRENT_ASSEMBLIES
         {
             self.evict_stalest();
         }
@@ -264,7 +263,9 @@ mod tests {
     #[test]
     fn rejects_oversized_fragment_payload() {
         let mut asm = FragmentAssembler::new();
-        assert!(asm.process_chunk(frame(1, 0, 4, MAX_UDP_PAYLOAD + 1)).is_none());
+        assert!(asm
+            .process_chunk(frame(1, 0, 4, MAX_UDP_PAYLOAD + 1))
+            .is_none());
         assert!(asm.is_empty());
     }
 
