@@ -1,0 +1,23 @@
+# Code owners for phantom_core.
+#
+# Matching owners are auto-requested for review on a PR. The security-sensitive
+# subsystems below mirror CONTRIBUTING.md ("Security-sensitive changes") and the
+# "Touch-with-care paths" documented in the project guide.
+#
+# NOTE: codeowner review is only *enforced* when branch protection enables
+# "Require review from Code Owners". It is otherwise advisory (auto-request).
+
+# Default owner for everything in the repo.
+*                                       @snaart
+
+# ── Security-sensitive cryptography & transport core ────────────────────────
+/core/src/crypto/                       @snaart
+/core/src/security/                     @snaart
+/core/src/transport/handshake.rs        @snaart
+/core/src/transport/session.rs          @snaart
+/core/src/transport/legs/faketls.rs     @snaart
+
+# ── Supply chain: CI, release, and dependency policy ────────────────────────
+/.github/                               @snaart
+/deny.toml                              @snaart
+/Cargo.toml                             @snaart

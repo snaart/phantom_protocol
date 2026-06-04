@@ -15,6 +15,15 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Least-privilege default for GITHUB_TOKEN.
+permissions:
+  contents: read
+
+# Cancel superseded in-progress runs on PR branches; never cancel a main run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 # Miri is the Rust mid-level-IR interpreter. It catches:
 # - Undefined behavior (out-of-bounds, uninitialized memory, aliasing
 #   violations, mis-aligned references, ...).
@@ -30,12 +39,12 @@ jobs:
     name: cargo miri test (synchronous suite)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Install nightly toolchain with miri
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           components: miri
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "."
           key: miri

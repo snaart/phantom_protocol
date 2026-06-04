@@ -1,0 +1,89 @@
+# Dependabot keeps dependencies and the SHA-pinned GitHub Actions fresh.
+# Action `uses:` are pinned to full commit SHAs (see the workflows); the
+# `github-actions` ecosystem below proposes SHA bumps as reviewable PRs so the
+# pins never go stale silently.
+#
+# Cargo is declared once per manifest tree. The workspace root (`/`, members =
+# ["core"]) and each sibling crate carry their own `[workspace]`, so they are
+# distinct update surfaces.
+version: 2
+updates:
+  # ── Cargo: workspace root (core) ──────────────────────────────────────────
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ── Cargo: sibling crates (each has its own [workspace]) ──────────────────
+  - package-ecosystem: cargo
+    directory: /cli
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: /server
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: /examples/wasm-demo
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: /examples/observability-demo
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ── GitHub Actions: keep the SHA pins current ─────────────────────────────
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      github-actions:
+        update-types:
+          - minor
+          - patch
