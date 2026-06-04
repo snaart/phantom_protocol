@@ -142,6 +142,32 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   timeout. It now reads incrementally, caps frames at 4 MiB, and bounds the read
   with a 30s timeout (terminal for the leg on expiry).
 
+- **DOS-2 (medium): per-IP PoW escalation wired (was dead code) — fixed.** The
+  `ReputationTracker` was never wired into the live handshake, so the only
+  establishment-cost gate was the *global* load tier (0 PoW below 100
+  handshakes/min, identical for every IP) — an abusive source could not be
+  singled out and a low-and-slow attacker paid nothing while forcing full
+  ML-KEM/ML-DSA work per handshake. It is now wired into the server handshake as
+  `difficulty = max(global_tier, per_ip_escalation)`: a clean IP (or
+  resumption-ticket holder) adds **0** (well-behaved clients stay 1-RTT when the
+  server is idle), while an IP with recent handshake violations pays an
+  escalating PoW (capped at difficulty 20). Violations are recorded on genuine
+  protocol failures (retry-round-cap exceeded, version/variant reject, fail) and
+  cleared on a successful handshake. The per-IP map is **bounded**
+  (`max_entries = 100_000`, evict-on-overflow + periodic GC) so wiring it cannot
+  turn a CPU-DoS into a memory-DoS. Also fixed a latent shift-overflow in the
+  escalation formula (`1 << (violations - 1)` for a large violation count). No
+  wire change. Pinned by `reputation::tests::*` and
+  `handshake::tests::reputation_wiring_escalates_and_resets_per_ip`.
+
+### Removed
+
+- **`HalfOpenSlots` (DOS-3).** The unused `transport::half_open::HalfOpenSlots`
+  SYN-flood scaffolding is deleted — it was dead code (a TTL slot store, the
+  wrong primitive for the TCP path), and the concurrent-handshake cap is now
+  provided by the listener's in-flight-handshake semaphore (H4/DOS-1). Removing
+  `pub mod half_open` is a pre-1.0 public-surface removal.
+
 ### Added
 
 - **Graceful unsupported-version signal.** When a `ClientHello.version` is one

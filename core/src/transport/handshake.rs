@@ -19,6 +19,7 @@ use crate::crypto::hybrid_sign::{HybridSignature, HybridSigningKey, HybridVerify
 use crate::crypto::kdf::derive_early_data_keying;
 use crate::crypto::pow::{PoWChallenge, PoWSolution};
 use crate::errors::CoreError;
+use crate::transport::reputation::ReputationTracker;
 use crate::transport::session::{CryptoState, Session};
 use crate::transport::session_cache::SessionCache;
 use crate::transport::types::{SchedulerMode, SessionId};
@@ -323,6 +324,11 @@ pub struct HandshakeServer {
     /// `Arc<Mutex<>>` so all handshake threads share one cache.
     #[zeroize(skip)]
     session_cache: Arc<parking_lot::Mutex<SessionCache>>,
+    /// Per-IP reputation tracker (DOS-2). Drives a PoW-difficulty escalation for
+    /// abusive sources on top of the global load tier; bounded map. Holds no
+    /// secrets, hence `#[zeroize(skip)]`.
+    #[zeroize(skip)]
+    reputation: Arc<ReputationTracker>,
 }
 
 impl HandshakeServer {
@@ -374,6 +380,7 @@ impl HandshakeServer {
             handshakes_this_minute: AtomicU64::new(0),
             minute_start_unix_sec: AtomicU64::new(now_sec),
             session_cache: Arc::new(parking_lot::Mutex::new(SessionCache::new())),
+            reputation: Arc::new(ReputationTracker::new()),
         })
     }
 
@@ -420,6 +427,34 @@ impl HandshakeServer {
             2000..=9999 => 12,
             _ => 16,
         }
+    }
+
+    /// Per-IP PoW-difficulty escalation for `client_ip` (DOS-2) — 0 for clean
+    /// IPs and resumption-ticket holders, escalating for sources with recent
+    /// handshake violations. The server uses
+    /// `max(adaptive_difficulty(), reputation_difficulty(...))` so an abusive IP
+    /// is singled out even when the global load tier is idle, without penalizing
+    /// well-behaved clients.
+    pub(crate) fn reputation_difficulty(&self, client_ip: IpAddr, has_ticket: bool) -> u8 {
+        self.reputation.calculate_difficulty(client_ip, has_ticket)
+    }
+
+    /// Record a handshake violation for `client_ip` (DOS-2) — drives the
+    /// escalation. Called on a genuine protocol failure (bad/old/abusive client),
+    /// NOT on a normal first-contact cookie/PoW retry.
+    pub(crate) fn record_violation(&self, client_ip: IpAddr) {
+        self.reputation.record_violation(client_ip);
+    }
+
+    /// Clear `client_ip`'s violation record after a successful handshake (DOS-2).
+    pub(crate) fn reset_violations(&self, client_ip: IpAddr) {
+        self.reputation.reset_violations(client_ip);
+    }
+
+    /// Drop expired reputation entries (DOS-2) — driven periodically by the
+    /// listener's acceptor loop.
+    pub(crate) fn gc_reputation(&self) {
+        self.reputation.gc();
     }
 
     /// Current per-minute handshake count. Exposed for metrics
@@ -1654,6 +1689,42 @@ mod tests {
                 HandshakeResponse::Retry(_)
             ),
             "unknown ticket → no bypass → cookie Retry"
+        );
+    }
+
+    /// **DOS-2.** The `HandshakeServer` wires per-IP reputation: a clean IP (and
+    /// a ticket holder) adds no PoW difficulty, repeated violations escalate it,
+    /// and a successful-handshake reset clears it.
+    #[test]
+    fn reputation_wiring_escalates_and_resets_per_ip() {
+        let server = HandshakeServer::new().unwrap();
+        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(
+            server.reputation_difficulty(ip, false),
+            0,
+            "clean IP adds nothing"
+        );
+        assert_eq!(
+            server.reputation_difficulty(ip, true),
+            0,
+            "ticket holder skips PoW"
+        );
+        server.record_violation(ip);
+        let d1 = server.reputation_difficulty(ip, false);
+        assert!(
+            d1 >= 8,
+            "a violation escalates the per-IP difficulty, got {d1}"
+        );
+        server.record_violation(ip);
+        assert!(
+            server.reputation_difficulty(ip, false) >= d1,
+            "more violations escalate further"
+        );
+        server.reset_violations(ip);
+        assert_eq!(
+            server.reputation_difficulty(ip, false),
+            0,
+            "reset clears it"
         );
     }
 }

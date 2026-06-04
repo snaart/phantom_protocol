@@ -33,8 +33,6 @@ pub mod fallback;
 #[cfg(feature = "std")]
 pub mod fragmentation;
 #[cfg(feature = "std")]
-pub mod half_open;
-#[cfg(feature = "std")]
 pub mod handshake;
 #[cfg(feature = "std")]
 pub mod multiplexer;
