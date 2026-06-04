@@ -1580,7 +1580,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "proptest",
- "rand 0.8.6",
+ "rand 0.9.4",
  "ring",
  "serde",
  "serde_json",
