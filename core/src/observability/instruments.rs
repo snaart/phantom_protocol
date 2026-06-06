@@ -362,7 +362,7 @@ mod otel_on {
         ///
         /// Exemplar note: when the embedder configures an exemplar
         /// reservoir on the SDK (not on by default in `opentelemetry_sdk`
-        /// 0.28) and this call happens inside an active `tracing` span,
+        /// 0.32) and this call happens inside an active `tracing` span,
         /// the observation carries that span's `trace_id` — enabling a
         /// Grafana → Tempo drill-down. Without reservoir configuration the
         /// histogram still records normally, just without exemplars.
