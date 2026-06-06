@@ -15,10 +15,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use kcp_tokio::{
-    async_kcp::{KcpListener, KcpStream},
-    KcpConfig,
-};
+use kcp_tokio::{KcpConfig, KcpListener, KcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
