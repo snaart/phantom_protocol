@@ -163,7 +163,7 @@ typedef void (*PhantomRustFutureContinuationCallback)(uint64_t handle,
  * runtime value reported by ffi_phantom_core_uniffi_contract_version()
  * MUST match — if not, the dylib was rebuilt with an incompatible
  * UniFFI release and this header is stale. */
-#define PHANTOM_UNIFFI_CONTRACT_VERSION 29
+#define PHANTOM_UNIFFI_CONTRACT_VERSION 30
 
 /* ====================================================================
  * SECTION 3 — Runtime / infrastructure FFI
