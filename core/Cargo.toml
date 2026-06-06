@@ -168,7 +168,7 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # to `borsh` can silently shift the handshake bytes and break interop with no
 # `WIRE_VERSION` change, so it is pinned to an exact version — bump it only as a
 # deliberate wire change, paired with a vector regeneration.
-borsh = { version = "=1.6.0", default-features = false, optional = true, features = ["derive"] }
+borsh = { version = "=1.6.1", default-features = false, optional = true, features = ["derive"] }
 hex = { version = "0.4", default-features = false, optional = true, features = ["alloc"] }
 base64 = { version = "0.22", default-features = false, optional = true, features = ["alloc"] }
 anyhow = { version = "1", optional = true }
@@ -194,14 +194,14 @@ ring = { version = "0.17", optional = true }  # HW-accelerated AES-GCM (ARM64 AE
 # (additive API; no change to the production random path). Used by the NIST KAT
 # test (`core/tests/nist_kat.rs`) to byte-match published FIPS-203 vectors.
 ml-kem = { version = "0.2", optional = true, features = ["deterministic"] }
-ml-dsa = { version = "0.1.0", optional = true }   # stable release; a release candidate must not ship in a 1.0
+ml-dsa = { version = "0.1.1", optional = true }   # stable release; a release candidate must not ship in a 1.0
 # `signature` traits are re-exported via `ml_dsa::{Signer, Verifier}` from
 # the version ml-dsa pins (3.x); we do not need a direct dependency here.
 hkdf = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
 blake3 = { version = "1.5", optional = true }
 getrandom = { version = "0.2", optional = true }
-bitflags = { version = "2.4", optional = true }
+bitflags = { version = "2.13", optional = true }
 parking_lot = { version = "0.12", optional = true }  # Fast mutex for buffer pool
 arc-swap = { version = "1", optional = true }        # Lock-free atomic swap for the CryptoState rekey path (Phase 1.5)
 lz4_flex = { version = "0.11.6", optional = true }   # Fastest pure-Rust LZ4 (safe, no C bindings); >=0.11.6 floor avoids yanked 0.11.5 (RUSTSEC-2026-0041)
@@ -242,7 +242,7 @@ dashmap = { version = "6.1.0", optional = true }
 # bumped its MSRV to 1.85, so it is capped at `< 3.4` to hold the crate MSRV of
 # 1.75 — relax this cap once the crate MSRV moves.
 embedded-io-async = { version = "0.6", optional = true }
-async-lock = { version = ">=3, <3.4", optional = true, default-features = false }
+async-lock = { version = ">=3, <3.5", optional = true, default-features = false }
 
 [build-dependencies]
 uniffi = { version = "0.31", features = ["build"] }
