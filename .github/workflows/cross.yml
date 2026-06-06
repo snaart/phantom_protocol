@@ -83,13 +83,19 @@ jobs:
             runner: windows-latest
             install_target: true
           # ── WASM ─────────────────────────────────────────────────────────
-          # wasm32-unknown-unknown is now a hard gate as of Phase 3.3 + 3.5:
+          # wasm32-unknown-unknown is a hard gate as of Phase 3.3 + 3.5:
           # WebSocketLeg + WasmRuntime land; getrandom 0.4's `wasm_js` Cargo
-          # feature is forced via core/Cargo.toml so the transitive
-          # ml-dsa / uniffi-tempfile pulls compile cleanly.
+          # feature is forced via core/Cargo.toml so the transitive ml-dsa
+          # pulls compile cleanly. The browser target uses wasm-bindgen, NOT
+          # UniFFI, so `bindings` is dropped here via `--no-default-features`
+          # (mirroring the wasm32-wasip2 row): UniFFI 0.31's runtime is not
+          # wasm32-unknown-unknown-compatible (its rust-future glue requires
+          # `Send`, which browser futures are not) and its FFI scaffolding is
+          # unused in the browser build.
           - target: wasm32-unknown-unknown
             runner: ubuntu-latest
             install_target: true
+            cargo_args: "--no-default-features --features std,compression-zstd"
           # wasm32-wasip2 (Preview 2) — hard gate as of B6. The
           # `wasi-leg` Cargo feature pulls in `wasi 0.14` (WIT-bindgen
           # bindings for Preview 2) and the matching `WasiLeg` /
