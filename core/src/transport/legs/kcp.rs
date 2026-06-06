@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::transport::bandwidth_estimator;
-use kcp_tokio::{async_kcp::KcpStream, KcpConfig};
+use kcp_tokio::{KcpConfig, KcpStream};
 
 /// KCP leg configuration
 #[derive(Debug, Clone)]
