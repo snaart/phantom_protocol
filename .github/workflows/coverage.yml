@@ -56,7 +56,7 @@ jobs:
               --summary-only
       - name: Upload to Codecov
         # Soft-fail: a missing CODECOV_TOKEN should not break CI.
-        uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe # v5
+        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
         if: ${{ env.CODECOV_TOKEN != '' }}
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
