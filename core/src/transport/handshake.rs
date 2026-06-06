@@ -4,7 +4,7 @@
 //! for optimistic start, Early Data, and 0-RTT resumption.
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
