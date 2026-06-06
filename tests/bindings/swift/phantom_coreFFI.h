@@ -50,9 +50,9 @@ typedef void (*UniffiRustFutureContinuationCallback)(uint64_t, int8_t
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_FREE
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_FREE
-typedef void (*UniffiForeignFutureFree)(uint64_t
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_DROPPED_CALLBACK
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_DROPPED_CALLBACK
+typedef void (*UniffiForeignFutureDroppedCallback)(uint64_t
     );
 
 #endif
@@ -62,228 +62,220 @@ typedef void (*UniffiCallbackInterfaceFree)(uint64_t
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE
-typedef struct UniffiForeignFuture {
-    uint64_t handle;
-    UniffiForeignFutureFree _Nonnull free;
-} UniffiForeignFuture;
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_CLONE
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_CLONE
+typedef uint64_t (*UniffiCallbackInterfaceClone)(uint64_t
+    );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U8
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U8
-typedef struct UniffiForeignFutureStructU8 {
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_DROPPED_CALLBACK_STRUCT
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_DROPPED_CALLBACK_STRUCT
+typedef struct UniffiForeignFutureDroppedCallbackStruct {
+    uint64_t handle;
+    UniffiForeignFutureDroppedCallback _Nonnull free;
+} UniffiForeignFutureDroppedCallbackStruct;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_U8
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_U8
+typedef struct UniffiForeignFutureResultU8 {
     uint8_t returnValue;
     RustCallStatus callStatus;
-} UniffiForeignFutureStructU8;
+} UniffiForeignFutureResultU8;
 
 #endif
 #ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U8
 #define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U8
-typedef void (*UniffiForeignFutureCompleteU8)(uint64_t, UniffiForeignFutureStructU8
+typedef void (*UniffiForeignFutureCompleteU8)(uint64_t, UniffiForeignFutureResultU8
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I8
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I8
-typedef struct UniffiForeignFutureStructI8 {
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_I8
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_I8
+typedef struct UniffiForeignFutureResultI8 {
     int8_t returnValue;
     RustCallStatus callStatus;
-} UniffiForeignFutureStructI8;
+} UniffiForeignFutureResultI8;
 
 #endif
 #ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I8
 #define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I8
-typedef void (*UniffiForeignFutureCompleteI8)(uint64_t, UniffiForeignFutureStructI8
+typedef void (*UniffiForeignFutureCompleteI8)(uint64_t, UniffiForeignFutureResultI8
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U16
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U16
-typedef struct UniffiForeignFutureStructU16 {
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_U16
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_U16
+typedef struct UniffiForeignFutureResultU16 {
     uint16_t returnValue;
     RustCallStatus callStatus;
-} UniffiForeignFutureStructU16;
+} UniffiForeignFutureResultU16;
 
 #endif
 #ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U16
 #define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U16
-typedef void (*UniffiForeignFutureCompleteU16)(uint64_t, UniffiForeignFutureStructU16
+typedef void (*UniffiForeignFutureCompleteU16)(uint64_t, UniffiForeignFutureResultU16
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I16
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I16
-typedef struct UniffiForeignFutureStructI16 {
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_I16
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_I16
+typedef struct UniffiForeignFutureResultI16 {
     int16_t returnValue;
     RustCallStatus callStatus;
-} UniffiForeignFutureStructI16;
+} UniffiForeignFutureResultI16;
 
 #endif
 #ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I16
 #define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I16
-typedef void (*UniffiForeignFutureCompleteI16)(uint64_t, UniffiForeignFutureStructI16
+typedef void (*UniffiForeignFutureCompleteI16)(uint64_t, UniffiForeignFutureResultI16
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U32
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U32
-typedef struct UniffiForeignFutureStructU32 {
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_U32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_U32
+typedef struct UniffiForeignFutureResultU32 {
     uint32_t returnValue;
     RustCallStatus callStatus;
-} UniffiForeignFutureStructU32;
+} UniffiForeignFutureResultU32;
 
 #endif
 #ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U32
 #define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U32
-typedef void (*UniffiForeignFutureCompleteU32)(uint64_t, UniffiForeignFutureStructU32
+typedef void (*UniffiForeignFutureCompleteU32)(uint64_t, UniffiForeignFutureResultU32
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I32
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I32
-typedef struct UniffiForeignFutureStructI32 {
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_I32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_I32
+typedef struct UniffiForeignFutureResultI32 {
     int32_t returnValue;
     RustCallStatus callStatus;
-} UniffiForeignFutureStructI32;
+} UniffiForeignFutureResultI32;
 
 #endif
 #ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I32
 #define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I32
-typedef void (*UniffiForeignFutureCompleteI32)(uint64_t, UniffiForeignFutureStructI32
+typedef void (*UniffiForeignFutureCompleteI32)(uint64_t, UniffiForeignFutureResultI32
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U64
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U64
-typedef struct UniffiForeignFutureStructU64 {
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_U64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_U64
+typedef struct UniffiForeignFutureResultU64 {
     uint64_t returnValue;
     RustCallStatus callStatus;
-} UniffiForeignFutureStructU64;
+} UniffiForeignFutureResultU64;
 
 #endif
 #ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U64
 #define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U64
-typedef void (*UniffiForeignFutureCompleteU64)(uint64_t, UniffiForeignFutureStructU64
+typedef void (*UniffiForeignFutureCompleteU64)(uint64_t, UniffiForeignFutureResultU64
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I64
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I64
-typedef struct UniffiForeignFutureStructI64 {
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_I64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_I64
+typedef struct UniffiForeignFutureResultI64 {
     int64_t returnValue;
     RustCallStatus callStatus;
-} UniffiForeignFutureStructI64;
+} UniffiForeignFutureResultI64;
 
 #endif
 #ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I64
 #define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I64
-typedef void (*UniffiForeignFutureCompleteI64)(uint64_t, UniffiForeignFutureStructI64
+typedef void (*UniffiForeignFutureCompleteI64)(uint64_t, UniffiForeignFutureResultI64
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_F32
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_F32
-typedef struct UniffiForeignFutureStructF32 {
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_F32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_F32
+typedef struct UniffiForeignFutureResultF32 {
     float returnValue;
     RustCallStatus callStatus;
-} UniffiForeignFutureStructF32;
+} UniffiForeignFutureResultF32;
 
 #endif
 #ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_F32
 #define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_F32
-typedef void (*UniffiForeignFutureCompleteF32)(uint64_t, UniffiForeignFutureStructF32
+typedef void (*UniffiForeignFutureCompleteF32)(uint64_t, UniffiForeignFutureResultF32
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_F64
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_F64
-typedef struct UniffiForeignFutureStructF64 {
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_F64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_F64
+typedef struct UniffiForeignFutureResultF64 {
     double returnValue;
     RustCallStatus callStatus;
-} UniffiForeignFutureStructF64;
+} UniffiForeignFutureResultF64;
 
 #endif
 #ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_F64
 #define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_F64
-typedef void (*UniffiForeignFutureCompleteF64)(uint64_t, UniffiForeignFutureStructF64
+typedef void (*UniffiForeignFutureCompleteF64)(uint64_t, UniffiForeignFutureResultF64
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_POINTER
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_POINTER
-typedef struct UniffiForeignFutureStructPointer {
-    void*_Nonnull returnValue;
-    RustCallStatus callStatus;
-} UniffiForeignFutureStructPointer;
-
-#endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_POINTER
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_POINTER
-typedef void (*UniffiForeignFutureCompletePointer)(uint64_t, UniffiForeignFutureStructPointer
-    );
-
-#endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_RUST_BUFFER
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_RUST_BUFFER
-typedef struct UniffiForeignFutureStructRustBuffer {
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_RUST_BUFFER
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_RUST_BUFFER
+typedef struct UniffiForeignFutureResultRustBuffer {
     RustBuffer returnValue;
     RustCallStatus callStatus;
-} UniffiForeignFutureStructRustBuffer;
+} UniffiForeignFutureResultRustBuffer;
 
 #endif
 #ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_RUST_BUFFER
 #define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_RUST_BUFFER
-typedef void (*UniffiForeignFutureCompleteRustBuffer)(uint64_t, UniffiForeignFutureStructRustBuffer
+typedef void (*UniffiForeignFutureCompleteRustBuffer)(uint64_t, UniffiForeignFutureResultRustBuffer
     );
 
 #endif
-#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_VOID
-#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_VOID
-typedef struct UniffiForeignFutureStructVoid {
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_VOID
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_RESULT_VOID
+typedef struct UniffiForeignFutureResultVoid {
     RustCallStatus callStatus;
-} UniffiForeignFutureStructVoid;
+} UniffiForeignFutureResultVoid;
 
 #endif
 #ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_VOID
 #define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_VOID
-typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureStructVoid
+typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureResultVoid
     );
 
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CLONE_ACCEPTOUTCOME
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CLONE_ACCEPTOUTCOME
-void*_Nonnull uniffi_phantom_core_fn_clone_acceptoutcome(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_phantom_core_fn_clone_acceptoutcome(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FREE_ACCEPTOUTCOME
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FREE_ACCEPTOUTCOME
-void uniffi_phantom_core_fn_free_acceptoutcome(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+void uniffi_phantom_core_fn_free_acceptoutcome(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_ACCEPTOUTCOME_HAS_EARLY_DATA
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_ACCEPTOUTCOME_HAS_EARLY_DATA
-int8_t uniffi_phantom_core_fn_method_acceptoutcome_has_early_data(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+int8_t uniffi_phantom_core_fn_method_acceptoutcome_has_early_data(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_ACCEPTOUTCOME_SESSION
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_ACCEPTOUTCOME_SESSION
-void*_Nonnull uniffi_phantom_core_fn_method_acceptoutcome_session(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_phantom_core_fn_method_acceptoutcome_session(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_ACCEPTOUTCOME_TAKE_EARLY_DATA
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_ACCEPTOUTCOME_TAKE_EARLY_DATA
-RustBuffer uniffi_phantom_core_fn_method_acceptoutcome_take_early_data(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_phantom_core_fn_method_acceptoutcome_take_early_data(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CLONE_PHANTOMLISTENER
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CLONE_PHANTOMLISTENER
-void*_Nonnull uniffi_phantom_core_fn_clone_phantomlistener(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_phantom_core_fn_clone_phantomlistener(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FREE_PHANTOMLISTENER
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FREE_PHANTOMLISTENER
-void uniffi_phantom_core_fn_free_phantomlistener(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+void uniffi_phantom_core_fn_free_phantomlistener(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CONSTRUCTOR_PHANTOMLISTENER_BIND
@@ -293,152 +285,152 @@ uint64_t uniffi_phantom_core_fn_constructor_phantomlistener_bind(RustBuffer addr
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMLISTENER_ACCEPT
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMLISTENER_ACCEPT
-uint64_t uniffi_phantom_core_fn_method_phantomlistener_accept(void*_Nonnull ptr
+uint64_t uniffi_phantom_core_fn_method_phantomlistener_accept(uint64_t ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMLISTENER_IS_SHUTTING_DOWN
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMLISTENER_IS_SHUTTING_DOWN
-int8_t uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+int8_t uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMLISTENER_LOCAL_ADDR
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMLISTENER_LOCAL_ADDR
-RustBuffer uniffi_phantom_core_fn_method_phantomlistener_local_addr(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_phantom_core_fn_method_phantomlistener_local_addr(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMLISTENER_SHUTDOWN
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMLISTENER_SHUTDOWN
-void uniffi_phantom_core_fn_method_phantomlistener_shutdown(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+void uniffi_phantom_core_fn_method_phantomlistener_shutdown(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMLISTENER_VERIFYING_KEY_BYTES
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMLISTENER_VERIFYING_KEY_BYTES
-RustBuffer uniffi_phantom_core_fn_method_phantomlistener_verifying_key_bytes(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_phantom_core_fn_method_phantomlistener_verifying_key_bytes(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CLONE_PHANTOMSESSION
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CLONE_PHANTOMSESSION
-void*_Nonnull uniffi_phantom_core_fn_clone_phantomsession(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_phantom_core_fn_clone_phantomsession(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FREE_PHANTOMSESSION
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FREE_PHANTOMSESSION
-void uniffi_phantom_core_fn_free_phantomsession(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+void uniffi_phantom_core_fn_free_phantomsession(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CONSTRUCTOR_PHANTOMSESSION_CONNECT
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CONSTRUCTOR_PHANTOMSESSION_CONNECT
-void*_Nonnull uniffi_phantom_core_fn_constructor_phantomsession_connect(RustBuffer peer_addr, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_phantom_core_fn_constructor_phantomsession_connect(RustBuffer peer_addr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_CONNECTION_STATE
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_CONNECTION_STATE
-RustBuffer uniffi_phantom_core_fn_method_phantomsession_connection_state(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_phantom_core_fn_method_phantomsession_connection_state(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_CURRENT_EPOCH
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_CURRENT_EPOCH
-uint64_t uniffi_phantom_core_fn_method_phantomsession_current_epoch(void*_Nonnull ptr
+uint64_t uniffi_phantom_core_fn_method_phantomsession_current_epoch(uint64_t ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_DISCONNECT
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_DISCONNECT
-uint64_t uniffi_phantom_core_fn_method_phantomsession_disconnect(void*_Nonnull ptr
+uint64_t uniffi_phantom_core_fn_method_phantomsession_disconnect(uint64_t ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_EARLY_DATA_ACCEPTED
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_EARLY_DATA_ACCEPTED
-uint64_t uniffi_phantom_core_fn_method_phantomsession_early_data_accepted(void*_Nonnull ptr
+uint64_t uniffi_phantom_core_fn_method_phantomsession_early_data_accepted(uint64_t ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_FLUSH_QUEUE
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_FLUSH_QUEUE
-uint64_t uniffi_phantom_core_fn_method_phantomsession_flush_queue(void*_Nonnull ptr
+uint64_t uniffi_phantom_core_fn_method_phantomsession_flush_queue(uint64_t ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_ID
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_ID
-RustBuffer uniffi_phantom_core_fn_method_phantomsession_id(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_phantom_core_fn_method_phantomsession_id(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_IS_DATA_READY
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_IS_DATA_READY
-int8_t uniffi_phantom_core_fn_method_phantomsession_is_data_ready(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+int8_t uniffi_phantom_core_fn_method_phantomsession_is_data_ready(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_IS_PQC_READY
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_IS_PQC_READY
-int8_t uniffi_phantom_core_fn_method_phantomsession_is_pqc_ready(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+int8_t uniffi_phantom_core_fn_method_phantomsession_is_pqc_ready(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_OPEN_STREAM
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_OPEN_STREAM
-void*_Nonnull uniffi_phantom_core_fn_method_phantomsession_open_stream(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_phantom_core_fn_method_phantomsession_open_stream(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_PEER_ADDR
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_PEER_ADDR
-RustBuffer uniffi_phantom_core_fn_method_phantomsession_peer_addr(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_phantom_core_fn_method_phantomsession_peer_addr(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_QUEUED_COUNT
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_QUEUED_COUNT
-uint64_t uniffi_phantom_core_fn_method_phantomsession_queued_count(void*_Nonnull ptr
+uint64_t uniffi_phantom_core_fn_method_phantomsession_queued_count(uint64_t ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_RECV
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_RECV
-uint64_t uniffi_phantom_core_fn_method_phantomsession_recv(void*_Nonnull ptr
+uint64_t uniffi_phantom_core_fn_method_phantomsession_recv(uint64_t ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_RESUMPTION_HINT
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_RESUMPTION_HINT
-uint64_t uniffi_phantom_core_fn_method_phantomsession_resumption_hint(void*_Nonnull ptr
+uint64_t uniffi_phantom_core_fn_method_phantomsession_resumption_hint(uint64_t ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_SEND
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_SEND
-uint64_t uniffi_phantom_core_fn_method_phantomsession_send(void*_Nonnull ptr, RustBuffer data
+uint64_t uniffi_phantom_core_fn_method_phantomsession_send(uint64_t ptr, RustBuffer data
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_SET_REKEY_THRESHOLD
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSESSION_SET_REKEY_THRESHOLD
-uint64_t uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold(void*_Nonnull ptr, uint64_t n
+uint64_t uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold(uint64_t ptr, uint64_t n
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CLONE_PHANTOMSTREAM
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_CLONE_PHANTOMSTREAM
-void*_Nonnull uniffi_phantom_core_fn_clone_phantomstream(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_phantom_core_fn_clone_phantomstream(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FREE_PHANTOMSTREAM
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FREE_PHANTOMSTREAM
-void uniffi_phantom_core_fn_free_phantomstream(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+void uniffi_phantom_core_fn_free_phantomstream(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_DISCONNECT
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_DISCONNECT
-uint64_t uniffi_phantom_core_fn_method_phantomstream_disconnect(void*_Nonnull ptr
+uint64_t uniffi_phantom_core_fn_method_phantomstream_disconnect(uint64_t ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_RECV
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_RECV
-uint64_t uniffi_phantom_core_fn_method_phantomstream_recv(void*_Nonnull ptr
+uint64_t uniffi_phantom_core_fn_method_phantomstream_recv(uint64_t ptr
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_SEND_RELIABLE
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_SEND_RELIABLE
-uint64_t uniffi_phantom_core_fn_method_phantomstream_send_reliable(void*_Nonnull ptr, RustBuffer data
+uint64_t uniffi_phantom_core_fn_method_phantomstream_send_reliable(uint64_t ptr, RustBuffer data
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_SEND_UNRELIABLE
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_SEND_UNRELIABLE
-uint64_t uniffi_phantom_core_fn_method_phantomstream_send_unreliable(void*_Nonnull ptr, RustBuffer data
+uint64_t uniffi_phantom_core_fn_method_phantomstream_send_unreliable(uint64_t ptr, RustBuffer data
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_STREAM_ID
 #define UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_METHOD_PHANTOMSTREAM_STREAM_ID
-uint32_t uniffi_phantom_core_fn_method_phantomstream_stream_id(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+uint32_t uniffi_phantom_core_fn_method_phantomstream_stream_id(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHANTOM_CORE_FN_FUNC_CONNECT_PINNED
@@ -669,26 +661,6 @@ void ffi_phantom_core_rust_future_free_f64(uint64_t handle
 #ifndef UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_COMPLETE_F64
 #define UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_COMPLETE_F64
 double ffi_phantom_core_rust_future_complete_f64(uint64_t handle, RustCallStatus *_Nonnull out_status
-);
-#endif
-#ifndef UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_POLL_POINTER
-#define UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_POLL_POINTER
-void ffi_phantom_core_rust_future_poll_pointer(uint64_t handle, UniffiRustFutureContinuationCallback _Nonnull callback, uint64_t callback_data
-);
-#endif
-#ifndef UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_CANCEL_POINTER
-#define UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_CANCEL_POINTER
-void ffi_phantom_core_rust_future_cancel_pointer(uint64_t handle
-);
-#endif
-#ifndef UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_FREE_POINTER
-#define UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_FREE_POINTER
-void ffi_phantom_core_rust_future_free_pointer(uint64_t handle
-);
-#endif
-#ifndef UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_COMPLETE_POINTER
-#define UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_COMPLETE_POINTER
-void*_Nonnull ffi_phantom_core_rust_future_complete_pointer(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_PHANTOM_CORE_RUST_FUTURE_POLL_RUST_BUFFER
