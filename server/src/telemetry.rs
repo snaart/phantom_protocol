@@ -92,7 +92,7 @@ impl TelemetryHandle {
             .build();
         global::set_tracer_provider(tracer_provider.clone());
 
-        // Note on sampling: the 0.28 SDK reads `OTEL_TRACES_SAMPLER` and
+        // Note on sampling: the SDK reads `OTEL_TRACES_SAMPLER` and
         // `OTEL_TRACES_SAMPLER_ARG` from the environment, so we surface
         // `trace_sample_ratio` to the operator via that env path rather
         // than coupling our config to the Sampler builder API. The CLI
