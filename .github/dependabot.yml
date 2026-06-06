@@ -87,3 +87,10 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # dtolnay/rust-toolchain selects the Rust channel by branch (stable /
+      # nightly / 1.93.0 are different branch tips → different commit SHAs).
+      # Dependabot can't model that and tries to unify all three pins to one
+      # SHA, which silently repoints the nightly pins to the stable revision
+      # and breaks miri/fuzz. The pins are kept fresh manually instead.
+      - dependency-name: "dtolnay/rust-toolchain"
