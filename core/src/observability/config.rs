@@ -37,7 +37,7 @@ pub struct ObservabilityConfig {
 ///
 /// Applied directly to the OTel `Histogram` instrument via
 /// `f64_histogram(...).with_boundaries(...)` — a version-stable API across
-/// the `opentelemetry` 0.27–0.29 line. (Base-2 exponential aggregation
+/// the `opentelemetry` 0.27–0.32 line. (Base-2 exponential aggregation
 /// would need an SDK View; the View API is still in flux across these
 /// versions, so explicit boundaries are the supported choice for now.)
 #[derive(Debug, Clone)]
