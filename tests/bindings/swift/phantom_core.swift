@@ -352,19 +352,29 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
+// Initial value and increment amount for handles. 
+// These ensure that SWIFT handles always have the lowest bit set
+fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
+fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
+
 fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
     // All mutation happens with this lock held, which is why we implement @unchecked Sendable.
     private let lock = NSLock()
     private var map: [UInt64: T] = [:]
-    private var currentHandle: UInt64 = 1
+    private var currentHandle: UInt64 = UNIFFI_HANDLEMAP_INITIAL
 
     func insert(obj: T) -> UInt64 {
         lock.withLock {
-            let handle = currentHandle
-            currentHandle += 1
-            map[handle] = obj
-            return handle
+            return doInsert(obj)
         }
+    }
+
+    // Low-level insert function, this assumes `lock` is held.
+    private func doInsert(_ obj: T) -> UInt64 {
+        let handle = currentHandle
+        currentHandle += UNIFFI_HANDLEMAP_DELTA
+        map[handle] = obj
+        return handle
     }
 
      func get(handle: UInt64) throws -> T {
@@ -373,6 +383,15 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
                 throw UniffiInternalError.unexpectedStaleHandle
             }
             return obj
+        }
+    }
+
+     func clone(handle: UInt64) throws -> UInt64 {
+        try lock.withLock {
+            guard let obj = map[handle] else {
+                throw UniffiInternalError.unexpectedStaleHandle
+            }
+            return doInsert(obj)
         }
     }
 
@@ -617,13 +636,13 @@ public protocol AcceptOutcomeProtocol: AnyObject, Sendable {
  * is take-once so a ≤16 KiB blob is moved out, not cloned.
  */
 open class AcceptOutcome: AcceptOutcomeProtocol, @unchecked Sendable {
-    fileprivate let pointer: UnsafeMutableRawPointer!
+    fileprivate let handle: UInt64
 
-    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public struct NoPointer {
+    public struct NoHandle {
         public init() {}
     }
 
@@ -633,36 +652,37 @@ open class AcceptOutcome: AcceptOutcomeProtocol, @unchecked Sendable {
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
-        self.pointer = pointer
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
     }
 
     // This constructor can be used to instantiate a fake object.
-    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
     //
     // - Warning:
-    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public init(noPointer: NoPointer) {
-        self.pointer = nil
+    public init(noHandle: NoHandle) {
+        self.handle = 0
     }
 
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
-        return try! rustCall { uniffi_phantom_core_fn_clone_acceptoutcome(self.pointer, $0) }
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_phantom_core_fn_clone_acceptoutcome(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
     deinit {
-        guard let pointer = pointer else {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
             return
         }
 
-        try! rustCall { uniffi_phantom_core_fn_free_acceptoutcome(pointer, $0) }
+        try! rustCall { uniffi_phantom_core_fn_free_acceptoutcome(handle, $0) }
     }
 
     
@@ -673,7 +693,8 @@ open class AcceptOutcome: AcceptOutcomeProtocol, @unchecked Sendable {
      */
 open func hasEarlyData() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_acceptoutcome_has_early_data(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_acceptoutcome_has_early_data(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -683,7 +704,8 @@ open func hasEarlyData() -> Bool  {
      */
 open func session() -> PhantomSession  {
     return try!  FfiConverterTypePhantomSession_lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_acceptoutcome_session(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_acceptoutcome_session(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -696,12 +718,14 @@ open func session() -> PhantomSession  {
      */
 open func takeEarlyData() -> Data?  {
     return try!  FfiConverterOptionData.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_acceptoutcome_take_early_data(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_acceptoutcome_take_early_data(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 
+    
 }
 
 
@@ -709,33 +733,24 @@ open func takeEarlyData() -> Data?  {
 @_documentation(visibility: private)
 #endif
 public struct FfiConverterTypeAcceptOutcome: FfiConverter {
-
-    typealias FfiType = UnsafeMutableRawPointer
+    typealias FfiType = UInt64
     typealias SwiftType = AcceptOutcome
 
-    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> AcceptOutcome {
-        return AcceptOutcome(unsafeFromRawPointer: pointer)
+    public static func lift(_ handle: UInt64) throws -> AcceptOutcome {
+        return AcceptOutcome(unsafeFromHandle: handle)
     }
 
-    public static func lower(_ value: AcceptOutcome) -> UnsafeMutableRawPointer {
-        return value.uniffiClonePointer()
+    public static func lower(_ value: AcceptOutcome) -> UInt64 {
+        return value.uniffiCloneHandle()
     }
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AcceptOutcome {
-        let v: UInt64 = try readInt(&buf)
-        // The Rust code won't compile if a pointer won't fit in a UInt64.
-        // We have to go via `UInt` because that's the thing that's the size of a pointer.
-        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
-        if (ptr == nil) {
-            throw UniffiInternalError.unexpectedNullPointer
-        }
-        return try lift(ptr!)
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
     }
 
     public static func write(_ value: AcceptOutcome, into buf: inout [UInt8]) {
-        // This fiddling is because `Int` is the thing that's the same size as a pointer.
-        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
-        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+        writeInt(&buf, lower(value))
     }
 }
 
@@ -743,14 +758,14 @@ public struct FfiConverterTypeAcceptOutcome: FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeAcceptOutcome_lift(_ pointer: UnsafeMutableRawPointer) throws -> AcceptOutcome {
-    return try FfiConverterTypeAcceptOutcome.lift(pointer)
+public func FfiConverterTypeAcceptOutcome_lift(_ handle: UInt64) throws -> AcceptOutcome {
+    return try FfiConverterTypeAcceptOutcome.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeAcceptOutcome_lower(_ value: AcceptOutcome) -> UnsafeMutableRawPointer {
+public func FfiConverterTypeAcceptOutcome_lower(_ value: AcceptOutcome) -> UInt64 {
     return FfiConverterTypeAcceptOutcome.lower(value)
 }
 
@@ -804,13 +819,13 @@ public protocol PhantomListenerProtocol: AnyObject, Sendable {
     
 }
 open class PhantomListener: PhantomListenerProtocol, @unchecked Sendable {
-    fileprivate let pointer: UnsafeMutableRawPointer!
+    fileprivate let handle: UInt64
 
-    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public struct NoPointer {
+    public struct NoHandle {
         public init() {}
     }
 
@@ -820,36 +835,37 @@ open class PhantomListener: PhantomListenerProtocol, @unchecked Sendable {
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
-        self.pointer = pointer
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
     }
 
     // This constructor can be used to instantiate a fake object.
-    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
     //
     // - Warning:
-    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public init(noPointer: NoPointer) {
-        self.pointer = nil
+    public init(noHandle: NoHandle) {
+        self.handle = 0
     }
 
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
-        return try! rustCall { uniffi_phantom_core_fn_clone_phantomlistener(self.pointer, $0) }
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_phantom_core_fn_clone_phantomlistener(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
     deinit {
-        guard let pointer = pointer else {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
             return
         }
 
-        try! rustCall { uniffi_phantom_core_fn_free_phantomlistener(pointer, $0) }
+        try! rustCall { uniffi_phantom_core_fn_free_phantomlistener(handle, $0) }
     }
 
     
@@ -860,9 +876,9 @@ public static func bind(addr: String)async throws  -> PhantomListener  {
                 uniffi_phantom_core_fn_constructor_phantomlistener_bind(FfiConverterString.lower(addr)
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_pointer,
-            completeFunc: ffi_phantom_core_rust_future_complete_pointer,
-            freeFunc: ffi_phantom_core_rust_future_free_pointer,
+            pollFunc: ffi_phantom_core_rust_future_poll_u64,
+            completeFunc: ffi_phantom_core_rust_future_complete_u64,
+            freeFunc: ffi_phantom_core_rust_future_free_u64,
             liftFunc: FfiConverterTypePhantomListener_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -884,13 +900,13 @@ open func accept()async throws  -> AcceptOutcome  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomlistener_accept(
-                    self.uniffiClonePointer()
+                    self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_pointer,
-            completeFunc: ffi_phantom_core_rust_future_complete_pointer,
-            freeFunc: ffi_phantom_core_rust_future_free_pointer,
+            pollFunc: ffi_phantom_core_rust_future_poll_u64,
+            completeFunc: ffi_phantom_core_rust_future_complete_u64,
+            freeFunc: ffi_phantom_core_rust_future_free_u64,
             liftFunc: FfiConverterTypeAcceptOutcome_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -901,7 +917,8 @@ open func accept()async throws  -> AcceptOutcome  {
      */
 open func isShuttingDown() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -913,7 +930,8 @@ open func isShuttingDown() -> Bool  {
      */
 open func localAddr() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomlistener_local_addr(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_phantomlistener_local_addr(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -928,7 +946,8 @@ open func localAddr() -> String  {
      * serving until their owning task closes them.
      */
 open func shutdown()  {try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomlistener_shutdown(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_phantomlistener_shutdown(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
@@ -940,12 +959,14 @@ open func shutdown()  {try! rustCall() {
      */
 open func verifyingKeyBytes() -> Data  {
     return try!  FfiConverterData.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomlistener_verifying_key_bytes(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_phantomlistener_verifying_key_bytes(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 
+    
 }
 
 
@@ -953,33 +974,24 @@ open func verifyingKeyBytes() -> Data  {
 @_documentation(visibility: private)
 #endif
 public struct FfiConverterTypePhantomListener: FfiConverter {
-
-    typealias FfiType = UnsafeMutableRawPointer
+    typealias FfiType = UInt64
     typealias SwiftType = PhantomListener
 
-    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> PhantomListener {
-        return PhantomListener(unsafeFromRawPointer: pointer)
+    public static func lift(_ handle: UInt64) throws -> PhantomListener {
+        return PhantomListener(unsafeFromHandle: handle)
     }
 
-    public static func lower(_ value: PhantomListener) -> UnsafeMutableRawPointer {
-        return value.uniffiClonePointer()
+    public static func lower(_ value: PhantomListener) -> UInt64 {
+        return value.uniffiCloneHandle()
     }
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PhantomListener {
-        let v: UInt64 = try readInt(&buf)
-        // The Rust code won't compile if a pointer won't fit in a UInt64.
-        // We have to go via `UInt` because that's the thing that's the size of a pointer.
-        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
-        if (ptr == nil) {
-            throw UniffiInternalError.unexpectedNullPointer
-        }
-        return try lift(ptr!)
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
     }
 
     public static func write(_ value: PhantomListener, into buf: inout [UInt8]) {
-        // This fiddling is because `Int` is the thing that's the same size as a pointer.
-        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
-        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+        writeInt(&buf, lower(value))
     }
 }
 
@@ -987,14 +999,14 @@ public struct FfiConverterTypePhantomListener: FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypePhantomListener_lift(_ pointer: UnsafeMutableRawPointer) throws -> PhantomListener {
-    return try FfiConverterTypePhantomListener.lift(pointer)
+public func FfiConverterTypePhantomListener_lift(_ handle: UInt64) throws -> PhantomListener {
+    return try FfiConverterTypePhantomListener.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypePhantomListener_lower(_ value: PhantomListener) -> UnsafeMutableRawPointer {
+public func FfiConverterTypePhantomListener_lower(_ value: PhantomListener) -> UInt64 {
     return FfiConverterTypePhantomListener.lower(value)
 }
 
@@ -1150,13 +1162,13 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
  * `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
  */
 open class PhantomSession: PhantomSessionProtocol, @unchecked Sendable {
-    fileprivate let pointer: UnsafeMutableRawPointer!
+    fileprivate let handle: UInt64
 
-    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public struct NoPointer {
+    public struct NoHandle {
         public init() {}
     }
 
@@ -1166,36 +1178,37 @@ open class PhantomSession: PhantomSessionProtocol, @unchecked Sendable {
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
-        self.pointer = pointer
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
     }
 
     // This constructor can be used to instantiate a fake object.
-    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
     //
     // - Warning:
-    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public init(noPointer: NoPointer) {
-        self.pointer = nil
+    public init(noHandle: NoHandle) {
+        self.handle = 0
     }
 
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
-        return try! rustCall { uniffi_phantom_core_fn_clone_phantomsession(self.pointer, $0) }
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_phantom_core_fn_clone_phantomsession(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
     deinit {
-        guard let pointer = pointer else {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
             return
         }
 
-        try! rustCall { uniffi_phantom_core_fn_free_phantomsession(pointer, $0) }
+        try! rustCall { uniffi_phantom_core_fn_free_phantomsession(handle, $0) }
     }
 
     
@@ -1220,7 +1233,8 @@ public static func connect(peerAddr: String) -> PhantomSession  {
      */
 open func connectionState() -> ConnectionState  {
     return try!  FfiConverterTypeConnectionState_lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_connection_state(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_phantomsession_connection_state(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -1235,7 +1249,7 @@ open func currentEpoch()async  -> UInt8?  {
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomsession_current_epoch(
-                    self.uniffiClonePointer()
+                    self.uniffiCloneHandle()
                     
                 )
             },
@@ -1260,7 +1274,7 @@ open func disconnect()async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomsession_disconnect(
-                    self.uniffiClonePointer()
+                    self.uniffiCloneHandle()
                     
                 )
             },
@@ -1287,7 +1301,7 @@ open func earlyDataAccepted()async  -> Bool?  {
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomsession_early_data_accepted(
-                    self.uniffiClonePointer()
+                    self.uniffiCloneHandle()
                     
                 )
             },
@@ -1308,7 +1322,7 @@ open func flushQueue()async throws  -> UInt32  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomsession_flush_queue(
-                    self.uniffiClonePointer()
+                    self.uniffiCloneHandle()
                     
                 )
             },
@@ -1325,7 +1339,8 @@ open func flushQueue()async throws  -> UInt32  {
      */
 open func id() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_id(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_phantomsession_id(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -1335,7 +1350,8 @@ open func id() -> String  {
      */
 open func isDataReady() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_is_data_ready(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_phantomsession_is_data_ready(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -1345,7 +1361,8 @@ open func isDataReady() -> Bool  {
      */
 open func isPqcReady() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_is_pqc_ready(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_phantomsession_is_pqc_ready(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -1355,7 +1372,8 @@ open func isPqcReady() -> Bool  {
      */
 open func openStream() -> PhantomStream  {
     return try!  FfiConverterTypePhantomStream_lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_open_stream(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_phantomsession_open_stream(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -1365,7 +1383,8 @@ open func openStream() -> PhantomStream  {
      */
 open func peerAddr() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_peer_addr(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_phantomsession_peer_addr(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -1378,7 +1397,7 @@ open func queuedCount()async  -> UInt32  {
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomsession_queued_count(
-                    self.uniffiClonePointer()
+                    self.uniffiCloneHandle()
                     
                 )
             },
@@ -1405,7 +1424,7 @@ open func recv()async throws  -> Data  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomsession_recv(
-                    self.uniffiClonePointer()
+                    self.uniffiCloneHandle()
                     
                 )
             },
@@ -1435,7 +1454,7 @@ open func resumptionHint()async  -> ResumptionHint?  {
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomsession_resumption_hint(
-                    self.uniffiClonePointer()
+                    self.uniffiCloneHandle()
                     
                 )
             },
@@ -1459,7 +1478,7 @@ open func send(data: Data)async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomsession_send(
-                    self.uniffiClonePointer(),
+                    self.uniffiCloneHandle(),
                     FfiConverterData.lower(data)
                 )
             },
@@ -1483,7 +1502,7 @@ open func setRekeyThreshold(n: UInt64)async  -> Bool  {
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold(
-                    self.uniffiClonePointer(),
+                    self.uniffiCloneHandle(),
                     FfiConverterUInt64.lower(n)
                 )
             },
@@ -1497,6 +1516,7 @@ open func setRekeyThreshold(n: UInt64)async  -> Bool  {
 }
     
 
+    
 }
 
 
@@ -1504,33 +1524,24 @@ open func setRekeyThreshold(n: UInt64)async  -> Bool  {
 @_documentation(visibility: private)
 #endif
 public struct FfiConverterTypePhantomSession: FfiConverter {
-
-    typealias FfiType = UnsafeMutableRawPointer
+    typealias FfiType = UInt64
     typealias SwiftType = PhantomSession
 
-    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> PhantomSession {
-        return PhantomSession(unsafeFromRawPointer: pointer)
+    public static func lift(_ handle: UInt64) throws -> PhantomSession {
+        return PhantomSession(unsafeFromHandle: handle)
     }
 
-    public static func lower(_ value: PhantomSession) -> UnsafeMutableRawPointer {
-        return value.uniffiClonePointer()
+    public static func lower(_ value: PhantomSession) -> UInt64 {
+        return value.uniffiCloneHandle()
     }
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PhantomSession {
-        let v: UInt64 = try readInt(&buf)
-        // The Rust code won't compile if a pointer won't fit in a UInt64.
-        // We have to go via `UInt` because that's the thing that's the size of a pointer.
-        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
-        if (ptr == nil) {
-            throw UniffiInternalError.unexpectedNullPointer
-        }
-        return try lift(ptr!)
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
     }
 
     public static func write(_ value: PhantomSession, into buf: inout [UInt8]) {
-        // This fiddling is because `Int` is the thing that's the same size as a pointer.
-        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
-        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+        writeInt(&buf, lower(value))
     }
 }
 
@@ -1538,14 +1549,14 @@ public struct FfiConverterTypePhantomSession: FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypePhantomSession_lift(_ pointer: UnsafeMutableRawPointer) throws -> PhantomSession {
-    return try FfiConverterTypePhantomSession.lift(pointer)
+public func FfiConverterTypePhantomSession_lift(_ handle: UInt64) throws -> PhantomSession {
+    return try FfiConverterTypePhantomSession.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypePhantomSession_lower(_ value: PhantomSession) -> UnsafeMutableRawPointer {
+public func FfiConverterTypePhantomSession_lower(_ value: PhantomSession) -> UInt64 {
     return FfiConverterTypePhantomSession.lower(value)
 }
 
@@ -1575,13 +1586,13 @@ public protocol PhantomStreamProtocol: AnyObject, Sendable {
     
 }
 open class PhantomStream: PhantomStreamProtocol, @unchecked Sendable {
-    fileprivate let pointer: UnsafeMutableRawPointer!
+    fileprivate let handle: UInt64
 
-    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public struct NoPointer {
+    public struct NoHandle {
         public init() {}
     }
 
@@ -1591,36 +1602,37 @@ open class PhantomStream: PhantomStreamProtocol, @unchecked Sendable {
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
-        self.pointer = pointer
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
     }
 
     // This constructor can be used to instantiate a fake object.
-    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
     //
     // - Warning:
-    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public init(noPointer: NoPointer) {
-        self.pointer = nil
+    public init(noHandle: NoHandle) {
+        self.handle = 0
     }
 
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
-        return try! rustCall { uniffi_phantom_core_fn_clone_phantomstream(self.pointer, $0) }
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_phantom_core_fn_clone_phantomstream(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
     deinit {
-        guard let pointer = pointer else {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
             return
         }
 
-        try! rustCall { uniffi_phantom_core_fn_free_phantomstream(pointer, $0) }
+        try! rustCall { uniffi_phantom_core_fn_free_phantomstream(handle, $0) }
     }
 
     
@@ -1638,7 +1650,7 @@ open func disconnect()async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomstream_disconnect(
-                    self.uniffiClonePointer()
+                    self.uniffiCloneHandle()
                     
                 )
             },
@@ -1655,7 +1667,7 @@ open func recv()async throws  -> Data  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomstream_recv(
-                    self.uniffiClonePointer()
+                    self.uniffiCloneHandle()
                     
                 )
             },
@@ -1672,7 +1684,7 @@ open func sendReliable(data: Data)async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomstream_send_reliable(
-                    self.uniffiClonePointer(),
+                    self.uniffiCloneHandle(),
                     FfiConverterData.lower(data)
                 )
             },
@@ -1689,7 +1701,7 @@ open func sendUnreliable(data: Data)async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_core_fn_method_phantomstream_send_unreliable(
-                    self.uniffiClonePointer(),
+                    self.uniffiCloneHandle(),
                     FfiConverterData.lower(data)
                 )
             },
@@ -1703,12 +1715,14 @@ open func sendUnreliable(data: Data)async throws   {
     
 open func streamId() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomstream_stream_id(self.uniffiClonePointer(),$0
+    uniffi_phantom_core_fn_method_phantomstream_stream_id(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 
+    
 }
 
 
@@ -1716,33 +1730,24 @@ open func streamId() -> UInt32  {
 @_documentation(visibility: private)
 #endif
 public struct FfiConverterTypePhantomStream: FfiConverter {
-
-    typealias FfiType = UnsafeMutableRawPointer
+    typealias FfiType = UInt64
     typealias SwiftType = PhantomStream
 
-    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> PhantomStream {
-        return PhantomStream(unsafeFromRawPointer: pointer)
+    public static func lift(_ handle: UInt64) throws -> PhantomStream {
+        return PhantomStream(unsafeFromHandle: handle)
     }
 
-    public static func lower(_ value: PhantomStream) -> UnsafeMutableRawPointer {
-        return value.uniffiClonePointer()
+    public static func lower(_ value: PhantomStream) -> UInt64 {
+        return value.uniffiCloneHandle()
     }
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PhantomStream {
-        let v: UInt64 = try readInt(&buf)
-        // The Rust code won't compile if a pointer won't fit in a UInt64.
-        // We have to go via `UInt` because that's the thing that's the size of a pointer.
-        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
-        if (ptr == nil) {
-            throw UniffiInternalError.unexpectedNullPointer
-        }
-        return try lift(ptr!)
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
     }
 
     public static func write(_ value: PhantomStream, into buf: inout [UInt8]) {
-        // This fiddling is because `Int` is the thing that's the same size as a pointer.
-        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
-        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+        writeInt(&buf, lower(value))
     }
 }
 
@@ -1750,21 +1755,21 @@ public struct FfiConverterTypePhantomStream: FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypePhantomStream_lift(_ pointer: UnsafeMutableRawPointer) throws -> PhantomStream {
-    return try FfiConverterTypePhantomStream.lift(pointer)
+public func FfiConverterTypePhantomStream_lift(_ handle: UInt64) throws -> PhantomStream {
+    return try FfiConverterTypePhantomStream.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypePhantomStream_lower(_ value: PhantomStream) -> UnsafeMutableRawPointer {
+public func FfiConverterTypePhantomStream_lower(_ value: PhantomStream) -> UInt64 {
     return FfiConverterTypePhantomStream.lower(value)
 }
 
 
 
 
-public struct PhantomConfig {
+public struct PhantomConfig: Equatable, Hashable {
     /**
      * Interval between keep-alive pings
      */
@@ -1866,71 +1871,15 @@ public struct PhantomConfig {
         self.connectTimeout = connectTimeout
         self.upgradeDelay = upgradeDelay
     }
+
+    
+
+    
 }
 
 #if compiler(>=6)
 extension PhantomConfig: Sendable {}
 #endif
-
-
-extension PhantomConfig: Equatable, Hashable {
-    public static func ==(lhs: PhantomConfig, rhs: PhantomConfig) -> Bool {
-        if lhs.keepaliveInterval != rhs.keepaliveInterval {
-            return false
-        }
-        if lhs.sessionTimeout != rhs.sessionTimeout {
-            return false
-        }
-        if lhs.maxPacketSize != rhs.maxPacketSize {
-            return false
-        }
-        if lhs.sendBufferSize != rhs.sendBufferSize {
-            return false
-        }
-        if lhs.recvBufferSize != rhs.recvBufferSize {
-            return false
-        }
-        if lhs.sessionCacheCapacity != rhs.sessionCacheCapacity {
-            return false
-        }
-        if lhs.sessionTicketLifetime != rhs.sessionTicketLifetime {
-            return false
-        }
-        if lhs.autoFallback != rhs.autoFallback {
-            return false
-        }
-        if lhs.fallbackLossThreshold != rhs.fallbackLossThreshold {
-            return false
-        }
-        if lhs.fallbackFailureThreshold != rhs.fallbackFailureThreshold {
-            return false
-        }
-        if lhs.connectTimeout != rhs.connectTimeout {
-            return false
-        }
-        if lhs.upgradeDelay != rhs.upgradeDelay {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(keepaliveInterval)
-        hasher.combine(sessionTimeout)
-        hasher.combine(maxPacketSize)
-        hasher.combine(sendBufferSize)
-        hasher.combine(recvBufferSize)
-        hasher.combine(sessionCacheCapacity)
-        hasher.combine(sessionTicketLifetime)
-        hasher.combine(autoFallback)
-        hasher.combine(fallbackLossThreshold)
-        hasher.combine(fallbackFailureThreshold)
-        hasher.combine(connectTimeout)
-        hasher.combine(upgradeDelay)
-    }
-}
-
-
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -2004,7 +1953,7 @@ public func FfiConverterTypePhantomConfig_lower(_ value: PhantomConfig) -> RustB
  * server-pinned, and reusing a hint across servers is a configuration
  * bug.
  */
-public struct ResumptionHint {
+public struct ResumptionHint: Equatable, Hashable {
     /**
      * The negotiated session id (32 bytes).
      */
@@ -2026,31 +1975,15 @@ public struct ResumptionHint {
         self.sessionId = sessionId
         self.resumptionSecret = resumptionSecret
     }
+
+    
+
+    
 }
 
 #if compiler(>=6)
 extension ResumptionHint: Sendable {}
 #endif
-
-
-extension ResumptionHint: Equatable, Hashable {
-    public static func ==(lhs: ResumptionHint, rhs: ResumptionHint) -> Bool {
-        if lhs.sessionId != rhs.sessionId {
-            return false
-        }
-        if lhs.resumptionSecret != rhs.resumptionSecret {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(sessionId)
-        hasher.combine(resumptionSecret)
-    }
-}
-
-
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -2094,7 +2027,7 @@ public func FfiConverterTypeResumptionHint_lower(_ value: ResumptionHint) -> Rus
  * until the handshake completes.
  */
 
-public enum ConnectionState : UInt8 {
+public enum ConnectionState: UInt8, Equatable, Hashable {
     
     /**
      * Connection initiated, handshake pending
@@ -2124,8 +2057,12 @@ public enum ConnectionState : UInt8 {
      * Gracefully closed
      */
     case closed = 6
-}
 
+
+
+
+
+}
 
 #if compiler(>=6)
 extension ConnectionState: Sendable {}
@@ -2210,18 +2147,11 @@ public func FfiConverterTypeConnectionState_lower(_ value: ConnectionState) -> R
 }
 
 
-extension ConnectionState: Equatable, Hashable {}
-
-
-
-
-
-
 
 /**
  * Universal Core Error Enum compatible with FFI exports
  */
-public enum CoreError: Swift.Error {
+public enum CoreError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
@@ -2268,8 +2198,21 @@ public enum CoreError: Swift.Error {
      */
     case CipherSuiteUnavailable(String
     )
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
 }
 
+#if compiler(>=6)
+extension CoreError: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -2438,21 +2381,6 @@ public func FfiConverterTypeCoreError_lower(_ value: CoreError) -> RustBuffer {
     return FfiConverterTypeCoreError.lower(value)
 }
 
-
-extension CoreError: Equatable, Hashable {}
-
-
-
-
-extension CoreError: Foundation.LocalizedError {
-    public var errorDescription: String? {
-        String(reflecting: self)
-    }
-}
-
-
-
-
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -2549,7 +2477,7 @@ fileprivate struct FfiConverterOptionTypeResumptionHint: FfiConverterRustBuffer 
     }
 }
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
-private let UNIFFI_RUST_FUTURE_POLL_MAYBE_READY: Int8 = 1
+private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
 fileprivate let uniffiContinuationHandleMap = UniffiHandleMap<UnsafeContinuation<Int8, Never>>()
 
@@ -2573,7 +2501,9 @@ fileprivate func uniffiRustCallAsync<F, T>(
         pollResult = await withUnsafeContinuation {
             pollFunc(
                 rustFuture,
-                uniffiFutureContinuationCallback,
+                { handle, pollResult in
+                    uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult)
+                },
                 uniffiContinuationHandleMap.insert(obj: $0)
             )
         }
@@ -2601,9 +2531,9 @@ public func connectPinned(host: String, port: UInt16, pinnedKey: Data)async thro
                 uniffi_phantom_core_fn_func_connect_pinned(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey)
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_pointer,
-            completeFunc: ffi_phantom_core_rust_future_complete_pointer,
-            freeFunc: ffi_phantom_core_rust_future_free_pointer,
+            pollFunc: ffi_phantom_core_rust_future_poll_u64,
+            completeFunc: ffi_phantom_core_rust_future_complete_u64,
+            freeFunc: ffi_phantom_core_rust_future_free_u64,
             liftFunc: FfiConverterTypePhantomSession_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -2633,9 +2563,9 @@ public func connectPinnedWithResumption(host: String, port: UInt16, pinnedKey: D
                 uniffi_phantom_core_fn_func_connect_pinned_with_resumption(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey),FfiConverterTypeResumptionHint_lower(hint),FfiConverterData.lower(earlyData)
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_pointer,
-            completeFunc: ffi_phantom_core_rust_future_complete_pointer,
-            freeFunc: ffi_phantom_core_rust_future_free_pointer,
+            pollFunc: ffi_phantom_core_rust_future_poll_u64,
+            completeFunc: ffi_phantom_core_rust_future_complete_u64,
+            freeFunc: ffi_phantom_core_rust_future_free_u64,
             liftFunc: FfiConverterTypePhantomSession_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -2650,106 +2580,106 @@ private enum InitializationResult {
 // the code inside is only computed once.
 private let initializationResult: InitializationResult = {
     // Get the bindings contract version from our ComponentInterface
-    let bindings_contract_version = 29
+    let bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
     let scaffolding_contract_version = ffi_phantom_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_phantom_core_checksum_func_connect_pinned() != 59015) {
+    if (uniffi_phantom_core_checksum_func_connect_pinned() != 13314) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_func_connect_pinned_with_resumption() != 47866) {
+    if (uniffi_phantom_core_checksum_func_connect_pinned_with_resumption() != 53474) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data() != 16642) {
+    if (uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data() != 13542) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_acceptoutcome_session() != 49660) {
+    if (uniffi_phantom_core_checksum_method_acceptoutcome_session() != 21382) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_acceptoutcome_take_early_data() != 486) {
+    if (uniffi_phantom_core_checksum_method_acceptoutcome_take_early_data() != 14981) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomlistener_accept() != 39902) {
+    if (uniffi_phantom_core_checksum_method_phantomlistener_accept() != 45298) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomlistener_is_shutting_down() != 2657) {
+    if (uniffi_phantom_core_checksum_method_phantomlistener_is_shutting_down() != 15405) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomlistener_local_addr() != 18579) {
+    if (uniffi_phantom_core_checksum_method_phantomlistener_local_addr() != 3001) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomlistener_shutdown() != 32103) {
+    if (uniffi_phantom_core_checksum_method_phantomlistener_shutdown() != 4301) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes() != 27980) {
+    if (uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes() != 56433) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 58300) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 46933) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_current_epoch() != 35997) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_current_epoch() != 16607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_disconnect() != 18611) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_disconnect() != 15471) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted() != 3077) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted() != 19420) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_flush_queue() != 41158) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_flush_queue() != 43783) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_id() != 60002) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_id() != 52711) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_is_data_ready() != 43904) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_is_data_ready() != 23471) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_is_pqc_ready() != 25634) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_is_pqc_ready() != 28414) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_open_stream() != 23478) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_open_stream() != 786) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_peer_addr() != 2094) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_peer_addr() != 14301) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_queued_count() != 9183) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_queued_count() != 30495) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_recv() != 61516) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_recv() != 62383) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_resumption_hint() != 18816) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_resumption_hint() != 14542) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_send() != 35674) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_send() != 50671) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_set_rekey_threshold() != 11165) {
+    if (uniffi_phantom_core_checksum_method_phantomsession_set_rekey_threshold() != 63141) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 13449) {
+    if (uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 45364) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomstream_recv() != 59636) {
+    if (uniffi_phantom_core_checksum_method_phantomstream_recv() != 20087) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomstream_send_reliable() != 49428) {
+    if (uniffi_phantom_core_checksum_method_phantomstream_send_reliable() != 29433) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomstream_send_unreliable() != 4743) {
+    if (uniffi_phantom_core_checksum_method_phantomstream_send_unreliable() != 51399) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomstream_stream_id() != 4640) {
+    if (uniffi_phantom_core_checksum_method_phantomstream_stream_id() != 21353) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_constructor_phantomlistener_bind() != 5086) {
+    if (uniffi_phantom_core_checksum_constructor_phantomlistener_bind() != 49290) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_constructor_phantomsession_connect() != 9656) {
+    if (uniffi_phantom_core_checksum_constructor_phantomsession_connect() != 50668) {
         return InitializationResult.apiChecksumMismatch
     }
 
