@@ -640,7 +640,7 @@ impl PhantomSession {
     }
 }
 
-/// Drive the client side of the Phantom handshake to completion.
+/// Drive the client side of the Phantom Protocol handshake to completion.
 ///
 /// When `resumption` is `Some((resume_id, resume_secret, early_data))` the
 /// first-flight `ClientHello` carries the resume id and, when `early_data` is

@@ -25,7 +25,7 @@ groups:
           severity: critical
           team: security
         annotations:
-          summary: "Phantom session(s) received unencrypted post-handshake data"
+          summary: "Phantom Protocol session(s) received unencrypted post-handshake data"
           description: |
             Over the past 5 minutes, {{ $value }} application-data packets
             arrived without the ENCRYPTED flag set. Downgrade signal.
@@ -38,7 +38,7 @@ groups:
           severity: high
           team: security
         annotations:
-          summary: "Phantom AEAD decryption failure rate elevated"
+          summary: "Phantom Protocol AEAD decryption failure rate elevated"
           description: |
             AEAD tag-mismatch rate is {{ $value | humanize }} per second
             over the past 5 minutes. Investigate active tampering, MitM,
@@ -51,7 +51,7 @@ groups:
           severity: warning
           team: security
         annotations:
-          summary: "Phantom replay-window rejection rate elevated"
+          summary: "Phantom Protocol replay-window rejection rate elevated"
           description: |
             Replay-rejection rate is {{ $value | humanize }} per second
             over 10 minutes. Could be reordered traffic or replay attack.
@@ -66,7 +66,7 @@ groups:
           severity: warning
           team: security
         annotations:
-          summary: "Phantom handshake failure rate elevated"
+          summary: "Phantom Protocol handshake failure rate elevated"
           description: |
             {{ $value | humanize }} handshake failures per second over the
             past 5 minutes. Check adaptive-PoW tier and recent deploys.
@@ -79,7 +79,7 @@ groups:
           severity: warning
           team: security
         annotations:
-          summary: "Phantom PoW rejection rate elevated (possible DoS)"
+          summary: "Phantom Protocol PoW rejection rate elevated (possible DoS)"
           description: |
             PoW rejection rate is {{ $value | humanize }}/s. Adaptive PoW
             is doing its job; verify normal client population is not
@@ -96,7 +96,7 @@ groups:
           severity: warning
           team: ops
         annotations:
-          summary: "Phantom active-sessions gauge near capacity"
+          summary: "Phantom Protocol active-sessions gauge near capacity"
           description: |
             Active sessions = {{ $value }}. Consider scaling horizontally
             or raising the configured capacity limit.
@@ -114,7 +114,7 @@ groups:
           severity: warning
           team: ops
         annotations:
-          summary: "Phantom handshake p95 latency > 1 s"
+          summary: "Phantom Protocol handshake p95 latency > 1 s"
           description: |
             p95 handshake latency over the past 5 minutes is {{ $value }} s.
             Investigate CPU saturation, RNG starvation, or aggressive PoW
@@ -132,7 +132,7 @@ groups:
           severity: critical
           team: ops
         annotations:
-          summary: "Phantom listener has accepted no sessions in 15 minutes"
+          summary: "Phantom Protocol listener has accepted no sessions in 15 minutes"
           description: |
             handshakes/sec = 0 and active_sessions = 0 for 15+ minutes.
             Listener may be unreachable. Cross-check from outside the host.

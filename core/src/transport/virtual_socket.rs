@@ -1,4 +1,4 @@
-//! Phantom Transport - Virtual Socket
+//! Phantom Protocol - Virtual Socket
 //!
 //! Unified socket abstraction over multiple transport legs.
 //! Routes packets through the scheduler, handles fallback.
