@@ -65,7 +65,7 @@ the round-trip time plus the reply bytes as hex.
 
 ```bash
 phantom-cli version
-# phantom-cli 0.3.0
+# phantom-cli 0.1.1
 # phantom_protocol features: compression-zstd, std (phantom_protocol defaults)
 # target: aarch64-apple-darwin
 ```

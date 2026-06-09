@@ -1,5 +1,11 @@
 # Phantom Protocol
 
+[![crates.io](https://img.shields.io/crates/v/phantom-protocol.svg)](https://crates.io/crates/phantom-protocol)
+[![docs.rs](https://img.shields.io/docsrs/phantom-protocol)](https://docs.rs/phantom-protocol)
+[![CI](https://github.com/snaart/phantom_protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/snaart/phantom_protocol/actions/workflows/ci.yml)
+[![license](https://img.shields.io/crates/l/phantom-protocol.svg)](LICENSE)
+![MSRV](https://img.shields.io/badge/MSRV-1.75-blue)
+
 Post-quantum-secure L4/L6 universal transport framework in Rust.
 
 Phantom Protocol gives applications an authenticated, confidential, post-quantum-secure
@@ -10,10 +16,22 @@ framing; KCP / FakeTLS / multipath as experimental legs) and adaptive fallback.
 Cross-language bindings via UniFFI (Python, Swift, Kotlin, C); native WASM
 target; bare-metal `EmbeddedLeg` for no_std.
 
-> **Pre-1.0 (`0.3.0`).** Wire format may break between minors; SemVer kicks in at
+> **Pre-1.0 (`0.1.1`).** Wire format may break between minors; SemVer kicks in at
 > 1.0. 0 workspace warnings, 0 `unsafe` outside three audited opt-ins, MSRV Rust
 > 1.75, CI green across the full cross-target matrix. See
 > [Status & limitations](#status--limitations).
+
+## Install
+
+Published on crates.io as [`phantom-protocol`](https://crates.io/crates/phantom-protocol)
+(the import path is `phantom_protocol`):
+
+```toml
+[dependencies]
+phantom-protocol = "0.1"
+```
+
+or `cargo add phantom-protocol`. API docs: <https://docs.rs/phantom-protocol>.
 
 ## Highlights
 
@@ -235,7 +253,7 @@ non-root `phantom` UID 65532, EXPOSE 4242 + 9090, signing-key volume at
 and TCP healthcheck.
 
 ```bash
-docker build -t phantom-server:0.3.0 .
+docker build -t phantom-server:0.1.1 .
 docker compose up -d
 ```
 
@@ -243,7 +261,7 @@ docker compose up -d
 
 Production-shape chart at
 [`docs/operations/helm/phantom-protocol/`](docs/operations/helm/phantom-protocol/).
-`appVersion: 0.3.0`, ClusterIP service on `4242`, 3 replicas,
+`appVersion: 0.1.1`, ClusterIP service on `4242`, 3 replicas,
 `tcpSocket` liveness / readiness. Raw manifests + walkthrough in
 [`docs/operations/kubernetes.md`](docs/operations/kubernetes.md).
 
@@ -385,7 +403,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 
 ## Status & limitations
 
-- **Pre-1.0 (`0.3.0`).** Wire format may break between minors; SemVer applies
+- **Pre-1.0 (`0.1.1`).** Wire format may break between minors; SemVer applies
   once 1.0 ships. The current wire protocol is a single pinned version — the
   former V1/V2/V3 axes were collapsed pre-1.0 (no users, no negotiation, no
   fallback), so there are no cross-version migration guides.

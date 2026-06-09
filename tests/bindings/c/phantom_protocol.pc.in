@@ -8,7 +8,7 @@ includedir=${prefix}/include
 Name: phantom_protocol
 Description: Phantom Protocol — post-quantum-secure L4/L6 transport (C FFI)
 URL: https://github.com/SNAcorp/phantom-protocol
-Version: 0.1.0
+Version: 0.1.1
 Cflags: -I${includedir}
 Libs: -L${libdir} -lphantom_protocol
 Libs.private: -lpthread -lm -ldl
