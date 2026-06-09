@@ -11,7 +11,7 @@ claim or gap that will appear in the formal ST.
 is a transport *library* that downstream applications embed; it is not an
 independent binary. The VPN Client module is the closest NIAP match for a
 post-quantum-secure L4/L6 session layer. Alternative: PP for Network Devices
-v3.0e would apply if Phantom is deployed as a server-side gateway binary —
+v3.0e would apply if Phantom Protocol is deployed as a server-side gateway binary —
 evaluators targeting that posture should treat §3 as the starting point and
 add FMT_SMF / FMT_MSA families. This document does not cover the ND PP.
 
@@ -203,8 +203,8 @@ the session from the wire:
 
 | SFR | Title | Implementation | Status | Notes / Evidence |
 |-----|-------|---------------|--------|-----------------|
-| FCS_TLSC_EXT.1 | TLS Client | Phantom does not implement TLS. It implements its own post-quantum session protocol. | N/A | The Phantom protocol is the trusted channel (see `FTP_DIT.1` below). Evaluators should treat §3 of `docs/protocol/PROTOCOL.md` as the protocol specification in lieu of a TLS profile claim. The `legs/faketls.rs` leg presents a TLS 1.3 ClientHello to deep-packet inspection but the *inner* session is Phantom, not TLS. |
-| FCS_HTTPS_EXT.1 | HTTPS for management | Phantom does not expose an HTTPS management interface. The WebSocket leg (`legs/websocket.rs`) carries the Phantom session; it is not an independent HTTPS service. | N/A | `docs/protocol/PROTOCOL.md §11` and `docs/operations/wasm.md` describe the WebSocket transport. Metrics exposition is now via the observability module (Phase 8); the library provides `MetricsSnapshot` and OTel instruments, and the embedder integrates with collectors. The HTTP server is OE. |
+| FCS_TLSC_EXT.1 | TLS Client | Phantom Protocol does not implement TLS. It implements its own post-quantum session protocol. | N/A | The Phantom Protocol session is the trusted channel (see `FTP_DIT.1` below). Evaluators should treat §3 of `docs/protocol/PROTOCOL.md` as the protocol specification in lieu of a TLS profile claim. The `legs/faketls.rs` leg presents a TLS 1.3 ClientHello to deep-packet inspection but the *inner* session is Phantom Protocol, not TLS. |
+| FCS_HTTPS_EXT.1 | HTTPS for management | Phantom Protocol does not expose an HTTPS management interface. The WebSocket leg (`legs/websocket.rs`) carries the Phantom Protocol session; it is not an independent HTTPS service. | N/A | `docs/protocol/PROTOCOL.md §11` and `docs/operations/wasm.md` describe the WebSocket transport. Metrics exposition is now via the observability module (Phase 8); the library provides `MetricsSnapshot` and OTel instruments, and the embedder integrates with collectors. The HTTP server is OE. |
 | FCS_STO_EXT.1 | Key storage | `key-management.md §Storage at rest`: Phantom Protocol does not persist any key material. All key bytes exist only in process memory. Long-term server signing key (`HybridSigningKey`) is heap-resident; ephemeral KEM keys are dropped after handshake. | 🔄 | Platform key-store integration (iOS Keychain, Android Keystore) is OE responsibility. A future `SigningKeyBackend` trait is planned but not on the current roadmap. Evaluators must confirm the embedder's key-storage posture. |
 
 ---
@@ -213,7 +213,7 @@ the session from the wire:
 
 | SFR | Title | Implementation | Status | Notes / Evidence |
 |-----|-------|---------------|--------|-----------------|
-| FTP_ITC.1.1 | Trusted channel between the TOE and remote endpoints | The Phantom session protocol is the trusted channel. After handshake, every application-data packet is AEAD-encrypted (`api/session.rs:906` — `PacketFlags::ENCRYPTED` set unconditionally). Unencrypted application-data packets are dropped on receipt (`api/session.rs:1141-1150`). | ✅ | Security invariant 2 (`SECURITY.md` / `docs/security/threat-model.md`). Negative: `security_invariants.rs:48` (`tampered_ciphertext_is_rejected`), `security_invariants.rs:76` (`tampered_header_is_rejected_via_aad`). |
+| FTP_ITC.1.1 | Trusted channel between the TOE and remote endpoints | The Phantom Protocol session protocol is the trusted channel. After handshake, every application-data packet is AEAD-encrypted (`api/session.rs:906` — `PacketFlags::ENCRYPTED` set unconditionally). Unencrypted application-data packets are dropped on receipt (`api/session.rs:1141-1150`). | ✅ | Security invariant 2 (`SECURITY.md` / `docs/security/threat-model.md`). Negative: `security_invariants.rs:48` (`tampered_ciphertext_is_rejected`), `security_invariants.rs:76` (`tampered_header_is_rejected_via_aad`). |
 | FTP_ITC.1.2 | Channel initiation | Clients always initiate via `PhantomSession::connect_with_transport`. Server identity pinning is mandatory: `expected_server_key: HybridVerifyingKey` is a required parameter (`api/session.rs:182`). The handshake passes `Some(&expected_server_key)` to `process_server_hello` — never `None`. | ✅ | Security invariant 1 (`SECURITY.md` / `docs/security/threat-model.md`). Negative: `security_invariants.rs:146` (`server_identity_mismatch_aborts_handshake`). |
 
 ---
@@ -233,7 +233,7 @@ the session from the wire:
 
 | SFR | Title | Implementation | Status | Notes / Evidence |
 |-----|-------|---------------|--------|-----------------|
-| FIA_X509_EXT.1 | X.509 certificate validation | Phantom does not use X.509. Server authentication is via pinned `HybridVerifyingKey` (hybrid Ed25519 + ML-DSA-65). | N/A | The evaluator should document this as a protocol deviation and reference `docs/protocol/PROTOCOL.md §5` (Server Authentication). The pinned-key model provides equivalent MITM resistance without a PKI. |
+| FIA_X509_EXT.1 | X.509 certificate validation | Phantom Protocol does not use X.509. Server authentication is via pinned `HybridVerifyingKey` (hybrid Ed25519 + ML-DSA-65). | N/A | The evaluator should document this as a protocol deviation and reference `docs/protocol/PROTOCOL.md §5` (Server Authentication). The pinned-key model provides equivalent MITM resistance without a PKI. |
 | FIA_SASL_EXT.1 | Authentication during initial connection | The handshake provides mutual authentication: the server signs the transcript with `HybridSigningKey`; the client verifies against the pinned key. The client's freshness is established via the handshake nonce (`handshake.rs:437`). | ✅ | `transport/handshake.rs:860-930` (`process_server_hello`). Negative: `security_invariants.rs:146`. |
 
 ---
@@ -250,7 +250,7 @@ the session from the wire:
 ### FMT — Security Management
 
 The PP App v1.4 includes lightweight FMT requirements for application
-configuration and security-relevant parameters. Phantom's relevant surface:
+configuration and security-relevant parameters. Phantom Protocol's relevant surface:
 
 | SFR | Title | Implementation | Status | Notes |
 |-----|-------|---------------|--------|-------|
@@ -262,11 +262,11 @@ configuration and security-relevant parameters. Phantom's relevant surface:
 ### FPR — Privacy
 
 The PP VPN Client module adds a lightweight privacy requirement covering
-the client's IP address protection. Phantom's position:
+the client's IP address protection. Phantom Protocol's position:
 
 | SFR | Title | Implementation | Status | Notes |
 |-----|-------|---------------|--------|-------|
-| FPR_ANO_EXT.1 | IP address anonymisation | Phantom encrypts all application-layer payloads but does not anonymise the transport IP header. IP anonymisation (VPN tunnel) is the embedder's responsibility. | N/A | The library provides the authenticated encrypted channel; the routing overlay is OE. Evaluators should document this boundary clearly in the ST. |
+| FPR_ANO_EXT.1 | IP address anonymisation | Phantom Protocol encrypts all application-layer payloads but does not anonymise the transport IP header. IP anonymisation (VPN tunnel) is the embedder's responsibility. | N/A | The library provides the authenticated encrypted channel; the routing overlay is OE. Evaluators should document this boundary clearly in the ST. |
 
 ---
 
@@ -316,9 +316,9 @@ the client's IP address protection. Phantom's position:
 
 | # | SFR | Gap | Resolution |
 |---|-----|-----|-----------|
-| G-7 | FCS_TLSC_EXT.1 | Phantom is not TLS. The VPN Client PP assumes TLS for channel protection. | Document as an explicit protocol deviation in the Security Target. Reference `docs/protocol/PROTOCOL.md` as the authoritative spec. The evaluator must accept FTP_ITC.1 satisfaction via the Phantom protocol in lieu of TLS. NIAP has accepted custom protocols for equivalent trusted-channel claims in prior evaluations. |
+| G-7 | FCS_TLSC_EXT.1 | Phantom Protocol is not TLS. The VPN Client PP assumes TLS for channel protection. | Document as an explicit protocol deviation in the Security Target. Reference `docs/protocol/PROTOCOL.md` as the authoritative spec. The evaluator must accept FTP_ITC.1 satisfaction via Phantom Protocol in lieu of TLS. NIAP has accepted custom protocols for equivalent trusted-channel claims in prior evaluations. |
 | G-8 | FCS_HTTPS_EXT.1 | No HTTPS management plane. Metrics exposition is now via the observability module's OTel integration (Phase 8); the embedder provides the HTTP/OTLP infrastructure. No code change required to the library. |
-| G-9 | FIA_X509_EXT.1 | Phantom uses pinned hybrid public keys (`HybridVerifyingKey`), not X.509 PKI. | Not a code gap. Document the pinned-key model as the authentication mechanism in the ST (`transport/handshake.rs:866-930`). |
+| G-9 | FIA_X509_EXT.1 | Phantom Protocol uses pinned hybrid public keys (`HybridVerifyingKey`), not X.509 PKI. | Not a code gap. Document the pinned-key model as the authentication mechanism in the ST (`transport/handshake.rs:866-930`). |
 | G-10 | FPR_ANO_EXT.1 | Transport IP header is not anonymised. Routing overlay is OE. | Document OE obligation in ST. No code change. |
 
 ### Key Storage and Zeroization Gaps

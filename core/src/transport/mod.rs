@@ -1,4 +1,4 @@
-//! Phantom Universal Transport Core
+//! Phantom Protocol
 //!
 //! A meta-transport layer combining SCTP, QUIC, and KCP advantages:
 //! - Multi-homing (seamless Wi-Fi ↔ LTE)

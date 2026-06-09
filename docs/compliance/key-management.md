@@ -170,7 +170,7 @@ type exists but is not exchanged on the wire.
 ## Storage at rest
 
 Phantom Protocol itself **does not persist any key material**. All key bytes
-exist only in process memory. SDK consumers integrating Phantom into
+exist only in process memory. SDK consumers integrating Phantom Protocol into
 larger systems are responsible for any disk / keystore persistence and for
 applying the appropriate platform key-store APIs (iOS Keychain, Android
 Keystore, Linux kernel keyring, Windows DPAPI / TPM).

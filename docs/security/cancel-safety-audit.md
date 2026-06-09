@@ -193,7 +193,7 @@ let server_hello = loop {
 ### `transport/legs/faketls.rs::do_client_handshake` / `do_server_handshake`
 
 Looking at the leg's handshake code (FakeTLS record exchange — pre-
-Phantom handshake): straight-line `read_exact` / `write_all`. No
+Phantom Protocol handshake): straight-line `read_exact` / `write_all`. No
 `select!`. Same logic as above — cancel mid-`.await` leaves the TCP
 connection in a state where the next handshake attempt will reset.
 

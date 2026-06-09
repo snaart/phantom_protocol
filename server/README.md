@@ -38,7 +38,7 @@ when both are set (clap default).
 
 | CLI flag              | Env var                     | Default                            | Purpose                                                    |
 | --------------------- | --------------------------- | ---------------------------------- | ---------------------------------------------------------- |
-| `--bind`                   | `PHANTOM_BIND`                 | `0.0.0.0:4242`                    | TCP bind address for the Phantom transport.                          |
+| `--bind`                   | `PHANTOM_BIND`                 | `0.0.0.0:4242`                    | TCP bind address for the Phantom Protocol transport.                          |
 | `--signing-key-file`       | `PHANTOM_SIGNING_KEY_FILE`     | `/etc/phantom-server/signing.key` | On-disk path for the long-lived hybrid signing key.                  |
 | `--otlp-endpoint`          | `OTEL_EXPORTER_OTLP_ENDPOINT`  | `http://localhost:4317`           | OTLP/gRPC endpoint for OpenTelemetry metrics + traces export.        |
 | `--otel-service-name`      | `OTEL_SERVICE_NAME`            | `phantom-server`                  | `service.name` reported via the OTel Resource.                       |

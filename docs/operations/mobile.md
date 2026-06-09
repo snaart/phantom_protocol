@@ -71,9 +71,9 @@ await session.disconnect()
 ```
 
 **App Transport Security note.** iOS ATS blocks non-TLS connections by default.
-Add an explicit ATS hostname exception in `Info.plist`, or front the Phantom server
+Add an explicit ATS hostname exception in `Info.plist`, or front the Phantom Protocol server
 with a WebSocket endpoint carrying a valid PKI cert — the outer TLS satisfies ATS;
-Phantom's `HybridVerifyingKey` provides the post-quantum auth layer.
+Phantom Protocol's `HybridVerifyingKey` provides the post-quantum auth layer.
 
 **Background mode.** iOS suspends connections when the app backgrounds. Register
 for Background App Refresh (`BGAppRefreshTask`); on `sceneDidEnterBackground`
@@ -152,7 +152,7 @@ via `android:networkSecurityConfig` in the manifest:
 </network-security-config>
 ```
 
-**Foreground service.** Android Doze kills background connections. Host the Phantom
+**Foreground service.** Android Doze kills background connections. Host the Phantom Protocol
 session in a `ForegroundService` (declare `FOREGROUND_SERVICE` and
 `FOREGROUND_SERVICE_DATA_SYNC` permissions):
 

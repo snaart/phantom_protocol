@@ -114,7 +114,7 @@ process is a weaker boundary (we trust the caller and the OS).
 | Quantum computer (CRQC) attacker | Yes | Hybrid PQ + classical KEM and signatures. Drop-classical degradation harmless until classical is broken; drop-PQ degradation harmless until CRQC arrives. |
 | Endpoint compromise (root on peer) | **No** | Out of scope; defender problem. |
 | OS RNG compromise | **No** | Out of scope; we treat `getrandom` as a trusted oracle. |
-| Long-lived signing-key theft | **No** (post-compromise) | Phantom relies on the server signing key for authentication — once leaked, attacker can serve as the server. Key revocation is an out-of-band concern (PKI / OOB re-pinning). |
+| Long-lived signing-key theft | **No** (post-compromise) | Phantom Protocol relies on the server signing key for authentication — once leaked, attacker can serve as the server. Key revocation is an out-of-band concern (PKI / OOB re-pinning). |
 
 ---
 
@@ -179,7 +179,7 @@ expose any privileged operation. The library is a passive data conduit.
 | **I**dentifiability of the client | No mitigation | Source IP is necessarily visible to the server. Client may use Tor / VPN externally. |
 | **N**on-repudiation | Intentionally out of scope (see STRIDE-R) |
 | **D**etectability that this is `phantom_protocol` | Mitigated by FakeTLS | The outer leg simulates TLS 1.2/1.3 record framing; DPI fingerprinting probability greatly reduced but not zero (timing, sizing). |
-| **D**isclosure of metadata (sizes, timing) | No mitigation | Traffic analysis defeats Phantom as it would defeat any non-padded protocol. Future work could add cover traffic. |
+| **D**isclosure of metadata (sizes, timing) | No mitigation | Traffic analysis defeats Phantom Protocol as it would defeat any non-padded protocol. Future work could add cover traffic. |
 | **U**nawareness of data flows | Documented | This file. Operators must understand what does/doesn't leak. |
 | **N**on-compliance | Tracked | Phase 5 (FIPS 140-3 / CC) work covers regulatory compliance. |
 

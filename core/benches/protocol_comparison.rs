@@ -1,7 +1,7 @@
 //! Complete Protocol Comparison Benchmarks (recompile)
 //!
 //! Real comparison of:
-//! - Phantom PQC Transport encryption
+//! - Phantom Protocol PQC Transport encryption
 //! - Raw TCP echo (no encryption)
 //! - Classical vs Post-Quantum cryptography
 
@@ -11,7 +11,7 @@ use criterion::{
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-// Phantom imports
+// Phantom Protocol imports
 use phantom_protocol::crypto::hybrid_kem::HybridSecretKey;
 use phantom_protocol::crypto::hybrid_sign::HybridSigningKey;
 use phantom_protocol::transport::handshake::{HandshakeClient, HandshakeResponse, HandshakeServer};
@@ -25,7 +25,7 @@ fn phantom_handshake_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("handshake_comparison");
     group.measurement_time(Duration::from_secs(15));
 
-    // Phantom PQC Handshake (full, with server-key pinning enabled — matches prod path)
+    // Phantom Protocol PQC Handshake (full, with server-key pinning enabled — matches prod path)
     group.bench_function("phantom_pqc_full", |b| {
         let client_ip = "127.0.0.1".parse().unwrap();
         b.iter(|| {
@@ -65,7 +65,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("throughput_comparison");
     group.measurement_time(Duration::from_secs(10));
 
-    // Setup Phantom session once
+    // Setup Phantom Protocol session once
     let client = HandshakeClient::new().expect("HandshakeClient::new");
     let server = HandshakeServer::new().unwrap();
     let server_pk = server.verifying_key().clone();

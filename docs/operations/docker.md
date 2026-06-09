@@ -131,7 +131,7 @@ Collector's `prometheusexporter` or `remote_write`), Tempo / Jaeger for
 traces, or a SaaS backend (Datadog / Honeycomb / Grafana Cloud) directly.
 To land metrics in Prometheus, run a Collector with an `otlp` receiver plus
 a `prometheus` exporter and have Prometheus scrape the **Collector** — never
-the Phantom containers.
+the Phantom Protocol containers.
 
 Configure the exporter via flags (each has an env fallback, ideal for
 container env):

@@ -1,4 +1,4 @@
-//! Phantom Transport - Multi-Path Scheduler
+//! Phantom Protocol - Multi-Path Scheduler
 //!
 //! Round-robin and low-latency scheduling across multiple transport legs.
 

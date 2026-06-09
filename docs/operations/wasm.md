@@ -79,7 +79,7 @@ pub async fn start_phantom_session() -> Result<(), JsError> {
 
 ## Pinning the server key
 
-Phantom requires clients to pin the server's `HybridVerifyingKey` — the parameter
+Phantom Protocol requires clients to pin the server's `HybridVerifyingKey` — the parameter
 is non-optional. Export it via `PhantomListener::verifying_key_bytes()` during
 server provisioning and bake it into the wasm module at compile time:
 
@@ -134,7 +134,7 @@ IndexedDB helper; use `web_sys::IdbDatabase` / `IdbObjectStore` directly.
 
 ## Bundle size
 
-Phantom's wasm32 build pulls in ml-kem (FIPS 203), ml-dsa (FIPS 204), ring
+Phantom Protocol's wasm32 build pulls in ml-kem (FIPS 203), ml-dsa (FIPS 204), ring
 AES-256-GCM, and ChaCha20-Poly1305 unconditionally.
 
 **Measuring** (TBD — the wasm32 build was unblocked in Phase 3.5):
@@ -165,7 +165,7 @@ wc -c phantom-wasm-client/pkg/phantom_wasm_client_bg.wasm
 
 ## Browser console observability
 
-Phantom uses `tracing` spans. On `wasm32`, pick one backend (SDK bundles
+Phantom Protocol uses `tracing` spans. On `wasm32`, pick one backend (SDK bundles
 neither):
 
 ```toml
@@ -196,10 +196,10 @@ Span names are not part of the stable API surface.
   `Content-Security-Policy`, no XSS surface, and `Subresource-Integrity` on
   third-party scripts. Clear resumption hints on logout.
 - **`wss://` is required in production.** Browsers block `ws://` from HTTPS
-  origins (mixed-content rules). Place Phantom behind a TLS-terminating proxy.
-- **Phantom key vs TLS cert.** `HybridVerifyingKey` is Phantom-layer identity,
+  origins (mixed-content rules). Place Phantom Protocol behind a TLS-terminating proxy.
+- **Phantom Protocol key vs TLS cert.** `HybridVerifyingKey` is Phantom-layer identity,
   independent of the WebSocket TLS cert. TLS cert rotation does not require a
-  wasm rebuild; Phantom signing key rotation does.
+  wasm rebuild; Phantom Protocol signing key rotation does.
 
 ## Performance notes
 

@@ -17,7 +17,7 @@ each to its concrete OS / platform backend. The audit's purpose is twofold:
 | `x86_64-apple-darwin` / `aarch64-apple-darwin` | `getentropy(2)` (BSD-style). | Returns `EIO` only on syscall misuse, never for entropy starvation. | macOS guarantees a seeded CSPRNG before user space starts. |
 | `aarch64-apple-ios` / `-ios-sim` | `SecRandomCopyBytes` via `getentropy(2)` shim. | Same. | |
 | `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` | `BCryptGenRandom(BCRYPT_USE_SYSTEM_PREFERRED_RNG)` via getrandom. | Cannot fail under normal operation. | CNG's system DRBG is SP 800-90A AES-CTR. |
-| `wasm32-unknown-unknown` (browser) | `window.crypto.getRandomValues` via `js-sys`. Enabled by the `getrandom = { features = ["js"] }` declaration in the wasm-only Cargo block. | Throws `QuotaExceededError` only for unreasonable lengths (`> 65536` per call). Phantom calls request `≤ 32` bytes per primitive — never hit. | Browser-provided CSPRNG (typically based on the platform PRNG). |
+| `wasm32-unknown-unknown` (browser) | `window.crypto.getRandomValues` via `js-sys`. Enabled by the `getrandom = { features = ["js"] }` declaration in the wasm-only Cargo block. | Throws `QuotaExceededError` only for unreasonable lengths (`> 65536` per call). Phantom Protocol calls request `≤ 32` bytes per primitive — never hit. | Browser-provided CSPRNG (typically based on the platform PRNG). |
 | `wasm32-wasi` | WASI `random_get`. | Cannot fail in WASI snapshot 1. | Host-provided entropy. |
 | `thumbv7em-none-eabihf` (Cortex-M, embedded) | **Not currently supported** — Phase 3.4 must select between a hardware TRNG driver or a software DRBG seeded externally. | N/A today. | See "Embedded path" below. |
 
