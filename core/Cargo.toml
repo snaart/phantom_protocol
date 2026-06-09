@@ -1,12 +1,13 @@
 [package]
 name = "phantom-protocol"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.75"
-description = "Phantom Universal Transport Core SDK — post-quantum secure L4/L6 network framework"
+description = "Post-quantum-secure L4/L6 universal transport framework — hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65, multi-path, UniFFI bindings"
 license = "Apache-2.0"
 repository = "https://github.com/snaart/phantom_protocol"
 documentation = "https://docs.rs/phantom-protocol"
+readme = "README.md"
 keywords = ["post-quantum", "transport", "cryptography", "networking", "ml-kem"]
 categories = ["network-programming", "cryptography", "no-std"]
 
