@@ -120,7 +120,7 @@ where
 /// they expose:
 ///
 /// ```ignore
-/// use phantom_core::impl_embedded_session_transport;
+/// use phantom_protocol::impl_embedded_session_transport;
 /// impl_embedded_session_transport!(MyUartRx, MyUartTx, 1024);
 /// ```
 ///

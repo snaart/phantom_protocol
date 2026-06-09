@@ -14,14 +14,14 @@ OUT_DIR="$(mktemp -d)"
 trap 'rm -rf "${OUT_DIR}"' EXIT
 
 # `-import-objc-header` exposes the C FFI symbols directly, so the
-# generated phantom_core.swift compiles inline (its `canImport` guard
+# generated phantom_protocol.swift compiles inline (its `canImport` guard
 # falls through to the no-module path).
 swiftc \
     -I "${SCRIPT_DIR}" \
     -L "${REPO_ROOT}/target/release" \
-    -lphantom_core \
-    -import-objc-header "${SCRIPT_DIR}/phantom_coreFFI.h" \
-    "${SCRIPT_DIR}/phantom_core.swift" \
+    -lphantom_protocol \
+    -import-objc-header "${SCRIPT_DIR}/phantom_protocolFFI.h" \
+    "${SCRIPT_DIR}/phantom_protocol.swift" \
     "${SCRIPT_DIR}/LoopbackTest.swift" \
     -o "${OUT_DIR}/phantom_swift_test"
 

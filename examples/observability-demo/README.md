@@ -1,4 +1,4 @@
-# Phantom Core — Observability Demo
+# Phantom Protocol — Observability Demo
 
 End-to-end demo of the OTel pipeline:
 

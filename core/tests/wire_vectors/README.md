@@ -1,6 +1,6 @@
 # Wire vectors — the byte-exact wire-format freeze (Phase 6)
 
-These `*.bin` files are the canonical on-wire bytes of the Phantom Core
+These `*.bin` files are the canonical on-wire bytes of the Phantom Protocol
 protocol, frozen byte-for-byte. They are the only place the repo pins the
 **bytes**: every other protocol test drives Rust types ↔ Rust types, so a
 layout / endianness / discriminant regression in the hand-rolled packet codec

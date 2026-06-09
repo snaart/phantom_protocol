@@ -1,4 +1,4 @@
-//! Phantom Core Public API
+//! Phantom Protocol Public API
 //!
 //! Transport session facade for the SDK.
 //! - [`session::PhantomSession`] — Client-first transport session (all targets)

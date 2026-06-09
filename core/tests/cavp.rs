@@ -1,4 +1,4 @@
-//! CAVP-style known-answer-tests for Phantom Core's FIPS-approved primitives.
+//! CAVP-style known-answer-tests for Phantom Protocol's FIPS-approved primitives.
 //!
 //! Each test pins one primitive against a published reference vector (or, for
 //! the PQ primitives exercised through Phantom's *hybrid* wrappers, a
@@ -19,8 +19,8 @@ use ml_dsa::{
 };
 use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{KemCore, MlKem768};
-use phantom_core::crypto::hybrid_kem::HybridSecretKey;
-use phantom_core::crypto::hybrid_sign::HybridSigningKey;
+use phantom_protocol::crypto::hybrid_kem::HybridSecretKey;
+use phantom_protocol::crypto::hybrid_sign::HybridSigningKey;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
@@ -99,7 +99,7 @@ fn ml_dsa_65_sign_verify_kat() {
     let sk: MlDsaSigningKey<MlDsa65> = MlDsaSigningKey::<MlDsa65>::new(&seed);
     let vk: MlDsaVerifyingKey<MlDsa65> = sk.verifying_key();
 
-    let msg: &[u8] = b"FIPS-204 ML-DSA-65 KAT vector / phantom_core";
+    let msg: &[u8] = b"FIPS-204 ML-DSA-65 KAT vector / phantom_protocol";
     let sig: MlDsaSignature<MlDsa65> = ml_dsa::Signer::sign(&sk, msg);
 
     // FIPS 204 ML-DSA-65 fixed sizes.
@@ -158,7 +158,7 @@ fn ml_dsa_65_sign_verify_kat() {
 /// authentication tag of `530f8afbc74536b9a963b4f1c4cb738b`.
 ///
 /// We exercise `ring::aead::AES_256_GCM` directly here (rather than
-/// `phantom_core::crypto::adaptive_crypto::CryptoSession`) because the
+/// `phantom_protocol::crypto::adaptive_crypto::CryptoSession`) because the
 /// Phantom wrapper derives its 32-byte AEAD key from a `shared_secret`
 /// via `blake3::derive_key("phantom-aes-send-v1", ...)` and builds its
 /// 12-byte nonce from a blake3-derived 4-byte prefix plus a u64 counter

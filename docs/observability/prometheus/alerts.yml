@@ -1,4 +1,4 @@
-# Prometheus alert rules for Phantom Core (Phase 8 — OTel-native metric names).
+# Prometheus alert rules for Phantom Protocol (Phase 8 — OTel-native metric names).
 #
 # Consume via an OTel Collector's `prometheusexporter`, which translates
 # `phantom.session.packets` → `phantom_session_packets_total` etc. (dots
@@ -17,7 +17,7 @@ groups:
     rules:
       - alert: PhantomUnencryptedDowngradeAttempt
         # Any non-empty post-handshake packet without the ENCRYPTED flag
-        # is an active downgrade signal. Phantom Core drops the packet;
+        # is an active downgrade signal. Phantom Protocol drops the packet;
         # the alert is for forensic visibility.
         expr: increase(phantom_security_unencrypted_dropped_total[5m]) > 0
         for: 1m

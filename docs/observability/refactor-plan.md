@@ -16,7 +16,7 @@ checklist. Update it inline as each commit lands.
 
 ### Why
 
-Phantom Core currently exposes metrics via a hand-rolled Prometheus
+Phantom Protocol currently exposes metrics via a hand-rolled Prometheus
 text-exposition implementation in `core/src/transport/metrics.rs`
 (`TransportMetrics` + `MetricsSnapshot::to_prometheus_text()`). The server
 embedder wires a minimal hyper-based `/metrics` endpoint over it. This was the
@@ -49,7 +49,7 @@ rewritten to consume the OTel-exported view.
 - OTel **logs** pillar. `tracing` stays as the structured-log fabric. The
   logs-via-OTLP path can be added later via `opentelemetry-appender-tracing`
   if needed; it's not in scope here.
-- A separate `phantom-core-otel` crate. The library remains one crate; OTel
+- A separate `phantom-protocol-otel` crate. The library remains one crate; OTel
   support lands as the `telemetry-otel` Cargo feature.
 
 ### Constraints
@@ -125,8 +125,8 @@ shim during the migration window, then is removed in step 3 of the rollout.
 
 - **`core`**: defines `Observability`, `ObservabilityConfig`,
   `PhantomInstruments`, all record-call signatures, and the observable
-  callbacks. Talks to `opentelemetry::global::meter("phantom_core")` /
-  `::tracer("phantom_core")`. Does NOT install a `MeterProvider` /
+  callbacks. Talks to `opentelemetry::global::meter("phantom_protocol")` /
+  `::tracer("phantom_protocol")`. Does NOT install a `MeterProvider` /
   `TracerProvider`; does NOT bundle an HTTP server.
 - **`server`** (or any embedder): installs `MeterProvider` /
   `TracerProvider` via `server/src/telemetry.rs` before constructing
@@ -361,7 +361,7 @@ contended ≈ 84 ns across 8 threads (`core/benches/observability_bench.rs`).
 
 `tracing` is already wired in `core` as an optional dependency (Phase 4.5).
 Add `tracing-opentelemetry = "0.28"` under the `telemetry-otel` feature.
-`OpenTelemetryLayer::new(tracer_provider.tracer("phantom_core"))` is composed
+`OpenTelemetryLayer::new(tracer_provider.tracer("phantom_protocol"))` is composed
 into the embedder's `tracing_subscriber::Registry`. The library itself does
 not call `tracing_subscriber::init()` — that's the embedder's responsibility,
 exactly as today.
@@ -497,7 +497,7 @@ impl TelemetryHandle {
 ## 8. Cross-Target Story
 
 - `telemetry-otel` is **off** in `core`'s `default = ["compression-zstd", "std"]`.
-- `server/Cargo.toml` adds `phantom_core = { path = "../core", features = ["telemetry-otel"] }`.
+- `server/Cargo.toml` adds `phantom_protocol = { path = "../core", features = ["telemetry-otel"] }`.
 - `cross.yml`: wasm32-unknown-unknown and thumbv7em-none-eabihf rows build
   with `--no-default-features --features embedded,no-std` (already do) — no
   OTel pulled in. Hard gates remain green.
@@ -580,14 +580,14 @@ runtime test would be strictly weaker than this static guarantee.
 ```
 ### Breaking
 - Removed:
-  - phantom_core::transport::metrics module (moved to phantom_core::observability)
+  - phantom_protocol::transport::metrics module (moved to phantom_protocol::observability)
   - MetricsSnapshot::to_prometheus_text()
   - PhantomListener::metrics_prometheus_text()
 - The hyper-based /metrics endpoint in `server/` is replaced by OTLP push.
 
 ### Added
 - Cargo feature `telemetry-otel`: opt-in OpenTelemetry pipeline.
-- phantom_core::observability::{Observability, ObservabilityConfig, ...}.
+- phantom_protocol::observability::{Observability, ObservabilityConfig, ...}.
 - PhantomListener::observability() -> Arc<Observability>.
 - New instruments: cookie/PoW gate counters, early_data outcomes, rekey,
   path validation latency, pacer/bandwidth gauges, buffer-pool counters,
@@ -685,5 +685,5 @@ history; the rows are not edited retroactively).
   <https://github.com/open-telemetry/oteps/blob/main/text/0149-exponential-histogram.md>
 - Exemplars (OTEP 113): <https://github.com/open-telemetry/oteps/blob/main/text/0113-exemplars.md>
 - `tracing-opentelemetry` docs: <https://docs.rs/tracing-opentelemetry/>
-- Current Phantom Core metrics module (to be deleted): `core/src/transport/metrics.rs`
-- Current Phantom Core Prometheus endpoint (to be deleted): `server/src/metrics_http.rs`
+- Current Phantom Protocol metrics module (to be deleted): `core/src/transport/metrics.rs`
+- Current Phantom Protocol Prometheus endpoint (to be deleted): `server/src/metrics_http.rs`

@@ -2,14 +2,14 @@
 //! (Section B / B5 + B7).
 //!
 //! Reads `PHANTOM_PORT` from the environment, opens a TCP connection
-//! to `127.0.0.1:PHANTOM_PORT` via `phantom_core::transport::legs::
+//! to `127.0.0.1:PHANTOM_PORT` via `phantom_protocol::transport::legs::
 //! wasi::WasiLeg`, sends a fixed length-prefixed payload, reads the
 //! echo, and exits with status 0 on byte-equality.
 //!
 //! `PHANTOM_MODE` selects the drive mechanism:
 //!  - unset / any other value — `futures::executor::block_on` —
 //!    proves `WasiLeg`'s `SessionTransport` impl works in isolation.
-//!  - `runtime` — `phantom_core::runtime::WasiRuntime::spawn` plus a
+//!  - `runtime` — `phantom_protocol::runtime::WasiRuntime::spawn` plus a
 //!    `drive` / `poll_until_progress` loop. Proves the runtime + leg
 //!    composition is sound end-to-end (the gap the original PR
 //!    review called out).
@@ -27,8 +27,8 @@
 
 use std::net::SocketAddr;
 
-use phantom_core::transport::legs::wasi::WasiLeg;
-use phantom_core::transport::session_transport::SessionTransport;
+use phantom_protocol::transport::legs::wasi::WasiLeg;
+use phantom_protocol::transport::session_transport::SessionTransport;
 
 const PAYLOAD: &[u8] = b"phantom-wasi-guest-roundtrip-v1";
 
@@ -77,7 +77,7 @@ fn run_with_block_on(addr: SocketAddr) {
 fn run_with_runtime(addr: SocketAddr) {
     // `.spawn(...)` is a trait method on `Runtime`; bring the trait
     // into scope so resolution finds it on `WasiRuntime`.
-    use phantom_core::runtime::{Runtime, WasiRuntime};
+    use phantom_protocol::runtime::{Runtime, WasiRuntime};
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::Arc;
     use std::time::Duration;

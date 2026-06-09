@@ -1,6 +1,6 @@
 //! Async runtime abstraction (Phase 3.1).
 //!
-//! `phantom_core` historically hard-coded `tokio` everywhere: every
+//! `phantom_protocol` historically hard-coded `tokio` everywhere: every
 //! `tokio::spawn`, every `tokio::time::sleep`, every `tokio::sync::Mutex`,
 //! every `tokio::net::TcpStream`. That couples the library to a
 //! multi-threaded executor that does not exist on `wasm32-unknown-unknown`

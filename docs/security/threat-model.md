@@ -1,4 +1,4 @@
-# Phantom Core Threat Model
+# Phantom Protocol Threat Model
 
 Methodology: STRIDE for security, LINDDUN for privacy. Audit-friendly format —
 each finding maps to a concrete mitigation with file:line traceability.
@@ -13,7 +13,7 @@ at the commit that introduces this file.
 
 ### In scope
 
-- The `phantom_core` library: hybrid post-quantum L4/L6 transport.
+- The `phantom_protocol` library: hybrid post-quantum L4/L6 transport.
 - Network adversary observing and manipulating traffic between two
   endpoints (active MITM, on-path attacker).
 - Volume-based denial-of-service against the listener.
@@ -58,7 +58,7 @@ at the commit that introduces this file.
        │ └──────────┬───────────────┘ │                │ └──────────┬───────────────┘ │
        │            ▼                 │                │            ▼                 │
        │ ╔════════════════════════╗   │                │   ╔════════════════════════╗ │
-       │ ║ phantom_core API       ║   │                │   ║ phantom_core API       ║ │
+       │ ║ phantom_protocol API       ║   │                │   ║ phantom_protocol API       ║ │
        │ ║ (PhantomSession,       ║   │                │   ║ (PhantomListener,      ║ │
        │ ║  PhantomStream, ...)   ║   │                │   ║  PhantomSession, ...)  ║ │
        │ ╚═════════╤══════════════╝   │                │   ╚═════════╤══════════════╝ │
@@ -75,7 +75,7 @@ at the commit that introduces this file.
                    └────────────────► hostile network ◄───────────────┘
 ```
 
-The double-line boxes inside each process (`phantom_core API` and
+The double-line boxes inside each process (`phantom_protocol API` and
 `transport / crypto`) are this library's responsibility. Everything outside
 is the caller's.
 
@@ -166,7 +166,7 @@ for a real-time secure transport.
 
 ### E — Elevation of privilege
 
-Out of scope — `phantom_core` does not run with elevated privileges or
+Out of scope — `phantom_protocol` does not run with elevated privileges or
 expose any privileged operation. The library is a passive data conduit.
 
 ---
@@ -178,7 +178,7 @@ expose any privileged operation. The library is a passive data conduit.
 | **L**inkability of two sessions to the same client | Partial | Same `HybridVerifyingKey` on the client side correlates handshakes (the client signing key is reused). Anonymous mode would require ephemeral client signing keys; tracked as future work. |
 | **I**dentifiability of the client | No mitigation | Source IP is necessarily visible to the server. Client may use Tor / VPN externally. |
 | **N**on-repudiation | Intentionally out of scope (see STRIDE-R) |
-| **D**etectability that this is `phantom_core` | Mitigated by FakeTLS | The outer leg simulates TLS 1.2/1.3 record framing; DPI fingerprinting probability greatly reduced but not zero (timing, sizing). |
+| **D**etectability that this is `phantom_protocol` | Mitigated by FakeTLS | The outer leg simulates TLS 1.2/1.3 record framing; DPI fingerprinting probability greatly reduced but not zero (timing, sizing). |
 | **D**isclosure of metadata (sizes, timing) | No mitigation | Traffic analysis defeats Phantom as it would defeat any non-padded protocol. Future work could add cover traffic. |
 | **U**nawareness of data flows | Documented | This file. Operators must understand what does/doesn't leak. |
 | **N**on-compliance | Tracked | Phase 5 (FIPS 140-3 / CC) work covers regulatory compliance. |

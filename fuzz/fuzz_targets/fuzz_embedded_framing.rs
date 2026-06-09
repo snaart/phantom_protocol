@@ -13,7 +13,7 @@
 //!    own reader rejects — a framing-desync bug.
 
 use libfuzzer_sys::fuzz_target;
-use phantom_core::transport::legs::embedded::framing::{decode_header, encode_header, HEADER_LEN};
+use phantom_protocol::transport::legs::embedded::framing::{decode_header, encode_header, HEADER_LEN};
 
 fuzz_target!(|input: &[u8]| {
     // ---- Property 1: decode_header is total on any 4-byte input ----

@@ -20,14 +20,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use embedded_io_async::{Read, Write};
-use phantom_core::api::session::{ConnectionState, PhantomSession, SessionTransport};
-use phantom_core::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
-use phantom_core::transport::legs::embedded::EmbeddedLeg;
-use phantom_core::transport::session::Session;
-use phantom_core::transport::types::{
+use phantom_protocol::api::session::{ConnectionState, PhantomSession, SessionTransport};
+use phantom_protocol::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+use phantom_protocol::transport::legs::embedded::EmbeddedLeg;
+use phantom_protocol::transport::session::Session;
+use phantom_protocol::transport::types::{
     PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId,
 };
-use phantom_core::CoreError;
+use phantom_protocol::CoreError;
 use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio::time::timeout;
 
@@ -149,7 +149,7 @@ impl Write for MockWriter {
 // macro would normally collapse this to one line, but it references the
 // crate-private `errors` module and the orphan rule blocks `impl ForeignTrait
 // for ForeignType<…>` from outside the defining crate. A local newtype
-// sidesteps both — production embedded crates that depend on `phantom_core`
+// sidesteps both — production embedded crates that depend on `phantom_protocol`
 // can still use the macro one-liner.
 struct DemoLeg(EmbeddedLeg<MockReader, MockWriter, BUF>);
 

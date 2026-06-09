@@ -1,5 +1,5 @@
 <!--
-Thanks for contributing to Phantom Core! Please fill out the sections below.
+Thanks for contributing to Phantom Protocol! Please fill out the sections below.
 See CONTRIBUTING.md for the full contributor guide.
 -->
 

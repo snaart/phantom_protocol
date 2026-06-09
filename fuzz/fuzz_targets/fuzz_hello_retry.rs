@@ -7,7 +7,7 @@
 //! the handshake. Arbitrary input must return `Err`, never panic, never loop.
 
 use libfuzzer_sys::fuzz_target;
-use phantom_core::transport::handshake::HelloRetryRequest;
+use phantom_protocol::transport::handshake::HelloRetryRequest;
 
 fuzz_target!(|data: &[u8]| {
     let _ = borsh::from_slice::<HelloRetryRequest>(data);

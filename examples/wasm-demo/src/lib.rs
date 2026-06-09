@@ -1,4 +1,4 @@
-//! Phantom Core — browser WASM demo.
+//! Phantom Protocol — browser WASM demo.
 //!
 //! Entry point: `run_demo(url, pinned_key_hex)` — opens a `WebSocketLeg`,
 //! performs a full post-quantum handshake via `PhantomSession`, sends
@@ -12,10 +12,10 @@
 use std::sync::Arc;
 
 use js_sys::JsString;
-use phantom_core::api::session::PhantomSession;
-use phantom_core::crypto::hybrid_sign::HybridVerifyingKey;
-use phantom_core::runtime::wasm_runtime::WasmRuntime;
-use phantom_core::transport::legs::websocket::WebSocketLeg;
+use phantom_protocol::api::session::PhantomSession;
+use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
+use phantom_protocol::runtime::wasm_runtime::WasmRuntime;
+use phantom_protocol::transport::legs::websocket::WebSocketLeg;
 use wasm_bindgen::prelude::*;
 use web_sys::console;
 
@@ -79,7 +79,7 @@ pub async fn run_demo(url: &str, pinned_key_hex: &str) -> Result<JsValue, JsValu
 
     // 3. Wrap the WasmRuntime and start the Phantom session (background
     //    handshake + data pump spawned via wasm_bindgen_futures::spawn_local).
-    let runtime: Arc<dyn phantom_core::runtime::Runtime> = Arc::new(WasmRuntime);
+    let runtime: Arc<dyn phantom_protocol::runtime::Runtime> = Arc::new(WasmRuntime);
     let session =
         PhantomSession::connect_with_transport_with_runtime(url, leg, pinned_key, runtime);
     log("[phantom] session created, handshake running");

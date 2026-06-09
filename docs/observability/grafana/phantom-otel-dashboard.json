@@ -1,7 +1,7 @@
 {
-  "uid": "phantom-core-otel",
-  "title": "Phantom Core (OTel)",
-  "description": "Phantom Core observability dashboard, Phase 8 OTel-native metric names. Pairs with docs/observability/prometheus/alerts.yml.",
+  "uid": "phantom-protocol-otel",
+  "title": "Phantom Protocol (OTel)",
+  "description": "Phantom Protocol observability dashboard, Phase 8 OTel-native metric names. Pairs with docs/observability/prometheus/alerts.yml.",
   "tags": ["phantom", "transport", "security", "otel"],
   "schemaVersion": 38,
   "version": 1,

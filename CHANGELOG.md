@@ -8,6 +8,20 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-09
+
+### Changed
+
+- **Renamed the crate `phantom_core` → `phantom-protocol`** for the first public
+  release on crates.io (the `phantom_core` / `phantom-core` name was already taken
+  by an unrelated crate). The Rust import path is now `phantom_protocol`, the
+  crates.io package is `phantom-protocol`, and the UniFFI namespace plus the
+  generated Swift / Kotlin / Python / C bindings move from `phantom_core` to
+  `phantom_protocol`. No wire-format or crypto change (`WIRE_VERSION` 2 /
+  `PROTOCOL_VERSION` 2 unchanged; the frozen wire vectors and CAVP KATs pass
+  unmodified). First versioned release; supersedes internal pre-1.0 development
+  under the old name.
+
 ### Security
 
 - **C1 (critical): AES-GCM nonce reuse from per-stream sequence wrap — fixed.**
@@ -334,7 +348,7 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   behind a new opt-in `uniffi-cli` Cargo feature, and the `uniffi-bindgen`
   binary declares `required-features = ["uniffi-cli"]` so a default `cargo build`
   skips it entirely. `clap` no longer appears in the default dependency tree.
-  The reference server's `phantom_core` dependency switches to
+  The reference server's `phantom_protocol` dependency switches to
   `default-features = false` (it embeds the Rust API and never generates FFI),
   dropping the UniFFI scaffolding from the server build too. The generated
   bindings are byte-identical (verified by regenerating all four languages).
@@ -429,7 +443,7 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [0.3.0] - 2026-06-01
 
-This release takes phantom_core from its 0.2.0 pre-1.0 baseline through the
+This release takes phantom_protocol from its 0.2.0 pre-1.0 baseline through the
 foundation, security-hardening, and production-readiness phases of the roadmap:
 the unified single wire protocol (WIRE-BREAKING
 — hence the `0.3.0` minor bump), byte-exact wire-format + NIST ACVP KAT vectors,
@@ -570,24 +584,24 @@ cannot interoperate with a post-collapse peer. Rebuild both ends together.
 - Removed the documented-but-never-emitted `phantom.telemetry.export_failures`
   metric from the metrics catalog, OTLP guide, and Prometheus alerts: the
   library never installs the exporter, so export health belongs to the OTel
-  SDK / Collector, not Phantom Core.
+  SDK / Collector, not Phantom Protocol.
 - New always-on integration test `core/tests/observability_e2e.rs` gates the
   wiring (a real session must populate the counters and return the gauge to 0).
 
 ### Added — `wasi-leg` Cargo feature (commits `f6c0c0a`..`255be95`)
 
 **`cargo build --target wasm32-wasip2 --features wasi-leg` is now a
-shipped configuration.** Phantom Core embedders can run inside any
+shipped configuration.** Phantom Protocol embedders can run inside any
 WASI Preview 2 host (Wasmtime, WasmEdge, Spin, wasmCloud, Cloudflare
 Workers WASI sandbox).
 
 New surface:
-- **`phantom_core::transport::legs::wasi::WasiLeg`** — length-prefix-
+- **`phantom_protocol::transport::legs::wasi::WasiLeg`** — length-prefix-
   framed `SessionTransport` over `wasi:sockets/tcp`. Client-only
   for now; `connect(SocketAddr)` wraps the Preview 2 socket-create +
   start_connect + poll + finish_connect dance. Same 4-byte
   big-endian framing as `TcpSessionTransport`.
-- **`phantom_core::runtime::wasi_runtime::WasiRuntime`** — single-
+- **`phantom_protocol::runtime::wasi_runtime::WasiRuntime`** — single-
   task `Runtime` impl. `drive()` polls every spawned future once;
   `poll_until_progress(max_wait)` blocks on `wasi:io/poll::poll`
   with a `subscribe_duration` watchdog so the drive loop always
@@ -613,7 +627,7 @@ bin/uniffi-bindgen}` was wrapped in `#[cfg_attr(feature =
 Default builds are unaffected (`default = ["compression-zstd", "std",
 "bindings"]`), and so is anything that opts into `default-features`.
 But a consumer pinning
-`phantom_core = { default-features = false, features = ["std"] }`
+`phantom_protocol = { default-features = false, features = ["std"] }`
 used to get the UniFFI scaffolding for free via `std`; after this
 PR they must explicitly add `bindings`:
 `features = ["std", "bindings"]`. Pre-1.0 SemVer permits this, but
@@ -664,7 +678,7 @@ non-FIPS-approved primitive call site:
 - **RNG** — `RngProvider for OsRng` swaps to
   `aws_lc_rs::rand::SystemRandom` (CTR_DRBG, SP 800-90A § 10.2.1).
 - **POST** — `crypto::self_tests::ensure_post_passed` is invoked from
-  every Phantom Core entry point that performs cryptographic work
+  every Phantom Protocol entry point that performs cryptographic work
   before serving traffic: `PhantomListener::bind*`,
   `PhantomSession::connect_with_transport*`,
   `PhantomSession::connect_with_resumption`, and the UniFFI
@@ -719,7 +733,7 @@ remaining documentation work for a real CMVP submission are in
 ### Phase 8 — OpenTelemetry refactor (Observability)
 
 **Breaking changes for embedders:**
-- Removed `phantom_core::transport::metrics` module entirely.
+- Removed `phantom_protocol::transport::metrics` module entirely.
 - Removed `PhantomListener::metrics_prometheus_text()` and the deprecated
   `PhantomListener::metrics()` alias. Use `PhantomListener::observability()`
   → `Arc<Observability>` and capture snapshots via `observability.snapshot()`.
@@ -743,7 +757,7 @@ remaining documentation work for a real CMVP submission are in
   pipeline. When on, the library exposes `Counter` / `Histogram` /
   `UpDownCounter` / `ObservableCounter` instruments under the configurable
   `phantom.*` namespace (env: `PHANTOM_TELEMETRY_NAMESPACE`).
-- `phantom_core::observability::*` module: `Observability` facade,
+- `phantom_protocol::observability::*` module: `Observability` facade,
   `ObservabilityConfig` builder, `MetricsSnapshot` (always available for
   FFI / debug), typed attribute enums (`Direction`, `HandshakeOutcome`,
   `AeadAlgorithm`, `ProtocolVersion`, `ReplayReason`, `CookieOutcome`,
@@ -780,7 +794,7 @@ remaining documentation work for a real CMVP submission are in
   `Option<([u8; 32], [u8; 32])>` tuple defined outside the export block.
 - CI: `.github/workflows/bindings.yml` `drift` job now runs
   `tests/bindings/check_versions.sh`, asserting that every binding
-  manifest (`pyproject.toml`, `phantom_core.pc.in`) reports the same
+  manifest (`pyproject.toml`, `phantom_protocol.pc.in`) reports the same
   version as the source-of-truth `core/Cargo.toml`. Catches release-time
   version skew before it ships to PyPI / pkg-config consumers. `server`
   and `cli` Cargo manifests are checked too.
@@ -844,9 +858,9 @@ remaining documentation work for a real CMVP submission are in
   `Bytes::to_vec` at the FFI boundary).
 - Bindings regen (post-Phase-8 sweep): Python, Swift, and Kotlin
   auto-generated bindings plus the hand-curated
-  `tests/bindings/c/phantom_core.h` were re-synced to the post-OTel
+  `tests/bindings/c/phantom_protocol.h` were re-synced to the post-OTel
   cdylib. The now-deleted `metrics_prometheus_text` was the last
-  residual symbol — Python `import phantom_core` would `dlsym`-fail
+  residual symbol — Python `import phantom_protocol` would `dlsym`-fail
   at import time against the new lib until the regen.
 - Tests: integration tests in `core/tests/tcp_integration.rs` no longer
   hard-code ports. They bind to `127.0.0.1:0` and read `local_addr()`,

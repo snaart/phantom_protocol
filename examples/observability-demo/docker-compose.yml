@@ -1,4 +1,4 @@
-# Phantom Core observability stack.
+# Phantom Protocol observability stack.
 #
 # Brings up an OTel Collector that fans the OTLP stream from
 # `phantom-observability-demo` into Prometheus (metrics) and Tempo
@@ -18,7 +18,7 @@ services:
     volumes:
       - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
     ports:
-      - "4317:4317"   # OTLP/gRPC (Phantom Core pushes here)
+      - "4317:4317"   # OTLP/gRPC (Phantom Protocol pushes here)
       - "8889:8889"   # Prometheus exporter scrape target
 
   prometheus:

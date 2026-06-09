@@ -1,4 +1,4 @@
-# Phantom Core uses Rust stable by default. The minimum supported version
+# Phantom Protocol uses Rust stable by default. The minimum supported version
 # (MSRV) is declared in `core/Cargo.toml` via `rust-version` (once added)
 # and enforced by a dedicated CI job using `dtolnay/rust-toolchain@1.75`.
 #

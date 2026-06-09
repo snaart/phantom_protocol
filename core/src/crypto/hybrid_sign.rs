@@ -4,7 +4,7 @@
 //! implementation of NIST PQC round-3 Dilithium3 to the RustCrypto pure-Rust
 //! `ml-dsa` crate's FIPS-204 ML-DSA-65. Same algorithm at the math level,
 //! different byte encoding per FIPS 204. Wire-incompatible with the prior
-//! `phantom_core` build.
+//! `phantom_protocol` build.
 //!
 //! Both signatures must verify for the hybrid to be considered valid.
 
@@ -116,7 +116,7 @@ impl HybridSigningKey {
         &self,
         verifying_key: &HybridVerifyingKey,
     ) -> Result<(), HybridSignError> {
-        let msg: &[u8] = b"phantom-core keygen pairwise-consistency test";
+        let msg: &[u8] = b"phantom-protocol keygen pairwise-consistency test";
         verifying_key.verify(msg, &self.sign(msg))
     }
 

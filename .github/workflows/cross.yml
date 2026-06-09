@@ -19,7 +19,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# This workflow only verifies that `phantom_core` *compiles* on each target —
+# This workflow only verifies that `phantom_protocol` *compiles* on each target —
 # we do not run tests here because most targets cannot run unit tests on a
 # GitHub-Actions hosted runner (cross-toolchain limitations, no QEMU, no
 # browser sandbox). The CI matrix in `ci.yml` runs the full test suite on

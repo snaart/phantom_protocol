@@ -101,7 +101,7 @@ to Tempo automatically — no Collector required.
 
 ## Recipe E: mTLS (any backend)
 
-Phantom Core uses `tonic` for OTLP/gRPC. To enable mTLS against a private
+Phantom Protocol uses `tonic` for OTLP/gRPC. To enable mTLS against a private
 Collector, set the standard OTel TLS env vars:
 
 ```bash
@@ -146,7 +146,7 @@ service:
 
 - **Lossy queues.** OTel batch processors drop telemetry rather than block.
   The library never installs the exporter, so export health is owned by the
-  SDK/Collector, not Phantom Core: watch the OTel SDK's own
+  SDK/Collector, not Phantom Protocol: watch the OTel SDK's own
   `otel_sdk_exporter_metric_data_points` / `..._span` failure counters and the
   Collector's `otelcol_exporter_send_failed_*` — non-zero means the Collector
   / backend is congested or unreachable.

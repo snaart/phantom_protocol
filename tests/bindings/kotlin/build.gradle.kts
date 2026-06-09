@@ -1,7 +1,7 @@
-// Android library module for the phantom_core Kotlin (UniFFI) binding.
+// Android library module for the phantom_protocol Kotlin (UniFFI) binding.
 //
-// Bundles per-ABI prebuilt `libphantom_core.so` from `jniLibs/` plus the
-// UniFFI-generated Kotlin source under `uniffi/phantom_core/`. Refresh
+// Bundles per-ABI prebuilt `libphantom_protocol.so` from `jniLibs/` plus the
+// UniFFI-generated Kotlin source under `uniffi/phantom_protocol/`. Refresh
 // the native libs via `./build-jnilibs.sh` (NDK cross-compile) and the
 // Kotlin source via `../generate_kotlin.sh` after any FFI surface change.
 
@@ -11,7 +11,7 @@ plugins {
 }
 
 android {
-    namespace = "uniffi.phantom_core"
+    namespace = "uniffi.phantom_protocol"
     compileSdk = 34
     defaultConfig {
         minSdk = 24

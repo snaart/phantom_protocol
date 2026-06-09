@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
-use phantom_core::crypto::hybrid_sign::HybridSigningKey;
+use phantom_protocol::crypto::hybrid_sign::HybridSigningKey;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
