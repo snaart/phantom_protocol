@@ -5,7 +5,7 @@
 //! Mirrors [`crate::api::tcp_transport::TcpSessionTransport`]'s framing
 //! (4-byte big-endian length prefix per message) so an embedder
 //! running inside `wasmtime` / `wasmer` / `jco` can drive the same
-//! Phantom session machinery without code-level branching.
+//! Phantom Protocol session machinery without code-level branching.
 //!
 //! **Single-task model.** WASI Preview 2 has no native thread
 //! primitive, so this leg uses the `wasi:io/streams` blocking

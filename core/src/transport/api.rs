@@ -1,4 +1,4 @@
-//! Phantom Universal Transport Core - Public API
+//! Phantom Protocol - Public API
 //!
 //! Post-quantum secure transport layer with:
 //! - Hybrid key exchange (X25519 + Kyber768)
@@ -15,7 +15,7 @@
 //! let server = PhantomListener::bind("0.0.0.0:8080").await?;
 //! while let Ok(session) = server.accept().await {
 //!     // Session established with PQC keys
-//!     session.send(b"Hello, Phantom!").await?;
+//!     session.send(b"Hello, Phantom Protocol!").await?;
 //! }
 //!
 //! // Client
@@ -40,7 +40,7 @@ pub use crate::crypto::hybrid_sign::{
     HybridSignError, HybridSignature, HybridSigningKey, HybridVerifyingKey,
 };
 
-/// Configuration for Phantom transport
+/// Configuration for Phantom Protocol transport
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
     /// Enable post-quantum cryptography (default: true)
@@ -91,7 +91,7 @@ impl TransportConfig {
     }
 }
 
-/// Builder for establishing Phantom connections
+/// Builder for establishing Phantom Protocol connections
 pub struct PhantomBuilder {
     config: TransportConfig,
     server_key: Option<HybridVerifyingKey>,

@@ -1,6 +1,6 @@
 //! Test Harness — Network Condition Simulator
 //!
-//! Provides tools for testing Phantom transport under various network conditions:
+//! Provides tools for testing Phantom Protocol transport under various network conditions:
 //! - Enable/disable UDP transport
 //! - Add artificial latency
 //! - Simulate packet loss

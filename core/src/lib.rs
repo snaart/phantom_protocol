@@ -128,7 +128,7 @@ pub mod validation;
 #[cfg(feature = "std")]
 pub mod crypto;
 
-// Transport module (Universal Transport Core). The module itself has a
+// Transport module (Phantom Protocol transport). The module itself has a
 // no_std-clean subset (`session_transport`, `legs::embedded`). The rest of the
 // sub-modules opt into `std` from within `transport/mod.rs`.
 pub mod transport;
