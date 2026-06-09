@@ -1,6 +1,6 @@
-//! Phantom Transport Core - Types
+//! Phantom Protocol - Types
 //!
-//! Core types for the Phantom Universal Transport protocol:
+//! Core types for the Phantom Protocol:
 //! - SessionId (256-bit, salt for encryption)
 //! - StreamId, SequenceNumber
 //! - PacketHeader, PacketFlags

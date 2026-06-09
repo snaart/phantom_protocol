@@ -8,6 +8,14 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+### Changed
+
+- Documentation & branding cleanup: replaced lingering old-brand prose
+  ("Phantom Transport Core", "Phantom Universal Transport") and standalone
+  "Phantom" product references with the "Phantom Protocol" brand across the docs
+  and source-level doc-comments. Comments/prose only — no code, API, wire-format,
+  or crypto change.
+
 ## [0.1.1] - 2026-06-09
 
 ### Changed

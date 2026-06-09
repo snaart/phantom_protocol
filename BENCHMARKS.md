@@ -245,7 +245,7 @@ workloads. Bottleneck column flags what gives out first.
 | Game backend (60 Hz tick, 300 B)                   | ~10,000 players                 | game logic, not us   |
 | SYN-flood / handshake-DoS gate                     | ~1.7M ClientHellos/sec parsed   | CPU (parse + rep)    |
 
-Where Phantom is **never** the bottleneck in practice: bulk encryption.
+Where Phantom Protocol is **never** the bottleneck in practice: bulk encryption.
 A 100 Gbps NIC carries ~12.5 GB/s, well below the 38 GiB/s crypto
 ceiling on this hardware.
 

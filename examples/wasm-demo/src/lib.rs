@@ -45,7 +45,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
-/// Connect to a Phantom server over WebSocket, send a ping, and return the
+/// Connect to a Phantom Protocol server over WebSocket, send a ping, and return the
 /// echoed response as a JS string.
 ///
 /// # Arguments
@@ -77,7 +77,7 @@ pub async fn run_demo(url: &str, pinned_key_hex: &str) -> Result<JsValue, JsValu
         .map_err(|e| err(format!("WebSocketLeg::connect: {e:?}")))?;
     log("[phantom] WebSocket open");
 
-    // 3. Wrap the WasmRuntime and start the Phantom session (background
+    // 3. Wrap the WasmRuntime and start the Phantom Protocol session (background
     //    handshake + data pump spawned via wasm_bindgen_futures::spawn_local).
     let runtime: Arc<dyn phantom_protocol::runtime::Runtime> = Arc::new(WasmRuntime);
     let session =

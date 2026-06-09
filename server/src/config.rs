@@ -16,7 +16,7 @@ use std::path::PathBuf;
     about = "Phantom Protocol reference server"
 )]
 pub struct Config {
-    /// Bind address for the Phantom transport (TCP).
+    /// Bind address for the Phantom Protocol transport (TCP).
     #[arg(long, env = "PHANTOM_BIND", default_value = "0.0.0.0:4242")]
     pub bind: SocketAddr,
 

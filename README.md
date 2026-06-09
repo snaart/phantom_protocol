@@ -193,7 +193,7 @@ security invariants are catalogued in
   Path 0 pre-validated; secondary paths transition `Unvalidated → Validating →
   Validated`. The recv pump auto-echoes responses.
 - **FakeTLS leg.** Anti-DPI obfuscation only — per-direction blake3-derived keys,
-  per-record counter nonces. The inner Phantom session provides real authenticated
+  per-record counter nonces. The inner Phantom Protocol session provides real authenticated
   confidentiality.
 
 ## Performance

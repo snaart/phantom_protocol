@@ -392,7 +392,7 @@ impl AcceptOutcome {
     }
 }
 
-/// Drive the server side of the Phantom hybrid PQC handshake on a freshly
+/// Drive the server side of the Phantom Protocol hybrid PQC handshake on a freshly
 /// accepted transport, handling the optional cookie / PoW retry round.
 ///
 /// Returns the established `Session` plus any decrypted 0-RTT early-data

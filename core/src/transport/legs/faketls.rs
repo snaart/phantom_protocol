@@ -58,14 +58,14 @@ pub enum FakeTlsState {
     ClientHelloDone = 1,
     /// Handshake completed, ready for Application Data (2)
     ServerHelloDone = 2,
-    /// Ready for Phantom packets wrapped in ApplicationData (3)
+    /// Ready for Phantom Protocol packets wrapped in ApplicationData (3)
     ApplicationData = 3,
 }
 
 /// FakeTLS transport leg
 ///
 /// AEAD note: This is an *outer* DPI-obfuscation layer. Real confidentiality
-/// and authentication come from the inner Phantom session (see
+/// and authentication come from the inner Phantom Protocol session (see
 /// `crate::transport::session::Session`). The outer AEAD key is derived
 /// deterministically from a public seed (SNI + version) so both peers reach
 /// the same key without a Diffie-Hellman exchange; nonce uniqueness per record
@@ -104,7 +104,7 @@ pub struct FakeTlsLeg {
 ///
 /// Because the seed is public this layer provides no real confidentiality — it
 /// exists solely to produce pseudo-random ciphertext that defeats DPI
-/// fingerprinting. The inner Phantom session provides actual auth/conf.
+/// fingerprinting. The inner Phantom Protocol session provides actual auth/conf.
 fn derive_outer_keys(
     sni: &str,
     version: u16,
@@ -117,7 +117,7 @@ fn derive_outer_keys(
 
     // `crypto::kdf::derive_key_32` dispatches to `blake3::derive_key`
     // by default and HKDF-SHA256 under `--features fips`. FakeTLS is
-    // anti-DPI obfuscation only (the inner Phantom session provides the
+    // anti-DPI obfuscation only (the inner Phantom Protocol session provides the
     // real confidentiality + auth), but consistency with the rest of
     // the codebase under fips removes a non-approved primitive from the
     // FIPS surface.

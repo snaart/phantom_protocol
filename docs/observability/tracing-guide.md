@@ -1,6 +1,6 @@
 # Tracing Guide
 
-This document inventories the OpenTelemetry / `tracing` spans that Phantom
+This document inventories the OpenTelemetry / `tracing` spans that Phantom Protocol
 Core emits, the attributes they carry, and how to wire the
 `tracing-opentelemetry` bridge in an embedder.
 

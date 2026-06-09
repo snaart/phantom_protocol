@@ -1,7 +1,7 @@
 # Phantom Protocol — Browser WASM Demo
 
 A minimal browser demo that runs a full post-quantum Phantom Protocol handshake
-over WebSocket, entirely inside a browser tab. It connects to a Phantom server,
+over WebSocket, entirely inside a browser tab. It connects to a Phantom Protocol server,
 sends a `"ping from wasm"` message, and logs the echoed response to the console.
 
 ## What this demo does
@@ -51,7 +51,7 @@ python3 -m http.server 8000
 
 Open `http://localhost:8000` in your browser and watch the console.
 
-## Pointing at a real Phantom server
+## Pointing at a real Phantom Protocol server
 
 Edit the two constants at the top of the `<script>` block in `index.html`:
 
@@ -73,7 +73,7 @@ println!("{hex_key}");
 ```
 
 The server must handle WebSocket upgrade at the path you specify and run a
-Phantom handshake — this is out of scope for the demo itself.
+Phantom Protocol handshake — this is out of scope for the demo itself.
 
 ## Caveats
 

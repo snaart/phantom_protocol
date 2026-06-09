@@ -11,7 +11,7 @@
 //!    and refuse to boot if any primitive fails.
 //! 5. Load-or-create the long-lived [`HybridSigningKey`].
 //! 6. Log the verifying-key hex (operator captures this for client pinning).
-//! 7. Bind the Phantom listener.
+//! 7. Bind the Phantom Protocol listener.
 //! 8. Install SIGTERM / SIGINT handlers.
 //! 9. Run the accept loop until shutdown is signaled.
 //! 10. On shutdown: stop accepting, give in-flight tasks a short drain
