@@ -142,7 +142,7 @@ above, scaled by ~16× and amortising fixed overhead.
 
 The encryption/decryption benchmarks use WIRE_VERSION=2 pinned format
 (`encrypt_packet` / `decrypt_packet`) with nonces derived from
-authenticated header fields. Historical versions (pre-0.3.0) used V1
+authenticated header fields. Earlier internal builds used the V1 wire
 format with internal counter-derived nonces, which could desync under
 back-to-back iterations; the current format avoids this. Re-using a fixed `PacketHeader` across
 iterations made the V1 throughput bench desync the counter on the

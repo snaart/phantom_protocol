@@ -21,7 +21,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "phantom-protocol"
-version = "0.1.0"
+version = "0.1.1"
 description = "Phantom Protocol — post-quantum-secure L4/L6 transport (Python binding)"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
