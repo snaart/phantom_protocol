@@ -575,7 +575,7 @@ runtime test would be strictly weaker than this static guarantee.
 
 ## 11. Breaking Changes & Migration
 
-`CHANGELOG.md` — Unreleased (0.3.0):
+`CHANGELOG.md` — Unreleased (0.1.1):
 
 ```
 ### Breaking
