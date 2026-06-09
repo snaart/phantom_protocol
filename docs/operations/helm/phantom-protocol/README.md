@@ -1,7 +1,7 @@
-# phantom-core Helm chart
+# phantom-protocol Helm chart
 
-Helm 3 chart for deploying a **Phantom Core** server binary on Kubernetes.
-Phantom Core is a post-quantum-secure L4/L6 transport library (X25519 + ML-KEM-768,
+Helm 3 chart for deploying a **Phantom Protocol** server binary on Kubernetes.
+Phantom Protocol is a post-quantum-secure L4/L6 transport library (X25519 + ML-KEM-768,
 Ed25519 + ML-DSA-65); this chart deploys the server-side wrapper binary that calls
 `PhantomListener::bind` / `accept`.
 
@@ -16,7 +16,7 @@ Prometheus chain — the pods expose no scrape port), and NetworkPolicy.
 
 - Kubernetes 1.24+ (uses `policy/v1` PDB, `autoscaling/v2` HPA)
 - Helm 3.10+
-- A container image built from your Phantom Core server binary
+- A container image built from your Phantom Protocol server binary
 - The `HybridSigningKey` pre-provisioned as a Kubernetes Secret (see below)
 
 ---
@@ -25,13 +25,13 @@ Prometheus chain — the pods expose no scrape port), and NetworkPolicy.
 
 ```bash
 # Minimal install pointing at an existing signing-key Secret
-helm install phantom-core ./docs/operations/helm/phantom-core \
+helm install phantom-protocol ./docs/operations/helm/phantom-protocol \
   --namespace phantom \
   --create-namespace \
   --set signingKey.existingSecret=phantom-signing-key
 
 # Override image and replica count
-helm install phantom-core ./docs/operations/helm/phantom-core \
+helm install phantom-protocol ./docs/operations/helm/phantom-protocol \
   --namespace phantom \
   --create-namespace \
   --set image.repository=myregistry.io/phantom-server \
@@ -43,7 +43,7 @@ helm install phantom-core ./docs/operations/helm/phantom-core \
 ## Upgrade
 
 ```bash
-helm upgrade phantom-core ./docs/operations/helm/phantom-core \
+helm upgrade phantom-protocol ./docs/operations/helm/phantom-protocol \
   --namespace phantom \
   --set signingKey.existingSecret=phantom-signing-key
 ```
@@ -51,7 +51,7 @@ helm upgrade phantom-core ./docs/operations/helm/phantom-core \
 ## Uninstall
 
 ```bash
-helm uninstall phantom-core --namespace phantom
+helm uninstall phantom-protocol --namespace phantom
 ```
 
 Note: if `signingKey.createSecret=true` was used, the chart sets

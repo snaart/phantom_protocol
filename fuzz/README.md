@@ -1,4 +1,4 @@
-# Phantom Core fuzz harnesses
+# Phantom Protocol fuzz harnesses
 
 Continuous fuzzing scaffolding using
 [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html) (which
@@ -55,7 +55,7 @@ This runs for 60 seconds. Failures (panics, ASan/UBSan reports) land in
 Fuzzing is exercised in CI on Linux (`ubuntu-latest`), where both the ASan
 runtime and the `cdylib` link work. On Apple Silicon (`aarch64-apple-darwin`)
 local fuzzing is awkward: the ASan runtime is not shipped (so you must pass
-`-s none`), and `phantom_core`'s `cdylib` artifact fails to link under the fuzz
+`-s none`), and `phantom_protocol`'s `cdylib` artifact fails to link under the fuzz
 profile. To fuzz locally on macOS, temporarily drop `"cdylib"` from
 `core/Cargo.toml`'s `crate-type` (leaving `["lib"]`) and run with `-s none`:
 

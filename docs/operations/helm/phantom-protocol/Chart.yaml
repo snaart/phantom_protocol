@@ -1,0 +1,19 @@
+apiVersion: v2
+name: phantom-protocol
+description: "Post-quantum-secure L4/L6 transport server (Phantom Protocol)"
+type: application
+version: 0.1.0
+# appVersion tracks core/Cargo.toml package.version
+appVersion: "0.3.0"
+home: https://github.com/phantom-protocol
+sources:
+  - https://github.com/phantom-protocol/phantom_protocol_rust
+keywords:
+  - phantom-protocol
+  - post-quantum
+  - transport
+  - pqc
+  - networking
+maintainers:
+  - name: Phantom Protocol Maintainers
+    email: ceo@snaart.com

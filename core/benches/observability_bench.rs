@@ -1,4 +1,4 @@
-//! Hot-path overhead microbench for `phantom_core::observability`.
+//! Hot-path overhead microbench for `phantom_protocol::observability`.
 //!
 //! Measures the cost of the recording functions that get called per packet
 //! on the data path:
@@ -17,8 +17,8 @@
 //! Run: `cargo bench --bench observability_bench`.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use phantom_core::observability::{Observability, ObservabilityConfig};
-use phantom_core::transport::types::LegType;
+use phantom_protocol::observability::{Observability, ObservabilityConfig};
+use phantom_protocol::transport::types::LegType;
 use std::sync::Arc;
 
 fn bench_record_send(c: &mut Criterion) {

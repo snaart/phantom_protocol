@@ -1,11 +1,11 @@
 # Deployment overview
 
-Index of Phantom Core deployment surfaces, with pointers to the
+Index of Phantom Protocol deployment surfaces, with pointers to the
 detailed guide for each.
 
 ## Server-side
 
-Phantom Core ships as a Rust library; you deploy a thin wrapper binary
+Phantom Protocol ships as a Rust library; you deploy a thin wrapper binary
 that calls `PhantomListener::bind` / `accept`. The wrapper is what gets
 containerized, packaged, or daemonized.
 
@@ -18,7 +18,7 @@ containerized, packaged, or daemonized.
 
 ## Client-side
 
-Clients link `phantom_core` directly (Rust) or through the UniFFI-
+Clients link `phantom_protocol` directly (Rust) or through the UniFFI-
 generated bindings (Python today; Swift / Kotlin / C are
 Phase 3.9 work).
 
@@ -34,7 +34,7 @@ Phase 3.9 work).
 
 ## Configuration
 
-Phantom Core has no config file or environment-variable surface
+Phantom Protocol has no config file or environment-variable surface
 itself. Configuration crosses the API boundary via constructor
 parameters. Wrapper binaries typically front the SDK with their own
 config — see the examples under `core/examples/`.
@@ -131,7 +131,7 @@ the cap and its log) and rate-limit at the edge instead.
 
 ## Monitoring
 
-Phantom Core emits OpenTelemetry metrics + traces; the library opens **no**
+Phantom Protocol emits OpenTelemetry metrics + traces; the library opens **no**
 inbound port and serves no `/metrics` endpoint. The reference server
 (`phantom-server`, built with the `telemetry-otel` feature) installs an
 OTLP/gRPC exporter and **pushes** to an OpenTelemetry Collector. Point it at the

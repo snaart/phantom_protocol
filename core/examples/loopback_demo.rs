@@ -21,8 +21,8 @@
 //!   per-direction keys derived from the shared secret; the wire bytes do
 //!   not contain the plaintext.
 
-use phantom_core::api::{PhantomListener, PhantomSession, TcpSessionTransport};
-use phantom_core::crypto::hybrid_sign::HybridVerifyingKey;
+use phantom_protocol::api::{PhantomListener, PhantomSession, TcpSessionTransport};
+use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
 use std::time::Duration;
 use tokio::net::TcpStream;
 

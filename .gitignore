@@ -9,7 +9,7 @@ Cargo.lock
 .idea
 output.md
 test_output.txt
-tests/bindings/libphantom_core.dylib
+tests/bindings/libphantom_protocol.dylib
 .claude
 # Security
 *.crt

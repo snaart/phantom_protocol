@@ -1,12 +1,12 @@
 [package]
-name = "phantom_core"
-version = "0.3.0"
+name = "phantom-protocol"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Phantom Universal Transport Core SDK — post-quantum secure L4/L6 network framework"
 license = "Apache-2.0"
 repository = "https://github.com/snaart/phantom_protocol"
-documentation = "https://docs.rs/phantom_core"
+documentation = "https://docs.rs/phantom-protocol"
 keywords = ["post-quantum", "transport", "cryptography", "networking", "ml-kem"]
 categories = ["network-programming", "cryptography", "no-std"]
 
@@ -373,5 +373,5 @@ required-features = ["embedded"]
 # from `cargo check`). Keep this comment as a reminder for future maintainers.
 
 [lib]
-name = "phantom_core"
+name = "phantom_protocol"
 crate-type = ["lib", "cdylib"]

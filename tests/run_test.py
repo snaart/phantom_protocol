@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback smoke test for the phantom_core Python (UniFFI) binding.
+"""Loopback smoke test for the phantom_protocol Python (UniFFI) binding.
 
 Binds an in-process ``PhantomListener`` on an OS-chosen loopback port,
 then runs two phases:
@@ -19,8 +19,8 @@ Run::
 
     python3 tests/run_test.py
 
-The phantom_core native library must be loadable: copy or symlink
-``libphantom_core.{so,dylib}`` next to ``tests/bindings/phantom_core.py``
+The phantom_protocol native library must be loadable: copy or symlink
+``libphantom_protocol.{so,dylib}`` next to ``tests/bindings/phantom_protocol.py``
 first (CI's ``bindings`` workflow does this automatically).
 """
 
@@ -33,10 +33,10 @@ sys.path.insert(
 )
 
 try:
-    import phantom_core
+    import phantom_protocol
 except ImportError as exc:  # pragma: no cover - import-environment failure
-    print(f"FAIL: cannot import phantom_core: {exc}")
-    print("Ensure phantom_core.py and libphantom_core.{so,dylib} are in tests/bindings/")
+    print(f"FAIL: cannot import phantom_protocol: {exc}")
+    print("Ensure phantom_protocol.py and libphantom_protocol.{so,dylib} are in tests/bindings/")
     sys.exit(1)
 
 PAYLOAD = b"hello phantom core"
@@ -60,7 +60,7 @@ async def _poll_hint(session, deadline_s: float = 5.0):
 
 async def main() -> int:
     # 1. Bind a loopback listener on an OS-chosen port.
-    listener = await phantom_core.PhantomListener.bind("127.0.0.1:0")
+    listener = await phantom_protocol.PhantomListener.bind("127.0.0.1:0")
     addr = listener.local_addr()
     host, _, port_str = addr.rpartition(":")
     port = int(port_str)
@@ -81,7 +81,7 @@ async def main() -> int:
     server = asyncio.create_task(serve())
 
     # 3. Phase 1: plain pinned connect — round-trip + harvest the hint.
-    s1 = await phantom_core.connect_pinned(host, port, pinned_key)
+    s1 = await phantom_protocol.connect_pinned(host, port, pinned_key)
     await s1.send(PAYLOAD)
     reply1 = await asyncio.wait_for(s1.recv(), timeout=10.0)
     if reply1 != PAYLOAD:
@@ -102,7 +102,7 @@ async def main() -> int:
     print("OK: phase-1 pinned round-trip + resumption hint")
 
     # 4. Phase 2: 0-RTT resumption — connect_pinned_with_resumption + early-data.
-    s2 = await phantom_core.connect_pinned_with_resumption(
+    s2 = await phantom_protocol.connect_pinned_with_resumption(
         host, port, pinned_key, hint, EARLY_DATA
     )
     await s2.send(PAYLOAD)

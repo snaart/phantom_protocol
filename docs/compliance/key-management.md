@@ -1,7 +1,7 @@
 # Key Management
 
 Documents the lifecycle (generation → use → rotation → destruction) of every
-keyed cryptographic object that Phantom Core touches.
+keyed cryptographic object that Phantom Protocol touches.
 
 This is the **module** view, not the SDK-consumer view. Consumers are
 responsible for ferrying long-term keys (`HybridSigningKey`) between
@@ -169,7 +169,7 @@ type exists but is not exchanged on the wire.
 
 ## Storage at rest
 
-Phantom Core itself **does not persist any key material**. All key bytes
+Phantom Protocol itself **does not persist any key material**. All key bytes
 exist only in process memory. SDK consumers integrating Phantom into
 larger systems are responsible for any disk / keystore persistence and for
 applying the appropriate platform key-store APIs (iOS Keychain, Android

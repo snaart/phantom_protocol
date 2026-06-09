@@ -1,6 +1,6 @@
 # phantom-cli
 
-Admin CLI for the Phantom Core post-quantum transport SDK.
+Admin CLI for the Phantom Protocol post-quantum transport SDK.
 
 ## Build
 
@@ -66,7 +66,7 @@ the round-trip time plus the reply bytes as hex.
 ```bash
 phantom-cli version
 # phantom-cli 0.3.0
-# phantom_core features: compression-zstd, std (phantom_core defaults)
+# phantom_protocol features: compression-zstd, std (phantom_protocol defaults)
 # target: aarch64-apple-darwin
 ```
 
@@ -80,7 +80,7 @@ phantom-cli version
   handshake does not carry a valid signature from the pinned verifying key.
   This prevents MITM even against classical and quantum adversaries.
 - The signing-key serialisation format (`ed25519_seed || ml_dsa_seed`, 64
-  bytes) is stable across Phantom Core 0.x.
+  bytes) is stable across Phantom Protocol 0.x.
 
 ## Further reading
 

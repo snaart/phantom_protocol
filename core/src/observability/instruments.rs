@@ -160,7 +160,7 @@ mod otel_on {
 
     impl PhantomInstruments {
         pub(crate) fn new(config: &ObservabilityConfig) -> Self {
-            let meter = opentelemetry::global::meter("phantom_core");
+            let meter = opentelemetry::global::meter("phantom_protocol");
             let ns = config.namespace.as_ref();
 
             // Counters

@@ -9,7 +9,7 @@
 //! # Quick Start
 //!
 //! ```rust,ignore
-//! use phantom_core::transport::api::*;
+//! use phantom_protocol::transport::api::*;
 //!
 //! // Server
 //! let server = PhantomListener::bind("0.0.0.0:8080").await?;

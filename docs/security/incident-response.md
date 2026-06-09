@@ -151,12 +151,12 @@ real production usage, no anonymous accounts).
 
 ## 6. CVE / GHSA filing
 
-Phantom Core uses **GitHub Security Advisories** (GHSA) as the primary
+Phantom Protocol uses **GitHub Security Advisories** (GHSA) as the primary
 identifier and requests CVE assignment through GitHub's CNA.
 
 GHSA fields:
 
-- **Title**: `Phantom Core <vN.N.N>: <one-line description>`
+- **Title**: `Phantom Protocol <vN.N.N>: <one-line description>`
 - **Affected versions**: pinned by `Cargo.toml`'s `[package].version`
   range syntax.
 - **CWE**: pick the closest from the OWASP / MITRE catalog.
@@ -187,7 +187,7 @@ post-mortem required.
 
 (Maintainer roster — update when the project changes hands.)
 
-- Primary contact: `security@phantom-core.invalid` (PGP-signed mail
+- Primary contact: `security@phantom-protocol.invalid` (PGP-signed mail
   preferred; key fingerprint in `SECURITY.md`).
 - Backup contact: ditto.
 - Out-of-band escalation: see organisation directory.
@@ -199,7 +199,7 @@ valid for verification for 12 months after rotation.
 
 ## 9. Tools and references
 
-- GHSA filing: https://github.com/<org>/phantom-core/security/advisories/new
+- GHSA filing: https://github.com/<org>/phantom-protocol/security/advisories/new
 - CVE search: https://nvd.nist.gov/vuln/search
 - CVSS 4.0 calculator: https://www.first.org/cvss/calculator/4-0
 - Fuzz harness: `fuzz/` (Phase 6.4) — reproduce known crashing inputs.

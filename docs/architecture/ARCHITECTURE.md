@@ -1,4 +1,4 @@
-# Phantom Core Architecture
+# Phantom Protocol Architecture
 
 Companion to `PROTOCOL.md` (wire format) and `SECURITY.md` (invariants).
 This document covers the **internal** structure: modules, data flow,

@@ -1,7 +1,7 @@
 /*
  * consumer_smoke.c — CI smoke test for the hand-curated C FFI header.
  *
- * Proves that phantom_core.h compiles as C, that libphantom_core links,
+ * Proves that phantom_protocol.h compiles as C, that libphantom_protocol links,
  * that the UniFFI contract version matches what the header documents, and
  * that one sync call path crosses the ABI cleanly:
  *
@@ -14,7 +14,7 @@
  * the Swift / Kotlin loopback harnesses.
  *
  * Build (see c/README.md):
- *   cc -I tests/bindings/c -L target/release -lphantom_core \
+ *   cc -I tests/bindings/c -L target/release -lphantom_protocol \
  *      tests/bindings/c/consumer_smoke.c -o consumer_smoke
  */
 
@@ -22,12 +22,12 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "phantom_core.h"
+#include "phantom_protocol.h"
 
 int main(void) {
     /* The dylib's contract version must match what the header documents;
      * a mismatch means the header is stale against the linked dylib. */
-    uint32_t contract = ffi_phantom_core_uniffi_contract_version();
+    uint32_t contract = ffi_phantom_protocol_uniffi_contract_version();
     if (contract != PHANTOM_UNIFFI_CONTRACT_VERSION) {
         fprintf(stderr, "FAIL: dylib UniFFI contract version %u, header "
                         "PHANTOM_UNIFFI_CONTRACT_VERSION is %u\n",
@@ -44,7 +44,7 @@ int main(void) {
         .data = (uint8_t *)addr,
     };
     PhantomRustBuffer addr_buf =
-        ffi_phantom_core_rustbuffer_from_bytes(addr_bytes, &status);
+        ffi_phantom_protocol_rustbuffer_from_bytes(addr_bytes, &status);
     if (status.code != 0) {
         fprintf(stderr, "FAIL: rustbuffer_from_bytes status=%d\n", status.code);
         return 1;
@@ -52,7 +52,7 @@ int main(void) {
 
     /* Sync placeholder constructor — consumes addr_buf, returns the handle. */
     void *session =
-        uniffi_phantom_core_fn_constructor_phantomsession_connect(addr_buf, &status);
+        uniffi_phantom_protocol_fn_constructor_phantomsession_connect(addr_buf, &status);
     if (status.code != 0 || session == NULL) {
         fprintf(stderr, "FAIL: phantomsession_connect status=%d\n", status.code);
         return 1;
@@ -61,15 +61,15 @@ int main(void) {
     /* Sync accessor — connection_state() lowers a ConnectionState enum
      * into an owned RustBuffer that the caller must free. */
     PhantomRustBuffer state =
-        uniffi_phantom_core_fn_method_phantomsession_connection_state(session, &status);
+        uniffi_phantom_protocol_fn_method_phantomsession_connection_state(session, &status);
     if (status.code != 0) {
         fprintf(stderr, "FAIL: connection_state status=%d\n", status.code);
         return 1;
     }
-    ffi_phantom_core_rustbuffer_free(state, &status);
+    ffi_phantom_protocol_rustbuffer_free(state, &status);
 
     /* Drop the Arc<PhantomSession>. */
-    uniffi_phantom_core_fn_free_phantomsession(session, &status);
+    uniffi_phantom_protocol_fn_free_phantomsession(session, &status);
     if (status.code != 0) {
         fprintf(stderr, "FAIL: free_phantomsession status=%d\n", status.code);
         return 1;
