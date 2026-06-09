@@ -35,9 +35,6 @@ Sites that pull cryptographic entropy:
 | `transport/handshake.rs:144` | 32 bytes | Server master secret (HMAC base for cookie + PoW bucket secrets) | `getrandom::getrandom`, propagates error |
 | `transport/handshake.rs:437` | 32 bytes | Client handshake nonce | `getrandom::getrandom`, propagates error |
 | `transport/path.rs:225` | 32 bytes | Multi-path validation challenge | `rand::random` (thread CSPRNG) — `getrandom`-failure fallback documented inline |
-| `transport/legs/faketls.rs:320` | 32 bytes | FakeTLS ClientHello random | `getrandom::getrandom`, falls back to `thread_rng` |
-| `transport/legs/faketls.rs:356` | ECDHE keypair | TLS 1.3 ECDHE key share | `OsRng` |
-| `transport/legs/faketls.rs:377-386` | 32 + 32 bytes | TLS ServerHello random + session ID | `getrandom::getrandom`, falls back to `thread_rng` |
 
 Sites that pull **non-cryptographic** entropy (test/jitter only):
 

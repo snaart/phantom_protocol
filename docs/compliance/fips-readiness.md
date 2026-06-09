@@ -75,7 +75,7 @@ Mechanics, by item:
 - `crypto::kdf::derive_key_32(label, ikm)` — cfg-dispatched helper:
   `blake3::derive_key` by default, `HKDF-SHA256.expand(label_bytes)`
   under fips. Adopted by `crypto::adaptive_crypto`,
-  `crypto::aes_session`, and `transport::legs::faketls`. (A5.)
+  `crypto::aes_session`. (A5.)
 - `crypto::rng::OsRng`'s `RngProvider` impl is cfg-split:
   `getrandom` default, `aws_lc_rs::rand::SystemRandom` under fips
   (CTR_DRBG SP 800-90A § 10.2.1 inside the FIPS module). (A6.)

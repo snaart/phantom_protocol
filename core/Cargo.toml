@@ -78,7 +78,6 @@ std = [
     # Native (non-wasm32) optional deps; activating these on a wasm32 target
     # is a no-op because the deps themselves are gated by the
     # `[target.'cfg(not(target_arch = "wasm32"))']` table.
-    "dep:kcp-tokio",
     "dep:socket2",
     "bytes/std",
     "serde/std",
@@ -255,7 +254,6 @@ uniffi = { version = "0.31", features = ["build"] }
 tokio = { version = "1.36", optional = true, features = [
     "net", "rt-multi-thread", "signal", "process", "fs", "io-std",
 ] }
-kcp-tokio = { version = "0.6", optional = true }
 # socket2 gives portable access to SO_REUSEPORT (Phase 2.9 — Linux
 # multi-accept). Already in the transitive tree via tokio so this is
 # free from a build-size standpoint.
