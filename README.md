@@ -46,12 +46,13 @@ or `cargo add phantom-protocol`. API docs: <https://docs.rs/phantom-protocol>.
   unknown / expired or the blob fails to open.
 - **Mid-session rekey** — HKDF ratchet, `REKEY` flag + per-packet `epoch`.
 - **Transports** — `PhantomSession` runs an authenticated session over **TCP**
-  and **WebSocket** today (plus WASI and Embedded as framing legs). The
-  KCP-over-UDP and FakeTLS-over-TCP legs, and the multipath scheduler
-  (constant-time path validation, per-path RTT/loss tracking, round-robin /
-  low-latency selection), are implemented as `TransportLeg`s but **not yet wired
-  to the session data plane** — experimental, out of 1.0 scope (see
-  [Status & limitations](#status--limitations)).
+  and **WebSocket** today (plus WASI and Embedded as framing legs). A native
+  reliable-UDP transport (**PhantomUDP**) is in development to add multi-path,
+  congestion control, and connection migration with no extra crypto layer (see
+  [Status & limitations](#status--limitations)). The earlier experimental
+  KCP / FakeTLS legs and the unused `TransportLeg` multipath trait were removed
+  pending that work; FakeTLS-style HTTP traffic mimicry will return as a
+  dedicated mode.
 - **Multi-stream** — strict-priority scheduler, `WINDOW_UPDATE` per-stream
   flow control, BBRv2-inspired pacing (Startup / Drain / ProbeBW / ProbeRTT /
   FastRecovery).
@@ -84,7 +85,6 @@ Loopback integration tests are `#[ignore]`-gated:
 
 ```bash
 cargo test --manifest-path core/Cargo.toml --test tcp_integration -- --ignored
-cargo test --manifest-path core/Cargo.toml --test kcp_integration -- --ignored
 ```
 
 More commands (benches, fuzz, miri, cross-targets, embedded) are in
@@ -407,12 +407,13 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   once 1.0 ships. The current wire protocol is a single pinned version — the
   former V1/V2/V3 axes were collapsed pre-1.0 (no users, no negotiation, no
   fallback), so there are no cross-version migration guides.
-- **KCP / FakeTLS / multipath are experimental.** `PhantomSession` runs an
-  authenticated session over TCP and WebSocket (and WASI / Embedded as framing
-  legs). The `KcpLeg` / `FakeTlsLeg` and the multipath `Scheduler` are
-  implemented as `TransportLeg`s but are **not yet wired into the session data
-  plane** — there is no `TransportLeg → SessionTransport` adapter and the pump
-  uses a single fixed transport. Treat them as out of 1.0 scope.
+- **Native UDP transport (PhantomUDP) is in development.** `PhantomSession`
+  runs an authenticated session over TCP and WebSocket today (and WASI /
+  Embedded as framing legs). The earlier experimental KCP / FakeTLS legs and the
+  unused `TransportLeg` multipath trait were removed — they were never wired into
+  the session data plane — and a native reliable-UDP transport with multi-path,
+  congestion control, and connection migration is being built to replace them.
+  FakeTLS-style HTTP traffic mimicry will return as a dedicated transport mode.
 - **Mobile connection migration (Wi-Fi ↔ LTE) is not yet supported.** The
   path-validation primitives are internal-only; on a network change, reconnect
   (use 0-RTT resumption via `connect_pinned_with_resumption` to minimise cost).

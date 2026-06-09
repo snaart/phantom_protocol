@@ -35,7 +35,7 @@ Outside the boundary:
 
 - The host OS and TCP/UDP networking stack.
 - The transport-leg implementations that handle non-crypto framing
-  (`transport/legs/tcp.rs`, `kcp.rs`).
+  (`api/tcp_transport.rs`).
 - The runtime abstraction (`runtime/`) — Tokio, WASM, embedded.
 - Application code linking the SDK.
 

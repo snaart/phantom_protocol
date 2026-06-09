@@ -277,8 +277,7 @@ jobs:
       #   - TCP: server-key pinning (positive + negative) and on-the-wire AES-GCM
       #     (the test sniffs raw bytes and asserts plaintext never appears),
       #     plus a 0-RTT resumption round-trip.
-      #   - KCP-over-UDP: echo, length-prefix framing, concurrent streams.
-      # Both files are `#[ignore]`-gated so they stay out of the default
-      # `cargo test`; this dedicated job runs them with --ignored (mirroring the
-      # wasi_integration job). Each KCP test carries an in-test 20s deadlock guard.
-      - run: cargo test --manifest-path core/Cargo.toml --test tcp_integration --test kcp_integration -- --ignored
+      # The file is `#[ignore]`-gated so it stays out of the default
+      # `cargo test`; this dedicated job runs it with --ignored (mirroring the
+      # wasi_integration job).
+      - run: cargo test --manifest-path core/Cargo.toml --test tcp_integration -- --ignored
