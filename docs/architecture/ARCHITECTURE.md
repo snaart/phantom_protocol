@@ -22,7 +22,7 @@ concurrency, and ownership.
                   │  Session  CryptoState  PacketHeader           │     Rust-only API
                   │  HandshakeServer HandshakeClient              │
                   │  Stream  Scheduler  ReplayWindow              │
-                  │  legs/{tcp, kcp, faketls}                     │
+                  │  legs/{ws, wasi,embedded}                     │
                   └────────────────────┬──────────────────────────┘
                                        │
                                        ▼
@@ -122,7 +122,7 @@ handles both directions of data after the handshake derives the
 | `Stream` | Per-stream send/recv buffers, sequence counters, reliability machinery |
 | `Scheduler` | Multi-leg path selection (currently placeholder for future Phase 4.2 migration) |
 | `PacketHeader` / `PhantomPacket` | Wire types |
-| `legs/{tcp,kcp,faketls}` | `TransportLeg` trait impls |
+| `legs/{websocket,wasi,embedded}` | `SessionTransport` impls (browser / WASI / bare-metal) |
 | `BufferPool`, `Pacer`, `PacketCoalescer`, `BandwidthEstimator` | Performance infrastructure — most not yet wired in (Phase 2.1, 2.4, 2.5, 2.6) |
 
 ### Encryption boundary
@@ -240,7 +240,7 @@ allocator reuses the memory.
 
 ## 7. Wire framing
 
-For TCP-based legs (`TcpSessionTransport`, `legs/tcp.rs`), every
+For TCP-based legs (`TcpSessionTransport`), every
 `PhantomPacket` is wrapped in a 4-byte big-endian length prefix on the
 TCP byte stream:
 

@@ -8,6 +8,16 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+### Removed
+
+- **Removed the unwired `TransportLeg` multipath cluster** — `transport/legs/{kcp,tcp,faketls}.rs`,
+  the `TransportLeg` trait, and `transport/virtual_socket.rs` — plus the `kcp-tokio` dependency and
+  the `kcp_integration` test. These were never wired into the `PhantomSession` data plane (which
+  consumes `SessionTransport`, not `TransportLeg`) and are superseded by an in-development native
+  reliable-UDP transport (PhantomUDP). The `fragmentation` / `compression` / `device_profile`
+  building blocks are retained for integration into that work. FakeTLS-style HTTP traffic mimicry
+  will return as a dedicated transport mode. No change to the live data plane, wire format, or crypto.
+
 ### Changed
 
 - Documentation & branding cleanup: replaced lingering old-brand prose
