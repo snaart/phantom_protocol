@@ -1,7 +1,7 @@
 //! CAVP-style known-answer-tests for Phantom Protocol's FIPS-approved primitives.
 //!
 //! Each test pins one primitive against a published reference vector (or, for
-//! the PQ primitives exercised through Phantom's *hybrid* wrappers, a
+//! the PQ primitives exercised through Phantom Protocol's *hybrid* wrappers, a
 //! deterministic end-to-end round-trip). The intent is the same as a NIST CAVP
 //! submission: prove a regression in any of these primitives shows up as a hard
 //! red here.
@@ -34,13 +34,13 @@ use sha2::{Digest, Sha256};
 /// seeded `StdRng` (ChaCha-based CSPRNG, `CryptoRngCore`) through the standard
 /// `KemCore::generate` + `Encapsulate` + `Decapsulate` path and asserts the
 /// encap and decap sides recover the same shared secret — the FIPS 203
-/// correctness invariant — and exercises Phantom's hybrid combiner end-to-end.
+/// correctness invariant — and exercises Phantom Protocol's hybrid combiner end-to-end.
 ///
 /// The same primitive sits inside `HybridSecretKey` (the X25519 + ML-KEM-768
 /// hybrid that `crypto::hybrid_kem` builds the handshake on), and we also
 /// exercise that wrapper end-to-end via `HybridSecretKey::generate` /
 /// `HybridKeyPackage::encapsulate` / `HybridSecretKey::decapsulate` so a
-/// regression in either the raw ML-KEM call or Phantom's hybrid combiner
+/// regression in either the raw ML-KEM call or Phantom Protocol's hybrid combiner
 /// surfaces here.
 #[test]
 fn ml_kem_768_encap_decap_kat() {
@@ -67,7 +67,7 @@ fn ml_kem_768_encap_decap_kat() {
         "FIPS 203 ML-KEM-768 shared secret length is 32 bytes"
     );
 
-    // ── Phantom hybrid wiring ──────────────────────────────────────────
+    // ── Phantom Protocol hybrid wiring ──────────────────────────────────────────
     // The classical X25519 half is mixed in via HKDF-SHA256 with the
     // `HybridKEM_X25519_Kyber768` label (kept from V1 per `hybrid_kem.rs`).
     // Encap-side and decap-side must agree on the 32-byte hybrid secret.
@@ -90,7 +90,7 @@ fn ml_kem_768_encap_decap_kat() {
 /// mask vector `y`). We pin the verification invariant instead: a signature
 /// produced under a seed-derived key over a known message must verify, and
 /// flipping a single byte of the message must fail verification. We exercise
-/// both the raw `ml-dsa` API and Phantom's `HybridSigningKey` wrapper so a
+/// both the raw `ml-dsa` API and Phantom Protocol's `HybridSigningKey` wrapper so a
 /// regression in either lights up here.
 #[test]
 fn ml_dsa_65_sign_verify_kat() {
@@ -133,7 +133,7 @@ fn ml_dsa_65_sign_verify_kat() {
         "FIPS 204 ML-DSA-65: tampered message must NOT verify"
     );
 
-    // ── Phantom hybrid wiring (Ed25519 + ML-DSA-65) ────────────────────
+    // ── Phantom Protocol hybrid wiring (Ed25519 + ML-DSA-65) ────────────────────
     // `HybridSigningKey::from_bytes` reconstructs both halves from a 64-byte
     // seed (32 bytes ed25519 + 32 bytes ML-DSA), per `hybrid_sign.rs`.
     let hybrid_seed = [0x33u8; 64];
@@ -159,14 +159,14 @@ fn ml_dsa_65_sign_verify_kat() {
 ///
 /// We exercise `ring::aead::AES_256_GCM` directly here (rather than
 /// `phantom_protocol::crypto::adaptive_crypto::CryptoSession`) because the
-/// Phantom wrapper derives its 32-byte AEAD key from a `shared_secret`
+/// Phantom Protocol wrapper derives its 32-byte AEAD key from a `shared_secret`
 /// via `blake3::derive_key("phantom-aes-send-v1", ...)` and builds its
 /// 12-byte nonce from a blake3-derived 4-byte prefix plus a u64 counter
 /// — there is no public API surface that accepts a caller-supplied raw
 /// AES key and raw 12-byte nonce. The primitive under test
-/// (`AES_256_GCM`) is the same `ring` object Phantom passes to
+/// (`AES_256_GCM`) is the same `ring` object Phantom Protocol passes to
 /// `UnboundKey::new` (`adaptive_crypto.rs:188-191`), so a regression in
-/// Phantom's AEAD backend would surface here too.
+/// Phantom Protocol's AEAD backend would surface here too.
 #[test]
 fn aes_256_gcm_kat() {
     // Test Case 13 (McGrew & Viega, "GCM", §3.3).
@@ -228,7 +228,7 @@ fn aes_256_gcm_kat() {
 /// primitive — `Hkdf::<Sha256>::new(salt, ikm).expand(info, &mut out)`,
 /// see `kdf.rs:42-56`. We exercise the underlying `hkdf` crate directly
 /// here because the helper is constrained to fixed labels and output
-/// sizes; the dependency is the same one Phantom links against.
+/// sizes; the dependency is the same one Phantom Protocol links against.
 #[test]
 fn hkdf_sha256_rfc5869_a1() {
     const IKM: [u8; 22] = [0x0b; 22];
@@ -262,7 +262,7 @@ fn hkdf_sha256_rfc5869_a1() {
 ///     canonical zero-length-input digest, also referenced in NIST CAVS
 ///     `SHA256ShortMsg.rsp` at Len=0).
 ///
-/// SHA-256 is the hash inside Phantom's KDF (`hybrid_kem::combine_secrets`
+/// SHA-256 is the hash inside Phantom Protocol's KDF (`hybrid_kem::combine_secrets`
 /// and `kdf::derive_early_data_keying` both bind to `Hkdf::<Sha256>`), so a
 /// regression in the `sha2` crate would silently break every key derivation
 /// the handshake performs. Pinning both vectors here is cheap insurance.

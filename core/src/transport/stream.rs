@@ -1,4 +1,4 @@
-//! Phantom Transport - Stream Management
+//! Phantom Protocol - Stream Management
 //!
 //! Multiplexed streams within a session.
 //! Each stream has independent sequence numbers (no Head-of-Line blocking).

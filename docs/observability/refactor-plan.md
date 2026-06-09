@@ -489,8 +489,8 @@ impl TelemetryHandle {
 | `OTEL_RESOURCE_ATTRIBUTES` | OTel std | — | `service.namespace=prod,…` |
 | `OTEL_BSP_MAX_QUEUE_SIZE` | OTel std | `2048` | Lossy queue depth |
 | `OTEL_BSP_EXPORT_TIMEOUT` | OTel std | `5000` (ms) | Export timeout |
-| `PHANTOM_TELEMETRY_NAMESPACE` | Phantom | `phantom` | Instrument-name prefix |
-| `PHANTOM_TELEMETRY_DISABLED` | Phantom | `false` | Runtime kill-switch |
+| `PHANTOM_TELEMETRY_NAMESPACE` | Phantom Protocol | `phantom` | Instrument-name prefix |
+| `PHANTOM_TELEMETRY_DISABLED` | Phantom Protocol | `false` | Runtime kill-switch |
 
 ---
 

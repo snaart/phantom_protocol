@@ -1,4 +1,4 @@
-//! Phantom Transport - Fallback State Machine
+//! Phantom Protocol - Fallback State Machine
 //!
 //! Automatic transport mode degradation:
 //! Turbo (KCP) → Reliable (TCP) → Stealth (FakeTLS)

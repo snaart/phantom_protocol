@@ -126,7 +126,7 @@ net.ipv4.tcp_mtu_probing = 1
 
 Apply: `sudo sysctl --system`.
 
-Phantom uses `SO_REUSEPORT` on Linux (`PhantomListener::bind`,
+Phantom Protocol uses `SO_REUSEPORT` on Linux (`PhantomListener::bind`,
 Phase 2.9). Multiple service instances bound to the same `(addr, port)`
 load-balance incoming SYNs across themselves. Pair this with
 `Type=forking` or a `[Service]` `Slice=` template if you want one
