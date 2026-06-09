@@ -1,4 +1,4 @@
-//! Phantom Core observability subsystem.
+//! Phantom Protocol observability subsystem.
 //!
 //! Replaces the Phase 4.5 hand-rolled metrics module (`transport::metrics`).
 //! Lock-free hot-path atomics for per-packet recording plus opt-in

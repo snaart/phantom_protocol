@@ -1,10 +1,10 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "phantom-core.fullname" . }}
+  name: {{ include "phantom-protocol.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "phantom-core.labels" . | nindent 4 }}
+    {{- include "phantom-protocol.labels" . | nindent 4 }}
 spec:
   {{- if not .Values.autoscaling.enabled }}
   # When HPA is enabled, HPA controls replica count; omit here to avoid conflicts.
@@ -12,7 +12,7 @@ spec:
   {{- end }}
   selector:
     matchLabels:
-      {{- include "phantom-core.selectorLabels" . | nindent 6 }}
+      {{- include "phantom-protocol.selectorLabels" . | nindent 6 }}
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -24,7 +24,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "phantom-core.selectorLabels" . | nindent 8 }}
+        {{- include "phantom-protocol.selectorLabels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -37,7 +37,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "phantom-core.serviceAccountName" . }}
+      serviceAccountName: {{ include "phantom-protocol.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
       # fsGroup ensures the mounted signing-key Secret is readable by the container user.
       securityContext:
@@ -47,10 +47,10 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       containers:
         - name: {{ .Chart.Name }}
-          image: {{ include "phantom-core.image" . }}
+          image: {{ include "phantom-protocol.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
-            # Phantom Core opens only the transport port. Telemetry is PUSHED
+            # Phantom Protocol opens only the transport port. Telemetry is PUSHED
             # over OTLP/gRPC to a Collector — there is no inbound metrics port.
             - name: phantom
               containerPort: {{ .Values.service.port }}
@@ -118,7 +118,7 @@ spec:
       volumes:
         - name: signing-key
           secret:
-            secretName: {{ include "phantom-core.signingKeySecretName" . }}
+            secretName: {{ include "phantom-protocol.signingKeySecretName" . }}
             items:
               - key: {{ .Values.signingKey.existingSecretKey }}
                 path: {{ .Values.signingKey.fileName }}

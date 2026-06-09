@@ -10,11 +10,11 @@
 
 #![cfg(not(feature = "telemetry-otel"))]
 
-use phantom_core::observability::{
+use phantom_protocol::observability::{
     AeadAlgorithm, HandshakeOutcome, Observability, ObservabilityConfig, ProtocolVersion,
     ReplayReason,
 };
-use phantom_core::transport::types::LegType;
+use phantom_protocol::transport::types::LegType;
 use std::time::Duration;
 
 #[test]

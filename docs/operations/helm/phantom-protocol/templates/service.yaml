@@ -1,11 +1,11 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "phantom-core.fullname" . }}
+  name: {{ include "phantom-protocol.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "phantom-core.labels" . | nindent 4 }}
-  # Phantom Core exposes no inbound metrics port. It emits OpenTelemetry metrics
+    {{- include "phantom-protocol.labels" . | nindent 4 }}
+  # Phantom Protocol exposes no inbound metrics port. It emits OpenTelemetry metrics
   # and traces and PUSHES them over OTLP/gRPC to an OpenTelemetry Collector
   # (configure via OTEL_EXPORTER_OTLP_ENDPOINT). Do not add prometheus.io/scrape
   # annotations here — there is no /metrics endpoint to scrape. To land metrics in
@@ -15,7 +15,7 @@ metadata:
 spec:
   type: {{ .Values.service.type }}
   selector:
-    {{- include "phantom-core.selectorLabels" . | nindent 4 }}
+    {{- include "phantom-protocol.selectorLabels" . | nindent 4 }}
   ports:
     - name: phantom
       port: {{ .Values.service.port }}

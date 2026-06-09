@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent decoder for the Phantom Core wire vectors (Phase 6).
+"""Independent decoder for the Phantom Protocol wire vectors (Phase 6).
 
 A *second implementation* of the wire grammar — deliberately sharing no code
 with the Rust crate — that parses the byte-frozen fixtures under

@@ -6,7 +6,7 @@ mod pubkey;
 mod version;
 
 #[derive(Parser, Debug)]
-#[command(name = "phantom-cli", version, about = "Phantom Core admin CLI")]
+#[command(name = "phantom-cli", version, about = "Phantom Protocol admin CLI")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

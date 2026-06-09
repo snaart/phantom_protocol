@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Cross-compile libphantom_core.so for the three Android ABIs and stage them
+# Cross-compile libphantom_protocol.so for the three Android ABIs and stage them
 # under jniLibs/ for the Gradle module. Requires the Android NDK plus the
 # three Rust targets:
 #
@@ -27,8 +27,8 @@ for triple in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 done
 
 mkdir -p "${JNI_LIBS}/arm64-v8a" "${JNI_LIBS}/armeabi-v7a" "${JNI_LIBS}/x86_64"
-cp "${TARGET}/aarch64-linux-android/release/libphantom_core.so"   "${JNI_LIBS}/arm64-v8a/"
-cp "${TARGET}/armv7-linux-androideabi/release/libphantom_core.so" "${JNI_LIBS}/armeabi-v7a/"
-cp "${TARGET}/x86_64-linux-android/release/libphantom_core.so"    "${JNI_LIBS}/x86_64/"
+cp "${TARGET}/aarch64-linux-android/release/libphantom_protocol.so"   "${JNI_LIBS}/arm64-v8a/"
+cp "${TARGET}/armv7-linux-androideabi/release/libphantom_protocol.so" "${JNI_LIBS}/armeabi-v7a/"
+cp "${TARGET}/x86_64-linux-android/release/libphantom_protocol.so"    "${JNI_LIBS}/x86_64/"
 
 echo "==> jniLibs staged at ${JNI_LIBS}/"

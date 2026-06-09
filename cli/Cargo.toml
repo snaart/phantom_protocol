@@ -1,6 +1,6 @@
 [package]
 name = "phantom-cli"
-version = "0.3.0"
+version = "0.1.0"
 edition = "2024"
 
 [[bin]]
@@ -8,7 +8,7 @@ name = "phantom-cli"
 path = "src/main.rs"
 
 [dependencies]
-phantom_core = { path = "../core" }
+phantom-protocol = { path = "../core" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 hex = "0.4"

@@ -7,8 +7,8 @@ import Foundation
 // Depending on the consumer's build setup, the low-level FFI code
 // might be in a separate module, or it might be compiled inline into
 // this module. This is a bit of light hackery to work with both.
-#if canImport(phantom_coreFFI)
-import phantom_coreFFI
+#if canImport(phantom_protocolFFI)
+import phantom_protocolFFI
 #endif
 
 fileprivate extension RustBuffer {
@@ -25,13 +25,13 @@ fileprivate extension RustBuffer {
     }
 
     static func from(_ ptr: UnsafeBufferPointer<UInt8>) -> RustBuffer {
-        try! rustCall { ffi_phantom_core_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
+        try! rustCall { ffi_phantom_protocol_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
     }
 
     // Frees the buffer in place.
     // The buffer must not be used after this is called.
     func deallocate() {
-        try! rustCall { ffi_phantom_core_rustbuffer_free(self, $0) }
+        try! rustCall { ffi_phantom_protocol_rustbuffer_free(self, $0) }
     }
 }
 
@@ -281,7 +281,7 @@ private func makeRustCall<T, E: Swift.Error>(
     _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
     errorHandler: ((RustBuffer) throws -> E)?
 ) throws -> T {
-    uniffiEnsurePhantomCoreInitialized()
+    uniffiEnsurePhantomProtocolInitialized()
     var callStatus = RustCallStatus.init()
     let returnedVal = callback(&callStatus)
     try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
@@ -672,7 +672,7 @@ open class AcceptOutcome: AcceptOutcomeProtocol, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_phantom_core_fn_clone_acceptoutcome(self.handle, $0) }
+        return try! rustCall { uniffi_phantom_protocol_fn_clone_acceptoutcome(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -682,7 +682,7 @@ open class AcceptOutcome: AcceptOutcomeProtocol, @unchecked Sendable {
             return
         }
 
-        try! rustCall { uniffi_phantom_core_fn_free_acceptoutcome(handle, $0) }
+        try! rustCall { uniffi_phantom_protocol_fn_free_acceptoutcome(handle, $0) }
     }
 
     
@@ -693,7 +693,7 @@ open class AcceptOutcome: AcceptOutcomeProtocol, @unchecked Sendable {
      */
 open func hasEarlyData() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_acceptoutcome_has_early_data(
+    uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -704,7 +704,7 @@ open func hasEarlyData() -> Bool  {
      */
 open func session() -> PhantomSession  {
     return try!  FfiConverterTypePhantomSession_lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_acceptoutcome_session(
+    uniffi_phantom_protocol_fn_method_acceptoutcome_session(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -718,7 +718,7 @@ open func session() -> PhantomSession  {
      */
 open func takeEarlyData() -> Data?  {
     return try!  FfiConverterOptionData.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_acceptoutcome_take_early_data(
+    uniffi_phantom_protocol_fn_method_acceptoutcome_take_early_data(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -855,7 +855,7 @@ open class PhantomListener: PhantomListenerProtocol, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_phantom_core_fn_clone_phantomlistener(self.handle, $0) }
+        return try! rustCall { uniffi_phantom_protocol_fn_clone_phantomlistener(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -865,7 +865,7 @@ open class PhantomListener: PhantomListenerProtocol, @unchecked Sendable {
             return
         }
 
-        try! rustCall { uniffi_phantom_core_fn_free_phantomlistener(handle, $0) }
+        try! rustCall { uniffi_phantom_protocol_fn_free_phantomlistener(handle, $0) }
     }
 
     
@@ -873,12 +873,12 @@ public static func bind(addr: String)async throws  -> PhantomListener  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_constructor_phantomlistener_bind(FfiConverterString.lower(addr)
+                uniffi_phantom_protocol_fn_constructor_phantomlistener_bind(FfiConverterString.lower(addr)
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_u64,
-            completeFunc: ffi_phantom_core_rust_future_complete_u64,
-            freeFunc: ffi_phantom_core_rust_future_free_u64,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
             liftFunc: FfiConverterTypePhantomListener_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -899,14 +899,14 @@ open func accept()async throws  -> AcceptOutcome  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomlistener_accept(
+                uniffi_phantom_protocol_fn_method_phantomlistener_accept(
                     self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_u64,
-            completeFunc: ffi_phantom_core_rust_future_complete_u64,
-            freeFunc: ffi_phantom_core_rust_future_free_u64,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
             liftFunc: FfiConverterTypeAcceptOutcome_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -917,7 +917,7 @@ open func accept()async throws  -> AcceptOutcome  {
      */
 open func isShuttingDown() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down(
+    uniffi_phantom_protocol_fn_method_phantomlistener_is_shutting_down(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -930,7 +930,7 @@ open func isShuttingDown() -> Bool  {
      */
 open func localAddr() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomlistener_local_addr(
+    uniffi_phantom_protocol_fn_method_phantomlistener_local_addr(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -946,7 +946,7 @@ open func localAddr() -> String  {
      * serving until their owning task closes them.
      */
 open func shutdown()  {try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomlistener_shutdown(
+    uniffi_phantom_protocol_fn_method_phantomlistener_shutdown(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -959,7 +959,7 @@ open func shutdown()  {try! rustCall() {
      */
 open func verifyingKeyBytes() -> Data  {
     return try!  FfiConverterData.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomlistener_verifying_key_bytes(
+    uniffi_phantom_protocol_fn_method_phantomlistener_verifying_key_bytes(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -1198,7 +1198,7 @@ open class PhantomSession: PhantomSessionProtocol, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_phantom_core_fn_clone_phantomsession(self.handle, $0) }
+        return try! rustCall { uniffi_phantom_protocol_fn_clone_phantomsession(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -1208,7 +1208,7 @@ open class PhantomSession: PhantomSessionProtocol, @unchecked Sendable {
             return
         }
 
-        try! rustCall { uniffi_phantom_core_fn_free_phantomsession(handle, $0) }
+        try! rustCall { uniffi_phantom_protocol_fn_free_phantomsession(handle, $0) }
     }
 
     
@@ -1220,7 +1220,7 @@ open class PhantomSession: PhantomSessionProtocol, @unchecked Sendable {
      */
 public static func connect(peerAddr: String) -> PhantomSession  {
     return try!  FfiConverterTypePhantomSession_lift(try! rustCall() {
-    uniffi_phantom_core_fn_constructor_phantomsession_connect(
+    uniffi_phantom_protocol_fn_constructor_phantomsession_connect(
         FfiConverterString.lower(peerAddr),$0
     )
 })
@@ -1233,7 +1233,7 @@ public static func connect(peerAddr: String) -> PhantomSession  {
      */
 open func connectionState() -> ConnectionState  {
     return try!  FfiConverterTypeConnectionState_lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_connection_state(
+    uniffi_phantom_protocol_fn_method_phantomsession_connection_state(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -1248,14 +1248,14 @@ open func currentEpoch()async  -> UInt8?  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomsession_current_epoch(
+                uniffi_phantom_protocol_fn_method_phantomsession_current_epoch(
                     self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_rust_buffer,
-            completeFunc: ffi_phantom_core_rust_future_complete_rust_buffer,
-            freeFunc: ffi_phantom_core_rust_future_free_rust_buffer,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_rust_buffer,
+            freeFunc: ffi_phantom_protocol_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionUInt8.lift,
             errorHandler: nil
             
@@ -1273,14 +1273,14 @@ open func disconnect()async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomsession_disconnect(
+                uniffi_phantom_protocol_fn_method_phantomsession_disconnect(
                     self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_void,
-            completeFunc: ffi_phantom_core_rust_future_complete_void,
-            freeFunc: ffi_phantom_core_rust_future_free_void,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_void,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_void,
+            freeFunc: ffi_phantom_protocol_rust_future_free_void,
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -1300,14 +1300,14 @@ open func earlyDataAccepted()async  -> Bool?  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomsession_early_data_accepted(
+                uniffi_phantom_protocol_fn_method_phantomsession_early_data_accepted(
                     self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_rust_buffer,
-            completeFunc: ffi_phantom_core_rust_future_complete_rust_buffer,
-            freeFunc: ffi_phantom_core_rust_future_free_rust_buffer,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_rust_buffer,
+            freeFunc: ffi_phantom_protocol_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionBool.lift,
             errorHandler: nil
             
@@ -1321,14 +1321,14 @@ open func flushQueue()async throws  -> UInt32  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomsession_flush_queue(
+                uniffi_phantom_protocol_fn_method_phantomsession_flush_queue(
                     self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_u32,
-            completeFunc: ffi_phantom_core_rust_future_complete_u32,
-            freeFunc: ffi_phantom_core_rust_future_free_u32,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u32,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u32,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u32,
             liftFunc: FfiConverterUInt32.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -1339,7 +1339,7 @@ open func flushQueue()async throws  -> UInt32  {
      */
 open func id() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_id(
+    uniffi_phantom_protocol_fn_method_phantomsession_id(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -1350,7 +1350,7 @@ open func id() -> String  {
      */
 open func isDataReady() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_is_data_ready(
+    uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -1361,7 +1361,7 @@ open func isDataReady() -> Bool  {
      */
 open func isPqcReady() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_is_pqc_ready(
+    uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -1372,7 +1372,7 @@ open func isPqcReady() -> Bool  {
      */
 open func openStream() -> PhantomStream  {
     return try!  FfiConverterTypePhantomStream_lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_open_stream(
+    uniffi_phantom_protocol_fn_method_phantomsession_open_stream(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -1383,7 +1383,7 @@ open func openStream() -> PhantomStream  {
      */
 open func peerAddr() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomsession_peer_addr(
+    uniffi_phantom_protocol_fn_method_phantomsession_peer_addr(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -1396,14 +1396,14 @@ open func queuedCount()async  -> UInt32  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomsession_queued_count(
+                uniffi_phantom_protocol_fn_method_phantomsession_queued_count(
                     self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_u32,
-            completeFunc: ffi_phantom_core_rust_future_complete_u32,
-            freeFunc: ffi_phantom_core_rust_future_free_u32,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u32,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u32,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u32,
             liftFunc: FfiConverterUInt32.lift,
             errorHandler: nil
             
@@ -1423,14 +1423,14 @@ open func recv()async throws  -> Data  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomsession_recv(
+                uniffi_phantom_protocol_fn_method_phantomsession_recv(
                     self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_rust_buffer,
-            completeFunc: ffi_phantom_core_rust_future_complete_rust_buffer,
-            freeFunc: ffi_phantom_core_rust_future_free_rust_buffer,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_rust_buffer,
+            freeFunc: ffi_phantom_protocol_rust_future_free_rust_buffer,
             liftFunc: FfiConverterData.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -1453,14 +1453,14 @@ open func resumptionHint()async  -> ResumptionHint?  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomsession_resumption_hint(
+                uniffi_phantom_protocol_fn_method_phantomsession_resumption_hint(
                     self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_rust_buffer,
-            completeFunc: ffi_phantom_core_rust_future_complete_rust_buffer,
-            freeFunc: ffi_phantom_core_rust_future_free_rust_buffer,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_rust_buffer,
+            freeFunc: ffi_phantom_protocol_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeResumptionHint.lift,
             errorHandler: nil
             
@@ -1477,14 +1477,14 @@ open func send(data: Data)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomsession_send(
+                uniffi_phantom_protocol_fn_method_phantomsession_send(
                     self.uniffiCloneHandle(),
                     FfiConverterData.lower(data)
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_void,
-            completeFunc: ffi_phantom_core_rust_future_complete_void,
-            freeFunc: ffi_phantom_core_rust_future_free_void,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_void,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_void,
+            freeFunc: ffi_phantom_protocol_rust_future_free_void,
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -1501,14 +1501,14 @@ open func setRekeyThreshold(n: UInt64)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold(
+                uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold(
                     self.uniffiCloneHandle(),
                     FfiConverterUInt64.lower(n)
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_i8,
-            completeFunc: ffi_phantom_core_rust_future_complete_i8,
-            freeFunc: ffi_phantom_core_rust_future_free_i8,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_i8,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_i8,
+            freeFunc: ffi_phantom_protocol_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
             errorHandler: nil
             
@@ -1622,7 +1622,7 @@ open class PhantomStream: PhantomStreamProtocol, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_phantom_core_fn_clone_phantomstream(self.handle, $0) }
+        return try! rustCall { uniffi_phantom_protocol_fn_clone_phantomstream(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -1632,7 +1632,7 @@ open class PhantomStream: PhantomStreamProtocol, @unchecked Sendable {
             return
         }
 
-        try! rustCall { uniffi_phantom_core_fn_free_phantomstream(handle, $0) }
+        try! rustCall { uniffi_phantom_protocol_fn_free_phantomstream(handle, $0) }
     }
 
     
@@ -1649,14 +1649,14 @@ open func disconnect()async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomstream_disconnect(
+                uniffi_phantom_protocol_fn_method_phantomstream_disconnect(
                     self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_void,
-            completeFunc: ffi_phantom_core_rust_future_complete_void,
-            freeFunc: ffi_phantom_core_rust_future_free_void,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_void,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_void,
+            freeFunc: ffi_phantom_protocol_rust_future_free_void,
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -1666,14 +1666,14 @@ open func recv()async throws  -> Data  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomstream_recv(
+                uniffi_phantom_protocol_fn_method_phantomstream_recv(
                     self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_rust_buffer,
-            completeFunc: ffi_phantom_core_rust_future_complete_rust_buffer,
-            freeFunc: ffi_phantom_core_rust_future_free_rust_buffer,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_rust_buffer,
+            freeFunc: ffi_phantom_protocol_rust_future_free_rust_buffer,
             liftFunc: FfiConverterData.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -1683,14 +1683,14 @@ open func sendReliable(data: Data)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomstream_send_reliable(
+                uniffi_phantom_protocol_fn_method_phantomstream_send_reliable(
                     self.uniffiCloneHandle(),
                     FfiConverterData.lower(data)
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_void,
-            completeFunc: ffi_phantom_core_rust_future_complete_void,
-            freeFunc: ffi_phantom_core_rust_future_free_void,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_void,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_void,
+            freeFunc: ffi_phantom_protocol_rust_future_free_void,
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -1700,14 +1700,14 @@ open func sendUnreliable(data: Data)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_method_phantomstream_send_unreliable(
+                uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable(
                     self.uniffiCloneHandle(),
                     FfiConverterData.lower(data)
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_void,
-            completeFunc: ffi_phantom_core_rust_future_complete_void,
-            freeFunc: ffi_phantom_core_rust_future_free_void,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_void,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_void,
+            freeFunc: ffi_phantom_protocol_rust_future_free_void,
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -1715,7 +1715,7 @@ open func sendUnreliable(data: Data)async throws   {
     
 open func streamId() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_phantom_core_fn_method_phantomstream_stream_id(
+    uniffi_phantom_protocol_fn_method_phantomstream_stream_id(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -2491,7 +2491,7 @@ fileprivate func uniffiRustCallAsync<F, T>(
 ) async throws -> T {
     // Make sure to call the ensure init function since future creation doesn't have a
     // RustCallStatus param, so doesn't use makeRustCall()
-    uniffiEnsurePhantomCoreInitialized()
+    uniffiEnsurePhantomProtocolInitialized()
     let rustFuture = rustFutureFunc()
     defer {
         freeFunc(rustFuture)
@@ -2528,12 +2528,12 @@ public func connectPinned(host: String, port: UInt16, pinnedKey: Data)async thro
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_func_connect_pinned(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey)
+                uniffi_phantom_protocol_fn_func_connect_pinned(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey)
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_u64,
-            completeFunc: ffi_phantom_core_rust_future_complete_u64,
-            freeFunc: ffi_phantom_core_rust_future_free_u64,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
             liftFunc: FfiConverterTypePhantomSession_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -2560,12 +2560,12 @@ public func connectPinnedWithResumption(host: String, port: UInt16, pinnedKey: D
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_phantom_core_fn_func_connect_pinned_with_resumption(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey),FfiConverterTypeResumptionHint_lower(hint),FfiConverterData.lower(earlyData)
+                uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey),FfiConverterTypeResumptionHint_lower(hint),FfiConverterData.lower(earlyData)
                 )
             },
-            pollFunc: ffi_phantom_core_rust_future_poll_u64,
-            completeFunc: ffi_phantom_core_rust_future_complete_u64,
-            freeFunc: ffi_phantom_core_rust_future_free_u64,
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
             liftFunc: FfiConverterTypePhantomSession_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
@@ -2582,104 +2582,104 @@ private let initializationResult: InitializationResult = {
     // Get the bindings contract version from our ComponentInterface
     let bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
-    let scaffolding_contract_version = ffi_phantom_core_uniffi_contract_version()
+    let scaffolding_contract_version = ffi_phantom_protocol_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_phantom_core_checksum_func_connect_pinned() != 13314) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned() != 48812) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_func_connect_pinned_with_resumption() != 53474) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 60625) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data() != 13542) {
+    if (uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 13201) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_acceptoutcome_session() != 21382) {
+    if (uniffi_phantom_protocol_checksum_method_acceptoutcome_session() != 25558) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_acceptoutcome_take_early_data() != 14981) {
+    if (uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data() != 27328) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomlistener_accept() != 45298) {
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_accept() != 14433) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomlistener_is_shutting_down() != 15405) {
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_is_shutting_down() != 8474) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomlistener_local_addr() != 3001) {
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr() != 46930) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomlistener_shutdown() != 4301) {
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown() != 60837) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes() != 56433) {
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 14523) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 46933) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 25030) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_current_epoch() != 16607) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_current_epoch() != 39888) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_disconnect() != 15471) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 34217) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted() != 19420) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted() != 8121) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_flush_queue() != 43783) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue() != 15985) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_id() != 52711) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_id() != 42609) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_is_data_ready() != 23471) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 63798) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_is_pqc_ready() != 28414) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready() != 47934) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_open_stream() != 786) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 25882) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_peer_addr() != 14301) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 58516) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_queued_count() != 30495) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 50067) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_recv() != 62383) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 45587) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_resumption_hint() != 14542) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_send() != 50671) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_send() != 8664) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomsession_set_rekey_threshold() != 63141) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 53836) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 45364) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomstream_recv() != 20087) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 28528) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomstream_send_reliable() != 29433) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 50030) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomstream_send_unreliable() != 51399) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 38734) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_method_phantomstream_stream_id() != 21353) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 28026) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_constructor_phantomlistener_bind() != 49290) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_core_checksum_constructor_phantomsession_connect() != 50668) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 27162) {
         return InitializationResult.apiChecksumMismatch
     }
 
@@ -2688,7 +2688,7 @@ private let initializationResult: InitializationResult = {
 
 // Make the ensure init function public so that other modules which have external type references to
 // our types can call it.
-public func uniffiEnsurePhantomCoreInitialized() {
+public func uniffiEnsurePhantomProtocolInitialized() {
     switch initializationResult {
     case .ok:
         break

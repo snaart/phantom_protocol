@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use phantom_core::transport::handshake::{ClientHello, HandshakeClient, HandshakeServer};
-use phantom_core::transport::reputation::ReputationTracker;
+use phantom_protocol::transport::handshake::{ClientHello, HandshakeClient, HandshakeServer};
+use phantom_protocol::transport::reputation::ReputationTracker;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 

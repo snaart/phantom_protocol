@@ -17,7 +17,7 @@ ACK, a partially-allocated resource — cancellation can leave the
 session in an inconsistent state.
 
 This document inventories every `tokio::select!` and every long-held
-`.await` in `phantom_core` and confirms whether the pattern is
+`.await` in `phantom_protocol` and confirms whether the pattern is
 cancel-safe by tokio's stated guarantees.
 
 Methodology: I matched every `tokio::select!` in `core/src` against

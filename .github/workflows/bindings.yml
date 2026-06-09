@@ -41,10 +41,10 @@ jobs:
           echo "$C_OUT"
           MISSING="$(echo "$C_OUT" \
             | sed -n '/in dylib but NOT mentioned/,/mentioned in header but NOT/p' \
-            | grep -oE 'uniffi_phantom_core_fn_[A-Za-z0-9_]+' \
+            | grep -oE 'uniffi_phantom_protocol_fn_[A-Za-z0-9_]+' \
             | sort -u || true)"
           if [ -n "$MISSING" ]; then
-            echo "::error::tests/bindings/c/phantom_core.h is missing API symbols:"
+            echo "::error::tests/bindings/c/phantom_protocol.h is missing API symbols:"
             echo "$MISSING"
             exit 1
           fi
@@ -69,7 +69,7 @@ jobs:
       - name: Build cdylib + regenerate the Python binding
         run: tests/bindings/generate_python.sh
       - name: Stage the native library next to the binding
-        run: cp target/release/libphantom_core.so tests/bindings/
+        run: cp target/release/libphantom_protocol.so tests/bindings/
       - name: Run the loopback smoke test
         run: python3 tests/run_test.py
 
@@ -120,13 +120,13 @@ jobs:
       - name: Build the cdylib
         run: cargo build --release --manifest-path core/Cargo.toml
       - name: Compile + run the C consumer
-        # The source/object must precede `-lphantom_core`: GNU ld resolves
+        # The source/object must precede `-lphantom_protocol`: GNU ld resolves
         # symbols left-to-right and drops a library's symbols if nothing seen so
-        # far needs them. With the library first, every `uniffi_phantom_core_*`
+        # far needs them. With the library first, every `uniffi_phantom_protocol_*`
         # reference in consumer_smoke.c is reported undefined.
         run: |
           cc -I tests/bindings/c \
              tests/bindings/c/consumer_smoke.c \
-             -L target/release -lphantom_core \
+             -L target/release -lphantom_protocol \
              -o /tmp/phantom_c_smoke
           LD_LIBRARY_PATH=target/release /tmp/phantom_c_smoke

@@ -14,16 +14,16 @@ which the module operates.
 
 | Field | Value |
 | --- | --- |
-| Module name | Phantom Core |
+| Module name | Phantom Protocol |
 | Module type | Software, multi-target |
-| Versions | Tied to `phantom_core` crate version (`Cargo.toml`). FIPS-validated build identifier: `${cargo_version}-fips-${git_sha}`. |
+| Versions | Tied to `phantom_protocol` crate version (`Cargo.toml`). FIPS-validated build identifier: `${cargo_version}-fips-${git_sha}`. |
 | Vendor | (to be filled by deploying organization) |
 | Target environments | Listed in §3. |
 | Embodiment | Hybrid (software running on general-purpose hardware). |
 
 ## 2. Cryptographic boundary
 
-The boundary is the compiled `phantom_core` Rust library plus its
+The boundary is the compiled `phantom_protocol` Rust library plus its
 statically-linked cryptographic dependencies:
 
 - `aws-lc-rs` (FIPS-validated mode) — symmetric primitives, hashing, RNG.
@@ -118,7 +118,7 @@ authentication is required at the module boundary.
 A future runtime indicator (Phase 5.5):
 
 ```rust
-phantom_core::fips::is_in_approved_mode() -> bool
+phantom_protocol::fips::is_in_approved_mode() -> bool
 ```
 
 returns `true` iff the build is FIPS-feature'd AND POST has succeeded.

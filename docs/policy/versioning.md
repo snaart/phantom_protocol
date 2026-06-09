@@ -1,6 +1,6 @@
 # Versioning Policy
 
-Phantom Core has **two independent, live version axes** that consumers need to
+Phantom Protocol has **two independent, live version axes** that consumers need to
 reason about separately, plus a single **pinned wire-format constant** that is
 not (today) a negotiated axis. This document defines what each one promises.
 
@@ -10,7 +10,7 @@ not (today) a negotiated axis. This document defines what each one promises.
 
 | Axis | Identifier | Lives in | Bump triggers |
 | --- | --- | --- | --- |
-| Public Rust API | `phantom_core` crate version | `core/Cargo.toml :: [package].version` | Any signature change in a `pub` item, per SemVer |
+| Public Rust API | `phantom_protocol` crate version | `core/Cargo.toml :: [package].version` | Any signature change in a `pub` item, per SemVer |
 | FFI ABI | `uniffi::setup_scaffolding!()` output + the bindings under `tests/bindings/` | `core/src/lib.rs` and `tests/bindings/` | Any change to a UniFFI-exported type / method / record / enum |
 
 And one pinned constant that is **not** an evolving axis (see §3):
@@ -137,12 +137,12 @@ wire.
 
 ## 4. FFI / UniFFI ABI
 
-The FFI surface is what `tests/bindings/{phantom_core.py, swift/, kotlin/, c/}`
+The FFI surface is what `tests/bindings/{phantom_protocol.py, swift/, kotlin/, c/}`
 actually link against. Its compatibility contract is **stricter than** the Rust
 API:
 
 - Adding a new method or record field is **not** safe — bindings regenerated
-  against a newer `phantom_core` may not link against an older library.
+  against a newer `phantom_protocol` may not link against an older library.
 - Renaming any UniFFI-exported type / method / variant breaks all bindings.
 - Removing an export is always a break.
 
@@ -190,7 +190,7 @@ introduced the incompatibility.
 
 Note that the sibling `cli/` crate uses `edition = "2024"` and so builds only on
 recent stable, not under the 1.75 gate — the MSRV promise covers the
-`phantom_core` library, not the admin tooling.
+`phantom_protocol` library, not the admin tooling.
 
 ---
 
@@ -255,7 +255,7 @@ migration.
 
 ## 11. Future evolution of this document
 
-When `phantom_core` reaches 1.0, sections 2 and 5 tighten their pre-1.0
+When `phantom_protocol` reaches 1.0, sections 2 and 5 tighten their pre-1.0
 leniencies and the document gains a "1.0 stability promise" section. If a
 deliberate `WIRE_VERSION` / `PROTOCOL_VERSION` bump is ever scheduled, §3 and §9
 gain the specifics of that hard cut (the new packet layout and the

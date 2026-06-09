@@ -9,15 +9,15 @@
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: {{ include "phantom-core.fullname" . }}-hpa
+  name: {{ include "phantom-protocol.fullname" . }}-hpa
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "phantom-core.labels" . | nindent 4 }}
+    {{- include "phantom-protocol.labels" . | nindent 4 }}
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: {{ include "phantom-core.fullname" . }}
+    name: {{ include "phantom-protocol.fullname" . }}
   minReplicas: {{ .Values.autoscaling.minReplicas }}
   maxReplicas: {{ .Values.autoscaling.maxReplicas }}
   metrics:

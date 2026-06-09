@@ -1,4 +1,4 @@
-# Pre-commit hooks for phantom_core_rust (Phase 0.5).
+# Pre-commit hooks for phantom_protocol (Phase 0.5).
 #
 # Optional local gate that mirrors the cheapest CI checks. Install once with:
 #
@@ -23,9 +23,9 @@ repos:
         # Don't touch the auto-generated bindings — they get regenerated
         # by `generate_*.sh` and a whitespace tweak here would just drift
         # back next CI run.
-        exclude: ^tests/bindings/(phantom_core\.py|swift/phantom_core\.swift|swift/phantom_coreFFI\.h|kotlin/uniffi/phantom_core/phantom_core\.kt)$
+        exclude: ^tests/bindings/(phantom_protocol\.py|swift/phantom_protocol\.swift|swift/phantom_protocolFFI\.h|kotlin/uniffi/phantom_protocol/phantom_protocol\.kt)$
       - id: end-of-file-fixer
-        exclude: ^tests/bindings/(phantom_core\.py|swift/phantom_core\.swift|swift/phantom_coreFFI\.h|kotlin/uniffi/phantom_core/phantom_core\.kt)$
+        exclude: ^tests/bindings/(phantom_protocol\.py|swift/phantom_protocol\.swift|swift/phantom_protocolFFI\.h|kotlin/uniffi/phantom_protocol/phantom_protocol\.kt)$
       - id: check-yaml
         # GitHub Actions workflows use multi-document anchors and YAML that
         # tripped strict parsers; allow them.
@@ -62,5 +62,5 @@ repos:
         entry: tests/bindings/check_versions.sh
         language: system
         # Only fire when something touches a manifest the script reads.
-        files: ^(core/Cargo\.toml|server/Cargo\.toml|cli/Cargo\.toml|tests/bindings/pyproject\.toml|tests/bindings/c/phantom_core\.pc\.in)$
+        files: ^(core/Cargo\.toml|server/Cargo\.toml|cli/Cargo\.toml|tests/bindings/pyproject\.toml|tests/bindings/c/phantom_protocol\.pc\.in)$
         pass_filenames: false

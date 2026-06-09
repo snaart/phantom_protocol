@@ -46,11 +46,11 @@ PY_VERSION="$(
 )"
 check "pyproject.toml" "${SCRIPT_DIR}/pyproject.toml" "${PY_VERSION}"
 
-# tests/bindings/c/phantom_core.pc.in
+# tests/bindings/c/phantom_protocol.pc.in
 PC_VERSION="$(
-    awk '/^Version:/ { print $2; exit }' "${SCRIPT_DIR}/c/phantom_core.pc.in"
+    awk '/^Version:/ { print $2; exit }' "${SCRIPT_DIR}/c/phantom_protocol.pc.in"
 )"
-check "c/phantom_core.pc.in" "${SCRIPT_DIR}/c/phantom_core.pc.in" "${PC_VERSION}"
+check "c/phantom_protocol.pc.in" "${SCRIPT_DIR}/c/phantom_protocol.pc.in" "${PC_VERSION}"
 
 # Sibling Rust crates (server, cli) publish the same version as core.
 for MANIFEST in "${REPO_ROOT}/server/Cargo.toml" "${REPO_ROOT}/cli/Cargo.toml"; do
@@ -66,7 +66,7 @@ if [ "${fail}" -ne 0 ]; then
     echo "    core/Cargo.toml server/Cargo.toml cli/Cargo.toml \\"
     echo "    tests/bindings/pyproject.toml"
     echo "  sed -i.bak 's/^Version: ${CORE_VERSION}/Version: <NEW>/' \\"
-    echo "    tests/bindings/c/phantom_core.pc.in"
+    echo "    tests/bindings/c/phantom_protocol.pc.in"
     exit 1
 fi
 echo "OK: all manifests pinned to ${CORE_VERSION}"

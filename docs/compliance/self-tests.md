@@ -4,7 +4,7 @@ FIPS 140-3 requires a cryptographic module to run **known-answer tests
 (KATs)** at startup ("power-on self-tests" / POST) and **pairwise
 consistency tests (PCTs)** whenever a new key pair is generated.
 
-This document describes the self-test implementation for Phantom Core. **Power-on self-tests (POST) are implemented** in `core/src/crypto/self_tests.rs` (Phase 5.5) and are wired into PhantomListener::bind and PhantomSession::connect under the `fips` feature. Pairwise consistency tests (PCTs) are in-progress.
+This document describes the self-test implementation for Phantom Protocol. **Power-on self-tests (POST) are implemented** in `core/src/crypto/self_tests.rs` (Phase 5.5) and are wired into PhantomListener::bind and PhantomSession::connect under the `fips` feature. Pairwise consistency tests (PCTs) are in-progress.
 
 ## Test types
 
@@ -13,7 +13,7 @@ This document describes the self-test implementation for Phantom Core. **Power-o
 | **POST** | At module initialization (first `PhantomListener::bind` / `PhantomSession::connect`). | Each primitive implementation matches its standardized test vectors — i.e. the code path is bug-free for at least the published KAT inputs. |
 | **PCT** | After every key-pair generation (`HybridSigningKey::generate`, `HybridKemSecret::generate`). | The newly generated key pair satisfies the algorithm's correctness property (e.g., `verify(sign(m, sk), pk, m) == OK`). Detects RAM corruption or fault injection during keygen. |
 | **CST** (continuous self-test) | On every cryptographic operation, on hot paths where allowed. | Entropy source has not regressed; cipher implementation continues to produce expected output for sentinel inputs. **Most CSTs are platform-provided** by `aws-lc-rs` / `ring`. |
-| **On-demand** | API: `phantom_core::fips::run_self_tests()`. | Operator can re-run POSTs without restarting. |
+| **On-demand** | API: `phantom_protocol::fips::run_self_tests()`. | Operator can re-run POSTs without restarting. |
 
 ## POST plan (Phase 5.5)
 
@@ -53,7 +53,7 @@ Wired into:
 - `PhantomListener::bind` (first call) — runs POST and returns
   `CoreError::SelfTest` on failure.
 - `PhantomSession::connect_with_transport` (first call per process).
-- `phantom_core::fips::run_self_tests()` — public API for on-demand.
+- `phantom_protocol::fips::run_self_tests()` — public API for on-demand.
 
 A `std::sync::Once` ensures POST runs exactly once per process.
 
@@ -105,7 +105,7 @@ FIPS 140-3 requires that on POST or CST failure:
 3. Recovery requires either a process restart or an explicit on-demand
    re-run that succeeds.
 
-Mapping to Phantom Core:
+Mapping to Phantom Protocol:
 
 - POST failure → `PhantomListener::bind` / `PhantomSession::connect`
   return `CoreError::SelfTest(SelfTestError)`.

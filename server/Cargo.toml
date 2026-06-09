@@ -1,8 +1,8 @@
 [package]
 name = "phantom-server"
-version = "0.3.0"
+version = "0.1.0"
 edition = "2021"
-description = "Reference production server for phantom_core"
+description = "Reference production server for phantom-protocol"
 
 # Out of the core/-only workspace — sibling crate convention.
 [workspace]
@@ -16,7 +16,7 @@ path = "src/main.rs"
 # bindings, so it opts out of the default `bindings` feature (and with it the
 # whole UniFFI dependency tree). `std` + `compression-zstd` reproduce the rest
 # of the historical default surface. (SUPPLY-01)
-phantom_core = { path = "../core", default-features = false, features = [
+phantom-protocol = { path = "../core", default-features = false, features = [
     "std",
     "compression-zstd",
     "telemetry-otel",

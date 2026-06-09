@@ -1,7 +1,7 @@
 # Docker deployment
 
-Reference Dockerfile and run-time configuration for a Phantom Core server
-binary. Phantom Core itself is a library — the example below assumes a
+Reference Dockerfile and run-time configuration for a Phantom Protocol server
+binary. Phantom Protocol itself is a library — the example below assumes a
 small wrapper binary (`server-bin` in your workspace) that calls
 `PhantomListener::bind` and `accept`.
 
@@ -33,7 +33,7 @@ COPY --from=build /src/server-bin/target/release/server-bin /usr/local/bin/phant
 USER phantom
 
 EXPOSE 4242/tcp
-ENV RUST_LOG=info,phantom_core=info
+ENV RUST_LOG=info,phantom_protocol=info
 ENTRYPOINT ["/usr/local/bin/phantom-server"]
 ```
 
@@ -42,7 +42,7 @@ ENTRYPOINT ["/usr/local/bin/phantom-server"]
 ```sh
 docker build -t phantom-server:0.3.0 .
 docker run --rm -p 4242:4242 \
-    -e RUST_LOG=info,phantom_core=debug \
+    -e RUST_LOG=info,phantom_protocol=debug \
     --name phantom phantom-server:0.3.0
 ```
 
@@ -51,7 +51,7 @@ on the corresponding architecture.
 
 ## Recommended container settings
 
-- **CPU pinning.** Phantom Core's per-CPU work-stealing (Phase 4) benefits
+- **CPU pinning.** Phantom Protocol's per-CPU work-stealing (Phase 4) benefits
   from stable thread affinity. With Docker:
   ```
   docker run --cpuset-cpus=0-3 …
@@ -59,7 +59,7 @@ on the corresponding architecture.
 - **Networking.** Use host network mode (`--network host`) for highest
   throughput; otherwise the userspace NAT in Docker's bridge adds
   per-packet overhead.
-- **File descriptors.** Phantom Core sessions hold a single fd each
+- **File descriptors.** Phantom Protocol sessions hold a single fd each
   (TCP) or two (TCP + UDP for KCP). The default Docker ulimit (1024)
   is sufficient for ~1k concurrent sessions; raise it for higher fan-
   out:
@@ -69,7 +69,7 @@ on the corresponding architecture.
 - **Memory limits.** Each session keeps a small `BytesMut` accumulator
   (typically <16 KiB) plus per-stream buffers. Budget ~64 KiB per
   active session as a working estimate.
-- **Health check.** Phantom Core opens no HTTP server, so there is no `/health` endpoint. Instead, implement a TCP connectivity check against the listen port (default 4242). Docker's `HEALTHCHECK` can use a custom script or nc:
+- **Health check.** Phantom Protocol opens no HTTP server, so there is no `/health` endpoint. Instead, implement a TCP connectivity check against the listen port (default 4242). Docker's `HEALTHCHECK` can use a custom script or nc:
   ```dockerfile
   HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
       CMD nc -z localhost 4242 || exit 1
@@ -89,7 +89,7 @@ For tighter images:
 
 ## Logging
 
-Phantom Core uses the `tracing` ecosystem (Phase 4.5). The default
+Phantom Protocol uses the `tracing` ecosystem (Phase 4.5). The default
 `tracing_subscriber::fmt` writes to stderr in human-readable text. For
 structured (JSON) logs ready to ship to Loki / Elastic, wire the JSON
 formatter in your binary:
@@ -116,7 +116,7 @@ services:
 
 ## Telemetry (OpenTelemetry)
 
-Phantom Core emits OpenTelemetry metrics + traces (Phase 8). The library
+Phantom Protocol emits OpenTelemetry metrics + traces (Phase 8). The library
 opens **no** inbound port — there is no `/metrics` endpoint to scrape. The
 reference server (`phantom-server`, built with the `telemetry-otel` Cargo
 feature) installs an OTLP/gRPC exporter and **pushes** metrics + traces to

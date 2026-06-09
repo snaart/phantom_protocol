@@ -1,4 +1,4 @@
-//! Reference Phantom Core production server.
+//! Reference Phantom Protocol production server.
 //!
 //! Boot sequence:
 //!
@@ -24,7 +24,7 @@ mod telemetry;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use phantom_core::api::listener::PhantomListener;
+use phantom_protocol::api::listener::PhantomListener;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     // crypto-path readiness signal — not just "the process is up". (On a
     // `--features fips` build the bind/connect paths run this anyway; doing it
     // here makes it explicit and unconditional for the default build too.)
-    phantom_core::crypto::self_tests::run_post()
+    phantom_protocol::crypto::self_tests::run_post()
         .map_err(|e| anyhow::anyhow!("power-on self-test (POST) failed: {e:?}"))?;
     tracing::info!("power-on self-test passed");
 
@@ -265,7 +265,7 @@ async fn main() -> Result<()> {
                         // ConnectionClosed → shutdown was signalled
                         // concurrently from outside; just break. The unused
                         // `session_slot` drops here, releasing the slot.
-                        if matches!(e, phantom_core::CoreError::ConnectionClosed) {
+                        if matches!(e, phantom_protocol::CoreError::ConnectionClosed) {
                             tracing::info!("listener reported shutdown");
                             break;
                         }
@@ -316,7 +316,7 @@ async fn main() -> Result<()> {
 
 fn init_tracing(cfg: &Config, telemetry: &TelemetryHandle) {
     let filter = EnvFilter::try_new(&cfg.log_filter)
-        .unwrap_or_else(|_| EnvFilter::new("info,phantom_core=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("info,phantom_protocol=debug"));
     // OTel layer goes BEFORE fmt — fmt::layer doesn't forward `LookupSpan`
     // through, so OpenTelemetryLayer would not find the registry if
     // composed after it.

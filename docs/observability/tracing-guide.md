@@ -6,7 +6,7 @@ Core emits, the attributes they carry, and how to wire the
 
 ## How tracing reaches OTel
 
-Phantom Core uses the `tracing` crate as its structured-event fabric. When
+Phantom Protocol uses the `tracing` crate as its structured-event fabric. When
 the `telemetry-otel` Cargo feature is on, the embedder installs an
 `OpenTelemetryLayer` (from `tracing-opentelemetry`) into its
 `tracing_subscriber::Registry`. From then on, every `tracing` span the

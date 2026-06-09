@@ -7,8 +7,8 @@
 //! flag/payload-length combination an attacker can place on the wire.
 
 use libfuzzer_sys::fuzz_target;
-use phantom_core::transport::path_validation_codec::parse_path_validation;
-use phantom_core::transport::types::{PacketFlags, PacketHeader, PhantomPacket, SessionId};
+use phantom_protocol::transport::path_validation_codec::parse_path_validation;
+use phantom_protocol::transport::types::{PacketFlags, PacketHeader, PhantomPacket, SessionId};
 
 fuzz_target!(|data: &[u8]| {
     // (1) Wire parser: a hostile inbound frame is decoded with `from_wire`

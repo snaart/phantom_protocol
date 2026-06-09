@@ -1,6 +1,6 @@
 # systemd deployment
 
-Reference unit file and notes for running a Phantom Core server binary
+Reference unit file and notes for running a Phantom Protocol server binary
 under systemd on a Linux host.
 
 ## Unit file
@@ -9,7 +9,7 @@ under systemd on a Linux host.
 # /etc/systemd/system/phantom-server.service
 
 [Unit]
-Description=Phantom Core server
+Description=Phantom Protocol server
 After=network-online.target
 Wants=network-online.target
 
@@ -31,7 +31,7 @@ LimitNPROC=4096
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=phantom-server
-Environment="RUST_LOG=info,phantom_core=info"
+Environment="RUST_LOG=info,phantom_protocol=info"
 
 # ── Hardening ──────────────────────────────────────────────
 NoNewPrivileges=true
@@ -99,7 +99,7 @@ WantedBy=multi-user.target
 
 ## Sysctl knobs
 
-Phantom Core's hot path is the TCP recv loop. The defaults of stock
+Phantom Protocol's hot path is the TCP recv loop. The defaults of stock
 distros are tuned for desktop workloads; for a multi-thousand-session
 server, drop the following into `/etc/sysctl.d/99-phantom.conf`:
 
@@ -140,7 +140,7 @@ typically sufficient up to the per-core saturation point of AES-GCM
 # /etc/systemd/system/phantom-server@.service
 
 [Unit]
-Description=Phantom Core server instance %i
+Description=Phantom Protocol server instance %i
 After=network-online.target
 Wants=network-online.target
 
@@ -176,7 +176,7 @@ Loki / Elastic / CloudWatch:
 
 ## Monitoring
 
-Phantom Core emits OpenTelemetry metrics + traces and opens **no** inbound
+Phantom Protocol emits OpenTelemetry metrics + traces and opens **no** inbound
 port — there is no `/metrics` endpoint to scrape. The reference
 `phantom-server` (built with the `telemetry-otel` feature) installs an
 OTLP/gRPC exporter and **pushes** metrics + traces to an OpenTelemetry

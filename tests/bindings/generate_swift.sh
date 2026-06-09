@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Generates Swift UniFFI bindings into tests/bindings/swift/ from the
 # release cdylib. Re-run after any change to the UniFFI-exported surface
-# of `phantom_core`.
+# of `phantom_protocol`.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -11,12 +11,12 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cargo build --release --manifest-path "${REPO_ROOT}/core/Cargo.toml" --features uniffi-cli
 
 # Detect dylib path (macOS: .dylib, Linux: .so)
-DYLIB="${REPO_ROOT}/target/release/libphantom_core.dylib"
+DYLIB="${REPO_ROOT}/target/release/libphantom_protocol.dylib"
 if [ ! -f "${DYLIB}" ]; then
-    DYLIB="${REPO_ROOT}/target/release/libphantom_core.so"
+    DYLIB="${REPO_ROOT}/target/release/libphantom_protocol.so"
 fi
 if [ ! -f "${DYLIB}" ]; then
-    echo "ERROR: could not find libphantom_core.dylib or .so under target/release/" >&2
+    echo "ERROR: could not find libphantom_protocol.dylib or .so under target/release/" >&2
     exit 1
 fi
 

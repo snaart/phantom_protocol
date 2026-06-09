@@ -1,4 +1,4 @@
-// LoopbackTest.swift — loopback smoke test for the phantom_core Swift binding.
+// LoopbackTest.swift — loopback smoke test for the phantom_protocol Swift binding.
 //
 // Binds an in-process PhantomListener on an OS-chosen loopback port,
 // connects a pinned client via connectPinned, and asserts an encrypted

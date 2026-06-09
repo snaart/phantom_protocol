@@ -13,7 +13,7 @@
 //! sure that directory isn't world-readable).
 
 use anyhow::{Context, Result};
-use phantom_core::crypto::hybrid_sign::HybridSigningKey;
+use phantom_protocol::crypto::hybrid_sign::HybridSigningKey;
 use std::fs;
 use std::io::Write;
 use std::path::Path;

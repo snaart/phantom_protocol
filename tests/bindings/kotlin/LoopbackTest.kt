@@ -1,4 +1,4 @@
-// LoopbackTest.kt — loopback smoke test for the phantom_core Kotlin binding.
+// LoopbackTest.kt — loopback smoke test for the phantom_protocol Kotlin binding.
 //
 // Binds an in-process PhantomListener on an OS-chosen loopback port,
 // connects a pinned client via connectPinned, and asserts an encrypted
@@ -10,8 +10,8 @@
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
-import uniffi.phantom_core.PhantomListener
-import uniffi.phantom_core.connectPinned
+import uniffi.phantom_protocol.PhantomListener
+import uniffi.phantom_protocol.connectPinned
 
 fun main() = runBlocking {
     val payload = "hello phantom core".toByteArray()

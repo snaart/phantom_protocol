@@ -1,7 +1,7 @@
-# Phantom Core Wire Protocol
+# Phantom Protocol Wire Protocol
 
 Specification of the wire format, handshake state machine, and key-derivation
-constructions used by `phantom_core` 0.x. There is exactly **one** wire
+constructions used by `phantom_protocol` 0.x. There is exactly **one** wire
 protocol: a single packet shape, a single handshake, and a single pinned
 version byte. The protocol is **not negotiated** — pre-1.0 there are no
 deployed peers, so there is no version handshake, no fallback, and no
