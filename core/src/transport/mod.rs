@@ -69,8 +69,6 @@ pub mod types;
 pub mod framing;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod udp_transport;
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-pub mod virtual_socket;
 
 // Re-exports for convenience
 #[cfg(feature = "std")]
@@ -83,6 +81,3 @@ pub use session::Session;
 pub use stream::Stream;
 #[cfg(feature = "std")]
 pub use types::*;
-
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-pub use virtual_socket::VirtualSocket;
