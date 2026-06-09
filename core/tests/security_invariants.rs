@@ -17,15 +17,15 @@
 //!   - Cookie tampering yields a `Retry` (not `Success`) on the server side.
 
 use bytes::Bytes;
-use phantom_core::crypto::adaptive_crypto::{CipherSuite, CryptoSession};
-use phantom_core::crypto::hybrid_sign::{HybridSigningKey, HybridVerifyingKey};
-use phantom_core::transport::handshake::{
+use phantom_protocol::crypto::adaptive_crypto::{CipherSuite, CryptoSession};
+use phantom_protocol::crypto::hybrid_sign::{HybridSigningKey, HybridVerifyingKey};
+use phantom_protocol::transport::handshake::{
     ClientHello, HandshakeClient, HandshakeError, HandshakeResponse, HandshakeServer, ServerHello,
 };
-use phantom_core::transport::path::PathStateKind;
-use phantom_core::transport::session::{CryptoState, Session, MAX_REKEY_CATCHUP};
-use phantom_core::transport::stream::{Stream, INITIAL_STREAM_WINDOW};
-use phantom_core::transport::types::{
+use phantom_protocol::transport::path::PathStateKind;
+use phantom_protocol::transport::session::{CryptoState, Session, MAX_REKEY_CATCHUP};
+use phantom_protocol::transport::stream::{Stream, INITIAL_STREAM_WINDOW};
+use phantom_protocol::transport::types::{
     PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
 };
 use std::time::Duration;
@@ -304,7 +304,7 @@ fn tampered_epoch_or_path_id_is_rejected() {
 /// path_id.
 #[test]
 fn replay_window_rejects_duplicate_sequence() {
-    use phantom_core::CoreError;
+    use phantom_protocol::CoreError;
 
     let (client, server) = make_session_pair([0xF4u8; 32]);
     let header = PacketHeader::new(

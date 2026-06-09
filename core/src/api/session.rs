@@ -137,7 +137,7 @@ impl std::fmt::Debug for ResumptionHint {
 // `SessionTransport` now lives in `crate::transport::session_transport` — a
 // dependency-light module that can compile in a `no_std + alloc` build. It is
 // re-exported here so `crate::api::session::SessionTransport` and the public
-// `phantom_core::api::SessionTransport` path stay stable.
+// `phantom_protocol::api::SessionTransport` path stay stable.
 pub use crate::transport::session_transport::{FramePhase, SessionTransport};
 
 /// Transport decorator that records `record_send` / `record_recv` on the

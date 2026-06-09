@@ -1,4 +1,4 @@
-# Phantom Core Benchmarks
+# Phantom Protocol Benchmarks
 
 Reference numbers for tracking performance over time. Capture this file when
 landing performance-sensitive changes — regressions of more than ~5% on the

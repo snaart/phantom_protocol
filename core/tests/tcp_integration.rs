@@ -10,8 +10,8 @@
 //!
 //! Marked `#[ignore]` so it doesn't run by default — needs `cargo test -- --ignored`.
 
-use phantom_core::api::{PhantomListener, PhantomSession, TcpSessionTransport};
-use phantom_core::crypto::hybrid_sign::HybridVerifyingKey;
+use phantom_protocol::api::{PhantomListener, PhantomSession, TcpSessionTransport};
+use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -70,7 +70,7 @@ async fn tcp_integration_pinned_and_encrypted() {
 #[tokio::test]
 #[ignore]
 async fn tcp_integration_wrong_pinned_key_rejected() {
-    use phantom_core::api::ConnectionState;
+    use phantom_protocol::api::ConnectionState;
 
     let listener = PhantomListener::bind("127.0.0.1:0".to_string())
         .await
@@ -79,7 +79,7 @@ async fn tcp_integration_wrong_pinned_key_rejected() {
     let _real_key_bytes = listener.verifying_key_bytes();
 
     // Generate a completely unrelated server key as the "wrong" pin.
-    use phantom_core::crypto::hybrid_sign::HybridSigningKey;
+    use phantom_protocol::crypto::hybrid_sign::HybridSigningKey;
     let (_attacker_sk, attacker_pk) = HybridSigningKey::generate();
 
     // Drive the server side so the handshake actually progresses (and fails
@@ -118,7 +118,7 @@ async fn tcp_integration_wrong_pinned_key_rejected() {
 #[tokio::test]
 #[ignore]
 async fn tcp_integration_zero_rtt_resumption_round_trip() {
-    use phantom_core::api::session::{connect_pinned, connect_pinned_with_resumption};
+    use phantom_protocol::api::session::{connect_pinned, connect_pinned_with_resumption};
 
     let listener = PhantomListener::bind("127.0.0.1:0".to_string())
         .await
@@ -278,7 +278,7 @@ async fn tcp_soak_drives_automatic_rekey_end_to_end() {
 #[tokio::test]
 #[ignore]
 async fn tcp_zero_rtt_rejection_retransmits_early_data_over_1rtt() {
-    use phantom_core::api::session::{connect_pinned, connect_pinned_with_resumption};
+    use phantom_protocol::api::session::{connect_pinned, connect_pinned_with_resumption};
 
     let listener = PhantomListener::bind("127.0.0.1:0".to_string())
         .await

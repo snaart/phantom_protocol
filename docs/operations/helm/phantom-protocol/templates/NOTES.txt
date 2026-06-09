@@ -1,4 +1,4 @@
-Phantom Core has been deployed.
+Phantom Protocol has been deployed.
 
 Release name : {{ .Release.Name }}
 Namespace    : {{ .Release.Namespace }}
@@ -9,20 +9,20 @@ App version  : {{ .Chart.AppVersion }}
 Service endpoint
 ---------------------------------------------------------------------------
 
-The Phantom Core server is available within the cluster at:
+The Phantom Protocol server is available within the cluster at:
 
-  {{ include "phantom-core.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+  {{ include "phantom-protocol.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
 
 To forward the port locally for testing:
 
   kubectl port-forward -n {{ .Release.Namespace }} \
-    svc/{{ include "phantom-core.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+    svc/{{ include "phantom-protocol.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
 
 ---------------------------------------------------------------------------
 Telemetry (OpenTelemetry push)
 ---------------------------------------------------------------------------
 
-The Phantom Core server opens no inbound metrics port — there is no /metrics
+The Phantom Protocol server opens no inbound metrics port — there is no /metrics
 endpoint to scrape. Built with the telemetry-otel feature, it PUSHES metrics
 and traces over OTLP/gRPC to an OpenTelemetry Collector:
 
@@ -61,13 +61,13 @@ The Deployment will fail to start until a Secret is available.
 
 Create the Secret manually:
 
-  kubectl create secret generic {{ include "phantom-core.fullname" . }}-signing-key \
+  kubectl create secret generic {{ include "phantom-protocol.fullname" . }}-signing-key \
     -n {{ .Release.Namespace }} \
     --from-file=hybrid_signing_key=/path/to/hybrid_signing_key.bin
 
 Or re-install with:
 
-  helm upgrade {{ .Release.Name }} ./docs/operations/helm/phantom-core \
+  helm upgrade {{ .Release.Name }} ./docs/operations/helm/phantom-protocol \
     --set signingKey.existingSecret=<your-secret-name>
 {{- end }}
 

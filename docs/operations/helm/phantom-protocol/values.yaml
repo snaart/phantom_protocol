@@ -1,4 +1,4 @@
-# values.yaml — Phantom Core Helm chart defaults
+# values.yaml — Phantom Protocol Helm chart defaults
 # Every value has a comment explaining why the default is what it is.
 # Values marked "MUST set in production" are intentionally left empty or safe-fail
 # to force the operator to make an explicit decision rather than silently use a bad default.
@@ -39,7 +39,7 @@ service:
   # docs/operations/kubernetes.md so the chart + raw-manifest examples
   # stay in lockstep. Operators override via --set service.port=…
   port: 4242
-  # There is no metrics port. Phantom Core opens NO inbound metrics endpoint —
+  # There is no metrics port. Phantom Protocol opens NO inbound metrics endpoint —
   # telemetry is PUSHED via OTLP/gRPC to an OpenTelemetry Collector (see the
   # `telemetry` section below). The old :9090 /metrics listener was removed in
   # Phase 8.
@@ -152,7 +152,7 @@ signingKey:
   # NEVER set this in a values file committed to version control.
   secretValue: ""
   # Volume mount path inside the container.
-  mountPath: "/etc/phantom-core"
+  mountPath: "/etc/phantom-protocol"
   # Filename inside the mounted volume.
   fileName: "hybrid_signing_key"
 
@@ -164,7 +164,7 @@ signingKey:
 # chart renders into OTEL_* env vars on the container.
 env:
   - name: RUST_LOG
-    value: "info,phantom_core=info"
+    value: "info,phantom_protocol=info"
 
 # ---------------------------------------------------------------------------
 # Telemetry (OpenTelemetry, push-based)
@@ -285,7 +285,7 @@ serviceAccount:
   annotations: {}
   # Leave empty to use the fullname template as the service account name.
   name: ""
-  # Automount the service account token. Phantom Core does not call the
+  # Automount the service account token. Phantom Protocol does not call the
   # Kubernetes API; disable mounting to reduce the attack surface.
   automountServiceAccountToken: false
 
@@ -308,7 +308,7 @@ affinity: {}
 #         podAffinityTerm:
 #           labelSelector:
 #             matchLabels:
-#               app.kubernetes.io/name: phantom-core
+#               app.kubernetes.io/name: phantom-protocol
 #           topologyKey: topology.kubernetes.io/zone
 
 # ---------------------------------------------------------------------------

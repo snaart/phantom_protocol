@@ -37,7 +37,7 @@ pub async fn run(args: Args) -> Result<()> {
     let start = Instant::now();
 
     let result = tokio::time::timeout(timeout, async {
-        let session = phantom_core::api::session::connect_pinned(
+        let session = phantom_protocol::api::session::connect_pinned(
             args.host.clone(),
             args.port,
             pinned_key_bytes,

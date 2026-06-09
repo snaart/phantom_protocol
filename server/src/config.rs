@@ -13,7 +13,7 @@ use std::path::PathBuf;
 #[command(
     name = "phantom-server",
     version,
-    about = "Phantom Core reference server"
+    about = "Phantom Protocol reference server"
 )]
 pub struct Config {
     /// Bind address for the Phantom transport (TCP).
@@ -55,8 +55,8 @@ pub struct Config {
     #[arg(long, env = "PHANTOM_LOG_JSON")]
     pub log_json: bool,
 
-    /// Tracing filter (default: info,phantom_core=debug).
-    #[arg(long, env = "RUST_LOG", default_value = "info,phantom_core=debug")]
+    /// Tracing filter (default: info,phantom_protocol=debug).
+    #[arg(long, env = "RUST_LOG", default_value = "info,phantom_protocol=debug")]
     pub log_filter: String,
 
     /// Maximum number of concurrent sessions. Once this many are active the

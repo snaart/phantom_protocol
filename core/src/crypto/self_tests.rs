@@ -1,4 +1,4 @@
-//! Power-on + conditional self-tests for Phantom Core's cryptographic
+//! Power-on + conditional self-tests for Phantom Protocol's cryptographic
 //! primitives (FIPS 140-3 §7.7).
 //!
 //! FIPS 140-3 requires that **every approved algorithm pass a known-answer
@@ -12,7 +12,7 @@
 //! with a broken cryptographic module.
 //!
 //! The library does *not* auto-invoke `run_post` — embedders pulling in
-//! `phantom_core` for non-FIPS deployments shouldn't pay the (~ms) startup
+//! `phantom_protocol` for non-FIPS deployments shouldn't pay the (~ms) startup
 //! cost. The CAVP-style canonical vectors live in `core/tests/cavp.rs`
 //! (Phase 5.4); this module re-tests the same primitives via pairwise
 //! consistency + a fixed HKDF KAT, sufficient for a §7.7 POST without
@@ -192,7 +192,7 @@ pub fn run_post() -> Result<(), SelfTestError> {
 fn test_aead(suite: CipherSuite, name: &'static str) -> Result<(), SelfTestError> {
     let shared_secret = [0x42u8; 32];
     let aad = b"phantom-self-test-aad";
-    let plaintext = b"phantom-core self-test payload";
+    let plaintext = b"phantom-protocol self-test payload";
 
     let local =
         CryptoSession::with_suite(&shared_secret, suite).map_err(|_| SelfTestError::Aead {
@@ -283,7 +283,7 @@ fn test_hybrid_kem() -> Result<(), SelfTestError> {
 /// halves must verify for the hybrid to succeed.
 fn test_hybrid_sign() -> Result<(), SelfTestError> {
     let (sk, pk) = HybridSigningKey::generate();
-    let message = b"phantom-core self-test signature input";
+    let message = b"phantom-protocol self-test signature input";
     let sig = sk.sign(message);
     pk.verify(message, &sig)
         .map_err(|_| SelfTestError::HybridSign {
@@ -299,7 +299,7 @@ fn test_hybrid_sign() -> Result<(), SelfTestError> {
 /// `verify` returns `Err`.
 fn test_negative_verify() -> Result<(), SelfTestError> {
     let (sk, pk) = HybridSigningKey::generate();
-    let message = b"phantom-core self-test negative input";
+    let message = b"phantom-protocol self-test negative input";
     let sig = sk.sign(message);
     let mut sig_bytes = sig.to_bytes();
     // Pick a byte deep in the signature payload (not a length prefix at

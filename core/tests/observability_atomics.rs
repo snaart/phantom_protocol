@@ -1,11 +1,11 @@
-//! Integration tests for `phantom_core::observability` lock-free atomics.
+//! Integration tests for `phantom_protocol::observability` lock-free atomics.
 //!
 //! Complements the unit tests inside `core/src/observability/atomics.rs` by
 //! exercising the public `Observability` facade end-to-end (recording sites,
 //! per-leg slicing, snapshot read consistency).
 
-use phantom_core::observability::{Observability, ObservabilityConfig};
-use phantom_core::transport::types::LegType;
+use phantom_protocol::observability::{Observability, ObservabilityConfig};
+use phantom_protocol::transport::types::LegType;
 use std::sync::Arc;
 
 #[test]

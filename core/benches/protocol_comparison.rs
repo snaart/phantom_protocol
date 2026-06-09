@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 // Phantom imports
-use phantom_core::crypto::hybrid_kem::HybridSecretKey;
-use phantom_core::crypto::hybrid_sign::HybridSigningKey;
-use phantom_core::transport::handshake::{HandshakeClient, HandshakeResponse, HandshakeServer};
-use phantom_core::transport::types::{PacketFlags, PacketHeader};
+use phantom_protocol::crypto::hybrid_kem::HybridSecretKey;
+use phantom_protocol::crypto::hybrid_sign::HybridSigningKey;
+use phantom_protocol::transport::handshake::{HandshakeClient, HandshakeResponse, HandshakeServer};
+use phantom_protocol::transport::types::{PacketFlags, PacketHeader};
 
 // ============================================================================
 // PHANTOM PQC BENCHMARKS

@@ -16,8 +16,8 @@
 //!   carries no raw PII — aggregate session counts come from the OTel
 //!   `session.active` gauge, not per-connection log lines.
 
-use phantom_core::api::session::PhantomSession;
-use phantom_core::CoreError;
+use phantom_protocol::api::session::PhantomSession;
+use phantom_protocol::CoreError;
 use std::sync::Arc;
 
 pub async fn run_echo_handler(session: Arc<PhantomSession>) {

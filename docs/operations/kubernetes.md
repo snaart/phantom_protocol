@@ -1,7 +1,7 @@
 # Kubernetes deployment
 
-Reference Kubernetes manifests and configuration patterns for running a Phantom Core server
-binary on a Kubernetes cluster. Phantom Core is a library; manifests assume a wrapper binary
+Reference Kubernetes manifests and configuration patterns for running a Phantom Protocol server
+binary on a Kubernetes cluster. Phantom Protocol is a library; manifests assume a wrapper binary
 (`server-bin`) calling `PhantomListener::bind` and `accept`.
 
 ## Deployment vs StatefulSet
@@ -16,12 +16,12 @@ PVC complexity with no benefit here.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: phantom-core
-  labels: {app: phantom-core}
+  name: phantom-protocol
+  labels: {app: phantom-protocol}
 spec:
   replicas: 3
   selector:
-    matchLabels: {app: phantom-core}
+    matchLabels: {app: phantom-protocol}
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -29,11 +29,11 @@ spec:
       maxSurge: 1
   template:
     metadata:
-      labels: {app: phantom-core}
+      labels: {app: phantom-protocol}
     spec:
       terminationGracePeriodSeconds: 30  # in-flight handshakes have 30 s to complete
       containers:
-        - name: phantom-core
+        - name: phantom-protocol
           image: phantom-server:0.3.0
           imagePullPolicy: IfNotPresent
           ports:
@@ -56,10 +56,10 @@ spec:
             allowPrivilegeEscalation: false
             capabilities: {drop: ["ALL"]}
           env:
-            - {name: RUST_LOG, value: "info,phantom_core=info"}
+            - {name: RUST_LOG, value: "info,phantom_protocol=info"}
             # phantom-server pushes OTLP/gRPC to an OpenTelemetry Collector; it opens no metrics port.
             - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.monitoring.svc:4317"}
-            - {name: OTEL_SERVICE_NAME,           value: "phantom-core"}
+            - {name: OTEL_SERVICE_NAME,           value: "phantom-protocol"}
             - {name: OTEL_TRACES_SAMPLER_ARG,     value: "0.1"}   # head-sampling ratio
           volumeMounts:
             - {name: signing-key, mountPath: /etc/phantom/keys, readOnly: true}
@@ -75,17 +75,17 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: phantom-core
+  name: phantom-protocol
 spec:
   selector:
-    app: phantom-core
+    app: phantom-protocol
   ports:
     - {name: phantom, port: 4242, targetPort: phantom, protocol: TCP}
 ```
 
 ## Health checks
 
-**Liveness probe.** Phantom Core has no `/healthz` endpoint (SDK ships no HTTP server). Use a
+**Liveness probe.** Phantom Protocol has no `/healthz` endpoint (SDK ships no HTTP server). Use a
 `tcpSocket` probe on port `4242` — a successful TCP accept means the listener is alive.
 
 **Readiness probe.** Also `tcpSocket` on `4242`. Pod is removed from Service endpoints until the
@@ -132,11 +132,11 @@ For fleet management use `external-secrets-operator` (Vault / AWS / GCP) or `sea
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: phantom-core-pdb
+  name: phantom-protocol-pdb
 spec:
   maxUnavailable: 0                          # at least one pod always ready
   selector:
-    matchLabels: {app: phantom-core}
+    matchLabels: {app: phantom-protocol}
 ```
 
 Combined with `PhantomListener::shutdown()` on `SIGTERM`, the draining pod stops accepting
@@ -152,9 +152,9 @@ as a leading indicator. These metrics reach Prometheus through the OTLP-push cha
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
-  name: phantom-core-scaler
+  name: phantom-protocol-scaler
 spec:
-  scaleTargetRef: {name: phantom-core}
+  scaleTargetRef: {name: phantom-protocol}
   minReplicaCount: 2
   maxReplicaCount: 20
   triggers:
@@ -176,10 +176,10 @@ Metric names follow the OTel dot→underscore translation; the full catalog is i
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: phantom-core-netpol
+  name: phantom-protocol-netpol
 spec:
   podSelector:
-    matchLabels: {app: phantom-core}
+    matchLabels: {app: phantom-protocol}
   policyTypes: [Ingress, Egress]
   ingress:
     - ports: [{port: 4242, protocol: TCP}]
@@ -212,7 +212,7 @@ per-pod `SO_REUSEPORT` at cluster scale.
 
 ## Monitoring and logging
 
-**Metrics and traces.** Phantom Core emits OpenTelemetry metrics and traces; the library opens no
+**Metrics and traces.** Phantom Protocol emits OpenTelemetry metrics and traces; the library opens no
 inbound port and there is no `/metrics` endpoint to scrape. `phantom-server` (built with the
 `telemetry-otel` feature) installs an OTLP/gRPC exporter and **pushes** to an OpenTelemetry
 Collector — configured via the env vars in the Deployment manifest

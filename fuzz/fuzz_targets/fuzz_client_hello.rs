@@ -7,7 +7,7 @@
 //! reads bytes from the network and runs this parser unconditionally.
 
 use libfuzzer_sys::fuzz_target;
-use phantom_core::transport::handshake::ClientHello;
+use phantom_protocol::transport::handshake::ClientHello;
 
 fuzz_target!(|data: &[u8]| {
     let _ = borsh::from_slice::<ClientHello>(data);

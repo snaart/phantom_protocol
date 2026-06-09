@@ -1,8 +1,8 @@
-# Phantom Core
+# Phantom Protocol
 
 Post-quantum-secure L4/L6 universal transport framework in Rust.
 
-Phantom Core gives applications an authenticated, confidential, post-quantum-secure
+Phantom Protocol gives applications an authenticated, confidential, post-quantum-secure
 byte pipe. It pairs a hybrid classical-plus-PQ handshake (X25519 + ML-KEM-768 KEM,
 Ed25519 + ML-DSA-65 signatures — FIPS 203 / FIPS 204, pure Rust) with a
 transport layer (TCP / WebSocket for sessions today; WASI / embedded byte-stream
@@ -78,8 +78,8 @@ Server identity must be pinned — `connect_with_transport` requires a
 `HybridVerifyingKey`; there is no skip path (Security Invariant 1).
 
 ```rust
-use phantom_core::api::{PhantomListener, PhantomSession, TcpSessionTransport};
-use phantom_core::crypto::hybrid_sign::HybridVerifyingKey;
+use phantom_protocol::api::{PhantomListener, PhantomSession, TcpSessionTransport};
+use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
 use tokio::net::TcpStream;
 
 // ── Server ────────────────────────────────────────────────────────────────
@@ -92,11 +92,11 @@ tokio::spawn(async move {
     let session = outcome.session();
     let req = session.recv().await?;
     session.send(b"hello, post-quantum world".to_vec()).await?;
-    Ok::<_, phantom_core::errors::CoreError>(())
+    Ok::<_, phantom_protocol::errors::CoreError>(())
 });
 
 // ── Client (one-shot helper used by mobile / FFI consumers) ───────────────
-let session = phantom_core::api::session::connect_pinned(
+let session = phantom_protocol::api::session::connect_pinned(
     "127.0.0.1".into(), 4242, pinned_key,
 ).await?;
 session.send(b"ping".to_vec()).await?;
@@ -219,7 +219,7 @@ pushes OTLP telemetry to an OTel Collector / SaaS backend, handles SIGTERM
 | `--otel-trace-sample-ratio` | `OTEL_TRACES_SAMPLER_ARG` | `0.01` |
 | `--signing-key-file` | `PHANTOM_SIGNING_KEY_FILE` | `/etc/phantom-server/signing.key` (0600, auto-created) |
 | `--log-json` | `PHANTOM_LOG_JSON` | `false` |
-| `--log-filter` | `RUST_LOG` | `info,phantom_core=debug` |
+| `--log-filter` | `RUST_LOG` | `info,phantom_protocol=debug` |
 
 ```bash
 cargo run --manifest-path server/Cargo.toml -- \
@@ -242,7 +242,7 @@ docker compose up -d
 ### Kubernetes / Helm
 
 Production-shape chart at
-[`docs/operations/helm/phantom-core/`](docs/operations/helm/phantom-core/).
+[`docs/operations/helm/phantom-protocol/`](docs/operations/helm/phantom-protocol/).
 `appVersion: 0.3.0`, ClusterIP service on `4242`, 3 replicas,
 `tcpSocket` liveness / readiness. Raw manifests + walkthrough in
 [`docs/operations/kubernetes.md`](docs/operations/kubernetes.md).
@@ -308,7 +308,7 @@ Regen: `tests/bindings/{generate_swift,generate_kotlin,generate_c}.sh`.
 
 ### Embedded (`embedded` feature, default off)
 
-On bare-metal `thumbv7em-none-eabihf` Phantom Core ships the **framing transport
+On bare-metal `thumbv7em-none-eabihf` Phantom Protocol ships the **framing transport
 only** — `EmbeddedLeg` and its length-prefix codec. The PQ handshake,
 `PhantomSession`, the crypto primitives, and `TokioRuntime` are `std`-gated and
 **not** built there; a bare-metal embedder brings its own crypto/handshake driver

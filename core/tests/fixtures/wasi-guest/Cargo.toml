@@ -6,7 +6,7 @@
 # `--target` resolution does not try to build this crate for non-WASI
 # targets (it cannot link there — `wasi` crate is WASI-only).
 #
-# The wasi guest dep on `phantom_core` is `--features wasi-leg`; the
+# The wasi guest dep on `phantom-protocol` is `--features wasi-leg`; the
 # `core/tests/wasi_integration.rs` driver invokes `cargo build`
 # explicitly with the right target + feature combination.
 
@@ -21,7 +21,7 @@ name = "phantom-wasi-guest"
 path = "src/main.rs"
 
 [dependencies]
-phantom_core = { path = "../../../", default-features = false, features = ["std", "wasi-leg"] }
+phantom-protocol = { path = "../../../", default-features = false, features = ["std", "wasi-leg"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 

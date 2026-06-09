@@ -6,7 +6,7 @@
 //! out-of-bounds read from a hostile length prefix).
 
 use libfuzzer_sys::fuzz_target;
-use phantom_core::transport::types::PhantomPacket;
+use phantom_protocol::transport::types::PhantomPacket;
 
 fuzz_target!(|data: &[u8]| {
     // Random bytes must parse to `Err`, never panic.

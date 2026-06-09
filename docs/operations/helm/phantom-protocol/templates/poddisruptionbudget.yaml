@@ -2,10 +2,10 @@
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: {{ include "phantom-core.fullname" . }}-pdb
+  name: {{ include "phantom-protocol.fullname" . }}-pdb
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "phantom-core.labels" . | nindent 4 }}
+    {{- include "phantom-protocol.labels" . | nindent 4 }}
 spec:
   # maxUnavailable: 0 means at least one pod must remain Ready at all times
   # during voluntary disruptions (node drain, cluster upgrades). Combined with
@@ -15,5 +15,5 @@ spec:
   maxUnavailable: {{ .Values.pdb.maxUnavailable }}
   selector:
     matchLabels:
-      {{- include "phantom-core.selectorLabels" . | nindent 6 }}
+      {{- include "phantom-protocol.selectorLabels" . | nindent 6 }}
 {{- end }}

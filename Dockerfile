@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
 #
-# Phantom Core reference server — production container.
+# Phantom Protocol reference server — production container.
 #
 # Builds the `phantom-server` binary (sibling `server/` crate, depends on
-# `phantom_core` via path) and ships a hardened runtime image:
+# `phantom_protocol` via path) and ships a hardened runtime image:
 #   - non-root user (UID 65532)
 #   - read-only rootfs friendly (signing key on a volume at /etc/phantom-server)
 #   - exposes 4242 (app — matches docs/operations/kubernetes.md + helm chart)
@@ -27,7 +27,7 @@
 # ── Build stage ────────────────────────────────────────────────────────────
 FROM rust:1-slim-bookworm AS builder
 
-# Build deps for the sibling server crate. Phantom Core itself is pure-Rust
+# Build deps for the sibling server crate. Phantom Protocol itself is pure-Rust
 # (ml-kem / ml-dsa swap in Phase 5.1 removed all C deps from the lib);
 # `pkg-config` covers transitive build scripts (e.g. the OTLP exporter's
 # tonic/prost stack).
@@ -38,7 +38,7 @@ RUN apt-get update \
 WORKDIR /workspace
 COPY . .
 
-# `server/` is a workspace-excluded sibling crate (depends on phantom_core
+# `server/` is a workspace-excluded sibling crate (depends on phantom_protocol
 # via path = "../core") — its target dir is server/target.
 RUN cargo build --release --manifest-path server/Cargo.toml
 
@@ -71,6 +71,6 @@ ENV PHANTOM_BIND=0.0.0.0:4242 \
     PHANTOM_LOG_JSON=true \
     OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317 \
     OTEL_SERVICE_NAME=phantom-server \
-    RUST_LOG=info,phantom_core=info
+    RUST_LOG=info,phantom_protocol=info
 
 ENTRYPOINT ["/usr/local/bin/phantom-server"]

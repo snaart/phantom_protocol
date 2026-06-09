@@ -1,6 +1,6 @@
 # Mobile client deployment
 
-Reference patterns for embedding a Phantom Core client in native iOS (Swift) and Android (Kotlin)
+Reference patterns for embedding a Phantom Protocol client in native iOS (Swift) and Android (Kotlin)
 apps via UniFFI bindings.
 
 ## iOS (Swift)
@@ -15,18 +15,18 @@ cargo build --release --target x86_64-apple-ios         --manifest-path core/Car
 
 # Merge simulator slices; then build the XCFramework
 lipo -create \
-    target/aarch64-apple-ios-sim/release/libphantom_core.a \
-    target/x86_64-apple-ios/release/libphantom_core.a \
-    -output target/universal-sim/libphantom_core.a
+    target/aarch64-apple-ios-sim/release/libphantom_protocol.a \
+    target/x86_64-apple-ios/release/libphantom_protocol.a \
+    -output target/universal-sim/libphantom_protocol.a
 
 xcodebuild -create-xcframework \
-    -library target/aarch64-apple-ios/release/libphantom_core.a  -headers tests/bindings/swift/ \
-    -library target/universal-sim/libphantom_core.a              -headers tests/bindings/swift/ \
-    -output PhantomCore.xcframework
+    -library target/aarch64-apple-ios/release/libphantom_protocol.a  -headers tests/bindings/swift/ \
+    -library target/universal-sim/libphantom_protocol.a              -headers tests/bindings/swift/ \
+    -output PhantomProtocol.xcframework
 ```
 
-Auto-generated Swift sources in `tests/bindings/swift/`: `phantom_core.swift`,
-`phantom_coreFFI.h`, `phantom_coreFFI.modulemap`. Regenerate via
+Auto-generated Swift sources in `tests/bindings/swift/`: `phantom_protocol.swift`,
+`phantom_protocolFFI.h`, `phantom_protocolFFI.modulemap`. Regenerate via
 `core/src/bin/uniffi-bindgen.rs` (uniffi 0.29 cli) after any surface change.
 
 **SwiftPM integration.**
@@ -36,13 +36,13 @@ Auto-generated Swift sources in `tests/bindings/swift/`: `phantom_core.swift`,
 let package = Package(
     name: "MyApp", platforms: [.iOS(.v16)],
     targets: [
-        .binaryTarget(name: "PhantomCoreFFI", path: "PhantomCore.xcframework"),
+        .binaryTarget(name: "PhantomProtocolFFI", path: "PhantomProtocol.xcframework"),
         .target(
-            name: "PhantomCore", dependencies: ["PhantomCoreFFI"],
-            path: "Sources/PhantomCore",          // place phantom_core.swift here
+            name: "PhantomProtocol", dependencies: ["PhantomProtocolFFI"],
+            path: "Sources/PhantomProtocol",          // place phantom_protocol.swift here
             swiftSettings: [.unsafeFlags(["-suppress-warnings"])]
         ),
-        .target(name: "MyApp", dependencies: ["PhantomCore"]),
+        .target(name: "MyApp", dependencies: ["PhantomProtocol"]),
     ]
 )
 ```
@@ -54,14 +54,14 @@ from_bytes`, and delegates to `PhantomSession::connect_with_transport`
 (Security Invariant 1 enforced unconditionally). Use it directly:
 
 ```swift
-import PhantomCore
+import PhantomProtocol
 
 // Pinned key baked into the bundle — NEVER fetched at runtime.
 let keyData = try! Data(contentsOf: Bundle.main.url(
     forResource: "phantom_server_pk", withExtension: "bin")!)
 
 // Shim exposes: connectPinned(host:port:pinnedKey:) -> PhantomSession
-let session = try await PhantomCore.connectPinned(
+let session = try await PhantomProtocol.connectPinned(
     host: "phantom.example.com", port: 4242,
     pinnedKey: keyData   // from PhantomListener::verifying_key_bytes()
 )
@@ -97,13 +97,13 @@ cargo build --release --target armv7-linux-androideabi --manifest-path core/Carg
 cargo build --release --target x86_64-linux-android    --manifest-path core/Cargo.toml
 
 mkdir -p app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}
-cp target/aarch64-linux-android/release/libphantom_core.so   app/src/main/jniLibs/arm64-v8a/
-cp target/armv7-linux-androideabi/release/libphantom_core.so app/src/main/jniLibs/armeabi-v7a/
-cp target/x86_64-linux-android/release/libphantom_core.so    app/src/main/jniLibs/x86_64/
+cp target/aarch64-linux-android/release/libphantom_protocol.so   app/src/main/jniLibs/arm64-v8a/
+cp target/armv7-linux-androideabi/release/libphantom_protocol.so app/src/main/jniLibs/armeabi-v7a/
+cp target/x86_64-linux-android/release/libphantom_protocol.so    app/src/main/jniLibs/x86_64/
 ```
 
-Auto-generated Kotlin source: `tests/bindings/kotlin/uniffi/phantom_core/phantom_core.kt`.
-Copy to `src/main/kotlin/uniffi/phantom_core/`; regenerate via `uniffi-bindgen.rs`.
+Auto-generated Kotlin source: `tests/bindings/kotlin/uniffi/phantom_protocol/phantom_protocol.kt`.
+Copy to `src/main/kotlin/uniffi/phantom_protocol/`; regenerate via `uniffi-bindgen.rs`.
 
 **Gradle integration.**
 
@@ -111,7 +111,7 @@ Copy to `src/main/kotlin/uniffi/phantom_core/`; regenerate via `uniffi-bindgen.r
 // app/build.gradle
 android {
     sourceSets.main {
-        jniLibs.srcDirs = ['src/main/jniLibs']   // picks up libphantom_core.so
+        jniLibs.srcDirs = ['src/main/jniLibs']   // picks up libphantom_protocol.so
         java.srcDirs   += ['src/main/kotlin']
     }
 }
@@ -124,12 +124,12 @@ dependencies {
 surface as of `bfbf808` — call it directly:
 
 ```kotlin
-import uniffi.phantom_core.*
+import uniffi.phantom_protocol.*
 
 val pinnedKeyBytes = resources.openRawResource(R.raw.phantom_server_pk).use { it.readBytes() }
 
 // Shim: connectPinned(host, port, pinnedKey) — wraps connect_with_transport
-val session = PhantomCoreKt.connectPinned(
+val session = PhantomProtocolKt.connectPinned(
     host = "phantom.example.com", port = 4242u,
     pinnedKey = pinnedKeyBytes   // from PhantomListener::verifying_key_bytes()
 )
@@ -247,4 +247,4 @@ your threat model; clear tickets on detected compromise.
 - `docs/operations/kubernetes.md` — server-side cluster deployment
 - `docs/operations/perf-tuning.md` — server-side build flags and throughput numbers
 - `tests/bindings/swift/` — auto-generated Swift sources
-- `tests/bindings/kotlin/uniffi/phantom_core/phantom_core.kt` — auto-generated Kotlin source
+- `tests/bindings/kotlin/uniffi/phantom_protocol/phantom_protocol.kt` — auto-generated Kotlin source

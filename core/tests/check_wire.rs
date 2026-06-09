@@ -1,4 +1,4 @@
-use phantom_core::transport::types::*;
+use phantom_protocol::transport::types::*;
 
 #[test]
 fn test_header_size() {

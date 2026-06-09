@@ -44,7 +44,7 @@ mod otel_on {
         atomics: &Arc<HotPathAtomics>,
         config: &ObservabilityConfig,
     ) {
-        let meter = opentelemetry::global::meter("phantom_core");
+        let meter = opentelemetry::global::meter("phantom_protocol");
         let ns = config.namespace.as_ref();
 
         // phantom.session.packets — ObservableCounter, labeled (direction, leg)

@@ -10,8 +10,8 @@
 //! decryption to succeed; we only require the function to be total.
 
 use libfuzzer_sys::fuzz_target;
-use phantom_core::transport::session::{CryptoState, Session};
-use phantom_core::transport::types::{PacketFlags, PacketHeader, SchedulerMode, SessionId};
+use phantom_protocol::transport::session::{CryptoState, Session};
+use phantom_protocol::transport::types::{PacketFlags, PacketHeader, SchedulerMode, SessionId};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 4 {

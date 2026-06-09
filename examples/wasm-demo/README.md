@@ -1,6 +1,6 @@
-# Phantom Core — Browser WASM Demo
+# Phantom Protocol — Browser WASM Demo
 
-A minimal browser demo that runs a full post-quantum Phantom Core handshake
+A minimal browser demo that runs a full post-quantum Phantom Protocol handshake
 over WebSocket, entirely inside a browser tab. It connects to a Phantom server,
 sends a `"ping from wasm"` message, and logs the echoed response to the console.
 
@@ -28,7 +28,7 @@ All status messages are written to the browser console via `console.log`.
   ```
   cargo install wasm-pack
   ```
-- A running Phantom Core server with WebSocket support. See the operator
+- A running Phantom Protocol server with WebSocket support. See the operator
   guide at `docs/operations/wasm.md` in the main repo.
 
 ## Build

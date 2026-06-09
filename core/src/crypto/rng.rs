@@ -1,4 +1,4 @@
-//! `RngProvider` — the indirection through which Phantom Core obtains
+//! `RngProvider` — the indirection through which Phantom Protocol obtains
 //! cryptographic randomness. Default is [`OsRng`], which delegates to
 //! [`getrandom::getrandom`] and therefore picks up the platform's CSPRNG on
 //! every supported target (Linux `getrandom(2)`, macOS / iOS
@@ -27,7 +27,7 @@
 //! - A real NIST SP 800-90A DRBG (e.g., HMAC-DRBG). The trait is shaped to
 //!   accept one, but the impl itself is Phase 5 (FIPS) work.
 //! - A hardware-RNG impl. Those are inherently target-specific and belong
-//!   in a downstream HAL adapter crate, not in `phantom_core` itself.
+//!   in a downstream HAL adapter crate, not in `phantom_protocol` itself.
 //!
 //! ## Slotting in alternative providers
 //!
@@ -40,7 +40,7 @@
 //! adapter looks roughly like:
 //!
 //! ```ignore
-//! use phantom_core::crypto::rng::RngProvider;
+//! use phantom_protocol::crypto::rng::RngProvider;
 //! use core::sync::atomic::AtomicBool;
 //! use spin::Mutex;          // or critical_section::Mutex on no_std-no-alloc
 //!
@@ -76,7 +76,7 @@
 //! per SP 800-90A § 9. The skeleton:
 //!
 //! ```ignore
-//! use phantom_core::crypto::rng::RngProvider;
+//! use phantom_protocol::crypto::rng::RngProvider;
 //! use std::sync::Mutex;
 //!
 //! pub struct HmacDrbg { /* V, Key, reseed_counter, ... */ }
@@ -121,7 +121,7 @@ use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 ///
 /// Implementations are expected to be **infallible** at the call boundary
 /// — randomness is required for crypto correctness, and there is no
-/// useful fallback at the Phantom Core layer. If the underlying source
+/// useful fallback at the Phantom Protocol layer. If the underlying source
 /// can fail (a hardware-RNG health-test trip, an OS RNG that returns
 /// `EIO`, …) the impl must surface that as a panic so the higher layer
 /// fails loudly rather than silently producing biased keys. The default

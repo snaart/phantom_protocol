@@ -1,6 +1,6 @@
 # Browser / WASM client deployment
 
-Reference patterns for embedding a Phantom Core client in a browser via the
+Reference patterns for embedding a Phantom Protocol client in a browser via the
 `wasm32-unknown-unknown` target.
 
 ## Build setup
@@ -19,7 +19,7 @@ wasm-pack build --target bundler --release -- --manifest-path phantom-wasm-clien
 
 ```toml
 [dependencies]
-phantom_core    = { path = "../core", default-features = false }
+phantom_protocol    = { path = "../core", default-features = false }
 wasm-bindgen    = "0.2"
 wasm-bindgen-futures = "0.4"
 ```
@@ -47,7 +47,7 @@ and resolves once `onopen` fires. Pair it with `WasmRuntime`:
 
 ```rust
 use std::sync::Arc;
-use phantom_core::{
+use phantom_protocol::{
     api::session::PhantomSession,
     crypto::hybrid_sign::HybridVerifyingKey,
     runtime::WasmRuntime,
