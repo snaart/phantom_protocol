@@ -8,6 +8,19 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-09
+
+### Changed
+
+- Crate `description` reworded to drop the legacy "Core" branding and lead with
+  the post-quantum primitive set.
+- Added a crate-level `core/README.md` (rendered on crates.io / docs.rs) wired in
+  via the `readme` manifest field, plus badges and a crates.io install section in
+  the repository README.
+- Refreshed documentation version references — server / CLI / Helm `appVersion` /
+  packaging / WASI examples — from the pre-rename `0.3.0` (and a stray `0.2`) to
+  the current `0.1.x` series. Docs-only; no code, wire-format, or crypto change.
+
 ## [0.1.0] - 2026-06-09
 
 ### Changed
