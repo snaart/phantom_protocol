@@ -760,6 +760,8 @@ network attacker cannot learn anything from the shape of the failure.
 - `SessionId`, `HybridKeyPackage`, `HybridVerifyingKey`, `HybridCiphertext`,
   `HybridSignature` derive `BorshSerialize + BorshDeserialize`; their on-wire
   bytes are the concatenation of their internal fields in declaration order.
+> **Note (Phase 0):** the FakeTLS leg was removed; this section is retained for the planned HTTP-mimicry transport mode.
+
 - FakeTLS outer obfuscation (Invariant 3) uses per-record counter nonces and
   direction-keyed AEAD derived from a public `(SNI || version)` seed via the
   `"phantom-faketls-*-v1"` labels (§ 3). It is anti-DPI obfuscation only — the

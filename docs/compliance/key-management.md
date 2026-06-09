@@ -106,7 +106,7 @@ dedicated key plus a 4-byte nonce prefix and an 8-byte invocation counter.
 12-byte nonce prefix, derived from a public seed via BLAKE3 with labels
 `phantom-faketls-c2s-v1` / `s2c-v1` / `pfx-v1`.
 
-**Stored in:** `FakeTlsLeg` value.
+**Stored in:** `FakeTlsLeg` value. *(FakeTLS leg removed in Phase 0; returns with the planned HTTP-mimicry mode.)*
 
 **Used for:** the **outer** FakeTLS-record AEAD (anti-DPI obfuscation
 only — see security note in `SECURITY.md` invariant 3).
@@ -165,7 +165,7 @@ type exists but is not exchanged on the wire.
 | `HandshakeServer.master_secret` | inline `[u8; 32]` | ✅ derive |
 | `HandshakeClient.nonce` | inline `[u8; 32]` | ✅ derive |
 | `Session.resumption_secret` | inline `[u8; 32]` | ✅ derive |
-| `FakeTlsLeg` keys (ring `LessSafeKey`) | heap (opaque) | partial — ring does not zero its interior; input bytes are zeroed |
+| `FakeTlsLeg` keys *(removed in Phase 0)* | heap (opaque) | partial — ring does not zero its interior; input bytes are zeroed |
 
 ## Storage at rest
 
