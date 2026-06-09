@@ -69,7 +69,7 @@ tokio::spawn(async move {
     let session = outcome.session();
     let _req = session.recv().await?;
     session.send(b"hello, post-quantum world".to_vec()).await?;
-    Ok::<_, phantom_protocol::errors::CoreError>(())
+    Ok::<_, phantom_protocol::CoreError>(())
 });
 
 // ── Client ──────────────────────────────────────────────────────────────
