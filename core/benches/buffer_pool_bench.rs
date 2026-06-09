@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use parking_lot::Mutex;
-use phantom_core::transport::buffer_pool::BufferPool;
+use phantom_protocol::transport::buffer_pool::BufferPool;
 use std::sync::Arc;
 use std::thread;
 

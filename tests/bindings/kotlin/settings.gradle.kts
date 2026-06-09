@@ -1,4 +1,4 @@
-rootProject.name = "phantom_core"
+rootProject.name = "phantom_protocol"
 
 pluginManagement {
     repositories {

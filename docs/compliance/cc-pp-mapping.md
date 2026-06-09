@@ -1,13 +1,13 @@
 # Common Criteria Protection Profile Mapping
 
-**Scope.** This document maps the `phantom_core` library against the
+**Scope.** This document maps the `phantom_protocol` library against the
 **NIAP PP-Module for VPN Client v2.5** layered on the **PP for Application
 Software v1.4**. It is the primary artifact for a NIAP CC evaluation
 submission. A CC consultant or CCEVS-accredited laboratory should treat it
 as the starting Security Target skeleton: each row below corresponds to a
 claim or gap that will appear in the formal ST.
 
-**Target PP chosen.** PP-Module VPN Client v2.5 + PP App v1.4. Phantom Core
+**Target PP chosen.** PP-Module VPN Client v2.5 + PP App v1.4. Phantom Protocol
 is a transport *library* that downstream applications embed; it is not an
 independent binary. The VPN Client module is the closest NIAP match for a
 post-quantum-secure L4/L6 session layer. Alternative: PP for Network Devices
@@ -28,7 +28,7 @@ add FMT_SMF / FMT_MSA families. This document does not cover the ND PP.
 
 ### In Scope
 
-- `core/` — the `phantom_core` Rust library (`std` build, default features
+- `core/` — the `phantom_protocol` Rust library (`std` build, default features
   `["compression-zstd", "std"]`). This is the software TOE.
 - `tests/bindings/{swift,kotlin,c,python}` — the UniFFI-generated consumer
   FFI surfaces, treated as part of the TOE boundary for the purposes of
@@ -63,7 +63,7 @@ add FMT_SMF / FMT_MSA families. This document does not cover the ND PP.
  └────────────┼─────────────────────────────┼────────────────────-┘
               │                             │
  ┌────────────▼─────────────────────────────▼─────────────────────┐
- │  TOE: phantom_core (core/)                                     │
+ │  TOE: phantom_protocol (core/)                                     │
  │                                                                 │
  │  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌───────────┐  │
  │  │ api/     │  │transport/│  │  crypto/     │  │security/  │  │
@@ -80,7 +80,7 @@ add FMT_SMF / FMT_MSA families. This document does not cover the ND PP.
 
 ## Phantom Protocol Summary (for evaluators)
 
-Phantom Core implements a bespoke post-quantum session protocol, not TLS.
+Phantom Protocol implements a bespoke post-quantum session protocol, not TLS.
 Understanding the protocol is necessary to evaluate the FCS and FTP claims.
 The full specification is in `docs/protocol/PROTOCOL.md`.
 
@@ -205,7 +205,7 @@ the session from the wire:
 |-----|-------|---------------|--------|-----------------|
 | FCS_TLSC_EXT.1 | TLS Client | Phantom does not implement TLS. It implements its own post-quantum session protocol. | N/A | The Phantom protocol is the trusted channel (see `FTP_DIT.1` below). Evaluators should treat §3 of `docs/protocol/PROTOCOL.md` as the protocol specification in lieu of a TLS profile claim. The `legs/faketls.rs` leg presents a TLS 1.3 ClientHello to deep-packet inspection but the *inner* session is Phantom, not TLS. |
 | FCS_HTTPS_EXT.1 | HTTPS for management | Phantom does not expose an HTTPS management interface. The WebSocket leg (`legs/websocket.rs`) carries the Phantom session; it is not an independent HTTPS service. | N/A | `docs/protocol/PROTOCOL.md §11` and `docs/operations/wasm.md` describe the WebSocket transport. Metrics exposition is now via the observability module (Phase 8); the library provides `MetricsSnapshot` and OTel instruments, and the embedder integrates with collectors. The HTTP server is OE. |
-| FCS_STO_EXT.1 | Key storage | `key-management.md §Storage at rest`: Phantom Core does not persist any key material. All key bytes exist only in process memory. Long-term server signing key (`HybridSigningKey`) is heap-resident; ephemeral KEM keys are dropped after handshake. | 🔄 | Platform key-store integration (iOS Keychain, Android Keystore) is OE responsibility. A future `SigningKeyBackend` trait is planned but not on the current roadmap. Evaluators must confirm the embedder's key-storage posture. |
+| FCS_STO_EXT.1 | Key storage | `key-management.md §Storage at rest`: Phantom Protocol does not persist any key material. All key bytes exist only in process memory. Long-term server signing key (`HybridSigningKey`) is heap-resident; ephemeral KEM keys are dropped after handshake. | 🔄 | Platform key-store integration (iOS Keychain, Android Keystore) is OE responsibility. A future `SigningKeyBackend` trait is planned but not on the current roadmap. Evaluators must confirm the embedder's key-storage posture. |
 
 ---
 
@@ -272,7 +272,7 @@ the client's IP address protection. Phantom's position:
 
 ## Security Assurance Requirements (SAR) Mapping
 
-| SAR | Title | Phantom Core Evidence |
+| SAR | Title | Phantom Protocol Evidence |
 |-----|-------|-----------------------|
 | SAR | Title | Evidence Document(s) | Gap / Note |
 |-----|-------|---------------------|------------|

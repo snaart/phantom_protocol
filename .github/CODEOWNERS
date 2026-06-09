@@ -1,4 +1,4 @@
-# Code owners for phantom_core.
+# Code owners for phantom_protocol.
 #
 # Matching owners are auto-requested for review on a PR. The security-sensitive
 # subsystems below mirror CONTRIBUTING.md ("Security-sensitive changes") and the

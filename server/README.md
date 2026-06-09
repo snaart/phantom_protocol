@@ -1,9 +1,9 @@
 # phantom-server
 
-Reference production server binary for [`phantom_core`].
+Reference production server binary for [`phantom_protocol`].
 
 This crate is intentionally **not** a workspace member — it lives next to
-`core/`, `cli/`, `tests/`, and `fuzz/` and depends on `phantom_core` via
+`core/`, `cli/`, `tests/`, and `fuzz/` and depends on `phantom_protocol` via
 a path dependency. The pattern matches the rest of the repository (see
 the root `Cargo.toml` `exclude` list).
 
@@ -46,7 +46,7 @@ when both are set (clap default).
 | `--max-sessions`           | `PHANTOM_MAX_SESSIONS`         | `1024`                            | Global concurrent-session cap (backpressure, not drop); `0` = unbounded. |
 | `--max-sessions-per-ip`    | `PHANTOM_MAX_SESSIONS_PER_IP`  | `64`                              | Per-source-IP concurrent-session cap; `0` disables it.               |
 | `--log-json`               | `PHANTOM_LOG_JSON`             | `false` (pretty)                  | Emit structured JSON logs.                                           |
-| `--log-filter`             | `RUST_LOG`                     | `info,phantom_core=debug`         | `tracing-subscriber` `EnvFilter` directive.                          |
+| `--log-filter`             | `RUST_LOG`                     | `info,phantom_protocol=debug`         | `tracing-subscriber` `EnvFilter` directive.                          |
 
 ## Verifying-key pinning
 
@@ -59,7 +59,7 @@ WARN phantom_server: listener verifying key (pin this on clients): <hex>
 Clients **MUST** pin this exact value:
 
 ```rust
-use phantom_core::crypto::hybrid_sign::HybridVerifyingKey;
+use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
 let pinned = HybridVerifyingKey::from_bytes(&hex::decode("...")?)?;
 PhantomSession::connect_with_transport(addr, transport, pinned).await?;
 ```
@@ -72,7 +72,7 @@ Anything less reintroduces the MITM vector documented in
 The on-disk blob is 64 bytes — `ed25519_seed[32] || ml_dsa_seed[32]`.
 The full ML-DSA-65 signing key (≈4 KiB expanded) is regenerated from its
 32-byte seed on load per FIPS 204 § Algorithm 1, so the on-disk format
-is the compact seed pair. See `phantom_core::crypto::hybrid_sign::HybridSigningKey::to_bytes`.
+is the compact seed pair. See `phantom_protocol::crypto::hybrid_sign::HybridSigningKey::to_bytes`.
 
 On Unix the file is created with `0600` permissions. Operators are
 responsible for the parent directory's permissions (`/etc/phantom-server/`
@@ -104,7 +104,7 @@ When `--otlp-endpoint` is set (default `http://localhost:4317`), the server push
 - **Docker** — `docs/operations/docker.md`
 - **systemd** — `docs/operations/systemd.md`
 - **Kubernetes** — `docs/operations/kubernetes.md`
-- **Helm** — `docs/operations/helm/phantom-core/`
+- **Helm** — `docs/operations/helm/phantom-protocol/`
 
 All operator docs assume the binary is named `phantom-server` and that
 the binding contract matches this README.

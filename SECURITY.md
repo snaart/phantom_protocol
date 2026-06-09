@@ -10,7 +10,7 @@ publicly. Do not file public GitHub issues for security problems.
 - For ongoing reports, expect an acknowledgement within 5 business days and
   a triage outcome within 14 business days.
 
-Phantom Core uses GitHub Security Advisories for public CVE coordination.
+Phantom Protocol uses GitHub Security Advisories for public CVE coordination.
 
 ## Supported versions
 
@@ -22,7 +22,7 @@ Phantom Core uses GitHub Security Advisories for public CVE coordination.
 
 ## Threat model (summary)
 
-Phantom Core is a post-quantum-secure L4/L6 transport. The full threat model
+Phantom Protocol is a post-quantum-secure L4/L6 transport. The full threat model
 will live in `docs/security/threat-model.md` (in preparation). At a glance:
 
 - **In scope:** authenticated key agreement, confidentiality and integrity of
@@ -78,4 +78,4 @@ T+45  Coordinated release across affected branches
 T+90  Public disclosure with CVE
 ```
 
-Phantom Core honors longer embargoes for downstream coordination on request.
+Phantom Protocol honors longer embargoes for downstream coordination on request.

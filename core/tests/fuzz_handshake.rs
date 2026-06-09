@@ -3,7 +3,7 @@
 //! Uses `rand` to generate random inputs and verify robustness of
 //! state transitions and parsing logic.
 
-use phantom_core::transport::handshake::{
+use phantom_protocol::transport::handshake::{
     ClientHello, HandshakeClient, HandshakeResponse, HandshakeServer,
 };
 use rand::Rng;

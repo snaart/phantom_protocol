@@ -8,7 +8,7 @@
 //! non-zero — proving the runtime indirection is wired all the way
 //! through the data pump.
 
-use phantom_core::runtime::{BoxFuture, Runtime, SpawnHandle, TokioRuntime};
+use phantom_protocol::runtime::{BoxFuture, Runtime, SpawnHandle, TokioRuntime};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -54,8 +54,8 @@ impl Runtime for CountingRuntime {
 /// observed at least one `spawn` call from the data pump.
 #[tokio::test]
 async fn runtime_substitution_drives_session_and_listener() {
-    use phantom_core::api::{PhantomListener, PhantomSession, TcpSessionTransport};
-    use phantom_core::crypto::hybrid_sign::HybridVerifyingKey;
+    use phantom_protocol::api::{PhantomListener, PhantomSession, TcpSessionTransport};
+    use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
     use tokio::net::TcpStream;
 
     let listener_rt: Arc<CountingRuntime> = Arc::new(CountingRuntime::default());

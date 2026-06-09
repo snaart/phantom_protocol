@@ -1,4 +1,4 @@
-# Phantom Core Metrics Catalog
+# Phantom Protocol Metrics Catalog
 
 Single source of truth for every metric instrument the library emits.
 Instrument names use OTel dotted notation under the `{namespace}.*`

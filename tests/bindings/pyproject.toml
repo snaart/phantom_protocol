@@ -1,7 +1,7 @@
-# Python wheel for the phantom_core UniFFI binding.
+# Python wheel for the phantom_protocol UniFFI binding.
 #
-# This produces a pure-Python wheel containing `phantom_core.py`; the
-# native `libphantom_core.{dylib,so,dll}` is NOT auto-bundled — it must
+# This produces a pure-Python wheel containing `phantom_protocol.py`; the
+# native `libphantom_protocol.{dylib,so,dll}` is NOT auto-bundled — it must
 # be staged next to the module before publishing or sitting next to it
 # inside `site-packages/` after install. UniFFI's `_uniffi_load_indirect`
 # expects the library at `os.path.dirname(__file__)`.
@@ -20,12 +20,12 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "phantom-core"
-version = "0.3.0"
-description = "Phantom Core — post-quantum-secure L4/L6 transport (Python binding)"
+name = "phantom-protocol"
+version = "0.1.0"
+description = "Phantom Protocol — post-quantum-secure L4/L6 transport (Python binding)"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
-authors = [{ name = "Phantom Core developers" }]
+authors = [{ name = "Phantom Protocol developers" }]
 keywords = ["post-quantum", "cryptography", "transport", "uniffi"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -41,7 +41,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/SNAcorp/phantom-core"
+Repository = "https://github.com/SNAcorp/phantom-protocol"
 
 [tool.setuptools]
-py-modules = ["phantom_core"]
+py-modules = ["phantom_protocol"]

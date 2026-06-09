@@ -16,10 +16,10 @@
 //! Defaults to 1024 cases per property; turn the dial via
 //! `PROPTEST_CASES=10000 cargo test --test property`.
 
-use phantom_core::crypto::adaptive_crypto::{CipherSuite, CryptoSession};
-use phantom_core::security::ReplayWindow;
-use phantom_core::transport::session::{CryptoState, Session, MAX_REKEY_CATCHUP};
-use phantom_core::transport::types::{
+use phantom_protocol::crypto::adaptive_crypto::{CipherSuite, CryptoSession};
+use phantom_protocol::security::ReplayWindow;
+use phantom_protocol::transport::session::{CryptoState, Session, MAX_REKEY_CATCHUP};
+use phantom_protocol::transport::types::{
     PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
 };
 use proptest::prelude::*;

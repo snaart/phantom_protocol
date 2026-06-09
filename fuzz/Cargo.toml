@@ -1,5 +1,5 @@
 [package]
-name = "phantom-core-fuzz"
+name = "phantom-protocol-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -11,7 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 borsh = { version = "1.0", features = ["derive"] }
 
-[dependencies.phantom_core]
+[dependencies.phantom-protocol]
 path = "../core"
 features = ["embedded"]
 

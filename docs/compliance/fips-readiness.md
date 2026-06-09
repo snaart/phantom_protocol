@@ -1,6 +1,6 @@
 # FIPS 140-3 / Common Criteria Readiness
 
-Living document tracking the gap between the current `phantom_core` build
+Living document tracking the gap between the current `phantom_protocol` build
 and a FIPS 140-3 (or equivalent CC) validated configuration. Authoritative
 for what the FIPS-validation phase of the roadmap has to deliver.
 

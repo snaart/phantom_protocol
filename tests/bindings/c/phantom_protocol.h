@@ -1,12 +1,12 @@
 /*
- * phantom_core.h — C-language FFI declarations for Phantom Core (libphantom_core)
+ * phantom_protocol.h — C-language FFI declarations for Phantom Protocol (libphantom_protocol)
  *
- * Phantom Core is a post-quantum-secure L4/L6 transport library (Rust).
+ * Phantom Protocol is a post-quantum-secure L4/L6 transport library (Rust).
  * It exposes a foreign-function-interface through Mozilla UniFFI 0.29's
  * `setup_scaffolding!()` macro, which emits a stable `extern "C"` surface
  * in the produced `cdylib`. This file declares the symbols of that surface
  * for use from C / C++ programs that link against the produced
- * `libphantom_core.{dylib,so,dll}`.
+ * `libphantom_protocol.{dylib,so,dll}`.
  *
  * IMPORTANT: This header was hand-curated from the symbols actually
  * exported by the shared library. UniFFI does NOT ship a first-class C
@@ -18,7 +18,7 @@
  *
  * The calling convention follows UniFFI 0.29 "contract version 29". The
  * runtime contract version reported by the dylib MUST match what the
- * caller expects; check it via `ffi_phantom_core_uniffi_contract_version`
+ * caller expects; check it via `ffi_phantom_protocol_uniffi_contract_version`
  * at startup.
  *
  * Calling-convention summary (read this before invoking any function):
@@ -35,8 +35,8 @@
  *   2. Bytes / strings cross the FFI in a `PhantomRustBuffer { capacity,
  *      len, data }`. The `data` pointer is owned by the Rust allocator —
  *      ALWAYS free a returned buffer with
- *      `ffi_phantom_core_rustbuffer_free`. Conversely, when handing bytes
- *      *to* Rust, allocate via `ffi_phantom_core_rustbuffer_alloc` (or
+ *      `ffi_phantom_protocol_rustbuffer_free`. Conversely, when handing bytes
+ *      *to* Rust, allocate via `ffi_phantom_protocol_rustbuffer_alloc` (or
  *      construct from a borrowed slice via `_from_bytes`) and let Rust
  *      take ownership.
  *
@@ -49,7 +49,7 @@
  *
  *   4. Async constructors / methods return a `uint64_t` future handle
  *      rather than a result. Drive the future to completion via the
- *      `ffi_phantom_core_rust_future_poll_*` family — pick the variant
+ *      `ffi_phantom_protocol_rust_future_poll_*` family — pick the variant
  *      whose suffix matches the eventual return type (pointer,
  *      rust_buffer, void, etc.). The poll function calls back into your
  *      `PhantomRustFutureContinuationCallback` with a poll-code
@@ -62,12 +62,12 @@
  * load-bearing values from the protocol — they are NOT exported symbols.
  *
  * --- LICENSE -----------------------------------------------------------
- * This declarations file is part of Phantom Core and shares its license
+ * This declarations file is part of Phantom Protocol and shares its license
  * (Apache-2.0 OR MIT). See the project root.
  * --------------------------------------------------------------------- */
 
-#ifndef PHANTOM_CORE_H
-#define PHANTOM_CORE_H
+#ifndef PHANTOM_PROTOCOL_H
+#define PHANTOM_PROTOCOL_H
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -99,7 +99,7 @@ typedef struct PhantomRustCallStatus {
 /*
  * Owned byte vector that crosses the FFI boundary. Returned by anything
  * that hands back bytes / strings / lowered records. Must be released
- * with `ffi_phantom_core_rustbuffer_free` regardless of `len`.
+ * with `ffi_phantom_protocol_rustbuffer_free` regardless of `len`.
  *
  * Aliased separately so the field name in `PhantomRustCallStatus` is
  * still legal C.
@@ -108,7 +108,7 @@ typedef struct PhantomRustBuffer PhantomRustBuffer;
 
 /*
  * Borrowed view of caller-owned bytes, accepted by
- * `ffi_phantom_core_rustbuffer_from_bytes`. The data must remain valid
+ * `ffi_phantom_protocol_rustbuffer_from_bytes`. The data must remain valid
  * until the call returns.
  */
 typedef struct PhantomForeignBytes {
@@ -160,7 +160,7 @@ typedef void (*PhantomRustFutureContinuationCallback)(uint64_t handle,
 #define PHANTOM_RESUMPTION_SECRET_LEN 32
 
 /* UniFFI contract version this header was generated against. The
- * runtime value reported by ffi_phantom_core_uniffi_contract_version()
+ * runtime value reported by ffi_phantom_protocol_uniffi_contract_version()
  * MUST match — if not, the dylib was rebuilt with an incompatible
  * UniFFI release and this header is stale. */
 #define PHANTOM_UNIFFI_CONTRACT_VERSION 30
@@ -168,29 +168,29 @@ typedef void (*PhantomRustFutureContinuationCallback)(uint64_t handle,
 /* ====================================================================
  * SECTION 3 — Runtime / infrastructure FFI
  *
- * The `ffi_phantom_core_*` symbols are the language-agnostic runtime
+ * The `ffi_phantom_protocol_*` symbols are the language-agnostic runtime
  * that backs every higher-level call. Read them first; everything in
  * SECTION 4 depends on the conventions established here.
  * ==================================================================== */
 
 /* Returns the contract version baked into the dylib. Compare against
  * PHANTOM_UNIFFI_CONTRACT_VERSION at process start. */
-uint32_t ffi_phantom_core_uniffi_contract_version(void);
+uint32_t ffi_phantom_protocol_uniffi_contract_version(void);
 
 /* RustBuffer lifecycle. */
-PhantomRustBuffer ffi_phantom_core_rustbuffer_alloc(
+PhantomRustBuffer ffi_phantom_protocol_rustbuffer_alloc(
     uint64_t                 size,
     PhantomRustCallStatus   *call_status);
 
-PhantomRustBuffer ffi_phantom_core_rustbuffer_from_bytes(
+PhantomRustBuffer ffi_phantom_protocol_rustbuffer_from_bytes(
     PhantomForeignBytes      bytes,
     PhantomRustCallStatus   *call_status);
 
-void ffi_phantom_core_rustbuffer_free(
+void ffi_phantom_protocol_rustbuffer_free(
     PhantomRustBuffer        buf,
     PhantomRustCallStatus   *call_status);
 
-PhantomRustBuffer ffi_phantom_core_rustbuffer_reserve(
+PhantomRustBuffer ffi_phantom_protocol_rustbuffer_reserve(
     PhantomRustBuffer        buf,
     uint64_t                 additional,
     PhantomRustCallStatus   *call_status);
@@ -214,48 +214,48 @@ PhantomRustBuffer ffi_phantom_core_rustbuffer_reserve(
  * can re-declare them following the pattern.
  */
 
-void ffi_phantom_core_rust_future_poll_pointer(
+void ffi_phantom_protocol_rust_future_poll_pointer(
     uint64_t                                handle,
     PhantomRustFutureContinuationCallback   callback,
     uint64_t                                callback_data);
-void ffi_phantom_core_rust_future_cancel_pointer(uint64_t handle);
-void ffi_phantom_core_rust_future_free_pointer(uint64_t handle);
-void *ffi_phantom_core_rust_future_complete_pointer(
+void ffi_phantom_protocol_rust_future_cancel_pointer(uint64_t handle);
+void ffi_phantom_protocol_rust_future_free_pointer(uint64_t handle);
+void *ffi_phantom_protocol_rust_future_complete_pointer(
     uint64_t                                handle,
     PhantomRustCallStatus                  *call_status);
 
-void ffi_phantom_core_rust_future_poll_rust_buffer(
+void ffi_phantom_protocol_rust_future_poll_rust_buffer(
     uint64_t                                handle,
     PhantomRustFutureContinuationCallback   callback,
     uint64_t                                callback_data);
-void ffi_phantom_core_rust_future_cancel_rust_buffer(uint64_t handle);
-void ffi_phantom_core_rust_future_free_rust_buffer(uint64_t handle);
-PhantomRustBuffer ffi_phantom_core_rust_future_complete_rust_buffer(
+void ffi_phantom_protocol_rust_future_cancel_rust_buffer(uint64_t handle);
+void ffi_phantom_protocol_rust_future_free_rust_buffer(uint64_t handle);
+PhantomRustBuffer ffi_phantom_protocol_rust_future_complete_rust_buffer(
     uint64_t                                handle,
     PhantomRustCallStatus                  *call_status);
 
-void ffi_phantom_core_rust_future_poll_void(
+void ffi_phantom_protocol_rust_future_poll_void(
     uint64_t                                handle,
     PhantomRustFutureContinuationCallback   callback,
     uint64_t                                callback_data);
-void ffi_phantom_core_rust_future_cancel_void(uint64_t handle);
-void ffi_phantom_core_rust_future_free_void(uint64_t handle);
-void ffi_phantom_core_rust_future_complete_void(
+void ffi_phantom_protocol_rust_future_cancel_void(uint64_t handle);
+void ffi_phantom_protocol_rust_future_free_void(uint64_t handle);
+void ffi_phantom_protocol_rust_future_complete_void(
     uint64_t                                handle,
     PhantomRustCallStatus                  *call_status);
 
-void ffi_phantom_core_rust_future_poll_u8(
+void ffi_phantom_protocol_rust_future_poll_u8(
     uint64_t                                handle,
     PhantomRustFutureContinuationCallback   callback,
     uint64_t                                callback_data);
-void ffi_phantom_core_rust_future_cancel_u8(uint64_t handle);
-void ffi_phantom_core_rust_future_free_u8(uint64_t handle);
-uint8_t ffi_phantom_core_rust_future_complete_u8(
+void ffi_phantom_protocol_rust_future_cancel_u8(uint64_t handle);
+void ffi_phantom_protocol_rust_future_free_u8(uint64_t handle);
+uint8_t ffi_phantom_protocol_rust_future_complete_u8(
     uint64_t                                handle,
     PhantomRustCallStatus                  *call_status);
 
 /* ====================================================================
- * SECTION 4 — Domain API surface (Phantom Core exported objects)
+ * SECTION 4 — Domain API surface (Phantom Protocol exported objects)
  *
  * Four UniFFI-exported objects:
  *
@@ -275,20 +275,20 @@ uint8_t ffi_phantom_core_rust_future_complete_u8(
  *     pointer previously obtained from a constructor or clone.
  *   - The last argument of every sync call is the `PhantomRustCallStatus *`.
  *
- * NOTE: Static checksums (uniffi_phantom_core_checksum_*) are emitted
+ * NOTE: Static checksums (uniffi_phantom_protocol_checksum_*) are emitted
  * for every exported method. They take no arguments and return uint16_t.
  * Higher-level bindings call them at load time to detect ABI drift.
  * They are NOT declared individually here for brevity — re-declare as
- * `uint16_t uniffi_phantom_core_checksum_<name>(void);` when needed.
+ * `uint16_t uniffi_phantom_protocol_checksum_<name>(void);` when needed.
  * ==================================================================== */
 
 /* -------------------------- PhantomListener ------------------------- */
 
-void *uniffi_phantom_core_fn_clone_phantomlistener(
+void *uniffi_phantom_protocol_fn_clone_phantomlistener(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
-void uniffi_phantom_core_fn_free_phantomlistener(
+void uniffi_phantom_protocol_fn_free_phantomlistener(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
@@ -297,40 +297,40 @@ void uniffi_phantom_core_fn_free_phantomlistener(
  * length prefix). Returns a u64 future handle that, when complete,
  * yields a `void *` PhantomListener pointer (use _poll_pointer +
  * _complete_pointer). */
-uint64_t uniffi_phantom_core_fn_constructor_phantomlistener_bind(
+uint64_t uniffi_phantom_protocol_fn_constructor_phantomlistener_bind(
     PhantomRustBuffer        addr);
 
 /* accept() -> async AcceptOutcome (pointer result). */
-uint64_t uniffi_phantom_core_fn_method_phantomlistener_accept(
+uint64_t uniffi_phantom_protocol_fn_method_phantomlistener_accept(
     void                    *ptr);
 
 /* is_shutting_down() -> bool (sync). */
-int8_t uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down(
+int8_t uniffi_phantom_protocol_fn_method_phantomlistener_is_shutting_down(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* local_addr() -> string (sync; RustBuffer carries UTF-8). */
-PhantomRustBuffer uniffi_phantom_core_fn_method_phantomlistener_local_addr(
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomlistener_local_addr(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* shutdown() -> async void. */
-uint64_t uniffi_phantom_core_fn_method_phantomlistener_shutdown(
+uint64_t uniffi_phantom_protocol_fn_method_phantomlistener_shutdown(
     void                    *ptr);
 
 /* verifying_key_bytes() -> Vec<u8> (sync). Hand to clients for
  * server-identity pinning. */
-PhantomRustBuffer uniffi_phantom_core_fn_method_phantomlistener_verifying_key_bytes(
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomlistener_verifying_key_bytes(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* --------------------------- PhantomSession ------------------------- */
 
-void *uniffi_phantom_core_fn_clone_phantomsession(
+void *uniffi_phantom_protocol_fn_clone_phantomsession(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
-void uniffi_phantom_core_fn_free_phantomsession(
+void uniffi_phantom_protocol_fn_free_phantomsession(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
@@ -341,140 +341,140 @@ void uniffi_phantom_core_fn_free_phantomsession(
  * callers MUST use the `connect_pinned` / `connect_pinned_with_resumption`
  * free functions below, which take the server's pinned verifying key.
  * This is a sync call: the PhantomSession handle is returned directly. */
-void *uniffi_phantom_core_fn_constructor_phantomsession_connect(
+void *uniffi_phantom_protocol_fn_constructor_phantomsession_connect(
     PhantomRustBuffer        peer_addr,
     PhantomRustCallStatus   *call_status);
 
 /* disconnect() -> async void. Sends the graceful close frame. */
-uint64_t uniffi_phantom_core_fn_method_phantomsession_disconnect(
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_disconnect(
     void                    *ptr);
 
 /* connection_state() -> i32 enum (sync). 0=Idle 1=Connecting
  * 2=Connected 3=DataReady 4=Disconnected. */
-PhantomRustBuffer uniffi_phantom_core_fn_method_phantomsession_connection_state(
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomsession_connection_state(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* current_epoch() -> async Option<u8>. Some(epoch) once established;
  * advances when automatic mid-session rekey bumps the epoch. */
-uint64_t uniffi_phantom_core_fn_method_phantomsession_current_epoch(
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_current_epoch(
     void                    *ptr);
 
 /* early_data_accepted() -> Option<bool>. None for non-V3 handshakes. */
-PhantomRustBuffer uniffi_phantom_core_fn_method_phantomsession_early_data_accepted(
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomsession_early_data_accepted(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* flush_queue() -> async void. */
-uint64_t uniffi_phantom_core_fn_method_phantomsession_flush_queue(
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_flush_queue(
     void                    *ptr);
 
 /* id() -> string (sync). */
-PhantomRustBuffer uniffi_phantom_core_fn_method_phantomsession_id(
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomsession_id(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* is_data_ready() -> bool (sync). */
-int8_t uniffi_phantom_core_fn_method_phantomsession_is_data_ready(
+int8_t uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* is_pqc_ready() -> bool (sync). True once ML-KEM-768 +
  * ML-DSA-65 sides of the hybrid handshake have completed. */
-int8_t uniffi_phantom_core_fn_method_phantomsession_is_pqc_ready(
+int8_t uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* open_stream() -> async PhantomStream (pointer result). */
-uint64_t uniffi_phantom_core_fn_method_phantomsession_open_stream(
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_open_stream(
     void                    *ptr);
 
 /* peer_addr() -> string (sync). */
-PhantomRustBuffer uniffi_phantom_core_fn_method_phantomsession_peer_addr(
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomsession_peer_addr(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* queued_count() -> u64 (sync). */
-uint64_t uniffi_phantom_core_fn_method_phantomsession_queued_count(
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_queued_count(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* recv() -> async Vec<u8> (rust_buffer result). */
-uint64_t uniffi_phantom_core_fn_method_phantomsession_recv(
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_recv(
     void                    *ptr);
 
 /* resumption_hint() -> async Option<ResumptionHint> (rust_buffer result).
  * Some(...) after a completed handshake; feeds connect_pinned_with_resumption. */
-uint64_t uniffi_phantom_core_fn_method_phantomsession_resumption_hint(
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_resumption_hint(
     void                    *ptr);
 
 /* send(data: Vec<u8>) -> async void. */
-uint64_t uniffi_phantom_core_fn_method_phantomsession_send(
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_send(
     void                    *ptr,
     PhantomRustBuffer        data);
 
 /* set_rekey_threshold(threshold: u64) -> async bool. Lowers the
  * per-direction AEAD-invocation count that triggers automatic rekey;
  * returns false if the session is not yet established. */
-uint64_t uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold(
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold(
     void                    *ptr,
     uint64_t                 threshold);
 
 /* --------------------------- PhantomStream -------------------------- */
 
-void *uniffi_phantom_core_fn_clone_phantomstream(
+void *uniffi_phantom_protocol_fn_clone_phantomstream(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
-void uniffi_phantom_core_fn_free_phantomstream(
+void uniffi_phantom_protocol_fn_free_phantomstream(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* disconnect() -> async void. Closes this multiplexed stream. */
-uint64_t uniffi_phantom_core_fn_method_phantomstream_disconnect(
+uint64_t uniffi_phantom_protocol_fn_method_phantomstream_disconnect(
     void                    *ptr);
 
 /* recv() -> async Vec<u8>. */
-uint64_t uniffi_phantom_core_fn_method_phantomstream_recv(
+uint64_t uniffi_phantom_protocol_fn_method_phantomstream_recv(
     void                    *ptr);
 
 /* send_reliable(data: Vec<u8>) -> async void. */
-uint64_t uniffi_phantom_core_fn_method_phantomstream_send_reliable(
+uint64_t uniffi_phantom_protocol_fn_method_phantomstream_send_reliable(
     void                    *ptr,
     PhantomRustBuffer        data);
 
 /* send_unreliable(data: Vec<u8>) -> async void. */
-uint64_t uniffi_phantom_core_fn_method_phantomstream_send_unreliable(
+uint64_t uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable(
     void                    *ptr,
     PhantomRustBuffer        data);
 
 /* stream_id() -> u32 (sync). */
-uint32_t uniffi_phantom_core_fn_method_phantomstream_stream_id(
+uint32_t uniffi_phantom_protocol_fn_method_phantomstream_stream_id(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* --------------------------- AcceptOutcome -------------------------- */
 
-void *uniffi_phantom_core_fn_clone_acceptoutcome(
+void *uniffi_phantom_protocol_fn_clone_acceptoutcome(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
-void uniffi_phantom_core_fn_free_acceptoutcome(
+void uniffi_phantom_protocol_fn_free_acceptoutcome(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* has_early_data() -> bool (sync). */
-int8_t uniffi_phantom_core_fn_method_acceptoutcome_has_early_data(
+int8_t uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* session() -> PhantomSession (sync; returns a fresh refcounted handle). */
-void *uniffi_phantom_core_fn_method_acceptoutcome_session(
+void *uniffi_phantom_protocol_fn_method_acceptoutcome_session(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
 /* take_early_data() -> Option<Vec<u8>> (sync; consumes the blob). */
-PhantomRustBuffer uniffi_phantom_core_fn_method_acceptoutcome_take_early_data(
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_acceptoutcome_take_early_data(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
@@ -493,7 +493,7 @@ PhantomRustBuffer uniffi_phantom_core_fn_method_acceptoutcome_take_early_data(
  * PhantomSession pointer (use `_poll_pointer` + `_complete_pointer`).
  * Decode failures of `pinned_key` surface as `CoreError::CryptoError`;
  * TCP connect failures as `CoreError::NetworkError`. */
-uint64_t uniffi_phantom_core_fn_func_connect_pinned(
+uint64_t uniffi_phantom_protocol_fn_func_connect_pinned(
     PhantomRustBuffer        host,
     uint16_t                 port,
     PhantomRustBuffer        pinned_key);
@@ -511,7 +511,7 @@ uint64_t uniffi_phantom_core_fn_func_connect_pinned(
  *
  * Returns a u64 future handle yielding a `void *` PhantomSession pointer
  * (use `_poll_pointer` + `_complete_pointer`). */
-uint64_t uniffi_phantom_core_fn_func_connect_pinned_with_resumption(
+uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(
     PhantomRustBuffer        host,
     uint16_t                 port,
     PhantomRustBuffer        pinned_key,
@@ -522,7 +522,7 @@ uint64_t uniffi_phantom_core_fn_func_connect_pinned_with_resumption(
  * SECTION 5 — Caveats & non-exported items
  *
  *  - Pinned client connect is available on the FFI surface via
- *    `uniffi_phantom_core_fn_func_connect_pinned` (Phase 7.2 mobile
+ *    `uniffi_phantom_protocol_fn_func_connect_pinned` (Phase 7.2 mobile
  *    bridge). The placeholder `_constructor_phantomsession_connect`
  *    above remains for backwards compatibility but does NOT perform
  *    a fully-pinned PQC handshake. Production C / mobile clients MUST
@@ -530,7 +530,7 @@ uint64_t uniffi_phantom_core_fn_func_connect_pinned_with_resumption(
  *    bytes (obtainable from `verifying_key_bytes()` on the listener).
  *
  *    0-RTT resumption is available via
- *    `uniffi_phantom_core_fn_func_connect_pinned_with_resumption`. The
+ *    `uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption`. The
  *    generic `connect_with_resumption` and the `_with_runtime` overloads
  *    remain Rust-only; callers needing those should build a similar shim.
  *
@@ -549,12 +549,12 @@ uint64_t uniffi_phantom_core_fn_func_connect_pinned_with_resumption(
  *    omitted from this header. They follow the exact pattern of the
  *    `_u8` quartet declared above.
  *
- *  - The 30+ `uniffi_phantom_core_checksum_*` symbols are present and
+ *  - The 30+ `uniffi_phantom_protocol_checksum_*` symbols are present and
  *    callable but not declared here. Each takes no arguments and
  *    returns `uint16_t`; higher-level bindings invoke them at load
  *    time to detect ABI drift.
  *
- *  - The shape (UniFFI 0.29, contract 29) is current as of phantom_core
+ *  - The shape (UniFFI 0.29, contract 29) is current as of phantom_protocol
  *    0.2.0. If you bump the UniFFI dependency, regenerate this header.
  * ==================================================================== */
 
@@ -562,4 +562,4 @@ uint64_t uniffi_phantom_core_fn_func_connect_pinned_with_resumption(
 }
 #endif
 
-#endif /* PHANTOM_CORE_H */
+#endif /* PHANTOM_PROTOCOL_H */

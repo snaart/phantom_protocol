@@ -38,13 +38,13 @@
 use std::fs;
 use std::path::PathBuf;
 
-use phantom_core::crypto::hybrid_kem::{HybridCiphertext, HybridKeyPackage};
-use phantom_core::crypto::hybrid_sign::{HybridSignature, HybridVerifyingKey};
-use phantom_core::crypto::pow::{PoWChallenge, PoWSolution};
-use phantom_core::transport::handshake::{
+use phantom_protocol::crypto::hybrid_kem::{HybridCiphertext, HybridKeyPackage};
+use phantom_protocol::crypto::hybrid_sign::{HybridSignature, HybridVerifyingKey};
+use phantom_protocol::crypto::pow::{PoWChallenge, PoWSolution};
+use phantom_protocol::transport::handshake::{
     ClientHello, HelloRetryRequest, ServerHello, PROTOCOL_VARIANT, PROTOCOL_VERSION,
 };
-use phantom_core::transport::types::{
+use phantom_protocol::transport::types::{
     PacketFlags, PacketHeader, PhantomPacket, SessionId, WIRE_VERSION,
 };
 
