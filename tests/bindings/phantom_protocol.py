@@ -47,14 +47,14 @@ class _UniffiRustBuffer(ctypes.Structure):
 
     @staticmethod
     def alloc(size):
-        return _uniffi_rust_call(_UniffiLib.ffi_phantom_core_rustbuffer_alloc, size)
+        return _uniffi_rust_call(_UniffiLib.ffi_phantom_protocol_rustbuffer_alloc, size)
 
     @staticmethod
     def reserve(rbuf, additional):
-        return _uniffi_rust_call(_UniffiLib.ffi_phantom_core_rustbuffer_reserve, rbuf, additional)
+        return _uniffi_rust_call(_UniffiLib.ffi_phantom_protocol_rustbuffer_reserve, rbuf, additional)
 
     def free(self):
-        return _uniffi_rust_call(_UniffiLib.ffi_phantom_core_rustbuffer_free, self)
+        return _uniffi_rust_call(_UniffiLib.ffi_phantom_protocol_rustbuffer_free, self)
 
     def __str__(self):
         return "_UniffiRustBuffer(capacity={}, len={}, data={})".format(
@@ -465,7 +465,7 @@ def _uniffi_load_indirect():
         # Anything else must be an ELF platform - Linux, *BSD, Solaris/illumos
         libname = "lib{}.so"
 
-    libname = libname.format("phantom_core")
+    libname = libname.format("phantom_protocol")
     path = os.path.join(os.path.dirname(__file__), libname)
     lib = ctypes.cdll.LoadLibrary(path)
     return lib
@@ -474,101 +474,101 @@ def _uniffi_check_contract_api_version(lib):
     # Get the bindings contract version from our ComponentInterface
     bindings_contract_version = 30
     # Get the scaffolding contract version by calling the into the dylib
-    scaffolding_contract_version = lib.ffi_phantom_core_uniffi_contract_version()
+    scaffolding_contract_version = lib.ffi_phantom_protocol_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version:
         raise InternalError("UniFFI contract version mismatch: try cleaning and rebuilding your project")
 
 def _uniffi_check_api_checksums(lib):
-    if lib.uniffi_phantom_core_checksum_func_connect_pinned() != 13314:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 48812:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_func_connect_pinned_with_resumption() != 53474:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 60625:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data() != 13542:
+    if lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 13201:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_acceptoutcome_session() != 21382:
+    if lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_session() != 25558:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_acceptoutcome_take_early_data() != 14981:
+    if lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data() != 27328:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_constructor_phantomlistener_bind() != 49290:
+    if lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomlistener_accept() != 45298:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomlistener_accept() != 14433:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomlistener_is_shutting_down() != 15405:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomlistener_is_shutting_down() != 8474:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomlistener_local_addr() != 3001:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr() != 46930:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomlistener_shutdown() != 4301:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown() != 60837:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes() != 56433:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 14523:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_constructor_phantomsession_connect() != 50668:
+    if lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 27162:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_connection_state() != 46933:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 25030:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_current_epoch() != 16607:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_current_epoch() != 39888:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_disconnect() != 15471:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 34217:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted() != 19420:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted() != 8121:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_flush_queue() != 43783:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue() != 15985:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_id() != 52711:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_id() != 42609:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_is_data_ready() != 23471:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 63798:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_is_pqc_ready() != 28414:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready() != 47934:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_open_stream() != 786:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 25882:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_peer_addr() != 14301:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 58516:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_queued_count() != 30495:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 50067:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_recv() != 62383:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 45587:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_resumption_hint() != 14542:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_send() != 50671:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 8664:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomsession_set_rekey_threshold() != 63141:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 53836:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomstream_disconnect() != 45364:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomstream_recv() != 20087:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 28528:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomstream_send_reliable() != 29433:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 50030:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomstream_send_unreliable() != 51399:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 38734:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_core_checksum_method_phantomstream_stream_id() != 21353:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 28026:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
 
 # A ctypes library to expose the extern-C FFI definitions.
 # This is an implementation detail which will be called internally by the public API.
 
 _UniffiLib = _uniffi_load_indirect()
-_UniffiLib.ffi_phantom_core_rustbuffer_alloc.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rustbuffer_alloc.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rustbuffer_alloc.restype = _UniffiRustBuffer
-_UniffiLib.ffi_phantom_core_rustbuffer_from_bytes.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rustbuffer_alloc.restype = _UniffiRustBuffer
+_UniffiLib.ffi_phantom_protocol_rustbuffer_from_bytes.argtypes = (
     _UniffiForeignBytes,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rustbuffer_from_bytes.restype = _UniffiRustBuffer
-_UniffiLib.ffi_phantom_core_rustbuffer_free.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rustbuffer_from_bytes.restype = _UniffiRustBuffer
+_UniffiLib.ffi_phantom_protocol_rustbuffer_free.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rustbuffer_free.restype = None
-_UniffiLib.ffi_phantom_core_rustbuffer_reserve.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rustbuffer_free.restype = None
+_UniffiLib.ffi_phantom_protocol_rustbuffer_reserve.argtypes = (
     _UniffiRustBuffer,
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rustbuffer_reserve.restype = _UniffiRustBuffer
+_UniffiLib.ffi_phantom_protocol_rustbuffer_reserve.restype = _UniffiRustBuffer
 _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK = ctypes.CFUNCTYPE(None,ctypes.c_uint64,ctypes.c_int8,
 )
 _UNIFFI_FOREIGN_FUTURE_DROPPED_CALLBACK = ctypes.CFUNCTYPE(None,ctypes.c_uint64,
@@ -578,526 +578,526 @@ class _UniffiForeignFutureDroppedCallbackStruct(ctypes.Structure):
         ("handle", ctypes.c_uint64),
         ("free", _UNIFFI_FOREIGN_FUTURE_DROPPED_CALLBACK),
     ]
-_UniffiLib.ffi_phantom_core_rust_future_poll_u8.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_u8.argtypes = (
     ctypes.c_uint64,
     _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_poll_u8.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_cancel_u8.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_u8.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_u8.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_cancel_u8.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_complete_u8.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_u8.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_u8.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rust_future_complete_u8.restype = ctypes.c_uint8
-_UniffiLib.ffi_phantom_core_rust_future_free_u8.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_u8.restype = ctypes.c_uint8
+_UniffiLib.ffi_phantom_protocol_rust_future_free_u8.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_free_u8.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_poll_i8.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_free_u8.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_i8.argtypes = (
     ctypes.c_uint64,
     _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_poll_i8.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_cancel_i8.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_i8.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_i8.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_cancel_i8.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_complete_i8.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_i8.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_i8.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rust_future_complete_i8.restype = ctypes.c_int8
-_UniffiLib.ffi_phantom_core_rust_future_free_i8.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_i8.restype = ctypes.c_int8
+_UniffiLib.ffi_phantom_protocol_rust_future_free_i8.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_free_i8.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_poll_u16.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_free_i8.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_u16.argtypes = (
     ctypes.c_uint64,
     _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_poll_u16.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_cancel_u16.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_u16.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_u16.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_cancel_u16.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_complete_u16.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_u16.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_u16.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rust_future_complete_u16.restype = ctypes.c_uint16
-_UniffiLib.ffi_phantom_core_rust_future_free_u16.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_u16.restype = ctypes.c_uint16
+_UniffiLib.ffi_phantom_protocol_rust_future_free_u16.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_free_u16.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_poll_i16.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_free_u16.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_i16.argtypes = (
     ctypes.c_uint64,
     _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_poll_i16.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_cancel_i16.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_i16.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_i16.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_cancel_i16.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_complete_i16.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_i16.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_i16.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rust_future_complete_i16.restype = ctypes.c_int16
-_UniffiLib.ffi_phantom_core_rust_future_free_i16.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_i16.restype = ctypes.c_int16
+_UniffiLib.ffi_phantom_protocol_rust_future_free_i16.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_free_i16.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_poll_u32.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_free_i16.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_u32.argtypes = (
     ctypes.c_uint64,
     _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_poll_u32.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_cancel_u32.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_u32.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_u32.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_cancel_u32.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_complete_u32.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_u32.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_u32.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rust_future_complete_u32.restype = ctypes.c_uint32
-_UniffiLib.ffi_phantom_core_rust_future_free_u32.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_u32.restype = ctypes.c_uint32
+_UniffiLib.ffi_phantom_protocol_rust_future_free_u32.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_free_u32.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_poll_i32.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_free_u32.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_i32.argtypes = (
     ctypes.c_uint64,
     _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_poll_i32.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_cancel_i32.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_i32.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_i32.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_cancel_i32.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_complete_i32.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_i32.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_i32.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rust_future_complete_i32.restype = ctypes.c_int32
-_UniffiLib.ffi_phantom_core_rust_future_free_i32.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_i32.restype = ctypes.c_int32
+_UniffiLib.ffi_phantom_protocol_rust_future_free_i32.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_free_i32.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_poll_u64.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_free_i32.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_u64.argtypes = (
     ctypes.c_uint64,
     _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_poll_u64.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_cancel_u64.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_u64.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_u64.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_cancel_u64.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_complete_u64.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_u64.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_u64.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rust_future_complete_u64.restype = ctypes.c_uint64
-_UniffiLib.ffi_phantom_core_rust_future_free_u64.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_u64.restype = ctypes.c_uint64
+_UniffiLib.ffi_phantom_protocol_rust_future_free_u64.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_free_u64.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_poll_i64.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_free_u64.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_i64.argtypes = (
     ctypes.c_uint64,
     _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_poll_i64.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_cancel_i64.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_i64.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_i64.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_cancel_i64.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_complete_i64.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_i64.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_i64.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rust_future_complete_i64.restype = ctypes.c_int64
-_UniffiLib.ffi_phantom_core_rust_future_free_i64.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_i64.restype = ctypes.c_int64
+_UniffiLib.ffi_phantom_protocol_rust_future_free_i64.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_free_i64.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_poll_f32.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_free_i64.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_f32.argtypes = (
     ctypes.c_uint64,
     _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_poll_f32.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_cancel_f32.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_f32.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_f32.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_cancel_f32.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_complete_f32.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_f32.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_f32.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rust_future_complete_f32.restype = ctypes.c_float
-_UniffiLib.ffi_phantom_core_rust_future_free_f32.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_f32.restype = ctypes.c_float
+_UniffiLib.ffi_phantom_protocol_rust_future_free_f32.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_free_f32.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_poll_f64.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_free_f32.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_f64.argtypes = (
     ctypes.c_uint64,
     _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_poll_f64.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_cancel_f64.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_f64.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_f64.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_cancel_f64.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_complete_f64.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_f64.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_f64.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rust_future_complete_f64.restype = ctypes.c_double
-_UniffiLib.ffi_phantom_core_rust_future_free_f64.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_f64.restype = ctypes.c_double
+_UniffiLib.ffi_phantom_protocol_rust_future_free_f64.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_free_f64.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_free_f64.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_rust_buffer.argtypes = (
     ctypes.c_uint64,
     _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_cancel_rust_buffer.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_rust_buffer.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_rust_buffer.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_cancel_rust_buffer.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_rust_buffer.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_rust_buffer.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer.restype = _UniffiRustBuffer
-_UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_rust_buffer.restype = _UniffiRustBuffer
+_UniffiLib.ffi_phantom_protocol_rust_future_free_rust_buffer.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_poll_void.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_free_rust_buffer.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_void.argtypes = (
     ctypes.c_uint64,
     _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_poll_void.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_cancel_void.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_poll_void.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_void.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.ffi_phantom_core_rust_future_cancel_void.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_complete_void.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_phantom_core_rust_future_complete_void.restype = None
-_UniffiLib.ffi_phantom_core_rust_future_free_void.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_phantom_core_rust_future_free_void.restype = None
-_UniffiLib.uniffi_phantom_core_fn_clone_acceptoutcome.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_cancel_void.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_void.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_clone_acceptoutcome.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_free_acceptoutcome.argtypes = (
+_UniffiLib.ffi_phantom_protocol_rust_future_complete_void.restype = None
+_UniffiLib.ffi_phantom_protocol_rust_future_free_void.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_phantom_protocol_rust_future_free_void.restype = None
+_UniffiLib.uniffi_phantom_protocol_fn_clone_acceptoutcome.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_free_acceptoutcome.restype = None
-_UniffiLib.uniffi_phantom_core_fn_clone_phantomlistener.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_clone_acceptoutcome.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_free_acceptoutcome.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_clone_phantomlistener.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_free_phantomlistener.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_free_acceptoutcome.restype = None
+_UniffiLib.uniffi_phantom_protocol_fn_clone_phantomlistener.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_free_phantomlistener.restype = None
-_UniffiLib.uniffi_phantom_core_fn_clone_phantomsession.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_clone_phantomlistener.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_free_phantomlistener.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_clone_phantomsession.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_free_phantomsession.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_free_phantomlistener.restype = None
+_UniffiLib.uniffi_phantom_protocol_fn_clone_phantomsession.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_free_phantomsession.restype = None
-_UniffiLib.uniffi_phantom_core_fn_clone_phantomstream.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_clone_phantomsession.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_free_phantomsession.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_clone_phantomstream.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_free_phantomstream.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_free_phantomsession.restype = None
+_UniffiLib.uniffi_phantom_protocol_fn_clone_phantomstream.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_free_phantomstream.restype = None
-_UniffiLib.uniffi_phantom_core_fn_func_connect_pinned.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_clone_phantomstream.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_free_phantomstream.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_free_phantomstream.restype = None
+_UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned.argtypes = (
     _UniffiRustBuffer,
     ctypes.c_uint16,
     _UniffiRustBuffer,
 )
-_UniffiLib.uniffi_phantom_core_fn_func_connect_pinned.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_func_connect_pinned_with_resumption.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption.argtypes = (
     _UniffiRustBuffer,
     ctypes.c_uint16,
     _UniffiRustBuffer,
     _UniffiRustBuffer,
     _UniffiRustBuffer,
 )
-_UniffiLib.uniffi_phantom_core_fn_func_connect_pinned_with_resumption.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_has_early_data.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_has_early_data.restype = ctypes.c_int8
-_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_session.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data.restype = ctypes.c_int8
+_UniffiLib.uniffi_phantom_protocol_fn_method_acceptoutcome_session.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_session.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_take_early_data.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_acceptoutcome_session.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_acceptoutcome_take_early_data.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_take_early_data.restype = _UniffiRustBuffer
-_UniffiLib.uniffi_phantom_core_fn_constructor_phantomlistener_bind.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_acceptoutcome_take_early_data.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind.argtypes = (
     _UniffiRustBuffer,
 )
-_UniffiLib.uniffi_phantom_core_fn_constructor_phantomlistener_bind.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_accept.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_accept.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_accept.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down.restype = ctypes.c_int8
-_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_local_addr.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_accept.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_is_shutting_down.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_local_addr.restype = _UniffiRustBuffer
-_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_shutdown.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_is_shutting_down.restype = ctypes.c_int8
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_local_addr.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_shutdown.restype = None
-_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_verifying_key_bytes.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_local_addr.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_shutdown.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_verifying_key_bytes.restype = _UniffiRustBuffer
-_UniffiLib.uniffi_phantom_core_fn_constructor_phantomsession_connect.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_shutdown.restype = None
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_verifying_key_bytes.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_verifying_key_bytes.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomsession_connect.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_constructor_phantomsession_connect.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomsession_connect.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_connection_state.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state.restype = _UniffiRustBuffer
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_current_epoch.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_connection_state.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_current_epoch.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_current_epoch.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_disconnect.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_current_epoch.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_disconnect.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_disconnect.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_early_data_accepted.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_disconnect.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_early_data_accepted.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_early_data_accepted.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_flush_queue.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_early_data_accepted.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_flush_queue.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_flush_queue.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_id.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_flush_queue.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_id.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_id.restype = _UniffiRustBuffer
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_is_data_ready.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_id.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_is_data_ready.restype = ctypes.c_int8
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_is_pqc_ready.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready.restype = ctypes.c_int8
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_is_pqc_ready.restype = ctypes.c_int8
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_open_stream.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready.restype = ctypes.c_int8
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_open_stream.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_open_stream.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_peer_addr.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_open_stream.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_peer_addr.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_peer_addr.restype = _UniffiRustBuffer
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_queued_count.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_peer_addr.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_queued_count.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_queued_count.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_recv.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_queued_count.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_recv.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_recv.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_resumption_hint.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_recv.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_resumption_hint.argtypes = (
     ctypes.c_uint64,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_resumption_hint.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_send.argtypes = (
-    ctypes.c_uint64,
-    _UniffiRustBuffer,
-)
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_send.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold.argtypes = (
-    ctypes.c_uint64,
-    ctypes.c_uint64,
-)
-_UniffiLib.uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_disconnect.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_disconnect.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_recv.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_recv.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_send_reliable.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_resumption_hint.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_send.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_send_reliable.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_send_unreliable.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_send.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold.argtypes = (
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_disconnect.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_disconnect.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_recv.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_recv.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_send_reliable.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_send_unreliable.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_stream_id.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_send_reliable.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_stream_id.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_phantom_core_fn_method_phantomstream_stream_id.restype = ctypes.c_uint32
-_UniffiLib.ffi_phantom_core_uniffi_contract_version.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_stream_id.restype = ctypes.c_uint32
+_UniffiLib.ffi_phantom_protocol_uniffi_contract_version.argtypes = (
 )
-_UniffiLib.ffi_phantom_core_uniffi_contract_version.restype = ctypes.c_uint32
-_UniffiLib.uniffi_phantom_core_checksum_func_connect_pinned.argtypes = (
+_UniffiLib.ffi_phantom_protocol_uniffi_contract_version.restype = ctypes.c_uint32
+_UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_func_connect_pinned.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_func_connect_pinned_with_resumption.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_func_connect_pinned_with_resumption.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_acceptoutcome_has_early_data.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_acceptoutcome_session.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_acceptoutcome_session.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_acceptoutcome_session.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_acceptoutcome_take_early_data.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_acceptoutcome_session.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_acceptoutcome_take_early_data.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_constructor_phantomlistener_bind.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_constructor_phantomlistener_bind.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_accept.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomlistener_accept.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_accept.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_is_shutting_down.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomlistener_accept.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomlistener_is_shutting_down.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_is_shutting_down.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_local_addr.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomlistener_is_shutting_down.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_local_addr.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_shutdown.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_shutdown.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomlistener_verifying_key_bytes.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_constructor_phantomsession_connect.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_constructor_phantomsession_connect.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_connection_state.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_connection_state.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_current_epoch.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_current_epoch.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_current_epoch.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_disconnect.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_current_epoch.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_disconnect.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_early_data_accepted.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_flush_queue.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_flush_queue.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_id.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_id.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_id.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_is_data_ready.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_id.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_is_data_ready.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_is_pqc_ready.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_is_pqc_ready.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_open_stream.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_open_stream.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_peer_addr.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_peer_addr.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_queued_count.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_queued_count.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_queued_count.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_recv.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_queued_count.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_recv.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_recv.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_resumption_hint.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_recv.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_resumption_hint.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_send.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_send.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_send.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_set_rekey_threshold.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_send.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomsession_set_rekey_threshold.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_disconnect.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_disconnect.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_recv.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_recv.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_recv.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_send_reliable.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_recv.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_send_reliable.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_send_unreliable.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_send_unreliable.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_stream_id.argtypes = (
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id.argtypes = (
 )
-_UniffiLib.uniffi_phantom_core_checksum_method_phantomstream_stream_id.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id.restype = ctypes.c_uint16
 
 _uniffi_check_contract_api_version(_UniffiLib)
 # _uniffi_check_api_checksums(_UniffiLib)
@@ -2082,10 +2082,10 @@ class PhantomStream(PhantomStreamProtocol):
         # In case of partial initialization of instances.
         handle = getattr(self, "_handle", None)
         if handle is not None:
-            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_free_phantomstream, handle)
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_protocol_fn_free_phantomstream, handle)
 
     def _uniffi_clone_handle(self):
-        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_clone_phantomstream, self._handle)
+        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_protocol_fn_clone_phantomstream, self._handle)
 
     # Used by alternative constructors or any methods which return this type.
     @classmethod
@@ -2109,10 +2109,10 @@ class PhantomStream(PhantomStreamProtocol):
         _uniffi_lift_return = lambda val: None
         _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomstream_disconnect(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_void,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_void,
-            _UniffiLib.ffi_phantom_core_rust_future_free_void,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_disconnect(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_void,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_void,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_void,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2123,10 +2123,10 @@ class PhantomStream(PhantomStreamProtocol):
         _uniffi_lift_return = _UniffiFfiConverterBytes.lift
         _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomstream_recv(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer,
-            _UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_recv(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_rust_buffer,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2140,10 +2140,10 @@ class PhantomStream(PhantomStreamProtocol):
         _uniffi_lift_return = lambda val: None
         _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomstream_send_reliable(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_void,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_void,
-            _UniffiLib.ffi_phantom_core_rust_future_free_void,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_send_reliable(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_void,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_void,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_void,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2157,10 +2157,10 @@ class PhantomStream(PhantomStreamProtocol):
         _uniffi_lift_return = lambda val: None
         _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomstream_send_unreliable(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_void,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_void,
-            _UniffiLib.ffi_phantom_core_rust_future_free_void,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_void,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_void,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_void,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2172,7 +2172,7 @@ class PhantomStream(PhantomStreamProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomstream_stream_id,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_stream_id,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -2411,7 +2411,7 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_constructor_phantomsession_connect,
+            _UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomsession_connect,
             *_uniffi_lowered_args,
         )
         return cls._uniffi_make_instance(_uniffi_ffi_result)
@@ -2423,10 +2423,10 @@ class PhantomSession(PhantomSessionProtocol):
         # In case of partial initialization of instances.
         handle = getattr(self, "_handle", None)
         if handle is not None:
-            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_free_phantomsession, handle)
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_protocol_fn_free_phantomsession, handle)
 
     def _uniffi_clone_handle(self):
-        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_clone_phantomsession, self._handle)
+        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_protocol_fn_clone_phantomsession, self._handle)
 
     # Used by alternative constructors or any methods which return this type.
     @classmethod
@@ -2447,7 +2447,7 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_connection_state,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_connection_state,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -2463,10 +2463,10 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_lift_return = _UniffiFfiConverterOptionalUInt8.lift
         _uniffi_error_converter = None
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_current_epoch(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer,
-            _UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_current_epoch(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_rust_buffer,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2484,10 +2484,10 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_lift_return = lambda val: None
         _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_disconnect(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_void,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_void,
-            _UniffiLib.ffi_phantom_core_rust_future_free_void,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_disconnect(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_void,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_void,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_void,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2508,10 +2508,10 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_lift_return = _UniffiFfiConverterOptionalBoolean.lift
         _uniffi_error_converter = None
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_early_data_accepted(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer,
-            _UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_early_data_accepted(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_rust_buffer,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2525,10 +2525,10 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_lift_return = _UniffiFfiConverterUInt32.lift
         _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_flush_queue(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_u32,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_u32,
-            _UniffiLib.ffi_phantom_core_rust_future_free_u32,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_flush_queue(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_u32,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_u32,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_u32,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2543,7 +2543,7 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_id,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_id,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -2558,7 +2558,7 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_is_data_ready,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -2573,7 +2573,7 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_is_pqc_ready,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -2588,7 +2588,7 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_open_stream,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_open_stream,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -2603,7 +2603,7 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_peer_addr,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_peer_addr,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -2617,10 +2617,10 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_lift_return = _UniffiFfiConverterUInt32.lift
         _uniffi_error_converter = None
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_queued_count(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_u32,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_u32,
-            _UniffiLib.ffi_phantom_core_rust_future_free_u32,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_queued_count(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_u32,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_u32,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_u32,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2640,10 +2640,10 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_lift_return = _UniffiFfiConverterBytes.lift
         _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_recv(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer,
-            _UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_recv(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_rust_buffer,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2667,10 +2667,10 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_lift_return = _UniffiFfiConverterOptionalTypeResumptionHint.lift
         _uniffi_error_converter = None
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_resumption_hint(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_rust_buffer,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_rust_buffer,
-            _UniffiLib.ffi_phantom_core_rust_future_free_rust_buffer,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_resumption_hint(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_rust_buffer,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2690,10 +2690,10 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_lift_return = lambda val: None
         _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_send(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_void,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_void,
-            _UniffiLib.ffi_phantom_core_rust_future_free_void,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_send(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_void,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_void,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_void,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2714,10 +2714,10 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
         _uniffi_error_converter = None
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomsession_set_rekey_threshold(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_i8,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_i8,
-            _UniffiLib.ffi_phantom_core_rust_future_free_i8,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_i8,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_i8,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_i8,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2829,10 +2829,10 @@ class AcceptOutcome(AcceptOutcomeProtocol):
         # In case of partial initialization of instances.
         handle = getattr(self, "_handle", None)
         if handle is not None:
-            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_free_acceptoutcome, handle)
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_protocol_fn_free_acceptoutcome, handle)
 
     def _uniffi_clone_handle(self):
-        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_clone_acceptoutcome, self._handle)
+        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_protocol_fn_clone_acceptoutcome, self._handle)
 
     # Used by alternative constructors or any methods which return this type.
     @classmethod
@@ -2853,7 +2853,7 @@ class AcceptOutcome(AcceptOutcomeProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_has_early_data,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -2868,7 +2868,7 @@ class AcceptOutcome(AcceptOutcomeProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_session,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_acceptoutcome_session,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -2886,7 +2886,7 @@ class AcceptOutcome(AcceptOutcomeProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_acceptoutcome_take_early_data,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_acceptoutcome_take_early_data,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -2978,10 +2978,10 @@ class PhantomListener(PhantomListenerProtocol):
         _uniffi_lift_return = _UniffiFfiConverterTypePhantomListener.lift
         _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_constructor_phantomlistener_bind(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_u64,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_u64,
-            _UniffiLib.ffi_phantom_core_rust_future_free_u64,
+            _UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_u64,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_u64,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_u64,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -2993,10 +2993,10 @@ class PhantomListener(PhantomListenerProtocol):
         # In case of partial initialization of instances.
         handle = getattr(self, "_handle", None)
         if handle is not None:
-            _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_free_phantomlistener, handle)
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_protocol_fn_free_phantomlistener, handle)
 
     def _uniffi_clone_handle(self):
-        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_core_fn_clone_phantomlistener, self._handle)
+        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_protocol_fn_clone_phantomlistener, self._handle)
 
     # Used by alternative constructors or any methods which return this type.
     @classmethod
@@ -3022,10 +3022,10 @@ class PhantomListener(PhantomListenerProtocol):
         _uniffi_lift_return = _UniffiFfiConverterTypeAcceptOutcome.lift
         _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
         return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_accept(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_core_rust_future_poll_u64,
-            _UniffiLib.ffi_phantom_core_rust_future_complete_u64,
-            _UniffiLib.ffi_phantom_core_rust_future_free_u64,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_accept(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_u64,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_u64,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_u64,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -3040,7 +3040,7 @@ class PhantomListener(PhantomListenerProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_is_shutting_down,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_is_shutting_down,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -3057,7 +3057,7 @@ class PhantomListener(PhantomListenerProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_local_addr,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_local_addr,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -3078,7 +3078,7 @@ class PhantomListener(PhantomListenerProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_shutdown,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_shutdown,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -3095,7 +3095,7 @@ class PhantomListener(PhantomListenerProtocol):
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_core_fn_method_phantomlistener_verifying_key_bytes,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_verifying_key_bytes,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -3156,10 +3156,10 @@ async def connect_pinned(host: str,port: int,pinned_key: bytes) -> PhantomSessio
     _uniffi_lift_return = _UniffiFfiConverterTypePhantomSession.lift
     _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
     return await _uniffi_rust_call_async(
-        _UniffiLib.uniffi_phantom_core_fn_func_connect_pinned(*_uniffi_lowered_args),
-        _UniffiLib.ffi_phantom_core_rust_future_poll_u64,
-        _UniffiLib.ffi_phantom_core_rust_future_complete_u64,
-        _UniffiLib.ffi_phantom_core_rust_future_free_u64,
+        _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned(*_uniffi_lowered_args),
+        _UniffiLib.ffi_phantom_protocol_rust_future_poll_u64,
+        _UniffiLib.ffi_phantom_protocol_rust_future_complete_u64,
+        _UniffiLib.ffi_phantom_protocol_rust_future_free_u64,
         _uniffi_lift_return,
         _uniffi_error_converter,
     )
@@ -3202,10 +3202,10 @@ async def connect_pinned_with_resumption(host: str,port: int,pinned_key: bytes,h
     _uniffi_lift_return = _UniffiFfiConverterTypePhantomSession.lift
     _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
     return await _uniffi_rust_call_async(
-        _UniffiLib.uniffi_phantom_core_fn_func_connect_pinned_with_resumption(*_uniffi_lowered_args),
-        _UniffiLib.ffi_phantom_core_rust_future_poll_u64,
-        _UniffiLib.ffi_phantom_core_rust_future_complete_u64,
-        _UniffiLib.ffi_phantom_core_rust_future_free_u64,
+        _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(*_uniffi_lowered_args),
+        _UniffiLib.ffi_phantom_protocol_rust_future_poll_u64,
+        _UniffiLib.ffi_phantom_protocol_rust_future_complete_u64,
+        _UniffiLib.ffi_phantom_protocol_rust_future_free_u64,
         _uniffi_lift_return,
         _uniffi_error_converter,
     )

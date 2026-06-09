@@ -1,4 +1,4 @@
-//! Integration tests for `phantom_core::observability` under the
+//! Integration tests for `phantom_protocol::observability` under the
 //! `telemetry-otel` feature. These tests verify that the labeled recording
 //! API compiles, runs, and exercises the OTel instrument call graph
 //! without crashing. They do NOT spin up a real exporter; that's covered
@@ -8,12 +8,12 @@
 
 #![cfg(feature = "telemetry-otel")]
 
-use phantom_core::observability::{
+use phantom_protocol::observability::{
     AeadAlgorithm, CookieOutcome, Direction, EarlyDataOutcome, FallbackReason, HandshakeOutcome,
     Observability, ObservabilityConfig, PathValidationOutcome, PowOutcome, ProtocolVersion,
     ReplayReason, ResumptionMode,
 };
-use phantom_core::transport::types::LegType;
+use phantom_protocol::transport::types::LegType;
 use std::time::Duration;
 
 #[test]

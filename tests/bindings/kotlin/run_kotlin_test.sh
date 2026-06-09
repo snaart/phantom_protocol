@@ -71,7 +71,7 @@ verify_sha256 "${WORK}/coroutines.jar" "${COROUTINES_SHA256}" "coroutines ${CORO
 echo "==> All artifacts verified, compiling the generated binding + LoopbackTest.kt"
 "${WORK}/kotlinc/bin/kotlinc" \
     -classpath "${WORK}/jna.jar:${WORK}/coroutines.jar" \
-    "${SCRIPT_DIR}/uniffi/phantom_core/phantom_core.kt" \
+    "${SCRIPT_DIR}/uniffi/phantom_protocol/phantom_protocol.kt" \
     "${SCRIPT_DIR}/LoopbackTest.kt" \
     -d "${WORK}/classes"
 

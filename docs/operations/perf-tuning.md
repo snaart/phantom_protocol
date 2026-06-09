@@ -1,7 +1,7 @@
 # Performance Tuning Guide
 
 Practical knobs for getting maximum throughput / minimum latency out of a
-production `phantom_core` deployment. Combines build-time choices with
+production `phantom_protocol` deployment. Combines build-time choices with
 deploy-time OS settings.
 
 ---

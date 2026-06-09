@@ -8,7 +8,7 @@
 //! that polls every task once. The intended embedder loop is:
 //!
 //! ```ignore
-//! let rt = phantom_core::runtime::WasiRuntime::new();
+//! let rt = phantom_protocol::runtime::WasiRuntime::new();
 //! // ... spawn tasks via Runtime::spawn ...
 //! while rt.tasks_pending() > 0 {
 //!     rt.drive();

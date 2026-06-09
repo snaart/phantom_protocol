@@ -1,6 +1,6 @@
-# Phantom Core Observability
+# Phantom Protocol Observability
 
-Phantom Core ships an OpenTelemetry-native observability subsystem (Phase 8).
+Phantom Protocol ships an OpenTelemetry-native observability subsystem (Phase 8).
 The library exposes OTel instruments + `tracing` spans; embedders install
 OTLP exporters; metrics and traces flow into any OTel-compatible backend
 (Datadog, Honeycomb, Grafana Cloud, AWS CloudWatch, Tempo, Jaeger,
@@ -29,13 +29,13 @@ scope for the OTel pipeline of this release.
 
 ## How to enable
 
-`telemetry-otel` is an **opt-in Cargo feature** in `phantom_core`. The
+`telemetry-otel` is an **opt-in Cargo feature** in `phantom_protocol`. The
 default build is unchanged. The reference server (`phantom-server`) turns
 it on:
 
 ```toml
 # in server/Cargo.toml
-phantom_core = { path = "../core", features = ["telemetry-otel"] }
+phantom_protocol = { path = "../core", features = ["telemetry-otel"] }
 ```
 
 For a custom embedder, enable the feature the same way and install
@@ -48,7 +48,7 @@ For a custom embedder, enable the feature the same way and install
 your-app
   │
   ▼
-phantom_core::observability::Observability        (recording API)
+phantom_protocol::observability::Observability        (recording API)
   │                              │
   │                              ▼
   │            opentelemetry::global::meter / tracer   (when feature ON)
@@ -65,7 +65,7 @@ threads.
 
 ## What's NOT in the library
 
-- HTTP server — `phantom_core` never bundles one. The Phase 4.5 hyper
+- HTTP server — `phantom_protocol` never bundles one. The Phase 4.5 hyper
   endpoint is gone (Phase 8). For Prometheus pull, run an OTel Collector
   with a `prometheusexporter`.
 - Exporter configuration — the embedder owns it. See `server/src/telemetry.rs`
@@ -84,7 +84,7 @@ threads.
 
 ## Environment variables
 
-Phantom Core honors the OpenTelemetry SDK env-var spec where applicable:
+Phantom Protocol honors the OpenTelemetry SDK env-var spec where applicable:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|

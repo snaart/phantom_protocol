@@ -1,4 +1,4 @@
-# Contributing to Phantom Core
+# Contributing to Phantom Protocol
 
 Thank you for your interest in contributing.
 
@@ -6,7 +6,7 @@ Thank you for your interest in contributing.
 
 ```bash
 git clone <repo>
-cd phantom_core_rust
+cd phantom_protocol
 cargo build   --manifest-path core/Cargo.toml
 cargo test    --manifest-path core/Cargo.toml --lib
 cargo clippy  --manifest-path core/Cargo.toml --lib -- -D warnings

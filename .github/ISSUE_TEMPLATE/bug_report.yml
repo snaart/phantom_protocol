@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a defect in Phantom Core
+description: Report a defect in Phantom Protocol
 labels:
   - bug
 body:

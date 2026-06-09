@@ -2,21 +2,21 @@
 
 `wasm32-wasip2` is a hard CI gate as of Section B of the pre-1.0
 deferred-followups rollout (commits `f6c0c0a`..`255be95`). This page
-is the quickstart for embedders running Phantom Core inside a WASI
+is the quickstart for embedders running Phantom Protocol inside a WASI
 Preview 2 host (Wasmtime, WasmEdge, Spin, wasmCloud, Cloudflare
 Workers WASI sandbox).
 
 ## TL;DR
 
 ```toml
-# Cargo.toml of a WASI guest using phantom_core
+# Cargo.toml of a WASI guest using phantom_protocol
 [package]
 name = "my-wasi-guest"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-phantom_core = { version = "0.2", default-features = false, features = ["std", "wasi-leg"] }
+phantom_protocol = { version = "0.2", default-features = false, features = ["std", "wasi-leg"] }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 
 [[bin]]
@@ -31,8 +31,8 @@ not for the simple `fn main()` quickstart below.
 
 ```rust
 use std::net::SocketAddr;
-use phantom_core::api::session::SessionTransport;
-use phantom_core::transport::legs::wasi::WasiLeg;
+use phantom_protocol::api::session::SessionTransport;
+use phantom_protocol::transport::legs::wasi::WasiLeg;
 
 fn main() {
     let addr: SocketAddr = "127.0.0.1:4242".parse().unwrap();
@@ -58,8 +58,8 @@ wasmtime run -S inherit-network ./target/wasm32-wasip2/release/your-guest.wasm
 
 | Symbol | Path | Role |
 | --- | --- | --- |
-| `WasiLeg` | `phantom_core::transport::legs::wasi::WasiLeg` | Length-prefix-framed `SessionTransport` over `wasi:sockets/tcp`. Client-only (no `accept` yet). |
-| `WasiRuntime` | `phantom_core::runtime::wasi_runtime::WasiRuntime` | Single-task `Runtime` impl. Spawns futures into an in-process queue; `drive()` polls all tasks, `poll_until_progress(max_wait)` blocks the host on `wasi:io/poll::poll` with a `subscribe_duration` watchdog. |
+| `WasiLeg` | `phantom_protocol::transport::legs::wasi::WasiLeg` | Length-prefix-framed `SessionTransport` over `wasi:sockets/tcp`. Client-only (no `accept` yet). |
+| `WasiRuntime` | `phantom_protocol::runtime::wasi_runtime::WasiRuntime` | Single-task `Runtime` impl. Spawns futures into an in-process queue; `drive()` polls all tasks, `poll_until_progress(max_wait)` blocks the host on `wasi:io/poll::poll` with a `subscribe_duration` watchdog. |
 
 Both are gated on `cfg(all(feature = "wasi-leg", target_os = "wasi"))`.
 The Cargo feature itself implies `std`; it is mutually exclusive with
@@ -79,7 +79,7 @@ bag of named exports). WASI guests therefore drop `bindings` and
 re-add only the features they need:
 
 ```toml
-phantom_core = { ..., default-features = false, features = ["std", "wasi-leg"] }
+phantom_protocol = { ..., default-features = false, features = ["std", "wasi-leg"] }
 ```
 
 The `bindings` feature is irrelevant inside a WASI guest anyway —

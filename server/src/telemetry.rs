@@ -10,7 +10,7 @@
 //!   `prometheusexporter` converts to cumulative for a Prometheus pull).
 //!   gzip compression on the gRPC channel. Latency-histogram bucket
 //!   boundaries are set on the instruments themselves (see
-//!   `phantom_core::observability::HistogramConfig`).
+//!   `phantom_protocol::observability::HistogramConfig`).
 //! - **Traces**: batch span processor, gzip-compressed OTLP/gRPC.
 //!
 //! Sampling, headers, and TLS follow the OTel SDK env-var convention

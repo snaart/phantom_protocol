@@ -1,15 +1,15 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "phantom-core.fullname" . }}-config
+  name: {{ include "phantom-protocol.fullname" . }}-config
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "phantom-core.labels" . | nindent 4 }}
+    {{- include "phantom-protocol.labels" . | nindent 4 }}
 data:
   # Non-secret server configuration. Keep sensitive values (keys, tokens) out
   # of ConfigMaps — use Secrets or external-secrets-operator instead.
   #
-  # The Phantom Core library is configured entirely via the server binary's
+  # The Phantom Protocol library is configured entirely via the server binary's
   # environment and the signing key Secret. Extend this ConfigMap if your
   # wrapper binary reads a config file.
   #

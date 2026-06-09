@@ -13,9 +13,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use phantom_core::api::{PhantomListener, PhantomSession, TcpSessionTransport};
-use phantom_core::crypto::hybrid_sign::HybridVerifyingKey;
-use phantom_core::observability::{MetricsSnapshot, Observability};
+use phantom_protocol::api::{PhantomListener, PhantomSession, TcpSessionTransport};
+use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
+use phantom_protocol::observability::{MetricsSnapshot, Observability};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 

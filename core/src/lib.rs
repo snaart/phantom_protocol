@@ -1,4 +1,4 @@
-//! # Phantom Core SDK
+//! # Phantom Protocol SDK
 //!
 //! Post-quantum secure L4/L6 universal transport framework.
 //!
@@ -72,7 +72,7 @@
 // Phase 5.5 / A8 — the FIPS 140-3 primitive swap (X25519 → ECDH-P-256,
 // ring → aws-lc-rs, blake3 → HKDF-SHA256, drop ChaCha20-Poly1305,
 // CTR_DRBG RNG, POST hook) is **shipped**. `--features fips` now
-// builds and serves a FIPS-substrate Phantom Core. The scaffold
+// builds and serves a FIPS-substrate Phantom Protocol. The scaffold
 // `compile_error!` from commit `d4d121b` is gone; the only
 // remaining build-time gate enforces mutual exclusion with `no-std`,
 // since `aws-lc-rs` requires libc + dlopen / OpenSSL ABI and cannot
