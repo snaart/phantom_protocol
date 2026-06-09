@@ -229,7 +229,7 @@ fn test_aead(suite: CipherSuite, name: &'static str) -> Result<(), SelfTestError
 }
 
 /// HKDF-SHA256 KAT. The IKM / salt / info triple below was derived from
-/// the Phantom rekey path's exact construction (label
+/// the Phantom Protocol rekey path's exact construction (label
 /// `phantom-rekey-v1`) over a fixed 32-byte traffic secret of `0x11..`.
 /// Output is a 32-byte expansion. A mismatch here is a regression in
 /// the underlying `hkdf` / `sha2` crates or in their wiring at the

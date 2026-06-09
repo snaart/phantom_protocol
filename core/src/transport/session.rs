@@ -1,4 +1,4 @@
-//! Phantom Transport - Session Management
+//! Phantom Protocol - Session Management
 //!
 //! Virtual association that persists across IP changes.
 //! Manages streams, encryption state, and multi-path scheduling.

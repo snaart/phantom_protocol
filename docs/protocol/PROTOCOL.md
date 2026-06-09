@@ -763,7 +763,7 @@ network attacker cannot learn anything from the shape of the failure.
 - FakeTLS outer obfuscation (Invariant 3) uses per-record counter nonces and
   direction-keyed AEAD derived from a public `(SNI || version)` seed via the
   `"phantom-faketls-*-v1"` labels (§ 3). It is anti-DPI obfuscation only — the
-  inner Phantom session provides real auth/conf; the seed is intentionally
+  inner Phantom Protocol session provides real auth/conf; the seed is intentionally
   public.
 
 ---

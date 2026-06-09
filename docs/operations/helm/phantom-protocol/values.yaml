@@ -32,7 +32,7 @@ replicaCount: 3
 # Service
 # ---------------------------------------------------------------------------
 service:
-  # ClusterIP keeps the Phantom port internal; expose via LoadBalancer or
+  # ClusterIP keeps the Phantom Protocol port internal; expose via LoadBalancer or
   # Ingress in front if you need external access.
   type: ClusterIP
   # Default app port. Matches the canonical reference port used in

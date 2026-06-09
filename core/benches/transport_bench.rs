@@ -1,8 +1,8 @@
-//! Phantom Transport Benchmarks
+//! Phantom Protocol Benchmarks
 //!
 //! Compares performance of:
-//! - Phantom PQC handshake
-//! - Phantom data transfer
+//! - Phantom Protocol PQC handshake
+//! - Phantom Protocol data transfer
 //! - gRPC (tonic) baseline
 //! - HTTP (hyper) baseline
 
@@ -12,7 +12,7 @@ use criterion::{
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-// Import Phantom types
+// Import Phantom Protocol types
 use phantom_protocol::crypto::hybrid_kem::HybridSecretKey;
 use phantom_protocol::crypto::hybrid_sign::HybridSigningKey;
 use phantom_protocol::transport::handshake::{HandshakeClient, HandshakeResponse, HandshakeServer};
@@ -92,7 +92,7 @@ fn bench_handshake(c: &mut Criterion) {
     let mut group = c.benchmark_group("handshake");
     group.measurement_time(Duration::from_secs(15));
 
-    // Phantom PQC handshake (unpinned — measures handshake without identity check).
+    // Phantom Protocol PQC handshake (unpinned — measures handshake without identity check).
     // NOTE: production code path requires pinning (see PhantomSession); this
     // variant exists purely to isolate handshake performance.
     group.bench_function("phantom_pqc_handshake", |b| {
@@ -127,7 +127,7 @@ fn bench_handshake(c: &mut Criterion) {
         })
     });
 
-    // Phantom handshake with key pinning
+    // Phantom Protocol handshake with key pinning
     group.bench_function("phantom_pqc_handshake_pinned", |b| {
         let server = HandshakeServer::new().unwrap();
         let server_pk = server.verifying_key().clone();

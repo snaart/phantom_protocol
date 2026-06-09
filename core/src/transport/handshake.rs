@@ -1,4 +1,4 @@
-//! Unified Phantom Handshake Protocol
+//! Unified Phantom Protocol Handshake
 //!
 //! Combines PQC security (Hybrid KEM/Sign) with Staged state machine
 //! for optimistic start, Early Data, and 0-RTT resumption.
