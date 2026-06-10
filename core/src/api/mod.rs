@@ -21,6 +21,8 @@ pub mod stream;
 pub mod listener;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tcp_transport;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod udp_transport;
 
 // Cross-target re-exports
 pub use session::{ConnectionState, PhantomSession, SessionTransport};
@@ -31,3 +33,5 @@ pub use stream::PhantomStream;
 pub use listener::PhantomListener;
 #[cfg(not(target_arch = "wasm32"))]
 pub use tcp_transport::TcpSessionTransport;
+#[cfg(not(target_arch = "wasm32"))]
+pub use udp_transport::UdpClientTransport;
