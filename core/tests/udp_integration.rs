@@ -8,7 +8,7 @@ use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
 use std::time::Duration;
 use tokio::time::timeout;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn udp_integration_pinned_and_encrypted() {
     let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
@@ -44,7 +44,7 @@ async fn udp_integration_pinned_and_encrypted() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn udp_integration_two_sessions_one_client_socket_is_not_required_but_two_clients_ok() {
     // Two independent clients (each its own socket + CID) to one server socket route correctly —
