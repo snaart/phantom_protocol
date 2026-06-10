@@ -151,8 +151,6 @@ impl SessionTransport for UdpClientTransport {
 
 /// Per-session server transport. The listener's demux task reassembles inbound datagrams and pushes
 /// the inner frames to `rx`; outbound frames are enveloped and sent to the captured `peer`.
-// `new` has no caller outside of tests yet — the listener task (a later task) will wire it up.
-#[allow(dead_code)]
 pub struct UdpServerTransport {
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
@@ -163,8 +161,6 @@ pub struct UdpServerTransport {
 }
 
 impl UdpServerTransport {
-    // No caller outside tests yet; the listener task will wire this up.
-    #[allow(dead_code)]
     pub fn new(
         socket: Arc<UdpSocket>,
         peer: SocketAddr,
