@@ -22,9 +22,9 @@ pub struct MetricsSnapshot {
     pub bytes_recv: u64,
 
     /// Per-leg packet counts: `(LegType, packets_sent, packets_recv)`.
-    pub per_leg_packets: [(LegType, u64, u64); 3],
+    pub per_leg_packets: [(LegType, u64, u64); 4],
     /// Per-leg byte counts: `(LegType, bytes_sent, bytes_recv)`.
-    pub per_leg_bytes: [(LegType, u64, u64); 3],
+    pub per_leg_bytes: [(LegType, u64, u64); 4],
 
     pub avg_encrypt_ns: u64,
     pub avg_decrypt_ns: u64,
@@ -55,11 +55,13 @@ impl Default for MetricsSnapshot {
                 (LegType::Kcp, 0, 0),
                 (LegType::Tcp, 0, 0),
                 (LegType::FakeTls, 0, 0),
+                (LegType::Udp, 0, 0),
             ],
             per_leg_bytes: [
                 (LegType::Kcp, 0, 0),
                 (LegType::Tcp, 0, 0),
                 (LegType::FakeTls, 0, 0),
+                (LegType::Udp, 0, 0),
             ],
             avg_encrypt_ns: 0,
             avg_decrypt_ns: 0,
@@ -98,6 +100,11 @@ impl MetricsSnapshot {
                 h.packets_per_leg(DIR_SEND, LegType::FakeTls),
                 h.packets_per_leg(DIR_RECV, LegType::FakeTls),
             ),
+            (
+                LegType::Udp,
+                h.packets_per_leg(DIR_SEND, LegType::Udp),
+                h.packets_per_leg(DIR_RECV, LegType::Udp),
+            ),
         ];
         let per_leg_bytes = [
             (
@@ -114,6 +121,11 @@ impl MetricsSnapshot {
                 LegType::FakeTls,
                 h.bytes_per_leg(DIR_SEND, LegType::FakeTls),
                 h.bytes_per_leg(DIR_RECV, LegType::FakeTls),
+            ),
+            (
+                LegType::Udp,
+                h.bytes_per_leg(DIR_SEND, LegType::Udp),
+                h.bytes_per_leg(DIR_RECV, LegType::Udp),
             ),
         ];
 

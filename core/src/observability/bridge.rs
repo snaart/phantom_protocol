@@ -54,7 +54,7 @@ mod otel_on {
             .with_description("Packets transmitted/received, sliced by direction and leg")
             .with_callback(move |observer| {
                 for (dir_idx, dir) in [(DIR_SEND, Direction::Send), (DIR_RECV, Direction::Recv)] {
-                    for leg in [LegType::Kcp, LegType::Tcp, LegType::FakeTls] {
+                    for leg in [LegType::Kcp, LegType::Tcp, LegType::FakeTls, LegType::Udp] {
                         let v = packets_atomics.packets_per_leg(dir_idx, leg);
                         observer.observe(
                             v,
@@ -76,7 +76,7 @@ mod otel_on {
             .with_unit("By")
             .with_callback(move |observer| {
                 for (dir_idx, dir) in [(DIR_SEND, Direction::Send), (DIR_RECV, Direction::Recv)] {
-                    for leg in [LegType::Kcp, LegType::Tcp, LegType::FakeTls] {
+                    for leg in [LegType::Kcp, LegType::Tcp, LegType::FakeTls, LegType::Udp] {
                         let v = bytes_atomics.bytes_per_leg(dir_idx, leg);
                         observer.observe(
                             v,

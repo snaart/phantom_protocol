@@ -24,15 +24,18 @@ use std::time::Instant;
 ///
 /// Keep in sync with `LegType`. The compile-time assert below fails the
 /// build if a new variant is added without growing this constant.
-pub(crate) const NUM_LEGS: usize = 3;
+pub(crate) const NUM_LEGS: usize = 4;
 
 // Compile-time pin: ensures `NUM_LEGS` matches `LegType` cardinality.
-// `LegType::FakeTls` is currently the highest discriminant (== 2), so
-// `NUM_LEGS == 3` covers `Kcp` (0), `Tcp` (1), `FakeTls` (2). Adding a new
-// variant will fail this assert and force an update here.
+// `LegType::Udp` is currently the highest discriminant (== 3), so
+// `NUM_LEGS == 4` covers `Kcp` (0), `Tcp` (1), `FakeTls` (2), `Udp` (3).
+// The guard must reference the *highest* discriminant — pinning it to a
+// lower variant (e.g. `FakeTls`) would let a newly added variant slip
+// past the assert and index out of bounds at runtime. Adding a new variant
+// will fail this assert and force an update here.
 const _: () = {
     assert!(
-        (LegType::FakeTls as usize) < NUM_LEGS,
+        (LegType::Udp as usize) < NUM_LEGS,
         "NUM_LEGS must cover all LegType variants"
     );
 };
