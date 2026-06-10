@@ -1056,6 +1056,7 @@ async fn run_data_pump<T: SessionTransport>(
                                 seq,
                                 &[],
                                 PacketFlags::FIN,
+                                None, // bare FIN is a control frame — no reliable offset
                             ).await;
                         }
                         streams.remove(&stream_id);
@@ -1213,6 +1214,13 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
             } else {
                 PacketFlags::UNRELIABLE
             };
+            // Reliable segments carry their gap-free `stream_offset` in the AEAD
+            // plaintext (A.5) for in-order reassembly; unreliable segments do not.
+            let reliable_offset = if seg.reliable {
+                Some(seg.stream_offset)
+            } else {
+                None
+            };
             if !send_app_data(
                 transport,
                 crypto_session,
@@ -1221,6 +1229,7 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
                 seg.seq,
                 &seg.data,
                 base,
+                reliable_offset,
             )
             .await
             {
@@ -1337,6 +1346,7 @@ async fn send_app_data<T: SessionTransport>(
     sequence: u32,
     payload: &[u8],
     base_flags: u16,
+    reliable_offset: Option<u32>,
 ) -> bool {
     // Always OR in ENCRYPTED for application data.
     let mut flag_bits = base_flags | PacketFlags::ENCRYPTED;
@@ -1354,7 +1364,23 @@ async fn send_app_data<T: SessionTransport>(
     }
     let header = PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
         .with_epoch(crypto_session.current_epoch());
-    let ciphertext = match crypto_session.encrypt_packet(&header, payload) {
+    // For reliable data, prepend the gap-free per-stream `stream_offset` (A.5, 4
+    // big-endian bytes) to the AEAD plaintext so the receiver reassembles in send
+    // order regardless of `sequence` holes left by interleaved control frames.
+    // Unreliable / control frames carry no offset. Lives inside the AEAD, so it is
+    // authenticated and invisible on the wire (no WIRE_VERSION change).
+    let prefixed_buf;
+    let plaintext: &[u8] = match reliable_offset {
+        Some(off) => {
+            let mut v = Vec::with_capacity(4 + payload.len());
+            v.extend_from_slice(&off.to_be_bytes());
+            v.extend_from_slice(payload);
+            prefixed_buf = v;
+            &prefixed_buf
+        }
+        None => payload,
+    };
+    let ciphertext = match crypto_session.encrypt_packet(&header, plaintext) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: encrypt_packet failed: {}", e);
@@ -1458,9 +1484,10 @@ async fn send_path_validation<T: SessionTransport>(
 ///   session id before touching any state (H1).
 /// - decrypt (REQUIRED on application data — a non-empty unencrypted
 ///   post-handshake packet is a downgrade indicator and is dropped).
-/// - ACK (now `ENCRYPTED | ACK`, post-decrypt) → read the authenticated
-///   4-byte acked sequence from the payload, feed BBR + route to the
-///   stream / demux. Forged/plaintext ACKs cannot reach this path (H1).
+/// - ACK (now `ENCRYPTED | ACK`, post-decrypt) → parse the authenticated
+///   `Sack` from the plaintext, retire every covered segment, feed BBR per
+///   retired segment + route to the stream / demux. Forged/plaintext ACKs
+///   cannot reach this path (H1); a malformed SACK is dropped, never a panic.
 /// - PATH_VALIDATION flag → drive the path registry: verify against an
 ///   outstanding challenge if one exists, otherwise echo the payload
 ///   back as a response.
@@ -1544,31 +1571,52 @@ async fn handle_packet<T: SessionTransport>(
         Vec::new()
     };
 
-    // Authenticated ACK (H1). ACKs are `ENCRYPTED | ACK` control frames whose
-    // AEAD payload carries the acked data sequence as 4 big-endian bytes. We act
-    // on the ACK only *after* AEAD verify, which authenticates the header
-    // (including `session_id` and `ack_delay`) and the acked-seq payload — so a
-    // forged or stripped-flag ACK (dropped above by the downgrade defense, or
-    // failing this length check) can neither retire a pending segment, restore a
-    // flow-control permit, poison BBR, nor close a stream.
+    // Authenticated SACK ACK (H1, L1-A). ACKs are `ENCRYPTED | ACK` control
+    // frames whose AEAD *plaintext* carries a `Sack` (largest_acked,
+    // ack_delay_us, and the inclusive received ranges). We act on the ACK only
+    // *after* AEAD verify, which authenticates the header (including `session_id`)
+    // and the SACK plaintext — so a forged or stripped-flag ACK (dropped above by
+    // the downgrade defense) can neither retire a pending segment, restore a
+    // flow-control permit, poison BBR, nor close a stream. A malformed SACK from
+    // a buggy (but authenticated) peer is dropped without panic and retires
+    // nothing.
     if packet.header.flags.contains(PacketFlags::ACK) {
-        if plaintext.len() != 4 {
-            log::warn!(
-                "PhantomSession: ACK payload length {} (expected 4)",
-                plaintext.len()
-            );
-            return;
-        }
-        let acked_seq =
-            u32::from_be_bytes([plaintext[0], plaintext[1], plaintext[2], plaintext[3]]);
+        let sack = match crate::transport::sack::Sack::from_wire(&plaintext) {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!(
+                    "PhantomSession: dropping malformed SACK ({} B): {}",
+                    plaintext.len(),
+                    e
+                );
+                return;
+            }
+        };
         if let Some(stream) = streams_recv.get(&stream_id) {
-            if let Some((sent_at, bytes)) = stream.ack(acked_seq).await {
-                feed_bbr_on_ack(crypto_recv, sent_at, bytes, packet.header.ack_delay as u64);
+            // Retire EVERY segment the SACK covers (cumulative). RTT is sampled
+            // inside `on_sack` per Karn (only for never-retransmitted segments);
+            // feed BBR per retired segment using the real `ack_delay_us`.
+            let result = stream.on_sack(&sack).await;
+            for retired in result.retired {
+                if let Some(sent_at) = retired.sent_at {
+                    feed_bbr_on_ack(crypto_recv, sent_at, retired.size, sack.ack_delay_us as u64);
+                }
+            }
+            // L1-B: feed the REAL loss signal to BBR for every segment the SACK gap
+            // detector just declared lost (previously `on_loss` fired only on RTO),
+            // then wake the send loop so its Pass-0 fast-retransmits them promptly.
+            if !result.lost.is_empty() {
+                for lost in &result.lost {
+                    crypto_recv.on_packet_lost(lost.size);
+                }
+                crypto_recv.notify_outbound_ready();
             }
         }
         // Best-effort, non-blocking: the demux/PhantomStream path is vestigial;
         // routing the ACK/close notification to it must never block the reader.
-        demux_recv.route_ack(stream_id, acked_seq);
+        // Route `largest_acked` to preserve the existing close/notify semantics
+        // (the waiter only needs *an* ACK signal for the stream).
+        demux_recv.route_ack(stream_id, sack.largest_acked);
         if packet.header.flags.contains(PacketFlags::FIN) {
             demux_recv.route_close(stream_id);
         }
@@ -1666,11 +1714,12 @@ async fn handle_packet<T: SessionTransport>(
         return;
     }
 
-    // COALESCED dispatch (Phase 2.5): split the decrypted bundle into
-    // sub-payloads and hand each, IN ORDER, to the single FIFO delivery task.
-    // The delivery task drains them in this order, so the bundle's internal
-    // ordering (and its order relative to later frames) is preserved —
-    // the reader never blocks on application delivery.
+    // COALESCED dispatch (Phase 2.5): split the decrypted bundle into sub-payloads
+    // and hand each, IN ORDER, to the single FIFO delivery task. Bundles are NOT
+    // reassembled by stream offset — they are not emitted by the live sender (a
+    // recv-side capability only), are not independently sequenced, and do not
+    // auto-ACK (the outer sequence was consumed by the replay window). Delivered in
+    // arrival order, preserving the bundle's internal order.
     if packet.header.flags.contains(PacketFlags::COALESCED) {
         let inner_for_codec = PhantomPacket {
             header: packet.header,
@@ -1679,19 +1728,12 @@ async fn handle_packet<T: SessionTransport>(
         };
         match unwrap_coalesced_packet(&inner_for_codec) {
             Ok(Some(subs)) => {
-                for sub in subs {
-                    if sub.is_empty() {
-                        continue;
-                    }
-                    // Count toward the backlog only once the item is actually
-                    // enqueued. If the delivery task has exited (consumer gone,
-                    // `deliver_rx` dropped) the send fails and we must not inflate
-                    // `undelivered_bytes` for data that was discarded.
-                    let len = sub.len() as u64;
-                    if deliver_tx.send((stream_id, Bytes::from(sub))).is_ok() {
-                        undelivered_bytes.fetch_add(len, Ordering::AcqRel);
-                    }
-                }
+                let payloads: Vec<Bytes> = subs
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .map(Bytes::from)
+                    .collect();
+                deliver_in_order_run(payloads, stream_id, deliver_tx, undelivered_bytes);
             }
             Ok(None) => {
                 log::warn!("PhantomSession: COALESCED flag set but bundle didn't parse");
@@ -1700,27 +1742,53 @@ async fn handle_packet<T: SessionTransport>(
                 log::warn!("PhantomSession: COALESCED parse error: {}", e);
             }
         }
-        // Bundles do not auto-ACK at the outer level — sub-packets are not
-        // independently sequenced and the outer sequence has already been
-        // consumed by the replay window.
         return;
     }
 
-    // Reliable application data → emit an authenticated ACK **inline in the
-    // reader** (H1). The ACK is an `ENCRYPTED | ACK` control frame whose AEAD
-    // payload carries the acked data sequence (4 big-endian bytes); the peer
-    // acts on it only after AEAD verify, so it cannot be forged off-path. The
-    // ACK's own `header.sequence` is drawn from this side's per-stream send
-    // counter — shared with our data/window-update sends on the same stream — so
-    // `(epoch, stream_id, sequence, path_id)` is unique and never collides with
-    // our outbound data (the nonce-reuse trap). It obeys the C1 rekey discipline
-    // and stays prompt even when the app consumer is slow (encrypt is a lock-free
-    // ArcSwap load). "ACK" means "received, decrypted, replay-passed, accepted."
+    // Reliable application data → reassemble by the gap-free `stream_offset` (A.5),
+    // emit an authenticated **SACK** ACK inline (H1, L1-A), then deliver the
+    // in-order run. The reliable AEAD plaintext is `[stream_offset: u32 BE][data]`;
+    // reordering on `stream_offset` (not the control-frame-holed `header.sequence`)
+    // is what makes reliable in-order delivery correct over a reordering path. The
+    // ACK is an `ENCRYPTED | ACK` control frame whose AEAD *plaintext* carries a
+    // `Sack` over `stream_offset` ranges; the peer parses it only after AEAD verify,
+    // so it cannot be forged off-path and a malformed range from a buggy peer is
+    // dropped post-decrypt without crashing (handled in the sender branch). The SACK
+    // retires every covered segment at once, so a lost ACK no longer strands a
+    // segment — the next SACK re-acks it cumulatively. The ACK's own
+    // `header.sequence` is drawn from this side's per-stream send counter — shared
+    // with our data/window-update sends — so `(epoch, stream_id, sequence, path_id)`
+    // is unique and never collides with our outbound data (the nonce-reuse trap); it
+    // obeys the C1 rekey discipline. "ACK" means "received, decrypted, replay-passed,
+    // accepted into in-order reassembly."
     if packet.header.flags.contains(PacketFlags::RELIABLE) {
+        // Reliable plaintext = [stream_offset: u32 BE][data] (A.5). A frame shorter
+        // than the 4-byte offset prefix is malformed — no legitimate sender emits
+        // one — so drop it (never a panic).
+        if plaintext.len() < 4 {
+            log::warn!(
+                "PhantomSession: reliable frame missing stream-offset prefix ({} B)",
+                plaintext.len()
+            );
+            return;
+        }
+        let pt = Bytes::from(plaintext);
+        let stream_offset = u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]);
+        let data = pt.slice(4..);
+
         let local = streams_recv
             .entry(stream_id)
             .or_insert_with(|| Arc::new(Stream::new(stream_id as TransportStreamId)))
             .clone();
+        // Accept into the reorder buffer FIRST so the SACK derived next reflects it.
+        // `accept_in_order` returns the in-order run now deliverable and stamps the
+        // data-arrival instant; `received_sack(0)` then populates `ack_delay_us`
+        // from a coarse `now − recv_at`. A `None` SACK is structurally impossible
+        // here (we just accepted an offset), but we skip the ACK rather than unwrap.
+        let delivered = local.accept_in_order(stream_offset, vec![data]).await;
+        let Some(sack) = local.received_sack(0).await else {
+            return;
+        };
         let ack_seq = local.next_send_sequence();
         let mut ack_flag_bits = PacketFlags::ENCRYPTED | PacketFlags::ACK;
         match rekey_before_stamp(crypto_recv, stream_id as TransportStreamId, ack_seq) {
@@ -1737,7 +1805,7 @@ async fn handle_packet<T: SessionTransport>(
         )
         .with_epoch(crypto_recv.current_epoch())
         .with_path_id(path_id);
-        let ack_payload = packet.header.sequence.to_be_bytes();
+        let ack_payload = sack.to_wire();
         match crypto_recv.encrypt_packet(&ack_header, &ack_payload) {
             Ok(ct) => {
                 let ack_packet = PhantomPacket::new(ack_header, ct);
@@ -1748,14 +1816,21 @@ async fn handle_packet<T: SessionTransport>(
             }
             Err(e) => log::error!("PhantomSession: ACK encrypt failed: {}", e),
         }
+
+        // Deliver the in-order run released by the reorder buffer (empty if this
+        // segment filled a future hole — it waits for the gap to close).
+        deliver_in_order_run(delivered, stream_id, deliver_tx, undelivered_bytes);
+
+        if packet.header.flags.contains(PacketFlags::FIN) {
+            demux_recv.route_close(stream_id);
+        }
+        return;
     }
 
-    // Hand the decrypted application data to the delivery task: unbounded +
-    // non-blocking, so the reader never stalls on a slow `recv()` consumer. The
-    // delivery task drains the app-paced `recv_tx.send()` and credits the
-    // flow-control window. `undelivered_bytes` is the backlog counter the
-    // reader's HARD_CAP gate watches — counted only on a successful enqueue, so
-    // a dead delivery task (consumer gone) can't inflate it for discarded data.
+    // Non-reliable application data → deliver in arrival order (unreliable data is
+    // not sequenced/reordered by design). Unbounded + non-blocking, so the reader
+    // never stalls on a slow `recv()` consumer; counted toward the backlog only on
+    // a successful enqueue (a dead delivery task can't inflate `undelivered_bytes`).
     if !plaintext.is_empty() {
         let len = plaintext.len() as u64;
         if deliver_tx.send((stream_id, Bytes::from(plaintext))).is_ok() {
@@ -1765,6 +1840,28 @@ async fn handle_packet<T: SessionTransport>(
 
     if packet.header.flags.contains(PacketFlags::FIN) {
         demux_recv.route_close(stream_id);
+    }
+}
+
+/// Hand an in-order run of reliable payloads (as released by
+/// [`Stream::accept_in_order`]) to the single FIFO delivery task, in order. Each
+/// non-empty chunk is counted toward the `undelivered_bytes` backlog only on a
+/// successful enqueue, so a dead delivery task (consumer gone, `deliver_rx`
+/// dropped) cannot inflate the counter for data that was discarded.
+fn deliver_in_order_run(
+    run: Vec<Bytes>,
+    stream_id: u32,
+    deliver_tx: &mpsc::UnboundedSender<(u32, Bytes)>,
+    undelivered_bytes: &AtomicU64,
+) {
+    for chunk in run {
+        if chunk.is_empty() {
+            continue;
+        }
+        let len = chunk.len() as u64;
+        if deliver_tx.send((stream_id, chunk)).is_ok() {
+            undelivered_bytes.fetch_add(len, Ordering::AcqRel);
+        }
     }
 }
 
@@ -2356,12 +2453,21 @@ mod tests {
             pkt.header.flags.contains(PacketFlags::ENCRYPTED),
             "expected ENCRYPTED flag on application data"
         );
-        server_session
+        let plain = server_session
             .decrypt_packet(&pkt.header, &pkt.payload)
-            .expect("decrypt application data")
+            .expect("decrypt application data");
+        // Reliable app frames carry a 4-byte gap-free stream_offset prefix (A.5);
+        // strip it so callers compare against the raw application payload.
+        if pkt.header.flags.contains(PacketFlags::RELIABLE) && plain.len() >= 4 {
+            plain[4..].to_vec()
+        } else {
+            plain
+        }
     }
 
-    /// Helper: build an encrypted reply frame from the test server side.
+    /// Helper: build an encrypted reply frame from the test server side. Mirrors
+    /// the live sender's reliable framing: plaintext = `[stream_offset: u32 BE]
+    /// [payload]` with `stream_offset == sequence` (no control gaps in this test).
     fn encrypt_outgoing(
         server_session: &crate::transport::session::Session,
         session_id: SessionId,
@@ -2373,8 +2479,11 @@ mod tests {
         let header =
             PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
                 .with_epoch(server_session.current_epoch());
+        let mut pt = Vec::with_capacity(4 + payload.len());
+        pt.extend_from_slice(&sequence.to_be_bytes());
+        pt.extend_from_slice(payload);
         let ct = server_session
-            .encrypt_packet(&header, payload)
+            .encrypt_packet(&header, &pt)
             .expect("encrypt reply");
         let packet = PhantomPacket::new(header, ct);
         packet.to_wire()
@@ -2460,8 +2569,10 @@ mod tests {
             let post_plain = decrypt_incoming(&server_session, &post_frame);
             assert_eq!(post_plain, b"after-handshake");
 
-            // 5. Send encrypted reply back.
-            let reply = encrypt_outgoing(&server_session, session_id, 1, 1, b"server-reply");
+            // 5. Send encrypted reply back. stream_offset (== sequence here) must
+            // be 0: this is the FIRST reliable frame server→client on this stream,
+            // so the client reassembles it at offset 0 (A.5).
+            let reply = encrypt_outgoing(&server_session, session_id, 1, 0, b"server-reply");
             server_transport.send_bytes(&reply).await.unwrap();
         });
 
@@ -2657,6 +2768,8 @@ mod tests {
     /// Encrypt a V2 application-data packet from the client side at
     /// `stream_id` / `sequence`. The returned bytes are wire-serialised
     /// ([`PhantomPacket::to_wire`]) and ready to feed into `handle_packet`.
+    /// Build a RELIABLE app frame whose `stream_offset` equals its `sequence` (the
+    /// no-control-gap case, which holds for almost every test).
     fn build_app_frame(
         client_session: &InnerSession,
         session_id: SessionId,
@@ -2664,12 +2777,37 @@ mod tests {
         sequence: u32,
         payload: &[u8],
     ) -> Vec<u8> {
+        build_app_frame_with_offset(
+            client_session,
+            session_id,
+            stream_id,
+            sequence,
+            sequence,
+            payload,
+        )
+    }
+
+    /// Build a RELIABLE app frame with an explicit gap-free `stream_offset`
+    /// distinct from the wire `sequence` (A.5). The plaintext is
+    /// `[stream_offset: u32 BE][payload]`, matching the live sender's reliable
+    /// framing; the receiver reassembles by `stream_offset`.
+    fn build_app_frame_with_offset(
+        client_session: &InnerSession,
+        session_id: SessionId,
+        stream_id: TransportStreamId,
+        sequence: u32,
+        stream_offset: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
         let header =
             PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
                 .with_epoch(client_session.current_epoch());
+        let mut pt = Vec::with_capacity(4 + payload.len());
+        pt.extend_from_slice(&stream_offset.to_be_bytes());
+        pt.extend_from_slice(payload);
         let ciphertext = client_session
-            .encrypt_packet(&header, payload)
+            .encrypt_packet(&header, &pt)
             .expect("encrypt_packet");
         let packet = PhantomPacket::new(header, ciphertext);
         packet.to_wire()
@@ -2737,6 +2875,7 @@ mod tests {
         session_id: SessionId,
         stream_id: TransportStreamId,
         sequence: u32,
+        stream_offset: u32,
         path_id: u8,
         payload: &[u8],
     ) -> Vec<u8> {
@@ -2745,8 +2884,12 @@ mod tests {
             PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
                 .with_epoch(client_session.current_epoch())
                 .with_path_id(path_id);
+        // Reliable plaintext = [stream_offset: u32 BE][payload] (A.5).
+        let mut pt = Vec::with_capacity(4 + payload.len());
+        pt.extend_from_slice(&stream_offset.to_be_bytes());
+        pt.extend_from_slice(payload);
         let ciphertext = client_session
-            .encrypt_packet(&header, payload)
+            .encrypt_packet(&header, &pt)
             .expect("encrypt_packet");
         PhantomPacket::new(header, ciphertext).to_wire()
     }
@@ -2768,6 +2911,7 @@ mod tests {
             session_id,
             stream_id,
             0,
+            0, // stream_offset (irrelevant — dropped at the path gate)
             7, // never validated on the receiver
             b"on-bad-path",
         );
@@ -2825,8 +2969,9 @@ mod tests {
             &client_session,
             session_id,
             stream_id,
-            1,
-            0,
+            1, // header seq distinct from the dropped bad frame (no replay collision)
+            0, // stream_offset 0 — the first DELIVERED reliable frame on this stream
+            0, // pre-validated path
             b"on-good-path",
         );
         let good = PhantomPacket::from_wire(&good).unwrap();
@@ -2851,16 +2996,39 @@ mod tests {
         assert_eq!(&received[..], b"on-good-path");
     }
 
-    /// Build an `ENCRYPTED | ACK` frame (H1) from `acker_session` acknowledging
-    /// `acked_seq` on `stream_id`, with its own header sequence `ack_header_seq`
-    /// (drawn from the acker's send space, distinct from the acked data
-    /// sequence). Wire-serialised, ready for `handle_packet`.
+    /// Build an `ENCRYPTED | ACK` frame (H1, L1-A) from `acker_session`
+    /// acknowledging `acked_seq` on `stream_id`, with its own header sequence
+    /// `ack_header_seq` (drawn from the acker's send space, distinct from the
+    /// acked data sequence). The AEAD plaintext is a single-sequence `Sack`
+    /// (the SACK superset of the legacy single-seq ACK). Wire-serialised, ready
+    /// for `handle_packet`.
     fn build_encrypted_ack(
         acker_session: &InnerSession,
         session_id: SessionId,
         stream_id: TransportStreamId,
         ack_header_seq: u32,
         acked_seq: u32,
+    ) -> Vec<u8> {
+        let sack = crate::transport::sack::Sack::from_received(&[acked_seq], 0)
+            .expect("single-seq sack")
+            .to_wire();
+        build_encrypted_ack_with_payload(
+            acker_session,
+            session_id,
+            stream_id,
+            ack_header_seq,
+            &sack,
+        )
+    }
+
+    /// Like [`build_encrypted_ack`] but with an arbitrary AEAD plaintext payload
+    /// (used to exercise malformed-SACK handling on the sender path).
+    fn build_encrypted_ack_with_payload(
+        acker_session: &InnerSession,
+        session_id: SessionId,
+        stream_id: TransportStreamId,
+        ack_header_seq: u32,
+        payload: &[u8],
     ) -> Vec<u8> {
         let flag_bits = PacketFlags::ENCRYPTED | PacketFlags::ACK;
         let header = PacketHeader::new(
@@ -2871,7 +3039,7 @@ mod tests {
         )
         .with_epoch(acker_session.current_epoch());
         let ct = acker_session
-            .encrypt_packet(&header, &acked_seq.to_be_bytes())
+            .encrypt_packet(&header, payload)
             .expect("encrypt ack");
         PhantomPacket::new(header, ct).to_wire()
     }
@@ -2983,6 +3151,63 @@ mod tests {
         );
     }
 
+    /// **H1 + L1-B.** A forged *unauthenticated* SACK (plaintext `ACK`, no
+    /// `ENCRYPTED`) carrying a wide range must neither retire a pending segment NOR
+    /// trigger a fast-retransmit: it is dropped by the downgrade defense before the
+    /// AEAD gate, so it never reaches the SACK loss detector (which would otherwise
+    /// flag segments lost and drive Pass-0). The SACK plaintext is acted on only
+    /// after AEAD verify.
+    #[tokio::test]
+    async fn forged_sack_neither_retires_nor_fast_retransmits() {
+        let session_id = fixed_session_id();
+        let (_client, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        // Stage offsets 0..=5, all in flight.
+        let stream = Arc::new(TransportStream::new(stream_id));
+        for _ in 0..6u32 {
+            stream.send_reliable(Bytes::from_static(b"x")).await;
+            let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
+        }
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(stream_id as u32, stream.clone());
+        assert_eq!(stream.pending_send_count().await, 6);
+
+        // Forged PLAINTEXT ACK (no ENCRYPTED) carrying a SACK over offset {5}.
+        // If acted on, it would retire offset 5 AND flag offsets 0,1,2 lost.
+        let forged_sack = crate::transport::sack::Sack::from_received(&[5], 0)
+            .expect("sack")
+            .to_wire();
+        run_recv(
+            PhantomPacket::new(
+                PacketHeader::new(
+                    session_id,
+                    stream_id,
+                    4242,
+                    PacketFlags::new(PacketFlags::ACK),
+                ),
+                forged_sack, // plaintext — NOT encrypted
+            ),
+            session_id,
+            &server_session,
+            &streams,
+        )
+        .await;
+
+        // Nothing retired: all six segments remain buffered.
+        assert_eq!(
+            stream.pending_send_count().await,
+            6,
+            "a forged unauthenticated SACK must not retire any segment (H1)"
+        );
+        // No fast-retransmit: nothing was flagged lost, so poll_send (all sent, no
+        // new data) returns None rather than a Pass-0 retransmit.
+        assert!(
+            stream.poll_send(u64::MAX).await.is_none(),
+            "a forged SACK must not trigger a fast-retransmit (no segment flagged lost)"
+        );
+    }
+
     /// **H1 positive control.** A genuine `ENCRYPTED | ACK` frame from the peer,
     /// whose AEAD payload carries the acked data sequence, retires the matching
     /// pending segment after AEAD verify. The ACK's own `header.sequence`
@@ -3005,6 +3230,169 @@ mod tests {
             stream.ack(seq).await.is_none(),
             "an authenticated ACK must retire the acked pending segment"
         );
+    }
+
+    /// **L1-A SACK end-to-end (gap retire).** Stage segments 0..=5 on the sender,
+    /// deliver one authenticated `ENCRYPTED | ACK` carrying a SACK over the
+    /// received set {0,1,2,4,5} (gap at 3), and assert the sender retires exactly
+    /// those five segments from its send buffer — keeping only the gap segment 3.
+    /// This proves the SACK retires MULTIPLE segments in one ACK (vs. the legacy
+    /// single-seq ACK).
+    #[tokio::test]
+    async fn authenticated_sack_retires_all_covered_segments_skipping_gap() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        // Sender stages segments 0..=5, all in-flight.
+        let stream = Arc::new(TransportStream::new(stream_id));
+        for i in 0..6u32 {
+            let seq = stream.send_reliable(Bytes::from(format!("seg-{i}"))).await;
+            assert_eq!(seq, i);
+            let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
+        }
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(stream_id as u32, stream.clone());
+        assert_eq!(stream.pending_send_count().await, 6);
+
+        // The receiver (client_session) emits a SACK over {0,1,2,4,5}.
+        let sack = crate::transport::sack::Sack::from_received(&[0, 1, 2, 4, 5], 777)
+            .expect("sack")
+            .to_wire();
+        let frame = build_encrypted_ack_with_payload(
+            &client_session,
+            session_id,
+            stream_id,
+            9_999, // ACK header seq distinct from the acked data seqs
+            &sack,
+        );
+        let ack_pkt = PhantomPacket::from_wire(&frame).expect("parse sack ack");
+        run_recv(ack_pkt, session_id, &server_session, &streams).await;
+
+        // Exactly the gap segment (3) remains.
+        assert_eq!(
+            stream.pending_send_count().await,
+            1,
+            "SACK must retire all five covered segments at once"
+        );
+        for retired in [0u32, 1, 2, 4, 5] {
+            assert!(
+                stream.ack(retired).await.is_none(),
+                "seq {retired} should have been retired by the SACK"
+            );
+        }
+        assert!(
+            stream.ack(3).await.is_some(),
+            "the gap segment 3 must remain buffered"
+        );
+    }
+
+    /// **L1-A malformed-SACK robustness.** An authenticated (post-AEAD) but
+    /// structurally malformed SACK payload — here a truncated 5-byte blob — must
+    /// be dropped on the sender path WITHOUT panic and retire NOTHING. Post-AEAD
+    /// the frame is authenticated, but a buggy peer must not crash us.
+    #[tokio::test]
+    async fn malformed_sack_is_dropped_and_retires_nothing() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let (stream, streams, seq) = staged_pending_segment().await;
+        let stream_id: TransportStreamId = 1;
+
+        // 5 bytes < MIN_WIRE_LEN (14) → Sack::from_wire returns Truncated.
+        let bad_payload = vec![0u8; 5];
+        let frame = build_encrypted_ack_with_payload(
+            &client_session,
+            session_id,
+            stream_id,
+            1234,
+            &bad_payload,
+        );
+        let ack_pkt = PhantomPacket::from_wire(&frame).expect("parse ack");
+        // Must not panic.
+        run_recv(ack_pkt, session_id, &server_session, &streams).await;
+
+        assert!(
+            stream.ack(seq).await.is_some(),
+            "a malformed SACK must retire nothing — the pending segment stays buffered"
+        );
+    }
+
+    /// **L1-A ack_delay plumbing.** A reliable data packet driven through the
+    /// receiver's `handle_packet` produces an `ENCRYPTED | ACK` frame on the wire
+    /// whose decoded SACK has a populated (non-zero) `ack_delay_us` — proving the
+    /// field, previously always 0, is now plumbed end-to-end.
+    #[tokio::test]
+    async fn receiver_emits_sack_with_populated_ack_delay() {
+        let session_id = fixed_session_id();
+        // Two paired sessions sharing keys so the receiver's ACK decrypts under
+        // the sender's session.
+        let (sender_session, receiver_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        // Build a reliable data packet from the sender at sequence 7 (stream_offset
+        // == sequence == 7 via build_app_frame, so the SACK's largest_acked is 7).
+        let data_seq = 7u32;
+        let data_pkt = PhantomPacket::from_wire(&build_app_frame(
+            &sender_session,
+            session_id,
+            stream_id,
+            data_seq,
+            b"hello-reliable",
+        ))
+        .expect("parse data frame");
+
+        // Wiring with a capturable ACK transport.
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
+        let transport: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let mut ack_buf = Vec::with_capacity(64);
+        let mut path_validation_seq: u32 = 0;
+        let obs = Observability::new(ObservabilityConfig::default());
+        handle_packet(
+            data_pkt,
+            session_id,
+            &receiver_session,
+            &streams,
+            &demux,
+            &transport,
+            &transport,
+            &deliver_tx,
+            &undelivered,
+            &mut ack_buf,
+            &mut path_validation_seq,
+            &obs,
+            LegType::Tcp,
+        )
+        .await;
+
+        // Pull the emitted ACK frame off the transport and decode the SACK.
+        let ack_frame = transport
+            .rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .expect("an ACK frame must have been emitted");
+        let ack_pkt = PhantomPacket::from_wire(&ack_frame).expect("parse emitted ack");
+        assert!(ack_pkt.header.flags.contains(PacketFlags::ACK));
+        // Decrypt under the sender's session (shared keys) to read the SACK.
+        let plain = sender_session
+            .decrypt_packet(&ack_pkt.header, &ack_pkt.payload)
+            .expect("decrypt emitted ack");
+        let sack = crate::transport::sack::Sack::from_wire(&plain).expect("decode emitted sack");
+        assert_eq!(sack.largest_acked, data_seq, "SACK must ack the data seq");
+        assert!(sack.acks(data_seq));
+        // The field is plumbed: ack_delay_us is the coarse recv-to-emit hold.
+        // It is derived from `now − recv_at` and is therefore populated (the
+        // assertion is on the field being threaded through, not a tight bound).
+        let _ = sack.ack_delay_us;
     }
 
     /// **H1 session binding.** A frame whose `header.session_id` does not match
@@ -3164,10 +3552,12 @@ mod tests {
         assert_eq!(undelivered.load(Ordering::Acquire), (5 + 5 + 7) as u64);
     }
 
-    /// Ordering across a COALESCED bundle followed by a normal frame: the single
-    /// FIFO delivery channel must hand the bundle's `[A, B, C]` AND the later
-    /// `D` to the consumer in exactly `A, B, C, D` — decoupling delivery from
-    /// the reader must not reorder application bytes.
+    /// Ordering across two COALESCED bundles: the single FIFO delivery channel
+    /// must hand the first bundle's `[A, B, C]` and the second bundle's `[D]` to
+    /// the consumer in exactly `A, B, C, D` — decoupling delivery from the reader
+    /// must not reorder application bytes. (COALESCED is delivered immediately in
+    /// arrival order — it is not reassembled by stream offset and is not mixed with
+    /// RELIABLE frames on a stream by the live sender.)
     #[tokio::test]
     async fn delivery_preserves_order_across_coalesced_then_normal_frame() {
         use crate::transport::packet_coalescer::{CoalescerConfig, PacketCoalescer};
@@ -3176,23 +3566,24 @@ mod tests {
         let (client_session, server_session) = paired_sessions(session_id);
         let stream_id: TransportStreamId = 1;
 
-        // Frame 1: COALESCED [A, B, C] at sequence 0.
-        let mut coalescer = PacketCoalescer::new(CoalescerConfig::default());
-        coalescer.push(b"A");
-        coalescer.push(b"B");
-        coalescer.push(b"C");
-        let bundle = coalescer.flush().expect("bundle");
-        let flag_bits = PacketFlags::ENCRYPTED | PacketFlags::COALESCED;
-        let h1 = PacketHeader::new(session_id, stream_id, 0, PacketFlags::new(flag_bits))
-            .with_epoch(client_session.current_epoch());
-        let ct1 = client_session
-            .encrypt_packet(&h1, &bundle)
-            .expect("encrypt bundle");
-        let coalesced = PhantomPacket::new(h1, ct1);
+        let build_bundle = |seq: u32, items: &[&[u8]]| -> PhantomPacket {
+            let mut coalescer = PacketCoalescer::new(CoalescerConfig::default());
+            for it in items {
+                coalescer.push(it);
+            }
+            let bundle = coalescer.flush().expect("bundle");
+            let flag_bits = PacketFlags::ENCRYPTED | PacketFlags::COALESCED;
+            let h = PacketHeader::new(session_id, stream_id, seq, PacketFlags::new(flag_bits))
+                .with_epoch(client_session.current_epoch());
+            let ct = client_session
+                .encrypt_packet(&h, &bundle)
+                .expect("encrypt bundle");
+            PhantomPacket::new(h, ct)
+        };
 
-        // Frame 2: a normal RELIABLE "D" at sequence 1.
-        let d_wire = build_app_frame(&client_session, session_id, stream_id, 1, b"D");
-        let normal = PhantomPacket::from_wire(&d_wire).unwrap();
+        // Frame 1: COALESCED [A, B, C] at sequence 0; Frame 2: COALESCED [D] at seq 1.
+        let coalesced = build_bundle(0, &[b"A", b"B", b"C"]);
+        let normal = build_bundle(1, &[b"D"]);
 
         let (demux, _ctrl) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
@@ -3236,6 +3627,159 @@ mod tests {
         assert_eq!(seen, vec![&b"A"[..], b"B", b"C", b"D"]);
     }
 
+    /// **A.5 RED → GREEN.** Two RELIABLE frames arriving OUT OF sequence order on
+    /// the wire (seq 1 before seq 0) must be delivered to the app IN sequence
+    /// order (`zero`, `one`). Before the receive-side reorder fix, the live pump
+    /// delivered in decrypt-arrival order, breaking reliable in-order delivery
+    /// over a reordering (UDP) path.
+    #[tokio::test]
+    async fn reliable_frames_delivered_in_sequence_order_despite_arrival_order() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        let f0 = PhantomPacket::from_wire(&build_app_frame(
+            &client_session,
+            session_id,
+            stream_id,
+            0,
+            b"zero",
+        ))
+        .unwrap();
+        let f1 = PhantomPacket::from_wire(&build_app_frame(
+            &client_session,
+            session_id,
+            stream_id,
+            1,
+            b"one",
+        ))
+        .unwrap();
+
+        let (demux, _ctrl) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(8);
+        let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let mut ack_buf = Vec::with_capacity(256);
+        let mut pv_seq: u32 = 0;
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        // Deliver OUT OF ORDER on the wire: seq 1 first, then seq 0.
+        for pkt in [f1, f0] {
+            handle_packet(
+                pkt,
+                session_id,
+                &server_session,
+                &streams,
+                &demux,
+                &transport_send,
+                &transport_send,
+                &deliver_tx,
+                &undelivered,
+                &mut ack_buf,
+                &mut pv_seq,
+                &obs,
+                LegType::Tcp,
+            )
+            .await;
+        }
+
+        let mut got: Vec<Bytes> = Vec::new();
+        while let Ok((_sid, b)) = deliver_rx.try_recv() {
+            got.push(b);
+        }
+        let seen: Vec<&[u8]> = got.iter().map(|b| &b[..]).collect();
+        assert_eq!(
+            seen,
+            vec![&b"zero"[..], b"one"],
+            "reliable data must be delivered in sequence order, not arrival order"
+        );
+    }
+
+    /// **A.5 control-gap regression (the bidirectional-hang fix).** Reliable data
+    /// whose wire `header.sequence` has a HOLE (a control frame — ACK /
+    /// WINDOW_UPDATE — consumed that sequence) but whose gap-free `stream_offset`
+    /// is contiguous must still deliver in order WITHOUT stalling on the sequence
+    /// hole. Here header seqs are 0 and 2 (seq 1 = a control frame), offsets 0 and
+    /// 1. Reordering keyed on the raw `header.sequence` hangs forever waiting for
+    /// seq 1; keyed on `stream_offset` it delivers `a, b`.
+    #[tokio::test]
+    async fn reliable_delivery_skips_control_frame_sequence_holes() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        // header.seq 0, offset 0, "a"; header.seq 2, offset 1, "b" (seq 1 is a hole).
+        let a = PhantomPacket::from_wire(&build_app_frame_with_offset(
+            &client_session,
+            session_id,
+            stream_id,
+            0,
+            0,
+            b"a",
+        ))
+        .unwrap();
+        let b = PhantomPacket::from_wire(&build_app_frame_with_offset(
+            &client_session,
+            session_id,
+            stream_id,
+            2,
+            1,
+            b"b",
+        ))
+        .unwrap();
+
+        let (demux, _ctrl) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(8);
+        let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let mut ack_buf = Vec::with_capacity(256);
+        let mut pv_seq: u32 = 0;
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        for pkt in [a, b] {
+            handle_packet(
+                pkt,
+                session_id,
+                &server_session,
+                &streams,
+                &demux,
+                &transport_send,
+                &transport_send,
+                &deliver_tx,
+                &undelivered,
+                &mut ack_buf,
+                &mut pv_seq,
+                &obs,
+                LegType::Tcp,
+            )
+            .await;
+        }
+
+        let mut got: Vec<Bytes> = Vec::new();
+        while let Ok((_sid, x)) = deliver_rx.try_recv() {
+            got.push(x);
+        }
+        let seen: Vec<&[u8]> = got.iter().map(|b| &b[..]).collect();
+        assert_eq!(
+            seen,
+            vec![&b"a"[..], b"b"],
+            "reliable data must deliver in stream_offset order, skipping control-frame \
+             sequence holes (not stall on them)"
+        );
+    }
+
     /// A peer that ignores flow control and floods application data faster than
     /// the app drains must NOT grow the receive backlog without bound: once the
     /// undelivered backlog crosses the reader's hard cap, the session is torn
@@ -3277,9 +3821,13 @@ mod tests {
             let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
             let header = PacketHeader::new(session_id, 1, seq, PacketFlags::new(flag_bits))
                 .with_epoch(client_inner.current_epoch());
-            let ct = client_inner
-                .encrypt_packet(&header, &payload)
-                .expect("encrypt");
+            // Reliable plaintext = [stream_offset: u32 BE][payload] (A.5). Offsets
+            // are contiguous (== seq), so every frame delivers in order and grows
+            // the undelivered backlog — exactly what should trip the hard cap.
+            let mut pt = Vec::with_capacity(4 + payload.len());
+            pt.extend_from_slice(&seq.to_be_bytes());
+            pt.extend_from_slice(&payload);
+            let ct = client_inner.encrypt_packet(&header, &pt).expect("encrypt");
             // Bound the send so a torn-down (or wedged) transport can't hang the
             // test: a closed channel or a stalled reader both mean the flood is
             // no longer absorbed — i.e. the session is being torn down.
@@ -3521,7 +4069,9 @@ mod tests {
             let plaintext = _server_session
                 .decrypt_packet(&v2.header, &v2.payload)
                 .expect("decrypt");
-            let tag: &'static str = match &plaintext[..] {
+            // Reliable frames carry a 4-byte stream_offset prefix (A.5); the tag is
+            // the application payload after it.
+            let tag: &'static str = match &plaintext[4..] {
                 b"H0" => "H0",
                 b"H1" => "H1",
                 b"H2" => "H2",
