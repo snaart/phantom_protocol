@@ -195,7 +195,10 @@ impl Sack {
     /// already-coalesced ranges, reverse to descending, **cap to the highest
     /// [`MAX_SACK_RANGES`]** (drop the lowest, oldest ranges so the wire form always
     /// decodes at the peer), set `largest_acked`, and construct. `None` if empty.
-    fn from_ascending_coalesced(mut asc_ranges: Vec<(u32, u32)>, ack_delay_us: u32) -> Option<Sack> {
+    fn from_ascending_coalesced(
+        mut asc_ranges: Vec<(u32, u32)>,
+        ack_delay_us: u32,
+    ) -> Option<Sack> {
         if asc_ranges.is_empty() {
             return None;
         }
