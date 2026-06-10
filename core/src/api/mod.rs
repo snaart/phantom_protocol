@@ -26,6 +26,9 @@ pub mod udp_listener;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod udp_transport;
 
+#[cfg(test)]
+mod loss_recovery_tests;
+
 // Cross-target re-exports
 pub use session::{ConnectionState, PhantomSession, SessionTransport};
 pub use stream::PhantomStream;
