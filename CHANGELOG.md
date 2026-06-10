@@ -8,6 +8,19 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+### Added
+
+- **PhantomUDP (Phase 1):** native datagram `SessionTransport` over raw UDP with connection-ID
+  demultiplexing — `PhantomUdpListener` (server accept) plus `UdpClientTransport` / `UdpServerTransport`.
+  The multi-KB post-quantum handshake is fragmented to the path MTU and reassembled. No wire-format or
+  crypto change — `WIRE_VERSION` / `PROTOCOL_VERSION` unchanged; the outer UDP envelope is transport framing.
+
+### Fixed
+
+- Graceful session shutdown (outer handle drop or `disconnect()`) now flushes buffered `send()` data to the
+  peer before closing, instead of potentially dropping a payload handed to `send()` immediately before
+  shutdown. Affects all transports.
+
 ### Removed
 
 - **Removed the unwired `TransportLeg` multipath cluster** — `transport/legs/{kcp,tcp,faketls}.rs`,
