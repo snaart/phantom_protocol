@@ -397,8 +397,8 @@ impl AcceptOutcome {
 ///
 /// Returns the established `Session` plus any decrypted 0-RTT early-data
 /// (`Some` only when the client carried a valid early-data blob).
-async fn drive_server_handshake(
-    transport: &TcpSessionTransport,
+pub(crate) async fn drive_server_handshake<T: SessionTransport>(
+    transport: &T,
     hs: &HandshakeServer,
     client_ip: IpAddr,
 ) -> Result<(crate::transport::session::Session, Option<Vec<u8>>), CoreError> {
@@ -556,6 +556,7 @@ async fn run_acceptor(
                         Arc::new(server_session),
                         task_runtime.clone(),
                         observability.clone(),
+                        LegType::Tcp,
                     );
                     let outcome = AcceptOutcome::new(session, early_data, peer);
                     // Bounded hand-off; a send error means the listener was dropped.

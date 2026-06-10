@@ -430,6 +430,7 @@ impl PhantomSession {
             server_session,
             Arc::new(TokioRuntime),
             Observability::new(ObservabilityConfig::default()),
+            LegType::Tcp,
         )
     }
 
@@ -440,6 +441,7 @@ impl PhantomSession {
         server_session: Arc<Session>,
         runtime: Arc<dyn Runtime>,
         observability: Arc<Observability>,
+        leg: LegType,
     ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (recv_tx, recv_rx) = mpsc::channel(256);
@@ -481,7 +483,7 @@ impl PhantomSession {
         let observed = Arc::new(ObservedTransport::new(
             transport,
             observability.clone(),
-            LegType::Tcp,
+            leg,
         ));
         let _detached = runtime.spawn(Box::pin(run_data_pump(
             server_session,
@@ -495,7 +497,7 @@ impl PhantomSession {
             streams,
             runtime_for_pump,
             observability,
-            LegType::Tcp,
+            leg,
         )));
 
         session
@@ -1061,10 +1063,40 @@ async fn run_data_pump<T: SessionTransport>(
                     }
                     Some(SessionCommand::Close) => {
                         log::info!("PhantomSession: closing");
+                        // `disconnect()` is a *graceful* close (doc: "Send the
+                        // graceful close frame and shut the session down" — TCP-FIN
+                        // semantics: finish sending, then close). Mirror the
+                        // handle-drop (`None`) arm so buffered `send()` data still
+                        // reaches the peer: `session.send(x); session.disconnect()`
+                        // must not lose `x`, just like `send(x); drop(session)`.
+                        flush_pending_window_updates(
+                            &transport, &crypto_session, session_id, &streams,
+                        )
+                        .await;
+                        drain_streams_priority_ordered(
+                            &transport, &crypto_session, session_id, &streams,
+                        )
+                        .await;
                         break;
                     }
                     None => {
                         log::info!("PhantomSession: command channel dropped");
+                        // The outer `PhantomSession` handle was dropped. Data already
+                        // handed to `send()` was routed onto the raw-app stream but may
+                        // not have hit the wire yet (transmission happens on the next
+                        // tick / notify of THIS loop). Flush it before exiting so a
+                        // fire-and-forget `send()` immediately followed by dropping the
+                        // handle still reaches the peer — otherwise a freshly-accepted
+                        // server session that does `recv(); send(echo)` then drops loses
+                        // the echo, and the client's `recv()` hangs to its timeout.
+                        flush_pending_window_updates(
+                            &transport, &crypto_session, session_id, &streams,
+                        )
+                        .await;
+                        drain_streams_priority_ordered(
+                            &transport, &crypto_session, session_id, &streams,
+                        )
+                        .await;
                         break;
                     }
                 }
