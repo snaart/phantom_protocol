@@ -111,6 +111,15 @@ impl SessionTransport for UdpClientTransport {
             // `&buf[..n]`. When the RTO arm wins, the recv future is dropped too, then we retransmit.
             let n = if in_handshake {
                 tokio::select! {
+                    // `biased;` polls the recv arm first: the RTO must be a true
+                    // "no data arrived for HANDSHAKE_RTO" timer, not a coin-flip against an
+                    // already-queued datagram. With the default unbiased select, when BOTH a datagram
+                    // is ready AND the sleep has elapsed (common under contention from concurrent PQ
+                    // handshakes), the recv arm is starved ~50% of the time, so the client spuriously
+                    // retransmits instead of processing the already-arrived ServerHello — exhausting
+                    // MAX_HANDSHAKE_RETX and timing the handshake out. Biasing toward received data
+                    // makes the RTO fire only when recv is genuinely pending.
+                    biased;
                     r = self.socket.recv(&mut buf) =>
                         r.map_err(|e| CoreError::NetworkError(format!("udp recv: {e}")))?,
                     _ = tokio::time::sleep(HANDSHAKE_RTO) => {

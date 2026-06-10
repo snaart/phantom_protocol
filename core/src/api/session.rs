@@ -1067,6 +1067,22 @@ async fn run_data_pump<T: SessionTransport>(
                     }
                     None => {
                         log::info!("PhantomSession: command channel dropped");
+                        // The outer `PhantomSession` handle was dropped. Data already
+                        // handed to `send()` was routed onto the raw-app stream but may
+                        // not have hit the wire yet (transmission happens on the next
+                        // tick / notify of THIS loop). Flush it before exiting so a
+                        // fire-and-forget `send()` immediately followed by dropping the
+                        // handle still reaches the peer — otherwise a freshly-accepted
+                        // server session that does `recv(); send(echo)` then drops loses
+                        // the echo, and the client's `recv()` hangs to its timeout.
+                        flush_pending_window_updates(
+                            &transport, &crypto_session, session_id, &streams,
+                        )
+                        .await;
+                        drain_streams_priority_ordered(
+                            &transport, &crypto_session, session_id, &streams,
+                        )
+                        .await;
                         break;
                     }
                 }
