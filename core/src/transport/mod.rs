@@ -68,6 +68,8 @@ pub mod types;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod framing;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+pub mod phantom_udp;
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod udp_transport;
 
 // Re-exports for convenience
