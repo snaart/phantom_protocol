@@ -85,3 +85,56 @@ async fn udp_integration_two_sessions_one_client_socket_is_not_required_but_two_
     }
     server.await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_recovers_dropped_first_flight() {
+    use tokio::net::UdpSocket;
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .unwrap();
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+    let server = tokio::spawn(async move {
+        let s = listener.accept().await.expect("accept").session();
+        let m = s.recv().await.expect("recv");
+        s.send(m).await.expect("echo");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    // Relay: client <-> relay <-> server, dropping the very first client->server datagram.
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    upstream.connect(server_addr).await.unwrap();
+    tokio::spawn(async move {
+        let mut c2s_buf = vec![0u8; 2048];
+        let mut s2c_buf = vec![0u8; 2048];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        let mut dropped_first = false;
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s_buf) => {
+                    let (n, from) = r.unwrap();
+                    client_addr = Some(from);
+                    if !dropped_first { dropped_first = true; continue; } // drop first client->server
+                    upstream.send(&c2s_buf[..n]).await.unwrap();
+                }
+                r = upstream.recv(&mut s2c_buf) => {
+                    let n = r.unwrap();
+                    if let Some(ca) = client_addr { relay.send_to(&s2c_buf[..n], ca).await.unwrap(); }
+                }
+            }
+        }
+    });
+
+    let transport = UdpClientTransport::connect(relay_addr).await.unwrap();
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+    client.send(b"ping".to_vec()).await.unwrap();
+    let echo = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo, b"ping");
+    server.await.unwrap();
+}
