@@ -49,6 +49,7 @@ pub fn leg_str(leg: LegType) -> &'static str {
         LegType::Kcp => "kcp",
         LegType::Tcp => "tcp",
         LegType::FakeTls => "faketls",
+        LegType::Udp => "udp",
     }
 }
 
@@ -243,6 +244,7 @@ mod tests {
         assert_eq!(leg_str(LegType::Kcp), "kcp");
         assert_eq!(leg_str(LegType::Tcp), "tcp");
         assert_eq!(leg_str(LegType::FakeTls), "faketls");
+        assert_eq!(leg_str(LegType::Udp), "udp");
     }
 
     #[test]
