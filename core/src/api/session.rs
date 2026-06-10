@@ -1063,6 +1063,20 @@ async fn run_data_pump<T: SessionTransport>(
                     }
                     Some(SessionCommand::Close) => {
                         log::info!("PhantomSession: closing");
+                        // `disconnect()` is a *graceful* close (doc: "Send the
+                        // graceful close frame and shut the session down" — TCP-FIN
+                        // semantics: finish sending, then close). Mirror the
+                        // handle-drop (`None`) arm so buffered `send()` data still
+                        // reaches the peer: `session.send(x); session.disconnect()`
+                        // must not lose `x`, just like `send(x); drop(session)`.
+                        flush_pending_window_updates(
+                            &transport, &crypto_session, session_id, &streams,
+                        )
+                        .await;
+                        drain_streams_priority_ordered(
+                            &transport, &crypto_session, session_id, &streams,
+                        )
+                        .await;
                         break;
                     }
                     None => {
