@@ -8,13 +8,15 @@
 
 Post-quantum-secure L4/L6 universal transport framework in Rust.
 
-Phantom Protocol gives applications an authenticated, confidential, post-quantum-secure
-byte pipe. It pairs a hybrid classical-plus-PQ handshake (X25519 + ML-KEM-768 KEM,
-Ed25519 + ML-DSA-65 signatures — FIPS 203 / FIPS 204, pure Rust) with a
-transport layer (TCP / WebSocket for sessions today; WASI / embedded byte-stream
-framing; KCP / FakeTLS / multipath as experimental legs) and adaptive fallback.
-Cross-language bindings via UniFFI (Python, Swift, Kotlin, C); native WASM
-target; bare-metal `EmbeddedLeg` for no_std.
+Phantom Protocol is an **SDK** — a foundation for building secure networked
+products (VPN, messaging, …), not an end-user application. It gives applications
+an authenticated, confidential, post-quantum-secure byte pipe, pairing a hybrid
+classical-plus-PQ handshake (X25519 + ML-KEM-768 KEM, Ed25519 + ML-DSA-65
+signatures — FIPS 203 / FIPS 204, pure Rust) with a transport layer: TCP /
+WebSocket sessions and a native reliable-UDP transport (PhantomUDP), plus
+WASI / embedded byte-stream framing. Cross-language bindings via UniFFI
+(Python, Swift, Kotlin, C); native WASM target; bare-metal `EmbeddedLeg` for
+no_std. (A DPI-mimicry transport mode is planned, not yet built.)
 
 > **Pre-1.0 (`0.1.1`).** Wire format may break between minors; SemVer kicks in at
 > 1.0. 0 workspace warnings, 0 `unsafe` outside three audited opt-ins, MSRV Rust
@@ -155,7 +157,7 @@ RustCrypto FIPS-203 / FIPS-204 implementations. The crate compiles on
 ├─────────────────────────────────────────────────────────────────┤
 │  Transport    (core/src/transport/)                             │
 │  Handshake{Client,Server} · Session · scheduler · pacer · paths │
-│  legs/{tcp, kcp, faketls, websocket, embedded}                  │
+│  api/{tcp,udp}_transport · legs/{websocket, wasi, embedded}     │
 ├─────────────────────────────────────────────────────────────────┤
 │  Crypto       (core/src/crypto/)                                │
 │  hybrid_kem · hybrid_sign · adaptive_crypto · kdf · pow · rng   │
@@ -189,12 +191,10 @@ security invariants are catalogued in
   `HandshakeTranscript` leading with `protocol_variant`. The pinned
   `PROTOCOL_VERSION` / `WIRE_VERSION` bytes are tamper-check anchors and a hook
   for a future deliberate bump.
-- **Multi-path validation.** `PathRegistry` + constant-time challenge/response.
-  Path 0 pre-validated; secondary paths transition `Unvalidated → Validating →
-  Validated`. The recv pump auto-echoes responses.
-- **FakeTLS leg.** Anti-DPI obfuscation only — per-direction blake3-derived keys,
-  per-record counter nonces. The inner Phantom Protocol session provides real authenticated
-  confidentiality.
+- **Path-validation primitive (internal).** `PathRegistry` + constant-time
+  challenge/response; path 0 pre-validated, secondary paths transition
+  `Unvalidated → Validating → Validated`. This is the building block for future
+  connection migration; it is not yet wired into a live multi-path data plane.
 
 ## Performance
 
@@ -370,21 +370,23 @@ Full threat model, mitigations, and disclosure policy are in
 - 6 documented production panic sites with `PANIC-SAFETY:` invariants — see
   [`docs/security/panic-sites.md`](docs/security/panic-sites.md).
 
-### FIPS 140-3 / Common Criteria
+### FIPS 140-3 / Common Criteria — exploratory only, NOT validated
 
-- **FIPS 140-3: partial.** Approved primitives already in use: ML-KEM-768,
-  ML-DSA-65, Ed25519, SHA-256, HMAC-SHA-256, HKDF-SHA-256. Gaps blocking lab
-  validation: X25519 (needs an approved-only ECDH-P-256 path), AES-256-GCM via
-  `ring` (needs an `aws-lc-rs`-backed module), ChaCha20-Poly1305 + blake3 (must
-  be gated out in FIPS mode), DRBG (needs SP 800-90A), §7.7 power-on self-tests
-  (not yet implemented). A `fips` Cargo feature is shipped (`--features fips`). Full gap analysis:
-  [`docs/compliance/fips-readiness.md`](docs/compliance/fips-readiness.md).
-  CAVP-style known-answer tests always-on in
-  [`core/tests/cavp.rs`](core/tests/cavp.rs).
-- **Common Criteria: SFR mapping documented**, against NIAP **PP-Module VPN
-  Client v2.5** layered on **PP App SW v1.4**, with per-SFR file:line evidence
-  and gap table G-1…G-13. Not yet lab-evaluated. See
-  [`docs/compliance/cc-pp-mapping.md`](docs/compliance/cc-pp-mapping.md).
+> **No FIPS validation and no Common Criteria evaluation exist, and none is in
+> progress.** The files under [`docs/compliance/`](docs/compliance/) are
+> self-authored *readiness/gap analyses*, not certifications — do not rely on
+> them for any compliance claim.
+
+- **FIPS 140-3:** the crypto uses several FIPS-approved primitives (ML-KEM-768,
+  ML-DSA-65, Ed25519, SHA-256, HMAC/HKDF-SHA-256), and an optional `fips` Cargo
+  feature swaps the remaining non-approved primitives toward an `aws-lc-rs`
+  substrate. This is *not* a validated cryptographic module (no CMVP). Gap
+  analysis: [`docs/compliance/fips-readiness.md`](docs/compliance/fips-readiness.md);
+  CAVP-style known-answer vectors in [`core/tests/cavp.rs`](core/tests/cavp.rs).
+- **Common Criteria:** an internal SFR gap-mapping exercise against NIAP
+  PP-Module VPN Client exists for design reference only
+  ([`docs/compliance/cc-pp-mapping.md`](docs/compliance/cc-pp-mapping.md)). No
+  lab evaluation is planned.
 
 ### Disclosure
 
@@ -403,35 +405,54 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 
 ## Status & limitations
 
+> **Maturity: early. Not production-ready.** This is a single implementation
+> with **no external security audit**. The cryptographic handshake and identity
+> layer are implemented and well-tested; the **data plane is the unfinished
+> part** — the UDP transport's reliability (loss recovery) has **not yet been
+> exercised against real packet loss** (see below). Do not protect anything
+> high-risk with this until it has been independently audited and the loss-
+> recovery path is validated.
+
 - **Pre-1.0 (`0.1.1`).** Wire format may break between minors; SemVer applies
   once 1.0 ships. The current wire protocol is a single pinned version — the
   former V1/V2/V3 axes were collapsed pre-1.0 (no users, no negotiation, no
   fallback), so there are no cross-version migration guides.
-- **Native UDP transport (PhantomUDP) is in development.** `PhantomSession`
-  runs an authenticated session over TCP and WebSocket today (and WASI /
-  Embedded as framing legs). The earlier experimental KCP / FakeTLS legs and the
-  unused `TransportLeg` multipath trait were removed — they were never wired into
-  the session data plane — and a native reliable-UDP transport with multi-path,
-  congestion control, and connection migration is being built to replace them.
-  FakeTLS-style HTTP traffic mimicry will return as a dedicated transport mode.
+- **Native UDP transport (PhantomUDP): handshake + demux work; loss recovery is
+  the open piece.** `PhantomSession` runs an authenticated session over TCP,
+  WebSocket, and now raw UDP (connection-ID demux, server accept, fragmented
+  handshake) — proven end-to-end on a lossless loopback. What is **not** done:
+  the UDP data plane's loss recovery has only ever run over reliable pipes and
+  has not been validated over real loss; a deterministic lossy/reordering test
+  transport (needed to validate it) is being built first. The earlier
+  experimental KCP / FakeTLS legs and the unused `TransportLeg` multipath trait
+  were removed (never wired into the data plane). Roadmap: prove single-path UDP
+  loss recovery → seamless connection migration (one live path at a time, for
+  Wi-Fi↔cellular handoff without re-handshake) → a DPI-mimicry transport mode.
+  Bandwidth *aggregation* across transports is **not** planned — analysis showed
+  it regresses for this workload and harms unobservability.
 - **Mobile connection migration (Wi-Fi ↔ LTE) is not yet supported.** The
   path-validation primitives are internal-only; on a network change, reconnect
   (use 0-RTT resumption via `connect_pinned_with_resumption` to minimise cost).
-- **Loss recovery is timeout-based (no SACK).** Reliable delivery ships with
-  RFC-6298 RTO + retransmission + a BBR-style congestion window and automatic
-  mid-session rekey. Dup-ACK fast-retransmit and selective ACK (SACK) are
-  **deferred post-1.0** — they need security-sensitive packet-number / ACK-range
-  fields in the AAD-covered header, i.e. a deliberate `WIRE_VERSION` bump.
-- **Negative-security suite: 28 always-on tests** in
+- **Loss recovery is timeout-based (no SACK) and unproven over loss.** The code
+  has an RFC-6298 RTO + retransmission + a BBR-style congestion window + mid-
+  session rekey, but this machinery was built for reliable byte pipes and has
+  **never been exercised against real packet loss/reorder** — validating it
+  (and the lossy test rig that makes that possible) is the current priority.
+  SACK / dup-ACK fast-retransmit / PTO are the next work item and need
+  security-sensitive packet-number / ACK-range fields, i.e. a deliberate
+  `WIRE_VERSION` bump.
+- **Negative-security suite: 33 always-on tests** in
   `core/tests/security_invariants.rs`, pinning every documented invariant.
   Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
-  and 13 `#[ignore]`-gated integration tests (8 TCP, 3 KCP, 2 WASI). 0 workspace warnings,
-  0 clippy warnings.
-- **All 8 production-readiness phases (0–7) closed code-side.** Deferred with
-  rationale: external CMVP / CC lab validation (Phase 5.7 — procurement, not
-  code), ProVerif / Tamarin formal verification (Phase 6.10 — separate research
-  engagement). `wasm32-wasip2` shipped as a hard gate (`WasiLeg` + `WasiRuntime`,
-  client-side framing-only).
+  282 library unit tests, and `#[ignore]`-gated loopback integration suites
+  (TCP, UDP, WASI). 0 workspace warnings, 0 clippy warnings. **Note:** broad
+  test coverage is *not* the same as a validated transport — none of these
+  exercise the data plane under real loss yet (see the loss-recovery item above).
+- **Broad feature coverage across the planned phases, but not production-ready.**
+  The handshake/identity/observability/cross-target work is largely in place;
+  the data plane (UDP loss recovery) is the unfinished, unvalidated piece, and
+  there has been no external security audit or CMVP/CC validation. Formal
+  verification (ProVerif / Tamarin) and an external audit are open, not done.
 - **`PhantomListener::bind()` generates a fresh signing key per process** —
   identities don't survive restart. Pin-stable production deployments must use
   `bind_with_signing_key()` with a key loaded from disk (`phantom-cli keygen`
