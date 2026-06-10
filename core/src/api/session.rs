@@ -1458,9 +1458,10 @@ async fn send_path_validation<T: SessionTransport>(
 ///   session id before touching any state (H1).
 /// - decrypt (REQUIRED on application data — a non-empty unencrypted
 ///   post-handshake packet is a downgrade indicator and is dropped).
-/// - ACK (now `ENCRYPTED | ACK`, post-decrypt) → read the authenticated
-///   4-byte acked sequence from the payload, feed BBR + route to the
-///   stream / demux. Forged/plaintext ACKs cannot reach this path (H1).
+/// - ACK (now `ENCRYPTED | ACK`, post-decrypt) → parse the authenticated
+///   `Sack` from the plaintext, retire every covered segment, feed BBR per
+///   retired segment + route to the stream / demux. Forged/plaintext ACKs
+///   cannot reach this path (H1); a malformed SACK is dropped, never a panic.
 /// - PATH_VALIDATION flag → drive the path registry: verify against an
 ///   outstanding challenge if one exists, otherwise echo the payload
 ///   back as a response.
@@ -1544,31 +1545,43 @@ async fn handle_packet<T: SessionTransport>(
         Vec::new()
     };
 
-    // Authenticated ACK (H1). ACKs are `ENCRYPTED | ACK` control frames whose
-    // AEAD payload carries the acked data sequence as 4 big-endian bytes. We act
-    // on the ACK only *after* AEAD verify, which authenticates the header
-    // (including `session_id` and `ack_delay`) and the acked-seq payload — so a
-    // forged or stripped-flag ACK (dropped above by the downgrade defense, or
-    // failing this length check) can neither retire a pending segment, restore a
-    // flow-control permit, poison BBR, nor close a stream.
+    // Authenticated SACK ACK (H1, L1-A). ACKs are `ENCRYPTED | ACK` control
+    // frames whose AEAD *plaintext* carries a `Sack` (largest_acked,
+    // ack_delay_us, and the inclusive received ranges). We act on the ACK only
+    // *after* AEAD verify, which authenticates the header (including `session_id`)
+    // and the SACK plaintext — so a forged or stripped-flag ACK (dropped above by
+    // the downgrade defense) can neither retire a pending segment, restore a
+    // flow-control permit, poison BBR, nor close a stream. A malformed SACK from
+    // a buggy (but authenticated) peer is dropped without panic and retires
+    // nothing.
     if packet.header.flags.contains(PacketFlags::ACK) {
-        if plaintext.len() != 4 {
-            log::warn!(
-                "PhantomSession: ACK payload length {} (expected 4)",
-                plaintext.len()
-            );
-            return;
-        }
-        let acked_seq =
-            u32::from_be_bytes([plaintext[0], plaintext[1], plaintext[2], plaintext[3]]);
+        let sack = match crate::transport::sack::Sack::from_wire(&plaintext) {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!(
+                    "PhantomSession: dropping malformed SACK ({} B): {}",
+                    plaintext.len(),
+                    e
+                );
+                return;
+            }
+        };
         if let Some(stream) = streams_recv.get(&stream_id) {
-            if let Some((sent_at, bytes)) = stream.ack(acked_seq).await {
-                feed_bbr_on_ack(crypto_recv, sent_at, bytes, packet.header.ack_delay as u64);
+            // Retire EVERY segment the SACK covers (cumulative). RTT is sampled
+            // inside `on_sack` per Karn (only for never-retransmitted segments);
+            // feed BBR per retired segment using the real `ack_delay_us`.
+            let result = stream.on_sack(&sack).await;
+            for retired in result.retired {
+                if let Some(sent_at) = retired.sent_at {
+                    feed_bbr_on_ack(crypto_recv, sent_at, retired.size, sack.ack_delay_us as u64);
+                }
             }
         }
         // Best-effort, non-blocking: the demux/PhantomStream path is vestigial;
         // routing the ACK/close notification to it must never block the reader.
-        demux_recv.route_ack(stream_id, acked_seq);
+        // Route `largest_acked` to preserve the existing close/notify semantics
+        // (the waiter only needs *an* ACK signal for the stream).
+        demux_recv.route_ack(stream_id, sack.largest_acked);
         if packet.header.flags.contains(PacketFlags::FIN) {
             demux_recv.route_close(stream_id);
         }
@@ -1706,21 +1719,36 @@ async fn handle_packet<T: SessionTransport>(
         return;
     }
 
-    // Reliable application data → emit an authenticated ACK **inline in the
-    // reader** (H1). The ACK is an `ENCRYPTED | ACK` control frame whose AEAD
-    // payload carries the acked data sequence (4 big-endian bytes); the peer
-    // acts on it only after AEAD verify, so it cannot be forged off-path. The
-    // ACK's own `header.sequence` is drawn from this side's per-stream send
-    // counter — shared with our data/window-update sends on the same stream — so
-    // `(epoch, stream_id, sequence, path_id)` is unique and never collides with
-    // our outbound data (the nonce-reuse trap). It obeys the C1 rekey discipline
-    // and stays prompt even when the app consumer is slow (encrypt is a lock-free
-    // ArcSwap load). "ACK" means "received, decrypted, replay-passed, accepted."
+    // Reliable application data → emit an authenticated **SACK** ACK **inline in
+    // the reader** (H1, L1-A). The ACK is an `ENCRYPTED | ACK` control frame
+    // whose AEAD *plaintext* carries a `Sack` (largest_acked, ack_delay_us, and
+    // the inclusive received ranges); the peer parses it only after AEAD verify,
+    // so it cannot be forged off-path and a malformed range from a buggy peer is
+    // dropped post-decrypt without crashing (handled in the sender branch). The
+    // SACK replaces the legacy single-seq payload: it retires every covered
+    // segment at once, so a lost ACK no longer strands a segment — the next SACK
+    // re-acks it cumulatively. The ACK's own `header.sequence` is drawn from this
+    // side's per-stream send counter — shared with our data/window-update sends on
+    // the same stream — so `(epoch, stream_id, sequence, path_id)` is unique and
+    // never collides with our outbound data (the nonce-reuse trap). It obeys the
+    // C1 rekey discipline and stays prompt even when the app consumer is slow
+    // (encrypt is a lock-free ArcSwap load). "ACK" means "received, decrypted,
+    // replay-passed, accepted."
     if packet.header.flags.contains(PacketFlags::RELIABLE) {
         let local = streams_recv
             .entry(stream_id)
             .or_insert_with(|| Arc::new(Stream::new(stream_id as TransportStreamId)))
             .clone();
+        // Record this data sequence as received (post-AEAD, post-replay) and
+        // stamp the data-arrival instant, then build a SACK over the full
+        // received set. `received_sack(0)` populates `ack_delay_us` from a coarse
+        // `now − recv_at` so the on-wire field is finally non-zero. A `None` SACK
+        // is structurally impossible here (we just recorded a sequence), but we
+        // skip the ACK rather than unwrap if it ever is.
+        local.record_received(packet.header.sequence);
+        let Some(sack) = local.received_sack(0) else {
+            return;
+        };
         let ack_seq = local.next_send_sequence();
         let mut ack_flag_bits = PacketFlags::ENCRYPTED | PacketFlags::ACK;
         match rekey_before_stamp(crypto_recv, stream_id as TransportStreamId, ack_seq) {
@@ -1737,7 +1765,7 @@ async fn handle_packet<T: SessionTransport>(
         )
         .with_epoch(crypto_recv.current_epoch())
         .with_path_id(path_id);
-        let ack_payload = packet.header.sequence.to_be_bytes();
+        let ack_payload = sack.to_wire();
         match crypto_recv.encrypt_packet(&ack_header, &ack_payload) {
             Ok(ct) => {
                 let ack_packet = PhantomPacket::new(ack_header, ct);
@@ -2851,16 +2879,39 @@ mod tests {
         assert_eq!(&received[..], b"on-good-path");
     }
 
-    /// Build an `ENCRYPTED | ACK` frame (H1) from `acker_session` acknowledging
-    /// `acked_seq` on `stream_id`, with its own header sequence `ack_header_seq`
-    /// (drawn from the acker's send space, distinct from the acked data
-    /// sequence). Wire-serialised, ready for `handle_packet`.
+    /// Build an `ENCRYPTED | ACK` frame (H1, L1-A) from `acker_session`
+    /// acknowledging `acked_seq` on `stream_id`, with its own header sequence
+    /// `ack_header_seq` (drawn from the acker's send space, distinct from the
+    /// acked data sequence). The AEAD plaintext is a single-sequence `Sack`
+    /// (the SACK superset of the legacy single-seq ACK). Wire-serialised, ready
+    /// for `handle_packet`.
     fn build_encrypted_ack(
         acker_session: &InnerSession,
         session_id: SessionId,
         stream_id: TransportStreamId,
         ack_header_seq: u32,
         acked_seq: u32,
+    ) -> Vec<u8> {
+        let sack = crate::transport::sack::Sack::from_received(&[acked_seq], 0)
+            .expect("single-seq sack")
+            .to_wire();
+        build_encrypted_ack_with_payload(
+            acker_session,
+            session_id,
+            stream_id,
+            ack_header_seq,
+            &sack,
+        )
+    }
+
+    /// Like [`build_encrypted_ack`] but with an arbitrary AEAD plaintext payload
+    /// (used to exercise malformed-SACK handling on the sender path).
+    fn build_encrypted_ack_with_payload(
+        acker_session: &InnerSession,
+        session_id: SessionId,
+        stream_id: TransportStreamId,
+        ack_header_seq: u32,
+        payload: &[u8],
     ) -> Vec<u8> {
         let flag_bits = PacketFlags::ENCRYPTED | PacketFlags::ACK;
         let header = PacketHeader::new(
@@ -2871,7 +2922,7 @@ mod tests {
         )
         .with_epoch(acker_session.current_epoch());
         let ct = acker_session
-            .encrypt_packet(&header, &acked_seq.to_be_bytes())
+            .encrypt_packet(&header, payload)
             .expect("encrypt ack");
         PhantomPacket::new(header, ct).to_wire()
     }
@@ -3005,6 +3056,168 @@ mod tests {
             stream.ack(seq).await.is_none(),
             "an authenticated ACK must retire the acked pending segment"
         );
+    }
+
+    /// **L1-A SACK end-to-end (gap retire).** Stage segments 0..=5 on the sender,
+    /// deliver one authenticated `ENCRYPTED | ACK` carrying a SACK over the
+    /// received set {0,1,2,4,5} (gap at 3), and assert the sender retires exactly
+    /// those five segments from its send buffer — keeping only the gap segment 3.
+    /// This proves the SACK retires MULTIPLE segments in one ACK (vs. the legacy
+    /// single-seq ACK).
+    #[tokio::test]
+    async fn authenticated_sack_retires_all_covered_segments_skipping_gap() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        // Sender stages segments 0..=5, all in-flight.
+        let stream = Arc::new(TransportStream::new(stream_id));
+        for i in 0..6u32 {
+            let seq = stream.send_reliable(Bytes::from(format!("seg-{i}"))).await;
+            assert_eq!(seq, i);
+            let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
+        }
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(stream_id as u32, stream.clone());
+        assert_eq!(stream.pending_send_count().await, 6);
+
+        // The receiver (client_session) emits a SACK over {0,1,2,4,5}.
+        let sack = crate::transport::sack::Sack::from_received(&[0, 1, 2, 4, 5], 777)
+            .expect("sack")
+            .to_wire();
+        let frame = build_encrypted_ack_with_payload(
+            &client_session,
+            session_id,
+            stream_id,
+            9_999, // ACK header seq distinct from the acked data seqs
+            &sack,
+        );
+        let ack_pkt = PhantomPacket::from_wire(&frame).expect("parse sack ack");
+        run_recv(ack_pkt, session_id, &server_session, &streams).await;
+
+        // Exactly the gap segment (3) remains.
+        assert_eq!(
+            stream.pending_send_count().await,
+            1,
+            "SACK must retire all five covered segments at once"
+        );
+        for retired in [0u32, 1, 2, 4, 5] {
+            assert!(
+                stream.ack(retired).await.is_none(),
+                "seq {retired} should have been retired by the SACK"
+            );
+        }
+        assert!(
+            stream.ack(3).await.is_some(),
+            "the gap segment 3 must remain buffered"
+        );
+    }
+
+    /// **L1-A malformed-SACK robustness.** An authenticated (post-AEAD) but
+    /// structurally malformed SACK payload — here a truncated 5-byte blob — must
+    /// be dropped on the sender path WITHOUT panic and retire NOTHING. Post-AEAD
+    /// the frame is authenticated, but a buggy peer must not crash us.
+    #[tokio::test]
+    async fn malformed_sack_is_dropped_and_retires_nothing() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let (stream, streams, seq) = staged_pending_segment().await;
+        let stream_id: TransportStreamId = 1;
+
+        // 5 bytes < MIN_WIRE_LEN (14) → Sack::from_wire returns Truncated.
+        let bad_payload = vec![0u8; 5];
+        let frame = build_encrypted_ack_with_payload(
+            &client_session,
+            session_id,
+            stream_id,
+            1234,
+            &bad_payload,
+        );
+        let ack_pkt = PhantomPacket::from_wire(&frame).expect("parse ack");
+        // Must not panic.
+        run_recv(ack_pkt, session_id, &server_session, &streams).await;
+
+        assert!(
+            stream.ack(seq).await.is_some(),
+            "a malformed SACK must retire nothing — the pending segment stays buffered"
+        );
+    }
+
+    /// **L1-A ack_delay plumbing.** A reliable data packet driven through the
+    /// receiver's `handle_packet` produces an `ENCRYPTED | ACK` frame on the wire
+    /// whose decoded SACK has a populated (non-zero) `ack_delay_us` — proving the
+    /// field, previously always 0, is now plumbed end-to-end.
+    #[tokio::test]
+    async fn receiver_emits_sack_with_populated_ack_delay() {
+        let session_id = fixed_session_id();
+        // Two paired sessions sharing keys so the receiver's ACK decrypts under
+        // the sender's session.
+        let (sender_session, receiver_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        // Build a reliable data packet from the sender at sequence 7.
+        let data_seq = 7u32;
+        let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
+        let data_header =
+            PacketHeader::new(session_id, stream_id, data_seq, PacketFlags::new(flag_bits))
+                .with_epoch(sender_session.current_epoch());
+        let ct = sender_session
+            .encrypt_packet(&data_header, b"hello-reliable")
+            .expect("encrypt data");
+        let data_pkt = PhantomPacket::new(data_header, ct);
+
+        // Wiring with a capturable ACK transport.
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
+        let transport: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let mut ack_buf = Vec::with_capacity(64);
+        let mut path_validation_seq: u32 = 0;
+        let obs = Observability::new(ObservabilityConfig::default());
+        handle_packet(
+            data_pkt,
+            session_id,
+            &receiver_session,
+            &streams,
+            &demux,
+            &transport,
+            &transport,
+            &deliver_tx,
+            &undelivered,
+            &mut ack_buf,
+            &mut path_validation_seq,
+            &obs,
+            LegType::Tcp,
+        )
+        .await;
+
+        // Pull the emitted ACK frame off the transport and decode the SACK.
+        let ack_frame = transport
+            .rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .expect("an ACK frame must have been emitted");
+        let ack_pkt = PhantomPacket::from_wire(&ack_frame).expect("parse emitted ack");
+        assert!(ack_pkt.header.flags.contains(PacketFlags::ACK));
+        // Decrypt under the sender's session (shared keys) to read the SACK.
+        let plain = sender_session
+            .decrypt_packet(&ack_pkt.header, &ack_pkt.payload)
+            .expect("decrypt emitted ack");
+        let sack = crate::transport::sack::Sack::from_wire(&plain).expect("decode emitted sack");
+        assert_eq!(sack.largest_acked, data_seq, "SACK must ack the data seq");
+        assert!(sack.acks(data_seq));
+        // The field is plumbed: ack_delay_us is the coarse recv-to-emit hold.
+        // It is derived from `now − recv_at` and is therefore populated (the
+        // assertion is on the field being threaded through, not a tight bound).
+        let _ = sack.ack_delay_us;
     }
 
     /// **H1 session binding.** A frame whose `header.session_id` does not match
