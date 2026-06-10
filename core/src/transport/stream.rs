@@ -906,7 +906,7 @@ impl Stream {
     /// live data pump routes every reliable app payload through here so the app
     /// sees the reliable stream strictly in `sequence` order even over a
     /// reordering (UDP) path. Out-of-order segments are held in `recv_buffer`
-    /// (bounded by [`MAX_RECV_REORDER`]); the data-arrival instant is stamped for
+    /// (bounded by `MAX_RECV_REORDER`); the data-arrival instant is stamped for
     /// the SACK `ack_delay_us`.
     pub async fn accept_in_order(
         &self,
