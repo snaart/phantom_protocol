@@ -161,8 +161,47 @@ impl Sack {
             }
         }
 
-        // Reverse to get descending order.
+        Self::from_ascending_coalesced(asc_ranges, ack_delay_us)
+    }
+
+    /// Build a [`Sack`] from explicit inclusive `(low, high)` ranges in any order
+    /// (each must have `low <= high`). Ranges are sorted ascending, coalesced
+    /// (adjacent/overlapping merged), reversed to descending, and **capped to the
+    /// highest [`MAX_SACK_RANGES`]** so the encoded SACK always decodes at the peer
+    /// (`from_wire` rejects `range_count > MAX_SACK_RANGES`). Dropping the lowest
+    /// ranges is safe: those sequences are recovered by cumulative re-ACK as holes
+    /// fill, or by RTO. Returns `None` if `ranges` is empty.
+    pub fn from_inclusive_ranges(mut ranges: Vec<(u32, u32)>, ack_delay_us: u32) -> Option<Sack> {
+        if ranges.is_empty() {
+            return None;
+        }
+        ranges.sort_unstable_by_key(|&(lo, _)| lo);
+        let mut asc: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+        for (lo, hi) in ranges {
+            match asc.last_mut() {
+                // Adjacent or overlapping with the previous (ascending) range → merge.
+                Some(last) if lo <= last.1.saturating_add(1) => {
+                    if hi > last.1 {
+                        last.1 = hi;
+                    }
+                }
+                _ => asc.push((lo, hi)),
+            }
+        }
+        Self::from_ascending_coalesced(asc, ack_delay_us)
+    }
+
+    /// Shared tail for [`from_received`] / [`from_inclusive_ranges`]: take ascending,
+    /// already-coalesced ranges, reverse to descending, **cap to the highest
+    /// [`MAX_SACK_RANGES`]** (drop the lowest, oldest ranges so the wire form always
+    /// decodes at the peer), set `largest_acked`, and construct. `None` if empty.
+    fn from_ascending_coalesced(mut asc_ranges: Vec<(u32, u32)>, ack_delay_us: u32) -> Option<Sack> {
+        if asc_ranges.is_empty() {
+            return None;
+        }
+        // Reverse to descending order (highest first), then keep the highest ranges.
         asc_ranges.reverse();
+        asc_ranges.truncate(MAX_SACK_RANGES);
         let largest_acked = asc_ranges[0].1;
 
         Some(Sack {
@@ -372,6 +411,57 @@ mod tests {
     fn from_received_duplicate_seqs_coalesced() {
         let sack = Sack::from_received(&[3, 3, 3, 5, 5], 0).unwrap();
         assert_eq!(sack.ranges(), &[(5, 5), (3, 3)]);
+    }
+
+    // ── F1: generation must cap to MAX_SACK_RANGES so the peer can decode ──
+
+    #[test]
+    fn from_received_caps_ranges_to_max_and_stays_decodable() {
+        // 40 disjoint singleton islands (even sequences 0,2,..,78) → 40 ranges,
+        // which a peer would reject as TooManyRanges. Generation must cap to 32,
+        // keep the HIGHEST ranges (nearest largest_acked), and remain decodable.
+        let seqs: Vec<u32> = (0u32..40).map(|i| i * 2).collect();
+        let sack = Sack::from_received(&seqs, 0).expect("non-empty");
+        assert!(
+            sack.ranges().len() <= MAX_SACK_RANGES,
+            "generated SACK must be capped to MAX_SACK_RANGES, got {}",
+            sack.ranges().len()
+        );
+        // Kept the highest 32 ranges: (78,78) down to (16,16); largest unchanged.
+        assert_eq!(sack.largest_acked, 78);
+        assert_eq!(sack.ranges().len(), MAX_SACK_RANGES);
+        assert_eq!(sack.ranges()[0], (78, 78));
+        assert_eq!(sack.ranges()[MAX_SACK_RANGES - 1], (16, 16));
+        let wire = sack.to_wire();
+        let decoded = Sack::from_wire(&wire).expect("a capped SACK must decode at the peer");
+        assert_eq!(decoded, sack);
+    }
+
+    #[test]
+    fn from_inclusive_ranges_caps_and_keeps_highest() {
+        // Ascending (low,high) input with 40 islands; keep the highest 32.
+        let asc: Vec<(u32, u32)> = (0u32..40).map(|i| (i * 2, i * 2)).collect();
+        let sack = Sack::from_inclusive_ranges(asc, 7).expect("non-empty");
+        assert_eq!(sack.ack_delay_us, 7);
+        assert_eq!(sack.ranges().len(), MAX_SACK_RANGES);
+        assert_eq!(sack.largest_acked, 78);
+        assert_eq!(sack.ranges()[0], (78, 78));
+        // Decodes at the peer.
+        assert_eq!(Sack::from_wire(&sack.to_wire()).expect("decode"), sack);
+    }
+
+    #[test]
+    fn from_inclusive_ranges_coalesces_and_orders() {
+        // Unsorted, with an adjacent pair (4,5)+(6,7) that must coalesce to (4,7).
+        let sack = Sack::from_inclusive_ranges(vec![(6, 7), (0, 1), (4, 5)], 0).expect("non-empty");
+        assert_eq!(sack.ranges(), &[(4, 7), (0, 1)]);
+        assert_eq!(sack.largest_acked, 7);
+        assert_eq!(Sack::from_wire(&sack.to_wire()).expect("decode"), sack);
+    }
+
+    #[test]
+    fn from_inclusive_ranges_empty_is_none() {
+        assert!(Sack::from_inclusive_ranges(Vec::new(), 0).is_none());
     }
 
     // ── round-trip tests ─────────────────────────────────────────────────
