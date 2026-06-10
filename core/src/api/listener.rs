@@ -556,6 +556,7 @@ async fn run_acceptor(
                         Arc::new(server_session),
                         task_runtime.clone(),
                         observability.clone(),
+                        LegType::Tcp,
                     );
                     let outcome = AcceptOutcome::new(session, early_data, peer);
                     // Bounded hand-off; a send error means the listener was dropped.
