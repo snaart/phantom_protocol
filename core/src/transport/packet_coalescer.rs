@@ -9,8 +9,23 @@
 
 use std::time::{Duration, Instant};
 
-/// Максимальный размер UDP-датаграммы (без фрагментации)
-pub const MAX_UDP_PAYLOAD: usize = 65507;
+/// Theoretical maximum UDP payload size (IPv4, RFC 791).
+///
+/// NOT the path MTU — coalescing must be configured to cap at the path MTU
+/// to avoid IP fragmentation. Use [`DEFAULT_MAX_DATAGRAM`] for the
+/// conservative path-MTU-safe default. This constant is intended for tests
+/// and benchmarks that deliberately exercise the maximum UDP payload capacity.
+pub const MAX_ASSEMBLED_DATAGRAM: usize = 65507;
+
+/// Conservative path-MTU cap for datagram coalescing.
+///
+/// Matches the `MAX_UDP_PAYLOAD = 1200` constant used by
+/// `transport::fragmentation` and the PhantomUDP envelope. Keeps coalesced
+/// datagrams below the common Internet path MTU floor, preventing IP
+/// fragmentation in the default configuration. DPLPMTUD (Phase 5) may raise
+/// this at runtime once the actual path MTU is probed.
+pub const DEFAULT_MAX_DATAGRAM: usize = 1200;
+
 /// Размер заголовка coalesced-пакета (2 байта count)
 const HEADER_SIZE: usize = 2;
 /// Размер заголовка каждого sub-пакета (2 байта length)
@@ -30,7 +45,7 @@ pub struct CoalescerConfig {
 impl Default for CoalescerConfig {
     fn default() -> Self {
         Self {
-            max_datagram_size: MAX_UDP_PAYLOAD,
+            max_datagram_size: DEFAULT_MAX_DATAGRAM,
             flush_timeout_us: 500, // 0.5ms — агрессивный flush
             max_packets: 256,
         }
@@ -245,6 +260,37 @@ mod tests {
         let d2 = c.flush().unwrap();
         let mut dec2 = Decoalescer::new(&d2).unwrap();
         assert_eq!(dec2.next(), Some(b"CCCCC".as_slice()));
+    }
+
+    /// Verify that a default-config coalescer never emits a datagram larger
+    /// than `DEFAULT_MAX_DATAGRAM`, even when many small packets are pushed.
+    #[test]
+    fn default_config_never_exceeds_path_mtu() {
+        let mut c = PacketCoalescer::new(CoalescerConfig::default());
+        let small = vec![0xCCu8; 50]; // 50-byte packets
+        let mut datagrams: Vec<Vec<u8>> = Vec::new();
+
+        for _ in 0..200 {
+            if let Some(d) = c.push(&small) {
+                datagrams.push(d);
+            }
+        }
+        if let Some(d) = c.flush() {
+            datagrams.push(d);
+        }
+
+        assert!(
+            !datagrams.is_empty(),
+            "expected at least one flushed datagram"
+        );
+        for (i, d) in datagrams.iter().enumerate() {
+            assert!(
+                d.len() <= DEFAULT_MAX_DATAGRAM,
+                "datagram {i} is {} bytes — exceeds DEFAULT_MAX_DATAGRAM ({})",
+                d.len(),
+                DEFAULT_MAX_DATAGRAM,
+            );
+        }
     }
 
     #[test]
