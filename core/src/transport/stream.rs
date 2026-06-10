@@ -3,6 +3,7 @@
 //! Multiplexed streams within a session.
 //! Each stream has independent sequence numbers (no Head-of-Line blocking).
 
+use crate::transport::sack::Sack;
 use crate::transport::types::{SequenceNumber, StreamId};
 
 use bytes::Bytes;
@@ -13,6 +14,17 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify, Semaphore};
 
 const MAX_PENDING_PACKETS: usize = 1024;
+
+/// Upper bound on out-of-order segments held for reassembly per stream. In
+/// practice the flow-control window bounds in-flight (hence reorderable) data far
+/// below this; a peer that floods past its window with huge gaps is refused here
+/// (the refused segment is NOT recorded as received, so it is not SACKed and the
+/// sender retransmits it — no SACK-without-data hazard, bounded memory).
+const MAX_RECV_REORDER: usize = 2048;
+
+/// RFC 9002 §6.1.1 packet-threshold: a still-unacked segment is declared lost
+/// once a segment at least this many offsets *newer* has been SACK-acked.
+const PACKET_THRESHOLD: u32 = 3;
 
 /// Initial per-stream send window — caps how many bytes the local
 /// side will put on the wire before receiving a `WINDOW_UPDATE` from
@@ -43,18 +55,82 @@ pub enum StreamState {
 /// Pending data waiting to be sent
 #[derive(Debug)]
 struct PendingData {
+    /// Wire `header.sequence` — the AEAD-nonce / replay id (shared with control
+    /// frames, so NOT gap-free). Reused verbatim on retransmit.
     sequence: SequenceNumber,
+    /// Gap-free per-stream reliable-data offset — the reassembly / SACK / loss-
+    /// detection key (A.5). Carried in the AEAD plaintext so the receiver can
+    /// deliver reliable data strictly in send order even when `sequence` has
+    /// control-frame holes. Stable across retransmits.
+    stream_offset: SequenceNumber,
     data: Bytes,
     sent_at: Option<tokio::time::Instant>,
     #[allow(dead_code)]
     retries: u32,
+    /// Flagged lost by the SACK-driven loss detector (RFC 9002 packet- or
+    /// time-threshold, L1-B). `poll_send`'s Pass-0 fast-retransmits it ahead of
+    /// cwnd/window, then clears the flag. Distinct from the RTO pass (Pass-1).
+    lost: bool,
+}
+
+/// One reliable segment retired by [`Stream::on_sack`] — a segment whose
+/// sequence a received SACK covered and which has now been removed from the
+/// send buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct RetiredSegment {
+    /// When the segment was last (re)transmitted, if it had been sent at all.
+    /// `None` means the segment was acknowledged before `poll_send` ever stamped
+    /// it (e.g. a duplicate cumulative SACK) — no RTT sample is taken.
+    pub sent_at: Option<tokio::time::Instant>,
+    /// On-wire payload size of the segment.
+    pub size: u64,
+    /// True if the segment had been retransmitted at least once (`retries > 0`).
+    /// Per Karn's algorithm, the caller must NOT sample RTT from such a segment.
+    pub was_retransmit: bool,
+}
+
+/// One segment newly declared lost by [`Stream::on_sack`]'s RFC-9002 loss
+/// detector (L1-B) — still buffered, now flagged for fast-retransmit.
+#[derive(Debug, Clone, Copy)]
+pub struct LostSegment {
+    /// Gap-free reliable offset of the lost segment.
+    pub stream_offset: SequenceNumber,
+    /// On-wire payload size — the caller reports it to congestion control via
+    /// `Session::on_packet_lost`.
+    pub size: u64,
+}
+
+/// Outcome of processing a received SACK against the send buffer.
+#[derive(Debug, Default)]
+pub struct SackResult {
+    /// The segments newly retired by this SACK (were in the send buffer, now
+    /// removed). The caller feeds each into congestion control / the RTT
+    /// estimator. Empty if the SACK acknowledged nothing still buffered (e.g. a
+    /// duplicate or stale ACK).
+    pub retired: Vec<RetiredSegment>,
+    /// Segments newly declared lost (packet- or time-threshold, RFC 9002) by this
+    /// SACK — still buffered, now flagged for Pass-0 fast-retransmit. The caller
+    /// feeds each into `Session::on_packet_lost` (the real BBR loss signal).
+    pub lost: Vec<LostSegment>,
+}
+
+impl SackResult {
+    /// The gap-free offsets of the segments newly declared lost, ascending.
+    pub fn lost_offsets(&self) -> Vec<SequenceNumber> {
+        self.lost.iter().map(|l| l.stream_offset).collect()
+    }
 }
 
 /// One segment handed back by [`Stream::poll_send`] for transmission.
 #[derive(Debug, Clone)]
 pub struct OutboundSegment {
-    /// Sequence number of the segment.
+    /// Wire `header.sequence` of the segment (AEAD nonce / replay id).
     pub seq: SequenceNumber,
+    /// Gap-free per-stream reliable-data offset (A.5). The send path prepends it
+    /// (big-endian u32) to the AEAD plaintext of a reliable segment so the
+    /// receiver reassembles in send order regardless of `seq` holes. Meaningless
+    /// for unreliable segments (the send path does not prefix those).
+    pub stream_offset: SequenceNumber,
     /// Payload bytes.
     pub data: Bytes,
     /// Whether the segment is on the reliable (ACK-tracked) path.
@@ -181,16 +257,23 @@ pub struct Stream {
     id: StreamId,
     /// Current state
     state: Mutex<StreamState>,
-    /// Send sequence number
+    /// Send sequence number — the wire `header.sequence` counter, shared with
+    /// control frames (`next_send_sequence`), so it is NOT gap-free.
     send_sequence: AtomicU32,
-    /// Next expected receive sequence
+    /// Gap-free per-stream reliable-data offset counter (A.5). Only reliable data
+    /// consumes it, so it has no control-frame holes; it is the reassembly / SACK
+    /// key carried in the reliable-data AEAD plaintext.
+    reliable_offset: AtomicU32,
+    /// Next expected receive **stream offset** (gap-free reassembly cursor, A.5).
     recv_sequence: AtomicU32,
     /// Send buffer (data waiting to be sent)
     send_buffer: Mutex<VecDeque<PendingData>>,
     /// Unreliable send buffer (fire and forget)
     unreliable_buffer: Mutex<VecDeque<(SequenceNumber, Bytes)>>,
-    /// Receive buffer (out-of-order data)
-    recv_buffer: Mutex<VecDeque<(SequenceNumber, Bytes)>>,
+    /// Receive buffer (out-of-order data). Each entry is one cursor position
+    /// `(sequence, payloads)`; `payloads` is normally a single reliable frame but
+    /// carries a COALESCED bundle's sub-payloads when several share one sequence.
+    recv_buffer: Mutex<VecDeque<(SequenceNumber, Vec<Bytes>)>>,
     /// Ordered receive queue (ready for application)
     recv_ready: Mutex<VecDeque<Bytes>>,
     /// Notify when data is ready to read
@@ -227,6 +310,10 @@ pub struct Stream {
     /// updated only from the serial ACK path and read by `poll_send`, and the
     /// guard is never held across an `.await`.
     rto: std::sync::Mutex<RtoEstimator>,
+    /// Receive instant of the most recent reliable data packet, used to populate
+    /// the SACK's `ack_delay_us` (`now − recv_at`). A plain sync mutex; the guard
+    /// is never held across an `.await`.
+    last_data_recv_at: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl Stream {
@@ -236,6 +323,7 @@ impl Stream {
             id,
             state: Mutex::new(StreamState::Open),
             send_sequence: AtomicU32::new(0),
+            reliable_offset: AtomicU32::new(0),
             recv_sequence: AtomicU32::new(0),
             send_buffer: Mutex::new(VecDeque::new()),
             unreliable_buffer: Mutex::new(VecDeque::new()),
@@ -251,6 +339,7 @@ impl Stream {
             bytes_since_last_update: AtomicU32::new(0),
             pending_window_update: AtomicU32::new(0),
             rto: std::sync::Mutex::new(RtoEstimator::new()),
+            last_data_recv_at: std::sync::Mutex::new(None),
         }
     }
 
@@ -262,6 +351,15 @@ impl Stream {
         match self.rto.lock() {
             Ok(g) => g.rto(),
             Err(poisoned) => poisoned.into_inner().rto(),
+        }
+    }
+
+    /// Smoothed RTT estimate, or `None` before the first measurement. Feeds the
+    /// RFC-9002 time-threshold loss detector (L1-B).
+    fn smoothed_rtt(&self) -> Option<Duration> {
+        match self.rto.lock() {
+            Ok(g) => g.srtt,
+            Err(poisoned) => poisoned.into_inner().srtt,
         }
     }
 
@@ -445,12 +543,16 @@ impl Stream {
         permit.forget();
 
         let seq = self.send_sequence.fetch_add(1, Ordering::SeqCst);
+        // Gap-free reliable-data offset (distinct from the shared wire sequence).
+        let stream_offset = self.reliable_offset.fetch_add(1, Ordering::SeqCst);
 
         let pending = PendingData {
             sequence: seq,
+            stream_offset,
             data,
             sent_at: None,
             retries: 0,
+            lost: false,
         };
 
         self.send_buffer.lock().await.push_back(pending);
@@ -497,6 +599,9 @@ impl Stream {
         if let Some((seq, data)) = self.unreliable_buffer.lock().await.pop_front() {
             return Some(OutboundSegment {
                 seq,
+                // Unreliable segments are not reassembled; offset is unused (the
+                // send path does not prefix it). Mirror `seq` for a sane value.
+                stream_offset: seq,
                 data,
                 reliable: false,
                 retransmit: false,
@@ -508,6 +613,27 @@ impl Stream {
         // Adaptive RFC 6298 timeout (was a fixed 500ms).
         let timeout = self.current_rto();
 
+        // Pass 0: fast-retransmit a segment the SACK loss detector flagged (RFC
+        // 9002, L1-B). Recovers a loss in ~1 RTT instead of waiting out an RTO.
+        // Like Pass 1 it BYPASSES cwnd/window (loss recovery must always proceed —
+        // the flow-control invariant), but it does NOT back the RTO off (this was a
+        // SACK-detected loss, not a timeout). Clears the flag and marks the segment
+        // retransmitted (ambiguous for RTT — Karn).
+        for pending in buffer.iter_mut() {
+            if pending.lost && pending.sent_at.is_some() {
+                pending.lost = false;
+                pending.sent_at = Some(now);
+                pending.retries += 1;
+                return Some(OutboundSegment {
+                    seq: pending.sequence,
+                    stream_offset: pending.stream_offset,
+                    data: pending.data.clone(),
+                    reliable: true,
+                    retransmit: true,
+                });
+            }
+        }
+
         // Pass 1: a timed-out segment (retransmission) — always allowed.
         for pending in buffer.iter_mut() {
             if let Some(sent_at) = pending.sent_at {
@@ -518,6 +644,7 @@ impl Stream {
                     self.note_rto_timeout();
                     return Some(OutboundSegment {
                         seq: pending.sequence,
+                        stream_offset: pending.stream_offset,
                         data: pending.data.clone(),
                         reliable: true,
                         retransmit: true,
@@ -551,6 +678,7 @@ impl Stream {
                 pending.sent_at = Some(now);
                 return Some(OutboundSegment {
                     seq: pending.sequence,
+                    stream_offset: pending.stream_offset,
                     data: pending.data.clone(),
                     reliable: true,
                     retransmit: false,
@@ -605,50 +733,245 @@ impl Stream {
         }
     }
 
-    /// Handle received data
+    // ── SACK (selective acknowledgement) — L1-A / A.5 ──
+
+    /// Build a [`Sack`] describing exactly the reliable-data sequences this stream
+    /// currently holds, derived from the **reorder state** (single source of truth):
+    /// the contiguous delivered run `[0, recv_sequence-1]` as one range, plus one
+    /// range per out-of-order island still buffered in `recv_buffer`. Returns
+    /// `None` if nothing has been received yet.
     ///
-    /// Data is buffered until it can be delivered in order.
-    pub async fn on_receive(&self, sequence: SequenceNumber, data: Bytes) {
-        let expected = self.recv_sequence.load(Ordering::SeqCst);
-
-        if sequence == expected {
-            // In-order delivery
-            self.recv_ready.lock().await.push_back(data);
-            self.recv_sequence.fetch_add(1, Ordering::SeqCst);
-
-            // Try to deliver buffered out-of-order data
-            self.deliver_buffered().await;
-
-            // Notify waiters
-            self.recv_notify.notify_waiters();
-        } else if sequence > expected {
-            // Out-of-order, buffer it
-            self.recv_buffer.lock().await.push_back((sequence, data));
+    /// Because the SACK is derived from what the reorder buffer actually holds, the
+    /// receiver never SACKs a sequence it has dropped (the SACK-without-data hazard
+    /// of a separate received-set). `ack_delay_us`: the caller's measured value, or
+    /// — when `0` — a coarse `now − last_data_recv_at` so the on-wire field is
+    /// populated. The range set is capped to [`crate::transport::sack::MAX_SACK_RANGES`]
+    /// by [`Sack::from_inclusive_ranges`] so it always decodes at the peer.
+    pub async fn received_sack(&self, ack_delay_us: u32) -> Option<Sack> {
+        let next = self.recv_sequence.load(Ordering::SeqCst);
+        let buf = self.recv_buffer.lock().await;
+        if next == 0 && buf.is_empty() {
+            return None;
         }
-        // sequence < expected means duplicate, ignore it
+        // Contiguous delivered run first (lowest), then the buffered islands
+        // (all strictly above `next`, since `next` itself is the missing hole).
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        if next > 0 {
+            ranges.push((0, next - 1));
+        }
+        let mut islands: Vec<SequenceNumber> = buf.iter().map(|(s, _)| *s).collect();
+        drop(buf);
+        islands.sort_unstable();
+        for s in islands {
+            match ranges.last_mut() {
+                // Coalesce adjacent / duplicate into the previous ascending range.
+                Some(last) if s <= last.1.saturating_add(1) => {
+                    if s > last.1 {
+                        last.1 = s;
+                    }
+                }
+                _ => ranges.push((s, s)),
+            }
+        }
+
+        let delay = if ack_delay_us != 0 {
+            ack_delay_us
+        } else {
+            // Coarse fallback: time since the most recent data arrival.
+            let recv_at = match self.last_data_recv_at.lock() {
+                Ok(g) => *g,
+                Err(poisoned) => *poisoned.into_inner(),
+            };
+            recv_at
+                .map(|t| {
+                    let micros = tokio::time::Instant::now().duration_since(t).as_micros();
+                    u32::try_from(micros).unwrap_or(u32::MAX)
+                })
+                .unwrap_or(0)
+        };
+        Sack::from_inclusive_ranges(ranges, delay)
     }
 
-    /// Try to deliver buffered out-of-order data
-    async fn deliver_buffered(&self) {
-        let mut recv_buf = self.recv_buffer.lock().await;
-        let mut ready = self.recv_ready.lock().await;
+    /// Process a received SACK, retiring **every** buffered reliable segment whose
+    /// gap-free `stream_offset` the SACK covers (A.5; the SACK ranges are over
+    /// `stream_offset`, not the control-frame-holed wire `sequence`). Returns a
+    /// [`SackResult`] listing the newly-retired segments so the caller can feed
+    /// congestion control / the RTT estimator per segment.
+    ///
+    /// RTT is sampled here (Karn's algorithm) only for segments that were never
+    /// retransmitted (`retries == 0`); `RetiredSegment::was_retransmit` marks the
+    /// rest so the caller does not double-count or use an ambiguous sample.
+    ///
+    /// This is a cumulative retire: a SACK re-acks every still-buffered offset it
+    /// covers, so a lost ACK no longer strands a segment — the next SACK retires
+    /// it. **No loss detection / fast-retransmit here** — that is L1-B.
+    pub async fn on_sack(&self, sack: &Sack) -> SackResult {
+        let mut buffer = self.send_buffer.lock().await;
+        let mut retired = Vec::new();
+        let mut freed = 0u32;
+        let now = tokio::time::Instant::now();
 
-        loop {
-            let expected = self.recv_sequence.load(Ordering::SeqCst);
-
-            // Find and remove the expected sequence.
-            // PANIC-SAFETY: `pos` was just returned by `iter().position(...)`,
-            // so `recv_buf` has an element at that index — `remove` cannot
-            // return `None`. `recv_buf` is locked for the duration of this
-            // loop, so no other task can drain it.
-            if let Some(pos) = recv_buf.iter().position(|(seq, _)| *seq == expected) {
+        // Retain only the segments the SACK does NOT cover; collect the rest.
+        let mut i = 0;
+        while i < buffer.len() {
+            // SACK ranges are over the gap-free reliable `stream_offset` (A.5),
+            // NOT the wire `sequence` (which has control-frame holes).
+            // PANIC-SAFETY: `i < buffer.len()` is the loop guard, so the index is
+            // in range; `get` cannot return `None`.
+            #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+            let covered = sack.acks(buffer.get(i).unwrap().stream_offset);
+            if covered {
+                // PANIC-SAFETY: `i` is a valid index (loop guard); `remove`
+                // returns `Some` for an in-range index in a VecDeque.
                 #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
-                let (_, data) = recv_buf.remove(pos).unwrap();
-                ready.push_back(data);
+                let pending = buffer.remove(i).unwrap();
+                freed += 1;
+                let was_retransmit = pending.retries > 0;
+                let size = pending.data.len() as u64;
+                if let Some(sent_at) = pending.sent_at {
+                    // Karn: only sample RTT from segments never retransmitted.
+                    if !was_retransmit {
+                        let rtt = now.duration_since(sent_at);
+                        self.record_rtt_sample(rtt);
+                    }
+                }
+                retired.push(RetiredSegment {
+                    sent_at: pending.sent_at,
+                    size,
+                    was_retransmit,
+                });
+                // Do NOT advance `i`: `remove` shifted the next element into `i`.
+            } else {
+                i += 1;
+            }
+        }
+
+        // Loss detection (RFC 9002 §6.1.1) over the still-buffered, in-flight
+        // segments, keyed on the gap-free `stream_offset`: declare lost any offset
+        // at least `PACKET_THRESHOLD` behind `largest_acked` (packet-threshold), or
+        // — if an srtt is known — any offset below `largest_acked` aged past
+        // srtt·9/8 (RACK time-threshold). Flagged segments are fast-retransmitted
+        // by `poll_send`'s Pass-0; already-flagged ones are skipped (no double-count
+        // into congestion control).
+        let largest_acked = sack.largest_acked;
+        // RFC 9002: loss_delay = max(kGranularity, kTimeThreshold · smoothed_rtt).
+        // The kGranularity (1 ms) floor is load-bearing: without it a near-zero
+        // srtt makes the threshold ~0 and flags freshly-sent segments as "aged",
+        // which would over-report loss.
+        let time_threshold = self
+            .smoothed_rtt()
+            .map(|r| std::cmp::max(Duration::from_millis(1), r * 9 / 8));
+        let mut lost = Vec::new();
+        for pending in buffer.iter_mut() {
+            if pending.lost {
+                continue;
+            }
+            let Some(sent_at) = pending.sent_at else {
+                continue; // not yet on the wire — nothing to lose
+            };
+            if pending.stream_offset >= largest_acked {
+                continue; // not behind the largest ack — still legitimately in flight
+            }
+            let packet_lost =
+                largest_acked >= pending.stream_offset.saturating_add(PACKET_THRESHOLD);
+            let time_lost = time_threshold.is_some_and(|t| now.duration_since(sent_at) >= t);
+            if packet_lost || time_lost {
+                pending.lost = true;
+                lost.push(LostSegment {
+                    stream_offset: pending.stream_offset,
+                    size: pending.data.len() as u64,
+                });
+            }
+        }
+        drop(buffer);
+
+        // Return the buffer permits for every retired segment in one shot.
+        if freed > 0 {
+            self.send_semaphore.add_permits(freed as usize);
+        }
+
+        SackResult { retired, lost }
+    }
+
+    // ── Receive-side in-order reassembly (A.5) ──
+
+    /// Accept reliable data payloads carried at `sequence` and return the
+    /// contiguous in-order run now deliverable to the application, in ascending
+    /// order. The returned `Vec` is empty when this is a future hole (buffered for
+    /// later), a duplicate, or refused for capacity.
+    ///
+    /// `payloads` is normally one element (a single RELIABLE frame); a COALESCED
+    /// bundle passes its sub-payloads so the whole bundle occupies one cursor
+    /// position. This is the **single source of truth** for receive ordering: the
+    /// live data pump routes every reliable app payload through here so the app
+    /// sees the reliable stream strictly in `sequence` order even over a
+    /// reordering (UDP) path. Out-of-order segments are held in `recv_buffer`
+    /// (bounded by `MAX_RECV_REORDER`); the data-arrival instant is stamped for
+    /// the SACK `ack_delay_us`.
+    pub async fn accept_in_order(
+        &self,
+        sequence: SequenceNumber,
+        payloads: Vec<Bytes>,
+    ) -> Vec<Bytes> {
+        {
+            let mut at = match self.last_data_recv_at.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *at = Some(tokio::time::Instant::now());
+        }
+
+        let expected = self.recv_sequence.load(Ordering::SeqCst);
+        if sequence < expected {
+            return Vec::new(); // duplicate of already-delivered data
+        }
+
+        let mut buf = self.recv_buffer.lock().await;
+        if sequence != expected {
+            // Future segment: buffer if not already held and within capacity.
+            // A refused segment is NOT recorded, so it is not SACKed → the sender
+            // retransmits it (no SACK-without-data hazard).
+            let already = buf.iter().any(|(s, _)| *s == sequence);
+            if !already && buf.len() < MAX_RECV_REORDER {
+                buf.push_back((sequence, payloads));
+            }
+            return Vec::new();
+        }
+
+        // In-order: deliver this segment's payloads, then drain any now-contiguous
+        // buffered segments.
+        let mut out = payloads;
+        self.recv_sequence.fetch_add(1, Ordering::SeqCst);
+        loop {
+            let next = self.recv_sequence.load(Ordering::SeqCst);
+            if let Some(pos) = buf.iter().position(|(s, _)| *s == next) {
+                // PANIC-SAFETY: `pos` was just returned by `position`, so the
+                // index is valid; `recv_buf` is locked, so no concurrent drain.
+                #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+                let (_, payloads) = buf.remove(pos).unwrap();
+                out.extend(payloads);
                 self.recv_sequence.fetch_add(1, Ordering::SeqCst);
             } else {
                 break;
             }
+        }
+        out
+    }
+
+    /// Pull-API adapter over [`accept_in_order`](Self::accept_in_order): buffer a
+    /// single reliable payload for in-order reassembly and push the released run
+    /// into `recv_ready` for [`recv`](Self::recv) / [`try_recv`](Self::try_recv).
+    /// (Not used by the live session pump, which consumes the returned run
+    /// directly; retained for the pull-style read API.)
+    pub async fn on_receive(&self, sequence: SequenceNumber, data: Bytes) {
+        let delivered = self.accept_in_order(sequence, vec![data]).await;
+        if !delivered.is_empty() {
+            let mut ready = self.recv_ready.lock().await;
+            for d in delivered {
+                ready.push_back(d);
+            }
+            drop(ready);
+            self.recv_notify.notify_waiters();
         }
     }
 
@@ -919,6 +1242,277 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), send_future).await;
         assert!(result.is_ok(), "Send should have succeeded after ack");
         assert_eq!(stream.pending_send_count().await, MAX_PENDING_PACKETS);
+    }
+
+    // ── SACK (selective acknowledgement) — L1-A ──
+
+    /// Stage segments 0..=5 on the send buffer, feed a SACK that covers
+    /// {0,1,2,4,5} (gap at 3), and assert it retires exactly those five segments,
+    /// leaving only segment 3 buffered. This is the headline L1-A behaviour: a
+    /// single SACK retires multiple segments at once, skipping the gap.
+    #[tokio::test]
+    async fn on_sack_retires_all_covered_segments_skipping_the_gap() {
+        let stream = Stream::new(1);
+        for i in 0..6u32 {
+            let seq = stream.send_reliable(Bytes::from(format!("seg-{i}"))).await;
+            assert_eq!(seq, i);
+            // Stamp it as in-flight so RTT sampling has a `sent_at`.
+            let seg = stream.poll_send(u64::MAX).await.expect("poll");
+            assert_eq!(seg.seq, i);
+        }
+        assert_eq!(stream.pending_send_count().await, 6);
+
+        // SACK covers {0,1,2,4,5} — segment 3 is the gap.
+        let sack = Sack::from_received(&[0, 1, 2, 4, 5], 1234).expect("sack");
+        assert_eq!(sack.ranges(), &[(4, 5), (0, 2)]);
+        let result = stream.on_sack(&sack).await;
+
+        // Five segments retired, none of them retransmissions.
+        assert_eq!(result.retired.len(), 5);
+        assert!(result.retired.iter().all(|r| !r.was_retransmit));
+        assert!(result.retired.iter().all(|r| r.sent_at.is_some()));
+
+        // Only segment 3 remains buffered.
+        assert_eq!(stream.pending_send_count().await, 1);
+        // Re-acking the retired sequences finds nothing (already removed); seq 3
+        // is still ackable.
+        for retired_seq in [0u32, 1, 2, 4, 5] {
+            assert!(
+                stream.ack(retired_seq).await.is_none(),
+                "seq {retired_seq} should already be retired by the SACK"
+            );
+        }
+        assert!(
+            stream.ack(3).await.is_some(),
+            "the gap segment 3 must remain buffered"
+        );
+    }
+
+    /// A SACK that covers nothing still buffered (stale / duplicate) retires
+    /// nothing and leaves the send buffer intact.
+    #[tokio::test]
+    async fn on_sack_for_unbuffered_sequences_retires_nothing() {
+        let stream = Stream::new(1);
+        stream.send_reliable(Bytes::from("zero")).await; // seq 0
+        let _ = stream.poll_send(u64::MAX).await.expect("poll");
+
+        // SACK only covers high sequences we never sent.
+        let sack = Sack::from_received(&[100, 101, 102], 0).expect("sack");
+        let result = stream.on_sack(&sack).await;
+        assert!(result.retired.is_empty());
+        assert_eq!(stream.pending_send_count().await, 1);
+    }
+
+    /// A retransmitted segment retired by a SACK is flagged `was_retransmit`, so
+    /// the caller does not sample RTT from it (Karn's algorithm).
+    #[tokio::test]
+    async fn on_sack_flags_retransmits_for_karn() {
+        tokio::time::pause();
+        let stream = Stream::new(1);
+        stream.send_reliable(Bytes::from("payload")).await; // seq 0
+        let _ = stream.poll_send(u64::MAX).await.expect("first send");
+
+        // Force a retransmit by crossing the RTO, so retries > 0.
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        let retx = stream.poll_send(u64::MAX).await.expect("retransmit");
+        assert!(retx.retransmit);
+
+        let sack = Sack::from_received(&[0], 0).expect("sack");
+        let result = stream.on_sack(&sack).await;
+        assert_eq!(result.retired.len(), 1);
+        assert!(
+            result.retired[0].was_retransmit,
+            "a retransmitted segment must be flagged so the caller skips RTT sampling"
+        );
+    }
+
+    // ── L1-B: loss detection (RFC 9002) + fast-retransmit ──
+
+    /// **L1-B packet-threshold loss + Pass-0 fast-retransmit.** Stage offsets
+    /// 0..=5 in flight; a SACK acking only {4,5} declares every still-buffered
+    /// offset ≤ largest_acked − PACKET_THRESHOLD(3) = 2 lost (0,1,2), leaving 3
+    /// unflagged. `poll_send`'s Pass-0 then fast-retransmits a flagged-lost segment
+    /// even with a CLOSED congestion window (cwnd_budget = 0), ahead of new data.
+    #[tokio::test]
+    async fn on_sack_packet_threshold_marks_lost_and_pass0_fast_retransmits() {
+        // Pause time so no segment ages past the 1 ms time-threshold floor — this
+        // isolates the PACKET-threshold (the time-threshold has its own test).
+        tokio::time::pause();
+        let stream = Stream::new(1);
+        for _ in 0..6u32 {
+            stream.send_reliable(Bytes::from_static(b"x")).await;
+            let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
+        }
+        // SACK acks offsets {4,5}: 0,1,2 are ≤ 5−3 → lost; 3 is within threshold.
+        let sack = Sack::from_received(&[4, 5], 0).expect("sack");
+        let result = stream.on_sack(&sack).await;
+        assert_eq!(
+            result.lost_offsets(),
+            vec![0, 1, 2],
+            "packet-threshold must flag every offset ≤ largest_acked − 3"
+        );
+        // Pass-0 re-sends a flagged segment even with a closed congestion window.
+        let seg = stream
+            .poll_send(0)
+            .await
+            .expect("Pass-0 fast-retransmit must ignore the congestion window");
+        assert!(seg.retransmit, "Pass-0 segment is a retransmit");
+        assert!(
+            [0u32, 1, 2].contains(&seg.stream_offset),
+            "a flagged-lost offset is fast-retransmitted (got {})",
+            seg.stream_offset
+        );
+    }
+
+    /// **L1-B time-threshold (RACK) loss.** With an established srtt, a
+    /// still-buffered segment older than srtt·9/8 is declared lost once a LATER
+    /// segment is acked, even when the packet threshold cannot fire (fewer than 3
+    /// newer offsets acked). Offsets 0 and 1 are in flight; a SACK acks only {1}
+    /// (largest_acked = 1, so 0 is within the packet threshold) but 0 has aged past
+    /// srtt·9/8 → lost by time-threshold.
+    #[tokio::test]
+    async fn on_sack_time_threshold_marks_aged_segment_lost() {
+        tokio::time::pause();
+        let stream = Stream::new(1);
+        // Establish a small srtt: send offset 0, ack it after ~10 ms.
+        stream.send_reliable(Bytes::from_static(b"a")).await; // offset 0
+        let _ = stream.poll_send(u64::MAX).await.expect("send 0");
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let _ = stream
+            .on_sack(&Sack::from_received(&[0], 0).expect("sack"))
+            .await; // srtt ≈ 10 ms
+
+        // Send offsets 1 and 2; age them well past srtt·9/8 (≈ 11 ms).
+        stream.send_reliable(Bytes::from_static(b"b")).await; // offset 1
+        stream.send_reliable(Bytes::from_static(b"c")).await; // offset 2
+        let _ = stream.poll_send(u64::MAX).await.expect("send 1");
+        let _ = stream.poll_send(u64::MAX).await.expect("send 2");
+        tokio::time::advance(Duration::from_millis(50)).await;
+
+        // SACK acks only {2} (largest_acked = 2). Offset 1 is within the packet
+        // threshold (2 − 1 < 3) but aged past srtt·9/8 → lost by time-threshold.
+        let result = stream
+            .on_sack(&Sack::from_received(&[2], 0).expect("sack"))
+            .await;
+        assert_eq!(
+            result.lost_offsets(),
+            vec![1],
+            "an aged unacked segment must be flagged by the time-threshold"
+        );
+    }
+
+    /// `received_sack` derives ranges from the reorder state with a gap, and
+    /// `ack_delay_us` is populated (non-zero) when the receiver holds before
+    /// emitting (here, the coarse `now − recv_at` fallback under paused time).
+    #[tokio::test]
+    async fn received_sack_builds_ranges_with_gap_and_populates_ack_delay() {
+        tokio::time::pause();
+        let stream = Stream::new(1);
+        // Receiver got 0,1,2,4,5 (gap at 3): 0,1,2 deliver in order (recv_sequence
+        // → 3), 4 and 5 stay buffered as an island.
+        for seq in [0u32, 1, 2, 4, 5] {
+            let _ = stream
+                .accept_in_order(seq, vec![Bytes::from_static(b"x")])
+                .await;
+        }
+        // Hold briefly so `now − recv_at` is non-zero.
+        tokio::time::advance(Duration::from_micros(500)).await;
+
+        let sack = stream
+            .received_sack(0)
+            .await
+            .expect("non-empty received set");
+        assert_eq!(sack.largest_acked, 5);
+        // Contiguous run (0,2) plus the buffered island (4,5), descending.
+        assert_eq!(sack.ranges(), &[(4, 5), (0, 2)]);
+        assert!(
+            sack.ack_delay_us >= 500,
+            "ack_delay_us must be populated from the recv-to-emit hold (got {})",
+            sack.ack_delay_us
+        );
+
+        // An explicit (non-zero) ack_delay passes through verbatim.
+        let sack2 = stream.received_sack(42).await.expect("non-empty");
+        assert_eq!(sack2.ack_delay_us, 42);
+    }
+
+    /// Nothing received yet yields no SACK.
+    #[tokio::test]
+    async fn received_sack_empty_returns_none() {
+        let stream = Stream::new(1);
+        assert!(stream.received_sack(0).await.is_none());
+    }
+
+    /// `accept_in_order` delivers the contiguous run and buffers holes: feeding
+    /// 0, then 2, then 1 yields `[0]`, `[]` (2 buffered), `[1, 2]` (1 fills the
+    /// gap and drains the buffered 2) — strict in-order delivery.
+    #[tokio::test]
+    async fn accept_in_order_delivers_contiguous_run_and_buffers_holes() {
+        let stream = Stream::new(1);
+        let d0 = stream
+            .accept_in_order(0, vec![Bytes::from_static(b"0")])
+            .await;
+        assert_eq!(d0, vec![Bytes::from_static(b"0")]);
+        let d2 = stream
+            .accept_in_order(2, vec![Bytes::from_static(b"2")])
+            .await;
+        assert!(
+            d2.is_empty(),
+            "seq 2 is a future hole — buffered, not delivered"
+        );
+        let d1 = stream
+            .accept_in_order(1, vec![Bytes::from_static(b"1")])
+            .await;
+        assert_eq!(
+            d1,
+            vec![Bytes::from_static(b"1"), Bytes::from_static(b"2")],
+            "filling the gap at 1 must release 1 then the buffered 2, in order"
+        );
+    }
+
+    /// `accept_in_order` drops duplicates of already-delivered sequences.
+    #[tokio::test]
+    async fn accept_in_order_drops_duplicates() {
+        let stream = Stream::new(1);
+        let _ = stream
+            .accept_in_order(0, vec![Bytes::from_static(b"0")])
+            .await;
+        let _ = stream
+            .accept_in_order(1, vec![Bytes::from_static(b"1")])
+            .await;
+        let dup = stream
+            .accept_in_order(0, vec![Bytes::from_static(b"0")])
+            .await;
+        assert!(
+            dup.is_empty(),
+            "a duplicate of delivered data must release nothing"
+        );
+    }
+
+    /// A COALESCED bundle's multiple sub-payloads occupy ONE cursor position and
+    /// are delivered together, in order, ahead of the next sequence.
+    #[tokio::test]
+    async fn accept_in_order_delivers_coalesced_bundle_as_one_cursor_position() {
+        let stream = Stream::new(1);
+        let bundle = vec![
+            Bytes::from_static(b"A"),
+            Bytes::from_static(b"B"),
+            Bytes::from_static(b"C"),
+        ];
+        let d0 = stream.accept_in_order(0, bundle).await;
+        assert_eq!(
+            d0,
+            vec![
+                Bytes::from_static(b"A"),
+                Bytes::from_static(b"B"),
+                Bytes::from_static(b"C")
+            ]
+        );
+        // The bundle consumed exactly one sequence; the next reliable frame is 1.
+        let d1 = stream
+            .accept_in_order(1, vec![Bytes::from_static(b"D")])
+            .await;
+        assert_eq!(d1, vec![Bytes::from_static(b"D")]);
     }
 
     // ── Flow control (Phase 4.3) ──
