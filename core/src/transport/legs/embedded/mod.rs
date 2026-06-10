@@ -493,14 +493,23 @@ mod tests {
             pkt.header.flags.contains(PacketFlags::ENCRYPTED),
             "expected ENCRYPTED flag on application data"
         );
-        server_session
+        let plain = server_session
             .decrypt_packet(&pkt.header, &pkt.payload)
-            .expect("decrypt application data")
+            .expect("decrypt application data");
+        // Reliable app frames carry a 4-byte gap-free stream_offset prefix (A.5);
+        // strip it so callers compare against the raw application payload.
+        if pkt.header.flags.contains(PacketFlags::RELIABLE) && plain.len() >= 4 {
+            plain[4..].to_vec()
+        } else {
+            plain
+        }
     }
 
     /// Build an encrypted reply frame from the test server side.
     /// Local duplicate of the helper in
-    /// `api::session::tests` — see module comment above.
+    /// `api::session::tests` — see module comment above. Mirrors the live sender's
+    /// reliable framing: plaintext = `[stream_offset: u32 BE][payload]` with
+    /// `stream_offset == sequence` (no control gaps in this test).
     fn encrypt_outgoing_local(
         server_session: &crate::transport::session::Session,
         session_id: SessionId,
@@ -512,8 +521,11 @@ mod tests {
         let header =
             PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
                 .with_epoch(server_session.current_epoch());
+        let mut pt = Vec::with_capacity(4 + payload.len());
+        pt.extend_from_slice(&sequence.to_be_bytes());
+        pt.extend_from_slice(payload);
         let ct = server_session
-            .encrypt_packet(&header, payload)
+            .encrypt_packet(&header, &pt)
             .expect("encrypt reply");
         let packet = PhantomPacket::new(header, ct);
         packet.to_wire()
@@ -675,7 +687,9 @@ mod tests {
             assert_eq!(post_plain, b"after-handshake");
 
             // 5. Send an encrypted reply.
-            let reply = encrypt_outgoing_local(&server_session, session_id, 1, 1, b"server-reply");
+            // stream_offset (== sequence) must be 0: first reliable frame
+            // server→client, so the client reassembles it at offset 0 (A.5).
+            let reply = encrypt_outgoing_local(&server_session, session_id, 1, 0, b"server-reply");
             tokio::time::timeout(Duration::from_secs(5), server_leg.send_frame(&reply))
                 .await
                 .expect("send reply within 5s")
