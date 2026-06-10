@@ -22,6 +22,10 @@ const MAX_PENDING_PACKETS: usize = 1024;
 /// sender retransmits it — no SACK-without-data hazard, bounded memory).
 const MAX_RECV_REORDER: usize = 2048;
 
+/// RFC 9002 §6.1.1 packet-threshold: a still-unacked segment is declared lost
+/// once a segment at least this many offsets *newer* has been SACK-acked.
+const PACKET_THRESHOLD: u32 = 3;
+
 /// Initial per-stream send window — caps how many bytes the local
 /// side will put on the wire before receiving a `WINDOW_UPDATE` from
 /// the peer. 64 KiB matches QUIC's stream initial-window default.
@@ -63,6 +67,10 @@ struct PendingData {
     sent_at: Option<tokio::time::Instant>,
     #[allow(dead_code)]
     retries: u32,
+    /// Flagged lost by the SACK-driven loss detector (RFC 9002 packet- or
+    /// time-threshold, L1-B). `poll_send`'s Pass-0 fast-retransmits it ahead of
+    /// cwnd/window, then clears the flag. Distinct from the RTO pass (Pass-1).
+    lost: bool,
 }
 
 /// One reliable segment retired by [`Stream::on_sack`] — a segment whose
@@ -81,6 +89,17 @@ pub struct RetiredSegment {
     pub was_retransmit: bool,
 }
 
+/// One segment newly declared lost by [`Stream::on_sack`]'s RFC-9002 loss
+/// detector (L1-B) — still buffered, now flagged for fast-retransmit.
+#[derive(Debug, Clone, Copy)]
+pub struct LostSegment {
+    /// Gap-free reliable offset of the lost segment.
+    pub stream_offset: SequenceNumber,
+    /// On-wire payload size — the caller reports it to congestion control via
+    /// `Session::on_packet_lost`.
+    pub size: u64,
+}
+
 /// Outcome of processing a received SACK against the send buffer.
 #[derive(Debug, Default)]
 pub struct SackResult {
@@ -89,6 +108,17 @@ pub struct SackResult {
     /// estimator. Empty if the SACK acknowledged nothing still buffered (e.g. a
     /// duplicate or stale ACK).
     pub retired: Vec<RetiredSegment>,
+    /// Segments newly declared lost (packet- or time-threshold, RFC 9002) by this
+    /// SACK — still buffered, now flagged for Pass-0 fast-retransmit. The caller
+    /// feeds each into `Session::on_packet_lost` (the real BBR loss signal).
+    pub lost: Vec<LostSegment>,
+}
+
+impl SackResult {
+    /// The gap-free offsets of the segments newly declared lost, ascending.
+    pub fn lost_offsets(&self) -> Vec<SequenceNumber> {
+        self.lost.iter().map(|l| l.stream_offset).collect()
+    }
 }
 
 /// One segment handed back by [`Stream::poll_send`] for transmission.
@@ -324,6 +354,15 @@ impl Stream {
         }
     }
 
+    /// Smoothed RTT estimate, or `None` before the first measurement. Feeds the
+    /// RFC-9002 time-threshold loss detector (L1-B).
+    fn smoothed_rtt(&self) -> Option<Duration> {
+        match self.rto.lock() {
+            Ok(g) => g.srtt,
+            Err(poisoned) => poisoned.into_inner().srtt,
+        }
+    }
+
     /// Feed a fresh RTT measurement into the RTO estimator.
     fn record_rtt_sample(&self, rtt: Duration) {
         let mut g = match self.rto.lock() {
@@ -513,6 +552,7 @@ impl Stream {
             data,
             sent_at: None,
             retries: 0,
+            lost: false,
         };
 
         self.send_buffer.lock().await.push_back(pending);
@@ -572,6 +612,27 @@ impl Stream {
         let now = tokio::time::Instant::now();
         // Adaptive RFC 6298 timeout (was a fixed 500ms).
         let timeout = self.current_rto();
+
+        // Pass 0: fast-retransmit a segment the SACK loss detector flagged (RFC
+        // 9002, L1-B). Recovers a loss in ~1 RTT instead of waiting out an RTO.
+        // Like Pass 1 it BYPASSES cwnd/window (loss recovery must always proceed —
+        // the flow-control invariant), but it does NOT back the RTO off (this was a
+        // SACK-detected loss, not a timeout). Clears the flag and marks the segment
+        // retransmitted (ambiguous for RTT — Karn).
+        for pending in buffer.iter_mut() {
+            if pending.lost && pending.sent_at.is_some() {
+                pending.lost = false;
+                pending.sent_at = Some(now);
+                pending.retries += 1;
+                return Some(OutboundSegment {
+                    seq: pending.sequence,
+                    stream_offset: pending.stream_offset,
+                    data: pending.data.clone(),
+                    reliable: true,
+                    retransmit: true,
+                });
+            }
+        }
 
         // Pass 1: a timed-out segment (retransmission) — always allowed.
         for pending in buffer.iter_mut() {
@@ -784,6 +845,44 @@ impl Stream {
                 i += 1;
             }
         }
+
+        // Loss detection (RFC 9002 §6.1.1) over the still-buffered, in-flight
+        // segments, keyed on the gap-free `stream_offset`: declare lost any offset
+        // at least `PACKET_THRESHOLD` behind `largest_acked` (packet-threshold), or
+        // — if an srtt is known — any offset below `largest_acked` aged past
+        // srtt·9/8 (RACK time-threshold). Flagged segments are fast-retransmitted
+        // by `poll_send`'s Pass-0; already-flagged ones are skipped (no double-count
+        // into congestion control).
+        let largest_acked = sack.largest_acked;
+        // RFC 9002: loss_delay = max(kGranularity, kTimeThreshold · smoothed_rtt).
+        // The kGranularity (1 ms) floor is load-bearing: without it a near-zero
+        // srtt makes the threshold ~0 and flags freshly-sent segments as "aged",
+        // which would over-report loss.
+        let time_threshold = self
+            .smoothed_rtt()
+            .map(|r| std::cmp::max(Duration::from_millis(1), r * 9 / 8));
+        let mut lost = Vec::new();
+        for pending in buffer.iter_mut() {
+            if pending.lost {
+                continue;
+            }
+            let Some(sent_at) = pending.sent_at else {
+                continue; // not yet on the wire — nothing to lose
+            };
+            if pending.stream_offset >= largest_acked {
+                continue; // not behind the largest ack — still legitimately in flight
+            }
+            let packet_lost =
+                largest_acked >= pending.stream_offset.saturating_add(PACKET_THRESHOLD);
+            let time_lost = time_threshold.is_some_and(|t| now.duration_since(sent_at) >= t);
+            if packet_lost || time_lost {
+                pending.lost = true;
+                lost.push(LostSegment {
+                    stream_offset: pending.stream_offset,
+                    size: pending.data.len() as u64,
+                });
+            }
+        }
         drop(buffer);
 
         // Return the buffer permits for every retired segment in one shot.
@@ -791,7 +890,7 @@ impl Stream {
             self.send_semaphore.add_permits(freed as usize);
         }
 
-        SackResult { retired }
+        SackResult { retired, lost }
     }
 
     // ── Receive-side in-order reassembly (A.5) ──
@@ -1224,6 +1323,81 @@ mod tests {
         assert!(
             result.retired[0].was_retransmit,
             "a retransmitted segment must be flagged so the caller skips RTT sampling"
+        );
+    }
+
+    // ── L1-B: loss detection (RFC 9002) + fast-retransmit ──
+
+    /// **L1-B packet-threshold loss + Pass-0 fast-retransmit.** Stage offsets
+    /// 0..=5 in flight; a SACK acking only {4,5} declares every still-buffered
+    /// offset ≤ largest_acked − PACKET_THRESHOLD(3) = 2 lost (0,1,2), leaving 3
+    /// unflagged. `poll_send`'s Pass-0 then fast-retransmits a flagged-lost segment
+    /// even with a CLOSED congestion window (cwnd_budget = 0), ahead of new data.
+    #[tokio::test]
+    async fn on_sack_packet_threshold_marks_lost_and_pass0_fast_retransmits() {
+        // Pause time so no segment ages past the 1 ms time-threshold floor — this
+        // isolates the PACKET-threshold (the time-threshold has its own test).
+        tokio::time::pause();
+        let stream = Stream::new(1);
+        for _ in 0..6u32 {
+            stream.send_reliable(Bytes::from_static(b"x")).await;
+            let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
+        }
+        // SACK acks offsets {4,5}: 0,1,2 are ≤ 5−3 → lost; 3 is within threshold.
+        let sack = Sack::from_received(&[4, 5], 0).expect("sack");
+        let result = stream.on_sack(&sack).await;
+        assert_eq!(
+            result.lost_offsets(),
+            vec![0, 1, 2],
+            "packet-threshold must flag every offset ≤ largest_acked − 3"
+        );
+        // Pass-0 re-sends a flagged segment even with a closed congestion window.
+        let seg = stream
+            .poll_send(0)
+            .await
+            .expect("Pass-0 fast-retransmit must ignore the congestion window");
+        assert!(seg.retransmit, "Pass-0 segment is a retransmit");
+        assert!(
+            [0u32, 1, 2].contains(&seg.stream_offset),
+            "a flagged-lost offset is fast-retransmitted (got {})",
+            seg.stream_offset
+        );
+    }
+
+    /// **L1-B time-threshold (RACK) loss.** With an established srtt, a
+    /// still-buffered segment older than srtt·9/8 is declared lost once a LATER
+    /// segment is acked, even when the packet threshold cannot fire (fewer than 3
+    /// newer offsets acked). Offsets 0 and 1 are in flight; a SACK acks only {1}
+    /// (largest_acked = 1, so 0 is within the packet threshold) but 0 has aged past
+    /// srtt·9/8 → lost by time-threshold.
+    #[tokio::test]
+    async fn on_sack_time_threshold_marks_aged_segment_lost() {
+        tokio::time::pause();
+        let stream = Stream::new(1);
+        // Establish a small srtt: send offset 0, ack it after ~10 ms.
+        stream.send_reliable(Bytes::from_static(b"a")).await; // offset 0
+        let _ = stream.poll_send(u64::MAX).await.expect("send 0");
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let _ = stream
+            .on_sack(&Sack::from_received(&[0], 0).expect("sack"))
+            .await; // srtt ≈ 10 ms
+
+        // Send offsets 1 and 2; age them well past srtt·9/8 (≈ 11 ms).
+        stream.send_reliable(Bytes::from_static(b"b")).await; // offset 1
+        stream.send_reliable(Bytes::from_static(b"c")).await; // offset 2
+        let _ = stream.poll_send(u64::MAX).await.expect("send 1");
+        let _ = stream.poll_send(u64::MAX).await.expect("send 2");
+        tokio::time::advance(Duration::from_millis(50)).await;
+
+        // SACK acks only {2} (largest_acked = 2). Offset 1 is within the packet
+        // threshold (2 − 1 < 3) but aged past srtt·9/8 → lost by time-threshold.
+        let result = stream
+            .on_sack(&Sack::from_received(&[2], 0).expect("sack"))
+            .await;
+        assert_eq!(
+            result.lost_offsets(),
+            vec![1],
+            "an aged unacked segment must be flagged by the time-threshold"
         );
     }
 

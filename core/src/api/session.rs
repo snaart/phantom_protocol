@@ -1602,6 +1602,15 @@ async fn handle_packet<T: SessionTransport>(
                     feed_bbr_on_ack(crypto_recv, sent_at, retired.size, sack.ack_delay_us as u64);
                 }
             }
+            // L1-B: feed the REAL loss signal to BBR for every segment the SACK gap
+            // detector just declared lost (previously `on_loss` fired only on RTO),
+            // then wake the send loop so its Pass-0 fast-retransmits them promptly.
+            if !result.lost.is_empty() {
+                for lost in &result.lost {
+                    crypto_recv.on_packet_lost(lost.size);
+                }
+                crypto_recv.notify_outbound_ready();
+            }
         }
         // Best-effort, non-blocking: the demux/PhantomStream path is vestigial;
         // routing the ACK/close notification to it must never block the reader.
