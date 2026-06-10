@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 /// Retransmit timeout for the Handshake phase stop-and-wait shim.
 const HANDSHAKE_RTO: Duration = Duration::from_millis(400);
@@ -149,6 +149,76 @@ impl SessionTransport for UdpClientTransport {
     }
 }
 
+/// Per-session server transport. The listener's demux task reassembles inbound datagrams and pushes
+/// the inner frames to `rx`; outbound frames are enveloped and sent to the captured `peer`.
+// `new` has no caller outside of tests yet — the listener task (a later task) will wire it up.
+#[allow(dead_code)]
+pub struct UdpServerTransport {
+    socket: Arc<UdpSocket>,
+    peer: SocketAddr,
+    cid: ConnId,
+    phase: AtomicU8,
+    next_packet_id: AtomicU32,
+    rx: Mutex<mpsc::Receiver<Bytes>>,
+}
+
+impl UdpServerTransport {
+    // No caller outside tests yet; the listener task will wire this up.
+    #[allow(dead_code)]
+    pub fn new(
+        socket: Arc<UdpSocket>,
+        peer: SocketAddr,
+        cid: ConnId,
+        rx: mpsc::Receiver<Bytes>,
+    ) -> Self {
+        Self {
+            socket,
+            peer,
+            cid,
+            phase: AtomicU8::new(PHASE_HANDSHAKE),
+            next_packet_id: AtomicU32::new(0),
+            rx: Mutex::new(rx),
+        }
+    }
+}
+
+impl SessionTransport for UdpServerTransport {
+    async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError> {
+        let ty = if self.phase.load(Ordering::Relaxed) == PHASE_HANDSHAKE {
+            PacketType::Initial
+        } else {
+            PacketType::OneRtt
+        };
+        let pid = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
+        let dgrams = encode_datagrams(ty, &self.cid, pid, data)
+            .map_err(|e| CoreError::NetworkError(format!("frame too large to fragment: {e}")))?;
+        for d in &dgrams {
+            self.socket
+                .send_to(d, self.peer)
+                .await
+                .map_err(|e| CoreError::NetworkError(format!("udp send_to: {e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
+        self.rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(CoreError::ConnectionClosed)
+    }
+
+    fn set_frame_phase(&self, phase: FramePhase) {
+        let v = match phase {
+            FramePhase::Handshake => PHASE_HANDSHAKE,
+            FramePhase::Established => PHASE_ESTABLISHED,
+        };
+        self.phase.store(v, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +283,29 @@ mod tests {
         let (_s, n, r) = tokio::join!(send, recv, recv_client);
         assert!(n >= super::HDR_LEN);
         assert_eq!(&r.unwrap().unwrap()[..], &b"reply"[..]);
+    }
+
+    #[tokio::test]
+    async fn server_transport_send_and_recv() {
+        use tokio::sync::mpsc;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let st = UdpServerTransport::new(sock.clone(), peer_addr, [3u8; 8], rx);
+
+        // recv_bytes returns frames pushed to the channel (as the demux would).
+        tx.send(Bytes::from_static(b"from-demux")).await.unwrap();
+        assert_eq!(&st.recv_bytes().await.unwrap()[..], b"from-demux");
+
+        // send_bytes writes an enveloped datagram the raw peer can decode.
+        st.set_frame_phase(FramePhase::Established);
+        st.send_bytes(b"to-peer").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (n, _from) = peer.recv_from(&mut buf).await.unwrap();
+        let mut asm = FragmentAssembler::new();
+        let (hdr, got) = push_datagram(&mut asm, &buf[..n]).unwrap();
+        assert_eq!(hdr.cid, [3u8; 8]);
+        assert_eq!(got.as_deref(), Some(&b"to-peer"[..]));
     }
 }
