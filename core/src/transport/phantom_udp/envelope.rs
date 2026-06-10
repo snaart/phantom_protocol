@@ -46,6 +46,7 @@ pub enum EnvelopeError {
     Truncated,
     ReservedType,
     ReservedBitsSet,
+    FrameTooLarge,
 }
 
 impl core::fmt::Display for EnvelopeError {
@@ -54,6 +55,7 @@ impl core::fmt::Display for EnvelopeError {
             Self::Truncated => write!(f, "datagram too short for the PhantomUDP envelope header"),
             Self::ReservedType => write!(f, "reserved PhantomUDP packet type"),
             Self::ReservedBitsSet => write!(f, "reserved PhantomUDP flag bits set"),
+            Self::FrameTooLarge => write!(f, "frame exceeds the maximum fragmentable size"),
         }
     }
 }
