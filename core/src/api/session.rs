@@ -3151,6 +3151,63 @@ mod tests {
         );
     }
 
+    /// **H1 + L1-B.** A forged *unauthenticated* SACK (plaintext `ACK`, no
+    /// `ENCRYPTED`) carrying a wide range must neither retire a pending segment NOR
+    /// trigger a fast-retransmit: it is dropped by the downgrade defense before the
+    /// AEAD gate, so it never reaches the SACK loss detector (which would otherwise
+    /// flag segments lost and drive Pass-0). The SACK plaintext is acted on only
+    /// after AEAD verify.
+    #[tokio::test]
+    async fn forged_sack_neither_retires_nor_fast_retransmits() {
+        let session_id = fixed_session_id();
+        let (_client, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        // Stage offsets 0..=5, all in flight.
+        let stream = Arc::new(TransportStream::new(stream_id));
+        for _ in 0..6u32 {
+            stream.send_reliable(Bytes::from_static(b"x")).await;
+            let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
+        }
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(stream_id as u32, stream.clone());
+        assert_eq!(stream.pending_send_count().await, 6);
+
+        // Forged PLAINTEXT ACK (no ENCRYPTED) carrying a SACK over offset {5}.
+        // If acted on, it would retire offset 5 AND flag offsets 0,1,2 lost.
+        let forged_sack = crate::transport::sack::Sack::from_received(&[5], 0)
+            .expect("sack")
+            .to_wire();
+        run_recv(
+            PhantomPacket::new(
+                PacketHeader::new(
+                    session_id,
+                    stream_id,
+                    4242,
+                    PacketFlags::new(PacketFlags::ACK),
+                ),
+                forged_sack, // plaintext — NOT encrypted
+            ),
+            session_id,
+            &server_session,
+            &streams,
+        )
+        .await;
+
+        // Nothing retired: all six segments remain buffered.
+        assert_eq!(
+            stream.pending_send_count().await,
+            6,
+            "a forged unauthenticated SACK must not retire any segment (H1)"
+        );
+        // No fast-retransmit: nothing was flagged lost, so poll_send (all sent, no
+        // new data) returns None rather than a Pass-0 retransmit.
+        assert!(
+            stream.poll_send(u64::MAX).await.is_none(),
+            "a forged SACK must not trigger a fast-retransmit (no segment flagged lost)"
+        );
+    }
+
     /// **H1 positive control.** A genuine `ENCRYPTED | ACK` frame from the peer,
     /// whose AEAD payload carries the acked data sequence, retires the matching
     /// pending segment after AEAD verify. The ACK's own `header.sequence`

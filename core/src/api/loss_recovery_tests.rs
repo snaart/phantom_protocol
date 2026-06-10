@@ -78,12 +78,35 @@
 //!   - **Robustly-green CI config: ≤ 5% loss.** That's the PASSING test below
 //!     (3% + 1% reorder, sub-2s, zero flakes over 20 runs).
 //!
-//! The geometric latency cliff is exactly what a future **SACK + fast-retransmit
-//! pass (Phase 2 / L1)** must lift: with SACK, a dropped segment is recovered in
-//! ~1 RTT on the next ACK instead of waiting out a (backed-off) RTO, flattening
-//! the curve so 10–30% loss is fast rather than tens-of-seconds slow. The
-//! `loss_recovery_high_loss_recovers_but_is_slow` marker below pins the
-//! observation as an `#[ignore]`d, documented target.
+//! The geometric latency cliff is exactly what the **SACK + fast-retransmit pass
+//! (L1)** lifts: with SACK, a dropped segment is recovered in ~1 RTT on the next
+//! ACK instead of waiting out a (backed-off) RTO.
+//!
+//! ## L1 RESULT (A.5 in-order delivery + L1-B SACK fast-retransmit — SHIPPED)
+//!
+//! The cliff above is the RTO-only **synchronous** baseline (1 packet in flight,
+//! so loss is recovered only by RTO). With reliable in-order delivery (A.5) the
+//! exchange can **pipeline** (many in flight), so L1-B's SACK fast-retransmit
+//! recovers a mid-stream loss in ~1 RTT. Measured on the seeded
+//! [`run_pipelined_echo`] rig (40 messages, worst of 3 seeds, light reorder):
+//!
+//! | loss | RTO-only synchronous | A.5 + L1-B pipelined |
+//! |------|----------------------|----------------------|
+//! |  5%  | ~0.8 s               | ~0.20 s              |
+//! | 10%  | ~2.1 s               | ~0.40 s              |
+//! | 15%  | ~4.3 s               | ~0.41 s              |
+//! | 20%  | ~9.5 s               | ~0.41 s              |
+//! | 30%  | ~6.2 s               | ~0.62 s              |
+//!
+//! The curve is now **flat** (sub-second to 30% loss) rather than a geometric
+//! cliff — every result still recovers byte-exact and IN ORDER. The robustly-green
+//! ceiling rises from ≤5% to ≥20% (gated by `pipelined_recovers_at_*` below); the
+//! residual ~0.2–0.6 s is the MIN_RTO=200ms floor on *tail* losses (the last few
+//! pipelined packets have no successor to SACK-reveal the gap, so they fall back
+//! to the RTO). A PTO/tail-loss probe (RFC 9002 §6.2) could shave that floor — it
+//! was measured as NOT required to meet the L1 ceiling/cliff goal and is left as a
+//! future optimisation. `loss_recovery_high_loss_recovers_but_is_slow` keeps the
+//! RTO-only synchronous baseline as an `#[ignore]`d reference.
 
 #![cfg(test)]
 
@@ -284,6 +307,136 @@ async fn run_lossy_round_trips(
     client.disconnect().await.expect("client clean disconnect");
 }
 
+/// Pipelined echo over seeded loss + reorder on the client→server path: the
+/// client fires `n` distinct messages back-to-back (MANY in flight at once), a
+/// full-pump server echoes each, and the client collects `n` echoes. Asserts
+/// every echo arrives byte-exact and **in send order** — proving reliable
+/// in-order delivery (A.5) plus loss recovery (RTO + L1-B fast-retransmit) under
+/// *multi-packet* reorder, which the synchronous `run_lossy_round_trips` (1 in
+/// flight) cannot exercise. Returns the data-phase wall-clock (latency-vs-loss
+/// measurement). The handshake runs loss-free.
+async fn run_pipelined_echo(
+    seed: u64,
+    loss_prob: f64,
+    reorder_prob: f64,
+    n: usize,
+    budget: Duration,
+) -> Duration {
+    let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
+    let server_pinned_key = server_hs.verifying_key().clone();
+    let (client_channel, server_channel) = ChannelTransport::pair();
+
+    let faults = FaultControl::with_seed(seed, loss_prob, 0.0, reorder_prob, 0);
+    faults.arm_stochastic(false);
+    let lossy_client = LossyTransport::new(client_channel, faults.clone());
+    let client =
+        PhantomSession::connect_with_transport("test-server:9000", lossy_client, server_pinned_key);
+
+    let server_handle = tokio::spawn(async move {
+        let client_ip = "127.0.0.1".parse().expect("parse IP");
+        let hello_bytes = server_channel
+            .recv_bytes()
+            .await
+            .expect("server recv ClientHello");
+        let client_hello =
+            borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize ClientHello");
+        // The server's DoS gate may answer the first hello with a cookie Retry;
+        // handle that round before Success (mirrors `run_lossy_round_trips`).
+        let inner = loop {
+            match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+                HandshakeResponse::Retry(retry) => {
+                    let retry_bytes = borsh::to_vec(&retry).expect("serialize retry");
+                    server_channel
+                        .send_bytes(&retry_bytes)
+                        .await
+                        .expect("server send retry");
+                    let next_bytes = server_channel
+                        .recv_bytes()
+                        .await
+                        .expect("server recv retry ClientHello");
+                    let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
+                        .expect("deserialize retry ClientHello");
+                    match server_hs.process_client_hello(&next_hello, 0, client_ip) {
+                        HandshakeResponse::Success(server_hello, session, _) => {
+                            let b = borsh::to_vec(&server_hello).expect("serialize ServerHello");
+                            server_channel
+                                .send_bytes(&b)
+                                .await
+                                .expect("server send ServerHello");
+                            break session;
+                        }
+                        other => panic!("expected Success after retry, got {other:?}"),
+                    }
+                }
+                HandshakeResponse::Success(server_hello, session, _) => {
+                    let b = borsh::to_vec(&server_hello).expect("serialize ServerHello");
+                    server_channel
+                        .send_bytes(&b)
+                        .await
+                        .expect("server send ServerHello");
+                    break session;
+                }
+                HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+                HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+            }
+        };
+        let server = PhantomSession::from_accepted_server_session(
+            "test-client".into(),
+            server_channel,
+            Arc::new(inner),
+        );
+        for _ in 0..n {
+            let m = timeout(budget, server.recv())
+                .await
+                .expect("server recv timed out — client retransmit never arrived")
+                .expect("server recv error");
+            server.send(m).await.expect("server echo");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        server
+    });
+
+    let mut established = false;
+    for _ in 0..200 {
+        if client.connection_state() == ConnectionState::Connected {
+            established = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(established, "client session never became established");
+    faults.arm_stochastic(true);
+
+    let start = tokio::time::Instant::now();
+    // Fire all n messages WITHOUT waiting for echoes → many packets in flight,
+    // so reorder actually reorders DATA and B's fast-retransmit can trigger.
+    let mut sent: Vec<Vec<u8>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let payload = format!("pipe-{i:05}").into_bytes();
+        client.send(payload.clone()).await.expect("client send");
+        sent.push(payload);
+    }
+    // Collect n echoes — must arrive in send order, byte-exact.
+    let mut got: Vec<Vec<u8>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let echo = timeout(budget, client.recv())
+            .await
+            .unwrap_or_else(|_| panic!("client recv timed out on echo {i} — loss not recovered"))
+            .expect("client recv error");
+        got.push(echo);
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(
+        got, sent,
+        "every echo must round-trip byte-exact and IN ORDER under pipelined loss+reorder"
+    );
+
+    let server = server_handle.await.expect("server task panicked");
+    server.disconnect().await.expect("server clean disconnect");
+    client.disconnect().await.expect("client clean disconnect");
+    elapsed
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// **The deliverable.** A real session survives seeded packet loss + light
@@ -352,6 +505,89 @@ async fn loss_recovery_high_loss_recovers_but_is_slow() {
         0.02,
         30,
         Duration::from_secs(90),
+    )
+    .await;
+}
+
+/// **Measurement (ignored): pipelined loss sweep (L1).** Prints data-phase
+/// wall-clock at increasing client→server loss with light reorder, to compare
+/// against the RTO-only synchronous baseline (module docs table) and confirm
+/// A.5 (in-order delivery) + L1-B (SACK fast-retransmit) lift the ceiling and
+/// flatten the cliff. Run:
+///   `cargo test --lib -- pipelined_loss_sweep --ignored --nocapture`
+#[tokio::test]
+#[ignore = "measurement: prints pipelined recovery latency across loss rates"]
+async fn pipelined_loss_sweep() {
+    for (loss, reorder) in [
+        (0.05, 0.02),
+        (0.10, 0.03),
+        (0.15, 0.05),
+        (0.20, 0.05),
+        (0.30, 0.05),
+    ] {
+        let mut worst = Duration::ZERO;
+        for seed in [
+            0x1111_2222_3333_4444u64,
+            0xAAAA_BBBB_CCCC_DDDD,
+            0x0F0F_0F0F_0F0F_0F0F,
+        ] {
+            let t = run_pipelined_echo(seed, loss, reorder, 40, Duration::from_secs(90)).await;
+            if t > worst {
+                worst = t;
+            }
+        }
+        println!(
+            "PIPELINED loss={:>2.0}% reorder={:>2.0}% n=40 → worst-seed {:?}",
+            loss * 100.0,
+            reorder * 100.0,
+            worst
+        );
+    }
+}
+
+/// **L1 acceptance (D): ≥15% loss, pipelined, in order.** A real session with
+/// MANY messages in flight survives 15% client→server loss + 5% reorder,
+/// recovering every echo byte-exact and IN ORDER. This is the robustly-green
+/// ceiling lifted from ≤5% (RTO-only synchronous) to ≥15% by A.5 (in-order
+/// delivery) + L1-B (SACK fast-retransmit). Seeded ⇒ deterministic. Measured
+/// worst-seed ≈ 0.4 s vs ~4.3 s for the RTO-only baseline (module-doc table);
+/// the 30 s budget is huge margin for CI contention.
+#[tokio::test]
+async fn pipelined_recovers_at_15pct_loss_with_reorder() {
+    run_pipelined_echo(
+        0xACCE_5515_0000_0001,
+        0.15,
+        0.05,
+        30,
+        Duration::from_secs(30),
+    )
+    .await;
+}
+
+/// Independent second seed at 15% — guards against a single lucky seed.
+#[tokio::test]
+async fn pipelined_recovers_at_15pct_loss_second_seed() {
+    run_pipelined_echo(
+        0x5EED_0015_2222_3333,
+        0.15,
+        0.05,
+        30,
+        Duration::from_secs(30),
+    )
+    .await;
+}
+
+/// Stretch target: 20% loss + 5% reorder still recovers byte-exact and in order
+/// (measured worst-seed ≈ 0.4 s — the latency curve is flat, not the RTO-only
+/// geometric cliff).
+#[tokio::test]
+async fn pipelined_recovers_at_20pct_loss() {
+    run_pipelined_echo(
+        0x2020_2020_ABCD_0001,
+        0.20,
+        0.05,
+        30,
+        Duration::from_secs(30),
     )
     .await;
 }
