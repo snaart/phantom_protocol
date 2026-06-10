@@ -430,6 +430,7 @@ impl PhantomSession {
             server_session,
             Arc::new(TokioRuntime),
             Observability::new(ObservabilityConfig::default()),
+            LegType::Tcp,
         )
     }
 
@@ -440,6 +441,7 @@ impl PhantomSession {
         server_session: Arc<Session>,
         runtime: Arc<dyn Runtime>,
         observability: Arc<Observability>,
+        leg: LegType,
     ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (recv_tx, recv_rx) = mpsc::channel(256);
@@ -481,7 +483,7 @@ impl PhantomSession {
         let observed = Arc::new(ObservedTransport::new(
             transport,
             observability.clone(),
-            LegType::Tcp,
+            leg,
         ));
         let _detached = runtime.spawn(Box::pin(run_data_pump(
             server_session,
@@ -495,7 +497,7 @@ impl PhantomSession {
             streams,
             runtime_for_pump,
             observability,
-            LegType::Tcp,
+            leg,
         )));
 
         session
