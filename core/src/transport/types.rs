@@ -496,12 +496,17 @@ pub enum LegType {
     Tcp,
     /// FakeTLS over TCP - obfuscated for DPI bypass
     FakeTls,
+    /// PhantomUDP — native reliable transport over raw UDP (Phase 1).
+    Udp,
 }
 
 impl LegType {
     /// Whether this leg type provides reliability at transport level
     pub fn is_reliable(&self) -> bool {
-        matches!(self, LegType::Kcp | LegType::Tcp | LegType::FakeTls)
+        matches!(
+            self,
+            LegType::Kcp | LegType::Tcp | LegType::FakeTls | LegType::Udp
+        )
     }
 
     /// Whether this leg type uses encryption/obfuscation
