@@ -3,16 +3,24 @@
 //! Multiplexed streams within a session.
 //! Each stream has independent sequence numbers (no Head-of-Line blocking).
 
+use crate::transport::sack::Sack;
 use crate::transport::types::{SequenceNumber, StreamId};
 
 use bytes::Bytes;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, Semaphore};
 
 const MAX_PENDING_PACKETS: usize = 1024;
+
+/// Upper bound on the number of distinct received sequences a stream tracks for
+/// SACK generation. The set holds the highest received sequences; older ones
+/// (which the sender has long since seen ACKed cumulatively) are evicted. This
+/// caps the receiver's per-stream memory and bounds the number of SACK ranges —
+/// the codec also rejects more than [`crate::transport::sack::MAX_SACK_RANGES`].
+const MAX_TRACKED_RECEIVED: usize = 4096;
 
 /// Initial per-stream send window — caps how many bytes the local
 /// side will put on the wire before receiving a `WINDOW_UPDATE` from
@@ -48,6 +56,32 @@ struct PendingData {
     sent_at: Option<tokio::time::Instant>,
     #[allow(dead_code)]
     retries: u32,
+}
+
+/// One reliable segment retired by [`Stream::on_sack`] — a segment whose
+/// sequence a received SACK covered and which has now been removed from the
+/// send buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct RetiredSegment {
+    /// When the segment was last (re)transmitted, if it had been sent at all.
+    /// `None` means the segment was acknowledged before `poll_send` ever stamped
+    /// it (e.g. a duplicate cumulative SACK) — no RTT sample is taken.
+    pub sent_at: Option<tokio::time::Instant>,
+    /// On-wire payload size of the segment.
+    pub size: u64,
+    /// True if the segment had been retransmitted at least once (`retries > 0`).
+    /// Per Karn's algorithm, the caller must NOT sample RTT from such a segment.
+    pub was_retransmit: bool,
+}
+
+/// Outcome of processing a received SACK against the send buffer.
+#[derive(Debug, Default)]
+pub struct SackResult {
+    /// The segments newly retired by this SACK (were in the send buffer, now
+    /// removed). The caller feeds each into congestion control / the RTT
+    /// estimator. Empty if the SACK acknowledged nothing still buffered (e.g. a
+    /// duplicate or stale ACK).
+    pub retired: Vec<RetiredSegment>,
 }
 
 /// One segment handed back by [`Stream::poll_send`] for transmission.
@@ -227,6 +261,18 @@ pub struct Stream {
     /// updated only from the serial ACK path and read by `poll_send`, and the
     /// guard is never held across an `.await`.
     rto: std::sync::Mutex<RtoEstimator>,
+    /// Set of **reliable data** sequence numbers received on this stream,
+    /// kept for SACK generation (L1-A). Populated post-AEAD / post-replay by the
+    /// reader (`Stream::record_received`) and read by `received_sack`. Bounded to
+    /// the highest [`MAX_TRACKED_RECEIVED`] sequences — older ones have long been
+    /// reported and re-reporting them cumulatively buys nothing. Distinct from
+    /// the (currently production-unused) `recv_buffer`/`recv_sequence` reassembly
+    /// state, which the live receive path does not drive.
+    received: std::sync::Mutex<BTreeSet<SequenceNumber>>,
+    /// Receive instant of the most recent reliable data packet, used to populate
+    /// the SACK's `ack_delay_us` (`now − recv_at`). A plain sync mutex; the guard
+    /// is never held across an `.await`.
+    last_data_recv_at: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl Stream {
@@ -251,6 +297,8 @@ impl Stream {
             bytes_since_last_update: AtomicU32::new(0),
             pending_window_update: AtomicU32::new(0),
             rto: std::sync::Mutex::new(RtoEstimator::new()),
+            received: std::sync::Mutex::new(BTreeSet::new()),
+            last_data_recv_at: std::sync::Mutex::new(None),
         }
     }
 
@@ -605,6 +653,137 @@ impl Stream {
         }
     }
 
+    // ── SACK (selective acknowledgement) — L1-A ──
+
+    /// Record that a **reliable data** packet at `sequence` was received and
+    /// accepted (called post-AEAD, post-replay-check by the reader). Builds the
+    /// received-sequence set that [`received_sack`](Self::received_sack) turns
+    /// into SACK ranges, and stamps the data-arrival instant used for the SACK's
+    /// `ack_delay_us`.
+    ///
+    /// The set is bounded to the highest [`MAX_TRACKED_RECEIVED`] sequences: when
+    /// it overflows, the lowest sequences are evicted. Those low sequences were
+    /// reported in earlier (cumulative) SACKs and the sender has retired them; a
+    /// re-ACK buys nothing, so dropping them is safe and bounds memory.
+    pub fn record_received(&self, sequence: SequenceNumber) {
+        {
+            let mut at = match self.last_data_recv_at.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *at = Some(tokio::time::Instant::now());
+        }
+        let mut set = match self.received.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        set.insert(sequence);
+        // Evict the lowest sequences if we exceed the cap. `pop_first` keeps the
+        // *highest* (most recently relevant) sequences, which is what a SACK
+        // wants to report.
+        while set.len() > MAX_TRACKED_RECEIVED {
+            set.pop_first();
+        }
+    }
+
+    /// Build a [`Sack`] describing every reliable-data sequence this stream has
+    /// received so far, or `None` if nothing has been received yet.
+    ///
+    /// `ack_delay_us` is the delay (microseconds) between receiving the packet
+    /// being acknowledged and emitting this SACK. The caller may pass a measured
+    /// value; if `0` is passed, this method substitutes a coarse `now − recv_at`
+    /// derived from the most recent data-arrival instant so the on-wire field is
+    /// still populated. The contiguous in-order run and any out-of-order gaps are
+    /// both encoded by [`Sack::from_received`].
+    pub fn received_sack(&self, ack_delay_us: u32) -> Option<Sack> {
+        let set = match self.received.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if set.is_empty() {
+            return None;
+        }
+        let seqs: Vec<SequenceNumber> = set.iter().copied().collect();
+        drop(set);
+
+        let delay = if ack_delay_us != 0 {
+            ack_delay_us
+        } else {
+            // Coarse fallback: time since the most recent data arrival.
+            let recv_at = match self.last_data_recv_at.lock() {
+                Ok(g) => *g,
+                Err(poisoned) => *poisoned.into_inner(),
+            };
+            recv_at
+                .map(|t| {
+                    let micros = tokio::time::Instant::now().duration_since(t).as_micros();
+                    u32::try_from(micros).unwrap_or(u32::MAX)
+                })
+                .unwrap_or(0)
+        };
+        Sack::from_received(&seqs, delay)
+    }
+
+    /// Process a received SACK, retiring **every** buffered reliable segment whose
+    /// sequence the SACK covers (was: only a single sequence). Returns a
+    /// [`SackResult`] listing the newly-retired segments so the caller can feed
+    /// congestion control / the RTT estimator per segment.
+    ///
+    /// RTT is sampled here (Karn's algorithm) only for segments that were never
+    /// retransmitted (`retries == 0`); `RetiredSegment::was_retransmit` marks the
+    /// rest so the caller does not double-count or use an ambiguous sample.
+    ///
+    /// This is a cumulative retire: a SACK re-acks every still-buffered sequence
+    /// it covers, so a lost ACK no longer strands a segment — the next SACK
+    /// retires it. **No loss detection / fast-retransmit here** — that is L1-B.
+    pub async fn on_sack(&self, sack: &Sack) -> SackResult {
+        let mut buffer = self.send_buffer.lock().await;
+        let mut retired = Vec::new();
+        let mut freed = 0u32;
+        let now = tokio::time::Instant::now();
+
+        // Retain only the segments the SACK does NOT cover; collect the rest.
+        let mut i = 0;
+        while i < buffer.len() {
+            // PANIC-SAFETY: `i < buffer.len()` is the loop guard, so the index is
+            // in range; `get` cannot return `None`.
+            #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+            let covered = sack.acks(buffer.get(i).unwrap().sequence);
+            if covered {
+                // PANIC-SAFETY: `i` is a valid index (loop guard); `remove`
+                // returns `Some` for an in-range index in a VecDeque.
+                #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+                let pending = buffer.remove(i).unwrap();
+                freed += 1;
+                let was_retransmit = pending.retries > 0;
+                let size = pending.data.len() as u64;
+                if let Some(sent_at) = pending.sent_at {
+                    // Karn: only sample RTT from segments never retransmitted.
+                    if !was_retransmit {
+                        let rtt = now.duration_since(sent_at);
+                        self.record_rtt_sample(rtt);
+                    }
+                }
+                retired.push(RetiredSegment {
+                    sent_at: pending.sent_at,
+                    size,
+                    was_retransmit,
+                });
+                // Do NOT advance `i`: `remove` shifted the next element into `i`.
+            } else {
+                i += 1;
+            }
+        }
+        drop(buffer);
+
+        // Return the buffer permits for every retired segment in one shot.
+        if freed > 0 {
+            self.send_semaphore.add_permits(freed as usize);
+        }
+
+        SackResult { retired }
+    }
+
     /// Handle received data
     ///
     /// Data is buffered until it can be delivered in order.
@@ -919,6 +1098,123 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), send_future).await;
         assert!(result.is_ok(), "Send should have succeeded after ack");
         assert_eq!(stream.pending_send_count().await, MAX_PENDING_PACKETS);
+    }
+
+    // ── SACK (selective acknowledgement) — L1-A ──
+
+    /// Stage segments 0..=5 on the send buffer, feed a SACK that covers
+    /// {0,1,2,4,5} (gap at 3), and assert it retires exactly those five segments,
+    /// leaving only segment 3 buffered. This is the headline L1-A behaviour: a
+    /// single SACK retires multiple segments at once, skipping the gap.
+    #[tokio::test]
+    async fn on_sack_retires_all_covered_segments_skipping_the_gap() {
+        let stream = Stream::new(1);
+        for i in 0..6u32 {
+            let seq = stream.send_reliable(Bytes::from(format!("seg-{i}"))).await;
+            assert_eq!(seq, i);
+            // Stamp it as in-flight so RTT sampling has a `sent_at`.
+            let seg = stream.poll_send(u64::MAX).await.expect("poll");
+            assert_eq!(seg.seq, i);
+        }
+        assert_eq!(stream.pending_send_count().await, 6);
+
+        // SACK covers {0,1,2,4,5} — segment 3 is the gap.
+        let sack = Sack::from_received(&[0, 1, 2, 4, 5], 1234).expect("sack");
+        assert_eq!(sack.ranges(), &[(4, 5), (0, 2)]);
+        let result = stream.on_sack(&sack).await;
+
+        // Five segments retired, none of them retransmissions.
+        assert_eq!(result.retired.len(), 5);
+        assert!(result.retired.iter().all(|r| !r.was_retransmit));
+        assert!(result.retired.iter().all(|r| r.sent_at.is_some()));
+
+        // Only segment 3 remains buffered.
+        assert_eq!(stream.pending_send_count().await, 1);
+        // Re-acking the retired sequences finds nothing (already removed); seq 3
+        // is still ackable.
+        for retired_seq in [0u32, 1, 2, 4, 5] {
+            assert!(
+                stream.ack(retired_seq).await.is_none(),
+                "seq {retired_seq} should already be retired by the SACK"
+            );
+        }
+        assert!(
+            stream.ack(3).await.is_some(),
+            "the gap segment 3 must remain buffered"
+        );
+    }
+
+    /// A SACK that covers nothing still buffered (stale / duplicate) retires
+    /// nothing and leaves the send buffer intact.
+    #[tokio::test]
+    async fn on_sack_for_unbuffered_sequences_retires_nothing() {
+        let stream = Stream::new(1);
+        stream.send_reliable(Bytes::from("zero")).await; // seq 0
+        let _ = stream.poll_send(u64::MAX).await.expect("poll");
+
+        // SACK only covers high sequences we never sent.
+        let sack = Sack::from_received(&[100, 101, 102], 0).expect("sack");
+        let result = stream.on_sack(&sack).await;
+        assert!(result.retired.is_empty());
+        assert_eq!(stream.pending_send_count().await, 1);
+    }
+
+    /// A retransmitted segment retired by a SACK is flagged `was_retransmit`, so
+    /// the caller does not sample RTT from it (Karn's algorithm).
+    #[tokio::test]
+    async fn on_sack_flags_retransmits_for_karn() {
+        tokio::time::pause();
+        let stream = Stream::new(1);
+        stream.send_reliable(Bytes::from("payload")).await; // seq 0
+        let _ = stream.poll_send(u64::MAX).await.expect("first send");
+
+        // Force a retransmit by crossing the RTO, so retries > 0.
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        let retx = stream.poll_send(u64::MAX).await.expect("retransmit");
+        assert!(retx.retransmit);
+
+        let sack = Sack::from_received(&[0], 0).expect("sack");
+        let result = stream.on_sack(&sack).await;
+        assert_eq!(result.retired.len(), 1);
+        assert!(
+            result.retired[0].was_retransmit,
+            "a retransmitted segment must be flagged so the caller skips RTT sampling"
+        );
+    }
+
+    /// `received_sack` builds ranges from the received set with a gap, and
+    /// `ack_delay_us` is populated (non-zero) when the receiver holds before
+    /// emitting (here, the coarse `now − recv_at` fallback under paused time).
+    #[tokio::test]
+    async fn received_sack_builds_ranges_with_gap_and_populates_ack_delay() {
+        tokio::time::pause();
+        let stream = Stream::new(1);
+        // Receiver got 0,1,2,4,5 (gap at 3).
+        for seq in [0u32, 1, 2, 4, 5] {
+            stream.record_received(seq);
+        }
+        // Hold briefly so `now − recv_at` is non-zero.
+        tokio::time::advance(Duration::from_micros(500)).await;
+
+        let sack = stream.received_sack(0).expect("non-empty received set");
+        assert_eq!(sack.largest_acked, 5);
+        assert_eq!(sack.ranges(), &[(4, 5), (0, 2)]);
+        assert!(
+            sack.ack_delay_us >= 500,
+            "ack_delay_us must be populated from the recv-to-emit hold (got {})",
+            sack.ack_delay_us
+        );
+
+        // An explicit (non-zero) ack_delay passes through verbatim.
+        let sack2 = stream.received_sack(42).expect("non-empty");
+        assert_eq!(sack2.ack_delay_us, 42);
+    }
+
+    /// An empty received set yields no SACK.
+    #[test]
+    fn received_sack_empty_returns_none() {
+        let stream = Stream::new(1);
+        assert!(stream.received_sack(0).is_none());
     }
 
     // ── Flow control (Phase 4.3) ──
