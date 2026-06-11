@@ -193,6 +193,16 @@ pub struct Session {
     /// packet draws the next value here at send time, so the AEAD nonce is never
     /// reused. Replaces the deleted per-stream `send_sequence` + the C1 watermark.
     send_packet_number: AtomicU64,
+    /// Client-owned send-side `path_id` stamped on every outbound packet (D5 —
+    /// Phase 4). Defaults to 0 (the implicit handshake path, pre-validated on both
+    /// peers). [`next_migration_path_id`](Self::next_migration_path_id) bumps it on
+    /// each `migrate()` so the peer's source-change detector sees a new path label
+    /// and challenges it; reuse is nonce-safe because ① took `path_id` out of the
+    /// AEAD nonce. Never set to 0 by the bump — 0 is reserved for the
+    /// always-Validated handshake path. (Field name differs from the
+    /// [`current_send_path_id`](Self::current_send_path_id) accessor, mirroring the
+    /// `send_packet_number` / `next_send_pn` split.)
+    send_path_id: AtomicU8,
     /// Per-direction sliding-window replay protection on the packet number
     /// (① — Phase 4, Inv-4). One window per direction (the PN is unique across all
     /// streams), replacing the per-`StreamId` `DashMap<…, ReplayWindow>`.
@@ -258,6 +268,7 @@ impl Session {
             last_activity: RwLock::new(Instant::now()),
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
             send_packet_number: AtomicU64::new(0),
+            send_path_id: AtomicU8::new(0),
             recv_replay: Mutex::new(ReplayWindow::new()),
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
@@ -298,6 +309,7 @@ impl Session {
             last_activity: RwLock::new(Instant::now()),
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
             send_packet_number: AtomicU64::new(0),
+            send_path_id: AtomicU8::new(0),
             recv_replay: Mutex::new(ReplayWindow::new()),
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
@@ -333,6 +345,7 @@ impl Session {
             last_activity: RwLock::new(Instant::now()),
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
             send_packet_number: AtomicU64::new(0),
+            send_path_id: AtomicU8::new(0),
             recv_replay: Mutex::new(ReplayWindow::new()),
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
@@ -776,6 +789,39 @@ impl Session {
     /// send time, so the AEAD nonce is never reused.
     pub fn next_send_pn(&self) -> PacketNumber {
         self.send_packet_number.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// The client-owned send-side `path_id` currently stamped on outbound packets
+    /// (D5 — Phase 4). Defaults to 0 (the implicit handshake path). Bumped by
+    /// [`next_migration_path_id`](Self::next_migration_path_id) on a migration.
+    pub fn current_send_path_id(&self) -> u8 {
+        self.send_path_id.load(Ordering::SeqCst)
+    }
+
+    /// Bump the send-side `path_id` to a fresh value and return it (D5 — Phase 4).
+    /// Called on each `migrate()`/rebind so the peer's source-change detector sees a
+    /// new path label and issues a PATH_CHALLENGE. Never returns 0 — that id is
+    /// permanently the always-Validated handshake path, so reusing it would make the
+    /// peer skip the challenge and the switch could never fire. Wraps 255 → 1. Reuse
+    /// of a retired id is nonce-safe because ① took `path_id` out of the AEAD nonce
+    /// (`nonce = nonce_prefix ‖ packet_number`).
+    pub fn next_migration_path_id(&self) -> u8 {
+        // migrate() is embedder-driven and not concurrent, but a CAS loop keeps the
+        // "never 0" invariant correct even under a racing caller.
+        loop {
+            let cur = self.send_path_id.load(Ordering::SeqCst);
+            let next = match cur.wrapping_add(1) {
+                0 => 1,
+                n => n,
+            };
+            if self
+                .send_path_id
+                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return next;
+            }
+        }
     }
 
     /// Build the AEAD nonce (① — Phase 4): `prefix(4) ‖ packet_number(8)` = 12 B.
