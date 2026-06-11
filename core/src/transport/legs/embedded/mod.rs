@@ -518,9 +518,13 @@ mod tests {
         payload: &[u8],
     ) -> Vec<u8> {
         let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
-        let header =
-            PacketHeader::new(session_id, stream_id, sequence as u64, PacketFlags::new(flag_bits))
-                .with_epoch(server_session.current_epoch());
+        let header = PacketHeader::new(
+            session_id,
+            stream_id,
+            sequence as u64,
+            PacketFlags::new(flag_bits),
+        )
+        .with_epoch(server_session.current_epoch());
         let mut pt = Vec::with_capacity(4 + payload.len());
         pt.extend_from_slice(&sequence.to_be_bytes());
         pt.extend_from_slice(payload);
