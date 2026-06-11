@@ -74,6 +74,27 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   and source-level doc-comments. Comments/prose only — no code, API, wire-format,
   or crypto change.
 
+### Security
+
+- **PhantomUDP pre-auth DoS hardening (post-audit Tier 1).** Closes the pre-authentication
+  resource-exhaustion surface on the native UDP transport found in the 2026-06-11 security
+  audit. No wire-format or crypto change.
+  - *Demux route table (H-1):* the per-CID `routes` map is now bounded and self-reaping
+    (a hard cap + reclaiming a route as soon as its handshake task finishes), so a fresh-CID
+    garbage spray can no longer leak one permanent entry per datagram.
+  - *Address validation before state (H-2):* the stateless cookie/Retry round now runs on the
+    demux thread **before** any per-connection slot (inflight permit + route + task) is
+    committed, so a spoofed source can never pin a handshake slot; plus a per-source-IP
+    pending-handshake cap. (0-RTT-over-UDP completes a cookie round first; TCP is unchanged.)
+  - *Receive memory (H-3):* the out-of-order reorder buffer is now bounded by **bytes**
+    (tied to the flow-control window) rather than entry count, and concurrent receive streams
+    are capped (`MAX_STREAMS`), so a peer leaving the stream head missing cannot pin unbounded
+    receiver RAM. New `PhantomUdpListener::active_route_count()` and `Stream::recv_reorder_bytes()`.
+  - *Handshake decode (M-7):* a `ClientHello` whose borsh length prefixes are forged is now
+    rejected by a non-allocating structural pre-check before `borsh::from_slice`, removing the
+    ~45-byte → 1 MiB allocate+memset amplifier; fragment reassembly is insert-if-absent.
+  - The always-on `security_invariants` negative-test suite is now part of the CI `test` gate.
+
 ## [0.1.1] - 2026-06-09
 
 ### Changed
