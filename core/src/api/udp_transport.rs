@@ -11,9 +11,10 @@ use crate::transport::phantom_udp::envelope::{ConnId, PacketType, PATH_MTU};
 // import trips clippy's `--lib` unused-import check, which excludes `#[cfg(test)]` code.
 #[cfg(test)]
 use crate::transport::phantom_udp::envelope::HDR_LEN;
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -166,7 +167,16 @@ pub struct UdpServerTransport {
     cid: ConnId,
     phase: AtomicU8,
     next_packet_id: AtomicU32,
-    rx: Mutex<mpsc::Receiver<Bytes>>,
+    rx: Mutex<mpsc::Receiver<(Bytes, SocketAddr)>>,
+    /// Migration candidate (Phase 4, P4.1): a source address other than `peer`
+    /// observed for this CID. The session challenges it before any switch; the
+    /// switch itself (changing `peer`) is P4.2. `None` until a new source appears.
+    candidate: ArcSwap<Option<SocketAddr>>,
+    /// Anti-amplification budget for the candidate (D9, RFC 9000 §8.2): bytes
+    /// received from / sent to the candidate, so a challenge to a possibly-spoofed
+    /// address never exceeds 3× what it sent us.
+    cand_recv: AtomicU64,
+    cand_sent: AtomicU64,
 }
 
 impl UdpServerTransport {
@@ -174,7 +184,7 @@ impl UdpServerTransport {
         socket: Arc<UdpSocket>,
         peer: SocketAddr,
         cid: ConnId,
-        rx: mpsc::Receiver<Bytes>,
+        rx: mpsc::Receiver<(Bytes, SocketAddr)>,
     ) -> Self {
         Self {
             socket,
@@ -183,6 +193,9 @@ impl UdpServerTransport {
             phase: AtomicU8::new(PHASE_HANDSHAKE),
             next_packet_id: AtomicU32::new(0),
             rx: Mutex::new(rx),
+            candidate: ArcSwap::from_pointee(None),
+            cand_recv: AtomicU64::new(0),
+            cand_sent: AtomicU64::new(0),
         }
     }
 }
@@ -207,12 +220,58 @@ impl SessionTransport for UdpServerTransport {
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
-        self.rx
+        let (frame, src) = self
+            .rx
             .lock()
             .await
             .recv()
             .await
-            .ok_or(CoreError::ConnectionClosed)
+            .ok_or(CoreError::ConnectionClosed)?;
+        // Migration source-detection (Phase 4, P4.1). A frame from a source other
+        // than the established `peer` marks a candidate path. We do NOT switch the
+        // peer here (that is P4.2) — only record the candidate + (re)seed its
+        // anti-amplification budget so the session can challenge it.
+        if src != self.peer {
+            if self.candidate.load().as_ref() == &Some(src) {
+                self.cand_recv
+                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
+            } else {
+                self.candidate.store(Arc::new(Some(src)));
+                self.cand_recv.store(frame.len() as u64, Ordering::Relaxed);
+                self.cand_sent.store(0, Ordering::Relaxed);
+            }
+        }
+        Ok(frame)
+    }
+
+    fn has_migration_candidate(&self) -> bool {
+        self.candidate.load().is_some()
+    }
+
+    async fn send_to_candidate(&self, data: &[u8]) -> Result<bool, CoreError> {
+        let cand = self.candidate.load();
+        let addr = match cand.as_ref() {
+            Some(a) => *a,
+            None => return Ok(false),
+        };
+        let pid = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
+        let dgrams = encode_datagrams(PacketType::OneRtt, &self.cid, pid, data)
+            .map_err(|e| CoreError::NetworkError(format!("challenge too large: {e}")))?;
+        let wire: u64 = dgrams.iter().map(|d| d.len() as u64).sum();
+        // Anti-amplification (D9, RFC 9000 §8.2): never send > 3× what the
+        // candidate sent us. Drop the challenge rather than become a reflector.
+        let recv = self.cand_recv.load(Ordering::Relaxed);
+        if self.cand_sent.load(Ordering::Relaxed).saturating_add(wire) > recv.saturating_mul(3) {
+            return Ok(false);
+        }
+        for d in &dgrams {
+            self.socket
+                .send_to(d, addr)
+                .await
+                .map_err(|e| CoreError::NetworkError(format!("udp send_to candidate: {e}")))?;
+        }
+        self.cand_sent.fetch_add(wire, Ordering::Relaxed);
+        Ok(true)
     }
 
     fn set_frame_phase(&self, phase: FramePhase) {
@@ -299,8 +358,11 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let st = UdpServerTransport::new(sock.clone(), peer_addr, [3u8; 8], rx);
 
-        // recv_bytes returns frames pushed to the channel (as the demux would).
-        tx.send(Bytes::from_static(b"from-demux")).await.unwrap();
+        // recv_bytes returns frames pushed to the channel (as the demux would),
+        // tagged with the source address (here the established peer).
+        tx.send((Bytes::from_static(b"from-demux"), peer_addr))
+            .await
+            .unwrap();
         assert_eq!(&st.recv_bytes().await.unwrap()[..], b"from-demux");
 
         // send_bytes writes an enveloped datagram the raw peer can decode.
@@ -312,5 +374,65 @@ mod tests {
         let (hdr, got) = push_datagram(&mut asm, &buf[..n]).unwrap();
         assert_eq!(hdr.cid, [3u8; 8]);
         assert_eq!(got.as_deref(), Some(&b"to-peer"[..]));
+    }
+
+    /// P4.1: a frame from a source other than the established peer registers a
+    /// migration candidate; `send_to_candidate` reaches it under the 3×
+    /// anti-amplification cap (D9). No peer switch happens here (that is P4.2).
+    #[tokio::test]
+    async fn server_detects_candidate_and_caps_amplification() {
+        use tokio::sync::mpsc;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let st = UdpServerTransport::new(sock.clone(), peer, [9u8; 8], rx);
+
+        // The established peer is not a candidate, and there is nothing to send to.
+        tx.send((Bytes::from_static(b"hi"), peer)).await.unwrap();
+        let _ = st.recv_bytes().await.unwrap();
+        assert!(!st.has_migration_candidate(), "the peer is not a candidate");
+        assert!(
+            !st.send_to_candidate(b"x").await.unwrap(),
+            "no candidate => Ok(false)"
+        );
+
+        // A frame from a NEW source registers a candidate + seeds the 3× budget
+        // (10 received bytes here).
+        let cand_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cand_addr = cand_sock.local_addr().unwrap();
+        tx.send((Bytes::from_static(b"0123456789"), cand_addr))
+            .await
+            .unwrap();
+        let _ = st.recv_bytes().await.unwrap();
+        assert!(
+            st.has_migration_candidate(),
+            "a new source must set a candidate"
+        );
+
+        // A challenge within budget is delivered to the candidate address.
+        assert!(
+            st.send_to_candidate(b"chal").await.unwrap(),
+            "first challenge is within the 3× budget"
+        );
+        let mut buf = vec![0u8; 2048];
+        let (n, _from) = cand_sock.recv_from(&mut buf).await.unwrap();
+        assert!(n > 0, "the challenge must reach the candidate socket");
+
+        // Keep challenging until the 3× anti-amplification cap blocks.
+        let mut blocked = false;
+        for _ in 0..50 {
+            if !st.send_to_candidate(b"chal").await.unwrap() {
+                blocked = true;
+                break;
+            }
+        }
+        assert!(
+            blocked,
+            "the 3× anti-amplification cap must eventually block"
+        );
     }
 }
