@@ -20,7 +20,7 @@ use crate::transport::types::LegType;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -50,6 +50,9 @@ pub struct PhantomUdpListener {
     accepted_tx: mpsc::Sender<Arc<AcceptOutcome>>,
     accepted_rx: Mutex<mpsc::Receiver<Arc<AcceptOutcome>>>,
     demux: parking_lot::Mutex<Option<SpawnHandle>>,
+    /// Live gauge mirroring the demux `routes` table size (H-1 observability). The
+    /// demux owns the table; this lets `active_route_count()` read it without a lock.
+    active_routes: Arc<AtomicUsize>,
 }
 
 impl PhantomUdpListener {
@@ -96,6 +99,7 @@ impl PhantomUdpListener {
             accepted_tx,
             accepted_rx: Mutex::new(accepted_rx),
             demux: parking_lot::Mutex::new(None),
+            active_routes: Arc::new(AtomicUsize::new(0)),
         }))
     }
 
@@ -104,6 +108,13 @@ impl PhantomUdpListener {
     }
     pub fn local_addr(&self) -> String {
         self.local_addr.to_string()
+    }
+
+    /// Number of live demux routes (one per in-flight handshake or established
+    /// session). Bounded by reaping + a hard cap (H-1); exposed so a fresh-CID
+    /// spray's failure to grow this without bound is observable/testable.
+    pub fn active_route_count(&self) -> usize {
+        self.active_routes.load(Ordering::Relaxed)
     }
 
     pub async fn accept(self: &Arc<Self>) -> Result<Arc<AcceptOutcome>, CoreError> {
@@ -149,9 +160,81 @@ impl Drop for PhantomUdpListener {
     }
 }
 
+/// Hard upper bound on concurrent demux routes (H-1 backstop). One route exists per
+/// in-flight handshake or established session; reaping keeps the steady-state size near the
+/// in-flight ceiling, and this cap bounds memory even if reaping ever lagged. A fresh-CID
+/// spray cannot grow the map past this — excess `Initial`s are dropped (the peer
+/// retransmits). Sized well above any realistic concurrent-session count.
+const MAX_ROUTES: usize = 1 << 16;
+
+/// Bounded, self-reaping demux route table keyed on the unauthenticated 8-byte CID (H-1).
+/// A route's liveness is exactly its inbound channel's: a closed `Sender` (`is_closed()`)
+/// means the handshake task failed or the established session was dropped, so the entry is
+/// reclaimable. The `gauge` mirrors `len()` so `active_route_count()` can read the size
+/// without a lock. A live session's route is never evicted to admit a new connection.
+struct RouteTable {
+    routes: HashMap<ConnId, mpsc::Sender<(Bytes, SocketAddr)>>,
+    gauge: Arc<AtomicUsize>,
+}
+
+impl RouteTable {
+    fn new(gauge: Arc<AtomicUsize>) -> Self {
+        gauge.store(0, Ordering::Relaxed);
+        Self {
+            routes: HashMap::new(),
+            gauge,
+        }
+    }
+
+    fn sync(&self) {
+        self.gauge.store(self.routes.len(), Ordering::Relaxed);
+    }
+
+    fn get(&self, cid: &ConnId) -> Option<&mpsc::Sender<(Bytes, SocketAddr)>> {
+        self.routes.get(cid)
+    }
+
+    /// Reclaim every route whose receiver was dropped (failed handshake / gone session).
+    fn reap_dead(&mut self) {
+        self.routes.retain(|_, tx| !tx.is_closed());
+        self.sync();
+    }
+
+    /// Insert a fresh route, enforcing `MAX_ROUTES`. Reaps dead entries first when at the
+    /// cap; returns `false` (inserting nothing) only if still full of *live* routes, so the
+    /// caller drops the new `Initial`. A live route is never evicted to admit a new one.
+    fn try_insert(&mut self, cid: ConnId, tx: mpsc::Sender<(Bytes, SocketAddr)>) -> bool {
+        if self.routes.len() >= MAX_ROUTES {
+            self.reap_dead();
+            if self.routes.len() >= MAX_ROUTES {
+                return false;
+            }
+        }
+        self.routes.insert(cid, tx);
+        self.sync();
+        true
+    }
+
+    /// Remove a CID iff its route is dead. Safe for any CID — a live session's route (its
+    /// `Sender` still held by the running session) is left untouched.
+    fn remove_if_dead(&mut self, cid: &ConnId) {
+        if self.routes.get(cid).is_some_and(|tx| tx.is_closed()) {
+            self.routes.remove(cid);
+            self.sync();
+        }
+    }
+}
+
 /// Central demux: own the socket, route each datagram by its connection-ID.
 async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
-    let mut routes: HashMap<ConnId, mpsc::Sender<(Bytes, SocketAddr)>> = HashMap::new();
+    // Bounded, self-reaping route table (H-1). Dead routes (failed handshakes / dropped
+    // sessions) are reclaimed promptly via `reap_rx` and on the `% 256` cadence, with the
+    // hard `MAX_ROUTES` cap as a backstop, so a fresh-CID spray cannot grow it unboundedly.
+    let mut routes = RouteTable::new(listener.active_routes.clone());
+    // Each handshake task signals its CID here when it finishes; the demux then reaps the
+    // route iff it is dead (a live established session keeps its inbound channel open, so
+    // its route survives the signal untouched).
+    let (reap_tx, mut reap_rx) = mpsc::unbounded_channel::<ConnId>();
     // NOTE (Phase 1): one assembler shared across ALL CIDs. Its key includes the cid, but a fragment
     // spray shares the single 256-slot assembly table with every live session's in-flight
     // reassemblies. Bounded — the assembler self-caps at MAX_CONCURRENT_ASSEMBLIES with
@@ -169,6 +252,12 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
         let (n, peer) = tokio::select! {
             biased;
             _ = &mut shutdown_fut => break,
+            // Reap dead routes before reading more datagrams so the table cannot grow under
+            // a spray faster than finished handshakes are reclaimed.
+            Some(cid) = reap_rx.recv() => {
+                routes.remove_if_dead(&cid);
+                continue;
+            }
             r = listener.socket.recv_from(&mut buf) => match r {
                 Ok(v) => v,
                 Err(e) => { log::warn!("PhantomUdpListener: recv_from: {e}"); continue; }
@@ -181,8 +270,9 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
         };
         // Existing connection: deliver the inner frame.
         if let Some(tx) = routes.get(&hdr.cid) {
-            if tx.try_send((Bytes::from(frame), peer)).is_err() && tx.is_closed() {
-                routes.remove(&hdr.cid);
+            let dead = tx.try_send((Bytes::from(frame), peer)).is_err() && tx.is_closed();
+            if dead {
+                routes.remove_if_dead(&hdr.cid);
             }
             continue;
         }
@@ -196,14 +286,20 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
         };
         let (tx, rx) = mpsc::channel(SESSION_CHANNEL_DEPTH);
         let st = UdpServerTransport::new(listener.socket.clone(), peer, hdr.cid, rx);
-        routes.insert(hdr.cid, tx.clone());
+        // H-1: refuse the route (and the slot) when the table is full of *live* routes.
+        if !routes.try_insert(hdr.cid, tx.clone()) {
+            drop(permit);
+            drop(st);
+            continue;
+        }
         let _ = tx.try_send((Bytes::from(frame), peer));
-        spawn_handshake_task(listener.clone(), st, peer, permit);
-        // DoS-hardening parity with the TCP acceptor: periodically drop expired
-        // reputation entries so the bounded map stays small under new-connection churn.
+        spawn_handshake_task(listener.clone(), st, peer, hdr.cid, permit, reap_tx.clone());
+        // DoS-hardening parity with the TCP acceptor: periodically drop expired reputation
+        // entries AND reap dead routes so both bounded maps stay small under churn.
         new_conn_count = new_conn_count.wrapping_add(1);
         if new_conn_count % 256 == 0 {
             listener.handshake_server.gc_reputation();
+            routes.reap_dead();
         }
     }
 }
@@ -212,7 +308,9 @@ fn spawn_handshake_task(
     listener: Arc<PhantomUdpListener>,
     transport: UdpServerTransport,
     peer: SocketAddr,
+    cid: ConnId,
     permit: tokio::sync::OwnedSemaphorePermit,
+    reap_tx: mpsc::UnboundedSender<ConnId>,
 ) {
     let hs = listener.handshake_server.clone();
     let runtime = listener.runtime.clone();
@@ -250,6 +348,8 @@ fn spawn_handshake_task(
                 );
                 let outcome = AcceptOutcome::new(session, early_data, peer);
                 let _ = accepted_tx.send(outcome).await;
+                // Success: the live session now owns the inbound channel, so the demux
+                // keeps this route — the reap signal below is a no-op (route not dead).
             }
             Err(e) => {
                 observability.record_handshake(
@@ -259,9 +359,15 @@ fn spawn_handshake_task(
                     AeadAlgorithm::Aes256Gcm,
                     ProtocolVersion::Current,
                 );
+                // H-1: drop the transport (and its inbound channel) before signalling, so
+                // the demux observes this route as dead and reclaims it promptly.
+                drop(transport);
                 log::debug!("PhantomUdpListener: handshake failed: {e}");
             }
         }
+        // Signal the demux to reap this CID. It removes the route only if it is dead, so
+        // this is safe on both the success (live, kept) and failure (dead, reclaimed) paths.
+        let _ = reap_tx.send(cid);
     }));
 }
 
