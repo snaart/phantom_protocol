@@ -721,6 +721,20 @@ impl Session {
         self.bandwidth_estimator.lock().on_loss(bytes);
     }
 
+    /// Reset the congestion controller + pacer to startup (Phase 4 / QUIC §9.4):
+    /// a migration path switch lands on a different network, so the old
+    /// bottleneck-bandwidth / cwnd estimate must not carry over — inheriting a low
+    /// RTT/cwnd would trigger a spurious-retransmit storm on the first packets of
+    /// the new path. Wired by the P4.2 migration switch.
+    pub fn reset_congestion(&self) {
+        let mut est = self.bandwidth_estimator.lock();
+        *est = BandwidthEstimator::new();
+        let rate = est.pacing_rate();
+        drop(est);
+        // Drop the dead path's stale pacing rate; BBR re-paces on the first ACK.
+        self.pacer.set_rate(rate);
+    }
+
     /// Current BBR congestion-control state. Observability / test hook — lets
     /// callers confirm a loss drove the estimator into `FastRecovery`.
     pub fn bbr_state(&self) -> crate::transport::bandwidth_estimator::BbrState {
@@ -780,11 +794,11 @@ impl Session {
 
     /// Encrypt a packet payload.
     ///
-    /// The AEAD nonce is derived from the authenticated `(epoch, stream_id,
-    /// sequence, path_id)` fields of the packet header rather than from an
-    /// internal monotonic counter, so a failed peer decrypt never desyncs the
-    /// receiver. The AAD is the 45-byte wire image of the header
-    /// ([`PacketHeader::to_wire`]), so any wire-level mutation invalidates the tag.
+    /// The AEAD nonce is `prefix || packet_number` (① — Phase 4), derived from the
+    /// authenticated header rather than an internal counter, so a failed peer
+    /// decrypt never desyncs the receiver. The AAD is the 47-byte wire image of the
+    /// header ([`PacketHeader::to_wire`]) — which still binds `epoch` / `stream_id`
+    /// / `path_id` — so any wire-level mutation invalidates the tag.
     pub fn encrypt_packet(
         &self,
         header: &PacketHeader,
@@ -796,10 +810,10 @@ impl Session {
         crypto.encrypt_with_nonce(nonce, &header_bytes, plaintext)
     }
 
-    /// Decrypt a packet payload. Performs AEAD verify + per-stream
-    /// sliding-window replay rejection (the window check runs **after** a
-    /// successful AEAD open — Invariant 4 — so we never key off
-    /// un-authenticated sequence numbers).
+    /// Decrypt a packet payload. Performs AEAD verify + per-direction
+    /// sliding-window replay rejection on the packet number (the window check runs
+    /// **after** a successful AEAD open — Invariant 4 — so we never key off
+    /// un-authenticated packet numbers).
     ///
     /// A failed decrypt does NOT desync future decrypts: the AEAD nonce is
     /// derived from this packet's authenticated header fields, so the receiver

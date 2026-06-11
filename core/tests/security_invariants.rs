@@ -1091,7 +1091,10 @@ fn path_id_is_in_aad_not_nonce() {
         "ciphertext body differs => path_id leaked into the nonce"
     );
     // path_id IS authenticated (it is in the AAD) => the tag must differ.
-    assert_ne!(tag0, tag5, "tag identical => path_id not bound into the AAD");
+    assert_ne!(
+        tag0, tag5,
+        "tag identical => path_id not bound into the AAD"
+    );
 }
 
 /// The collapse from per-`StreamId` replay windows to ONE per-direction window
@@ -1122,5 +1125,35 @@ fn per_direction_window_accepts_interleaved_streams() {
             Err(phantom_protocol::CoreError::ReplayDetected(_))
         ),
         "a replayed packet_number must be rejected after AEAD verify (Inv-4)"
+    );
+}
+
+// ── D8 (Phase 4): migration-switch congestion-controller reset ──────────────
+
+/// `Session::reset_congestion` re-initialises the BBR controller so a migration
+/// path switch (QUIC §9.4) measures the new network's bandwidth/cwnd fresh rather
+/// than inheriting the dead path's estimate. (`RtoEstimator::reset` — the RTT
+/// half — is unit-tested in `transport::stream::rto_tests`.)
+#[test]
+fn reset_congestion_returns_controller_to_initial() {
+    let (s, _server) = make_session_pair([0x94u8; 32]);
+    let (fresh, _f) = make_session_pair([0x95u8; 32]);
+    let initial_cwnd = fresh.bandwidth_snapshot().cwnd_bytes;
+
+    // Perturb the controller: register inflight + a loss.
+    s.on_packet_sent(200_000);
+    s.on_packet_lost(100_000);
+    assert!(
+        s.bandwidth_snapshot().inflight_bytes > 0,
+        "precondition: on_packet_sent should register inflight bytes"
+    );
+
+    s.reset_congestion();
+
+    let snap = s.bandwidth_snapshot();
+    assert_eq!(snap.inflight_bytes, 0, "reset must clear inflight");
+    assert_eq!(
+        snap.cwnd_bytes, initial_cwnd,
+        "reset must restore the initial cwnd"
     );
 }
