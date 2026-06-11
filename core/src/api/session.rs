@@ -1659,7 +1659,19 @@ async fn handle_packet<T: SessionTransport>(
         // registry already transitioned to Failed — also done.
         match crypto_recv.path_state(path_id) {
             Some(crate::transport::path::PathStateKind::Validating) => {
-                let _ = crypto_recv.complete_path_validation(path_id, &payload_buf);
+                // The peer echoed our challenge on this path. If it validates AND a
+                // migration candidate is pending, SWITCH the active peer to it (D7)
+                // and reset RTT/cwnd for the new network (D8) — no re-handshake,
+                // keys persist; subsequent app data + ARQ retransmits flow to the
+                // new peer. (P4.1 only challenged; P4.2 performs the switch.)
+                if crypto_recv.complete_path_validation(path_id, &payload_buf)
+                    && transport_for_path.promote_candidate()
+                {
+                    crypto_recv.reset_congestion();
+                    for s in streams_recv.iter() {
+                        s.value().reset_rto();
+                    }
+                }
                 return;
             }
             Some(crate::transport::path::PathStateKind::Validated)
