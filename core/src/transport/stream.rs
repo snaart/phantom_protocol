@@ -254,6 +254,20 @@ mod rto_tests {
         est.on_rtt_sample(Duration::from_millis(100));
         assert_eq!(est.rto(), Duration::from_millis(250));
     }
+
+    #[test]
+    fn reset_clears_estimate_and_backoff() {
+        let mut est = RtoEstimator::new();
+        // Build up an SRTT and a backed-off RTO.
+        est.on_rtt_sample(Duration::from_millis(100)); // RTO = 300ms
+        est.on_timeout(); // RTO = 600ms (backed off)
+        assert_eq!(est.rto(), Duration::from_millis(600));
+        // Phase 4 / QUIC §9.4: a migration path switch must reset the estimate so
+        // the new network's RTT is measured fresh (no stale tiny RTO => no
+        // spurious-retransmit storm on the first packets of the new path).
+        est.reset();
+        assert_eq!(est.rto(), Duration::from_secs(1)); // INITIAL_RTO, no backoff
+    }
 }
 
 /// Stream - multiplexed data channel within a session
