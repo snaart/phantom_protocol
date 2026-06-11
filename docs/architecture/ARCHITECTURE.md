@@ -2,45 +2,49 @@
 
 Companion to `PROTOCOL.md` (wire format) and `SECURITY.md` (invariants).
 This document covers the **internal** structure: modules, data flow,
-concurrency, and ownership.
+concurrency, and ownership. It is current as of Phase 8 (OpenTelemetry) +
+Phase 4 (connection migration & liveness, P4.0–P4.4) — the native **PhantomUDP**
+transport, the per-direction `u64` packet number, path validation, and the
+liveness state machine are all live and described below.
 
 ---
 
-## 1. Three-layer overview
+## 1. Layer overview
 
 ```
                   ┌───────────────────────────────────────────────┐
-                  │                  api/                         │  ←── public surface,
-                  │  PhantomSession   PhantomListener             │     UniFFI-exported,
-                  │  PhantomStream    PhantomConfig               │     FFI-stable
-                  │  ConnectionState  SessionTransport            │
+                  │                  api/                          │  ←── public surface,
+                  │  PhantomSession   PhantomListener              │     UniFFI-exported,
+                  │  PhantomUdpListener   PhantomStream            │     FFI-stable
+                  │  UdpClientTransport   UdpServerTransport       │
+                  │  ConnectionState  ResumptionHint  AcceptOutcome│
+                  │  TcpSessionTransport  SessionTransport (trait) │
                   └────────────────────┬──────────────────────────┘
                                        │
                                        ▼
                   ┌───────────────────────────────────────────────┐
-                  │             transport/                        │  ←── protocol internals,
-                  │  Session  CryptoState  PacketHeader           │     Rust-only API
-                  │  HandshakeServer HandshakeClient              │
-                  │  Stream  Scheduler  ReplayWindow              │
-                  │  legs/{ws, wasi,embedded}                     │
+                  │             transport/                         │  ←── protocol internals,
+                  │  Session  CryptoState  PacketHeader            │     Rust-only API
+                  │  HandshakeServer/Client  Stream  Sack          │
+                  │  PathRegistry  liveness  ReplayWindow          │
+                  │  phantom_udp/{envelope,datagram}  legs/*       │
                   └────────────────────┬──────────────────────────┘
                                        │
                                        ▼
                   ┌───────────────────────────────────────────────┐
-                  │               crypto/                         │  ←── primitives,
-                  │  hybrid_kem  hybrid_sign                      │     called only by
-                  │  adaptive_crypto (AEAD)  aes_session          │     transport layer
-                  │  pow                                          │
+                  │               crypto/                          │  ←── primitives,
+                  │  hybrid_kem  hybrid_sign  adaptive_crypto      │     called only by
+                  │  kdf  rng  self_tests  aes_session  pow        │     transport layer
                   └───────────────────────────────────────────────┘
+
+   sibling, std-light:   security/ (ReplayWindow) · runtime/ (Runtime trait) · observability/ (OTel)
 ```
 
-**Direction of dependency** flows strictly downward: `api` may use anything
-in `transport` or `crypto`; `transport` may use anything in `crypto`;
-`crypto` does not depend on anything else inside the crate.
-
-The `security/` module is sibling to `transport/` and depends only on
-`std` + crypto helpers; it provides `ReplayWindow` and the older
-`ReplayProtection` map-based deduper.
+**Direction of dependency** flows strictly downward: `api` may use anything in
+`transport`/`crypto`; `transport` may use `crypto`; `crypto` depends on nothing
+else in the crate. `security/`, `runtime/`, and `observability/` are siblings to
+`transport/` and depend only on `crypto/` helpers + `std`/OS crates (the
+`session_transport` trait and `legs/embedded` are `no_std + alloc`-clean).
 
 ---
 
@@ -50,62 +54,68 @@ The `security/` module is sibling to `transport/` and depends only on
 
 | Type | Role | UniFFI exported |
 | --- | --- | --- |
-| `PhantomSession` | Client session — non-blocking connect, queued sends | Yes (`uniffi::Object`) |
-| `PhantomListener` | Server: bind, accept, expose verifying key bytes | Yes (`uniffi::Object`) |
-| `PhantomStream` | Per-stream API on top of a session | Yes (`uniffi::Object`) |
-| `ConnectionState` | Lifecycle enum (`Connecting` → ... → `Closed`) | Yes (`uniffi::Enum`) |
-| `PhantomConfig` | User-tunable knobs | Yes (`uniffi::Record`) |
-| `SessionTransport` (trait) | Byte-pipe abstraction below the encryption layer | No (Rust trait) |
+| `PhantomSession` | Client/served session — non-blocking connect, queued sends, `migrate()` | Yes (`uniffi::Object`) |
+| `PhantomListener` | TCP server: bind, accept, expose verifying-key bytes | Yes (`uniffi::Object`) |
+| `PhantomUdpListener` | **PhantomUDP server**: `bind_udp`, CID-demuxed accept | Yes (`uniffi::Object`) |
+| `UdpClientTransport` / `UdpServerTransport` | Native UDP `SessionTransport` impls (client = connected socket + dual-socket migrate; server = per-session demux shim with `ArcSwap` peer) | No (Rust) |
 | `TcpSessionTransport` | Length-prefix-framed TCP impl of `SessionTransport` | No |
+| `PhantomStream` | Per-stream API on top of a session | Yes (`uniffi::Object`) |
+| `AcceptOutcome` | `accept()` result — `.session()` + take-once 0-RTT early-data | Yes (`uniffi::Object`) |
+| `ConnectionState` | Lifecycle enum: `Connecting`/`ClassicalReady`/`PqcUpgrading`/`PqcReady`/`Connected`/`Failed`/`Closed`/**`Migrating`**/**`Dead`** | Yes (`uniffi::Enum`) |
+| `ResumptionHint` | 0-RTT `(session_id, resumption_secret)` record (redacting `Debug`) | Yes (`uniffi::Record`) |
+| `PhantomConfig` | User-tunable knobs | Yes (`uniffi::Record`) |
+| `SessionTransport` (trait) | Byte-pipe abstraction below the encryption layer; SocketAddr-free migration hooks (`has_migration_candidate` / `send_to_candidate` / `promote_candidate` / `migrate`) | No (Rust trait) |
+
+Free functions exported for mobile/FFI: `connect_pinned`, `connect_pinned_with_resumption`.
 
 ### Lifecycle
 
 ```
 client                                            server
 ──────                                            ──────
-
-PhantomSession::connect_with_transport(           PhantomListener::bind(addr)
-    addr, transport, expected_server_key)            ↓
-    ↓                                             listener.accept()  ──┐
-spawns background_task                                                  │
-    ↓                                                                   │
-    └─── ClientHello (borsh) ───────────────────────────────────────────►
-                                                  drive_server_handshake
-                                                     ↓
-    ◄─── HelloRetryRequest (if cookie/PoW bad) ─────────┤
-    └─── ClientHello (with cookie+pow) ─────────────────►
-                                                  process_client_hello
-                                                  → derives Session
-                                                  ↓
-    ◄─── ServerHello (transcript-signed) ───────────────┘
-    ↓
-process_server_hello(Some(expected_server_key))
-    ↓
-PhantomSession.state = Connected
-                                                  ↓
-spawn run_data_pump(crypto_session, ...)         spawn run_data_pump(server_session, ...)
-                                                  via PhantomSession::from_accepted_server_session
-    ↓                                                 ↓
-
-    ──── encrypted PhantomPacket frames ──────────────►
-    ◄─── encrypted PhantomPacket frames ───────────────
+connect_with_transport(addr, transport,           PhantomListener::bind(addr)  /  PhantomUdpListener::bind_udp(addr)
+    expected_server_key)                              ↓
+    ↓ spawns background_task                       accept()  (UDP: run_udp_demux routes by CID → spawn_handshake_task)
+    └── ClientHello (borsh; UDP: fragmented to PATH_MTU=1200, reassembled) ─────►
+    ◄── HelloRetryRequest (if cookie/PoW missing) ────────┤  drive_server_handshake
+    └── ClientHello (+ cookie + PoW) ─────────────────────►  process_client_hello → derives Session
+    ◄── ServerHello (transcript-signed) ──────────────────┘
+    ↓ process_server_hello(Some(expected_server_key)); pin + verify; derive Session
+ConnectionState = Connected
+    ↓ spawn run_data_pump(crypto_session, ...)        spawn run_data_pump(server_session, ...)
+    ──── encrypted PhantomPacket frames (WIRE 3) ─────────►
+    ◄──── encrypted PhantomPacket frames ──────────────────
+    │
+    └─ [optional] migrate(new_local_addr) → rebind + new path_id → server detects new source → PATH_CHALLENGE → validate → peer switch
 ```
+
+**Only the server is authenticated** by the handshake (server-key pinning +
+transcript signature). The client sends `client_verify_key` but does **not**
+prove possession of its private half at this stage — mutual / peer-identity
+authentication, if needed by a product on top, lives above the transport.
 
 ### The shared data pump (`api/session.rs::run_data_pump`)
 
-Both client and server, after their respective handshakes, spawn the same `run_data_pump` function, which owns three tasks:
+Both client and server, after their handshakes, spawn the **same** `run_data_pump`
+(one function, three concurrent units):
 
-- A **delivery task** that drains an unbounded `deliver_rx` channel, handles the app-paced `recv_tx.send()`, and credits the flow-control window. This decoupling lets the reader emit inline ACKs without blocking on slow consumers.
-- A **receive (reader) task** looping `transport.recv_bytes() → PhantomPacket::from_wire → decrypt → handle_packet()`, which emits inline ACKs for reliable packets and hands application data to the unbounded `deliver_tx` channel without ever blocking on the consumer.
-- A **main select! loop** in the calling task that picks among:
-  - `poll_interval.tick()` every 10 ms — sweeps all streams for queued sends and flushes pending WINDOW_UPDATEs.
-  - `send_notify.notified()` — wakes immediately on outbound-ready notification (event-driven fast path, Phase 2.4+).
-  - `cmd_rx.recv()` — application-level `SessionCommand`s (Send, SendStreamReliable, etc.).
-  - `recv_done_rx` — exit when the receive task ends (transport closed).
-
-The asymmetry between client and server stops here: the same pump
-handles both directions of data after the handshake derives the
-`Session`.
+- **Delivery task** — drains the unbounded `deliver_rx` queue, paces `recv_tx.send()`,
+  decrements `undelivered_bytes`, and stages flow-control (`WINDOW_UPDATE`) credit.
+  Decoupling lets the reader never block on a slow consumer.
+- **Reader task** — loops `transport.recv_bytes() → PhantomPacket::from_wire → handle_packet()`.
+  `handle_packet` binds every frame to the negotiated `session_id`, decrypts (the
+  `ENCRYPTED` gate, with a single authenticated forward-rekey catch-up step), then
+  dispatches: authenticated **SACK ACK** (`ENCRYPTED|ACK`, post-AEAD — the H1 fix),
+  `WINDOW_UPDATE`, `PATH_VALIDATION` (migration), `COALESCED`, and reliable data
+  (gap-free `stream_offset` reassembly). Inbound that passes AEAD calls
+  `update_activity()` (the liveness signal).
+- **Main `select!` loop** picks among:
+  - `poll_interval.tick()` (10 ms) — drains streams, flushes `WINDOW_UPDATE`s, and runs
+    the **liveness sweep** (`apply_liveness`).
+  - `send_notify.notified()` — event-driven outbound-ready fast path.
+  - `cmd_rx.recv()` — `SessionCommand`s: `Send`, `SendStreamReliable/Unreliable`,
+    `CloseStream`, **`Migrate(local_addr)`**, `Close`.
+  - `recv_done_rx` — exit when the reader ends (transport closed).
 
 ---
 
@@ -115,264 +125,270 @@ handles both directions of data after the handshake derives the
 
 | Type | Role |
 | --- | --- |
-| `Session` | Per-association state: id, AEAD `CryptoState`, streams, scheduler, replay windows. Immutable post-handshake fields use plain `&CryptoState` (Phase 2.7); mutable state is in `RwLock` / `DashMap`. |
-| `CryptoState` | The per-direction AEAD keying material (`CryptoSession`) plus a 32-byte `session_key` for further HKDF. `ZeroizeOnDrop`. |
-| `HandshakeServer` | Long-lived signing key + master secret for cookie/PoW. Per-process. `ZeroizeOnDrop`. |
-| `HandshakeClient` | Per-connection ephemeral state — KEM key pair, signing key pair, nonce. `ZeroizeOnDrop`. |
-| `Stream` | Per-stream send/recv buffers, sequence counters, reliability machinery |
-| `Scheduler` | Multi-leg path selection (currently placeholder for future Phase 4.2 migration) |
-| `PacketHeader` / `PhantomPacket` | Wire types |
-| `legs/{websocket,wasi,embedded}` | `SessionTransport` impls (browser / WASI / bare-metal) |
-| `BufferPool`, `Pacer`, `PacketCoalescer`, `BandwidthEstimator` | Performance infrastructure — most not yet wired in (Phase 2.1, 2.4, 2.5, 2.6) |
+| `Session` | Per-association state: `id`, AEAD `CryptoState` (`ArcSwap`, rekey-swappable), `traffic_secret`, `epoch` (`AtomicU8`, saturates), the **`send_packet_number: AtomicU64`** (the per-direction nonce + replay identity — ① / P4.0), `send_path_id: AtomicU8` (client-owned migration label), one per-direction `recv_replay: Mutex<ReplayWindow>`, `path_registry: Arc<PathRegistry>`, `liveness_config`, `pacer`, `bandwidth_estimator`, `scheduler`, streams. |
+| `CryptoState` | Per-direction AEAD keying (`CryptoSession`) + 32-byte `session_key` for further HKDF. `ZeroizeOnDrop`. Swapped wholesale on rekey via `ArcSwap`. |
+| `HandshakeServer` | Long-lived signing key + master secret (cookie/PoW), per-IP `ReputationTracker`. Per-process. `ZeroizeOnDrop`. |
+| `HandshakeClient` | Per-connection **ephemeral** state — hybrid KEM key pair, signing key pair, nonce. `ZeroizeOnDrop`. |
+| `Stream` | Per-stream send/recv buffers, the gap-free **`stream_offset: u32`** (A.5 reliability layer), `RtoEstimator` (RFC 6298), reorder buffer, SACK-driven retransmit. |
+| `Sack` | Authenticated ACK payload: `largest_acked: u32`, `ack_delay_us: u32`, inclusive received ranges — over `stream_offset`, **not** the wire packet number (the layer split). |
+| `PathRegistry` | Per-session path lifecycle (`Unvalidated → Validating → Validated/Failed`), constant-time challenge/response (Invariant 6), `retire` for `path_id` reuse. |
+| `liveness` | Pure `liveness_verdict()` (PathDown / Recovered / Dead) + `LivenessConfig` thresholds. |
+| `PathRegistry`/`Scheduler` | Path selection / migration state (migration is **shipped** — see § 4; the `Scheduler` does per-leg RTT/loss tracking). |
+| `PacketHeader` / `PhantomPacket` | Wire types (47-byte header; § PROTOCOL.md). |
+| `phantom_udp/{envelope,datagram}` | The PhantomUDP `[flags][cid]` envelope + fragmentation/reassembly to `PATH_MTU`. |
+| `legs/{websocket,wasi,embedded}` | `SessionTransport` impls (browser / WASI / bare-metal). |
+| `BufferPool`, `Pacer`, `PacketCoalescer`, `BandwidthEstimator` (BBR) | Performance infrastructure. |
 
 ### Encryption boundary
 
-Every byte that crosses `Session::encrypt_packet` / `Session::decrypt_packet`
-is authenticated with the `PacketHeader` as AAD. This is THE place to look
-when reasoning about confidentiality + integrity:
+Every byte that crosses `Session::encrypt_packet` / `decrypt_packet` is
+authenticated with the **47-byte** `PacketHeader` as AAD. The AEAD nonce is
+`nonce_prefix(4) ‖ packet_number(8)` — the per-direction monotonic `u64` packet
+number drawn at send time (① / P4.0). `epoch`/`stream_id`/`path_id` are in the
+AAD but **not** the nonce.
 
 ```rust
-pub fn encrypt_packet(&self, header: &PacketHeader, plaintext: &[u8]) -> Result<Vec<u8>, CoreError> {
-    let header_bytes = header.to_wire(); // 45-byte big-endian image = AAD
-    self.crypto.encrypt(&header_bytes, plaintext)
+fn build_packet_nonce(prefix: [u8;4], header: &PacketHeader) -> [u8;12] // prefix ‖ packet_number_be
+pub fn encrypt_packet(&self, header: &PacketHeader, pt: &[u8]) -> Result<Vec<u8>, CoreError> {
+    let nonce = Self::build_packet_nonce(self.crypto.load().nonce_prefix(), header);
+    // AAD = header.to_wire()  (47 bytes)
 }
 ```
 
-There is no second path. Every send goes through here. Every receive
-goes through `decrypt_packet` which adds a ReplayWindow check after AEAD
-verification.
+There is no second path. Every receive goes through `decrypt_packet`
+(`decrypt_packet_accepting_rekey` on the recv side), which consults **one
+per-direction** `ReplayWindow` keyed on the `u64` packet number **after** AEAD
+verify (Invariant 4). A failed/tampered decrypt never desyncs the receiver
+(the nonce is derived from the authenticated header, not an internal counter).
 
 ---
 
-## 4. Cryptography layer (`core/src/crypto/`)
+## 4. PhantomUDP native transport & connection migration (Phase 4)
+
+The primary native transport. A single PQ-pinned identity survives a network-path
+change (Wi-Fi↔cellular, NAT-rebind) **without** re-running the handshake — one live
+path at a time (aggregation/multipath are out of scope).
+
+### Framing & demux
+
+- **Envelope** (`phantom_udp/envelope.rs`): each datagram = `[flags: u8][cid: 8]` +
+  inner frame; `flags` carries the packet type (`Initial`/`OneRtt`) + a fragment bit.
+  The 8-byte `cid` is the **plaintext** demux key.
+- **Fragmentation** (`phantom_udp/datagram.rs`): frames above `MAX_INNER_UNFRAGMENTED`
+  (the multi-KB PQ handshake) are split to `PATH_MTU = 1200` and reassembled by a
+  `FragmentAssembler` (bounded slot table with stalest-eviction).
+- **Server demux** (`api/udp_listener.rs::run_udp_demux`): a single task routes inbound
+  datagrams to per-session channels by CID, gates new handshakes behind a 256-permit
+  `inflight` semaphore, and spawns `drive_server_handshake` per fresh CID.
+
+### The migration switch (detect → challenge → validate → swap)
+
+1. **Client** (`UdpClientTransport::migrate_to`): binds a fresh local socket, keeps the
+   old one for the overlap (dual-socket; `socket`/`prev_socket` are `ArcSwap`), bumps the
+   send `path_id` (`Session::next_migration_path_id`, never 0), and routes app data + ARQ
+   retransmits out the new socket.
+2. **Server** detects *known CID + new source 5-tuple* and records a migration candidate
+   (`UdpServerTransport`, `ArcSwap` peer + candidate + a 3× anti-amplification budget, D9).
+3. **Server** challenges the candidate path with a 32-byte `PATH_VALIDATION` (constant-time
+   verify, Invariant 6), then atomically `ArcSwap`s its peer to the new source, resets the
+   RTT estimator + congestion controller (QUIC §9.4), and retires the old path.
+
+**PATH-001 split (D10):** *send-gate strict* — app data is sent only to the established
+peer / a `Validated` path; *recv-delivery relaxed* — AEAD-authenticated, non-replayed data
+is delivered regardless of source (so a NAT-rebind upload is seamless; only the real
+key-holder can produce it, and the per-direction replay window gates duplicates).
+
+### Liveness (P4.3)
+
+`transport/liveness.rs` is a pure decision (`liveness_verdict`); the pump's 10 ms tick
+feeds it `(silence, inflight, min_rtt, migrating_since)`:
+
+- **PathDown** — *N×PTO of inbound silence while reliable data is outstanding* →
+  `ConnectionState::Migrating` (keys held, outbound buffered; the embedder reacts by
+  calling `migrate()`).
+- **Recovered** — inbound resumes → back to `Connected`.
+- **Dead** — no recovery before the migration-idle timeout → terminal `Dead`, the pump
+  ends, `recv()` errors (not a hang).
+
+`update_activity()` is called only on **AEAD-authenticated** inbound, so a forged/replayed
+packet cannot mask a dead path or reset the timer. The same pump runs on both peers, so a
+server detects a vanished client symmetrically.
+
+### The layer split (① + A.5)
+
+- **Packet layer:** the per-direction monotonic `u64` `packet_number` — the AEAD nonce +
+  anti-replay identity. Assigned at send time; a retransmit draws a fresh PN.
+- **Stream layer:** the gap-free per-stream `u32` `stream_offset` in the reliable AEAD
+  plaintext — feeds reassembly, SACK, loss detection, retransmit dedup.
+
+> Migration is **functional but linkable** via the stable plaintext CID (documented
+> honestly in PROTOCOL.md §12.5); unlinkable migration (header protection + CID rotation)
+> is a deferred hardening phase.
+
+---
+
+## 5. Cryptography layer (`core/src/crypto/`)
 
 | Module | Type | Role |
 | --- | --- | --- |
-| `hybrid_kem` | `HybridSecretKey`, `HybridKeyPackage`, `HybridCiphertext` | X25519 + Kyber768; ZeroizeOnDrop on secret |
-| `hybrid_sign` | `HybridSigningKey`, `HybridVerifyingKey`, `HybridSignature` | Ed25519 + Dilithium3; ZeroizeOnDrop |
-| `adaptive_crypto` | `CryptoSession`, `CipherSuite`, `HwCaps` | Per-direction AEAD with counter-derived nonce; HW auto-selection |
-| `aes_session` | `AesSession` | Earlier AEAD reference design; still used in places |
-| `pow` | `PoWChallenge`, `PoWSolution` | Proof-of-work for handshake DoS resistance |
+| `hybrid_kem` | `HybridSecretKey`, `HybridKeyPackage`, `HybridCiphertext` | X25519 + ML-KEM-768 (FIPS 203); ECDH-P-256 + ML-KEM-768 under `fips`. `ZeroizeOnDrop` on secrets. Combiner = `HKDF-SHA256(ss_classical ‖ ss_pq)` under a domain label. |
+| `hybrid_sign` | `HybridSigningKey`, `HybridVerifyingKey`, `HybridSignature` | Ed25519 (`verify_strict`) + ML-DSA-65 (FIPS 204); both halves must verify. `ZeroizeOnDrop`. |
+| `adaptive_crypto` | `CryptoSession`, `CipherSuite`, `HwCaps` | AES-256-GCM / ChaCha20-Poly1305 with the `prefix ‖ packet_number` nonce; HW auto-select (AES-NI → AES). `aws-lc-rs` backend + ChaCha rejected under `fips`. |
+| `kdf` | side-agnostic `derive_key_32` + early-data keying | `blake3::derive_key` (default) / `HKDF-SHA256` (`fips`). |
+| `rng` | `RngProvider` + `OsRng` | `getrandom` default; `aws-lc-rs` CTR_DRBG under `fips`. |
+| `self_tests` | `run_post` / `ensure_post_passed` | FIPS 140-3 §7.7 power-on self-tests; auto-invoked under `fips` before any handshake (Invariant 11). |
+| `aes_session` | `AesSession` | Reference per-direction AEAD pattern. |
+| `pow` | `PoWChallenge`, `PoWSolution` | blake3 PoW + stateless cookie DoS gate (constant-time MAC compare). |
 
-The crate has `#[allow(unsafe_code)]` in three modules: `transport/udp_transport.rs` for libc GSO syscalls, `transport/legs/wasi.rs` for WASI syscalls, and `transport/legs/websocket.rs` for wasm-bindgen JS-boundary glue. The previous `crypto/keys.rs` (pqcrypto byte zeroing via `ptr::write_volatile`) was deleted in Phase 5.1; ml-dsa and ml-kem now provide native `ZeroizeOnDrop` (hybrid_sign and hybrid_kem modules).
+`#![deny(unsafe_code)]` at the crate root; three audited, sound opt-ins:
+`transport/udp_transport.rs` (libc GSO/`recvmmsg`), `transport/legs/wasi.rs`
+(`unsafe impl Send/Sync` over WIT-bindgen handles), `transport/legs/websocket.rs`
+(wasm-bindgen JS glue). No `unsafe` in `crypto/`.
 
 ---
 
-## 5. Concurrency model
+## 6. Concurrency model
+
+**Task topology per session: three spawned units** (main `select!` loop + delivery
+task + reader task), communicating via `mpsc` channels + `Arc<…>` shared state.
 
 ```
-              ┌────────────────────────────────────┐
-              │  PhantomSession (Arc<Self>)         │  ← cloned freely;
-              │   id, peer, state (AtomicU8),       │     all method bodies
-              │   send_queue (tokio::Mutex),        │     take &self
-              │   cmd_tx (mpsc::Sender),            │
-              │   recv_rx (tokio::Mutex<Receiver>), │
-              │   demux (Arc<Demultiplexer>),       │
-              │   streams (Arc<DashMap>)            │
-              └─────┬──────────────────────┬───────┘
-                    │                      │
-                    │ cmd_tx               │ recv_rx
-                    ▼                      ▲
-              ┌─────────────────────────────────────────────────────────────────────┐
-              │ run_data_pump  (the calling / select! task)                         │
-              │                                                                     │
-              │ spawns DELIVERY task:                                               │
-              │   deliver_rx.recv()                                                 │
-              │     → undelivered_bytes -= n                                        │
-              │     → record_app_consumed → stage WINDOW_UPDATE credit              │
-              │   → recv_tx.send().await        (app-paced; the backpressure point) │
-              │                                                                     │
-              │ spawns READER task  (never blocks on the app consumer):             │
-              │   transport.recv_bytes() → PhantomPacket::from_wire                 │
-              │     → AEAD decrypt + per-stream replay check                        │
-              │     → inline ACK for RELIABLE (unencrypted; no rekey dep)           │
-              │     → deliver_tx.send()   [unbounded queue, never blocks]           │
-              │     → route_close on FIN                                            │
-              │                                                                     │
-              │ loop select! { poll_interval.tick() | send_notify.notified()        │
-              │                | cmd_rx.recv() | recv_done_rx => break }            │
-              └─────────────────────────────────────────────────────────────────────┘
+PhantomSession (Arc) ── cmd_tx ──► run_data_pump select! loop ── drain/flush/apply_liveness (10ms) ──► transport.send_bytes
+       ▲ recv_rx ◄── delivery task ◄── deliver_rx (unbounded) ◄── reader task: recv_bytes → handle_packet → AEAD → replay → dispatch
 ```
 
-**Task topology per session: 3 spawned tasks.**
+**Shared mutable state & its primitives:**
+- `ArcSwap` — `Session.crypto` (rekey), and on the UDP transport: `UdpServerTransport.peer`
+  + `candidate`, `UdpClientTransport.socket` + `prev_socket` (migration swaps, lock-free w.r.t.
+  the send/recv loops).
+- `parking_lot::RwLock` / `Mutex` — `state`, `traffic_secret`, `liveness_config`,
+  `bandwidth_estimator`; `recv_replay` (`Mutex<ReplayWindow>`).
+- `AtomicU8/U32/U64` — `epoch`, `send_packet_number` (the nonce/replay counter), `send_path_id`,
+  the anti-amp budget (`cand_recv`/`cand_sent`), `ConnectionState`.
+- `dashmap::DashMap` — the per-stream map.
+- `mpsc` (bounded cmd + bounded app-recv; unbounded delivery decoupling).
 
-- The main task (`run_data_pump`) drives the send path and application command channel via the `select!` loop.
-- The delivery task handles the app-paced `recv_tx.send()` and flow-control window crediting from the unbounded `deliver_rx` queue.
-- The reader task drives the receive path: decrypt, emit inline ACKs, and hand off data to `deliver_tx` without blocking.
+**Rekey serialization (honest note):** `rekey_lock` serializes each epoch transition, but
+there are **two writers** to `(epoch, crypto)`: the send loop (`rekey_before_stamp`) and the
+**recv task** (the forward-rekey catch-up commits on an authenticated peer rekey). The
+nonce is safe regardless (fresh per-epoch prefix + unique `u64` PN), but a recv-side commit
+can race a concurrent send's read-epoch→encrypt window and produce a self-inconsistent
+epoch-stamp that the peer drops (reliable data self-heals via ARQ). The in-code "single
+rekey owner" comments overstate this — the recv task is a second writer.
 
-They communicate through `mpsc` channels (one for commands client→pump,
-one for decrypted payloads pump→app) and through `Arc<...>` shared
-state.
-
-**Concurrency primitives used:**
-
-- `tokio::sync::Mutex` — for state held across `.await`.
-- `parking_lot::RwLock` — for fast sync state.
-- `AtomicU8` / `AtomicU32` / `AtomicU64` — for lock-free flags and
-  counters.
-- `dashmap::DashMap` — for the per-stream map (lock-free concurrent map).
-- `tokio::sync::mpsc` (bounded) — async channels for commands (cmd_rx/cmd_tx) and bounded app recv (recv_tx/recv_rx).
-- `tokio::sync::mpsc::unbounded_channel` — for receive-delivery decoupling (`deliver_tx`/`deliver_rx`), allowing the reader to hand off data without blocking on app consumption.
-
-**Lock-free fast path.** Phase 2.7 dropped the `RwLock` around
-`CryptoState`, so encrypt/decrypt now reads through a plain `&CryptoState`
-reference — no lock acquisition per packet. Interior counters in
-`CryptoSessionInner` are `AtomicU64`.
-
----
-
-## 6. Ownership model
-
-`PhantomSession` is `Arc<Self>` from construction. Cloning is cheap (refcount
-bump). The spawned tasks all hold `Arc<...>` clones of the things they
-need; nothing crosses task boundaries by reference.
-
-`Session` (the lower-level transport association) is owned by the
-spawned data pump task as `Arc<Session>` — the same value flows from
-the handshake into the data plane.
-
-`CryptoState`, `HandshakeServer`, `HandshakeClient`, and
-`Session.resumption_secret` all carry `ZeroizeOnDrop` so dropping the
-Arc — once refcount hits zero — zeroes the key material before the
-allocator reuses the memory.
+**Single-threaded reader.** The per-session reader processes `recv_bytes` then
+`handle_packet` **sequentially** per datagram; this ordering is load-bearing for migration
+correctness (the legitimate `PATH_VALIDATION` echo's own `recv_bytes` sets the candidate
+before `handle_packet` promotes it). Making the reader concurrent would require binding the
+promoted peer to the authenticated challenge source.
 
 ---
 
-## 7. Wire framing
+## 7. Ownership model
 
-For TCP-based legs (`TcpSessionTransport`), every
-`PhantomPacket` is wrapped in a 4-byte big-endian length prefix on the
-TCP byte stream:
-
-```
-[len: u32 BE][PhantomPacket::to_wire image]
-[len: u32 BE][PhantomPacket::to_wire image]
-...
-```
-
-Maximum frame size: `MAX_FRAME_BYTES = 16 MiB`
-(`core/src/api/tcp_transport.rs:21`). Frames larger than the cap are
-rejected at the framing layer before the packet is parsed.
-
-KCP-based legs reuse KCP's own segmentation; FakeTLS wraps frames in
-fake TLS 1.3 records.
+`PhantomSession` is `Arc<Self>` from construction (cheap clones; all methods take `&self`).
+The lower-level `Session` flows from the handshake into the data-pump task as `Arc<Session>`.
+Migration state (`peer`/`socket`/`candidate`) lives behind `ArcSwap` inside the concrete UDP
+transport, swapped atomically without touching the generic pump. `CryptoState`,
+`HandshakeServer/Client`, and `Session.resumption_secret` are `ZeroizeOnDrop`. *(Audit gap:
+the `Session.traffic_secret` rekey-master and the handshake `shared_secret` copy are **not**
+yet zeroized — tracked in the pre-1.0 remediation plan.)*
 
 ---
 
-## 8. Error propagation
+## 8. Wire framing
 
-Errors flow upward as typed `CoreError` (UniFFI-exported) at the API
-boundary, internally as the more specific module-level error enums
-(`HandshakeError`, `CryptoError`, etc.). The conversion is mechanical:
-each module's `From<ModuleError> for CoreError` impl maps the variant.
+- **PhantomUDP** (primary): `[flags: u8][cid: 8]` envelope + fragmentation to
+  `PATH_MTU = 1200`; reassembled before parsing the inner `PhantomPacket`.
+- **TCP** (`TcpSessionTransport`): a 4-byte big-endian length prefix per `PhantomPacket`,
+  capped at `MAX_FRAME_BYTES = 16 MiB`; a tight `HANDSHAKE_FRAME_CAP` bounds the
+  unauthenticated handshake frame. *(The legacy KCP and FakeTLS legs were removed; FakeTLS
+  HTTP-mimicry will return as a dedicated transport mode.)*
 
-The public surface has **no** `.unwrap()` / `.expect()` / `panic!` /
-`unreachable!` calls in production code paths
-(`#![warn(clippy::unwrap_used, ...)]` in `lib.rs` enforces this for the
-lib target; test/bench scaffolding is exempt).
+The inner `PhantomPacket` wire image is one bare packet (`header(47) ‖ payload_len:u32be ‖
+payload ‖ ext_len:u32be ‖ extensions`); `from_wire` is bounds-checked and overflow-safe.
 
 ---
 
-## 9. Performance landmarks
+## 9. Error propagation
 
-| Module | Why it's hot | What we did |
+Errors flow upward as typed `CoreError` (UniFFI-exported) at the API boundary; internally
+as module-level enums (`HandshakeError`, `CryptoError`, `WireError`). Conversions are
+mechanical `From` impls. The recv/handshake/data-plane hot paths carry **no**
+`unwrap`/`expect`/`panic`/`unreachable` (`#![deny(clippy::unwrap_used, …)]`; the 16
+inventoried production panic sites are documented in `docs/security/panic-sites.md`).
+A wrong-key / wrong-AAD / wrong-PN failure all surface as a single opaque "decrypt failed".
+
+---
+
+## 10. Performance landmarks
+
+| Module | Why hot | What we did |
 | --- | --- | --- |
-| `api/session.rs::run_data_pump` (recv) | Every inbound packet | Unbounded delivery queue decoupling (Phase 2.2, prevent reader blocking on slow consumers); inline ACK emission in reader (Phase 2.3); ACK buffer hoisted (Phase 2.3); per-stream WINDOW_UPDATE sequence (Phase 4.3); inline FIN sequence (Phase 4.3) |
-| `api/session.rs::send_app_data` | Every outbound packet | `Vec::with_capacity(payload + 64)` to avoid realloc (Phase 2.3) |
-| `transport/session.rs::encrypt/decrypt_packet` | Per packet | Lock-free `&CryptoState` (Phase 2.7) |
-| `transport/udp_transport.rs` | UDP fast paths | GSO / `sendmmsg` on Linux (pre-existing) |
-| `crypto/adaptive_crypto.rs` | Per AEAD op | HW-AES detection; ring's optimized AES-NI / NEON paths |
+| `run_data_pump` (recv) | Every inbound packet | Unbounded delivery-queue decoupling; authenticated SACK ACK; the 10 ms tick also runs the (cheap) liveness sweep |
+| `send_app_data` | Every outbound packet | Pre-sized buffers; PN drawn once at send (nonce never reused) |
+| `session.rs::encrypt/decrypt_packet` | Per packet | Lock-free `ArcSwap` `CryptoState` load; nonce from the authenticated header |
+| `udp_transport.rs` | UDP fast path | GSO / `sendmmsg` on Linux |
+| `adaptive_crypto.rs` | Per AEAD op | HW-AES detection; ring/aws-lc optimized paths |
+| `observability/atomics.rs` | Per packet record | Lock-free `CachePadded` atomics (~2.5 ns/call) |
 
-Hot paths still on the deferred list:
-- `api/tcp_transport.rs::recv_bytes` allocates a fresh `Vec` per packet
-  (Phase 2.1, blocked on `SessionTransport` trait refactor).
-- The 10 ms `poll_interval.tick()` in `run_data_pump` (Phase 2.4
-  event-driven replacement).
-
----
-
-## 10. Module dependency map
-
-```
-                    api/
-                  ┌──┴──┐
-                 session  listener  stream  config  tcp_transport
-                    │       │        │       │       │
-                    │       └────┐   │       │       │
-                    │            ▼   │       │       │
-                    │       transport│       │       │
-                    │       ┌───────┴┐      │       │
-                    └──────►│session │◄─────┤       │
-                            │handshake      │       │
-                            │stream         │       │
-                            │types          │       │
-                            │legs/*         │       │
-                            └──┬───────────┴───────┘
-                               │
-                               ▼
-                             crypto/
-                         ┌─────┴─────┐
-                       hybrid_kem  hybrid_sign  adaptive_crypto  pow  keys
-                            │            │             │           │    │
-                            └────────────┴─────────────┴───────────┴────┘
-                                          standard / OS crates only
-```
-
-`security/` is parallel to `transport/` and similarly depends only on
-`crypto/` + std.
+Per-packet overhead is 71 bytes (47-byte header incl. a 32-byte plaintext `session_id`, +8
+length, +16 AEAD tag) — heavy for small/voice payloads; the future header-protection phase
+(QUIC-style PN encryption + shorter/rotated CID) is the lever.
 
 ---
 
-## 11. Roadmap for evolution
-
-The architecture sketched here is the single-protocol baseline. The major
-moves in the eight-phase production-readiness plan:
-
-- **Phase 3**: introduce a `Runtime` trait between the API layer and
-  the tokio types, so WASM / embedded backends can drop into the same
-  shape. The trait itself has landed in [`crate::runtime`] with
-  `TokioRuntime` as the default impl; call-site migration is in
-  progress.
-- **Phase 4**: turn `Scheduler` from a placeholder into a real
-  multi-path / migration policy (`PacketHeader.path_id` is in place;
-  scheduler integration is the next step).
-- **Phase 5**: gate the crypto layer behind `fips` feature so it can be
-  built with ML-KEM / ML-DSA / aws-lc-rs primitives.
-- **Phase 4.5**: insert `tracing` instrumentation and `metrics`
-  counters at the boundary between the API layer and the data pump
-  without altering the data flow. Tracing foundation is in place on
-  the four entry points (Phase 4.5 partial).
-
-The split into the four layers (api / transport / crypto / runtime) is
-designed to keep each of those moves self-contained.
-
-## 12. The `runtime/` module (Phase 3.1)
+## 11. Module dependency map
 
 ```
-                ┌────────────────────────────────┐
-                │  runtime::Runtime  (trait)      │
-                │  ┌──────────────────────────┐  │
-                │  │ spawn(BoxFuture<()>)     │  │
-                │  │ sleep(Duration)          │  │
-                │  │ now_monotonic()          │  │
-                │  │ now_wall_clock()         │  │
-                │  └──────────────────────────┘  │
-                └────────────────┬───────────────┘
-                                 │ implemented by
-                  ┌──────────────┼──────────────┬─────────────┐
-                  ▼              ▼              ▼             ▼
-           TokioRuntime   (WasmRuntime)   (EmbeddedRuntime)  test mocks
-              ✅              scaffold         scaffold
+                api/  session · listener · udp_listener · udp_transport · stream · config · tcp_transport
+                  │
+                  ▼
+            transport/  session · handshake · stream · sack · path · liveness · types
+                        phantom_udp/{envelope,datagram} · scheduler · pacer · bandwidth_estimator · legs/*
+                  │
+                  ▼
+              crypto/  hybrid_kem · hybrid_sign · adaptive_crypto · kdf · rng · self_tests · pow
+                  │
+                  ▼
+            standard / OS crates only
+
+   security/ (replay_window)   runtime/ (Runtime trait)   observability/ (OTel)   ── siblings of transport/
 ```
 
-`TokioRuntime` is a zero-sized struct that wraps the existing
-`tokio::spawn` / `tokio::time::sleep` / `std::time::Instant` /
-`std::time::SystemTime` calls. Callers that take `Arc<dyn Runtime>`
-have zero behavioural difference today.
+---
 
-`SpawnHandle` is the runtime-agnostic equivalent of
-`tokio::task::JoinHandle<()>` — exposes `abort()` and `is_finished()`.
-Dropping it detaches the task (matches tokio semantics).
+## 12. The `runtime/` module
 
-When WASM and embedded backends land, they implement the same trait;
-no other code in the crate needs to change shape.
+A `Runtime` trait (`spawn` / `sleep` / `now_monotonic` / `now_wall_clock`) between the
+data plane and the concrete async runtime. Default `TokioRuntime` (native, zero-cost).
+`WasmRuntime` (browser, `spawn_local` + `Performance.now()`), `WasiRuntime` (WASI P2,
+single-task `drive()` executor), and an `EmbeddedRuntime` scaffold all implement the same
+trait, injected via the `_with_runtime` constructor variants (UniFFI stays on `TokioRuntime`).
+`SpawnHandle` is the runtime-agnostic `JoinHandle` equivalent (`abort` / `is_finished`).
+
+---
+
+## 13. Evolution & known hardening backlog
+
+- **Phase 3** (portability): the `Runtime` trait + WASM/WASI/embedded backends — **landed**;
+  `wasm32-unknown-unknown` / `wasm32-wasip2` / `thumbv7em-none-eabihf` are hard CI gates.
+- **Phase 4** (connection migration & liveness, P4.0–P4.4): the per-direction `u64` PN
+  (retiring the C1 nonce-reuse hazard), server-side path detection + challenge, the peer
+  switch + client `migrate()` + dual-socket overlap, and the liveness state machine — **all
+  shipped** (see § 4 and PROTOCOL.md §12).
+- **Phase 5** (`fips`): the aws-lc-rs FIPS-140-3 substrate swap — **shipped**.
+- **Phase 8** (observability): the OpenTelemetry refactor (`observability/`) replaced the
+  Phase-4.5 hand-rolled metrics — **shipped**.
+- **Deferred hardening:** unlinkable migration (header protection / PN encryption + CID
+  rotation) — the `u64` PN and single PN space are HP-ready by design.
+- **Pre-1.0 remediation backlog** (from the 2026-06-11 security audit + external spec review):
+  PhantomUDP pre-auth DoS bounding (demux `routes` cap, cookie-before-slot, reorder-byte
+  budget + `MAX_STREAMS`), authentication-ordering fixes (encrypted FIN, AEAD-bound migration
+  candidate, reputation validity/poisoning), ICMP-as-advisory, passive-NAT-rebind recovery,
+  master-secret zeroization, KEM-combiner ct/pk binding, `extensions`-in-AAD, MSRV/CI, and the
+  ML-KEM/ML-DSA NIST-KAT gate. See `docs/security/audit-report-2026-06-11.md` and the
+  consolidated remediation plan.
+
+The four-layer split (api / transport / crypto / runtime, with security & observability
+siblings) keeps each of these self-contained.
