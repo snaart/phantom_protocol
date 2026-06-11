@@ -13,14 +13,10 @@ use crate::transport::{
     path::{PathRegistry, PathStateKind, PATH_CHALLENGE_LEN},
     scheduler::Scheduler,
     stream::Stream,
-    types::{
-        ControlMessage, PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId,
-        StreamId,
-    },
+    types::{PacketHeader, PacketNumber, SchedulerMode, SessionId, StreamId},
 };
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -65,19 +61,6 @@ pub const REKEY_SOFT_LIMIT: u64 = AEAD_MAX_INVOCATIONS / 2;
 /// practice (production `REKEY_SOFT_LIMIT` of `2^47`) the gap is essentially
 /// always 0 or 1.
 pub const MAX_REKEY_CATCHUP: u8 = 16;
-
-/// Per-stream sequence-space high-watermark that forces a mid-session rekey
-/// (C1). The AEAD nonce is `(epoch, stream_id, sequence, path_id)`; `sequence`
-/// is a per-stream `u32` that wraps at `2^32`. A single hot stream would wrap —
-/// reusing a nonce under a fixed key (the Forbidden Attack on AES-GCM) — long
-/// before the *direction-wide* [`REKEY_SOFT_LIMIT`] (`2^47`) could fire. So once
-/// *any* stream's sequence advances this far within the current epoch, the send
-/// path forces a rekey: the epoch bump gives every subsequent packet a fresh
-/// nonce prefix, and no stream can traverse the full `2^32` sequence space
-/// within a single epoch. `2^31` leaves a full `2^31` of headroom below the wrap
-/// to absorb reordered / in-flight packets from the old epoch. Tests lower it
-/// via [`Session::set_seq_rekey_watermark`].
-pub const SEQ_REKEY_WATERMARK: u32 = 1 << 31;
 
 /// Crypto state for session encryption.
 ///
@@ -183,17 +166,6 @@ pub struct Session {
     /// mid-session rekey (C1). Defaults to [`REKEY_SOFT_LIMIT`]; tests/embedders
     /// lower it via [`set_rekey_threshold`](Self::set_rekey_threshold).
     rekey_after: AtomicU64,
-    /// Per-stream sequence high-watermark that forces a rekey for AEAD nonce
-    /// uniqueness (C1). Defaults to [`SEQ_REKEY_WATERMARK`] (`2^31`); tests lower
-    /// it via [`set_seq_rekey_watermark`](Self::set_seq_rekey_watermark).
-    seq_rekey_watermark: AtomicU32,
-    /// Per-stream `(epoch, base_sequence)` checkpoint bounding how far a stream's
-    /// sequence may advance within one epoch (C1). `base_sequence` is the stream's
-    /// sequence when it entered the current epoch; the send path forces a rekey
-    /// once `sequence - base_sequence` crosses
-    /// [`seq_rekey_watermark`](Self::seq_rekey_watermark). Rebased lazily, per
-    /// stream, on the first send after an epoch change.
-    seq_epoch_base: DashMap<StreamId, (u8, u32)>,
     /// Serialises every epoch transition (C1). The data pump runs the send loop
     /// and the receive task concurrently over one `Arc<Session>`, so a send-side
     /// `rekey()` can race a receive-side ratchet. Both hold this mutex across
@@ -208,8 +180,6 @@ pub struct Session {
     streams: RwLock<HashMap<StreamId, Arc<Stream>>>,
     /// Next stream ID counter
     next_stream_id: AtomicU32,
-    /// Control sequence number
-    control_sequence: AtomicU32,
     /// Multi-path scheduler
     scheduler: Arc<Scheduler>,
     /// Resumption secret for 0-RTT
@@ -219,10 +189,14 @@ pub struct Session {
     /// Fallback state machine
     #[allow(dead_code)]
     fallback: Arc<FallbackStateMachine>,
-    /// Per-stream sliding-window replay protection. Lazily populated as
-    /// streams appear on the wire. Sits alongside (not in place of) the AEAD
-    /// strict-counter replay protection — see `decrypt_packet`.
-    replay_windows: DashMap<StreamId, Mutex<ReplayWindow>>,
+    /// Per-direction monotonic AEAD packet number (① — Phase 4). Every outbound
+    /// packet draws the next value here at send time, so the AEAD nonce is never
+    /// reused. Replaces the deleted per-stream `send_sequence` + the C1 watermark.
+    send_packet_number: AtomicU64,
+    /// Per-direction sliding-window replay protection on the packet number
+    /// (① — Phase 4, Inv-4). One window per direction (the PN is unique across all
+    /// streams), replacing the per-`StreamId` `DashMap<…, ReplayWindow>`.
+    recv_replay: Mutex<ReplayWindow>,
     /// Cumulative count of replay rejections (across all streams) — exposed
     /// for metrics/telemetry.
     replay_rejected_total: AtomicU64,
@@ -275,18 +249,16 @@ impl Session {
             traffic_secret: RwLock::new(*shared_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
-            seq_rekey_watermark: AtomicU32::new(SEQ_REKEY_WATERMARK),
-            seq_epoch_base: DashMap::new(),
             rekey_lock: Mutex::new(()),
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
-            control_sequence: AtomicU32::new(0),
             scheduler: Arc::new(Scheduler::new(SchedulerMode::LowLatency)),
             resumption_secret: RwLock::new(None),
             last_activity: RwLock::new(Instant::now()),
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
-            replay_windows: DashMap::new(),
+            send_packet_number: AtomicU64::new(0),
+            recv_replay: Mutex::new(ReplayWindow::new()),
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
             pacer: Arc::new(Pacer::unlimited()),
@@ -317,18 +289,16 @@ impl Session {
             traffic_secret: RwLock::new(traffic_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
-            seq_rekey_watermark: AtomicU32::new(SEQ_REKEY_WATERMARK),
-            seq_epoch_base: DashMap::new(),
             rekey_lock: Mutex::new(()),
             is_server,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
-            control_sequence: AtomicU32::new(0),
             scheduler: Arc::new(Scheduler::new(scheduler_mode)),
             resumption_secret: RwLock::new(None),
             last_activity: RwLock::new(Instant::now()),
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
-            replay_windows: DashMap::new(),
+            send_packet_number: AtomicU64::new(0),
+            recv_replay: Mutex::new(ReplayWindow::new()),
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
             pacer: Arc::new(Pacer::unlimited()),
@@ -354,18 +324,16 @@ impl Session {
             traffic_secret: RwLock::new(*resumption_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
-            seq_rekey_watermark: AtomicU32::new(SEQ_REKEY_WATERMARK),
-            seq_epoch_base: DashMap::new(),
             rekey_lock: Mutex::new(()),
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
-            control_sequence: AtomicU32::new(0),
             scheduler: Arc::new(Scheduler::new(SchedulerMode::LowLatency)),
             resumption_secret: RwLock::new(Some(*resumption_secret)),
             last_activity: RwLock::new(Instant::now()),
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
-            replay_windows: DashMap::new(),
+            send_packet_number: AtomicU64::new(0),
+            recv_replay: Mutex::new(ReplayWindow::new()),
             replay_rejected_total: AtomicU64::new(0),
             path_registry,
             pacer: Arc::new(Pacer::unlimited()),
@@ -549,37 +517,6 @@ impl Session {
         self.rekey_after.store(n.max(1), Ordering::Relaxed);
     }
 
-    /// Override the per-stream sequence rekey watermark (default
-    /// [`SEQ_REKEY_WATERMARK`], `2^31`). Clamped to `>= 1`. Rust-only — primarily
-    /// for tests/soak harnesses that need to exercise the per-stream forced rekey
-    /// (C1) without driving a single stream through `2^31` sequence numbers.
-    pub fn set_seq_rekey_watermark(&self, n: u32) {
-        self.seq_rekey_watermark.store(n.max(1), Ordering::Relaxed);
-    }
-
-    /// True once `stream_id`'s sequence has advanced past the per-stream
-    /// watermark within the current epoch (C1). The send path checks this before
-    /// stamping each packet and, when set, forces a [`rekey`](Self::rekey) so a
-    /// per-stream `u32` sequence can never wrap within one epoch — which would
-    /// otherwise repeat the AEAD nonce `(epoch, stream_id, sequence, path_id)`
-    /// under a fixed key (Invariant 8).
-    ///
-    /// The per-stream `(epoch, base)` checkpoint is rebased lazily on the first
-    /// call after an epoch change, so the measured span is always relative to
-    /// where the stream entered the *current* epoch.
-    pub fn stream_seq_needs_rekey(&self, stream_id: StreamId, seq: u32) -> bool {
-        let epoch = self.current_epoch();
-        let mut entry = self.seq_epoch_base.entry(stream_id).or_insert((epoch, seq));
-        let (base_epoch, base_seq) = *entry;
-        if base_epoch != epoch {
-            // First send on this stream since a rekey — rebase to the current
-            // sequence and measure this epoch's span from here.
-            *entry = (epoch, seq);
-            return false;
-        }
-        seq.wrapping_sub(base_seq) >= self.seq_rekey_watermark.load(Ordering::Relaxed)
-    }
-
     /// True once the send direction has crossed the rekey high-watermark and the
     /// epoch has room to advance. The data pump checks this before each
     /// application send and, when set, rekeys + flags the packet `REKEY` so the
@@ -668,16 +605,12 @@ impl Session {
         // epoch-independent, so it needs no rekey serialisation).
         self.commit_forward_crypto(steps, final_secret, final_crypto);
         drop(_rekey);
-        let window_entry = self
-            .replay_windows
-            .entry(header.stream_id)
-            .or_insert_with(|| Mutex::new(ReplayWindow::new()));
-        let accepted = window_entry.lock().accept(header.sequence);
+        let accepted = self.recv_replay.lock().accept(header.packet_number);
         if !accepted {
             self.replay_rejected_total.fetch_add(1, Ordering::Relaxed);
             return Err(CoreError::ReplayDetected(format!(
-                "stream {} sequence {} already seen or beyond window",
-                header.stream_id, header.sequence
+                "packet_number {} already seen or beyond window",
+                header.packet_number
             )));
         }
         Ok(plaintext)
@@ -788,6 +721,20 @@ impl Session {
         self.bandwidth_estimator.lock().on_loss(bytes);
     }
 
+    /// Reset the congestion controller + pacer to startup (Phase 4 / QUIC §9.4):
+    /// a migration path switch lands on a different network, so the old
+    /// bottleneck-bandwidth / cwnd estimate must not carry over — inheriting a low
+    /// RTT/cwnd would trigger a spurious-retransmit storm on the first packets of
+    /// the new path. Wired by the P4.2 migration switch.
+    pub fn reset_congestion(&self) {
+        let mut est = self.bandwidth_estimator.lock();
+        *est = BandwidthEstimator::new();
+        let rate = est.pacing_rate();
+        drop(est);
+        // Drop the dead path's stale pacing rate; BBR re-paces on the first ACK.
+        self.pacer.set_rate(rate);
+    }
+
     /// Current BBR congestion-control state. Observability / test hook — lets
     /// callers confirm a loss drove the estimator into `FastRecovery`.
     pub fn bbr_state(&self) -> crate::transport::bandwidth_estimator::BbrState {
@@ -823,40 +770,35 @@ impl Session {
         self.send_notify.notify_one();
     }
 
-    /// Build the AEAD nonce from the authenticated header fields.
+    /// Reserve the next outbound packet number for this direction (① — Phase 4).
+    /// Strictly monotonic; never reused within a session. Drawn by the data pump
+    /// for every outbound packet (data, control, path-validation, retransmit) at
+    /// send time, so the AEAD nonce is never reused.
+    pub fn next_send_pn(&self) -> PacketNumber {
+        self.send_packet_number.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Build the AEAD nonce (① — Phase 4): `prefix(4) ‖ packet_number(8)` = 12 B.
     ///
-    /// Layout (12 bytes total):
-    /// ```text
-    ///   [0..4]  : nonce_prefix (from CryptoState; identical for the lifetime
-    ///             of a session, freshly derived per rekey)
-    ///   [4]     : epoch
-    ///   [5..7]  : stream_id (big-endian)
-    ///   [7..11] : sequence  (big-endian)
-    ///   [11]    : path_id
-    /// ```
-    ///
-    /// Uniqueness argument: senders never reuse `(stream_id, sequence)`
-    /// within a single epoch. The path_id distinguishes the same logical
-    /// packet replayed across paths (Phase 4.2 multi-path). Together the
-    /// 12-byte nonce is unique for every `seal_in_place_*` invocation
-    /// under the given key.
+    /// `epoch` / `stream_id` / `path_id` are authenticated in the 47-byte AAD but
+    /// NOT in the nonce — a `u64` packet number is unique per direction within an
+    /// epoch (and the prefix is fresh per epoch), so the nonce is never reused.
+    /// `epoch` is still read from the header to select the key. Audit anchor: "PN
+    /// strictly monotonic, used once per direction → nonce never reused, full stop."
     fn build_packet_nonce(prefix: [u8; 4], header: &PacketHeader) -> [u8; 12] {
         let mut n = [0u8; 12];
         n[..4].copy_from_slice(&prefix);
-        n[4] = header.epoch;
-        n[5..7].copy_from_slice(&header.stream_id.to_be_bytes());
-        n[7..11].copy_from_slice(&header.sequence.to_be_bytes());
-        n[11] = header.path_id;
+        n[4..12].copy_from_slice(&header.packet_number.to_be_bytes());
         n
     }
 
     /// Encrypt a packet payload.
     ///
-    /// The AEAD nonce is derived from the authenticated `(epoch, stream_id,
-    /// sequence, path_id)` fields of the packet header rather than from an
-    /// internal monotonic counter, so a failed peer decrypt never desyncs the
-    /// receiver. The AAD is the 45-byte wire image of the header
-    /// ([`PacketHeader::to_wire`]), so any wire-level mutation invalidates the tag.
+    /// The AEAD nonce is `prefix || packet_number` (① — Phase 4), derived from the
+    /// authenticated header rather than an internal counter, so a failed peer
+    /// decrypt never desyncs the receiver. The AAD is the 47-byte wire image of the
+    /// header ([`PacketHeader::to_wire`]) — which still binds `epoch` / `stream_id`
+    /// / `path_id` — so any wire-level mutation invalidates the tag.
     pub fn encrypt_packet(
         &self,
         header: &PacketHeader,
@@ -868,10 +810,10 @@ impl Session {
         crypto.encrypt_with_nonce(nonce, &header_bytes, plaintext)
     }
 
-    /// Decrypt a packet payload. Performs AEAD verify + per-stream
-    /// sliding-window replay rejection (the window check runs **after** a
-    /// successful AEAD open — Invariant 4 — so we never key off
-    /// un-authenticated sequence numbers).
+    /// Decrypt a packet payload. Performs AEAD verify + per-direction
+    /// sliding-window replay rejection on the packet number (the window check runs
+    /// **after** a successful AEAD open — Invariant 4 — so we never key off
+    /// un-authenticated packet numbers).
     ///
     /// A failed decrypt does NOT desync future decrypts: the AEAD nonce is
     /// derived from this packet's authenticated header fields, so the receiver
@@ -892,36 +834,15 @@ impl Session {
         // replay identity because replay is a property of "is this sequence
         // a duplicate", independent of which path it arrived over or which
         // rekey generation produced it.
-        let window_entry = self
-            .replay_windows
-            .entry(header.stream_id)
-            .or_insert_with(|| Mutex::new(ReplayWindow::new()));
-        let accepted = window_entry.lock().accept(header.sequence);
+        let accepted = self.recv_replay.lock().accept(header.packet_number);
         if !accepted {
             self.replay_rejected_total.fetch_add(1, Ordering::Relaxed);
             return Err(CoreError::ReplayDetected(format!(
-                "stream {} sequence {} already seen or beyond window",
-                header.stream_id, header.sequence
+                "packet_number {} already seen or beyond window",
+                header.packet_number
             )));
         }
         Ok(plaintext)
-    }
-
-    /// Create a control packet
-    pub fn create_control_packet(
-        &self,
-        _message: ControlMessage,
-        payload: Vec<u8>,
-    ) -> PhantomPacket {
-        let seq = self.control_sequence.fetch_add(1, Ordering::SeqCst);
-        let header = PacketHeader::new(
-            self.id,
-            0, // control stream
-            seq,
-            PacketFlags::new(PacketFlags::CONTROL | PacketFlags::RELIABLE),
-        );
-        // Note: Real implementation would also encrypt control packet
-        PhantomPacket::new(header, payload)
     }
 
     /// Get the scheduler

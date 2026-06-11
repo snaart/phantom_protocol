@@ -93,7 +93,7 @@ proptest! {
     /// the absolute values picked.
     #[test]
     fn replay_window_accepts_monotonic(
-        starts in proptest::collection::vec(0u32..1_000_000_u32, 1..32),
+        starts in proptest::collection::vec(0u64..1_000_000_u64, 1..32),
     ) {
         let mut sorted = starts.clone();
         sorted.sort_unstable();
@@ -108,11 +108,11 @@ proptest! {
     /// it is rejected (within the 1024-bit window).
     #[test]
     fn replay_window_rejects_duplicates(
-        base in 1024u32..(u32::MAX / 2),
+        base in 1024u64..(u64::MAX / 2),
         // offset must be strictly positive — `offset == 0` would mean
         // `seq == base`, and `base` was already accepted on the first
         // call, so the "first time it shows up" precondition fails.
-        offset in 1u32..1023,
+        offset in 1u64..1023,
     ) {
         let mut w = ReplayWindow::new();
         prop_assert!(w.accept(base));
@@ -133,7 +133,7 @@ proptest! {
     fn wire_round_trip_preserves_fields(
         sid_bytes in proptest::array::uniform32(any::<u8>()),
         stream_id in any::<u16>(),
-        sequence in any::<u32>(),
+        sequence in any::<u64>(),
         flags_bits in any::<u16>(),
         epoch in any::<u8>(),
         path_id in any::<u8>(),
@@ -155,7 +155,7 @@ proptest! {
 
         prop_assert_eq!(decoded.header.version, WIRE_VERSION);
         prop_assert_eq!(decoded.header.stream_id, stream_id);
-        prop_assert_eq!(decoded.header.sequence, sequence);
+        prop_assert_eq!(decoded.header.packet_number, sequence);
         prop_assert_eq!(decoded.header.flags.0, flags_bits);
         prop_assert_eq!(decoded.header.epoch, epoch);
         prop_assert_eq!(decoded.header.path_id, path_id);
@@ -166,7 +166,7 @@ proptest! {
     /// the payload (both length-prefixed sections must be recovered).
     #[test]
     fn wire_round_trip_preserves_payload_and_extensions(
-        sequence in any::<u32>(),
+        sequence in any::<u64>(),
         payload in proptest::collection::vec(any::<u8>(), 0..1024),
         extensions in proptest::collection::vec(any::<u8>(), 0..512),
     ) {
@@ -255,54 +255,5 @@ proptest! {
             .expect("accepting decrypt follows a bounded forward step");
         prop_assert_eq!(pt, b"forward".to_vec());
         prop_assert_eq!(server.current_epoch(), steps);
-    }
-}
-
-proptest! {
-    /// C1 (Invariant 8): for any per-stream sequence watermark and send count,
-    /// driving the production send-side rekey decision over a single stream must
-    /// keep every epoch's per-stream sequence span at or below the watermark — so
-    /// the per-stream `u32` can never wrap within one epoch and repeat the AEAD
-    /// nonce `(epoch, stream_id, sequence, path_id)`. The direction-wide trigger
-    /// is disabled so the per-stream watermark is the sole rekey driver; a rekey
-    /// that fails (epoch saturated) fails closed (stop emitting) rather than wrap.
-    #[test]
-    fn no_nonce_repeats_across_forced_rekeys(
-        secret in any::<[u8; 32]>(),
-        watermark in 1u32..=64,
-        sends in 1u32..2000,
-        stream in any::<u16>(),
-    ) {
-        let (client, _server) = session_pair(secret);
-        client.set_rekey_threshold(u64::MAX);
-        client.set_seq_rekey_watermark(watermark);
-
-        let mut spans: std::collections::BTreeMap<u8, (u32, u32)> = std::collections::BTreeMap::new();
-        let mut seen: std::collections::HashSet<(u8, u16, u32)> = std::collections::HashSet::new();
-
-        for seq in 0u32..sends {
-            if client.send_needs_rekey() || client.stream_seq_needs_rekey(stream, seq) {
-                if client.rekey().is_err() {
-                    break; // fail closed at epoch saturation — never wrap
-                }
-            }
-            let epoch = client.current_epoch();
-            prop_assert!(
-                seen.insert((epoch, stream, seq)),
-                "nonce tuple (epoch={}, stream={}, seq={}) repeated",
-                epoch, stream, seq
-            );
-            let e = spans.entry(epoch).or_insert((seq, seq));
-            e.0 = e.0.min(seq);
-            e.1 = e.1.max(seq);
-        }
-
-        for (epoch, (lo, hi)) in &spans {
-            prop_assert!(
-                hi - lo <= watermark,
-                "epoch {} spans {} sequences > watermark {}",
-                epoch, hi - lo, watermark
-            );
-        }
     }
 }

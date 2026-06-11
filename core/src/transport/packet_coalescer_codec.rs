@@ -47,12 +47,17 @@ use crate::transport::types::{
 pub fn wrap_coalesced_packet(
     session_id: SessionId,
     stream_id: StreamId,
-    sequence: SequenceNumber,
+    packet_number: u64,
     flags_extra: u16,
     bundle: Vec<u8>,
 ) -> PhantomPacket {
     let flag_bits = flags_extra | PacketFlags::COALESCED;
-    let header = PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits));
+    let header = PacketHeader::new(
+        session_id,
+        stream_id,
+        packet_number,
+        PacketFlags::new(flag_bits),
+    );
     PhantomPacket::new(header, bundle)
 }
 
@@ -134,7 +139,17 @@ pub fn drain_coalescer_to_packets(
 ) -> Vec<PhantomPacket> {
     let mut out = Vec::new();
     while let Some(bundle) = coalescer.flush() {
-        let pkt = wrap_coalesced_packet(session_id, stream_id, *next_sequence, flags_extra, bundle);
+        // NOTE: this codec is not wired into the live send path (COALESCED is not
+        // emitted by the sender). If it is ever wired up, the packet number MUST
+        // come from `Session::next_send_pn` (① — Phase 4), not this local counter,
+        // or it will collide with the real per-direction PN space.
+        let pkt = wrap_coalesced_packet(
+            session_id,
+            stream_id,
+            *next_sequence as u64,
+            flags_extra,
+            bundle,
+        );
         *next_sequence = next_sequence.wrapping_add(1);
         out.push(pkt);
     }
@@ -261,7 +276,7 @@ mod tests {
         assert!(v2.header.flags.contains(PacketFlags::COALESCED));
         assert!(v2.header.flags.contains(PacketFlags::ENCRYPTED));
         assert_eq!(v2.header.stream_id, 3);
-        assert_eq!(v2.header.sequence, 100);
+        assert_eq!(v2.header.packet_number, 100);
 
         // Sequence advanced for the next round.
         assert_eq!(next_seq, 101);

@@ -23,6 +23,10 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Removed
 
+- Retired the C1 per-stream sequence rekey watermark (`SEQ_REKEY_WATERMARK` /
+  `set_seq_rekey_watermark` / `stream_seq_needs_rekey`): a `u64` packet number cannot wrap within a
+  session, so the forced-rekey crutch is gone. Also removed the now-unwired `ReplayProtection` helper and
+  the dead unencrypted `Session::create_control_packet` stub.
 - **Removed the unwired `TransportLeg` multipath cluster** — `transport/legs/{kcp,tcp,faketls}.rs`,
   the `TransportLeg` trait, and `transport/virtual_socket.rs` — plus the `kcp-tokio` dependency and
   the `kcp_integration` test. These were never wired into the `PhantomSession` data plane (which
@@ -33,6 +37,14 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Changed
 
+- **PhantomUDP (Phase 4 / P4.0):** the AEAD packet identity moved to a single per-direction monotonic
+  `u64` **packet number** (model ①), replacing the per-stream `u32` `sequence`. `WIRE_VERSION` bumped
+  **2 → 3**: the 47-byte `PacketHeader` drops the dead `ack_delay` field and widens `sequence` (u32) to
+  `packet_number` (u64); the AEAD nonce is now `nonce_prefix ‖ packet_number` (`epoch` / `stream_id` /
+  `path_id` remain in the authenticated 47-byte AAD but leave the nonce). Anti-replay is now a single
+  per-direction sliding window on the packet number. **Interop-breaking** vs. 0.1.x (batched into the
+  upcoming 0.2.0). Reliable in-order delivery is unaffected — it keys on the A.5 `stream_offset`, not the
+  wire packet number.
 - Documentation & branding cleanup: replaced lingering old-brand prose
   ("Phantom Transport Core", "Phantom Universal Transport") and standalone
   "Phantom" product references with the "Phantom Protocol" brand across the docs

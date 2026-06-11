@@ -56,14 +56,19 @@ impl fmt::Display for SessionId {
 /// Each stream has independent sequence numbers (no HoL blocking).
 pub type StreamId = u16;
 
-/// Per-stream sequence number
+/// Per-stream gap-free reliable-data offset (A.5). Stays `u32`.
 pub type SequenceNumber = u32;
 
+/// Per-direction monotonic AEAD packet number (① — Phase 4). Feeds the AEAD
+/// nonce and the per-direction replay window. `u64` so it never wraps within a
+/// session — this is what retires the C1 forced-rekey watermark.
+pub type PacketNumber = u64;
+
 /// The sole on-wire packet-header version byte. Pinned — the wire format is not
-/// negotiated (pre-1.0, no users); a decoder rejects anything else. Incremented
-/// to `2` when the packet layout moved from `alkahest` to the explicit
-/// big-endian codec ([`PacketHeader::to_wire`] / [`PacketHeader::from_wire`]).
-pub const WIRE_VERSION: u8 = 2;
+/// negotiated (pre-1.0, no users); a decoder rejects anything else. `3` since
+/// Phase 4 (①) widened the packet number to `u64`, dropped the dead `ack_delay`,
+/// and moved the nonce to `prefix‖packet_number` (see PROTOCOL.md § 4.2).
+pub const WIRE_VERSION: u8 = 3;
 
 /// Error decoding a packet header / packet from its on-wire bytes.
 ///
@@ -226,27 +231,28 @@ impl fmt::Debug for PacketFlags {
     }
 }
 
-/// Packet header — 45 bytes on the wire (the AEAD AAD).
+/// Packet header — 47 bytes on the wire (the AEAD AAD).
 ///
 /// Serialised by [`PacketHeader::to_wire`] as an explicit, fixed **big-endian**
 /// (network byte order) image, `version` first — declaration order == wire
 /// order, no reordering, no reversed arrays:
 ///
 /// ```text
-/// off  0  version    u8      (= WIRE_VERSION)
-/// off  1  session_id [u8;32]
-/// off 33  stream_id  u16 be
-/// off 35  sequence   u32 be
-/// off 39  flags      u16 be
-/// off 41  ack_delay  u16 be
-/// off 43  epoch      u8
-/// off 44  path_id    u8
+/// off  0  version        u8       (= WIRE_VERSION = 3)
+/// off  1  session_id     [u8;32]
+/// off 33  stream_id      u16 be
+/// off 35  packet_number  u64 be   (① per-direction monotonic; feeds nonce + replay)
+/// off 43  flags          u16 be
+/// off 45  epoch          u8
+/// off 46  path_id        u8
 /// ```
 ///
-/// The whole 45-byte image is the AEAD AAD, so flipping any byte (`version`
-/// included) fails decryption. The recv path additionally drops a frame whose
-/// `version != WIRE_VERSION`. Frozen by `core/tests/wire_vectors/packet_header.bin`;
-/// grammar in `docs/protocol/PROTOCOL.md` § 4.2.
+/// The whole 47-byte image is the AEAD AAD, so flipping any byte (`version`
+/// included) fails decryption. `epoch`/`stream_id`/`path_id` are authenticated in
+/// the AAD but are NOT in the nonce (which is `prefix‖packet_number`). The recv
+/// path additionally drops a frame whose `version != WIRE_VERSION`. Frozen by
+/// `core/tests/wire_vectors/packet_header.bin`; grammar in
+/// `docs/protocol/PROTOCOL.md` § 4.2.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct PacketHeader {
@@ -257,12 +263,11 @@ pub struct PacketHeader {
     pub session_id: SessionId,
     /// Stream within session (0 = control)
     pub stream_id: StreamId,
-    /// Per-stream sequence number
-    pub sequence: SequenceNumber,
+    /// Per-direction monotonic AEAD packet number (① — Phase 4). Feeds the AEAD
+    /// nonce and the per-direction replay window; assigned at send time.
+    pub packet_number: PacketNumber,
     /// Packet flags
     pub flags: PacketFlags,
-    /// Delay between processing packet and sending ACK (in microseconds)
-    pub ack_delay: u16,
     /// Rekey generation. Zero at session establishment, incremented in lock-
     /// step on each in-band rekey (Phase 1.5).
     pub epoch: u8,
@@ -272,23 +277,22 @@ pub struct PacketHeader {
 
 impl PacketHeader {
     /// Header size in bytes (serialised wire length).
-    pub const SIZE: usize = 45;
+    pub const SIZE: usize = 47;
 
     /// Create a new packet header (version = [`WIRE_VERSION`], epoch = 0,
-    /// path_id = 0, ack_delay = 0).
+    /// path_id = 0).
     pub fn new(
         session_id: SessionId,
         stream_id: StreamId,
-        sequence: SequenceNumber,
+        packet_number: PacketNumber,
         flags: PacketFlags,
     ) -> Self {
         Self {
             version: WIRE_VERSION,
             session_id,
             stream_id,
-            sequence,
+            packet_number,
             flags,
-            ack_delay: 0,
             epoch: 0,
             path_id: 0,
         }
@@ -306,18 +310,17 @@ impl PacketHeader {
         self
     }
 
-    /// Serialise to the fixed 45 on-wire bytes (big-endian, `version` first).
+    /// Serialise to the fixed 47 on-wire bytes (big-endian, `version` first).
     /// This image is the AEAD AAD.
     pub fn to_wire(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
         b[0] = self.version;
         b[1..33].copy_from_slice(&self.session_id.0);
         b[33..35].copy_from_slice(&self.stream_id.to_be_bytes());
-        b[35..39].copy_from_slice(&self.sequence.to_be_bytes());
-        b[39..41].copy_from_slice(&self.flags.0.to_be_bytes());
-        b[41..43].copy_from_slice(&self.ack_delay.to_be_bytes());
-        b[43] = self.epoch;
-        b[44] = self.path_id;
+        b[35..43].copy_from_slice(&self.packet_number.to_be_bytes());
+        b[43..45].copy_from_slice(&self.flags.0.to_be_bytes());
+        b[45] = self.epoch;
+        b[46] = self.path_id;
         b
     }
 
@@ -334,11 +337,13 @@ impl PacketHeader {
             version: bytes[0],
             session_id: SessionId(session_id),
             stream_id: u16::from_be_bytes([bytes[33], bytes[34]]),
-            sequence: u32::from_be_bytes([bytes[35], bytes[36], bytes[37], bytes[38]]),
-            flags: PacketFlags(u16::from_be_bytes([bytes[39], bytes[40]])),
-            ack_delay: u16::from_be_bytes([bytes[41], bytes[42]]),
-            epoch: bytes[43],
-            path_id: bytes[44],
+            packet_number: u64::from_be_bytes([
+                bytes[35], bytes[36], bytes[37], bytes[38], bytes[39], bytes[40], bytes[41],
+                bytes[42],
+            ]),
+            flags: PacketFlags(u16::from_be_bytes([bytes[43], bytes[44]])),
+            epoch: bytes[45],
+            path_id: bytes[46],
         })
     }
 }
@@ -349,7 +354,7 @@ impl fmt::Debug for PacketHeader {
             .field("version", &self.version)
             .field("session", &self.session_id)
             .field("stream", &self.stream_id)
-            .field("seq", &self.sequence)
+            .field("pn", &self.packet_number)
             .field("flags", &self.flags)
             .field("epoch", &self.epoch)
             .field("path_id", &self.path_id)
@@ -405,12 +410,12 @@ impl PhantomPacket {
     }
 
     /// Create an ACK packet: `ACK` flag only, empty payload, unencrypted.
-    pub fn ack(session_id: SessionId, stream_id: StreamId, ack_sequence: SequenceNumber) -> Self {
+    pub fn ack(session_id: SessionId, stream_id: StreamId, ack_packet_number: u64) -> Self {
         Self {
             header: PacketHeader::new(
                 session_id,
                 stream_id,
-                ack_sequence,
+                ack_packet_number,
                 PacketFlags::new(PacketFlags::ACK),
             ),
             payload: Vec::new(),
@@ -581,8 +586,8 @@ mod tests {
     }
 
     #[test]
-    fn packet_header_serializes_to_45_bytes() {
-        assert_eq!(PacketHeader::SIZE, 45);
+    fn packet_header_serializes_to_47_bytes() {
+        assert_eq!(PacketHeader::SIZE, 47);
         let header = PacketHeader::new(
             SessionId::from_bytes([0u8; 32]),
             1,
@@ -593,7 +598,7 @@ mod tests {
         assert_eq!(
             bytes.len(),
             PacketHeader::SIZE,
-            "the serialised header (= AEAD AAD) must be exactly 45 bytes"
+            "the serialised header (= AEAD AAD) must be exactly 47 bytes"
         );
         // version-first, big-endian: the pinned version is the leading byte.
         assert_eq!(bytes[0], WIRE_VERSION);
@@ -607,7 +612,7 @@ mod tests {
 
         assert!(ack.header.flags.is_ack());
         assert_eq!(ack.header.stream_id, 5);
-        assert_eq!(ack.header.sequence, 100);
+        assert_eq!(ack.header.packet_number, 100);
         assert!(ack.payload.is_empty());
         assert!(ack.extensions.is_empty());
     }
@@ -630,7 +635,7 @@ mod tests {
         assert_eq!(decoded, packet);
         assert_eq!(decoded.header.version, WIRE_VERSION);
         assert_eq!(decoded.header.stream_id, 7);
-        assert_eq!(decoded.header.sequence, 42);
+        assert_eq!(decoded.header.packet_number, 42);
         assert_eq!(decoded.header.epoch, 3);
         assert_eq!(decoded.header.path_id, 1);
         assert!(decoded.header.flags.is_reliable());

@@ -362,7 +362,10 @@ fn failed_decrypt_does_not_desync_session() {
     assert_eq!(pt1, b"first");
 
     // And a subsequent packet at sequence 2 also goes through.
-    let h2 = PacketHeader { sequence: 2, ..h1 };
+    let h2 = PacketHeader {
+        packet_number: 2,
+        ..h1
+    };
     let ct2 = client.encrypt_packet(&h2, b"second").expect("encrypt 2");
     let pt2 = server.decrypt_packet(&h2, &ct2).expect("decrypt 2");
     assert_eq!(pt2, b"second");
@@ -593,7 +596,7 @@ fn send_needs_rekey_fires_at_threshold_and_clears_on_rekey() {
     let header = PacketHeader::new(*client.id(), 1, 0, PacketFlags::new(PacketFlags::ENCRYPTED));
     for i in 0..4u32 {
         let h = PacketHeader {
-            sequence: i,
+            packet_number: i as u64,
             ..header
         };
         client.encrypt_packet(&h, b"x").expect("encrypt");
@@ -837,109 +840,12 @@ async fn retransmissions_bypass_congestion_and_flow_control_windows() {
         .await
         .expect("retransmission must bypass both the congestion and flow-control windows");
     assert!(rtx.retransmit, "must be flagged as a retransmission");
-    assert_eq!(rtx.seq, first.seq);
+    assert_eq!(rtx.stream_offset, first.stream_offset);
     assert_eq!(rtx.data.len(), 200);
     assert_eq!(
         s.peer_send_window(),
         0,
         "a retransmission must not debit the flow-control window again"
-    );
-}
-
-// ── C1: per-stream sequence nonce-reuse (Invariant 8) ───────────────────────
-
-/// **C1 (critical).** The AEAD nonce is `(epoch, stream_id, sequence, path_id)`.
-/// `sequence` is a per-stream `u32` that wraps at `2^32`, while the only
-/// pre-existing rekey trigger keys off the *direction-wide* invocation counter
-/// (`REKEY_SOFT_LIMIT = 2^47`). A single hot stream therefore wraps its
-/// sequence — repeating a nonce under a fixed key (the Forbidden Attack) — long
-/// before any rekey fires. The fix forces a rekey once a stream's sequence
-/// advances past a per-stream watermark within the current epoch.
-///
-/// We drive the exact send-side decision (`send_needs_rekey ||
-/// stream_seq_needs_rekey` then `rekey`) with the direction-wide trigger
-/// disabled and a tiny injected watermark, and assert that **no epoch's
-/// per-stream sequence span ever exceeds the watermark**. Scaled to the real
-/// `W = 2^31` against the `2^32` wrap, that is exactly "no stream can traverse
-/// the full sequence space within one epoch", so the nonce never repeats.
-#[test]
-fn single_stream_seq_watermark_forces_rekey_before_wrap() {
-    let (client, _server) = make_session_pair([0x5Au8; 32]);
-    // Isolate the per-stream trigger: push the direction-wide AEAD trigger out
-    // of reach so ONLY the sequence watermark can fire a rekey.
-    client.set_rekey_threshold(u64::MAX);
-    const W: u32 = 8;
-    client.set_seq_rekey_watermark(W);
-
-    let stream: u16 = 1;
-    let mut spans: std::collections::BTreeMap<u8, (u32, u32)> = std::collections::BTreeMap::new();
-    let mut seen: std::collections::HashSet<(u8, u16, u32)> = std::collections::HashSet::new();
-
-    for seq in 0u32..(4 * W + 3) {
-        // Exact production decision — mirrors `send_app_data`.
-        if client.send_needs_rekey() || client.stream_seq_needs_rekey(stream, seq) {
-            client
-                .rekey()
-                .expect("rekey must succeed within the epoch budget");
-        }
-        let epoch = client.current_epoch();
-        assert!(
-            seen.insert((epoch, stream, seq)),
-            "nonce tuple (epoch={epoch}, stream={stream}, seq={seq}) repeated"
-        );
-        let e = spans.entry(epoch).or_insert((seq, seq));
-        e.0 = e.0.min(seq);
-        e.1 = e.1.max(seq);
-    }
-
-    assert!(
-        spans.len() >= 2,
-        "the sequence watermark never forced a rekey"
-    );
-    for (epoch, (lo, hi)) in &spans {
-        assert!(
-            hi - lo <= W,
-            "epoch {epoch} spans {} sequences, exceeding watermark {W} — a wider epoch could wrap",
-            hi - lo
-        );
-    }
-}
-
-/// **C1 fail-closed.** Once the `u8` epoch saturates at `u8::MAX`, no further
-/// rekey is possible. The per-stream watermark must then surface a hard error
-/// from `rekey()` (which `send_app_data` turns into a failed send → session
-/// reconnect) rather than letting the sequence wrap and silently reuse a nonce.
-#[test]
-fn seq_watermark_fails_closed_at_epoch_saturation() {
-    let (client, _server) = make_session_pair([0x77u8; 32]);
-    client.set_rekey_threshold(u64::MAX);
-    client.set_seq_rekey_watermark(4);
-
-    let stream: u16 = 1;
-    let mut seq = 0u32;
-    let mut rekeys = 0u32;
-    loop {
-        if client.send_needs_rekey() || client.stream_seq_needs_rekey(stream, seq) {
-            match client.rekey() {
-                Ok(_) => rekeys += 1,
-                Err(_) => break, // fail-closed: epoch saturated, no nonce reuse
-            }
-        }
-        seq += 1;
-        assert!(
-            seq < 1_000_000,
-            "must fail closed at saturation, not loop forever"
-        );
-    }
-    assert_eq!(
-        client.current_epoch(),
-        u8::MAX,
-        "must fail closed exactly when the epoch saturates"
-    );
-    assert_eq!(
-        rekeys,
-        u8::MAX as u32,
-        "should perform 255 successful rekeys before the epoch saturates"
     );
 }
 
@@ -1127,5 +1033,127 @@ fn failed_resume_handshake_leaves_ticket_usable() {
             HandshakeResponse::Success(..)
         ),
         "the re-inserted ticket must be usable by a clean resume"
+    );
+}
+
+// ── 1 (Phase 4): per-direction u64 packet-number invariants ─────────────────
+// These replace the deleted C1 per-stream-watermark tests: under model 1 the
+// AEAD nonce is `prefix || packet_number`, with `packet_number` a per-direction
+// monotonic u64 that cannot wrap within a session.
+
+/// `next_send_pn` yields a strictly increasing, never-repeating per-direction
+/// sequence — the basis of "the AEAD nonce is never reused, full stop".
+#[test]
+fn packet_number_is_strictly_monotonic_and_unique() {
+    let (client, _server) = make_session_pair([0x91u8; 32]);
+    let mut seen = std::collections::HashSet::new();
+    let mut last: Option<u64> = None;
+    for _ in 0..10_000 {
+        let pn = client.next_send_pn();
+        assert!(seen.insert(pn), "packet number {pn} reused");
+        if let Some(prev) = last {
+            assert!(
+                pn > prev,
+                "packet number not strictly increasing: {prev} -> {pn}"
+            );
+        }
+        last = Some(pn);
+    }
+}
+
+/// D5 audit anchor: `path_id` is authenticated in the 47-byte AAD but is NOT in
+/// the AEAD nonce (`prefix || packet_number`). Encrypting the SAME plaintext
+/// under the SAME `(packet_number, stream_id, epoch)` but a DIFFERENT `path_id`
+/// must yield an identical ciphertext **body** (same nonce => same keystream) and
+/// a DIFFERENT auth tag (path_id is in the AAD). The body-equality is what makes
+/// retiring/reusing a `path_id` nonce-safe; the tag-difference confirms path_id
+/// stays authenticated.
+#[test]
+fn path_id_is_in_aad_not_nonce() {
+    let (client, _server) = make_session_pair([0x92u8; 32]);
+    let sid = *client.id();
+    let pt = b"phantom-path-id-nonce-probe";
+    let h0 =
+        PacketHeader::new(sid, 1, 42, PacketFlags::new(PacketFlags::ENCRYPTED)).with_path_id(0);
+    let h5 =
+        PacketHeader::new(sid, 1, 42, PacketFlags::new(PacketFlags::ENCRYPTED)).with_path_id(5);
+    let c0 = client.encrypt_packet(&h0, pt).expect("encrypt h0");
+    let c5 = client.encrypt_packet(&h5, pt).expect("encrypt h5");
+    // AEAD output = ciphertext-body || 16-byte auth tag.
+    const TAG: usize = 16;
+    assert_eq!(c0.len(), c5.len());
+    assert!(c0.len() > TAG);
+    let (body0, tag0) = c0.split_at(c0.len() - TAG);
+    let (body5, tag5) = c5.split_at(c5.len() - TAG);
+    // Nonce ignores path_id => identical keystream => identical ciphertext body.
+    assert_eq!(
+        body0, body5,
+        "ciphertext body differs => path_id leaked into the nonce"
+    );
+    // path_id IS authenticated (it is in the AAD) => the tag must differ.
+    assert_ne!(
+        tag0, tag5,
+        "tag identical => path_id not bound into the AAD"
+    );
+}
+
+/// The collapse from per-`StreamId` replay windows to ONE per-direction window
+/// must still accept packets interleaved across streams (the packet number is
+/// unique per direction regardless of stream) and reject only a true PN dup.
+#[test]
+fn per_direction_window_accepts_interleaved_streams() {
+    let (client, server) = make_session_pair([0x93u8; 32]);
+    let sid = *client.id();
+    let mut pn = 0u64;
+    for _round in 0..500 {
+        for stream_id in [1u16, 7u16] {
+            let h = PacketHeader::new(sid, stream_id, pn, PacketFlags::new(PacketFlags::ENCRYPTED));
+            let ct = client.encrypt_packet(&h, b"x").expect("encrypt");
+            assert!(
+                server.decrypt_packet(&h, &ct).is_ok(),
+                "stream {stream_id} pn {pn} must be accepted by the single window"
+            );
+            pn += 1;
+        }
+    }
+    // Replaying an earlier packet number is now a duplicate.
+    let h_dup = PacketHeader::new(sid, 1, 0, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let ct_dup = client.encrypt_packet(&h_dup, b"x").expect("encrypt");
+    assert!(
+        matches!(
+            server.decrypt_packet(&h_dup, &ct_dup),
+            Err(phantom_protocol::CoreError::ReplayDetected(_))
+        ),
+        "a replayed packet_number must be rejected after AEAD verify (Inv-4)"
+    );
+}
+
+// ── D8 (Phase 4): migration-switch congestion-controller reset ──────────────
+
+/// `Session::reset_congestion` re-initialises the BBR controller so a migration
+/// path switch (QUIC §9.4) measures the new network's bandwidth/cwnd fresh rather
+/// than inheriting the dead path's estimate. (`RtoEstimator::reset` — the RTT
+/// half — is unit-tested in `transport::stream::rto_tests`.)
+#[test]
+fn reset_congestion_returns_controller_to_initial() {
+    let (s, _server) = make_session_pair([0x94u8; 32]);
+    let (fresh, _f) = make_session_pair([0x95u8; 32]);
+    let initial_cwnd = fresh.bandwidth_snapshot().cwnd_bytes;
+
+    // Perturb the controller: register inflight + a loss.
+    s.on_packet_sent(200_000);
+    s.on_packet_lost(100_000);
+    assert!(
+        s.bandwidth_snapshot().inflight_bytes > 0,
+        "precondition: on_packet_sent should register inflight bytes"
+    );
+
+    s.reset_congestion();
+
+    let snap = s.bandwidth_snapshot();
+    assert_eq!(snap.inflight_bytes, 0, "reset must clear inflight");
+    assert_eq!(
+        snap.cwnd_bytes, initial_cwnd,
+        "reset must restore the initial cwnd"
     );
 }
