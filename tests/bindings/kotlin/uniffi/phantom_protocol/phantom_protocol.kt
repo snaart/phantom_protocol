@@ -679,6 +679,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready(
     ): Short
+    external fun uniffi_phantom_protocol_checksum_method_phantomsession_migrate(
+    ): Short
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_open_stream(
     ): Short
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr(
@@ -773,6 +775,8 @@ external fun uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready(`ptr
 ): Byte
 external fun uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
+external fun uniffi_phantom_protocol_fn_method_phantomsession_migrate(`ptr`: Long,`localAddr`: RustBuffer.ByValue,
+): Long
 external fun uniffi_phantom_protocol_fn_method_phantomsession_open_stream(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_phantom_protocol_fn_method_phantomsession_peer_addr(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -976,6 +980,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready() != 47934.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 22155.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 25882.toShort()) {
@@ -2334,6 +2341,23 @@ public interface PhantomSessionInterface {
     fun `isPqcReady`(): kotlin.Boolean
     
     /**
+     * Migrate the session to a new local network address (Phase 4 — embedder-
+     * triggered connection migration). The embedder calls this when the OS reports a
+     * network change (Wi-Fi↔cellular, NAT rebind); `local_addr` is the new local
+     * bind address (e.g. `"0.0.0.0:0"` to let the OS pick an ephemeral port on the
+     * new interface).
+     *
+     * **Best-effort and non-blocking on validation.** It hands the request to the
+     * background pump, which rebinds the transport (keeping the old socket for the
+     * overlap) and bumps the send `path_id`; the path validation + server-side peer
+     * switch then complete asynchronously. The keys and session persist — **no
+     * re-handshake**. A failed rebind never tears the session down: it keeps running
+     * on the existing socket (broken-rebind safety). `Err` here means only that the
+     * session was already closed (the command channel is gone).
+     */
+    suspend fun `migrate`(`localAddr`: kotlin.String)
+    
+    /**
      * Open a new multiplexed stream
      */
     fun `openStream`(): PhantomStream
@@ -2677,6 +2701,43 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
     )
     }
     
+
+    
+    /**
+     * Migrate the session to a new local network address (Phase 4 — embedder-
+     * triggered connection migration). The embedder calls this when the OS reports a
+     * network change (Wi-Fi↔cellular, NAT rebind); `local_addr` is the new local
+     * bind address (e.g. `"0.0.0.0:0"` to let the OS pick an ephemeral port on the
+     * new interface).
+     *
+     * **Best-effort and non-blocking on validation.** It hands the request to the
+     * background pump, which rebinds the transport (keeping the old socket for the
+     * overlap) and bumps the send `path_id`; the path validation + server-side peer
+     * switch then complete asynchronously. The keys and session persist — **no
+     * re-handshake**. A failed rebind never tears the session down: it keeps running
+     * on the existing socket (broken-rebind safety). `Err` here means only that the
+     * session was already closed (the command channel is gone).
+     */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `migrate`(`localAddr`: kotlin.String) {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_migrate(
+                uniffiHandle,
+                FfiConverterString.lower(`localAddr`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_void(future) },
+        // lift function
+        { Unit },
+        
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
 
     
     /**

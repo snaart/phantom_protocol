@@ -92,8 +92,11 @@ impl UdpClientTransport {
     /// migration to a dead/invalid address never tears the session down — the session
     /// keeps running on the old socket.
     ///
+    /// Typed core of the migration; the SocketAddr-free [`SessionTransport::migrate`]
+    /// trait entry parses a `String` and delegates here.
+    ///
     /// [`Session::next_migration_path_id`]: crate::transport::session::Session::next_migration_path_id
-    pub async fn migrate(&self, new_local_addr: SocketAddr) -> Result<(), CoreError> {
+    pub async fn migrate_to(&self, new_local_addr: SocketAddr) -> Result<(), CoreError> {
         let new_sock = UdpSocket::bind(new_local_addr)
             .await
             .map_err(|e| CoreError::NetworkError(format!("udp migrate bind: {e}")))?;
@@ -237,6 +240,17 @@ impl SessionTransport for UdpClientTransport {
             FramePhase::Established => PHASE_ESTABLISHED,
         };
         self.phase.store(v, Ordering::Relaxed);
+    }
+
+    /// SocketAddr-free trait entry for connection migration (Phase 4 / P4.2c). Parses
+    /// the embedder-supplied local bind address and delegates to the typed
+    /// [`migrate_to`](Self::migrate_to). A malformed address is a clean `Err` that
+    /// leaves the session on its existing socket (best-effort, never fatal).
+    async fn migrate(&self, local_addr: String) -> Result<(), CoreError> {
+        let addr: SocketAddr = local_addr.parse().map_err(|e| {
+            CoreError::NetworkError(format!("migrate: bad local addr '{local_addr}': {e}"))
+        })?;
+        self.migrate_to(addr).await
     }
 }
 
@@ -608,7 +622,7 @@ mod tests {
 
         // Migrate to a fresh ephemeral local socket.
         client
-            .migrate("127.0.0.1:0".parse().unwrap())
+            .migrate_to("127.0.0.1:0".parse().unwrap())
             .await
             .expect("migrate binds a new socket");
 
@@ -647,7 +661,7 @@ mod tests {
         let (_n, src_old) = server.recv_from(&mut buf).await.unwrap();
 
         client
-            .migrate("127.0.0.1:0".parse().unwrap())
+            .migrate_to("127.0.0.1:0".parse().unwrap())
             .await
             .expect("migrate binds a new socket");
 
@@ -662,5 +676,32 @@ mod tests {
             .expect("no timeout")
             .expect("recv on retained old socket");
         assert_eq!(&got[..], b"downstream-old");
+    }
+
+    /// P4.2c: the SocketAddr-free `migrate(String)` trait entry parses the address; a
+    /// malformed address is a clean `Err` and leaves the session untouched on the old
+    /// socket (best-effort, never fatal). The session keeps working afterwards.
+    #[tokio::test]
+    async fn migrate_with_a_bad_local_addr_is_a_clean_error() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpClientTransport::connect(server_addr).await.unwrap();
+        client.set_frame_phase(FramePhase::Established);
+
+        // Unparseable address → Err, no rebind (the SocketAddr-free trait entry).
+        let err = client.migrate("not-an-address".to_string()).await;
+        assert!(err.is_err(), "a malformed local addr must be a clean Err");
+
+        // The session still works on the original socket.
+        client.send_bytes(b"still-alive").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+            .await
+            .expect("no timeout")
+            .unwrap();
+        assert!(
+            n > 0,
+            "data still flows on the original socket after a failed migrate"
+        );
     }
 }

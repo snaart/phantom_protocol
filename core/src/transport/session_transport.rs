@@ -23,6 +23,11 @@
 
 use crate::errors::CoreError;
 use bytes::Bytes;
+// `String` is in the std prelude on std builds; under `no_std` it comes from `alloc`
+// (the migration address crosses this boundary as a `String` to keep the trait
+// `SocketAddr`-free — `std::net::SocketAddr` does not exist in `core`/`alloc`).
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
 
 /// Lifecycle phase of a [`SessionTransport`], used to bound the receive frame
 /// size differently before vs. after the handshake (WIRE-001). During the
@@ -105,5 +110,21 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// SocketAddr-free — the address is internal to the concrete transport.
     fn promote_candidate(&self) -> bool {
         false
+    }
+
+    /// Migrate this transport to a new local address (Phase 4 / P4.2c — embedder-
+    /// triggered connection migration). The address crosses as an
+    /// [`alloc::string::String`] (parsed inside the concrete native transport) so the
+    /// trait stays `SocketAddr`-free and no_std-clean — `std::net::SocketAddr` does
+    /// not exist in `core`/`alloc`. Best-effort: a parse / bind / connect failure
+    /// returns `Err` and the session is expected to keep running on its existing
+    /// socket — migration never tears it down. Default no-op `Ok(())` for transports
+    /// without migration (TCP / WebSocket / WASI / Embedded / the in-memory test
+    /// pipe); only the native UDP client implements it.
+    fn migrate(
+        &self,
+        _local_addr: String,
+    ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
+        async { Ok(()) }
     }
 }

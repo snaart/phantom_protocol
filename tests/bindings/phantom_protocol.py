@@ -519,6 +519,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready() != 47934:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 22155:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 25882:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 58516:
@@ -944,6 +946,11 @@ _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready.argtype
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready.restype = ctypes.c_int8
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_migrate.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_migrate.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_open_stream.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1062,6 +1069,9 @@ _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready.
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream.restype = ctypes.c_uint16
@@ -2316,6 +2326,23 @@ class PhantomSessionProtocol(typing.Protocol):
         Whether the session has full PQC protection.
 """
         raise NotImplementedError
+    async def migrate(self, local_addr: str) -> None:
+        """
+        Migrate the session to a new local network address (Phase 4 — embedder-
+        triggered connection migration). The embedder calls this when the OS reports a
+        network change (Wi-Fi↔cellular, NAT rebind); `local_addr` is the new local
+        bind address (e.g. `"0.0.0.0:0"` to let the OS pick an ephemeral port on the
+        new interface).
+
+        **Best-effort and non-blocking on validation.** It hands the request to the
+        background pump, which rebinds the transport (keeping the old socket for the
+        overlap) and bumps the send `path_id`; the path validation + server-side peer
+        switch then complete asynchronously. The keys and session persist — **no
+        re-handshake**. A failed rebind never tears the session down: it keeps running
+        on the existing socket (broken-rebind safety). `Err` here means only that the
+        session was already closed (the command channel is gone).
+"""
+        raise NotImplementedError
     def open_stream(self, ) -> PhantomStream:
         """
         Open a new multiplexed stream
@@ -2577,6 +2604,38 @@ class PhantomSession(PhantomSessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    async def migrate(self, local_addr: str) -> None:
+        """
+        Migrate the session to a new local network address (Phase 4 — embedder-
+        triggered connection migration). The embedder calls this when the OS reports a
+        network change (Wi-Fi↔cellular, NAT rebind); `local_addr` is the new local
+        bind address (e.g. `"0.0.0.0:0"` to let the OS pick an ephemeral port on the
+        new interface).
+
+        **Best-effort and non-blocking on validation.** It hands the request to the
+        background pump, which rebinds the transport (keeping the old socket for the
+        overlap) and bumps the send `path_id`; the path validation + server-side peer
+        switch then complete asynchronously. The keys and session persist — **no
+        re-handshake**. A failed rebind never tears the session down: it keeps running
+        on the existing socket (broken-rebind safety). `Err` here means only that the
+        session was already closed (the command channel is gone).
+"""
+        
+        _UniffiFfiConverterString.check_lower(local_addr)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(local_addr),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_migrate(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_void,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_void,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_void,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
     def open_stream(self, ) -> PhantomStream:
         """
         Open a new multiplexed stream
