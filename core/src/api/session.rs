@@ -1340,7 +1340,12 @@ async fn send_app_data<T: SessionTransport>(
         packet_number,
         PacketFlags::new(flag_bits),
     )
-    .with_epoch(crypto_session.current_epoch());
+    .with_epoch(crypto_session.current_epoch())
+    // Stamp the current send-side path_id (D5 — Phase 4). Default 0 (the implicit
+    // handshake path) is behaviour-preserving; after a `migrate()` bump this carries
+    // the new path label so the peer detects the new path and issues a challenge.
+    // Retransmits flow through here too, so ARQ re-carries on the new path (D7).
+    .with_path_id(crypto_session.current_send_path_id());
     // For reliable data, prepend the gap-free per-stream `stream_offset` (A.5, 4
     // big-endian bytes) to the AEAD plaintext so the receiver reassembles in send
     // order regardless of `sequence` holes left by interleaved control frames.
@@ -2921,6 +2926,88 @@ mod tests {
             .encrypt_packet(&header, &pt)
             .expect("encrypt_packet");
         PhantomPacket::new(header, ciphertext).to_wire()
+    }
+
+    #[test]
+    fn send_path_id_starts_at_zero_then_bumps_per_migration() {
+        // D5 (Phase 4): the client owns a monotonic send-side path_id, default 0 (the
+        // implicit handshake path), bumped on each migration so the server can detect
+        // and challenge the new path. Reuse is nonce-safe under ① (path_id left the
+        // AEAD nonce — `nonce = nonce_prefix ‖ packet_number`).
+        let session_id = fixed_session_id();
+        let (client_session, _server_session) = paired_sessions(session_id);
+        assert_eq!(client_session.current_send_path_id(), 0);
+        assert_eq!(client_session.next_migration_path_id(), 1);
+        assert_eq!(client_session.current_send_path_id(), 1);
+        assert_eq!(client_session.next_migration_path_id(), 2);
+        assert_eq!(client_session.current_send_path_id(), 2);
+    }
+
+    #[test]
+    fn migration_path_id_never_collides_with_the_handshake_path() {
+        // The migration counter must never hand back path_id 0 — that id is
+        // permanently the Validated handshake path on both peers, so reusing it would
+        // make the server skip the challenge (path 0 is always Validated) and the
+        // switch would never fire. Spanning > 2 u8 wraps proves 255 → 1 (never 0).
+        let session_id = fixed_session_id();
+        let (client_session, _server_session) = paired_sessions(session_id);
+        for _ in 0..600 {
+            assert_ne!(client_session.next_migration_path_id(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn send_app_data_stamps_the_current_send_path_id() {
+        // P4.2b: `send_app_data` must stamp `header.path_id` from the session's
+        // current send path_id (default 0). After a migration bump, every outbound
+        // app-data packet — including ARQ retransmits, which also flow through
+        // `send_app_data` — carries the new path_id, which is exactly what makes the
+        // server detect the new path and issue a PATH_CHALLENGE (D5 / D6).
+        let session_id = fixed_session_id();
+        let (client_session, _server_session) = paired_sessions(session_id);
+        let (client_t, server_t) = ChannelTransport::pair();
+        let client_t = Arc::new(client_t);
+
+        // Default: app data is stamped on the implicit path 0.
+        assert!(
+            send_app_data(
+                &client_t,
+                &client_session,
+                session_id,
+                1,
+                b"pre-migration",
+                PacketFlags::RELIABLE,
+                Some(0),
+            )
+            .await
+        );
+        let wire = server_t.recv_bytes().await.unwrap();
+        let pkt = PhantomPacket::from_wire(&wire).unwrap();
+        assert_eq!(
+            pkt.header.path_id, 0,
+            "default send path is the implicit path 0"
+        );
+
+        // After a migration bump, the new path_id is stamped on subsequent app data.
+        assert_eq!(client_session.next_migration_path_id(), 1);
+        assert!(
+            send_app_data(
+                &client_t,
+                &client_session,
+                session_id,
+                1,
+                b"post-migration",
+                PacketFlags::RELIABLE,
+                Some(13),
+            )
+            .await
+        );
+        let wire2 = server_t.recv_bytes().await.unwrap();
+        let pkt2 = PhantomPacket::from_wire(&wire2).unwrap();
+        assert_eq!(
+            pkt2.header.path_id, 1,
+            "after migrate(), app data must carry the bumped send path_id"
+        );
     }
 
     #[tokio::test]
