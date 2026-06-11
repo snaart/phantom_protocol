@@ -97,4 +97,13 @@ pub trait SessionTransport: Send + Sync + 'static {
     ) -> impl core::future::Future<Output = Result<bool, CoreError>> + Send {
         async { Ok(false) }
     }
+
+    /// Promote the migration candidate to the established peer (Phase 4, the
+    /// switch): after the candidate's path validates, subsequent app data and
+    /// retransmits go to it instead of the old peer. Returns `true` if a candidate
+    /// was promoted. Default no-op (`false`) for transports without migration.
+    /// SocketAddr-free — the address is internal to the concrete transport.
+    fn promote_candidate(&self) -> bool {
+        false
+    }
 }

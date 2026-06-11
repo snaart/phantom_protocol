@@ -209,8 +209,7 @@ impl RtoEstimator {
 
     /// Reset to the initial state (Phase 4 / QUIC §9.4): a migration path switch
     /// lands on a different network, so the old RTT estimate must not carry over.
-    /// Wired by the P4.2 migration switch; unit-tested in P4.0 Task 5.
-    #[allow(dead_code)]
+    /// Wired by the P4.2 migration switch (`Stream::reset_rto`).
     fn reset(&mut self) {
         self.srtt = None;
         self.rttvar = Duration::ZERO;
@@ -366,6 +365,16 @@ impl Stream {
         match self.rto.lock() {
             Ok(g) => g.rto(),
             Err(poisoned) => poisoned.into_inner().rto(),
+        }
+    }
+
+    /// Reset the RTT estimator (Phase 4 / QUIC §9.4): a migration path switch lands
+    /// on a different network, so the old RTT must not carry over. A poisoned lock
+    /// is recovered by taking the inner value — the RTO is a heuristic.
+    pub fn reset_rto(&self) {
+        match self.rto.lock() {
+            Ok(mut g) => g.reset(),
+            Err(poisoned) => poisoned.into_inner().reset(),
         }
     }
 

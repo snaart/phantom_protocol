@@ -163,7 +163,9 @@ impl SessionTransport for UdpClientTransport {
 /// the inner frames to `rx`; outbound frames are enveloped and sent to the captured `peer`.
 pub struct UdpServerTransport {
     socket: Arc<UdpSocket>,
-    peer: SocketAddr,
+    /// Established peer. `ArcSwap` so the session can atomically switch it to a
+    /// validated migration candidate (Phase 4 / P4.2) without re-handshake.
+    peer: ArcSwap<SocketAddr>,
     cid: ConnId,
     phase: AtomicU8,
     next_packet_id: AtomicU32,
@@ -188,7 +190,7 @@ impl UdpServerTransport {
     ) -> Self {
         Self {
             socket,
-            peer,
+            peer: ArcSwap::from_pointee(peer),
             cid,
             phase: AtomicU8::new(PHASE_HANDSHAKE),
             next_packet_id: AtomicU32::new(0),
@@ -210,9 +212,10 @@ impl SessionTransport for UdpServerTransport {
         let pid = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
         let dgrams = encode_datagrams(ty, &self.cid, pid, data)
             .map_err(|e| CoreError::NetworkError(format!("frame too large to fragment: {e}")))?;
+        let peer = **self.peer.load();
         for d in &dgrams {
             self.socket
-                .send_to(d, self.peer)
+                .send_to(d, peer)
                 .await
                 .map_err(|e| CoreError::NetworkError(format!("udp send_to: {e}")))?;
         }
@@ -231,7 +234,7 @@ impl SessionTransport for UdpServerTransport {
         // than the established `peer` marks a candidate path. We do NOT switch the
         // peer here (that is P4.2) — only record the candidate + (re)seed its
         // anti-amplification budget so the session can challenge it.
-        if src != self.peer {
+        if src != **self.peer.load() {
             if self.candidate.load().as_ref() == &Some(src) {
                 self.cand_recv
                     .fetch_add(frame.len() as u64, Ordering::Relaxed);
@@ -272,6 +275,23 @@ impl SessionTransport for UdpServerTransport {
         }
         self.cand_sent.fetch_add(wire, Ordering::Relaxed);
         Ok(true)
+    }
+
+    fn promote_candidate(&self) -> bool {
+        let cand = self.candidate.load();
+        match cand.as_ref() {
+            Some(addr) => {
+                // Switch the active peer to the validated candidate; clear the
+                // candidate + its anti-amp budget. Subsequent send_bytes + ARQ
+                // retransmits now target the new address.
+                self.peer.store(Arc::new(*addr));
+                self.candidate.store(Arc::new(None));
+                self.cand_recv.store(0, Ordering::Relaxed);
+                self.cand_sent.store(0, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
     }
 
     fn set_frame_phase(&self, phase: FramePhase) {
@@ -434,5 +454,58 @@ mod tests {
             blocked,
             "the 3× anti-amplification cap must eventually block"
         );
+    }
+
+    /// P4.2: promote_candidate atomically switches the established peer to the
+    /// validated candidate; subsequent send_bytes targets the new address.
+    #[tokio::test]
+    async fn promote_candidate_switches_the_peer() {
+        use tokio::sync::mpsc;
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let old_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old_peer = old_peer_sock.local_addr().unwrap();
+        let new_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let new_addr = new_sock.local_addr().unwrap();
+
+        let (tx, rx) = mpsc::channel(8);
+        let ust = UdpServerTransport::new(server_sock.clone(), old_peer, [7u8; 8], rx);
+        ust.set_frame_phase(FramePhase::Established);
+
+        assert!(
+            !ust.promote_candidate(),
+            "no candidate => nothing to promote"
+        );
+
+        // A frame from a new source sets the candidate.
+        tx.send((Bytes::from_static(b"hi"), new_addr))
+            .await
+            .unwrap();
+        let _ = ust.recv_bytes().await.unwrap();
+        assert!(ust.has_migration_candidate());
+
+        // Pre-switch: send_bytes goes to the OLD peer.
+        ust.send_bytes(b"before").await.unwrap();
+        let mut buf = vec![0u8; 512];
+        let (n, _) =
+            tokio::time::timeout(Duration::from_secs(1), old_peer_sock.recv_from(&mut buf))
+                .await
+                .expect("pre-switch data reaches the old peer")
+                .unwrap();
+        assert!(n > 0);
+
+        // Switch.
+        assert!(ust.promote_candidate(), "candidate must be promoted");
+        assert!(
+            !ust.has_migration_candidate(),
+            "candidate cleared after promotion"
+        );
+
+        // Post-switch: send_bytes now goes to the NEW peer.
+        ust.send_bytes(b"after").await.unwrap();
+        let (n2, _) = tokio::time::timeout(Duration::from_secs(1), new_sock.recv_from(&mut buf))
+            .await
+            .expect("post-switch data reaches the new peer")
+            .unwrap();
+        assert!(n2 > 0);
     }
 }
