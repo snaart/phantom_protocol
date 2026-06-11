@@ -9,6 +9,7 @@ use crate::security::ReplayWindow;
 use crate::transport::{
     bandwidth_estimator::{BandwidthEstimator, DeliverySample},
     fallback::FallbackStateMachine,
+    liveness::LivenessConfig,
     pacer::Pacer,
     path::{PathRegistry, PathStateKind, PATH_CHALLENGE_LEN},
     scheduler::Scheduler,
@@ -184,8 +185,14 @@ pub struct Session {
     scheduler: Arc<Scheduler>,
     /// Resumption secret for 0-RTT
     resumption_secret: RwLock<Option<[u8; 32]>>,
-    /// Last activity timestamp
+    /// Last activity timestamp. Refreshed on every authenticated inbound packet;
+    /// the liveness sweep (P4.3) measures inbound silence from here.
     last_activity: RwLock<Instant>,
+    /// Path-liveness thresholds (Phase 4 / P4.3). Read each pump heartbeat to decide
+    /// path-down / recovery / death; lowerable via [`set_liveness_config`] for tests.
+    ///
+    /// [`set_liveness_config`]: Self::set_liveness_config
+    liveness_config: RwLock<LivenessConfig>,
     /// Fallback state machine
     #[allow(dead_code)]
     fallback: Arc<FallbackStateMachine>,
@@ -266,6 +273,7 @@ impl Session {
             scheduler: Arc::new(Scheduler::new(SchedulerMode::LowLatency)),
             resumption_secret: RwLock::new(None),
             last_activity: RwLock::new(Instant::now()),
+            liveness_config: RwLock::new(LivenessConfig::default()),
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
             send_packet_number: AtomicU64::new(0),
             send_path_id: AtomicU8::new(0),
@@ -307,6 +315,7 @@ impl Session {
             scheduler: Arc::new(Scheduler::new(scheduler_mode)),
             resumption_secret: RwLock::new(None),
             last_activity: RwLock::new(Instant::now()),
+            liveness_config: RwLock::new(LivenessConfig::default()),
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
             send_packet_number: AtomicU64::new(0),
             send_path_id: AtomicU8::new(0),
@@ -343,6 +352,7 @@ impl Session {
             scheduler: Arc::new(Scheduler::new(SchedulerMode::LowLatency)),
             resumption_secret: RwLock::new(Some(*resumption_secret)),
             last_activity: RwLock::new(Instant::now()),
+            liveness_config: RwLock::new(LivenessConfig::default()),
             fallback: Arc::new(FallbackStateMachine::with_defaults()),
             send_packet_number: AtomicU64::new(0),
             send_path_id: AtomicU8::new(0),
@@ -943,6 +953,23 @@ impl Session {
     /// Check if session is expired
     pub fn is_expired(&self, timeout: Duration) -> bool {
         self.last_activity.read().elapsed() > timeout
+    }
+
+    /// Elapsed time since the last authenticated inbound packet — the inbound-silence
+    /// signal the liveness sweep evaluates (Phase 4 / P4.3).
+    pub fn last_activity_elapsed(&self) -> Duration {
+        self.last_activity.read().elapsed()
+    }
+
+    /// Current path-liveness thresholds (P4.3).
+    pub fn liveness_config(&self) -> LivenessConfig {
+        *self.liveness_config.read()
+    }
+
+    /// Override the path-liveness thresholds (P4.3). Rust-only test/advanced hook,
+    /// mirroring [`set_rekey_threshold`](Self::set_rekey_threshold).
+    pub fn set_liveness_config(&self, cfg: LivenessConfig) {
+        *self.liveness_config.write() = cfg;
     }
 }
 

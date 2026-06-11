@@ -2106,6 +2106,17 @@ public enum ConnectionState: UInt8, Equatable, Hashable {
      * Gracefully closed
      */
     case closed = 6
+    /**
+     * The active path went silent (liveness lost); the session is held alive
+     * (keys retained, outbound buffered) awaiting a `migrate()` or the path's
+     * return. The embedder reacts by calling `migrate()` (Phase 4 / P4.3).
+     */
+    case migrating = 7
+    /**
+     * The session is dead: the path stayed down past the migration idle-timeout
+     * with no recovery. Terminal — `recv()` errors instead of hanging (P4.3).
+     */
+    case dead = 8
 
 
 
@@ -2141,6 +2152,10 @@ public struct FfiConverterTypeConnectionState: FfiConverterRustBuffer {
         
         case 7: return .closed
         
+        case 8: return .migrating
+        
+        case 9: return .dead
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -2175,6 +2190,14 @@ public struct FfiConverterTypeConnectionState: FfiConverterRustBuffer {
         
         case .closed:
             writeInt(&buf, Int32(7))
+        
+        
+        case .migrating:
+            writeInt(&buf, Int32(8))
+        
+        
+        case .dead:
+            writeInt(&buf, Int32(9))
         
         }
     }
