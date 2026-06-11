@@ -37,9 +37,7 @@
 //! know about the other.
 
 use crate::transport::path::PATH_CHALLENGE_LEN;
-use crate::transport::types::{
-    PacketFlags, PacketHeader, PhantomPacket, SequenceNumber, SessionId, StreamId,
-};
+use crate::transport::types::{PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId};
 
 /// Whether a frame carries an outgoing challenge or an echoed
 /// response. The two are wire-identical; the distinction lives in the
@@ -53,21 +51,20 @@ pub enum PathValidationKind {
 /// Build a V2 PATH_VALIDATION packet carrying the given 32-byte
 /// challenge/response payload on the supplied `path_id`.
 ///
-/// The control stream is hard-coded to id 0. The caller supplies a
-/// `sequence` value — pick a fresh per-(session, path_id) counter so
-/// the replay window can dedupe duplicates if the same challenge is
-/// retransmitted.
+/// The control stream is hard-coded to id 0. The caller supplies the
+/// per-direction `packet_number` (① — Phase 4) so the replay window can dedupe a
+/// retransmitted challenge.
 pub fn build_path_validation_packet(
     session_id: SessionId,
     path_id: u8,
-    sequence: SequenceNumber,
+    packet_number: u64,
     payload: [u8; PATH_CHALLENGE_LEN],
 ) -> PhantomPacket {
     let stream_id: StreamId = 0;
     let header = PacketHeader::new(
         session_id,
         stream_id,
-        sequence,
+        packet_number,
         PacketFlags::new(PacketFlags::PATH_VALIDATION),
     )
     .with_path_id(path_id);
@@ -146,7 +143,7 @@ mod tests {
         assert_eq!(v2.header.path_id, 7);
         assert!(v2.header.flags.contains(PacketFlags::PATH_VALIDATION));
         assert_eq!(v2.header.stream_id, 0u16);
-        assert_eq!(v2.header.sequence, 42u32);
+        assert_eq!(v2.header.packet_number, 42u64);
         assert_eq!(v2.payload, payload.to_vec());
     }
 
@@ -164,7 +161,7 @@ mod tests {
         let header = PacketHeader::new(
             fixed_session_id(),
             0u16,
-            0u32,
+            0u64,
             PacketFlags::new(PacketFlags::ENCRYPTED), // not PATH_VALIDATION
         );
         let p = PhantomPacket::new(header, vec![0u8; PATH_CHALLENGE_LEN]);
@@ -177,7 +174,7 @@ mod tests {
         let header = PacketHeader::new(
             fixed_session_id(),
             0u16,
-            0u32,
+            0u64,
             PacketFlags::new(PacketFlags::PATH_VALIDATION),
         );
         let p = PhantomPacket::new(header, vec![0u8; 16]); // wrong length

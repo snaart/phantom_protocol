@@ -894,12 +894,6 @@ async fn run_data_pump<T: SessionTransport>(
         // 45-byte header plus a couple of length prefixes), so the underlying
         // buffer is never reallocated after the first frame.
         let mut ack_buf: Vec<u8> = Vec::with_capacity(256);
-        // Monotonic sequence space for outbound PATH_VALIDATION packets.
-        // Local to the recv task because that's where
-        // path-validation echoes are emitted in response to incoming
-        // challenges. Wraps via `wrapping_add` — sequence space is the
-        // session's overall stream-0 control space.
-        let mut path_validation_seq: u32 = 0;
         // Buffering ceiling: the delivery queue is unbounded so the reader
         // never blocks, but a peer that ignores flow control could flood it.
         // Compliant senders are bounded by ~one window per stream (enforced
@@ -947,7 +941,6 @@ async fn run_data_pump<T: SessionTransport>(
                 &deliver_tx,
                 &undelivered_reader,
                 &mut ack_buf,
-                &mut path_validation_seq,
                 &observability_recv,
                 leg,
             )
@@ -1044,16 +1037,11 @@ async fn run_data_pump<T: SessionTransport>(
                     Some(SessionCommand::CloseStream { stream_id }) => {
                         if let Some(stream) = streams.get(&stream_id) {
                             stream.finish().await;
-                            // Same per-stream sequence space as the stream's data
-                            // (and its WINDOW_UPDATEs) so this bare FIN cannot
-                            // collide on the AEAD nonce / replay window.
-                            let seq = stream.next_send_sequence();
                             let _ = send_app_data(
                                 &transport,
                                 &crypto_session,
                                 session_id,
                                 stream_id as TransportStreamId,
-                                seq,
                                 &[],
                                 PacketFlags::FIN,
                                 None, // bare FIN is a control frame — no reliable offset
@@ -1141,18 +1129,11 @@ async fn flush_pending_window_updates<T: SessionTransport>(
         })
         .collect();
     for (stream_id, credit, stream) in pending {
-        // Draw the control-frame sequence from the SAME per-stream outbound
-        // space as application data (`Stream::next_send_sequence`) so a
-        // WINDOW_UPDATE never collides with a data packet on (stream_id,
-        // sequence) — a collision would reuse an AEAD nonce within the epoch and
-        // be dropped by the peer's replay window, silently starving flow control.
-        let seq = stream.next_send_sequence();
         if !send_window_update(
             transport,
             crypto_session,
             session_id,
             stream_id as TransportStreamId,
-            seq,
             credit,
         )
         .await
@@ -1226,7 +1207,6 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
                 crypto_session,
                 session_id,
                 stream_id as TransportStreamId,
-                seg.seq,
                 &seg.data,
                 base,
                 reliable_offset,
@@ -1240,7 +1220,7 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
                 // RTO before the retransmit pass. Unreliable segments were
                 // removed by `poll_send` (fire-and-forget) — nothing to reset.
                 if seg.reliable {
-                    stream.mark_unsent(seg.seq).await;
+                    stream.mark_unsent(seg.stream_offset).await;
                 }
                 break;
             }
@@ -1302,26 +1282,18 @@ async fn pace_send(crypto_session: &Arc<Session>, bytes: u64) {
     }
 }
 
-/// C1: decide whether a rekey is needed before stamping a packet for
-/// `(stream_id, sequence)` and, if so, perform it. A rekey fires when either the
-/// direction-wide AEAD high-watermark ([`Session::send_needs_rekey`]) or this
-/// stream's sequence watermark ([`Session::stream_seq_needs_rekey`]) is crossed
-/// — the latter prevents a per-stream `u32` sequence from wrapping within one
-/// epoch and reusing the AEAD nonce `(epoch, stream_id, sequence, path_id)`
-/// under a fixed key (Invariant 8).
+/// Decide whether a rekey is needed before stamping a packet and, if so, perform
+/// it. A rekey fires when the direction-wide AEAD-invocation high-watermark
+/// ([`Session::send_needs_rekey`]) is crossed (Invariant 8). The per-stream C1
+/// watermark is gone — under ① the packet number is a per-direction `u64` that
+/// cannot wrap within a session, so the nonce can never repeat.
 ///
 /// Returns the extra flag bits to OR into the header (`PacketFlags::REKEY` on a
 /// successful rotation, `0` when no rekey was needed), or `None` if a rekey was
 /// required but failed (epoch saturated at `u8::MAX`) — the caller MUST fail the
 /// send so the session reconnects rather than reusing a nonce.
-fn rekey_before_stamp(
-    crypto_session: &Arc<Session>,
-    stream_id: TransportStreamId,
-    sequence: u32,
-) -> Option<u16> {
-    if crypto_session.send_needs_rekey()
-        || crypto_session.stream_seq_needs_rekey(stream_id, sequence)
-    {
+fn rekey_before_stamp(crypto_session: &Arc<Session>) -> Option<u16> {
+    if crypto_session.send_needs_rekey() {
         match crypto_session.rekey() {
             Ok(_) => Some(PacketFlags::REKEY),
             Err(e) => {
@@ -1343,27 +1315,32 @@ async fn send_app_data<T: SessionTransport>(
     crypto_session: &Arc<Session>,
     session_id: SessionId,
     stream_id: TransportStreamId,
-    sequence: u32,
     payload: &[u8],
     base_flags: u16,
     reliable_offset: Option<u32>,
 ) -> bool {
     // Always OR in ENCRYPTED for application data.
     let mut flag_bits = base_flags | PacketFlags::ENCRYPTED;
-    // Mid-session rekey (C1): rotate to a fresh key BEFORE stamping this header
-    // when either the direction-wide AEAD high-watermark or this stream's
-    // sequence watermark is crossed, so the header carries the new epoch (+ the
-    // REKEY flag) and no per-stream sequence can wrap within an epoch and reuse a
-    // nonce (Invariant 8). The peer follows on the authenticated epoch bump (it
-    // trial-decrypts under the next key).
-    match rekey_before_stamp(crypto_session, stream_id, sequence) {
+    // Mid-session rekey: rotate to a fresh key BEFORE stamping this header when the
+    // direction-wide AEAD high-watermark is crossed, so the header carries the new
+    // epoch (+ the REKEY flag). The peer follows on the authenticated epoch bump
+    // (it trial-decrypts under the next key).
+    match rekey_before_stamp(crypto_session) {
         Some(extra) => flag_bits |= extra,
         // Epoch saturated (u8::MAX): can't rotate further. Surface as a failed
         // send so the caller re-offers; the session reconnects rather than wrap.
         None => return false,
     }
-    let header = PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
-        .with_epoch(crypto_session.current_epoch());
+    // ① — Phase 4: draw the per-direction packet number at send time (so a
+    // retransmit gets a fresh PN and the nonce is never reused).
+    let packet_number = crypto_session.next_send_pn();
+    let header = PacketHeader::new(
+        session_id,
+        stream_id,
+        packet_number,
+        PacketFlags::new(flag_bits),
+    )
+    .with_epoch(crypto_session.current_epoch());
     // For reliable data, prepend the gap-free per-stream `stream_offset` (A.5, 4
     // big-endian bytes) to the AEAD plaintext so the receiver reassembles in send
     // order regardless of `sequence` holes left by interleaved control frames.
@@ -1416,18 +1393,22 @@ async fn send_window_update<T: SessionTransport>(
     crypto_session: &Arc<Session>,
     session_id: SessionId,
     stream_id: TransportStreamId,
-    sequence: u32,
     new_window: u32,
 ) -> bool {
     let mut flag_bits = PacketFlags::ENCRYPTED | PacketFlags::WINDOW_UPDATE;
-    // WINDOW_UPDATE shares the per-stream sequence space with application data,
-    // so it must obey the same C1 rekey discipline before stamping (Invariant 8).
-    match rekey_before_stamp(crypto_session, stream_id, sequence) {
+    // WINDOW_UPDATE obeys the same direction-wide rekey discipline before stamping.
+    match rekey_before_stamp(crypto_session) {
         Some(extra) => flag_bits |= extra,
         None => return false,
     }
-    let header = PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
-        .with_epoch(crypto_session.current_epoch());
+    let packet_number = crypto_session.next_send_pn();
+    let header = PacketHeader::new(
+        session_id,
+        stream_id,
+        packet_number,
+        PacketFlags::new(flag_bits),
+    )
+    .with_epoch(crypto_session.current_epoch());
     let payload = new_window.to_be_bytes();
     let ciphertext = match crypto_session.encrypt_packet(&header, &payload) {
         Ok(c) => c,
@@ -1453,12 +1434,12 @@ async fn send_path_validation<T: SessionTransport>(
     crypto_session: &Arc<Session>,
     session_id: SessionId,
     path_id: u8,
-    sequence: u32,
     payload: [u8; crate::transport::path::PATH_CHALLENGE_LEN],
 ) -> bool {
     // Build the packet skeleton via the codec, then layer ENCRYPTED
     // and epoch on top before the actual encrypt.
-    let mut packet = build_path_validation_packet(session_id, path_id, sequence, payload);
+    let packet_number = crypto_session.next_send_pn();
+    let mut packet = build_path_validation_packet(session_id, path_id, packet_number, payload);
     let flag_bits = packet.header.flags.0 | PacketFlags::ENCRYPTED;
     packet.header.flags = PacketFlags::new(flag_bits);
     packet.header.epoch = crypto_session.current_epoch();
@@ -1509,7 +1490,6 @@ async fn handle_packet<T: SessionTransport>(
     deliver_tx: &mpsc::UnboundedSender<(u32, Bytes)>,
     undelivered_bytes: &AtomicU64,
     ack_buf: &mut Vec<u8>,
-    path_validation_seq: &mut u32,
     observability: &Observability,
     leg: LegType,
 ) {
@@ -1677,14 +1657,11 @@ async fn handle_packet<T: SessionTransport>(
                 // incoming challenge and echo the payload back as our
                 // response. The remote will then verify it against its
                 // own pending challenge.
-                let seq = *path_validation_seq;
-                *path_validation_seq = path_validation_seq.wrapping_add(1);
                 let _ = send_path_validation(
                     transport_for_path,
                     crypto_recv,
                     session_id,
                     path_id,
-                    seq,
                     payload_buf,
                 )
                 .await;
@@ -1789,18 +1766,18 @@ async fn handle_packet<T: SessionTransport>(
         let Some(sack) = local.received_sack(0).await else {
             return;
         };
-        let ack_seq = local.next_send_sequence();
         let mut ack_flag_bits = PacketFlags::ENCRYPTED | PacketFlags::ACK;
-        match rekey_before_stamp(crypto_recv, stream_id as TransportStreamId, ack_seq) {
+        match rekey_before_stamp(crypto_recv) {
             Some(extra) => ack_flag_bits |= extra,
             // Epoch saturated — drop this ACK rather than reuse a nonce; the
             // sender retransmits and the session is expected to reconnect.
             None => return,
         }
+        let ack_pn = crypto_recv.next_send_pn();
         let ack_header = PacketHeader::new(
             session_id,
             stream_id as TransportStreamId,
-            ack_seq,
+            ack_pn,
             PacketFlags::new(ack_flag_bits),
         )
         .with_epoch(crypto_recv.current_epoch())
@@ -2476,9 +2453,13 @@ mod tests {
         payload: &[u8],
     ) -> Vec<u8> {
         let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
-        let header =
-            PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
-                .with_epoch(server_session.current_epoch());
+        let header = PacketHeader::new(
+            session_id,
+            stream_id,
+            sequence as u64,
+            PacketFlags::new(flag_bits),
+        )
+        .with_epoch(server_session.current_epoch());
         let mut pt = Vec::with_capacity(4 + payload.len());
         pt.extend_from_slice(&sequence.to_be_bytes());
         pt.extend_from_slice(payload);
@@ -2800,9 +2781,13 @@ mod tests {
         payload: &[u8],
     ) -> Vec<u8> {
         let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
-        let header =
-            PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
-                .with_epoch(client_session.current_epoch());
+        let header = PacketHeader::new(
+            session_id,
+            stream_id,
+            sequence as u64,
+            PacketFlags::new(flag_bits),
+        )
+        .with_epoch(client_session.current_epoch());
         let mut pt = Vec::with_capacity(4 + payload.len());
         pt.extend_from_slice(&stream_offset.to_be_bytes());
         pt.extend_from_slice(payload);
@@ -2838,7 +2823,6 @@ mod tests {
         });
 
         let mut ack_buf = Vec::with_capacity(256);
-        let mut path_validation_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
         handle_packet(
             v2,
@@ -2851,7 +2835,6 @@ mod tests {
             &deliver_tx,
             &undelivered,
             &mut ack_buf,
-            &mut path_validation_seq,
             &obs,
             LegType::Tcp,
         )
@@ -2880,10 +2863,14 @@ mod tests {
         payload: &[u8],
     ) -> Vec<u8> {
         let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
-        let header =
-            PacketHeader::new(session_id, stream_id, sequence, PacketFlags::new(flag_bits))
-                .with_epoch(client_session.current_epoch())
-                .with_path_id(path_id);
+        let header = PacketHeader::new(
+            session_id,
+            stream_id,
+            sequence as u64,
+            PacketFlags::new(flag_bits),
+        )
+        .with_epoch(client_session.current_epoch())
+        .with_path_id(path_id);
         // Reliable plaintext = [stream_offset: u32 BE][payload] (A.5).
         let mut pt = Vec::with_capacity(4 + payload.len());
         pt.extend_from_slice(&stream_offset.to_be_bytes());
@@ -2928,7 +2915,6 @@ mod tests {
             rx: Mutex::new(ack_b),
         });
         let mut ack_buf = Vec::with_capacity(256);
-        let mut path_validation_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
 
         handle_packet(
@@ -2942,7 +2928,6 @@ mod tests {
             &deliver_tx,
             &undelivered,
             &mut ack_buf,
-            &mut path_validation_seq,
             &obs,
             LegType::Tcp,
         )
@@ -2986,7 +2971,6 @@ mod tests {
             &deliver_tx,
             &undelivered,
             &mut ack_buf,
-            &mut path_validation_seq,
             &obs,
             LegType::Tcp,
         )
@@ -3034,7 +3018,7 @@ mod tests {
         let header = PacketHeader::new(
             session_id,
             stream_id,
-            ack_header_seq,
+            ack_header_seq as u64,
             PacketFlags::new(flag_bits),
         )
         .with_epoch(acker_session.current_epoch());
@@ -3062,7 +3046,6 @@ mod tests {
             rx: Mutex::new(ack_b),
         });
         let mut ack_buf = Vec::with_capacity(64);
-        let mut path_validation_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
         handle_packet(
             pkt,
@@ -3075,7 +3058,6 @@ mod tests {
             &deliver_tx,
             &undelivered,
             &mut ack_buf,
-            &mut path_validation_seq,
             &obs,
             LegType::Tcp,
         )
@@ -3118,7 +3100,7 @@ mod tests {
                 PacketHeader::new(
                     session_id,
                     stream_id,
-                    seq,
+                    seq as u64,
                     PacketFlags::new(PacketFlags::ACK),
                 ),
                 Vec::new(),
@@ -3353,7 +3335,6 @@ mod tests {
             rx: Mutex::new(ack_b),
         });
         let mut ack_buf = Vec::with_capacity(64);
-        let mut path_validation_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
         handle_packet(
             data_pkt,
@@ -3366,7 +3347,6 @@ mod tests {
             &deliver_tx,
             &undelivered,
             &mut ack_buf,
-            &mut path_validation_seq,
             &obs,
             LegType::Tcp,
         )
@@ -3408,7 +3388,12 @@ mod tests {
         let wrong_id = SessionId::from_bytes([0x11; 32]);
         run_recv(
             PhantomPacket::new(
-                PacketHeader::new(wrong_id, stream_id, seq, PacketFlags::new(PacketFlags::ACK)),
+                PacketHeader::new(
+                    wrong_id,
+                    stream_id,
+                    seq as u64,
+                    PacketFlags::new(PacketFlags::ACK),
+                ),
                 Vec::new(),
             ),
             session_id,
@@ -3452,7 +3437,6 @@ mod tests {
         });
 
         let mut ack_buf = Vec::with_capacity(256);
-        let mut path_validation_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
         handle_packet(
             bad_packet,
@@ -3465,7 +3449,6 @@ mod tests {
             &deliver_tx,
             &undelivered,
             &mut ack_buf,
-            &mut path_validation_seq,
             &obs,
             LegType::Tcp,
         )
@@ -3517,7 +3500,6 @@ mod tests {
         });
 
         let mut ack_buf = Vec::with_capacity(256);
-        let mut path_validation_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
         handle_packet(
             v2,
@@ -3530,7 +3512,6 @@ mod tests {
             &deliver_tx,
             &undelivered,
             &mut ack_buf,
-            &mut path_validation_seq,
             &obs,
             LegType::Tcp,
         )
@@ -3573,8 +3554,13 @@ mod tests {
             }
             let bundle = coalescer.flush().expect("bundle");
             let flag_bits = PacketFlags::ENCRYPTED | PacketFlags::COALESCED;
-            let h = PacketHeader::new(session_id, stream_id, seq, PacketFlags::new(flag_bits))
-                .with_epoch(client_session.current_epoch());
+            let h = PacketHeader::new(
+                session_id,
+                stream_id,
+                seq as u64,
+                PacketFlags::new(flag_bits),
+            )
+            .with_epoch(client_session.current_epoch());
             let ct = client_session
                 .encrypt_packet(&h, &bundle)
                 .expect("encrypt bundle");
@@ -3596,7 +3582,6 @@ mod tests {
             rx: Mutex::new(ack_b),
         });
         let mut ack_buf = Vec::with_capacity(256);
-        let mut pv_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
 
         for pkt in [coalesced, normal] {
@@ -3611,7 +3596,6 @@ mod tests {
                 &deliver_tx,
                 &undelivered,
                 &mut ack_buf,
-                &mut pv_seq,
                 &obs,
                 LegType::Tcp,
             )
@@ -3666,7 +3650,6 @@ mod tests {
             rx: Mutex::new(ack_b),
         });
         let mut ack_buf = Vec::with_capacity(256);
-        let mut pv_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
 
         // Deliver OUT OF ORDER on the wire: seq 1 first, then seq 0.
@@ -3682,7 +3665,6 @@ mod tests {
                 &deliver_tx,
                 &undelivered,
                 &mut ack_buf,
-                &mut pv_seq,
                 &obs,
                 LegType::Tcp,
             )
@@ -3745,7 +3727,6 @@ mod tests {
             rx: Mutex::new(ack_b),
         });
         let mut ack_buf = Vec::with_capacity(256);
-        let mut pv_seq: u32 = 0;
         let obs = Observability::new(ObservabilityConfig::default());
 
         for pkt in [a, b] {
@@ -3760,7 +3741,6 @@ mod tests {
                 &deliver_tx,
                 &undelivered,
                 &mut ack_buf,
-                &mut pv_seq,
                 &obs,
                 LegType::Tcp,
             )
@@ -3819,7 +3799,7 @@ mod tests {
                 break;
             }
             let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
-            let header = PacketHeader::new(session_id, 1, seq, PacketFlags::new(flag_bits))
+            let header = PacketHeader::new(session_id, 1, seq as u64, PacketFlags::new(flag_bits))
                 .with_epoch(client_inner.current_epoch());
             // Reliable plaintext = [stream_offset: u32 BE][payload] (A.5). Offsets
             // are contiguous (== seq), so every frame delivers in order and grows
@@ -4132,7 +4112,6 @@ mod tests {
         let _back_tx_keepalive = back_tx; // keep the recv side alive
 
         let mut ack_buf = Vec::with_capacity(256);
-        let mut path_validation_seq: u32 = 100;
         let obs = Observability::new(ObservabilityConfig::default());
 
         handle_packet(
@@ -4146,7 +4125,6 @@ mod tests {
             &deliver_tx,
             &undelivered,
             &mut ack_buf,
-            &mut path_validation_seq,
             &obs,
             LegType::Tcp,
         )
@@ -4166,9 +4144,6 @@ mod tests {
         let echo_v2 = PhantomPacket::from_wire(&echo_bytes).unwrap();
         assert!(echo_v2.header.flags.contains(PacketFlags::PATH_VALIDATION));
         assert_eq!(echo_v2.header.path_id, path_id);
-
-        // Sequence space advanced by exactly one (we sent one echo).
-        assert_eq!(path_validation_seq, 101);
     }
 
     // ────────────────────────────────────────────────────────────────────

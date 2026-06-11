@@ -43,7 +43,7 @@ ML_DSA_SIG_LEN = 3309
 CLASSICAL_PK_LEN = 32
 PROTOCOL_VARIANT = b"phantom-default-1"
 PROTOCOL_VERSION = 2  # bumped 1->2: H2 transcript-signs early_data_accepted + HS-03 adds resumption_binder
-WIRE_VERSION = 2
+WIRE_VERSION = 3
 
 
 def pat(seed: int, n: int) -> bytes:
@@ -264,18 +264,17 @@ def enc_hrr(w: BorshWriter, v):
 
 # ─── packet codec: hand-rolled, big-endian, version-first ───────────────────
 #
-# PacketHeader (45 bytes), declaration order == wire order:
-#   [0]     version    u8   (= WIRE_VERSION)
-#   [1:33]  session_id [u8;32]
-#   [33:35] stream_id  u16 be
-#   [35:39] sequence   u32 be
-#   [39:41] flags      u16 be
-#   [41:43] ack_delay  u16 be
-#   [43]    epoch      u8
-#   [44]    path_id    u8
+# PacketHeader (47 bytes), declaration order == wire order:
+#   [0]     version       u8   (= WIRE_VERSION)
+#   [1:33]  session_id    [u8;32]
+#   [33:35] stream_id     u16 be
+#   [35:43] packet_number u64 be   (① — Phase 4)
+#   [43:45] flags         u16 be
+#   [45]    epoch         u8
+#   [46]    path_id       u8
 # PhantomPacket: header || payload_len:u32be || payload || ext_len:u32be || ext.
 
-HEADER_SIZE = 45
+HEADER_SIZE = 47
 
 
 def dec_packet_header(b: bytes):
@@ -284,11 +283,10 @@ def dec_packet_header(b: bytes):
         "version": b[0],
         "session_id": bytes(b[1:33]),
         "stream_id": struct.unpack(">H", b[33:35])[0],
-        "sequence": struct.unpack(">I", b[35:39])[0],
-        "flags": struct.unpack(">H", b[39:41])[0],
-        "ack_delay": struct.unpack(">H", b[41:43])[0],
-        "epoch": b[43],
-        "path_id": b[44],
+        "packet_number": struct.unpack(">Q", b[35:43])[0],
+        "flags": struct.unpack(">H", b[43:45])[0],
+        "epoch": b[45],
+        "path_id": b[46],
     }
 
 
@@ -297,9 +295,8 @@ def enc_packet_header(h) -> bytes:
         bytes([h["version"]])
         + h["session_id"]
         + struct.pack(">H", h["stream_id"])
-        + struct.pack(">I", h["sequence"])
+        + struct.pack(">Q", h["packet_number"])
         + struct.pack(">H", h["flags"])
-        + struct.pack(">H", h["ack_delay"])
         + bytes([h["epoch"], h["path_id"]])
     )
 
@@ -461,9 +458,8 @@ def packet_header():
     check(h["version"] == WIRE_VERSION, "header version pin (byte 0)")
     check(h["session_id"] == arr32(0x01), "header session_id (as-is, byte 1)")
     check(h["stream_id"] == 7, "header stream_id")
-    check(h["sequence"] == 42, "header sequence")
+    check(h["packet_number"] == 42, "header packet_number")
     check(h["flags"] == 0x0021, "header flags ENCRYPTED|RELIABLE")
-    check(h["ack_delay"] == 0, "header ack_delay")
     check(h["epoch"] == 3, "header epoch")
     check(h["path_id"] == 1, "header path_id")
     check(enc_packet_header(h) == raw, "header re-encode != fixture")
