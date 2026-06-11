@@ -15,7 +15,7 @@ use crate::transport::handshake::{
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::packet_coalescer_codec::unwrap_coalesced_packet;
 use crate::transport::path_validation_codec::build_path_validation_packet;
-use crate::transport::session::Session;
+use crate::transport::session::{Session, SessionState};
 use crate::transport::stream::Stream;
 use crate::transport::types::{
     LegType, PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
@@ -63,6 +63,13 @@ pub enum ConnectionState {
     Failed = 5,
     /// Gracefully closed
     Closed = 6,
+    /// The active path went silent (liveness lost); the session is held alive
+    /// (keys retained, outbound buffered) awaiting a `migrate()` or the path's
+    /// return. The embedder reacts by calling `migrate()` (Phase 4 / P4.3).
+    Migrating = 7,
+    /// The session is dead: the path stayed down past the migration idle-timeout
+    /// with no recovery. Terminal — `recv()` errors instead of hanging (P4.3).
+    Dead = 8,
 }
 
 impl ConnectionState {
@@ -75,15 +82,23 @@ impl ConnectionState {
             4 => Self::Connected,
             5 => Self::Failed,
             6 => Self::Closed,
+            7 => Self::Migrating,
+            8 => Self::Dead,
             _ => Self::Failed,
         }
     }
 
-    /// Whether data can flow (classical or better).
+    /// Whether data can flow (classical or better). `Migrating` counts as ready:
+    /// the keep-alive window still accepts `send()` (buffered + retransmitted until
+    /// the path recovers), so the embedder's send path doesn't error mid-migration.
     pub fn is_data_ready(&self) -> bool {
         matches!(
             self,
-            Self::ClassicalReady | Self::PqcUpgrading | Self::PqcReady | Self::Connected
+            Self::ClassicalReady
+                | Self::PqcUpgrading
+                | Self::PqcReady
+                | Self::Connected
+                | Self::Migrating
         )
     }
 }
@@ -783,6 +798,11 @@ async fn run_data_pump<T: SessionTransport>(
     // so it tracks live sessions instead of growing monotonically.
     observability.session_opened(leg);
 
+    // Liveness (P4.3): stamp "alive now" at establishment so the inbound-silence
+    // sweep measures from the data-plane start, not from session construction (which
+    // predates the multi-KB handshake and would otherwise look stale immediately).
+    crypto_session.update_activity();
+
     // ── Raw-app session stream (reserved id 1) ──
     // The connectionless `send()` / `recv()` surface is multiplexed onto one
     // reserved stream so it gets the same reliable-delivery machinery as
@@ -972,6 +992,11 @@ async fn run_data_pump<T: SessionTransport>(
     // the notifier yet.
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(10));
     let send_notify = crypto_session.send_notifier();
+    // Liveness keep-alive bookkeeping (P4.3): `Some(t)` while in the `Migrating`
+    // window (the pump-local truth + how long); `died` records an idle-timeout death
+    // so the teardown publishes `Dead` instead of overwriting it with `Closed`.
+    let mut migrating_since: Option<std::time::Instant> = None;
+    let mut died = false;
     // Outbound WINDOW_UPDATE control packets are emitted on the send loop — the
     // single writer that also owns the rekey lock — so the encrypted control
     // frame is always sealed under a consistent epoch. The delivery task only
@@ -994,6 +1019,13 @@ async fn run_data_pump<T: SessionTransport>(
                     &streams,
                 )
                 .await;
+                // Liveness sweep (P4.3): the 10 ms heartbeat is the reliable place to
+                // evaluate inbound silence vs. outstanding data and surface
+                // Migrating / recover / Dead. A `Dead` verdict ends the pump.
+                if apply_liveness(&crypto_session, &state, &mut migrating_since) {
+                    died = true;
+                    break;
+                }
             }
             _ = send_notify.notified() => {
                 // Same drain logic as the tick arm — fast-wake path. Also flush
@@ -1136,9 +1168,65 @@ async fn run_data_pump<T: SessionTransport>(
     // Abort the recv task if it's still running; idempotent on a finished
     // handle. Goes through the runtime-agnostic `SpawnHandle::abort`.
     recv_handle.abort();
-    state.store(ConnectionState::Closed as u8, Ordering::Relaxed);
+    // A liveness idle-timeout death already published `ConnectionState::Dead`; only a
+    // normal teardown (graceful close / transport drop) publishes `Closed`.
+    if !died {
+        state.store(ConnectionState::Closed as u8, Ordering::Relaxed);
+    }
     // Session torn down — drop the active-session gauge back down.
     observability.session_closed(leg);
+}
+
+/// Evaluate path liveness once (Phase 4 / P4.3) and apply the resulting transition to
+/// both the internal [`SessionState`] and the FFI-visible [`ConnectionState`]. Returns
+/// `true` when the session has died (idle-timeout in `Migrating`), so the caller ends
+/// the pump. `migrating_since` is the pump-local truth for the keep-alive window.
+fn apply_liveness(
+    crypto_session: &Arc<Session>,
+    state: &Arc<AtomicU8>,
+    migrating_since: &mut Option<std::time::Instant>,
+) -> bool {
+    use crate::transport::liveness::{liveness_verdict, LivenessVerdict};
+    let cfg = crypto_session.liveness_config();
+    let snap = crypto_session.bandwidth_snapshot();
+    let silence = crypto_session.last_activity_elapsed();
+    let in_migrating = migrating_since.is_some();
+    let migrating_for = migrating_since
+        .map(|t| t.elapsed())
+        .unwrap_or(std::time::Duration::ZERO);
+    match liveness_verdict(
+        silence,
+        snap.inflight_bytes,
+        snap.min_rtt,
+        in_migrating,
+        migrating_for,
+        &cfg,
+    ) {
+        LivenessVerdict::PathDown => {
+            *migrating_since = Some(std::time::Instant::now());
+            crypto_session.set_state(SessionState::Migrating);
+            state.store(ConnectionState::Migrating as u8, Ordering::Relaxed);
+            log::info!(
+                "PhantomSession: path down (no inbound for {silence:?} with data in flight) \
+                 — entering Migrating; the embedder should migrate()"
+            );
+            false
+        }
+        LivenessVerdict::Recovered => {
+            *migrating_since = None;
+            crypto_session.set_state(SessionState::Connected);
+            state.store(ConnectionState::Connected as u8, Ordering::Relaxed);
+            log::info!("PhantomSession: path recovered — back to Connected");
+            false
+        }
+        LivenessVerdict::Dead => {
+            crypto_session.set_state(SessionState::Closed);
+            state.store(ConnectionState::Dead as u8, Ordering::Relaxed);
+            log::warn!("PhantomSession: migration idle-timeout elapsed — session dead");
+            true
+        }
+        LivenessVerdict::Unchanged => false,
+    }
 }
 
 /// Emit any flow-control credit the receive **delivery** task staged.
@@ -1606,6 +1694,15 @@ async fn handle_packet<T: SessionTransport>(
     } else {
         Vec::new()
     };
+
+    // Liveness (P4.3): an authenticated inbound packet (it passed AEAD above) proves
+    // the peer is alive on some path — refresh the activity timer so the pump's
+    // liveness sweep does not false-trip. Plaintext/forged packets never reach here
+    // (a failed decrypt returned early), so an off-path attacker cannot keep a dead
+    // session looking alive.
+    if packet.header.flags.contains(PacketFlags::ENCRYPTED) {
+        crypto_recv.update_activity();
+    }
 
     // Authenticated SACK ACK (H1, L1-A). ACKs are `ENCRYPTED | ACK` control
     // frames whose AEAD *plaintext* carries a `Sack` (largest_acked,
@@ -2174,6 +2271,24 @@ impl PhantomSession {
     /// Get the stream demultiplexer (internal use, not exposed to UniFFI)
     pub fn demux(&self) -> Arc<StreamDemultiplexer> {
         self.demux.clone()
+    }
+
+    /// Override the path-liveness thresholds on the established session (Phase 4 /
+    /// P4.3). Returns `false` if the session is still connecting. Rust-only (the
+    /// `LivenessConfig` type is not on the UniFFI surface) — for tests / advanced
+    /// embedders that want a faster or slower path-down / migration-idle timeout than
+    /// the default.
+    pub async fn set_liveness_config(
+        &self,
+        cfg: crate::transport::liveness::LivenessConfig,
+    ) -> bool {
+        match self.inner_session.lock().await.as_ref() {
+            Some(s) => {
+                s.set_liveness_config(cfg);
+                true
+            }
+            None => false,
+        }
     }
 }
 

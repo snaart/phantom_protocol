@@ -1470,6 +1470,19 @@ class ConnectionState(enum.Enum):
     Gracefully closed
 """
     
+    MIGRATING = 7
+    """
+    The active path went silent (liveness lost); the session is held alive
+    (keys retained, outbound buffered) awaiting a `migrate()` or the path's
+    return. The embedder reacts by calling `migrate()` (Phase 4 / P4.3).
+"""
+    
+    DEAD = 8
+    """
+    The session is dead: the path stayed down past the migration idle-timeout
+    with no recovery. Terminal — `recv()` errors instead of hanging (P4.3).
+"""
+    
 
 
 class _UniffiFfiConverterTypeConnectionState(_UniffiConverterRustBuffer):
@@ -1490,6 +1503,10 @@ class _UniffiFfiConverterTypeConnectionState(_UniffiConverterRustBuffer):
             return ConnectionState.FAILED
         if variant == 7:
             return ConnectionState.CLOSED
+        if variant == 8:
+            return ConnectionState.MIGRATING
+        if variant == 9:
+            return ConnectionState.DEAD
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -1507,6 +1524,10 @@ class _UniffiFfiConverterTypeConnectionState(_UniffiConverterRustBuffer):
         if value == ConnectionState.FAILED:
             return
         if value == ConnectionState.CLOSED:
+            return
+        if value == ConnectionState.MIGRATING:
+            return
+        if value == ConnectionState.DEAD:
             return
         raise ValueError(value)
 
@@ -1526,6 +1547,10 @@ class _UniffiFfiConverterTypeConnectionState(_UniffiConverterRustBuffer):
             buf.write_i32(6)
         if value == ConnectionState.CLOSED:
             buf.write_i32(7)
+        if value == ConnectionState.MIGRATING:
+            buf.write_i32(8)
+        if value == ConnectionState.DEAD:
+            buf.write_i32(9)
 
 
 
