@@ -94,7 +94,7 @@ process is a weaker boundary (we trust the caller and the OS).
 | A3 | Hybrid KEM private keys (ephemeral, per-handshake) | `HandshakeClient.kem_secret` | Compromise of one session's KEM key leaks that session's symmetric keys â all traffic from that session decryptable. Mitigated by ephemeral generation per handshake + `ZeroizeOnDrop`. |
 | A4 | Session AEAD keys | `CryptoState.session_key`, ring `LessSafeKey` inside `CryptoSessionInner` | Compromise leaks all packets in that session direction. Mitigated by `ZeroizeOnDrop` (Phase 1.2) and (future) mid-session rekey (Phase 1.5, V2). |
 | A5 | Application plaintext | passed in/out via `Vec<u8>` / `Bytes` | The whole point of the transport. |
-| A6 | Session identity / linkability metadata | session id (32 B), stream id, sequence numbers | Traffic-analysis input. Out of scope for full anonymity. |
+| A6 | Session identity / linkability metadata | session id / CID (32 B, **plaintext**), stream id, packet numbers | Traffic-analysis input; the plaintext CID is also the cross-network migration link (LINDDUN-L, §12.5). Out of scope for full anonymity. |
 | A7 | Cookie / PoW state | client-side stored cookies | Loss enables replay of one round trip within freshness window only. |
 
 ---
@@ -127,15 +127,16 @@ process is a weaker boundary (we trust the caller and the OS).
 | Adversary presents a fake server key in `ServerHello` | Client pins `expected_server_key`; mismatch â `HandshakeError::ServerIdentityMismatch` | `core/src/transport/handshake.rs:283-286` |
 | Adversary forges a `ClientHello` to spoof an IP | Cookie + adaptive PoW; cookie is HMAC(rotating-secret, ip, bucket) so forgery requires the secret | `core/src/transport/handshake.rs:402-475` |
 | Replay of an old, captured `ServerHello` to a fresh client | Transcript signature binds `client_hello.nonce` and `session_id_bytes`; replay fails signature check | `core/src/transport/handshake.rs:201-204, 320-326` |
+| Connection-migration hijack: a known (plaintext) `session_id`/CID replayed from a spoofed source to steal the session | Path validation — a fresh unguessable 32-byte challenge must be echoed *from* the claimed address (only the session-key holder can), constant-time verified, before the server switches its peer; pinned-key AEAD blocks read/inject. Worst achievable is a **redirection-DoS**, **never** hijack/decrypt (the QUIC §9 boundary) | `core/src/transport/path.rs`, `core/src/api/session.rs`, `PROTOCOL.md` §12 |
 
 ### T â Tampering with data
 
 | Threat | Mitigation | Code |
 | --- | --- | --- |
 | Bit-flip in ciphertext | AEAD tag check fails â packet dropped | `core/src/crypto/adaptive_crypto.rs:255-260` |
-| Mutation of header on the wire | Header is serialized via `PacketHeader::to_wire` (45-byte big-endian image) and used as AEAD AAD; any mutation invalidates the tag | `core/src/transport/session.rs` |
+| Mutation of header on the wire | Header is serialized via `PacketHeader::to_wire` (47-byte big-endian image) and used as AEAD AAD; any mutation invalidates the tag | `core/src/transport/session.rs` |
 | Tampering with handshake messages | Transcript signature covers every field of `ClientHello`/`ServerHello` | `core/src/transport/handshake.rs:201-204, 320-326` |
-| Sequence-number mutation (replay or skip) | After AEAD verify, `Session::decrypt_packet` consults a per-stream `ReplayWindow` and rejects duplicates / out-of-window-old | `core/src/transport/session.rs:251-270`, `core/src/security/replay_window.rs` |
+| Packet-number mutation (replay or skip) | After AEAD verify, `Session::decrypt_packet` consults a single per-direction `ReplayWindow` (keyed on the `u64` packet number) and rejects duplicates / out-of-window-old | `core/src/transport/session.rs`, `core/src/security/replay_window.rs` |
 
 ### R â Repudiation
 
@@ -162,7 +163,8 @@ for a real-time secure transport.
 | CPU-exhaustion via cheap handshake attempts | Adaptive PoW difficulty tiers from 0 â 16 (~64k hash evals) based on per-minute load | `core/src/transport/handshake.rs::adaptive_difficulty` (Phase 1.14) |
 | Panic-on-malformed input | `#![warn(clippy::unwrap_used, expect_used, panic, unreachable, todo, unimplemented)]`; no `.unwrap()` on the recv/handshake hot path; fuzz harnesses in `fuzz/` | Phase 1.3, 6.4 |
 | AEAD nonce exhaustion (theoretical) | Hard ceiling `AEAD_MAX_INVOCATIONS = 1 << 48` â `CryptoError::NonceExhausted` | `core/src/crypto/adaptive_crypto.rs:24-44` |
-| Replay-window memory amplification | Per-stream `ReplayWindow` is 144 bytes; created lazily, bounded by stream count | `core/src/security/replay_window.rs` |
+| Replay-window memory amplification | One per-direction `ReplayWindow` (~144 bytes) per session — no per-stream growth | `core/src/security/replay_window.rs` |
+| Connection-migration amplification: known CID + spoofed source used as a reflector toward a victim | To an unvalidated address the server is **challenge-only** and caps bytes sent to **≤ 3× bytes received** (RFC 9000 §8.2); a spoofed address never echoes the challenge so it is never switched-to | `core/src/api/udp_transport.rs` (anti-amp budget), `PROTOCOL.md` §12.3 |
 
 ### E â Elevation of privilege
 
@@ -176,6 +178,7 @@ expose any privileged operation. The library is a passive data conduit.
 | Threat | Status | Note |
 | --- | --- | --- |
 | **L**inkability of two sessions to the same client | Partial | Same `HybridVerifyingKey` on the client side correlates handshakes (the client signing key is reused). Anonymous mode would require ephemeral client signing keys; tracked as future work. |
+| **L**inkability of one session across a network change (migration) | **Documented — functional but linkable** | Connection migration (Phase 4) keeps the **plaintext** `session_id`/CID across a path change, so an on-path / colluding observer seeing both networks can link "same session moved Wi-Fi→cellular". A narrow regression vs. the re-handshake fallback (two unlinkable connections) for a *global* observer; **no** new linkability for a same-network NAT-rebind. We make **no claim of unobservable migration**. Unlinkable migration (header-protection / packet-number encryption + CID rotation) is a deferred hardening phase. See `PROTOCOL.md` §12.5. |
 | **I**dentifiability of the client | No mitigation | Source IP is necessarily visible to the server. Client may use Tor / VPN externally. |
 | **N**on-repudiation | Intentionally out of scope (see STRIDE-R) |
 | **D**etectability that this is `phantom_protocol` | Planned (HTTP-mimicry mode) | FakeTLS leg removed in Phase 0; HTTP traffic mimicry will return as a dedicated transport mode. |
@@ -196,7 +199,9 @@ and the specialist docs in this directory. Cross-reference quick map:
 - STRIDE-I (info disclosure) â Phase 1.2 zeroize, Phase 1.1 constant-time.
 - STRIDE-D (DoS) â Phase 1.10, 1.11, 1.14 cookie/PoW rotation + adaptive.
 - LINDDUN â partially mitigated; full anonymity is out of scope.
-
+- Connection migration (Phase 4) -> path validation (path.rs, Invariant 6), 3x
+  anti-amplification (udp_transport.rs), PATH-001 strict send-gate + relaxed
+  recv-delivery, and PTO-based liveness. See PROTOCOL.md §12.
 ---
 
 ## 8. Known limitations / future work
@@ -206,10 +211,13 @@ and the specialist docs in this directory. Cross-reference quick map:
   the entire session lifetime. Acceptable because AEAD safety limits are
   far above any practical session volume, but adds forward-secrecy
   surface area that a future leak would expose.
-- Multi-path migration validation (Phase 4.2) â without it, an attacker
-  who can MITM both legs simultaneously could potentially confuse the
-  sender about which path is active. Documented; the existing
-  `expected_server_key` pinning still prevents impersonation.
+- Connection migration with path validation (Phase 4) is SHIPPED (P4.0-P4.4):
+  the server validates a new path (a 32-byte challenge echoed from the claimed
+  address, constant-time) before switching its peer, so a MITM cannot redirect or
+  hijack the session - worst case is a redirection-DoS, never decrypt
+  (PROTOCOL.md §12). Residual: migration is functional but LINKABLE via the
+  stable plaintext CID (LINDDUN-L above); unlinkable migration (header-protection +
+  CID rotation) is a deferred hardening phase.
 - No protection against side-channel cryptanalysis of the AEAD itself.
   Rely on ring / dalek / RustCrypto (`ml-kem`, `ml-dsa`) upstream
   constant-time properties.
@@ -222,3 +230,4 @@ and the specialist docs in this directory. Cross-reference quick map:
 | Date | Reviewer | Notes |
 | --- | --- | --- |
 | _Initial draft_ | n/a | Captures state at the commit that introduced this file (Phase 6.1). |
+| 2026-06-11 | Phase 4 | Connection migration + liveness (P4.0-P4.4): per-direction u64 packet number (WIRE 3); path validation; PATH-001a/b; 3x anti-amplification; Migrating/Dead liveness; honest "functional but linkable via stable CID" note (LINDDUN-L, PROTOCOL.md section 12). |
