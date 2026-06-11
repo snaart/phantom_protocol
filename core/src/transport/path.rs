@@ -199,6 +199,14 @@ impl PathRegistry {
         }
     }
 
+    /// Remove a path so its `path_id` becomes re-registerable (D5 — Phase 4).
+    /// Called when a path is retired after a migration switch. Reuse is
+    /// nonce-safe because ① took `path_id` out of the AEAD nonce
+    /// (`nonce = nonce_prefix ‖ packet_number`). No-op for unknown paths.
+    pub fn retire(&self, path_id: u8) {
+        self.paths.remove(&path_id);
+    }
+
     /// Update `last_packet_seen` on the path. No-op for unknown paths.
     pub fn mark_seen(&self, path_id: u8) {
         if let Some(p) = self.paths.get(&path_id) {
@@ -458,5 +466,26 @@ mod tests {
         c2[0] ^= 1;
         assert!(!r.verify_response(2, &c2)); // Failed.
         assert!(r.issue_challenge(2).is_none());
+    }
+
+    #[test]
+    fn retire_removes_path_and_allows_re_register() {
+        let r = PathRegistry::new();
+        r.register(7);
+        let c = r.issue_challenge(7).expect("challenge");
+        assert!(r.verify_response(7, &c)); // path 7 -> Validated
+        assert_eq!(r.state(7), Some(PathStateKind::Validated));
+
+        // Retire frees the path_id.
+        r.retire(7);
+        assert_eq!(r.state(7), None, "retired path must be gone");
+
+        // It is now re-registerable as a fresh Unvalidated path (D5 — nonce-safe
+        // to reuse because ① took path_id out of the AEAD nonce).
+        assert_eq!(r.register(7), RegistrationResult::Created);
+        assert_eq!(r.state(7), Some(PathStateKind::Unvalidated));
+
+        // Retiring an unknown path is a harmless no-op.
+        r.retire(200);
     }
 }
