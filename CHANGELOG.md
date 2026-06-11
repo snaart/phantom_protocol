@@ -10,6 +10,16 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **Liveness — autonomous dead-path detection (Phase 4 / P4.3):** the SDK now notices a **silently-dead
+  path** on its own — no inbound for N×PTO while reliable data is outstanding — and surfaces
+  `ConnectionState::Migrating` so the embedder can `migrate()`; the session is held alive (keys retained,
+  outbound buffered + retransmitted) rather than torn down. With no recovery (a `migrate()`, or the path's
+  return) before a migration-idle timeout it transitions to the terminal `ConnectionState::Dead` and
+  `recv()` errors instead of hanging. Detection is read-only over existing signals (BBR in-flight + an
+  inbound-activity timer) and runs on both peers via the shared data pump, so a server detects a vanished
+  client symmetrically. Two new `ConnectionState` variants (`Migrating`, `Dead`) → bindings regenerated.
+  Thresholds (default ~1s-to-down / 30s-to-dead) are overridable; **no wire change**. Keep-alive PINGs for a
+  purely-passive (download-only) path are deferred.
 - **Seamless connection migration (Phase 4 / P4.1–P4.2):** a live PhantomUDP session now survives a
   client network change (Wi-Fi↔cellular, NAT rebind) **without re-running the post-quantum handshake** —
   the connection loses throughput briefly, never liveness. The embedder triggers it via the new

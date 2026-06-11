@@ -3548,7 +3548,18 @@ enum class ConnectionState(val value: kotlin.UByte) {
     /**
      * Gracefully closed
      */
-    CLOSED(6u);
+    CLOSED(6u),
+    /**
+     * The active path went silent (liveness lost); the session is held alive
+     * (keys retained, outbound buffered) awaiting a `migrate()` or the path's
+     * return. The embedder reacts by calling `migrate()` (Phase 4 / P4.3).
+     */
+    MIGRATING(7u),
+    /**
+     * The session is dead: the path stayed down past the migration idle-timeout
+     * with no recovery. Terminal — `recv()` errors instead of hanging (P4.3).
+     */
+    DEAD(8u);
 
     
 
