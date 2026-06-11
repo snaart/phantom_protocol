@@ -198,6 +198,17 @@ pub struct HelloRetryRequest {
     pub cookie: Option<[u8; 32]>,
 }
 
+/// Outcome of the UDP demux address-validation pre-gate
+/// ([`HandshakeServer::udp_admit`], H-2).
+pub(crate) enum UdpAdmit {
+    /// The hello carries a valid IP-bound cookie — the caller may allocate a slot.
+    Admit,
+    /// No/invalid cookie — reply with this stateless cookie demand; commit no slot.
+    Retry(HelloRetryRequest),
+    /// Internal cookie-generation failure — drop without reply.
+    Drop,
+}
+
 /// Server hello message (response to ClientHello)
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct ServerHello {
@@ -449,6 +460,33 @@ impl HandshakeServer {
     /// Clear `client_ip`'s violation record after a successful handshake (DOS-2).
     pub(crate) fn reset_violations(&self, client_ip: IpAddr) {
         self.reputation.reset_violations(client_ip);
+    }
+
+    /// Stateless UDP demux address-validation pre-gate (H-2). On the connectionless UDP
+    /// path the datagram source is unverified, so a per-connection slot (an `inflight`
+    /// permit + a demux route + a handshake task) must not be committed until the source
+    /// proves it can receive at its claimed address by echoing a stateless cookie. This
+    /// runs only the cookie half of [`Self::cookie_pow_gate`] — cheaply, on the demux
+    /// thread, with no KEM/signature work and no committed state — and hands back a cookie
+    /// demand otherwise. The PoW/handshake work stays in the per-connection task (post-slot,
+    /// for an already address-validated source). Resume tickets do NOT bypass this cookie:
+    /// unlike TCP (address-validated by its 3-way handshake), the UDP source is unproven, so
+    /// 0-RTT-over-UDP completes a cookie round first.
+    pub(crate) fn udp_admit(&self, client_hello: &ClientHello, client_ip: IpAddr) -> UdpAdmit {
+        let cookie_valid = match client_hello.cookie {
+            Some(c) => validate_cookie(&self.master_secret, client_ip, &c).unwrap_or(false),
+            None => false,
+        };
+        if cookie_valid {
+            return UdpAdmit::Admit;
+        }
+        match generate_cookie(&self.master_secret, client_ip) {
+            Ok(cookie) => UdpAdmit::Retry(HelloRetryRequest {
+                challenge: None,
+                cookie: Some(cookie),
+            }),
+            Err(_) => UdpAdmit::Drop,
+        }
     }
 
     /// Drop expired reputation entries (DOS-2) — driven periodically by the

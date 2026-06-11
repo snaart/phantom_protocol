@@ -1218,3 +1218,68 @@ async fn udp_demux_routes_map_is_bounded_under_fresh_cid_spray() {
          spraying {SPRAY} garbage Initials (expected <= {BOUND} once dead routes are reaped)"
     );
 }
+
+/// H-2 (audit 2026-06-11): on the connectionless UDP path a per-connection slot (an
+/// `inflight` permit + a demux route + a handshake task that can hold the permit for up to
+/// HANDSHAKE_DEADLINE) must NOT be committed to a source that has not proven it can receive
+/// at its claimed address. The demux must run the stateless cookie/Retry round itself and
+/// allocate a slot only once a valid address-validation cookie echoes back. A spray of
+/// cookie-less (but otherwise borsh-valid) ClientHellos — exactly what a spoofed source can
+/// cheaply send — must therefore allocate ZERO slots, so legitimate connects are never
+/// locked out by pinned permits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_cookieless_initials_get_no_slot_until_address_validated() {
+    use phantom_protocol::api::udp_listener::PhantomUdpListener;
+    use phantom_protocol::transport::handshake::HandshakeClient;
+    use phantom_protocol::transport::phantom_udp::datagram::encode_datagrams;
+    use phantom_protocol::transport::phantom_udp::envelope::PacketType;
+    use tokio::net::UdpSocket;
+
+    const SPRAY: usize = 400; // > the 256 inflight permits
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let l = listener.clone();
+    let _demux_pump = tokio::spawn(async move { l.accept().await });
+
+    // One real first-flight ClientHello (cookie = None), serialized once and sprayed under
+    // many fresh CIDs — a borsh-valid hello with no cookie, exactly what a spoofer sends. A
+    // real PQ ClientHello (~6 KB) exceeds the path MTU, so it must be sent as the same
+    // multi-datagram fragmentation the demux reassembles for a genuine client.
+    let hello = HandshakeClient::new()
+        .expect("client")
+        .create_client_hello();
+    assert!(
+        hello.cookie.is_none(),
+        "a first-flight hello must carry no cookie"
+    );
+    let hello_bytes = borsh::to_vec(&hello).expect("serialize hello");
+
+    let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    attacker.connect(server_addr).await.unwrap();
+    for i in 0..SPRAY {
+        let cid: [u8; 8] = (i as u64).to_be_bytes(); // distinct CID per connection attempt
+        let dgrams = encode_datagrams(PacketType::Initial, &cid, 0, &hello_bytes).expect("encode");
+        for d in &dgrams {
+            let _ = attacker.send(d).await;
+        }
+        if i % 16 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // A slot-allocating demux climbs to the 256-permit ceiling and pins those permits for
+    // HANDSHAKE_DEADLINE; an address-validating demux commits nothing for a cookie-less hello.
+    let mut peak = 0usize;
+    for _ in 0..100 {
+        peak = peak.max(listener.active_route_count());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        peak, 0,
+        "cookie-less Initials must allocate no demux slots (saw {peak} routes); the demux must \
+         answer the cookie round statelessly before committing any per-connection slot"
+    );
+}
