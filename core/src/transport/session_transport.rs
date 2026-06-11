@@ -113,8 +113,8 @@ pub trait SessionTransport: Send + Sync + 'static {
     }
 
     /// Migrate this transport to a new local address (Phase 4 / P4.2c — embedder-
-    /// triggered connection migration). The address crosses as an
-    /// [`alloc::string::String`] (parsed inside the concrete native transport) so the
+    /// triggered connection migration). The address crosses as a `String` (parsed
+    /// inside the concrete native transport) so the
     /// trait stays `SocketAddr`-free and no_std-clean — `std::net::SocketAddr` does
     /// not exist in `core`/`alloc`. Best-effort: a parse / bind / connect failure
     /// returns `Err` and the session is expected to keep running on its existing
