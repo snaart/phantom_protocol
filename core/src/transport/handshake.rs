@@ -165,6 +165,124 @@ pub struct ClientHello {
     pub early_data: Option<Vec<u8>>,
 }
 
+/// Real maximum byte lengths of the variable-length `ClientHello` fields (M-7). The ML-KEM-768
+/// encapsulation key is 1184 B and the ML-DSA-65 verifying key 1952 B — both fixed by FIPS
+/// 203 / 204, independent of the classical/fips build — and the `PROTOCOL_VARIANT` tag is well
+/// under 32 B; 0-RTT early-data is capped at [`EARLY_DATA_MAX_LEN`].
+const ML_KEM_PK_MAX: usize = 1184;
+const ML_DSA_PK_MAX: usize = 1952;
+const PROTOCOL_VARIANT_MAX: usize = 64;
+
+/// Structural length pre-check for a borsh-encoded [`ClientHello`] (M-7). Walks the frozen
+/// borsh field layout reading ONLY the `Vec<u8>` length prefixes (u32 little-endian) and the
+/// 1-byte `Option` tags, validating each variable field against its real maximum WITHOUT
+/// allocating — so a forged length (e.g. `0xFFFF_FFFF` on `ml_kem_pk`) is rejected before
+/// `borsh::from_slice` performs its `vec![0u8; len.min(1 MiB)]` eager allocate+memset. Returns
+/// `false` on any out-of-bounds length, truncation, or trailing bytes; the caller then drops
+/// the frame.
+///
+/// NOTE: coupled to the `ClientHello` borsh layout (frozen by `core/tests/wire_vectors`). A
+/// field-order/type change must update this AND the vectors together; the unit test feeds a
+/// real `create_client_hello()` through it, so a layout drift that breaks a genuine hello is
+/// caught here as a hard red.
+pub(crate) fn client_hello_lengths_within_bounds(bytes: &[u8]) -> bool {
+    /// Advance `pos` by `n` fixed bytes; false on truncation.
+    fn skip(bytes: &[u8], pos: &mut usize, n: usize) -> bool {
+        match pos.checked_add(n) {
+            Some(end) if end <= bytes.len() => {
+                *pos = end;
+                true
+            }
+            _ => false,
+        }
+    }
+    /// Read a borsh u32 length prefix (little-endian); `None` on truncation.
+    fn read_len(bytes: &[u8], pos: &mut usize) -> Option<usize> {
+        let end = pos.checked_add(4)?;
+        if end > bytes.len() {
+            return None;
+        }
+        let l = u32::from_le_bytes([
+            bytes[*pos],
+            bytes[*pos + 1],
+            bytes[*pos + 2],
+            bytes[*pos + 3],
+        ]);
+        *pos = end;
+        Some(l as usize)
+    }
+    /// Read a borsh `Option` tag (1 byte: 0 = None, 1 = Some); `None` on a bad tag/truncation.
+    fn read_opt(bytes: &[u8], pos: &mut usize) -> Option<bool> {
+        let tag = *bytes.get(*pos)?;
+        *pos += 1;
+        match tag {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+    /// Validate a length-prefixed `Vec<u8>` whose length must be `<= max`.
+    fn vec_le(bytes: &[u8], pos: &mut usize, max: usize) -> bool {
+        match read_len(bytes, pos) {
+            Some(l) if l <= max => skip(bytes, pos, l),
+            _ => false,
+        }
+    }
+    /// Validate an `Option<[u8; n]>` fixed-size field.
+    fn opt_fixed(bytes: &[u8], pos: &mut usize, n: usize) -> bool {
+        match read_opt(bytes, pos) {
+            Some(true) => skip(bytes, pos, n),
+            Some(false) => true,
+            None => false,
+        }
+    }
+
+    let mut pos = 0usize;
+    // client_key_package: classical_pk [u8; CLASSICAL_PK_BYTES] ++ ml_kem_pk Vec<u8>
+    if !skip(
+        bytes,
+        &mut pos,
+        crate::crypto::hybrid_kem::CLASSICAL_PK_BYTES,
+    ) || !vec_le(bytes, &mut pos, ML_KEM_PK_MAX)
+    {
+        return false;
+    }
+    // client_verify_key: ed25519_pk [u8; 32] ++ ml_dsa_pk Vec<u8>
+    if !skip(bytes, &mut pos, 32) || !vec_le(bytes, &mut pos, ML_DSA_PK_MAX) {
+        return false;
+    }
+    // nonce [u8; 32] ++ version u8
+    if !skip(bytes, &mut pos, 32 + 1) {
+        return false;
+    }
+    // cookie Option<[u8;32]>, pow_solution Option<PoWSolution = [u8;32] ++ u64 = 40 B>,
+    // resume_session_id Option<[u8;32]>, resumption_binder Option<[u8;32]>
+    if !opt_fixed(bytes, &mut pos, 32)
+        || !opt_fixed(bytes, &mut pos, 40)
+        || !opt_fixed(bytes, &mut pos, 32)
+        || !opt_fixed(bytes, &mut pos, 32)
+    {
+        return false;
+    }
+    // protocol_variant Vec<u8>
+    if !vec_le(bytes, &mut pos, PROTOCOL_VARIANT_MAX) {
+        return false;
+    }
+    // early_data Option<Vec<u8>>
+    match read_opt(bytes, &mut pos) {
+        Some(true) => {
+            if !vec_le(bytes, &mut pos, EARLY_DATA_MAX_LEN) {
+                return false;
+            }
+        }
+        Some(false) => {}
+        None => return false,
+    }
+    // Exactly consumed: a well-formed, bounded ClientHello. Trailing bytes = malformed
+    // (borsh::from_slice itself rejects trailing data).
+    pos == bytes.len()
+}
+
 /// Server response to ClientHello
 //
 // Intentionally large — the `Success` variant carries a full `Session`.
@@ -1764,5 +1882,35 @@ mod tests {
             0,
             "reset clears it"
         );
+    }
+
+    /// M-7: `client_hello_lengths_within_bounds` must accept a real first-flight ClientHello
+    /// but reject a frame whose `ml_kem_pk` length prefix is forged to a huge value — so a
+    /// malformed Initial is dropped before `borsh::from_slice` performs its
+    /// `vec![0u8; len.min(1 MiB)]` eager allocation (the ~45-byte → 1 MiB amplifier on the
+    /// UDP demux / TCP handshake recv).
+    #[test]
+    fn client_hello_length_validator_rejects_a_forged_vector_length() {
+        let hello = HandshakeClient::new()
+            .expect("client")
+            .create_client_hello();
+        let bytes = borsh::to_vec(&hello).expect("serialize");
+        assert!(
+            client_hello_lengths_within_bounds(&bytes),
+            "a real ClientHello must pass the structural length pre-check"
+        );
+
+        // Forge the ml_kem_pk length prefix (u32 LE at offset CLASSICAL_PK_BYTES) to 0xFFFFFFFF.
+        let mut forged = bytes.clone();
+        let off = crate::crypto::hybrid_kem::CLASSICAL_PK_BYTES;
+        forged[off..off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            !client_hello_lengths_within_bounds(&forged),
+            "a forged ml_kem_pk length must be rejected before borsh allocates"
+        );
+
+        // Short garbage / empty frames (what a spoofed Initial carries) are rejected.
+        assert!(!client_hello_lengths_within_bounds(b"not-a-clienthello"));
+        assert!(!client_hello_lengths_within_bounds(&[]));
     }
 }
