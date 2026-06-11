@@ -115,7 +115,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = encrypt_seq.fetch_add(1, Ordering::Relaxed);
-                    PacketHeader::new(session_id, 1, seq, flags)
+                    PacketHeader::new(session_id, 1, seq as u64, flags)
                 },
                 |header| {
                     let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
@@ -129,7 +129,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = decrypt_seq.fetch_add(1, Ordering::Relaxed);
-                    let header = PacketHeader::new(session_id, 2, seq, flags);
+                    let header = PacketHeader::new(session_id, 2, seq as u64, flags);
                     let encrypted = server_session
                         .encrypt_packet(&header, &data)
                         .expect("encrypt setup");
@@ -147,7 +147,7 @@ fn phantom_throughput_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = roundtrip_seq.fetch_add(1, Ordering::Relaxed);
-                    PacketHeader::new(session_id, 3, seq, flags)
+                    PacketHeader::new(session_id, 3, seq as u64, flags)
                 },
                 |header| {
                     let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
@@ -367,7 +367,7 @@ fn encryption_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = seq_counter.fetch_add(1, Ordering::Relaxed);
-                    PacketHeader::new(session_id, 1, seq, flags)
+                    PacketHeader::new(session_id, 1, seq as u64, flags)
                 },
                 |header| {
                     let encrypted = server_session.encrypt_packet(&header, &data).unwrap();
