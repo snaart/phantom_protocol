@@ -5,8 +5,10 @@ constructions used by `phantom_protocol` 0.x. There is exactly **one** wire
 protocol: a single packet shape, a single handshake, and a single pinned
 version byte. The protocol is **not negotiated** — pre-1.0 there are no
 deployed peers, so there is no version handshake, no fallback, and no
-migration path. The one surviving version byte is a tamper-check anchor and a
-hook for a future, deliberate bump.
+protocol-*version* migration path. The one surviving version byte is a
+tamper-check anchor and a hook for a future, deliberate bump. (*Connection*
+migration — one session surviving a network-path change without re-handshaking
+— is a separate axis on the **same** wire; see § 12.)
 
 Audit-friendly format: every field has its Rust source-of-truth pinned with
 `file:line`. The canonical wire bytes are the byte-frozen vectors in
@@ -23,11 +25,15 @@ that sees any other value drops the frame (packets) or rejects the handshake
 
 | Constant | Value | Source | Where it lives on the wire |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `2` | `core/src/transport/types.rs` | `PacketHeader.version` byte (first byte of the 45-byte header — § 4.2) |
-| `PROTOCOL_VERSION` | `2` | `core/src/transport/handshake.rs:55` | `ClientHello.version`, transcript-bound |
+| `WIRE_VERSION` | `3` | `core/src/transport/types.rs:71` | `PacketHeader.version` byte (first byte of the 47-byte header — § 4.2) |
+| `PROTOCOL_VERSION` | `2` | `core/src/transport/handshake.rs:56` | `ClientHello.version`, transcript-bound |
 
-`WIRE_VERSION` is `2` (incremented when the packet codec moved from `alkahest`
-to the explicit big-endian layout in § 4.2); `PROTOCOL_VERSION` is `2` (bumped
+`WIRE_VERSION` is `3`: it went `1 → 2` when the packet codec moved from
+`alkahest` to the explicit big-endian layout in § 4.2, then `2 → 3` (Phase 4 /
+P4.0) when the AEAD packet identity became a single **per-direction monotonic
+`u64` packet number** — the header dropped the dead `ack_delay` field and widened
+`sequence: u32` to `packet_number: u64` (45 → 47 bytes; § 4.2 / § 5).
+`PROTOCOL_VERSION` is `2` (bumped
 `1 → 2` when the signed transcript began covering the 0-RTT verdict
 `early_data_accepted` (H2) and `ClientHello` gained the `resumption_binder`
 proof-of-possession field (HS-03); a v1 ↔ v2 handshake cannot interoperate
@@ -136,7 +142,7 @@ wire-format constants.
 
 ```rust
 pub struct PhantomPacket {
-    pub header: PacketHeader,   // 45 bytes (§ 4.2)
+    pub header: PacketHeader,   // 47 bytes (§ 4.2)
     pub payload: Vec<u8>,       // AEAD ciphertext (+16-byte tag) when ENCRYPTED;
                                 // raw bytes for control/ACK; coalesced bundle when COALESCED
     pub extensions: Vec<u8>,    // TLV headroom; empty today, ignored if non-empty
@@ -152,7 +158,7 @@ The packet is serialised by `PhantomPacket::to_wire` as an explicit,
 length-prefixed image — no serialization library:
 
 ```text
-header        45 bytes (§ 4.2)
+header        47 bytes (§ 4.2)
 payload_len   u32 big-endian
 payload       payload_len bytes
 ext_len       u32 big-endian
@@ -172,13 +178,13 @@ serialised `PacketHeader` bytes (§ 5).
 frame this build emits; a decoder ignores its contents.
 
 > **Security note.** `extensions` is **not** covered by the AEAD AAD (the AAD is
-> exactly the 45-byte `PacketHeader` image — § 5), so its bytes are
+> exactly the 47-byte `PacketHeader` image — § 5), so its bytes are
 > attacker-malleable. A future TLV reader must therefore treat `extensions` as
 > untrusted input and either authenticate it separately or restrict it to
 > values that are safe when forged. For 1.0 it is reserved and never
 > interpreted, which is why no reader exists yet.
 
-### 4.2 `PacketHeader` (45 bytes)
+### 4.2 `PacketHeader` (47 bytes)
 
 Serialised by `PacketHeader::to_wire` as an explicit, fixed **big-endian**
 (network byte order) image — no serialization library, declaration order == wire
@@ -187,20 +193,21 @@ order, `version` first, byte arrays as-is:
 ```rust
 #[repr(C)]
 pub struct PacketHeader {
-    pub version: u8,             // pinned WIRE_VERSION
-    pub session_id: SessionId,   // [u8; 32]
-    pub stream_id: StreamId,     // u16  (0 = control stream)
-    pub sequence: SequenceNumber,// u32  (per-stream)
-    pub flags: PacketFlags,      // u16  (§ 4.3)
-    pub ack_delay: u16,          // microseconds before ACK was sent (0 if N/A)
-    pub epoch: u8,               // rekey generation (0 at establishment)
-    pub path_id: u8,             // multi-path leg id (0 = default)
+    pub version: u8,                 // pinned WIRE_VERSION
+    pub session_id: SessionId,       // [u8; 32]
+    pub stream_id: StreamId,         // u16  (0 = control stream)
+    pub packet_number: PacketNumber, // u64  per-direction, monotonic (① — Phase 4)
+    pub flags: PacketFlags,          // u16  (§ 4.3)
+    pub epoch: u8,                   // rekey generation (0 at establishment)
+    pub path_id: u8,                 // client-owned migration path label (0 = default)
 }
 ```
 
-Source: `core/src/transport/types.rs`. `PacketHeader::SIZE = 45`, pinned by
-`core/tests/check_wire.rs`, `types.rs::packet_header_serializes_to_45_bytes`, and
+Source: `core/src/transport/types.rs:258`. `PacketHeader::SIZE = 47`, pinned by
+`core/tests/check_wire.rs`, `types.rs::packet_header_serializes_to_47_bytes`, and
 the byte-frozen vector `core/tests/wire_vectors/packet_header.bin` (§ 11).
+(`WIRE_VERSION 2 → 3` dropped the dead `ack_delay: u16` and widened the former
+per-stream `sequence: u32` to the per-direction `packet_number: u64` — § 5.)
 
 Wire byte layout (the load-bearing contract — this image is the AEAD AAD, so any
 layout drift silently breaks interop):
@@ -210,19 +217,18 @@ layout drift silently breaks interop):
 | 0 | `version` | 1 | u8, `= WIRE_VERSION` |
 | 1 | `session_id` | 32 | 32 bytes, as-is |
 | 33 | `stream_id` | 2 | u16 big-endian |
-| 35 | `sequence` | 4 | u32 big-endian |
-| 39 | `flags` | 2 | u16 big-endian (§ 4.3) |
-| 41 | `ack_delay` | 2 | u16 big-endian |
-| 43 | `epoch` | 1 | u8 |
-| 44 | `path_id` | 1 | u8 |
-| **total** | | **45** | |
+| 35 | `packet_number` | 8 | u64 big-endian |
+| 43 | `flags` | 2 | u16 big-endian (§ 4.3) |
+| 45 | `epoch` | 1 | u8 |
+| 46 | `path_id` | 1 | u8 |
+| **total** | | **47** | |
 
-The pinned `version` byte leads the header. The full 45-byte image is the AEAD
+The pinned `version` byte leads the header. The full 47-byte image is the AEAD
 AAD, so flipping *any* byte — `version` included — fails decryption (§ 5); the
 recv path additionally drops a frame whose `version != WIRE_VERSION`. The same
-big-endian convention is used for the `stream_id` / `sequence` bytes that feed
-the AEAD nonce (§ 5). An independent (non-Rust) decoder + encoder that reproduces
-this layout exactly is `tests/wire_vectors_decode.py`.
+big-endian convention is used for the `packet_number` bytes that feed the AEAD
+nonce (§ 5). An independent (non-Rust) decoder + encoder that reproduces this
+layout exactly is `tests/wire_vectors_decode.py`.
 
 ### 4.3 `PacketFlags` (u16 bitfield)
 
@@ -231,7 +237,7 @@ Source: `core/src/transport/types.rs:74-107`.
 | Bit | Constant | Meaning |
 | --- | --- | --- |
 | `0x0001` | `RELIABLE` | Requires ACK; retransmitted on timeout |
-| `0x0002` | `ACK` | This packet is an authenticated ACK (`ENCRYPTED`; AEAD payload = acked seq) |
+| `0x0002` | `ACK` | This packet is an authenticated ACK (`ENCRYPTED`; AEAD payload = a `Sack` — § 4.3) |
 | `0x0004` | `FIN` | Stream finished |
 | `0x0008` | `UNRELIABLE` | Fire-and-forget |
 | `0x0010` | `PRIORITY` | Voice/video frame priority hint |
@@ -248,14 +254,16 @@ Source: `core/src/transport/types.rs:74-107`.
 every application-data packet, and the receive loop drops any non-empty
 unencrypted application-data packet as a stripped-flag downgrade attempt
 (Invariant 2; `api/session.rs`). ACK packets are **authenticated control frames**
-(H1): they carry `ENCRYPTED | ACK`, their AEAD payload is the 4-byte big-endian
-acked data sequence, and the receiver acts on them **only after AEAD verify** —
-so a forged or plaintext ACK can neither retire a pending segment, restore a
-flow-control permit, poison the BBR estimator, nor close a stream. Every inbound
-frame is additionally bound to the negotiated `session_id` before any processing.
-An ACK's own `header.sequence` is drawn from the acker's per-stream send counter
-(shared with its data/`WINDOW_UPDATE` sends) so the AEAD nonce never collides, and
-it obeys the §5 rekey discipline.
+(H1): they carry `ENCRYPTED | ACK`, and their AEAD plaintext is a **`Sack`**
+(`core/src/transport/sack.rs`) — `largest_acked: u32 be`, `ack_delay_us: u32 be`
+(the live ACK-delay signal, since A.5 moved it out of the header), and a list of
+inclusive received ranges (selective ACK). The receiver acts on them **only after
+AEAD verify** — so a forged or plaintext ACK can neither retire a pending segment,
+restore a flow-control permit, poison the BBR estimator, nor close a stream. Every
+inbound frame is additionally bound to the negotiated `session_id` before any
+processing. An ACK's own `header.packet_number` is drawn from the acker's single
+per-direction packet-number space (shared with its data / `WINDOW_UPDATE` sends),
+so the AEAD nonce never collides, and it obeys the §5 rekey discipline.
 
 ### 4.4 `SessionId`
 
@@ -271,67 +279,70 @@ Server-side it is derived as `SHA256(b"phantom-session-id-v1" || shared_secret
 
 Per-direction keys (`send_key` / `recv_key`) and a 4-byte `nonce_prefix` are
 derived once at session establishment from the hybrid shared secret (§ 3
-labels). The per-packet AEAD nonce is **derived from the authenticated header
-fields**, not from an internal counter — so a failed or tampered decrypt never
-desyncs the receiver.
+labels). The per-packet AEAD nonce is **derived from the authenticated header's
+packet number**, not from an internal counter — so a failed or tampered decrypt
+never desyncs the receiver.
 
-Nonce layout (12 bytes total; `transport/session.rs:560-568`):
+Nonce layout (12 bytes total; `Session::build_packet_nonce`,
+`transport/session.rs`):
 
 ```
 nonce[0..4]  = nonce_prefix          (from CryptoState; fresh per rekey epoch)
-nonce[4]     = header.epoch
-nonce[5..7]  = header.stream_id      (big-endian)
-nonce[7..11] = header.sequence       (big-endian)
-nonce[11]    = header.path_id
+nonce[4..12] = header.packet_number  (u64, big-endian)
 ```
 
-The version byte is in the AAD (the serialised 45-byte `PacketHeader`) but
-**not** in the nonce.
+`epoch`, `stream_id`, and `path_id` are **not** in the nonce (① — Phase 4); they
+remain authenticated as part of the 47-byte AAD. The version byte is likewise in
+the AAD but not the nonce. `epoch` is still read from the header to *select* the
+key (`CryptoState`) during the rekey-catchup window.
 
 ```
 Sender:    plaintext, header  →  AEAD-encrypt(key  = send_key,
-                                              nonce= prefix||epoch||sid_be||seq_be||path,
-                                              aad  = serialize(header),   // 45 bytes
+                                              nonce= prefix||packet_number_be,
+                                              aad  = serialize(header),   // 47 bytes
                                               plaintext)
                               →  ciphertext (with 16-byte tag)
 Receiver:  ciphertext, header →  AEAD-decrypt(key  = recv_key,
-                                              nonce= prefix||epoch||sid_be||seq_be||path,
+                                              nonce= prefix||packet_number_be,
                                               aad  = serialize(header),
                                               ciphertext)
                               →  plaintext  OR  a single opaque "decrypt failed"
 ```
 
 Source: `Session::encrypt_packet` / `decrypt_packet`
-(`transport/session.rs:577-627`).
+(`core/src/transport/session.rs`).
 
-**Uniqueness (Invariant 8).** `sequence` is a **per-stream `u32`** that wraps at
-`2^32`; `epoch` distinguishes rekey generations; `path_id` distinguishes the same
-logical packet across multi-path legs. Uniqueness of `(epoch, stream_id, sequence,
-path_id)` under a given key therefore requires that **no single stream's `sequence`
-wraps within one epoch** — otherwise a stream that emits `2^32` packets without a
-rekey would repeat the nonce (catastrophic AES-GCM nonce reuse / the Forbidden
-Attack). The send path enforces this directly: it forces a rekey (epoch bump +
-fresh nonce prefix) once any stream's `sequence` advances past
-`SEQ_REKEY_WATERMARK = 2^31` within the current epoch (see *Automatic rekey*
-below), so a stream's per-epoch sequence span is bounded to `2^31` — half the
-wrap distance. The `epoch` is `u8` and **saturates** (never wraps), so once the
-budget of 255 rekeys is exhausted the session fails closed and reconnects rather
-than reuse a `(epoch, sequence)` pair. The `2^48` direction-wide invocation
-ceiling below is a secondary backstop, not the primary nonce-uniqueness
-guarantee.
+**Uniqueness (Invariant 8).** The `packet_number` is a **single per-direction
+`u64`**, assigned at *send* time and **strictly monotonic** — it never resets, not
+even across a rekey, and every transmission (including a retransmission) draws a
+fresh value. Within an epoch the `nonce_prefix` is fixed and the packet number is
+unique, so the nonce is never reused; across epochs the key + prefix are fresh
+**and** the packet number keeps climbing — double safety. Because a `u64` cannot
+wrap within any realistic session, the audit anchor is simply: *the packet number
+is strictly monotonic and used exactly once per direction → the AEAD nonce is never
+reused, full stop.* `epoch` and `path_id` are authenticated (AAD) but do not
+participate in nonce uniqueness — so a rekey mid-migration, or a reused `path_id`
+after a path is retired, can never collide a nonce. This **retires** the old
+per-stream `u32`-sequence hazard and its `SEQ_REKEY_WATERMARK = 2^31` forced-rekey
+crutch (Phase 4 / P4.0); the C1 nonce-reuse finding from the security audit is
+closed.
 
-**Replay window runs after AEAD verify (Invariant 4).** After a successful
-AEAD open, the receiver consults a per-stream sliding-window bitmap
-(`core/src/security/replay_window.rs`, RFC 4303 §3.4.3, default 1024 bits)
-keyed on `(stream_id, sequence)` only — `epoch` and `path_id` do not
-contribute to replay identity. Duplicates and below-window sequences yield
-`CoreError::ReplayDetected`. The window check is **never** moved before the
-AEAD verify, so the receiver never keys off an unauthenticated sequence number.
+**Replay window runs after AEAD verify (Invariant 4).** After a successful AEAD
+open, the receiver consults **one per-direction** sliding-window bitmap
+(`core/src/security/replay_window.rs`, RFC 4303 §3.4.3, default 1024 bits) keyed on
+the `u64` packet number — not per-stream, since the packet number is already unique
+across all streams and paths. Duplicates and below-window packet numbers yield
+`CoreError::ReplayDetected`. The window check is **never** moved before the AEAD
+verify, so the receiver never keys off an unauthenticated counter. A legitimately
+reordered packet that arrives on the overlapping *old* path during a migration is
+still within the window and accepted; the resulting data duplicate (old + new path
+carrying the same `stream_offset`) is deduped at the stream layer.
 
 **Nonce-exhaustion guard (Invariant 8).** `AEAD_MAX_INVOCATIONS = 1 << 48`
-(`adaptive_crypto.rs:42`). The per-direction counter (kept for telemetry, not
-for nonce derivation) reaching this ceiling yields `CryptoError::NonceExhausted`.
-This is a defensive ceiling well below any practical AEAD safety boundary.
+(`adaptive_crypto.rs`). The per-direction invocation count reaching this ceiling
+yields `CryptoError::NonceExhausted` — a defensive ceiling far below any practical
+AEAD safety boundary, and far below where a `u64` packet number could itself be a
+concern (the `2^47` rekey soft-limit fires long first).
 
 **Mid-session rekey (Invariant 5).** `Session::rekey()`:
 
@@ -348,26 +359,18 @@ Every epoch transition is serialised by a per-session rekey mutex, so the
 concurrent send-loop and receive-task of the data pump can never let the
 installed key depth diverge from the `epoch` counter.
 
-**Automatic rekey (C1).** The data pump triggers a rekey on the send path, *before
-stamping a packet's header*, when **either** of two thresholds is crossed:
-
-1. **Per-stream sequence watermark (primary nonce-uniqueness guarantee).** Once
-   any stream's `sequence` advances `SEQ_REKEY_WATERMARK = 2^31` past where that
-   stream entered the current epoch (`Session::stream_seq_needs_rekey`), a rekey
-   is forced so the per-stream `u32` can never wrap within one epoch. The
-   per-stream `(epoch, base_sequence)` checkpoint is rebased lazily on the first
-   send after an epoch change. This is what closes C1: a single high-throughput
-   stream (which advances the *direction-wide* counter only ~`2^32`, far below
-   threshold 2) would otherwise wrap its sequence and reuse a nonce.
-2. **Direction-wide invocation watermark (secondary backstop).** Once a
-   direction's AEAD invocation count crosses `REKEY_SOFT_LIMIT` (default
-   `2^48 / 2`), well below the hard `AEAD_MAX_INVOCATIONS = 2^48` ceiling.
+**Automatic rekey.** The data pump triggers a rekey on the send path, *before
+stamping a packet's header*, once a direction's AEAD invocation count crosses
+`REKEY_SOFT_LIMIT` (default `2^48 / 2 = 2^47`), well below the hard
+`AEAD_MAX_INVOCATIONS = 2^48` ceiling. The old per-stream `SEQ_REKEY_WATERMARK`
+forced-rekey threshold (the C1 crutch) is **gone**: with a per-direction `u64`
+packet number there is no sequence to wrap, so the invocation soft-limit is the
+only rekey driver.
 
 If a rekey is required but the `epoch` has saturated (`u8::MAX`), the send **fails
 closed** — the packet is not stamped, the send is reported as failed, and the
-session is expected to reconnect rather than reuse a nonce. Both data
-(`send_app_data`) and `WINDOW_UPDATE` (`send_window_update`) packets, which share
-the per-stream sequence space, obey this discipline.
+session is expected to reconnect rather than continue. Both data (`send_app_data`)
+and `WINDOW_UPDATE` (`send_window_update`) sends obey this discipline.
 
 Wire signalling: the sender emits a packet whose header carries the new `epoch`
 and the `PacketFlags::REKEY` flag. The receiver follows via
@@ -384,7 +387,7 @@ reliable transport the sender retransmits at the then-current epoch, so no data
 is lost. The `"phantom-rekey-v1"` label is a wire-format constant.
 
 The single opaque "decrypt failed" surface is deliberate: AEAD-tag mismatch,
-wrong key, wrong AAD, and wrong sequence all manifest identically so a network
+wrong key, wrong AAD, and wrong packet number all manifest identically so a network
 attacker learns nothing from the shape of the failure (§ 8).
 
 ---
@@ -707,9 +710,10 @@ three messages — it leaves the frozen wire vectors (§11) untouched.
 
 ## 7. Reserved / forward-compatibility surface
 
-- `PacketHeader.path_id` / `epoch`: active for multi-path (Phase 4.2) and rekey
-  (Phase 1.5) respectively; both default to 0 for a single-leg, single-epoch
-  session.
+- `PacketHeader.path_id`: the client-owned connection-migration path label
+  (Phase 4, § 12); `epoch`: the rekey generation (Phase 1.5). Both default to 0.
+  Since ① (§ 5) `path_id` no longer feeds the AEAD nonce — it is AAD-only — so a
+  `path_id` becomes safely reusable once its path is retired.
 - `PhantomPacket.extensions`: TLV headroom, empty today. A decoder ignores it;
   future amendments add fields here without a layout change.
 - `ServerHello.server_key_package`: ephemeral hybrid KEM public bound into the
@@ -744,17 +748,17 @@ Wire-visible errors fall into:
   (`CoreError::FipsSelfTestFailure`).
 
 The library never surfaces an error that distinguishes "wrong key" from "wrong
-sequence" from "wrong AAD" — all manifest as a single "decrypt failed" so a
+packet number" from "wrong AAD" — all manifest as a single "decrypt failed" so a
 network attacker cannot learn anything from the shape of the failure.
 
 ---
 
 ## 9. Side notes
 
-- The serialised `PacketHeader` is exactly 45 bytes and is used verbatim as the
+- The serialised `PacketHeader` is exactly 47 bytes and is used verbatim as the
   AEAD AAD. Any layout drift is a wire-incompatible regression.
-- The nonce's `stream_id` / `sequence` fields are big-endian (§ 5); this is
-  pinned independently of the header serialisation.
+- The nonce's `packet_number` field is big-endian (§ 5); this is pinned
+  independently of the header serialisation.
 - Every length-prefix on the wire (e.g. `TcpSessionTransport` framing) is a
   4-byte big-endian `u32` length capped at `MAX_FRAME_BYTES = 16 MiB`.
 - `SessionId`, `HybridKeyPackage`, `HybridVerifyingKey`, `HybridCiphertext`,
@@ -782,7 +786,7 @@ this spec as follows:
 | 3 — FakeTLS per-record counter nonces (anti-Forbidden-Attack) | § 3 / § 9 |
 | 4 — Replay rejection after AEAD verify | § 5 |
 | 5 — Rekey via HKDF `"phantom-rekey-v1"`, saturating epoch | § 5 |
-| 6 — Constant-time path-validation responses | § 4.3 (`PATH_VALIDATION`) |
+| 6 — Constant-time path-validation responses | § 4.3 (`PATH_VALIDATION`) / § 12.1 |
 | 7 — Transcript-bound version | § 1 / § 6.5 |
 | 8 — AEAD nonce-exhaustion guard at 2^48 | § 5 |
 | 9 — 0-RTT early-data one-shot + best-effort | § 6.6 |
@@ -835,3 +839,108 @@ is landed by bumping `WIRE_VERSION` / `PROTOCOL_VERSION` and regenerating:
 PHANTOM_REGEN_WIRE_VECTORS=1 cargo test --manifest-path core/Cargo.toml --lib
 PHANTOM_REGEN_WIRE_VECTORS=1 cargo test --manifest-path core/Cargo.toml --test wire_vectors
 ```
+
+---
+
+## 12. Connection migration & liveness (Phase 4)
+
+One PQ-pinned identity survives a substrate change — Wi-Fi↔cellular, NAT-rebind —
+**without** re-running the kilobyte hybrid handshake. The session keeps the same
+`session_id` and the same AEAD keys; only the underlying network path changes. The
+connection loses **throughput** briefly, never **liveness**. This rides entirely on
+the **existing** wire — there is no migration-specific packet type and no wire bump
+beyond ① (§ 5); migration reuses the `PATH_VALIDATION` flag (§ 4.3), the `path_id`
+header byte (§ 4.2 / § 7), and the stable plaintext `session_id` (the demux key).
+One live path at a time — aggregation / simultaneous multipath is out of scope.
+
+**SDK-boundary principle.** The product on top owns *when* to migrate (it has the
+best signal — `NWPathMonitor` / `ConnectivityManager`); the SDK owns *how* to
+survive it. So migration is **embedder-triggered** on the client (`migrate()`); the
+server is the universal detector / validator.
+
+### 12.1 The switch (detect → challenge → validate → swap)
+
+1. **Client rebind.** `migrate(new_local_addr)` binds a fresh local UDP socket,
+   keeps the old one for the overlap (broken-rebind safety), bumps the client-owned
+   send `path_id` to a fresh non-zero value, and routes app data + ARQ retransmits
+   out the new socket. (Path 0 is permanently *validated*; a fresh non-zero label is
+   what lets the server tell the new path apart and challenge it.)
+2. **Server detect.** The Phase-1 connection-ID demux already routes a known
+   `session_id`/CID arriving from a new source 5-tuple into the same session. *Known
+   CID + new source* is the universal trigger — it covers a deliberate `migrate()`
+   **and** a passive NAT-rebind identically, since the server does not care *why*
+   the source changed.
+3. **Server challenge.** The server mints a `path_id`-bound entry for the new source
+   and sends a `PATH_VALIDATION` packet carrying a fresh **32-byte** random challenge
+   to it (`PathRegistry::issue_challenge`). The legitimate peer — the only party
+   holding the session AEAD key — echoes the bytes back in a `PATH_VALIDATION`
+   response. Verification is **constant-time** (`subtle::ConstantTimeEq`, Invariant
+   6): a match transitions the path `Unvalidated → Validating → Validated`, a
+   mismatch → `Failed`.
+4. **Server swap.** On validation the server atomically switches its peer
+   (`ArcSwap<SocketAddr>`) to the new source, drops the queue aimed at the dead
+   address (the L1 ARQ re-carries every un-ACKed reliable byte on the new path with
+   fresh packet numbers — § 5), retires the old `path_id`, and **resets the RTT
+   estimator + congestion controller** (QUIC §9.4) — Wi-Fi→cellular is a different
+   network, so the old bottleneck/RTT must not carry over and trigger a spurious
+   retransmit storm.
+
+### 12.2 PATH-001 — strict send-gate, relaxed recv-delivery (Invariant 6 / RFC 9000 §9.3)
+
+- **PATH-001a — send-gate (strict).** Application data is *sent* only to the
+  established peer / a `Validated` path. To an *unvalidated* source the server sends
+  **only** the `PATH_VALIDATION` challenge. This is the anti-redirection /
+  anti-amplification core; it is non-negotiable.
+- **PATH-001b — recv-delivery (relaxed).** AEAD-authenticated, non-replayed app data
+  is *delivered* regardless of which source/path it arrived on. Dropping authenticated
+  data by source buys no security — AEAD already gates authenticity and the
+  per-direction replay window (§ 5) gates duplicates — and would needlessly stall a
+  NAT-rebind's *upload* for ~1 RTT. The new source still triggers register → challenge.
+
+The asymmetry is load-bearing: the client sends to the **pinned, unchanged** server
+address (always "validated" for it), so on a break-before-make rebind the client's
+**upload is seamless** (server delivers it recv-relaxed) while the server's
+**download** resumes once it validates the new path (~1 RTT).
+
+### 12.3 Anti-amplification (D9 / RFC 9000 §8.2)
+
+To an unvalidated (possibly spoofed) address the server is **challenge-only** and
+caps total bytes sent to **≤ 3× the bytes received** from that address. A spoofed
+`(victim_addr, hijacked CID)` never echoes the unguessable 32-byte challenge → never
+`Validated` → never switched-to; the only traffic a victim sees is the capped
+challenge (≈1×). Without this cap, *known CID + spoofed source* would be a reflector.
+
+### 12.4 Liveness (P4.3)
+
+A silently-**dead** path (cellular degraded; the embedder missed the OS event) is
+detected autonomously: **N×PTO of inbound silence while reliable data is
+outstanding** (`PTO = max(min_pto, 3 × min_rtt)`) → the path is down. The session is
+**held alive** — keys retained, outbound buffered + retransmitted — and the
+`ConnectionState` surfaces **`Migrating`** so the embedder reacts (calls `migrate()`).
+Inbound life resuming (a successful migrate, or the path's return) recovers
+`Migrating → Connected`; no recovery before a **migration-idle timeout** transitions
+to the terminal **`Dead`** (so `recv()` errors instead of hanging). The detector runs
+on both peers via the shared data pump, so a server detects a vanished client
+symmetrically. Detection is read-only over existing signals (BBR in-flight + an
+inbound-activity timer); a purely-passive download-only receiver needs keep-alive
+PINGs to notice a dead path, which are deferred. No wire change.
+
+### 12.5 Threat model & residual risk (honest)
+
+- **Worst achievable, even by a privileged attacker** who sees the plaintext CID
+  *and* controls an address: a **redirection-DoS** — the server sends *encrypted*
+  data "to the wrong place" and the real client stops receiving — **never a hijack
+  or a decrypt.** This is exactly the QUIC §9 boundary; migration does not worsen it.
+  Defences: path validation (an unguessable challenge that must be echoed *from* the
+  claimed address), pinned-key AEAD (an attacker without the session keys can neither
+  read nor inject app data), and the per-direction replay window (§ 5).
+- **Linkability (documented honestly).** Phase-4 migration is **functional but
+  linkable**: the `session_id`/CID is **plaintext** (it is the demux key), so an
+  on-path / colluding observer who sees both networks can link "same session moved
+  Wi-Fi→cellular". This is a *narrow* regression versus the re-handshake fallback
+  (which presents two unlinkable connections) for a global observer; for a NAT-rebind
+  on the same network there is no new linkability. We accept the trade (liveness ≫
+  narrow linkability) and make **no claim of unobservable migration**. **Unlinkable
+  migration** — header protection (packet-number encryption) + connection-ID rotation
+  — is a dedicated future hardening phase; the `u64` packet number and single PN space
+  (① — § 5) are exactly what such header protection would later mask.
