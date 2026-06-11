@@ -2985,6 +2985,99 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn server_challenges_a_migration_candidate() {
+        // P4.1 end-to-end over a real UdpServerTransport: app data on a NEW path_id
+        // from a NEW source makes the server issue a PATH_VALIDATION challenge TO
+        // THAT SOURCE (not the established peer), under the 3× anti-amp cap, and the
+        // new path goes Validating. No peer switch (that is P4.2).
+        use crate::api::udp_transport::UdpServerTransport;
+        use crate::transport::path::PathStateKind;
+        use crate::transport::phantom_udp::datagram::{push_datagram, FragmentAssembler};
+
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        let server_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap(); // established (old) peer
+        let cand_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cand_addr = cand_sock.local_addr().unwrap();
+
+        // Build the server transport and set the candidate by feeding a frame from
+        // the candidate source through the demux channel (as the demux would), with
+        // enough received bytes that the 3× budget admits a challenge.
+        let (tx, rx) = mpsc::channel(8);
+        let ust = Arc::new(UdpServerTransport::new(
+            server_sock.clone(),
+            peer,
+            [5u8; 8],
+            rx,
+        ));
+        tx.send((Bytes::from(vec![0u8; 256]), cand_addr))
+            .await
+            .unwrap();
+        let _ = ust.recv_bytes().await.unwrap();
+        assert!(
+            ust.has_migration_candidate(),
+            "new source must set a candidate"
+        );
+
+        // App data on a NEW (unvalidated) path id → the server must challenge it.
+        let frame =
+            build_app_frame_on_path(&client_session, session_id, stream_id, 0, 0, 1, b"migrated");
+        let frame = PhantomPacket::from_wire(&frame).unwrap();
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let mut ack_buf = Vec::with_capacity(256);
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        handle_packet(
+            frame,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &ust,
+            &ust,
+            &deliver_tx,
+            &undelivered,
+            &mut ack_buf,
+            &obs,
+            LegType::Udp,
+        )
+        .await;
+
+        // The server issued a challenge → path 1 is now Validating.
+        assert_eq!(
+            server_session.path_state(1),
+            Some(PathStateKind::Validating),
+            "an unvalidated path on a candidate source must be challenged"
+        );
+        // ...and the challenge datagram reached the CANDIDATE socket (not the peer).
+        let mut buf = vec![0u8; 2048];
+        let (n, _from) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cand_sock.recv_from(&mut buf),
+        )
+        .await
+        .expect("challenge must reach the candidate")
+        .unwrap();
+        let mut asm = FragmentAssembler::new();
+        let (_hdr, inner) = push_datagram(&mut asm, &buf[..n]).expect("decode envelope");
+        let inner = inner.expect("single-datagram challenge");
+        let pkt = PhantomPacket::from_wire(&inner).expect("inner packet");
+        assert!(
+            pkt.header.flags.contains(PacketFlags::PATH_VALIDATION),
+            "the candidate must receive a PATH_VALIDATION challenge"
+        );
+        assert_eq!(pkt.header.path_id, 1, "challenge must be on the new path");
+    }
+
     /// Build an `ENCRYPTED | ACK` frame (H1, L1-A) from `acker_session`
     /// acknowledging `acked_seq` on `stream_id`, with its own header sequence
     /// `ack_header_seq` (drawn from the acker's send space, distinct from the
