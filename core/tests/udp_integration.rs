@@ -138,3 +138,70 @@ async fn udp_integration_recovers_dropped_first_flight() {
     assert_eq!(echo, b"ping");
     server.await.unwrap();
 }
+
+/// ★ Phase 4 P4.2 mandatory bidirectional test: a live session **survives** an
+/// embedder-triggered migration **mid-exchange**, the reliable byte stream resumes
+/// **byte-exact**, and there is **no re-handshake** (the same session/keys persist —
+/// the test never reconnects). The server follows the peer to the new address
+/// (the client drops its old socket once the new path shows life, so the
+/// post-migration echoes can only arrive over the new path the server switched to —
+/// the direct peer-switch is unit-tested in `udp_transport::promote_candidate_*`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_migration_survives_mid_exchange() {
+    const ROUNDS: usize = 8;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    // Server echoes ROUNDS messages back over the SAME accepted session. The client
+    // migrates mid-stream; the server must keep serving that one session and follow
+    // the peer to the new address — never re-accepting / re-handshaking.
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        for _ in 0..ROUNDS {
+            let m = session.recv().await.expect("server recv");
+            session.send(m).await.expect("server echo");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let transport = UdpClientTransport::connect(addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+
+    // Round 0 establishes the data plane on the original path.
+    let m0 = b"round-0-pre-migration".to_vec();
+    client.send(m0.clone()).await.expect("send 0");
+    let e0 = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv 0");
+    assert_eq!(e0, m0, "pre-migration echo must be byte-exact");
+
+    // Migrate mid-exchange to a fresh local socket (a new ephemeral port = a new
+    // source 5-tuple the server detects). Best-effort, non-blocking.
+    client
+        .migrate("127.0.0.1:0".to_string())
+        .await
+        .expect("migrate");
+
+    // Rounds 1..ROUNDS: the reliable byte stream continues byte-exact across the
+    // migration with NO re-handshake. The server detects the new source, challenges +
+    // validates the new path, switches its peer, and keeps echoing.
+    for i in 1..ROUNDS {
+        let m = format!("round-{i}-post-migration-{}", "x".repeat(i * 7)).into_bytes();
+        client.send(m.clone()).await.expect("send post-migration");
+        let e = timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("no timeout (the session must survive the migration)")
+            .expect("recv post-migration");
+        assert_eq!(e, m, "post-migration echo must be byte-exact (round {i})");
+    }
+
+    server.await.unwrap();
+}
