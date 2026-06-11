@@ -1,8 +1,8 @@
 //! Bitmap-based sliding-window replay detection (RFC 4303 § 3.4.3 / IPsec ESP).
 //!
-//! Per-stream replay protection for the data plane. Tracks the highest accepted
-//! sequence number plus a 1024-bit bitmap covering `[high - 1024 + 1, high]`,
-//! rejecting duplicates and out-of-window-old packets.
+//! Per-direction replay protection for the data plane (① — Phase 4). Tracks the
+//! highest accepted packet number plus a 1024-bit bitmap covering
+//! `[high - 1024 + 1, high]`, rejecting duplicates and out-of-window-old packets.
 //!
 //! ## Why this exists if the AEAD already prevents replay
 //!
@@ -26,8 +26,8 @@
 //!   and set the bit otherwise.
 //! - Sequence numbers below `high_watermark - WINDOW_BITS + 1`: too old, reject.
 //!
-//! The struct is small (128-byte bitmap + a couple of u32 words) and intended
-//! to be held per-stream under a `parking_lot::Mutex`.
+//! The struct is small (128-byte bitmap + a couple of small words) and intended
+//! to be held once per direction under a `parking_lot::Mutex`.
 
 /// Width of the sliding window in bits. 1024 matches RFC 4303's recommended
 /// upper bound and gives us comfortable headroom for severely reordered
@@ -35,14 +35,14 @@
 pub const WINDOW_BITS: usize = 1024;
 const WINDOW_WORDS: usize = WINDOW_BITS / 64;
 
-/// Sliding-window replay tracker for a single sequence-numbered stream.
+/// Sliding-window replay tracker for one direction's packet-number space.
 #[derive(Debug)]
 pub struct ReplayWindow {
     /// Bitmap. Bit `i` (counting from LSB of word 0) corresponds to
     /// `high_watermark - i`. Bit 0 is the high-watermark itself.
     bitmap: [u64; WINDOW_WORDS],
-    /// Highest accepted sequence number seen so far.
-    high_watermark: u32,
+    /// Highest accepted packet number seen so far.
+    high_watermark: u64,
     /// Whether any packet has been accepted yet. Until the first packet, every
     /// sequence number is novel.
     initialized: bool,
@@ -72,7 +72,7 @@ impl ReplayWindow {
     /// Returns `false` for:
     /// - Exact duplicate of a previously-accepted sequence within the window.
     /// - Sequence below the window (too old).
-    pub fn accept(&mut self, seq: u32) -> bool {
+    pub fn accept(&mut self, seq: u64) -> bool {
         if !self.initialized {
             self.high_watermark = seq;
             self.bitmap[0] = 1; // bit 0 set: high_watermark itself
@@ -110,7 +110,7 @@ impl ReplayWindow {
 
     /// Highest accepted sequence number. Returns 0 if no packets have been
     /// accepted yet (caller should check `is_initialized` to disambiguate).
-    pub fn high_watermark(&self) -> u32 {
+    pub fn high_watermark(&self) -> u64 {
         self.high_watermark
     }
 
@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn monotonic_sequence_accepted() {
         let mut w = ReplayWindow::new();
-        for seq in 1..=2000u32 {
+        for seq in 1..=2000u64 {
             assert!(w.accept(seq), "seq {} must be accepted", seq);
         }
         assert_eq!(w.high_watermark(), 2000);
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn boundary_exactly_at_window_edge() {
         let mut w = ReplayWindow::new();
-        assert!(w.accept(WINDOW_BITS as u32));
+        assert!(w.accept(WINDOW_BITS as u64));
         // The edge: high_watermark - WINDOW_BITS + 1 = 1 → accepted.
         assert!(w.accept(1));
         // One below the edge: 0 → too old.

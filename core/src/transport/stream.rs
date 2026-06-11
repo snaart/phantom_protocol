@@ -55,9 +55,6 @@ pub enum StreamState {
 /// Pending data waiting to be sent
 #[derive(Debug)]
 struct PendingData {
-    /// Wire `header.sequence` — the AEAD-nonce / replay id (shared with control
-    /// frames, so NOT gap-free). Reused verbatim on retransmit.
-    sequence: SequenceNumber,
     /// Gap-free per-stream reliable-data offset — the reassembly / SACK / loss-
     /// detection key (A.5). Carried in the AEAD plaintext so the receiver can
     /// deliver reliable data strictly in send order even when `sequence` has
@@ -124,12 +121,10 @@ impl SackResult {
 /// One segment handed back by [`Stream::poll_send`] for transmission.
 #[derive(Debug, Clone)]
 pub struct OutboundSegment {
-    /// Wire `header.sequence` of the segment (AEAD nonce / replay id).
-    pub seq: SequenceNumber,
     /// Gap-free per-stream reliable-data offset (A.5). The send path prepends it
     /// (big-endian u32) to the AEAD plaintext of a reliable segment so the
-    /// receiver reassembles in send order regardless of `seq` holes. Meaningless
-    /// for unreliable segments (the send path does not prefix those).
+    /// receiver reassembles in send order regardless of control-frame holes.
+    /// Meaningless for unreliable segments (the send path does not prefix those).
     pub stream_offset: SequenceNumber,
     /// Payload bytes.
     pub data: Bytes,
@@ -211,6 +206,16 @@ impl RtoEstimator {
     fn on_timeout(&mut self) {
         self.backoff_shift = (self.backoff_shift + 1).min(Self::MAX_BACKOFF_SHIFT);
     }
+
+    /// Reset to the initial state (Phase 4 / QUIC §9.4): a migration path switch
+    /// lands on a different network, so the old RTT estimate must not carry over.
+    /// Wired by the P4.2 migration switch; unit-tested in P4.0 Task 5.
+    #[allow(dead_code)]
+    fn reset(&mut self) {
+        self.srtt = None;
+        self.rttvar = Duration::ZERO;
+        self.backoff_shift = 0;
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +254,20 @@ mod rto_tests {
         est.on_rtt_sample(Duration::from_millis(100));
         assert_eq!(est.rto(), Duration::from_millis(250));
     }
+
+    #[test]
+    fn reset_clears_estimate_and_backoff() {
+        let mut est = RtoEstimator::new();
+        // Build up an SRTT and a backed-off RTO.
+        est.on_rtt_sample(Duration::from_millis(100)); // RTO = 300ms
+        est.on_timeout(); // RTO = 600ms (backed off)
+        assert_eq!(est.rto(), Duration::from_millis(600));
+        // Phase 4 / QUIC §9.4: a migration path switch must reset the estimate so
+        // the new network's RTT is measured fresh (no stale tiny RTO => no
+        // spurious-retransmit storm on the first packets of the new path).
+        est.reset();
+        assert_eq!(est.rto(), Duration::from_secs(1)); // INITIAL_RTO, no backoff
+    }
 }
 
 /// Stream - multiplexed data channel within a session
@@ -257,9 +276,6 @@ pub struct Stream {
     id: StreamId,
     /// Current state
     state: Mutex<StreamState>,
-    /// Send sequence number — the wire `header.sequence` counter, shared with
-    /// control frames (`next_send_sequence`), so it is NOT gap-free.
-    send_sequence: AtomicU32,
     /// Gap-free per-stream reliable-data offset counter (A.5). Only reliable data
     /// consumes it, so it has no control-frame holes; it is the reassembly / SACK
     /// key carried in the reliable-data AEAD plaintext.
@@ -269,7 +285,7 @@ pub struct Stream {
     /// Send buffer (data waiting to be sent)
     send_buffer: Mutex<VecDeque<PendingData>>,
     /// Unreliable send buffer (fire and forget)
-    unreliable_buffer: Mutex<VecDeque<(SequenceNumber, Bytes)>>,
+    unreliable_buffer: Mutex<VecDeque<Bytes>>,
     /// Receive buffer (out-of-order data). Each entry is one cursor position
     /// `(sequence, payloads)`; `payloads` is normally a single reliable frame but
     /// carries a COALESCED bundle's sub-payloads when several share one sequence.
@@ -322,7 +338,6 @@ impl Stream {
         Self {
             id,
             state: Mutex::new(StreamState::Open),
-            send_sequence: AtomicU32::new(0),
             reliable_offset: AtomicU32::new(0),
             recv_sequence: AtomicU32::new(0),
             send_buffer: Mutex::new(VecDeque::new()),
@@ -525,9 +540,11 @@ impl Stream {
         }
     }
 
-    /// Queue data for sending with reliability
+    /// Queue data for sending with reliability.
     ///
-    /// Returns the sequence number assigned to this chunk.
+    /// Returns the gap-free `stream_offset` assigned to this chunk (the reassembly
+    /// / SACK key). The wire packet number is assigned later, at send time, by the
+    /// data pump (① — Phase 4).
     pub async fn send_reliable(&self, data: Bytes) -> SequenceNumber {
         // Backpressure: wait until there is space in the buffer.
         // PANIC-SAFETY: `Semaphore::acquire` only errors after `close()`. The
@@ -542,12 +559,10 @@ impl Stream {
             .expect("Semaphore closed");
         permit.forget();
 
-        let seq = self.send_sequence.fetch_add(1, Ordering::SeqCst);
-        // Gap-free reliable-data offset (distinct from the shared wire sequence).
+        // Gap-free reliable-data offset (A.5) — the reassembly / SACK key.
         let stream_offset = self.reliable_offset.fetch_add(1, Ordering::SeqCst);
 
         let pending = PendingData {
-            sequence: seq,
             stream_offset,
             data,
             sent_at: None,
@@ -557,34 +572,14 @@ impl Stream {
 
         self.send_buffer.lock().await.push_back(pending);
 
-        seq
+        stream_offset
     }
 
-    /// Reserve the next outbound sequence number from this stream's send space.
-    ///
-    /// Control frames that are emitted directly on a data stream (e.g.
-    /// `WINDOW_UPDATE`, a bare `FIN`) MUST draw their sequence from here rather
-    /// than a private counter: the AEAD nonce is `(epoch, stream_id, sequence,
-    /// path_id)` and the receiver's replay window is keyed on `(stream_id,
-    /// sequence)`, so a control frame sharing a `(stream_id, sequence)` with a
-    /// data packet in the same epoch would reuse a nonce **and** be dropped as a
-    /// replay. Sharing one monotonic space keeps every packet on the stream
-    /// unique. Control frames are unreliable, so the resulting gap in the data
-    /// sequence is harmless (no ACK is expected, nothing waits to reassemble it).
-    pub fn next_send_sequence(&self) -> SequenceNumber {
-        self.send_sequence.fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Queue data for unreliable sending
-    ///
-    /// Returns the sequence number assigned to this chunk.
-    pub async fn send_unreliable(&self, data: Bytes) -> SequenceNumber {
-        // Unreliable data does not consume buffer permits
-        let seq = self.send_sequence.fetch_add(1, Ordering::SeqCst);
-
-        self.unreliable_buffer.lock().await.push_back((seq, data));
-
-        seq
+    /// Queue data for unreliable sending. Fire-and-forget; the wire packet number
+    /// is assigned at send time by the data pump (① — Phase 4).
+    pub async fn send_unreliable(&self, data: Bytes) {
+        // Unreliable data does not consume buffer permits.
+        self.unreliable_buffer.lock().await.push_back(data);
     }
 
     /// Get the next segment to (re)transmit, or `None` if nothing is due.
@@ -596,12 +591,11 @@ impl Stream {
     /// Pass `u64::MAX` to disable the limit.
     pub async fn poll_send(&self, cwnd_budget: u64) -> Option<OutboundSegment> {
         // Unreliable data is fire-and-forget and not congestion-controlled.
-        if let Some((seq, data)) = self.unreliable_buffer.lock().await.pop_front() {
+        if let Some(data) = self.unreliable_buffer.lock().await.pop_front() {
             return Some(OutboundSegment {
-                seq,
                 // Unreliable segments are not reassembled; offset is unused (the
-                // send path does not prefix it). Mirror `seq` for a sane value.
-                stream_offset: seq,
+                // send path does not prefix it).
+                stream_offset: 0,
                 data,
                 reliable: false,
                 retransmit: false,
@@ -625,7 +619,6 @@ impl Stream {
                 pending.sent_at = Some(now);
                 pending.retries += 1;
                 return Some(OutboundSegment {
-                    seq: pending.sequence,
                     stream_offset: pending.stream_offset,
                     data: pending.data.clone(),
                     reliable: true,
@@ -643,7 +636,6 @@ impl Stream {
                     // Back the RTO off exponentially for the next attempt.
                     self.note_rto_timeout();
                     return Some(OutboundSegment {
-                        seq: pending.sequence,
                         stream_offset: pending.stream_offset,
                         data: pending.data.clone(),
                         reliable: true,
@@ -677,7 +669,6 @@ impl Stream {
                 }
                 pending.sent_at = Some(now);
                 return Some(OutboundSegment {
-                    seq: pending.sequence,
                     stream_offset: pending.stream_offset,
                     data: pending.data.clone(),
                     reliable: true,
@@ -691,12 +682,12 @@ impl Stream {
 
     /// Mark a sequence number as acknowledged.
     /// Returns the timestamp when the packet was originally sent and its size, if found.
-    pub async fn ack(&self, sequence: SequenceNumber) -> Option<(tokio::time::Instant, u64)> {
+    pub async fn ack(&self, stream_offset: SequenceNumber) -> Option<(tokio::time::Instant, u64)> {
         let mut buffer = self.send_buffer.lock().await;
         let mut result = None;
 
-        // Find the packet and get its sent_at time
-        if let Some(pos) = buffer.iter().position(|p| p.sequence == sequence) {
+        // Find the segment (by gap-free `stream_offset`, A.5) and get its sent_at.
+        if let Some(pos) = buffer.iter().position(|p| p.stream_offset == stream_offset) {
             let sent_at = buffer[pos].sent_at;
             let retries = buffer[pos].retries;
             let size = buffer[pos].data.len() as u64;
@@ -726,9 +717,9 @@ impl Stream {
     /// `sent_at` — the bytes never reached the wire, so the segment must not be
     /// treated as in-flight. No-op if the segment was already acknowledged and
     /// removed.
-    pub async fn mark_unsent(&self, sequence: SequenceNumber) {
+    pub async fn mark_unsent(&self, stream_offset: SequenceNumber) {
         let mut buffer = self.send_buffer.lock().await;
-        if let Some(pending) = buffer.iter_mut().find(|p| p.sequence == sequence) {
+        if let Some(pending) = buffer.iter_mut().find(|p| p.stream_offset == stream_offset) {
             pending.sent_at = None;
         }
     }
@@ -1048,8 +1039,7 @@ impl std::fmt::Debug for Stream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Stream")
             .field("id", &self.id)
-            .field("send_seq", &self.send_sequence.load(Ordering::Relaxed))
-            .field("recv_seq", &self.recv_sequence.load(Ordering::Relaxed))
+            .field("recv_offset", &self.recv_sequence.load(Ordering::Relaxed))
             .field("priority", &self.priority.load(Ordering::Relaxed))
             .finish()
     }
@@ -1072,13 +1062,13 @@ mod tests {
 
         // Poll send twice, the second should be None because it's already sent and hasn't timed out
         let seg = stream.poll_send(u64::MAX).await.unwrap();
-        assert_eq!(seg.seq, 0);
+        assert_eq!(seg.stream_offset, 0);
         assert_eq!(seg.data, Bytes::from("hello"));
         assert!(seg.reliable);
         assert!(!seg.retransmit);
 
         let seg2 = stream.poll_send(u64::MAX).await.unwrap();
-        assert_eq!(seg2.seq, 1);
+        assert_eq!(seg2.stream_offset, 1);
         assert_eq!(seg2.data, Bytes::from("world"));
         assert!(seg2.reliable);
         assert!(!seg2.retransmit);
@@ -1096,7 +1086,7 @@ mod tests {
 
         // First send — not a retransmission.
         let seg = stream.poll_send(u64::MAX).await.unwrap();
-        assert_eq!(seg.seq, 0);
+        assert_eq!(seg.stream_offset, 0);
         assert!(seg.reliable);
         assert!(!seg.retransmit);
 
@@ -1113,7 +1103,7 @@ mod tests {
 
         // Now it should retransmit — flagged as a retransmission.
         let seg2 = stream.poll_send(u64::MAX).await.unwrap();
-        assert_eq!(seg2.seq, 0);
+        assert_eq!(seg2.stream_offset, 0);
         assert_eq!(seg2.data, Bytes::from("hello"));
         assert!(seg2.reliable);
         assert!(seg2.retransmit);
@@ -1137,7 +1127,7 @@ mod tests {
         // First poll stamps `sent_at`; an immediate re-poll yields nothing
         // (treated as in-flight, not yet timed out).
         let seg = stream.poll_send(u64::MAX).await.unwrap();
-        assert_eq!(seg.seq, 0);
+        assert_eq!(seg.stream_offset, 0);
         assert!(!seg.retransmit);
         assert!(stream.poll_send(u64::MAX).await.is_none());
 
@@ -1148,7 +1138,7 @@ mod tests {
         // It is re-offered immediately — without advancing past the RTO — and as
         // a fresh send (Pass 2), not a retransmission.
         let seg2 = stream.poll_send(u64::MAX).await.unwrap();
-        assert_eq!(seg2.seq, 0);
+        assert_eq!(seg2.stream_offset, 0);
         assert_eq!(seg2.data, Bytes::from("hello"));
         assert!(seg2.reliable);
         assert!(!seg2.retransmit);
@@ -1258,7 +1248,7 @@ mod tests {
             assert_eq!(seq, i);
             // Stamp it as in-flight so RTT sampling has a `sent_at`.
             let seg = stream.poll_send(u64::MAX).await.expect("poll");
-            assert_eq!(seg.seq, i);
+            assert_eq!(seg.stream_offset, i);
         }
         assert_eq!(stream.pending_send_count().await, 6);
 
