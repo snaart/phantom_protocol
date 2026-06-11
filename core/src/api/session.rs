@@ -1429,15 +1429,16 @@ async fn send_window_update<T: SessionTransport>(
 /// Emit a V2 PATH_VALIDATION packet on `path_id` carrying the given
 /// 32-byte challenge or response payload. Encrypted under the current
 /// session epoch.
-async fn send_path_validation<T: SessionTransport>(
-    transport: &Arc<T>,
+/// Build + encrypt a `PATH_VALIDATION` packet, returning its on-wire bytes. The
+/// caller routes them: to the established peer (a response echo) via `send_bytes`,
+/// or to a migration candidate (a server-issued challenge) via `send_to_candidate`
+/// (Phase 4). Returns `None` only if the AEAD seal fails.
+fn encrypt_path_validation(
     crypto_session: &Arc<Session>,
     session_id: SessionId,
     path_id: u8,
     payload: [u8; crate::transport::path::PATH_CHALLENGE_LEN],
-) -> bool {
-    // Build the packet skeleton via the codec, then layer ENCRYPTED
-    // and epoch on top before the actual encrypt.
+) -> Option<Vec<u8>> {
     let packet_number = crypto_session.next_send_pn();
     let mut packet = build_path_validation_packet(session_id, path_id, packet_number, payload);
     let flag_bits = packet.header.flags.0 | PacketFlags::ENCRYPTED;
@@ -1448,11 +1449,25 @@ async fn send_path_validation<T: SessionTransport>(
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: PATH_VALIDATION encrypt failed: {}", e);
-            return false;
+            return None;
         }
     };
     packet.payload = ciphertext;
-    let buf = packet.to_wire();
+    Some(packet.to_wire())
+}
+
+/// Send a `PATH_VALIDATION` packet to the established peer (a response echo).
+async fn send_path_validation<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    path_id: u8,
+    payload: [u8; crate::transport::path::PATH_CHALLENGE_LEN],
+) -> bool {
+    let buf = match encrypt_path_validation(crypto_session, session_id, path_id, payload) {
+        Some(b) => b,
+        None => return false,
+    };
     if let Err(e) = transport.send_bytes(&buf).await {
         log::error!("PhantomSession: PATH_VALIDATION send failed: {}", e);
         return false;
@@ -1670,25 +1685,40 @@ async fn handle_packet<T: SessionTransport>(
         }
     }
 
-    // PATH-001 (Invariant 6): application data is delivered only on a Validated
-    // path. Path 0 is pre-validated at session establishment; any other path_id
-    // must complete a PATH_VALIDATION challenge/response first. The control
-    // frames (ACK / WINDOW_UPDATE / PATH_VALIDATION) were handled above and
-    // returned; this gates the app-data delivery branches below. It runs AFTER
-    // AEAD verify, so it never acts on an attacker-chosen plaintext path_id that
-    // fails decryption.
+    // PATH-001 split (D10, Phase 4). Runs AFTER AEAD verify + the per-direction
+    // replay window, so it never acts on an attacker-chosen plaintext path_id.
+    //
+    // PATH-001b (recv, relaxed): AEAD-authenticated, non-replayed app data is
+    // DELIVERED regardless of which path it arrived on. Dropping it by source buys
+    // no security (only the real peer holds the keys; replays are already rejected)
+    // and would break a seamless NAT-rebind / migration. PATH-001a (the strict
+    // send-gate) lives in the send loop: app data is only ever sent to the
+    // established peer — a candidate gets a PATH_CHALLENGE, never app data.
+    //
+    // Server-side migration (P4.1): if this app packet arrived on a not-yet-
+    // Validated path AND the transport flagged a migration candidate (a new source
+    // for this CID), proactively issue + send a challenge to the candidate so the
+    // new path can validate. We do NOT switch the peer here (that is P4.2); the
+    // challenge goes to the candidate under its anti-amplification budget.
     if !matches!(
         crypto_recv.path_state(path_id),
         Some(crate::transport::path::PathStateKind::Validated)
     ) {
-        // Track a first-seen path id so a future challenge/response can promote
-        // it; drop the data until then.
-        crypto_recv.register_unvalidated_path(path_id);
-        log::warn!(
-            "PhantomSession: dropping application data on non-validated path_id {}",
-            path_id
-        );
-        return;
+        if transport_for_path.has_migration_candidate() {
+            if let Some(challenge) = crypto_recv.begin_path_validation(path_id) {
+                if let Some(buf) =
+                    encrypt_path_validation(crypto_recv, session_id, path_id, challenge)
+                {
+                    // To the candidate, NOT the peer; capped at 3× by the transport.
+                    let _ = transport_for_path.send_to_candidate(&buf).await;
+                }
+            }
+        } else {
+            // No migration candidate (non-address transport, or a path id seen
+            // without a source change): track it for a possible later challenge.
+            crypto_recv.register_unvalidated_path(path_id);
+        }
+        // PATH-001b: fall through and deliver the authenticated data below.
     }
 
     // COALESCED dispatch (Phase 2.5): split the decrypted bundle into sub-payloads
@@ -2882,27 +2912,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_data_on_non_validated_path_is_dropped() {
-        // PATH-001 (Invariant 6): application data is delivered only on a
-        // Validated path. Path 0 is pre-validated; any other path_id must
-        // complete a PATH_VALIDATION challenge first. A frame on an unvalidated
-        // path is dropped (even though it decrypts cleanly) and the path is
-        // registered Unvalidated so a later challenge can promote it.
+    async fn app_data_on_non_validated_path_is_delivered_recv_relax() {
+        // PATH-001 split (D10, Phase 4). RECV is relaxed: AEAD-authenticated,
+        // non-replayed app data is DELIVERED regardless of which path it arrived
+        // on (the data already passed AEAD + the per-direction replay window, so
+        // dropping it by source buys no security and would break a seamless
+        // NAT-rebind). The path is still registered Unvalidated so it can be
+        // challenged. The strict half (PATH-001a, the send-gate: app data only to
+        // the peer / a Validated path) is exercised over a real UdpServerTransport
+        // in udp_integration.
         use crate::transport::path::PathStateKind;
         let session_id = fixed_session_id();
         let (client_session, server_session) = paired_sessions(session_id);
         let stream_id: TransportStreamId = 1;
 
-        let bad = build_app_frame_on_path(
+        let frame = build_app_frame_on_path(
             &client_session,
             session_id,
             stream_id,
             0,
-            0, // stream_offset (irrelevant — dropped at the path gate)
-            7, // never validated on the receiver
-            b"on-bad-path",
+            0, // stream_offset 0 — first reliable frame on this stream
+            7, // a path the receiver has never validated
+            b"on-new-path",
         );
-        let bad = PhantomPacket::from_wire(&bad).unwrap();
+        let frame = PhantomPacket::from_wire(&frame).unwrap();
 
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
@@ -2918,7 +2951,7 @@ mod tests {
         let obs = Observability::new(ObservabilityConfig::default());
 
         handle_packet(
-            bad,
+            frame,
             session_id,
             &server_session,
             &streams,
@@ -2933,51 +2966,116 @@ mod tests {
         )
         .await;
 
-        assert!(
-            deliver_rx.try_recv().is_err(),
-            "application data on a non-validated path must be dropped"
-        );
-        assert_eq!(
-            undelivered.load(Ordering::Acquire),
-            0,
-            "dropped data must not count toward the backlog"
-        );
+        // Recv-relax (D10b): the authenticated frame IS delivered, even though
+        // path 7 is not validated.
+        let (sid, received) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), deliver_rx.recv())
+                .await
+                .expect("recv-relax must deliver promptly (no drop / hang)")
+                .expect("delivery channel open");
+        assert_eq!(sid, stream_id as u32);
+        assert_eq!(&received[..], b"on-new-path");
+        // The new path is registered Unvalidated for a later challenge. (The
+        // ChannelTransport reports no migration candidate, so no challenge is
+        // issued here — the server-challenge path is exercised in udp_integration.)
         assert_eq!(
             server_session.path_state(7),
             Some(PathStateKind::Unvalidated),
-            "the unseen path id must be registered for a later challenge"
+            "the new path id must be registered for a later challenge"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_challenges_a_migration_candidate() {
+        // P4.1 end-to-end over a real UdpServerTransport: app data on a NEW path_id
+        // from a NEW source makes the server issue a PATH_VALIDATION challenge TO
+        // THAT SOURCE (not the established peer), under the 3× anti-amp cap, and the
+        // new path goes Validating. No peer switch (that is P4.2).
+        use crate::api::udp_transport::UdpServerTransport;
+        use crate::transport::path::PathStateKind;
+        use crate::transport::phantom_udp::datagram::{push_datagram, FragmentAssembler};
+
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        let server_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap(); // established (old) peer
+        let cand_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cand_addr = cand_sock.local_addr().unwrap();
+
+        // Build the server transport and set the candidate by feeding a frame from
+        // the candidate source through the demux channel (as the demux would), with
+        // enough received bytes that the 3× budget admits a challenge.
+        let (tx, rx) = mpsc::channel(8);
+        let ust = Arc::new(UdpServerTransport::new(
+            server_sock.clone(),
+            peer,
+            [5u8; 8],
+            rx,
+        ));
+        tx.send((Bytes::from(vec![0u8; 256]), cand_addr))
+            .await
+            .unwrap();
+        let _ = ust.recv_bytes().await.unwrap();
+        assert!(
+            ust.has_migration_candidate(),
+            "new source must set a candidate"
         );
 
-        // Positive control: the SAME stream on the pre-validated path 0 IS
-        // delivered, proving the gate only blocks non-validated paths.
-        let good = build_app_frame_on_path(
-            &client_session,
-            session_id,
-            stream_id,
-            1, // header seq distinct from the dropped bad frame (no replay collision)
-            0, // stream_offset 0 — the first DELIVERED reliable frame on this stream
-            0, // pre-validated path
-            b"on-good-path",
-        );
-        let good = PhantomPacket::from_wire(&good).unwrap();
+        // App data on a NEW (unvalidated) path id → the server must challenge it.
+        let frame =
+            build_app_frame_on_path(&client_session, session_id, stream_id, 0, 0, 1, b"migrated");
+        let frame = PhantomPacket::from_wire(&frame).unwrap();
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let mut ack_buf = Vec::with_capacity(256);
+        let obs = Observability::new(ObservabilityConfig::default());
+
         handle_packet(
-            good,
+            frame,
             session_id,
             &server_session,
             &streams,
             &demux,
-            &transport_send,
-            &transport_send,
+            &ust,
+            &ust,
             &deliver_tx,
             &undelivered,
             &mut ack_buf,
             &obs,
-            LegType::Tcp,
+            LegType::Udp,
         )
         .await;
-        let (sid, received) = deliver_rx.recv().await.expect("path-0 delivery");
-        assert_eq!(sid, stream_id as u32);
-        assert_eq!(&received[..], b"on-good-path");
+
+        // The server issued a challenge → path 1 is now Validating.
+        assert_eq!(
+            server_session.path_state(1),
+            Some(PathStateKind::Validating),
+            "an unvalidated path on a candidate source must be challenged"
+        );
+        // ...and the challenge datagram reached the CANDIDATE socket (not the peer).
+        let mut buf = vec![0u8; 2048];
+        let (n, _from) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cand_sock.recv_from(&mut buf),
+        )
+        .await
+        .expect("challenge must reach the candidate")
+        .unwrap();
+        let mut asm = FragmentAssembler::new();
+        let (_hdr, inner) = push_datagram(&mut asm, &buf[..n]).expect("decode envelope");
+        let inner = inner.expect("single-datagram challenge");
+        let pkt = PhantomPacket::from_wire(&inner).expect("inner packet");
+        assert!(
+            pkt.header.flags.contains(PacketFlags::PATH_VALIDATION),
+            "the candidate must receive a PATH_VALIDATION challenge"
+        );
+        assert_eq!(pkt.header.path_id, 1, "challenge must be on the new path");
     }
 
     /// Build an `ENCRYPTED | ACK` frame (H1, L1-A) from `acker_session`
