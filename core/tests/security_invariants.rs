@@ -2,8 +2,9 @@
 //!
 //! Each test pins a specific property from `SECURITY.md` / `docs/security/threat-model.md` so that
 //! a future regression which silently weakens one of them surfaces as a hard
-//! red here. These run on every `cargo test --lib`-equivalent path — they are
-//! NOT `#[ignore]`-gated — because they do not need real network sockets.
+//! red here. These run on every `cargo test --test security_invariants` path —
+//! they are NOT `#[ignore]`-gated. Most are pure (no sockets); the PhantomUDP
+//! pre-auth DoS-bound tests bind a loopback `UdpSocket` (fast + deterministic).
 //!
 //! Coverage map (Phase 6.8 of `docs/PRODUCTION_READINESS.md`):
 //!   - AEAD authenticated decryption rejects bit-flipped ciphertext.
@@ -1155,5 +1156,65 @@ fn reset_congestion_returns_controller_to_initial() {
     assert_eq!(
         snap.cwnd_bytes, initial_cwnd,
         "reset must restore the initial cwnd"
+    );
+}
+
+/// H-1 (audit 2026-06-11): the PhantomUDP demux `routes` map must not grow without
+/// bound under a fresh-CID garbage spray. Each garbage `Initial` carries a new random
+/// connection-ID and a payload that fails `ClientHello` parsing, so its handshake task
+/// dies immediately and its route becomes dead. The demux must reap dead routes (with a
+/// hard cap as a backstop), keeping `active_route_count()` bounded near the in-flight
+/// ceiling rather than leaking one permanent entry per spoofed datagram.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_demux_routes_map_is_bounded_under_fresh_cid_spray() {
+    use phantom_protocol::api::udp_listener::PhantomUdpListener;
+    use tokio::net::UdpSocket;
+
+    const SPRAY: usize = 3000;
+    // Far below SPRAY: a leak-per-datagram demux sits near SPRAY; a reaping one returns
+    // to roughly the in-flight handshake ceiling (<= the 256 concurrency permits).
+    const BOUND: usize = 512;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+
+    // accept() lazily starts the demux task. No garbage datagram completes a handshake,
+    // so this never resolves — keep it pending in the background to drive the demux.
+    let l = listener.clone();
+    let _demux_pump = tokio::spawn(async move { l.accept().await });
+
+    // Spray fresh-CID garbage Initials. Outer envelope = [flags=0x00 (Initial, unfragmented)]
+    // ++ [cid: 8 bytes] ++ [inner frame]; the inner frame is garbage that fails ClientHello.
+    let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    attacker.connect(server_addr).await.unwrap();
+    for i in 0..SPRAY {
+        let mut dg = Vec::with_capacity(20);
+        dg.push(0x00u8); // Initial, not fragmented, reserved bits clear
+        dg.extend_from_slice(&(i as u64).to_be_bytes()); // distinct 8-byte CID per datagram
+        dg.extend_from_slice(b"not-a-clienthello"); // non-empty garbage -> borsh fails
+        let _ = attacker.send(&dg).await;
+        // Periodically yield so the single demux task keeps pace with the spray (otherwise
+        // the loopback socket buffer just drops datagrams, which only weakens the attack).
+        if i % 64 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // The map must settle to a bounded size as the failed handshakes are reaped. Poll up to
+    // ~5s; a leaking demux never drops to BOUND and the assertion fires.
+    let mut observed = listener.active_route_count();
+    for _ in 0..250 {
+        observed = listener.active_route_count();
+        if observed <= BOUND {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        observed <= BOUND,
+        "demux routes leaked under fresh-CID spray: active_route_count()={observed} after \
+         spraying {SPRAY} garbage Initials (expected <= {BOUND} once dead routes are reaped)"
     );
 }

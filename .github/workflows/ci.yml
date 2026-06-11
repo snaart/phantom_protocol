@@ -63,6 +63,10 @@ jobs:
         with:
           workspaces: "."
       - run: cargo test --manifest-path core/Cargo.toml --lib
+      # Formal negative-security tests pinning the documented invariants (server
+      # pinning, AEAD/AAD binding, replay, rekey, flow-control, and the PhantomUDP
+      # pre-auth DoS bounds). Always-on; a regression surfaces as a hard red here.
+      - run: cargo test --manifest-path core/Cargo.toml --test security_invariants
       # Byte-exact wire-format freeze. Always-on integration test; gates any
       # accidental on-wire byte change. The lib run above already covers the
       # transcript-hash vector (transport::handshake::tests).
