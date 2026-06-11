@@ -205,3 +205,228 @@ async fn udp_integration_migration_survives_mid_exchange() {
 
     server.await.unwrap();
 }
+
+/// A bidirectional UDP relay `client <-> relay <-> server` whose forwarding can be
+/// cut and restored at will via the returned flag — used to simulate a path that
+/// silently dies (and later returns) without tearing down either endpoint's socket.
+async fn spawn_cuttable_relay(
+    server_addr: std::net::SocketAddr,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    upstream.connect(server_addr).await.unwrap();
+    let forward = Arc::new(AtomicBool::new(true));
+    let f = forward.clone();
+    tokio::spawn(async move {
+        let mut c2s = vec![0u8; 2048];
+        let mut s2c = vec![0u8; 2048];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s) => {
+                    let (n, from) = match r { Ok(x) => x, Err(_) => continue };
+                    client_addr = Some(from);
+                    if f.load(Ordering::Relaxed) {
+                        let _ = upstream.send(&c2s[..n]).await;
+                    }
+                }
+                r = upstream.recv(&mut s2c) => {
+                    let n = match r { Ok(x) => x, Err(_) => continue };
+                    if f.load(Ordering::Relaxed) {
+                        if let Some(ca) = client_addr {
+                            let _ = relay.send_to(&s2c[..n], ca).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (relay_addr, forward)
+}
+
+/// P4.3: the SDK autonomously detects a silently-dead path. With outstanding unacked
+/// data and no inbound, the client surfaces `ConnectionState::Migrating` (so the
+/// embedder can `migrate()`), and — with no recovery before the idle-timeout —
+/// transitions to `Dead`. `recv()` must error, never hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_liveness_dead_path_surfaces_migrating_then_dead() {
+    use phantom_protocol::api::session::ConnectionState;
+    use phantom_protocol::transport::liveness::LivenessConfig;
+    use std::sync::atomic::Ordering;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        // Echo until the path dies (then recv() errors and we exit).
+        while let Ok(m) = session.recv().await {
+            let _ = session.send(m).await;
+        }
+    });
+
+    let (relay_addr, forward) = spawn_cuttable_relay(server_addr).await;
+    let transport = UdpClientTransport::connect(relay_addr)
+        .await
+        .expect("connect");
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+
+    // Warm up one round trip (establishes + measures RTT).
+    client.send(b"warmup".to_vec()).await.expect("send");
+    let echo = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv");
+    assert_eq!(echo, b"warmup");
+
+    // Shrink the liveness thresholds so the state machine fires in milliseconds.
+    assert!(
+        client.set_liveness_config(LivenessConfig::for_test()).await,
+        "session must be established to set the liveness config"
+    );
+
+    // Kill the path, then keep sending so there is outstanding unacked data.
+    forward.store(false, Ordering::Relaxed);
+    for i in 0..30u32 {
+        let _ = client.send(format!("post-{i}").into_bytes()).await;
+    }
+
+    let mut saw_migrating = false;
+    let mut saw_dead = false;
+    for _ in 0..400 {
+        match client.connection_state() {
+            ConnectionState::Migrating => saw_migrating = true,
+            ConnectionState::Dead => {
+                saw_dead = true;
+                break;
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        saw_migrating,
+        "a dead path must surface ConnectionState::Migrating"
+    );
+    assert!(
+        saw_dead,
+        "no recovery before the idle-timeout must surface ConnectionState::Dead"
+    );
+
+    // recv() on a dead session must resolve with an error, not hang forever.
+    let r = timeout(Duration::from_secs(2), client.recv()).await;
+    assert!(
+        matches!(r, Ok(Err(_))),
+        "recv() must error on a dead session (got {r:?})"
+    );
+
+    server.abort();
+}
+
+/// P4.3: a path that goes silent then RETURNS (before the idle-timeout) recovers the
+/// same session — `Migrating → Connected` on resumed inbound — and the reliable byte
+/// stream continues byte-exact, with no re-handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_liveness_recovers_when_the_path_returns() {
+    use phantom_protocol::api::session::ConnectionState;
+    use phantom_protocol::transport::liveness::LivenessConfig;
+    use std::sync::atomic::Ordering;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        while let Ok(m) = session.recv().await {
+            let _ = session.send(m).await;
+        }
+    });
+
+    let (relay_addr, forward) = spawn_cuttable_relay(server_addr).await;
+    let transport = UdpClientTransport::connect(relay_addr)
+        .await
+        .expect("connect");
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+
+    client.send(b"warmup".to_vec()).await.expect("send");
+    let echo = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv");
+    assert_eq!(echo, b"warmup");
+
+    // Short path-down, but a LONG idle-timeout so there is room to recover.
+    let cfg = LivenessConfig {
+        min_pto: Duration::from_millis(10),
+        path_down_ptos: 3,
+        idle_timeout: Duration::from_secs(20),
+    };
+    assert!(client.set_liveness_config(cfg).await);
+
+    // Cut the path + create outstanding data → detect down.
+    forward.store(false, Ordering::Relaxed);
+    for i in 0..30u32 {
+        let _ = client.send(format!("gap-{i}").into_bytes()).await;
+    }
+    let mut saw_migrating = false;
+    for _ in 0..300 {
+        if client.connection_state() == ConnectionState::Migrating {
+            saw_migrating = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(saw_migrating, "a dead path must surface Migrating");
+
+    // Restore the path: retransmits reach the server, ACKs return → recovery.
+    forward.store(true, Ordering::Relaxed);
+    let mut recovered = false;
+    for _ in 0..500 {
+        if client.connection_state() == ConnectionState::Connected {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        recovered,
+        "the path returning must recover the session to Connected"
+    );
+
+    // The reliable byte stream resumes byte-exact: drain the buffered echoes until the
+    // post-recovery marker arrives.
+    client.send(b"after-recovery".to_vec()).await.expect("send");
+    let mut got_final = false;
+    for _ in 0..60 {
+        let m = timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("no timeout")
+            .expect("recv");
+        if m == b"after-recovery" {
+            got_final = true;
+            break;
+        }
+    }
+    assert!(
+        got_final,
+        "the reliable stream must resume and deliver post-recovery data byte-exact"
+    );
+
+    server.abort();
+}
