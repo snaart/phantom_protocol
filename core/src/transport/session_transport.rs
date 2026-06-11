@@ -71,4 +71,30 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// boundary. Adding this defaulted method is source-compatible for every
     /// existing impl.
     fn set_frame_phase(&self, _phase: FramePhase) {}
+
+    /// Whether the transport has observed an unvalidated **candidate** source for
+    /// this session — a connection-migration signal (Phase 4). Only an
+    /// address-aware transport (the UDP server) ever returns `true`; stream
+    /// transports (TCP / WebSocket / WASI / Embedded) have no migration and use
+    /// the default `false`. Deliberately **SocketAddr-free** so the generic data
+    /// pump that calls it stays no_std-clean (`std::net::SocketAddr` does not
+    /// exist in `core`/`alloc`); the candidate address is held inside the
+    /// concrete transport.
+    fn has_migration_candidate(&self) -> bool {
+        false
+    }
+
+    /// Send `data` — an already-encrypted `PATH_VALIDATION` challenge built by the
+    /// session — to the transport's internally-tracked candidate source, distinct
+    /// from the established peer, under the transport's own anti-amplification cap
+    /// (RFC 9000 §8.2). Returns `Ok(true)` if a candidate existed and the send was
+    /// within budget, `Ok(false)` otherwise (no candidate, or the 3× cap was hit).
+    /// Default (non-address transports): a no-op `Ok(false)`. The candidate
+    /// address never crosses this boundary, keeping the trait no_std-safe.
+    fn send_to_candidate(
+        &self,
+        _data: &[u8],
+    ) -> impl core::future::Future<Output = Result<bool, CoreError>> + Send {
+        async { Ok(false) }
+    }
 }

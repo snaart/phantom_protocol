@@ -151,7 +151,7 @@ impl Drop for PhantomUdpListener {
 
 /// Central demux: own the socket, route each datagram by its connection-ID.
 async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
-    let mut routes: HashMap<ConnId, mpsc::Sender<Bytes>> = HashMap::new();
+    let mut routes: HashMap<ConnId, mpsc::Sender<(Bytes, SocketAddr)>> = HashMap::new();
     // NOTE (Phase 1): one assembler shared across ALL CIDs. Its key includes the cid, but a fragment
     // spray shares the single 256-slot assembly table with every live session's in-flight
     // reassemblies. Bounded — the assembler self-caps at MAX_CONCURRENT_ASSEMBLIES with
@@ -181,7 +181,7 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
         };
         // Existing connection: deliver the inner frame.
         if let Some(tx) = routes.get(&hdr.cid) {
-            if tx.try_send(Bytes::from(frame)).is_err() && tx.is_closed() {
+            if tx.try_send((Bytes::from(frame), peer)).is_err() && tx.is_closed() {
                 routes.remove(&hdr.cid);
             }
             continue;
@@ -197,7 +197,7 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
         let (tx, rx) = mpsc::channel(SESSION_CHANNEL_DEPTH);
         let st = UdpServerTransport::new(listener.socket.clone(), peer, hdr.cid, rx);
         routes.insert(hdr.cid, tx.clone());
-        let _ = tx.try_send(Bytes::from(frame));
+        let _ = tx.try_send((Bytes::from(frame), peer));
         spawn_handshake_task(listener.clone(), st, peer, permit);
         // DoS-hardening parity with the TCP acceptor: periodically drop expired
         // reputation entries so the bounded map stays small under new-connection churn.
