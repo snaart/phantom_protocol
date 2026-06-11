@@ -247,6 +247,10 @@ pub enum SessionCommand {
     SendStreamUnreliable { stream_id: u32, data: bytes::Bytes },
     /// Close a specific stream
     CloseStream { stream_id: u32 },
+    /// Migrate to a new local address (Phase 4 / P4.2 — embedder-triggered). Carries
+    /// the new local bind address as a `String`; the pump rebinds the transport and
+    /// bumps the send `path_id` (best-effort, never fatal to the session).
+    Migrate(String),
     /// Close the session
     Close,
 }
@@ -1049,6 +1053,38 @@ async fn run_data_pump<T: SessionTransport>(
                         }
                         streams.remove(&stream_id);
                         demux.close_stream(stream_id);
+                    }
+                    Some(SessionCommand::Migrate(local_addr)) => {
+                        // Embedder-triggered connection migration (Phase 4 / P4.2).
+                        // Rebind the transport to the new local socket FIRST (it keeps
+                        // the old socket for the overlap); only on a successful rebind
+                        // bump the send `path_id` so every subsequent packet from the
+                        // new socket carries a fresh, not-yet-Validated path label —
+                        // which is what makes the server detect + challenge the new
+                        // path (a still-`0` path_id would be skipped, path 0 being
+                        // permanently Validated). Both happen inside this `select!`
+                        // arm, so no send interleaves between them. Best-effort: a
+                        // failed rebind leaves the session untouched on the old socket
+                        // (broken-rebind safety) — migration never tears it down.
+                        match transport.migrate(local_addr).await {
+                            Ok(()) => {
+                                let new_path = crypto_session.next_migration_path_id();
+                                log::info!(
+                                    "PhantomSession: migrated send path -> path_id {}",
+                                    new_path
+                                );
+                                // Wake the send loop so app data + L1 retransmits flow
+                                // from the new socket immediately, triggering the
+                                // server-side new-source detection.
+                                crypto_session.notify_outbound_ready();
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "PhantomSession: migrate rebind failed (staying on the old path): {}",
+                                    e
+                                );
+                            }
+                        }
                     }
                     Some(SessionCommand::Close) => {
                         log::info!("PhantomSession: closing");
@@ -2100,6 +2136,26 @@ impl PhantomSession {
             }
             None => false,
         }
+    }
+
+    /// Migrate the session to a new local network address (Phase 4 — embedder-
+    /// triggered connection migration). The embedder calls this when the OS reports a
+    /// network change (Wi-Fi↔cellular, NAT rebind); `local_addr` is the new local
+    /// bind address (e.g. `"0.0.0.0:0"` to let the OS pick an ephemeral port on the
+    /// new interface).
+    ///
+    /// **Best-effort and non-blocking on validation.** It hands the request to the
+    /// background pump, which rebinds the transport (keeping the old socket for the
+    /// overlap) and bumps the send `path_id`; the path validation + server-side peer
+    /// switch then complete asynchronously. The keys and session persist — **no
+    /// re-handshake**. A failed rebind never tears the session down: it keeps running
+    /// on the existing socket (broken-rebind safety). `Err` here means only that the
+    /// session was already closed (the command channel is gone).
+    pub async fn migrate(&self, local_addr: String) -> Result<(), CoreError> {
+        self.cmd_tx
+            .send(SessionCommand::Migrate(local_addr))
+            .await
+            .map_err(|_| CoreError::NetworkError("Session closed".into()))
     }
 
     /// Send the graceful close frame and shut the session down.
