@@ -8,7 +8,7 @@ use crate::transport::types::{SequenceNumber, StreamId};
 
 use bytes::Bytes;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, Semaphore};
@@ -21,6 +21,15 @@ const MAX_PENDING_PACKETS: usize = 1024;
 /// (the refused segment is NOT recorded as received, so it is not SACKed and the
 /// sender retransmits it — no SACK-without-data hazard, bounded memory).
 const MAX_RECV_REORDER: usize = 2048;
+
+/// Per-stream byte budget for the out-of-order reorder buffer (H-3), tied to the flow-control
+/// window. A compliant peer keeps in-flight (hence reorderable) data within ~one
+/// [`INITIAL_STREAM_WINDOW`]; the 2× headroom absorbs a boundary segment. A future hole that
+/// would push the buffered total past this is refused (dropped → retransmitted via the
+/// "refused segment is not SACKed" contract), so per-stream reorder memory is bounded
+/// regardless of the per-entry frame size (~253 KiB UDP / 4 MiB TCP) — the entry cap alone is
+/// not, since one entry can dwarf the window.
+pub const MAX_RECV_REORDER_BYTES: usize = 2 * INITIAL_STREAM_WINDOW as usize;
 
 /// RFC 9002 §6.1.1 packet-threshold: a still-unacked segment is declared lost
 /// once a segment at least this many offsets *newer* has been SACK-acked.
@@ -289,6 +298,12 @@ pub struct Stream {
     /// `(sequence, payloads)`; `payloads` is normally a single reliable frame but
     /// carries a COALESCED bundle's sub-payloads when several share one sequence.
     recv_buffer: Mutex<VecDeque<(SequenceNumber, Vec<Bytes>)>>,
+    /// Total payload bytes currently held in `recv_buffer` (H-3). Mutated only under the
+    /// `recv_buffer` lock (in `accept_in_order`), so it stays exactly in step with the
+    /// buffer; an `AtomicUsize` only so it can be read lock-free for stats/tests. Bounds the
+    /// out-of-order reorder buffer by *bytes*, not entries, since one entry can be ~253 KiB
+    /// (UDP) / 4 MiB (TCP).
+    recv_buffer_bytes: AtomicUsize,
     /// Ordered receive queue (ready for application)
     recv_ready: Mutex<VecDeque<Bytes>>,
     /// Notify when data is ready to read
@@ -342,6 +357,7 @@ impl Stream {
             send_buffer: Mutex::new(VecDeque::new()),
             unreliable_buffer: Mutex::new(VecDeque::new()),
             recv_buffer: Mutex::new(VecDeque::new()),
+            recv_buffer_bytes: AtomicUsize::new(0),
             recv_ready: Mutex::new(VecDeque::new()),
             recv_notify: Notify::new(),
             local_finished: AtomicBool::new(false),
@@ -928,12 +944,21 @@ impl Stream {
 
         let mut buf = self.recv_buffer.lock().await;
         if sequence != expected {
-            // Future segment: buffer if not already held and within capacity.
-            // A refused segment is NOT recorded, so it is not SACKed → the sender
-            // retransmits it (no SACK-without-data hazard).
+            // Future segment: buffer if not already held, within the entry cap, AND within
+            // the per-stream byte budget (H-3). A refused segment is NOT recorded, so it is
+            // not SACKed → the sender retransmits it (no SACK-without-data hazard, bounded
+            // memory regardless of per-entry frame size).
             let already = buf.iter().any(|(s, _)| *s == sequence);
-            if !already && buf.len() < MAX_RECV_REORDER {
+            let seg_bytes: usize = payloads.iter().map(Bytes::len).sum();
+            let within_byte_budget = self
+                .recv_buffer_bytes
+                .load(Ordering::Relaxed)
+                .saturating_add(seg_bytes)
+                <= MAX_RECV_REORDER_BYTES;
+            if !already && buf.len() < MAX_RECV_REORDER && within_byte_budget {
                 buf.push_back((sequence, payloads));
+                self.recv_buffer_bytes
+                    .fetch_add(seg_bytes, Ordering::Relaxed);
             }
             return Vec::new();
         }
@@ -949,6 +974,9 @@ impl Stream {
                 // index is valid; `recv_buf` is locked, so no concurrent drain.
                 #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
                 let (_, payloads) = buf.remove(pos).unwrap();
+                let seg_bytes: usize = payloads.iter().map(Bytes::len).sum();
+                self.recv_buffer_bytes
+                    .fetch_sub(seg_bytes, Ordering::Relaxed);
                 out.extend(payloads);
                 self.recv_sequence.fetch_add(1, Ordering::SeqCst);
             } else {
@@ -956,6 +984,12 @@ impl Stream {
             }
         }
         out
+    }
+
+    /// Total payload bytes currently held in the out-of-order reorder buffer (H-3). Bounded
+    /// by `MAX_RECV_REORDER_BYTES`; exposed so the byte bound is observable/testable.
+    pub fn recv_reorder_bytes(&self) -> usize {
+        self.recv_buffer_bytes.load(Ordering::Relaxed)
     }
 
     /// Pull-API adapter over [`accept_in_order`](Self::accept_in_order): buffer a

@@ -1283,3 +1283,27 @@ async fn udp_cookieless_initials_get_no_slot_until_address_validated() {
          answer the cookie round statelessly before committing any per-connection slot"
     );
 }
+
+/// H-3 (audit 2026-06-11): the per-stream out-of-order reorder buffer must be bounded by
+/// BYTES, not just entries. A peer that leaves the head (offset 0) missing and streams future
+/// segments must not pin unbounded receiver RAM — each entry can be ~253 KiB (UDP) / 4 MiB
+/// (TCP), and a future hole is never counted against flow control (only delivered data is).
+/// Once the per-stream byte budget is reached, further future holes are refused (dropped →
+/// retransmitted, which the "refused segment is not SACKed" contract already handles), so the
+/// reorder buffer is byte-bounded.
+#[tokio::test]
+async fn reorder_buffer_is_byte_bounded_when_the_head_is_missing() {
+    let stream = Stream::new(0);
+    let chunk = Bytes::from(vec![0u8; 4096]); // 4 KiB per future segment
+                                              // A peer that never sends offset 0 floods future offsets 1.. (each held for reassembly).
+    for off in 1u32..2000 {
+        let _ = stream.accept_in_order(off, vec![chunk.clone()]).await;
+    }
+    let buffered = stream.recv_reorder_bytes();
+    assert!(
+        buffered <= 256 * 1024,
+        "reorder buffer must be byte-bounded under a missing head: held {buffered} B (≈{} KiB) \
+         — a per-stream byte budget must refuse future holes past the window",
+        buffered / 1024
+    );
+}
