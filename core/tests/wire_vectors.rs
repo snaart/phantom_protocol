@@ -281,7 +281,7 @@ fn vector_packet_header() {
     assert_eq!(decoded, h);
     assert_eq!(decoded.version, WIRE_VERSION);
     assert_eq!(decoded.stream_id, 7);
-    assert_eq!(decoded.sequence, 42);
+    assert_eq!(decoded.packet_number, 42);
     assert_eq!(decoded.epoch, 3);
     assert_eq!(decoded.path_id, 1);
 }

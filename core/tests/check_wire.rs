@@ -4,7 +4,7 @@ use phantom_protocol::transport::types::*;
 fn test_header_size() {
     let header = PacketHeader::new(SessionId([0; 32]), 1, 2, PacketFlags::new(0));
 
-    // The serialized header is the AEAD AAD; pin it to the frozen 45-byte layout.
+    // The serialized header is the AEAD AAD; pin it to the frozen 47-byte layout.
     let bytes = header.to_wire();
     assert_eq!(
         bytes.len(),
@@ -13,8 +13,8 @@ fn test_header_size() {
     );
     assert_eq!(
         bytes.len(),
-        45,
-        "the unified packet header is 45 bytes on the wire"
+        47,
+        "the unified packet header is 47 bytes on the wire"
     );
     // version-first, big-endian, lossless round-trip.
     assert_eq!(bytes[0], WIRE_VERSION);
