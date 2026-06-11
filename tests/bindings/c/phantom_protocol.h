@@ -385,6 +385,13 @@ int8_t uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
+/* migrate(local_addr: String) -> async void (Result). Embedder-triggered
+ * connection migration (Phase 4): rebinds to the new local address, keeping
+ * the old socket for the overlap; best-effort, never tears the session down. */
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_migrate(
+    void                    *ptr,
+    PhantomRustBuffer        local_addr);
+
 /* open_stream() -> async PhantomStream (pointer result). */
 uint64_t uniffi_phantom_protocol_fn_method_phantomsession_open_stream(
     void                    *ptr);

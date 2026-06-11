@@ -1087,6 +1087,23 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
     func isPqcReady()  -> Bool
     
     /**
+     * Migrate the session to a new local network address (Phase 4 — embedder-
+     * triggered connection migration). The embedder calls this when the OS reports a
+     * network change (Wi-Fi↔cellular, NAT rebind); `local_addr` is the new local
+     * bind address (e.g. `"0.0.0.0:0"` to let the OS pick an ephemeral port on the
+     * new interface).
+     *
+     * **Best-effort and non-blocking on validation.** It hands the request to the
+     * background pump, which rebinds the transport (keeping the old socket for the
+     * overlap) and bumps the send `path_id`; the path validation + server-side peer
+     * switch then complete asynchronously. The keys and session persist — **no
+     * re-handshake**. A failed rebind never tears the session down: it keeps running
+     * on the existing socket (broken-rebind safety). `Err` here means only that the
+     * session was already closed (the command channel is gone).
+     */
+    func migrate(localAddr: String) async throws 
+    
+    /**
      * Open a new multiplexed stream
      */
     func openStream()  -> PhantomStream
@@ -1365,6 +1382,38 @@ open func isPqcReady() -> Bool  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Migrate the session to a new local network address (Phase 4 — embedder-
+     * triggered connection migration). The embedder calls this when the OS reports a
+     * network change (Wi-Fi↔cellular, NAT rebind); `local_addr` is the new local
+     * bind address (e.g. `"0.0.0.0:0"` to let the OS pick an ephemeral port on the
+     * new interface).
+     *
+     * **Best-effort and non-blocking on validation.** It hands the request to the
+     * background pump, which rebinds the transport (keeping the old socket for the
+     * overlap) and bumps the send `path_id`; the path validation + server-side peer
+     * switch then complete asynchronously. The keys and session persist — **no
+     * re-handshake**. A failed rebind never tears the session down: it keeps running
+     * on the existing socket (broken-rebind safety). `Err` here means only that the
+     * session was already closed (the command channel is gone).
+     */
+open func migrate(localAddr: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_method_phantomsession_migrate(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(localAddr)
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_void,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_void,
+            freeFunc: ffi_phantom_protocol_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -2638,6 +2687,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready() != 47934) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 22155) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 25882) {
