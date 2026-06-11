@@ -10,6 +10,19 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **Seamless connection migration (Phase 4 / P4.1–P4.2):** a live PhantomUDP session now survives a
+  client network change (Wi-Fi↔cellular, NAT rebind) **without re-running the post-quantum handshake** —
+  the connection loses throughput briefly, never liveness. The embedder triggers it via the new
+  `PhantomSession::migrate(local_addr)` (FFI-exported, best-effort, non-blocking): the client rebinds its
+  UDP socket (keeping the old one for the overlap — broken-rebind safety) and stamps a fresh client-owned
+  `path_id`; the server detects the new source, validates it with a `PATH_CHALLENGE` (anti-amplification-
+  capped, RFC 9000 §8.2), then atomically switches its peer and resets the RTT / congestion estimators for
+  the new network (QUIC §9.4). Keys and the session id persist; the reliable byte stream resumes
+  byte-exact. No wire-format change — `path_id` already rode the 47-byte header and left the AEAD nonce
+  under model ①. PATH-001 is split into a strict send-gate (app data only to validated paths) and a
+  relaxed recv-delivery (authenticated, non-replayed data is delivered regardless of source), so a
+  NAT-rebind upload is seamless. Migration is functional but **linkable** via the stable connection-ID;
+  unlinkable migration (header protection + CID rotation) is a later hardening phase.
 - **PhantomUDP (Phase 1):** native datagram `SessionTransport` over raw UDP with connection-ID
   demultiplexing — `PhantomUdpListener` (server accept) plus `UdpClientTransport` / `UdpServerTransport`.
   The multi-KB post-quantum handshake is fragmented to the path MTU and reassembled. No wire-format or
