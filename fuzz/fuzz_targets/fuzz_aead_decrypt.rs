@@ -43,7 +43,7 @@ fuzz_target!(|data: &[u8]| {
     let header = PacketHeader::new(
         id,
         stream_id,
-        sequence,
+        sequence as u64,
         PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
 
