@@ -1035,3 +1035,92 @@ fn failed_resume_handshake_leaves_ticket_usable() {
         "the re-inserted ticket must be usable by a clean resume"
     );
 }
+
+// ── 1 (Phase 4): per-direction u64 packet-number invariants ─────────────────
+// These replace the deleted C1 per-stream-watermark tests: under model 1 the
+// AEAD nonce is `prefix || packet_number`, with `packet_number` a per-direction
+// monotonic u64 that cannot wrap within a session.
+
+/// `next_send_pn` yields a strictly increasing, never-repeating per-direction
+/// sequence — the basis of "the AEAD nonce is never reused, full stop".
+#[test]
+fn packet_number_is_strictly_monotonic_and_unique() {
+    let (client, _server) = make_session_pair([0x91u8; 32]);
+    let mut seen = std::collections::HashSet::new();
+    let mut last: Option<u64> = None;
+    for _ in 0..10_000 {
+        let pn = client.next_send_pn();
+        assert!(seen.insert(pn), "packet number {pn} reused");
+        if let Some(prev) = last {
+            assert!(
+                pn > prev,
+                "packet number not strictly increasing: {prev} -> {pn}"
+            );
+        }
+        last = Some(pn);
+    }
+}
+
+/// D5 audit anchor: `path_id` is authenticated in the 47-byte AAD but is NOT in
+/// the AEAD nonce (`prefix || packet_number`). Encrypting the SAME plaintext
+/// under the SAME `(packet_number, stream_id, epoch)` but a DIFFERENT `path_id`
+/// must yield an identical ciphertext **body** (same nonce => same keystream) and
+/// a DIFFERENT auth tag (path_id is in the AAD). The body-equality is what makes
+/// retiring/reusing a `path_id` nonce-safe; the tag-difference confirms path_id
+/// stays authenticated.
+#[test]
+fn path_id_is_in_aad_not_nonce() {
+    let (client, _server) = make_session_pair([0x92u8; 32]);
+    let sid = *client.id();
+    let pt = b"phantom-path-id-nonce-probe";
+    let h0 =
+        PacketHeader::new(sid, 1, 42, PacketFlags::new(PacketFlags::ENCRYPTED)).with_path_id(0);
+    let h5 =
+        PacketHeader::new(sid, 1, 42, PacketFlags::new(PacketFlags::ENCRYPTED)).with_path_id(5);
+    let c0 = client.encrypt_packet(&h0, pt).expect("encrypt h0");
+    let c5 = client.encrypt_packet(&h5, pt).expect("encrypt h5");
+    // AEAD output = ciphertext-body || 16-byte auth tag.
+    const TAG: usize = 16;
+    assert_eq!(c0.len(), c5.len());
+    assert!(c0.len() > TAG);
+    let (body0, tag0) = c0.split_at(c0.len() - TAG);
+    let (body5, tag5) = c5.split_at(c5.len() - TAG);
+    // Nonce ignores path_id => identical keystream => identical ciphertext body.
+    assert_eq!(
+        body0, body5,
+        "ciphertext body differs => path_id leaked into the nonce"
+    );
+    // path_id IS authenticated (it is in the AAD) => the tag must differ.
+    assert_ne!(tag0, tag5, "tag identical => path_id not bound into the AAD");
+}
+
+/// The collapse from per-`StreamId` replay windows to ONE per-direction window
+/// must still accept packets interleaved across streams (the packet number is
+/// unique per direction regardless of stream) and reject only a true PN dup.
+#[test]
+fn per_direction_window_accepts_interleaved_streams() {
+    let (client, server) = make_session_pair([0x93u8; 32]);
+    let sid = *client.id();
+    let mut pn = 0u64;
+    for _round in 0..500 {
+        for stream_id in [1u16, 7u16] {
+            let h = PacketHeader::new(sid, stream_id, pn, PacketFlags::new(PacketFlags::ENCRYPTED));
+            let ct = client.encrypt_packet(&h, b"x").expect("encrypt");
+            assert!(
+                server.decrypt_packet(&h, &ct).is_ok(),
+                "stream {stream_id} pn {pn} must be accepted by the single window"
+            );
+            pn += 1;
+        }
+    }
+    // Replaying an earlier packet number is now a duplicate.
+    let h_dup = PacketHeader::new(sid, 1, 0, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let ct_dup = client.encrypt_packet(&h_dup, b"x").expect("encrypt");
+    assert!(
+        matches!(
+            server.decrypt_packet(&h_dup, &ct_dup),
+            Err(phantom_protocol::CoreError::ReplayDetected(_))
+        ),
+        "a replayed packet_number must be rejected after AEAD verify (Inv-4)"
+    );
+}
