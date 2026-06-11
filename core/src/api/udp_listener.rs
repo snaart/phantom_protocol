@@ -13,7 +13,9 @@ use crate::errors::CoreError;
 use crate::observability::attrs::{AeadAlgorithm, HandshakeOutcome, ProtocolVersion};
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, SpawnHandle, TokioRuntime};
-use crate::transport::handshake::{ClientHello, HandshakeServer, HelloRetryRequest, UdpAdmit};
+use crate::transport::handshake::{
+    client_hello_lengths_within_bounds, ClientHello, HandshakeServer, HelloRetryRequest, UdpAdmit,
+};
 use crate::transport::phantom_udp::datagram::{encode_datagrams, push_datagram, FragmentAssembler};
 use crate::transport::phantom_udp::envelope::{ConnId, PacketType};
 use crate::transport::types::LegType;
@@ -324,6 +326,12 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
         // New connection: only an Initial (handshake) starts one.
         if hdr.ty != PacketType::Initial {
             continue; // unknown OneRtt/Retry -> drop
+        }
+        // M-7: structurally bound the ClientHello's variable fields BEFORE borsh, so a forged
+        // length prefix can't force borsh's `vec![0u8; len.min(1 MiB)]` eager allocate+memset
+        // on the demux thread (a ~45-byte → 1 MiB amplifier). Also bounds the frame size.
+        if !client_hello_lengths_within_bounds(&frame) {
+            continue;
         }
         // H-2: on the connectionless UDP path the source is unverified. Run the stateless
         // cookie/address-validation round on the demux thread BEFORE committing any
