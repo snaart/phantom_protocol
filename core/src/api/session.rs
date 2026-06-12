@@ -853,11 +853,18 @@ async fn run_data_pump<T: SessionTransport>(
     {
         let mut queue = send_queue.lock().await;
         let count = queue.len();
-        for msg in queue.drain(..) {
+        'flush: for msg in queue.drain(..) {
             for chunk in msg.chunks(TRANSPORT_MTU) {
-                raw_stream
+                if let Err(e) = raw_stream
                     .send_reliable(Bytes::copy_from_slice(chunk))
-                    .await;
+                    .await
+                {
+                    // T4.5 fail-closed: the reliable offset space is exhausted (~2^32
+                    // segments) — refuse rather than wrap. Astronomically unreachable;
+                    // the session stalls and the liveness sweep tears it down.
+                    log::error!("PhantomSession: early-data flush aborted — {e}");
+                    break 'flush;
+                }
             }
         }
         if count > 0 {
@@ -1082,16 +1089,25 @@ async fn run_data_pump<T: SessionTransport>(
                         // `drain_streams_priority_ordered`), instead of being
                         // fired once and forgotten on the wire.
                         for chunk in data.chunks(TRANSPORT_MTU) {
-                            raw_stream
+                            if let Err(e) = raw_stream
                                 .send_reliable(Bytes::copy_from_slice(chunk))
-                                .await;
+                                .await
+                            {
+                                log::error!("PhantomSession: send aborted — {e}");
+                                break;
+                            }
                         }
                         crypto_session.notify_outbound_ready();
                     }
                     Some(SessionCommand::SendStreamReliable { stream_id, data }) => {
                         if let Some(stream) = streams.get(&stream_id) {
                             for chunk in data.chunks(TRANSPORT_MTU) {
-                                stream.send_reliable(Bytes::copy_from_slice(chunk)).await;
+                                if let Err(e) =
+                                    stream.send_reliable(Bytes::copy_from_slice(chunk)).await
+                                {
+                                    log::error!("PhantomSession: stream send aborted — {e}");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -3018,7 +3034,7 @@ mod tests {
         let (client, _server) = paired_sessions(sid);
 
         let stream = Arc::new(TransportStream::new(1));
-        stream.send_reliable(Bytes::from("payload")).await;
+        stream.send_reliable(Bytes::from("payload")).await.unwrap();
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         streams.insert(1u32, stream);
 
@@ -3052,7 +3068,7 @@ mod tests {
         let inflight_before = client.bandwidth_snapshot().inflight_bytes;
 
         let stream = Arc::new(TransportStream::new(1));
-        stream.send_reliable(Bytes::from("new-data")).await;
+        stream.send_reliable(Bytes::from("new-data")).await.unwrap();
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         streams.insert(1u32, stream);
 
@@ -3685,7 +3701,8 @@ mod tests {
         let stream = Arc::new(TransportStream::new(stream_id));
         let seq = stream
             .send_reliable(Bytes::from_static(b"reliable-payload"))
-            .await;
+            .await
+            .unwrap();
         let _ = stream.poll_send(u64::MAX).await.expect("segment in-flight");
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         streams.insert(stream_id as u32, stream.clone());
@@ -3758,7 +3775,10 @@ mod tests {
         // Stage offsets 0..=5, all in flight.
         let stream = Arc::new(TransportStream::new(stream_id));
         for _ in 0..6u32 {
-            stream.send_reliable(Bytes::from_static(b"x")).await;
+            stream
+                .send_reliable(Bytes::from_static(b"x"))
+                .await
+                .unwrap();
             let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
         }
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
@@ -3839,7 +3859,10 @@ mod tests {
         // Sender stages segments 0..=5, all in-flight.
         let stream = Arc::new(TransportStream::new(stream_id));
         for i in 0..6u32 {
-            let seq = stream.send_reliable(Bytes::from(format!("seg-{i}"))).await;
+            let seq = stream
+                .send_reliable(Bytes::from(format!("seg-{i}")))
+                .await
+                .unwrap();
             assert_eq!(seq, i);
             let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
         }
@@ -4628,17 +4651,17 @@ mod tests {
         // Stream 11: low priority (1), 3 reliable chunks.
         let low = Arc::new(TransportStream::new(11));
         low.set_priority(1);
-        low.send_reliable(Bytes::from_static(b"L0")).await;
-        low.send_reliable(Bytes::from_static(b"L1")).await;
-        low.send_reliable(Bytes::from_static(b"L2")).await;
+        low.send_reliable(Bytes::from_static(b"L0")).await.unwrap();
+        low.send_reliable(Bytes::from_static(b"L1")).await.unwrap();
+        low.send_reliable(Bytes::from_static(b"L2")).await.unwrap();
         streams.insert(11, low);
 
         // Stream 22: HIGH priority (100), 3 reliable chunks.
         let hi = Arc::new(TransportStream::new(22));
         hi.set_priority(100);
-        hi.send_reliable(Bytes::from_static(b"H0")).await;
-        hi.send_reliable(Bytes::from_static(b"H1")).await;
-        hi.send_reliable(Bytes::from_static(b"H2")).await;
+        hi.send_reliable(Bytes::from_static(b"H0")).await.unwrap();
+        hi.send_reliable(Bytes::from_static(b"H1")).await.unwrap();
+        hi.send_reliable(Bytes::from_static(b"H2")).await.unwrap();
         streams.insert(22, hi);
 
         drain_streams_priority_ordered(&transport, &client_session, session_id, &streams).await;

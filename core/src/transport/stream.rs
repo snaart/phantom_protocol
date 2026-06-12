@@ -3,6 +3,7 @@
 //! Multiplexed streams within a session.
 //! Each stream has independent sequence numbers (no Head-of-Line blocking).
 
+use crate::errors::CoreError;
 use crate::transport::sack::Sack;
 use crate::transport::types::{SequenceNumber, StreamId};
 
@@ -565,12 +566,41 @@ impl Stream {
         }
     }
 
+    /// Assign the next gap-free reliable `stream_offset`, failing closed at `u32`
+    /// exhaustion (T4.5, reviewer §1). The cursor (`reliable_offset`) holds the
+    /// next-to-assign value; the last assignable offset is `u32::MAX - 1` (assigning
+    /// it advances the cursor to the `u32::MAX` exhaustion sentinel). A plain
+    /// `fetch_add(1)` would wrap `u32::MAX` back to `0`, re-issuing offset `0` and
+    /// corrupting reassembly / SACK dedup (a duplicate offset — NOT an AEAD nonce
+    /// reuse, since the nonce is the `u64` packet number). Instead we fail closed,
+    /// mirroring the epoch-saturation guard in [`Session::rekey`]. The CAS loop keeps
+    /// the "never wrap" invariant correct even under a (rare) concurrent caller.
+    fn next_reliable_offset(&self) -> Result<SequenceNumber, CoreError> {
+        loop {
+            let cur = self.reliable_offset.load(Ordering::SeqCst);
+            let next = cur.checked_add(1).ok_or_else(|| {
+                CoreError::StreamError(
+                    "reliable stream offset space exhausted (u32); reconnect required".into(),
+                )
+            })?;
+            if self
+                .reliable_offset
+                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Ok(cur);
+            }
+        }
+    }
+
     /// Queue data for sending with reliability.
     ///
     /// Returns the gap-free `stream_offset` assigned to this chunk (the reassembly
     /// / SACK key). The wire packet number is assigned later, at send time, by the
-    /// data pump (① — Phase 4).
-    pub async fn send_reliable(&self, data: Bytes) -> SequenceNumber {
+    /// data pump (① — Phase 4). Fails closed with [`CoreError::StreamError`] once the
+    /// `u32` offset space is exhausted (T4.5) — the acquired backpressure permit is
+    /// released on that path so the semaphore accounting stays correct.
+    pub async fn send_reliable(&self, data: Bytes) -> Result<SequenceNumber, CoreError> {
         // Backpressure: wait until there is space in the buffer.
         // PANIC-SAFETY: `Semaphore::acquire` only errors after `close()`. The
         // `send_semaphore` is a private field of this struct, constructed in
@@ -582,10 +612,12 @@ impl Stream {
             .acquire()
             .await
             .expect("Semaphore closed");
-        permit.forget();
 
-        // Gap-free reliable-data offset (A.5) — the reassembly / SACK key.
-        let stream_offset = self.reliable_offset.fetch_add(1, Ordering::SeqCst);
+        // Gap-free reliable-data offset (A.5) — the reassembly / SACK key. Assigned
+        // BEFORE forgetting the permit so a fail-closed exhaustion (`?`) drops the
+        // permit and releases the slot instead of leaking backpressure capacity.
+        let stream_offset = self.next_reliable_offset()?;
+        permit.forget();
 
         let pending = PendingData {
             stream_offset,
@@ -597,7 +629,7 @@ impl Stream {
 
         self.send_buffer.lock().await.push_back(pending);
 
-        stream_offset
+        Ok(stream_offset)
     }
 
     /// Queue data for unreliable sending. Fire-and-forget; the wire packet number
@@ -1104,8 +1136,8 @@ mod tests {
         let stream = Stream::new(1);
 
         // Send data
-        stream.send_reliable(Bytes::from("hello")).await;
-        stream.send_reliable(Bytes::from("world")).await;
+        stream.send_reliable(Bytes::from("hello")).await.unwrap();
+        stream.send_reliable(Bytes::from("world")).await.unwrap();
 
         // Check pending
         assert_eq!(stream.pending_send_count().await, 2);
@@ -1126,13 +1158,49 @@ mod tests {
         assert!(stream.poll_send(u64::MAX).await.is_none());
     }
 
+    /// T4.5 (reviewer §1, `stream_offset`): the gap-free reliable offset is a `u32`
+    /// assigned per reliable segment. A naive `fetch_add(1)` silently wraps `u32::MAX`
+    /// back to `0`, colliding with the first segment's offset and corrupting
+    /// reassembly / SACK dedup (a duplicate offset, NOT a nonce reuse — the AEAD nonce
+    /// is the `u64` packet number). It must fail-closed instead — mirroring the epoch
+    /// saturation guard in `Session::rekey` — so an exhausted stream refuses new
+    /// reliable data rather than corrupting the stream.
+    #[tokio::test]
+    async fn reliable_offset_fails_closed_at_u32_exhaustion() {
+        let stream = Stream::new(1);
+
+        // The last assignable offset is `u32::MAX - 1`; assigning it leaves the cursor
+        // at `u32::MAX`, the exhaustion sentinel.
+        stream.reliable_offset.store(u32::MAX - 1, Ordering::SeqCst);
+        let last = stream
+            .send_reliable(Bytes::from_static(b"a"))
+            .await
+            .expect("offset u32::MAX-1 must still be assignable");
+        assert_eq!(last, u32::MAX - 1, "last assignable reliable offset");
+
+        // The next send must fail-closed — never wrap to 0.
+        let exhausted = stream.send_reliable(Bytes::from_static(b"b")).await;
+        assert!(
+            matches!(exhausted, Err(crate::errors::CoreError::StreamError(_))),
+            "send_reliable must fail-closed (StreamError) at u32 offset exhaustion, got {exhausted:?}"
+        );
+
+        // And directly at the sentinel.
+        stream.reliable_offset.store(u32::MAX, Ordering::SeqCst);
+        let at_sentinel = stream.send_reliable(Bytes::from_static(b"c")).await;
+        assert!(
+            at_sentinel.is_err(),
+            "send_reliable at the u32::MAX sentinel must fail-closed, got {at_sentinel:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_stream_retransmission() {
         // We use tokio::time::pause to mock time and test timeout
         tokio::time::pause();
         let stream = Stream::new(1);
 
-        stream.send_reliable(Bytes::from("hello")).await;
+        stream.send_reliable(Bytes::from("hello")).await.unwrap();
 
         // First send — not a retransmission.
         let seg = stream.poll_send(u64::MAX).await.unwrap();
@@ -1172,7 +1240,7 @@ mod tests {
         // due to `mark_unsent`, not the retransmit timer.
         tokio::time::pause();
         let stream = Stream::new(1);
-        stream.send_reliable(Bytes::from("hello")).await;
+        stream.send_reliable(Bytes::from("hello")).await.unwrap();
 
         // First poll stamps `sent_at`; an immediate re-poll yields nothing
         // (treated as in-flight, not yet timed out).
@@ -1202,8 +1270,11 @@ mod tests {
     #[tokio::test]
     async fn poll_send_respects_the_cwnd_budget() {
         let stream = Stream::new(1);
-        stream.send_reliable(Bytes::from("0123456789")).await; // 10 bytes
-        stream.send_reliable(Bytes::from("abcde")).await; // 5 bytes
+        stream
+            .send_reliable(Bytes::from("0123456789"))
+            .await
+            .unwrap(); // 10 bytes
+        stream.send_reliable(Bytes::from("abcde")).await.unwrap(); // 5 bytes
 
         // Budget of 10 admits the 10-byte head segment.
         let seg = stream.poll_send(10).await.unwrap();
@@ -1264,7 +1335,7 @@ mod tests {
 
         // Fill the buffer
         for _ in 0..MAX_PENDING_PACKETS {
-            stream.send_reliable(Bytes::from("data")).await;
+            stream.send_reliable(Bytes::from("data")).await.unwrap();
         }
 
         assert_eq!(stream.pending_send_count().await, MAX_PENDING_PACKETS);
@@ -1294,7 +1365,10 @@ mod tests {
     async fn on_sack_retires_all_covered_segments_skipping_the_gap() {
         let stream = Stream::new(1);
         for i in 0..6u32 {
-            let seq = stream.send_reliable(Bytes::from(format!("seg-{i}"))).await;
+            let seq = stream
+                .send_reliable(Bytes::from(format!("seg-{i}")))
+                .await
+                .unwrap();
             assert_eq!(seq, i);
             // Stamp it as in-flight so RTT sampling has a `sent_at`.
             let seg = stream.poll_send(u64::MAX).await.expect("poll");
@@ -1336,7 +1410,10 @@ mod tests {
     async fn on_sack_clamps_inflated_largest_acked() {
         let stream = Stream::new(1);
         for i in 0..5u32 {
-            let seq = stream.send_reliable(Bytes::from(format!("seg-{i}"))).await;
+            let seq = stream
+                .send_reliable(Bytes::from(format!("seg-{i}")))
+                .await
+                .unwrap();
             assert_eq!(seq, i);
             let seg = stream.poll_send(u64::MAX).await.expect("poll"); // stamps sent_at
             assert_eq!(seg.stream_offset, i);
@@ -1359,7 +1436,7 @@ mod tests {
     #[tokio::test]
     async fn on_sack_for_unbuffered_sequences_retires_nothing() {
         let stream = Stream::new(1);
-        stream.send_reliable(Bytes::from("zero")).await; // seq 0
+        stream.send_reliable(Bytes::from("zero")).await.unwrap(); // seq 0
         let _ = stream.poll_send(u64::MAX).await.expect("poll");
 
         // SACK only covers high sequences we never sent.
@@ -1375,7 +1452,7 @@ mod tests {
     async fn on_sack_flags_retransmits_for_karn() {
         tokio::time::pause();
         let stream = Stream::new(1);
-        stream.send_reliable(Bytes::from("payload")).await; // seq 0
+        stream.send_reliable(Bytes::from("payload")).await.unwrap(); // seq 0
         let _ = stream.poll_send(u64::MAX).await.expect("first send");
 
         // Force a retransmit by crossing the RTO, so retries > 0.
@@ -1406,7 +1483,10 @@ mod tests {
         tokio::time::pause();
         let stream = Stream::new(1);
         for _ in 0..6u32 {
-            stream.send_reliable(Bytes::from_static(b"x")).await;
+            stream
+                .send_reliable(Bytes::from_static(b"x"))
+                .await
+                .unwrap();
             let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
         }
         // SACK acks offsets {4,5}: 0,1,2 are ≤ 5−3 → lost; 3 is within threshold.
@@ -1441,7 +1521,10 @@ mod tests {
         tokio::time::pause();
         let stream = Stream::new(1);
         // Establish a small srtt: send offset 0, ack it after ~10 ms.
-        stream.send_reliable(Bytes::from_static(b"a")).await; // offset 0
+        stream
+            .send_reliable(Bytes::from_static(b"a"))
+            .await
+            .unwrap(); // offset 0
         let _ = stream.poll_send(u64::MAX).await.expect("send 0");
         tokio::time::advance(Duration::from_millis(10)).await;
         let _ = stream
@@ -1449,8 +1532,14 @@ mod tests {
             .await; // srtt ≈ 10 ms
 
         // Send offsets 1 and 2; age them well past srtt·9/8 (≈ 11 ms).
-        stream.send_reliable(Bytes::from_static(b"b")).await; // offset 1
-        stream.send_reliable(Bytes::from_static(b"c")).await; // offset 2
+        stream
+            .send_reliable(Bytes::from_static(b"b"))
+            .await
+            .unwrap(); // offset 1
+        stream
+            .send_reliable(Bytes::from_static(b"c"))
+            .await
+            .unwrap(); // offset 2
         let _ = stream.poll_send(u64::MAX).await.expect("send 1");
         let _ = stream.poll_send(u64::MAX).await.expect("send 2");
         tokio::time::advance(Duration::from_millis(50)).await;
