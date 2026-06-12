@@ -28,6 +28,48 @@ const MAX_HANDSHAKE_RETX: u32 = 6;
 const PHASE_HANDSHAKE: u8 = 0;
 const PHASE_ESTABLISHED: u8 = 1;
 
+/// Outcome of classifying a UDP `recv` result (M-6).
+enum RecvAction {
+    /// A datagram of this many bytes arrived.
+    Got(usize),
+    /// An ICMP-induced *advisory* error — retry, do not tear the session down.
+    Retry,
+    /// A genuine, fatal socket error.
+    Fatal(std::io::Error),
+}
+
+/// Whether a UDP `recv` error is an ICMP-induced *advisory* condition (RFC 8085 §5.5 /
+/// RFC 9000 §14.2). On a connected socket the kernel surfaces a matching ICMP error
+/// (port/host/net-unreachable, reset) on the next `recv`; a single such error — which an
+/// off-path attacker can forge (the UDP analogue of a forged RST) — must NOT kill the session.
+fn is_advisory_recv_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    // ConnectionRefused (ICMP port-unreachable — the audit's M-6 case) and ConnectionReset are
+    // stable on MSRV 1.75. The HostUnreachable / NetworkUnreachable `ErrorKind`s only stabilised
+    // in Rust 1.83, so match their errno directly where the OS reports them that way (Linux:
+    // EHOSTUNREACH = 113, ENETUNREACH = 101).
+    if matches!(
+        e.kind(),
+        ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
+    ) {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(errno) = e.raw_os_error() {
+        return errno == 113 || errno == 101;
+    }
+    false
+}
+
+/// Classify a `recv` result: an advisory ICMP error is retried, a genuine error is fatal (M-6).
+fn classify_recv(r: std::io::Result<usize>) -> RecvAction {
+    match r {
+        Ok(n) => RecvAction::Got(n),
+        Err(e) if is_advisory_recv_error(&e) => RecvAction::Retry,
+        Err(e) => RecvAction::Fatal(e),
+    }
+}
+
 pub struct UdpClientTransport {
     /// Active send/recv socket. `ArcSwap` so `migrate()` can atomically rebind to a
     /// new local socket (Phase 4 / P4.2b) without re-handshake; `send_bytes` and the
@@ -186,8 +228,16 @@ impl SessionTransport for UdpClientTransport {
                     // MAX_HANDSHAKE_RETX and timing the handshake out. Biasing toward received data
                     // makes the RTO fire only when recv is genuinely pending.
                     biased;
-                    r = active.recv(&mut buf) =>
-                        (r.map_err(|e| CoreError::NetworkError(format!("udp recv: {e}")))?, false),
+                    r = active.recv(&mut buf) => match classify_recv(r) {
+                        RecvAction::Got(n) => (n, false),
+                        RecvAction::Retry => {
+                            log::debug!("PhantomUDP: advisory recv error (ignored, RFC 8085 §5.5)");
+                            continue;
+                        }
+                        RecvAction::Fatal(e) => {
+                            return Err(CoreError::NetworkError(format!("udp recv: {e}")))
+                        }
+                    },
                     _ = tokio::time::sleep(HANDSHAKE_RTO) => {
                         retx += 1;
                         if retx > MAX_HANDSHAKE_RETX {
@@ -205,23 +255,43 @@ impl SessionTransport for UdpClientTransport {
                 }
                 tokio::select! {
                     r = active.recv(&mut buf) => {
-                        let n = r.map_err(|e| CoreError::NetworkError(format!("udp recv: {e}")))?;
+                        let n = match classify_recv(r) {
+                            RecvAction::Got(n) => n,
+                            RecvAction::Retry => {
+                                log::debug!("PhantomUDP: advisory recv error on new path (ignored)");
+                                continue;
+                            }
+                            RecvAction::Fatal(e) => {
+                                return Err(CoreError::NetworkError(format!("udp recv: {e}")))
+                            }
+                        };
                         // First life on the new path: the server is now reaching us on
                         // the new socket → drop the retained old socket (overlap done).
                         self.prev_socket.store(Arc::new(None));
                         (n, false)
                     }
-                    r = prev_sock.recv(&mut buf_prev) =>
-                        (r.map_err(|e| CoreError::NetworkError(format!("udp recv: {e}")))?, true),
+                    r = prev_sock.recv(&mut buf_prev) => match classify_recv(r) {
+                        RecvAction::Got(n) => (n, true),
+                        RecvAction::Retry => {
+                            log::debug!("PhantomUDP: advisory recv error on old path (ignored)");
+                            continue;
+                        }
+                        RecvAction::Fatal(e) => {
+                            return Err(CoreError::NetworkError(format!("udp recv: {e}")))
+                        }
+                    },
                 }
             } else {
-                (
-                    active
-                        .recv(&mut buf)
-                        .await
-                        .map_err(|e| CoreError::NetworkError(format!("udp recv: {e}")))?,
-                    false,
-                )
+                match classify_recv(active.recv(&mut buf).await) {
+                    RecvAction::Got(n) => (n, false),
+                    RecvAction::Retry => {
+                        log::debug!("PhantomUDP: advisory recv error (ignored, RFC 8085 §5.5)");
+                        continue;
+                    }
+                    RecvAction::Fatal(e) => {
+                        return Err(CoreError::NetworkError(format!("udp recv: {e}")))
+                    }
+                }
             };
             retx = 0; // progress: reset the RTO budget
             let datagram = if from_prev { &buf_prev[..n] } else { &buf[..n] };
@@ -771,5 +841,27 @@ mod tests {
             st.has_migration_candidate(),
             "an AEAD-authenticated new source sets the migration candidate"
         );
+    }
+
+    /// M-6 (audit 2026-06-11): an ICMP-induced recv error on a connected UDP socket (the
+    /// forged-RST analogue — a spoofed "port unreachable") must be treated as ADVISORY and
+    /// retried, never mapped to a fatal `NetworkError` that tears the session down bypassing the
+    /// liveness machinery (RFC 8085 §5.5 / RFC 9000 §14.2). A genuine error stays fatal.
+    #[test]
+    fn advisory_icmp_recv_errors_are_retried_not_fatal() {
+        use std::io::{Error, ErrorKind};
+        assert!(matches!(
+            classify_recv(Err(Error::from(ErrorKind::ConnectionRefused))),
+            RecvAction::Retry
+        ));
+        assert!(matches!(
+            classify_recv(Err(Error::from(ErrorKind::ConnectionReset))),
+            RecvAction::Retry
+        ));
+        assert!(matches!(
+            classify_recv(Err(Error::from(ErrorKind::PermissionDenied))),
+            RecvAction::Fatal(_)
+        ));
+        assert!(matches!(classify_recv(Ok(42)), RecvAction::Got(42)));
     }
 }
