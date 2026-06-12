@@ -21,7 +21,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use embedded_io_async::{Read, Write};
 use phantom_protocol::api::session::{ConnectionState, PhantomSession, SessionTransport};
-use phantom_protocol::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+use phantom_protocol::transport::handshake::{
+    ClientHello, HandshakeResponse, HandshakeServer, ServerReply,
+};
 use phantom_protocol::transport::legs::embedded::EmbeddedLeg;
 use phantom_protocol::transport::session::Session;
 use phantom_protocol::transport::types::{
@@ -168,23 +170,41 @@ impl SessionTransport for DemoLeg {
 // ── Server-side encrypt/decrypt helpers ────────────────────────────────────
 
 fn decrypt_incoming(sess: &Session, bytes: &[u8]) -> Vec<u8> {
-    let p = PhantomPacket::from_wire(bytes).expect("deserialize PhantomPacket");
-    sess.decrypt_packet(&p.header, &p.payload, &[])
-        .expect("decrypt")
+    // T4.6: the client pump applies header protection; unmask with this side's
+    // recv HP key (== the client's send HP key) before decrypting.
+    let p = sess
+        .parse_protected(bytes)
+        .expect("parse header-protected PhantomPacket");
+    let plain = sess
+        .decrypt_packet(&p.header, &p.payload, &[])
+        .expect("decrypt");
+    // Reliable frames carry a 4-byte gap-free stream_offset prefix (A.5); strip
+    // it so the printed payload is the raw application bytes.
+    if p.header.flags.contains(PacketFlags::RELIABLE) && plain.len() >= 4 {
+        plain[4..].to_vec()
+    } else {
+        plain
+    }
 }
 
 fn encrypt_outgoing(
     sess: &Session,
     sid: SessionId,
     stream: StreamId,
-    seq: u32,
+    seq: u64,
     payload: &[u8],
 ) -> Vec<u8> {
     let flags = PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::ENCRYPTED);
     let header = PacketHeader::new(sid, stream, seq, flags).with_epoch(sess.current_epoch());
-    let ct = sess.encrypt_packet(&header, payload, &[]).expect("encrypt");
+    // Reliable plaintext = [stream_offset: u32 BE][payload] (A.5); the receiver
+    // reassembles by gap-free offset, so a reply at offset 0 delivers immediately.
+    let mut pt = Vec::with_capacity(4 + payload.len());
+    pt.extend_from_slice(&(seq as u32).to_be_bytes());
+    pt.extend_from_slice(payload);
+    let ct = sess.encrypt_packet(&header, &pt, &[]).expect("encrypt");
     let packet = PhantomPacket::new(header, ct);
-    packet.to_wire()
+    // Apply header protection so the client pump's parse_protected unmasks it.
+    sess.protect_packet(&packet).expect("header protection")
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -225,7 +245,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let server_session = loop {
             match server_hs.process_client_hello(&client_hello, 0, client_ip) {
                 HandshakeResponse::Success(server_hello, session, _) => {
-                    let bytes = borsh::to_vec(&server_hello).expect("serialize ServerHello");
+                    // T4.4: frame with the ServerReply discriminant the client dispatches on.
+                    let bytes = ServerReply::Hello(server_hello)
+                        .to_wire()
+                        .expect("serialize ServerHello");
                     timeout(IO_TIMEOUT, server_leg.send_frame(&bytes))
                         .await
                         .expect("send ServerHello timed out")
@@ -233,7 +256,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break session;
                 }
                 HandshakeResponse::Retry(retry) => {
-                    let bytes = borsh::to_vec(&retry).expect("serialize HelloRetryRequest");
+                    let bytes = ServerReply::Retry(retry)
+                        .to_wire()
+                        .expect("serialize HelloRetryRequest");
                     timeout(IO_TIMEOUT, server_leg.send_frame(&bytes))
                         .await
                         .expect("send retry timed out")
@@ -267,7 +292,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Server replying with: {:?}",
             String::from_utf8_lossy(reply_msg)
         );
-        let reply = encrypt_outgoing(&server_session, session_id, 1, 1, reply_msg);
+        // First reliable server→client frame on stream 1: packet_number 0 and
+        // stream_offset 0, so the client reassembles it at the head of the stream.
+        let reply = encrypt_outgoing(&server_session, session_id, 1, 0, reply_msg);
         timeout(IO_TIMEOUT, server_leg.send_frame(&reply))
             .await
             .expect("send reply timed out")

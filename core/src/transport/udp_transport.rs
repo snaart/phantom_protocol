@@ -23,7 +23,7 @@ use super::buffer_pool::BufferPool;
 use super::pacer::Pacer;
 use crate::crypto::aes_session::AesSession;
 use crate::transport::bandwidth_estimator;
-use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer, ServerReply};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{self, Result as IoResult};
@@ -205,14 +205,15 @@ impl UdpHandshakeListener {
             // Process ClientHello
             match server.process_client_hello(&client_hello, difficulty, addr.ip()) {
                 HandshakeResponse::Retry(retry_req) => {
-                    // Server demands PoW or Cookie, send Retry (stateless) and forget
-                    if let Ok(encoded) = borsh::to_vec(&retry_req) {
+                    // Server demands PoW or Cookie, send Retry (stateless) and forget.
+                    // T4.4: frame with the ServerReply discriminant the client dispatches on.
+                    if let Ok(encoded) = ServerReply::Retry(retry_req).to_wire() {
                         let _ = self.socket.send_to(&encoded, addr).await;
                     }
                 }
                 HandshakeResponse::Success(server_hello, _session, _early_data) => {
-                    // Handshake Success, send ServerHello
-                    if let Ok(encoded) = borsh::to_vec(&server_hello) {
+                    // Handshake Success, send the discriminant-framed ServerHello.
+                    if let Ok(encoded) = ServerReply::Hello(server_hello).to_wire() {
                         let _ = self.socket.send_to(&encoded, addr).await;
                     }
                     // Transition connection to established state...
@@ -220,7 +221,7 @@ impl UdpHandshakeListener {
                 HandshakeResponse::Reject(reject) => {
                     // Unsupported version (H9): send the typed reject so the
                     // client gets an actionable signal, then forget.
-                    if let Ok(encoded) = borsh::to_vec(&reject) {
+                    if let Ok(encoded) = ServerReply::Reject(reject).to_wire() {
                         let _ = self.socket.send_to(&encoded, addr).await;
                     }
                 }
