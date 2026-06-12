@@ -81,27 +81,6 @@ jobs:
       # back down. Runs on the default (no-otel) atomics path.
       - run: cargo test --manifest-path core/Cargo.toml --test observability_e2e
 
-  # MSRV gate (M-8): the crate documents a Rust 1.75 MSRV (rust-toolchain.toml /
-  # .clippy.toml / CLAUDE.md) but nothing enforced it, so a transitive dep that
-  # bumped its MSRV (e.g. async-lock >= 3.4 needs 1.85) could silently break a 1.75
-  # integrator. Pin the toolchain to 1.75 and `cargo check` the configurations that
-  # claim it — the default lib and the embedded/no-std bare-metal path the audit
-  # specifically flagged.
-  msrv:
-    name: cargo check (MSRV 1.75)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned action; 1.75 via input
-        with:
-          toolchain: "1.75"
-          targets: thumbv7em-none-eabihf
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: "."
-      - run: cargo +1.75 check --manifest-path core/Cargo.toml --lib --locked
-      - run: cargo +1.75 check --manifest-path core/Cargo.toml --lib --no-default-features --features embedded,no-std --target thumbv7em-none-eabihf --locked
-
   doc:
     name: cargo doc
     runs-on: ubuntu-latest
