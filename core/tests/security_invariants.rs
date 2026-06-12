@@ -62,7 +62,7 @@ fn tampered_header_is_rejected_via_aad() {
     );
 
     let ct = client
-        .encrypt_packet(&real_header, b"AAD-bound payload")
+        .encrypt_packet(&real_header, b"AAD-bound payload", &[])
         .expect("encrypt");
 
     // Server tries to decrypt with a different header (stream_id changed).
@@ -71,10 +71,119 @@ fn tampered_header_is_rejected_via_aad() {
         ..real_header
     };
 
-    let result = server.decrypt_packet(&tampered_header, &ct);
+    let result = server.decrypt_packet(&tampered_header, &ct, &[]);
     assert!(
         result.is_err(),
         "AEAD must reject a packet whose header (AAD) was mutated"
+    );
+}
+
+/// T4.1 — `PhantomPacket.extensions` is bound into the AEAD AAD. The trailing
+/// TLV headroom used to sit *outside* the AAD (the AAD was only the 47-byte
+/// header image), so an on-path attacker could rewrite `extensions` without
+/// invalidating the tag. Binding it closes that malleability: decrypting under
+/// a different `extensions` than the sender sealed must fail, and the untampered
+/// value must still decrypt. (Companion to `tampered_header_is_rejected_via_aad`,
+/// which covers the header fields.)
+#[test]
+fn tampered_extensions_is_rejected_via_aad() {
+    let (client, server) = make_session_pair([0x4Au8; 32]);
+    let header = PacketHeader::new(*server.id(), 3, 1, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let ext = vec![0xFFu8, 0x01, 0x00, 0x04, b't', b'e', b's', b't'];
+
+    let ct = client
+        .encrypt_packet(&header, b"ext-bound payload", &ext)
+        .expect("encrypt");
+
+    // Same header + ciphertext, but a single flipped extensions byte → the
+    // AEAD open must reject it (extensions are part of the AAD).
+    let mut tampered = ext.clone();
+    tampered[0] ^= 0x80;
+    assert!(
+        server.decrypt_packet(&header, &ct, &tampered).is_err(),
+        "AEAD must reject a packet whose extensions (AAD) were mutated"
+    );
+
+    // The intact extensions still decrypt to the original payload.
+    let pt = server
+        .decrypt_packet(&header, &ct, &ext)
+        .expect("decrypt with intact extensions");
+    assert_eq!(pt, b"ext-bound payload");
+}
+
+/// T4.6 — header protection (QUIC RFC 9001 §5.4) masks the 14 variable header
+/// bytes (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖ path_id`, wire `[33..47]`)
+/// so a passive on-path observer reads neither the packet number nor the
+/// `PRIORITY` ("voice") flag; only `version ‖ session_id` (the routing CID) stay
+/// cleartext. The peer recovers the exact packet via `parse_protected`.
+#[test]
+fn hp_masks_header_fields_on_the_wire() {
+    let (client, server) = make_session_pair([0x71u8; 32]);
+    let header = PacketHeader::new(
+        *server.id(),
+        9,
+        0xA1B2C3D4E5F60718,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::PRIORITY),
+    )
+    .with_epoch(2)
+    .with_path_id(3);
+    let ct = client
+        .encrypt_packet(&header, b"voice frame", &[])
+        .expect("encrypt");
+    let packet = PhantomPacket::new(header, ct);
+    let wire = client.protect_packet(&packet).expect("protect");
+    let cleartext = packet.to_wire();
+
+    // The 14-byte protected region is masked → not the cleartext header bytes.
+    assert_ne!(
+        &wire[33..47],
+        &cleartext[33..47],
+        "pn/flags/stream_id/epoch/path_id must be masked on the wire"
+    );
+    // version + session_id (the routing CID) stay cleartext for the demux.
+    assert_eq!(&wire[..33], &cleartext[..33]);
+    // The flags bytes (incl. the PRIORITY/voice bit) sit in the masked span, so
+    // an observer cannot read the priority class off the wire.
+    assert_ne!(
+        &wire[41..43],
+        &cleartext[41..43],
+        "the PRIORITY/voice flag must not be readable on the wire without the hp key"
+    );
+    // The peer recovers the exact packet (header + payload) by unmasking.
+    let parsed = server.parse_protected(&wire).expect("parse");
+    assert_eq!(parsed.header, header);
+    assert_eq!(parsed.payload, packet.payload);
+}
+
+/// T4.6 — header protection adds NO new decryption oracle: a wire mutation of the
+/// masked `[33..47]` region unmasks to a WRONG header, so the subsequent AEAD
+/// open (the cleartext header is the AAD) fails — caught exactly like any other
+/// AAD / ciphertext tamper, with no separate signal.
+#[test]
+fn hp_masked_region_tamper_fails_aead() {
+    let (client, server) = make_session_pair([0x72u8; 32]);
+    let header = PacketHeader::new(*server.id(), 1, 5, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let ct = client
+        .encrypt_packet(&header, b"payload", &[])
+        .expect("encrypt");
+    let packet = PhantomPacket::new(header, ct);
+    let mut wire = client.protect_packet(&packet).expect("protect");
+
+    // Flip a byte inside the masked header region.
+    wire[35] ^= 0x40;
+    // Unmasking still "succeeds" structurally but recovers a different header...
+    let tampered = server.parse_protected(&wire).expect("parse");
+    assert_ne!(
+        tampered.header, header,
+        "a flipped masked byte must change the recovered header"
+    );
+    // ...and the AEAD open under that wrong header (its wire image is the AAD)
+    // fails — the masked-region tamper is caught by the AEAD, not a new oracle.
+    assert!(
+        server
+            .decrypt_packet(&tampered.header, &tampered.payload, &tampered.extensions)
+            .is_err(),
+        "a tampered masked-header byte must fail the AEAD via the AAD"
     );
 }
 
@@ -226,13 +335,15 @@ fn encrypted_packet_round_trip_preserves_payload() {
         42,
         PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
-    let ct = client.encrypt_packet(&header, payload).expect("encrypt");
+    let ct = client
+        .encrypt_packet(&header, payload, &[])
+        .expect("encrypt");
     assert_ne!(
         &ct[..payload.len()],
         payload,
         "ciphertext must not contain plaintext"
     );
-    let pt = server.decrypt_packet(&header, &ct).expect("decrypt");
+    let pt = server.decrypt_packet(&header, &ct, &[]).expect("decrypt");
     assert_eq!(&pt, payload);
 }
 
@@ -251,11 +362,11 @@ fn tampered_ciphertext_is_rejected() {
     .with_path_id(3);
 
     let mut ct = client
-        .encrypt_packet(&header, b"v2 payload")
+        .encrypt_packet(&header, b"v2 payload", &[])
         .expect("encrypt v2");
     ct[0] ^= 0x01;
 
-    let result = server.decrypt_packet(&header, &ct);
+    let result = server.decrypt_packet(&header, &ct, &[]);
     assert!(
         result.is_err(),
         "V2 AEAD must reject bit-flipped ciphertext; got {:?}",
@@ -277,7 +388,7 @@ fn tampered_epoch_or_path_id_is_rejected() {
     .with_epoch(5)
     .with_path_id(0);
     let ct = client
-        .encrypt_packet(&real_header, b"epoch-bound payload")
+        .encrypt_packet(&real_header, b"epoch-bound payload", &[])
         .expect("encrypt");
 
     // Mutate epoch.
@@ -285,17 +396,17 @@ fn tampered_epoch_or_path_id_is_rejected() {
         epoch: 6,
         ..real_header
     };
-    assert!(server.decrypt_packet(&tampered_epoch, &ct).is_err());
+    assert!(server.decrypt_packet(&tampered_epoch, &ct, &[]).is_err());
 
     // Re-encrypt fresh so the AEAD recv counter aligns, then mutate path_id.
     let ct2 = client
-        .encrypt_packet(&real_header, b"path-bound payload")
+        .encrypt_packet(&real_header, b"path-bound payload", &[])
         .expect("re-encrypt");
     let tampered_path = PacketHeader {
         path_id: 7,
         ..real_header
     };
-    assert!(server.decrypt_packet(&tampered_path, &ct2).is_err());
+    assert!(server.decrypt_packet(&tampered_path, &ct2, &[]).is_err());
 }
 
 /// Replay window: re-feeding a fresh ciphertext that reuses an
@@ -314,12 +425,14 @@ fn replay_window_rejects_duplicate_sequence() {
         17,
         PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
-    let ct1 = client.encrypt_packet(&header, b"payload").expect("e1");
-    server.decrypt_packet(&header, &ct1).expect("first decrypt");
+    let ct1 = client.encrypt_packet(&header, b"payload", &[]).expect("e1");
+    server
+        .decrypt_packet(&header, &ct1, &[])
+        .expect("first decrypt");
     assert_eq!(server.replay_rejected_total(), 0);
 
-    let ct2 = client.encrypt_packet(&header, b"payload").expect("e2");
-    match server.decrypt_packet(&header, &ct2) {
+    let ct2 = client.encrypt_packet(&header, b"payload", &[]).expect("e2");
+    match server.decrypt_packet(&header, &ct2, &[]) {
         Err(CoreError::ReplayDetected(_)) => { /* expected */ }
         other => panic!(
             "expected ReplayDetected on V2 duplicate, got {:?}",
@@ -348,18 +461,20 @@ fn failed_decrypt_does_not_desync_session() {
         1,
         PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
-    let ct1 = client.encrypt_packet(&h1, b"first").expect("encrypt 1");
+    let ct1 = client
+        .encrypt_packet(&h1, b"first", &[])
+        .expect("encrypt 1");
 
     // Bad packet arrives in between — flipped tag byte.
     let mut tampered = ct1.clone();
     let n = tampered.len();
     tampered[n - 1] ^= 0x80;
-    assert!(server.decrypt_packet(&h1, &tampered).is_err());
+    assert!(server.decrypt_packet(&h1, &tampered, &[]).is_err());
 
     // The original ct1 (same header, same payload) must still decrypt —
     // in V1 this would fail because the recv_counter desynchronised; in
     // V2 the nonce is reconstructible from h1 alone.
-    let pt1 = server.decrypt_packet(&h1, &ct1).expect("decrypt 1");
+    let pt1 = server.decrypt_packet(&h1, &ct1, &[]).expect("decrypt 1");
     assert_eq!(pt1, b"first");
 
     // And a subsequent packet at sequence 2 also goes through.
@@ -367,8 +482,10 @@ fn failed_decrypt_does_not_desync_session() {
         packet_number: 2,
         ..h1
     };
-    let ct2 = client.encrypt_packet(&h2, b"second").expect("encrypt 2");
-    let pt2 = server.decrypt_packet(&h2, &ct2).expect("decrypt 2");
+    let ct2 = client
+        .encrypt_packet(&h2, b"second", &[])
+        .expect("encrypt 2");
+    let pt2 = server.decrypt_packet(&h2, &ct2, &[]).expect("decrypt 2");
     assert_eq!(pt2, b"second");
 }
 
@@ -388,7 +505,7 @@ fn rekey_changes_keys_and_breaks_old_ciphertexts() {
         PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
     let ct_epoch0 = client
-        .encrypt_packet(&header, b"pre-rekey payload")
+        .encrypt_packet(&header, b"pre-rekey payload", &[])
         .expect("encrypt e0");
 
     // Lock-step rekey on both ends.
@@ -402,7 +519,9 @@ fn rekey_changes_keys_and_breaks_old_ciphertexts() {
     // The OLD ciphertext must NOT authenticate under the new keys.
     let header_epoch1 = PacketHeader { epoch: 1, ..header };
     assert!(
-        server.decrypt_packet(&header_epoch1, &ct_epoch0).is_err(),
+        server
+            .decrypt_packet(&header_epoch1, &ct_epoch0, &[])
+            .is_err(),
         "post-rekey CryptoState must reject pre-rekey ciphertext"
     );
 
@@ -415,10 +534,10 @@ fn rekey_changes_keys_and_breaks_old_ciphertexts() {
     )
     .with_epoch(1);
     let ct_epoch1 = client
-        .encrypt_packet(&header_v1_e1, b"post-rekey payload")
+        .encrypt_packet(&header_v1_e1, b"post-rekey payload", &[])
         .expect("encrypt e1");
     let pt = server
-        .decrypt_packet(&header_v1_e1, &ct_epoch1)
+        .decrypt_packet(&header_v1_e1, &ct_epoch1, &[])
         .expect("decrypt e1");
     assert_eq!(pt, b"post-rekey payload");
 }
@@ -471,12 +590,12 @@ fn accepting_decrypt_follows_one_authentic_rekey_step() {
     )
     .with_epoch(1);
     let ct = client
-        .encrypt_packet(&header, b"first post-rekey")
+        .encrypt_packet(&header, b"first post-rekey", &[])
         .expect("encrypt e1");
 
     // Receiver is still at epoch 0; the accepting decrypt ratchets it forward.
     let pt = server
-        .decrypt_packet_accepting_rekey(&header, &ct)
+        .decrypt_packet_accepting_rekey(&header, &ct, &[])
         .expect("accepting decrypt follows the bump");
     assert_eq!(pt, b"first post-rekey");
     assert_eq!(server.current_epoch(), 1, "receiver committed the ratchet");
@@ -502,7 +621,7 @@ fn accepting_decrypt_rejects_forged_bump_without_desync() {
     let garbage = vec![0xABu8; 64];
     assert!(
         server
-            .decrypt_packet_accepting_rekey(&forged, &garbage)
+            .decrypt_packet_accepting_rekey(&forged, &garbage, &[])
             .is_err(),
         "a forged epoch bump must fail the AEAD trial"
     );
@@ -515,10 +634,10 @@ fn accepting_decrypt_rejects_forged_bump_without_desync() {
     // The session is intact: a genuine epoch-0 packet still round-trips.
     let header = PacketHeader::new(*server.id(), 1, 2, PacketFlags::new(PacketFlags::ENCRYPTED));
     let ct = client
-        .encrypt_packet(&header, b"still in sync")
+        .encrypt_packet(&header, b"still in sync", &[])
         .expect("encrypt e0");
     let pt = server
-        .decrypt_packet_accepting_rekey(&header, &ct)
+        .decrypt_packet_accepting_rekey(&header, &ct, &[])
         .expect("same-epoch decrypt still works");
     assert_eq!(pt, b"still in sync");
 }
@@ -540,12 +659,12 @@ fn accepting_decrypt_follows_bounded_multi_step_catchup() {
     )
     .with_epoch(3);
     let ct = client
-        .encrypt_packet(&header, b"three ahead")
+        .encrypt_packet(&header, b"three ahead", &[])
         .expect("encrypt e3");
 
     // Receiver at epoch 0 catches up 3 steps because the ciphertext authenticates.
     let pt = server
-        .decrypt_packet_accepting_rekey(&header, &ct)
+        .decrypt_packet_accepting_rekey(&header, &ct, &[])
         .expect("bounded multi-step catch-up follows a valid jump");
     assert_eq!(pt, b"three ahead");
     assert_eq!(server.current_epoch(), 3, "receiver caught up to epoch 3");
@@ -568,11 +687,13 @@ fn accepting_decrypt_rejects_jump_beyond_catchup_bound() {
     )
     .with_epoch(target);
     let ct = client
-        .encrypt_packet(&header, b"too far")
+        .encrypt_packet(&header, b"too far", &[])
         .expect("encrypt far");
 
     assert!(
-        server.decrypt_packet_accepting_rekey(&header, &ct).is_err(),
+        server
+            .decrypt_packet_accepting_rekey(&header, &ct, &[])
+            .is_err(),
         "a jump beyond MAX_REKEY_CATCHUP must be rejected"
     );
     assert_eq!(
@@ -600,7 +721,7 @@ fn send_needs_rekey_fires_at_threshold_and_clears_on_rekey() {
             packet_number: i as u64,
             ..header
         };
-        client.encrypt_packet(&h, b"x").expect("encrypt");
+        client.encrypt_packet(&h, b"x", &[]).expect("encrypt");
     }
     assert!(
         client.send_needs_rekey(),
@@ -658,10 +779,10 @@ fn concurrent_rekeys_keep_epoch_and_key_in_lockstep() {
     let header = PacketHeader::new(*client.id(), 1, 1, PacketFlags::new(PacketFlags::ENCRYPTED))
         .with_epoch(epoch);
     let ct = client
-        .encrypt_packet(&header, b"post-race payload")
+        .encrypt_packet(&header, b"post-race payload", &[])
         .expect("encrypt at final epoch");
     let pt = server
-        .decrypt_packet(&header, &ct)
+        .decrypt_packet(&header, &ct, &[])
         .expect("installed key depth must equal the epoch counter");
     assert_eq!(pt, b"post-race payload");
 }
@@ -770,8 +891,8 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     // Two new-data segments queued: the first fits the 100-byte window, the
     // second does not. The congestion budget is unbounded so ONLY the
     // flow-control window can gate us here.
-    s.send_reliable(Bytes::from(vec![0u8; 60])).await; // seq 0
-    s.send_reliable(Bytes::from(vec![0u8; 60])).await; // seq 1
+    s.send_reliable(Bytes::from(vec![0u8; 60])).await.unwrap(); // seq 0
+    s.send_reliable(Bytes::from(vec![0u8; 60])).await.unwrap(); // seq 1
 
     let first = s
         .poll_send(u64::MAX)
@@ -794,7 +915,7 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
 
     // ── Congestion window bound ──
     let s2 = Stream::new(2);
-    s2.send_reliable(Bytes::from(vec![0u8; 100])).await;
+    s2.send_reliable(Bytes::from(vec![0u8; 100])).await.unwrap();
     // cwnd budget smaller than the segment → withheld by congestion control,
     // BEFORE the flow-control window is even consulted.
     assert!(
@@ -816,7 +937,7 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
 async fn retransmissions_bypass_congestion_and_flow_control_windows() {
     tokio::time::pause();
     let s = Stream::new(1);
-    s.send_reliable(Bytes::from(vec![0u8; 200])).await; // seq 0
+    s.send_reliable(Bytes::from(vec![0u8; 200])).await.unwrap(); // seq 0
 
     // First transmission debits the window (200 bytes) under an unbounded cwnd.
     let first = s.poll_send(u64::MAX).await.expect("first transmission");
@@ -1078,8 +1199,8 @@ fn path_id_is_in_aad_not_nonce() {
         PacketHeader::new(sid, 1, 42, PacketFlags::new(PacketFlags::ENCRYPTED)).with_path_id(0);
     let h5 =
         PacketHeader::new(sid, 1, 42, PacketFlags::new(PacketFlags::ENCRYPTED)).with_path_id(5);
-    let c0 = client.encrypt_packet(&h0, pt).expect("encrypt h0");
-    let c5 = client.encrypt_packet(&h5, pt).expect("encrypt h5");
+    let c0 = client.encrypt_packet(&h0, pt, &[]).expect("encrypt h0");
+    let c5 = client.encrypt_packet(&h5, pt, &[]).expect("encrypt h5");
     // AEAD output = ciphertext-body || 16-byte auth tag.
     const TAG: usize = 16;
     assert_eq!(c0.len(), c5.len());
@@ -1109,9 +1230,9 @@ fn per_direction_window_accepts_interleaved_streams() {
     for _round in 0..500 {
         for stream_id in [1u16, 7u16] {
             let h = PacketHeader::new(sid, stream_id, pn, PacketFlags::new(PacketFlags::ENCRYPTED));
-            let ct = client.encrypt_packet(&h, b"x").expect("encrypt");
+            let ct = client.encrypt_packet(&h, b"x", &[]).expect("encrypt");
             assert!(
-                server.decrypt_packet(&h, &ct).is_ok(),
+                server.decrypt_packet(&h, &ct, &[]).is_ok(),
                 "stream {stream_id} pn {pn} must be accepted by the single window"
             );
             pn += 1;
@@ -1119,10 +1240,10 @@ fn per_direction_window_accepts_interleaved_streams() {
     }
     // Replaying an earlier packet number is now a duplicate.
     let h_dup = PacketHeader::new(sid, 1, 0, PacketFlags::new(PacketFlags::ENCRYPTED));
-    let ct_dup = client.encrypt_packet(&h_dup, b"x").expect("encrypt");
+    let ct_dup = client.encrypt_packet(&h_dup, b"x", &[]).expect("encrypt");
     assert!(
         matches!(
-            server.decrypt_packet(&h_dup, &ct_dup),
+            server.decrypt_packet(&h_dup, &ct_dup, &[]),
             Err(phantom_protocol::CoreError::ReplayDetected(_))
         ),
         "a replayed packet_number must be rejected after AEAD verify (Inv-4)"

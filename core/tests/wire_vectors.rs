@@ -149,7 +149,7 @@ fn sample_client_hello_full() -> ClientHello {
 
 fn sample_server_hello(accepted: bool) -> ServerHello {
     ServerHello {
-        server_key_package: sample_key_package(),
+        server_nonce: arr32(0x70),
         ciphertext: sample_ciphertext(),
         server_verify_key: sample_verify_key(),
         signature: sample_signature(),

@@ -81,7 +81,16 @@ std = [
     "dep:socket2",
     "bytes/std",
     "serde/std",
+    "header-protection",
 ]
+
+# Header protection (QUIC RFC 9001 §5.4, T4.6). Pulls the RustCrypto `aes` +
+# `chacha20` mask primitives. Folded into `std` because the data-plane codec
+# (`crypto`/`transport::session`) that applies HP is itself std-gated; the
+# bare-metal `no-std` subset compiles none of it, so it needs neither crate.
+# Under `--features fips` the AES mask uses `aws_lc_rs::cipher` instead, but the
+# RustCrypto crates still link (dead) — the same posture as `ring` under fips.
+header-protection = ["dep:aes", "dep:chacha20"]
 
 # zstd compression. Disabled when building for WASM / embedded targets where
 # the C bindings in `zstd-sys` are unavailable. lz4_flex (pure-Rust) remains
@@ -184,6 +193,19 @@ tracing = { version = "0.1", optional = true }  # Structured spans / events for 
 x25519-dalek = { version = "2", optional = true, features = ["static_secrets", "zeroize"] }
 ed25519-dalek = { version = "2", optional = true, features = ["zeroize", "rand_core"] }
 ring = { version = "0.17", optional = true }  # HW-accelerated AES-GCM (ARM64 AES intrinsics / x86 AES-NI) + ChaCha20-Poly1305
+# --- Header protection (QUIC RFC 9001 §5.4) primitives, T4.6 ---
+# Raw AES-256-ECB single-block (`aes::Aes256`) + ChaCha20 keystream
+# (`chacha20::ChaCha20`) for the per-packet header-protection mask — `ring` /
+# `aws-lc-rs` AEAD expose neither. Both are pure-Rust, `#![no_std]`, with a
+# constant-time soft fallback on every target (no `cpufeatures` off x86/aarch64),
+# so they cross-compile to wasm32 + thumbv7em unchanged. `aes 0.8` / `chacha20 0.9`
+# share one `cipher 0.4` / `crypto-common 0.1` generation (already in-tree via
+# ml-kem → digest 0.10). Pulled by the `header-protection` feature (folded into
+# `std`); under `--features fips` the AES mask routes through `aws_lc_rs::cipher`
+# instead and the ChaCha mask is unreachable (suite pinned to AES) — these crates
+# then link dead, exactly as `ring` does under fips.
+aes = { version = "0.8", default-features = false, optional = true }
+chacha20 = { version = "0.9", default-features = false, optional = true }
 # Phase 5.1: switched from `pqcrypto-kyber` / `pqcrypto-dilithium` (which
 # wrap NIST PQC round-3 C reference impls and require libc) to the
 # RustCrypto pure-Rust FIPS-203 / FIPS-204 implementations. These compile
