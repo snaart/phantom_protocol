@@ -770,8 +770,8 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     // Two new-data segments queued: the first fits the 100-byte window, the
     // second does not. The congestion budget is unbounded so ONLY the
     // flow-control window can gate us here.
-    s.send_reliable(Bytes::from(vec![0u8; 60])).await; // seq 0
-    s.send_reliable(Bytes::from(vec![0u8; 60])).await; // seq 1
+    s.send_reliable(Bytes::from(vec![0u8; 60])).await.unwrap(); // seq 0
+    s.send_reliable(Bytes::from(vec![0u8; 60])).await.unwrap(); // seq 1
 
     let first = s
         .poll_send(u64::MAX)
@@ -794,7 +794,7 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
 
     // ── Congestion window bound ──
     let s2 = Stream::new(2);
-    s2.send_reliable(Bytes::from(vec![0u8; 100])).await;
+    s2.send_reliable(Bytes::from(vec![0u8; 100])).await.unwrap();
     // cwnd budget smaller than the segment → withheld by congestion control,
     // BEFORE the flow-control window is even consulted.
     assert!(
@@ -816,7 +816,7 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
 async fn retransmissions_bypass_congestion_and_flow_control_windows() {
     tokio::time::pause();
     let s = Stream::new(1);
-    s.send_reliable(Bytes::from(vec![0u8; 200])).await; // seq 0
+    s.send_reliable(Bytes::from(vec![0u8; 200])).await.unwrap(); // seq 0
 
     // First transmission debits the window (200 bytes) under an unbounded cwnd.
     let first = s.poll_send(u64::MAX).await.expect("first transmission");
