@@ -2,7 +2,7 @@
 name = "phantom-protocol"
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.93"
 description = "Post-quantum-secure L4/L6 universal transport framework — hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65, multi-path, UniFFI bindings"
 license = "Apache-2.0"
 repository = "https://github.com/snaart/phantom_protocol"
@@ -234,15 +234,14 @@ hmac = { version = "0.13", optional = true }
 dashmap = { version = "6.1.0", optional = true }
 
 # --- Embedded transport (optional, behind the `embedded` feature) ---
-# Pure-Rust, no_std + alloc. `embedded-io-async` 0.6 is the byte-stream trait
-# the `EmbeddedLeg` is generic over — 0.6 keeps MSRV 1.75, 0.7 bumped it to
-# 1.81. `async-lock` is the async mutex guarding the split read/write handles;
-# chosen over `embassy-sync` because the latter drags in `heapless` (MSRV 1.87)
-# and would need a link-time `critical-section` impl. `async-lock` >= 3.4
-# bumped its MSRV to 1.85, so it is capped at `< 3.4` to hold the crate MSRV of
-# 1.75 — relax this cap once the crate MSRV moves.
+# Pure-Rust, no_std + alloc. `embedded-io-async` is the byte-stream trait the
+# `EmbeddedLeg` is generic over; `async-lock` is the async mutex guarding the split
+# read/write handles (chosen over `embassy-sync`, which drags in `heapless` + a
+# link-time `critical-section` impl). The crate MSRV is now 1.93, so the prior
+# `async-lock < 3.4` cap (held only for the old 1.75 MSRV — 3.4 needs 1.85) is
+# dropped; `embedded-io-async` stays at 0.6 to avoid a 0.7 API migration for now.
 embedded-io-async = { version = "0.6", optional = true }
-async-lock = { version = ">=3, <3.5", optional = true, default-features = false }
+async-lock = { version = ">=3, <4", optional = true, default-features = false }
 
 [build-dependencies]
 uniffi = { version = "0.31", features = ["build"] }

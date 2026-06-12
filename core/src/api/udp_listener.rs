@@ -376,7 +376,7 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
         // DoS-hardening parity with the TCP acceptor: periodically drop expired reputation
         // entries AND reap dead routes so both bounded maps stay small under churn.
         new_conn_count = new_conn_count.wrapping_add(1);
-        if new_conn_count % 256 == 0 {
+        if new_conn_count.is_multiple_of(256) {
             listener.handshake_server.gc_reputation();
             routes.reap_dead();
         }
