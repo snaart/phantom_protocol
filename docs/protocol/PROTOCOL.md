@@ -866,10 +866,19 @@ server is the universal detector / validator.
    out the new socket. (Path 0 is permanently *validated*; a fresh non-zero label is
    what lets the server tell the new path apart and challenge it.)
 2. **Server detect.** The Phase-1 connection-ID demux already routes a known
-   `session_id`/CID arriving from a new source 5-tuple into the same session. *Known
-   CID + new source* is the universal trigger — it covers a deliberate `migrate()`
-   **and** a passive NAT-rebind identically, since the server does not care *why*
-   the source changed.
+   `session_id`/CID arriving from a new source 5-tuple into the same session, and the
+   new source is registered as the migration **candidate** only from an
+   AEAD-authenticated frame (M-1, 2026-06-11 audit — a spoofed datagram never
+   decrypts, so it cannot clobber the candidate). A deliberate `migrate()` then bumps
+   the client send `path_id` to a fresh non-zero value, which the server sees as a
+   not-yet-`Validated` path and challenges (step 3). A **passive NAT-rebind**,
+   however, keeps `path_id` 0 — permanently *validated* — so the server does **not**
+   yet autonomously challenge/swap on it: the rebind's *upload* is still delivered
+   (PATH-001b recv-relax, § 12.2) and the session stays alive, but the server keeps
+   sending *downstream* to the old address until an embedder `migrate()` bumps the
+   path label. *(Known limitation — M-3, 2026-06-11 audit; autonomous passive-rebind
+   recovery for path 0 is a planned fix. The candidate is already registered, so only
+   the path-0 challenge gating remains.)*
 3. **Server challenge.** The server mints a `path_id`-bound entry for the new source
    and sends a `PATH_VALIDATION` packet carrying a fresh **32-byte** random challenge
    to it (`PathRegistry::issue_challenge`). The legitimate peer — the only party
