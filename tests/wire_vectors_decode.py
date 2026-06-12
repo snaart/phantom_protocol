@@ -18,7 +18,7 @@ What it covers:
 
   * **packet header + `PhantomPacket`** — the hand-rolled big-endian codec:
     `version` first, integers network byte order, byte arrays as-is, and the body
-    is `header(45) || payload_len:u32be || payload || ext_len:u32be || extensions`.
+    is `header(47) || payload_len:u32be || payload || ext_len:u32be || extensions`.
     Fully decoded **and** re-encoded, same as the borsh structs.
 
 Run: ``python3 tests/wire_vectors_decode.py`` (stdlib only; exits non-zero on
@@ -43,7 +43,7 @@ ML_DSA_SIG_LEN = 3309
 CLASSICAL_PK_LEN = 32
 PROTOCOL_VARIANT = b"phantom-default-1"
 PROTOCOL_VERSION = 3  # bumped 2->3 (T4.3): ServerHello server_key_package -> 32-byte server_nonce
-WIRE_VERSION = 3
+WIRE_VERSION = 4
 
 
 def pat(seed: int, n: int) -> bytes:
@@ -264,15 +264,21 @@ def enc_hrr(w: BorshWriter, v):
 
 # ─── packet codec: hand-rolled, big-endian, version-first ───────────────────
 #
-# PacketHeader (47 bytes), declaration order == wire order:
-#   [0]     version       u8   (= WIRE_VERSION)
-#   [1:33]  session_id    [u8;32]
-#   [33:35] stream_id     u16 be
-#   [35:43] packet_number u64 be   (① — Phase 4)
-#   [43:45] flags         u16 be
-#   [45]    epoch         u8
-#   [46]    path_id       u8
+# PacketHeader (47 bytes), WIRE_VERSION 4 layout (T4.6 — the 14 HP-protected
+# bytes are contiguous at [33:47] so they can be masked in one span; only
+# version + session_id stay cleartext on the wire):
+#   [0]     version       u8   (= WIRE_VERSION)            CLEARTEXT
+#   [1:33]  session_id    [u8;32]  (routing CID)           CLEARTEXT
+#   [33:41] packet_number u64 be   (① — Phase 4)           HP-MASKED
+#   [41:43] flags         u16 be                           HP-MASKED
+#   [43:45] stream_id     u16 be                           HP-MASKED
+#   [45]    epoch         u8                               HP-MASKED
+#   [46]    path_id       u8                               HP-MASKED
 # PhantomPacket: header || payload_len:u32be || payload || ext_len:u32be || ext.
+# NOTE: these fixtures freeze the *cleartext* codec image (the AEAD AAD); the
+# on-wire [33:47] span is XOR-masked by the per-session HeaderProtector, which
+# is keyed crypto (blake3/HKDF + AES-ECB/ChaCha20) and verified in Rust — this
+# independent decoder deliberately stays crypto-free and decodes the cleartext.
 
 HEADER_SIZE = 47
 
@@ -282,9 +288,9 @@ def dec_packet_header(b: bytes):
     return {
         "version": b[0],
         "session_id": bytes(b[1:33]),
-        "stream_id": struct.unpack(">H", b[33:35])[0],
-        "packet_number": struct.unpack(">Q", b[35:43])[0],
-        "flags": struct.unpack(">H", b[43:45])[0],
+        "packet_number": struct.unpack(">Q", b[33:41])[0],
+        "flags": struct.unpack(">H", b[41:43])[0],
+        "stream_id": struct.unpack(">H", b[43:45])[0],
         "epoch": b[45],
         "path_id": b[46],
     }
@@ -294,9 +300,9 @@ def enc_packet_header(h) -> bytes:
     return (
         bytes([h["version"]])
         + h["session_id"]
-        + struct.pack(">H", h["stream_id"])
         + struct.pack(">Q", h["packet_number"])
         + struct.pack(">H", h["flags"])
+        + struct.pack(">H", h["stream_id"])
         + bytes([h["epoch"], h["path_id"]])
     )
 
