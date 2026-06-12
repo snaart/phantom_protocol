@@ -607,6 +607,27 @@ impl HandshakeServer {
         }
     }
 
+    /// Non-consuming check that `client_hello` carries a VALID 0-RTT resume — its
+    /// `resume_session_id` names a still-cached ticket AND the `resumption_binder` proves
+    /// possession of that ticket's secret (constant-time). Gates the per-IP PoW-difficulty
+    /// reduction on real ticket holders, so attaching a junk `resume_session_id` cannot
+    /// nullify the reputation escalation (M-5). Does NOT consume the ticket — the resume fast
+    /// path in [`Self::process_client_hello`] still peeks + consumes it.
+    pub(crate) fn has_valid_resume(&self, client_hello: &ClientHello) -> bool {
+        let Some(rid) = client_hello.resume_session_id else {
+            return false;
+        };
+        let Some((secret, _suite, _created_at, _expires_at)) = self.session_cache.lock().peek(&rid)
+        else {
+            return false;
+        };
+        let Some(presented) = client_hello.resumption_binder else {
+            return false;
+        };
+        let expected = derive_resumption_binder(&secret, &rid, &client_hello.nonce);
+        bool::from(presented.ct_eq(&expected))
+    }
+
     /// Drop expired reputation entries (DOS-2) — driven periodically by the
     /// listener's acceptor loop.
     pub(crate) fn gc_reputation(&self) {
@@ -1912,5 +1933,67 @@ mod tests {
         // Short garbage / empty frames (what a spoofed Initial carries) are rejected.
         assert!(!client_hello_lengths_within_bounds(b"not-a-clienthello"));
         assert!(!client_hello_lengths_within_bounds(&[]));
+    }
+
+    /// M-5 (audit 2026-06-11): the per-IP PoW-difficulty reduction for "ticket holders" must
+    /// key on a VALID resume — a cached ticket whose binder verifies — not on mere presence of
+    /// a `resume_session_id`. Otherwise a flagged abuser attaches 32 random bytes and pays zero
+    /// PoW, nullifying the reputation escalation (DOS-2). `has_valid_resume` is the gate.
+    #[test]
+    fn has_valid_resume_requires_a_real_ticket_and_binder() {
+        let server = HandshakeServer::new().expect("server");
+        let server_pk = server.verifying_key().clone();
+        let client = HandshakeClient::new().expect("client");
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+
+        // Mint a REAL ticket via a first handshake (answering the one cookie retry).
+        let hello1 = client.create_client_hello();
+        let (effective, sh) = match server.process_client_hello(&hello1, 0, ip) {
+            HandshakeResponse::Retry(r) => {
+                let mut h = hello1.clone();
+                h.cookie = r.cookie;
+                match server.process_client_hello(&h, 0, ip) {
+                    HandshakeResponse::Success(sh, _, _) => (h, sh),
+                    o => panic!("unexpected after retry: {o:?}"),
+                }
+            }
+            HandshakeResponse::Success(sh, _, _) => (hello1.clone(), sh),
+            o => panic!("unexpected first response: {o:?}"),
+        };
+        let (session, _) = client
+            .process_server_hello(&effective, &sh, Some(&server_pk))
+            .expect("client establishes a session");
+        let secret = session
+            .resumption_secret()
+            .expect("resumption secret installed");
+
+        // No resume id, and a junk resume id (no cached ticket) are both NOT valid tickets.
+        assert!(!server.has_valid_resume(&client.create_client_hello()));
+        let mut junk = client.create_client_hello();
+        junk.resume_session_id = Some([0x55u8; 32]);
+        junk.resumption_binder = Some([0xAAu8; 32]);
+        assert!(
+            !server.has_valid_resume(&junk),
+            "a junk resume_session_id must not count as a valid ticket (M-5)"
+        );
+
+        // A flagged IP keeps its elevated PoW difficulty when the resume is junk.
+        for _ in 0..5 {
+            server.record_violation(ip);
+        }
+        let flagged = server.reputation_difficulty(ip, false);
+        assert!(flagged > 0, "precondition: a flagged IP has difficulty > 0");
+        assert_eq!(
+            server.reputation_difficulty(ip, server.has_valid_resume(&junk)),
+            flagged,
+            "a junk resume must not zero a flagged IP's PoW difficulty (M-5)"
+        );
+
+        // The real ticket with a valid binder DOES count as a valid resume.
+        let resume = client.create_client_hello_with_resume(sh.session_id, &secret, None);
+        assert!(
+            server.has_valid_resume(&resume),
+            "a real cached ticket with a valid binder must count as a valid resume"
+        );
     }
 }

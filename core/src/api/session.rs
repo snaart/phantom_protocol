@@ -702,65 +702,97 @@ async fn run_client_handshake<T: SessionTransport>(
     // for a benign reorder. Without it, a MITM answering every ClientHello with
     // a fresh cheap HelloRetryRequest could loop the client forever.
     const MAX_CLIENT_RETRY_ROUNDS: u32 = 3;
+    // Reviewer §5: bound how many injected/genuine ServerRejects we read past while still
+    // waiting for a ServerHello, so a reject flood can't loop the inner read forever.
+    const MAX_CLIENT_REJECT_ROUNDS: u32 = 3;
     let mut retry_rounds: u32 = 0;
+    let mut reject_rounds: u32 = 0;
+    // Reviewer §5: an *injected* ServerReject (a tiny pre-crypto blob a network attacker can
+    // spray) must not abort a healthy handshake. Remember it and keep reading for a valid
+    // ServerHello; surface it only if one never arrives (do NOT auto-downgrade — Invariant 7).
+    let mut remembered_reject: Option<ServerReject> = None;
 
     loop {
+        // (Re)send the current hello (fresh, or cookie/PoW-updated after a HelloRetryRequest).
         let bytes = borsh::to_vec(&hello).map_err(|e| {
             CoreError::SerializationError(format!("ClientHello encode failed: {}", e))
         })?;
         transport.send_bytes(&bytes).await?;
-        let resp = transport.recv_bytes().await?;
 
-        // The reply is one of three shapes: a `ServerHello` (success), a
-        // `HelloRetryRequest` (cookie/PoW demand), or a `ServerReject` (the
-        // server cannot speak our version). Try the success shape first — a
-        // retry/reject blob is far too small to deserialize as a multi-KiB
-        // ServerHello, so the disambiguation is unambiguous.
-        if let Ok(sh) = borsh::from_slice::<ServerHello>(&resp) {
-            let (session, accepted) =
-                handshake.process_server_hello(&hello, &sh, Some(expected_server_key))?;
-            return Ok((session, accepted));
-        } else if let Ok(reject) = borsh::from_slice::<ServerReject>(&resp) {
-            // The marker guard keeps a same-sized non-reject blob from being
-            // mistaken for a reject. We surface this as a hard error and do
-            // NOT auto-downgrade to `reject.supported_version` — a forced
-            // downgrade on an injected reject would defeat the transcript-bound
-            // version pin (Invariant 7).
-            if reject.has_marker() {
-                return Err(CoreError::HandshakeError(format!(
-                    "server rejected the handshake: unsupported protocol version \
-                     (client speaks v{}, server speaks v{})",
-                    hello.version, reject.supported_version
-                )));
+        // Read responses for THIS hello, reading past an injected ServerReject (WITHOUT
+        // re-sending) until a ServerHello (success), a HelloRetryRequest (re-send with the
+        // cookie/PoW), or the channel ends.
+        loop {
+            let resp = match transport.recv_bytes().await {
+                Ok(r) => r,
+                Err(e) => {
+                    // No further responses: surface a remembered reject (a genuine version
+                    // mismatch) over the raw transport error.
+                    return match &remembered_reject {
+                        Some(r) => Err(CoreError::HandshakeError(format!(
+                            "server rejected the handshake: unsupported protocol version \
+                             (client speaks v{}, server speaks v{})",
+                            hello.version, r.supported_version
+                        ))),
+                        None => Err(e),
+                    };
+                }
+            };
+
+            // The reply is one of three shapes: a `ServerHello` (success), a
+            // `HelloRetryRequest` (cookie/PoW demand), or a `ServerReject`. Try the success
+            // shape first — a retry/reject blob is far too small to deserialize as a multi-KiB
+            // ServerHello, so the disambiguation is unambiguous.
+            if let Ok(sh) = borsh::from_slice::<ServerHello>(&resp) {
+                let (session, accepted) =
+                    handshake.process_server_hello(&hello, &sh, Some(expected_server_key))?;
+                return Ok((session, accepted));
+            } else if let Ok(reject) = borsh::from_slice::<ServerReject>(&resp) {
+                // The marker guard keeps a same-sized non-reject blob from being mistaken for a
+                // reject. We do NOT auto-downgrade to `reject.supported_version` (Invariant 7).
+                if reject.has_marker() {
+                    reject_rounds += 1;
+                    if reject_rounds > MAX_CLIENT_REJECT_ROUNDS {
+                        return Err(CoreError::HandshakeError(format!(
+                            "server rejected the handshake: unsupported protocol version \
+                             (client speaks v{}, server speaks v{})",
+                            hello.version, reject.supported_version
+                        )));
+                    }
+                    // reviewer §5: keep waiting for a valid ServerHello — read the next frame
+                    // WITHOUT re-sending, so a single forged reject can't kill the handshake.
+                    remembered_reject = Some(reject);
+                    continue;
+                }
+                return Err(CoreError::HandshakeError(
+                    "invalid ServerHello, Retry, or Reject received".into(),
+                ));
+            } else if let Ok(retry) = borsh::from_slice::<HelloRetryRequest>(&resp) {
+                retry_rounds += 1;
+                if retry_rounds > MAX_CLIENT_RETRY_ROUNDS {
+                    return Err(CoreError::HandshakeError(format!(
+                        "server demanded more than {MAX_CLIENT_RETRY_ROUNDS} HelloRetryRequest rounds"
+                    )));
+                }
+                log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
+                hello.cookie = retry.cookie;
+                if let Some(challenge) = retry.challenge {
+                    // H3: cap the accepted difficulty and bound the solver, so an
+                    // injected/malicious HelloRetryRequest (e.g. difficulty 255)
+                    // surfaces a handshake error instead of pinning a CPU core.
+                    log::info!("PhantomSession: Solving PoW challenge...");
+                    hello.pow_solution = Some(
+                        challenge
+                            .solve_capped(crate::crypto::pow::MAX_CLIENT_POW_DIFFICULTY)
+                            .map_err(|e| CoreError::HandshakeError(e.to_string()))?,
+                    );
+                }
+                break; // re-send the cookie/PoW-updated hello (outer loop)
+            } else {
+                return Err(CoreError::HandshakeError(
+                    "invalid ServerHello, Retry, or Reject received".into(),
+                ));
             }
-            return Err(CoreError::HandshakeError(
-                "invalid ServerHello, Retry, or Reject received".into(),
-            ));
-        } else if let Ok(retry) = borsh::from_slice::<HelloRetryRequest>(&resp) {
-            retry_rounds += 1;
-            if retry_rounds > MAX_CLIENT_RETRY_ROUNDS {
-                return Err(CoreError::HandshakeError(format!(
-                    "server demanded more than {MAX_CLIENT_RETRY_ROUNDS} HelloRetryRequest rounds"
-                )));
-            }
-            log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
-            hello.cookie = retry.cookie;
-            if let Some(challenge) = retry.challenge {
-                // H3: cap the accepted difficulty and bound the solver, so an
-                // injected/malicious HelloRetryRequest (e.g. difficulty 255)
-                // surfaces a handshake error instead of pinning a CPU core.
-                log::info!("PhantomSession: Solving PoW challenge...");
-                hello.pow_solution = Some(
-                    challenge
-                        .solve_capped(crate::crypto::pow::MAX_CLIENT_POW_DIFFICULTY)
-                        .map_err(|e| CoreError::HandshakeError(e.to_string()))?,
-                );
-            }
-            continue;
-        } else {
-            return Err(CoreError::HandshakeError(
-                "invalid ServerHello, Retry, or Reject received".into(),
-            ));
         }
     }
 }
@@ -1690,16 +1722,16 @@ async fn handle_packet<T: SessionTransport>(
                 return;
             }
         }
-    } else if !packet.payload.is_empty() {
-        // Stripped-flag downgrade defense (Invariant 2): a non-empty unencrypted
-        // post-handshake application packet is dropped.
+    } else {
+        // Stripped-flag downgrade defense (Invariant 2, M-2): ANY unencrypted post-handshake
+        // packet is dropped — including an empty-payload one whose only remaining effect would
+        // be a forged standalone FIN tearing down an `open_stream()` stream without AEAD
+        // verification. Legitimate data and control frames (incl. FIN) always set ENCRYPTED.
         observability.record_unencrypted_dropped(leg);
         log::warn!(
-            "PhantomSession: dropping unencrypted V2 post-handshake data packet (downgrade?)"
+            "PhantomSession: dropping unencrypted post-handshake packet (downgrade / forged FIN?)"
         );
         return;
-    } else {
-        Vec::new()
     };
 
     // Liveness (P4.3): an authenticated inbound packet (it passed AEAD above) proves
@@ -1709,6 +1741,12 @@ async fn handle_packet<T: SessionTransport>(
     // session looking alive.
     if packet.header.flags.contains(PacketFlags::ENCRYPTED) {
         crypto_recv.update_activity();
+        // M-1: this packet just AEAD-authenticated, so its source really is the peer — possibly
+        // at a NEW address (migration / NAT rebind). Commit it as the migration candidate ONLY
+        // now (post-decrypt), so a spoofed CID-matched datagram (which never decrypts) cannot
+        // clobber the candidate slot and misdirect / stall a legitimate migration. No-op for
+        // same-source packets and for non-address transports (default trait impl).
+        transport_for_path.confirm_authenticated_source();
     }
 
     // Authenticated SACK ACK (H1, L1-A). ACKs are `ENCRYPTED | ACK` control
@@ -2540,6 +2578,72 @@ mod tests {
         );
     }
 
+    /// Reviewer §5: an **injected** `ServerReject` (a tiny, pre-crypto blob a network
+    /// attacker can spray) during a HEALTHY handshake must NOT abort it. The client remembers
+    /// the reject and keeps waiting for a valid `ServerHello`; it gives up (surfacing the
+    /// reject) only if one never arrives. Here the attacker injects a reject ahead of the real
+    /// cookie/ServerHello flow; the handshake must still succeed.
+    #[tokio::test]
+    async fn injected_server_reject_does_not_abort_a_healthy_handshake() {
+        use crate::transport::handshake::ServerReject;
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        let server_hs = HandshakeServer::new().unwrap();
+        let expected_vk = server_hs.verifying_key().clone();
+
+        let server = tokio::spawn(async move {
+            let Ok(hello_bytes) = server_transport.recv_bytes().await else {
+                return;
+            };
+            let Ok(client_hello) = borsh::from_slice::<ClientHello>(&hello_bytes) else {
+                return;
+            };
+            // Inject a forged reject AHEAD of the real handshake responses.
+            let reject = borsh::to_vec(&ServerReject::unsupported_version()).unwrap();
+            if server_transport.send_bytes(&reject).await.is_err() {
+                return;
+            }
+            let ip = "127.0.0.1".parse().unwrap();
+            let sh = match server_hs.process_client_hello(&client_hello, 0, ip) {
+                HandshakeResponse::Retry(retry) => {
+                    if server_transport
+                        .send_bytes(&borsh::to_vec(&retry).unwrap())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let Ok(h2) = server_transport.recv_bytes().await else {
+                        return;
+                    };
+                    let Ok(next) = borsh::from_slice::<ClientHello>(&h2) else {
+                        return;
+                    };
+                    match server_hs.process_client_hello(&next, 0, ip) {
+                        HandshakeResponse::Success(sh, _, _) => sh,
+                        _ => return,
+                    }
+                }
+                HandshakeResponse::Success(sh, _, _) => sh,
+                _ => return,
+            };
+            let _ = server_transport
+                .send_bytes(&borsh::to_vec(&sh).unwrap())
+                .await;
+        });
+
+        let result = run_client_handshake(&client_transport, &expected_vk, None).await;
+        // Close the channel so the server task ends even if the client aborted (RED), instead
+        // of blocking forever on the retried-hello it will never receive.
+        drop(client_transport);
+        let _ = server.await;
+        assert!(
+            result.is_ok(),
+            "an injected ServerReject ahead of the real ServerHello must not abort a healthy \
+             handshake; got {result:?}"
+        );
+    }
+
     /// **HS-02.** A MITM that answers every `ClientHello` with a fresh cheap
     /// `HelloRetryRequest` must NOT loop the client forever — `run_client_handshake`
     /// caps the retry rounds and returns an error. (Pre-fix this test would hang.)
@@ -3153,6 +3257,57 @@ mod tests {
         );
     }
 
+    /// M-2 (audit 2026-06-11, residual of prior H1): a forged **unencrypted, empty-payload**
+    /// packet carrying only the `FIN` flag (valid `session_id`) must NOT tear down an
+    /// `open_stream()` stream. The stripped-flag downgrade defense must drop ALL unencrypted
+    /// post-handshake packets — not only non-empty ones — so the standalone-FIN path is never
+    /// reached without AEAD verification. Legitimate FINs are always `ENCRYPTED`.
+    #[tokio::test]
+    async fn forged_unencrypted_fin_does_not_close_a_stream() {
+        let session_id = fixed_session_id();
+        let (_client_session, server_session) = paired_sessions(session_id);
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        // Register stream 2 — an open_stream()-style stream (ids 2+), the M-2 target.
+        let mut handle = demux.register_stream(2, 8);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
+        let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let mut ack_buf = Vec::with_capacity(64);
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        // Forged: UNENCRYPTED, empty payload, FIN flag, valid session_id, stream 2.
+        let header = PacketHeader::new(session_id, 2, 0, PacketFlags::new(PacketFlags::FIN));
+        let forged = PhantomPacket::new(header, Vec::new());
+
+        handle_packet(
+            forged,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &transport_send,
+            &transport_send,
+            &deliver_tx,
+            &undelivered,
+            &mut ack_buf,
+            &obs,
+            LegType::Tcp,
+        )
+        .await;
+
+        assert!(
+            handle.rx.try_recv().is_err(),
+            "a forged unencrypted FIN must not close an open_stream() stream"
+        );
+    }
+
     /// Like [`build_app_frame`] but stamps a caller-chosen `path_id` so the
     /// receive-side path gate (PATH-001) can be exercised.
     fn build_app_frame_on_path(
@@ -3372,6 +3527,9 @@ mod tests {
             .await
             .unwrap();
         let _ = ust.recv_bytes().await.unwrap();
+        // M-1: the candidate is committed only on the post-decrypt (authenticated) path, which
+        // handle_packet drives in production; mirror that here for the manual setup.
+        ust.confirm_authenticated_source();
         assert!(
             ust.has_migration_candidate(),
             "new source must set a candidate"
