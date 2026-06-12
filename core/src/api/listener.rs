@@ -6,7 +6,8 @@ use crate::observability::attrs::{AeadAlgorithm, HandshakeOutcome, ProtocolVersi
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, SpawnHandle, TokioRuntime};
 use crate::transport::handshake::{
-    client_hello_lengths_within_bounds, ClientHello, HandshakeResponse, HandshakeServer,
+    client_hello_lengths_within_bounds, ClientHello, HandshakeError, HandshakeResponse,
+    HandshakeServer,
 };
 use crate::transport::types::LegType;
 use std::net::{IpAddr, SocketAddr};
@@ -423,7 +424,10 @@ pub(crate) async fn drive_server_handshake<T: SessionTransport>(
         // per-IP reputation escalation (DOS-2). A clean IP / ticket holder adds
         // nothing; an IP with recent handshake violations pays escalating PoW
         // even when the server is idle, so an abusive source is singled out.
-        let has_ticket = client_hello.resume_session_id.is_some();
+        // M-5: gate the PoW-difficulty reduction on a *valid* resume (cached ticket + verified
+        // binder), not mere presence of a `resume_session_id` — else a flagged abuser attaches
+        // 32 random bytes and pays zero PoW, nullifying the per-IP reputation escalation.
+        let has_ticket = hs.has_valid_resume(&client_hello);
         let difficulty = hs
             .adaptive_difficulty()
             .max(hs.reputation_difficulty(client_ip, has_ticket));
@@ -463,16 +467,23 @@ pub(crate) async fn drive_server_handshake<T: SessionTransport>(
                 if let Ok(bytes) = borsh::to_vec(&reject) {
                     let _ = transport.send_bytes(&bytes).await;
                 }
-                // DOS-2: a structurally-unspeakable hello (e.g. wrong version /
-                // build-variant) is a genuine protocol violation.
-                hs.record_violation(client_ip);
+                // M-4: a version mismatch is detected BEFORE the address-validation cookie gate,
+                // so charging a reputation violation here could poison a spoofed / on-path-
+                // captured source IP. It is a forward-compat / misconfiguration signal, not
+                // proof of abuse → no reputation escalation.
                 return Err(CoreError::InternalError(format!(
                     "handshake rejected: unsupported client version (server speaks v{})",
                     reject.supported_version
                 )));
             }
             HandshakeResponse::Fail(e) => {
-                hs.record_violation(client_ip);
+                // M-4: the protocol-variant mismatch is also a pre-cookie check, so (like the
+                // version Reject above) it must not escalate a possibly-spoofed IP's reputation.
+                // Every other Fail is reached only after the cookie/PoW gate, i.e. from an
+                // address-validated source, so it remains a genuine violation.
+                if !matches!(e, HandshakeError::ProtocolVariantMismatch { .. }) {
+                    hs.record_violation(client_ip);
+                }
                 return Err(CoreError::InternalError(format!(
                     "handshake rejected: {}",
                     e
@@ -706,5 +717,54 @@ mod tests {
             Ok(_) => panic!("expected FipsSelfTestFailure, got Ok"),
             Err(other) => panic!("expected FipsSelfTestFailure, got {other:?}"),
         }
+    }
+
+    /// M-4 (audit 2026-06-11): a pre-cookie protocol-variant / version mismatch is detected
+    /// before the address-validation gate, so charging a reputation violation for it could
+    /// poison a spoofed / on-path-captured source IP. It must NOT escalate the per-IP PoW
+    /// difficulty. (Cookie-before-slot — T1.2 — already keeps an off-path spoof from reaching
+    /// here on UDP; this closes the on-path-cookie-capture residual too.)
+    #[tokio::test]
+    async fn variant_mismatch_does_not_escalate_reputation() {
+        use crate::transport::handshake::HandshakeClient;
+        use bytes::Bytes;
+        use std::net::IpAddr;
+
+        struct OneShot {
+            hello: std::sync::Mutex<Option<Vec<u8>>>,
+        }
+        impl SessionTransport for OneShot {
+            async fn send_bytes(&self, _data: &[u8]) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
+                let taken = self.hello.lock().unwrap().take();
+                taken.map(Bytes::from).ok_or(CoreError::ConnectionClosed)
+            }
+        }
+
+        let hs = HandshakeServer::new().expect("server");
+        let client = HandshakeClient::new().expect("client");
+        let ip: IpAddr = "198.51.100.9".parse().unwrap();
+
+        // Drive several bad-variant hellos (each a structurally-valid hello whose
+        // protocol_variant value is wrong) — enough that, under the old behaviour, the per-IP
+        // reputation would escalate the PoW difficulty above zero.
+        for _ in 0..16 {
+            let mut hello = client.create_client_hello();
+            hello.protocol_variant = b"phantom-evil-1".to_vec();
+            let bytes = borsh::to_vec(&hello).expect("serialize");
+            let transport = OneShot {
+                hello: std::sync::Mutex::new(Some(bytes)),
+            };
+            let res = drive_server_handshake(&transport, &hs, ip).await;
+            assert!(res.is_err(), "a variant mismatch must fail the handshake");
+        }
+        assert_eq!(
+            hs.reputation_difficulty(ip, false),
+            0,
+            "a pre-cookie variant mismatch must not escalate the (possibly spoofed) IP's \
+             reputation (M-4)"
+        );
     }
 }
