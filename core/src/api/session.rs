@@ -1741,6 +1741,12 @@ async fn handle_packet<T: SessionTransport>(
     // session looking alive.
     if packet.header.flags.contains(PacketFlags::ENCRYPTED) {
         crypto_recv.update_activity();
+        // M-1: this packet just AEAD-authenticated, so its source really is the peer — possibly
+        // at a NEW address (migration / NAT rebind). Commit it as the migration candidate ONLY
+        // now (post-decrypt), so a spoofed CID-matched datagram (which never decrypts) cannot
+        // clobber the candidate slot and misdirect / stall a legitimate migration. No-op for
+        // same-source packets and for non-address transports (default trait impl).
+        transport_for_path.confirm_authenticated_source();
     }
 
     // Authenticated SACK ACK (H1, L1-A). ACKs are `ENCRYPTED | ACK` control
@@ -3521,6 +3527,9 @@ mod tests {
             .await
             .unwrap();
         let _ = ust.recv_bytes().await.unwrap();
+        // M-1: the candidate is committed only on the post-decrypt (authenticated) path, which
+        // handle_packet drives in production; mirror that here for the manual setup.
+        ust.confirm_authenticated_source();
         assert!(
             ust.has_migration_candidate(),
             "new source must set a candidate"
