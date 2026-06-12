@@ -67,8 +67,9 @@ The implementation enforces (and integration tests verify) the following invaria
    enforcement.
 2. **No raw user data after handshake.** Every application-data packet has
    `PacketFlags::ENCRYPTED` set and goes through `Session::encrypt_packet`.
-   Non-empty unencrypted packets received post-handshake are dropped (stripped-flag
-   downgrade defense).
+   **All** unencrypted packets received post-handshake are dropped — including an
+   empty-payload one whose only effect would be a forged standalone `FIN` (stripped-flag
+   downgrade defense; the empty-FIN gap was closed as M-2).
 3. **FakeTLS uses per-record counter nonces.** The outer obfuscation layer derives
    `send_key` / `recv_key` / `nonce_prefix` from a public seed
    (`SNI + version`) via `blake3::derive_key` with direction-specific labels, and

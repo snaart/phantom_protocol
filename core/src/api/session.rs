@@ -1690,16 +1690,16 @@ async fn handle_packet<T: SessionTransport>(
                 return;
             }
         }
-    } else if !packet.payload.is_empty() {
-        // Stripped-flag downgrade defense (Invariant 2): a non-empty unencrypted
-        // post-handshake application packet is dropped.
+    } else {
+        // Stripped-flag downgrade defense (Invariant 2, M-2): ANY unencrypted post-handshake
+        // packet is dropped — including an empty-payload one whose only remaining effect would
+        // be a forged standalone FIN tearing down an `open_stream()` stream without AEAD
+        // verification. Legitimate data and control frames (incl. FIN) always set ENCRYPTED.
         observability.record_unencrypted_dropped(leg);
         log::warn!(
-            "PhantomSession: dropping unencrypted V2 post-handshake data packet (downgrade?)"
+            "PhantomSession: dropping unencrypted post-handshake packet (downgrade / forged FIN?)"
         );
         return;
-    } else {
-        Vec::new()
     };
 
     // Liveness (P4.3): an authenticated inbound packet (it passed AEAD above) proves
@@ -3150,6 +3150,57 @@ mod tests {
             streams.len() <= MAX_STREAMS,
             "recv path must cap concurrent receive streams at MAX_STREAMS ({MAX_STREAMS}); have {}",
             streams.len()
+        );
+    }
+
+    /// M-2 (audit 2026-06-11, residual of prior H1): a forged **unencrypted, empty-payload**
+    /// packet carrying only the `FIN` flag (valid `session_id`) must NOT tear down an
+    /// `open_stream()` stream. The stripped-flag downgrade defense must drop ALL unencrypted
+    /// post-handshake packets — not only non-empty ones — so the standalone-FIN path is never
+    /// reached without AEAD verification. Legitimate FINs are always `ENCRYPTED`.
+    #[tokio::test]
+    async fn forged_unencrypted_fin_does_not_close_a_stream() {
+        let session_id = fixed_session_id();
+        let (_client_session, server_session) = paired_sessions(session_id);
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        // Register stream 2 — an open_stream()-style stream (ids 2+), the M-2 target.
+        let mut handle = demux.register_stream(2, 8);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
+        let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let mut ack_buf = Vec::with_capacity(64);
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        // Forged: UNENCRYPTED, empty payload, FIN flag, valid session_id, stream 2.
+        let header = PacketHeader::new(session_id, 2, 0, PacketFlags::new(PacketFlags::FIN));
+        let forged = PhantomPacket::new(header, Vec::new());
+
+        handle_packet(
+            forged,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &transport_send,
+            &transport_send,
+            &deliver_tx,
+            &undelivered,
+            &mut ack_buf,
+            &obs,
+            LegType::Tcp,
+        )
+        .await;
+
+        assert!(
+            handle.rx.try_recv().is_err(),
+            "a forged unencrypted FIN must not close an open_stream() stream"
         );
     }
 
