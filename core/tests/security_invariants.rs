@@ -111,6 +111,82 @@ fn tampered_extensions_is_rejected_via_aad() {
     assert_eq!(pt, b"ext-bound payload");
 }
 
+/// T4.6 — header protection (QUIC RFC 9001 §5.4) masks the 14 variable header
+/// bytes (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖ path_id`, wire `[33..47]`)
+/// so a passive on-path observer reads neither the packet number nor the
+/// `PRIORITY` ("voice") flag; only `version ‖ session_id` (the routing CID) stay
+/// cleartext. The peer recovers the exact packet via `parse_protected`.
+#[test]
+fn hp_masks_header_fields_on_the_wire() {
+    let (client, server) = make_session_pair([0x71u8; 32]);
+    let header = PacketHeader::new(
+        *server.id(),
+        9,
+        0xA1B2C3D4E5F60718,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::PRIORITY),
+    )
+    .with_epoch(2)
+    .with_path_id(3);
+    let ct = client
+        .encrypt_packet(&header, b"voice frame", &[])
+        .expect("encrypt");
+    let packet = PhantomPacket::new(header, ct);
+    let wire = client.protect_packet(&packet).expect("protect");
+    let cleartext = packet.to_wire();
+
+    // The 14-byte protected region is masked → not the cleartext header bytes.
+    assert_ne!(
+        &wire[33..47],
+        &cleartext[33..47],
+        "pn/flags/stream_id/epoch/path_id must be masked on the wire"
+    );
+    // version + session_id (the routing CID) stay cleartext for the demux.
+    assert_eq!(&wire[..33], &cleartext[..33]);
+    // The flags bytes (incl. the PRIORITY/voice bit) sit in the masked span, so
+    // an observer cannot read the priority class off the wire.
+    assert_ne!(
+        &wire[41..43],
+        &cleartext[41..43],
+        "the PRIORITY/voice flag must not be readable on the wire without the hp key"
+    );
+    // The peer recovers the exact packet (header + payload) by unmasking.
+    let parsed = server.parse_protected(&wire).expect("parse");
+    assert_eq!(parsed.header, header);
+    assert_eq!(parsed.payload, packet.payload);
+}
+
+/// T4.6 — header protection adds NO new decryption oracle: a wire mutation of the
+/// masked `[33..47]` region unmasks to a WRONG header, so the subsequent AEAD
+/// open (the cleartext header is the AAD) fails — caught exactly like any other
+/// AAD / ciphertext tamper, with no separate signal.
+#[test]
+fn hp_masked_region_tamper_fails_aead() {
+    let (client, server) = make_session_pair([0x72u8; 32]);
+    let header = PacketHeader::new(*server.id(), 1, 5, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let ct = client
+        .encrypt_packet(&header, b"payload", &[])
+        .expect("encrypt");
+    let packet = PhantomPacket::new(header, ct);
+    let mut wire = client.protect_packet(&packet).expect("protect");
+
+    // Flip a byte inside the masked header region.
+    wire[35] ^= 0x40;
+    // Unmasking still "succeeds" structurally but recovers a different header...
+    let tampered = server.parse_protected(&wire).expect("parse");
+    assert_ne!(
+        tampered.header, header,
+        "a flipped masked byte must change the recovered header"
+    );
+    // ...and the AEAD open under that wrong header (its wire image is the AAD)
+    // fails — the masked-region tamper is caught by the AEAD, not a new oracle.
+    assert!(
+        server
+            .decrypt_packet(&tampered.header, &tampered.payload, &tampered.extensions)
+            .is_err(),
+        "a tampered masked-header byte must fail the AEAD via the AAD"
+    );
+}
+
 /// Malformed wire bytes must fail parsing as a typed error, never a panic.
 /// This protects the receive loop from a malicious peer crashing the process
 /// by sending random bytes.

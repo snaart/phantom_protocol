@@ -985,9 +985,12 @@ async fn run_data_pump<T: SessionTransport>(
                 Err(_) => break,
             };
 
-            // A malformed / unparseable frame (no legitimate peer produces
-            // one) is dropped — never a panic.
-            let packet = match PhantomPacket::from_wire(&data) {
+            // Remove header protection (T4.6) and parse: a malformed / unparseable
+            // / short-of-the-AEAD-tag frame (no legitimate peer produces one) is
+            // dropped — never a panic. The cleartext version + session_id stay
+            // readable; the [33..47] span is unmasked with this session's recv HP
+            // key before the header is interpreted.
+            let packet = match crypto_recv.parse_protected(&data) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -1547,7 +1550,15 @@ async fn send_app_data<T: SessionTransport>(
         }
     };
     let packet = PhantomPacket::new(header, ciphertext);
-    let buf = packet.to_wire();
+    // Header protection (T4.6): mask the [33..47] header span before it hits the
+    // wire. Infallible in practice (the payload always carries the AEAD tag).
+    let buf = match crypto_session.protect_packet(&packet) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("PhantomSession: header protection failed: {}", e);
+            return false;
+        }
+    };
     let size = buf.len();
     // Pacing is a wire-rate limiter, so it consumes the full on-wire size.
     pace_send(crypto_session, size as u64).await;
@@ -1600,7 +1611,16 @@ async fn send_window_update<T: SessionTransport>(
         }
     };
     let packet = PhantomPacket::new(header, ciphertext);
-    let buf = packet.to_wire();
+    let buf = match crypto_session.protect_packet(&packet) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!(
+                "PhantomSession: WINDOW_UPDATE header protection failed: {}",
+                e
+            );
+            return false;
+        }
+    };
     if let Err(e) = transport.send_bytes(&buf).await {
         log::error!("PhantomSession: WINDOW_UPDATE send failed: {}", e);
         return false;
@@ -1635,7 +1655,16 @@ fn encrypt_path_validation(
         }
     };
     packet.payload = ciphertext;
-    Some(packet.to_wire())
+    match crypto_session.protect_packet(&packet) {
+        Ok(buf) => Some(buf),
+        Err(e) => {
+            log::error!(
+                "PhantomSession: PATH_VALIDATION header protection failed: {}",
+                e
+            );
+            None
+        }
+    }
 }
 
 /// Send a `PATH_VALIDATION` packet to the established peer (a response echo).
@@ -2053,10 +2082,17 @@ async fn handle_packet<T: SessionTransport>(
         match crypto_recv.encrypt_packet(&ack_header, &ack_payload, &[]) {
             Ok(ct) => {
                 let ack_packet = PhantomPacket::new(ack_header, ct);
-                ack_buf.clear();
-                ack_buf.extend_from_slice(&ack_packet.to_wire());
-                let size = ack_buf.len();
-                let _ = transport_send_ack.send_bytes(&ack_buf[..size]).await;
+                match crypto_recv.protect_packet(&ack_packet) {
+                    Ok(buf) => {
+                        ack_buf.clear();
+                        ack_buf.extend_from_slice(&buf);
+                        let size = ack_buf.len();
+                        let _ = transport_send_ack.send_bytes(&ack_buf[..size]).await;
+                    }
+                    Err(e) => {
+                        log::error!("PhantomSession: ACK header protection failed: {}", e)
+                    }
+                }
             }
             Err(e) => log::error!("PhantomSession: ACK encrypt failed: {}", e),
         }
@@ -2800,7 +2836,11 @@ mod tests {
         server_session: &crate::transport::session::Session,
         bytes: &[u8],
     ) -> Vec<u8> {
-        let pkt = PhantomPacket::from_wire(bytes).expect("deserialize PhantomPacket");
+        // The peer pump applies header protection (T4.6); unmask with this
+        // side's recv HP key (== the sender's send HP key) before reading.
+        let pkt = server_session
+            .parse_protected(bytes)
+            .expect("parse header-protected PhantomPacket");
         assert!(
             pkt.header.flags.contains(PacketFlags::ENCRYPTED),
             "expected ENCRYPTED flag on application data"
@@ -2842,7 +2882,10 @@ mod tests {
             .encrypt_packet(&header, &pt, &[])
             .expect("encrypt reply");
         let packet = PhantomPacket::new(header, ct);
-        packet.to_wire()
+        // Apply header protection so the peer pump's parse_protected unmasks it.
+        server_session
+            .protect_packet(&packet)
+            .expect("header protection")
     }
 
     /// Integration test: Client handshake via ChannelTransport with a
@@ -3171,8 +3214,10 @@ mod tests {
         let ciphertext = client_session
             .encrypt_packet(&header, &pt, &[])
             .expect("encrypt_packet");
-        let packet = PhantomPacket::new(header, ciphertext);
-        packet.to_wire()
+        // Cleartext wire: this frame is decoded back to a struct and fed to
+        // handle_packet directly (it never traverses the pump's transport, which
+        // is the only path that applies/removes header protection).
+        PhantomPacket::new(header, ciphertext).to_wire()
     }
 
     #[tokio::test]
@@ -3366,6 +3411,9 @@ mod tests {
         let ciphertext = client_session
             .encrypt_packet(&header, &pt, &[])
             .expect("encrypt_packet");
+        // Cleartext wire: this frame is decoded back to a struct and fed to
+        // handle_packet directly (it never traverses the pump's transport, which
+        // is the only path that applies/removes header protection).
         PhantomPacket::new(header, ciphertext).to_wire()
     }
 
@@ -3423,7 +3471,7 @@ mod tests {
             .await
         );
         let wire = server_t.recv_bytes().await.unwrap();
-        let pkt = PhantomPacket::from_wire(&wire).unwrap();
+        let pkt = _server_session.parse_protected(&wire).unwrap();
         assert_eq!(
             pkt.header.path_id, 0,
             "default send path is the implicit path 0"
@@ -3444,7 +3492,7 @@ mod tests {
             .await
         );
         let wire2 = server_t.recv_bytes().await.unwrap();
-        let pkt2 = PhantomPacket::from_wire(&wire2).unwrap();
+        let pkt2 = _server_session.parse_protected(&wire2).unwrap();
         assert_eq!(
             pkt2.header.path_id, 1,
             "after migrate(), app data must carry the bumped send path_id"
@@ -3613,7 +3661,11 @@ mod tests {
         let mut asm = FragmentAssembler::new();
         let (_hdr, inner) = push_datagram(&mut asm, &buf[..n]).expect("decode envelope");
         let inner = inner.expect("single-datagram challenge");
-        let pkt = PhantomPacket::from_wire(&inner).expect("inner packet");
+        // The server emitted this challenge (protect_packet under its send HP
+        // key); unmask it from the client side (== the server's send key).
+        let pkt = client_session
+            .parse_protected(&inner)
+            .expect("inner packet");
         assert!(
             pkt.header.flags.contains(PacketFlags::PATH_VALIDATION),
             "the candidate must receive a PATH_VALIDATION challenge"
@@ -4008,7 +4060,11 @@ mod tests {
             .recv()
             .await
             .expect("an ACK frame must have been emitted");
-        let ack_pkt = PhantomPacket::from_wire(&ack_frame).expect("parse emitted ack");
+        // The receiver pump emitted this ACK with header protection; unmask from
+        // the sender side (== the receiver's send HP key).
+        let ack_pkt = sender_session
+            .parse_protected(&ack_frame)
+            .expect("parse emitted ack");
         assert!(ack_pkt.header.flags.contains(PacketFlags::ACK));
         // Decrypt under the sender's session (shared keys) to read the SACK.
         let plain = sender_session
@@ -4461,7 +4517,12 @@ mod tests {
             // Bound the send so a torn-down (or wedged) transport can't hang the
             // test: a closed channel or a stalled reader both mean the flood is
             // no longer absorbed — i.e. the session is being torn down.
-            let wire = PhantomPacket::new(header, ct).to_wire();
+            // This frame traverses the server pump's transport, which removes
+            // header protection on recv — so apply it on the way out.
+            let packet = PhantomPacket::new(header, ct);
+            let wire = client_inner
+                .protect_packet(&packet)
+                .expect("header protection");
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 client_t.send_bytes(&wire),
@@ -4605,7 +4666,7 @@ mod tests {
             .await
             .expect("expected a WINDOW_UPDATE frame")
             .expect("channel open");
-        let pv2 = PhantomPacket::from_wire(&frame).unwrap();
+        let pv2 = client_session.parse_protected(&frame).unwrap();
         assert!(pv2.header.flags.contains(PacketFlags::WINDOW_UPDATE));
         // The control frame's sequence comes from the stream's own send space —
         // distinct from any data packet so the AEAD nonce never repeats.
@@ -4693,7 +4754,7 @@ mod tests {
                 Some(b) => b,
                 None => break,
             };
-            let v2 = PhantomPacket::from_wire(&bytes).unwrap();
+            let v2 = _server_session.parse_protected(&bytes).unwrap();
             // Decrypt under the SERVER role so the per-direction key
             // matches the client-side encrypt.
             let plaintext = _server_session
@@ -4791,7 +4852,9 @@ mod tests {
 
         // Decrypt the echo on the original (client) side — server-side
         // ciphertext authenticates the round-trip.
-        let echo_v2 = PhantomPacket::from_wire(&echo_bytes).unwrap();
+        // The server emitted this echo with header protection; unmask from the
+        // client side (== the server's send HP key).
+        let echo_v2 = client_session.parse_protected(&echo_bytes).unwrap();
         assert!(echo_v2.header.flags.contains(PacketFlags::PATH_VALIDATION));
         assert_eq!(echo_v2.header.path_id, path_id);
     }
