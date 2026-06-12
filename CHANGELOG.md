@@ -117,6 +117,14 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     NAT-rebind and a deliberate `migrate()` are recovered identically — the rebind's upload is
     delivered and the session survives, but autonomous downstream re-pointing on path 0 is a
     documented planned fix (the candidate is already registered only from an authenticated source).
+- **Crypto / transport hygiene (post-audit Tier 5).** No wire-format change.
+  - *Rekey margin (T5.3):* the automatic-rekey soft watermark drops from `2^47` to `2^32` for
+    clean CFRG / QUIC standards alignment (defense-in-depth; far above any realistic session).
+  - *SACK clamp (T5.4):* a SACK's `largest_acked` is clamped to the highest stream-offset
+    actually sent, so an authenticated peer can't inflate it to force a cwnd-bypassing
+    retransmit storm against fresh in-flight segments.
+  - *AEAD recv counter (T5.5):* a failed (forged) AEAD open no longer advances the per-direction
+    recv invocation counter toward the `NonceExhausted` ceiling — only an authenticated open counts.
 
 ### Changed
 
