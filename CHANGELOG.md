@@ -108,6 +108,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     binder), not mere presence of a `resume_session_id`.
   - *Injected `ServerReject`:* an injected reject during a healthy handshake no longer aborts it —
     the client remembers it and keeps waiting for a valid `ServerHello`.
+- **Network-layer robustness (post-audit Tier 3).** No wire-format or crypto change.
+  - *ICMP advisory (M-6):* a single ICMP-induced recv error on the connected client UDP socket
+    (`ConnectionRefused` / `ConnectionReset`, plus host/net-unreachable by errno on Linux) — the
+    UDP analogue of a forged RST — is now treated as **advisory** (logged + retried), not a fatal
+    error that tears the session down bypassing liveness (RFC 8085 §5.5 / RFC 9000 §14.2).
+  - *Passive NAT-rebind (M-3, doc):* `docs/protocol/PROTOCOL.md` §12.1 no longer claims a passive
+    NAT-rebind and a deliberate `migrate()` are recovered identically — the rebind's upload is
+    delivered and the session survives, but autonomous downstream re-pointing on path 0 is a
+    documented planned fix (the candidate is already registered only from an authenticated source).
 
 ### Changed
 
