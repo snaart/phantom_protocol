@@ -1307,3 +1307,28 @@ async fn reorder_buffer_is_byte_bounded_when_the_head_is_missing() {
         buffered / 1024
     );
 }
+
+/// T5.5 (audit recv-counter-on-fail LOW): a FAILED AEAD open must NOT advance the per-direction
+/// recv invocation counter. Otherwise a stream of forged same-epoch packets drives the counter
+/// toward the `AEAD_MAX_INVOCATIONS` (2^48) `NonceExhausted` ceiling — only a successful,
+/// authenticated decryption should count. (Matches `decrypt_with_nonce`'s own doc contract.)
+#[test]
+fn failed_decrypt_does_not_advance_recv_invocation_counter() {
+    let secret = [0x77u8; 32];
+    let session = CryptoSession::with_suite(&secret, CipherSuite::Aes256Gcm).expect("session");
+    let before = session.recv_invocations();
+
+    // A forged ciphertext (garbage) with a well-formed nonce fails the tag check.
+    let forged = vec![0u8; 48];
+    assert!(
+        session
+            .decrypt_with_nonce([0u8; 12], b"aad", &forged)
+            .is_err(),
+        "a forged ciphertext must fail to decrypt"
+    );
+    assert_eq!(
+        session.recv_invocations(),
+        before,
+        "a failed AEAD open must not advance the recv invocation counter (T5.5)"
+    );
+}
