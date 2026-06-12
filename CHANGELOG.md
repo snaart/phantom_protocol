@@ -128,6 +128,11 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Changed
 
+- **MSRV raised to Rust 1.93** (from 1.75). The post-quantum dependency chain (`pkcs8 0.11` via the
+  ML-KEM / ML-DSA / signature crates) requires Cargo's `edition2024` feature (stable from Rust 1.85),
+  so the prior 1.75 claim was already unenforceable. 1.93 is now declared in `rust-version` /
+  `.clippy.toml` and enforced by a new `cargo check (MSRV 1.93)` CI gate; the temporary
+  `async-lock < 3.4` MSRV cap is removed (now tracks 3.4.x).
 - **Target threat model recorded (`SECURITY.md`):** TLS-like guarantees **plus** resistance to
   traffic-analysis linkability (unobservability). Header protection (encrypting the packet number
   + variable header fields) and connection-ID rotation are a core pre-1.0 requirement for the next

@@ -188,7 +188,7 @@ impl RtoEstimator {
             Some(srtt) => {
                 // RFC 6298 (2.3): RTTVAR = (1-1/4)·RTTVAR + 1/4·|SRTT-R|;
                 //                 SRTT  = (1-1/8)·SRTT  + 1/8·R.
-                let diff = if srtt > r { srtt - r } else { r - srtt };
+                let diff = srtt.abs_diff(r);
                 self.rttvar = (self.rttvar * 3 + diff) / 4;
                 self.srtt = Some((srtt * 7 + r) / 8);
             }
