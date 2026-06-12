@@ -494,7 +494,7 @@ mod tests {
             "expected ENCRYPTED flag on application data"
         );
         let plain = server_session
-            .decrypt_packet(&pkt.header, &pkt.payload)
+            .decrypt_packet(&pkt.header, &pkt.payload, &[])
             .expect("decrypt application data");
         // Reliable app frames carry a 4-byte gap-free stream_offset prefix (A.5);
         // strip it so callers compare against the raw application payload.
@@ -529,7 +529,7 @@ mod tests {
         pt.extend_from_slice(&sequence.to_be_bytes());
         pt.extend_from_slice(payload);
         let ct = server_session
-            .encrypt_packet(&header, &pt)
+            .encrypt_packet(&header, &pt, &[])
             .expect("encrypt reply");
         let packet = PhantomPacket::new(header, ct);
         packet.to_wire()
