@@ -4,6 +4,7 @@
 //! Manages streams, encryption state, and multi-path scheduling.
 
 use crate::crypto::adaptive_crypto::{CryptoSession, AEAD_MAX_INVOCATIONS};
+use crate::crypto::header_protection::{HeaderProtector, HP_SAMPLE_LEN};
 use crate::errors::CoreError;
 use crate::security::ReplayWindow;
 use crate::transport::{
@@ -14,7 +15,9 @@ use crate::transport::{
     path::{PathRegistry, PathStateKind, PATH_CHALLENGE_LEN},
     scheduler::Scheduler,
     stream::Stream,
-    types::{PacketHeader, PacketNumber, SchedulerMode, SessionId, StreamId},
+    types::{
+        PacketHeader, PacketNumber, PhantomPacket, RawPacket, SchedulerMode, SessionId, StreamId,
+    },
 };
 
 use arc_swap::ArcSwap;
@@ -162,6 +165,14 @@ pub struct Session {
     /// per packet. `rekey()` is a single `store()` of a freshly-derived
     /// `Arc<CryptoState>`.
     crypto: ArcSwap<CryptoState>,
+    /// Per-session, per-direction header-protection keys (T4.6, QUIC RFC 9001
+    /// §5.4). Derived ONCE from the initial session secret + the negotiated
+    /// cipher suite and held stable for the session's lifetime — it does NOT
+    /// rotate with `crypto`/`epoch` (QUIC §6.1: the hp key must be constant
+    /// across key updates because `epoch` lives inside the masked header region;
+    /// see [`HeaderProtector`]). Masks the 14-byte `[33..47]` header span on the
+    /// wire via [`Self::protect_packet`] / unmasks it via [`Self::parse_protected`].
+    header_protection: HeaderProtector,
     /// Per-direction traffic secret. Initial value is the hybrid handshake's
     /// shared secret; each `rekey()` derives the next via
     /// `HKDF-Expand(current, "phantom-rekey-v1", 32)` (Phase 1.5).
@@ -260,6 +271,10 @@ impl Session {
         peer_side: bool,
     ) -> Result<Self, CoreError> {
         let crypto = CryptoState::new(shared_secret, peer_side)?;
+        // HP keys derive from the INITIAL secret + the negotiated suite and stay
+        // stable for the session (QUIC §6.1) — see the `header_protection` field.
+        let header_protection =
+            HeaderProtector::derive(crypto.session.cipher_suite(), shared_secret, peer_side);
         let path_registry = Arc::new(PathRegistry::new());
         // Pre-register `path_id = 0` as the implicit default path — the
         // handshake itself proved reachability over this path, so no
@@ -270,6 +285,7 @@ impl Session {
             id: session_id,
             state: RwLock::new(SessionState::Handshaking),
             crypto: ArcSwap::new(Arc::new(crypto)),
+            header_protection,
             traffic_secret: RwLock::new(*shared_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
@@ -306,12 +322,15 @@ impl Session {
         traffic_secret: [u8; 32],
         is_server: bool,
     ) -> Self {
+        let header_protection =
+            HeaderProtector::derive(crypto.session.cipher_suite(), &traffic_secret, is_server);
         let path_registry = Arc::new(PathRegistry::new());
         path_registry.register_validated(0);
         Self {
             id: session_id,
             state: RwLock::new(SessionState::Connected),
             crypto: ArcSwap::new(Arc::new(crypto)),
+            header_protection,
             traffic_secret: RwLock::new(traffic_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
@@ -342,6 +361,8 @@ impl Session {
         peer_side: bool,
     ) -> Result<Self, CoreError> {
         let crypto = CryptoState::new(resumption_secret, peer_side)?;
+        let header_protection =
+            HeaderProtector::derive(crypto.session.cipher_suite(), resumption_secret, peer_side);
         let path_registry = Arc::new(PathRegistry::new());
         path_registry.register_validated(0);
 
@@ -349,6 +370,7 @@ impl Session {
             id: session_id,
             state: RwLock::new(SessionState::Connected),
             crypto: ArcSwap::new(Arc::new(crypto)),
+            header_protection,
             traffic_secret: RwLock::new(*resumption_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
@@ -939,6 +961,53 @@ impl Session {
             )));
         }
         Ok(plaintext)
+    }
+
+    // ── Header protection (T4.6, QUIC RFC 9001 §5.4) ──────────────────────────
+
+    /// Serialise a packet to its **header-protected** on-wire bytes: the
+    /// `[33..47]` header span is XOR-masked with this session's send-direction HP
+    /// key, keyed by the packet's ciphertext sample (the first 16 bytes of
+    /// `packet.payload`). The data plane calls this instead of `to_wire` for
+    /// every post-handshake packet. `packet.payload` must be AEAD ciphertext
+    /// (>= the 16-byte tag) — always true for the output of
+    /// [`encrypt_packet`](Self::encrypt_packet).
+    pub fn protect_packet(&self, packet: &PhantomPacket) -> Result<Vec<u8>, CoreError> {
+        let sample = Self::hp_sample(&packet.payload)?;
+        let mask = self.header_protection.mask_send(&sample)?;
+        Ok(packet.to_wire_masked(&mask))
+    }
+
+    /// Parse a **header-protected** wire packet: recover the cleartext header by
+    /// unmasking the `[33..47]` span with this session's recv-direction HP key
+    /// (keyed by the cleartext ciphertext sample), then reassemble the
+    /// `PhantomPacket`. The caller still gates on `version` / `session_id` and
+    /// runs AEAD on the result — a wire mutation of the masked region unmasks to a
+    /// wrong header, so the subsequent AEAD open fails (no new oracle). A short /
+    /// malformed frame returns `Err` and is dropped by the recv loop.
+    pub fn parse_protected(&self, bytes: &[u8]) -> Result<PhantomPacket, CoreError> {
+        let raw = RawPacket::from_wire(bytes)
+            .map_err(|e| CoreError::CryptoError(format!("HP: malformed wire packet: {e}")))?;
+        let sample = Self::hp_sample(&raw.payload)?;
+        let mask = self.header_protection.mask_recv(&sample)?;
+        let header = raw
+            .unmask_header(&mask)
+            .map_err(|e| CoreError::CryptoError(format!("HP: header unmask failed: {e}")))?;
+        Ok(raw.into_packet(header))
+    }
+
+    /// The 16-byte HP sample = the first [`HP_SAMPLE_LEN`] bytes of the AEAD
+    /// ciphertext. The tag is always present, so this exists even for an
+    /// empty-plaintext packet (sample = tag). A payload shorter than the tag is a
+    /// malformed / never-encrypted frame → typed error, never a panic.
+    #[inline]
+    fn hp_sample(payload: &[u8]) -> Result<[u8; HP_SAMPLE_LEN], CoreError> {
+        payload
+            .get(..HP_SAMPLE_LEN)
+            .and_then(|s| <[u8; HP_SAMPLE_LEN]>::try_from(s).ok())
+            .ok_or_else(|| {
+                CoreError::CryptoError("HP: packet payload shorter than the AEAD tag".into())
+            })
     }
 
     /// Get the scheduler
