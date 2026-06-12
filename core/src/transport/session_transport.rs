@@ -103,6 +103,15 @@ pub trait SessionTransport: Send + Sync + 'static {
         async { Ok(false) }
     }
 
+    /// Commit the most-recently-received frame's source as the migration candidate — call ONLY
+    /// from the post-decrypt path, i.e. once that frame has been AEAD-verified (M-1). On the
+    /// address-aware UDP server this is the migration-integrity fix: the candidate (and hence
+    /// the server's `PATH_CHALLENGE` target) is only ever an AEAD-authenticated source, so a
+    /// spoofed CID-matched datagram (which never decrypts) cannot clobber the candidate slot
+    /// and misdirect / stall a legitimate migration. SocketAddr-free — the address stays inside
+    /// the concrete transport. Default no-op for transports without migration.
+    fn confirm_authenticated_source(&self) {}
+
     /// Promote the migration candidate to the established peer (Phase 4, the
     /// switch): after the candidate's path validates, subsequent app data and
     /// retransmits go to it instead of the old peer. Returns `true` if a candidate
