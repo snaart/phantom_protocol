@@ -176,18 +176,53 @@ impl HybridSecretKey {
             .decapsulate(&ct_array)
             .map_err(|e| anyhow::anyhow!("ML-KEM decapsulation failed: {:?}", e))?;
 
-        // 3. Combine the two 32-byte secrets via HKDF.
-        Self::combine_secrets(&classical_shared, ml_kem_shared.as_slice())
+        // 3. Our own classical public key — bound into the combiner (T4.2). Derived
+        // from the long-lived classical secret on each build path.
+        #[cfg(not(feature = "fips"))]
+        let our_classical_pk: [u8; CLASSICAL_PK_BYTES] =
+            *X25519PublicKey::from(&self.classical_sk).as_bytes();
+        #[cfg(feature = "fips")]
+        let our_classical_pk: [u8; CLASSICAL_PK_BYTES] = {
+            let pk = self
+                .classical_sk
+                .compute_public_key()
+                .map_err(|e| anyhow::anyhow!("aws-lc-rs P-256 compute_public_key: {:?}", e))?;
+            let mut b = [0u8; CLASSICAL_PK_BYTES];
+            b.copy_from_slice(pk.as_ref());
+            b
+        };
+
+        // 4. Combine the two 32-byte secrets via HKDF, binding the classical ciphertext
+        // (the sender's ephemeral pk) + the recipient classical pk (T4.2).
+        Self::combine_secrets(
+            &classical_shared,
+            ml_kem_shared.as_slice(),
+            &ciphertext.classical_pk,
+            &our_classical_pk,
+        )
     }
 
+    /// Combine the classical + ML-KEM shared secrets into the 32-byte session secret.
+    ///
+    /// T4.2 (X-Wing / draft-ietf-tls-hybrid-design): the IKM binds, in addition to the
+    /// two raw shared secrets, the **classical ciphertext** (`classical_ct` — the
+    /// sender's ephemeral classical pubkey, carried in [`HybridCiphertext::classical_pk`])
+    /// and the **recipient classical pubkey** (`classical_pk`). This makes the combined
+    /// secret commit to the full classical transcript so the combiner's security does not
+    /// rest on the handshake signature alone. The ML-KEM half is implicitly committed via
+    /// its shared secret (ML-KEM is IND-CCA / binds its ciphertext); only the classical
+    /// half needs the explicit ct/pk binding here.
     pub(crate) fn combine_secrets(
         ecc_secret: &[u8],
         pq_secret: &[u8],
+        classical_ct: &[u8],
+        classical_pk: &[u8],
     ) -> Result<[u8; 32], anyhow::Error> {
         // CRYPTO-3: the combined IKM holds both raw classical and ML-KEM shared
         // secrets — wipe it on every exit path rather than leaving it in freed
         // memory.
-        let ikm = zeroize::Zeroizing::new([ecc_secret, pq_secret].concat());
+        let ikm =
+            zeroize::Zeroizing::new([ecc_secret, pq_secret, classical_ct, classical_pk].concat());
         let hkdf = Hkdf::<Sha256>::new(None, &ikm);
         let mut okm = [0u8; 32];
         hkdf.expand(COMBINE_LABEL, &mut okm)
@@ -259,9 +294,14 @@ impl HybridKeyPackage {
             .encapsulate(&mut rng)
             .map_err(|e| anyhow::anyhow!("ML-KEM encapsulation failed: {:?}", e))?;
 
-        // 3. Combine via HKDF.
-        let shared_secret =
-            HybridSecretKey::combine_secrets(&classical_shared, ml_kem_shared.as_slice())?;
+        // 3. Combine via HKDF, binding the classical ciphertext (this ephemeral pk)
+        // + the recipient classical pk (T4.2).
+        let shared_secret = HybridSecretKey::combine_secrets(
+            &classical_shared,
+            ml_kem_shared.as_slice(),
+            &eph_pk_bytes,
+            &self.classical_pk,
+        )?;
 
         let ciphertext = HybridCiphertext {
             classical_pk: eph_pk_bytes,
@@ -310,6 +350,35 @@ mod tests {
         assert_eq!(
             ss_send, ss_recv,
             "encap/decap must agree on the shared secret"
+        );
+    }
+
+    /// T4.2 (X-Wing / draft-ietf-tls-hybrid-design): the hybrid combiner must bind the
+    /// classical ciphertext (the sender's ephemeral pubkey) and the recipient classical
+    /// pubkey into the IKM, not just the two raw shared secrets — so the combined secret
+    /// commits to the full classical transcript and the construction's security does not
+    /// rest on the handshake signature alone. Changing either the ct or the pk while
+    /// holding both shared secrets fixed must change the combined secret.
+    #[test]
+    fn combiner_binds_classical_ct_and_pk() {
+        let ecc = [7u8; 32];
+        let pq = [9u8; 32];
+        let ct1 = [1u8; CLASSICAL_PK_BYTES];
+        let ct2 = [2u8; CLASSICAL_PK_BYTES];
+        let pk1 = [3u8; CLASSICAL_PK_BYTES];
+        let pk2 = [4u8; CLASSICAL_PK_BYTES];
+
+        let base = HybridSecretKey::combine_secrets(&ecc, &pq, &ct1, &pk1).expect("combine");
+        let diff_ct = HybridSecretKey::combine_secrets(&ecc, &pq, &ct2, &pk1).expect("combine");
+        let diff_pk = HybridSecretKey::combine_secrets(&ecc, &pq, &ct1, &pk2).expect("combine");
+
+        assert_ne!(
+            base, diff_ct,
+            "combined secret must depend on the classical ciphertext (sender ephemeral pk)"
+        );
+        assert_ne!(
+            base, diff_pk,
+            "combined secret must depend on the recipient classical pubkey"
         );
     }
 
