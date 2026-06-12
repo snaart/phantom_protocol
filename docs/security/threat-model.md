@@ -94,7 +94,7 @@ process is a weaker boundary (we trust the caller and the OS).
 | A3 | Hybrid KEM private keys (ephemeral, per-handshake) | `HandshakeClient.kem_secret` | Compromise of one session's KEM key leaks that session's symmetric keys â all traffic from that session decryptable. Mitigated by ephemeral generation per handshake + `ZeroizeOnDrop`. |
 | A4 | Session AEAD keys | `CryptoState.session_key`, ring `LessSafeKey` inside `CryptoSessionInner` | Compromise leaks all packets in that session direction. Mitigated by `ZeroizeOnDrop` (Phase 1.2) and (future) mid-session rekey (Phase 1.5, V2). |
 | A5 | Application plaintext | passed in/out via `Vec<u8>` / `Bytes` | The whole point of the transport. |
-| A6 | Session identity / linkability metadata | session id / CID (32 B, **plaintext**), stream id, packet numbers | Traffic-analysis input; the plaintext CID is also the cross-network migration link (LINDDUN-L, §12.5). Out of scope for full anonymity. |
+| A6 | Session identity / linkability metadata | session id / CID (32 B, **plaintext**); stream id, packet numbers, flags, epoch, path id (**HP-masked** on the wire — T4.6 §4.6) | The stable plaintext CID is the cross-network migration link (LINDDUN-L, §12.5); the variable per-packet fields are masked by header protection but the CID is not yet rotated. Out of scope for full anonymity. |
 | A7 | Cookie / PoW state | client-side stored cookies | Loss enables replay of one round trip within freshness window only. |
 
 ---
@@ -178,7 +178,7 @@ expose any privileged operation. The library is a passive data conduit.
 | Threat | Status | Note |
 | --- | --- | --- |
 | **L**inkability of two sessions to the same client | Partial | Same `HybridVerifyingKey` on the client side correlates handshakes (the client signing key is reused). Anonymous mode would require ephemeral client signing keys; tracked as future work. |
-| **L**inkability of one session across a network change (migration) | **Documented — functional but linkable** | Connection migration (Phase 4) keeps the **plaintext** `session_id`/CID across a path change, so an on-path / colluding observer seeing both networks can link "same session moved Wi-Fi→cellular". A narrow regression vs. the re-handshake fallback (two unlinkable connections) for a *global* observer; **no** new linkability for a same-network NAT-rebind. We make **no claim of unobservable migration**. Unlinkable migration (header-protection / packet-number encryption + CID rotation) is a deferred hardening phase. See `PROTOCOL.md` §12.5. |
+| **L**inkability of one session across a network change (migration) | **Partially mitigated — functional but linkable via the stable CID** | Header protection (T4.6, QUIC RFC 9001 §5.4) now **masks** the variable per-packet metadata on the wire — packet numbers, flags (incl. the PRIORITY/voice bit), stream id, epoch, and path id are no longer observable (§4.6). The **residual** cross-network link is the **stable cleartext `session_id`/CID** (32 B at wire `[1..33]`; on the PhantomUDP path also the outer 8-byte `ConnId`), unchanged across a migration — so an on-path / colluding observer seeing both networks can still link "same session moved Wi-Fi→cellular" by that identifier. **No** new linkability for a same-network NAT-rebind; we make **no claim of unobservable migration**. The remaining piece — **CID rotation** (QUIC `NEW_CONNECTION_ID`) — is a separate change; until it lands, migration is functional but linkable via the stable CID. See `PROTOCOL.md` §4.6 / §12.5. |
 | **I**dentifiability of the client | No mitigation | Source IP is necessarily visible to the server. Client may use Tor / VPN externally. |
 | **N**on-repudiation | Intentionally out of scope (see STRIDE-R) |
 | **D**etectability that this is `phantom_protocol` | Planned (HTTP-mimicry mode) | FakeTLS leg removed in Phase 0; HTTP traffic mimicry will return as a dedicated transport mode. |
@@ -215,9 +215,10 @@ and the specialist docs in this directory. Cross-reference quick map:
   the server validates a new path (a 32-byte challenge echoed from the claimed
   address, constant-time) before switching its peer, so a MITM cannot redirect or
   hijack the session - worst case is a redirection-DoS, never decrypt
-  (PROTOCOL.md §12). Residual: migration is functional but LINKABLE via the
-  stable plaintext CID (LINDDUN-L above); unlinkable migration (header-protection +
-  CID rotation) is a deferred hardening phase.
+  (PROTOCOL.md §12). Residual: header protection (T4.6, §4.6) now masks the
+  variable per-packet metadata (packet numbers, flags, stream id, epoch, path id),
+  but migration stays LINKABLE via the stable plaintext CID (LINDDUN-L above);
+  CID rotation — the remaining piece of unlinkable migration — is deferred.
 - No protection against side-channel cryptanalysis of the AEAD itself.
   Rely on ring / dalek / RustCrypto (`ml-kem`, `ml-dsa`) upstream
   constant-time properties.
@@ -231,3 +232,4 @@ and the specialist docs in this directory. Cross-reference quick map:
 | --- | --- | --- |
 | _Initial draft_ | n/a | Captures state at the commit that introduced this file (Phase 6.1). |
 | 2026-06-11 | Phase 4 | Connection migration + liveness (P4.0-P4.4): per-direction u64 packet number (WIRE 3); path validation; PATH-001a/b; 3x anti-amplification; Migrating/Dead liveness; honest "functional but linkable via stable CID" note (LINDDUN-L, PROTOCOL.md section 12). |
+| 2026-06-12 | T4.6 | Header protection (QUIC RFC 9001 section 5.4; WIRE 4): the variable header fields (packet number, flags incl. PRIORITY, stream id, epoch, path id) are XOR-masked on the wire, leaving only version + session_id cleartext (PROTOCOL.md section 4.6). LINDDUN-L narrowed from "all metadata plaintext" to "linkable via the stable cleartext CID only"; CID rotation (the remaining piece) deferred. Also T4.1: packet extensions folded into the AEAD AAD; T4.2 X-Wing KEM combiner; T4.3/T4.4 ServerHello shrink + discriminant byte; T4.5 reliable-offset fail-closed. |
