@@ -353,6 +353,67 @@ pub struct ServerHello {
     pub early_data_accepted: bool,
 }
 
+/// A discriminated server handshake reply (T4.4).
+///
+/// The wire form is `[kind: u8] ‖ borsh(body)`. The leading discriminant byte lets the
+/// client dispatch the three possible replies **explicitly**, instead of the former
+/// trial-deserialization that distinguished them by message size (a `ServerReject` is a
+/// handful of bytes, a `HelloRetryRequest` tens, a `ServerHello` thousands — robust in
+/// practice, but a same-size confusion was structurally possible). The discriminant is an
+/// API-layer framing byte that sits *outside* the borsh message structs, so it does not
+/// affect the frozen `wire_vectors` (which fix the bare message encodings).
+// `ServerReply` is a transient wire-framing wrapper: it is constructed once per handshake
+// reply, immediately `to_wire`/`from_wire`'d, then dropped — never stored or passed in bulk.
+// The `Hello` variant is intrinsically large (the multi-KiB signed `ServerHello`); boxing it
+// would add a heap allocation to every reply for no real benefit at this lifetime.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum ServerReply {
+    /// Handshake succeeded — carries the signed [`ServerHello`].
+    Hello(ServerHello),
+    /// DoS gate — carries a cookie / PoW [`HelloRetryRequest`].
+    Retry(HelloRetryRequest),
+    /// Structural rejection (e.g. unknown `version`) — carries a [`ServerReject`].
+    Reject(ServerReject),
+}
+
+impl ServerReply {
+    const KIND_HELLO: u8 = 0;
+    const KIND_RETRY: u8 = 1;
+    const KIND_REJECT: u8 = 2;
+
+    /// Serialise to `[kind: u8] ‖ borsh(body)`.
+    pub fn to_wire(&self) -> Result<Vec<u8>, HandshakeError> {
+        let map = |e: borsh::io::Error| HandshakeError::SerializationError(e.to_string());
+        let (kind, body) = match self {
+            ServerReply::Hello(h) => (Self::KIND_HELLO, borsh::to_vec(h).map_err(map)?),
+            ServerReply::Retry(r) => (Self::KIND_RETRY, borsh::to_vec(r).map_err(map)?),
+            ServerReply::Reject(r) => (Self::KIND_REJECT, borsh::to_vec(r).map_err(map)?),
+        };
+        let mut out = Vec::with_capacity(1 + body.len());
+        out.push(kind);
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Parse `[kind: u8] ‖ borsh(body)` with explicit dispatch on the discriminant. An
+    /// empty input or an unknown kind byte is an error — never a silent misparse.
+    pub fn from_wire(bytes: &[u8]) -> Result<Self, HandshakeError> {
+        let (&kind, body) = bytes
+            .split_first()
+            .ok_or_else(|| HandshakeError::SerializationError("empty server reply".into()))?;
+        let map = |e: borsh::io::Error| HandshakeError::SerializationError(e.to_string());
+        match kind {
+            Self::KIND_HELLO => Ok(ServerReply::Hello(borsh::from_slice(body).map_err(map)?)),
+            Self::KIND_RETRY => Ok(ServerReply::Retry(borsh::from_slice(body).map_err(map)?)),
+            Self::KIND_REJECT => Ok(ServerReply::Reject(borsh::from_slice(body).map_err(map)?)),
+            other => Err(HandshakeError::SerializationError(format!(
+                "unknown server-reply discriminant {other}"
+            ))),
+        }
+    }
+}
+
 /// Handshake transcript for signing.
 ///
 /// Embeds the whole `ClientHello` by reference — including the optional
@@ -1567,6 +1628,45 @@ mod tests {
             }
             other => panic!("expected Reject, got {other:?}"),
         }
+    }
+
+    /// T4.4: a server reply carries a leading discriminant byte, so the client dispatches
+    /// the three kinds explicitly instead of trial-deserializing by size. Round-trip each
+    /// kind, assert the discriminant byte, and reject empty / unknown-kind inputs (never a
+    /// silent misparse).
+    #[test]
+    fn server_reply_discriminant_dispatches_explicitly() {
+        // Reject (kind 2).
+        let reject = ServerReject::unsupported_version();
+        let wire = ServerReply::Reject(reject.clone())
+            .to_wire()
+            .expect("frame reject");
+        assert_eq!(wire[0], 2, "reject discriminant byte");
+        assert!(matches!(
+            ServerReply::from_wire(&wire),
+            Ok(ServerReply::Reject(r)) if r == reject
+        ));
+
+        // Retry (kind 1).
+        let hrr = HelloRetryRequest {
+            challenge: None,
+            cookie: Some([7u8; 32]),
+        };
+        let wire = ServerReply::Retry(hrr.clone())
+            .to_wire()
+            .expect("frame retry");
+        assert_eq!(wire[0], 1, "retry discriminant byte");
+        assert!(matches!(
+            ServerReply::from_wire(&wire),
+            Ok(ServerReply::Retry(r)) if r.cookie == hrr.cookie && r.challenge.is_none()
+        ));
+
+        // Unknown discriminant and empty input are errors, not silent misparses.
+        assert!(
+            ServerReply::from_wire(&[0xFF, 0x00]).is_err(),
+            "unknown kind rejected"
+        );
+        assert!(ServerReply::from_wire(&[]).is_err(), "empty reply rejected");
     }
 
     /// The reject frame survives a borsh round-trip and is shape-distinct from

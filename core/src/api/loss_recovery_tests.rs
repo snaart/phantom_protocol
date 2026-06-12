@@ -120,7 +120,7 @@ use tokio::time::timeout;
 use crate::api::session::{ConnectionState, PhantomSession, SessionTransport};
 use crate::errors::CoreError;
 use crate::test_harness::fault_transport::{FaultControl, LossyTransport};
-use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer, ServerReply};
 
 // ── Local in-memory transport (mirrors the one in session::tests) ────────────
 
@@ -213,7 +213,9 @@ async fn run_lossy_round_trips(
         let inner_session = loop {
             match server_hs.process_client_hello(&client_hello, 0, client_ip) {
                 HandshakeResponse::Retry(retry) => {
-                    let retry_bytes = borsh::to_vec(&retry).expect("serialize retry");
+                    let retry_bytes = ServerReply::Retry(retry)
+                        .to_wire()
+                        .expect("serialize retry");
                     server_channel
                         .send_bytes(&retry_bytes)
                         .await
@@ -226,7 +228,9 @@ async fn run_lossy_round_trips(
                         .expect("deserialize retry ClientHello");
                     match server_hs.process_client_hello(&next_hello, 0, client_ip) {
                         HandshakeResponse::Success(server_hello, session, _) => {
-                            let b = borsh::to_vec(&server_hello).expect("serialize ServerHello");
+                            let b = ServerReply::Hello(server_hello)
+                                .to_wire()
+                                .expect("serialize ServerHello");
                             server_channel
                                 .send_bytes(&b)
                                 .await
@@ -237,7 +241,9 @@ async fn run_lossy_round_trips(
                     }
                 }
                 HandshakeResponse::Success(server_hello, session, _) => {
-                    let b = borsh::to_vec(&server_hello).expect("serialize ServerHello");
+                    let b = ServerReply::Hello(server_hello)
+                        .to_wire()
+                        .expect("serialize ServerHello");
                     server_channel
                         .send_bytes(&b)
                         .await
@@ -345,7 +351,9 @@ async fn run_pipelined_echo(
         let inner = loop {
             match server_hs.process_client_hello(&client_hello, 0, client_ip) {
                 HandshakeResponse::Retry(retry) => {
-                    let retry_bytes = borsh::to_vec(&retry).expect("serialize retry");
+                    let retry_bytes = ServerReply::Retry(retry)
+                        .to_wire()
+                        .expect("serialize retry");
                     server_channel
                         .send_bytes(&retry_bytes)
                         .await
@@ -358,7 +366,9 @@ async fn run_pipelined_echo(
                         .expect("deserialize retry ClientHello");
                     match server_hs.process_client_hello(&next_hello, 0, client_ip) {
                         HandshakeResponse::Success(server_hello, session, _) => {
-                            let b = borsh::to_vec(&server_hello).expect("serialize ServerHello");
+                            let b = ServerReply::Hello(server_hello)
+                                .to_wire()
+                                .expect("serialize ServerHello");
                             server_channel
                                 .send_bytes(&b)
                                 .await
@@ -369,7 +379,9 @@ async fn run_pipelined_echo(
                     }
                 }
                 HandshakeResponse::Success(server_hello, session, _) => {
-                    let b = borsh::to_vec(&server_hello).expect("serialize ServerHello");
+                    let b = ServerReply::Hello(server_hello)
+                        .to_wire()
+                        .expect("serialize ServerHello");
                     server_channel
                         .send_bytes(&b)
                         .await

@@ -9,9 +9,7 @@ use crate::errors::CoreError;
 use crate::observability::attrs::{AeadAlgorithm, ReplayReason};
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
-use crate::transport::handshake::{
-    HandshakeClient, HelloRetryRequest, ServerHello, ServerReject, EARLY_DATA_MAX_LEN,
-};
+use crate::transport::handshake::{HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN};
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::packet_coalescer_codec::unwrap_coalesced_packet;
 use crate::transport::path_validation_codec::build_path_validation_packet;
@@ -739,59 +737,64 @@ async fn run_client_handshake<T: SessionTransport>(
                 }
             };
 
-            // The reply is one of three shapes: a `ServerHello` (success), a
-            // `HelloRetryRequest` (cookie/PoW demand), or a `ServerReject`. Try the success
-            // shape first — a retry/reject blob is far too small to deserialize as a multi-KiB
-            // ServerHello, so the disambiguation is unambiguous.
-            if let Ok(sh) = borsh::from_slice::<ServerHello>(&resp) {
-                let (session, accepted) =
-                    handshake.process_server_hello(&hello, &sh, Some(expected_server_key))?;
-                return Ok((session, accepted));
-            } else if let Ok(reject) = borsh::from_slice::<ServerReject>(&resp) {
-                // The marker guard keeps a same-sized non-reject blob from being mistaken for a
-                // reject. We do NOT auto-downgrade to `reject.supported_version` (Invariant 7).
-                if reject.has_marker() {
-                    reject_rounds += 1;
-                    if reject_rounds > MAX_CLIENT_REJECT_ROUNDS {
+            // T4.4: the reply leads with an explicit discriminant byte
+            // (`[kind] ‖ borsh(body)`); dispatch on it instead of trial-deserializing by
+            // size. An unknown kind / malformed body is a handshake error, not a misparse.
+            match ServerReply::from_wire(&resp) {
+                Ok(ServerReply::Hello(sh)) => {
+                    let (session, accepted) =
+                        handshake.process_server_hello(&hello, &sh, Some(expected_server_key))?;
+                    return Ok((session, accepted));
+                }
+                Ok(ServerReply::Reject(reject)) => {
+                    // The marker is an extra sanity check on top of the discriminant. We do
+                    // NOT auto-downgrade to `reject.supported_version` (Invariant 7).
+                    if reject.has_marker() {
+                        reject_rounds += 1;
+                        if reject_rounds > MAX_CLIENT_REJECT_ROUNDS {
+                            return Err(CoreError::HandshakeError(format!(
+                                "server rejected the handshake: unsupported protocol version \
+                                 (client speaks v{}, server speaks v{})",
+                                hello.version, reject.supported_version
+                            )));
+                        }
+                        // reviewer §5: keep waiting for a valid ServerHello — read the next
+                        // frame WITHOUT re-sending, so a single forged reject can't kill the
+                        // handshake.
+                        remembered_reject = Some(reject);
+                        continue;
+                    }
+                    return Err(CoreError::HandshakeError(
+                        "server reject missing marker".into(),
+                    ));
+                }
+                Ok(ServerReply::Retry(retry)) => {
+                    retry_rounds += 1;
+                    if retry_rounds > MAX_CLIENT_RETRY_ROUNDS {
                         return Err(CoreError::HandshakeError(format!(
-                            "server rejected the handshake: unsupported protocol version \
-                             (client speaks v{}, server speaks v{})",
-                            hello.version, reject.supported_version
+                            "server demanded more than {MAX_CLIENT_RETRY_ROUNDS} HelloRetryRequest rounds"
                         )));
                     }
-                    // reviewer §5: keep waiting for a valid ServerHello — read the next frame
-                    // WITHOUT re-sending, so a single forged reject can't kill the handshake.
-                    remembered_reject = Some(reject);
-                    continue;
+                    log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
+                    hello.cookie = retry.cookie;
+                    if let Some(challenge) = retry.challenge {
+                        // H3: cap the accepted difficulty and bound the solver, so an
+                        // injected/malicious HelloRetryRequest (e.g. difficulty 255)
+                        // surfaces a handshake error instead of pinning a CPU core.
+                        log::info!("PhantomSession: Solving PoW challenge...");
+                        hello.pow_solution = Some(
+                            challenge
+                                .solve_capped(crate::crypto::pow::MAX_CLIENT_POW_DIFFICULTY)
+                                .map_err(|e| CoreError::HandshakeError(e.to_string()))?,
+                        );
+                    }
+                    break; // re-send the cookie/PoW-updated hello (outer loop)
                 }
-                return Err(CoreError::HandshakeError(
-                    "invalid ServerHello, Retry, or Reject received".into(),
-                ));
-            } else if let Ok(retry) = borsh::from_slice::<HelloRetryRequest>(&resp) {
-                retry_rounds += 1;
-                if retry_rounds > MAX_CLIENT_RETRY_ROUNDS {
+                Err(e) => {
                     return Err(CoreError::HandshakeError(format!(
-                        "server demanded more than {MAX_CLIENT_RETRY_ROUNDS} HelloRetryRequest rounds"
+                        "invalid server reply: {e}"
                     )));
                 }
-                log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
-                hello.cookie = retry.cookie;
-                if let Some(challenge) = retry.challenge {
-                    // H3: cap the accepted difficulty and bound the solver, so an
-                    // injected/malicious HelloRetryRequest (e.g. difficulty 255)
-                    // surfaces a handshake error instead of pinning a CPU core.
-                    log::info!("PhantomSession: Solving PoW challenge...");
-                    hello.pow_solution = Some(
-                        challenge
-                            .solve_capped(crate::crypto::pow::MAX_CLIENT_POW_DIFFICULTY)
-                            .map_err(|e| CoreError::HandshakeError(e.to_string()))?,
-                    );
-                }
-                break; // re-send the cookie/PoW-updated hello (outer loop)
-            } else {
-                return Err(CoreError::HandshakeError(
-                    "invalid ServerHello, Retry, or Reject received".into(),
-                ));
             }
         }
     }
@@ -2570,16 +2573,18 @@ mod tests {
     /// generic failure — and crucially does NOT auto-downgrade.
     #[tokio::test]
     async fn client_surfaces_server_reject_as_version_error() {
-        use crate::transport::handshake::ServerReject;
+        use crate::transport::handshake::{ServerReject, ServerReply};
 
         let (client_transport, server_transport) = ChannelTransport::pair();
         // The reject path errors before any key verification, so any key works.
         let (_sk, expected_vk) = crate::crypto::hybrid_sign::HybridSigningKey::generate();
 
         let server = tokio::spawn(async move {
-            // Consume the ClientHello, then reply with the typed reject.
+            // Consume the ClientHello, then reply with the typed reject (T4.4 framed).
             let _hello = server_transport.recv_bytes().await.unwrap();
-            let reject = borsh::to_vec(&ServerReject::unsupported_version()).unwrap();
+            let reject = ServerReply::Reject(ServerReject::unsupported_version())
+                .to_wire()
+                .unwrap();
             server_transport.send_bytes(&reject).await.unwrap();
         });
 
@@ -2601,7 +2606,7 @@ mod tests {
     /// cookie/ServerHello flow; the handshake must still succeed.
     #[tokio::test]
     async fn injected_server_reject_does_not_abort_a_healthy_handshake() {
-        use crate::transport::handshake::ServerReject;
+        use crate::transport::handshake::{ServerReject, ServerReply};
 
         let (client_transport, server_transport) = ChannelTransport::pair();
         let server_hs = HandshakeServer::new().unwrap();
@@ -2614,8 +2619,10 @@ mod tests {
             let Ok(client_hello) = borsh::from_slice::<ClientHello>(&hello_bytes) else {
                 return;
             };
-            // Inject a forged reject AHEAD of the real handshake responses.
-            let reject = borsh::to_vec(&ServerReject::unsupported_version()).unwrap();
+            // Inject a forged reject AHEAD of the real handshake responses (T4.4 framed).
+            let reject = ServerReply::Reject(ServerReject::unsupported_version())
+                .to_wire()
+                .unwrap();
             if server_transport.send_bytes(&reject).await.is_err() {
                 return;
             }
@@ -2623,7 +2630,7 @@ mod tests {
             let sh = match server_hs.process_client_hello(&client_hello, 0, ip) {
                 HandshakeResponse::Retry(retry) => {
                     if server_transport
-                        .send_bytes(&borsh::to_vec(&retry).unwrap())
+                        .send_bytes(&ServerReply::Retry(retry).to_wire().unwrap())
                         .await
                         .is_err()
                     {
@@ -2644,7 +2651,7 @@ mod tests {
                 _ => return,
             };
             let _ = server_transport
-                .send_bytes(&borsh::to_vec(&sh).unwrap())
+                .send_bytes(&ServerReply::Hello(sh).to_wire().unwrap())
                 .await;
         });
 
@@ -2863,7 +2870,7 @@ mod tests {
                 let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
                 match response {
                     HandshakeResponse::Retry(retry) => {
-                        let retry_bytes = borsh::to_vec(&retry).unwrap();
+                        let retry_bytes = ServerReply::Retry(retry).to_wire().unwrap();
                         server_transport.send_bytes(&retry_bytes).await.unwrap();
                         // Receive retried client hello
                         let next_bytes = server_transport.recv_bytes().await.unwrap();
@@ -2871,7 +2878,8 @@ mod tests {
                         let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
                         match resp2 {
                             HandshakeResponse::Success(server_hello, session, _) => {
-                                let server_hello_bytes = borsh::to_vec(&server_hello).unwrap();
+                                let server_hello_bytes =
+                                    ServerReply::Hello(server_hello).to_wire().unwrap();
                                 server_transport
                                     .send_bytes(&server_hello_bytes)
                                     .await
@@ -2882,7 +2890,8 @@ mod tests {
                         }
                     }
                     HandshakeResponse::Success(server_hello, session, _) => {
-                        let server_hello_bytes = borsh::to_vec(&server_hello).unwrap();
+                        let server_hello_bytes =
+                            ServerReply::Hello(server_hello).to_wire().unwrap();
                         server_transport
                             .send_bytes(&server_hello_bytes)
                             .await
@@ -2969,13 +2978,13 @@ mod tests {
             let server_session = loop {
                 match server_hs.process_client_hello(&client_hello, 0, client_ip) {
                     HandshakeResponse::Retry(retry) => {
-                        let retry_bytes = borsh::to_vec(&retry).unwrap();
+                        let retry_bytes = ServerReply::Retry(retry).to_wire().unwrap();
                         server_transport.send_bytes(&retry_bytes).await.unwrap();
                         let next_bytes = server_transport.recv_bytes().await.unwrap();
                         let next_hello = borsh::from_slice::<ClientHello>(&next_bytes).unwrap();
                         match server_hs.process_client_hello(&next_hello, 0, client_ip) {
                             HandshakeResponse::Success(server_hello, session, _) => {
-                                let b = borsh::to_vec(&server_hello).unwrap();
+                                let b = ServerReply::Hello(server_hello).to_wire().unwrap();
                                 server_transport.send_bytes(&b).await.unwrap();
                                 break session;
                             }
@@ -2983,7 +2992,7 @@ mod tests {
                         }
                     }
                     HandshakeResponse::Success(server_hello, session, _) => {
-                        let b = borsh::to_vec(&server_hello).unwrap();
+                        let b = ServerReply::Hello(server_hello).to_wire().unwrap();
                         server_transport.send_bytes(&b).await.unwrap();
                         break session;
                     }
@@ -4812,14 +4821,16 @@ mod tests {
             HandshakeResponse::Retry(r) => r,
             _ => panic!("expected Retry"),
         };
-        s1.send_bytes(&borsh::to_vec(&retry).unwrap())
+        s1.send_bytes(&ServerReply::Retry(retry).to_wire().unwrap())
             .await
             .unwrap();
         let next = s1.recv_bytes().await.unwrap();
         let ch2 = borsh::from_slice::<ClientHello>(&next).unwrap();
         match server_hs.process_client_hello(&ch2, 0, client_ip) {
             HandshakeResponse::Success(sh, _session, _) => {
-                s1.send_bytes(&borsh::to_vec(&sh).unwrap()).await.unwrap();
+                s1.send_bytes(&ServerReply::Hello(sh).to_wire().unwrap())
+                    .await
+                    .unwrap();
             }
             _ => panic!("expected Success"),
         }
@@ -4865,7 +4876,9 @@ mod tests {
                 // The server decrypted exactly what the client sealed.
                 assert_eq!(early_data.as_deref(), Some(&early_payload[..]));
                 assert!(sh.early_data_accepted);
-                s2.send_bytes(&borsh::to_vec(&sh).unwrap()).await.unwrap();
+                s2.send_bytes(&ServerReply::Hello(sh).to_wire().unwrap())
+                    .await
+                    .unwrap();
             }
             _ => {
                 panic!("expected Success with accepted early-data — the resumption ticket is fresh")
