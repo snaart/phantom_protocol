@@ -274,6 +274,11 @@ pub struct UdpServerTransport {
     /// address never exceeds 3× what it sent us.
     cand_recv: AtomicU64,
     cand_sent: AtomicU64,
+    /// Source + byte length of the most recent `recv_bytes` frame (M-1). The candidate is
+    /// committed from this ONLY by `confirm_authenticated_source` on the post-decrypt path, so
+    /// a spoofed (never-decrypting) datagram cannot clobber the candidate slot.
+    last_recv_src: ArcSwap<Option<SocketAddr>>,
+    last_frame_len: AtomicU64,
 }
 
 impl UdpServerTransport {
@@ -293,6 +298,8 @@ impl UdpServerTransport {
             candidate: ArcSwap::from_pointee(None),
             cand_recv: AtomicU64::new(0),
             cand_sent: AtomicU64::new(0),
+            last_recv_src: ArcSwap::from_pointee(None),
+            last_frame_len: AtomicU64::new(0),
         }
     }
 }
@@ -325,21 +332,38 @@ impl SessionTransport for UdpServerTransport {
             .recv()
             .await
             .ok_or(CoreError::ConnectionClosed)?;
-        // Migration source-detection (Phase 4, P4.1). A frame from a source other
-        // than the established `peer` marks a candidate path. We do NOT switch the
-        // peer here (that is P4.2) — only record the candidate + (re)seed its
-        // anti-amplification budget so the session can challenge it.
-        if src != **self.peer.load() {
-            if self.candidate.load().as_ref() == &Some(src) {
-                self.cand_recv
-                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
-            } else {
-                self.candidate.store(Arc::new(Some(src)));
-                self.cand_recv.store(frame.len() as u64, Ordering::Relaxed);
-                self.cand_sent.store(0, Ordering::Relaxed);
-            }
-        }
+        // M-1: record the source + length but do NOT register a migration candidate here — this
+        // frame has not been AEAD-verified yet, and a spoofed CID-matched datagram looks
+        // identical at this point. The candidate is committed only from the post-decrypt
+        // `confirm_authenticated_source`, so a spoofed source cannot clobber the candidate slot
+        // and misdirect / stall a legitimate migration (Phase 4, P4.1 — detect-only, no switch).
+        self.last_recv_src.store(Arc::new(Some(src)));
+        self.last_frame_len
+            .store(frame.len() as u64, Ordering::Relaxed);
         Ok(frame)
+    }
+
+    fn confirm_authenticated_source(&self) {
+        // M-1: the frame from `last_recv_src` just authenticated (AEAD-opened), so it really is
+        // the established peer — possibly at a NEW address (migration / NAT rebind). Register it
+        // as the candidate the session challenges before switching, and (re)seed its
+        // anti-amplification budget. A spoofed source never reaches here (its frame fails
+        // decrypt), so it can never become the candidate.
+        let src = match **self.last_recv_src.load() {
+            Some(s) => s,
+            None => return,
+        };
+        if src == **self.peer.load() {
+            return; // already the established peer — not a new path
+        }
+        let len = self.last_frame_len.load(Ordering::Relaxed);
+        if self.candidate.load().as_ref() == &Some(src) {
+            self.cand_recv.fetch_add(len, Ordering::Relaxed);
+        } else {
+            self.candidate.store(Arc::new(Some(src)));
+            self.cand_recv.store(len, Ordering::Relaxed);
+            self.cand_sent.store(0, Ordering::Relaxed);
+        }
     }
 
     fn has_migration_candidate(&self) -> bool {
@@ -523,6 +547,8 @@ mod tests {
             .await
             .unwrap();
         let _ = st.recv_bytes().await.unwrap();
+        // M-1: the candidate is committed only on the post-decrypt (authenticated) path.
+        st.confirm_authenticated_source();
         assert!(
             st.has_migration_candidate(),
             "a new source must set a candidate"
@@ -571,11 +597,12 @@ mod tests {
             "no candidate => nothing to promote"
         );
 
-        // A frame from a new source sets the candidate.
+        // A frame from a new source sets the candidate (once it authenticates — M-1).
         tx.send((Bytes::from_static(b"hi"), new_addr))
             .await
             .unwrap();
         let _ = ust.recv_bytes().await.unwrap();
+        ust.confirm_authenticated_source();
         assert!(ust.has_migration_candidate());
 
         // Pre-switch: send_bytes goes to the OLD peer.
@@ -702,6 +729,47 @@ mod tests {
         assert!(
             n > 0,
             "data still flows on the original socket after a failed migrate"
+        );
+    }
+
+    /// M-1 (audit 2026-06-11): the migration candidate (the server's PATH_CHALLENGE target)
+    /// must be registered only from an AEAD-AUTHENTICATED frame, not from any CID-matched
+    /// datagram's raw source — else a spoofed source can clobber the single candidate slot and
+    /// misdirect / stall a legitimate migration. `recv_bytes` records but does not commit; the
+    /// post-decrypt `confirm_authenticated_source` commits.
+    #[tokio::test]
+    async fn candidate_is_set_only_from_an_authenticated_source() {
+        use tokio::sync::mpsc;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let st = UdpServerTransport::new(sock.clone(), peer, [5u8; 8], rx);
+
+        // A frame from a NEW source arrives but has not yet been AEAD-verified (pre-decrypt) —
+        // exactly what a spoofed CID-matched datagram looks like at recv time.
+        let other = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        tx.send((Bytes::from_static(b"pre-decrypt-source"), other))
+            .await
+            .unwrap();
+        let _ = st.recv_bytes().await.unwrap();
+        assert!(
+            !st.has_migration_candidate(),
+            "a pre-decrypt (possibly spoofed) source must NOT set the migration candidate (M-1)"
+        );
+
+        // Once that frame authenticates (AEAD-opens), the post-decrypt path commits it.
+        st.confirm_authenticated_source();
+        assert!(
+            st.has_migration_candidate(),
+            "an AEAD-authenticated new source sets the migration candidate"
         );
     }
 }
