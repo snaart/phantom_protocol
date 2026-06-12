@@ -169,7 +169,8 @@ impl SessionTransport for DemoLeg {
 
 fn decrypt_incoming(sess: &Session, bytes: &[u8]) -> Vec<u8> {
     let p = PhantomPacket::from_wire(bytes).expect("deserialize PhantomPacket");
-    sess.decrypt_packet(&p.header, &p.payload).expect("decrypt")
+    sess.decrypt_packet(&p.header, &p.payload, &[])
+        .expect("decrypt")
 }
 
 fn encrypt_outgoing(
@@ -181,7 +182,7 @@ fn encrypt_outgoing(
 ) -> Vec<u8> {
     let flags = PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::ENCRYPTED);
     let header = PacketHeader::new(sid, stream, seq, flags).with_epoch(sess.current_epoch());
-    let ct = sess.encrypt_packet(&header, payload).expect("encrypt");
+    let ct = sess.encrypt_packet(&header, payload, &[]).expect("encrypt");
     let packet = PhantomPacket::new(header, ct);
     packet.to_wire()
 }

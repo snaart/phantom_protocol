@@ -1537,7 +1537,9 @@ async fn send_app_data<T: SessionTransport>(
         }
         None => payload,
     };
-    let ciphertext = match crypto_session.encrypt_packet(&header, plaintext) {
+    // The data-plane packet carries no `extensions` (TLV headroom stays empty),
+    // so the AEAD AAD binds an empty extensions slice — matching the wire.
+    let ciphertext = match crypto_session.encrypt_packet(&header, plaintext, &[]) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: encrypt_packet failed: {}", e);
@@ -1590,7 +1592,7 @@ async fn send_window_update<T: SessionTransport>(
     )
     .with_epoch(crypto_session.current_epoch());
     let payload = new_window.to_be_bytes();
-    let ciphertext = match crypto_session.encrypt_packet(&header, &payload) {
+    let ciphertext = match crypto_session.encrypt_packet(&header, &payload, &[]) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: WINDOW_UPDATE encrypt failed: {}", e);
@@ -1625,7 +1627,7 @@ fn encrypt_path_validation(
     packet.header.flags = PacketFlags::new(flag_bits);
     packet.header.epoch = crypto_session.current_epoch();
     let plaintext = std::mem::take(&mut packet.payload);
-    let ciphertext = match crypto_session.encrypt_packet(&packet.header, &plaintext) {
+    let ciphertext = match crypto_session.encrypt_packet(&packet.header, &plaintext, &[]) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: PATH_VALIDATION encrypt failed: {}", e);
@@ -1724,7 +1726,11 @@ async fn handle_packet<T: SessionTransport>(
         // packet's epoch is one ahead, the peer rekeyed — trial-decrypt under
         // the next key and only commit the ratchet on AEAD success, so a forged
         // epoch can't desync us. Same-epoch packets take the ordinary path.
-        match crypto_recv.decrypt_packet_accepting_rekey(&packet.header, &packet.payload) {
+        match crypto_recv.decrypt_packet_accepting_rekey(
+            &packet.header,
+            &packet.payload,
+            &packet.extensions,
+        ) {
             Ok(pt) => pt,
             Err(e) => {
                 // Distinguish the two drop reasons for the security metrics: a
@@ -2044,7 +2050,7 @@ async fn handle_packet<T: SessionTransport>(
         .with_epoch(crypto_recv.current_epoch())
         .with_path_id(path_id);
         let ack_payload = sack.to_wire();
-        match crypto_recv.encrypt_packet(&ack_header, &ack_payload) {
+        match crypto_recv.encrypt_packet(&ack_header, &ack_payload, &[]) {
             Ok(ct) => {
                 let ack_packet = PhantomPacket::new(ack_header, ct);
                 ack_buf.clear();
@@ -2800,7 +2806,7 @@ mod tests {
             "expected ENCRYPTED flag on application data"
         );
         let plain = server_session
-            .decrypt_packet(&pkt.header, &pkt.payload)
+            .decrypt_packet(&pkt.header, &pkt.payload, &[])
             .expect("decrypt application data");
         // Reliable app frames carry a 4-byte gap-free stream_offset prefix (A.5);
         // strip it so callers compare against the raw application payload.
@@ -2833,7 +2839,7 @@ mod tests {
         pt.extend_from_slice(&sequence.to_be_bytes());
         pt.extend_from_slice(payload);
         let ct = server_session
-            .encrypt_packet(&header, &pt)
+            .encrypt_packet(&header, &pt, &[])
             .expect("encrypt reply");
         let packet = PhantomPacket::new(header, ct);
         packet.to_wire()
@@ -3163,7 +3169,7 @@ mod tests {
         pt.extend_from_slice(&stream_offset.to_be_bytes());
         pt.extend_from_slice(payload);
         let ciphertext = client_session
-            .encrypt_packet(&header, &pt)
+            .encrypt_packet(&header, &pt, &[])
             .expect("encrypt_packet");
         let packet = PhantomPacket::new(header, ciphertext);
         packet.to_wire()
@@ -3358,7 +3364,7 @@ mod tests {
         pt.extend_from_slice(&stream_offset.to_be_bytes());
         pt.extend_from_slice(payload);
         let ciphertext = client_session
-            .encrypt_packet(&header, &pt)
+            .encrypt_packet(&header, &pt, &[])
             .expect("encrypt_packet");
         PhantomPacket::new(header, ciphertext).to_wire()
     }
@@ -3658,7 +3664,7 @@ mod tests {
         )
         .with_epoch(acker_session.current_epoch());
         let ct = acker_session
-            .encrypt_packet(&header, payload)
+            .encrypt_packet(&header, payload, &[])
             .expect("encrypt ack");
         PhantomPacket::new(header, ct).to_wire()
     }
@@ -4006,7 +4012,7 @@ mod tests {
         assert!(ack_pkt.header.flags.contains(PacketFlags::ACK));
         // Decrypt under the sender's session (shared keys) to read the SACK.
         let plain = sender_session
-            .decrypt_packet(&ack_pkt.header, &ack_pkt.payload)
+            .decrypt_packet(&ack_pkt.header, &ack_pkt.payload, &[])
             .expect("decrypt emitted ack");
         let sack = crate::transport::sack::Sack::from_wire(&plain).expect("decode emitted sack");
         assert_eq!(sack.largest_acked, data_seq, "SACK must ack the data seq");
@@ -4126,7 +4132,7 @@ mod tests {
         let header = PacketHeader::new(session_id, stream_id, 0, PacketFlags::new(flag_bits))
             .with_epoch(client_session.current_epoch());
         let ciphertext = client_session
-            .encrypt_packet(&header, &bundle)
+            .encrypt_packet(&header, &bundle, &[])
             .expect("encrypt bundle");
         let v2 = PhantomPacket::new(header, ciphertext);
 
@@ -4204,7 +4210,7 @@ mod tests {
             )
             .with_epoch(client_session.current_epoch());
             let ct = client_session
-                .encrypt_packet(&h, &bundle)
+                .encrypt_packet(&h, &bundle, &[])
                 .expect("encrypt bundle");
             PhantomPacket::new(h, ct)
         };
@@ -4449,7 +4455,9 @@ mod tests {
             let mut pt = Vec::with_capacity(4 + payload.len());
             pt.extend_from_slice(&seq.to_be_bytes());
             pt.extend_from_slice(&payload);
-            let ct = client_inner.encrypt_packet(&header, &pt).expect("encrypt");
+            let ct = client_inner
+                .encrypt_packet(&header, &pt, &[])
+                .expect("encrypt");
             // Bound the send so a torn-down (or wedged) transport can't hang the
             // test: a closed channel or a stalled reader both mean the flood is
             // no longer absorbed — i.e. the session is being torn down.
@@ -4602,7 +4610,7 @@ mod tests {
         // The control frame's sequence comes from the stream's own send space —
         // distinct from any data packet so the AEAD nonce never repeats.
         let pt = client_session
-            .decrypt_packet(&pv2.header, &pv2.payload)
+            .decrypt_packet(&pv2.header, &pv2.payload, &[])
             .expect("decrypt WINDOW_UPDATE");
         assert_eq!(pt.len(), 4);
         let announced = u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]);
@@ -4689,7 +4697,7 @@ mod tests {
             // Decrypt under the SERVER role so the per-direction key
             // matches the client-side encrypt.
             let plaintext = _server_session
-                .decrypt_packet(&v2.header, &v2.payload)
+                .decrypt_packet(&v2.header, &v2.payload, &[])
                 .expect("decrypt");
             // Reliable frames carry a 4-byte stream_offset prefix (A.5); the tag is
             // the application payload after it.
@@ -4735,7 +4743,7 @@ mod tests {
             .with_epoch(client_session.current_epoch())
             .with_path_id(path_id);
         let ciphertext = client_session
-            .encrypt_packet(&header, &payload)
+            .encrypt_packet(&header, &payload, &[])
             .expect("encrypt challenge");
         let v2 = PhantomPacket::new(header, ciphertext);
 

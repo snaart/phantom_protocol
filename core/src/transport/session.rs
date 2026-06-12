@@ -574,11 +574,12 @@ impl Session {
         &self,
         header: &PacketHeader,
         ciphertext: &[u8],
+        extensions: &[u8],
     ) -> Result<Vec<u8>, CoreError> {
         // Fast paths that need no epoch transition (no lock).
         let cur = self.current_epoch();
         if header.epoch == cur {
-            return self.decrypt_packet(header, ciphertext);
+            return self.decrypt_packet(header, ciphertext, extensions);
         }
         if header.epoch < cur {
             return Err(CoreError::CryptoError(format!(
@@ -597,7 +598,7 @@ impl Session {
         let cur = self.current_epoch();
         if header.epoch == cur {
             drop(_rekey);
-            return self.decrypt_packet(header, ciphertext);
+            return self.decrypt_packet(header, ciphertext, extensions);
         }
         if header.epoch < cur {
             return Err(CoreError::CryptoError(format!(
@@ -616,11 +617,12 @@ impl Session {
         // Candidate key `steps` epochs ahead — derived but NOT installed.
         let (mut final_secret, final_crypto) = self.derive_forward_crypto(steps)?;
         let nonce = Self::build_packet_nonce(final_crypto.nonce_prefix(), header);
-        let header_bytes = header.to_wire();
         // AEAD gate: a forged epoch bump fails here and we return without
         // committing — the live epoch is untouched. Zero the (valid, sensitive)
         // candidate secret we are not going to install.
-        let plaintext = match final_crypto.decrypt_with_nonce(nonce, &header_bytes, ciphertext) {
+        let plaintext = match Self::with_packet_aad(header, extensions, |aad| {
+            final_crypto.decrypt_with_nonce(nonce, aad, ciphertext)
+        }) {
             Ok(pt) => pt,
             Err(e) => {
                 final_secret.zeroize();
@@ -855,22 +857,51 @@ impl Session {
         n
     }
 
+    /// Run `f` with the AEAD AAD for a packet: the 47-byte header wire image
+    /// (`PacketHeader::to_wire`) followed by the packet's `extensions` TLV.
+    ///
+    /// T4.1 — `extensions` (the forward-compat TLV headroom) is authenticated
+    /// here, closing the prior malleability where it sat *outside* the AAD and an
+    /// on-path attacker could rewrite the trailing bytes without breaking the tag.
+    /// When `extensions` is empty — the data-plane default — the AAD is exactly
+    /// the 47-byte header image and no allocation occurs, so the hot path stays
+    /// alloc-free.
+    #[inline]
+    fn with_packet_aad<R>(
+        header: &PacketHeader,
+        extensions: &[u8],
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> R {
+        let header_bytes = header.to_wire();
+        if extensions.is_empty() {
+            f(&header_bytes)
+        } else {
+            let mut aad = Vec::with_capacity(header_bytes.len() + extensions.len());
+            aad.extend_from_slice(&header_bytes);
+            aad.extend_from_slice(extensions);
+            f(&aad)
+        }
+    }
+
     /// Encrypt a packet payload.
     ///
     /// The AEAD nonce is `prefix || packet_number` (① — Phase 4), derived from the
     /// authenticated header rather than an internal counter, so a failed peer
     /// decrypt never desyncs the receiver. The AAD is the 47-byte wire image of the
     /// header ([`PacketHeader::to_wire`]) — which still binds `epoch` / `stream_id`
-    /// / `path_id` — so any wire-level mutation invalidates the tag.
+    /// / `path_id` — followed by the packet's `extensions` TLV (T4.1), so any
+    /// wire-level mutation of the header *or* the extensions invalidates the tag.
     pub fn encrypt_packet(
         &self,
         header: &PacketHeader,
         plaintext: &[u8],
+        extensions: &[u8],
     ) -> Result<Vec<u8>, CoreError> {
         let crypto = self.crypto.load();
         let nonce = Self::build_packet_nonce(crypto.nonce_prefix(), header);
-        let header_bytes = header.to_wire();
-        crypto.encrypt_with_nonce(nonce, &header_bytes, plaintext)
+        Self::with_packet_aad(header, extensions, |aad| {
+            crypto.encrypt_with_nonce(nonce, aad, plaintext)
+        })
     }
 
     /// Decrypt a packet payload. Performs AEAD verify + per-direction
@@ -886,11 +917,13 @@ impl Session {
         &self,
         header: &PacketHeader,
         ciphertext: &[u8],
+        extensions: &[u8],
     ) -> Result<Vec<u8>, CoreError> {
         let crypto = self.crypto.load();
         let nonce = Self::build_packet_nonce(crypto.nonce_prefix(), header);
-        let header_bytes = header.to_wire();
-        let plaintext = crypto.decrypt_with_nonce(nonce, &header_bytes, ciphertext)?;
+        let plaintext = Self::with_packet_aad(header, extensions, |aad| {
+            crypto.decrypt_with_nonce(nonce, aad, ciphertext)
+        })?;
 
         // Sliding-window guard. ReplayWindow keys on `(stream_id, sequence)`
         // only — the `epoch` / `path_id` fields do NOT contribute to the

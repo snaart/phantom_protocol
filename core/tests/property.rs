@@ -225,8 +225,8 @@ proptest! {
             PacketFlags::new(PacketFlags::ENCRYPTED),
         )
         .with_epoch(n);
-        let ct = client.encrypt_packet(&header, b"chain").expect("encrypt");
-        let pt = server.decrypt_packet(&header, &ct).expect("decrypt at matched epoch");
+        let ct = client.encrypt_packet(&header, b"chain", &[]).expect("encrypt");
+        let pt = server.decrypt_packet(&header, &ct, &[]).expect("decrypt at matched epoch");
         prop_assert_eq!(pt, b"chain".to_vec());
     }
 
@@ -249,9 +249,9 @@ proptest! {
             PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::REKEY),
         )
         .with_epoch(steps);
-        let ct = client.encrypt_packet(&header, b"forward").expect("encrypt");
+        let ct = client.encrypt_packet(&header, b"forward", &[]).expect("encrypt");
         let pt = server
-            .decrypt_packet_accepting_rekey(&header, &ct)
+            .decrypt_packet_accepting_rekey(&header, &ct, &[])
             .expect("accepting decrypt follows a bounded forward step");
         prop_assert_eq!(pt, b"forward".to_vec());
         prop_assert_eq!(server.current_epoch(), steps);
