@@ -117,9 +117,22 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     NAT-rebind and a deliberate `migrate()` are recovered identically — the rebind's upload is
     delivered and the session survives, but autonomous downstream re-pointing on path 0 is a
     documented planned fix (the candidate is already registered only from an authenticated source).
+- **Crypto / transport hygiene (post-audit Tier 5).** No wire-format change.
+  - *Rekey margin (T5.3):* the automatic-rekey soft watermark drops from `2^47` to `2^32` for
+    clean CFRG / QUIC standards alignment (defense-in-depth; far above any realistic session).
+  - *SACK clamp (T5.4):* a SACK's `largest_acked` is clamped to the highest stream-offset
+    actually sent, so an authenticated peer can't inflate it to force a cwnd-bypassing
+    retransmit storm against fresh in-flight segments.
+  - *AEAD recv counter (T5.5):* a failed (forged) AEAD open no longer advances the per-direction
+    recv invocation counter toward the `NonceExhausted` ceiling — only an authenticated open counts.
 
 ### Changed
 
+- **MSRV raised to Rust 1.93** (from 1.75). The post-quantum dependency chain (`pkcs8 0.11` via the
+  ML-KEM / ML-DSA / signature crates) requires Cargo's `edition2024` feature (stable from Rust 1.85),
+  so the prior 1.75 claim was already unenforceable. 1.93 is now declared in `rust-version` /
+  `.clippy.toml` and enforced by a new `cargo check (MSRV 1.93)` CI gate; the temporary
+  `async-lock < 3.4` MSRV cap is removed (now tracks 3.4.x).
 - **Target threat model recorded (`SECURITY.md`):** TLS-like guarantees **plus** resistance to
   traffic-analysis linkability (unobservability). Header protection (encrypting the packet number
   + variable header fields) and connection-ID rotation are a core pre-1.0 requirement for the next

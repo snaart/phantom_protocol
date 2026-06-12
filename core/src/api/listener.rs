@@ -531,7 +531,7 @@ async fn run_acceptor(
         // DOS-2: periodically drop expired reputation entries so the bounded map
         // stays small under churn (the cap already prevents unbounded growth).
         accept_count = accept_count.wrapping_add(1);
-        if accept_count % 256 == 0 {
+        if accept_count.is_multiple_of(256) {
             hs.gc_reputation();
         }
         // Bound concurrent in-flight handshakes. The permit is held for the

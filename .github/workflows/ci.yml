@@ -81,6 +81,27 @@ jobs:
       # back down. Runs on the default (no-otel) atomics path.
       - run: cargo test --manifest-path core/Cargo.toml --test observability_e2e
 
+  # MSRV gate (M-8): the crate documents a Rust 1.93 MSRV (rust-version /
+  # .clippy.toml / docs/policy/versioning.md) but nothing enforced it. Pin the
+  # toolchain to 1.93 and `cargo check` the configurations that claim it — the
+  # default lib and the embedded/no-std bare-metal path — so a dependency that
+  # bumps its MSRV past 1.93 can't silently break an integrator. (The MSRV was
+  # raised from 1.75: pkcs8 0.11 via the PQ crates needs edition2024 / Rust 1.85.)
+  msrv:
+    name: cargo check (MSRV 1.93)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned action; 1.93 via input
+        with:
+          toolchain: "1.93"
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "."
+      - run: cargo +1.93 check --manifest-path core/Cargo.toml --lib --locked
+      - run: cargo +1.93 check --manifest-path core/Cargo.toml --lib --no-default-features --features embedded,no-std --target thumbv7em-none-eabihf --locked
+
   doc:
     name: cargo doc
     runs-on: ubuntu-latest
