@@ -42,7 +42,7 @@ ML_DSA_PK_LEN = 1952
 ML_DSA_SIG_LEN = 3309
 CLASSICAL_PK_LEN = 32
 PROTOCOL_VARIANT = b"phantom-default-1"
-PROTOCOL_VERSION = 2  # bumped 1->2: H2 transcript-signs early_data_accepted + HS-03 adds resumption_binder
+PROTOCOL_VERSION = 3  # bumped 2->3 (T4.3): ServerHello server_key_package -> 32-byte server_nonce
 WIRE_VERSION = 3
 
 
@@ -232,7 +232,7 @@ def enc_client_hello(w: BorshWriter, v):
 
 def dec_server_hello(r: BorshReader):
     return {
-        "server_key_package": dec_key_package(r),
+        "server_nonce": r.fixed(32),
         "ciphertext": dec_ciphertext(r),
         "server_verify_key": dec_verify_key(r),
         "signature": dec_signature(r),
@@ -242,7 +242,7 @@ def dec_server_hello(r: BorshReader):
 
 
 def enc_server_hello(w: BorshWriter, v):
-    enc_key_package(w, v["server_key_package"])
+    w.fixed(v["server_nonce"])
     enc_ciphertext(w, v["ciphertext"])
     enc_verify_key(w, v["server_verify_key"])
     enc_signature(w, v["signature"])
@@ -424,6 +424,7 @@ def client_hello_full():
 def server_hello():
     v = borsh_roundtrip("server_hello.bin", dec_server_hello, enc_server_hello)
     check(v["early_data_accepted"] is True, "server_hello accepted=true")
+    check(v["server_nonce"] == arr32(0x70), "server_hello server_nonce filler (T4.3)")
     check(v["session_id"] == arr32(0xE0), "server_hello session_id filler")
     check(v["ciphertext"]["ml_kem_ct"] == pat(0x40, ML_KEM_CT_LEN), "server_hello ct filler")
     check(v["signature"]["ml_dsa_sig"] == pat(0x80, ML_DSA_SIG_LEN), "server_hello sig filler")

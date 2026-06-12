@@ -26,17 +26,19 @@ that sees any other value drops the frame (packets) or rejects the handshake
 | Constant | Value | Source | Where it lives on the wire |
 | --- | --- | --- | --- |
 | `WIRE_VERSION` | `3` | `core/src/transport/types.rs:71` | `PacketHeader.version` byte (first byte of the 47-byte header — § 4.2) |
-| `PROTOCOL_VERSION` | `2` | `core/src/transport/handshake.rs:56` | `ClientHello.version`, transcript-bound |
+| `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs:56` | `ClientHello.version`, transcript-bound |
 
 `WIRE_VERSION` is `3`: it went `1 → 2` when the packet codec moved from
 `alkahest` to the explicit big-endian layout in § 4.2, then `2 → 3` (Phase 4 /
 P4.0) when the AEAD packet identity became a single **per-direction monotonic
 `u64` packet number** — the header dropped the dead `ack_delay` field and widened
 `sequence: u32` to `packet_number: u64` (45 → 47 bytes; § 4.2 / § 5).
-`PROTOCOL_VERSION` is `2` (bumped
+`PROTOCOL_VERSION` is `3` (bumped
 `1 → 2` when the signed transcript began covering the 0-RTT verdict
 `early_data_accepted` (H2) and `ClientHello` gained the `resumption_binder`
-proof-of-possession field (HS-03); a v1 ↔ v2 handshake cannot interoperate
+proof-of-possession field (HS-03); `2 → 3` (T4.3) when `ServerHello`'s
+`server_key_package` was replaced by a 32-byte `server_nonce`, changing the
+signed-transcript content; handshakes across these versions cannot interoperate
 because the signed transcript content differs). They exist so that:
 
 - a tampered frame / hello that flips the byte is rejected up front
@@ -468,7 +470,7 @@ Source: `core/src/transport/handshake.rs:75-106`.
 
 ```rust
 pub struct ServerHello {
-    pub server_key_package:   HybridKeyPackage,  // ephemeral; bound into transcript for freshness
+    pub server_nonce:         [u8; 32],          // server-contributed, transcript-bound (T4.3)
     pub ciphertext:           HybridCiphertext,  // KEM encapsulation
     pub server_verify_key:    HybridVerifyingKey,// pinned by client (Invariant 1)
     pub signature:            HybridSignature,   // over transcript hash
@@ -477,9 +479,13 @@ pub struct ServerHello {
 }
 ```
 
-Source: `core/src/transport/handshake.rs:137-155`. `server_key_package` is an
-ephemeral hybrid KEM public bound into the transcript hash for freshness; the
-corresponding secret is discarded (no second KEM round trip today).
+Source: `core/src/transport/handshake.rs`. `server_nonce` is a 32-byte
+server-contributed value bound into the transcript hash, giving the server a
+session-specific, tamper-evident contribution beyond `session_id` + the client
+nonce. **T4.3:** it replaced the former `server_key_package` — a full ~1184 B
+ephemeral hybrid KEM public key whose secret was discarded (the protocol runs no
+second KEM round trip), saving ~1.1 KB on every `ServerHello`. A future
+second-KEM ring could repurpose this slot.
 
 ### 6.4 `HelloRetryRequest` (borsh)
 
@@ -501,12 +507,14 @@ field, including the `early_data` ciphertext) and **leads** with the build-side
 
 ```rust
 struct HandshakeTranscript<'a> {
-    protocol_variant:   &'a [u8],            // leading field — binds the build variant
-    client_hello:       &'a ClientHello,     // whole hello, early_data included
-    server_key_package: &'a HybridKeyPackage,
-    ciphertext:         &'a HybridCiphertext,
-    server_verify_key:  &'a HybridVerifyingKey,
-    session_id:         &'a [u8; 32],
+    protocol_variant:    &'a [u8],            // leading field — binds the build variant
+    client_hello:        &'a ClientHello,     // whole hello, early_data included
+    server_nonce:        &'a [u8; 32],        // server-contributed (T4.3)
+    ciphertext:          &'a HybridCiphertext,
+    server_verify_key:   &'a HybridVerifyingKey,
+    session_id:          &'a [u8; 32],
+    early_data_accepted: bool,                // 0-RTT verdict, signed (Invariant 9); LAST so
+                                              // protocol_variant stays the leading field
 }
 ```
 
@@ -716,9 +724,9 @@ three messages — it leaves the frozen wire vectors (§11) untouched.
   `path_id` becomes safely reusable once its path is retired.
 - `PhantomPacket.extensions`: TLV headroom, empty today. A decoder ignores it;
   future amendments add fields here without a layout change.
-- `ServerHello.server_key_package`: ephemeral hybrid KEM public bound into the
-  transcript for freshness; the secret half is discarded (no second KEM round
-  trip yet).
+- `ServerHello.server_nonce`: a 32-byte server-contributed, transcript-bound
+  value (T4.3, replacing the old discarded ~1184 B ephemeral `server_key_package`).
+  A future second-KEM ring could repurpose this slot for real key material.
 - `PacketFlags 0x1000 … 0x8000`: reserved bits.
 
 A future protocol revision that needs more than this headroom increments
