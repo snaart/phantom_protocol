@@ -53,7 +53,7 @@ pub const PROTOCOL_VARIANT: &[u8] = b"phantom-fips-1";
 /// handshake transcript. Pinned to one value — the protocol is not negotiated
 /// (pre-1.0, no users). It is a tamper-check anchor and a hook for a future,
 /// deliberate version increment.
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 
 /// Marker leading a [`ServerReject`] frame. The client disambiguates the three
 /// possible server replies by trial-deserialization; the marker (plus the
@@ -330,8 +330,13 @@ pub(crate) enum UdpAdmit {
 /// Server hello message (response to ClientHello)
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct ServerHello {
-    /// Server's hybrid public key
-    pub server_key_package: HybridKeyPackage,
+    /// Server-contributed 32-byte nonce (T4.3). Replaces the former ~1184 B
+    /// `server_key_package` — a full ML-KEM key package whose KEM secret was discarded
+    /// (the protocol runs no second KEM round). It is bound into the signed transcript,
+    /// so it remains a session-specific, tamper-evident server contribution beyond
+    /// `session_id` + the client nonce; a future second-KEM ring could repurpose this
+    /// slot. Saves ~1.1 KB on every ServerHello.
+    pub server_nonce: [u8; 32],
     /// Encapsulated secret (ciphertext for client)
     pub ciphertext: HybridCiphertext,
     /// Server's hybrid verifying key
@@ -361,7 +366,7 @@ pub struct ServerHello {
 struct HandshakeTranscript<'a> {
     protocol_variant: &'a [u8],
     client_hello: &'a ClientHello,
-    server_key_package: &'a HybridKeyPackage,
+    server_nonce: &'a [u8; 32],
     ciphertext: &'a HybridCiphertext,
     server_verify_key: &'a HybridVerifyingKey,
     session_id: &'a [u8; 32],
@@ -769,12 +774,16 @@ impl HandshakeServer {
             }
         };
 
-        // Generate a per-session ephemeral hybrid KEM keypair. The public half
-        // is bound into the transcript signature (defense-in-depth: commits
-        // the server to a session-specific value beyond `session_id` and the
-        // client's nonce). The secret half is intentionally discarded — the
-        // current protocol does not perform a second KEM round trip using it.
-        let (_ephemeral_kem_secret, ephemeral_kem_public) = HybridSecretKey::generate();
+        // Server-contributed 32-byte nonce (T4.3). Bound into the transcript signature so
+        // the server commits to a session-specific value beyond `session_id` + the client
+        // nonce. Replaces the former discarded ephemeral KEM key package (~1.1 KB).
+        let mut server_nonce = [0u8; 32];
+        if let Err(e) = getrandom::getrandom(&mut server_nonce) {
+            return self.fail_and_reinsert(
+                &resumed,
+                HandshakeResponse::Fail(HandshakeError::RngError(e.to_string())),
+            );
+        }
 
         let session_id_bytes = derive_session_id(&shared_secret, &client_hello.nonce);
         let session_id = SessionId::from_bytes(session_id_bytes);
@@ -785,7 +794,7 @@ impl HandshakeServer {
         let transcript = HandshakeTranscript {
             protocol_variant: PROTOCOL_VARIANT,
             client_hello,
-            server_key_package: &ephemeral_kem_public,
+            server_nonce: &server_nonce,
             ciphertext: &ciphertext,
             server_verify_key: &self.verifying_key,
             session_id: &session_id_bytes,
@@ -798,7 +807,7 @@ impl HandshakeServer {
         let signature = self.signing_key.sign(&transcript_hash);
 
         let server_hello = ServerHello {
-            server_key_package: ephemeral_kem_public,
+            server_nonce,
             ciphertext,
             server_verify_key: self.verifying_key.clone(),
             signature,
@@ -1136,7 +1145,7 @@ impl HandshakeClient {
         let transcript = HandshakeTranscript {
             protocol_variant: PROTOCOL_VARIANT,
             client_hello,
-            server_key_package: &server_hello.server_key_package,
+            server_nonce: &server_hello.server_nonce,
             ciphertext: &server_hello.ciphertext,
             server_verify_key: &server_hello.server_verify_key,
             session_id: &server_hello.session_id,
@@ -1483,7 +1492,7 @@ mod tests {
         let transcript = HandshakeTranscript {
             protocol_variant: PROTOCOL_VARIANT,
             client_hello: &client_hello,
-            server_key_package: &key_package,
+            server_nonce: &arr32(0x70),
             ciphertext: &ciphertext,
             server_verify_key: &verify_key,
             session_id: &session_id,
@@ -1615,6 +1624,50 @@ mod tests {
             HandshakeResponse::Success(..) => {}
             other => panic!("expected success, got {other:?}"),
         }
+    }
+
+    /// T4.3: `server_key_package` (a full ~1184 B ML-KEM key package whose KEM secret
+    /// was discarded) is replaced by a 32-byte `server_nonce`. Its sole purpose is to be
+    /// a server-contributed, transcript-bound, session-specific value — so flipping it on
+    /// the wire must break the client's transcript-signature check (Invariants 7/10),
+    /// exactly as the discarded key package did. The positive control rules out a broken
+    /// setup masking the negative assertion.
+    #[tokio::test]
+    async fn server_nonce_is_transcript_bound() {
+        let server = HandshakeServer::new().expect("HandshakeServer::new");
+        let client = HandshakeClient::new().expect("HandshakeClient::new");
+        let client_ip = "127.0.0.1".parse().expect("parse client_ip");
+
+        let hello = client.create_client_hello();
+        let cookie = match server.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(r) => r.cookie.expect("cookie"),
+            _ => panic!("expected retry"),
+        };
+        let mut hello_retry = hello.clone();
+        hello_retry.cookie = Some(cookie);
+        let server_hello = match server.process_client_hello(&hello_retry, 0, client_ip) {
+            HandshakeResponse::Success(h, _s, _) => h,
+            _ => panic!("expected success"),
+        };
+
+        // Positive control: the untampered `server_nonce` verifies + the handshake completes.
+        assert!(
+            client
+                .process_server_hello(&hello_retry, &server_hello, Some(server.verifying_key()))
+                .is_ok(),
+            "untampered server_nonce must verify"
+        );
+
+        // Negative: a flipped `server_nonce` byte makes the recomputed transcript hash
+        // diverge from what the server signed → signature check fails (before decapsulate).
+        let mut tampered = server_hello.clone();
+        tampered.server_nonce[0] ^= 0xFF;
+        assert!(
+            client
+                .process_server_hello(&hello_retry, &tampered, Some(server.verifying_key()))
+                .is_err(),
+            "a flipped server_nonce byte must fail the transcript-signature check"
+        );
     }
 
     #[tokio::test]
