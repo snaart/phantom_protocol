@@ -22,15 +22,26 @@ Phantom Protocol uses GitHub Security Advisories for public CVE coordination.
 
 ## Threat model (summary)
 
-Phantom Protocol is a post-quantum-secure L4/L6 transport. The full threat model
-will live in `docs/security/threat-model.md` (in preparation). At a glance:
+Phantom Protocol is a post-quantum-secure L4/L6 transport. The full STRIDE / LINDDUN
+analysis lives in `docs/security/threat-model.md`. **Target threat model: TLS-like
+guarantees _plus_ resistance to traffic-analysis linkability (unobservability)** — header
+protection is a core pre-1.0 requirement, not a deferred hardening. At a glance:
 
-- **In scope:** authenticated key agreement, confidentiality and integrity of
-  application data after handshake, downgrade resistance, DoS-resistance during
-  handshake (cookie + optional PoW), anti-DPI obfuscation (FakeTLS).
-- **Out of scope:** non-repudiation, traffic analysis (timing/size correlation),
-  endpoint compromise, compromise of long-lived server signing keys, supply-chain
-  attacks against the build toolchain.
+- **In scope:** authenticated key agreement; confidentiality and integrity of application
+  data after handshake; downgrade resistance; DoS-resistance, including the
+  pre-authentication PhantomUDP surface (a stateless address-validation cookie is required
+  before any per-connection state, with bounded demux / reorder buffers and optional PoW);
+  outer anti-DPI obfuscation on the FakeTLS leg; and **resistance to passive linkability of a
+  connection across network changes** — the committed pre-1.0 mechanism is QUIC-style header
+  protection (encrypting the packet number and the variable header fields) plus
+  connection-ID rotation, landing in the next wire-format revision.
+- **Currently a known gap (being closed):** the on-wire header is presently cleartext, so a
+  passive observer can link a connection by its stable connection-ID and classify each
+  packet's purpose. The transport is functional but **linkable** until header protection
+  ships; see `docs/protocol/PROTOCOL.md` §12.5.
+- **Out of scope:** non-repudiation; full traffic-shape unobservability (timing / size
+  correlation — length-hiding padding is not yet wired); endpoint compromise; compromise of
+  long-lived server signing keys; supply-chain attacks against the build toolchain.
 
 ## Cryptographic primitives
 
