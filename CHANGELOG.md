@@ -94,6 +94,27 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     rejected by a non-allocating structural pre-check before `borsh::from_slice`, removing the
     ~45-byte → 1 MiB allocate+memset amplifier; fragment reassembly is insert-if-absent.
   - The always-on `security_invariants` negative-test suite is now part of the CI `test` gate.
+- **Data-plane authentication-ordering (post-audit Tier 2).** Closes the authentication-ordering
+  and migration-integrity gaps found in the 2026-06-11 audit. No wire-format or crypto change.
+  - *Forged FIN (M-2):* **all** unencrypted post-handshake packets are now dropped — including an
+    empty-payload one — so a forged unencrypted `FIN` can no longer tear down an `open_stream()`
+    stream without AEAD verification (Invariant 2 strengthened).
+  - *Migration candidate (M-1):* the migration candidate (the server's `PATH_CHALLENGE` target)
+    is registered only from an **AEAD-authenticated** source, so a spoofed CID-matched datagram
+    can no longer clobber the slot and stall a legitimate migration.
+  - *Per-IP DoS reputation (M-4, M-5):* a pre-cookie protocol-variant / version mismatch no
+    longer escalates a (possibly spoofed) IP's PoW difficulty, and the per-IP difficulty
+    reduction for "ticket holders" now requires a **valid** resume (cached ticket + verified
+    binder), not mere presence of a `resume_session_id`.
+  - *Injected `ServerReject`:* an injected reject during a healthy handshake no longer aborts it —
+    the client remembers it and keeps waiting for a valid `ServerHello`.
+
+### Changed
+
+- **Target threat model recorded (`SECURITY.md`):** TLS-like guarantees **plus** resistance to
+  traffic-analysis linkability (unobservability). Header protection (encrypting the packet number
+  + variable header fields) and connection-ID rotation are a core pre-1.0 requirement for the next
+  wire revision; the current cleartext header (linkable) is documented as a known gap being closed.
 
 ## [0.1.1] - 2026-06-09
 
