@@ -476,7 +476,9 @@ mod tests {
     // at zero so parallel agents in adjacent modules can't conflict.
 
     use crate::api::session::{ConnectionState, PhantomSession};
-    use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+    use crate::transport::handshake::{
+        ClientHello, HandshakeResponse, HandshakeServer, ServerReply,
+    };
     use crate::transport::types::{
         PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
     };
@@ -488,13 +490,17 @@ mod tests {
         server_session: &crate::transport::session::Session,
         bytes: &[u8],
     ) -> Vec<u8> {
-        let pkt = PhantomPacket::from_wire(bytes).expect("deserialize PhantomPacket");
+        // The peer pump applies header protection (T4.6); unmask with this side's
+        // recv HP key (== the sender's send HP key) before reading.
+        let pkt = server_session
+            .parse_protected(bytes)
+            .expect("parse header-protected PhantomPacket");
         assert!(
             pkt.header.flags.contains(PacketFlags::ENCRYPTED),
             "expected ENCRYPTED flag on application data"
         );
         let plain = server_session
-            .decrypt_packet(&pkt.header, &pkt.payload)
+            .decrypt_packet(&pkt.header, &pkt.payload, &[])
             .expect("decrypt application data");
         // Reliable app frames carry a 4-byte gap-free stream_offset prefix (A.5);
         // strip it so callers compare against the raw application payload.
@@ -529,10 +535,13 @@ mod tests {
         pt.extend_from_slice(&sequence.to_be_bytes());
         pt.extend_from_slice(payload);
         let ct = server_session
-            .encrypt_packet(&header, &pt)
+            .encrypt_packet(&header, &pt, &[])
             .expect("encrypt reply");
         let packet = PhantomPacket::new(header, ct);
-        packet.to_wire()
+        // Apply header protection so the peer pump's parse_protected unmasks it.
+        server_session
+            .protect_packet(&packet)
+            .expect("header protection")
     }
 
     /// `MockWriter` wrapper that tees every byte through to a side recorder
@@ -621,8 +630,11 @@ mod tests {
                 let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
                 match response {
                     HandshakeResponse::Retry(retry) => {
-                        let retry_bytes =
-                            borsh::to_vec(&retry).expect("serialize HelloRetryRequest");
+                        // T4.4: the client dispatches on the ServerReply discriminant
+                        // byte, so the server must frame its reply the same way.
+                        let retry_bytes = ServerReply::Retry(retry)
+                            .to_wire()
+                            .expect("serialize retry");
                         tokio::time::timeout(
                             Duration::from_secs(5),
                             server_leg.send_frame(&retry_bytes),
@@ -641,8 +653,9 @@ mod tests {
                         let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
                         match resp2 {
                             HandshakeResponse::Success(server_hello, session, _) => {
-                                let server_hello_bytes =
-                                    borsh::to_vec(&server_hello).expect("serialize ServerHello");
+                                let server_hello_bytes = ServerReply::Hello(server_hello)
+                                    .to_wire()
+                                    .expect("serialize ServerHello");
                                 tokio::time::timeout(
                                     Duration::from_secs(5),
                                     server_leg.send_frame(&server_hello_bytes),
@@ -656,8 +669,9 @@ mod tests {
                         }
                     }
                     HandshakeResponse::Success(server_hello, session, _) => {
-                        let server_hello_bytes =
-                            borsh::to_vec(&server_hello).expect("serialize ServerHello");
+                        let server_hello_bytes = ServerReply::Hello(server_hello)
+                            .to_wire()
+                            .expect("serialize ServerHello");
                         tokio::time::timeout(
                             Duration::from_secs(5),
                             server_leg.send_frame(&server_hello_bytes),

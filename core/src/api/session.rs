@@ -9,9 +9,7 @@ use crate::errors::CoreError;
 use crate::observability::attrs::{AeadAlgorithm, ReplayReason};
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
-use crate::transport::handshake::{
-    HandshakeClient, HelloRetryRequest, ServerHello, ServerReject, EARLY_DATA_MAX_LEN,
-};
+use crate::transport::handshake::{HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN};
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::packet_coalescer_codec::unwrap_coalesced_packet;
 use crate::transport::path_validation_codec::build_path_validation_packet;
@@ -739,59 +737,64 @@ async fn run_client_handshake<T: SessionTransport>(
                 }
             };
 
-            // The reply is one of three shapes: a `ServerHello` (success), a
-            // `HelloRetryRequest` (cookie/PoW demand), or a `ServerReject`. Try the success
-            // shape first — a retry/reject blob is far too small to deserialize as a multi-KiB
-            // ServerHello, so the disambiguation is unambiguous.
-            if let Ok(sh) = borsh::from_slice::<ServerHello>(&resp) {
-                let (session, accepted) =
-                    handshake.process_server_hello(&hello, &sh, Some(expected_server_key))?;
-                return Ok((session, accepted));
-            } else if let Ok(reject) = borsh::from_slice::<ServerReject>(&resp) {
-                // The marker guard keeps a same-sized non-reject blob from being mistaken for a
-                // reject. We do NOT auto-downgrade to `reject.supported_version` (Invariant 7).
-                if reject.has_marker() {
-                    reject_rounds += 1;
-                    if reject_rounds > MAX_CLIENT_REJECT_ROUNDS {
+            // T4.4: the reply leads with an explicit discriminant byte
+            // (`[kind] ‖ borsh(body)`); dispatch on it instead of trial-deserializing by
+            // size. An unknown kind / malformed body is a handshake error, not a misparse.
+            match ServerReply::from_wire(&resp) {
+                Ok(ServerReply::Hello(sh)) => {
+                    let (session, accepted) =
+                        handshake.process_server_hello(&hello, &sh, Some(expected_server_key))?;
+                    return Ok((session, accepted));
+                }
+                Ok(ServerReply::Reject(reject)) => {
+                    // The marker is an extra sanity check on top of the discriminant. We do
+                    // NOT auto-downgrade to `reject.supported_version` (Invariant 7).
+                    if reject.has_marker() {
+                        reject_rounds += 1;
+                        if reject_rounds > MAX_CLIENT_REJECT_ROUNDS {
+                            return Err(CoreError::HandshakeError(format!(
+                                "server rejected the handshake: unsupported protocol version \
+                                 (client speaks v{}, server speaks v{})",
+                                hello.version, reject.supported_version
+                            )));
+                        }
+                        // reviewer §5: keep waiting for a valid ServerHello — read the next
+                        // frame WITHOUT re-sending, so a single forged reject can't kill the
+                        // handshake.
+                        remembered_reject = Some(reject);
+                        continue;
+                    }
+                    return Err(CoreError::HandshakeError(
+                        "server reject missing marker".into(),
+                    ));
+                }
+                Ok(ServerReply::Retry(retry)) => {
+                    retry_rounds += 1;
+                    if retry_rounds > MAX_CLIENT_RETRY_ROUNDS {
                         return Err(CoreError::HandshakeError(format!(
-                            "server rejected the handshake: unsupported protocol version \
-                             (client speaks v{}, server speaks v{})",
-                            hello.version, reject.supported_version
+                            "server demanded more than {MAX_CLIENT_RETRY_ROUNDS} HelloRetryRequest rounds"
                         )));
                     }
-                    // reviewer §5: keep waiting for a valid ServerHello — read the next frame
-                    // WITHOUT re-sending, so a single forged reject can't kill the handshake.
-                    remembered_reject = Some(reject);
-                    continue;
+                    log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
+                    hello.cookie = retry.cookie;
+                    if let Some(challenge) = retry.challenge {
+                        // H3: cap the accepted difficulty and bound the solver, so an
+                        // injected/malicious HelloRetryRequest (e.g. difficulty 255)
+                        // surfaces a handshake error instead of pinning a CPU core.
+                        log::info!("PhantomSession: Solving PoW challenge...");
+                        hello.pow_solution = Some(
+                            challenge
+                                .solve_capped(crate::crypto::pow::MAX_CLIENT_POW_DIFFICULTY)
+                                .map_err(|e| CoreError::HandshakeError(e.to_string()))?,
+                        );
+                    }
+                    break; // re-send the cookie/PoW-updated hello (outer loop)
                 }
-                return Err(CoreError::HandshakeError(
-                    "invalid ServerHello, Retry, or Reject received".into(),
-                ));
-            } else if let Ok(retry) = borsh::from_slice::<HelloRetryRequest>(&resp) {
-                retry_rounds += 1;
-                if retry_rounds > MAX_CLIENT_RETRY_ROUNDS {
+                Err(e) => {
                     return Err(CoreError::HandshakeError(format!(
-                        "server demanded more than {MAX_CLIENT_RETRY_ROUNDS} HelloRetryRequest rounds"
+                        "invalid server reply: {e}"
                     )));
                 }
-                log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
-                hello.cookie = retry.cookie;
-                if let Some(challenge) = retry.challenge {
-                    // H3: cap the accepted difficulty and bound the solver, so an
-                    // injected/malicious HelloRetryRequest (e.g. difficulty 255)
-                    // surfaces a handshake error instead of pinning a CPU core.
-                    log::info!("PhantomSession: Solving PoW challenge...");
-                    hello.pow_solution = Some(
-                        challenge
-                            .solve_capped(crate::crypto::pow::MAX_CLIENT_POW_DIFFICULTY)
-                            .map_err(|e| CoreError::HandshakeError(e.to_string()))?,
-                    );
-                }
-                break; // re-send the cookie/PoW-updated hello (outer loop)
-            } else {
-                return Err(CoreError::HandshakeError(
-                    "invalid ServerHello, Retry, or Reject received".into(),
-                ));
             }
         }
     }
@@ -853,11 +856,18 @@ async fn run_data_pump<T: SessionTransport>(
     {
         let mut queue = send_queue.lock().await;
         let count = queue.len();
-        for msg in queue.drain(..) {
+        'flush: for msg in queue.drain(..) {
             for chunk in msg.chunks(TRANSPORT_MTU) {
-                raw_stream
+                if let Err(e) = raw_stream
                     .send_reliable(Bytes::copy_from_slice(chunk))
-                    .await;
+                    .await
+                {
+                    // T4.5 fail-closed: the reliable offset space is exhausted (~2^32
+                    // segments) — refuse rather than wrap. Astronomically unreachable;
+                    // the session stalls and the liveness sweep tears it down.
+                    log::error!("PhantomSession: early-data flush aborted — {e}");
+                    break 'flush;
+                }
             }
         }
         if count > 0 {
@@ -975,9 +985,12 @@ async fn run_data_pump<T: SessionTransport>(
                 Err(_) => break,
             };
 
-            // A malformed / unparseable frame (no legitimate peer produces
-            // one) is dropped — never a panic.
-            let packet = match PhantomPacket::from_wire(&data) {
+            // Remove header protection (T4.6) and parse: a malformed / unparseable
+            // / short-of-the-AEAD-tag frame (no legitimate peer produces one) is
+            // dropped — never a panic. The cleartext version + session_id stay
+            // readable; the [33..47] span is unmasked with this session's recv HP
+            // key before the header is interpreted.
+            let packet = match crypto_recv.parse_protected(&data) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -1082,16 +1095,25 @@ async fn run_data_pump<T: SessionTransport>(
                         // `drain_streams_priority_ordered`), instead of being
                         // fired once and forgotten on the wire.
                         for chunk in data.chunks(TRANSPORT_MTU) {
-                            raw_stream
+                            if let Err(e) = raw_stream
                                 .send_reliable(Bytes::copy_from_slice(chunk))
-                                .await;
+                                .await
+                            {
+                                log::error!("PhantomSession: send aborted — {e}");
+                                break;
+                            }
                         }
                         crypto_session.notify_outbound_ready();
                     }
                     Some(SessionCommand::SendStreamReliable { stream_id, data }) => {
                         if let Some(stream) = streams.get(&stream_id) {
                             for chunk in data.chunks(TRANSPORT_MTU) {
-                                stream.send_reliable(Bytes::copy_from_slice(chunk)).await;
+                                if let Err(e) =
+                                    stream.send_reliable(Bytes::copy_from_slice(chunk)).await
+                                {
+                                    log::error!("PhantomSession: stream send aborted — {e}");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1518,7 +1540,9 @@ async fn send_app_data<T: SessionTransport>(
         }
         None => payload,
     };
-    let ciphertext = match crypto_session.encrypt_packet(&header, plaintext) {
+    // The data-plane packet carries no `extensions` (TLV headroom stays empty),
+    // so the AEAD AAD binds an empty extensions slice — matching the wire.
+    let ciphertext = match crypto_session.encrypt_packet(&header, plaintext, &[]) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: encrypt_packet failed: {}", e);
@@ -1526,7 +1550,15 @@ async fn send_app_data<T: SessionTransport>(
         }
     };
     let packet = PhantomPacket::new(header, ciphertext);
-    let buf = packet.to_wire();
+    // Header protection (T4.6): mask the [33..47] header span before it hits the
+    // wire. Infallible in practice (the payload always carries the AEAD tag).
+    let buf = match crypto_session.protect_packet(&packet) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("PhantomSession: header protection failed: {}", e);
+            return false;
+        }
+    };
     let size = buf.len();
     // Pacing is a wire-rate limiter, so it consumes the full on-wire size.
     pace_send(crypto_session, size as u64).await;
@@ -1571,7 +1603,7 @@ async fn send_window_update<T: SessionTransport>(
     )
     .with_epoch(crypto_session.current_epoch());
     let payload = new_window.to_be_bytes();
-    let ciphertext = match crypto_session.encrypt_packet(&header, &payload) {
+    let ciphertext = match crypto_session.encrypt_packet(&header, &payload, &[]) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: WINDOW_UPDATE encrypt failed: {}", e);
@@ -1579,7 +1611,16 @@ async fn send_window_update<T: SessionTransport>(
         }
     };
     let packet = PhantomPacket::new(header, ciphertext);
-    let buf = packet.to_wire();
+    let buf = match crypto_session.protect_packet(&packet) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!(
+                "PhantomSession: WINDOW_UPDATE header protection failed: {}",
+                e
+            );
+            return false;
+        }
+    };
     if let Err(e) = transport.send_bytes(&buf).await {
         log::error!("PhantomSession: WINDOW_UPDATE send failed: {}", e);
         return false;
@@ -1606,7 +1647,7 @@ fn encrypt_path_validation(
     packet.header.flags = PacketFlags::new(flag_bits);
     packet.header.epoch = crypto_session.current_epoch();
     let plaintext = std::mem::take(&mut packet.payload);
-    let ciphertext = match crypto_session.encrypt_packet(&packet.header, &plaintext) {
+    let ciphertext = match crypto_session.encrypt_packet(&packet.header, &plaintext, &[]) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: PATH_VALIDATION encrypt failed: {}", e);
@@ -1614,7 +1655,16 @@ fn encrypt_path_validation(
         }
     };
     packet.payload = ciphertext;
-    Some(packet.to_wire())
+    match crypto_session.protect_packet(&packet) {
+        Ok(buf) => Some(buf),
+        Err(e) => {
+            log::error!(
+                "PhantomSession: PATH_VALIDATION header protection failed: {}",
+                e
+            );
+            None
+        }
+    }
 }
 
 /// Send a `PATH_VALIDATION` packet to the established peer (a response echo).
@@ -1705,7 +1755,11 @@ async fn handle_packet<T: SessionTransport>(
         // packet's epoch is one ahead, the peer rekeyed — trial-decrypt under
         // the next key and only commit the ratchet on AEAD success, so a forged
         // epoch can't desync us. Same-epoch packets take the ordinary path.
-        match crypto_recv.decrypt_packet_accepting_rekey(&packet.header, &packet.payload) {
+        match crypto_recv.decrypt_packet_accepting_rekey(
+            &packet.header,
+            &packet.payload,
+            &packet.extensions,
+        ) {
             Ok(pt) => pt,
             Err(e) => {
                 // Distinguish the two drop reasons for the security metrics: a
@@ -2025,13 +2079,20 @@ async fn handle_packet<T: SessionTransport>(
         .with_epoch(crypto_recv.current_epoch())
         .with_path_id(path_id);
         let ack_payload = sack.to_wire();
-        match crypto_recv.encrypt_packet(&ack_header, &ack_payload) {
+        match crypto_recv.encrypt_packet(&ack_header, &ack_payload, &[]) {
             Ok(ct) => {
                 let ack_packet = PhantomPacket::new(ack_header, ct);
-                ack_buf.clear();
-                ack_buf.extend_from_slice(&ack_packet.to_wire());
-                let size = ack_buf.len();
-                let _ = transport_send_ack.send_bytes(&ack_buf[..size]).await;
+                match crypto_recv.protect_packet(&ack_packet) {
+                    Ok(buf) => {
+                        ack_buf.clear();
+                        ack_buf.extend_from_slice(&buf);
+                        let size = ack_buf.len();
+                        let _ = transport_send_ack.send_bytes(&ack_buf[..size]).await;
+                    }
+                    Err(e) => {
+                        log::error!("PhantomSession: ACK header protection failed: {}", e)
+                    }
+                }
             }
             Err(e) => log::error!("PhantomSession: ACK encrypt failed: {}", e),
         }
@@ -2554,16 +2615,18 @@ mod tests {
     /// generic failure — and crucially does NOT auto-downgrade.
     #[tokio::test]
     async fn client_surfaces_server_reject_as_version_error() {
-        use crate::transport::handshake::ServerReject;
+        use crate::transport::handshake::{ServerReject, ServerReply};
 
         let (client_transport, server_transport) = ChannelTransport::pair();
         // The reject path errors before any key verification, so any key works.
         let (_sk, expected_vk) = crate::crypto::hybrid_sign::HybridSigningKey::generate();
 
         let server = tokio::spawn(async move {
-            // Consume the ClientHello, then reply with the typed reject.
+            // Consume the ClientHello, then reply with the typed reject (T4.4 framed).
             let _hello = server_transport.recv_bytes().await.unwrap();
-            let reject = borsh::to_vec(&ServerReject::unsupported_version()).unwrap();
+            let reject = ServerReply::Reject(ServerReject::unsupported_version())
+                .to_wire()
+                .unwrap();
             server_transport.send_bytes(&reject).await.unwrap();
         });
 
@@ -2585,7 +2648,7 @@ mod tests {
     /// cookie/ServerHello flow; the handshake must still succeed.
     #[tokio::test]
     async fn injected_server_reject_does_not_abort_a_healthy_handshake() {
-        use crate::transport::handshake::ServerReject;
+        use crate::transport::handshake::{ServerReject, ServerReply};
 
         let (client_transport, server_transport) = ChannelTransport::pair();
         let server_hs = HandshakeServer::new().unwrap();
@@ -2598,8 +2661,10 @@ mod tests {
             let Ok(client_hello) = borsh::from_slice::<ClientHello>(&hello_bytes) else {
                 return;
             };
-            // Inject a forged reject AHEAD of the real handshake responses.
-            let reject = borsh::to_vec(&ServerReject::unsupported_version()).unwrap();
+            // Inject a forged reject AHEAD of the real handshake responses (T4.4 framed).
+            let reject = ServerReply::Reject(ServerReject::unsupported_version())
+                .to_wire()
+                .unwrap();
             if server_transport.send_bytes(&reject).await.is_err() {
                 return;
             }
@@ -2607,7 +2672,7 @@ mod tests {
             let sh = match server_hs.process_client_hello(&client_hello, 0, ip) {
                 HandshakeResponse::Retry(retry) => {
                     if server_transport
-                        .send_bytes(&borsh::to_vec(&retry).unwrap())
+                        .send_bytes(&ServerReply::Retry(retry).to_wire().unwrap())
                         .await
                         .is_err()
                     {
@@ -2628,7 +2693,7 @@ mod tests {
                 _ => return,
             };
             let _ = server_transport
-                .send_bytes(&borsh::to_vec(&sh).unwrap())
+                .send_bytes(&ServerReply::Hello(sh).to_wire().unwrap())
                 .await;
         });
 
@@ -2771,13 +2836,17 @@ mod tests {
         server_session: &crate::transport::session::Session,
         bytes: &[u8],
     ) -> Vec<u8> {
-        let pkt = PhantomPacket::from_wire(bytes).expect("deserialize PhantomPacket");
+        // The peer pump applies header protection (T4.6); unmask with this
+        // side's recv HP key (== the sender's send HP key) before reading.
+        let pkt = server_session
+            .parse_protected(bytes)
+            .expect("parse header-protected PhantomPacket");
         assert!(
             pkt.header.flags.contains(PacketFlags::ENCRYPTED),
             "expected ENCRYPTED flag on application data"
         );
         let plain = server_session
-            .decrypt_packet(&pkt.header, &pkt.payload)
+            .decrypt_packet(&pkt.header, &pkt.payload, &[])
             .expect("decrypt application data");
         // Reliable app frames carry a 4-byte gap-free stream_offset prefix (A.5);
         // strip it so callers compare against the raw application payload.
@@ -2810,10 +2879,13 @@ mod tests {
         pt.extend_from_slice(&sequence.to_be_bytes());
         pt.extend_from_slice(payload);
         let ct = server_session
-            .encrypt_packet(&header, &pt)
+            .encrypt_packet(&header, &pt, &[])
             .expect("encrypt reply");
         let packet = PhantomPacket::new(header, ct);
-        packet.to_wire()
+        // Apply header protection so the peer pump's parse_protected unmasks it.
+        server_session
+            .protect_packet(&packet)
+            .expect("header protection")
     }
 
     /// Integration test: Client handshake via ChannelTransport with a
@@ -2847,7 +2919,7 @@ mod tests {
                 let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
                 match response {
                     HandshakeResponse::Retry(retry) => {
-                        let retry_bytes = borsh::to_vec(&retry).unwrap();
+                        let retry_bytes = ServerReply::Retry(retry).to_wire().unwrap();
                         server_transport.send_bytes(&retry_bytes).await.unwrap();
                         // Receive retried client hello
                         let next_bytes = server_transport.recv_bytes().await.unwrap();
@@ -2855,7 +2927,8 @@ mod tests {
                         let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
                         match resp2 {
                             HandshakeResponse::Success(server_hello, session, _) => {
-                                let server_hello_bytes = borsh::to_vec(&server_hello).unwrap();
+                                let server_hello_bytes =
+                                    ServerReply::Hello(server_hello).to_wire().unwrap();
                                 server_transport
                                     .send_bytes(&server_hello_bytes)
                                     .await
@@ -2866,7 +2939,8 @@ mod tests {
                         }
                     }
                     HandshakeResponse::Success(server_hello, session, _) => {
-                        let server_hello_bytes = borsh::to_vec(&server_hello).unwrap();
+                        let server_hello_bytes =
+                            ServerReply::Hello(server_hello).to_wire().unwrap();
                         server_transport
                             .send_bytes(&server_hello_bytes)
                             .await
@@ -2953,13 +3027,13 @@ mod tests {
             let server_session = loop {
                 match server_hs.process_client_hello(&client_hello, 0, client_ip) {
                     HandshakeResponse::Retry(retry) => {
-                        let retry_bytes = borsh::to_vec(&retry).unwrap();
+                        let retry_bytes = ServerReply::Retry(retry).to_wire().unwrap();
                         server_transport.send_bytes(&retry_bytes).await.unwrap();
                         let next_bytes = server_transport.recv_bytes().await.unwrap();
                         let next_hello = borsh::from_slice::<ClientHello>(&next_bytes).unwrap();
                         match server_hs.process_client_hello(&next_hello, 0, client_ip) {
                             HandshakeResponse::Success(server_hello, session, _) => {
-                                let b = borsh::to_vec(&server_hello).unwrap();
+                                let b = ServerReply::Hello(server_hello).to_wire().unwrap();
                                 server_transport.send_bytes(&b).await.unwrap();
                                 break session;
                             }
@@ -2967,7 +3041,7 @@ mod tests {
                         }
                     }
                     HandshakeResponse::Success(server_hello, session, _) => {
-                        let b = borsh::to_vec(&server_hello).unwrap();
+                        let b = ServerReply::Hello(server_hello).to_wire().unwrap();
                         server_transport.send_bytes(&b).await.unwrap();
                         break session;
                     }
@@ -3018,7 +3092,7 @@ mod tests {
         let (client, _server) = paired_sessions(sid);
 
         let stream = Arc::new(TransportStream::new(1));
-        stream.send_reliable(Bytes::from("payload")).await;
+        stream.send_reliable(Bytes::from("payload")).await.unwrap();
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         streams.insert(1u32, stream);
 
@@ -3052,7 +3126,7 @@ mod tests {
         let inflight_before = client.bandwidth_snapshot().inflight_bytes;
 
         let stream = Arc::new(TransportStream::new(1));
-        stream.send_reliable(Bytes::from("new-data")).await;
+        stream.send_reliable(Bytes::from("new-data")).await.unwrap();
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         streams.insert(1u32, stream);
 
@@ -3138,10 +3212,12 @@ mod tests {
         pt.extend_from_slice(&stream_offset.to_be_bytes());
         pt.extend_from_slice(payload);
         let ciphertext = client_session
-            .encrypt_packet(&header, &pt)
+            .encrypt_packet(&header, &pt, &[])
             .expect("encrypt_packet");
-        let packet = PhantomPacket::new(header, ciphertext);
-        packet.to_wire()
+        // Cleartext wire: this frame is decoded back to a struct and fed to
+        // handle_packet directly (it never traverses the pump's transport, which
+        // is the only path that applies/removes header protection).
+        PhantomPacket::new(header, ciphertext).to_wire()
     }
 
     #[tokio::test]
@@ -3333,8 +3409,11 @@ mod tests {
         pt.extend_from_slice(&stream_offset.to_be_bytes());
         pt.extend_from_slice(payload);
         let ciphertext = client_session
-            .encrypt_packet(&header, &pt)
+            .encrypt_packet(&header, &pt, &[])
             .expect("encrypt_packet");
+        // Cleartext wire: this frame is decoded back to a struct and fed to
+        // handle_packet directly (it never traverses the pump's transport, which
+        // is the only path that applies/removes header protection).
         PhantomPacket::new(header, ciphertext).to_wire()
     }
 
@@ -3392,7 +3471,7 @@ mod tests {
             .await
         );
         let wire = server_t.recv_bytes().await.unwrap();
-        let pkt = PhantomPacket::from_wire(&wire).unwrap();
+        let pkt = _server_session.parse_protected(&wire).unwrap();
         assert_eq!(
             pkt.header.path_id, 0,
             "default send path is the implicit path 0"
@@ -3413,7 +3492,7 @@ mod tests {
             .await
         );
         let wire2 = server_t.recv_bytes().await.unwrap();
-        let pkt2 = PhantomPacket::from_wire(&wire2).unwrap();
+        let pkt2 = _server_session.parse_protected(&wire2).unwrap();
         assert_eq!(
             pkt2.header.path_id, 1,
             "after migrate(), app data must carry the bumped send path_id"
@@ -3582,7 +3661,11 @@ mod tests {
         let mut asm = FragmentAssembler::new();
         let (_hdr, inner) = push_datagram(&mut asm, &buf[..n]).expect("decode envelope");
         let inner = inner.expect("single-datagram challenge");
-        let pkt = PhantomPacket::from_wire(&inner).expect("inner packet");
+        // The server emitted this challenge (protect_packet under its send HP
+        // key); unmask it from the client side (== the server's send key).
+        let pkt = client_session
+            .parse_protected(&inner)
+            .expect("inner packet");
         assert!(
             pkt.header.flags.contains(PacketFlags::PATH_VALIDATION),
             "the candidate must receive a PATH_VALIDATION challenge"
@@ -3633,7 +3716,7 @@ mod tests {
         )
         .with_epoch(acker_session.current_epoch());
         let ct = acker_session
-            .encrypt_packet(&header, payload)
+            .encrypt_packet(&header, payload, &[])
             .expect("encrypt ack");
         PhantomPacket::new(header, ct).to_wire()
     }
@@ -3685,7 +3768,8 @@ mod tests {
         let stream = Arc::new(TransportStream::new(stream_id));
         let seq = stream
             .send_reliable(Bytes::from_static(b"reliable-payload"))
-            .await;
+            .await
+            .unwrap();
         let _ = stream.poll_send(u64::MAX).await.expect("segment in-flight");
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         streams.insert(stream_id as u32, stream.clone());
@@ -3758,7 +3842,10 @@ mod tests {
         // Stage offsets 0..=5, all in flight.
         let stream = Arc::new(TransportStream::new(stream_id));
         for _ in 0..6u32 {
-            stream.send_reliable(Bytes::from_static(b"x")).await;
+            stream
+                .send_reliable(Bytes::from_static(b"x"))
+                .await
+                .unwrap();
             let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
         }
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
@@ -3839,7 +3926,10 @@ mod tests {
         // Sender stages segments 0..=5, all in-flight.
         let stream = Arc::new(TransportStream::new(stream_id));
         for i in 0..6u32 {
-            let seq = stream.send_reliable(Bytes::from(format!("seg-{i}"))).await;
+            let seq = stream
+                .send_reliable(Bytes::from(format!("seg-{i}")))
+                .await
+                .unwrap();
             assert_eq!(seq, i);
             let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
         }
@@ -3970,11 +4060,15 @@ mod tests {
             .recv()
             .await
             .expect("an ACK frame must have been emitted");
-        let ack_pkt = PhantomPacket::from_wire(&ack_frame).expect("parse emitted ack");
+        // The receiver pump emitted this ACK with header protection; unmask from
+        // the sender side (== the receiver's send HP key).
+        let ack_pkt = sender_session
+            .parse_protected(&ack_frame)
+            .expect("parse emitted ack");
         assert!(ack_pkt.header.flags.contains(PacketFlags::ACK));
         // Decrypt under the sender's session (shared keys) to read the SACK.
         let plain = sender_session
-            .decrypt_packet(&ack_pkt.header, &ack_pkt.payload)
+            .decrypt_packet(&ack_pkt.header, &ack_pkt.payload, &[])
             .expect("decrypt emitted ack");
         let sack = crate::transport::sack::Sack::from_wire(&plain).expect("decode emitted sack");
         assert_eq!(sack.largest_acked, data_seq, "SACK must ack the data seq");
@@ -4094,7 +4188,7 @@ mod tests {
         let header = PacketHeader::new(session_id, stream_id, 0, PacketFlags::new(flag_bits))
             .with_epoch(client_session.current_epoch());
         let ciphertext = client_session
-            .encrypt_packet(&header, &bundle)
+            .encrypt_packet(&header, &bundle, &[])
             .expect("encrypt bundle");
         let v2 = PhantomPacket::new(header, ciphertext);
 
@@ -4172,7 +4266,7 @@ mod tests {
             )
             .with_epoch(client_session.current_epoch());
             let ct = client_session
-                .encrypt_packet(&h, &bundle)
+                .encrypt_packet(&h, &bundle, &[])
                 .expect("encrypt bundle");
             PhantomPacket::new(h, ct)
         };
@@ -4417,11 +4511,18 @@ mod tests {
             let mut pt = Vec::with_capacity(4 + payload.len());
             pt.extend_from_slice(&seq.to_be_bytes());
             pt.extend_from_slice(&payload);
-            let ct = client_inner.encrypt_packet(&header, &pt).expect("encrypt");
+            let ct = client_inner
+                .encrypt_packet(&header, &pt, &[])
+                .expect("encrypt");
             // Bound the send so a torn-down (or wedged) transport can't hang the
             // test: a closed channel or a stalled reader both mean the flood is
             // no longer absorbed — i.e. the session is being torn down.
-            let wire = PhantomPacket::new(header, ct).to_wire();
+            // This frame traverses the server pump's transport, which removes
+            // header protection on recv — so apply it on the way out.
+            let packet = PhantomPacket::new(header, ct);
+            let wire = client_inner
+                .protect_packet(&packet)
+                .expect("header protection");
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 client_t.send_bytes(&wire),
@@ -4565,12 +4666,12 @@ mod tests {
             .await
             .expect("expected a WINDOW_UPDATE frame")
             .expect("channel open");
-        let pv2 = PhantomPacket::from_wire(&frame).unwrap();
+        let pv2 = client_session.parse_protected(&frame).unwrap();
         assert!(pv2.header.flags.contains(PacketFlags::WINDOW_UPDATE));
         // The control frame's sequence comes from the stream's own send space —
         // distinct from any data packet so the AEAD nonce never repeats.
         let pt = client_session
-            .decrypt_packet(&pv2.header, &pv2.payload)
+            .decrypt_packet(&pv2.header, &pv2.payload, &[])
             .expect("decrypt WINDOW_UPDATE");
         assert_eq!(pt.len(), 4);
         let announced = u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]);
@@ -4628,17 +4729,17 @@ mod tests {
         // Stream 11: low priority (1), 3 reliable chunks.
         let low = Arc::new(TransportStream::new(11));
         low.set_priority(1);
-        low.send_reliable(Bytes::from_static(b"L0")).await;
-        low.send_reliable(Bytes::from_static(b"L1")).await;
-        low.send_reliable(Bytes::from_static(b"L2")).await;
+        low.send_reliable(Bytes::from_static(b"L0")).await.unwrap();
+        low.send_reliable(Bytes::from_static(b"L1")).await.unwrap();
+        low.send_reliable(Bytes::from_static(b"L2")).await.unwrap();
         streams.insert(11, low);
 
         // Stream 22: HIGH priority (100), 3 reliable chunks.
         let hi = Arc::new(TransportStream::new(22));
         hi.set_priority(100);
-        hi.send_reliable(Bytes::from_static(b"H0")).await;
-        hi.send_reliable(Bytes::from_static(b"H1")).await;
-        hi.send_reliable(Bytes::from_static(b"H2")).await;
+        hi.send_reliable(Bytes::from_static(b"H0")).await.unwrap();
+        hi.send_reliable(Bytes::from_static(b"H1")).await.unwrap();
+        hi.send_reliable(Bytes::from_static(b"H2")).await.unwrap();
         streams.insert(22, hi);
 
         drain_streams_priority_ordered(&transport, &client_session, session_id, &streams).await;
@@ -4653,11 +4754,11 @@ mod tests {
                 Some(b) => b,
                 None => break,
             };
-            let v2 = PhantomPacket::from_wire(&bytes).unwrap();
+            let v2 = _server_session.parse_protected(&bytes).unwrap();
             // Decrypt under the SERVER role so the per-direction key
             // matches the client-side encrypt.
             let plaintext = _server_session
-                .decrypt_packet(&v2.header, &v2.payload)
+                .decrypt_packet(&v2.header, &v2.payload, &[])
                 .expect("decrypt");
             // Reliable frames carry a 4-byte stream_offset prefix (A.5); the tag is
             // the application payload after it.
@@ -4703,7 +4804,7 @@ mod tests {
             .with_epoch(client_session.current_epoch())
             .with_path_id(path_id);
         let ciphertext = client_session
-            .encrypt_packet(&header, &payload)
+            .encrypt_packet(&header, &payload, &[])
             .expect("encrypt challenge");
         let v2 = PhantomPacket::new(header, ciphertext);
 
@@ -4751,7 +4852,9 @@ mod tests {
 
         // Decrypt the echo on the original (client) side — server-side
         // ciphertext authenticates the round-trip.
-        let echo_v2 = PhantomPacket::from_wire(&echo_bytes).unwrap();
+        // The server emitted this echo with header protection; unmask from the
+        // client side (== the server's send HP key).
+        let echo_v2 = client_session.parse_protected(&echo_bytes).unwrap();
         assert!(echo_v2.header.flags.contains(PacketFlags::PATH_VALIDATION));
         assert_eq!(echo_v2.header.path_id, path_id);
     }
@@ -4789,14 +4892,16 @@ mod tests {
             HandshakeResponse::Retry(r) => r,
             _ => panic!("expected Retry"),
         };
-        s1.send_bytes(&borsh::to_vec(&retry).unwrap())
+        s1.send_bytes(&ServerReply::Retry(retry).to_wire().unwrap())
             .await
             .unwrap();
         let next = s1.recv_bytes().await.unwrap();
         let ch2 = borsh::from_slice::<ClientHello>(&next).unwrap();
         match server_hs.process_client_hello(&ch2, 0, client_ip) {
             HandshakeResponse::Success(sh, _session, _) => {
-                s1.send_bytes(&borsh::to_vec(&sh).unwrap()).await.unwrap();
+                s1.send_bytes(&ServerReply::Hello(sh).to_wire().unwrap())
+                    .await
+                    .unwrap();
             }
             _ => panic!("expected Success"),
         }
@@ -4842,7 +4947,9 @@ mod tests {
                 // The server decrypted exactly what the client sealed.
                 assert_eq!(early_data.as_deref(), Some(&early_payload[..]));
                 assert!(sh.early_data_accepted);
-                s2.send_bytes(&borsh::to_vec(&sh).unwrap()).await.unwrap();
+                s2.send_bytes(&ServerReply::Hello(sh).to_wire().unwrap())
+                    .await
+                    .unwrap();
             }
             _ => {
                 panic!("expected Success with accepted early-data — the resumption ticket is fresh")

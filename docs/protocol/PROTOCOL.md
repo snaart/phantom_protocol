@@ -25,18 +25,25 @@ that sees any other value drops the frame (packets) or rejects the handshake
 
 | Constant | Value | Source | Where it lives on the wire |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `3` | `core/src/transport/types.rs:71` | `PacketHeader.version` byte (first byte of the 47-byte header — § 4.2) |
-| `PROTOCOL_VERSION` | `2` | `core/src/transport/handshake.rs:56` | `ClientHello.version`, transcript-bound |
+| `WIRE_VERSION` | `4` | `core/src/transport/types.rs:71` | `PacketHeader.version` byte (first byte of the 47-byte header — § 4.2) |
+| `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs:56` | `ClientHello.version`, transcript-bound |
 
-`WIRE_VERSION` is `3`: it went `1 → 2` when the packet codec moved from
+`WIRE_VERSION` is `4`: it went `1 → 2` when the packet codec moved from
 `alkahest` to the explicit big-endian layout in § 4.2, then `2 → 3` (Phase 4 /
 P4.0) when the AEAD packet identity became a single **per-direction monotonic
 `u64` packet number** — the header dropped the dead `ack_delay` field and widened
-`sequence: u32` to `packet_number: u64` (45 → 47 bytes; § 4.2 / § 5).
-`PROTOCOL_VERSION` is `2` (bumped
+`sequence: u32` to `packet_number: u64` (45 → 47 bytes; § 4.2 / § 5) — then
+`3 → 4` (T4.6) when **header protection** (QUIC RFC 9001 § 5.4) landed: the 47-byte
+header was **reordered** so the 14 variable bytes (`packet_number ‖ flags ‖
+stream_id ‖ epoch ‖ path_id`) form a contiguous span at offset `[33..47]` that is
+**XOR-masked on the wire**, leaving only `version ‖ session_id` cleartext (§ 4.2 /
+§ 4.6). The handshake (`PROTOCOL_VERSION`) is unchanged by T4.6.
+`PROTOCOL_VERSION` is `3` (bumped
 `1 → 2` when the signed transcript began covering the 0-RTT verdict
 `early_data_accepted` (H2) and `ClientHello` gained the `resumption_binder`
-proof-of-possession field (HS-03); a v1 ↔ v2 handshake cannot interoperate
+proof-of-possession field (HS-03); `2 → 3` (T4.3) when `ServerHello`'s
+`server_key_package` was replaced by a 32-byte `server_nonce`, changing the
+signed-transcript content; handshakes across these versions cannot interoperate
 because the signed transcript content differs). They exist so that:
 
 - a tampered frame / hello that flips the byte is rejected up front
@@ -51,7 +58,7 @@ small typed `ServerReject` frame *before* any KEM / signature work:
 
 | Offset | Field | Size | Notes |
 |---|---|---|---|
-| 0 | `marker` | 4 | `= b"PRJ1"` (`SERVER_REJECT_MARKER`); lets the client tell a reject from a `ServerHello` / `HelloRetryRequest` on its trial-deserialization path |
+| 0 | `marker` | 4 | `= b"PRJ1"` (`SERVER_REJECT_MARKER`); an extra sanity check on top of the T4.4 discriminant byte (`kind = 2`) that frames the reply |
 | 4 | `code` | 1 | reject reason; `1 = REJECT_UNSUPPORTED_VERSION` |
 | 5 | `supported_version` | 1 | the `PROTOCOL_VERSION` this server speaks |
 
@@ -187,19 +194,21 @@ frame this build emits; a decoder ignores its contents.
 ### 4.2 `PacketHeader` (47 bytes)
 
 Serialised by `PacketHeader::to_wire` as an explicit, fixed **big-endian**
-(network byte order) image — no serialization library, declaration order == wire
-order, `version` first, byte arrays as-is:
+(network byte order) image — no serialization library, `version` first, byte
+arrays as-is. WIRE_VERSION 4 (T4.6) **reorders** the variable fields relative to
+the struct declaration so the 14 header-protected bytes are a contiguous
+`[33..47]` span (see § 4.6); the Rust struct field order is unchanged:
 
 ```rust
 #[repr(C)]
 pub struct PacketHeader {
-    pub version: u8,                 // pinned WIRE_VERSION
-    pub session_id: SessionId,       // [u8; 32]
-    pub stream_id: StreamId,         // u16  (0 = control stream)
-    pub packet_number: PacketNumber, // u64  per-direction, monotonic (① — Phase 4)
-    pub flags: PacketFlags,          // u16  (§ 4.3)
-    pub epoch: u8,                   // rekey generation (0 at establishment)
-    pub path_id: u8,                 // client-owned migration path label (0 = default)
+    pub version: u8,                 // pinned WIRE_VERSION   — wire [0],    cleartext
+    pub session_id: SessionId,       // [u8; 32] (routing CID) — wire [1..33], cleartext
+    pub stream_id: StreamId,         // u16  (0 = control)    — wire [43..45], HP-masked
+    pub packet_number: PacketNumber, // u64  per-dir monotonic — wire [33..41], HP-masked
+    pub flags: PacketFlags,          // u16  (§ 4.3)          — wire [41..43], HP-masked
+    pub epoch: u8,                   // rekey generation       — wire [45],    HP-masked
+    pub path_id: u8,                 // migration path label   — wire [46],    HP-masked
 }
 ```
 
@@ -207,28 +216,33 @@ Source: `core/src/transport/types.rs:258`. `PacketHeader::SIZE = 47`, pinned by
 `core/tests/check_wire.rs`, `types.rs::packet_header_serializes_to_47_bytes`, and
 the byte-frozen vector `core/tests/wire_vectors/packet_header.bin` (§ 11).
 (`WIRE_VERSION 2 → 3` dropped the dead `ack_delay: u16` and widened the former
-per-stream `sequence: u32` to the per-direction `packet_number: u64` — § 5.)
+per-stream `sequence: u32` to the per-direction `packet_number: u64` — § 5;
+`3 → 4` reordered the `[33..47]` span for header protection — § 4.6.)
 
-Wire byte layout (the load-bearing contract — this image is the AEAD AAD, so any
-layout drift silently breaks interop):
+Wire byte layout (the load-bearing contract — this **cleartext** image is the
+AEAD AAD, so any layout drift silently breaks interop). The `[33..47]` span is
+XOR-masked on the wire (§ 4.6), but the AAD and this table are the *cleartext*
+image:
 
-| Offset | Field | Width | Encoding |
-| --- | --- | --- | --- |
-| 0 | `version` | 1 | u8, `= WIRE_VERSION` |
-| 1 | `session_id` | 32 | 32 bytes, as-is |
-| 33 | `stream_id` | 2 | u16 big-endian |
-| 35 | `packet_number` | 8 | u64 big-endian |
-| 43 | `flags` | 2 | u16 big-endian (§ 4.3) |
-| 45 | `epoch` | 1 | u8 |
-| 46 | `path_id` | 1 | u8 |
-| **total** | | **47** | |
+| Offset | Field | Width | Encoding | On the wire |
+| --- | --- | --- | --- | --- |
+| 0 | `version` | 1 | u8, `= WIRE_VERSION` | cleartext |
+| 1 | `session_id` | 32 | 32 bytes, as-is (routing CID) | cleartext |
+| 33 | `packet_number` | 8 | u64 big-endian | HP-masked |
+| 41 | `flags` | 2 | u16 big-endian (§ 4.3) | HP-masked |
+| 43 | `stream_id` | 2 | u16 big-endian | HP-masked |
+| 45 | `epoch` | 1 | u8 | HP-masked |
+| 46 | `path_id` | 1 | u8 | HP-masked |
+| **total** | | **47** | | |
 
-The pinned `version` byte leads the header. The full 47-byte image is the AEAD
-AAD, so flipping *any* byte — `version` included — fails decryption (§ 5); the
-recv path additionally drops a frame whose `version != WIRE_VERSION`. The same
-big-endian convention is used for the `packet_number` bytes that feed the AEAD
-nonce (§ 5). An independent (non-Rust) decoder + encoder that reproduces this
-layout exactly is `tests/wire_vectors_decode.py`.
+The pinned `version` byte leads the header. The full **cleartext** 47-byte image
+is the AEAD AAD, so flipping *any* byte — `version` included — fails decryption
+(§ 5); the recv path additionally drops a frame whose `version != WIRE_VERSION`.
+The same big-endian convention is used for the `packet_number` bytes that feed
+the AEAD nonce (§ 5). An independent (non-Rust) decoder + encoder that reproduces
+this **cleartext** layout exactly is `tests/wire_vectors_decode.py` (the frozen
+vectors are the cleartext codec image; the HP mask is keyed crypto, verified
+separately in Rust — § 4.6).
 
 ### 4.3 `PacketFlags` (u16 bitfield)
 
@@ -273,6 +287,54 @@ Server-side it is derived as `SHA256(b"phantom-session-id-v1" || shared_secret
 || client_nonce)` (`transport/handshake.rs:830-836`); the client adopts the
 `session_id` echoed in the `ServerHello`.
 
+### 4.6 Header protection (T4.6, QUIC RFC 9001 § 5.4)
+
+The 14-byte `[33..47]` span (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖
+path_id`) is **XOR-masked on the wire** so a passive on-path observer cannot read
+the packet number, the `PRIORITY` ("voice") flag, the stream id, the rekey epoch,
+or the migration path label. Only `version ‖ session_id` (the routing CID) plus
+the cleartext length prefixes stay readable, so the demux can route and the recv
+path can locate the ciphertext sample before unmasking.
+
+**Keys.** Per-direction `hp_send` / `hp_recv` (32 bytes each) are derived ONCE at
+session establishment via `kdf::derive_key_32("phantom-hp-{send,recv}-v1",
+initial_secret)` (§ 3), swapped by side exactly like the AEAD keys. They are
+**session-stable**: unlike the AEAD keys they do NOT rotate on rekey (QUIC § 6.1)
+— `epoch` lives *inside* the masked span, so the receiver must remove header
+protection before it knows the epoch; a per-epoch hp key would deadlock the
+rekey-catchup path. Forward secrecy of confidentiality is unaffected — the hp key
+masks only header metadata, never payload.
+
+**Mask.** `sample` = the first 16 bytes of the AEAD ciphertext (the tag is always
+present, so a sample exists even for an empty payload; the sample comes from the
+payload ciphertext, which is never masked — so there is **no circular
+dependency**). Per the negotiated suite:
+
+```
+AES-256-GCM suite:  mask = AES-256-ECB(hp_key, sample)                    (one block)
+ChaCha20 suite:     mask = ChaCha20(key=hp_key, counter=u32_le(sample[0..4]),
+                                    nonce=sample[4..16])[0..16]
+apply / remove:     wire[33..47] ^= mask[0..14]
+```
+
+Under `--features fips` the AES mask routes through `aws_lc_rs::cipher` ECB (the
+FIPS substrate); the ChaCha20 mask is unreachable (the suite is pinned to AES).
+
+**No new oracle.** The AEAD AAD is the **cleartext** header image (the unmasked
+`[33..47]`). A wire mutation of the masked span unmasks to a wrong header → wrong
+AAD → the AEAD open fails, exactly like any other AAD tamper. HP is an orthogonal
+outer wrapping; it adds no decryption oracle. Source:
+`core/src/crypto/header_protection.rs`, `Session::protect_packet` /
+`parse_protected` (`transport/session.rs`). KATs: AES-256-ECB vs NIST SP 800-38A
+F.1.5, ChaCha20 HP vs RFC 9001 § A.5; live end-to-end via `udp_integration` /
+`tcp_integration`.
+
+**Residual.** Header protection hides the *variable* per-packet metadata, but the
+32-byte `session_id` (and, on the PhantomUDP path, the outer 8-byte routing
+`ConnId`) stay **cleartext and stable** for the session — so a flow is still
+linkable across a migration by that stable identifier. Closing that requires CID
+rotation (a separate change); see the threat model § 12.5.
+
 ---
 
 ## 5. AEAD construction
@@ -299,18 +361,26 @@ key (`CryptoState`) during the rekey-catchup window.
 ```
 Sender:    plaintext, header  →  AEAD-encrypt(key  = send_key,
                                               nonce= prefix||packet_number_be,
-                                              aad  = serialize(header),   // 47 bytes
+                                              aad  = serialize(header)||extensions, // 47 B + TLV
                                               plaintext)
                               →  ciphertext (with 16-byte tag)
 Receiver:  ciphertext, header →  AEAD-decrypt(key  = recv_key,
                                               nonce= prefix||packet_number_be,
-                                              aad  = serialize(header),
+                                              aad  = serialize(header)||extensions,
                                               ciphertext)
                               →  plaintext  OR  a single opaque "decrypt failed"
 ```
 
-Source: `Session::encrypt_packet` / `decrypt_packet`
-(`core/src/transport/session.rs`).
+The AAD is the **cleartext** 47-byte header image (`serialize(header)`) followed
+by the packet's `extensions` TLV (T4.1 — the forward-compat headroom is now
+authenticated, closing the prior gap where it sat outside the AAD; it is empty on
+every current packet, so the AAD is just the 47-byte image in practice). On the
+wire the header's `[33..47]` span is HP-masked (§ 4.6); the receiver reconstructs
+the **cleartext** header (the AAD) by unmasking before this AEAD-decrypt, so a
+masked-region tamper surfaces here as a `decrypt failed` — no separate oracle.
+
+Source: `Session::encrypt_packet` / `decrypt_packet` / `protect_packet` /
+`parse_protected` (`core/src/transport/session.rs`).
 
 **Uniqueness (Invariant 8).** The `packet_number` is a **single per-direction
 `u64`**, assigned at *send* time and **strictly monotonic** — it never resets, not
@@ -394,12 +464,16 @@ attacker learns nothing from the shape of the failure (§ 8).
 
 ## 6. Handshake
 
-The handshake messages are bare borsh structs — no envelope, no per-message
-version discriminant. The client distinguishes the server's reply purely by
-trial-deserialisation: a `ServerHello` is thousands of bytes (it carries KEM
-ciphertext + hybrid signature + verifying key); a `HelloRetryRequest` is tiny; a
-`ServerReject` (§6.10) is a fixed 6 bytes led by the `b"PRJ1"` marker. The sizes
-and the marker make the three unambiguous.
+The `ClientHello` is a bare borsh struct (no envelope). **Server replies are framed
+with a leading discriminant byte (T4.4):** the wire form is `[kind: u8] ‖ borsh(body)`,
+where `kind` is `0 = ServerHello`, `1 = HelloRetryRequest`, `2 = ServerReject`. The
+client dispatches on `kind` **explicitly** (`ServerReply::from_wire`) — an unknown kind
+or a malformed body is a handshake error, never a misparse. This replaced the former
+trial-deserialization (which distinguished the three by message size + the `b"PRJ1"`
+reject marker — robust in practice, but a same-size confusion was structurally possible).
+The discriminant byte is an API-layer framing element that sits *outside* the borsh
+message structs, so it does not affect the frozen `wire_vectors` (which fix the bare
+message encodings). The `ServerReject` marker is retained as an extra sanity check.
 
 ### 6.1 State machine
 
@@ -468,7 +542,7 @@ Source: `core/src/transport/handshake.rs:75-106`.
 
 ```rust
 pub struct ServerHello {
-    pub server_key_package:   HybridKeyPackage,  // ephemeral; bound into transcript for freshness
+    pub server_nonce:         [u8; 32],          // server-contributed, transcript-bound (T4.3)
     pub ciphertext:           HybridCiphertext,  // KEM encapsulation
     pub server_verify_key:    HybridVerifyingKey,// pinned by client (Invariant 1)
     pub signature:            HybridSignature,   // over transcript hash
@@ -477,9 +551,13 @@ pub struct ServerHello {
 }
 ```
 
-Source: `core/src/transport/handshake.rs:137-155`. `server_key_package` is an
-ephemeral hybrid KEM public bound into the transcript hash for freshness; the
-corresponding secret is discarded (no second KEM round trip today).
+Source: `core/src/transport/handshake.rs`. `server_nonce` is a 32-byte
+server-contributed value bound into the transcript hash, giving the server a
+session-specific, tamper-evident contribution beyond `session_id` + the client
+nonce. **T4.3:** it replaced the former `server_key_package` — a full ~1184 B
+ephemeral hybrid KEM public key whose secret was discarded (the protocol runs no
+second KEM round trip), saving ~1.1 KB on every `ServerHello`. A future
+second-KEM ring could repurpose this slot.
 
 ### 6.4 `HelloRetryRequest` (borsh)
 
@@ -501,12 +579,14 @@ field, including the `early_data` ciphertext) and **leads** with the build-side
 
 ```rust
 struct HandshakeTranscript<'a> {
-    protocol_variant:   &'a [u8],            // leading field — binds the build variant
-    client_hello:       &'a ClientHello,     // whole hello, early_data included
-    server_key_package: &'a HybridKeyPackage,
-    ciphertext:         &'a HybridCiphertext,
-    server_verify_key:  &'a HybridVerifyingKey,
-    session_id:         &'a [u8; 32],
+    protocol_variant:    &'a [u8],            // leading field — binds the build variant
+    client_hello:        &'a ClientHello,     // whole hello, early_data included
+    server_nonce:        &'a [u8; 32],        // server-contributed (T4.3)
+    ciphertext:          &'a HybridCiphertext,
+    server_verify_key:   &'a HybridVerifyingKey,
+    session_id:          &'a [u8; 32],
+    early_data_accepted: bool,                // 0-RTT verdict, signed (Invariant 9); LAST so
+                                              // protocol_variant stays the leading field
 }
 ```
 
@@ -698,8 +778,9 @@ the listener (and the UDP demo path) *before* the connection closes — the one
 case where the server speaks after an unacceptable hello instead of dropping
 silently.
 
-The client identifies it by the marker on its trial-deserialisation path and
-surfaces a hard error naming both versions. It deliberately does **not**
+The client identifies it by the T4.4 discriminant byte (`kind = 2`, with the
+`b"PRJ1"` marker as an extra check) and surfaces a hard error naming both
+versions. It deliberately does **not**
 auto-downgrade to `supported_version`: the version is bound into the signed
 transcript (§6.5, Invariant 7), so honouring an attacker-injected reject would
 be a downgrade oracle. The frame is purely diagnostic. Because it is an
@@ -716,9 +797,9 @@ three messages — it leaves the frozen wire vectors (§11) untouched.
   `path_id` becomes safely reusable once its path is retired.
 - `PhantomPacket.extensions`: TLV headroom, empty today. A decoder ignores it;
   future amendments add fields here without a layout change.
-- `ServerHello.server_key_package`: ephemeral hybrid KEM public bound into the
-  transcript for freshness; the secret half is discarded (no second KEM round
-  trip yet).
+- `ServerHello.server_nonce`: a 32-byte server-contributed, transcript-bound
+  value (T4.3, replacing the old discarded ~1184 B ephemeral `server_key_package`).
+  A future second-KEM ring could repurpose this slot for real key material.
 - `PacketFlags 0x1000 … 0x8000`: reserved bits.
 
 A future protocol revision that needs more than this headroom increments
@@ -829,6 +910,14 @@ Validating the ML-KEM / ML-DSA encodings themselves against published NIST KATs
 is tracked separately. The vectors are scoped to the default (non-fips) build;
 the fips build is a distinct wire (different `PROTOCOL_VARIANT`, 65-byte
 classical key) and would need its own set.
+
+The packet fixtures freeze the **cleartext** codec image (= the AEAD AAD). The
+on-wire `[33..47]` header-protection mask (§ 4.6) is keyed crypto, so it is pinned
+separately — by the `crypto::header_protection` KATs (NIST SP 800-38A F.1.5 for
+AES-256-ECB, RFC 9001 § A.5 for ChaCha20), the `to_wire_masked` /
+`RawPacket::unmask_header` round-trip, and the `security_invariants` HP
+regressions — which keeps this fixture set and `wire_vectors_decode.py`
+crypto-free while still pinning the masked wire by composition.
 
 The packets use a hand-rolled big-endian codec (no serialization dependency);
 the handshake uses `borsh`, pinned to an exact `=` version in `core/Cargo.toml`

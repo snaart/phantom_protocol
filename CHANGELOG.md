@@ -31,12 +31,46 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   byte-exact. No wire-format change — `path_id` already rode the 47-byte header and left the AEAD nonce
   under model ①. PATH-001 is split into a strict send-gate (app data only to validated paths) and a
   relaxed recv-delivery (authenticated, non-replayed data is delivered regardless of source), so a
-  NAT-rebind upload is seamless. Migration is functional but **linkable** via the stable connection-ID;
-  unlinkable migration (header protection + CID rotation) is a later hardening phase.
+  NAT-rebind upload is seamless. Header protection (below, T4.6) now masks the variable per-packet
+  metadata, but migration stays **linkable via the stable connection-ID**; CID rotation — the remaining
+  piece of unlinkable migration — is a later hardening phase.
 - **PhantomUDP (Phase 1):** native datagram `SessionTransport` over raw UDP with connection-ID
   demultiplexing — `PhantomUdpListener` (server accept) plus `UdpClientTransport` / `UdpServerTransport`.
   The multi-KB post-quantum handshake is fragmented to the path MTU and reassembled. No wire-format or
   crypto change — `WIRE_VERSION` / `PROTOCOL_VERSION` unchanged; the outer UDP envelope is transport framing.
+
+### Security
+
+- **Header protection (T4.6 — QUIC RFC 9001 §5.4):** the 14 variable header bytes — packet number, flags
+  (incl. the `PRIORITY`/voice bit), stream id, rekey epoch, and migration path id — are now **XOR-masked on
+  the wire**, leaving only `version` + `session_id` (the routing CID) cleartext. A passive on-path observer
+  can no longer read per-packet metadata. Per-direction header-protection keys are derived once from the
+  initial session secret and held **session-stable** (they do NOT rotate on rekey — QUIC §6.1, because the
+  epoch lives inside the masked span); the mask is `AES-256-ECB(hp_key, sample)` (AES suite) or a ChaCha20
+  keystream (ChaCha suite), keyed by the AEAD ciphertext sample. The AEAD AAD remains the cleartext header,
+  so a masked-region tamper fails decryption — **no new oracle**. Under `--features fips` the AES mask
+  routes through `aws-lc-rs` ECB. This is the first half of the §12.5 traffic-analysis hardening; CID
+  rotation (the stable-CID residual) follows in a later phase.
+- **Packet `extensions` are now authenticated (T4.1):** the forward-compat TLV headroom was previously
+  outside the AEAD AAD — an on-path attacker could rewrite it without breaking the tag. The AAD is now
+  `header ‖ extensions`. Empty on every current packet, so no wire/vector drift.
+- **X-Wing-style hybrid-KEM combiner (T4.2):** the KEM combiner now binds the classical ciphertext and the
+  recipient classical public key into the shared-secret derivation (per draft-ietf-tls-hybrid-design /
+  X-Wing), so its security no longer leans on the transcript signature alone.
+- **Fail-closed on `reliable_offset` exhaustion (T4.5):** `Stream::send_reliable` returns `Result` and fails
+  closed (rather than wrapping the `u32` gap-free reliable offset) at exhaustion, mirroring epoch saturation.
+
+### Changed
+
+- **`WIRE_VERSION` 3 → 4 (T4.6):** the 47-byte packet header is reordered so the 14 HP-protected bytes form
+  a contiguous `[33..47]` span, and that span is masked on the wire (above). Interop-breaking, but no
+  deployed peers (pre-1.0 0.2.0 window). Frozen wire vectors + the independent Python decoder regenerated.
+- **`ServerHello` shrunk ~1.1 KB + `PROTOCOL_VERSION` 2 → 3 (T4.3):** the unused `server_key_package` (a full
+  ML-KEM key package whose secret was discarded) is replaced by a 32-byte `server_nonce` (still
+  transcript-bound). Handshakes across the version boundary cannot interoperate.
+- **Explicit server-reply discriminant (T4.4):** `ServerReply{Hello,Retry,Reject}` is framed as
+  `[kind:u8] ‖ borsh(body)`, so the client dispatches on an explicit tag instead of trial-deserialization +
+  size heuristics. Framing sits outside the borsh structs, so the frozen handshake vectors are unaffected.
 
 ### Fixed
 

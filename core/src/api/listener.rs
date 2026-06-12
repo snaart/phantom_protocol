@@ -7,7 +7,7 @@ use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, SpawnHandle, TokioRuntime};
 use crate::transport::handshake::{
     client_hello_lengths_within_bounds, ClientHello, HandshakeError, HandshakeResponse,
-    HandshakeServer,
+    HandshakeServer, ServerReply,
 };
 use crate::transport::types::LegType;
 use std::net::{IpAddr, SocketAddr};
@@ -444,13 +444,16 @@ pub(crate) async fn drive_server_handshake<T: SessionTransport>(
                         "client exceeded {MAX_SERVER_RETRY_ROUNDS} cookie/PoW retry rounds"
                     )));
                 }
-                let bytes = borsh::to_vec(&retry)
+                // T4.4: frame with the explicit discriminant byte (`[kind] ‖ borsh`).
+                let bytes = ServerReply::Retry(retry)
+                    .to_wire()
                     .map_err(|e| CoreError::NetworkError(format!("Retry encode failed: {}", e)))?;
                 transport.send_bytes(&bytes).await?;
                 // Loop back and read the retried hello.
             }
             HandshakeResponse::Success(server_hello, session, early_data) => {
-                let bytes = borsh::to_vec(&server_hello).map_err(|e| {
+                // T4.4: frame with the explicit discriminant byte (`[kind] ‖ borsh`).
+                let bytes = ServerReply::Hello(server_hello).to_wire().map_err(|e| {
                     CoreError::NetworkError(format!("ServerHello encode failed: {}", e))
                 })?;
                 transport.send_bytes(&bytes).await?;
@@ -464,7 +467,8 @@ pub(crate) async fn drive_server_handshake<T: SessionTransport>(
                 // signal — the version we DO speak — instead of a silent drop,
                 // then close. Best-effort: if the send fails the client just
                 // sees the close, same as before.
-                if let Ok(bytes) = borsh::to_vec(&reject) {
+                // T4.4: frame with the explicit discriminant byte (`[kind] ‖ borsh`).
+                if let Ok(bytes) = ServerReply::Reject(reject.clone()).to_wire() {
                     let _ = transport.send_bytes(&bytes).await;
                 }
                 // M-4: a version mismatch is detected BEFORE the address-validation cookie gate,
