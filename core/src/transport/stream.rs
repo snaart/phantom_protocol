@@ -869,7 +869,14 @@ impl Stream {
         // srtt·9/8 (RACK time-threshold). Flagged segments are fast-retransmitted
         // by `poll_send`'s Pass-0; already-flagged ones are skipped (no double-count
         // into congestion control).
-        let largest_acked = sack.largest_acked;
+        // T5.4: clamp `largest_acked` to the highest `stream_offset` we have actually assigned
+        // (`reliable_offset` is the next-to-assign, so it bounds every offset on the wire). A
+        // peer cannot legitimately ack an offset we never sent; without this an authenticated
+        // peer inflating `largest_acked` (e.g. `high + 1e6`) would declare freshly-sent,
+        // in-flight segments "lost" and force a cwnd-bypassing Pass-0 retransmit storm.
+        let largest_acked = sack
+            .largest_acked
+            .min(self.reliable_offset.load(Ordering::SeqCst));
         // RFC 9002: loss_delay = max(kGranularity, kTimeThreshold · smoothed_rtt).
         // The kGranularity (1 ms) floor is load-bearing: without it a near-zero
         // srtt makes the threshold ~0 and flags freshly-sent segments as "aged",
@@ -1318,6 +1325,32 @@ mod tests {
         assert!(
             stream.ack(3).await.is_some(),
             "the gap segment 3 must remain buffered"
+        );
+    }
+
+    /// T5.4 (audit SACK-storm LOW): a SACK's `largest_acked` is clamped to the highest
+    /// stream_offset actually sent, so an authenticated peer can't inflate it (e.g.
+    /// `high + 1e6`) to declare freshly-sent, legitimately-in-flight segments "lost" and force
+    /// a cwnd-bypassing Pass-0 retransmit storm.
+    #[tokio::test]
+    async fn on_sack_clamps_inflated_largest_acked() {
+        let stream = Stream::new(1);
+        for i in 0..5u32 {
+            let seq = stream.send_reliable(Bytes::from(format!("seg-{i}"))).await;
+            assert_eq!(seq, i);
+            let seg = stream.poll_send(u64::MAX).await.expect("poll"); // stamps sent_at
+            assert_eq!(seg.stream_offset, i);
+        }
+        // A SACK that acks NONE of our segments (0..5) but claims a `largest_acked` far beyond
+        // anything we ever sent.
+        let sack = Sack::from_received(&[1_000_000], 0).expect("sack");
+        assert_eq!(sack.largest_acked, 1_000_000);
+        let result = stream.on_sack(&sack).await;
+        // The freshest in-flight segment (within PACKET_THRESHOLD of the highest sent) must NOT
+        // be flagged lost — the clamp limits loss detection to the real sent range.
+        assert!(
+            !result.lost.iter().any(|l| l.stream_offset == 4),
+            "an inflated largest_acked must not flag the freshest in-flight segment as lost"
         );
     }
 

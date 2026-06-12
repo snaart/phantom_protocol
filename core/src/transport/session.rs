@@ -45,12 +45,19 @@ pub enum SessionState {
 /// *before* the hard [`AEAD_MAX_INVOCATIONS`] ceiling (Invariant 8) so a
 /// long-lived session ratchets keys instead of failing with `NonceExhausted`.
 ///
-/// Default is half the ceiling — `2^47` invocations — which leaves a `2^47`
-/// headroom for in-flight packets from the old epoch. It is far larger than any
-/// realistic session lifetime, so production sessions essentially never hit it;
-/// it is a correctness backstop. Tests lower it via
-/// [`Session::set_rekey_threshold`] to exercise the path.
-pub const REKEY_SOFT_LIMIT: u64 = AEAD_MAX_INVOCATIONS / 2;
+/// Set to `2^32`, far below the hard [`AEAD_MAX_INVOCATIONS`] (`2^48`) ceiling — clean
+/// standards alignment (T5.3): the AES-256-GCM IND-CPA advantage at `2^32` records is
+/// ~`2^-33`, comfortably inside the CFRG / QUIC confidentiality margins (the prior `2^47`
+/// gave ~`2^-27`), so this is defense-in-depth, not a real exposure. It still dwarfs any
+/// realistic session's packet count — a session sending `2^32` packets re-keys roughly
+/// hourly even at 1 M pps — leaving ample headroom for in-flight old-epoch packets, so
+/// production sessions ratchet a fresh key rather than approaching the ceiling. Tests lower
+/// it via [`Session::set_rekey_threshold`] to exercise the path.
+pub const REKEY_SOFT_LIMIT: u64 = 1 << 32;
+
+// The soft rekey watermark must stay below the hard nonce-exhaustion ceiling so a session
+// always rotates keys before it would fail with `NonceExhausted` (Invariant 8).
+const _: () = assert!(REKEY_SOFT_LIMIT < AEAD_MAX_INVOCATIONS);
 
 /// How many epochs the receive path will catch up in one packet when accepting
 /// an authenticated forward rekey (C1). A small bound caps the HKDF work an
@@ -59,7 +66,7 @@ pub const REKEY_SOFT_LIMIT: u64 = AEAD_MAX_INVOCATIONS / 2;
 /// divergence that arises when both directions rekey at slightly different
 /// cadences. A gap larger than this is rejected; over a reliable transport the
 /// sender retransmits at the then-current epoch, so no data is lost. In
-/// practice (production `REKEY_SOFT_LIMIT` of `2^47`) the gap is essentially
+/// practice (production `REKEY_SOFT_LIMIT` of `2^32`) the gap is essentially
 /// always 0 or 1.
 pub const MAX_REKEY_CATCHUP: u8 = 16;
 
