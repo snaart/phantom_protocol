@@ -53,7 +53,7 @@ small typed `ServerReject` frame *before* any KEM / signature work:
 
 | Offset | Field | Size | Notes |
 |---|---|---|---|
-| 0 | `marker` | 4 | `= b"PRJ1"` (`SERVER_REJECT_MARKER`); lets the client tell a reject from a `ServerHello` / `HelloRetryRequest` on its trial-deserialization path |
+| 0 | `marker` | 4 | `= b"PRJ1"` (`SERVER_REJECT_MARKER`); an extra sanity check on top of the T4.4 discriminant byte (`kind = 2`) that frames the reply |
 | 4 | `code` | 1 | reject reason; `1 = REJECT_UNSUPPORTED_VERSION` |
 | 5 | `supported_version` | 1 | the `PROTOCOL_VERSION` this server speaks |
 
@@ -396,12 +396,16 @@ attacker learns nothing from the shape of the failure (§ 8).
 
 ## 6. Handshake
 
-The handshake messages are bare borsh structs — no envelope, no per-message
-version discriminant. The client distinguishes the server's reply purely by
-trial-deserialisation: a `ServerHello` is thousands of bytes (it carries KEM
-ciphertext + hybrid signature + verifying key); a `HelloRetryRequest` is tiny; a
-`ServerReject` (§6.10) is a fixed 6 bytes led by the `b"PRJ1"` marker. The sizes
-and the marker make the three unambiguous.
+The `ClientHello` is a bare borsh struct (no envelope). **Server replies are framed
+with a leading discriminant byte (T4.4):** the wire form is `[kind: u8] ‖ borsh(body)`,
+where `kind` is `0 = ServerHello`, `1 = HelloRetryRequest`, `2 = ServerReject`. The
+client dispatches on `kind` **explicitly** (`ServerReply::from_wire`) — an unknown kind
+or a malformed body is a handshake error, never a misparse. This replaced the former
+trial-deserialization (which distinguished the three by message size + the `b"PRJ1"`
+reject marker — robust in practice, but a same-size confusion was structurally possible).
+The discriminant byte is an API-layer framing element that sits *outside* the borsh
+message structs, so it does not affect the frozen `wire_vectors` (which fix the bare
+message encodings). The `ServerReject` marker is retained as an extra sanity check.
 
 ### 6.1 State machine
 
@@ -706,8 +710,9 @@ the listener (and the UDP demo path) *before* the connection closes — the one
 case where the server speaks after an unacceptable hello instead of dropping
 silently.
 
-The client identifies it by the marker on its trial-deserialisation path and
-surfaces a hard error naming both versions. It deliberately does **not**
+The client identifies it by the T4.4 discriminant byte (`kind = 2`, with the
+`b"PRJ1"` marker as an extra check) and surfaces a hard error naming both
+versions. It deliberately does **not**
 auto-downgrade to `supported_version`: the version is bound into the signed
 transcript (§6.5, Invariant 7), so honouring an attacker-injected reject would
 be a downgrade oracle. The frame is purely diagnostic. Because it is an

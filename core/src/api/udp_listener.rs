@@ -14,7 +14,8 @@ use crate::observability::attrs::{AeadAlgorithm, HandshakeOutcome, ProtocolVersi
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, SpawnHandle, TokioRuntime};
 use crate::transport::handshake::{
-    client_hello_lengths_within_bounds, ClientHello, HandshakeServer, HelloRetryRequest, UdpAdmit,
+    client_hello_lengths_within_bounds, ClientHello, HandshakeServer, HelloRetryRequest,
+    ServerReply, UdpAdmit,
 };
 use crate::transport::phantom_udp::datagram::{encode_datagrams, push_datagram, FragmentAssembler};
 use crate::transport::phantom_udp::envelope::{ConnId, PacketType};
@@ -393,7 +394,9 @@ async fn send_demux_retry(
     peer: SocketAddr,
     hrr: &HelloRetryRequest,
 ) {
-    let bytes = match borsh::to_vec(hrr) {
+    // T4.4: frame with the explicit discriminant byte (`[kind] ‖ borsh`), same as the
+    // per-connection `drive_server_handshake` retry — the client dispatches on it.
+    let bytes = match ServerReply::Retry(hrr.clone()).to_wire() {
         Ok(b) => b,
         Err(_) => return,
     };
