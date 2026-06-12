@@ -1604,6 +1604,13 @@ async fn send_path_validation<T: SessionTransport>(
     true
 }
 
+/// Hard cap on concurrent receive streams a peer can open on one session (H-3). The recv
+/// path auto-creates a `Stream` for any of the 2^32 `stream_id`s; without a cap a peer can
+/// spray distinct ids to explode the stream table. With the per-stream reorder budget,
+/// `MAX_STREAMS` times `MAX_RECV_REORDER_BYTES` bounds the session's total reorder memory.
+/// Sized well above QUIC's ~100-stream default so real multiplexing is unaffected.
+const MAX_STREAMS: usize = 256;
+
 /// Recv-side handler for a packet:
 /// - session-id guard → drop any frame not stamped with the negotiated
 ///   session id before touching any state (H1).
@@ -1933,10 +1940,27 @@ async fn handle_packet<T: SessionTransport>(
         let stream_offset = u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]);
         let data = pt.slice(4..);
 
-        let local = streams_recv
-            .entry(stream_id)
-            .or_insert_with(|| Arc::new(Stream::new(stream_id as TransportStreamId)))
-            .clone();
+        // H-3: cap concurrent receive streams. A new stream_id is auto-created only while
+        // under MAX_STREAMS; past the cap the segment is refused (and, being unrecorded, not
+        // SACKed → the sender retransmits / the stream stalls), so a peer cannot explode the
+        // stream table across the 2^32 id space.
+        let existing = streams_recv.get(&stream_id).map(|s| s.clone());
+        let local = match existing {
+            Some(s) => s,
+            None => {
+                if streams_recv.len() >= MAX_STREAMS {
+                    log::warn!(
+                        "PhantomSession: refusing new receive stream {stream_id}: \
+                         MAX_STREAMS ({MAX_STREAMS}) reached"
+                    );
+                    return;
+                }
+                streams_recv
+                    .entry(stream_id)
+                    .or_insert_with(|| Arc::new(Stream::new(stream_id as TransportStreamId)))
+                    .clone()
+            }
+        };
         // Accept into the reorder buffer FIRST so the SACK derived next reflects it.
         // `accept_in_order` returns the in-order run now deliverable and stamps the
         // data-arrival instant; `received_sack(0)` then populates `ack_delay_us`
@@ -3066,6 +3090,66 @@ mod tests {
         assert_eq!(
             undelivered.load(Ordering::Acquire),
             b"hello-v2".len() as u64
+        );
+    }
+
+    /// H-3: the recv path must cap concurrent receive streams. A peer that sprays reliable
+    /// frames across far more distinct `stream_id`s than the cap must not auto-create an
+    /// unbounded number of `Stream`s — the table is bounded by `MAX_STREAMS`, which (with the
+    /// per-stream reorder byte budget) bounds the session's total reorder memory.
+    #[tokio::test]
+    async fn recv_path_caps_concurrent_streams_at_max_streams() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let attempts = MAX_STREAMS as u32 + 64;
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(attempts as usize + 16);
+        let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let mut ack_buf = Vec::with_capacity(256);
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        // A peer opens far more receive streams than the cap. Each frame uses a distinct
+        // `sequence` (the per-direction packet number, else they replay-reject) but
+        // stream_offset 0 so it delivers in order and creates its stream.
+        for sid in 0..attempts {
+            let frame = build_app_frame_with_offset(
+                &client_session,
+                session_id,
+                sid as TransportStreamId,
+                sid, // sequence = distinct per-direction PN
+                0,   // stream_offset 0 → in-order delivery
+                b"x",
+            );
+            let v2 = PhantomPacket::from_wire(&frame).unwrap();
+            handle_packet(
+                v2,
+                session_id,
+                &server_session,
+                &streams,
+                &demux,
+                &transport_send,
+                &transport_send,
+                &deliver_tx,
+                &undelivered,
+                &mut ack_buf,
+                &obs,
+                LegType::Tcp,
+            )
+            .await;
+        }
+
+        assert!(
+            streams.len() <= MAX_STREAMS,
+            "recv path must cap concurrent receive streams at MAX_STREAMS ({MAX_STREAMS}); have {}",
+            streams.len()
         );
     }
 
