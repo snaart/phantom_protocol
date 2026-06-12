@@ -93,7 +93,14 @@ impl FragmentAssembler {
             });
 
             state.last_update = Instant::now();
-            state.chunks.insert(frame.chunk_index, frame.payload);
+            // Insert-if-absent (M-7): a duplicate or poisoned chunk for an already-received
+            // index must NOT overwrite the first-seen payload — an on-path attacker who
+            // guessed the cleartext `(session_id, packet_id)` could otherwise corrupt a
+            // victim's reassembly (which then fails the victim's AEAD). The first chunk wins.
+            state
+                .chunks
+                .entry(frame.chunk_index)
+                .or_insert(frame.payload);
 
             state.chunks.len() == state.total_chunks as usize
         };
@@ -283,5 +290,37 @@ mod tests {
             );
         }
         assert_eq!(asm.len(), MAX_CONCURRENT_ASSEMBLIES);
+    }
+
+    /// M-7: chunk insertion is insert-if-absent. An on-path attacker who guessed the
+    /// cleartext `(session_id, packet_id)` of a victim's in-flight reassembly must not be
+    /// able to overwrite an already-received chunk with a poisoned payload (which would
+    /// corrupt the reassembly so it fails the victim's AEAD). The first chunk seen at an
+    /// index wins; a later duplicate at that index is ignored.
+    #[test]
+    fn duplicate_chunk_does_not_overwrite_first_seen_payload() {
+        let mut asm = FragmentAssembler::new();
+        let mk = |idx: u16, byte: u8| CryptoFrame {
+            session_id: [1u8; 16],
+            packet_id: 7,
+            chunk_index: idx,
+            total_chunks: 2,
+            payload: vec![byte; 4],
+        };
+        // Real chunk 0, then a poisoned duplicate of chunk 0 (different bytes).
+        assert!(asm.process_chunk(mk(0, 0xAA)).is_none());
+        assert!(
+            asm.process_chunk(mk(0, 0xFF)).is_none(),
+            "a duplicate index must not complete or overwrite"
+        );
+        // Chunk 1 completes the packet; chunk 0 must still be the first-seen (0xAA) payload.
+        let out = asm
+            .process_chunk(mk(1, 0xBB))
+            .expect("completes the 2-chunk packet");
+        assert_eq!(
+            out,
+            vec![0xAA, 0xAA, 0xAA, 0xAA, 0xBB, 0xBB, 0xBB, 0xBB],
+            "first-seen chunk 0 must win, not the poisoned duplicate"
+        );
     }
 }

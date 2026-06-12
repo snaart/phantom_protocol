@@ -5,7 +5,9 @@ use crate::errors::CoreError;
 use crate::observability::attrs::{AeadAlgorithm, HandshakeOutcome, ProtocolVersion};
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, SpawnHandle, TokioRuntime};
-use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+use crate::transport::handshake::{
+    client_hello_lengths_within_bounds, ClientHello, HandshakeResponse, HandshakeServer,
+};
 use crate::transport::types::LegType;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -405,6 +407,15 @@ pub(crate) async fn drive_server_handshake<T: SessionTransport>(
     let mut retry_rounds: u32 = 0;
     loop {
         let hello_bytes = transport.recv_bytes().await?;
+        // M-7: structurally bound the ClientHello's variable fields before borsh, so a forged
+        // length prefix can't force borsh's `vec![0u8; len.min(1 MiB)]` eager allocation. The
+        // TCP transport already frame-caps at HANDSHAKE_FRAME_CAP; this closes the per-field
+        // amplifier the outer cap does not.
+        if !client_hello_lengths_within_bounds(&hello_bytes) {
+            return Err(CoreError::NetworkError(
+                "ClientHello field length out of bounds".into(),
+            ));
+        }
         let client_hello = borsh::from_slice::<ClientHello>(&hello_bytes)
             .map_err(|e| CoreError::NetworkError(format!("ClientHello parse failed: {}", e)))?;
 
