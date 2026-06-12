@@ -702,65 +702,97 @@ async fn run_client_handshake<T: SessionTransport>(
     // for a benign reorder. Without it, a MITM answering every ClientHello with
     // a fresh cheap HelloRetryRequest could loop the client forever.
     const MAX_CLIENT_RETRY_ROUNDS: u32 = 3;
+    // Reviewer §5: bound how many injected/genuine ServerRejects we read past while still
+    // waiting for a ServerHello, so a reject flood can't loop the inner read forever.
+    const MAX_CLIENT_REJECT_ROUNDS: u32 = 3;
     let mut retry_rounds: u32 = 0;
+    let mut reject_rounds: u32 = 0;
+    // Reviewer §5: an *injected* ServerReject (a tiny pre-crypto blob a network attacker can
+    // spray) must not abort a healthy handshake. Remember it and keep reading for a valid
+    // ServerHello; surface it only if one never arrives (do NOT auto-downgrade — Invariant 7).
+    let mut remembered_reject: Option<ServerReject> = None;
 
     loop {
+        // (Re)send the current hello (fresh, or cookie/PoW-updated after a HelloRetryRequest).
         let bytes = borsh::to_vec(&hello).map_err(|e| {
             CoreError::SerializationError(format!("ClientHello encode failed: {}", e))
         })?;
         transport.send_bytes(&bytes).await?;
-        let resp = transport.recv_bytes().await?;
 
-        // The reply is one of three shapes: a `ServerHello` (success), a
-        // `HelloRetryRequest` (cookie/PoW demand), or a `ServerReject` (the
-        // server cannot speak our version). Try the success shape first — a
-        // retry/reject blob is far too small to deserialize as a multi-KiB
-        // ServerHello, so the disambiguation is unambiguous.
-        if let Ok(sh) = borsh::from_slice::<ServerHello>(&resp) {
-            let (session, accepted) =
-                handshake.process_server_hello(&hello, &sh, Some(expected_server_key))?;
-            return Ok((session, accepted));
-        } else if let Ok(reject) = borsh::from_slice::<ServerReject>(&resp) {
-            // The marker guard keeps a same-sized non-reject blob from being
-            // mistaken for a reject. We surface this as a hard error and do
-            // NOT auto-downgrade to `reject.supported_version` — a forced
-            // downgrade on an injected reject would defeat the transcript-bound
-            // version pin (Invariant 7).
-            if reject.has_marker() {
-                return Err(CoreError::HandshakeError(format!(
-                    "server rejected the handshake: unsupported protocol version \
-                     (client speaks v{}, server speaks v{})",
-                    hello.version, reject.supported_version
-                )));
+        // Read responses for THIS hello, reading past an injected ServerReject (WITHOUT
+        // re-sending) until a ServerHello (success), a HelloRetryRequest (re-send with the
+        // cookie/PoW), or the channel ends.
+        loop {
+            let resp = match transport.recv_bytes().await {
+                Ok(r) => r,
+                Err(e) => {
+                    // No further responses: surface a remembered reject (a genuine version
+                    // mismatch) over the raw transport error.
+                    return match &remembered_reject {
+                        Some(r) => Err(CoreError::HandshakeError(format!(
+                            "server rejected the handshake: unsupported protocol version \
+                             (client speaks v{}, server speaks v{})",
+                            hello.version, r.supported_version
+                        ))),
+                        None => Err(e),
+                    };
+                }
+            };
+
+            // The reply is one of three shapes: a `ServerHello` (success), a
+            // `HelloRetryRequest` (cookie/PoW demand), or a `ServerReject`. Try the success
+            // shape first — a retry/reject blob is far too small to deserialize as a multi-KiB
+            // ServerHello, so the disambiguation is unambiguous.
+            if let Ok(sh) = borsh::from_slice::<ServerHello>(&resp) {
+                let (session, accepted) =
+                    handshake.process_server_hello(&hello, &sh, Some(expected_server_key))?;
+                return Ok((session, accepted));
+            } else if let Ok(reject) = borsh::from_slice::<ServerReject>(&resp) {
+                // The marker guard keeps a same-sized non-reject blob from being mistaken for a
+                // reject. We do NOT auto-downgrade to `reject.supported_version` (Invariant 7).
+                if reject.has_marker() {
+                    reject_rounds += 1;
+                    if reject_rounds > MAX_CLIENT_REJECT_ROUNDS {
+                        return Err(CoreError::HandshakeError(format!(
+                            "server rejected the handshake: unsupported protocol version \
+                             (client speaks v{}, server speaks v{})",
+                            hello.version, reject.supported_version
+                        )));
+                    }
+                    // reviewer §5: keep waiting for a valid ServerHello — read the next frame
+                    // WITHOUT re-sending, so a single forged reject can't kill the handshake.
+                    remembered_reject = Some(reject);
+                    continue;
+                }
+                return Err(CoreError::HandshakeError(
+                    "invalid ServerHello, Retry, or Reject received".into(),
+                ));
+            } else if let Ok(retry) = borsh::from_slice::<HelloRetryRequest>(&resp) {
+                retry_rounds += 1;
+                if retry_rounds > MAX_CLIENT_RETRY_ROUNDS {
+                    return Err(CoreError::HandshakeError(format!(
+                        "server demanded more than {MAX_CLIENT_RETRY_ROUNDS} HelloRetryRequest rounds"
+                    )));
+                }
+                log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
+                hello.cookie = retry.cookie;
+                if let Some(challenge) = retry.challenge {
+                    // H3: cap the accepted difficulty and bound the solver, so an
+                    // injected/malicious HelloRetryRequest (e.g. difficulty 255)
+                    // surfaces a handshake error instead of pinning a CPU core.
+                    log::info!("PhantomSession: Solving PoW challenge...");
+                    hello.pow_solution = Some(
+                        challenge
+                            .solve_capped(crate::crypto::pow::MAX_CLIENT_POW_DIFFICULTY)
+                            .map_err(|e| CoreError::HandshakeError(e.to_string()))?,
+                    );
+                }
+                break; // re-send the cookie/PoW-updated hello (outer loop)
+            } else {
+                return Err(CoreError::HandshakeError(
+                    "invalid ServerHello, Retry, or Reject received".into(),
+                ));
             }
-            return Err(CoreError::HandshakeError(
-                "invalid ServerHello, Retry, or Reject received".into(),
-            ));
-        } else if let Ok(retry) = borsh::from_slice::<HelloRetryRequest>(&resp) {
-            retry_rounds += 1;
-            if retry_rounds > MAX_CLIENT_RETRY_ROUNDS {
-                return Err(CoreError::HandshakeError(format!(
-                    "server demanded more than {MAX_CLIENT_RETRY_ROUNDS} HelloRetryRequest rounds"
-                )));
-            }
-            log::info!("PhantomSession: Received HelloRetryRequest, retrying...");
-            hello.cookie = retry.cookie;
-            if let Some(challenge) = retry.challenge {
-                // H3: cap the accepted difficulty and bound the solver, so an
-                // injected/malicious HelloRetryRequest (e.g. difficulty 255)
-                // surfaces a handshake error instead of pinning a CPU core.
-                log::info!("PhantomSession: Solving PoW challenge...");
-                hello.pow_solution = Some(
-                    challenge
-                        .solve_capped(crate::crypto::pow::MAX_CLIENT_POW_DIFFICULTY)
-                        .map_err(|e| CoreError::HandshakeError(e.to_string()))?,
-                );
-            }
-            continue;
-        } else {
-            return Err(CoreError::HandshakeError(
-                "invalid ServerHello, Retry, or Reject received".into(),
-            ));
         }
     }
 }
@@ -2537,6 +2569,72 @@ mod tests {
         assert!(
             msg.contains("unsupported protocol version"),
             "expected a version-mismatch error, got: {msg}"
+        );
+    }
+
+    /// Reviewer §5: an **injected** `ServerReject` (a tiny, pre-crypto blob a network
+    /// attacker can spray) during a HEALTHY handshake must NOT abort it. The client remembers
+    /// the reject and keeps waiting for a valid `ServerHello`; it gives up (surfacing the
+    /// reject) only if one never arrives. Here the attacker injects a reject ahead of the real
+    /// cookie/ServerHello flow; the handshake must still succeed.
+    #[tokio::test]
+    async fn injected_server_reject_does_not_abort_a_healthy_handshake() {
+        use crate::transport::handshake::ServerReject;
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        let server_hs = HandshakeServer::new().unwrap();
+        let expected_vk = server_hs.verifying_key().clone();
+
+        let server = tokio::spawn(async move {
+            let Ok(hello_bytes) = server_transport.recv_bytes().await else {
+                return;
+            };
+            let Ok(client_hello) = borsh::from_slice::<ClientHello>(&hello_bytes) else {
+                return;
+            };
+            // Inject a forged reject AHEAD of the real handshake responses.
+            let reject = borsh::to_vec(&ServerReject::unsupported_version()).unwrap();
+            if server_transport.send_bytes(&reject).await.is_err() {
+                return;
+            }
+            let ip = "127.0.0.1".parse().unwrap();
+            let sh = match server_hs.process_client_hello(&client_hello, 0, ip) {
+                HandshakeResponse::Retry(retry) => {
+                    if server_transport
+                        .send_bytes(&borsh::to_vec(&retry).unwrap())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let Ok(h2) = server_transport.recv_bytes().await else {
+                        return;
+                    };
+                    let Ok(next) = borsh::from_slice::<ClientHello>(&h2) else {
+                        return;
+                    };
+                    match server_hs.process_client_hello(&next, 0, ip) {
+                        HandshakeResponse::Success(sh, _, _) => sh,
+                        _ => return,
+                    }
+                }
+                HandshakeResponse::Success(sh, _, _) => sh,
+                _ => return,
+            };
+            let _ = server_transport
+                .send_bytes(&borsh::to_vec(&sh).unwrap())
+                .await;
+        });
+
+        let result = run_client_handshake(&client_transport, &expected_vk, None).await;
+        // Close the channel so the server task ends even if the client aborted (RED), instead
+        // of blocking forever on the retried-hello it will never receive.
+        drop(client_transport);
+        let _ = server.await;
+        assert!(
+            result.is_ok(),
+            "an injected ServerReject ahead of the real ServerHello must not abort a healthy \
+             handshake; got {result:?}"
         );
     }
 
