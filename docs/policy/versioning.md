@@ -178,18 +178,23 @@ have implicitly relied on the included dependency.
 
 ## 6. MSRV (Minimum Supported Rust Version)
 
-Currently **Rust 1.75 stable**. Declared in:
+Currently **Rust 1.93 stable**. Declared in:
 
-- `.clippy.toml :: msrv` (already present).
-- `core/Cargo.toml :: [package].rust-version` (already present).
+- `.clippy.toml :: msrv`.
+- `core/Cargo.toml :: [package].rust-version`.
+
+The MSRV was raised from 1.75 to 1.93 in June 2026: the post-quantum dependency
+chain (`pkcs8 0.11` via the ML-KEM / ML-DSA / signature crates) pulls in Cargo's
+`edition2024` feature, which is stable only from Rust 1.85, so the old 1.75 claim
+was already unenforceable. 1.93 is the stable the project develops against.
 
 MSRV bumps are themselves SemVer-minor for `0.x` releases and SemVer-major once
-we hit 1.0. CI enforces 1.75 separately via `dtolnay/rust-toolchain@1.75`;
-failures on 1.75-only mean the MSRV must be raised in the same commit that
-introduced the incompatibility.
+we hit 1.0. CI enforces it via a `cargo check (MSRV 1.93)` job
+(`dtolnay/rust-toolchain@1.93`); a failure there means the MSRV must be raised in
+the same commit that introduced the incompatibility.
 
-Note that the sibling `cli/` crate uses `edition = "2024"` and so builds only on
-recent stable, not under the 1.75 gate — the MSRV promise covers the
+Note that the sibling `cli/` crate uses `edition = "2024"` and is checked on
+recent stable, not under the MSRV gate — the MSRV promise covers the
 `phantom_protocol` library, not the admin tooling.
 
 ---
