@@ -454,8 +454,10 @@ impl CryptoSession {
         aad: &[u8],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        let counter = self.inner.recv_counter.fetch_add(1, Ordering::Relaxed);
-        if counter >= AEAD_MAX_INVOCATIONS {
+        // T5.5: check the ceiling against the CURRENT count without consuming it — a forged
+        // packet (which fails the open below) must NOT advance the recv invocation counter
+        // toward `NonceExhausted`. Only a successful, authenticated open counts.
+        if self.inner.recv_counter.load(Ordering::Relaxed) >= AEAD_MAX_INVOCATIONS {
             return Err(CryptoError::NonceExhausted);
         }
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
@@ -466,6 +468,8 @@ impl CryptoSession {
             .open_in_place(nonce, Aad::from(aad), &mut buf)
             .map_err(|_| CryptoError::DecryptionFailed)?;
         let len = plaintext_slice.len();
+        // Authenticated open succeeded — now it counts toward the per-direction ceiling (T5.5).
+        self.inner.recv_counter.fetch_add(1, Ordering::Relaxed);
         buf.truncate(len);
         Ok(buf)
     }
