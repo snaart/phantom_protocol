@@ -1,7 +1,7 @@
 //! Header protection (QUIC RFC 9001 §5.4) — the per-packet mask that hides the
 //! variable header fields (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖
-//! path_id`, the 14 bytes at wire offset `[33..47]`) from a passive on-path
-//! observer.
+//! path_id`, the 14 bytes at wire offset `[1..15]` since ε / WIRE v5; `[33..47]`
+//! in v4) from a passive on-path observer.
 //!
 //! The mask is `cipher(hp_key, sample)` where `sample` is the first 16 bytes of
 //! the packet's AEAD ciphertext (the tag is always present, so a sample exists
@@ -40,10 +40,10 @@ use crate::errors::CoreError;
 use zeroize::Zeroize;
 
 /// Bytes of the packet header protected by HP — the contiguous region at wire
-/// offset `[33..47]`: `packet_number(8) ‖ flags(2) ‖ stream_id(2) ‖ epoch(1) ‖
-/// path_id(1)`. The cleartext `version(1)` and routing `session_id(32)` prefix
-/// (offsets `[0..33]`) is left in the clear so the demux can route before any
-/// crypto.
+/// offset `[1..15]` (ε / WIRE v5; was `[33..47]` in v4): `packet_number(8) ‖
+/// flags(2) ‖ stream_id(2) ‖ epoch(1) ‖ path_id(1)`. Only the cleartext
+/// `version(1)` byte (offset `[0..1]`) is left in the clear; the inner
+/// `session_id` is off-wire and routing is by the outer (rotating) ConnId.
 pub const HP_MASK_LEN: usize = 14;
 
 /// Bytes of AEAD ciphertext sampled to seed the mask cipher — one AES block

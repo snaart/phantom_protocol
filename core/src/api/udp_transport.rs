@@ -83,7 +83,13 @@ pub struct UdpClientTransport {
     /// The pinned server remote, captured at connect so `migrate()` can `connect` the
     /// freshly-bound socket to the same destination.
     server: SocketAddr,
+    /// The bootstrap (handshake) ConnId — a random lifetime id stamped until the
+    /// session sets the rotating chain via [`set_outbound_cid`](SessionTransport::set_outbound_cid).
     cid: ConnId,
+    /// The rotating routing CID set at the handshake → data-pump boundary (ε /
+    /// WIRE v5). `None` during the handshake (the bootstrap `cid` is stamped);
+    /// `Some(CID_0)` once the session sets it, after which every datagram stamps it.
+    established_cid: ArcSwap<Option<ConnId>>,
     phase: AtomicU8,
     next_packet_id: AtomicU32,
     /// Datagrams of the most recently sent frame, retransmitted on RTO during Handshake.
@@ -113,6 +119,7 @@ impl UdpClientTransport {
             prev_socket: ArcSwap::from_pointee(None),
             server,
             cid,
+            established_cid: ArcSwap::from_pointee(None),
             phase: AtomicU8::new(PHASE_HANDSHAKE),
             next_packet_id: AtomicU32::new(0),
             last_sent: Mutex::new(Vec::new()),
@@ -177,7 +184,10 @@ impl SessionTransport for UdpClientTransport {
         } else {
             PacketType::OneRtt
         };
-        let dgrams = encode_datagrams(ty, &self.cid, self.pkt_id(), data)
+        // ε / WIRE v5: stamp the rotating CID once the handshake set it; the
+        // bootstrap `cid` is stamped until then.
+        let cid = (**self.established_cid.load()).unwrap_or(self.cid);
+        let dgrams = encode_datagrams(ty, &cid, self.pkt_id(), data)
             .map_err(|e| CoreError::NetworkError(format!("frame too large to fragment: {e}")))?;
         // Snapshot the active socket (owned `Arc`, not a `Guard`) so we never hold an
         // `ArcSwap` guard across `.await` — `migrate()` can swap it concurrently.
@@ -312,6 +322,10 @@ impl SessionTransport for UdpClientTransport {
         self.phase.store(v, Ordering::Relaxed);
     }
 
+    fn set_outbound_cid(&self, cid: [u8; 8]) {
+        self.established_cid.store(Arc::new(Some(cid)));
+    }
+
     /// SocketAddr-free trait entry for connection migration (Phase 4 / P4.2c). Parses
     /// the embedder-supplied local bind address and delegates to the typed
     /// [`migrate_to`](Self::migrate_to). A malformed address is a clean `Err` that
@@ -331,7 +345,13 @@ pub struct UdpServerTransport {
     /// Established peer. `ArcSwap` so the session can atomically switch it to a
     /// validated migration candidate (Phase 4 / P4.2) without re-handshake.
     peer: ArcSwap<SocketAddr>,
+    /// The bootstrap (handshake) ConnId, stamped until the session sets the
+    /// rotating chain via [`set_outbound_cid`](SessionTransport::set_outbound_cid).
     cid: ConnId,
+    /// The rotating routing CID set at the handshake → data-pump boundary (ε /
+    /// WIRE v5). `None` during the handshake; `Some(CID_0)` once the session sets
+    /// it. Stamped on server→client datagrams so that direction also rotates.
+    established_cid: ArcSwap<Option<ConnId>>,
     phase: AtomicU8,
     next_packet_id: AtomicU32,
     rx: Mutex<mpsc::Receiver<(Bytes, SocketAddr)>>,
@@ -362,6 +382,7 @@ impl UdpServerTransport {
             socket,
             peer: ArcSwap::from_pointee(peer),
             cid,
+            established_cid: ArcSwap::from_pointee(None),
             phase: AtomicU8::new(PHASE_HANDSHAKE),
             next_packet_id: AtomicU32::new(0),
             rx: Mutex::new(rx),
@@ -382,7 +403,9 @@ impl SessionTransport for UdpServerTransport {
             PacketType::OneRtt
         };
         let pid = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
-        let dgrams = encode_datagrams(ty, &self.cid, pid, data)
+        // ε / WIRE v5: stamp the rotating CID once the handshake set it.
+        let cid = (**self.established_cid.load()).unwrap_or(self.cid);
+        let dgrams = encode_datagrams(ty, &cid, pid, data)
             .map_err(|e| CoreError::NetworkError(format!("frame too large to fragment: {e}")))?;
         let peer = **self.peer.load();
         for d in &dgrams {
@@ -489,6 +512,10 @@ impl SessionTransport for UdpServerTransport {
             FramePhase::Established => PHASE_ESTABLISHED,
         };
         self.phase.store(v, Ordering::Relaxed);
+    }
+
+    fn set_outbound_cid(&self, cid: [u8; 8]) {
+        self.established_cid.store(Arc::new(Some(cid)));
     }
 }
 
