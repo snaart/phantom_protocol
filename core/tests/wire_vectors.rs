@@ -173,8 +173,13 @@ fn sample_hrr_pow() -> HelloRetryRequest {
 }
 
 fn sample_header() -> PacketHeader {
+    // ε / WIRE v5: `session_id` is off-wire (the 15-byte `to_wire` image omits it
+    // and `from_wire` round-trips it as the placeholder zero), so the frozen
+    // packet fixtures use a zero session_id — `decode(fixture) == value` then
+    // holds. That a *non-zero* session_id is dropped is pinned separately by
+    // `types::tests::to_wire_omits_session_id` and the v5 security invariants.
     PacketHeader::new(
-        SessionId::from_bytes(arr32(0x01)),
+        SessionId::from_bytes([0u8; 32]),
         7,
         42,
         PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
@@ -188,7 +193,8 @@ fn sample_packet_data() -> PhantomPacket {
 }
 
 fn sample_packet_ack() -> PhantomPacket {
-    PhantomPacket::ack(SessionId::from_bytes(arr32(0x01)), 7, 42)
+    // Zero session_id — off-wire in v5 (see `sample_header`).
+    PhantomPacket::ack(SessionId::from_bytes([0u8; 32]), 7, 42)
 }
 
 fn sample_packet_ext() -> PhantomPacket {
@@ -273,7 +279,8 @@ fn vector_packet_header() {
     assert_eq!(
         bytes.len(),
         PacketHeader::SIZE,
-        "header is the AEAD AAD; must be exactly {} bytes",
+        "v5 wire header must be exactly {} bytes (session_id is off-wire; the AAD \
+         is the separate 47-byte to_aad_image)",
         PacketHeader::SIZE
     );
     let frozen = freeze("packet_header.bin", &bytes);

@@ -879,8 +879,15 @@ impl Session {
         n
     }
 
-    /// Run `f` with the AEAD AAD for a packet: the 47-byte header wire image
-    /// (`PacketHeader::to_wire`) followed by the packet's `extensions` TLV.
+    /// Run `f` with the AEAD AAD for a packet: the 47-byte header AAD image
+    /// (`PacketHeader::to_aad_image` — `version ‖ session_id ‖ packet_number ‖
+    /// flags ‖ stream_id ‖ epoch ‖ path_id`) followed by the packet's
+    /// `extensions` TLV.
+    ///
+    /// ε / WIRE v5 — `session_id` is off-wire (the on-wire header is 15 bytes),
+    /// but the AAD stays the byte-identical 47-byte v4 image so the AEAD security
+    /// argument is unchanged; the recv path reconstructs `header.session_id` from
+    /// the session context before calling this (see [`Self::parse_protected`]).
     ///
     /// T4.1 — `extensions` (the forward-compat TLV headroom) is authenticated
     /// here, closing the prior malleability where it sat *outside* the AAD and an
@@ -894,7 +901,7 @@ impl Session {
         extensions: &[u8],
         f: impl FnOnce(&[u8]) -> R,
     ) -> R {
-        let header_bytes = header.to_wire();
+        let header_bytes = header.to_aad_image();
         if extensions.is_empty() {
             f(&header_bytes)
         } else {
@@ -909,9 +916,10 @@ impl Session {
     ///
     /// The AEAD nonce is `prefix || packet_number` (① — Phase 4), derived from the
     /// authenticated header rather than an internal counter, so a failed peer
-    /// decrypt never desyncs the receiver. The AAD is the 47-byte wire image of the
-    /// header ([`PacketHeader::to_wire`]) — which still binds `epoch` / `stream_id`
-    /// / `path_id` — followed by the packet's `extensions` TLV (T4.1), so any
+    /// decrypt never desyncs the receiver. The AAD is the 47-byte AAD image of the
+    /// header ([`PacketHeader::to_aad_image`]) — which still binds `session_id` /
+    /// `epoch` / `stream_id` / `path_id` even though the wire header is 15 bytes —
+    /// followed by the packet's `extensions` TLV (T4.1), so any
     /// wire-level mutation of the header *or* the extensions invalidates the tag.
     pub fn encrypt_packet(
         &self,
@@ -966,7 +974,7 @@ impl Session {
     // ── Header protection (T4.6, QUIC RFC 9001 §5.4) ──────────────────────────
 
     /// Serialise a packet to its **header-protected** on-wire bytes: the
-    /// `[33..47]` header span is XOR-masked with this session's send-direction HP
+    /// `[1..15]` header span is XOR-masked with this session's send-direction HP
     /// key, keyed by the packet's ciphertext sample (the first 16 bytes of
     /// `packet.payload`). The data plane calls this instead of `to_wire` for
     /// every post-handshake packet. `packet.payload` must be AEAD ciphertext
@@ -979,20 +987,26 @@ impl Session {
     }
 
     /// Parse a **header-protected** wire packet: recover the cleartext header by
-    /// unmasking the `[33..47]` span with this session's recv-direction HP key
-    /// (keyed by the cleartext ciphertext sample), then reassemble the
-    /// `PhantomPacket`. The caller still gates on `version` / `session_id` and
-    /// runs AEAD on the result — a wire mutation of the masked region unmasks to a
-    /// wrong header, so the subsequent AEAD open fails (no new oracle). A short /
-    /// malformed frame returns `Err` and is dropped by the recv loop.
+    /// unmasking the `[1..15]` span with this session's recv-direction HP key
+    /// (keyed by the cleartext ciphertext sample), reconstruct the off-wire
+    /// `session_id` from this session's id (ε / WIRE v5), then reassemble the
+    /// `PhantomPacket`. The caller still gates on `version` and runs AEAD on the
+    /// result — a wire mutation of the masked region unmasks to a wrong header, so
+    /// the subsequent AEAD open fails (no new oracle). A short / malformed frame
+    /// returns `Err` and is dropped by the recv loop.
     pub fn parse_protected(&self, bytes: &[u8]) -> Result<PhantomPacket, CoreError> {
         let raw = RawPacket::from_wire(bytes)
             .map_err(|e| CoreError::CryptoError(format!("HP: malformed wire packet: {e}")))?;
         let sample = Self::hp_sample(&raw.payload)?;
         let mask = self.header_protection.mask_recv(&sample)?;
-        let header = raw
+        let mut header = raw
             .unmask_header(&mask)
             .map_err(|e| CoreError::CryptoError(format!("HP: header unmask failed: {e}")))?;
+        // ε / WIRE v5: session_id is off-wire — reconstruct it from the routed
+        // session context so the AAD image matches what the sender authenticated
+        // (the 47-byte `to_aad_image`). A wrong session here → wrong AAD → AEAD
+        // fail; this is the off-wire analogue of the v4 cleartext-session_id bind.
+        header.session_id = *self.id();
         Ok(raw.into_packet(header))
     }
 

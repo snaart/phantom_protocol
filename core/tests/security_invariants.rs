@@ -112,10 +112,11 @@ fn tampered_extensions_is_rejected_via_aad() {
 }
 
 /// T4.6 — header protection (QUIC RFC 9001 §5.4) masks the 14 variable header
-/// bytes (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖ path_id`, wire `[33..47]`)
-/// so a passive on-path observer reads neither the packet number nor the
-/// `PRIORITY` ("voice") flag; only `version ‖ session_id` (the routing CID) stay
-/// cleartext. The peer recovers the exact packet via `parse_protected`.
+/// bytes (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖ path_id`, wire `[1..15]`
+/// in ε / WIRE v5) so a passive on-path observer reads neither the packet number
+/// nor the `PRIORITY` ("voice") flag; only the `version` byte stays cleartext
+/// (session_id is off-wire; routing is by the outer ConnId). The peer recovers
+/// the exact packet via `parse_protected`.
 #[test]
 fn hp_masks_header_fields_on_the_wire() {
     let (client, server) = make_session_pair([0x71u8; 32]);
@@ -134,31 +135,33 @@ fn hp_masks_header_fields_on_the_wire() {
     let wire = client.protect_packet(&packet).expect("protect");
     let cleartext = packet.to_wire();
 
-    // The 14-byte protected region is masked → not the cleartext header bytes.
+    // The 14-byte protected region [1..15] is masked → not the cleartext bytes.
     assert_ne!(
-        &wire[33..47],
-        &cleartext[33..47],
+        &wire[1..15],
+        &cleartext[1..15],
         "pn/flags/stream_id/epoch/path_id must be masked on the wire"
     );
-    // version + session_id (the routing CID) stay cleartext for the demux.
-    assert_eq!(&wire[..33], &cleartext[..33]);
+    // Only the `version` byte stays cleartext (session_id is off-wire).
+    assert_eq!(&wire[..1], &cleartext[..1]);
     // The flags bytes (incl. the PRIORITY/voice bit) sit in the masked span, so
     // an observer cannot read the priority class off the wire.
     assert_ne!(
-        &wire[41..43],
-        &cleartext[41..43],
+        &wire[9..11],
+        &cleartext[9..11],
         "the PRIORITY/voice flag must not be readable on the wire without the hp key"
     );
-    // The peer recovers the exact packet (header + payload) by unmasking.
+    // The peer recovers the exact packet (header + payload) by unmasking; the
+    // off-wire session_id is reconstructed to this session's id (= the original,
+    // since both sides share the negotiated id here).
     let parsed = server.parse_protected(&wire).expect("parse");
     assert_eq!(parsed.header, header);
     assert_eq!(parsed.payload, packet.payload);
 }
 
 /// T4.6 — header protection adds NO new decryption oracle: a wire mutation of the
-/// masked `[33..47]` region unmasks to a WRONG header, so the subsequent AEAD
-/// open (the cleartext header is the AAD) fails — caught exactly like any other
-/// AAD / ciphertext tamper, with no separate signal.
+/// masked `[1..15]` region (ε / WIRE v5) unmasks to a WRONG header, so the
+/// subsequent AEAD open (the reconstructed header image is the AAD) fails —
+/// caught exactly like any other AAD / ciphertext tamper, with no separate signal.
 #[test]
 fn hp_masked_region_tamper_fails_aead() {
     let (client, server) = make_session_pair([0x72u8; 32]);
@@ -169,8 +172,9 @@ fn hp_masked_region_tamper_fails_aead() {
     let packet = PhantomPacket::new(header, ct);
     let mut wire = client.protect_packet(&packet).expect("protect");
 
-    // Flip a byte inside the masked header region.
-    wire[35] ^= 0x40;
+    // Flip a byte inside the masked header region [1..15] (here in the masked
+    // packet_number span).
+    wire[5] ^= 0x40;
     // Unmasking still "succeeds" structurally but recovers a different header...
     let tampered = server.parse_protected(&wire).expect("parse");
     assert_ne!(
@@ -187,13 +191,112 @@ fn hp_masked_region_tamper_fails_aead() {
     );
 }
 
+/// ε / WIRE v5 — the 32-byte inner `session_id` is dropped from the data-plane
+/// wire (the header shrinks to 15 bytes); it stays only in the AEAD AAD,
+/// reconstructed from session context by `parse_protected`. This pins both
+/// halves: (1) a distinctive session_id never appears on the protected wire, and
+/// (2) the peer still recovers it and the HP + AEAD round-trip succeeds.
+#[test]
+fn v5_session_id_is_off_wire_but_reconstructed() {
+    let shared = [0x33u8; 32];
+    let id = SessionId::from_bytes([0xC7u8; 32]);
+    let crypto_a = CryptoState::new(&shared, false).expect("client crypto");
+    let crypto_b = CryptoState::new(&shared, true).expect("server crypto");
+    let client = Session::from_derived(id, crypto_a, SchedulerMode::LowLatency, shared, false);
+    let server = Session::from_derived(id, crypto_b, SchedulerMode::LowLatency, shared, true);
+
+    let header = PacketHeader::new(*client.id(), 2, 9, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let ct = client
+        .encrypt_packet(&header, b"hidden id", &[])
+        .expect("encrypt");
+    let packet = PhantomPacket::new(header, ct);
+    let wire = client.protect_packet(&packet).expect("protect");
+
+    // The distinctive session id (0xC7..) never appears anywhere on the wire.
+    assert!(
+        !wire.windows(8).any(|w| w == [0xC7u8; 8]),
+        "session_id must not be serialised onto the v5 wire"
+    );
+    // ...yet the server reconstructs it from session context and decrypts.
+    let parsed = server.parse_protected(&wire).expect("parse");
+    assert_eq!(
+        parsed.header.session_id,
+        *server.id(),
+        "parse_protected reconstructs session_id from the routed session"
+    );
+    let pt = server
+        .decrypt_packet(&parsed.header, &parsed.payload, &parsed.extensions)
+        .expect("decrypt");
+    assert_eq!(pt, b"hidden id");
+}
+
+/// ε / WIRE v5 — `session_id` is bound through the AEAD AAD even though it is
+/// off-wire. Two sessions sharing the AEAD keys (same `shared` secret, swap-paired
+/// directions → matching keys + nonce) but holding DIFFERENT session ids must not
+/// open each other's packets: the receiver reconstructs ITS id into the 47-byte
+/// AAD image, which differs from the sender's → AEAD fail. A session with the
+/// matching id does open it. This is the off-wire analogue of the v4
+/// cleartext-session_id binding (design §2.2).
+#[test]
+fn v5_session_id_bound_via_aad_off_wire() {
+    let shared = [0x5Eu8; 32];
+    let id_a = SessionId::from_bytes([0xAAu8; 32]);
+    let id_b = SessionId::from_bytes([0xBBu8; 32]);
+
+    let sender = Session::from_derived(
+        id_a,
+        CryptoState::new(&shared, false).expect("sender crypto"),
+        SchedulerMode::LowLatency,
+        shared,
+        false,
+    );
+    // Same AEAD keys (shared secret + server direction), DIFFERENT session id.
+    let wrong = Session::from_derived(
+        id_b,
+        CryptoState::new(&shared, true).expect("wrong crypto"),
+        SchedulerMode::LowLatency,
+        shared,
+        true,
+    );
+    // Same AEAD keys AND the matching session id.
+    let right = Session::from_derived(
+        id_a,
+        CryptoState::new(&shared, true).expect("right crypto"),
+        SchedulerMode::LowLatency,
+        shared,
+        true,
+    );
+    assert_ne!(sender.id(), wrong.id(), "distinct session ids");
+
+    let header = PacketHeader::new(*sender.id(), 1, 1, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let ct = sender
+        .encrypt_packet(&header, b"bound to A", &[])
+        .expect("encrypt");
+
+    // The wrong session reconstructs id_b into the AAD → AEAD fails, even though
+    // its AEAD key and nonce match the sender's.
+    let wrong_header =
+        PacketHeader::new(*wrong.id(), 1, 1, PacketFlags::new(PacketFlags::ENCRYPTED));
+    assert!(
+        wrong.decrypt_packet(&wrong_header, &ct, &[]).is_err(),
+        "a different session_id (off-wire, in the AAD) must not open the packet"
+    );
+    // The session with the matching id reconstructs id_a → AAD matches → opens.
+    let right_header =
+        PacketHeader::new(*right.id(), 1, 1, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let pt = right
+        .decrypt_packet(&right_header, &ct, &[])
+        .expect("matching session_id must open");
+    assert_eq!(pt, b"bound to A");
+}
+
 /// Malformed wire bytes must fail parsing as a typed error, never a panic.
 /// This protects the receive loop from a malicious peer crashing the process
 /// by sending random bytes.
 #[test]
 fn malformed_versioned_packet_fails_to_parse_not_panic() {
-    // A short byte stream (< the 45-byte header): must be rejected, not parsed.
-    let garbage: Vec<u8> = (0u8..32).collect();
+    // A short byte stream (< the 15-byte v5 header): must be rejected, not parsed.
+    let garbage: Vec<u8> = (0u8..10).collect();
     let result = PhantomPacket::from_wire(&garbage);
     assert!(
         result.is_err(),
