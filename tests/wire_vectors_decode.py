@@ -18,7 +18,8 @@ What it covers:
 
   * **packet header + `PhantomPacket`** — the hand-rolled big-endian codec:
     `version` first, integers network byte order, byte arrays as-is, and the body
-    is `header(47) || payload_len:u32be || payload || ext_len:u32be || extensions`.
+    is `header(15) || payload_len:u32be || payload || ext_len:u32be || extensions`
+    (ε / WIRE v5: a 15-byte header — session_id is off-wire).
     Fully decoded **and** re-encoded, same as the borsh structs.
 
 Run: ``python3 tests/wire_vectors_decode.py`` (stdlib only; exits non-zero on
@@ -43,7 +44,7 @@ ML_DSA_SIG_LEN = 3309
 CLASSICAL_PK_LEN = 32
 PROTOCOL_VARIANT = b"phantom-default-1"
 PROTOCOL_VERSION = 3  # bumped 2->3 (T4.3): ServerHello server_key_package -> 32-byte server_nonce
-WIRE_VERSION = 4
+WIRE_VERSION = 5
 
 
 def pat(seed: int, n: int) -> bytes:
@@ -264,42 +265,41 @@ def enc_hrr(w: BorshWriter, v):
 
 # ─── packet codec: hand-rolled, big-endian, version-first ───────────────────
 #
-# PacketHeader (47 bytes), WIRE_VERSION 4 layout (T4.6 — the 14 HP-protected
-# bytes are contiguous at [33:47] so they can be masked in one span; only
-# version + session_id stay cleartext on the wire):
+# PacketHeader (15 bytes), WIRE_VERSION 5 layout (ε / CID-collapse — the 32-byte
+# inner session_id is OFF-WIRE; the 14 HP-protected bytes are contiguous at
+# [1:15], only the version byte stays cleartext; routing is by the outer rotating
+# ConnId):
 #   [0]     version       u8   (= WIRE_VERSION)            CLEARTEXT
-#   [1:33]  session_id    [u8;32]  (routing CID)           CLEARTEXT
-#   [33:41] packet_number u64 be   (① — Phase 4)           HP-MASKED
-#   [41:43] flags         u16 be                           HP-MASKED
-#   [43:45] stream_id     u16 be                           HP-MASKED
-#   [45]    epoch         u8                               HP-MASKED
-#   [46]    path_id       u8                               HP-MASKED
+#   [1:9]   packet_number u64 be                           HP-MASKED
+#   [9:11]  flags         u16 be                           HP-MASKED
+#   [11:13] stream_id     u16 be                           HP-MASKED
+#   [13]    epoch         u8                               HP-MASKED
+#   [14]    path_id       u8                               HP-MASKED
 # PhantomPacket: header || payload_len:u32be || payload || ext_len:u32be || ext.
-# NOTE: these fixtures freeze the *cleartext* codec image (the AEAD AAD); the
-# on-wire [33:47] span is XOR-masked by the per-session HeaderProtector, which
-# is keyed crypto (blake3/HKDF + AES-ECB/ChaCha20) and verified in Rust — this
-# independent decoder deliberately stays crypto-free and decodes the cleartext.
+# NOTE: these fixtures freeze the *cleartext wire image* (the 15-byte header). The
+# AEAD AAD is a SEPARATE 47-byte v4-style image (version‖session_id‖the-14),
+# reconstructed off-wire — NOT what these vectors freeze. The on-wire [1:15] span
+# is XOR-masked by the per-session HeaderProtector (keyed crypto, verified in
+# Rust); this independent decoder stays crypto-free and decodes the cleartext.
 
-HEADER_SIZE = 47
+HEADER_SIZE = 15
 
 
 def dec_packet_header(b: bytes):
     check(len(b) >= HEADER_SIZE, f"header needs {HEADER_SIZE} bytes, got {len(b)}")
     return {
         "version": b[0],
-        "session_id": bytes(b[1:33]),
-        "packet_number": struct.unpack(">Q", b[33:41])[0],
-        "flags": struct.unpack(">H", b[41:43])[0],
-        "stream_id": struct.unpack(">H", b[43:45])[0],
-        "epoch": b[45],
-        "path_id": b[46],
+        "packet_number": struct.unpack(">Q", b[1:9])[0],
+        "flags": struct.unpack(">H", b[9:11])[0],
+        "stream_id": struct.unpack(">H", b[11:13])[0],
+        "epoch": b[13],
+        "path_id": b[14],
     }
 
 
 def enc_packet_header(h) -> bytes:
     return (
         bytes([h["version"]])
-        + h["session_id"]
         + struct.pack(">Q", h["packet_number"])
         + struct.pack(">H", h["flags"])
         + struct.pack(">H", h["stream_id"])
@@ -463,7 +463,7 @@ def packet_header():
     check(len(raw) == HEADER_SIZE, f"header must be {HEADER_SIZE} bytes")
     h = dec_packet_header(raw)
     check(h["version"] == WIRE_VERSION, "header version pin (byte 0)")
-    check(h["session_id"] == arr32(0x01), "header session_id (as-is, byte 1)")
+    # session_id is off-wire in v5 — no longer a wire field to check.
     check(h["stream_id"] == 7, "header stream_id")
     check(h["packet_number"] == 42, "header packet_number")
     check(h["flags"] == 0x0021, "header flags ENCRYPTED|RELIABLE")

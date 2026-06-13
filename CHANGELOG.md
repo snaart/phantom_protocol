@@ -31,9 +31,8 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   byte-exact. No wire-format change — `path_id` already rode the 47-byte header and left the AEAD nonce
   under model ①. PATH-001 is split into a strict send-gate (app data only to validated paths) and a
   relaxed recv-delivery (authenticated, non-replayed data is delivered regardless of source), so a
-  NAT-rebind upload is seamless. Header protection (below, T4.6) now masks the variable per-packet
-  metadata, but migration stays **linkable via the stable connection-ID**; CID rotation — the remaining
-  piece of unlinkable migration — is a later hardening phase.
+  NAT-rebind upload is seamless. Combined with header protection (T4.6, below) and CID collapse +
+  rotation (ε, below), migration is now **unlinkable** by an on-path observer.
 - **PhantomUDP (Phase 1):** native datagram `SessionTransport` over raw UDP with connection-ID
   demultiplexing — `PhantomUdpListener` (server accept) plus `UdpClientTransport` / `UdpServerTransport`.
   The multi-KB post-quantum handshake is fragmented to the path MTU and reassembled. No wire-format or
@@ -41,6 +40,23 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Security
 
+- **Unlinkable migration — CID collapse + rotation (ε; `WIRE_VERSION` 4→5, breaking):** the data-plane
+  packet header drops the inner 32-byte `session_id` from the wire entirely (47→15 bytes — it stays in the
+  AEAD AAD, reconstructed from session context, so the AEAD binding is byte-identical to v4), and the single
+  remaining cleartext connection identifier — the outer 8-byte UDP `ConnId` — now **rotates** to an
+  independent-random value on each `migrate()` via a per-direction KDF chain (`CID_i =
+  derive_key_32("phantom-cid-v1", cid_secret‖i)[0..8]`), with the server demux routing on a sliding window
+  that advances post-AEAD on the peer's authenticated `path_id`. With header protection (T4.6) already
+  masking the variable per-packet metadata, **no stable cleartext identifier remains**, so an on-path /
+  colluding observer can no longer link a session across a network change (LINDDUN-L closed; threat-model
+  §12.5 / PROTOCOL.md §4.7). *Honest caveat:* like the HP keys, the CID chain is session-stable and **not**
+  forward-secret — a session-key compromise recomputes the chain and relinks a *recorded* flow; the payload
+  stays forward-secret. Breaking wire change (no deployed peers): `WIRE_VERSION` 4→5, packet wire-vectors
+  regenerated; `PROTOCOL_VERSION` (handshake) unchanged; TCP / embedded (socket-routed) carry no on-wire CID
+  and are unaffected. Also fixes a latent bug where `ObservedTransport` (the pump's observability wrapper)
+  only forwarded send/recv, silently no-op'ing the FFI `migrate()` and the server-side migration detection
+  once wrapped — the wrapper is now fully transparent, so FFI-triggered migration actually rebinds and the
+  server follows + slides its CID window.
 - **Header protection (T4.6 — QUIC RFC 9001 §5.4):** the 14 variable header bytes — packet number, flags
   (incl. the `PRIORITY`/voice bit), stream id, rekey epoch, and migration path id — are now **XOR-masked on
   the wire**, leaving only `version` + `session_id` (the routing CID) cleartext. A passive on-path observer

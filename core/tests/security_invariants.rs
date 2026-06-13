@@ -112,10 +112,11 @@ fn tampered_extensions_is_rejected_via_aad() {
 }
 
 /// T4.6 — header protection (QUIC RFC 9001 §5.4) masks the 14 variable header
-/// bytes (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖ path_id`, wire `[33..47]`)
-/// so a passive on-path observer reads neither the packet number nor the
-/// `PRIORITY` ("voice") flag; only `version ‖ session_id` (the routing CID) stay
-/// cleartext. The peer recovers the exact packet via `parse_protected`.
+/// bytes (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖ path_id`, wire `[1..15]`
+/// in ε / WIRE v5) so a passive on-path observer reads neither the packet number
+/// nor the `PRIORITY` ("voice") flag; only the `version` byte stays cleartext
+/// (session_id is off-wire; routing is by the outer ConnId). The peer recovers
+/// the exact packet via `parse_protected`.
 #[test]
 fn hp_masks_header_fields_on_the_wire() {
     let (client, server) = make_session_pair([0x71u8; 32]);
@@ -134,31 +135,33 @@ fn hp_masks_header_fields_on_the_wire() {
     let wire = client.protect_packet(&packet).expect("protect");
     let cleartext = packet.to_wire();
 
-    // The 14-byte protected region is masked → not the cleartext header bytes.
+    // The 14-byte protected region [1..15] is masked → not the cleartext bytes.
     assert_ne!(
-        &wire[33..47],
-        &cleartext[33..47],
+        &wire[1..15],
+        &cleartext[1..15],
         "pn/flags/stream_id/epoch/path_id must be masked on the wire"
     );
-    // version + session_id (the routing CID) stay cleartext for the demux.
-    assert_eq!(&wire[..33], &cleartext[..33]);
+    // Only the `version` byte stays cleartext (session_id is off-wire).
+    assert_eq!(&wire[..1], &cleartext[..1]);
     // The flags bytes (incl. the PRIORITY/voice bit) sit in the masked span, so
     // an observer cannot read the priority class off the wire.
     assert_ne!(
-        &wire[41..43],
-        &cleartext[41..43],
+        &wire[9..11],
+        &cleartext[9..11],
         "the PRIORITY/voice flag must not be readable on the wire without the hp key"
     );
-    // The peer recovers the exact packet (header + payload) by unmasking.
+    // The peer recovers the exact packet (header + payload) by unmasking; the
+    // off-wire session_id is reconstructed to this session's id (= the original,
+    // since both sides share the negotiated id here).
     let parsed = server.parse_protected(&wire).expect("parse");
     assert_eq!(parsed.header, header);
     assert_eq!(parsed.payload, packet.payload);
 }
 
 /// T4.6 — header protection adds NO new decryption oracle: a wire mutation of the
-/// masked `[33..47]` region unmasks to a WRONG header, so the subsequent AEAD
-/// open (the cleartext header is the AAD) fails — caught exactly like any other
-/// AAD / ciphertext tamper, with no separate signal.
+/// masked `[1..15]` region (ε / WIRE v5) unmasks to a WRONG header, so the
+/// subsequent AEAD open (the reconstructed header image is the AAD) fails —
+/// caught exactly like any other AAD / ciphertext tamper, with no separate signal.
 #[test]
 fn hp_masked_region_tamper_fails_aead() {
     let (client, server) = make_session_pair([0x72u8; 32]);
@@ -169,8 +172,9 @@ fn hp_masked_region_tamper_fails_aead() {
     let packet = PhantomPacket::new(header, ct);
     let mut wire = client.protect_packet(&packet).expect("protect");
 
-    // Flip a byte inside the masked header region.
-    wire[35] ^= 0x40;
+    // Flip a byte inside the masked header region [1..15] (here in the masked
+    // packet_number span).
+    wire[5] ^= 0x40;
     // Unmasking still "succeeds" structurally but recovers a different header...
     let tampered = server.parse_protected(&wire).expect("parse");
     assert_ne!(
@@ -187,13 +191,231 @@ fn hp_masked_region_tamper_fails_aead() {
     );
 }
 
+/// ε / WIRE v5 — the 32-byte inner `session_id` is dropped from the data-plane
+/// wire (the header shrinks to 15 bytes); it stays only in the AEAD AAD,
+/// reconstructed from session context by `parse_protected`. This pins both
+/// halves: (1) a distinctive session_id never appears on the protected wire, and
+/// (2) the peer still recovers it and the HP + AEAD round-trip succeeds.
+#[test]
+fn v5_session_id_is_off_wire_but_reconstructed() {
+    let shared = [0x33u8; 32];
+    let id = SessionId::from_bytes([0xC7u8; 32]);
+    let crypto_a = CryptoState::new(&shared, false).expect("client crypto");
+    let crypto_b = CryptoState::new(&shared, true).expect("server crypto");
+    let client = Session::from_derived(id, crypto_a, SchedulerMode::LowLatency, shared, false);
+    let server = Session::from_derived(id, crypto_b, SchedulerMode::LowLatency, shared, true);
+
+    let header = PacketHeader::new(*client.id(), 2, 9, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let ct = client
+        .encrypt_packet(&header, b"hidden id", &[])
+        .expect("encrypt");
+    let packet = PhantomPacket::new(header, ct);
+    let wire = client.protect_packet(&packet).expect("protect");
+
+    // The distinctive session id (0xC7..) never appears anywhere on the wire.
+    assert!(
+        !wire.windows(8).any(|w| w == [0xC7u8; 8]),
+        "session_id must not be serialised onto the v5 wire"
+    );
+    // ...yet the server reconstructs it from session context and decrypts.
+    let parsed = server.parse_protected(&wire).expect("parse");
+    assert_eq!(
+        parsed.header.session_id,
+        *server.id(),
+        "parse_protected reconstructs session_id from the routed session"
+    );
+    let pt = server
+        .decrypt_packet(&parsed.header, &parsed.payload, &parsed.extensions)
+        .expect("decrypt");
+    assert_eq!(pt, b"hidden id");
+}
+
+/// ε / WIRE v5 — `session_id` is bound through the AEAD AAD even though it is
+/// off-wire. Two sessions sharing the AEAD keys (same `shared` secret, swap-paired
+/// directions → matching keys + nonce) but holding DIFFERENT session ids must not
+/// open each other's packets: the receiver reconstructs ITS id into the 47-byte
+/// AAD image, which differs from the sender's → AEAD fail. A session with the
+/// matching id does open it. This is the off-wire analogue of the v4
+/// cleartext-session_id binding (design §2.2).
+#[test]
+fn v5_session_id_bound_via_aad_off_wire() {
+    let shared = [0x5Eu8; 32];
+    let id_a = SessionId::from_bytes([0xAAu8; 32]);
+    let id_b = SessionId::from_bytes([0xBBu8; 32]);
+
+    let sender = Session::from_derived(
+        id_a,
+        CryptoState::new(&shared, false).expect("sender crypto"),
+        SchedulerMode::LowLatency,
+        shared,
+        false,
+    );
+    // Same AEAD keys (shared secret + server direction), DIFFERENT session id.
+    let wrong = Session::from_derived(
+        id_b,
+        CryptoState::new(&shared, true).expect("wrong crypto"),
+        SchedulerMode::LowLatency,
+        shared,
+        true,
+    );
+    // Same AEAD keys AND the matching session id.
+    let right = Session::from_derived(
+        id_a,
+        CryptoState::new(&shared, true).expect("right crypto"),
+        SchedulerMode::LowLatency,
+        shared,
+        true,
+    );
+    assert_ne!(sender.id(), wrong.id(), "distinct session ids");
+
+    let header = PacketHeader::new(*sender.id(), 1, 1, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let ct = sender
+        .encrypt_packet(&header, b"bound to A", &[])
+        .expect("encrypt");
+
+    // The wrong session reconstructs id_b into the AAD → AEAD fails, even though
+    // its AEAD key and nonce match the sender's.
+    let wrong_header =
+        PacketHeader::new(*wrong.id(), 1, 1, PacketFlags::new(PacketFlags::ENCRYPTED));
+    assert!(
+        wrong.decrypt_packet(&wrong_header, &ct, &[]).is_err(),
+        "a different session_id (off-wire, in the AAD) must not open the packet"
+    );
+    // The session with the matching id reconstructs id_a → AAD matches → opens.
+    let right_header =
+        PacketHeader::new(*right.id(), 1, 1, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let pt = right
+        .decrypt_packet(&right_header, &ct, &[])
+        .expect("matching session_id must open");
+    assert_eq!(pt, b"bound to A");
+}
+
+/// ε / WIRE v5 (P3) — the rotating-CID chain is wired into `Session`: the
+/// client's current outbound CID (`CID_0`) is EXACTLY what the server routes on —
+/// it is the first entry of the server's inbound demux window. This is the
+/// routing contract the UDP demux relies on (client stamps `current_outbound_cid`;
+/// the server registers `inbound_window_cids` and a hit routes to the session).
+/// The chains are per-direction (c2s / s2c), so the property holds both ways.
+#[test]
+fn v5_session_cid_chain_outbound_matches_peer_inbound_window() {
+    let (client, server) = make_session_pair([0x5Eu8; 32]);
+
+    // Client → server: the client stamps CID_0; the server's inbound window (the
+    // c2s chain it routes on) must contain it as its leading entry.
+    let client_cid0 = client.current_outbound_cid();
+    let server_window = server.inbound_window_cids();
+    assert_eq!(
+        server_window[0], client_cid0,
+        "server inbound window[0] must equal the client's CID_0"
+    );
+    assert!(server_window.contains(&client_cid0));
+
+    // Server → client: symmetric (the s2c chain).
+    let server_cid0 = server.current_outbound_cid();
+    let client_window = client.inbound_window_cids();
+    assert_eq!(client_window[0], server_cid0);
+
+    // At index 0 the window is the leading lookahead (trailing saturates at 0):
+    // K + 1 = 5 CIDs (indices 0..=4).
+    assert_eq!(
+        server_window.len(),
+        5,
+        "leading window is K+1 = 5 CIDs at start"
+    );
+}
+
+/// ε / WIRE v5 (P4) — `migrate()` rotates the outbound CID: `advance_outbound_cid`
+/// bumps the index and returns the next CID (`CID_1` after `CID_0`). The rotated
+/// CID is independent-random vs `CID_0` (the unlinkability property) yet still
+/// inside the peer's pre-registered inbound window `[CID_0..CID_K]`, so the server
+/// routes it without a re-handshake (for up to K migrations before a slide).
+#[test]
+fn v5_advance_outbound_cid_rotates_within_peer_window() {
+    let (client, server) = make_session_pair([0x6Au8; 32]);
+    let cid0 = client.current_outbound_cid();
+    let cid1 = client.advance_outbound_cid();
+    assert_ne!(cid0, cid1, "the CID must rotate on migrate");
+    assert_eq!(
+        cid1,
+        client.current_outbound_cid(),
+        "the outbound index advanced to 1"
+    );
+
+    // The rotated CID is still in the server's pre-registered leading window, so a
+    // single migration routes without any window slide.
+    let window = server.inbound_window_cids();
+    assert!(
+        window.contains(&cid1),
+        "CID_1 must be routable via the pre-registered window"
+    );
+
+    // Each further migration yields another distinct CID (still within K).
+    let cid2 = client.advance_outbound_cid();
+    assert_ne!(cid1, cid2);
+    assert!(window.contains(&cid2));
+}
+
+/// ε / WIRE v5 (P4b) — the server slides its inbound CID window as the client
+/// migrates. `note_migration_path` advances the window one step per NEW (forward,
+/// mod-256) path_id and yields the CIDs to add (new leading edge) / remove (past
+/// the trailing edge); a reordered-old, duplicate, or unchanged path_id slides
+/// nothing (robust to reordering + passive rebind, which never advances the index).
+#[test]
+fn v5_note_migration_path_slides_inbound_window() {
+    use std::collections::HashSet;
+    let (_client, server) = make_session_pair([0x7Bu8; 32]);
+    let original: HashSet<[u8; 8]> = server.inbound_window_cids().into_iter().collect();
+
+    // path_id 0 is the initial path — no slide.
+    assert!(
+        server.note_migration_path(0).is_none(),
+        "the initial path does not slide"
+    );
+
+    // First migration: path_id 1 (forward) slides one step.
+    let s1 = server
+        .note_migration_path(1)
+        .expect("a forward path_id must slide the window");
+    assert_eq!(s1.add.len(), 1, "one CID added at the new leading edge");
+    assert!(
+        s1.remove.is_empty(),
+        "nothing removed yet (highest=1 <= trailing T)"
+    );
+    assert!(
+        !original.contains(&s1.add[0]),
+        "the added CID is a fresh leading-edge CID, not one already registered"
+    );
+    // The post-slide window now centers at index 1 and includes the new CID.
+    assert!(server.inbound_window_cids().contains(&s1.add[0]));
+
+    // A duplicate of the same path_id does NOT slide again (idempotent).
+    assert!(
+        server.note_migration_path(1).is_none(),
+        "a duplicate path_id slides nothing"
+    );
+    // A reordered OLD path_id (far behind, mod-256) does NOT slide.
+    assert!(
+        server.note_migration_path(0).is_none(),
+        "a reordered-old path_id slides nothing"
+    );
+
+    // The next migration (path_id 2) slides again, to a distinct leading CID.
+    let s2 = server
+        .note_migration_path(2)
+        .expect("the next forward path_id slides");
+    assert_ne!(
+        s1.add[0], s2.add[0],
+        "each slide adds a distinct leading-edge CID"
+    );
+}
+
 /// Malformed wire bytes must fail parsing as a typed error, never a panic.
 /// This protects the receive loop from a malicious peer crashing the process
 /// by sending random bytes.
 #[test]
 fn malformed_versioned_packet_fails_to_parse_not_panic() {
-    // A short byte stream (< the 45-byte header): must be rejected, not parsed.
-    let garbage: Vec<u8> = (0u8..32).collect();
+    // A short byte stream (< the 15-byte v5 header): must be rejected, not parsed.
+    let garbage: Vec<u8> = (0u8..10).collect();
     let result = PhantomPacket::from_wire(&garbage);
     assert!(
         result.is_err(),

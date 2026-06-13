@@ -191,6 +191,49 @@ impl<T: SessionTransport> SessionTransport for ObservedTransport<T> {
         }
         result
     }
+
+    // ── Transparent forwarding of the non-I/O trait surface ───────────────────
+    //
+    // ObservedTransport wraps the concrete transport for the whole data pump, so
+    // every control method the pump calls on it (phase, CID stamping, migration)
+    // MUST reach the inner transport — otherwise they silently hit the trait's
+    // defaults (no-op / `false`) and the feature is dead through the pump. (The
+    // pre-ε code only forwarded send/recv, so the FFI `migrate()` and the
+    // server-side migration detection were no-ops once wrapped; ε needs them live
+    // to rotate the CID on migration, so the wrapper is made fully transparent.)
+    fn set_frame_phase(&self, phase: FramePhase) {
+        self.inner.set_frame_phase(phase);
+    }
+
+    fn set_outbound_cid(&self, cid: [u8; 8]) {
+        self.inner.set_outbound_cid(cid);
+    }
+
+    fn has_migration_candidate(&self) -> bool {
+        self.inner.has_migration_candidate()
+    }
+
+    fn send_to_candidate(
+        &self,
+        data: &[u8],
+    ) -> impl core::future::Future<Output = Result<bool, CoreError>> + Send {
+        self.inner.send_to_candidate(data)
+    }
+
+    fn confirm_authenticated_source(&self) {
+        self.inner.confirm_authenticated_source();
+    }
+
+    fn promote_candidate(&self) -> bool {
+        self.inner.promote_candidate()
+    }
+
+    fn migrate(
+        &self,
+        local_addr: String,
+    ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
+        self.inner.migrate(local_addr)
+    }
 }
 
 // ─── Session ────────────────────────────────────────────────────────────────
@@ -497,6 +540,11 @@ impl PhantomSession {
         // cap from the tight unauthenticated handshake limit to the steady-state
         // application limit before the data pump takes over.
         transport.set_frame_phase(FramePhase::Established);
+        // ε / WIRE v5: switch the transport off the bootstrap ConnId onto this
+        // session's rotating CID_0 (the c2s chain the client routes on; the
+        // demux registers the matching inbound window). The server→client
+        // direction rotates too, so neither flow keeps a stable cleartext id.
+        transport.set_outbound_cid(server_session.current_outbound_cid());
         let observed = Arc::new(ObservedTransport::new(
             transport,
             observability.clone(),
@@ -636,6 +684,10 @@ impl PhantomSession {
         // WIRE-001: the handshake is done — raise the frame cap from the tight
         // unauthenticated handshake limit to the steady-state application limit.
         transport.set_frame_phase(FramePhase::Established);
+        // ε / WIRE v5: stamp this session's rotating CID_0 on every post-handshake
+        // datagram (the chain the server's demux routes on) instead of the
+        // bootstrap ConnId.
+        transport.set_outbound_cid(crypto_session.current_outbound_cid());
         let observed = Arc::new(ObservedTransport::new(
             transport,
             observability.clone(),
@@ -1155,8 +1207,15 @@ async fn run_data_pump<T: SessionTransport>(
                         match transport.migrate(local_addr).await {
                             Ok(()) => {
                                 let new_path = crypto_session.next_migration_path_id();
+                                // ε / WIRE v5: rotate the outbound CID so every
+                                // post-migration datagram stamps an
+                                // independent-random ConnId an observer cannot link
+                                // to the pre-migration flow. The new CID_{i+1} is
+                                // already in the server's pre-registered inbound
+                                // window (which slides post-AEAD beyond K migrations).
+                                transport.set_outbound_cid(crypto_session.advance_outbound_cid());
                                 log::info!(
-                                    "PhantomSession: migrated send path -> path_id {}",
+                                    "PhantomSession: migrated send path -> path_id {}, CID rotated",
                                     new_path
                                 );
                                 // Wake the send loop so app data + L1 retransmits flow
@@ -1729,12 +1788,15 @@ async fn handle_packet<T: SessionTransport>(
     let stream_id: u32 = packet.header.stream_id.into();
     let path_id = packet.header.path_id;
 
-    // Bind every inbound frame to the negotiated session (H1). A frame stamped
-    // with a different session id is dropped before any state mutation, so
-    // cross-session / off-path control injection (forged ACK/FIN) can never
-    // reach the stream table, BBR, or the path registry. Application data also
-    // binds session_id through the AEAD AAD; this guard extends the same
-    // protection to the non-AEAD header inspection that follows.
+    // Bind every inbound frame to the negotiated session (H1). In ε / WIRE v5 the
+    // inner `session_id` is off-wire: `parse_protected` reconstructed
+    // `header.session_id` from this session's id, so this comparison is now a
+    // structural backstop (always true on a correctly-routed frame). The real
+    // cross-session bind is the AEAD AAD, which still authenticates `session_id`
+    // — a frame mis-delivered to the wrong session reconstructs that session's id
+    // into the AAD → wrong AAD → AEAD fail below, so forged ACK/FIN injection can
+    // never reach the stream table, BBR, or the path registry. Retained as a
+    // defensive backstop (design §2.1).
     if packet.header.session_id != session_id {
         return;
     }
@@ -1801,6 +1863,13 @@ async fn handle_packet<T: SessionTransport>(
         // clobber the candidate slot and misdirect / stall a legitimate migration. No-op for
         // same-source packets and for non-address transports (default trait impl).
         transport_for_path.confirm_authenticated_source();
+        // ε / WIRE v5 (P4b): the path_id is now authenticated. If the peer migrated
+        // (a new forward path_id), slide our inbound CID demux window so its rotated
+        // CID stays routable for arbitrarily many migrations. No-op on the client and
+        // for a path_id that is not newer (reorder / duplicate / passive rebind).
+        if let Some(slide) = crypto_recv.note_migration_path(packet.header.path_id) {
+            crypto_recv.signal_cid_slide(slide);
+        }
     }
 
     // Authenticated SACK ACK (H1, L1-A). ACKs are `ENCRYPTED | ACK` control
@@ -3220,6 +3289,19 @@ mod tests {
         PhantomPacket::new(header, ciphertext).to_wire()
     }
 
+    /// Decode a test-built frame the way the recv pump's `parse_protected` does:
+    /// `from_wire` + reconstruct the off-wire `session_id` from session context
+    /// (ε / WIRE v5). The `build_*` helpers emit cleartext `to_wire` (header
+    /// protection is exercised separately), so the inner `session_id` is the
+    /// placeholder zero until this sets it — mirroring production, where
+    /// `parse_protected` reconstructs it before `handle_packet` ever sees the
+    /// packet.
+    fn decode_recv_frame(frame: &[u8], session_id: SessionId) -> PhantomPacket {
+        let mut packet = PhantomPacket::from_wire(frame).expect("decode test recv frame");
+        packet.header.session_id = session_id;
+        packet
+    }
+
     #[tokio::test]
     async fn v2_recv_routes_encrypted_app_data_through_recv_channel() {
         let session_id = fixed_session_id();
@@ -3229,9 +3311,9 @@ mod tests {
         let stream_id: TransportStreamId = 1;
         let frame = build_app_frame(&client_session, session_id, stream_id, 0, b"hello-v2");
 
-        // Receive on the server side: deserialize then drive
-        // handle_packet, which is the recv-path entry point.
-        let v2 = PhantomPacket::from_wire(&frame).unwrap();
+        // Receive on the server side: decode (reconstructing the off-wire
+        // session_id, as parse_protected does) then drive handle_packet.
+        let v2 = decode_recv_frame(&frame, session_id);
 
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
@@ -3308,7 +3390,7 @@ mod tests {
                 0,   // stream_offset 0 → in-order delivery
                 b"x",
             );
-            let v2 = PhantomPacket::from_wire(&frame).unwrap();
+            let v2 = decode_recv_frame(&frame, session_id);
             handle_packet(
                 v2,
                 session_id,
@@ -3523,7 +3605,7 @@ mod tests {
             7, // a path the receiver has never validated
             b"on-new-path",
         );
-        let frame = PhantomPacket::from_wire(&frame).unwrap();
+        let frame = decode_recv_frame(&frame, session_id);
 
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
@@ -3617,7 +3699,7 @@ mod tests {
         // App data on a NEW (unvalidated) path id → the server must challenge it.
         let frame =
             build_app_frame_on_path(&client_session, session_id, stream_id, 0, 0, 1, b"migrated");
-        let frame = PhantomPacket::from_wire(&frame).unwrap();
+        let frame = decode_recv_frame(&frame, session_id);
 
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
@@ -3902,7 +3984,7 @@ mod tests {
         let ack_header_seq = seq.wrapping_add(54_321);
         let frame =
             build_encrypted_ack(&client_session, session_id, stream_id, ack_header_seq, seq);
-        let ack_pkt = PhantomPacket::from_wire(&frame).expect("parse ack");
+        let ack_pkt = decode_recv_frame(&frame, session_id);
         run_recv(ack_pkt, session_id, &server_session, &streams).await;
 
         assert!(
@@ -3948,7 +4030,7 @@ mod tests {
             9_999, // ACK header seq distinct from the acked data seqs
             &sack,
         );
-        let ack_pkt = PhantomPacket::from_wire(&frame).expect("parse sack ack");
+        let ack_pkt = decode_recv_frame(&frame, session_id);
         run_recv(ack_pkt, session_id, &server_session, &streams).await;
 
         // Exactly the gap segment (3) remains.
@@ -3989,7 +4071,7 @@ mod tests {
             1234,
             &bad_payload,
         );
-        let ack_pkt = PhantomPacket::from_wire(&frame).expect("parse ack");
+        let ack_pkt = decode_recv_frame(&frame, session_id);
         // Must not panic.
         run_recv(ack_pkt, session_id, &server_session, &streams).await;
 
@@ -4014,14 +4096,16 @@ mod tests {
         // Build a reliable data packet from the sender at sequence 7 (stream_offset
         // == sequence == 7 via build_app_frame, so the SACK's largest_acked is 7).
         let data_seq = 7u32;
-        let data_pkt = PhantomPacket::from_wire(&build_app_frame(
-            &sender_session,
+        let data_pkt = decode_recv_frame(
+            &build_app_frame(
+                &sender_session,
+                session_id,
+                stream_id,
+                data_seq,
+                b"hello-reliable",
+            ),
             session_id,
-            stream_id,
-            data_seq,
-            b"hello-reliable",
-        ))
-        .expect("parse data frame");
+        );
 
         // Wiring with a capturable ACK transport.
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
@@ -4326,22 +4410,14 @@ mod tests {
         let (client_session, server_session) = paired_sessions(session_id);
         let stream_id: TransportStreamId = 1;
 
-        let f0 = PhantomPacket::from_wire(&build_app_frame(
-            &client_session,
+        let f0 = decode_recv_frame(
+            &build_app_frame(&client_session, session_id, stream_id, 0, b"zero"),
             session_id,
-            stream_id,
-            0,
-            b"zero",
-        ))
-        .unwrap();
-        let f1 = PhantomPacket::from_wire(&build_app_frame(
-            &client_session,
+        );
+        let f1 = decode_recv_frame(
+            &build_app_frame(&client_session, session_id, stream_id, 1, b"one"),
             session_id,
-            stream_id,
-            1,
-            b"one",
-        ))
-        .unwrap();
+        );
 
         let (demux, _ctrl) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
@@ -4401,24 +4477,14 @@ mod tests {
         let stream_id: TransportStreamId = 1;
 
         // header.seq 0, offset 0, "a"; header.seq 2, offset 1, "b" (seq 1 is a hole).
-        let a = PhantomPacket::from_wire(&build_app_frame_with_offset(
-            &client_session,
+        let a = decode_recv_frame(
+            &build_app_frame_with_offset(&client_session, session_id, stream_id, 0, 0, b"a"),
             session_id,
-            stream_id,
-            0,
-            0,
-            b"a",
-        ))
-        .unwrap();
-        let b = PhantomPacket::from_wire(&build_app_frame_with_offset(
-            &client_session,
+        );
+        let b = decode_recv_frame(
+            &build_app_frame_with_offset(&client_session, session_id, stream_id, 2, 1, b"b"),
             session_id,
-            stream_id,
-            2,
-            1,
-            b"b",
-        ))
-        .unwrap();
+        );
 
         let (demux, _ctrl) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);

@@ -4,6 +4,7 @@
 //! Manages streams, encryption state, and multi-path scheduling.
 
 use crate::crypto::adaptive_crypto::{CryptoSession, AEAD_MAX_INVOCATIONS};
+use crate::crypto::cid_chain::{CidChain, CID_LEN, CID_WINDOW_LEADING, CID_WINDOW_TRAILING};
 use crate::crypto::header_protection::{HeaderProtector, HP_SAMPLE_LEN};
 use crate::errors::CoreError;
 use crate::security::ReplayWindow;
@@ -151,6 +152,21 @@ impl CryptoState {
     }
 }
 
+/// A one-step slide of the inbound CID demux window (ε / WIRE v5, P4b), produced
+/// by [`Session::note_migration_path`] when the peer migrates. The demux applies
+/// it: `add` are the CIDs to register at the new leading edge, `remove` the CIDs
+/// that fell past the trailing edge, and `anchor` is a CID still routed for this
+/// session (the demux resolves the session's channel through it).
+#[derive(Clone, Debug)]
+pub struct CidSlide {
+    /// CIDs to register at the new leading edge.
+    pub add: Vec<[u8; CID_LEN]>,
+    /// CIDs to drop past the trailing edge.
+    pub remove: Vec<[u8; CID_LEN]>,
+    /// A CID currently routed for this session — the demux looks the channel up by it.
+    pub anchor: [u8; CID_LEN],
+}
+
 /// Session - virtual association between two endpoints
 pub struct Session {
     /// Unique session identifier (256-bit)
@@ -173,6 +189,29 @@ pub struct Session {
     /// see [`HeaderProtector`]). Masks the 14-byte `[33..47]` header span on the
     /// wire via [`Self::protect_packet`] / unmasks it via [`Self::parse_protected`].
     header_protection: HeaderProtector,
+    /// Per-direction, **session-stable** rotating connection-ID chain (ε / WIRE
+    /// v5). Derived ONCE from the initial session secret (mirroring
+    /// `header_protection`, same `is_server` swap); it does NOT rotate with
+    /// `crypto`/`epoch`. The outbound chain stamps this peer's envelope `ConnId`
+    /// ([`Self::current_outbound_cid`]); the inbound chain is what the peer's
+    /// demux routes on ([`Self::inbound_window_cids`]). Zeroized on drop.
+    cid_chain: CidChain,
+    /// This peer's outbound CID migration index (ε / WIRE v5). Starts at 0;
+    /// advances on `migrate()` (P4) so the stamped `ConnId` rotates to an
+    /// independent-random value an observer cannot link across a migration.
+    outbound_cid_index: AtomicU64,
+    /// Highest inbound CID migration index observed (ε / WIRE v5). Centers the
+    /// inbound demux window [`Self::inbound_window_cids`]. Starts at 0; advances
+    /// post-AEAD when the peer migrates (P4). Tracked separately from
+    /// `outbound_cid_index` — the two directions migrate independently.
+    inbound_cid_highest_seen: AtomicU64,
+    /// The highest peer `path_id` observed (ε / WIRE v5, P4b). The peer bumps its
+    /// `path_id` in lock-step with its outbound CID index on each `migrate()`, so a
+    /// NEW (forward, mod-256) `path_id` signals a migration → the inbound CID demux
+    /// window slides one step. Tracked here so a reordered-old / duplicate
+    /// `path_id` — or a passive rebind, which never bumps `path_id` — does not
+    /// falsely slide.
+    last_seen_path_id: AtomicU8,
     /// Per-direction traffic secret. Initial value is the hybrid handshake's
     /// shared secret; each `rekey()` derives the next via
     /// `HKDF-Expand(current, "phantom-rekey-v1", 32)` (Phase 1.5).
@@ -261,6 +300,12 @@ pub struct Session {
     /// instead of waiting for the next 10 ms `poll_interval` tick.
     /// The pump keeps the tick as a retransmit-timer fallback.
     send_notify: Arc<tokio::sync::Notify>,
+    /// Optional channel to the UDP demux for sliding this session's inbound CID
+    /// window (ε / WIRE v5, P4b). Set once post-handshake by the server's accept
+    /// path ([`Self::set_cid_slide_tx`]); `None` on the client and on socket-routed
+    /// transports (which have no CID demux). `handle_packet` signals a slide
+    /// through it when [`Self::note_migration_path`] reports the peer migrated.
+    cid_slide_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<CidSlide>>>,
 }
 
 impl Session {
@@ -286,6 +331,10 @@ impl Session {
             state: RwLock::new(SessionState::Handshaking),
             crypto: ArcSwap::new(Arc::new(crypto)),
             header_protection,
+            cid_chain: CidChain::derive(shared_secret, peer_side),
+            outbound_cid_index: AtomicU64::new(0),
+            inbound_cid_highest_seen: AtomicU64::new(0),
+            last_seen_path_id: AtomicU8::new(0),
             traffic_secret: RwLock::new(*shared_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
@@ -306,6 +355,7 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
+            cid_slide_tx: Mutex::new(None),
         })
     }
 
@@ -331,6 +381,10 @@ impl Session {
             state: RwLock::new(SessionState::Connected),
             crypto: ArcSwap::new(Arc::new(crypto)),
             header_protection,
+            cid_chain: CidChain::derive(&traffic_secret, is_server),
+            outbound_cid_index: AtomicU64::new(0),
+            inbound_cid_highest_seen: AtomicU64::new(0),
+            last_seen_path_id: AtomicU8::new(0),
             traffic_secret: RwLock::new(traffic_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
@@ -351,6 +405,7 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
+            cid_slide_tx: Mutex::new(None),
         }
     }
 
@@ -371,6 +426,10 @@ impl Session {
             state: RwLock::new(SessionState::Connected),
             crypto: ArcSwap::new(Arc::new(crypto)),
             header_protection,
+            cid_chain: CidChain::derive(resumption_secret, peer_side),
+            outbound_cid_index: AtomicU64::new(0),
+            inbound_cid_highest_seen: AtomicU64::new(0),
+            last_seen_path_id: AtomicU8::new(0),
             traffic_secret: RwLock::new(*resumption_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
@@ -391,7 +450,112 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
+            cid_slide_tx: Mutex::new(None),
         })
+    }
+
+    /// The envelope `ConnId` this peer currently stamps on outbound UDP datagrams
+    /// (ε / WIRE v5). At the current outbound CID index (0 until the first
+    /// `migrate()`) this is `CID_0` of the outbound chain — and it is exactly
+    /// `inbound_window_cids()[0]` for the peer, which is how the demux routes it.
+    /// TCP/embedded transports are socket-routed and ignore this.
+    pub fn current_outbound_cid(&self) -> [u8; CID_LEN] {
+        self.cid_chain
+            .outbound_cid(self.outbound_cid_index.load(Ordering::Relaxed))
+    }
+
+    /// This peer's current outbound CID migration index (ε / WIRE v5). 0 until the
+    /// first `migrate()`; exposed for the migration wiring (P4) and diagnostics.
+    pub fn outbound_cid_index(&self) -> u64 {
+        self.outbound_cid_index.load(Ordering::Relaxed)
+    }
+
+    /// Rotate the outbound CID one step (ε / WIRE v5; called on `migrate()`):
+    /// advance the outbound index and return the new `CID_{i+1}` for the transport
+    /// to stamp. The new CID is independent-random vs the previous one, so an
+    /// observer cannot link the pre- and post-migration flows; it stays inside the
+    /// peer's pre-registered inbound window for up to K migrations (the demux
+    /// window slides post-AEAD beyond that).
+    pub fn advance_outbound_cid(&self) -> [u8; CID_LEN] {
+        let i = self.outbound_cid_index.fetch_add(1, Ordering::Relaxed) + 1;
+        self.cid_chain.outbound_cid(i)
+    }
+
+    /// Track the peer's migration via its `path_id` and, on a NEW (forward) path,
+    /// slide the inbound CID demux window one step (ε / WIRE v5, P4b). Returns the
+    /// [`CidSlide`] to apply at the demux, or `None` if `path_id` is not newer — a
+    /// reordered-old or duplicate packet, or a passive rebind that did not rotate
+    /// the CID, none of which advance the index. Call **post-AEAD only** (the
+    /// `path_id` is then authenticated). The single-step advance keeps the window
+    /// tracking the peer's outbound index (both bump once per `migrate()`); the
+    /// leading window K absorbs any transient lag from a multi-hop jump.
+    pub fn note_migration_path(&self, path_id: u8) -> Option<CidSlide> {
+        let last = self.last_seen_path_id.load(Ordering::Relaxed);
+        // "Newer" = a forward distance in (0, 128] mod 256 — a reordered-old
+        // path_id is > 128 behind, and the 255 -> 1 migrate wrap is distance 2.
+        let fwd = path_id.wrapping_sub(last);
+        if fwd == 0 || fwd > 128 {
+            return None;
+        }
+        // CAS so concurrent recv handling slides exactly once per migration.
+        if self
+            .last_seen_path_id
+            .compare_exchange(last, path_id, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        let new_high = self
+            .inbound_cid_highest_seen
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        // `anchor` (the CID at the new index) was registered in a prior leading
+        // window, so it is currently in the demux route table.
+        let anchor = self.cid_chain.inbound_cid(new_high);
+        let add = vec![self.cid_chain.inbound_cid(new_high + CID_WINDOW_LEADING)];
+        let remove = if new_high > CID_WINDOW_TRAILING {
+            vec![self
+                .cid_chain
+                .inbound_cid(new_high - CID_WINDOW_TRAILING - 1)]
+        } else {
+            Vec::new()
+        };
+        Some(CidSlide {
+            add,
+            remove,
+            anchor,
+        })
+    }
+
+    /// Install the demux slide channel (ε / WIRE v5, P4b) — called once by the
+    /// server's accept path so `handle_packet` can signal inbound-window slides.
+    pub fn set_cid_slide_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<CidSlide>) {
+        *self.cid_slide_tx.lock() = Some(tx);
+    }
+
+    /// Signal the demux to apply a [`CidSlide`] (ε / WIRE v5, P4b). A no-op when no
+    /// slide channel is installed (the client and socket-routed transports).
+    pub fn signal_cid_slide(&self, slide: CidSlide) {
+        if let Some(tx) = self.cid_slide_tx.lock().as_ref() {
+            let _ = tx.send(slide);
+        }
+    }
+
+    /// The inbound CIDs the demux should route to this session (ε / WIRE v5): the
+    /// window `[highest_seen − T, highest_seen + K]` over this peer's inbound
+    /// chain. At session establishment (`highest_seen = 0`, trailing saturates)
+    /// this is the leading lookahead `[CID_0 .. CID_K]` (K + 1 entries). The
+    /// server registers these in its `RouteTable`; a datagram whose `ConnId` is in
+    /// the set routes to this session. The window slide on `migrate()` is P4.
+    pub fn inbound_window_cids(&self) -> Vec<[u8; CID_LEN]> {
+        self.cid_chain
+            .inbound_window(
+                self.inbound_cid_highest_seen.load(Ordering::Relaxed),
+                CID_WINDOW_TRAILING,
+                CID_WINDOW_LEADING,
+            )
+            .map(|(_, cid)| cid)
+            .collect()
     }
 
     /// Get session ID
@@ -879,8 +1043,15 @@ impl Session {
         n
     }
 
-    /// Run `f` with the AEAD AAD for a packet: the 47-byte header wire image
-    /// (`PacketHeader::to_wire`) followed by the packet's `extensions` TLV.
+    /// Run `f` with the AEAD AAD for a packet: the 47-byte header AAD image
+    /// (`PacketHeader::to_aad_image` — `version ‖ session_id ‖ packet_number ‖
+    /// flags ‖ stream_id ‖ epoch ‖ path_id`) followed by the packet's
+    /// `extensions` TLV.
+    ///
+    /// ε / WIRE v5 — `session_id` is off-wire (the on-wire header is 15 bytes),
+    /// but the AAD stays the byte-identical 47-byte v4 image so the AEAD security
+    /// argument is unchanged; the recv path reconstructs `header.session_id` from
+    /// the session context before calling this (see [`Self::parse_protected`]).
     ///
     /// T4.1 — `extensions` (the forward-compat TLV headroom) is authenticated
     /// here, closing the prior malleability where it sat *outside* the AAD and an
@@ -894,7 +1065,7 @@ impl Session {
         extensions: &[u8],
         f: impl FnOnce(&[u8]) -> R,
     ) -> R {
-        let header_bytes = header.to_wire();
+        let header_bytes = header.to_aad_image();
         if extensions.is_empty() {
             f(&header_bytes)
         } else {
@@ -909,9 +1080,10 @@ impl Session {
     ///
     /// The AEAD nonce is `prefix || packet_number` (① — Phase 4), derived from the
     /// authenticated header rather than an internal counter, so a failed peer
-    /// decrypt never desyncs the receiver. The AAD is the 47-byte wire image of the
-    /// header ([`PacketHeader::to_wire`]) — which still binds `epoch` / `stream_id`
-    /// / `path_id` — followed by the packet's `extensions` TLV (T4.1), so any
+    /// decrypt never desyncs the receiver. The AAD is the 47-byte AAD image of the
+    /// header ([`PacketHeader::to_aad_image`]) — which still binds `session_id` /
+    /// `epoch` / `stream_id` / `path_id` even though the wire header is 15 bytes —
+    /// followed by the packet's `extensions` TLV (T4.1), so any
     /// wire-level mutation of the header *or* the extensions invalidates the tag.
     pub fn encrypt_packet(
         &self,
@@ -966,7 +1138,7 @@ impl Session {
     // ── Header protection (T4.6, QUIC RFC 9001 §5.4) ──────────────────────────
 
     /// Serialise a packet to its **header-protected** on-wire bytes: the
-    /// `[33..47]` header span is XOR-masked with this session's send-direction HP
+    /// `[1..15]` header span is XOR-masked with this session's send-direction HP
     /// key, keyed by the packet's ciphertext sample (the first 16 bytes of
     /// `packet.payload`). The data plane calls this instead of `to_wire` for
     /// every post-handshake packet. `packet.payload` must be AEAD ciphertext
@@ -979,20 +1151,26 @@ impl Session {
     }
 
     /// Parse a **header-protected** wire packet: recover the cleartext header by
-    /// unmasking the `[33..47]` span with this session's recv-direction HP key
-    /// (keyed by the cleartext ciphertext sample), then reassemble the
-    /// `PhantomPacket`. The caller still gates on `version` / `session_id` and
-    /// runs AEAD on the result — a wire mutation of the masked region unmasks to a
-    /// wrong header, so the subsequent AEAD open fails (no new oracle). A short /
-    /// malformed frame returns `Err` and is dropped by the recv loop.
+    /// unmasking the `[1..15]` span with this session's recv-direction HP key
+    /// (keyed by the cleartext ciphertext sample), reconstruct the off-wire
+    /// `session_id` from this session's id (ε / WIRE v5), then reassemble the
+    /// `PhantomPacket`. The caller still gates on `version` and runs AEAD on the
+    /// result — a wire mutation of the masked region unmasks to a wrong header, so
+    /// the subsequent AEAD open fails (no new oracle). A short / malformed frame
+    /// returns `Err` and is dropped by the recv loop.
     pub fn parse_protected(&self, bytes: &[u8]) -> Result<PhantomPacket, CoreError> {
         let raw = RawPacket::from_wire(bytes)
             .map_err(|e| CoreError::CryptoError(format!("HP: malformed wire packet: {e}")))?;
         let sample = Self::hp_sample(&raw.payload)?;
         let mask = self.header_protection.mask_recv(&sample)?;
-        let header = raw
+        let mut header = raw
             .unmask_header(&mask)
             .map_err(|e| CoreError::CryptoError(format!("HP: header unmask failed: {e}")))?;
+        // ε / WIRE v5: session_id is off-wire — reconstruct it from the routed
+        // session context so the AAD image matches what the sender authenticated
+        // (the 47-byte `to_aad_image`). A wrong session here → wrong AAD → AEAD
+        // fail; this is the off-wire analogue of the v4 cleartext-session_id bind.
+        header.session_id = *self.id();
         Ok(raw.into_packet(header))
     }
 

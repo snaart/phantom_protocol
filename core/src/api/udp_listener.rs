@@ -19,6 +19,7 @@ use crate::transport::handshake::{
 };
 use crate::transport::phantom_udp::datagram::{encode_datagrams, push_datagram, FragmentAssembler};
 use crate::transport::phantom_udp::envelope::{ConnId, PacketType};
+use crate::transport::session::CidSlide;
 use crate::transport::types::LegType;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -170,6 +171,11 @@ impl Drop for PhantomUdpListener {
 /// retransmits). Sized well above any realistic concurrent-session count.
 const MAX_ROUTES: usize = 1 << 16;
 
+/// ε / WIRE v5: a session's inbound rotating-CID window paired with its inbound
+/// channel — the payload the handshake task sends the demux to install the
+/// window CIDs (N:1) so the client's `CID_0..` datagrams route to the session.
+type CidWindowRegistration = (Vec<ConnId>, mpsc::Sender<(Bytes, SocketAddr)>);
+
 /// Bounded, self-reaping demux route table keyed on the unauthenticated 8-byte CID (H-1).
 /// A route's liveness is exactly its inbound channel's: a closed `Sender` (`is_closed()`)
 /// means the handshake task failed or the established session was dropped, so the entry is
@@ -225,6 +231,36 @@ impl RouteTable {
             self.routes.remove(cid);
             self.sync();
         }
+    }
+
+    /// ε / WIRE v5: register the rotating-CID demux window — insert each window
+    /// CID → the session's inbound channel (N:1), so a datagram stamped with any
+    /// CID in the window routes to this session. `try_insert` reaps dead entries
+    /// at the cap; a CID that can't be inserted (table full of *live* routes) is
+    /// skipped — the peer retransmits, and the window stays bounded by MAX_ROUTES.
+    /// The bootstrap CID (registered separately at Initial accept) stays alongside
+    /// the window until the whole session's routes are reaped on disconnect.
+    fn register_window(&mut self, cids: &[ConnId], tx: &mpsc::Sender<(Bytes, SocketAddr)>) {
+        for &cid in cids {
+            self.try_insert(cid, tx.clone());
+        }
+    }
+
+    /// ε / WIRE v5 (P4b): apply a one-step inbound-window slide — register the new
+    /// leading-edge CIDs and drop the trailing ones — resolving the session's
+    /// channel through `anchor` (a CID still routed for it). A no-op if `anchor` is
+    /// gone (the session ended), so a late slide for a dead session does nothing.
+    fn apply_slide(&mut self, slide: &CidSlide) {
+        let Some(tx) = self.routes.get(&slide.anchor).cloned() else {
+            return;
+        };
+        for &cid in &slide.add {
+            self.try_insert(cid, tx.clone());
+        }
+        for cid in &slide.remove {
+            self.routes.remove(cid);
+        }
+        self.sync();
     }
 }
 
@@ -282,6 +318,17 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
     // releases the per-IP pending count and reaps the route iff it is dead (a live established
     // session keeps its inbound channel open, so its route survives the signal untouched).
     let (reap_tx, mut reap_rx) = mpsc::unbounded_channel::<(ConnId, IpAddr)>();
+    // ε / WIRE v5: a handshake task that established a session signals its inbound
+    // CID window here (its per-direction rotating chain). The demux registers
+    // every window CID → the session's channel so the client's post-handshake
+    // CID_0.. datagrams route to it (N:1). Same fire-and-forget pattern as the
+    // reap channel above.
+    let (register_tx, mut register_rx) = mpsc::unbounded_channel::<CidWindowRegistration>();
+    // ε / WIRE v5 (P4b): a session whose peer migrated signals a one-step inbound
+    // CID-window slide here (post-AEAD, from handle_packet via the session's
+    // slide channel). The demux registers the new leading-edge CID and drops the
+    // trailing one, keeping the window tracking the peer's outbound index.
+    let (slide_tx, mut slide_rx) = mpsc::unbounded_channel::<CidSlide>();
     // NOTE (Phase 1): one assembler shared across ALL CIDs. Its key includes the cid, but a fragment
     // spray shares the single 256-slot assembly table with every live session's in-flight
     // reassemblies. Bounded — the assembler self-caps at MAX_CONCURRENT_ASSEMBLIES with
@@ -304,6 +351,20 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
             Some((cid, ip)) = reap_rx.recv() => {
                 pending.release(ip);
                 routes.remove_if_dead(&cid);
+                continue;
+            }
+            // ε / WIRE v5: register a newly-established session's rotating-CID
+            // window so its client's CID_0.. datagrams route to it. Processed
+            // before reading more datagrams (biased select) so the window is in
+            // place by the time the client's first CID_0 frame could arrive.
+            Some((cids, tx)) = register_rx.recv() => {
+                routes.register_window(&cids, &tx);
+                continue;
+            }
+            // ε / WIRE v5 (P4b): slide a session's inbound CID window as its peer
+            // migrates (add the new leading CID, drop the trailing one).
+            Some(slide) = slide_rx.recv() => {
+                routes.apply_slide(&slide);
                 continue;
             }
             r = listener.socket.recv_from(&mut buf) => match r {
@@ -373,7 +434,17 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
         }
         pending.admit(peer.ip());
         let _ = tx.try_send((Bytes::from(frame), peer));
-        spawn_handshake_task(listener.clone(), st, peer, hdr.cid, permit, reap_tx.clone());
+        spawn_handshake_task(
+            listener.clone(),
+            st,
+            peer,
+            hdr.cid,
+            permit,
+            reap_tx.clone(),
+            tx,
+            register_tx.clone(),
+            slide_tx.clone(),
+        );
         // DoS-hardening parity with the TCP acceptor: periodically drop expired reputation
         // entries AND reap dead routes so both bounded maps stay small under churn.
         new_conn_count = new_conn_count.wrapping_add(1);
@@ -407,6 +478,7 @@ async fn send_demux_retry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_handshake_task(
     listener: Arc<PhantomUdpListener>,
     transport: UdpServerTransport,
@@ -414,6 +486,14 @@ fn spawn_handshake_task(
     cid: ConnId,
     permit: tokio::sync::OwnedSemaphorePermit,
     reap_tx: mpsc::UnboundedSender<(ConnId, IpAddr)>,
+    // ε / WIRE v5: the session's inbound channel (the demux holds a sibling
+    // clone for the bootstrap route); on success the task hands it to the demux
+    // paired with the rotating-CID window so those CIDs route to this session.
+    tx: mpsc::Sender<(Bytes, SocketAddr)>,
+    register_tx: mpsc::UnboundedSender<CidWindowRegistration>,
+    // ε / WIRE v5 (P4b): handed to the established session so it can signal
+    // inbound-window slides as the peer migrates.
+    slide_tx: mpsc::UnboundedSender<CidSlide>,
 ) {
     let hs = listener.handshake_server.clone();
     let runtime = listener.runtime.clone();
@@ -441,6 +521,14 @@ fn spawn_handshake_task(
                     AeadAlgorithm::Aes256Gcm,
                     ProtocolVersion::Current,
                 );
+                // ε / WIRE v5: register this session's inbound CID window so the
+                // client's post-handshake rotating CID_0.. datagrams route to it
+                // (sent BEFORE moving `server_session` into the API session). The
+                // bootstrap CID stays until the route is reaped on disconnect.
+                let _ = register_tx.send((server_session.inbound_window_cids(), tx));
+                // ε / WIRE v5 (P4b): give the session the demux slide channel so
+                // it can advance its inbound CID window as the peer migrates.
+                server_session.set_cid_slide_tx(slide_tx);
                 let session = PhantomSession::from_accepted_server_session_with_runtime(
                     peer.to_string(),
                     transport,

@@ -48,5 +48,7 @@ fuzz_target!(|data: &[u8]| {
     );
 
     let ct = data.get(6..).unwrap_or(&[]);
-    let _ = session.decrypt_packet(&header, ct);
+    // `decrypt_packet(header, ciphertext, extensions)` — the `extensions` TLV is
+    // bound into the AEAD AAD (T4.1); the fuzzer sends none.
+    let _ = session.decrypt_packet(&header, ct, &[]);
 });

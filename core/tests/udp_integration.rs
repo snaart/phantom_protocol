@@ -44,6 +44,58 @@ async fn udp_integration_pinned_and_encrypted() {
     server.await.unwrap();
 }
 
+/// ε / WIRE v5 (P3) — after the handshake the client stamps its rotating `CID_0`
+/// (not the bootstrap ConnId), and the server's demux routes it because it
+/// registered the inbound CID window `[CID_0 .. CID_K]`. The bidirectional
+/// exchange only completes if `CID_0` routes (without the window the data misses
+/// the demux and the exchange hangs); and the server's route table holds the
+/// window (> 1 route) — a v4 session had only the single bootstrap route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_client_stamps_cid0_and_server_routes_the_window() {
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let listener_for_server = listener.clone();
+    let server = tokio::spawn(async move {
+        let session = listener_for_server
+            .accept()
+            .await
+            .expect("accept")
+            .session();
+        let msg = session.recv().await.expect("server recv");
+        assert_eq!(msg, b"ping");
+        session.send(b"pong".to_vec()).await.expect("server send");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+
+    let transport = UdpClientTransport::connect(addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+    client.send(b"ping".to_vec()).await.expect("client send");
+    // The reply only arrives if the client's post-handshake CID_0 datagrams routed
+    // — i.e. the server registered the rotating-CID window. Without it, CID_0 misses
+    // the demux and this would time out.
+    let reply = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(reply, b"pong");
+
+    // While the session is still alive (server task sleeping), the server's route
+    // table holds the registered CID window in addition to the bootstrap ConnId.
+    assert!(
+        listener.active_route_count() > 1,
+        "server must register the CID window (> 1 route); got {}",
+        listener.active_route_count()
+    );
+    server.await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn udp_integration_two_sessions_one_client_socket_is_not_required_but_two_clients_ok() {
@@ -204,6 +256,178 @@ async fn udp_integration_migration_survives_mid_exchange() {
     }
 
     server.await.unwrap();
+}
+
+/// ε / WIRE v5 (P4) — DIRECT on-wire proof that the routing CID rotates across a
+/// migration. A relay records the ConnId of every post-handshake (OneRtt)
+/// client->server datagram; after `migrate()` the client stamps a fresh `CID_1`,
+/// so the relay observes >= 2 distinct post-handshake ConnIds — an on-path
+/// observer cannot link the pre- and post-migration flows by their cleartext CID
+/// (threat-model §12.5). The reliable stream resumes byte-exact through the
+/// rotation, routed by the server's pre-registered inbound window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_cid_rotates_on_the_wire_across_migration() {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::UdpSocket;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .unwrap();
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+    let server = tokio::spawn(async move {
+        let s = listener.accept().await.expect("accept").session();
+        // Round 0 only (pre-migration) — the client needs this echo. Post-migration
+        // we assert only the on-wire CID, so the server just stays alive (keeping its
+        // routes + window) while the client fires the rotated-CID datagrams.
+        let m = s.recv().await.expect("recv");
+        s.send(m).await.expect("echo");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+    });
+
+    // Relay (client <-> relay <-> server) that records the ConnId of each
+    // post-handshake (OneRtt) client->server datagram. OneRtt = type bits `01` in
+    // the envelope flags byte (`buf[0] >> 6 == 1`); the ConnId is `buf[1..9]`.
+    let onertt_cids: Arc<Mutex<HashSet<[u8; 8]>>> = Arc::new(Mutex::new(HashSet::new()));
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    upstream.connect(server_addr).await.unwrap();
+    let cids = onertt_cids.clone();
+    tokio::spawn(async move {
+        let mut c2s = vec![0u8; 2048];
+        let mut s2c = vec![0u8; 2048];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s) => {
+                    let (n, from) = r.unwrap();
+                    client_addr = Some(from);
+                    if n >= 9 && (c2s[0] >> 6) == 1 {
+                        let mut cid = [0u8; 8];
+                        cid.copy_from_slice(&c2s[1..9]);
+                        cids.lock().unwrap().insert(cid);
+                    }
+                    upstream.send(&c2s[..n]).await.unwrap();
+                }
+                r = upstream.recv(&mut s2c) => {
+                    let n = r.unwrap();
+                    if let Some(ca) = client_addr {
+                        relay.send_to(&s2c[..n], ca).await.unwrap();
+                    }
+                }
+            }
+        }
+    });
+
+    let transport = UdpClientTransport::connect(relay_addr).await.unwrap();
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+
+    // Round 0 (pre-migration): the data plane establishes on CID_0 (the relay
+    // records it).
+    client.send(b"r0".to_vec()).await.unwrap();
+    let e0 = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(e0, b"r0");
+    let before = onertt_cids.lock().unwrap().len();
+    assert!(before >= 1, "at least CID_0 must be seen pre-migration");
+
+    // Migrate -> the client rotates its outbound CID to CID_1, then fire
+    // post-migration datagrams. The rotated CID appears on the wire (the reliable
+    // stream keeps retransmitting, so the relay observes CID_1 regardless of
+    // consumption). The byte-exact stream survival across migration is covered by
+    // udp_integration_migration_survives_mid_exchange; this test isolates the
+    // on-wire CID rotation (the unlinkability property).
+    client.migrate("127.0.0.1:0".to_string()).await.unwrap();
+    for i in 1..4 {
+        let _ = client.send(format!("r{i}").into_bytes()).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The relay observed a fresh post-handshake ConnId after the migration: the
+    // cleartext CID rotated to an independent-random value, so an on-path observer
+    // cannot link the pre- and post-migration flows by it (threat-model §12.5).
+    let after = onertt_cids.lock().unwrap().len();
+    assert!(
+        after >= 2 && after > before,
+        "the on-wire CID must rotate across migration (before {before}, after {after} distinct OneRtt CIDs)"
+    );
+
+    server.await.unwrap();
+}
+
+/// ε / WIRE v5 (P4b) — the inbound CID demux window SLIDES as the client migrates,
+/// so a session keeps routing across MANY more than K=4 migrations (the
+/// pre-registered window covers only the first K). The client migrates HOPS >> K
+/// times, sending a distinct message after each; the server receives EVERY one,
+/// which is only possible if it slid its inbound CID window (post-AEAD, on each
+/// new authenticated path_id) to cover the rotated CID. A stuck window would
+/// strand the out-of-window message and this would time out.
+///
+/// This isolates the CID *routing* (the slide) from the migration peer-follow
+/// (promote, which governs the reverse/ACK direction): no echo is required, and
+/// the reliable retransmit makes the data delivery race-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_window_slides_across_many_migrations() {
+    use std::collections::HashSet;
+    const HOPS: usize = 12; // >> K = 4 — only a sliding window keeps routing this far
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    // Collect HOPS+1 DISTINCT messages. Each arrives only if its rotated CID routed
+    // — i.e. the window slid. Retransmits (no ACK reaches the client until the peer
+    // follows) are deduplicated by the reliable stream, so this counts distinct.
+    let server = tokio::spawn(async move {
+        let s = listener.accept().await.expect("accept").session();
+        let mut got: HashSet<Vec<u8>> = HashSet::new();
+        while got.len() <= HOPS {
+            let m = s
+                .recv()
+                .await
+                .expect("server recv (the inbound window must slide)");
+            got.insert(m.to_vec());
+        }
+        got.len()
+    });
+
+    let transport = UdpClientTransport::connect(addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+
+    client.send(b"msg-0".to_vec()).await.expect("send 0");
+    for i in 1..=HOPS {
+        client
+            .migrate("127.0.0.1:0".to_string())
+            .await
+            .expect("migrate");
+        client
+            .send(format!("msg-{i}").into_bytes())
+            .await
+            .expect("send hop");
+        // Let each hop's packet route + the slide apply before the next migration.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+
+    let count = timeout(Duration::from_secs(25), server)
+        .await
+        .expect("server must receive every hop's message — the inbound window slid")
+        .unwrap();
+    assert_eq!(
+        count,
+        HOPS + 1,
+        "all rotated CIDs routed via the slid window"
+    );
 }
 
 /// A bidirectional UDP relay `client <-> relay <-> server` whose forwarding can be
