@@ -1863,6 +1863,13 @@ async fn handle_packet<T: SessionTransport>(
         // clobber the candidate slot and misdirect / stall a legitimate migration. No-op for
         // same-source packets and for non-address transports (default trait impl).
         transport_for_path.confirm_authenticated_source();
+        // ε / WIRE v5 (P4b): the path_id is now authenticated. If the peer migrated
+        // (a new forward path_id), slide our inbound CID demux window so its rotated
+        // CID stays routable for arbitrarily many migrations. No-op on the client and
+        // for a path_id that is not newer (reorder / duplicate / passive rebind).
+        if let Some(slide) = crypto_recv.note_migration_path(packet.header.path_id) {
+            crypto_recv.signal_cid_slide(slide);
+        }
     }
 
     // Authenticated SACK ACK (H1, L1-A). ACKs are `ENCRYPTED | ACK` control

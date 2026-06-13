@@ -152,6 +152,21 @@ impl CryptoState {
     }
 }
 
+/// A one-step slide of the inbound CID demux window (ε / WIRE v5, P4b), produced
+/// by [`Session::note_migration_path`] when the peer migrates. The demux applies
+/// it: `add` are the CIDs to register at the new leading edge, `remove` the CIDs
+/// that fell past the trailing edge, and `anchor` is a CID still routed for this
+/// session (the demux resolves the session's channel through it).
+#[derive(Clone, Debug)]
+pub struct CidSlide {
+    /// CIDs to register at the new leading edge.
+    pub add: Vec<[u8; CID_LEN]>,
+    /// CIDs to drop past the trailing edge.
+    pub remove: Vec<[u8; CID_LEN]>,
+    /// A CID currently routed for this session — the demux looks the channel up by it.
+    pub anchor: [u8; CID_LEN],
+}
+
 /// Session - virtual association between two endpoints
 pub struct Session {
     /// Unique session identifier (256-bit)
@@ -190,6 +205,13 @@ pub struct Session {
     /// post-AEAD when the peer migrates (P4). Tracked separately from
     /// `outbound_cid_index` — the two directions migrate independently.
     inbound_cid_highest_seen: AtomicU64,
+    /// The highest peer `path_id` observed (ε / WIRE v5, P4b). The peer bumps its
+    /// `path_id` in lock-step with its outbound CID index on each `migrate()`, so a
+    /// NEW (forward, mod-256) `path_id` signals a migration → the inbound CID demux
+    /// window slides one step. Tracked here so a reordered-old / duplicate
+    /// `path_id` — or a passive rebind, which never bumps `path_id` — does not
+    /// falsely slide.
+    last_seen_path_id: AtomicU8,
     /// Per-direction traffic secret. Initial value is the hybrid handshake's
     /// shared secret; each `rekey()` derives the next via
     /// `HKDF-Expand(current, "phantom-rekey-v1", 32)` (Phase 1.5).
@@ -278,6 +300,12 @@ pub struct Session {
     /// instead of waiting for the next 10 ms `poll_interval` tick.
     /// The pump keeps the tick as a retransmit-timer fallback.
     send_notify: Arc<tokio::sync::Notify>,
+    /// Optional channel to the UDP demux for sliding this session's inbound CID
+    /// window (ε / WIRE v5, P4b). Set once post-handshake by the server's accept
+    /// path ([`Self::set_cid_slide_tx`]); `None` on the client and on socket-routed
+    /// transports (which have no CID demux). `handle_packet` signals a slide
+    /// through it when [`Self::note_migration_path`] reports the peer migrated.
+    cid_slide_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<CidSlide>>>,
 }
 
 impl Session {
@@ -306,6 +334,7 @@ impl Session {
             cid_chain: CidChain::derive(shared_secret, peer_side),
             outbound_cid_index: AtomicU64::new(0),
             inbound_cid_highest_seen: AtomicU64::new(0),
+            last_seen_path_id: AtomicU8::new(0),
             traffic_secret: RwLock::new(*shared_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
@@ -326,6 +355,7 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
+            cid_slide_tx: Mutex::new(None),
         })
     }
 
@@ -354,6 +384,7 @@ impl Session {
             cid_chain: CidChain::derive(&traffic_secret, is_server),
             outbound_cid_index: AtomicU64::new(0),
             inbound_cid_highest_seen: AtomicU64::new(0),
+            last_seen_path_id: AtomicU8::new(0),
             traffic_secret: RwLock::new(traffic_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
@@ -374,6 +405,7 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
+            cid_slide_tx: Mutex::new(None),
         }
     }
 
@@ -397,6 +429,7 @@ impl Session {
             cid_chain: CidChain::derive(resumption_secret, peer_side),
             outbound_cid_index: AtomicU64::new(0),
             inbound_cid_highest_seen: AtomicU64::new(0),
+            last_seen_path_id: AtomicU8::new(0),
             traffic_secret: RwLock::new(*resumption_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
@@ -417,6 +450,7 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
+            cid_slide_tx: Mutex::new(None),
         })
     }
 
@@ -445,6 +479,66 @@ impl Session {
     pub fn advance_outbound_cid(&self) -> [u8; CID_LEN] {
         let i = self.outbound_cid_index.fetch_add(1, Ordering::Relaxed) + 1;
         self.cid_chain.outbound_cid(i)
+    }
+
+    /// Track the peer's migration via its `path_id` and, on a NEW (forward) path,
+    /// slide the inbound CID demux window one step (ε / WIRE v5, P4b). Returns the
+    /// [`CidSlide`] to apply at the demux, or `None` if `path_id` is not newer — a
+    /// reordered-old or duplicate packet, or a passive rebind that did not rotate
+    /// the CID, none of which advance the index. Call **post-AEAD only** (the
+    /// `path_id` is then authenticated). The single-step advance keeps the window
+    /// tracking the peer's outbound index (both bump once per `migrate()`); the
+    /// leading window K absorbs any transient lag from a multi-hop jump.
+    pub fn note_migration_path(&self, path_id: u8) -> Option<CidSlide> {
+        let last = self.last_seen_path_id.load(Ordering::Relaxed);
+        // "Newer" = a forward distance in (0, 128] mod 256 — a reordered-old
+        // path_id is > 128 behind, and the 255 -> 1 migrate wrap is distance 2.
+        let fwd = path_id.wrapping_sub(last);
+        if fwd == 0 || fwd > 128 {
+            return None;
+        }
+        // CAS so concurrent recv handling slides exactly once per migration.
+        if self
+            .last_seen_path_id
+            .compare_exchange(last, path_id, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        let new_high = self
+            .inbound_cid_highest_seen
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        // `anchor` (the CID at the new index) was registered in a prior leading
+        // window, so it is currently in the demux route table.
+        let anchor = self.cid_chain.inbound_cid(new_high);
+        let add = vec![self.cid_chain.inbound_cid(new_high + CID_WINDOW_LEADING)];
+        let remove = if new_high > CID_WINDOW_TRAILING {
+            vec![self
+                .cid_chain
+                .inbound_cid(new_high - CID_WINDOW_TRAILING - 1)]
+        } else {
+            Vec::new()
+        };
+        Some(CidSlide {
+            add,
+            remove,
+            anchor,
+        })
+    }
+
+    /// Install the demux slide channel (ε / WIRE v5, P4b) — called once by the
+    /// server's accept path so `handle_packet` can signal inbound-window slides.
+    pub fn set_cid_slide_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<CidSlide>) {
+        *self.cid_slide_tx.lock() = Some(tx);
+    }
+
+    /// Signal the demux to apply a [`CidSlide`] (ε / WIRE v5, P4b). A no-op when no
+    /// slide channel is installed (the client and socket-routed transports).
+    pub fn signal_cid_slide(&self, slide: CidSlide) {
+        if let Some(tx) = self.cid_slide_tx.lock().as_ref() {
+            let _ = tx.send(slide);
+        }
     }
 
     /// The inbound CIDs the demux should route to this session (ε / WIRE v5): the

@@ -355,6 +355,60 @@ fn v5_advance_outbound_cid_rotates_within_peer_window() {
     assert!(window.contains(&cid2));
 }
 
+/// ε / WIRE v5 (P4b) — the server slides its inbound CID window as the client
+/// migrates. `note_migration_path` advances the window one step per NEW (forward,
+/// mod-256) path_id and yields the CIDs to add (new leading edge) / remove (past
+/// the trailing edge); a reordered-old, duplicate, or unchanged path_id slides
+/// nothing (robust to reordering + passive rebind, which never advances the index).
+#[test]
+fn v5_note_migration_path_slides_inbound_window() {
+    use std::collections::HashSet;
+    let (_client, server) = make_session_pair([0x7Bu8; 32]);
+    let original: HashSet<[u8; 8]> = server.inbound_window_cids().into_iter().collect();
+
+    // path_id 0 is the initial path — no slide.
+    assert!(
+        server.note_migration_path(0).is_none(),
+        "the initial path does not slide"
+    );
+
+    // First migration: path_id 1 (forward) slides one step.
+    let s1 = server
+        .note_migration_path(1)
+        .expect("a forward path_id must slide the window");
+    assert_eq!(s1.add.len(), 1, "one CID added at the new leading edge");
+    assert!(
+        s1.remove.is_empty(),
+        "nothing removed yet (highest=1 <= trailing T)"
+    );
+    assert!(
+        !original.contains(&s1.add[0]),
+        "the added CID is a fresh leading-edge CID, not one already registered"
+    );
+    // The post-slide window now centers at index 1 and includes the new CID.
+    assert!(server.inbound_window_cids().contains(&s1.add[0]));
+
+    // A duplicate of the same path_id does NOT slide again (idempotent).
+    assert!(
+        server.note_migration_path(1).is_none(),
+        "a duplicate path_id slides nothing"
+    );
+    // A reordered OLD path_id (far behind, mod-256) does NOT slide.
+    assert!(
+        server.note_migration_path(0).is_none(),
+        "a reordered-old path_id slides nothing"
+    );
+
+    // The next migration (path_id 2) slides again, to a distinct leading CID.
+    let s2 = server
+        .note_migration_path(2)
+        .expect("the next forward path_id slides");
+    assert_ne!(
+        s1.add[0], s2.add[0],
+        "each slide adds a distinct leading-edge CID"
+    );
+}
+
 /// Malformed wire bytes must fail parsing as a typed error, never a panic.
 /// This protects the receive loop from a malicious peer crashing the process
 /// by sending random bytes.

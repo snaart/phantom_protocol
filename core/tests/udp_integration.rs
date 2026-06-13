@@ -361,6 +361,75 @@ async fn udp_integration_cid_rotates_on_the_wire_across_migration() {
     server.await.unwrap();
 }
 
+/// ε / WIRE v5 (P4b) — the inbound CID demux window SLIDES as the client migrates,
+/// so a session keeps routing across MANY more than K=4 migrations (the
+/// pre-registered window covers only the first K). The client migrates HOPS >> K
+/// times, sending a distinct message after each; the server receives EVERY one,
+/// which is only possible if it slid its inbound CID window (post-AEAD, on each
+/// new authenticated path_id) to cover the rotated CID. A stuck window would
+/// strand the out-of-window message and this would time out.
+///
+/// This isolates the CID *routing* (the slide) from the migration peer-follow
+/// (promote, which governs the reverse/ACK direction): no echo is required, and
+/// the reliable retransmit makes the data delivery race-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_window_slides_across_many_migrations() {
+    use std::collections::HashSet;
+    const HOPS: usize = 12; // >> K = 4 — only a sliding window keeps routing this far
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    // Collect HOPS+1 DISTINCT messages. Each arrives only if its rotated CID routed
+    // — i.e. the window slid. Retransmits (no ACK reaches the client until the peer
+    // follows) are deduplicated by the reliable stream, so this counts distinct.
+    let server = tokio::spawn(async move {
+        let s = listener.accept().await.expect("accept").session();
+        let mut got: HashSet<Vec<u8>> = HashSet::new();
+        while got.len() <= HOPS {
+            let m = s
+                .recv()
+                .await
+                .expect("server recv (the inbound window must slide)");
+            got.insert(m.to_vec());
+        }
+        got.len()
+    });
+
+    let transport = UdpClientTransport::connect(addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+
+    client.send(b"msg-0".to_vec()).await.expect("send 0");
+    for i in 1..=HOPS {
+        client
+            .migrate("127.0.0.1:0".to_string())
+            .await
+            .expect("migrate");
+        client
+            .send(format!("msg-{i}").into_bytes())
+            .await
+            .expect("send hop");
+        // Let each hop's packet route + the slide apply before the next migration.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+
+    let count = timeout(Duration::from_secs(25), server)
+        .await
+        .expect("server must receive every hop's message — the inbound window slid")
+        .unwrap();
+    assert_eq!(
+        count,
+        HOPS + 1,
+        "all rotated CIDs routed via the slid window"
+    );
+}
+
 /// A bidirectional UDP relay `client <-> relay <-> server` whose forwarding can be
 /// cut and restored at will via the returned flag — used to simulate a path that
 /// silently dies (and later returns) without tearing down either endpoint's socket.
