@@ -436,6 +436,17 @@ impl Session {
         self.outbound_cid_index.load(Ordering::Relaxed)
     }
 
+    /// Rotate the outbound CID one step (ε / WIRE v5; called on `migrate()`):
+    /// advance the outbound index and return the new `CID_{i+1}` for the transport
+    /// to stamp. The new CID is independent-random vs the previous one, so an
+    /// observer cannot link the pre- and post-migration flows; it stays inside the
+    /// peer's pre-registered inbound window for up to K migrations (the demux
+    /// window slides post-AEAD beyond that).
+    pub fn advance_outbound_cid(&self) -> [u8; CID_LEN] {
+        let i = self.outbound_cid_index.fetch_add(1, Ordering::Relaxed) + 1;
+        self.cid_chain.outbound_cid(i)
+    }
+
     /// The inbound CIDs the demux should route to this session (ε / WIRE v5): the
     /// window `[highest_seen − T, highest_seen + K]` over this peer's inbound
     /// chain. At session establishment (`highest_seen = 0`, trailing saturates)

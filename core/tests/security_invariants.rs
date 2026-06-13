@@ -324,6 +324,37 @@ fn v5_session_cid_chain_outbound_matches_peer_inbound_window() {
     );
 }
 
+/// ε / WIRE v5 (P4) — `migrate()` rotates the outbound CID: `advance_outbound_cid`
+/// bumps the index and returns the next CID (`CID_1` after `CID_0`). The rotated
+/// CID is independent-random vs `CID_0` (the unlinkability property) yet still
+/// inside the peer's pre-registered inbound window `[CID_0..CID_K]`, so the server
+/// routes it without a re-handshake (for up to K migrations before a slide).
+#[test]
+fn v5_advance_outbound_cid_rotates_within_peer_window() {
+    let (client, server) = make_session_pair([0x6Au8; 32]);
+    let cid0 = client.current_outbound_cid();
+    let cid1 = client.advance_outbound_cid();
+    assert_ne!(cid0, cid1, "the CID must rotate on migrate");
+    assert_eq!(
+        cid1,
+        client.current_outbound_cid(),
+        "the outbound index advanced to 1"
+    );
+
+    // The rotated CID is still in the server's pre-registered leading window, so a
+    // single migration routes without any window slide.
+    let window = server.inbound_window_cids();
+    assert!(
+        window.contains(&cid1),
+        "CID_1 must be routable via the pre-registered window"
+    );
+
+    // Each further migration yields another distinct CID (still within K).
+    let cid2 = client.advance_outbound_cid();
+    assert_ne!(cid1, cid2);
+    assert!(window.contains(&cid2));
+}
+
 /// Malformed wire bytes must fail parsing as a typed error, never a panic.
 /// This protects the receive loop from a malicious peer crashing the process
 /// by sending random bytes.

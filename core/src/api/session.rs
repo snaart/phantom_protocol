@@ -1207,8 +1207,15 @@ async fn run_data_pump<T: SessionTransport>(
                         match transport.migrate(local_addr).await {
                             Ok(()) => {
                                 let new_path = crypto_session.next_migration_path_id();
+                                // ε / WIRE v5: rotate the outbound CID so every
+                                // post-migration datagram stamps an
+                                // independent-random ConnId an observer cannot link
+                                // to the pre-migration flow. The new CID_{i+1} is
+                                // already in the server's pre-registered inbound
+                                // window (which slides post-AEAD beyond K migrations).
+                                transport.set_outbound_cid(crypto_session.advance_outbound_cid());
                                 log::info!(
-                                    "PhantomSession: migrated send path -> path_id {}",
+                                    "PhantomSession: migrated send path -> path_id {}, CID rotated",
                                     new_path
                                 );
                                 // Wake the send loop so app data + L1 retransmits flow
