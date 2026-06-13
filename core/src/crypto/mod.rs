@@ -1,5 +1,6 @@
 pub mod adaptive_crypto;
 pub mod aes_session;
+pub mod cid_chain;
 pub mod header_protection;
 pub mod hybrid_kem;
 pub mod hybrid_sign;
