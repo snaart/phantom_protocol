@@ -25,7 +25,7 @@ that sees any other value drops the frame (packets) or rejects the handshake
 
 | Constant | Value | Source | Where it lives on the wire |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `4` | `core/src/transport/types.rs:71` | `PacketHeader.version` byte (first byte of the 47-byte header — § 4.2) |
+| `WIRE_VERSION` | `5` | `core/src/transport/types.rs` | `PacketHeader.version` byte (first byte of the 15-byte header — § 4.2) |
 | `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs:56` | `ClientHello.version`, transcript-bound |
 
 `WIRE_VERSION` is `4`: it went `1 → 2` when the packet codec moved from
@@ -37,7 +37,13 @@ P4.0) when the AEAD packet identity became a single **per-direction monotonic
 header was **reordered** so the 14 variable bytes (`packet_number ‖ flags ‖
 stream_id ‖ epoch ‖ path_id`) form a contiguous span at offset `[33..47]` that is
 **XOR-masked on the wire**, leaving only `version ‖ session_id` cleartext (§ 4.2 /
-§ 4.6). The handshake (`PROTOCOL_VERSION`) is unchanged by T4.6.
+§ 4.6). Then `4 → 5` (ε / CID-collapse) **dropped the 32-byte inner `session_id`
+from the data-plane wire entirely** — it stays in the AEAD AAD, reconstructed from
+session context (§ 5) — shrinking the header `47 → 15` bytes (only the cleartext
+`version` byte plus the 14 HP-masked variable bytes, now the span `[1..15]`;
+§ 4.2 / § 4.6). The sole routing identifier is the outer 8-byte UDP `ConnId`,
+which **rotates** on each migration (§ 4.7), so no stable cleartext connection
+identifier remains. The handshake (`PROTOCOL_VERSION`) is unchanged by T4.6 or ε.
 `PROTOCOL_VERSION` is `3` (bumped
 `1 → 2` when the signed transcript began covering the 0-RTT verdict
 `early_data_accepted` (H2) and `ClientHello` gained the `resumption_binder`
@@ -149,7 +155,7 @@ wire-format constants.
 
 ```rust
 pub struct PhantomPacket {
-    pub header: PacketHeader,   // 47 bytes (§ 4.2)
+    pub header: PacketHeader,   // 15 bytes on the wire (§ 4.2); session_id is off-wire
     pub payload: Vec<u8>,       // AEAD ciphertext (+16-byte tag) when ENCRYPTED;
                                 // raw bytes for control/ACK; coalesced bundle when COALESCED
     pub extensions: Vec<u8>,    // TLV headroom; empty today, ignored if non-empty
@@ -165,7 +171,7 @@ The packet is serialised by `PhantomPacket::to_wire` as an explicit,
 length-prefixed image — no serialization library:
 
 ```text
-header        47 bytes (§ 4.2)
+header        15 bytes (§ 4.2)
 payload_len   u32 big-endian
 payload       payload_len bytes
 ext_len       u32 big-endian
@@ -184,65 +190,82 @@ serialised `PacketHeader` bytes (§ 5).
 (packet-number / SACK fields) without a layout change. It is empty in every
 frame this build emits; a decoder ignores its contents.
 
-> **Security note.** `extensions` is **not** covered by the AEAD AAD (the AAD is
-> exactly the 47-byte `PacketHeader` image — § 5), so its bytes are
-> attacker-malleable. A future TLV reader must therefore treat `extensions` as
-> untrusted input and either authenticate it separately or restrict it to
-> values that are safe when forged. For 1.0 it is reserved and never
-> interpreted, which is why no reader exists yet.
+> **Security note.** The AEAD AAD is the reconstructed 47-byte header image
+> followed by `extensions` (§ 5) — `extensions` is authenticated (T4.1), so a
+> wire mutation of it fails the tag. Wire-format note for ε: the on-wire header
+> is 15 bytes (`session_id` is off-wire), but the AAD reconstructs the full
+> 47-byte v4 image, so the AEAD security argument is unchanged. `extensions` is
+> reserved and never interpreted for 1.0 (no reader exists yet).
 
-### 4.2 `PacketHeader` (47 bytes)
+### 4.2 `PacketHeader` (15 wire bytes; 47-byte AAD image)
 
 Serialised by `PacketHeader::to_wire` as an explicit, fixed **big-endian**
 (network byte order) image — no serialization library, `version` first, byte
-arrays as-is. WIRE_VERSION 4 (T4.6) **reorders** the variable fields relative to
-the struct declaration so the 14 header-protected bytes are a contiguous
-`[33..47]` span (see § 4.6); the Rust struct field order is unchanged:
+arrays as-is. WIRE_VERSION 5 (ε) **drops the inner `session_id` from the wire**
+and shifts the 14 header-protected bytes to a contiguous `[1..15]` span (see
+§ 4.6); the Rust struct keeps the `session_id` field (used for the AAD, off-wire):
 
 ```rust
 #[repr(C)]
 pub struct PacketHeader {
-    pub version: u8,                 // pinned WIRE_VERSION   — wire [0],    cleartext
-    pub session_id: SessionId,       // [u8; 32] (routing CID) — wire [1..33], cleartext
-    pub stream_id: StreamId,         // u16  (0 = control)    — wire [43..45], HP-masked
-    pub packet_number: PacketNumber, // u64  per-dir monotonic — wire [33..41], HP-masked
-    pub flags: PacketFlags,          // u16  (§ 4.3)          — wire [41..43], HP-masked
-    pub epoch: u8,                   // rekey generation       — wire [45],    HP-masked
-    pub path_id: u8,                 // migration path label   — wire [46],    HP-masked
+    pub version: u8,                 // pinned WIRE_VERSION   — wire [0],     cleartext
+    pub session_id: SessionId,       // [u8; 32]              — OFF-WIRE (AAD only; § 5)
+    pub stream_id: StreamId,         // u16  (0 = control)    — wire [11..13], HP-masked
+    pub packet_number: PacketNumber, // u64  per-dir monotonic — wire [1..9],   HP-masked
+    pub flags: PacketFlags,          // u16  (§ 4.3)          — wire [9..11],  HP-masked
+    pub epoch: u8,                   // rekey generation       — wire [13],    HP-masked
+    pub path_id: u8,                 // migration path label   — wire [14],    HP-masked
 }
 ```
 
-Source: `core/src/transport/types.rs:258`. `PacketHeader::SIZE = 47`, pinned by
-`core/tests/check_wire.rs`, `types.rs::packet_header_serializes_to_47_bytes`, and
-the byte-frozen vector `core/tests/wire_vectors/packet_header.bin` (§ 11).
-(`WIRE_VERSION 2 → 3` dropped the dead `ack_delay: u16` and widened the former
-per-stream `sequence: u32` to the per-direction `packet_number: u64` — § 5;
-`3 → 4` reordered the `[33..47]` span for header protection — § 4.6.)
+Source: `core/src/transport/types.rs`. `PacketHeader::SIZE = 15` (the on-wire
+header), pinned by `core/tests/check_wire.rs`,
+`types.rs::packet_header_serializes_to_15_bytes`, and the byte-frozen vector
+`core/tests/wire_vectors/packet_header.bin` (§ 11). The **AEAD AAD** is a separate
+`PacketHeader::AAD_SIZE = 47`-byte image (`to_aad_image`) — the byte-identical v4
+logical header `version ‖ session_id ‖ packet_number ‖ flags ‖ stream_id ‖ epoch
+‖ path_id`, with the off-wire `session_id` reconstructed from session context
+(§ 5). (`WIRE_VERSION 2 → 3` dropped the dead `ack_delay` and widened `sequence`
+to a per-direction `packet_number: u64`; `3 → 4` reordered the span for header
+protection — § 4.6; `4 → 5` (ε) dropped `session_id` from the wire.)
 
-Wire byte layout (the load-bearing contract — this **cleartext** image is the
-AEAD AAD, so any layout drift silently breaks interop). The `[33..47]` span is
-XOR-masked on the wire (§ 4.6), but the AAD and this table are the *cleartext*
-image:
+**Wire byte layout** (15 bytes — `version` cleartext, the rest HP-masked, § 4.6):
 
 | Offset | Field | Width | Encoding | On the wire |
 | --- | --- | --- | --- | --- |
 | 0 | `version` | 1 | u8, `= WIRE_VERSION` | cleartext |
-| 1 | `session_id` | 32 | 32 bytes, as-is (routing CID) | cleartext |
-| 33 | `packet_number` | 8 | u64 big-endian | HP-masked |
-| 41 | `flags` | 2 | u16 big-endian (§ 4.3) | HP-masked |
-| 43 | `stream_id` | 2 | u16 big-endian | HP-masked |
-| 45 | `epoch` | 1 | u8 | HP-masked |
-| 46 | `path_id` | 1 | u8 | HP-masked |
-| **total** | | **47** | | |
+| 1 | `packet_number` | 8 | u64 big-endian | HP-masked |
+| 9 | `flags` | 2 | u16 big-endian (§ 4.3) | HP-masked |
+| 11 | `stream_id` | 2 | u16 big-endian | HP-masked |
+| 13 | `epoch` | 1 | u8 | HP-masked |
+| 14 | `path_id` | 1 | u8 | HP-masked |
+| **total** | | **15** | | |
 
-The pinned `version` byte leads the header. The full **cleartext** 47-byte image
-is the AEAD AAD, so flipping *any* byte — `version` included — fails decryption
-(§ 5); the recv path additionally drops a frame whose `version != WIRE_VERSION`.
-The same big-endian convention is used for the `packet_number` bytes that feed
-the AEAD nonce (§ 5). An independent (non-Rust) decoder + encoder that reproduces
-this **cleartext** layout exactly is `tests/wire_vectors_decode.py` (the frozen
-vectors are the cleartext codec image; the HP mask is keyed crypto, verified
-separately in Rust — § 4.6).
+**AEAD AAD image** (47 bytes — the load-bearing crypto contract, byte-identical
+to the v4 header; reconstructed off-wire, never serialised onto the wire):
+
+| Offset | Field | Width |
+| --- | --- | --- |
+| 0 | `version` | 1 |
+| 1 | `session_id` | 32 |
+| 33 | `packet_number` | 8 |
+| 41 | `flags` | 2 |
+| 43 | `stream_id` | 2 |
+| 45 | `epoch` | 1 |
+| 46 | `path_id` | 1 |
+| **total** | | **47** |
+
+The `session_id` is **never on the wire** post-handshake (it was the v4 routing
+CID; routing is now by the outer rotating `ConnId` — § 4.7). On receive,
+`Session::parse_protected` reconstructs `header.session_id = self.id()` from the
+routed session before the AEAD open, so the 47-byte AAD a sender authenticated is
+reproduced byte-for-byte — a packet mis-delivered to the wrong session
+reconstructs *that* session's id → wrong AAD → AEAD fail (the off-wire analogue of
+the v4 cleartext-session_id bind). Flipping *any* AAD byte — `version` included —
+fails decryption (§ 5); the recv path additionally drops a frame whose
+`version != WIRE_VERSION`. An independent (non-Rust) decoder + encoder that
+reproduces the 15-byte wire layout exactly is `tests/wire_vectors_decode.py` (the
+HP mask is keyed crypto, verified separately in Rust — § 4.6).
 
 ### 4.3 `PacketFlags` (u16 bitfield)
 
@@ -289,12 +312,13 @@ Server-side it is derived as `SHA256(b"phantom-session-id-v1" || shared_secret
 
 ### 4.6 Header protection (T4.6, QUIC RFC 9001 § 5.4)
 
-The 14-byte `[33..47]` span (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖
+The 14-byte `[1..15]` span (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖
 path_id`) is **XOR-masked on the wire** so a passive on-path observer cannot read
 the packet number, the `PRIORITY` ("voice") flag, the stream id, the rekey epoch,
-or the migration path label. Only `version ‖ session_id` (the routing CID) plus
-the cleartext length prefixes stay readable, so the demux can route and the recv
-path can locate the ciphertext sample before unmasking.
+or the migration path label. Only the cleartext `version` byte plus the length
+prefixes stay readable, so the recv path can locate the ciphertext sample before
+unmasking; the `session_id` is off-wire (§ 4.2) and routing is by the outer
+**rotating** `ConnId` (§ 4.7).
 
 **Keys.** Per-direction `hp_send` / `hp_recv` (32 bytes each) are derived ONCE at
 session establishment via `kdf::derive_key_32("phantom-hp-{send,recv}-v1",
@@ -314,26 +338,80 @@ dependency**). Per the negotiated suite:
 AES-256-GCM suite:  mask = AES-256-ECB(hp_key, sample)                    (one block)
 ChaCha20 suite:     mask = ChaCha20(key=hp_key, counter=u32_le(sample[0..4]),
                                     nonce=sample[4..16])[0..16]
-apply / remove:     wire[33..47] ^= mask[0..14]
+apply / remove:     wire[1..15] ^= mask[0..14]
 ```
 
 Under `--features fips` the AES mask routes through `aws_lc_rs::cipher` ECB (the
 FIPS substrate); the ChaCha20 mask is unreachable (the suite is pinned to AES).
 
-**No new oracle.** The AEAD AAD is the **cleartext** header image (the unmasked
-`[33..47]`). A wire mutation of the masked span unmasks to a wrong header → wrong
-AAD → the AEAD open fails, exactly like any other AAD tamper. HP is an orthogonal
+**No new oracle.** The AEAD AAD is the reconstructed 47-byte header image (§ 4.2),
+which binds the unmasked `[1..15]` fields. A wire mutation of the masked span
+unmasks to a wrong header → wrong AAD → the AEAD open fails, exactly like any
+other AAD tamper. HP is an orthogonal
 outer wrapping; it adds no decryption oracle. Source:
 `core/src/crypto/header_protection.rs`, `Session::protect_packet` /
 `parse_protected` (`transport/session.rs`). KATs: AES-256-ECB vs NIST SP 800-38A
 F.1.5, ChaCha20 HP vs RFC 9001 § A.5; live end-to-end via `udp_integration` /
 `tcp_integration`.
 
-**Residual.** Header protection hides the *variable* per-packet metadata, but the
-32-byte `session_id` (and, on the PhantomUDP path, the outer 8-byte routing
-`ConnId`) stay **cleartext and stable** for the session — so a flow is still
-linkable across a migration by that stable identifier. Closing that requires CID
-rotation (a separate change); see the threat model § 12.5.
+**Residual (closed by ε).** T4.6 hid the *variable* per-packet metadata but left
+two stable cleartext identifiers — the 32-byte inner `session_id` and the outer
+8-byte routing `ConnId`. ε removes both: the `session_id` left the wire (§ 4.2),
+and the single routing `ConnId` now **rotates** on each migration (§ 4.7). No
+stable cleartext connection identifier remains, so flows are no longer linkable
+across a migration by an on-path observer (threat model § 12.5, now closed). The
+honest caveat: like the HP keys, the CID chain is session-stable and **not**
+forward-secret — a session-key compromise lets an attacker recompute the chain
+and link a *recorded* flow retroactively; the payload stays forward-secret.
+
+### 4.7 Rotating connection ID (ε / WIRE v5)
+
+After ε the **only** per-connection cleartext identifier is the outer 8-byte UDP
+`ConnId` (`transport/phantom_udp/envelope.rs`), and it **rotates** so an on-path
+observer sees independent-random values that cannot be linked across a migration.
+
+**Chain.** At session establishment each peer derives two per-direction secrets
+from the initial session secret (mirroring the HP / AEAD key swap):
+
+```
+cid_secret_c2s = derive_key_32("phantom-cid-c2s-v1", initial_secret)   // client→server
+cid_secret_s2c = derive_key_32("phantom-cid-s2c-v1", initial_secret)   // server→client
+CID_i          = derive_key_32("phantom-cid-v1", cid_secret ‖ i_be)[0..8]
+```
+
+The client stamps its outbound `ConnId` from the c2s chain (the chain the server
+routes on); the server stamps from the s2c chain (`is_server` swaps, like the HP
+keys). The chain secrets are **session-stable** (not rotated on rekey) and
+zeroized on drop (`crypto/cid_chain.rs`).
+
+**Index + window.** The outbound index `i` starts at 0 (`CID_0` is the first
+post-handshake CID, replacing the random bootstrap `ConnId` the handshake ran on)
+and **advances by one on each `migrate()`**, so post-migration datagrams stamp an
+independent-random `CID_{i+1}`. The receiver (the UDP demux) routes on a sliding
+window of accepted CIDs `[highest_seen − T, highest_seen + K]` (`T = 2` trailing
+for in-flight reorder across a migration boundary, `K = 4` leading for migration
+lookahead). The window advances **only post-AEAD**: an authenticated packet
+carrying a new (forward) `path_id` — which the peer bumps in lock-step with its
+CID index on each `migrate()` — slides the window one step (register the new
+leading CID, drop the trailing one). An off-path attacker cannot push the window
+(future CIDs are unguessable without `cid_secret`, and a replayed observed CID
+never AEAD-verifies). A CID outside every window is dropped → liveness → reconnect.
+
+**Bootstrap.** The handshake runs over a random bootstrap `ConnId` (the chain
+secret is unavailable until the handshake completes). On completion both sides
+derive the chain and the server registers `[CID_0 .. CID_K]`; the bootstrap id is
+retired when the session's routes are reaped. It is visible only during the
+inherently-observable handshake — unlinkability is about the post-migration flow.
+
+**Cross-transport.** TCP / embedded are socket-routed and carry no on-wire CID;
+the rotation applies only to the PhantomUDP envelope. The 15-byte inner header
+(§ 4.2) is uniform across all transports.
+
+Source: `crypto/cid_chain.rs`, `Session::{current_outbound_cid, advance_outbound_cid,
+inbound_window_cids, note_migration_path}` (`transport/session.rs`), the UDP demux
+`RouteTable` (`api/udp_listener.rs`). Live tests: `udp_integration`
+(`client_stamps_cid0_*`, `cid_rotates_on_the_wire_across_migration`,
+`window_slides_across_many_migrations`).
 
 ---
 
@@ -371,13 +449,15 @@ Receiver:  ciphertext, header →  AEAD-decrypt(key  = recv_key,
                               →  plaintext  OR  a single opaque "decrypt failed"
 ```
 
-The AAD is the **cleartext** 47-byte header image (`serialize(header)`) followed
-by the packet's `extensions` TLV (T4.1 — the forward-compat headroom is now
-authenticated, closing the prior gap where it sat outside the AAD; it is empty on
-every current packet, so the AAD is just the 47-byte image in practice). On the
-wire the header's `[33..47]` span is HP-masked (§ 4.6); the receiver reconstructs
-the **cleartext** header (the AAD) by unmasking before this AEAD-decrypt, so a
-masked-region tamper surfaces here as a `decrypt failed` — no separate oracle.
+The AAD is the reconstructed 47-byte header image (`header.to_aad_image()`, § 4.2)
+followed by the packet's `extensions` TLV (T4.1 — the forward-compat headroom is
+now authenticated, closing the prior gap where it sat outside the AAD; it is empty
+on every current packet, so the AAD is just the 47-byte image in practice). The
+on-wire header is only 15 bytes (`session_id` is off-wire — § 4.2); the receiver
+reconstructs `header.session_id = self.id()` from the routed session and unmasks
+the `[1..15]` HP span (§ 4.6) before this AEAD-decrypt, rebuilding the byte-identical
+47-byte AAD the sender authenticated, so a masked-region tamper or a wrong-session
+delivery surfaces here as a `decrypt failed` — no separate oracle.
 
 Source: `Session::encrypt_packet` / `decrypt_packet` / `protect_packet` /
 `parse_protected` (`core/src/transport/session.rs`).
@@ -836,8 +916,9 @@ network attacker cannot learn anything from the shape of the failure.
 
 ## 9. Side notes
 
-- The serialised `PacketHeader` is exactly 47 bytes and is used verbatim as the
-  AEAD AAD. Any layout drift is a wire-incompatible regression.
+- The on-wire `PacketHeader` is exactly 15 bytes (ε; `session_id` off-wire); the
+  AEAD AAD is the separate reconstructed 47-byte image (§ 4.2). Any layout drift
+  in either is a wire-incompatible regression.
 - The nonce's `packet_number` field is big-endian (§ 5); this is pinned
   independently of the header serialisation.
 - Every length-prefix on the wire (e.g. `TcpSessionTransport` framing) is a
@@ -911,8 +992,9 @@ is tracked separately. The vectors are scoped to the default (non-fips) build;
 the fips build is a distinct wire (different `PROTOCOL_VARIANT`, 65-byte
 classical key) and would need its own set.
 
-The packet fixtures freeze the **cleartext** codec image (= the AEAD AAD). The
-on-wire `[33..47]` header-protection mask (§ 4.6) is keyed crypto, so it is pinned
+The packet fixtures freeze the **cleartext** 15-byte wire image (ε; `session_id`
+is off-wire — the AEAD AAD is the separate reconstructed 47-byte image, § 4.2).
+The on-wire `[1..15]` header-protection mask (§ 4.6) is keyed crypto, so it is pinned
 separately — by the `crypto::header_protection` KATs (NIST SP 800-38A F.1.5 for
 AES-256-ECB, RFC 9001 § A.5 for ChaCha20), the `to_wire_masked` /
 `RawPacket::unmask_header` round-trip, and the `security_invariants` HP
@@ -1032,13 +1114,16 @@ PINGs to notice a dead path, which are deferred. No wire change.
   Defences: path validation (an unguessable challenge that must be echoed *from* the
   claimed address), pinned-key AEAD (an attacker without the session keys can neither
   read nor inject app data), and the per-direction replay window (§ 5).
-- **Linkability (documented honestly).** Phase-4 migration is **functional but
-  linkable**: the `session_id`/CID is **plaintext** (it is the demux key), so an
-  on-path / colluding observer who sees both networks can link "same session moved
-  Wi-Fi→cellular". This is a *narrow* regression versus the re-handshake fallback
-  (which presents two unlinkable connections) for a global observer; for a NAT-rebind
-  on the same network there is no new linkability. We accept the trade (liveness ≫
-  narrow linkability) and make **no claim of unobservable migration**. **Unlinkable
-  migration** — header protection (packet-number encryption) + connection-ID rotation
-  — is a dedicated future hardening phase; the `u64` packet number and single PN space
-  (① — § 5) are exactly what such header protection would later mask.
+- **Linkability — closed by ε.** Migration is now **unlinkable** by an on-path /
+  colluding observer. Header protection (T4.6, § 4.6) masks the variable per-packet
+  metadata, and ε (§ 4.2 / § 4.7) removed the two stable cleartext identifiers: the
+  inner 32-byte `session_id` left the wire (it is off-wire in the AEAD AAD), and the
+  single routing `ConnId` now **rotates** to an independent-random value on each
+  migration. So an observer seeing both networks can no longer link "same session
+  moved Wi-Fi→cellular" by any stable cleartext field. The `version` byte (= 5) is a
+  constant protocol fingerprint shared by all connections, **not** a per-connection
+  linker (full anti-fingerprinting — version/length padding — is a separate future
+  pass). **Honest caveat (not forward-secret):** like the HP keys, the CID chain is
+  session-stable; a session-key compromise lets an attacker recompute the chain (and
+  unmask headers) to link a *recorded* flow retroactively — but the payload stays
+  forward-secret (the AEAD ratchets). Same posture as the HP core.
