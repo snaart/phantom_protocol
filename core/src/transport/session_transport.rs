@@ -77,6 +77,14 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// existing impl.
     fn set_frame_phase(&self, _phase: FramePhase) {}
 
+    /// Stamp this transport's outbound routing CID (ε / WIRE v5). Called once by
+    /// the session machinery at the handshake → data-pump boundary with the
+    /// session's `current_outbound_cid()` (the rotating `CID_0`), switching the
+    /// transport off the bootstrap ConnId onto the chain. Default no-op —
+    /// socket-routed transports (TCP / WebSocket / WASI / Embedded) carry no
+    /// on-wire CID and ignore it. Source-compatible for every existing impl.
+    fn set_outbound_cid(&self, _cid: [u8; 8]) {}
+
     /// Whether the transport has observed an unvalidated **candidate** source for
     /// this session — a connection-migration signal (Phase 4). Only an
     /// address-aware transport (the UDP server) ever returns `true`; stream

@@ -44,6 +44,58 @@ async fn udp_integration_pinned_and_encrypted() {
     server.await.unwrap();
 }
 
+/// ε / WIRE v5 (P3) — after the handshake the client stamps its rotating `CID_0`
+/// (not the bootstrap ConnId), and the server's demux routes it because it
+/// registered the inbound CID window `[CID_0 .. CID_K]`. The bidirectional
+/// exchange only completes if `CID_0` routes (without the window the data misses
+/// the demux and the exchange hangs); and the server's route table holds the
+/// window (> 1 route) — a v4 session had only the single bootstrap route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_client_stamps_cid0_and_server_routes_the_window() {
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let listener_for_server = listener.clone();
+    let server = tokio::spawn(async move {
+        let session = listener_for_server
+            .accept()
+            .await
+            .expect("accept")
+            .session();
+        let msg = session.recv().await.expect("server recv");
+        assert_eq!(msg, b"ping");
+        session.send(b"pong".to_vec()).await.expect("server send");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+
+    let transport = UdpClientTransport::connect(addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+    client.send(b"ping".to_vec()).await.expect("client send");
+    // The reply only arrives if the client's post-handshake CID_0 datagrams routed
+    // — i.e. the server registered the rotating-CID window. Without it, CID_0 misses
+    // the demux and this would time out.
+    let reply = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(reply, b"pong");
+
+    // While the session is still alive (server task sleeping), the server's route
+    // table holds the registered CID window in addition to the bootstrap ConnId.
+    assert!(
+        listener.active_route_count() > 1,
+        "server must register the CID window (> 1 route); got {}",
+        listener.active_route_count()
+    );
+    server.await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn udp_integration_two_sessions_one_client_socket_is_not_required_but_two_clients_ok() {
