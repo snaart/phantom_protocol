@@ -290,6 +290,40 @@ fn v5_session_id_bound_via_aad_off_wire() {
     assert_eq!(pt, b"bound to A");
 }
 
+/// ε / WIRE v5 (P3) — the rotating-CID chain is wired into `Session`: the
+/// client's current outbound CID (`CID_0`) is EXACTLY what the server routes on —
+/// it is the first entry of the server's inbound demux window. This is the
+/// routing contract the UDP demux relies on (client stamps `current_outbound_cid`;
+/// the server registers `inbound_window_cids` and a hit routes to the session).
+/// The chains are per-direction (c2s / s2c), so the property holds both ways.
+#[test]
+fn v5_session_cid_chain_outbound_matches_peer_inbound_window() {
+    let (client, server) = make_session_pair([0x5Eu8; 32]);
+
+    // Client → server: the client stamps CID_0; the server's inbound window (the
+    // c2s chain it routes on) must contain it as its leading entry.
+    let client_cid0 = client.current_outbound_cid();
+    let server_window = server.inbound_window_cids();
+    assert_eq!(
+        server_window[0], client_cid0,
+        "server inbound window[0] must equal the client's CID_0"
+    );
+    assert!(server_window.contains(&client_cid0));
+
+    // Server → client: symmetric (the s2c chain).
+    let server_cid0 = server.current_outbound_cid();
+    let client_window = client.inbound_window_cids();
+    assert_eq!(client_window[0], server_cid0);
+
+    // At index 0 the window is the leading lookahead (trailing saturates at 0):
+    // K + 1 = 5 CIDs (indices 0..=4).
+    assert_eq!(
+        server_window.len(),
+        5,
+        "leading window is K+1 = 5 CIDs at start"
+    );
+}
+
 /// Malformed wire bytes must fail parsing as a typed error, never a panic.
 /// This protects the receive loop from a malicious peer crashing the process
 /// by sending random bytes.

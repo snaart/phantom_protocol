@@ -4,6 +4,7 @@
 //! Manages streams, encryption state, and multi-path scheduling.
 
 use crate::crypto::adaptive_crypto::{CryptoSession, AEAD_MAX_INVOCATIONS};
+use crate::crypto::cid_chain::{CidChain, CID_LEN, CID_WINDOW_LEADING, CID_WINDOW_TRAILING};
 use crate::crypto::header_protection::{HeaderProtector, HP_SAMPLE_LEN};
 use crate::errors::CoreError;
 use crate::security::ReplayWindow;
@@ -173,6 +174,22 @@ pub struct Session {
     /// see [`HeaderProtector`]). Masks the 14-byte `[33..47]` header span on the
     /// wire via [`Self::protect_packet`] / unmasks it via [`Self::parse_protected`].
     header_protection: HeaderProtector,
+    /// Per-direction, **session-stable** rotating connection-ID chain (ε / WIRE
+    /// v5). Derived ONCE from the initial session secret (mirroring
+    /// `header_protection`, same `is_server` swap); it does NOT rotate with
+    /// `crypto`/`epoch`. The outbound chain stamps this peer's envelope `ConnId`
+    /// ([`Self::current_outbound_cid`]); the inbound chain is what the peer's
+    /// demux routes on ([`Self::inbound_window_cids`]). Zeroized on drop.
+    cid_chain: CidChain,
+    /// This peer's outbound CID migration index (ε / WIRE v5). Starts at 0;
+    /// advances on `migrate()` (P4) so the stamped `ConnId` rotates to an
+    /// independent-random value an observer cannot link across a migration.
+    outbound_cid_index: AtomicU64,
+    /// Highest inbound CID migration index observed (ε / WIRE v5). Centers the
+    /// inbound demux window [`Self::inbound_window_cids`]. Starts at 0; advances
+    /// post-AEAD when the peer migrates (P4). Tracked separately from
+    /// `outbound_cid_index` — the two directions migrate independently.
+    inbound_cid_highest_seen: AtomicU64,
     /// Per-direction traffic secret. Initial value is the hybrid handshake's
     /// shared secret; each `rekey()` derives the next via
     /// `HKDF-Expand(current, "phantom-rekey-v1", 32)` (Phase 1.5).
@@ -286,6 +303,9 @@ impl Session {
             state: RwLock::new(SessionState::Handshaking),
             crypto: ArcSwap::new(Arc::new(crypto)),
             header_protection,
+            cid_chain: CidChain::derive(shared_secret, peer_side),
+            outbound_cid_index: AtomicU64::new(0),
+            inbound_cid_highest_seen: AtomicU64::new(0),
             traffic_secret: RwLock::new(*shared_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
@@ -331,6 +351,9 @@ impl Session {
             state: RwLock::new(SessionState::Connected),
             crypto: ArcSwap::new(Arc::new(crypto)),
             header_protection,
+            cid_chain: CidChain::derive(&traffic_secret, is_server),
+            outbound_cid_index: AtomicU64::new(0),
+            inbound_cid_highest_seen: AtomicU64::new(0),
             traffic_secret: RwLock::new(traffic_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
@@ -371,6 +394,9 @@ impl Session {
             state: RwLock::new(SessionState::Connected),
             crypto: ArcSwap::new(Arc::new(crypto)),
             header_protection,
+            cid_chain: CidChain::derive(resumption_secret, peer_side),
+            outbound_cid_index: AtomicU64::new(0),
+            inbound_cid_highest_seen: AtomicU64::new(0),
             traffic_secret: RwLock::new(*resumption_secret),
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
@@ -392,6 +418,39 @@ impl Session {
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
         })
+    }
+
+    /// The envelope `ConnId` this peer currently stamps on outbound UDP datagrams
+    /// (ε / WIRE v5). At the current outbound CID index (0 until the first
+    /// `migrate()`) this is `CID_0` of the outbound chain — and it is exactly
+    /// `inbound_window_cids()[0]` for the peer, which is how the demux routes it.
+    /// TCP/embedded transports are socket-routed and ignore this.
+    pub fn current_outbound_cid(&self) -> [u8; CID_LEN] {
+        self.cid_chain
+            .outbound_cid(self.outbound_cid_index.load(Ordering::Relaxed))
+    }
+
+    /// This peer's current outbound CID migration index (ε / WIRE v5). 0 until the
+    /// first `migrate()`; exposed for the migration wiring (P4) and diagnostics.
+    pub fn outbound_cid_index(&self) -> u64 {
+        self.outbound_cid_index.load(Ordering::Relaxed)
+    }
+
+    /// The inbound CIDs the demux should route to this session (ε / WIRE v5): the
+    /// window `[highest_seen − T, highest_seen + K]` over this peer's inbound
+    /// chain. At session establishment (`highest_seen = 0`, trailing saturates)
+    /// this is the leading lookahead `[CID_0 .. CID_K]` (K + 1 entries). The
+    /// server registers these in its `RouteTable`; a datagram whose `ConnId` is in
+    /// the set routes to this session. The window slide on `migrate()` is P4.
+    pub fn inbound_window_cids(&self) -> Vec<[u8; CID_LEN]> {
+        self.cid_chain
+            .inbound_window(
+                self.inbound_cid_highest_seen.load(Ordering::Relaxed),
+                CID_WINDOW_TRAILING,
+                CID_WINDOW_LEADING,
+            )
+            .map(|(_, cid)| cid)
+            .collect()
     }
 
     /// Get session ID
