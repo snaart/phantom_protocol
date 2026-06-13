@@ -497,6 +497,11 @@ impl PhantomSession {
         // cap from the tight unauthenticated handshake limit to the steady-state
         // application limit before the data pump takes over.
         transport.set_frame_phase(FramePhase::Established);
+        // ε / WIRE v5: switch the transport off the bootstrap ConnId onto this
+        // session's rotating CID_0 (the c2s chain the client routes on; the
+        // demux registers the matching inbound window). The server→client
+        // direction rotates too, so neither flow keeps a stable cleartext id.
+        transport.set_outbound_cid(server_session.current_outbound_cid());
         let observed = Arc::new(ObservedTransport::new(
             transport,
             observability.clone(),
@@ -636,6 +641,10 @@ impl PhantomSession {
         // WIRE-001: the handshake is done — raise the frame cap from the tight
         // unauthenticated handshake limit to the steady-state application limit.
         transport.set_frame_phase(FramePhase::Established);
+        // ε / WIRE v5: stamp this session's rotating CID_0 on every post-handshake
+        // datagram (the chain the server's demux routes on) instead of the
+        // bootstrap ConnId.
+        transport.set_outbound_cid(crypto_session.current_outbound_cid());
         let observed = Arc::new(ObservedTransport::new(
             transport,
             observability.clone(),
