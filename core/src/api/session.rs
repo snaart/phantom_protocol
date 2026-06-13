@@ -191,6 +191,49 @@ impl<T: SessionTransport> SessionTransport for ObservedTransport<T> {
         }
         result
     }
+
+    // ── Transparent forwarding of the non-I/O trait surface ───────────────────
+    //
+    // ObservedTransport wraps the concrete transport for the whole data pump, so
+    // every control method the pump calls on it (phase, CID stamping, migration)
+    // MUST reach the inner transport — otherwise they silently hit the trait's
+    // defaults (no-op / `false`) and the feature is dead through the pump. (The
+    // pre-ε code only forwarded send/recv, so the FFI `migrate()` and the
+    // server-side migration detection were no-ops once wrapped; ε needs them live
+    // to rotate the CID on migration, so the wrapper is made fully transparent.)
+    fn set_frame_phase(&self, phase: FramePhase) {
+        self.inner.set_frame_phase(phase);
+    }
+
+    fn set_outbound_cid(&self, cid: [u8; 8]) {
+        self.inner.set_outbound_cid(cid);
+    }
+
+    fn has_migration_candidate(&self) -> bool {
+        self.inner.has_migration_candidate()
+    }
+
+    fn send_to_candidate(
+        &self,
+        data: &[u8],
+    ) -> impl core::future::Future<Output = Result<bool, CoreError>> + Send {
+        self.inner.send_to_candidate(data)
+    }
+
+    fn confirm_authenticated_source(&self) {
+        self.inner.confirm_authenticated_source();
+    }
+
+    fn promote_candidate(&self) -> bool {
+        self.inner.promote_candidate()
+    }
+
+    fn migrate(
+        &self,
+        local_addr: String,
+    ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
+        self.inner.migrate(local_addr)
+    }
 }
 
 // ─── Session ────────────────────────────────────────────────────────────────
