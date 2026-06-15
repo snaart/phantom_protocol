@@ -42,9 +42,9 @@ from the data-plane wire entirely** — it stays in the AEAD AAD, reconstructed 
 session context (§ 5) — shrinking the header `47 → 15` bytes (only the cleartext
 `version` byte plus the 14 HP-masked variable bytes, now the span `[1..15]`;
 § 4.2 / § 4.6). The sole routing identifier is the outer 8-byte UDP `ConnId`,
-which **rotates** on each migration (§ 4.7) — the migrating peer's outbound
-direction; the *return* (server→client) ConnId does not yet rotate on a client
-migration (§ 12.5, EPS-02). The handshake (`PROTOCOL_VERSION`) is unchanged by T4.6 or ε.
+which **rotates** on each migration (§ 4.7) — symmetrically for a client migration
+(both directions, EPS-02 fix), with a residual on the rarer *server* migration
+(§ 12.5). The handshake (`PROTOCOL_VERSION`) is unchanged by T4.6 or ε.
 `PROTOCOL_VERSION` is `3` (bumped
 `1 → 2` when the signed transcript began covering the 0-RTT verdict
 `early_data_accepted` (H2) and `ClientHello` gained the `resumption_binder`
@@ -355,30 +355,36 @@ outer wrapping; it adds no decryption oracle. Source:
 F.1.5, ChaCha20 HP vs RFC 9001 § A.5; live end-to-end via `udp_integration` /
 `tcp_integration`.
 
-**Residual (partially closed by ε).** T4.6 hid the *variable* per-packet metadata
-but left two stable cleartext identifiers — the 32-byte inner `session_id` and the
-outer 8-byte routing `ConnId`. ε removes the `session_id` from the wire (§ 4.2) and
-makes the routing `ConnId` **rotate** on each migration (§ 4.7), but only for the
-**migrating peer's outbound direction**: a client migration unlinks the
-client→server flow, while the server→client `ConnId` stays stable across that
-migration (the server detects the move and slides its inbound window but does not
-rotate its own outbound CID). So migration is unlinkable in the c2s direction and
-**still linkable in the s2c direction** to a both-networks observer (threat model
-§ 12.5; audit 2026-06-15 **EPS-02** — symmetric-rotation remediation in progress).
-The honest caveat: like the HP keys, the CID chain is session-stable and **not**
-forward-secret — a session-key compromise lets an attacker recompute the chain
-and link a *recorded* flow retroactively; the payload stays forward-secret.
+**Residual (closed by ε for client migration).** T4.6 hid the *variable* per-packet
+metadata but left two stable cleartext identifiers — the 32-byte inner `session_id`
+and the outer 8-byte routing `ConnId`. ε removes the `session_id` from the wire
+(§ 4.2) and makes the routing `ConnId` **rotate** on each migration (§ 4.7). For a
+**client** migration the rotation is **symmetric** (EPS-02 fix): the client rotates
+its c2s chain on `migrate()` and the server rotates its s2c chain on authenticating
+the new `path_id`, so both directions are unlinkable. **Residual:** a *server*
+migration rotates s2c but not c2s (the socket-routed client does not rotate-on-detect
+— that would strand its CID outside the server's un-sliding c2s window for repeated
+server migrations), so a server move stays linkable in the c2s direction to a
+both-networks observer (threat model § 12.5; audit 2026-06-15 **EPS-02** — the full
+shared-epoch fix is tracked). The honest caveat: like the HP keys, the CID chain is
+session-stable and **not** forward-secret — a session-key compromise lets an attacker
+recompute the chain and link a *recorded* flow retroactively; the payload stays
+forward-secret.
 
 ### 4.7 Rotating connection ID (ε / WIRE v5)
 
 After ε the **only** per-connection cleartext identifier is the outer 8-byte UDP
 `ConnId` (`transport/phantom_udp/envelope.rs`), and it **rotates** so an on-path
-observer sees independent-random values on the migrating peer's outbound flow.
-**Caveat (audit 2026-06-15, EPS-02):** rotation is *asymmetric* — only the peer
-that calls `migrate()` advances its own outbound chain, so the *return* direction
-(e.g. server→client when the **client** migrates) keeps a stable `ConnId` and stays
-linkable to a both-networks observer. The remediation drives both directions' CID
-from one authenticated migration epoch; see § 12.5.
+observer sees independent-random values across a migration. For a **client
+migration** rotation is **symmetric** (EPS-02 fix): the client advances its c2s
+chain on `migrate()`, and the server, on authenticating the new `path_id`
+(post-AEAD), rotates its s2c chain too — the socket-routed client absorbs the new
+inbound CID without a window slide, and the server does not bump its own `path_id`,
+so there is no ping-pong. **Residual (audit 2026-06-15, EPS-02):** a *server*
+migration rotates s2c but not c2s (the socket-routed client does not rotate-on-detect
+— that would push its CID out of the server's un-sliding c2s window for repeated
+server migrations); the full fix (one shared authenticated migration epoch) is
+tracked. See § 12.5.
 
 **Chain.** At session establishment each peer derives two per-direction secrets
 from the initial session secret (mirroring the HP / AEAD key swap):
@@ -1130,21 +1136,25 @@ PINGs to notice a dead path, which are deferred. No wire change.
   Defences: path validation (an unguessable challenge that must be echoed *from* the
   claimed address), pinned-key AEAD (an attacker without the session keys can neither
   read nor inject app data), and the per-direction replay window (§ 5).
-- **Linkability — partially closed by ε (c2s unlinkable; s2c residual).** Header
-  protection (T4.6, § 4.6) masks the variable per-packet metadata, and ε (§ 4.2 /
-  § 4.7) removed the inner 32-byte `session_id` from the wire (off-wire in the AEAD
-  AAD) and makes the routing `ConnId` **rotate** to an independent-random value per
-  migration. But rotation is **asymmetric**: only the *migrating* peer advances its
-  own outbound CID chain. So a **client** migration unlinks the **client→server
-  (c2s)** flow, but the **server→client (s2c)** ConnId stays at `CID_s2c(0)` — the
-  server only detects the migration and slides its inbound window, it never rotates
-  its own outbound CID — so an observer seeing both networks can still link the s2c
-  flow across the move (audit 2026-06-15, **EPS-02**; remediation: drive both
-  directions' CID + the inbound window from a single authenticated migration epoch,
-  which re-closes this). The `version` byte (= 5) is a constant protocol fingerprint
-  shared by all connections, **not** a per-connection linker (full anti-fingerprinting
-  — version/length padding — is a separate future pass). **Honest caveat (not
-  forward-secret):** like the HP keys, the CID chain is session-stable; a session-key
-  compromise lets an attacker recompute the chain (and unmask headers) to link a
-  *recorded* flow retroactively — but the payload stays forward-secret (the AEAD
-  ratchets). Same posture as the HP core.
+- **Linkability — closed by ε for client migration; a server-migration residual
+  remains.** Header protection (T4.6, § 4.6) masks the variable per-packet metadata,
+  and ε (§ 4.2 / § 4.7) removed the inner 32-byte `session_id` from the wire
+  (off-wire in the AEAD AAD) and makes the routing `ConnId` **rotate** to an
+  independent-random value per migration. Rotation is **symmetric for a client
+  migration** (EPS-02 fix): the client advances its own c2s chain on `migrate()`,
+  and the server, on authenticating the new `path_id` (post-AEAD), rotates its s2c
+  chain too — the socket-routed client accepts any inbound CID, so no window slide
+  is needed and there is no ping-pong. So a **client** moving Wi-Fi→cellular is
+  **unlinkable in both directions** by an on-path / colluding observer. **Residual
+  (audit 2026-06-15, EPS-02):** a *server*-initiated migration rotates s2c (the
+  server's own `migrate()`) but **not** c2s — the socket-routed client does not
+  rotate-on-detect (doing so would push its CID out of the server's un-sliding c2s
+  window for repeated server migrations), so the client→server CID stays stable
+  across a *server* migration. Server migration is rare; the full fix (a shared
+  authenticated migration epoch) is tracked. The `version` byte (= 5) is a constant
+  protocol fingerprint shared by all connections, **not** a per-connection linker
+  (full anti-fingerprinting — version/length padding — is a separate future pass).
+  **Honest caveat (not forward-secret):** like the HP keys, the CID chain is
+  session-stable; a session-key compromise lets an attacker recompute the chain (and
+  unmask headers) to link a *recorded* flow retroactively — but the payload stays
+  forward-secret (the AEAD ratchets). Same posture as the HP core.
