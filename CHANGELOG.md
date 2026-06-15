@@ -42,6 +42,13 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Security
 
+- **Zeroize the master secrets — T5.1 (key hygiene).** The rekey master `Session.traffic_secret` is now
+  zeroized in `Session::drop` (rekey already wiped each *superseded* epoch secret; this covers the final
+  live one); `ResumptionTicket` derives `ZeroizeOnDrop` (the verbatim resumption secret no longer lingers in
+  the bounded session cache or in freed memory), guarded by a compile-time `ZeroizeOnDrop` assertion that
+  fails the build if the derive is ever removed; and the transient handshake KEM shared secret is held in
+  `Zeroizing` on both the encapsulate (server) and decapsulate (client) paths. Scoped the threat-model
+  "keys zeroize on drop" mitigation row to this reality. No behavior or wire change.
 - **Autonomous passive-NAT-rebind recovery (M-3):** a live PhantomUDP session now recovers from a
   **passive NAT rebind** — the peer's source address changes *without* the client calling `migrate()`,
   so its `path_id` stays `0` (the always-`Validated` handshake path) — with no embedder action and no
