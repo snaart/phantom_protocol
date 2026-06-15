@@ -24,7 +24,7 @@ use crate::transport::{
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -324,6 +324,15 @@ pub struct Session {
     /// transports (which have no CID demux). `handle_packet` signals a slide
     /// through it when [`Self::note_migration_path`] reports the peer migrated.
     cid_slide_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<CidSlide>>>,
+    /// An idle keep-alive PING is in flight, awaiting the peer's PONG (Direction
+    /// #3 — download-only liveness). Set when the pump emits a `KEEPALIVE` ping on
+    /// an idle path; cleared when the peer's `KEEPALIVE | ACK` echo arrives (or any
+    /// authenticated inbound packet refreshes liveness). While set it makes the
+    /// liveness sweep treat the path as having an outstanding probe, so a
+    /// silently-dead downstream on a download-only path is detected exactly like an
+    /// active one. A plain `AtomicBool` — the ping is a single outstanding probe, so
+    /// a richer counter buys nothing.
+    keepalive_outstanding: AtomicBool,
 }
 
 impl Session {
@@ -374,6 +383,7 @@ impl Session {
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
             cid_slide_tx: Mutex::new(None),
+            keepalive_outstanding: AtomicBool::new(false),
         })
     }
 
@@ -424,6 +434,7 @@ impl Session {
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
             cid_slide_tx: Mutex::new(None),
+            keepalive_outstanding: AtomicBool::new(false),
         }
     }
 
@@ -469,6 +480,7 @@ impl Session {
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
             cid_slide_tx: Mutex::new(None),
+            keepalive_outstanding: AtomicBool::new(false),
         })
     }
 
@@ -1277,9 +1289,30 @@ impl Session {
         Some((self.id.0, secret))
     }
 
-    /// Update last activity timestamp
+    /// Update last activity timestamp.
+    ///
+    /// Called on every authenticated inbound packet. Any such packet — the
+    /// keep-alive PONG, an ACK, or application data — proves the path is alive, so
+    /// it also clears an outstanding idle keep-alive probe (Direction #3): the
+    /// probe has been answered, so the liveness sweep no longer needs to treat the
+    /// path as awaiting a response.
     pub fn update_activity(&self) {
         *self.last_activity.write() = Instant::now();
+        self.keepalive_outstanding.store(false, Ordering::Relaxed);
+    }
+
+    /// Mark that an idle keep-alive PING was just emitted and is awaiting the
+    /// peer's PONG (Direction #3). While outstanding, the liveness sweep treats
+    /// the path as having a probe in flight even with no reliable data queued, so a
+    /// download-only path can detect a silently-dead downstream.
+    pub fn mark_keepalive_outstanding(&self) {
+        self.keepalive_outstanding.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether an idle keep-alive PING is currently awaiting a PONG (Direction #3).
+    /// `false` once any authenticated inbound packet refreshes activity.
+    pub fn keepalive_outstanding(&self) -> bool {
+        self.keepalive_outstanding.load(Ordering::Relaxed)
     }
 
     /// Check if session is expired

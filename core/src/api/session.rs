@@ -852,6 +852,12 @@ async fn run_client_handshake<T: SessionTransport>(
     }
 }
 
+/// Reserved stream id for the connectionless `send()`/`recv()` surface. The
+/// demultiplexer hands out ids of two and above, so this never collides with a
+/// user-opened stream. Idle keep-alives ([`send_keepalive`]) also stamp it for a
+/// well-formed, consistent header.
+const RAW_APP_STREAM_ID: u32 = 1;
+
 /// Shared client/server data pump.
 ///
 /// After the handshake completes (client side) or after the server `Session` is
@@ -897,7 +903,6 @@ async fn run_data_pump<T: SessionTransport>(
     // its buffered segments on the poll tick / outbound-ready notify, and
     // inbound ACKs for id 1 clear them via `Stream::ack`. The demultiplexer
     // hands out ids 2+, so this never collides with a user-opened stream.
-    const RAW_APP_STREAM_ID: u32 = 1;
     let raw_stream = Arc::new(Stream::new(RAW_APP_STREAM_ID as TransportStreamId));
     streams.insert(RAW_APP_STREAM_ID, raw_stream.clone());
 
@@ -1094,6 +1099,11 @@ async fn run_data_pump<T: SessionTransport>(
     // so the teardown publishes `Dead` instead of overwriting it with `Closed`.
     let mut migrating_since: Option<std::time::Instant> = None;
     let mut died = false;
+    // Idle keep-alive bookkeeping (Direction #3 — download-only liveness): the
+    // pump-local instant of the last keep-alive PING we emitted, so we send at most
+    // one per `keepalive_interval` (no 10 ms-heartbeat spam). Seeded at "now" so the
+    // first PING waits a full interval after the data plane starts.
+    let mut last_keepalive = std::time::Instant::now();
     // Outbound WINDOW_UPDATE control packets are emitted on the send loop — the
     // single writer that also owns the rekey lock — so the encrypted control
     // frame is always sealed under a consistent epoch. The delivery task only
@@ -1114,6 +1124,16 @@ async fn run_data_pump<T: SessionTransport>(
                     &crypto_session,
                     session_id,
                     &streams,
+                )
+                .await;
+                // Idle keep-alive (Direction #3 — download-only liveness): on an
+                // otherwise-idle Connected path, emit one small ENCRYPTED PING so a
+                // download-only path (which sends only ACKs) has an outstanding probe
+                // to anchor the liveness sweep below — and the peer's PONG refreshes
+                // its activity timer. Runs before the sweep so a just-emitted PING is
+                // already marked outstanding this tick.
+                maybe_send_keepalive(
+                    &transport, &crypto_session, session_id, &mut last_keepalive,
                 )
                 .await;
                 // Liveness sweep (P4.3): the 10 ms heartbeat is the reliable place to
@@ -1307,9 +1327,19 @@ fn apply_liveness(
     let migrating_for = migrating_since
         .map(|t| t.elapsed())
         .unwrap_or(std::time::Duration::ZERO);
+    // Direction #3 (download-only liveness): an outstanding idle keep-alive PING is
+    // an outstanding probe just like in-flight reliable data, so fold it into the
+    // sweep's `inflight > 0` gate. This is what lets a download-only path — which
+    // sends only ACKs and so has zero reliable bytes in flight — declare the path
+    // down when the PING goes unanswered (the PONG would have refreshed activity).
+    let effective_inflight = if crypto_session.keepalive_outstanding() {
+        snap.inflight_bytes.max(1)
+    } else {
+        snap.inflight_bytes
+    };
     match liveness_verdict(
         silence,
-        snap.inflight_bytes,
+        effective_inflight,
         snap.min_rtt,
         in_migrating,
         migrating_for,
@@ -1339,6 +1369,51 @@ fn apply_liveness(
             true
         }
         LivenessVerdict::Unchanged => false,
+    }
+}
+
+/// Emit an idle keep-alive PING when the path is idle (Direction #3 —
+/// download-only liveness). Decides via the pure [`should_send_keepalive`] gate
+/// over the live signals (Connected? nothing in flight? inbound silent ≥ interval?
+/// no recent PING?). On a fire it sends one empty `ENCRYPTED | KEEPALIVE` packet,
+/// marks the probe outstanding (so the very next liveness sweep treats the path as
+/// awaiting a response even with no reliable data queued), and records the send
+/// instant for the per-interval throttle. Best-effort: a send failure just leaves
+/// `last_keepalive` unchanged so the next tick retries.
+async fn maybe_send_keepalive<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    last_keepalive: &mut std::time::Instant,
+) {
+    use crate::transport::liveness::should_send_keepalive;
+    let cfg = crypto_session.liveness_config();
+    // Cheap fast-path: skip everything when keep-alives are disabled.
+    if cfg.keepalive_interval.is_none() {
+        return;
+    }
+    let connected = crypto_session.state() == SessionState::Connected;
+    let snap = crypto_session.bandwidth_snapshot();
+    // An already-outstanding PING is itself "in flight" — fold it into the gate so
+    // we don't queue a second PING before the first is answered or times out.
+    let inflight = if crypto_session.keepalive_outstanding() {
+        snap.inflight_bytes.max(1)
+    } else {
+        snap.inflight_bytes
+    };
+    if !should_send_keepalive(
+        connected,
+        inflight,
+        crypto_session.last_activity_elapsed(),
+        last_keepalive.elapsed(),
+        &cfg,
+    ) {
+        return;
+    }
+    // PING (not a PONG): a bare KEEPALIVE that the peer echoes back as KEEPALIVE|ACK.
+    if send_keepalive(transport, crypto_session, session_id, false).await {
+        crypto_session.mark_keepalive_outstanding();
+        *last_keepalive = std::time::Instant::now();
     }
 }
 
@@ -1687,6 +1762,68 @@ async fn send_window_update<T: SessionTransport>(
     true
 }
 
+/// Emit an idle keep-alive packet (Direction #3 — download-only liveness): a
+/// small `ENCRYPTED | KEEPALIVE` packet with an **empty** payload, stamped on the
+/// current send path.
+///
+/// `is_pong` selects the role: a bare `KEEPALIVE` is a PING (`is_pong = false`);
+/// `KEEPALIVE | ACK` is the PONG echo a receiver sends back (`is_pong = true`).
+/// Either way the payload is empty, so the peer's `recv()` never sees it. The
+/// packet is sealed exactly like application data — ENCRYPTED (Inv-2), a fresh
+/// per-direction packet number (no nonce reuse), header-protected — so an off-path
+/// peer can neither forge nor replay it (the replay window rejects a duplicate PN
+/// after AEAD verify, Inv-4). Returns `false` on a rekey-saturation or
+/// seal/transport failure (the caller just skips the keep-alive — it is
+/// best-effort).
+async fn send_keepalive<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    is_pong: bool,
+) -> bool {
+    let mut flag_bits = PacketFlags::ENCRYPTED | PacketFlags::KEEPALIVE;
+    if is_pong {
+        flag_bits |= PacketFlags::ACK;
+    }
+    // Obey the same direction-wide rekey discipline before stamping the header.
+    match rekey_before_stamp(crypto_session) {
+        Some(extra) => flag_bits |= extra,
+        None => return false,
+    }
+    let packet_number = crypto_session.next_send_pn();
+    let header = PacketHeader::new(
+        session_id,
+        // Reserved raw-app stream id (1) — the keep-alive carries no stream data,
+        // but a stable id keeps the header well-formed and consistent with the
+        // session's own send()/recv() surface.
+        RAW_APP_STREAM_ID as TransportStreamId,
+        packet_number,
+        PacketFlags::new(flag_bits),
+    )
+    .with_epoch(crypto_session.current_epoch())
+    .with_path_id(crypto_session.current_send_path_id());
+    let ciphertext = match crypto_session.encrypt_packet(&header, &[], &[]) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("PhantomSession: keep-alive encrypt failed: {}", e);
+            return false;
+        }
+    };
+    let packet = PhantomPacket::new(header, ciphertext);
+    let buf = match crypto_session.protect_packet(&packet) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("PhantomSession: keep-alive header protection failed: {}", e);
+            return false;
+        }
+    };
+    if let Err(e) = transport.send_bytes(&buf).await {
+        log::error!("PhantomSession: keep-alive send failed: {}", e);
+        return false;
+    }
+    true
+}
+
 /// Emit a V2 PATH_VALIDATION packet on `path_id` carrying the given
 /// 32-byte challenge or response payload. Encrypted under the current
 /// session epoch.
@@ -1887,6 +2024,23 @@ async fn handle_packet<T: SessionTransport>(
                 transport_for_path.set_outbound_cid(crypto_recv.advance_outbound_cid());
             }
         }
+    }
+
+    // Idle keep-alive (Direction #3 — download-only liveness). A keep-alive carries
+    // no application bytes; its sole effect is the `update_activity()` above (which
+    // refreshed this side's liveness timer and cleared any outstanding probe). It
+    // is handled here, BEFORE the ACK branch, because a PONG is `KEEPALIVE | ACK`
+    // and must not be mis-parsed as a SACK. A bare `KEEPALIVE` is a PING → echo a
+    // `KEEPALIVE | ACK` PONG so the peer's own liveness timer + outstanding-probe
+    // flag clear; a `KEEPALIVE | ACK` is that PONG → nothing more to do. Either way
+    // we return so the empty payload never reaches the SACK / data paths.
+    if packet.header.flags.contains(PacketFlags::KEEPALIVE) {
+        if !packet.header.flags.contains(PacketFlags::ACK) {
+            // PING → reply with a PONG (KEEPALIVE | ACK). Best-effort; a drop just
+            // means the peer re-PINGs next interval (its probe stays outstanding).
+            let _ = send_keepalive(transport_send_ack, crypto_recv, session_id, true).await;
+        }
+        return;
     }
 
     // Authenticated SACK ACK (H1, L1-A). ACKs are `ENCRYPTED | ACK` control

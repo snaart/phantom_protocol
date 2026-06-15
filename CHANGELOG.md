@@ -10,6 +10,17 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **Idle keep-alive PINGs — download-only liveness (Phase 4 / Direction #3):** a purely-passive,
+  **download-only** path (the receiver sends only ACKs, so nothing is in flight) can now detect a
+  silently-dead downstream. An otherwise-idle `Connected` session emits a small `ENCRYPTED | KEEPALIVE`
+  packet (empty payload) once per `keepalive_interval` (default 15 s; `None` disables it); the peer answers
+  with a `KEEPALIVE | ACK` PONG. The unanswered PING is an outstanding probe the liveness sweep folds into
+  its in-flight gate, so a dead download-only path surfaces `Migrating → Dead` exactly like an active one,
+  and the PONG refreshes the peer's activity timer symmetrically. A PING fires only when the path is
+  genuinely idle (Connected, nothing in flight, inbound silent ≥ interval, ≤ one per interval), so steady
+  traffic pays nothing; both PING and PONG are AEAD-sealed and carry no application bytes (never reach
+  `recv()`). `KEEPALIVE` is a spare `PacketFlags` bit (`0x1000`) — **no header layout or wire-version
+  change**. The keep-alive interval is configurable via `LivenessConfig::keepalive_interval`.
 - **Liveness — autonomous dead-path detection (Phase 4 / P4.3):** the SDK now notices a **silently-dead
   path** on its own — no inbound for N×PTO while reliable data is outstanding — and surfaces
   `ConnectionState::Migrating` so the embedder can `migrate()`; the session is held alive (keys retained,
@@ -18,8 +29,8 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `recv()` errors instead of hanging. Detection is read-only over existing signals (BBR in-flight + an
   inbound-activity timer) and runs on both peers via the shared data pump, so a server detects a vanished
   client symmetrically. Two new `ConnectionState` variants (`Migrating`, `Dead`) → bindings regenerated.
-  Thresholds (default ~1s-to-down / 30s-to-dead) are overridable; **no wire change**. Keep-alive PINGs for a
-  purely-passive (download-only) path are deferred.
+  Thresholds (default ~1s-to-down / 30s-to-dead) are overridable; **no wire change**. A purely-passive
+  (download-only) path is kept detectable by the idle keep-alive PINGs above.
 - **Seamless connection migration (Phase 4 / P4.1–P4.2):** a live PhantomUDP session now survives a
   client network change (Wi-Fi↔cellular, NAT rebind) **without re-running the post-quantum handshake** —
   the connection loses throughput briefly, never liveness. The embedder triggers it via the new

@@ -585,6 +585,123 @@ async fn udp_liveness_dead_path_surfaces_migrating_then_dead() {
     server.abort();
 }
 
+/// Direction #3 (idle keep-alive PINGs): a **download-only** path now detects a
+/// silently-dead downstream. The client never sends application data after the
+/// warm-up — it only ACKs (and, before the fix, has nothing in flight) — so the
+/// pure inactivity sweep (gated on `inflight > 0`) would NEVER trip for it and a
+/// dead path would go unnoticed forever. With idle keep-alives enabled, the idle
+/// client emits an encrypted `KEEPALIVE` PING every interval; once the path is
+/// cut, that PING goes unanswered (no PONG → the probe stays outstanding and
+/// inbound stays silent), so the same liveness sweep declares the path down →
+/// `Migrating` → `Dead`, exactly like an active path. `recv()` must error, never
+/// hang.
+///
+/// The distinction from `udp_liveness_dead_path_surfaces_migrating_then_dead` is
+/// load-bearing: that test calls `client.send()` after the cut to manufacture
+/// in-flight data; THIS test deliberately sends nothing post-warm-up, so the
+/// keep-alive PING is the *only* thing that can anchor the liveness timer. Without
+/// Direction #3 it times out (the download-only client never leaves `Connected`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_keepalive_download_only_path_detects_dead_downstream() {
+    use phantom_protocol::api::session::ConnectionState;
+    use phantom_protocol::transport::liveness::LivenessConfig;
+    use std::sync::atomic::Ordering;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    // The server sends ONE warm-up message (a tiny "download"), then goes quiet —
+    // it never asks the client for anything, so the client is purely a downloader.
+    // It also answers keep-alive PINGs automatically (the pump PONGs them), so
+    // while the path is alive the client must NOT trip; only the cut kills it.
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        session
+            .send(b"download-chunk".to_vec())
+            .await
+            .expect("server send");
+        // Stay alive (and keep PONGing keep-alives) until the test cuts the path
+        // and the session tears down.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let (relay_addr, forward) = spawn_cuttable_relay(server_addr).await;
+    let transport = UdpClientTransport::connect(relay_addr)
+        .await
+        .expect("connect");
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+
+    // The client receives the one download chunk — and sends NOTHING in reply
+    // (download-only). It must open the session with an initial client->server
+    // packet first (the handshake), but after this point it only ACKs + keep-alives.
+    let chunk = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv download chunk");
+    assert_eq!(chunk, b"download-chunk");
+
+    // Fast liveness thresholds (40 ms keep-alive, ~30 ms-to-down, 300 ms-to-dead).
+    assert!(
+        client.set_liveness_config(LivenessConfig::for_test()).await,
+        "session must be established to set the liveness config"
+    );
+
+    // The path is fully idle from the client's side: it has nothing to send and is
+    // not receiving. Let a few keep-alive intervals elapse WHILE the path is alive
+    // and assert the client stays Connected — a keep-alive that is being PONGed
+    // must NOT false-trip the liveness sweep (the PONG refreshes activity).
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            client.connection_state(),
+            ConnectionState::Connected,
+            "an idle path whose keep-alives are PONGed must stay Connected"
+        );
+    }
+
+    // Now SEVER the downstream. The client keeps sending keep-alive PINGs, but no
+    // PONG comes back and no inbound arrives → the outstanding probe + inbound
+    // silence drive the liveness sweep to PathDown even though the client has zero
+    // application data in flight (the download-only property). The client sends NO
+    // app data here — the keep-alive is the only liveness anchor.
+    forward.store(false, Ordering::Relaxed);
+
+    let mut saw_migrating = false;
+    let mut saw_dead = false;
+    for _ in 0..400 {
+        match client.connection_state() {
+            ConnectionState::Migrating => saw_migrating = true,
+            ConnectionState::Dead => {
+                saw_dead = true;
+                break;
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        saw_migrating,
+        "a dead DOWNLOAD-ONLY path must surface Migrating via the idle keep-alive probe"
+    );
+    assert!(
+        saw_dead,
+        "no recovery before the idle-timeout must surface Dead on a download-only path"
+    );
+
+    // recv() on a dead session must resolve with an error, not hang forever.
+    let r = timeout(Duration::from_secs(2), client.recv()).await;
+    assert!(
+        matches!(r, Ok(Err(_))),
+        "recv() must error on a dead session (got {r:?})"
+    );
+
+    server.abort();
+}
+
 /// P4.3: a path that goes silent then RETURNS (before the idle-timeout) recovers the
 /// same session — `Migrating → Connected` on resumed inbound — and the reliable byte
 /// stream continues byte-exact, with no re-handshake.
@@ -622,10 +739,12 @@ async fn udp_liveness_recovers_when_the_path_returns() {
     assert_eq!(echo, b"warmup");
 
     // Short path-down, but a LONG idle-timeout so there is room to recover.
+    // Keep-alives off — this test drives the inactivity sweep with explicit sends.
     let cfg = LivenessConfig {
         min_pto: Duration::from_millis(10),
         path_down_ptos: 3,
         idle_timeout: Duration::from_secs(20),
+        keepalive_interval: None,
     };
     assert!(client.set_liveness_config(cfg).await);
 

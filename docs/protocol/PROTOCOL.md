@@ -286,7 +286,8 @@ Source: `core/src/transport/types.rs:74-107`.
 | `0x0200` | `PATH_VALIDATION` | Payload is a 32-byte challenge / response (multi-path) |
 | `0x0400` | `COALESCED` | Payload bundles inner packets as `[count: u16][len1: u16][p1]…` (full byte layout — § 4.5) |
 | `0x0800` | `WINDOW_UPDATE` | Payload is a big-endian `u32` relative flow-control credit (per-stream; the receiver grants the sender an additional `u32` bytes that is added to the sender's send window, saturating at `MAX_SEND_WINDOW`) |
-| `0x1000` … `0x8000` | _reserved_ | Future amendments |
+| `0x1000` | `KEEPALIVE` | Idle keep-alive PING (empty payload); `KEEPALIVE \| ACK` is the PONG echo (download-only liveness — § 12.4) |
+| `0x2000` … `0x8000` | _reserved_ | Future amendments |
 
 `ENCRYPTED` is the post-handshake invariant flag — the API layer sets it on
 every application-data packet, and the receive loop drops any non-empty
@@ -991,7 +992,7 @@ three messages — it leaves the frozen wire vectors (§11) untouched.
 - `ServerHello.server_nonce`: a 32-byte server-contributed, transcript-bound
   value (T4.3, replacing the old discarded ~1184 B ephemeral `server_key_package`).
   A future second-KEM ring could repurpose this slot for real key material.
-- `PacketFlags 0x1000 … 0x8000`: reserved bits.
+- `PacketFlags 0x2000 … 0x8000`: reserved bits (`0x1000` = `KEEPALIVE`, § 4.3 / § 12.4).
 
 A future protocol revision that needs more than this headroom increments
 `WIRE_VERSION` / `PROTOCOL_VERSION` (§ 1) as a deliberate, code-gated bump.
@@ -1222,8 +1223,22 @@ Inbound life resuming (a successful migrate, or the path's return) recovers
 to the terminal **`Dead`** (so `recv()` errors instead of hanging). The detector runs
 on both peers via the shared data pump, so a server detects a vanished client
 symmetrically. Detection is read-only over existing signals (BBR in-flight + an
-inbound-activity timer); a purely-passive download-only receiver needs keep-alive
-PINGs to notice a dead path, which are deferred. No wire change.
+inbound-activity timer).
+
+**Idle keep-alive PINGs (Direction #3 — download-only liveness).** The in-flight
+gate above means a purely-passive **download-only** path — which sends only ACKs
+and so has zero reliable bytes in flight — would never trip the inactivity sweep,
+leaving a silently-dead downstream unnoticed. To close that gap, an otherwise-idle
+`Connected` session emits a small **`ENCRYPTED | KEEPALIVE`** packet (empty payload,
+§ 4.3) once per `keepalive_interval` (default 15 s; off if `None`). The peer answers
+with a **`KEEPALIVE | ACK`** PONG; both are AEAD-sealed control frames carrying no
+application bytes, so neither reaches `recv()`. The unanswered PING is an
+**outstanding probe** the sweep folds into its in-flight gate — so a dead downstream
+on a download-only path now surfaces `Migrating → Dead` exactly like an active path
+— while the PONG refreshes the peer's inbound-activity timer symmetrically. A PING
+fires only when the path is genuinely idle (Connected, nothing in flight, inbound
+silent ≥ interval, ≤ one PING per interval), so steady traffic pays nothing.
+`KEEPALIVE` is a spare flag bit — **no header layout or `WIRE_VERSION` change**.
 
 ### 12.5 Threat model & residual risk (honest)
 
