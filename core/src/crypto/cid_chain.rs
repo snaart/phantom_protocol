@@ -55,10 +55,19 @@ const CID_S2C_LABEL: &str = "phantom-cid-s2c-v1";
 
 /// Default demux window — trailing `T` (in-flight reordering across a migration
 /// boundary) and leading `K` (migration lookahead: the sender may have migrated
-/// ahead of delivery). `(T + K + 1) = 7` accepted CIDs per inbound direction.
+/// ahead of delivery). `(T + K + 1) = 19` accepted CIDs per inbound direction.
+///
+/// `K = 16` (audit 2026-06-15, EPS-01): it is the **hard cap on consecutive
+/// migrations whose packets are ALL lost** before the sender's CID falls outside
+/// the window and the session strands (recoverable by reconnect via the liveness
+/// sweep). A delivered migration packet recenters the window on its index (the
+/// multi-step slide in `Session::note_migration_path`), so only an unbroken run of
+/// `> K` fully-lost migrations strands — far beyond any realistic rapid-migration
+/// regime. The window costs `T + K + 1` route-table entries per session per inbound
+/// direction (bounded by `MAX_ROUTES`, sized to preserve the session capacity).
 pub const CID_WINDOW_TRAILING: u64 = 2;
 /// See [`CID_WINDOW_TRAILING`].
-pub const CID_WINDOW_LEADING: u64 = 4;
+pub const CID_WINDOW_LEADING: u64 = 16;
 
 /// Per-direction, **session-stable** rotating-CID chain secrets. `outbound_secret`
 /// is the chain this peer stamps its outbound `ConnId` from (the peer routes on
@@ -258,7 +267,8 @@ mod tests {
         assert_eq!(idxs, vec![0, 1, 2, 3, 4, 5]);
     }
 
-    /// The canonical window size is `T + K + 1 = 7` entries.
+    /// The canonical window size is `T + K + 1 = 19` entries (K widened 4→16 for
+    /// EPS-01 robustness; see [`CID_WINDOW_LEADING`]).
     #[test]
     fn canonical_window_size() {
         let chain = CidChain::derive(&[0x55u8; 32], false);
@@ -266,7 +276,7 @@ mod tests {
             .inbound_window(100, CID_WINDOW_TRAILING, CID_WINDOW_LEADING)
             .count();
         assert_eq!(n, (CID_WINDOW_TRAILING + CID_WINDOW_LEADING + 1) as usize);
-        assert_eq!(n, 7);
+        assert_eq!(n, 19);
     }
 
     /// Frozen-byte KAT (default/blake3 build): pins the exact CID bytes so an
