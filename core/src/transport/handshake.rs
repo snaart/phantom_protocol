@@ -826,7 +826,9 @@ impl HandshakeServer {
         // Hybrid Key Exchange (PFS preserved — a fresh KEM secret even on the
         // 0-RTT path).
         let (shared_secret, ciphertext) = match client_hello.client_key_package.encapsulate() {
-            Ok(res) => res,
+            // T5.1 — zeroize the transient KEM master on scope exit (it is copied
+            // into the now-zeroized `traffic_secret` + `CryptoState` below).
+            Ok((ss, ct)) => (zeroize::Zeroizing::new(ss), ct),
             Err(e) => {
                 return self.fail_and_reinsert(
                     &resumed,
@@ -1221,10 +1223,12 @@ impl HandshakeClient {
             .map_err(|e| HandshakeError::KemFailed(format!("Signature check failed: {:?}", e)))?;
 
         // 3. Decapsulate
-        let shared_secret = self
-            .kem_secret
-            .decapsulate(&server_hello.ciphertext)
-            .map_err(|e| HandshakeError::KemFailed(e.to_string()))?;
+        // T5.1 — zeroize the transient KEM master on scope exit.
+        let shared_secret = zeroize::Zeroizing::new(
+            self.kem_secret
+                .decapsulate(&server_hello.ciphertext)
+                .map_err(|e| HandshakeError::KemFailed(e.to_string()))?,
+        );
 
         // 4. Create Session
         let session_id = SessionId::from_bytes(server_hello.session_id);
@@ -1238,13 +1242,13 @@ impl HandshakeClient {
             session_id,
             crypto,
             SchedulerMode::LowLatency,
-            shared_secret,
+            *shared_secret,
             false,
         );
 
         // 5. Derive resumption secret (seeds the NEXT resume / 0-RTT).
         let mut resumption_secret = [0u8; 32];
-        let hk = hkdf::Hkdf::<Sha256>::new(None, &shared_secret);
+        let hk = hkdf::Hkdf::<Sha256>::new(None, &shared_secret[..]);
         if hk
             .expand(b"phantom-resumption-secret-v1", &mut resumption_secret)
             .is_ok()
