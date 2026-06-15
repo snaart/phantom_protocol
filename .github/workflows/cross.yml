@@ -46,10 +46,16 @@ jobs:
           # x86_64-unknown-linux-gnu; macOS / Windows can be added
           # later if a downstream cares. Needs cmake + a C
           # toolchain — install via the matrix `prep` step below.
+          # `--no-default-features` drops `default` (and with it the
+          # `classical-crypto` feature), so the FIPS build links neither
+          # `ring` nor `x25519-dalek` — the AEAD routes through `aws-lc-rs`
+          # and the classical KEM half through ECDH-P-256 (SUPPLY-03).
+          # `bindings,compression-zstd` restore the rest of the default
+          # surface; `fips` implies `std`.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             install_target: false
-            cargo_args: "--features fips"
+            cargo_args: "--no-default-features --features fips,bindings,compression-zstd"
             matrix_label: "x86_64-unknown-linux-gnu (--features fips)"
             apt_install: cmake
           - target: aarch64-unknown-linux-gnu
@@ -92,10 +98,13 @@ jobs:
           # wasm32-unknown-unknown-compatible (its rust-future glue requires
           # `Send`, which browser futures are not) and its FFI scaffolding is
           # unused in the browser build.
+          # `classical-crypto` is named explicitly here (it is no longer
+          # implied by `std`): the browser build is non-FIPS and uses the
+          # `ring` AEAD + `x25519-dalek` classical KEM half (SUPPLY-03).
           - target: wasm32-unknown-unknown
             runner: ubuntu-latest
             install_target: true
-            cargo_args: "--no-default-features --features std,compression-zstd"
+            cargo_args: "--no-default-features --features std,compression-zstd,classical-crypto"
           # wasm32-wasip2 (Preview 2) — hard gate as of B6. The
           # `wasi-leg` Cargo feature pulls in `wasi 0.14` (WIT-bindgen
           # bindings for Preview 2) and the matching `WasiLeg` /
@@ -107,10 +116,13 @@ jobs:
           # `core/tests/wasi_integration.rs` (`#[ignore]`-gated) and
           # is exercised by the dedicated `wasi-integration` job at
           # the bottom of this matrix.
+          # `classical-crypto` named explicitly (no longer implied by `std`):
+          # the WASI build is non-FIPS and uses `ring` + `x25519-dalek`
+          # (SUPPLY-03).
           - target: wasm32-wasip2
             runner: ubuntu-latest
             install_target: true
-            cargo_args: "--no-default-features --features std,wasi-leg"
+            cargo_args: "--no-default-features --features std,wasi-leg,classical-crypto"
           # ── Embedded smoke (Phase 3.4 + 3.6) — bare-metal-green as of
           #    722c6cb via the no_std subset. Hard gate. Note the
           #    `cargo_args` matrix field: thumbv7em requires

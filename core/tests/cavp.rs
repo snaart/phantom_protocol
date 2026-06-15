@@ -23,6 +23,13 @@ use phantom_protocol::crypto::hybrid_kem::HybridSecretKey;
 use phantom_protocol::crypto::hybrid_sign::HybridSigningKey;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+// AEAD backend mirrors the library's cfg dispatch (SUPPLY-03): `ring` on the
+// default build, `aws-lc-rs` under `--features fips` — `ring` is not linked on
+// the fips path, so importing it unconditionally here would break the fips
+// build of this test.
+#[cfg(feature = "fips")]
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+#[cfg(not(feature = "fips"))]
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use sha2::{Digest, Sha256};
 
