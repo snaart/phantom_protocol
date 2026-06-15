@@ -151,7 +151,7 @@ for a real-time secure transport.
 | --- | --- | --- |
 | Plaintext leak on the wire | AEAD encryption (post-handshake invariant `PacketFlags::ENCRYPTED`); unencrypted post-handshake packets dropped | `core/src/api/session.rs:1415-1422` |
 | Plaintext leak via error message | Error variants carry only the error class, not the payload; no `format!("{:?}", plaintext)` anywhere | grep `format!.*plaintext\|payload` in `core/src/` â 0 results |
-| Memory disclosure of keys after session close | `ZeroizeOnDrop` on every key-bearing struct | `core/src/transport/session.rs:75` (`CryptoState`), `core/src/transport/handshake.rs:253` (`HandshakeServer`), `core/src/transport/handshake.rs:686` (`HandshakeClient`) |
+| Memory disclosure of keys after session close | Key-bearing structs zeroize on drop: `ZeroizeOnDrop` on `CryptoState` (`session.rs`), `HandshakeServer` / `HandshakeClient` (`handshake.rs`), and `ResumptionTicket` (`session_cache.rs`, T5.1); the rekey master `Session.traffic_secret` is zeroized in `Session::drop` (T5.1) along with `resumption_secret`; the transient handshake KEM secret is held in `Zeroizing` (T5.1). Mid-session rekey also zeroizes each superseded epoch secret. | `session.rs` (`CryptoState`, `Session::drop`), `handshake.rs` (`HandshakeServer`/`HandshakeClient` + `Zeroizing` KEM secret), `session_cache.rs` (`ResumptionTicket`) |
 | Timing leak on cookie comparison | `subtle::ConstantTimeEq::ct_eq` â never branches on cookie content | `core/src/transport/handshake.rs:1065` |
 | DPI fingerprinting | None today — planned: FakeTLS-style HTTP traffic mimicry (removed in Phase 0, returns as a dedicated transport mode) | — |
 
