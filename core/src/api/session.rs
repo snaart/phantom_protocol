@@ -1869,6 +1869,23 @@ async fn handle_packet<T: SessionTransport>(
         // for a path_id that is not newer (reorder / duplicate / passive rebind).
         if let Some(slide) = crypto_recv.note_migration_path(packet.header.path_id) {
             crypto_recv.signal_cid_slide(slide);
+            // EPS-02 (symmetric rotation): the peer migrated, so rotate our OWN
+            // outbound CID too — otherwise the return direction keeps a stable
+            // cleartext ConnId across the peer's migration and an observer seeing
+            // both networks relinks the session by it (ε §12.5 residual). Only the
+            // **server** rotates here: it is the demuxing side, and the peer (the
+            // socket-routed client) accepts any inbound CID, so this needs no
+            // client-side window slide and cannot strand. We deliberately do NOT
+            // bump our own send `path_id` (this is a CID rotation, not an address
+            // migration), so the peer's `note_migration_path` sees no forward step
+            // and there is no ping-pong. The client side is left untouched: it has
+            // no inbound demux to follow a rotation, and rotating its c2s CID off a
+            // server migration would push it out of the server's (un-sliding) c2s
+            // window for repeated server migrations — a documented residual
+            // (audit-report-2026-06-15 EPS-02) the server-migration path keeps.
+            if crypto_recv.is_server() {
+                transport_for_path.set_outbound_cid(crypto_recv.advance_outbound_cid());
+            }
         }
     }
 
@@ -3668,6 +3685,74 @@ mod tests {
             rec.migrate.lock().unwrap().as_deref(),
             Some("127.0.0.1:0"),
             "migrate not forwarded"
+        );
+    }
+
+    /// EPS-02 (symmetric CID rotation) — when the **server** (the demuxing side)
+    /// detects a client migration (a new authenticated `path_id`, post-AEAD), it
+    /// must rotate its OWN outbound (server→client) CID so that direction also
+    /// gets a fresh `ConnId` across the move. Otherwise an on-path observer seeing
+    /// both networks links the session by the stable s2c CID (the ε §12.5 residual
+    /// this fix closes). The socket-routed client accepts any inbound CID, so no
+    /// client-side window slide is needed and there is no ping-pong (we never bump
+    /// the server's own send path_id here).
+    #[tokio::test]
+    async fn eps02_server_rotates_s2c_cid_on_client_migration() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+
+        assert!(server_session.is_server(), "server side");
+        let s2c_cid_before = server_session.current_outbound_cid();
+
+        // The client migrates: it bumps its send path_id and sends app data on the
+        // new path. Deliver that migration packet (path_id = 1) to the server.
+        let stream_id: TransportStreamId = 1;
+        let frame =
+            build_app_frame_on_path(&client_session, session_id, stream_id, 0, 0, 1, b"migrated");
+        let pkt = decode_recv_frame(&frame, session_id);
+        run_recv(pkt, session_id, &server_session, &streams).await;
+
+        assert_ne!(
+            server_session.current_outbound_cid(),
+            s2c_cid_before,
+            "the server must rotate its server->client CID when the client migrates (EPS-02)"
+        );
+    }
+
+    /// EPS-02 companion — the **client** (socket-routed) must NOT rotate-on-detect.
+    /// It has no inbound CID demux, and rotating its outbound (c2s) CID off an
+    /// authenticated server `path_id` would push its CID out of the server's
+    /// (un-sliding) c2s window for repeated server migrations. So a client that
+    /// observes a server migration leaves its own outbound CID untouched.
+    #[tokio::test]
+    async fn eps02_client_does_not_rotate_on_detecting_server_migration() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+
+        assert!(!client_session.is_server(), "client side");
+        let c2s_cid_before = client_session.current_outbound_cid();
+
+        // The server migrates: build a server→client app frame on a new path_id and
+        // deliver it to the client's recv path.
+        let stream_id: TransportStreamId = 1;
+        let frame = build_app_frame_on_path(
+            &server_session,
+            session_id,
+            stream_id,
+            0,
+            0,
+            1,
+            b"srv-moved",
+        );
+        let pkt = decode_recv_frame(&frame, session_id);
+        run_recv(pkt, session_id, &client_session, &streams).await;
+
+        assert_eq!(
+            client_session.current_outbound_cid(),
+            c2s_cid_before,
+            "the socket-routed client must NOT rotate its outbound CID on detecting a server migration"
         );
     }
 
