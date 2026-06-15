@@ -84,8 +84,17 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   ping-pong. Verified by `eps02_server_rotates_s2c_cid_on_client_migration` (in-crate) and the extended
   on-wire `udp_integration_cid_rotates_on_the_wire_across_migration` (asserts **both** directions' ConnIds
   rotate). **Residual:** a *server*-initiated migration rotates s2c but not c2s (the socket-routed client does
-  not rotate-on-detect — that would strand it in the server's un-sliding c2s window); rare, and the full
-  shared-migration-epoch fix (which also closes EPS-01) is tracked. No wire change.
+  not rotate-on-detect — that would strand it in the server's un-sliding c2s window); rare, and tracked.
+  No wire change.
+- **Robust migration window — EPS-01 fix (2026-06-15):** the rotating-CID demux window no longer strands a
+  client that migrates faster than delivery under loss. The window slide is now **multi-step** — it advances
+  by the authenticated `path_id` forward delta `d` (registering `d` leading CIDs, dropping `d` trailing),
+  recentring on the sender's actual migration index instead of lagging +1 per slide (the old single-step let
+  lost intermediate migrations cumulatively erode the leading margin) — and the leading window **K is widened
+  4 → 16**, so only an unbroken run of **> 16 consecutive fully-lost migrations** can push the sender's CID out
+  of the window (recoverable by reconnect via liveness), far beyond any realistic rapid-migration regime.
+  `MAX_ROUTES` is raised `1<<16 → 1<<18` to preserve concurrent-session capacity with the wider (19-CID)
+  per-session window. Pinned by `eps01_multistep_path_jump_slides_window_by_the_full_delta`. No wire change.
 - **Header protection (T4.6 — QUIC RFC 9001 §5.4):** the 14 variable header bytes — packet number, flags
   (incl. the `PRIORITY`/voice bit), stream id, rekey epoch, and migration path id — are now **XOR-masked on
   the wire**, leaving only `version` + `session_id` (the routing CID) cleartext. A passive on-path observer
