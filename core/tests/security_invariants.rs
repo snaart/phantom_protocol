@@ -1807,6 +1807,77 @@ async fn reorder_buffer_is_byte_bounded_when_the_head_is_missing() {
     );
 }
 
+/// Idle keep-alive (Direction #3) is invariant-safe: a keep-alive packet is
+/// `ENCRYPTED | KEEPALIVE` with an **empty** payload, so it
+///  (1) carries the post-handshake `ENCRYPTED` invariant flag (Inv-2 — the recv
+///      path drops every unencrypted post-handshake packet, including empty ones),
+///  (2) is AEAD-authenticated (the empty plaintext seals to a bare tag and opens
+///      back to empty — an off-path peer cannot forge one),
+///  (3) draws a per-direction packet number like any other packet, so a replayed
+///      keep-alive is rejected by the sliding replay window **after** AEAD verify
+///      (Inv-4) — it can neither reset a liveness timer nor be reused as a nonce.
+/// The `KEEPALIVE` flag is a distinct spare bit (`0x1000`) that overlaps no
+/// existing flag, so adding it changed no existing wire encoding.
+#[test]
+fn idle_keepalive_is_encrypted_authenticated_and_replay_protected() {
+    use phantom_protocol::CoreError;
+
+    // (1) The KEEPALIVE bit is a fresh spare bit — it collides with no other flag.
+    for other in [
+        PacketFlags::RELIABLE,
+        PacketFlags::ACK,
+        PacketFlags::FIN,
+        PacketFlags::UNRELIABLE,
+        PacketFlags::PRIORITY,
+        PacketFlags::ENCRYPTED,
+        PacketFlags::COMPRESSED,
+        PacketFlags::CONTROL,
+        PacketFlags::REKEY,
+        PacketFlags::PATH_VALIDATION,
+        PacketFlags::COALESCED,
+        PacketFlags::WINDOW_UPDATE,
+    ] {
+        assert_eq!(
+            PacketFlags::KEEPALIVE & other,
+            0,
+            "KEEPALIVE (0x{:04x}) must not overlap an existing flag (0x{other:04x})",
+            PacketFlags::KEEPALIVE
+        );
+    }
+
+    let (client, server) = make_session_pair([0x5Au8; 32]);
+    // A keep-alive: ENCRYPTED | KEEPALIVE, empty payload, drawn at a real PN.
+    let pn = client.next_send_pn();
+    let header = PacketHeader::new(
+        *server.id(),
+        1,
+        pn,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::KEEPALIVE),
+    )
+    .with_epoch(client.current_epoch());
+    // (1) it carries ENCRYPTED.
+    assert!(
+        header.flags.contains(PacketFlags::ENCRYPTED),
+        "a keep-alive must be ENCRYPTED (Inv-2 downgrade defense)"
+    );
+
+    // (2) it AEAD-seals an empty payload and opens back to empty — authenticated.
+    let ct = client
+        .encrypt_packet(&header, &[], &[])
+        .expect("seal keep-alive");
+    let pt = server
+        .decrypt_packet(&header, &ct, &[])
+        .expect("authenticated keep-alive opens");
+    assert!(pt.is_empty(), "a keep-alive carries no application bytes");
+
+    // (3) a replayed keep-alive (same PN) is rejected AFTER AEAD verify (Inv-4).
+    let replay = server.decrypt_packet(&header, &ct, &[]);
+    assert!(
+        matches!(replay, Err(CoreError::ReplayDetected(_))),
+        "a replayed keep-alive must be rejected by the replay window (Inv-4); got {replay:?}"
+    );
+}
+
 /// T5.5 (audit recv-counter-on-fail LOW): a FAILED AEAD open must NOT advance the per-direction
 /// recv invocation counter. Otherwise a stream of forged same-epoch packets drives the counter
 /// toward the `AEAD_MAX_INVOCATIONS` (2^48) `NonceExhausted` ceiling — only a successful,

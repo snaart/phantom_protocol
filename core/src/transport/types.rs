@@ -146,7 +146,17 @@ impl PacketFlags {
     /// window in bytes (absolute window size, NOT a delta — simpler
     /// and self-correcting under packet loss).
     pub const WINDOW_UPDATE: u16 = 0x0800;
-    // 0x1000 .. 0x8000 — reserved for future amendments.
+    /// Idle keep-alive PING (Direction #3 — download-only liveness). A small
+    /// `ENCRYPTED | KEEPALIVE` packet with an **empty** payload that an idle
+    /// sender emits to (a) refresh the peer's inbound-activity timer and (b)
+    /// anchor its own liveness timer (the in-flight keep-alive lets a
+    /// download-only path — which otherwise sends only ACKs and has nothing in
+    /// flight — detect a silently-dead downstream). A bare `KEEPALIVE` is a
+    /// PING; `KEEPALIVE | ACK` is the peer's PONG echo. Neither carries
+    /// application bytes, so neither reaches `recv()`. (Spare flag bit — no
+    /// header layout / `WIRE_VERSION` change.)
+    pub const KEEPALIVE: u16 = 0x1000;
+    // 0x2000 .. 0x8000 — reserved for future amendments.
 
     /// Create new flags with no bits set
     pub const fn empty() -> Self {
@@ -737,6 +747,7 @@ mod tests {
         assert_eq!(PacketFlags::PATH_VALIDATION, 0x0200);
         assert_eq!(PacketFlags::COALESCED, 0x0400);
         assert_eq!(PacketFlags::WINDOW_UPDATE, 0x0800);
+        assert_eq!(PacketFlags::KEEPALIVE, 0x1000);
     }
 
     #[test]
