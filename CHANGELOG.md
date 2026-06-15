@@ -42,6 +42,20 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Security
 
+- **Build-integrity / supply chain — T5.6 (SUPPLY-03/04).** The FIPS build no longer links the
+  non-FIPS classical crypto crates. `ring` (AEAD) and `x25519-dalek` (classical KEM half) are moved
+  behind a new `classical-crypto` Cargo feature (folded into `default`, intentionally *not* implied by
+  `std`), and the `AesSession` AEAD backend now cfg-dispatches `ring` → `aws-lc-rs` under `--features
+  fips` (matching `adaptive_crypto`). Under `--features fips` the AEAD already routes through `aws-lc-rs`
+  and the classical KEM half through ECDH-P-256, so both crates are genuinely unused there — they are now
+  *absent* from the FIPS dependency graph (`cargo tree --no-default-features --features fips -i ring` →
+  "did not match any packages"), shrinking the FIPS attack surface. A CI guard (`cargo tree -i`) fails the
+  `fips-feature` job if either crate ever leaks back in. The FIPS CI invocations and the `cross.yml` FIPS
+  row switch to `--no-default-features --features fips,...`; the `--no-default-features` non-FIPS
+  cross-target rows (wasm / WASI) and the `server` / `wasm-demo` / `wasi-guest` embedders name
+  `classical-crypto` explicitly. Separately, the dead `cargo-deny` advisory ignore (`RUSTSEC-2026-0097`,
+  no longer matching any crate in the tree → an `advisory-not-detected` warning) was removed so `cargo
+  deny check` is clean again. No wire, API, or crypto-behaviour change.
 - **Zeroize the master secrets — T5.1 (key hygiene).** The rekey master `Session.traffic_secret` is now
   zeroized in `Session::drop` (rekey already wiped each *superseded* epoch secret; this covers the final
   live one); `ResumptionTicket` derives `ZeroizeOnDrop` (the verbatim resumption secret no longer lingers in

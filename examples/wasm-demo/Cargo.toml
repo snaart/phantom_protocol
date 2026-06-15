@@ -11,7 +11,9 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-phantom-protocol = { path = "../../core", default-features = false, features = ["std", "compression-zstd"] }
+# `classical-crypto` carries the non-FIPS `ring` AEAD + `x25519-dalek` KEM
+# half (SUPPLY-03) — no longer implied by `std`, so name it explicitly.
+phantom-protocol = { path = "../../core", default-features = false, features = ["std", "compression-zstd", "classical-crypto"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"

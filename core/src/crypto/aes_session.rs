@@ -6,7 +6,17 @@
 //!
 //! `ring` uses hand-optimized assembly for both ARM64 and x86_64,
 //! ensuring maximum throughput compared to pure-Rust crates.
+//!
+//! Under `--features fips` the AEAD backend swaps to `aws-lc-rs`
+//! (FIPS-validated AWS-LC). The Rust API surface is identical to
+//! `ring::aead` (same `LessSafeKey` / `Nonce` / `seal_in_place_append_tag`
+//! / `open_in_place`), so the rest of this module is untouched and `ring`
+//! is no longer linked on the fips path — see `crypto/adaptive_crypto.rs`
+//! for the same backend dispatch.
 
+#[cfg(feature = "fips")]
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+#[cfg(not(feature = "fips"))]
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -188,7 +198,12 @@ mod tests {
 
         let total_mb = (data.len() * iters) as f64 / 1024.0 / 1024.0;
         let throughput = total_mb / elapsed.as_secs_f64();
-        eprintln!("ring AES-256-GCM: {:.0} MiB/s", throughput);
+        let backend = if cfg!(feature = "fips") {
+            "aws-lc-rs"
+        } else {
+            "ring"
+        };
+        eprintln!("{backend} AES-256-GCM: {throughput:.0} MiB/s");
         // With HW AES should be well above 1 GiB/s
     }
 }
