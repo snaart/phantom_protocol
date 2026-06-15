@@ -56,6 +56,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `classical-crypto` explicitly. Separately, the dead `cargo-deny` advisory ignore (`RUSTSEC-2026-0097`,
   no longer matching any crate in the tree → an `advisory-not-detected` warning) was removed so `cargo
   deny check` is clean again. No wire, API, or crypto-behaviour change.
+- **Documented the 0-RTT distributed-cache replay caveat (T5.7).** The one-shot anti-replay for 0-RTT
+  early-data (Invariant 9 — `SessionCache::try_resume` removes the ticket on first lookup) holds **only**
+  under a single coherent `SessionCache`. The cache is an in-process bounded-LRU, not replicated, so a
+  horizontally-scaled deployment with per-node caches lets an attacker replay a captured 0-RTT `ClientHello`
+  against a *different* node that still holds the unconsumed ticket — the classic TLS-1.3
+  0-RTT-across-a-server-farm replay. Mitigation is deployment-side (sticky/hashed routing of a
+  `resume_session_id`, a shared store with atomic compare-and-remove, or idempotent early-data); the
+  post-handshake session's PFS + auth are unaffected. Documented in PROTOCOL.md §6.6 and the threat-model
+  (STRIDE-S + §8). No code change.
 - **Zeroize the master secrets — T5.1 (key hygiene).** The rekey master `Session.traffic_secret` is now
   zeroized in `Session::drop` (rekey already wiped each *superseded* epoch secret; this covers the final
   live one); `ResumptionTicket` derives `ZeroizeOnDrop` (the verbatim resumption secret no longer lingers in
@@ -151,6 +160,19 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Changed
 
+- **`PhantomSession::connect(addr)` documented as deprecated/inert (T5.7).** This constructor never opens a
+  transport, runs no handshake, and sends no bytes — it returns a placeholder stuck in `Connecting`. Its
+  doc-comment now says so loudly and steers callers to the real entry points (`connect_with_transport` in
+  Rust, `connect_pinned` over FFI). A `#[deprecated]` *attribute* is deliberately **not** applied: UniFFI
+  0.31 emits FFI scaffolding that calls `Self::connect()` from generated code, which would trip the
+  `deprecated` lint that CI promotes to a hard error under `clippy --lib -D warnings`. The regenerated
+  Python / Swift / Kotlin docstrings carry the new wording (bindings committed; the `bindings` drift job
+  stays green). New regression test `deprecated_connect_is_inert_and_sends_no_bytes` pins the inert contract.
+- **PROTOCOL.md — byte-layout tables for the three AEAD-plaintext payload codecs (T5.7).** New §4.5
+  documents, against the actual codec, the `Sack` ACK plaintext (`largest_acked`, `ack_delay_us`, the
+  descending inclusive ranges), the reliable stream-frame plaintext (`[stream_offset: u32 BE][data]`), and
+  the `COALESCED` bundle (`[count: u16][len_i: u16][payload_i]…` sub-payloads under one AEAD tag). These are
+  AEAD plaintext, not the frozen outer container — documentation only, no wire change.
 - **`WIRE_VERSION` 3 → 4 (T4.6):** the 47-byte packet header is reordered so the 14 HP-protected bytes form
   a contiguous `[33..47]` span, and that span is masked on the wire (above). Interop-breaking, but no
   deployed peers (pre-1.0 0.2.0 window). Frozen wire vectors + the independent Python decoder regenerated.
