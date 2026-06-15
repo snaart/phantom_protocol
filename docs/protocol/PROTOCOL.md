@@ -1068,23 +1068,32 @@ server is the universal detector / validator.
    `session_id`/CID arriving from a new source 5-tuple into the same session, and the
    new source is registered as the migration **candidate** only from an
    AEAD-authenticated frame (M-1, 2026-06-11 audit — a spoofed datagram never
-   decrypts, so it cannot clobber the candidate). A deliberate `migrate()` then bumps
-   the client send `path_id` to a fresh non-zero value, which the server sees as a
-   not-yet-`Validated` path and challenges (step 3). A **passive NAT-rebind**,
-   however, keeps `path_id` 0 — permanently *validated* — so the server does **not**
-   yet autonomously challenge/swap on it: the rebind's *upload* is still delivered
-   (PATH-001b recv-relax, § 12.2) and the session stays alive, but the server keeps
-   sending *downstream* to the old address until an embedder `migrate()` bumps the
-   path label. *(Known limitation — M-3, 2026-06-11 audit; autonomous passive-rebind
-   recovery for path 0 is a planned fix. The candidate is already registered, so only
-   the path-0 challenge gating remains.)*
+   decrypts, so it cannot clobber the candidate). Detection is therefore
+   **address-driven**, not purely path-id-driven, and covers two cases:
+   - A deliberate `migrate()` bumps the client send `path_id` to a fresh non-zero
+     value, which the server sees as a not-yet-`Validated` path and challenges on
+     that path id (step 3).
+   - A **passive NAT-rebind** keeps `path_id` 0 — permanently *validated* — so the
+     client never bumps the label. The server still detects the new authenticated
+     source (the migration candidate) and challenges it on a **reserved validation
+     path-id** (`REBIND_VALIDATION_PATH_ID`, M-3), carved out of the active-migration
+     id space, which the registry can take `Validating → Validated` independently of
+     the always-`Validated` path 0. The reserved id is retired after a successful
+     promotion so a *later* rebind re-challenges from scratch.
+
+   In both cases the challenge goes **only to the candidate** (its claimed address)
+   under the same 3× anti-amplification cap (§ 12.3), and the peer swaps only on a
+   valid echo from that address (step 4) — anti-spoof is identical for the two paths.
+   *(M-3, autonomous passive-rebind recovery — shipped 2026-06-15. The rebind's
+   upload is also delivered immediately via PATH-001b recv-relax, § 12.2, so the
+   session never stalls in either direction.)*
 3. **Server challenge.** The server mints a `path_id`-bound entry for the new source
-   and sends a `PATH_VALIDATION` packet carrying a fresh **32-byte** random challenge
-   to it (`PathRegistry::issue_challenge`). The legitimate peer — the only party
-   holding the session AEAD key — echoes the bytes back in a `PATH_VALIDATION`
-   response. Verification is **constant-time** (`subtle::ConstantTimeEq`, Invariant
-   6): a match transitions the path `Unvalidated → Validating → Validated`, a
-   mismatch → `Failed`.
+   (the migrated path id, or the reserved rebind id for a passive rebind) and sends a
+   `PATH_VALIDATION` packet carrying a fresh **32-byte** random challenge to it
+   (`PathRegistry::issue_challenge`). The legitimate peer — the only party holding the
+   session AEAD key — echoes the bytes back in a `PATH_VALIDATION` response.
+   Verification is **constant-time** (`subtle::ConstantTimeEq`, Invariant 6): a match
+   transitions the path `Unvalidated → Validating → Validated`, a mismatch → `Failed`.
 4. **Server swap.** On validation the server atomically switches its peer
    (`ArcSwap<SocketAddr>`) to the new source, drops the queue aimed at the dead
    address (the L1 ARQ re-carries every un-ACKed reliable byte on the new path with

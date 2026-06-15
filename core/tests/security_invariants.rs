@@ -24,7 +24,9 @@ use phantom_protocol::transport::handshake::{
     ClientHello, HandshakeClient, HandshakeError, HandshakeResponse, HandshakeServer, ServerHello,
 };
 use phantom_protocol::transport::path::PathStateKind;
-use phantom_protocol::transport::session::{CryptoState, Session, MAX_REKEY_CATCHUP};
+use phantom_protocol::transport::session::{
+    CryptoState, Session, MAX_REKEY_CATCHUP, REBIND_VALIDATION_PATH_ID,
+};
 use phantom_protocol::transport::stream::{Stream, INITIAL_STREAM_WINDOW};
 use phantom_protocol::transport::types::{
     PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
@@ -406,6 +408,71 @@ fn v5_note_migration_path_slides_inbound_window() {
     assert_ne!(
         s1.add[0], s2.add[0],
         "each slide adds a distinct leading-edge CID"
+    );
+}
+
+/// M-3 (passive NAT rebind): a passive rebind keeps `path_id = 0` — the
+/// permanently-`Validated` handshake path — so the server CANNOT validate the new
+/// source by re-challenging path 0 (`begin_path_validation` refuses a Validated
+/// path). The fix reserves a dedicated validation id ([`REBIND_VALIDATION_PATH_ID`])
+/// that ① is never produced by the active-migration counter (no slot collision
+/// between an active migration and a concurrent passive rebind), ② can be taken
+/// `Validating → Validated` independently of path 0, and ③ is re-challengeable
+/// after a successful validation+retire (so a SECOND rebind also recovers). A
+/// regression that reused path 0, or let the migration counter hand back the
+/// reserved id, would silently break passive-rebind recovery or let two distinct
+/// validations resolve each other's registry slot.
+#[test]
+fn m3_reserved_rebind_validation_path_is_disjoint_and_challengeable() {
+    let (_client, server) = make_session_pair([0x3Cu8; 32]);
+
+    // ① The active-migration counter never hands back 0 (handshake path) nor the
+    //    reserved rebind id — across > 2 full u8 wraps.
+    for _ in 0..600 {
+        let id = server.next_migration_path_id();
+        assert_ne!(
+            id, 0,
+            "the migration counter must never reuse the handshake path"
+        );
+        assert_ne!(
+            id, REBIND_VALIDATION_PATH_ID,
+            "the migration counter must never reuse the reserved rebind validation path"
+        );
+    }
+
+    // ② Path 0 is permanently Validated, so it refuses a fresh challenge — which is
+    //    exactly why a passive rebind (path_id still 0) cannot validate via path 0.
+    assert_eq!(server.path_state(0), Some(PathStateKind::Validated));
+    assert!(
+        server.begin_path_validation(0).is_none(),
+        "the always-Validated path 0 must refuse a new challenge"
+    );
+
+    // ...but the reserved id has no prior state and DOES yield a challenge, taking
+    // it to Validating. This is the slot the server uses to validate the rebind.
+    assert_eq!(server.path_state(REBIND_VALIDATION_PATH_ID), None);
+    let challenge = server
+        .begin_path_validation(REBIND_VALIDATION_PATH_ID)
+        .expect("the reserved rebind id must be challengeable from scratch");
+    assert_eq!(
+        server.path_state(REBIND_VALIDATION_PATH_ID),
+        Some(PathStateKind::Validating)
+    );
+
+    // ③ A correct echo validates it; a wrong echo would fail it (anti-spoof: only a
+    //    response matching the server-issued random challenge promotes). The
+    //    promotion itself is address-gated at the transport (`promote_candidate`),
+    //    tested in the live udp_integration path.
+    let mut wrong = challenge;
+    wrong[0] ^= 0xFF;
+    assert!(
+        !server.complete_path_validation(REBIND_VALIDATION_PATH_ID, &wrong),
+        "a wrong echo must NOT validate the rebind path"
+    );
+    assert_eq!(
+        server.path_state(REBIND_VALIDATION_PATH_ID),
+        Some(PathStateKind::Failed),
+        "a wrong echo fails the path closed"
     );
 }
 
