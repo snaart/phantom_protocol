@@ -92,7 +92,7 @@ process is a weaker boundary (we trust the caller and the OS).
 | A1 | Server long-lived `HybridSigningKey` | `HandshakeServer.signing_key` | Catastrophic â attackers can impersonate the server for all future handshakes; no forward secrecy mitigates retroactive reads. |
 | A2 | Server master secret (cookie / PoW HMAC key root) | `HandshakeServer.master_secret` | Attacker can forge cookies, bypass PoW, mount IP-spoofing amplification. Hourly HKDF rotation (Phase 1.11) bounds compromise window. |
 | A3 | Hybrid KEM private keys (ephemeral, per-handshake) | `HandshakeClient.kem_secret` | Compromise of one session's KEM key leaks that session's symmetric keys â all traffic from that session decryptable. Mitigated by ephemeral generation per handshake + `ZeroizeOnDrop`. |
-| A4 | Session AEAD keys | `CryptoState.session_key`, ring `LessSafeKey` inside `CryptoSessionInner` | Compromise leaks all packets in that session direction. Mitigated by `ZeroizeOnDrop` (Phase 1.2) and (future) mid-session rekey (Phase 1.5, V2). |
+| A4 | Session AEAD keys | `CryptoState.session_key`, ring `LessSafeKey` inside `CryptoSessionInner` | Compromise leaks the **current epoch's** packets in that direction. Mitigated by `ZeroizeOnDrop` (Phase 1.2) and the **shipped** mid-session HKDF rekey — **past-epoch forward secrecy only, no post-compromise security** (a live `traffic_secret` yields all future epochs; healing needs a re-handshake — see §8). |
 | A5 | Application plaintext | passed in/out via `Vec<u8>` / `Bytes` | The whole point of the transport. |
 | A6 | Session identity / linkability metadata | the inner 32-byte session_id is **off-wire** (ε §4.2, in the AEAD AAD only); stream id, packet numbers, flags, epoch, path id (**HP-masked** — T4.6 §4.6); the single routing 8-byte `ConnId` is the only per-connection cleartext and it **rotates per migration** (ε §4.7) | **Closed by ε for client migration** (LINDDUN-L, PROTOCOL.md §12.5): a client migration rotates **both** directions' ConnId — the client rotates c2s on `migrate()`, and the server rotates s2c on authenticating the new `path_id` (EPS-02 fix, audit 2026-06-15), the socket-routed client absorbing it. So a client moving Wi-Fi→cellular is unlinkable both ways. **Residual:** a *server*-initiated migration rotates s2c but not c2s (the socket-routed client does not rotate-on-detect), so a server move stays c2s-linkable to a both-networks observer — rare; the full shared-epoch fix is tracked. Caveat: the CID chain is not forward-secret (a session-key compromise relinks a recorded flow). Full anti-fingerprinting (constant version byte / length padding) is a separate future pass. |
 | A7 | Cookie / PoW state | client-side stored cookies | Loss enables replay of one round trip within freshness window only. |
@@ -206,11 +206,18 @@ and the specialist docs in this directory. Cross-reference quick map:
 
 ## 8. Known limitations / future work
 
-- Mid-session key rotation (Phase 1.5) is blocked on V2 wire format.
-  Sessions today rely solely on the initial handshake's KEM secret for
-  the entire session lifetime. Acceptable because AEAD safety limits are
-  far above any practical session volume, but adds forward-secrecy
-  surface area that a future leak would expose.
+- **Mid-session key rotation SHIPS** (the HKDF traffic-secret ratchet; advertised on
+  the wire by `PacketFlags::REKEY` + the `epoch` byte, applied via
+  `decrypt_packet_accepting_rekey`; auto at `REKEY_SOFT_LIMIT = 2^32` send
+  invocations or embedder-triggered; `epoch: u8` saturates at 255). Its
+  forward-secrecy is **past-epoch only**: each `rekey()` zeroizes the previous
+  `traffic_secret`, so a later key compromise cannot read *already-rotated* epochs.
+  It provides **NO post-compromise security** — the ratchet is a deterministic
+  forward HKDF (`next = HKDF-Expand(current, "phantom-rekey-v1", 32)`), so
+  compromising a *live* `traffic_secret` yields every *future* epoch; healing
+  (recovering confidentiality after a key leak) requires a fresh hybrid
+  re-handshake, not a rekey. Cross-*session* forward secrecy is unaffected (each
+  session's hybrid KEM is ephemeral, `ZeroizeOnDrop`).
 - Connection migration with path validation (Phase 4) is SHIPPED (P4.0-P4.4):
   the server validates a new path (a 32-byte challenge echoed from the claimed
   address, constant-time) before switching its peer, so a MITM cannot redirect or
@@ -243,3 +250,4 @@ and the specialist docs in this directory. Cross-reference quick map:
 | 2026-06-15 | ε audit | Adversarial review of the ε surface (`docs/security/audit-report-2026-06-15-wire-v5-epsilon.md`): no confidentiality/integrity/auth regression; CID-chain, off-wire AAD bind, and post-AEAD window-slide verified sound. **Corrected the LINDDUN-L over-claim:** ε rotation is asymmetric — only the migrating peer rotates its outbound CID, so the **server→client** ConnId stays stable across a **client** migration (EPS-02, linkable to a both-networks observer); and migration tolerates at most K=4 un-acked in-flight generations before stranding (EPS-01, availability). |
 | 2026-06-15 | EPS-02 fix | Symmetric CID rotation for a **client** migration: the server now rotates its s2c chain on authenticating the client's new path_id (post-AEAD), so a client move is unlinkable in **both** directions (the socket-routed client absorbs the new inbound CID; no ping-pong — the server does not bump its own path_id). LINDDUN-L is now **closed for client migration**; the residual is a *server*-initiated migration (c2s stays stable — the client does not rotate-on-detect, which would strand it in the server's un-sliding c2s window). EPS-01 (the >K-generation strand) remains tracked. |
 | 2026-06-15 | EPS-01 fix | Robust migration window: the inbound CID demux slide is now **multi-step** (advances by the authenticated path_id forward delta, recentring on the sender's actual migration index — no cumulative lag) and the leading window **K is widened 4 → 16**, so only an unbroken run of > 16 consecutive fully-lost migrations strands the c2s data plane (recoverable by reconnect). `MAX_ROUTES` raised 1<<16 → 1<<18 to preserve concurrent-session capacity. Availability only; no security-invariant change. |
+| 2026-06-15 | T5.2 doc-honesty | Rewrote §8 + the A4 asset row to reflect shipped reality: mid-session HKDF rekey **ships** (was "blocked on V2 wire format"). Stated its forward-secrecy honestly — **past-epoch FS only, NO post-compromise security** (the deterministic forward ratchet means a live `traffic_secret` yields all future epochs; healing needs a re-handshake). No code change. |
