@@ -291,11 +291,16 @@ async fn udp_integration_cid_rotates_on_the_wire_across_migration() {
     // post-handshake (OneRtt) client->server datagram. OneRtt = type bits `01` in
     // the envelope flags byte (`buf[0] >> 6 == 1`); the ConnId is `buf[1..9]`.
     let onertt_cids: Arc<Mutex<HashSet<[u8; 8]>>> = Arc::new(Mutex::new(HashSet::new()));
+    // EPS-02: also record the server->client (s2c) OneRtt ConnIds, to assert the
+    // RETURN direction rotates too (the server rotates its outbound CID when it
+    // detects the client's migration — otherwise s2c stays linkable).
+    let onertt_s2c_cids: Arc<Mutex<HashSet<[u8; 8]>>> = Arc::new(Mutex::new(HashSet::new()));
     let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let relay_addr = relay.local_addr().unwrap();
     let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     upstream.connect(server_addr).await.unwrap();
     let cids = onertt_cids.clone();
+    let s2c_cids = onertt_s2c_cids.clone();
     tokio::spawn(async move {
         let mut c2s = vec![0u8; 2048];
         let mut s2c = vec![0u8; 2048];
@@ -314,6 +319,11 @@ async fn udp_integration_cid_rotates_on_the_wire_across_migration() {
                 }
                 r = upstream.recv(&mut s2c) => {
                     let n = r.unwrap();
+                    if n >= 9 && (s2c[0] >> 6) == 1 {
+                        let mut cid = [0u8; 8];
+                        cid.copy_from_slice(&s2c[1..9]);
+                        s2c_cids.lock().unwrap().insert(cid);
+                    }
                     if let Some(ca) = client_addr {
                         relay.send_to(&s2c[..n], ca).await.unwrap();
                     }
@@ -335,6 +345,12 @@ async fn udp_integration_cid_rotates_on_the_wire_across_migration() {
     assert_eq!(e0, b"r0");
     let before = onertt_cids.lock().unwrap().len();
     assert!(before >= 1, "at least CID_0 must be seen pre-migration");
+    // EPS-02: the server echoed r0, so its s2c CID_0 is on the wire pre-migration.
+    let s2c_before = onertt_s2c_cids.lock().unwrap().len();
+    assert!(
+        s2c_before >= 1,
+        "at least the server's s2c CID_0 must be seen pre-migration"
+    );
 
     // Migrate -> the client rotates its outbound CID to CID_1, then fire
     // post-migration datagrams. The rotated CID appears on the wire (the reliable
@@ -355,7 +371,17 @@ async fn udp_integration_cid_rotates_on_the_wire_across_migration() {
     let after = onertt_cids.lock().unwrap().len();
     assert!(
         after >= 2 && after > before,
-        "the on-wire CID must rotate across migration (before {before}, after {after} distinct OneRtt CIDs)"
+        "the on-wire c2s CID must rotate across migration (before {before}, after {after} distinct OneRtt CIDs)"
+    );
+    // EPS-02: the server, on detecting the client's migration (an authenticated
+    // new path_id), rotates its OWN outbound CID — so the server->client direction
+    // also shows a fresh ConnId (its post-migration ACKs carry CID_s2c(1)). Without
+    // the symmetric-rotation fix this stays at 1 (the s2c CID was stable across the
+    // client migration → linkable; threat-model §12.5 residual EPS-02).
+    let s2c_after = onertt_s2c_cids.lock().unwrap().len();
+    assert!(
+        s2c_after >= 2 && s2c_after > s2c_before,
+        "the on-wire s2c CID must ALSO rotate across a client migration (before {s2c_before}, after {s2c_after} distinct OneRtt CIDs) — EPS-02"
     );
 
     server.await.unwrap();

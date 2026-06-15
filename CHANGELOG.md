@@ -32,9 +32,9 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   under model ①. PATH-001 is split into a strict send-gate (app data only to validated paths) and a
   relaxed recv-delivery (authenticated, non-replayed data is delivered regardless of source), so a
   NAT-rebind upload is seamless. Combined with header protection (T4.6, below) and CID collapse +
-  rotation (ε, below), migration is unlinkable by an on-path observer in the **client→server**
-  direction; the server→client direction retains a stable CID across a client migration (a residual
-  found by the 2026-06-15 ε audit, EPS-02 — see Security below), pending a symmetric-rotation fix.
+  rotation (ε, below), a **client** migration is unlinkable by an on-path observer in **both**
+  directions (the server rotates its s2c CID on detecting the client's migration — EPS-02 fix, see
+  Security below); a rarer *server*-initiated migration leaves the client→server CID stable (residual).
 - **PhantomUDP (Phase 1):** native datagram `SessionTransport` over raw UDP with connection-ID
   demultiplexing — `PhantomUdpListener` (server accept) plus `UdpClientTransport` / `UdpServerTransport`.
   The multi-KB post-quantum handshake is fragmented to the path MTU and reassembled. No wire-format or
@@ -76,6 +76,16 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   forwarding in the test-only `LossyTransport` (the same latent partial-forwarding shape), a loud
   wrapper-contract note on the `SessionTransport` trait, and a widened `fuzz_aead_decrypt` that now exercises
   the non-empty-`extensions` AAD branch.
+- **Symmetric CID rotation on client migration — EPS-02 fix (2026-06-15):** the audit's linkability residual
+  is closed for the common case. When the server authenticates a client's new `path_id` (post-AEAD), it now
+  rotates its **own** outbound (server→client) CID too, so a client moving Wi-Fi↔cellular is **unlinkable in
+  both directions** — not just client→server. The socket-routed client accepts any inbound CID, so no
+  client-side window slide is needed; the server does not bump its own send `path_id`, so there is no
+  ping-pong. Verified by `eps02_server_rotates_s2c_cid_on_client_migration` (in-crate) and the extended
+  on-wire `udp_integration_cid_rotates_on_the_wire_across_migration` (asserts **both** directions' ConnIds
+  rotate). **Residual:** a *server*-initiated migration rotates s2c but not c2s (the socket-routed client does
+  not rotate-on-detect — that would strand it in the server's un-sliding c2s window); rare, and the full
+  shared-migration-epoch fix (which also closes EPS-01) is tracked. No wire change.
 - **Header protection (T4.6 — QUIC RFC 9001 §5.4):** the 14 variable header bytes — packet number, flags
   (incl. the `PRIORITY`/voice bit), stream id, rekey epoch, and migration path id — are now **XOR-masked on
   the wire**, leaving only `version` + `session_id` (the routing CID) cleartext. A passive on-path observer
