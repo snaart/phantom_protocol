@@ -53,6 +53,16 @@ pub enum FramePhase {
 /// clones — no `Vec → Bytes` conversion at the trait boundary.
 /// `send_bytes` keeps `&[u8]` because the caller routinely sends a
 /// borrowed slice of an already-allocated send buffer.
+///
+/// **Wrapper contract (audit EPS-04):** every method below the two I/O methods
+/// has a *silently-succeeding* default (`{}` / `false` / `Ok(())`). Those are
+/// correct for transports without migration, but they make a **partial wrapper**
+/// (a newtype that forwards only `send_bytes` / `recv_bytes`) compile with no
+/// warning while every control call no-ops on the default — the exact bug that
+/// made the pre-ε FFI `migrate()` vacuous through `ObservedTransport`. Any wrapper
+/// over a `SessionTransport` **MUST forward the full surface** (all the control
+/// methods, not just I/O); the `observed_transport_forwards_all_control_methods`
+/// tripwire test guards this for the in-crate wrappers.
 pub trait SessionTransport: Send + Sync + 'static {
     /// Send raw bytes to the peer.
     ///

@@ -47,8 +47,14 @@ fuzz_target!(|data: &[u8]| {
         PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     );
 
-    let ct = data.get(6..).unwrap_or(&[]);
     // `decrypt_packet(header, ciphertext, extensions)` — the `extensions` TLV is
-    // bound into the AEAD AAD (T4.1); the fuzzer sends none.
-    let _ = session.decrypt_packet(&header, ct, &[]);
+    // bound into the AEAD AAD (T4.1). Carve a variable-length `extensions` slice
+    // (length from `data[6]`, bounded by the remaining input) so BOTH
+    // `with_packet_aad` branches are fuzzed — the empty branch returns the 47-byte
+    // AAD image directly, the non-empty branch concatenates header‖extensions; the
+    // old constant `&[]` only ever drove the empty branch (audit EPS-06).
+    let rest = data.get(7..).unwrap_or(&[]);
+    let ext_len = (*data.get(6).unwrap_or(&0) as usize).min(rest.len());
+    let (extensions, ct) = rest.split_at(ext_len);
+    let _ = session.decrypt_packet(&header, ct, extensions);
 });
