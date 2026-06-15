@@ -505,21 +505,34 @@ impl Session {
         {
             return None;
         }
-        let new_high = self
+        // EPS-01 — advance by the FULL forward delta `d`, not +1. The peer bumps
+        // its path_id and CID index in lock-step on each `migrate()`, so a forward
+        // path_id distance of `d` means it migrated `d` times; sliding the window by
+        // `d` recenters it on the peer's *actual* migration index. The pre-fix +1
+        // step let lost intermediate migrations cumulatively erode the leading
+        // window until the peer's CID fell out of it and the session stranded. The
+        // triggering packet's CID (= `inbound_cid(new_high)`) was inside the pre-slide
+        // window (else it would have been dropped pre-AEAD and we would never run
+        // here), so `d <= CID_WINDOW_LEADING` and the widened K bounds the per-slide
+        // churn; `anchor` is therefore in the demux route table for `apply_slide`.
+        let d = fwd as u64;
+        let old_high = self
             .inbound_cid_highest_seen
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        // `anchor` (the CID at the new index) was registered in a prior leading
-        // window, so it is currently in the demux route table.
+            .fetch_add(d, Ordering::Relaxed);
+        let new_high = old_high + d;
         let anchor = self.cid_chain.inbound_cid(new_high);
-        let add = vec![self.cid_chain.inbound_cid(new_high + CID_WINDOW_LEADING)];
-        let remove = if new_high > CID_WINDOW_TRAILING {
-            vec![self
-                .cid_chain
-                .inbound_cid(new_high - CID_WINDOW_TRAILING - 1)]
-        } else {
-            Vec::new()
-        };
+        // Register the `d` new leading-edge CIDs `(old_high+K, new_high+K]`.
+        let add: Vec<[u8; CID_LEN]> = ((old_high + CID_WINDOW_LEADING + 1)
+            ..=(new_high + CID_WINDOW_LEADING))
+            .map(|i| self.cid_chain.inbound_cid(i))
+            .collect();
+        // Drop the trailing CIDs that fell past the window `[old_lo, new_lo)`
+        // (saturating at index 0 — indices below 0 were never registered).
+        let old_lo = old_high.saturating_sub(CID_WINDOW_TRAILING);
+        let new_lo = new_high.saturating_sub(CID_WINDOW_TRAILING);
+        let remove: Vec<[u8; CID_LEN]> = (old_lo..new_lo)
+            .map(|i| self.cid_chain.inbound_cid(i))
+            .collect();
         Some(CidSlide {
             add,
             remove,

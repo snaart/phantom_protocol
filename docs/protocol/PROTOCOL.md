@@ -405,19 +405,25 @@ post-handshake CID, replacing the random bootstrap `ConnId` the handshake ran on
 and **advances by one on each `migrate()`**, so post-migration datagrams stamp an
 independent-random `CID_{i+1}`. The receiver (the UDP demux) routes on a sliding
 window of accepted CIDs `[highest_seen − T, highest_seen + K]` (`T = 2` trailing
-for in-flight reorder across a migration boundary, `K = 4` leading for migration
+for in-flight reorder across a migration boundary, `K = 16` leading for migration
 lookahead). The window advances **only post-AEAD**: an authenticated packet
 carrying a new (forward) `path_id` — which the peer bumps in lock-step with its
-CID index on each `migrate()` — slides the window one step (register the new
-leading CID, drop the trailing one). An off-path attacker cannot push the window
-(future CIDs are unguessable without `cid_secret`, and a replayed observed CID
-never AEAD-verifies). A CID outside every window is dropped → liveness → reconnect.
-The single-step slide assumes each migration delivers ≥ 1 packet: a forward
-`path_id` jump of `d > 1` (intermediate migrations all lost) still slides only one
-step, so the window can lag the sender by up to its accumulated miss count and a
-sender that gets more than `K` migrations ahead strands until reconnect (audit
-2026-06-15, **EPS-01**; the symmetric-epoch remediation makes the slide catch up to
-the authenticated index in one step).
+CID index on each `migrate()` — slides the window by the **full forward delta `d`**
+(the `d` migrations the `path_id` jumped): register the `d` new leading CIDs, drop
+the `d` trailing ones, recentring the window on the sender's actual migration index
+(EPS-01 fix — a single +1 step let lost intermediate migrations cumulatively erode
+the leading margin). An off-path attacker cannot push the window (future CIDs are
+unguessable without `cid_secret`, and a replayed observed CID never AEAD-verifies).
+A CID outside every window is dropped → liveness → reconnect.
+
+Because the slide is post-AEAD, the **triggering** packet's CID must itself be in
+the current window — so `K` is the **hard cap on consecutive migrations whose
+packets are ALL lost** before the sender's CID falls outside the window and the
+session strands (recoverable by reconnect via the liveness sweep). A delivered
+migration recentres the window, so only an unbroken run of `> K = 16` fully-lost
+migrations strands — far beyond any realistic rapid-migration regime (audit
+2026-06-15, **EPS-01**; K was widened 4 → 16 and the slide made multi-step, with
+`MAX_ROUTES` raised to preserve session capacity).
 
 **Bootstrap.** The handshake runs over a random bootstrap `ConnId` (the chain
 secret is unavailable until the handshake completes). On completion both sides

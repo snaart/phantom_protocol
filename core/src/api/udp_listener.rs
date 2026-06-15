@@ -165,11 +165,14 @@ impl Drop for PhantomUdpListener {
 }
 
 /// Hard upper bound on concurrent demux routes (H-1 backstop). One route exists per
-/// in-flight handshake or established session; reaping keeps the steady-state size near the
-/// in-flight ceiling, and this cap bounds memory even if reaping ever lagged. A fresh-CID
-/// spray cannot grow the map past this — excess `Initial`s are dropped (the peer
-/// retransmits). Sized well above any realistic concurrent-session count.
-const MAX_ROUTES: usize = 1 << 16;
+/// in-flight handshake, plus — once established — a session's rotating-CID **window**
+/// of `CID_WINDOW_TRAILING + CID_WINDOW_LEADING + 1` (= 19) routes (ε / WIRE v5).
+/// Reaping keeps the steady-state size near the in-flight ceiling, and this cap bounds
+/// memory even if reaping ever lagged. A fresh-CID spray cannot grow the map past this —
+/// excess `Initial`s are dropped (the peer retransmits). `1 << 18` (raised from `1 << 16`
+/// when EPS-01 widened the per-session window 7→19) preserves the concurrent-session
+/// capacity: `(1 << 18) / 19 ≈ 13.8k` live sessions, above the prior `(1 << 16) / 7 ≈ 9.4k`.
+const MAX_ROUTES: usize = 1 << 18;
 
 /// ε / WIRE v5: a session's inbound rotating-CID window paired with its inbound
 /// channel — the payload the handshake task sends the demux to install the

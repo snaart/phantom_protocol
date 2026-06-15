@@ -316,11 +316,11 @@ fn v5_session_cid_chain_outbound_matches_peer_inbound_window() {
     assert_eq!(client_window[0], server_cid0);
 
     // At index 0 the window is the leading lookahead (trailing saturates at 0):
-    // K + 1 = 5 CIDs (indices 0..=4).
+    // K + 1 = 17 CIDs (indices 0..=16, with K = CID_WINDOW_LEADING = 16 — EPS-01).
     assert_eq!(
         server_window.len(),
-        5,
-        "leading window is K+1 = 5 CIDs at start"
+        17,
+        "leading window is K+1 = 17 CIDs at start (K = 16)"
     );
 }
 
@@ -721,6 +721,36 @@ fn eps_replay_rejected_across_cid_rotation() {
         ),
     }
     assert_eq!(server.replay_rejected_total(), 1);
+}
+
+/// EPS-01 (multi-step window slide) — a forward `path_id` jump of `d > 1` (the
+/// peer migrated d times but only the d-th packet was delivered + AEAD-verified)
+/// must advance the inbound CID demux window by the **full delta `d`** — registering
+/// `d` new leading CIDs — so the window recenters on the peer's actual migration
+/// index instead of lagging by one. The pre-fix single-step slide advanced only +1,
+/// so repeated lossy migrations cumulatively eroded the leading window until the
+/// peer's CID fell out of it and the session stranded (audit 2026-06-15, EPS-01).
+#[test]
+fn eps01_multistep_path_jump_slides_window_by_the_full_delta() {
+    let (_client, server) = make_session_pair([0x3Cu8; 32]);
+    let slide = server
+        .note_migration_path(5)
+        .expect("a forward path_id jump must slide");
+    assert_eq!(
+        slide.add.len(),
+        5,
+        "a 5-step path_id jump must add 5 leading CIDs (multi-step slide), not 1 (single-step lag)"
+    );
+    // The window now centers on index 5 (highest_seen advanced to 5), so a
+    // subsequent single migration to index 6 is a clean +1 step.
+    let next = server
+        .note_migration_path(6)
+        .expect("the next migration slides");
+    assert_eq!(
+        next.add.len(),
+        1,
+        "a subsequent +1 migration adds exactly 1 leading CID"
+    );
 }
 
 /// Nonce-from-header property — a tampered packet that fails AEAD
