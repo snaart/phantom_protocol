@@ -1024,7 +1024,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 27162.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 14331.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -2921,10 +2921,42 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
     companion object {
         
     /**
-     * Create a new session — returns instantly.
+     * Create a placeholder session — returns instantly and performs **no**
+     * handshake.
      *
-     * Handshake is not started until a transport is provided.
-     * Use `connect_with_transport()` for full integration.
+     * # ⚠️ This does not connect
+     *
+     * Despite the name, this constructor never opens a transport, never runs
+     * the PQC handshake, and never spawns the background data pump. It returns
+     * an inert shell stuck in [`ConnectionState::Connecting`]: any `send()`
+     * only queues into an in-memory buffer that is never flushed, and `recv()`
+     * never yields application bytes. **No bytes ever reach the network.** It
+     * exists only as a pre-handshake placeholder from an earlier API shape.
+     *
+     * **Deprecated — use a real entry point instead:**
+     * - [`PhantomSession::connect_with_transport`] (Rust) — supply a
+     * `SessionTransport` and the pinned `expected_server_key`; this spawns
+     * the handshake + pump.
+     * - [`connect_pinned`] (native FFI / mobile) — one-shot TCP connect with a
+     * pinned key.
+     *
+     * # Why no `#[deprecated]` attribute (T5.7)
+     *
+     * A `#[deprecated]` attribute would be the natural way to flag this, but it
+     * **cannot** be applied here: this constructor is `#[uniffi::constructor]`,
+     * and UniFFI 0.31 emits FFI scaffolding that calls `Self::connect()` from
+     * generated code in this same crate. That generated call would trip the
+     * `deprecated` lint, which CI promotes to a hard error under
+     * `clippy --lib -D warnings` — and no item-scoped `#[allow(deprecated)]`
+     * reaches the macro-generated call site (only a module-wide
+     * `#![allow(deprecated)]` would, which would silently mask every *future*
+     * genuine deprecation across this module). So the deprecation is documented
+     * loudly here instead. UniFFI copies this doc-comment into the generated
+     * Python / Swift / Kotlin docstrings (the C header carries no docstrings),
+     * so they were regenerated and committed alongside this change — the
+     * `bindings` `drift` CI job stays green. See
+     * `tests::deprecated_connect_is_inert_and_sends_no_bytes` for the regression
+     * pinning the inert behaviour.
      */ fun `connect`(`peerAddr`: kotlin.String): PhantomSession {
             return FfiConverterTypePhantomSession.lift(
     uniffiRustCall() { _status ->
