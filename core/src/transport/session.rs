@@ -74,6 +74,24 @@ const _: () = assert!(REKEY_SOFT_LIMIT < AEAD_MAX_INVOCATIONS);
 /// always 0 or 1.
 pub const MAX_REKEY_CATCHUP: u8 = 16;
 
+/// Reserved `path_id` for validating a **passive** NAT rebind (M-3).
+///
+/// A passive rebind (the peer's source address changes without it calling
+/// `migrate()`) keeps `path_id = 0` — the implicit, permanently-`Validated`
+/// handshake path. Because path 0 is always Validated, the path-id-gated
+/// challenge logic would skip it and the new source would never be validated,
+/// promoted, or used for the downstream direction (a stall). The server detects
+/// the rebind by *address* (an AEAD-authenticated frame whose source differs
+/// from the established peer) and challenges that candidate on this dedicated
+/// reserved id, which the registry can take through `Validating → Validated`
+/// independently of the always-Validated path 0.
+///
+/// This id is carved permanently out of the active-migration id space:
+/// [`Session::next_migration_path_id`] never returns it (it wraps `254 → 1`,
+/// skipping both `0` and `255`), so a client-driven migration and a passive
+/// rebind can never share this registry slot.
+pub const REBIND_VALIDATION_PATH_ID: u8 = 255;
+
 /// Crypto state for session encryption.
 ///
 /// On drop, `session_key` is zeroed. The wrapped [`CryptoSession`] holds AEAD
@@ -899,6 +917,16 @@ impl Session {
         }
     }
 
+    /// Remove a path from the registry so its id becomes re-registerable (D5 —
+    /// Phase 4). Used by the M-3 passive-rebind flow to retire the reserved
+    /// validation id after a successful promotion, so a later rebind can re-issue a
+    /// fresh challenge on it (a `Validated` path would otherwise refuse a new
+    /// challenge). No-op for unknown ids. Reuse is nonce-safe because ① took
+    /// `path_id` out of the AEAD nonce.
+    pub(crate) fn retire_path(&self, path_id: u8) {
+        self.path_registry.retire(path_id);
+    }
+
     /// Verify a peer's `PATH_VALIDATION` response. Returns `true` if
     /// the response matches the in-flight challenge (path is now
     /// `Validated`). Returns `false` otherwise — the path may have
@@ -1020,16 +1048,20 @@ impl Session {
     /// Called on each `migrate()`/rebind so the peer's source-change detector sees a
     /// new path label and issues a PATH_CHALLENGE. Never returns 0 — that id is
     /// permanently the always-Validated handshake path, so reusing it would make the
-    /// peer skip the challenge and the switch could never fire. Wraps 255 → 1. Reuse
-    /// of a retired id is nonce-safe because ① took `path_id` out of the AEAD nonce
-    /// (`nonce = nonce_prefix ‖ packet_number`).
+    /// peer skip the challenge and the switch could never fire. Also never returns
+    /// [`REBIND_VALIDATION_PATH_ID`] (`255`), reserved for the M-3 passive-rebind
+    /// challenge — sharing that slot would let an active-migration echo and a
+    /// passive-rebind echo resolve each other's registry entry. Wraps `254 → 1`.
+    /// Reuse of a retired id is nonce-safe because ① took `path_id` out of the AEAD
+    /// nonce (`nonce = nonce_prefix ‖ packet_number`).
     pub fn next_migration_path_id(&self) -> u8 {
         // migrate() is embedder-driven and not concurrent, but a CAS loop keeps the
-        // "never 0" invariant correct even under a racing caller.
+        // "never 0 / never reserved" invariant correct even under a racing caller.
         loop {
             let cur = self.send_path_id.load(Ordering::SeqCst);
+            // Skip 0 (handshake path) and REBIND_VALIDATION_PATH_ID (reserved).
             let next = match cur.wrapping_add(1) {
-                0 => 1,
+                0 | REBIND_VALIDATION_PATH_ID => 1,
                 n => n,
             };
             if self

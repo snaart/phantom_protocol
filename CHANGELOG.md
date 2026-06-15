@@ -42,6 +42,20 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Security
 
+- **Autonomous passive-NAT-rebind recovery (M-3):** a live PhantomUDP session now recovers from a
+  **passive NAT rebind** — the peer's source address changes *without* the client calling `migrate()`,
+  so its `path_id` stays `0` (the always-`Validated` handshake path) — with no embedder action and no
+  re-handshake. Previously the server's path-validation challenge was path-id-gated, so it skipped the
+  Validated path 0, never challenged the new authenticated source, never promoted it, and kept sending the
+  downstream (server→client) direction to the old, now-dead address → the reliable stream stalled
+  (upstream already survived via PATH-001b recv-relax). Detection is now **address-driven**: an
+  AEAD-authenticated frame from a new source on a Validated path is challenged on a reserved validation
+  `path_id` (`REBIND_VALIDATION_PATH_ID`, carved out of the active-migration id space), validated from the
+  claimed address, promoted, and the server's downstream follows. Anti-spoof is preserved exactly as for an
+  active migration: the candidate is committed only from an AEAD-authenticated source (M-1), the challenge
+  goes only to that address under the 3× anti-amplification cap (RFC 9000 §8.2), and the peer swaps only on
+  a valid echo. The reserved id is retired after promotion so a later rebind re-challenges from scratch.
+  **No wire change.**
 - **Unlinkable migration — CID collapse + rotation (ε; `WIRE_VERSION` 4→5, breaking):** the data-plane
   packet header drops the inner 32-byte `session_id` from the wire entirely (47→15 bytes — it stays in the
   AEAD AAD, reconstructed from session context, so the AEAD binding is byte-identical to v4), and the single
