@@ -284,7 +284,7 @@ Source: `core/src/transport/types.rs:74-107`.
 | `0x0080` | `CONTROL` | Handshake / migration control message |
 | `0x0100` | `REKEY` | Sender rekeyed; receiver trial-decrypts at `header.epoch` and commits the ratchet on AEAD success (§ 5) |
 | `0x0200` | `PATH_VALIDATION` | Payload is a 32-byte challenge / response (multi-path) |
-| `0x0400` | `COALESCED` | Payload bundles inner packets as `[count: u16][len1: u16][p1]…` |
+| `0x0400` | `COALESCED` | Payload bundles inner packets as `[count: u16][len1: u16][p1]…` (full byte layout — § 4.5) |
 | `0x0800` | `WINDOW_UPDATE` | Payload is a big-endian `u32` relative flow-control credit (per-stream; the receiver grants the sender an additional `u32` bytes that is added to the sender's send window, saturating at `MAX_SEND_WINDOW`) |
 | `0x1000` … `0x8000` | _reserved_ | Future amendments |
 
@@ -293,9 +293,10 @@ every application-data packet, and the receive loop drops any non-empty
 unencrypted application-data packet as a stripped-flag downgrade attempt
 (Invariant 2; `api/session.rs`). ACK packets are **authenticated control frames**
 (H1): they carry `ENCRYPTED | ACK`, and their AEAD plaintext is a **`Sack`**
-(`core/src/transport/sack.rs`) — `largest_acked: u32 be`, `ack_delay_us: u32 be`
-(the live ACK-delay signal, since A.5 moved it out of the header), and a list of
-inclusive received ranges (selective ACK). The receiver acts on them **only after
+(`core/src/transport/sack.rs`; full byte layout — § 4.5) — `largest_acked: u32 be`,
+`ack_delay_us: u32 be` (the live ACK-delay signal, since A.5 moved it out of the
+header), and a list of inclusive received ranges (selective ACK). The receiver
+acts on them **only after
 AEAD verify** — so a forged or plaintext ACK can neither retire a pending segment,
 restore a flow-control permit, poison the BBR estimator, nor close a stream. Every
 inbound frame is additionally bound to the negotiated `session_id` before any
@@ -310,6 +311,71 @@ identifier, used as encryption salt and for migration across IP changes.
 Server-side it is derived as `SHA256(b"phantom-session-id-v1" || shared_secret
 || client_nonce)` (`transport/handshake.rs:830-836`); the client adopts the
 `session_id` echoed in the `ServerHello`.
+
+### 4.5 AEAD-plaintext payload codecs (SACK / reliable frame / COALESCED)
+
+These three are the **AEAD plaintext** that lives *inside* `PhantomPacket.payload`
+once the AEAD opens — they are NOT the frozen outer `PhantomPacket` container
+(§ 4.1) and changing them does **not** require a `WIRE_VERSION` bump or invalidate
+`core/tests/wire_vectors`. They are authenticated (inside the AEAD) and invisible
+on the wire. All integers are big-endian, matching the rest of the codec.
+
+**SACK — the ACK control-frame plaintext** (`core/src/transport/sack.rs`).
+Carried as the plaintext of an `ENCRYPTED | ACK` packet (§ 4.3). The ranges are
+inclusive `(low, high)` runs of acknowledged reliable `stream_offset`s (the
+reliable stream-frame index defined below in this section), sorted **descending**
+(highest first), non-overlapping and non-adjacent;
+there is always ≥ 1 range. Lengths use a **"length − 1"** convention, so a
+single-acked offset encodes as `len = 0`.
+
+| Offset | Field | Width | Encoding |
+| --- | --- | --- | --- |
+| 0 | `largest_acked` | 4 | u32 big-endian — highest acked offset; `= ranges[0].high` |
+| 4 | `ack_delay_us` | 4 | u32 big-endian — sender-measured ACK delay (µs) |
+| 8 | `range_count` | 2 | u16 big-endian — `1 ≤ N ≤ MAX_SACK_RANGES (32)` |
+| 10 | `first_len` | 4 | u32 big-endian — width − 1 of the first (highest) range; `first_low = largest_acked − first_len` |
+| 14 | `gap, len` × (N − 1) | 8 each | two u32 big-endian per continuation: `gap` = unacked sequences below the previous range (≥ 1), `len` = width − 1; `high_i = prev_low − 1 − gap`, `low_i = high_i − len` |
+
+Minimum wire size = `10 + 4 + 8 × (N − 1)`: 14 bytes for one range, 22 for two.
+`from_wire` rejects `range_count == 0` / `> 32` (`Malformed` / `TooManyRanges`),
+a `gap == 0` (adjacent ranges — sender must coalesce), and any gap/len that
+underflows the sequence space (`Malformed`); a buffer shorter than the declared
+ranges is `Truncated`. The peer acts on a SACK **only after AEAD verify** (H1).
+
+**Reliable stream-frame plaintext** (`api/session.rs` send path; recv at
+`api/session.rs` reliable branch). A packet whose `flags` carry `RELIABLE`
+(§ 4.3) prepends a gap-free per-stream offset to the application bytes so the
+receiver reassembles in send order regardless of the `sequence` holes left by
+interleaved control frames (A.5). Unreliable / control frames carry **no** prefix.
+
+| Offset | Field | Width | Encoding |
+| --- | --- | --- | --- |
+| 0 | `stream_offset` | 4 | u32 big-endian — gap-free per-stream reassembly index |
+| 4 | `data` | variable | the application payload bytes |
+
+A reliable frame shorter than the 4-byte prefix is dropped as malformed (never a
+panic). The `u32` offset space fails closed on exhaustion (`StreamError`; T4.5) —
+it never wraps.
+
+**`COALESCED` bundle plaintext** (`core/src/transport/packet_coalescer.rs`,
+wrapped via `packet_coalescer_codec.rs`). A packet with `COALESCED` set (§ 4.3)
+carries several inner sub-payloads under **one** AEAD tag (one encrypt, one replay
+check, one sequence slot — the inner sub-packets are NOT re-numbered). The bundle
+layout is a 2-byte count followed by length-prefixed sub-payloads:
+
+| Offset | Field | Width | Encoding |
+| --- | --- | --- | --- |
+| 0 | `count` | 2 | u16 big-endian — number of sub-payloads |
+| 2 | `len₁` | 2 | u16 big-endian — length of sub-payload 1 |
+| 4 | `payload₁` | `len₁` | sub-payload 1 bytes |
+| … | `lenᵢ, payloadᵢ` | 2 + `lenᵢ` | repeated `count` times |
+
+`unwrap_coalesced_packet` rejects a payload shorter than the 2-byte header
+(`EmptyOrTruncatedHeader`) and a `count` larger than the number of well-formed
+sub-payloads actually present (`TruncatedSubPacket`). The default coalescer caps a
+flushed bundle at `DEFAULT_MAX_DATAGRAM = 1200` bytes (path-MTU-safe). The decode
+side is wired into the recv pump; the send-side wrap helper is a tested primitive
+not yet driven from the live send path.
 
 ### 4.6 Header protection (T4.6, QUIC RFC 9001 § 5.4)
 
@@ -750,6 +816,23 @@ ignores the early-data. Each ticket authorises exactly one 0-RTT attempt.
 Within that single delivery the application must still treat early-data with
 the standard TLS-1.3 0-RTT discipline — only idempotent operations belong in
 early-data.
+
+> **⚠️ Distributed-deployment caveat (single-cache assumption).** The one-shot
+> guarantee holds **only under a single coherent `SessionCache`** — i.e. one
+> process, or a cluster sharing one authoritative ticket store. `SessionCache` is
+> an in-process bounded-LRU `HashMap` (`core/src/transport/session_cache.rs`); it
+> is **not** replicated or coordinated across nodes. In a horizontally-scaled
+> deployment where each node keeps its **own** cache, an attacker who captures a
+> 0-RTT `ClientHello` can replay it against a *different* node that still holds an
+> unconsumed copy of the same ticket, and that node will accept the early-data a
+> second time — the classic TLS-1.3 0-RTT-across-a-server-farm replay. Mitigations
+> (all deployment-side, none enforced by this library): (a) consistently route a
+> given `resume_session_id` to the same node (sticky / hashed load-balancing); (b)
+> back the cache with a single shared store that performs an atomic
+> compare-and-remove on resume; or (c) accept the residual and keep early-data
+> strictly idempotent. The forward secrecy and authentication of the resulting
+> *post-handshake* session are unaffected — only the at-most-once property of the
+> 0-RTT early-data payload degrades. See the threat-model (STRIDE-S / LINDDUN).
 
 **Best-effort semantics (Invariant 9).** The handshake **always** completes (as
 1-RTT) even when early-data is rejected — unknown/expired ticket, oversized
