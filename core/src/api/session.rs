@@ -2287,10 +2287,42 @@ impl PhantomSession {
 
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 impl PhantomSession {
-    /// Create a new session — returns instantly.
+    /// Create a placeholder session — returns instantly and performs **no**
+    /// handshake.
     ///
-    /// Handshake is not started until a transport is provided.
-    /// Use `connect_with_transport()` for full integration.
+    /// # ⚠️ This does not connect
+    ///
+    /// Despite the name, this constructor never opens a transport, never runs
+    /// the PQC handshake, and never spawns the background data pump. It returns
+    /// an inert shell stuck in [`ConnectionState::Connecting`]: any `send()`
+    /// only queues into an in-memory buffer that is never flushed, and `recv()`
+    /// never yields application bytes. **No bytes ever reach the network.** It
+    /// exists only as a pre-handshake placeholder from an earlier API shape.
+    ///
+    /// **Deprecated — use a real entry point instead:**
+    /// - [`PhantomSession::connect_with_transport`] (Rust) — supply a
+    ///   `SessionTransport` and the pinned `expected_server_key`; this spawns
+    ///   the handshake + pump.
+    /// - [`connect_pinned`] (native FFI / mobile) — one-shot TCP connect with a
+    ///   pinned key.
+    ///
+    /// # Why no `#[deprecated]` attribute (T5.7)
+    ///
+    /// A `#[deprecated]` attribute would be the natural way to flag this, but it
+    /// **cannot** be applied here: this constructor is `#[uniffi::constructor]`,
+    /// and UniFFI 0.31 emits FFI scaffolding that calls `Self::connect()` from
+    /// generated code in this same crate. That generated call would trip the
+    /// `deprecated` lint, which CI promotes to a hard error under
+    /// `clippy --lib -D warnings` — and no item-scoped `#[allow(deprecated)]`
+    /// reaches the macro-generated call site (only a module-wide
+    /// `#![allow(deprecated)]` would, which would silently mask every *future*
+    /// genuine deprecation across this module). So the deprecation is documented
+    /// loudly here instead. UniFFI copies this doc-comment into the generated
+    /// Python / Swift / Kotlin docstrings (the C header carries no docstrings),
+    /// so they were regenerated and committed alongside this change — the
+    /// `bindings` `drift` CI job stays green. See
+    /// `tests::deprecated_connect_is_inert_and_sends_no_bytes` for the regression
+    /// pinning the inert behaviour.
     #[cfg_attr(feature = "bindings", uniffi::constructor)]
     pub fn connect(peer_addr: String) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -2898,6 +2930,52 @@ mod tests {
         assert_eq!(session.connection_state(), ConnectionState::Connecting);
         assert!(!session.is_data_ready());
         assert_eq!(session.peer_addr(), "example.com:443");
+    }
+
+    /// **T5.7 regression — the inert `connect()` performs no handshake and
+    /// sends no bytes.** The constructor is documented as deprecated (no
+    /// `#[deprecated]` attribute is possible — see the doc-comment for why), so
+    /// this test pins the inert contract the doc promises: the session is stuck
+    /// in `Connecting`, every `send()` only piles into the in-memory queue (no
+    /// transport / pump exists to flush it), and `recv()` never yields. If a
+    /// future change ever wires a real pump into this constructor, this test
+    /// must be updated alongside the doc — the two must not drift apart.
+    #[tokio::test]
+    async fn deprecated_connect_is_inert_and_sends_no_bytes() {
+        let session = PhantomSession::connect("example.com:443".to_string());
+
+        // Inert: never leaves the pre-handshake state on its own.
+        assert_eq!(session.connection_state(), ConnectionState::Connecting);
+        assert!(!session.is_data_ready());
+        assert!(!session.is_pqc_ready());
+
+        // Every send while inert only queues — it never reaches a transport,
+        // because no transport / data pump was ever spawned.
+        session.send(b"first".to_vec()).await.unwrap();
+        session.send(b"second".to_vec()).await.unwrap();
+        assert_eq!(
+            session.queued_count().await,
+            2,
+            "inert connect() must buffer sends in memory, never flush them to a wire"
+        );
+
+        // The session is STILL inert after sending — no background task moved
+        // the state forward, so the bytes are still sitting in the queue.
+        assert_eq!(session.connection_state(), ConnectionState::Connecting);
+
+        // recv() must never deliver application bytes — no pump feeds the recv
+        // channel, and the inert constructor drops the channel's sender at once,
+        // so recv() resolves to an error rather than any data. A short timeout
+        // bounds the wait and proves recv() does not yield a payload.
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(50), session.recv()).await;
+        match recv {
+            Ok(Err(_)) => { /* expected: "session closed" — never any bytes */ }
+            Ok(Ok(bytes)) => panic!(
+                "inert connect() must never deliver received data, got {} bytes",
+                bytes.len()
+            ),
+            Err(_elapsed) => { /* also acceptable: recv blocked the whole window */ }
+        }
     }
 
     #[tokio::test]

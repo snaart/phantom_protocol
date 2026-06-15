@@ -128,6 +128,8 @@ process is a weaker boundary (we trust the caller and the OS).
 | Adversary forges a `ClientHello` to spoof an IP | Cookie + adaptive PoW; cookie is HMAC(rotating-secret, ip, bucket) so forgery requires the secret | `core/src/transport/handshake.rs:402-475` |
 | Replay of an old, captured `ServerHello` to a fresh client | Transcript signature binds `client_hello.nonce` and `session_id_bytes`; replay fails signature check | `core/src/transport/handshake.rs:201-204, 320-326` |
 | Connection-migration hijack: a known (plaintext) `session_id`/CID replayed from a spoofed source to steal the session | Path validation — a fresh unguessable 32-byte challenge must be echoed *from* the claimed address (only the session-key holder can), constant-time verified, before the server switches its peer; pinned-key AEAD blocks read/inject. Worst achievable is a **redirection-DoS**, **never** hijack/decrypt (the QUIC §9 boundary) | `core/src/transport/path.rs`, `core/src/api/session.rs`, `PROTOCOL.md` §12 |
+| 0-RTT early-data replay against a **single** server | `SessionCache::try_resume` removes the resumption ticket on first lookup (Invariant 9), so a replayed `ClientHello` finds no ticket and the server falls back to a 1-RTT handshake that ignores the early-data | `core/src/transport/session_cache.rs::try_resume`, `PROTOCOL.md` §6.6 |
+| 0-RTT early-data replay against a **different node** (horizontal scale-out) | **Residual — not fully mitigated by the library.** The one-shot guarantee holds only under a *single coherent* `SessionCache`; it is an in-process LRU, not replicated. A horizontally-scaled deployment with per-node caches lets an attacker replay a captured 0-RTT `ClientHello` against a node that still holds an unconsumed copy of the same ticket, accepting the early-data a second time (the classic TLS-1.3 0-RTT-across-a-server-farm replay). Deployment-side mitigations: sticky/hashed routing of a `resume_session_id` to one node, a shared store with atomic compare-and-remove on resume, or keeping early-data idempotent. The post-handshake session's PFS + auth are unaffected — only the at-most-once property of the early-data payload degrades. | `core/src/transport/session_cache.rs` (in-process LRU), `PROTOCOL.md` §6.6 |
 
 ### T â Tampering with data
 
@@ -232,6 +234,20 @@ and the specialist docs in this directory. Cross-reference quick map:
   fix is tracked (audit 2026-06-15, EPS-02). Caveat: the CID chain is not
   forward-secret (a session-key compromise relinks a recorded flow); the payload
   stays forward-secret.
+- **0-RTT early-data is one-shot only under a single coherent cache.**
+  `SessionCache::try_resume` removes the resumption ticket on first lookup
+  (Invariant 9), which defeats replay against a single server. The cache is an
+  in-process bounded-LRU `HashMap` (`core/src/transport/session_cache.rs`), **not**
+  replicated across nodes — so a horizontally-scaled deployment with per-node
+  caches has a residual: an attacker who captures a 0-RTT `ClientHello` can replay
+  it against a *different* node that still holds an unconsumed copy of the same
+  ticket, re-running the early-data once more (the classic TLS-1.3
+  0-RTT-across-a-server-farm replay). Mitigation is deployment-side and not
+  enforced by the library: route a `resume_session_id` consistently to one node
+  (sticky/hashed LB), back the cache with a single shared store doing an atomic
+  compare-and-remove on resume, or keep early-data strictly idempotent. The
+  post-handshake session's forward secrecy and authentication are unaffected — only
+  the at-most-once property of the early-data payload degrades (PROTOCOL.md §6.6).
 - No protection against side-channel cryptanalysis of the AEAD itself.
   Rely on ring / dalek / RustCrypto (`ml-kem`, `ml-dsa`) upstream
   constant-time properties.
@@ -251,3 +267,4 @@ and the specialist docs in this directory. Cross-reference quick map:
 | 2026-06-15 | EPS-02 fix | Symmetric CID rotation for a **client** migration: the server now rotates its s2c chain on authenticating the client's new path_id (post-AEAD), so a client move is unlinkable in **both** directions (the socket-routed client absorbs the new inbound CID; no ping-pong — the server does not bump its own path_id). LINDDUN-L is now **closed for client migration**; the residual is a *server*-initiated migration (c2s stays stable — the client does not rotate-on-detect, which would strand it in the server's un-sliding c2s window). EPS-01 (the >K-generation strand) remains tracked. |
 | 2026-06-15 | EPS-01 fix | Robust migration window: the inbound CID demux slide is now **multi-step** (advances by the authenticated path_id forward delta, recentring on the sender's actual migration index — no cumulative lag) and the leading window **K is widened 4 → 16**, so only an unbroken run of > 16 consecutive fully-lost migrations strands the c2s data plane (recoverable by reconnect). `MAX_ROUTES` raised 1<<16 → 1<<18 to preserve concurrent-session capacity. Availability only; no security-invariant change. |
 | 2026-06-15 | T5.2 doc-honesty | Rewrote §8 + the A4 asset row to reflect shipped reality: mid-session HKDF rekey **ships** (was "blocked on V2 wire format"). Stated its forward-secrecy honestly — **past-epoch FS only, NO post-compromise security** (the deterministic forward ratchet means a live `traffic_secret` yields all future epochs; healing needs a re-handshake). No code change. |
+| 2026-06-15 | T5.7 doc-honesty | Documented the **0-RTT distributed-cache replay caveat**: the one-shot anti-replay (Invariant 9) holds only under a single coherent `SessionCache` (an in-process LRU, not replicated), so a horizontally-scaled deployment with per-node caches lets an attacker replay a captured 0-RTT `ClientHello` against a different node — added STRIDE-S rows + a §8 limitation; deployment-side mitigations only. Also PROTOCOL.md §6.6. No code change. |
