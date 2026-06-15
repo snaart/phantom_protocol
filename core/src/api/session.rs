@@ -3514,6 +3514,163 @@ mod tests {
         assert_eq!(client_session.current_send_path_id(), 2);
     }
 
+    /// ε / WIRE v5 (audit V-1 / Invariant 4) — the inbound CID-window slide is
+    /// signalled ONLY from the post-AEAD path. A forged packet that fails AEAD —
+    /// even one carrying a NEW forward `path_id` (the migration signal) — must not
+    /// advance the inbound CID window or emit a `CidSlide`. This pins that an
+    /// off-path attacker (who cannot produce a valid tag) cannot push the demux
+    /// window; a future refactor that hoists the slide above the AEAD gate fails here.
+    #[tokio::test]
+    async fn eps_slide_requires_aead_success() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+
+        // Install the demux slide channel and snapshot the inbound CID window.
+        let (slide_tx, mut slide_rx) = mpsc::unbounded_channel();
+        server_session.set_cid_slide_tx(slide_tx);
+        let window_before = server_session.inbound_window_cids();
+
+        // A valid frame on a NEW path_id (1, the migration signal), then corrupt
+        // the ciphertext so AEAD verification fails. The header stays intact.
+        let stream_id: TransportStreamId = 1;
+        let frame =
+            build_app_frame_on_path(&client_session, session_id, stream_id, 0, 0, 1, b"forged");
+        let mut pkt = decode_recv_frame(&frame, session_id);
+        assert!(!pkt.payload.is_empty(), "ciphertext present to corrupt");
+        pkt.payload[0] ^= 0xFF; // tamper → AEAD open fails
+
+        run_recv(pkt, session_id, &server_session, &streams).await;
+
+        assert!(
+            slide_rx.try_recv().is_err(),
+            "a forged (AEAD-failing) packet must emit no CidSlide"
+        );
+        assert_eq!(
+            server_session.inbound_window_cids(),
+            window_before,
+            "the inbound CID window must not advance on a forged packet (slide is post-AEAD)"
+        );
+    }
+
+    use std::sync::atomic::AtomicBool;
+
+    /// Records each `SessionTransport` control method the inner transport receives,
+    /// for the [`observed_transport_forwards_all_control_methods`] tripwire.
+    #[derive(Default)]
+    struct ControlRecorder {
+        set_frame_phase: AtomicBool,
+        set_outbound_cid: std::sync::Mutex<Option<[u8; 8]>>,
+        has_migration_candidate: AtomicBool,
+        send_to_candidate: AtomicBool,
+        confirm_authenticated_source: AtomicBool,
+        promote_candidate: AtomicBool,
+        migrate: std::sync::Mutex<Option<String>>,
+    }
+
+    struct RecordingTransport {
+        rec: Arc<ControlRecorder>,
+    }
+
+    impl SessionTransport for RecordingTransport {
+        async fn send_bytes(&self, _data: &[u8]) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
+            Ok(Bytes::new())
+        }
+        fn set_frame_phase(&self, _phase: FramePhase) {
+            self.rec.set_frame_phase.store(true, Ordering::SeqCst);
+        }
+        fn set_outbound_cid(&self, cid: [u8; 8]) {
+            *self.rec.set_outbound_cid.lock().unwrap() = Some(cid);
+        }
+        fn has_migration_candidate(&self) -> bool {
+            self.rec
+                .has_migration_candidate
+                .store(true, Ordering::SeqCst);
+            true
+        }
+        async fn send_to_candidate(&self, _data: &[u8]) -> Result<bool, CoreError> {
+            self.rec.send_to_candidate.store(true, Ordering::SeqCst);
+            Ok(true)
+        }
+        fn confirm_authenticated_source(&self) {
+            self.rec
+                .confirm_authenticated_source
+                .store(true, Ordering::SeqCst);
+        }
+        fn promote_candidate(&self) -> bool {
+            self.rec.promote_candidate.store(true, Ordering::SeqCst);
+            true
+        }
+        async fn migrate(&self, local_addr: String) -> Result<(), CoreError> {
+            *self.rec.migrate.lock().unwrap() = Some(local_addr);
+            Ok(())
+        }
+    }
+
+    /// ε / WIRE v5 (audit V-3 / EPS-03 / EPS-04) — `ObservedTransport` must forward
+    /// EVERY `SessionTransport` control method to the inner transport, not just
+    /// send/recv. A method left on the trait default silently no-ops — the bug that
+    /// made the pre-ε FFI `migrate()` vacuous and linkable. This always-on tripwire
+    /// pins the full control surface without UDP loopback: a dropped forward, or a
+    /// future-added trait method the wrapper forgets, fails an assertion here.
+    #[tokio::test]
+    async fn observed_transport_forwards_all_control_methods() {
+        let rec = Arc::new(ControlRecorder::default());
+        let observed = ObservedTransport::new(
+            RecordingTransport { rec: rec.clone() },
+            Observability::new(ObservabilityConfig::default()),
+            LegType::Udp,
+        );
+
+        observed.set_frame_phase(FramePhase::Established);
+        observed.set_outbound_cid([7u8; 8]);
+        assert!(observed.has_migration_candidate());
+        assert!(observed
+            .send_to_candidate(b"challenge")
+            .await
+            .expect("send_to_candidate"));
+        observed.confirm_authenticated_source();
+        assert!(observed.promote_candidate());
+        observed
+            .migrate("127.0.0.1:0".to_string())
+            .await
+            .expect("migrate");
+
+        assert!(
+            rec.set_frame_phase.load(Ordering::SeqCst),
+            "set_frame_phase not forwarded"
+        );
+        assert_eq!(
+            *rec.set_outbound_cid.lock().unwrap(),
+            Some([7u8; 8]),
+            "set_outbound_cid not forwarded"
+        );
+        assert!(
+            rec.has_migration_candidate.load(Ordering::SeqCst),
+            "has_migration_candidate not forwarded"
+        );
+        assert!(
+            rec.send_to_candidate.load(Ordering::SeqCst),
+            "send_to_candidate not forwarded"
+        );
+        assert!(
+            rec.confirm_authenticated_source.load(Ordering::SeqCst),
+            "confirm_authenticated_source not forwarded"
+        );
+        assert!(
+            rec.promote_candidate.load(Ordering::SeqCst),
+            "promote_candidate not forwarded"
+        );
+        assert_eq!(
+            rec.migrate.lock().unwrap().as_deref(),
+            Some("127.0.0.1:0"),
+            "migrate not forwarded"
+        );
+    }
+
     #[test]
     fn migration_path_id_never_collides_with_the_handshake_path() {
         // The migration counter must never hand back path_id 0 — that id is

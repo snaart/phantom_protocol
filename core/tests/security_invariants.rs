@@ -664,6 +664,65 @@ fn replay_window_rejects_duplicate_sequence() {
     assert_eq!(server.replay_rejected_total(), 1);
 }
 
+/// ε / WIRE v5 (audit EPS / V-2) — a CID rotation must open **no** replay hole.
+/// The rotating-CID chain and the replay window are orthogonal: rotating the
+/// outbound CID (`advance_outbound_cid`) or sliding the inbound window
+/// (`note_migration_path`, a peer-migration signal) touches only the CID
+/// counters, never the per-direction `u64` packet number or the sliding
+/// `ReplayWindow`. So a packet replayed *across* a migration boundary still
+/// carries its original `(stream_id, sequence)` and is rejected after AEAD
+/// verify, exactly as before rotation (Invariant 4 — replay after AEAD).
+#[test]
+fn eps_replay_rejected_across_cid_rotation() {
+    use phantom_protocol::CoreError;
+
+    let (client, server) = make_session_pair([0x77u8; 32]);
+    let header = PacketHeader::new(
+        *server.id(),
+        5,
+        9,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
+    );
+    let ct1 = client
+        .encrypt_packet(&header, b"v2-payload", &[])
+        .expect("e1");
+    server
+        .decrypt_packet(&header, &ct1, &[])
+        .expect("first decrypt accepts the sequence");
+    assert_eq!(server.replay_rejected_total(), 0);
+
+    // Rotate the CID on BOTH directions between the accept and the replay: the
+    // client advances its outbound CID, and the server observes the client's
+    // migration and slides its inbound window. Neither resets the replay state.
+    let cid_before = client.current_outbound_cid();
+    let _rotated = client.advance_outbound_cid();
+    let window_before = server.inbound_window_cids();
+    let _slide = server.note_migration_path(1);
+    assert_ne!(
+        client.current_outbound_cid(),
+        cid_before,
+        "outbound CID must actually rotate"
+    );
+    assert_ne!(
+        server.inbound_window_cids(),
+        window_before,
+        "inbound window must actually slide"
+    );
+
+    // The same (stream_id, sequence) is still a replay — rotation opened no hole.
+    let ct2 = client
+        .encrypt_packet(&header, b"v2-payload", &[])
+        .expect("e2");
+    match server.decrypt_packet(&header, &ct2, &[]) {
+        Err(CoreError::ReplayDetected(_)) => { /* expected */ }
+        other => panic!(
+            "expected ReplayDetected after a CID rotation, got {:?}",
+            other.as_ref().map(|_| "Ok").unwrap_or("Err(<other>)")
+        ),
+    }
+    assert_eq!(server.replay_rejected_total(), 1);
+}
+
 /// Nonce-from-header property — a tampered packet that fails AEAD
 /// verification must NOT desync the receiver from the sender. The next
 /// legitimate packet must still decrypt cleanly.

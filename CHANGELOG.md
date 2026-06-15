@@ -32,7 +32,9 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   under model ①. PATH-001 is split into a strict send-gate (app data only to validated paths) and a
   relaxed recv-delivery (authenticated, non-replayed data is delivered regardless of source), so a
   NAT-rebind upload is seamless. Combined with header protection (T4.6, below) and CID collapse +
-  rotation (ε, below), migration is now **unlinkable** by an on-path observer.
+  rotation (ε, below), migration is unlinkable by an on-path observer in the **client→server**
+  direction; the server→client direction retains a stable CID across a client migration (a residual
+  found by the 2026-06-15 ε audit, EPS-02 — see Security below), pending a symmetric-rotation fix.
 - **PhantomUDP (Phase 1):** native datagram `SessionTransport` over raw UDP with connection-ID
   demultiplexing — `PhantomUdpListener` (server accept) plus `UdpClientTransport` / `UdpServerTransport`.
   The multi-KB post-quantum handshake is fragmented to the path MTU and reassembled. No wire-format or
@@ -47,9 +49,11 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   independent-random value on each `migrate()` via a per-direction KDF chain (`CID_i =
   derive_key_32("phantom-cid-v1", cid_secret‖i)[0..8]`), with the server demux routing on a sliding window
   that advances post-AEAD on the peer's authenticated `path_id`. With header protection (T4.6) already
-  masking the variable per-packet metadata, **no stable cleartext identifier remains**, so an on-path /
-  colluding observer can no longer link a session across a network change (LINDDUN-L closed; threat-model
-  §12.5 / PROTOCOL.md §4.7). *Honest caveat:* like the HP keys, the CID chain is session-stable and **not**
+  masking the variable per-packet metadata, the migrating peer's outbound CID rotates — so a **client**
+  migration is unlinkable in the **client→server** direction (LINDDUN-L; threat-model §12.5 / PROTOCOL.md
+  §4.7). *Residual (2026-06-15 audit, EPS-02):* rotation is asymmetric — the **server→client** CID does not
+  rotate on a client migration, so that direction stays linkable to a both-networks observer; a
+  symmetric-rotation fix is tracked. *Honest caveat:* like the HP keys, the CID chain is session-stable and **not**
   forward-secret — a session-key compromise recomputes the chain and relinks a *recorded* flow; the payload
   stays forward-secret. Breaking wire change (no deployed peers): `WIRE_VERSION` 4→5, packet wire-vectors
   regenerated; `PROTOCOL_VERSION` (handshake) unchanged; TCP / embedded (socket-routed) carry no on-wire CID
@@ -57,6 +61,21 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   only forwarded send/recv, silently no-op'ing the FFI `migrate()` and the server-side migration detection
   once wrapped — the wrapper is now fully transparent, so FFI-triggered migration actually rebinds and the
   server follows + slides its CID window.
+- **ε security audit + regression/CI hardening (2026-06-15):** an adversarial multi-agent review of the
+  WIRE-v5 ε surface (`docs/security/audit-report-2026-06-15-wire-v5-epsilon.md`) found **no confidentiality /
+  integrity / authentication regression** — the CID-chain primitive, the off-wire AAD reconstruction, the
+  strictly-post-AEAD window slide, and replay-survives-rotation are all verified sound. It surfaced one
+  **linkability residual** (EPS-02: asymmetric CID rotation — the server→client CID stays stable across a
+  client migration; docs corrected above, fix tracked), one **availability** bound (EPS-01: the single-step
+  window slide strands a sender that gets > K=4 migrations ahead under loss; fix tracked), and a **coverage
+  gap** (EPS-03: no CI job ran the `udp_integration` suite, so a regression to a vacuous/linkable `migrate()`
+  would have passed green CI). This release adds the **always-on `observed_transport_forwards_all_control_methods`
+  tripwire** (pins that every `SessionTransport` control method is forwarded through the pump's wrapper),
+  GREEN invariant pins for the post-AEAD slide (`eps_slide_requires_aead_success`) and replay-across-rotation
+  (`eps_replay_rejected_across_cid_rotation`), a **`udp_integration --ignored` CI gate**, full control-surface
+  forwarding in the test-only `LossyTransport` (the same latent partial-forwarding shape), a loud
+  wrapper-contract note on the `SessionTransport` trait, and a widened `fuzz_aead_decrypt` that now exercises
+  the non-empty-`extensions` AAD branch.
 - **Header protection (T4.6 — QUIC RFC 9001 §5.4):** the 14 variable header bytes — packet number, flags
   (incl. the `PRIORITY`/voice bit), stream id, rekey epoch, and migration path id — are now **XOR-masked on
   the wire**, leaving only `version` + `session_id` (the routing CID) cleartext. A passive on-path observer
