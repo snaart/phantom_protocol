@@ -60,7 +60,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::errors::CoreError;
-use crate::transport::session_transport::SessionTransport;
+use crate::transport::session_transport::{FramePhase, SessionTransport};
 
 /// One SplitMix64 step: advance `*state` and return the mixed output.
 ///
@@ -472,6 +472,33 @@ impl<T: SessionTransport> SessionTransport for LossyTransport<T> {
 
     async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
         self.inner.recv_bytes().await
+    }
+
+    // ε / WIRE v5 (audit EPS-05): a `SessionTransport` wrapper MUST forward the
+    // full control surface, not just send/recv — a partial impl silently no-ops
+    // every control call (the exact bug ε fixed in `ObservedTransport`, where it
+    // made the FFI `migrate()` vacuous). Fault injection only concerns the send
+    // path, so these are pure pass-throughs to the inner transport.
+    fn set_frame_phase(&self, phase: FramePhase) {
+        self.inner.set_frame_phase(phase);
+    }
+    fn set_outbound_cid(&self, cid: [u8; 8]) {
+        self.inner.set_outbound_cid(cid);
+    }
+    fn has_migration_candidate(&self) -> bool {
+        self.inner.has_migration_candidate()
+    }
+    async fn send_to_candidate(&self, data: &[u8]) -> Result<bool, CoreError> {
+        self.inner.send_to_candidate(data).await
+    }
+    fn confirm_authenticated_source(&self) {
+        self.inner.confirm_authenticated_source();
+    }
+    fn promote_candidate(&self) -> bool {
+        self.inner.promote_candidate()
+    }
+    async fn migrate(&self, local_addr: String) -> Result<(), CoreError> {
+        self.inner.migrate(local_addr).await
     }
 }
 

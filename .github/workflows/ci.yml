@@ -287,6 +287,10 @@ jobs:
           echo "server startup smoke OK"
 
   integration:
+    # NOTE: this `name:` is a pinned branch-protection **required status check**
+    # context — do NOT rename it (a rename makes the required context never report
+    # and blocks every merge). The job covers tcp + udp loopback (kcp was dropped
+    # long ago); the legacy "kcp" wording is kept only to match the required context.
     name: tcp + kcp loopback integration
     runs-on: ubuntu-latest
     # Outer guard: even if an in-test deadlock-timeout somehow fails to fire,
@@ -306,3 +310,10 @@ jobs:
       # `cargo test`; this dedicated job runs it with --ignored (mirroring the
       # wasi_integration job).
       - run: cargo test --manifest-path core/Cargo.toml --test tcp_integration -- --ignored
+      # UDP loopback gate (audit EPS-03, 2026-06-15): the PhantomUDP suite —
+      # including the on-wire CID-rotation test that pins ε's unlinkable migration
+      # (`set_outbound_cid` reaching the inner transport through the pump's
+      # ObservedTransport) — was `#[ignore]`-gated with NO runner, so a regression
+      # to a vacuous, linkable `migrate()` would pass a fully green pipeline. Run
+      # it here, mirroring the tcp_integration gate above.
+      - run: cargo test --manifest-path core/Cargo.toml --test udp_integration -- --ignored
