@@ -211,10 +211,36 @@ jobs:
       # aws-lc-rs needs cmake + a C toolchain. ubuntu-latest already
       # ships gcc; install cmake explicitly.
       - run: sudo apt-get update && sudo apt-get install -y cmake
-      - run: cargo test --manifest-path core/Cargo.toml --lib --features fips
-      - run: cargo test --manifest-path core/Cargo.toml --test cavp --features fips
-      - run: cargo test --manifest-path core/Cargo.toml --test nist_kat --features fips
-      - run: cargo clippy --manifest-path core/Cargo.toml --lib --features fips -- -D warnings
+      # `--no-default-features` drops the `default` feature (and with it
+      # `classical-crypto`), so the FIPS build links neither `ring` nor
+      # `x25519-dalek` — the AEAD routes through `aws-lc-rs` and the
+      # classical KEM half through ECDH-P-256 (SUPPLY-03). `bindings`
+      # restores the UniFFI surface that `default` would otherwise carry.
+      - run: cargo test --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd --lib
+      - run: cargo test --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd --test cavp
+      - run: cargo test --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd --test nist_kat
+      - run: cargo clippy --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd --lib -- -D warnings
+      # Supply-chain guard (SUPPLY-03): the FIPS build must NOT link the
+      # non-FIPS `ring` / `x25519-dalek` crates. `cargo tree -i` exits
+      # non-zero ("did not match any packages") when the crate is absent,
+      # which is exactly the success condition here.
+      - name: assert ring + x25519-dalek absent from the fips dep graph
+        run: |
+          set +e
+          cargo tree --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd -i ring >/dev/null 2>&1
+          ring_rc=$?
+          cargo tree --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd -i x25519-dalek >/dev/null 2>&1
+          x25519_rc=$?
+          set -e
+          if [ "$ring_rc" -eq 0 ]; then
+            echo "::error::ring is linked in the fips build — SUPPLY-03 regressed (classical-crypto leaked into the fips path)"
+            exit 1
+          fi
+          if [ "$x25519_rc" -eq 0 ]; then
+            echo "::error::x25519-dalek is linked in the fips build — SUPPLY-03 regressed"
+            exit 1
+          fi
+          echo "ok: neither ring nor x25519-dalek is in the fips dependency graph"
       # Confirm the fips × no-std conflict guard fires loudly rather
       # than silently producing a broken binary.
       - name: assert fips + no-std is rejected

@@ -12,7 +12,17 @@ keywords = ["post-quantum", "transport", "cryptography", "networking", "ml-kem"]
 categories = ["network-programming", "cryptography", "no-std"]
 
 [features]
-default = ["compression-zstd", "std", "bindings"]
+# `classical-crypto` (SUPPLY-03) is folded into `default` so the normal
+# (non-FIPS) build pulls the classical AEAD + KEM substrate (`ring` /
+# `x25519-dalek`). It is intentionally NOT implied by `std`, because the
+# `fips` build also implies `std` and must NOT link them — under
+# `--features fips` the AEAD swaps to `aws-lc-rs` and the classical KEM half
+# swaps to ECDH-P-256, so `ring` and `x25519-dalek` are genuinely unused.
+# A FIPS build therefore drops `default` (`--no-default-features --features
+# fips,...`); every other std build keeps `default` (or, for the
+# `--no-default-features` cross-target rows in cross.yml, names
+# `classical-crypto` explicitly).
+default = ["compression-zstd", "std", "bindings", "classical-crypto"]
 
 # UniFFI bindings surface. Pulled in by `default` so the historical
 # native-FFI consumers (Swift / Kotlin / Python / C bindings under
@@ -59,8 +69,9 @@ std = [
     "dep:anyhow",
     "dep:thiserror",
     "dep:rand",
-    "dep:ring",
-    "dep:x25519-dalek",
+    # NB: `ring` + `x25519-dalek` are NOT listed here — they live behind the
+    # `classical-crypto` feature so the `fips` build (which also implies `std`)
+    # can drop them. See the `classical-crypto` feature below (SUPPLY-03).
     "dep:ed25519-dalek",
     "dep:ml-kem",
     "dep:ml-dsa",
@@ -83,6 +94,18 @@ std = [
     "serde/std",
     "header-protection",
 ]
+
+# Classical (non-FIPS) crypto substrate (SUPPLY-03). Pulls `ring`
+# (HW-accelerated AES-256-GCM + ChaCha20-Poly1305 AEAD) and `x25519-dalek`
+# (the classical half of the hybrid KEM). Folded into `default` rather than
+# `std` on purpose: the `fips` build implies `std` but swaps the AEAD to
+# `aws-lc-rs` and the classical KEM to ECDH-P-256, so it must NOT link these.
+# Keeping them out of `std` lets a FIPS build (`--no-default-features
+# --features fips,...`) drop them entirely (verifiable with
+# `cargo tree --no-default-features --features fips -i ring`). Every non-FIPS
+# std build pulls them via `default`; the `--no-default-features` cross-target
+# rows in `.github/workflows/cross.yml` name `classical-crypto` explicitly.
+classical-crypto = ["dep:ring", "dep:x25519-dalek"]
 
 # Header protection (QUIC RFC 9001 §5.4, T4.6). Pulls the RustCrypto `aes` +
 # `chacha20` mask primitives. Folded into `std` because the data-plane codec
@@ -373,9 +396,13 @@ harness = false
 name = "syn_flood_bench"
 harness = false
 
+# `protocol_comparison` benches the classical `x25519-dalek` keygen directly,
+# so it requires the `classical-crypto` feature (SUPPLY-03) — under `--features
+# fips` that crate is not linked, and the bench is meaningless there anyway.
 [[bench]]
 name = "protocol_comparison"
 harness = false
+required-features = ["classical-crypto"]
 
 [[bench]]
 name = "observability_bench"
@@ -387,6 +414,16 @@ harness = false
 [[example]]
 name = "embedded_demo"
 required-features = ["embedded"]
+
+# `crypto_bench` calls `ring::aead` directly to micro-benchmark the classical
+# AEAD, so it requires the `classical-crypto` feature (SUPPLY-03) — `ring` is
+# not linked under `--features fips`. Declared explicitly (it would otherwise
+# be an auto-discovered example) so the `required-features` gate applies and a
+# `cargo build --examples --features fips` skips it instead of failing to
+# resolve `ring`.
+[[example]]
+name = "crypto_bench"
+required-features = ["classical-crypto"]
 
 # NOTE: `[profile.release]` lives in the workspace root `Cargo.toml`. Declaring
 # release profiles in non-root members is silently ignored by cargo (see warning

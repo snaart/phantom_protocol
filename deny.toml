@@ -6,15 +6,10 @@ all-features = true
 
 [advisories]
 yanked = "deny"
-ignore = [
-    # `rand` unsoundness fires only in a narrow scenario: a custom `log` logger
-    # that calls `rand::rng()` and triggers a reseed mid-log. `rand` IS a runtime
-    # dependency here (e.g. session-id and path-challenge generation), pinned at
-    # the patched 0.8.x; but every production draw is a direct `rand::random()` /
-    # thread-rng call, never from inside a `log` logger, so the aliasing UB is
-    # unreachable on our code paths. The CSPRNG itself is OsRng/getrandom.
-    "RUSTSEC-2026-0097",
-]
+# No advisory ignores currently apply. (The former `RUSTSEC-2026-0097` ignore
+# was removed once it stopped matching any crate in the tree — cargo-deny
+# warns `advisory-not-detected` on a dead ignore, which is itself a failure.)
+ignore = []
 
 [licenses]
 allow = [
