@@ -1994,6 +1994,15 @@ async fn handle_packet<T: SessionTransport>(
                     for s in streams_recv.iter() {
                         s.value().reset_rto();
                     }
+                    // M-3: if this was a passive-rebind validation (the reserved id),
+                    // retire the path so a LATER rebind re-registers it fresh and can
+                    // be challenged again. The reserved id stays Validated otherwise,
+                    // and `begin_path_validation` on a Validated path returns None, so
+                    // the second rebind would never issue a challenge. Active-migration
+                    // ids are left intact (they are retired by their own lifecycle).
+                    if path_id == crate::transport::session::REBIND_VALIDATION_PATH_ID {
+                        crypto_recv.retire_path(path_id);
+                    }
                 }
                 return;
             }
@@ -2054,6 +2063,31 @@ async fn handle_packet<T: SessionTransport>(
             crypto_recv.register_unvalidated_path(path_id);
         }
         // PATH-001b: fall through and deliver the authenticated data below.
+    } else if transport_for_path.has_migration_candidate() {
+        // M-3 (passive NAT rebind): the frame arrived on an already-Validated path —
+        // the path-0 rebind case, where the peer's source address changed WITHOUT it
+        // calling `migrate()`, so it never bumped `path_id`. The active-migration gate
+        // above is skipped (path is Validated), so without this branch the new
+        // authenticated source would never be challenged → never promoted → the
+        // downstream (server→client) direction keeps targeting the OLD, now-dead
+        // address → stall. Detection is therefore ADDRESS-driven, not path-id-driven:
+        // a migration candidate exists only because `confirm_authenticated_source`
+        // committed an AEAD-authenticated source that differs from the established
+        // peer (M-1). We challenge that candidate on the RESERVED validation path-id
+        // (carved out of the migration id space), which the registry can take through
+        // `Validating → Validated` independently of the always-Validated path 0. The
+        // challenge goes ONLY to the candidate (its claimed address), under the same
+        // 3× anti-amplification cap — anti-spoof is preserved exactly as for an active
+        // migration. The peer switch happens later, when the candidate echoes the
+        // challenge (the PATH_VALIDATION completion branch above).
+        let rebind_path = crate::transport::session::REBIND_VALIDATION_PATH_ID;
+        if let Some(challenge) = crypto_recv.begin_path_validation(rebind_path) {
+            if let Some(buf) =
+                encrypt_path_validation(crypto_recv, session_id, rebind_path, challenge)
+            {
+                let _ = transport_for_path.send_to_candidate(&buf).await;
+            }
+        }
     }
 
     // COALESCED dispatch (Phase 2.5): split the decrypted bundle into sub-payloads
@@ -3761,7 +3795,8 @@ mod tests {
         // The migration counter must never hand back path_id 0 — that id is
         // permanently the Validated handshake path on both peers, so reusing it would
         // make the server skip the challenge (path 0 is always Validated) and the
-        // switch would never fire. Spanning > 2 u8 wraps proves 255 → 1 (never 0).
+        // switch would never fire. Spanning > 2 u8 wraps proves the wrap (never 0;
+        // it also skips the reserved 255 — see the dedicated collision test).
         let session_id = fixed_session_id();
         let (client_session, _server_session) = paired_sessions(session_id);
         for _ in 0..600 {
@@ -3995,6 +4030,140 @@ mod tests {
             "the candidate must receive a PATH_VALIDATION challenge"
         );
         assert_eq!(pkt.header.path_id, 1, "challenge must be on the new path");
+    }
+
+    #[tokio::test]
+    async fn server_challenges_a_passive_rebind_on_path_zero() {
+        // M-3: a *passive* NAT rebind keeps `path_id = 0` (the client never called
+        // `migrate()`, so it never bumped its send path_id). Path 0 is permanently
+        // `Validated`, so the path-id-gated challenge block is skipped — pre-fix the
+        // server NEVER challenged the new source, never promoted it, and kept sending
+        // downstream to the OLD (now-dead) address → stall. The fix makes detection
+        // address-driven: when an authenticated frame arrives on a Validated path AND
+        // the transport flags a migration candidate (a new authenticated source), the
+        // server issues a PATH_CHALLENGE to that candidate on a RESERVED validation
+        // path-id (`REBIND_VALIDATION_PATH_ID`), under the 3× anti-amp cap. Anti-spoof
+        // still holds: the candidate is only ever the AEAD-authenticated source, and
+        // the challenge only goes there.
+        use crate::api::udp_transport::UdpServerTransport;
+        use crate::transport::path::PathStateKind;
+        use crate::transport::phantom_udp::datagram::{push_datagram, FragmentAssembler};
+        use crate::transport::session::REBIND_VALIDATION_PATH_ID;
+
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        let server_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap(); // established (old) peer
+        let cand_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cand_addr = cand_sock.local_addr().unwrap();
+
+        let (tx, rx) = mpsc::channel(8);
+        let ust = Arc::new(UdpServerTransport::new(
+            server_sock.clone(),
+            peer,
+            [5u8; 8],
+            rx,
+        ));
+        // A frame from the rebind source seeds the candidate + its 3× budget.
+        tx.send((Bytes::from(vec![0u8; 256]), cand_addr))
+            .await
+            .unwrap();
+        let _ = ust.recv_bytes().await.unwrap();
+        ust.confirm_authenticated_source();
+        assert!(
+            ust.has_migration_candidate(),
+            "new source must set a candidate"
+        );
+
+        // The reserved validation path is untouched at the start.
+        assert_eq!(
+            server_session.path_state(REBIND_VALIDATION_PATH_ID),
+            None,
+            "the rebind validation path must not exist before the rebind is observed"
+        );
+
+        // App data on the ESTABLISHED, always-Validated path 0 (passive rebind:
+        // path_id unchanged) from the candidate source → the server must STILL
+        // challenge the candidate on the reserved validation path-id.
+        let frame =
+            build_app_frame_on_path(&client_session, session_id, stream_id, 0, 0, 0, b"rebound");
+        let frame = decode_recv_frame(&frame, session_id);
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let undelivered = AtomicU64::new(0);
+        let mut ack_buf = Vec::with_capacity(256);
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        handle_packet(
+            frame,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &ust,
+            &ust,
+            &deliver_tx,
+            &undelivered,
+            &mut ack_buf,
+            &obs,
+            LegType::Udp,
+        )
+        .await;
+
+        // The server issued a challenge on the RESERVED rebind path → it is Validating.
+        assert_eq!(
+            server_session.path_state(REBIND_VALIDATION_PATH_ID),
+            Some(PathStateKind::Validating),
+            "a path-0 rebind on a candidate source must be challenged on the reserved id"
+        );
+        // ...and the challenge datagram reached the CANDIDATE socket (not the peer).
+        let mut buf = vec![0u8; 2048];
+        let (n, _from) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cand_sock.recv_from(&mut buf),
+        )
+        .await
+        .expect("rebind challenge must reach the candidate")
+        .unwrap();
+        let mut asm = FragmentAssembler::new();
+        let (_hdr, inner) = push_datagram(&mut asm, &buf[..n]).expect("decode envelope");
+        let inner = inner.expect("single-datagram challenge");
+        let pkt = client_session
+            .parse_protected(&inner)
+            .expect("inner packet");
+        assert!(
+            pkt.header.flags.contains(PacketFlags::PATH_VALIDATION),
+            "the candidate must receive a PATH_VALIDATION challenge"
+        );
+        assert_eq!(
+            pkt.header.path_id, REBIND_VALIDATION_PATH_ID,
+            "the passive-rebind challenge must be stamped on the reserved validation path-id"
+        );
+    }
+
+    #[test]
+    fn migration_path_id_never_collides_with_the_rebind_validation_path() {
+        // M-3: the client's active-migration counter must never hand back the
+        // reserved rebind validation id — otherwise an active migration and a
+        // concurrent passive-rebind challenge would share a registry slot and a
+        // late echo to one could resolve the other. The counter wraps 254 → 1,
+        // skipping both 0 (the handshake path) and 255 (the reserved id).
+        use crate::transport::session::REBIND_VALIDATION_PATH_ID;
+        let session_id = fixed_session_id();
+        let (client_session, _server_session) = paired_sessions(session_id);
+        for _ in 0..600 {
+            let id = client_session.next_migration_path_id();
+            assert_ne!(id, 0, "must never reuse the handshake path");
+            assert_ne!(
+                id, REBIND_VALIDATION_PATH_ID,
+                "must never reuse the reserved rebind validation path"
+            );
+        }
     }
 
     /// Build an `ENCRYPTED | ACK` frame (H1, L1-A) from `acker_session`

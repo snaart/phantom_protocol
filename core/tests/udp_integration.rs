@@ -680,3 +680,137 @@ async fn udp_liveness_recovers_when_the_path_returns() {
 
     server.abort();
 }
+
+/// ★ M-3 mandatory bidirectional test: a live session **survives a PASSIVE NAT
+/// rebind** mid-download — the client's apparent source address (as seen by the
+/// server) changes WITHOUT the client calling `migrate()`, so its `path_id` stays
+/// 0 (the always-Validated handshake path). Pre-fix the server's challenge logic
+/// was path-id-gated, so it skipped the Validated path 0, never challenged the new
+/// source, never promoted it, and kept sending the downstream (server->client)
+/// echoes to the OLD, now-dead address → the reliable stream stalled. The fix
+/// makes detection ADDRESS-driven: an AEAD-authenticated frame from a new source
+/// on a Validated path is challenged on the reserved validation path-id, validated
+/// from the claimed address (anti-spoof preserved), promoted, and the server's
+/// downstream follows — all with NO re-handshake and NO client `migrate()`.
+///
+/// A relay forwards `client <-> relay <-> server`. The relay forwards c2s through
+/// one of two upstream sockets (each `connect`ed to the server from a distinct
+/// local port = a distinct apparent client source) and receives s2c on the same
+/// one. Flipping `use_b` mid-stream rewrites the client's apparent source from
+/// `upstream_a`'s port to `upstream_b`'s — exactly a passive rebind. The client
+/// socket is untouched; it never migrates. The post-rebind echoes can only arrive
+/// if the server detected the new source and switched its downstream to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_passive_rebind_recovers_without_client_migrate() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    const ROUNDS: usize = 8;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    // The server echoes ROUNDS messages over the SAME accepted session. It must
+    // keep serving that one session across the passive rebind and follow the peer
+    // to the new (relay upstream) source — never re-accepting / re-handshaking.
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        for _ in 0..ROUNDS {
+            let m = session.recv().await.expect("server recv");
+            session.send(m).await.expect("server echo");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+
+    // Relay: client <-> relay <-> server, with TWO upstream sockets toward the
+    // server (distinct local ports = distinct apparent client sources). `use_b`
+    // selects the active upstream for BOTH directions, so flipping it rewrites the
+    // client's apparent source to the server (a passive rebind) while keeping the
+    // client's own socket untouched.
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let up_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    up_a.connect(server_addr).await.unwrap();
+    let up_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    up_b.connect(server_addr).await.unwrap();
+    let use_b = Arc::new(AtomicBool::new(false));
+    let ub = use_b.clone();
+    tokio::spawn(async move {
+        let mut c2s = vec![0u8; 2048];
+        let mut sa = vec![0u8; 2048];
+        let mut sb = vec![0u8; 2048];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s) => {
+                    let (n, from) = match r { Ok(x) => x, Err(_) => continue };
+                    client_addr = Some(from);
+                    // Forward c2s out the currently-selected upstream — this is what
+                    // changes the apparent client source the server sees on a flip.
+                    if ub.load(Ordering::Relaxed) {
+                        let _ = up_b.send(&c2s[..n]).await;
+                    } else {
+                        let _ = up_a.send(&c2s[..n]).await;
+                    }
+                }
+                r = up_a.recv(&mut sa) => {
+                    let n = match r { Ok(x) => x, Err(_) => continue };
+                    // Once the rebind flips to B, the OLD upstream (A) is dead: drop
+                    // its s2c. This SEVERS the server's stale downstream and forces the
+                    // M-3 recovery — if the server keeps echoing to A, the client never
+                    // sees those packets and the stream stalls. (Pre-fix this is exactly
+                    // what happens, so the test times out → it guards the bug.)
+                    if !ub.load(Ordering::Relaxed) {
+                        if let Some(ca) = client_addr { let _ = relay.send_to(&sa[..n], ca).await; }
+                    }
+                }
+                r = up_b.recv(&mut sb) => {
+                    let n = match r { Ok(x) => x, Err(_) => continue };
+                    if ub.load(Ordering::Relaxed) {
+                        if let Some(ca) = client_addr { let _ = relay.send_to(&sb[..n], ca).await; }
+                    }
+                }
+            }
+        }
+    });
+
+    let transport = UdpClientTransport::connect(relay_addr).await.unwrap();
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+
+    // Round 0 establishes the data plane via upstream A (the server's view of the
+    // client source = up_a's port).
+    let m0 = b"round-0-pre-rebind".to_vec();
+    client.send(m0.clone()).await.expect("send 0");
+    let e0 = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv 0");
+    assert_eq!(e0, m0, "pre-rebind echo must be byte-exact");
+
+    // PASSIVE REBIND: flip the relay to upstream B. The server now sees the client
+    // arriving from a NEW source, but the client never called migrate() — its
+    // path_id is still 0. The server must detect this address change, challenge the
+    // new source on the reserved validation path-id, validate it, and switch its
+    // downstream so the echoes keep flowing.
+    use_b.store(true, Ordering::Relaxed);
+
+    // Rounds 1..ROUNDS: the reliable byte stream continues byte-exact across the
+    // passive rebind with NO re-handshake and NO client migrate(). This only works
+    // if M-3's address-driven challenge promoted the new source on the server.
+    for i in 1..ROUNDS {
+        let m = format!("round-{i}-post-rebind-{}", "y".repeat(i * 5)).into_bytes();
+        client.send(m.clone()).await.expect("send post-rebind");
+        let e = timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("no timeout (the session must survive the passive rebind)")
+            .expect("recv post-rebind");
+        assert_eq!(e, m, "post-rebind echo must be byte-exact (round {i})");
+    }
+
+    server.await.unwrap();
+}
