@@ -1324,10 +1324,15 @@ impl std::fmt::Debug for Session {
 }
 
 impl Drop for Session {
-    /// On session drop, explicitly zero the resumption secret. The
+    /// On session drop, explicitly zero the master secrets. The
     /// `CryptoState` inside `crypto` is itself `ZeroizeOnDrop`, so its
     /// `session_key` is handled there.
     fn drop(&mut self) {
+        // T5.1 — the rekey master (`traffic_secret`) seeds the HKDF ratchet for the
+        // whole session; zero it on drop so it does not linger in freed memory
+        // (rekey already zeroizes each *superseded* epoch secret; this covers the
+        // final live one). The `CipherSuite`/`Instant`-free `[u8; 32]` is `Zeroize`.
+        self.traffic_secret.write().zeroize();
         if let Some(mut secret) = self.resumption_secret.write().take() {
             secret.zeroize();
         }

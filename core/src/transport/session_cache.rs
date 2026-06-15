@@ -10,6 +10,7 @@
 use crate::crypto::adaptive_crypto::CipherSuite;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use zeroize::ZeroizeOnDrop;
 
 /// Maximum tickets in cache (Constrained: 8, Standard: 64, Performance: 256)
 const DEFAULT_MAX_TICKETS: usize = 64;
@@ -24,21 +25,32 @@ pub type SessionId = [u8; 32];
 /// [`SessionCache::try_resume`] removes the ticket on the first lookup,
 /// which is the one-shot anti-replay guarantee for 0-RTT early-data
 /// (Phase 4.1).
-#[derive(Clone)]
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct ResumptionTicket {
     /// Resumption secret — stored **verbatim**, byte-identical to the
     /// value `Session::resumption_hint()` hands the client. Both peers
     /// feed it into `crypto::kdf::derive_early_data_keying`, so the
     /// stored bytes MUST equal the client's hint — no extra derivation
-    /// layer here.
+    /// layer here. Zeroized on drop (T5.1).
     pub resumption_secret: [u8; 32],
     /// Negotiated cipher suite
+    #[zeroize(skip)]
     pub cipher_suite: CipherSuite,
     /// When the ticket was created
+    #[zeroize(skip)]
     pub created_at: Instant,
     /// When the ticket expires
+    #[zeroize(skip)]
     pub expires_at: Instant,
 }
+
+// T5.1 — `ResumptionTicket` holds a verbatim resumption secret, so it MUST zeroize
+// on drop. This compile-time assertion fails the build if the `ZeroizeOnDrop` derive
+// is ever removed (the secret would otherwise linger in freed memory).
+const _: fn() = || {
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    assert_zeroize_on_drop::<ResumptionTicket>();
+};
 
 impl ResumptionTicket {
     /// Create a ticket holding `resumption_secret` **verbatim**.
