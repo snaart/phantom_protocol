@@ -157,3 +157,31 @@ Verifies the dylib exists, lists exported `uniffi_*` / `ffi_phantom_*`
 symbols, and diffs them against the header. If new symbols appear
 (e.g. you added a `#[uniffi::export]` method), the script prints them
 so you can extend `phantom_protocol.h` accordingly.
+
+## Blocking helpers (`phantom_helpers.h`)
+
+The raw surface above is async: `connect_pinned` / `send` / `recv` / `disconnect`
+return a `uint64_t` future you must drive with the `_poll_*` / `_complete_*` /
+`_free_*` family (see the async quick-reference). `phantom_helpers.h` is a
+**header-only** (pure-C, no new Rust) convenience layer that factors that loop into
+plain blocking calls:
+
+```c
+#include "phantom_protocol.h"
+#include "phantom_helpers.h"   /* requires C11 <stdatomic.h> */
+
+/* pinned_key = server's HybridVerifyingKey bytes (PhantomListener::verifying_key_bytes) */
+void *s = phantom_blocking_connect_pinned("127.0.0.1", 4242, pinned_key, key_len);
+if (!s) { /* bad key / refused / handshake failed */ }
+phantom_blocking_send(s, (const uint8_t *)"hello", 5);
+uint8_t buf[2048];
+ptrdiff_t n = phantom_blocking_recv(s, buf, sizeof buf);   /* n bytes, or -1 */
+phantom_blocking_disconnect(s);
+uniffi_phantom_protocol_fn_free_phantomsession(s, &(PhantomRustCallStatus){0});
+```
+
+The wait is a 1 ms `nanosleep` poll on a C11 `_Atomic` flag the UniFFI continuation
+sets — no `-lpthread` needed. `tests/bindings/c/consumer_smoke.c` exercises it (a
+pinned connect to a dead port returns NULL through the full poll/complete/free path).
+The blocking helpers are intended for synchronous C callers; bindings that already
+have an event loop (Python/Swift/Kotlin) should keep using the async surface.

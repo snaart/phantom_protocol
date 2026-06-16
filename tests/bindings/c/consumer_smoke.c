@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "phantom_protocol.h"
+#include "phantom_helpers.h"
 
 int main(void) {
     /* The dylib's contract version must match what the header documents;
@@ -75,7 +76,25 @@ int main(void) {
         return 1;
     }
 
-    printf("OK: C header links; UniFFI contract v%u; sync call path works\n",
+    /* phantom_helpers.h — drive the ASYNC future ABI through a BLOCKING call.
+     * A pinned connect to a dead loopback port (nothing listening on :1) fails
+     * fast (connection refused) and the helper returns NULL — proving the
+     * future-poll / complete / free machinery works end-to-end without the
+     * caller hand-rolling a poll loop. (#14c) */
+    uint8_t dummy_key[64] = {0};
+    void *pinned = phantom_blocking_connect_pinned("127.0.0.1", 1, dummy_key,
+                                                   sizeof dummy_key);
+    if (pinned != NULL) {
+        fprintf(stderr, "FAIL: blocking_connect_pinned to a dead port should be NULL\n");
+        uniffi_phantom_protocol_fn_free_phantomsession(pinned, &status);
+        return 1;
+    }
+    /* Compile-link the rest of the blocking client surface. */
+    (void)&phantom_blocking_send;
+    (void)&phantom_blocking_recv;
+    (void)&phantom_blocking_disconnect;
+
+    printf("OK: C header links; UniFFI contract v%u; sync + blocking-helper paths work\n",
            contract);
     return 0;
 }
