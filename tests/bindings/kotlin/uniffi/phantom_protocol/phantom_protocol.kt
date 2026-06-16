@@ -3607,6 +3607,14 @@ data class TrafficShapingConfig (
      * [`PaddingPolicy::Padme`] = pad each packet up to a PADÉ bucket.
      */
     var `padding`: PaddingPolicy
+    , 
+    /**
+     * Send-timing jitter ceiling in milliseconds. `0` (default)
+     * = no jitter; otherwise each packet waits a uniform random `[0, jitter_ms]`
+     * ms before it is sent, so the inter-packet timing no longer tracks the
+     * application's writes — at a cost of up to `jitter_ms` of added latency.
+     */
+    var `jitterMs`: kotlin.UInt
     
 ){
     
@@ -3624,15 +3632,18 @@ public object FfiConverterTypeTrafficShapingConfig: FfiConverterRustBuffer<Traff
     override fun read(buf: ByteBuffer): TrafficShapingConfig {
         return TrafficShapingConfig(
             FfiConverterTypePaddingPolicy.read(buf),
+            FfiConverterUInt.read(buf),
         )
     }
 
     override fun allocationSize(value: TrafficShapingConfig) = (
-            FfiConverterTypePaddingPolicy.allocationSize(value.`padding`)
+            FfiConverterTypePaddingPolicy.allocationSize(value.`padding`) +
+            FfiConverterUInt.allocationSize(value.`jitterMs`)
     )
 
     override fun write(value: TrafficShapingConfig, buf: ByteBuffer) {
             FfiConverterTypePaddingPolicy.write(value.`padding`, buf)
+            FfiConverterUInt.write(value.`jitterMs`, buf)
     }
 }
 
