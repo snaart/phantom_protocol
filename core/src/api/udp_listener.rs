@@ -428,7 +428,10 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
             Err(_) => continue, // at capacity -> drop new handshakes (DoS bound)
         };
         let (tx, rx) = mpsc::channel(SESSION_CHANNEL_DEPTH);
-        let st = UdpServerTransport::new(listener.socket.clone(), peer, hdr.cid, rx);
+        // The transport gets a `tx` clone too (alongside the demux's route-table clone): a
+        // server migration spawns a recv loop on the new socket that feeds this same channel,
+        // so c2s frames arriving on the migrated address reach `recv_bytes` transparently.
+        let st = UdpServerTransport::new(listener.socket.clone(), peer, hdr.cid, tx.clone(), rx);
         // H-1: refuse the route (and the slot) when the table is full of *live* routes.
         if !routes.try_insert(hdr.cid, tx.clone()) {
             drop(permit);
