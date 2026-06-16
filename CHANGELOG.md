@@ -10,6 +10,21 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **Anti-fingerprint cover (dummy) traffic (WIRE v6, direction #4, deliverable (e)).**
+  Opt-in, additive (no wire change). When enabled, an otherwise-idle session
+  maintains a minimum outbound packet rate (`1000 / cover_interval_ms` packets/sec)
+  by emitting an `ENCRYPTED | COVER` dummy packet — empty inner plaintext, PADÉ-padded
+  to a bucket — whenever no packet has gone out for `cover_interval_ms`, so silence
+  and volume no longer leak. A cover packet AEAD-authenticates like any packet (so
+  it refreshes the peer's liveness and cannot be off-path injected) and the receiver
+  **drops** it before the data path — it never reaches `recv()`. New
+  `PacketFlags::COVER` (0x4000, masked) + `cover_interval_ms` field on
+  `TrafficShapingConfig` (FFI-exported; `0` = off, the default). The cover timer
+  reuses the send packet-number counter as a lock-free "did we send anything?"
+  signal, so cover only fills genuine idle gaps. Bindings regenerated. (This
+  completes the direction-#4 shaping suite: (a) masked version + (b) length-prefix
+  diet + (c) PADÉ padding + (d) timing jitter + (e) cover traffic.)
+
 - **Anti-fingerprint send-timing jitter (WIRE v6, direction #4, deliverable (d)).**
   Opt-in, additive (no wire change). When enabled, the send path waits a uniform
   random `[0, jitter_ms]` ms before each packet, so the inter-packet timing no

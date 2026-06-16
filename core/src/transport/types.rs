@@ -168,7 +168,16 @@ impl PacketFlags {
     /// the padding itself is encrypted + authenticated, so only the bucketed
     /// datagram size is observable. (Spare flag bit — no header layout change.)
     pub const PADDED: u16 = 0x2000;
-    // 0x4000 .. 0x8000 — reserved for future amendments.
+    /// Anti-fingerprint cover (dummy) traffic (WIRE v6, deliverable (e)). An
+    /// `ENCRYPTED | COVER` packet carries **no application data** (empty inner
+    /// plaintext, typically `PADDED` to a bucket); its sole purpose is to normalize
+    /// the outbound traffic pattern (idle-fill + a floor packet rate) so silence and
+    /// volume no longer leak. It AEAD-authenticates like any packet (so it refreshes
+    /// the peer's liveness and cannot be off-path injected); the receiver drops it
+    /// before the data path, so it never reaches `recv()`. (Spare flag bit — no
+    /// header layout / `WIRE_VERSION` change.)
+    pub const COVER: u16 = 0x4000;
+    // 0x8000 — reserved for future amendments.
 
     /// Create new flags with no bits set
     pub const fn empty() -> Self {
