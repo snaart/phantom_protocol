@@ -79,7 +79,11 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   cross-target rows (wasm / WASI) and the `server` / `wasm-demo` / `wasi-guest` embedders name
   `classical-crypto` explicitly. Separately, the dead `cargo-deny` advisory ignore (`RUSTSEC-2026-0097`,
   no longer matching any crate in the tree → an `advisory-not-detected` warning) was removed so `cargo
-  deny check` is clean again. No wire, API, or crypto-behaviour change.
+  deny check` is clean again. No wire, API, or crypto-behaviour change. (2026-06-16 docs follow-up:
+  corrected the now-stale `cargo tree --features fips` "ring-free dependency tree" assertion in
+  `docs/security/remediation-plan-2026-06-03.md` to the canonical `--no-default-features --features
+  fips` form — plain `--features fips` keeps `ring`/`x25519-dalek` linked-but-unused via the default
+  `classical-crypto` feature.)
 - **Documented the 0-RTT distributed-cache replay caveat (T5.7).** The one-shot anti-replay for 0-RTT
   early-data (Invariant 9 — `SessionCache::try_resume` removes the ticket on first lookup) holds **only**
   under a single coherent `SessionCache`. The cache is an in-process bounded-LRU, not replicated, so a
