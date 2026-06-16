@@ -1494,16 +1494,19 @@ class TrafficShapingConfig:
     phases. Padding hides the datagram *size*; it costs bounded (≈ ≤12% worst-case)
     extra bandwidth.
 """
-    def __init__(self, *, padding:PaddingPolicy):
+    def __init__(self, *, padding:PaddingPolicy, jitter_ms:int):
         self.padding = padding
+        self.jitter_ms = jitter_ms
         
         
 
     
     def __str__(self):
-        return "TrafficShapingConfig(padding={})".format(self.padding)
+        return "TrafficShapingConfig(padding={}, jitter_ms={})".format(self.padding, self.jitter_ms)
     def __eq__(self, other):
         if self.padding != other.padding:
+            return False
+        if self.jitter_ms != other.jitter_ms:
             return False
         return True
 
@@ -1512,15 +1515,18 @@ class _UniffiFfiConverterTypeTrafficShapingConfig(_UniffiConverterRustBuffer):
     def read(buf):
         return TrafficShapingConfig(
             padding=_UniffiFfiConverterTypePaddingPolicy.read(buf),
+            jitter_ms=_UniffiFfiConverterUInt32.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterTypePaddingPolicy.check_lower(value.padding)
+        _UniffiFfiConverterUInt32.check_lower(value.jitter_ms)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterTypePaddingPolicy.write(value.padding, buf)
+        _UniffiFfiConverterUInt32.write(value.jitter_ms, buf)
 
 
 
