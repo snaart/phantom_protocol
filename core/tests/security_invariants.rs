@@ -1114,6 +1114,179 @@ fn send_needs_rekey_fires_at_threshold_and_clears_on_rekey() {
     );
 }
 
+/// T5.5(b) — the forward-rekey catch-up GATE. A legitimate sender that has
+/// rekeyed but whose peer hasn't acknowledged it re-advertises
+/// `PacketFlags::REKEY` on EVERY new-epoch packet (see `rekey_unconfirmed`), so a
+/// forward-epoch packet WITHOUT the flag never comes from an honest
+/// not-yet-confirmed sender — it is forged/corrupt and is cheap-rejected BEFORE
+/// the HKDF catch-up walk runs. This pins the DoS bound: no key derivation for an
+/// unflagged spoofed epoch. The ciphertext here is genuinely valid under the next
+/// key (its AAD matches the flag-less header), so WITHOUT the gate the old code
+/// would follow the bump and silently advance the epoch — the gate is exactly
+/// what rejects it pre-catch-up.
+#[test]
+fn forward_epoch_without_rekey_flag_is_rejected_before_catchup() {
+    let (client, server) = make_session_pair([0x40u8; 32]);
+    // Sender rekeys to epoch 1 and encrypts a VALID epoch-1 packet whose header
+    // carries NO REKEY flag (so the AAD matches and the ciphertext would open if
+    // the catch-up actually ran).
+    assert_eq!(client.rekey().expect("client rekey"), 1);
+    let no_rekey = PacketHeader::new(
+        *server.id(),
+        1,
+        9,
+        PacketFlags::new(PacketFlags::ENCRYPTED), // deliberately NO REKEY
+    )
+    .with_epoch(1);
+    let ct = client
+        .encrypt_packet(&no_rekey, b"forward but unflagged", &[])
+        .expect("encrypt e1");
+
+    // The receiver (still at epoch 0) must reject it WITHOUT running the HKDF
+    // catch-up.
+    assert!(
+        server
+            .decrypt_packet_accepting_rekey(&no_rekey, &ct, &[])
+            .is_err(),
+        "a forward-epoch packet without REKEY must be rejected"
+    );
+    assert_eq!(
+        server.current_epoch(),
+        0,
+        "the gate rejects before catch-up: no HKDF step, no epoch advance"
+    );
+
+    // The SAME forward step but WITH the REKEY flag (the legitimate re-advertised
+    // form) IS followed — proving the rejection above was specifically the missing
+    // flag, not the epoch. (Re-encrypt because the flag is AAD-bound.)
+    let with_rekey = PacketHeader::new(
+        *server.id(),
+        1,
+        9,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::REKEY),
+    )
+    .with_epoch(1);
+    let ct2 = client
+        .encrypt_packet(&with_rekey, b"forward and flagged", &[])
+        .expect("encrypt e1 flagged");
+    let pt = server
+        .decrypt_packet_accepting_rekey(&with_rekey, &ct2, &[])
+        .expect("a REKEY-flagged forward packet is followed");
+    assert_eq!(pt, b"forward and flagged");
+    assert_eq!(server.current_epoch(), 1);
+}
+
+/// T5.5(b) — `rekey_unconfirmed` tracks whether our locally-initiated rekey has
+/// been acknowledged by the peer. It is SET when we `rekey()` and stays set —
+/// driving the REKEY re-advertise on every outbound packet — until we receive an
+/// AUTHENTICATED inbound packet at our current epoch (proof the peer caught up).
+/// A peer packet still BEHIND our epoch must NOT clear it.
+#[test]
+fn rekey_unconfirmed_set_on_rekey_cleared_only_by_peer_at_current_epoch() {
+    let (client, server) = make_session_pair([0x41u8; 32]);
+    assert!(
+        !client.rekey_unconfirmed(),
+        "fresh session: nothing to confirm"
+    );
+
+    // We rekey → unconfirmed until the peer is seen at our new epoch.
+    assert_eq!(client.rekey().expect("client rekey"), 1);
+    assert!(
+        client.rekey_unconfirmed(),
+        "a locally-initiated rekey is unconfirmed until the peer catches up"
+    );
+
+    // A peer packet still at the OLD epoch (peer hasn't processed our rekey) is
+    // BEHIND our epoch → rejected → must NOT clear the flag.
+    let behind = PacketHeader::new(*client.id(), 1, 1, PacketFlags::new(PacketFlags::ENCRYPTED));
+    let ct_behind = server
+        .encrypt_packet(&behind, b"still at e0", &[])
+        .expect("server encrypt e0");
+    assert!(
+        client
+            .decrypt_packet_accepting_rekey(&behind, &ct_behind, &[])
+            .is_err(),
+        "a peer packet behind our epoch is rejected"
+    );
+    assert!(
+        client.rekey_unconfirmed(),
+        "a behind-epoch peer packet does not confirm catch-up"
+    );
+
+    // The peer catches up to our epoch and sends there → an authenticated inbound
+    // packet at our current epoch CLEARS the flag (stop re-advertising REKEY).
+    assert_eq!(server.rekey().expect("server rekey"), 1);
+    let at_current =
+        PacketHeader::new(*client.id(), 1, 2, PacketFlags::new(PacketFlags::ENCRYPTED))
+            .with_epoch(1);
+    let ct_current = server
+        .encrypt_packet(&at_current, b"caught up to e1", &[])
+        .expect("server encrypt e1");
+    let pt = client
+        .decrypt_packet_accepting_rekey(&at_current, &ct_current, &[])
+        .expect("peer-at-current decrypts");
+    assert_eq!(pt, b"caught up to e1");
+    assert!(
+        !client.rekey_unconfirmed(),
+        "an authenticated peer packet at our epoch confirms the rekey"
+    );
+}
+
+/// T5.5(b) — re-advertising REKEY makes the rekey robust to losing the FIRST
+/// new-epoch packet. In the old design only the single trigger packet carried
+/// REKEY; if it was lost, later new-epoch packets (incl. reliable retransmits)
+/// went unflagged. With the gate in place that would strand the receiver. Because
+/// `rekey_unconfirmed` is still set after the loss, the NEXT packet at the new
+/// epoch is ALSO flagged REKEY, so the receiver still catches up through the gate.
+#[test]
+fn rekey_survives_loss_of_the_first_rekey_packet() {
+    let (client, server) = make_session_pair([0x42u8; 32]);
+    assert_eq!(client.rekey().expect("client rekey"), 1);
+    assert!(client.rekey_unconfirmed());
+
+    // Packet #1 at the new epoch (REKEY flagged) — LOST: encrypted but never
+    // delivered to the server.
+    let p1 = PacketHeader::new(
+        *server.id(),
+        1,
+        10,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::REKEY),
+    )
+    .with_epoch(1);
+    let _dropped = client
+        .encrypt_packet(&p1, b"lost trigger", &[])
+        .expect("encrypt p1");
+
+    // The client has heard nothing back, so it is still unconfirmed and the send
+    // path re-advertises REKEY on packet #2.
+    assert!(
+        client.rekey_unconfirmed(),
+        "no peer confirmation yet → keep re-advertising REKEY"
+    );
+    let p2 = PacketHeader::new(
+        *server.id(),
+        1,
+        11,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::REKEY),
+    )
+    .with_epoch(1);
+    let ct2 = client
+        .encrypt_packet(&p2, b"retransmit catches up", &[])
+        .expect("encrypt p2");
+
+    // The receiver never saw p1 but still catches up from p2 because REKEY was
+    // re-advertised.
+    let pt = server
+        .decrypt_packet_accepting_rekey(&p2, &ct2, &[])
+        .expect("re-advertised REKEY lets the receiver catch up after losing p1");
+    assert_eq!(pt, b"retransmit catches up");
+    assert_eq!(
+        server.current_epoch(),
+        1,
+        "receiver caught up despite the lost trigger packet"
+    );
+}
+
 /// C1 concurrency: the data pump drives the send loop and the receive task
 /// concurrently over one `Arc<Session>`, so a send-side `rekey()` can race a
 /// receive-side ratchet. Every transition must be atomic — the installed key
