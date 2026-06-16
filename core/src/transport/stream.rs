@@ -333,9 +333,14 @@ pub struct Stream {
     /// Pending **relative** flow-control credit to advertise in a
     /// `WINDOW_UPDATE`, staged by the receive **delivery** task (which credits
     /// the window on *real* app consumption) and flushed by the **send loop** —
-    /// the single writer that also owns rekey, so the encrypted control frame is
-    /// sealed under a consistent epoch. Credits accumulate additively, so
-    /// several grants between two flushes are never lost. `0` = nothing pending.
+    /// the sole *outbound* writer, so the encrypted control frame is sealed by the
+    /// same task that stamps every data packet, under the epoch live at flush
+    /// time. (The epoch itself has TWO writers — the send loop's own `rekey()` and
+    /// the receive task's authenticated forward catch-up in
+    /// `decrypt_packet_accepting_rekey` — but both serialise through the session's
+    /// `rekey_lock`, so the send loop always seals under a consistent key.)
+    /// Credits accumulate additively, so several grants between two flushes are
+    /// never lost. `0` = nothing pending.
     pending_window_update: AtomicU32,
     /// RFC 6298 retransmission-timeout estimator. A plain (sync) mutex: it is
     /// updated only from the serial ACK path and read by `poll_send`, and the

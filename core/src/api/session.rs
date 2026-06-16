@@ -975,7 +975,9 @@ async fn run_data_pump<T: SessionTransport>(
                 // still paced by `recv_tx.send()` completing below, so credit
                 // tracks app consumption (one item of look-ahead) — backpressure
                 // is preserved. Wake the send loop to flush the WINDOW_UPDATE
-                // (emitted there, under rekey ownership, so it is epoch-safe).
+                // (emitted there — the sole outbound writer — so it is sealed
+                // under the live epoch; the epoch's two writers both serialise
+                // through `rekey_lock`, so the flush is always epoch-consistent).
                 if let Some(stream) = streams_deliver.get(&stream_id) {
                     if let Some(credit) = stream.record_app_consumed(len as u32) {
                         stream.stage_window_update_credit(credit);
@@ -1105,8 +1107,11 @@ async fn run_data_pump<T: SessionTransport>(
     // first PING waits a full interval after the data plane starts.
     let mut last_keepalive = std::time::Instant::now();
     // Outbound WINDOW_UPDATE control packets are emitted on the send loop — the
-    // single writer that also owns the rekey lock — so the encrypted control
-    // frame is always sealed under a consistent epoch. The delivery task only
+    // sole outbound writer — so the encrypted control frame is always sealed under
+    // the epoch live when it stamps. The epoch has two writers (this loop's own
+    // `rekey()` and the receive task's authenticated forward catch-up in
+    // `decrypt_packet_accepting_rekey`), but both serialise through the session's
+    // `rekey_lock`, so the seal is always epoch-consistent. The delivery task only
     // stages the relative credit (`Stream::stage_window_update_credit`) and
     // wakes us; the wire sequence is drawn from the stream's own send-sequence
     // space inside `flush_pending_window_updates` (no private counter, so it
@@ -1421,9 +1426,12 @@ async fn maybe_send_keepalive<T: SessionTransport>(
 ///
 /// The delivery task credits the window on real app consumption and stages the
 /// relative credit via `Stream::stage_window_update_credit` + a send-loop wake;
-/// the send loop (this, the single rekey owner) actually encrypts and sends the
-/// `WINDOW_UPDATE`, so the control frame is always sealed under a consistent
-/// epoch. The staged credits are snapshotted out of the `DashMap` first so no
+/// the send loop (this, the sole outbound writer) actually encrypts and sends the
+/// `WINDOW_UPDATE`, so the control frame is always sealed under the epoch live
+/// when it stamps. The epoch can be advanced by either this loop's own `rekey()`
+/// or the receive task's authenticated forward catch-up, but both serialise
+/// through `rekey_lock`, so the seal is always epoch-consistent. The staged
+/// credits are snapshotted out of the `DashMap` first so no
 /// shard lock is held across the `.await` (which would deadlock the delivery /
 /// reader tasks that also touch `streams`).
 async fn flush_pending_window_updates<T: SessionTransport>(
@@ -1600,22 +1608,35 @@ async fn pace_send(crypto_session: &Arc<Session>, bytes: u64) {
 /// watermark is gone — under ① the packet number is a per-direction `u64` that
 /// cannot wrap within a session, so the nonce can never repeat.
 ///
-/// Returns the extra flag bits to OR into the header (`PacketFlags::REKEY` on a
-/// successful rotation, `0` when no rekey was needed), or `None` if a rekey was
+/// Returns the extra flag bits to OR into the header, or `None` if a rekey was
 /// required but failed (epoch saturated at `u8::MAX`) — the caller MUST fail the
 /// send so the session reconnects rather than reusing a nonce.
+///
+/// T5.5(b) — the returned `PacketFlags::REKEY` bit is set not only on the single
+/// rotation-trigger packet but on EVERY packet sent at the new epoch until the
+/// peer acknowledges the rekey ([`Session::rekey_unconfirmed`] clears once an
+/// authenticated inbound packet is seen at the new epoch). Re-advertising the
+/// flag is what makes the receive-side catch-up gate in
+/// [`Session::decrypt_packet_accepting_rekey`] safe: a lost rotation-trigger
+/// packet no longer strands the peer, because the next new-epoch packet (incl. a
+/// reliable retransmit) still carries REKEY and drives the catch-up.
 fn rekey_before_stamp(crypto_session: &Arc<Session>) -> Option<u16> {
     if crypto_session.send_needs_rekey() {
-        match crypto_session.rekey() {
-            Ok(_) => Some(PacketFlags::REKEY),
-            Err(e) => {
-                log::error!("PhantomSession: mid-session rekey failed: {}", e);
-                None
-            }
+        // Crossed the high-watermark: rotate now. `rekey()` marks the session
+        // `rekey_unconfirmed`, so the flag below re-arms automatically.
+        if let Err(e) = crypto_session.rekey() {
+            log::error!("PhantomSession: mid-session rekey failed: {}", e);
+            return None;
         }
-    } else {
-        Some(0)
     }
+    // Re-advertise REKEY while our last rekey is still unacknowledged — even when
+    // no rotation happened on this packet (the trigger may have rotated several
+    // packets ago and been lost).
+    Some(if crypto_session.rekey_unconfirmed() {
+        PacketFlags::REKEY
+    } else {
+        0
+    })
 }
 
 /// V2 send. Builds `PhantomPacket` with `PacketFlags::ENCRYPTED` and
@@ -2914,6 +2935,72 @@ mod tests {
     }
 
     // ── Tests ──
+
+    /// T5.5(b) send-side: `rekey_before_stamp` re-advertises `PacketFlags::REKEY`
+    /// on EVERY packet at the new epoch — not just the rotation-trigger packet —
+    /// until the peer acknowledges the rekey. This is what lets a lost trigger
+    /// packet recover: the next stamp still flags REKEY so the receive-side gate
+    /// follows the catch-up. Without re-advertise the second stamp would carry the
+    /// new epoch unflagged and the gate would strand the receiver.
+    #[test]
+    fn rekey_before_stamp_re_advertises_rekey_until_peer_confirms() {
+        use crate::transport::session::{CryptoState, Session};
+        use crate::transport::types::{SchedulerMode, SessionId};
+
+        let shared = [0x55u8; 32];
+        let id = SessionId::from_bytes([7u8; 32]);
+        let crypto = CryptoState::new(&shared, false).expect("crypto");
+        let session = Arc::new(Session::from_derived(
+            id,
+            crypto,
+            SchedulerMode::LowLatency,
+            shared,
+            false,
+        ));
+        session.set_rekey_threshold(2);
+
+        // Below the watermark: no rekey, no flag.
+        assert_eq!(
+            rekey_before_stamp(&session),
+            Some(0),
+            "below threshold: no flag"
+        );
+
+        // Cross the high-watermark so the next stamp rotates.
+        let h = PacketHeader::new(
+            *session.id(),
+            1,
+            0,
+            PacketFlags::new(PacketFlags::ENCRYPTED),
+        );
+        for i in 0..2u64 {
+            session
+                .encrypt_packet(
+                    &PacketHeader {
+                        packet_number: i,
+                        ..h
+                    },
+                    b"x",
+                    &[],
+                )
+                .expect("encrypt");
+        }
+        assert!(session.send_needs_rekey());
+
+        // The rotation-trigger stamp flags REKEY and bumps the epoch.
+        assert_eq!(rekey_before_stamp(&session), Some(PacketFlags::REKEY));
+        assert_eq!(session.current_epoch(), 1);
+        assert!(session.rekey_unconfirmed());
+
+        // The NEXT stamp re-advertises REKEY even though no further rekey happens —
+        // the peer has not confirmed yet.
+        assert_eq!(rekey_before_stamp(&session), Some(PacketFlags::REKEY));
+        assert_eq!(
+            session.current_epoch(),
+            1,
+            "no second rekey — only a re-advertise"
+        );
+    }
 
     /// H9 forward-compat (client side): when the server answers a `ClientHello`
     /// with a typed `ServerReject` (the version isn't one it speaks), the client

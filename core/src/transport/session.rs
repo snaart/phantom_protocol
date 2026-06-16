@@ -17,7 +17,8 @@ use crate::transport::{
     scheduler::Scheduler,
     stream::Stream,
     types::{
-        PacketHeader, PacketNumber, PhantomPacket, RawPacket, SchedulerMode, SessionId, StreamId,
+        PacketFlags, PacketHeader, PacketNumber, PhantomPacket, RawPacket, SchedulerMode,
+        SessionId, StreamId,
     },
 };
 
@@ -248,6 +249,18 @@ pub struct Session {
     /// their derive→install→epoch-bump so the installed key depth and the epoch
     /// counter never diverge (the bug would otherwise wedge the session).
     rekey_lock: Mutex<()>,
+    /// T5.5(b) — "our locally-initiated rekey is not yet acknowledged by the
+    /// peer". SET by [`rekey`](Self::rekey) and CLEARED by
+    /// [`confirm_rekey_caught_up`](Self::confirm_rekey_caught_up) when an
+    /// authenticated inbound packet arrives at our current epoch (proof the peer
+    /// caught up). While set, the send path OR-s `PacketFlags::REKEY` into EVERY
+    /// outbound header (not just the trigger packet), so losing the first
+    /// new-epoch packet cannot strand a receiver behind the catch-up gate in
+    /// [`decrypt_packet_accepting_rekey`](Self::decrypt_packet_accepting_rekey).
+    /// A best-effort hint (Relaxed): over-advertising one extra packet or
+    /// stopping one packet early is harmless — the security gate is the
+    /// AEAD-authenticated REKEY flag + epoch check, not this bit.
+    rekey_unconfirmed: AtomicBool,
     /// Which side of the handshake we are. Carried into every
     /// `CryptoState::new(...)` re-derivation so the per-direction keys are
     /// laid out the same way they were at session establishment.
@@ -366,6 +379,7 @@ impl Session {
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
             rekey_lock: Mutex::new(()),
+            rekey_unconfirmed: AtomicBool::new(false),
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -417,6 +431,7 @@ impl Session {
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
             rekey_lock: Mutex::new(()),
+            rekey_unconfirmed: AtomicBool::new(false),
             is_server,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -463,6 +478,7 @@ impl Session {
             epoch: AtomicU8::new(0),
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
             rekey_lock: Mutex::new(()),
+            rekey_unconfirmed: AtomicBool::new(false),
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -695,6 +711,15 @@ impl Session {
         }
         let (next_secret, new_crypto) = self.derive_forward_crypto(1)?;
         self.commit_forward_crypto(1, next_secret, new_crypto);
+        // T5.5(b): mark this locally-initiated rekey "unconfirmed" so the send
+        // path re-advertises `PacketFlags::REKEY` on EVERY new-epoch packet until
+        // the peer is seen at the new epoch. A lost trigger packet then no longer
+        // strands the peer behind the catch-up gate. Cleared in
+        // `confirm_rekey_caught_up` from the recv path. NOTE: a receive-side
+        // forward catch-up (`decrypt_packet_accepting_rekey` → `commit_forward_crypto`)
+        // deliberately does NOT set this — following the peer's rekey is not OUR
+        // rekey, so we owe no re-advertise.
+        self.rekey_unconfirmed.store(true, Ordering::Relaxed);
         Ok(current_epoch + 1)
     }
 
@@ -785,6 +810,26 @@ impl Session {
             && self.send_invocations() >= self.rekey_after.load(Ordering::Relaxed)
     }
 
+    /// T5.5(b) — true while a locally-initiated [`rekey`](Self::rekey) is still
+    /// unacknowledged by the peer. The send path OR-s `PacketFlags::REKEY` into
+    /// every outbound header while this holds, so the catch-up gate in
+    /// [`decrypt_packet_accepting_rekey`](Self::decrypt_packet_accepting_rekey)
+    /// can safely reject an unflagged forward epoch: an honest not-yet-confirmed
+    /// sender always re-advertises the flag. See the field doc for the relaxed
+    /// ordering rationale.
+    pub fn rekey_unconfirmed(&self) -> bool {
+        self.rekey_unconfirmed.load(Ordering::Relaxed)
+    }
+
+    /// Clear the [`rekey_unconfirmed`](Self::rekey_unconfirmed) re-advertise flag.
+    /// Called from the receive path on a successful authenticated decrypt of an
+    /// inbound packet at our current epoch (after any forward catch-up that packet
+    /// drove) — proof the peer has reached our epoch, so we stop re-advertising
+    /// `REKEY` (T5.5b). A no-op when the flag is already clear.
+    fn confirm_rekey_caught_up(&self) {
+        self.rekey_unconfirmed.store(false, Ordering::Relaxed);
+    }
+
     /// Decrypt a packet, transparently following an **authenticated** forward
     /// rekey of up to [`MAX_REKEY_CATCHUP`] epochs (C1).
     ///
@@ -808,11 +853,35 @@ impl Session {
         // Fast paths that need no epoch transition (no lock).
         let cur = self.current_epoch();
         if header.epoch == cur {
-            return self.decrypt_packet(header, ciphertext, extensions);
+            let pt = self.decrypt_packet(header, ciphertext, extensions)?;
+            // T5.5(b): an authenticated peer packet at our current epoch proves
+            // the peer caught up to any rekey we initiated — stop re-advertising.
+            self.confirm_rekey_caught_up();
+            return Ok(pt);
         }
         if header.epoch < cur {
             return Err(CoreError::CryptoError(format!(
                 "packet epoch {} is behind the current epoch {}",
+                header.epoch, cur
+            )));
+        }
+
+        // T5.5(b) catch-up GATE: a forward epoch must carry `PacketFlags::REKEY`.
+        // An honest sender that rekeyed re-advertises REKEY on EVERY new-epoch
+        // packet until we confirm (see `rekey_unconfirmed`), so an unflagged
+        // forward epoch is forged/corrupt — reject it cheaply HERE, before taking
+        // the rekey lock and running the HKDF catch-up walk. This tightens the DoS
+        // bound (a spoofed forward epoch with the flag cleared forces zero key
+        // derivation; with the flag set it still costs at most MAX_REKEY_CATCHUP
+        // HKDF steps + a failing trial decrypt). A genuine not-yet-caught-up sender
+        // is unaffected: it always sets the flag. NB this read is race-free against
+        // a concurrent send-side rekey — for `header.epoch` to be forward here our
+        // epoch is < header.epoch, and an honest sender only stops flagging once we
+        // have already reached its epoch (it saw our packet there), at which point
+        // header.epoch would not be forward. See the field doc.
+        if !header.flags.contains(PacketFlags::REKEY) {
+            return Err(CoreError::CryptoError(format!(
+                "forward epoch {} without the REKEY flag; rejected before catch-up (current {})",
                 header.epoch, cur
             )));
         }
@@ -827,7 +896,9 @@ impl Session {
         let cur = self.current_epoch();
         if header.epoch == cur {
             drop(_rekey);
-            return self.decrypt_packet(header, ciphertext, extensions);
+            let pt = self.decrypt_packet(header, ciphertext, extensions)?;
+            self.confirm_rekey_caught_up();
+            return Ok(pt);
         }
         if header.epoch < cur {
             return Err(CoreError::CryptoError(format!(
@@ -874,6 +945,10 @@ impl Session {
                 header.packet_number
             )));
         }
+        // T5.5(b): we just followed the peer forward and committed — the peer is
+        // now at our (new) current epoch, which is >= any epoch we rekeyed to, so
+        // our own pending rekey (if any) is confirmed. Stop re-advertising.
+        self.confirm_rekey_caught_up();
         Ok(plaintext)
     }
 
