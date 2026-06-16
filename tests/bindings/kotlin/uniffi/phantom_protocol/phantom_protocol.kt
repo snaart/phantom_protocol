@@ -695,6 +695,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold(
     ): Short
+    external fun uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping(
+    ): Short
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_disconnect(
     ): Short
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_recv(
@@ -790,6 +792,8 @@ external fun uniffi_phantom_protocol_fn_method_phantomsession_resumption_hint(`p
 external fun uniffi_phantom_protocol_fn_method_phantomsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,
 ): Long
 external fun uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold(`ptr`: Long,`n`: Long,
+): Long
+external fun uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping(`ptr`: Long,`config`: RustBuffer.ByValue,
 ): Long
 external fun uniffi_phantom_protocol_fn_clone_phantomstream(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
@@ -1004,6 +1008,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 53836.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625.toShort()) {
@@ -2415,6 +2422,17 @@ public interface PhantomSessionInterface {
      */
     suspend fun `setRekeyThreshold`(`n`: kotlin.ULong): kotlin.Boolean
     
+    /**
+     * Apply an anti-fingerprint traffic-shaping configuration to the established
+     * session (WIRE v6, direction #4). Returns `false` if the session is still
+     * connecting. All shaping is opt-in (default: none); enabling size padding
+     * ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
+     * the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
+     * worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
+     * tune it.
+     */
+    suspend fun `setTrafficShaping`(`config`: TrafficShapingConfig): kotlin.Boolean
+    
     companion object
 }
 
@@ -2900,6 +2918,35 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
             UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold(
                 uniffiHandle,
                 FfiConverterULong.lower(`n`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_i8(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_i8(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_i8(future) },
+        // lift function
+        { FfiConverterBoolean.lift(it) },
+        // Error FFI converter
+        UniffiNullRustCallStatusErrorHandler,
+    )
+    }
+
+    
+    /**
+     * Apply an anti-fingerprint traffic-shaping configuration to the established
+     * session (WIRE v6, direction #4). Returns `false` if the session is still
+     * connecting. All shaping is opt-in (default: none); enabling size padding
+     * ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
+     * the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
+     * worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
+     * tune it.
+     */
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `setTrafficShaping`(`config`: TrafficShapingConfig) : kotlin.Boolean {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping(
+                uniffiHandle,
+                FfiConverterTypeTrafficShapingConfig.lower(`config`),
             )
         },
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_i8(future, callback, continuation) },
@@ -3545,6 +3592,54 @@ public object FfiConverterTypeResumptionHint: FfiConverterRustBuffer<ResumptionH
 
 
 /**
+ * Anti-fingerprint traffic-shaping configuration (WIRE v6, direction #4). Set on
+ * an established session via [`PhantomSession::set_traffic_shaping`]. **All
+ * shaping is opt-in** — the default (and the field defaults here) is no shaping,
+ * so a session pays nothing unless an embedder enables it.
+ *
+ * Currently carries the size-padding policy (deliverable (c)); the timing-jitter
+ * (d) and cover-traffic (e) knobs will be added as further fields in later
+ * phases. Padding hides the datagram *size*; it costs bounded (≈ ≤12% worst-case)
+ * extra bandwidth.
+ */
+data class TrafficShapingConfig (
+    /**
+     * Size-padding policy. [`PaddingPolicy::None`] (default) = no padding;
+     * [`PaddingPolicy::Padme`] = pad each packet up to a PADÉ bucket.
+     */
+    var `padding`: PaddingPolicy
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTrafficShapingConfig: FfiConverterRustBuffer<TrafficShapingConfig> {
+    override fun read(buf: ByteBuffer): TrafficShapingConfig {
+        return TrafficShapingConfig(
+            FfiConverterTypePaddingPolicy.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: TrafficShapingConfig) = (
+            FfiConverterTypePaddingPolicy.allocationSize(value.`padding`)
+    )
+
+    override fun write(value: TrafficShapingConfig, buf: ByteBuffer) {
+            FfiConverterTypePaddingPolicy.write(value.`padding`, buf)
+    }
+}
+
+
+
+/**
  * Connection state for `PhantomSession`.
  *
  * The session is usable from the moment it's created — sends are queued
@@ -4008,6 +4103,49 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
     }
 
 }
+
+
+
+/**
+ * How a packet's on-wire size is chosen before sealing.
+ */
+
+enum class PaddingPolicy {
+    
+    /**
+     * No padding — the wire size is the natural payload size (default).
+     */
+    NONE,
+    /**
+     * PADÉ bucketing (bounded ≈12% worst-case overhead).
+     */
+    PADME;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePaddingPolicy: FfiConverterRustBuffer<PaddingPolicy> {
+    override fun read(buf: ByteBuffer) = try {
+        PaddingPolicy.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: PaddingPolicy) = 4UL
+
+    override fun write(value: PaddingPolicy, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
 
 
 

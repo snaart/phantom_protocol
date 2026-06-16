@@ -65,15 +65,17 @@ pub type SequenceNumber = u32;
 pub type PacketNumber = u64;
 
 /// The sole on-wire packet-header version byte. Pinned — the wire format is not
-/// negotiated (pre-1.0, no users); a decoder rejects anything else. `5` since ε
-/// (WIRE v5) collapsed the two connection identifiers into one rotating CID: the
-/// 32-byte inner `session_id` left the data-plane wire entirely (it stays in the
-/// AEAD AAD, reconstructed from session context), shrinking the header to 15
-/// bytes — only the cleartext `version(1)` plus the 14 HP-masked variable bytes
-/// (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖ path_id`) at offset `[1..15]`.
-/// Routing is by the outer (rotating) UDP `ConnId`. `4` (T4.6) added QUIC-style
-/// header protection (RFC 9001 §5.4) over a 47-byte header; `3` (Phase 4) widened
-/// the packet number to `u64`. See PROTOCOL.md § 4.2.
+/// negotiated (pre-1.0, no users); a decoder rejects anything else. `6` is the
+/// anti-fingerprint diet: the version byte is now itself HP-masked (the WHOLE
+/// 15-byte header `[0..15]` is masked — no constant cleartext byte), and the two
+/// cleartext `u32` length prefixes are dropped (`payload` is the message
+/// remainder — `recv_bytes` is message-framed — and `extensions` leave the wire),
+/// saving 8 bytes/packet. `5` (ε) collapsed the two connection identifiers into
+/// one rotating CID: the 32-byte inner `session_id` left the data-plane wire (it
+/// stays in the AEAD AAD, reconstructed from session context), shrinking the
+/// header to 15 bytes. `4` (T4.6) added QUIC-style header protection (RFC 9001
+/// §5.4) over a 47-byte header; `3` (Phase 4) widened the packet number to `u64`.
+/// See PROTOCOL.md § 4.2.
 pub const WIRE_VERSION: u8 = 6;
 
 /// Wire offset where the header-protected region begins. **WIRE v6
@@ -159,7 +161,14 @@ impl PacketFlags {
     /// application bytes, so neither reaches `recv()`. (Spare flag bit — no
     /// header layout / `WIRE_VERSION` change.)
     pub const KEEPALIVE: u16 = 0x1000;
-    // 0x2000 .. 0x8000 — reserved for future amendments.
+    /// Anti-fingerprint size padding present (WIRE v6, deliverable (c)). When set,
+    /// the AEAD **plaintext** ends with a trailer `‹pad_n zero bytes› ‖ pad_n:u16be`
+    /// that the receiver strips after decrypt (see [`crate::transport::shaping`]).
+    /// The flag rides inside the HP-masked header, so it is invisible on the wire;
+    /// the padding itself is encrypted + authenticated, so only the bucketed
+    /// datagram size is observable. (Spare flag bit — no header layout change.)
+    pub const PADDED: u16 = 0x2000;
+    // 0x4000 .. 0x8000 — reserved for future amendments.
 
     /// Create new flags with no bits set
     pub const fn empty() -> Self {

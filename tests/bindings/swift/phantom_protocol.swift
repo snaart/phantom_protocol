@@ -1161,6 +1161,17 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      */
     func setRekeyThreshold(n: UInt64) async  -> Bool
     
+    /**
+     * Apply an anti-fingerprint traffic-shaping configuration to the established
+     * session (WIRE v6, direction #4). Returns `false` if the session is still
+     * connecting. All shaping is opt-in (default: none); enabling size padding
+     * ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
+     * the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
+     * worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
+     * tune it.
+     */
+    func setTrafficShaping(config: TrafficShapingConfig) async  -> Bool
+    
 }
 /**
  * Client-first session — instant `connect()`, non-blocking `send()`.
@@ -1585,6 +1596,33 @@ open func setRekeyThreshold(n: UInt64)async  -> Bool  {
                 uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold(
                     self.uniffiCloneHandle(),
                     FfiConverterUInt64.lower(n)
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_i8,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_i8,
+            freeFunc: ffi_phantom_protocol_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Apply an anti-fingerprint traffic-shaping configuration to the established
+     * session (WIRE v6, direction #4). Returns `false` if the session is still
+     * connecting. All shaping is opt-in (default: none); enabling size padding
+     * ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
+     * the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
+     * worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
+     * tune it.
+     */
+open func setTrafficShaping(config: TrafficShapingConfig)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping(
+                    self.uniffiCloneHandle(),
+                    FfiConverterTypeTrafficShapingConfig_lower(config)
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_i8,
@@ -2099,6 +2137,75 @@ public func FfiConverterTypeResumptionHint_lower(_ value: ResumptionHint) -> Rus
     return FfiConverterTypeResumptionHint.lower(value)
 }
 
+
+/**
+ * Anti-fingerprint traffic-shaping configuration (WIRE v6, direction #4). Set on
+ * an established session via [`PhantomSession::set_traffic_shaping`]. **All
+ * shaping is opt-in** — the default (and the field defaults here) is no shaping,
+ * so a session pays nothing unless an embedder enables it.
+ *
+ * Currently carries the size-padding policy (deliverable (c)); the timing-jitter
+ * (d) and cover-traffic (e) knobs will be added as further fields in later
+ * phases. Padding hides the datagram *size*; it costs bounded (≈ ≤12% worst-case)
+ * extra bandwidth.
+ */
+public struct TrafficShapingConfig: Equatable, Hashable {
+    /**
+     * Size-padding policy. [`PaddingPolicy::None`] (default) = no padding;
+     * [`PaddingPolicy::Padme`] = pad each packet up to a PADÉ bucket.
+     */
+    public var padding: PaddingPolicy
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Size-padding policy. [`PaddingPolicy::None`] (default) = no padding;
+         * [`PaddingPolicy::Padme`] = pad each packet up to a PADÉ bucket.
+         */padding: PaddingPolicy) {
+        self.padding = padding
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TrafficShapingConfig: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTrafficShapingConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrafficShapingConfig {
+        return
+            try TrafficShapingConfig(
+                padding: FfiConverterTypePaddingPolicy.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TrafficShapingConfig, into buf: inout [UInt8]) {
+        FfiConverterTypePaddingPolicy.write(value.padding, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrafficShapingConfig_lift(_ buf: RustBuffer) throws -> TrafficShapingConfig {
+    return try FfiConverterTypeTrafficShapingConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrafficShapingConfig_lower(_ value: TrafficShapingConfig) -> RustBuffer {
+    return FfiConverterTypeTrafficShapingConfig.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -2485,6 +2592,82 @@ public func FfiConverterTypeCoreError_lower(_ value: CoreError) -> RustBuffer {
     return FfiConverterTypeCoreError.lower(value)
 }
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How a packet's on-wire size is chosen before sealing.
+ */
+
+public enum PaddingPolicy: Equatable, Hashable {
+    
+    /**
+     * No padding — the wire size is the natural payload size (default).
+     */
+    case none
+    /**
+     * PADÉ bucketing (bounded ≈12% worst-case overhead).
+     */
+    case padme
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PaddingPolicy: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePaddingPolicy: FfiConverterRustBuffer {
+    typealias SwiftType = PaddingPolicy
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PaddingPolicy {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .none
+        
+        case 2: return .padme
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PaddingPolicy, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .none:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .padme:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePaddingPolicy_lift(_ buf: RustBuffer) throws -> PaddingPolicy {
+    return try FfiConverterTypePaddingPolicy.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePaddingPolicy_lower(_ value: PaddingPolicy) -> RustBuffer {
+    return FfiConverterTypePaddingPolicy.lower(value)
+}
+
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -2766,6 +2949,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 53836) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625) {

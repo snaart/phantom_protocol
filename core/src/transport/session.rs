@@ -15,6 +15,7 @@ use crate::transport::{
     pacer::Pacer,
     path::{PathRegistry, PathStateKind, PATH_CHALLENGE_LEN},
     scheduler::Scheduler,
+    shaping::PaddingPolicy,
     stream::Stream,
     types::{
         PacketFlags, PacketHeader, PacketNumber, PhantomPacket, RawPacket, SchedulerMode,
@@ -261,6 +262,13 @@ pub struct Session {
     /// stopping one packet early is harmless — the security gate is the
     /// AEAD-authenticated REKEY flag + epoch check, not this bit.
     rekey_unconfirmed: AtomicBool,
+    /// Anti-fingerprint size-padding policy (WIRE v6, deliverable (c)). `0` =
+    /// [`PaddingPolicy::None`](crate::transport::shaping::PaddingPolicy::None)
+    /// (default — shaping is opt-in), `1` =
+    /// [`PaddingPolicy::Padme`](crate::transport::shaping::PaddingPolicy::Padme).
+    /// Read lock-free by the send path to decide whether to pad a packet to a PADÉ
+    /// bucket before sealing; set via [`set_padding_policy`](Self::set_padding_policy).
+    padding_policy: AtomicU8,
     /// Which side of the handshake we are. Carried into every
     /// `CryptoState::new(...)` re-derivation so the per-direction keys are
     /// laid out the same way they were at session establishment.
@@ -380,6 +388,7 @@ impl Session {
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
             rekey_lock: Mutex::new(()),
             rekey_unconfirmed: AtomicBool::new(false),
+            padding_policy: AtomicU8::new(0),
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -432,6 +441,7 @@ impl Session {
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
             rekey_lock: Mutex::new(()),
             rekey_unconfirmed: AtomicBool::new(false),
+            padding_policy: AtomicU8::new(0),
             is_server,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -479,6 +489,7 @@ impl Session {
             rekey_after: AtomicU64::new(REKEY_SOFT_LIMIT),
             rekey_lock: Mutex::new(()),
             rekey_unconfirmed: AtomicBool::new(false),
+            padding_policy: AtomicU8::new(0),
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -799,6 +810,27 @@ impl Session {
     /// need to exercise mid-session rekey without sending `2^47` packets.
     pub fn set_rekey_threshold(&self, n: u64) {
         self.rekey_after.store(n.max(1), Ordering::Relaxed);
+    }
+
+    /// The active anti-fingerprint size-padding policy (WIRE v6, deliverable (c)).
+    /// Default [`PaddingPolicy::None`] (shaping is opt-in).
+    pub fn padding_policy(&self) -> PaddingPolicy {
+        match self.padding_policy.load(Ordering::Relaxed) {
+            1 => PaddingPolicy::Padme,
+            _ => PaddingPolicy::None,
+        }
+    }
+
+    /// Set the size-padding policy. When [`PaddingPolicy::Padme`], the send path
+    /// pads every packet up to a PADÉ bucket (inside the AEAD) before sealing, so
+    /// the datagram size no longer tracks the payload size — at a bounded
+    /// (≈ ≤12% worst-case) bandwidth cost.
+    pub fn set_padding_policy(&self, policy: PaddingPolicy) {
+        let v = match policy {
+            PaddingPolicy::None => 0,
+            PaddingPolicy::Padme => 1,
+        };
+        self.padding_policy.store(v, Ordering::Relaxed);
     }
 
     /// True once the send direction has crossed the rekey high-watermark and the

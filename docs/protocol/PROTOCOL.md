@@ -25,7 +25,7 @@ that sees any other value drops the frame (packets) or rejects the handshake
 
 | Constant | Value | Source | Where it lives on the wire |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `5` | `core/src/transport/types.rs` | `PacketHeader.version` byte (first byte of the 15-byte header — § 4.2) |
+| `WIRE_VERSION` | `6` | `core/src/transport/types.rs` | `PacketHeader.version` byte (now HP-masked, inside the 15-byte header — § 4.2) |
 | `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs:56` | `ClientHello.version`, transcript-bound |
 
 `WIRE_VERSION` is `4`: it went `1 → 2` when the packet codec moved from
@@ -39,12 +39,20 @@ stream_id ‖ epoch ‖ path_id`) form a contiguous span at offset `[33..47]` th
 **XOR-masked on the wire**, leaving only `version ‖ session_id` cleartext (§ 4.2 /
 § 4.6). Then `4 → 5` (ε / CID-collapse) **dropped the 32-byte inner `session_id`
 from the data-plane wire entirely** — it stays in the AEAD AAD, reconstructed from
-session context (§ 5) — shrinking the header `47 → 15` bytes (only the cleartext
-`version` byte plus the 14 HP-masked variable bytes, now the span `[1..15]`;
-§ 4.2 / § 4.6). The sole routing identifier is the outer 8-byte UDP `ConnId`,
+session context (§ 5) — shrinking the header `47 → 15` bytes. Then `5 → 6`
+(**anti-fingerprint diet**, direction #4) removed the last two structural
+fingerprints: **(a)** the masked region grew to cover the WHOLE 15-byte header so
+the **`version` byte is itself HP-masked** (no constant cleartext byte left on the
+data-plane wire), and **(b)** the two cleartext `u32` length prefixes
+(`payload_len` / `ext_len`) were **dropped** — `payload` is now the message
+remainder (`recv_bytes` is message-framed on every transport, so they were pure
+redundancy) and `extensions` left the data-plane wire — saving 8 bytes/packet
+(§ 4.1 / § 4.2 / § 4.6). v6 also adds opt-in **encrypted size padding** (PADÉ
+bucketing, the `PADDED` flag) so the datagram size no longer tracks the payload
+size (§ 4.8). The sole routing identifier is the outer 8-byte UDP `ConnId`,
 which **rotates** on each migration (§ 4.7) — symmetrically for a client migration
 (both directions, EPS-02 fix), with a residual on the rarer *server* migration
-(§ 12.5). The handshake (`PROTOCOL_VERSION`) is unchanged by T4.6 or ε.
+(§ 12.5). The handshake (`PROTOCOL_VERSION`) is unchanged by T4.6, ε, or v6.
 `PROTOCOL_VERSION` is `3` (bumped
 `1 → 2` when the signed transcript began covering the 0-RTT verdict
 `early_data_accepted` (H2) and `ClientHello` gained the `resumption_binder`
@@ -168,48 +176,47 @@ deserializes a bare `PhantomPacket` directly (`PhantomPacket::from_wire`) and
 **drops** any frame whose `header.version != WIRE_VERSION`
 (`api/session.rs:679-687`). An unparseable frame is dropped, never panicked on.
 
-The packet is serialised by `PhantomPacket::to_wire` as an explicit,
-length-prefixed image — no serialization library:
+The packet is serialised by `PhantomPacket::to_wire` as an explicit image — no
+serialization library. **WIRE v6 (anti-fingerprint diet): no length prefixes.**
 
 ```text
 header        15 bytes (§ 4.2)
-payload_len   u32 big-endian
-payload       payload_len bytes
-ext_len       u32 big-endian
-extensions    ext_len bytes
+payload       the message remainder (all bytes after the 15-byte header)
 ```
 
-`from_wire` is bounds-checked (and overflow-safe on 32-bit targets), so a hostile
-length prefix yields a drop, never an out-of-bounds read. Any bytes after
-`extensions` are ignored (forward-compatibility headroom).
+`recv_bytes` is message-framed on every `SessionTransport` (UDP datagram / TCP
+4-byte frame / embedded frame), so the v5 cleartext `payload_len` / `ext_len`
+`u32` prefixes were pure redundancy *and* a verifiable structural fingerprint
+(`ext_len == 0x00000000`, `payload_len == datagram − const`); v6 drops both.
+`from_wire` is bounds-checked (a buffer shorter than the 15-byte header is a drop,
+never an out-of-bounds read). `extensions` is no longer carried on the data-plane
+wire (it was always empty; the AEAD AAD still binds an empty extensions slice).
 
 `payload` is the AEAD ciphertext when `PacketFlags::ENCRYPTED` is set,
 otherwise raw bytes (control / ACK / path-validation). The AAD is the
-serialised `PacketHeader` bytes (§ 5).
-
-`extensions` is forward-compatibility headroom for future TLV amendments
-(packet-number / SACK fields) without a layout change. It is empty in every
-frame this build emits; a decoder ignores its contents.
+reconstructed 47-byte header image (§ 5).
 
 > **Security note.** The AEAD AAD is the reconstructed 47-byte header image
-> followed by `extensions` (§ 5) — `extensions` is authenticated (T4.1), so a
-> wire mutation of it fails the tag. Wire-format note for ε: the on-wire header
-> is 15 bytes (`session_id` is off-wire), but the AAD reconstructs the full
-> 47-byte v4 image, so the AEAD security argument is unchanged. `extensions` is
-> reserved and never interpreted for 1.0 (no reader exists yet).
+> followed by `extensions` (§ 5). With `extensions` empty (always, on the v6
+> wire) the AAD is just the 47-byte image — which still binds `version` /
+> `session_id` / all header fields. The on-wire header is 15 bytes (`session_id`
+> off-wire), but the AAD reconstructs the full 47-byte v4 image, so the AEAD
+> security argument is unchanged. Forward-compatibility headroom can return later
+> via a reserved flag + an encrypted TLV inside the (padded) plaintext.
 
 ### 4.2 `PacketHeader` (15 wire bytes; 47-byte AAD image)
 
 Serialised by `PacketHeader::to_wire` as an explicit, fixed **big-endian**
 (network byte order) image — no serialization library, `version` first, byte
-arrays as-is. WIRE_VERSION 5 (ε) **drops the inner `session_id` from the wire**
-and shifts the 14 header-protected bytes to a contiguous `[1..15]` span (see
-§ 4.6); the Rust struct keeps the `session_id` field (used for the AAD, off-wire):
+arrays as-is. WIRE_VERSION 5 (ε) dropped the inner `session_id` from the wire;
+**WIRE_VERSION 6 (anti-fingerprint) masks the WHOLE 15-byte header `[0..15]`,
+version byte INCLUDED** (no constant cleartext byte — see § 4.6); the Rust struct
+keeps the `session_id` field (used for the AAD, off-wire):
 
 ```rust
 #[repr(C)]
 pub struct PacketHeader {
-    pub version: u8,                 // pinned WIRE_VERSION   — wire [0],     cleartext
+    pub version: u8,                 // pinned WIRE_VERSION   — wire [0],     HP-masked (v6)
     pub session_id: SessionId,       // [u8; 32]              — OFF-WIRE (AAD only; § 5)
     pub stream_id: StreamId,         // u16  (0 = control)    — wire [11..13], HP-masked
     pub packet_number: PacketNumber, // u64  per-dir monotonic — wire [1..9],   HP-masked
@@ -228,13 +235,14 @@ logical header `version ‖ session_id ‖ packet_number ‖ flags ‖ stream_id
 ‖ path_id`, with the off-wire `session_id` reconstructed from session context
 (§ 5). (`WIRE_VERSION 2 → 3` dropped the dead `ack_delay` and widened `sequence`
 to a per-direction `packet_number: u64`; `3 → 4` reordered the span for header
-protection — § 4.6; `4 → 5` (ε) dropped `session_id` from the wire.)
+protection — § 4.6; `4 → 5` (ε) dropped `session_id` from the wire; `5 → 6`
+(anti-fingerprint) masks the version byte too + drops the length prefixes.)
 
-**Wire byte layout** (15 bytes — `version` cleartext, the rest HP-masked, § 4.6):
+**Wire byte layout** (15 bytes — WIRE v6: the WHOLE header is HP-masked, § 4.6):
 
 | Offset | Field | Width | Encoding | On the wire |
 | --- | --- | --- | --- | --- |
-| 0 | `version` | 1 | u8, `= WIRE_VERSION` | cleartext |
+| 0 | `version` | 1 | u8, `= WIRE_VERSION` | **HP-masked (v6)** |
 | 1 | `packet_number` | 8 | u64 big-endian | HP-masked |
 | 9 | `flags` | 2 | u16 big-endian (§ 4.3) | HP-masked |
 | 11 | `stream_id` | 2 | u16 big-endian | HP-masked |
@@ -287,7 +295,8 @@ Source: `core/src/transport/types.rs:74-107`.
 | `0x0400` | `COALESCED` | Payload bundles inner packets as `[count: u16][len1: u16][p1]…` (full byte layout — § 4.5) |
 | `0x0800` | `WINDOW_UPDATE` | Payload is a big-endian `u32` relative flow-control credit (per-stream; the receiver grants the sender an additional `u32` bytes that is added to the sender's send window, saturating at `MAX_SEND_WINDOW`) |
 | `0x1000` | `KEEPALIVE` | Idle keep-alive PING (empty payload); `KEEPALIVE \| ACK` is the PONG echo (download-only liveness — § 12.4) |
-| `0x2000` … `0x8000` | _reserved_ | Future amendments |
+| `0x2000` | `PADDED` | Anti-fingerprint size padding present: the AEAD plaintext ends with a `‹zeros› ‖ pad_n:u16be` trailer the receiver strips post-decrypt (§ 4.8) |
+| `0x4000` … `0x8000` | _reserved_ | Future amendments |
 
 `ENCRYPTED` is the post-handshake invariant flag — the API layer sets it on
 every application-data packet, and the receive loop drops any non-empty
@@ -380,13 +389,15 @@ not yet driven from the live send path.
 
 ### 4.6 Header protection (T4.6, QUIC RFC 9001 § 5.4)
 
-The 14-byte `[1..15]` span (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖
-path_id`) is **XOR-masked on the wire** so a passive on-path observer cannot read
-the packet number, the `PRIORITY` ("voice") flag, the stream id, the rekey epoch,
-or the migration path label. Only the cleartext `version` byte plus the length
-prefixes stay readable, so the recv path can locate the ciphertext sample before
-unmasking; the `session_id` is off-wire (§ 4.2) and routing is by the outer
-**rotating** `ConnId` (§ 4.7).
+**WIRE v6:** the **whole 15-byte `[0..15]` header** (`version ‖ packet_number ‖
+flags ‖ stream_id ‖ epoch ‖ path_id`) is **XOR-masked on the wire** so a passive
+on-path observer cannot read the packet number, the `PRIORITY` ("voice") flag, the
+stream id, the rekey epoch, the migration path label, *or* the version byte — the
+data-plane wire has **no constant cleartext byte** to fingerprint. (v5 masked only
+`[1..15]`, leaving the version byte cleartext.) The recv path locates the
+ciphertext sample at the **fixed offset 15** (no length prefix needed — § 4.1), so
+masking the version byte introduces no bootstrapping problem; the `session_id` is
+off-wire (§ 4.2) and routing is by the outer **rotating** `ConnId` (§ 4.7).
 
 **Keys.** Per-direction `hp_send` / `hp_recv` (32 bytes each) are derived ONCE at
 session establishment via `kdf::derive_key_32("phantom-hp-{send,recv}-v1",
@@ -406,14 +417,14 @@ dependency**). Per the negotiated suite:
 AES-256-GCM suite:  mask = AES-256-ECB(hp_key, sample)                    (one block)
 ChaCha20 suite:     mask = ChaCha20(key=hp_key, counter=u32_le(sample[0..4]),
                                     nonce=sample[4..16])[0..16]
-apply / remove:     wire[1..15] ^= mask[0..14]
+apply / remove:     wire[0..15] ^= mask[0..15]      (v6: whole header, version incl.)
 ```
 
 Under `--features fips` the AES mask routes through `aws_lc_rs::cipher` ECB (the
 FIPS substrate); the ChaCha20 mask is unreachable (the suite is pinned to AES).
 
 **No new oracle.** The AEAD AAD is the reconstructed 47-byte header image (§ 4.2),
-which binds the unmasked `[1..15]` fields. A wire mutation of the masked span
+which binds the unmasked `[0..15]` fields (v6: version byte included). A wire mutation of the masked span
 unmasks to a wrong header → wrong AAD → the AEAD open fails, exactly like any
 other AAD tamper. HP is an orthogonal
 outer wrapping; it adds no decryption oracle. Source:
@@ -508,6 +519,47 @@ inbound_window_cids, note_migration_path}` (`transport/session.rs`), the UDP dem
 (`client_stamps_cid0_*`, `cid_rotates_on_the_wire_across_migration`,
 `window_slides_across_many_migrations`).
 
+### 4.8 Size padding (WIRE v6, anti-fingerprint deliverable (c))
+
+Even with the v6 length-prefix diet, the **datagram length** still tracks the
+payload size. Opt-in size padding hides it by padding each packet up to a size
+**bucket** before sealing. **Off by default** (it costs bandwidth); enabled per
+session via `PhantomSession::set_traffic_shaping(TrafficShapingConfig { padding:
+Padme })` (FFI-exported).
+
+The padding lives **inside the AEAD plaintext**, so a network observer can neither
+see, strip, nor forge it — only the bucketed datagram size is observable. A padded
+packet sets `PacketFlags::PADDED` (§ 4.3, masked on the wire); its AEAD plaintext
+gains the trailer:
+
+```
+‹inner plaintext› ‖ ‹pad_n zero bytes› ‖ pad_n : u16 big-endian
+```
+
+The receiver, after a successful AEAD open of a `PADDED` packet, reads the trailing
+`u16` `pad_n` and strips the last `2 + pad_n` bytes to recover the inner plaintext
+(a malformed trailer is dropped, never panicked on). The `PADDED` flag is in the
+47-byte AAD, so an attacker cannot flip it to make the receiver mis-strip — that
+fails the AEAD open like any other header tamper.
+
+**Bucket policy — PADÉ** (Nikitin et al., "PURBs", 2019): round a length `L` up so
+its low `E−S` bits are zero, where `E = ⌊log2 L⌋` and `S = ⌊log2 E⌋ + 1`. Overhead
+is bounded by ≈ `1/E` (≤ ~12% for small packets, → 0 for large) while the size
+distribution collapses to O(log) values per magnitude — far cheaper than
+pad-to-MTU, far better than fixed buckets near their edges. The padded on-wire
+packet is capped at `MAX_SHAPED_WIRE = 1184` bytes so the datagram stays under the
+1200-byte path MTU after the UDP envelope; a packet already larger is not padded.
+Padding bytes are paced (they consume the send rate) but do **not** inflate the
+congestion window (cwnd / inflight track real payload bytes only), and a lost
+padded packet retransmits only the real data, re-padded fresh.
+
+Source: `transport/shaping.rs` (`padme`, `padding_trailer_len`, `append_padding`,
+`strip_padding`), wired in `api/session.rs` `send_app_data` (apply) + the recv pump
+(strip). Tests: `transport::shaping` units (bounded overhead, idempotence,
+strip-is-inverse), `security_invariants` (padding inside the AEAD, bucketed, AAD-bound
+flag), live `udp_integration::udp_integration_size_padding_delivers_byte_exact`.
+Timing jitter (d) and cover traffic (e) are separate later phases.
+
 ---
 
 ## 5. AEAD construction
@@ -550,7 +602,7 @@ now authenticated, closing the prior gap where it sat outside the AAD; it is emp
 on every current packet, so the AAD is just the 47-byte image in practice). The
 on-wire header is only 15 bytes (`session_id` is off-wire — § 4.2); the receiver
 reconstructs `header.session_id = self.id()` from the routed session and unmasks
-the `[1..15]` HP span (§ 4.6) before this AEAD-decrypt, rebuilding the byte-identical
+the `[0..15]` HP span (§ 4.6) before this AEAD-decrypt, rebuilding the byte-identical
 47-byte AAD the sender authenticated, so a masked-region tamper or a wrong-session
 delivery surfaces here as a `decrypt failed` — no separate oracle.
 
@@ -1106,7 +1158,7 @@ classical key) and would need its own set.
 
 The packet fixtures freeze the **cleartext** 15-byte wire image (ε; `session_id`
 is off-wire — the AEAD AAD is the separate reconstructed 47-byte image, § 4.2).
-The on-wire `[1..15]` header-protection mask (§ 4.6) is keyed crypto, so it is pinned
+The on-wire `[0..15]` header-protection mask (§ 4.6) is keyed crypto, so it is pinned
 separately — by the `crypto::header_protection` KATs (NIST SP 800-38A F.1.5 for
 AES-256-ECB, RFC 9001 § A.5 for ChaCha20), the `to_wire_masked` /
 `RawPacket::unmask_header` round-trip, and the `security_invariants` HP

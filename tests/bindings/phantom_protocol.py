@@ -535,6 +535,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 53836:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 28528:
@@ -983,6 +985,11 @@ _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold.
     ctypes.c_uint64,
 )
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_disconnect.argtypes = (
     ctypes.c_uint64,
 )
@@ -1093,6 +1100,9 @@ _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_send.restype =
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect.restype = ctypes.c_uint16
@@ -1421,6 +1431,96 @@ class _UniffiFfiConverterTypeResumptionHint(_UniffiConverterRustBuffer):
     def write(value, buf):
         _UniffiFfiConverterBytes.write(value.session_id, buf)
         _UniffiFfiConverterBytes.write(value.resumption_secret, buf)
+
+
+
+
+
+
+class PaddingPolicy(enum.Enum):
+    """
+    How a packet's on-wire size is chosen before sealing.
+"""
+    
+    NONE = 0
+    """
+    No padding — the wire size is the natural payload size (default).
+"""
+    
+    PADME = 1
+    """
+    PADÉ bucketing (bounded ≈12% worst-case overhead).
+"""
+    
+
+
+class _UniffiFfiConverterTypePaddingPolicy(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return PaddingPolicy.NONE
+        if variant == 2:
+            return PaddingPolicy.PADME
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == PaddingPolicy.NONE:
+            return
+        if value == PaddingPolicy.PADME:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == PaddingPolicy.NONE:
+            buf.write_i32(1)
+        if value == PaddingPolicy.PADME:
+            buf.write_i32(2)
+
+
+
+@dataclass
+class TrafficShapingConfig:
+    """
+    Anti-fingerprint traffic-shaping configuration (WIRE v6, direction #4). Set on
+    an established session via [`PhantomSession::set_traffic_shaping`]. **All
+    shaping is opt-in** — the default (and the field defaults here) is no shaping,
+    so a session pays nothing unless an embedder enables it.
+
+    Currently carries the size-padding policy (deliverable (c)); the timing-jitter
+    (d) and cover-traffic (e) knobs will be added as further fields in later
+    phases. Padding hides the datagram *size*; it costs bounded (≈ ≤12% worst-case)
+    extra bandwidth.
+"""
+    def __init__(self, *, padding:PaddingPolicy):
+        self.padding = padding
+        
+        
+
+    
+    def __str__(self):
+        return "TrafficShapingConfig(padding={})".format(self.padding)
+    def __eq__(self, other):
+        if self.padding != other.padding:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeTrafficShapingConfig(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return TrafficShapingConfig(
+            padding=_UniffiFfiConverterTypePaddingPolicy.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypePaddingPolicy.check_lower(value.padding)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypePaddingPolicy.write(value.padding, buf)
 
 
 
@@ -2426,6 +2526,17 @@ class PhantomSessionProtocol(typing.Protocol):
         packets.
 """
         raise NotImplementedError
+    async def set_traffic_shaping(self, config: TrafficShapingConfig) -> bool:
+        """
+        Apply an anti-fingerprint traffic-shaping configuration to the established
+        session (WIRE v6, direction #4). Returns `false` if the session is still
+        connecting. All shaping is opt-in (default: none); enabling size padding
+        ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
+        the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
+        worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
+        tune it.
+"""
+        raise NotImplementedError
 
 class PhantomSession(PhantomSessionProtocol):
     """
@@ -2831,6 +2942,32 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_error_converter = None
         return await _uniffi_rust_call_async(
             _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_i8,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_i8,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_i8,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+    async def set_traffic_shaping(self, config: TrafficShapingConfig) -> bool:
+        """
+        Apply an anti-fingerprint traffic-shaping configuration to the established
+        session (WIRE v6, direction #4). Returns `false` if the session is still
+        connecting. All shaping is opt-in (default: none); enabling size padding
+        ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
+        the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
+        worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
+        tune it.
+"""
+        
+        _UniffiFfiConverterTypeTrafficShapingConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeTrafficShapingConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = None
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping(*_uniffi_lowered_args),
             _UniffiLib.ffi_phantom_protocol_rust_future_poll_i8,
             _UniffiLib.ffi_phantom_protocol_rust_future_complete_i8,
             _UniffiLib.ffi_phantom_protocol_rust_future_free_i8,
@@ -3328,10 +3465,12 @@ async def connect_pinned_with_resumption(host: str,port: int,pinned_key: bytes,h
 
 __all__ = [
     "InternalError",
+    "PaddingPolicy",
     "ConnectionState",
     "CoreError",
     "PhantomConfig",
     "ResumptionHint",
+    "TrafficShapingConfig",
     "connect_pinned",
     "connect_pinned_with_resumption",
     "PhantomStream",
