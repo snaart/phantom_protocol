@@ -428,12 +428,19 @@ uint64_t uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold(
     uint64_t                 threshold);
 
 /* set_traffic_shaping(config: TrafficShapingConfig) -> async bool. Applies an
- * anti-fingerprint traffic-shaping config (WIRE v6); currently the size-padding
- * policy. `config` is a serialized record (RustBuffer). Returns false if the
- * session is not yet established. */
+ * anti-fingerprint traffic-shaping config (WIRE v6): size padding + timing jitter
+ * + cover traffic. `config` is a serialized record (RustBuffer). Always returns
+ * true (accepted) — may be called BEFORE the session is established (stored as
+ * pending and applied on install, so the first packets are shaped). */
 uint64_t uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping(
     void                    *ptr,
     PhantomRustBuffer        config);
+
+/* traffic_shaping() -> async Option<TrafficShapingConfig>. Reads back the shaping
+ * config applied to the established session; None (serialized) while still
+ * connecting. Returns a future handle; the result is a RustBuffer. */
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping(
+    void                    *ptr);
 
 /* --------------------------- PhantomStream -------------------------- */
 
