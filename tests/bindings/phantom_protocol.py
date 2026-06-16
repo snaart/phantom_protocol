@@ -537,6 +537,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 29252:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 28528:
@@ -990,6 +992,10 @@ _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping.
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_disconnect.argtypes = (
     ctypes.c_uint64,
 )
@@ -1103,6 +1109,9 @@ _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_thre
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect.restype = ctypes.c_uint16
@@ -2391,6 +2400,31 @@ class _UniffiFfiConverterUInt64(_UniffiConverterPrimitiveInt):
     def write(value, buf):
         buf.write_u64(value)
 
+class _UniffiFfiConverterOptionalTypeTrafficShapingConfig(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeTrafficShapingConfig.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeTrafficShapingConfig.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeTrafficShapingConfig.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 
 class PhantomSessionProtocol(typing.Protocol):
     """
@@ -2547,6 +2581,14 @@ class PhantomSessionProtocol(typing.Protocol):
         the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
         worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
         tune it.
+"""
+        raise NotImplementedError
+    async def traffic_shaping(self, ) -> typing.Optional[TrafficShapingConfig]:
+        """
+        Read back the traffic-shaping config currently applied to the established
+        session (#9). `None` while still connecting (the session is not installed
+        yet — the pending config set via [`set_traffic_shaping`] will apply on
+        install). FFI-exported.
 """
         raise NotImplementedError
 
@@ -2983,6 +3025,26 @@ class PhantomSession(PhantomSessionProtocol):
             _UniffiLib.ffi_phantom_protocol_rust_future_poll_i8,
             _UniffiLib.ffi_phantom_protocol_rust_future_complete_i8,
             _UniffiLib.ffi_phantom_protocol_rust_future_free_i8,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+    async def traffic_shaping(self, ) -> typing.Optional[TrafficShapingConfig]:
+        """
+        Read back the traffic-shaping config currently applied to the established
+        session (#9). `None` while still connecting (the session is not installed
+        yet — the pending config set via [`set_traffic_shaping`] will apply on
+        install). FFI-exported.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterOptionalTypeTrafficShapingConfig.lift
+        _uniffi_error_converter = None
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_rust_buffer,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )

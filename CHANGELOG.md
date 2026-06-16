@@ -10,6 +10,16 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **Traffic-shaping can be configured before the session establishes (#9).**
+  `PhantomSession::set_traffic_shaping` may now be called **before** the (async)
+  client handshake completes: the config is stored as pending and applied to the
+  negotiated session the moment the background task installs it, so the **first
+  data packets are already shaped** (no "warm up, then configure" gap). It always
+  returns `true` (accepted) — previously it returned `false` while still
+  connecting and did nothing. New `PhantomSession::traffic_shaping() ->
+  Option<TrafficShapingConfig>` getter reads back the applied config (`None` while
+  connecting). Both FFI-exported; bindings regenerated.
+
 - **Anti-fingerprint cover (dummy) traffic (WIRE v6, direction #4, deliverable (e)).**
   Opt-in, additive (no wire change). When enabled, an otherwise-idle session
   maintains a minimum outbound packet rate (`1000 / cover_interval_ms` packets/sec)

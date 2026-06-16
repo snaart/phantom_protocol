@@ -100,6 +100,15 @@ pub struct TrafficShapingConfig {
     pub cover_interval_ms: u32,
 }
 
+/// Apply a [`TrafficShapingConfig`] to an established [`Session`] (#9). Shared by
+/// the immediate (`set_traffic_shaping` on a live session) and the deferred
+/// (background-task, at session install) paths.
+fn apply_shaping(session: &Session, cfg: TrafficShapingConfig) {
+    session.set_padding_policy(cfg.padding);
+    session.set_jitter_ms(cfg.jitter_ms);
+    session.set_cover_interval_ms(cfg.cover_interval_ms);
+}
+
 impl ConnectionState {
     fn from_u8(v: u8) -> Self {
         match v {
@@ -315,6 +324,13 @@ pub struct PhantomSession {
     /// consumed the early-data; `Some(false)` — the client sent early-data and
     /// the server rejected it. Exposed via `early_data_accepted()`.
     early_data_accepted: Arc<Mutex<Option<bool>>>,
+    /// Anti-fingerprint traffic-shaping config (#9). Set via `set_traffic_shaping`
+    /// at any time — **including before the (async) client handshake completes** —
+    /// and applied to the negotiated `Session` the moment it is installed by the
+    /// background task, so the very first data packets are already shaped. A
+    /// `parking_lot::Mutex` (no poison, never held across an `.await`). Default:
+    /// no shaping.
+    shaping: Arc<parking_lot::Mutex<TrafficShapingConfig>>,
     /// Session observability handle. Server-accepted sessions share the
     /// `PhantomListener`'s instance (so its `snapshot()` aggregates every
     /// session it accepted); client sessions get their own. The data pump
@@ -455,6 +471,8 @@ impl PhantomSession {
         let streams = Arc::new(DashMap::new());
         let inner_session: Arc<Mutex<Option<Arc<Session>>>> = Arc::new(Mutex::new(None));
         let early_data_accepted: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        // #9 — shared pending traffic-shaping config, applied at session install.
+        let shaping = Arc::new(parking_lot::Mutex::new(TrafficShapingConfig::default()));
         // Client sessions have no listener, so they own their observability
         // instance (its `snapshot()` reflects just this connection).
         let observability = Observability::new(ObservabilityConfig::default());
@@ -471,6 +489,7 @@ impl PhantomSession {
             streams: streams.clone(),
             inner_session: inner_session.clone(),
             early_data_accepted: early_data_accepted.clone(),
+            shaping: shaping.clone(),
             observability: observability.clone(),
         };
 
@@ -493,6 +512,7 @@ impl PhantomSession {
             runtime_for_pump,
             inner_session,
             early_data_accepted,
+            shaping,
             resumption_request,
             observability,
         )));
@@ -559,6 +579,9 @@ impl PhantomSession {
             // Server side: 0-RTT early-data is delivered via
             // `AcceptOutcome`, not this client-facing field.
             early_data_accepted: Arc::new(Mutex::new(None)),
+            // Server side: the session is already established here, so
+            // `set_traffic_shaping` applies immediately; default = no shaping.
+            shaping: Arc::new(parking_lot::Mutex::new(TrafficShapingConfig::default())),
             // Shares the listener's instance so its `snapshot()` aggregates
             // every accepted session.
             observability: observability.clone(),
@@ -614,6 +637,7 @@ impl PhantomSession {
         runtime: Arc<dyn Runtime>,
         inner_session: Arc<Mutex<Option<Arc<Session>>>>,
         early_data_accepted: Arc<Mutex<Option<bool>>>,
+        shaping: Arc<parking_lot::Mutex<TrafficShapingConfig>>,
         resumption_request: Option<([u8; 32], [u8; 32], Vec<u8>)>,
         observability: Arc<Observability>,
     ) {
@@ -685,6 +709,11 @@ impl PhantomSession {
             let mut guard = inner_session.lock().await;
             *guard = Some(crypto_session.clone());
         }
+        // #9 — apply any traffic-shaping config the embedder set BEFORE the
+        // handshake completed (connect is async), so the very first data packets
+        // are already shaped rather than only after a manual post-establishment
+        // `set_traffic_shaping`. A later `set_traffic_shaping` re-applies live.
+        apply_shaping(&crypto_session, *shaping.lock());
         *early_data_accepted.lock().await = ed_accepted;
 
         // C3 — 0-RTT rejection retransmission contract. If we sent early-data
@@ -2705,6 +2734,7 @@ impl PhantomSession {
             streams,
             inner_session: Arc::new(Mutex::new(None)),
             early_data_accepted: Arc::new(Mutex::new(None)),
+            shaping: Arc::new(parking_lot::Mutex::new(TrafficShapingConfig::default())),
             // Placeholder session (no transport / pump yet); a no-op holder
             // until `connect_with_transport` spawns the real pump.
             observability: Observability::new(ObservabilityConfig::default()),
@@ -2881,15 +2911,30 @@ impl PhantomSession {
     /// worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
     /// tune it.
     pub async fn set_traffic_shaping(&self, config: TrafficShapingConfig) -> bool {
-        match self.inner_session.lock().await.as_ref() {
-            Some(s) => {
-                s.set_padding_policy(config.padding);
-                s.set_jitter_ms(config.jitter_ms);
-                s.set_cover_interval_ms(config.cover_interval_ms);
-                true
-            }
-            None => false,
+        // #9 — store as the pending config (a clone applied at session install, so
+        // it works BEFORE the async client handshake completes), then apply
+        // immediately too if the session is already established. Always accepted.
+        *self.shaping.lock() = config;
+        if let Some(s) = self.inner_session.lock().await.as_ref() {
+            apply_shaping(s, config);
         }
+        true
+    }
+
+    /// Read back the traffic-shaping config currently applied to the established
+    /// session (#9). `None` while still connecting (the session is not installed
+    /// yet — the pending config set via [`set_traffic_shaping`](Self::set_traffic_shaping)
+    /// will apply on install). FFI-exported.
+    pub async fn traffic_shaping(&self) -> Option<TrafficShapingConfig> {
+        self.inner_session
+            .lock()
+            .await
+            .as_ref()
+            .map(|s| TrafficShapingConfig {
+                padding: s.padding_policy(),
+                jitter_ms: s.send_jitter().as_millis() as u32,
+                cover_interval_ms: s.cover_interval().as_millis() as u32,
+            })
     }
 
     /// Migrate the session to a new local network address (Phase 4 — embedder-

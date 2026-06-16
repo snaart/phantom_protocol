@@ -1172,6 +1172,14 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      */
     func setTrafficShaping(config: TrafficShapingConfig) async  -> Bool
     
+    /**
+     * Read back the traffic-shaping config currently applied to the established
+     * session (#9). `None` while still connecting (the session is not installed
+     * yet — the pending config set via [`set_traffic_shaping`] will apply on
+     * install). FFI-exported.
+     */
+    func trafficShaping() async  -> TrafficShapingConfig?
+    
 }
 /**
  * Client-first session — instant `connect()`, non-blocking `send()`.
@@ -1629,6 +1637,30 @@ open func setTrafficShaping(config: TrafficShapingConfig)async  -> Bool  {
             completeFunc: ffi_phantom_protocol_rust_future_complete_i8,
             freeFunc: ffi_phantom_protocol_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Read back the traffic-shaping config currently applied to the established
+     * session (#9). `None` while still connecting (the session is not installed
+     * yet — the pending config set via [`set_traffic_shaping`] will apply on
+     * install). FFI-exported.
+     */
+open func trafficShaping()async  -> TrafficShapingConfig?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping(
+                    self.uniffiCloneHandle()
+                    
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_rust_buffer,
+            freeFunc: ffi_phantom_protocol_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeTrafficShapingConfig.lift,
             errorHandler: nil
             
         )
@@ -2799,6 +2831,30 @@ fileprivate struct FfiConverterOptionTypeResumptionHint: FfiConverterRustBuffer 
         }
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeTrafficShapingConfig: FfiConverterRustBuffer {
+    typealias SwiftType = TrafficShapingConfig?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTrafficShapingConfig.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTrafficShapingConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
@@ -2988,6 +3044,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 29252) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625) {

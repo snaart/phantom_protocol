@@ -1303,3 +1303,60 @@ async fn udp_integration_cover_traffic_fills_idle_and_is_dropped() {
 
     server.await.unwrap();
 }
+
+/// #9 — traffic-shaping config can be set BEFORE the (async) client handshake
+/// completes, and is applied when the session installs — so the very first data
+/// packets are already shaped (no "warm up then configure" gap). `set_traffic_shaping`
+/// is accepted while still connecting (stored as pending), and `traffic_shaping()`
+/// reads it back once established.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_shaping_set_before_establishment_applies() {
+    use phantom_protocol::api::session::TrafficShapingConfig;
+    use phantom_protocol::transport::shaping::PaddingPolicy;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .unwrap();
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let server = tokio::spawn(async move {
+        let s = listener.accept().await.expect("accept").session();
+        let m = s.recv().await.expect("server recv");
+        s.send(m).await.expect("server echo");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let transport = UdpClientTransport::connect(addr).await.unwrap();
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+
+    // IMMEDIATELY — before the background handshake completes — set shaping. It must
+    // be accepted (stored pending), and not yet readable (session not installed).
+    let cfg = TrafficShapingConfig {
+        padding: PaddingPolicy::Padme,
+        jitter_ms: 7,
+        cover_interval_ms: 250,
+    };
+    assert!(
+        client.set_traffic_shaping(cfg).await,
+        "shaping must be accepted while still connecting (stored pending)"
+    );
+
+    // Drive establishment.
+    client.send(b"hello".to_vec()).await.unwrap();
+    let echo = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(echo, b"hello");
+
+    // The pending config was applied at session install — readable now.
+    assert_eq!(
+        client.traffic_shaping().await,
+        Some(cfg),
+        "pre-establishment shaping config must be applied to the installed session"
+    );
+
+    server.await.unwrap();
+}
