@@ -15,6 +15,11 @@ Audit-friendly format: every field has its Rust source-of-truth pinned with
 `core/tests/wire_vectors/` (§ 11) — the Rust types produce them and this doc
 narrates the grammar; all three are checked against each other in CI.
 
+**Building a second, wire-compatible peer?** Read this spec for the grammar, then
+follow the step-by-step conformance ladder in
+[`INTEROP.md`](./INTEROP.md) — it sequences these sections against the committed
+reference vectors, the independent Python decoder, and the CAVP primitive KATs.
+
 ---
 
 ## 1. Versioning policy
