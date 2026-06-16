@@ -1045,3 +1045,72 @@ async fn udp_integration_rekey_under_loss_survives_the_catchup_gate() {
 
     server.await.unwrap();
 }
+
+/// WIRE v6 (c) — a live session with PADÉ size padding enabled on BOTH ends still
+/// delivers byte-exact, across a range of payload lengths (so the receiver strips
+/// every pad amount correctly through the real pump: apply-on-send, strip-on-recv,
+/// for small, bucket-edge, and large payloads). The exact PADÉ bucketing of a
+/// packet is pinned separately by the `security_invariants` unit test; this proves
+/// the end-to-end data plane is not broken by padding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_size_padding_delivers_byte_exact() {
+    use phantom_protocol::api::session::TrafficShapingConfig;
+    use phantom_protocol::transport::shaping::PaddingPolicy;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .unwrap();
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let server = tokio::spawn(async move {
+        let s = listener.accept().await.expect("accept").session();
+        assert!(
+            s.set_traffic_shaping(TrafficShapingConfig {
+                padding: PaddingPolicy::Padme,
+            })
+            .await,
+            "server session established"
+        );
+        // 1 warmup + 6 loop messages = 7 echoes.
+        for _ in 0..7 {
+            let m = s.recv().await.expect("server recv");
+            s.send(m).await.expect("server echo");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+
+    let transport = UdpClientTransport::connect(addr).await.unwrap();
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+
+    // Warm up + enable padding on the client (post-establish).
+    client.send(b"warmup".to_vec()).await.unwrap();
+    let echo = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo, b"warmup");
+    assert!(
+        client
+            .set_traffic_shaping(TrafficShapingConfig {
+                padding: PaddingPolicy::Padme,
+            })
+            .await,
+        "client session established"
+    );
+
+    // A range of payload lengths — tiny, bucket-edge, and large — all echo
+    // byte-exact, so the receiver strips every pad amount correctly.
+    for len in [1usize, 2, 30, 63, 200, 700] {
+        let msg = vec![0xA5u8; len];
+        client.send(msg.clone()).await.unwrap();
+        let echo = timeout(Duration::from_secs(15), client.recv())
+            .await
+            .expect("no timeout")
+            .expect("client recv");
+        assert_eq!(echo, msg, "byte-exact echo of a {len}-byte padded message");
+    }
+
+    server.await.unwrap();
+}
