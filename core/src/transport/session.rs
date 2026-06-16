@@ -269,6 +269,12 @@ pub struct Session {
     /// Read lock-free by the send path to decide whether to pad a packet to a PADÉ
     /// bucket before sealing; set via [`set_padding_policy`](Self::set_padding_policy).
     padding_policy: AtomicU8,
+    /// Anti-fingerprint send-timing jitter ceiling, in milliseconds (WIRE v6,
+    /// deliverable (d)). `0` = off (default). When non-zero, the send path waits a
+    /// uniform random `[0, this]` ms before each packet so inter-packet timing no
+    /// longer tracks app writes. Read lock-free; set via
+    /// [`set_jitter_ms`](Self::set_jitter_ms).
+    jitter_max_ms: AtomicU32,
     /// Which side of the handshake we are. Carried into every
     /// `CryptoState::new(...)` re-derivation so the per-direction keys are
     /// laid out the same way they were at session establishment.
@@ -389,6 +395,7 @@ impl Session {
             rekey_lock: Mutex::new(()),
             rekey_unconfirmed: AtomicBool::new(false),
             padding_policy: AtomicU8::new(0),
+            jitter_max_ms: AtomicU32::new(0),
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -442,6 +449,7 @@ impl Session {
             rekey_lock: Mutex::new(()),
             rekey_unconfirmed: AtomicBool::new(false),
             padding_policy: AtomicU8::new(0),
+            jitter_max_ms: AtomicU32::new(0),
             is_server,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -490,6 +498,7 @@ impl Session {
             rekey_lock: Mutex::new(()),
             rekey_unconfirmed: AtomicBool::new(false),
             padding_policy: AtomicU8::new(0),
+            jitter_max_ms: AtomicU32::new(0),
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -831,6 +840,20 @@ impl Session {
             PaddingPolicy::Padme => 1,
         };
         self.padding_policy.store(v, Ordering::Relaxed);
+    }
+
+    /// The send-timing jitter ceiling as a `Duration` (WIRE v6, deliverable (d)).
+    /// `Duration::ZERO` = jitter off (default).
+    pub fn send_jitter(&self) -> Duration {
+        Duration::from_millis(self.jitter_max_ms.load(Ordering::Relaxed) as u64)
+    }
+
+    /// Set the send-timing jitter ceiling in milliseconds (`0` = off). When set,
+    /// the send path waits a uniform random `[0, ms]` ms before each packet so
+    /// inter-packet timing no longer tracks the application's writes, at a cost of
+    /// up to `ms` of added latency per packet.
+    pub fn set_jitter_ms(&self, ms: u32) {
+        self.jitter_max_ms.store(ms, Ordering::Relaxed);
     }
 
     /// True once the send direction has crossed the rekey high-watermark and the

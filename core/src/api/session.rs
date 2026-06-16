@@ -86,6 +86,11 @@ pub struct TrafficShapingConfig {
     /// Size-padding policy. [`PaddingPolicy::None`] (default) = no padding;
     /// [`PaddingPolicy::Padme`] = pad each packet up to a PADÉ bucket.
     pub padding: PaddingPolicy,
+    /// Send-timing jitter ceiling in milliseconds (deliverable (d)). `0` (default)
+    /// = no jitter; otherwise each packet waits a uniform random `[0, jitter_ms]`
+    /// ms before it is sent, so the inter-packet timing no longer tracks the
+    /// application's writes — at a cost of up to `jitter_ms` of added latency.
+    pub jitter_ms: u32,
 }
 
 impl ConnectionState {
@@ -1597,6 +1602,18 @@ fn feed_bbr_on_ack(
 /// Wait until the pacer has tokens for `bytes` bytes. No-op when the
 /// pacer is unlimited (the default until BBR sets a finite rate).
 async fn pace_send(crypto_session: &Arc<Session>, bytes: u64) {
+    // Anti-fingerprint send-timing jitter (WIRE v6, deliverable (d)): when enabled,
+    // wait a uniform random [0, max] ms before this send so the inter-packet timing
+    // no longer tracks the application's writes. Applied independently of the pacer
+    // (a wire-rate limiter) and before it, so the total delay is jitter + pacing.
+    // Opt-in (default 0 → no-op, no latency cost).
+    let jitter_max = crypto_session.send_jitter();
+    if !jitter_max.is_zero() {
+        let delay = shaping::random_jitter(jitter_max.as_millis() as u32);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
     let pacer = crypto_session.pacer();
     if !pacer.is_enabled() {
         return;
@@ -2743,6 +2760,7 @@ impl PhantomSession {
         match self.inner_session.lock().await.as_ref() {
             Some(s) => {
                 s.set_padding_policy(config.padding);
+                s.set_jitter_ms(config.jitter_ms);
                 true
             }
             None => false,

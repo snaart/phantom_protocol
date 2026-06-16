@@ -10,6 +10,16 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **Anti-fingerprint send-timing jitter (WIRE v6, direction #4, deliverable (d)).**
+  Opt-in, additive (no wire change). When enabled, the send path waits a uniform
+  random `[0, jitter_ms]` ms before each packet, so the inter-packet timing no
+  longer tracks the application's write pattern — at a cost of up to `jitter_ms` of
+  added latency per packet. Configured via the new `jitter_ms` field on
+  `TrafficShapingConfig` (FFI-exported; `0` = off, the default). Applied in
+  `pace_send` ahead of (and independently of) the wire-rate pacer; jitter only
+  delays, never reorders or drops. Bindings regenerated. (Cover traffic (e) is the
+  next phase.)
+
 - **Anti-fingerprint wire diet + opt-in size padding (WIRE v6, direction #4).**
   **BREAKING wire change (`WIRE_VERSION` 5 → 6).** Removes the last two structural
   data-plane fingerprints and adds opt-in size hiding:

@@ -2155,6 +2155,13 @@ public struct TrafficShapingConfig: Equatable, Hashable {
      * [`PaddingPolicy::Padme`] = pad each packet up to a PADÉ bucket.
      */
     public var padding: PaddingPolicy
+    /**
+     * Send-timing jitter ceiling in milliseconds (deliverable (d)). `0` (default)
+     * = no jitter; otherwise each packet waits a uniform random `[0, jitter_ms]`
+     * ms before it is sent, so the inter-packet timing no longer tracks the
+     * application's writes — at a cost of up to `jitter_ms` of added latency.
+     */
+    public var jitterMs: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2162,8 +2169,15 @@ public struct TrafficShapingConfig: Equatable, Hashable {
         /**
          * Size-padding policy. [`PaddingPolicy::None`] (default) = no padding;
          * [`PaddingPolicy::Padme`] = pad each packet up to a PADÉ bucket.
-         */padding: PaddingPolicy) {
+         */padding: PaddingPolicy, 
+        /**
+         * Send-timing jitter ceiling in milliseconds (deliverable (d)). `0` (default)
+         * = no jitter; otherwise each packet waits a uniform random `[0, jitter_ms]`
+         * ms before it is sent, so the inter-packet timing no longer tracks the
+         * application's writes — at a cost of up to `jitter_ms` of added latency.
+         */jitterMs: UInt32) {
         self.padding = padding
+        self.jitterMs = jitterMs
     }
 
     
@@ -2182,12 +2196,14 @@ public struct FfiConverterTypeTrafficShapingConfig: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrafficShapingConfig {
         return
             try TrafficShapingConfig(
-                padding: FfiConverterTypePaddingPolicy.read(from: &buf)
+                padding: FfiConverterTypePaddingPolicy.read(from: &buf), 
+                jitterMs: FfiConverterUInt32.read(from: &buf)
         )
     }
 
     public static func write(_ value: TrafficShapingConfig, into buf: inout [UInt8]) {
         FfiConverterTypePaddingPolicy.write(value.padding, into: &buf)
+        FfiConverterUInt32.write(value.jitterMs, into: &buf)
     }
 }
 

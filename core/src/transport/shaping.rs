@@ -25,6 +25,7 @@
 
 use crate::crypto::adaptive_crypto::AEAD_OVERHEAD;
 use crate::transport::types::{PacketHeader, WireError};
+use std::time::Duration;
 
 /// Upper bound on the padded on-wire packet size (the `PhantomPacket` wire image:
 /// 15-byte header + ciphertext). Capped below the 1200-byte path MTU with margin
@@ -119,6 +120,21 @@ pub fn strip_padding(plaintext: &[u8]) -> Result<&[u8], WireError> {
     Ok(&plaintext[..inner_len])
 }
 
+/// Anti-fingerprint timing jitter (WIRE v6, deliverable (d)): a **uniform random**
+/// delay in `[0, max_ms]` milliseconds to add before a send, so the inter-packet
+/// timing no longer tracks the application's write pattern. Returns
+/// `Duration::ZERO` when `max_ms == 0` (jitter off). Opt-in; it trades up to
+/// `max_ms` of added latency per packet for timing-correlation resistance.
+pub fn random_jitter(max_ms: u32) -> Duration {
+    if max_ms == 0 {
+        return Duration::ZERO;
+    }
+    use rand::Rng;
+    // Inclusive `[0, max_ms]` so both endpoints are reachable.
+    let ms = rand::thread_rng().gen_range(0..=max_ms);
+    Duration::from_millis(ms as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +205,27 @@ mod tests {
         // A plaintext whose wire size is already at/above the cap → no padding.
         let big = MAX_SHAPED_WIRE; // wire would exceed the cap once header+tag added
         assert_eq!(padding_trailer_len(big, PaddingPolicy::Padme), 0);
+    }
+
+    /// Timing jitter is bounded to `[0, max_ms]` and actually varies (so it isn't
+    /// the trivial zero implementation); `max_ms == 0` disables it.
+    #[test]
+    fn random_jitter_is_bounded_and_varies() {
+        assert_eq!(random_jitter(0), Duration::ZERO, "0 disables jitter");
+        let max = 15u32;
+        let cap = Duration::from_millis(max as u64);
+        let mut saw_nonzero = false;
+        for _ in 0..1000 {
+            let d = random_jitter(max);
+            assert!(d <= cap, "jitter {d:?} exceeds the {max}ms ceiling");
+            if d > Duration::ZERO {
+                saw_nonzero = true;
+            }
+        }
+        assert!(
+            saw_nonzero,
+            "jitter must actually add delay (not always zero)"
+        );
     }
 
     /// A malformed trailer (claims more pad than present) is a typed error, never a
