@@ -2,8 +2,9 @@
 //!
 //! Provides tools for testing Phantom Protocol transport under various network conditions:
 //! - Enable/disable UDP transport
-//! - Add artificial latency
+//! - Add artificial latency, with optional jitter (`latency + uniform[0, jitter]`)
 //! - Simulate packet loss
+//! - Throttle to a bandwidth limit (`bandwidth_delay` / `apply_bandwidth`)
 //! - Trigger IP address changes
 
 use rand::Rng;
@@ -27,6 +28,9 @@ struct NetworkSimulatorInner {
     tcp_enabled: AtomicBool,
     /// Additional latency in milliseconds
     latency_ms: AtomicU32,
+    /// Latency jitter in milliseconds — each packet's effective latency is
+    /// `latency + uniform[0, jitter]` (0 = no jitter).
+    jitter_ms: AtomicU32,
     /// Packet loss percentage (0-100)
     packet_loss_percent: AtomicU32,
     /// Bandwidth limit in bytes/second (0 = unlimited)
@@ -43,6 +47,7 @@ impl NetworkSimulator {
                 udp_enabled: AtomicBool::new(true),
                 tcp_enabled: AtomicBool::new(true),
                 latency_ms: AtomicU32::new(0),
+                jitter_ms: AtomicU32::new(0),
                 packet_loss_percent: AtomicU32::new(0),
                 bandwidth_limit: AtomicU32::new(0),
                 ip_change_counter: AtomicU32::new(0),
@@ -106,9 +111,35 @@ impl NetworkSimulator {
         log::info!("NetworkSimulator: latency set to {}ms", ms);
     }
 
-    /// Apply simulated latency (async delay)
+    /// Get the current latency jitter.
+    pub fn jitter(&self) -> Duration {
+        Duration::from_millis(self.inner.jitter_ms.load(Ordering::SeqCst) as u64)
+    }
+
+    /// Set the latency jitter: each packet's effective latency is `latency +
+    /// uniform[0, jitter]` (`Duration::ZERO` disables jitter, making the latency
+    /// deterministic).
+    pub fn set_jitter(&self, jitter: Duration) {
+        let ms = jitter.as_millis().min(u32::MAX as u128) as u32;
+        self.inner.jitter_ms.store(ms, Ordering::SeqCst);
+        log::info!("NetworkSimulator: jitter set to {}ms", ms);
+    }
+
+    /// The effective per-packet latency = `latency + uniform[0, jitter]`. Sampled
+    /// fresh on every call; equals exactly `latency()` when jitter is zero.
+    pub fn effective_latency(&self) -> Duration {
+        let base = self.latency();
+        let jitter_ms = self.inner.jitter_ms.load(Ordering::SeqCst);
+        if jitter_ms == 0 {
+            return base;
+        }
+        let extra = rand::rngs::OsRng.gen_range(0..=jitter_ms);
+        base + Duration::from_millis(extra as u64)
+    }
+
+    /// Apply the simulated latency (async delay), including jitter.
     pub async fn apply_latency(&self) {
-        let latency = self.latency();
+        let latency = self.effective_latency();
         if !latency.is_zero() {
             tokio::time::sleep(latency).await;
         }
@@ -160,6 +191,27 @@ impl NetworkSimulator {
         );
     }
 
+    /// The transmission delay a `bytes`-sized packet incurs under the current
+    /// bandwidth limit: `bytes / limit` seconds. `Duration::ZERO` when the limit is
+    /// 0 (unlimited). Computed in microseconds for precision.
+    pub fn bandwidth_delay(&self, bytes: usize) -> Duration {
+        let limit = self.bandwidth_limit();
+        if limit == 0 || bytes == 0 {
+            return Duration::ZERO;
+        }
+        let micros = (bytes as u64).saturating_mul(1_000_000) / limit as u64;
+        Duration::from_micros(micros)
+    }
+
+    /// Throttle to the bandwidth limit by awaiting [`bandwidth_delay`](Self::bandwidth_delay)
+    /// for a `bytes`-sized packet (no-op when unlimited).
+    pub async fn apply_bandwidth(&self, bytes: usize) {
+        let delay = self.bandwidth_delay(bytes);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     // === IP Change Simulation ===
 
     /// Get the current IP change counter
@@ -191,10 +243,13 @@ impl NetworkSimulator {
         self.set_packet_loss(20);
     }
 
-    /// Apply "mobile roaming" preset (triggers IP change every call)
+    /// Apply "mobile roaming" preset: 100 ms latency with 30 ms jitter, 2% loss, a
+    /// ~1 MB/s bandwidth cap (cellular-ish), and an IP change on each call.
     pub fn preset_mobile_roaming(&self) {
         self.set_latency(Duration::from_millis(100));
+        self.set_jitter(Duration::from_millis(30));
         self.set_packet_loss(2);
+        self.set_bandwidth_limit(1_000_000);
         self.trigger_ip_change();
     }
 
@@ -203,6 +258,7 @@ impl NetworkSimulator {
         self.set_udp_enabled(true);
         self.set_tcp_enabled(true);
         self.set_latency(Duration::ZERO);
+        self.set_jitter(Duration::ZERO);
         self.set_packet_loss(0);
         self.set_bandwidth_limit(0);
     }
@@ -220,6 +276,7 @@ impl std::fmt::Debug for NetworkSimulator {
             .field("udp_enabled", &self.is_udp_enabled())
             .field("tcp_enabled", &self.is_tcp_enabled())
             .field("latency_ms", &self.latency().as_millis())
+            .field("jitter_ms", &self.jitter().as_millis())
             .field("packet_loss_percent", &self.packet_loss_percent())
             .field("bandwidth_limit", &self.bandwidth_limit())
             .field("ip_changes", &self.ip_change_counter())
@@ -292,5 +349,68 @@ mod tests {
         for _ in 0..100 {
             assert!(sim.should_drop_packet());
         }
+    }
+
+    /// B5 — jitter varies the effective latency within `[latency, latency + jitter]`,
+    /// and `jitter == 0` makes it exactly the base latency (deterministic).
+    #[test]
+    fn jitter_bounds_effective_latency() {
+        let sim = NetworkSimulator::new();
+        sim.set_latency(Duration::from_millis(100));
+        sim.set_jitter(Duration::from_millis(20));
+        assert_eq!(sim.jitter(), Duration::from_millis(20));
+
+        let base = Duration::from_millis(100);
+        let cap = Duration::from_millis(120);
+        let mut saw_above = false;
+        for _ in 0..1000 {
+            let eff = sim.effective_latency();
+            assert!(eff >= base, "effective latency {eff:?} must be >= base");
+            assert!(
+                eff <= cap,
+                "effective latency {eff:?} must be <= base + jitter"
+            );
+            if eff > base {
+                saw_above = true;
+            }
+        }
+        assert!(
+            saw_above,
+            "jitter must actually vary the latency above the base"
+        );
+
+        // No jitter → exactly the base latency.
+        sim.set_jitter(Duration::ZERO);
+        for _ in 0..50 {
+            assert_eq!(sim.effective_latency(), base);
+        }
+    }
+
+    /// B5 — `bandwidth_delay(bytes)` is the time to transmit `bytes` at the limit
+    /// (0 = unlimited → no delay).
+    #[test]
+    fn bandwidth_delay_throttles_to_the_limit() {
+        let sim = NetworkSimulator::new();
+        // Unlimited.
+        assert_eq!(sim.bandwidth_delay(10_000), Duration::ZERO);
+        // 1000 B/s: 1000 B = 1 s, 500 B = 500 ms, 0 B = 0.
+        sim.set_bandwidth_limit(1000);
+        assert_eq!(sim.bandwidth_delay(1000), Duration::from_secs(1));
+        assert_eq!(sim.bandwidth_delay(500), Duration::from_millis(500));
+        assert_eq!(sim.bandwidth_delay(0), Duration::ZERO);
+    }
+
+    /// B5 — the mobile-roaming preset now also exercises jitter + a bandwidth cap
+    /// (real cellular characteristics), and `reset` clears them.
+    #[test]
+    fn mobile_roaming_preset_sets_jitter_and_bandwidth_and_reset_clears() {
+        let sim = NetworkSimulator::new();
+        sim.preset_mobile_roaming();
+        assert!(sim.jitter() > Duration::ZERO, "mobile roaming adds jitter");
+        assert!(sim.bandwidth_limit() > 0, "mobile roaming caps bandwidth");
+
+        sim.reset();
+        assert_eq!(sim.jitter(), Duration::ZERO);
+        assert_eq!(sim.bandwidth_limit(), 0);
     }
 }
