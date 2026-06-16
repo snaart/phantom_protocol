@@ -697,6 +697,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping(
     ): Short
+    external fun uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping(
+    ): Short
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_disconnect(
     ): Short
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_recv(
@@ -794,6 +796,8 @@ external fun uniffi_phantom_protocol_fn_method_phantomsession_send(`ptr`: Long,`
 external fun uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold(`ptr`: Long,`n`: Long,
 ): Long
 external fun uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping(`ptr`: Long,`config`: RustBuffer.ByValue,
+): Long
+external fun uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping(`ptr`: Long,
 ): Long
 external fun uniffi_phantom_protocol_fn_clone_phantomstream(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
@@ -1011,6 +1015,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8294.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625.toShort()) {
@@ -2433,6 +2440,14 @@ public interface PhantomSessionInterface {
      */
     suspend fun `setTrafficShaping`(`config`: TrafficShapingConfig): kotlin.Boolean
     
+    /**
+     * Read back the traffic-shaping config currently applied to the established
+     * session (#9). `None` while still connecting (the session is not installed
+     * yet — the pending config set via [`set_traffic_shaping`](Self::set_traffic_shaping)
+     * will apply on install). FFI-exported.
+     */
+    suspend fun `trafficShaping`(): TrafficShapingConfig?
+    
     companion object
 }
 
@@ -2954,6 +2969,32 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_i8(future) },
         // lift function
         { FfiConverterBoolean.lift(it) },
+        // Error FFI converter
+        UniffiNullRustCallStatusErrorHandler,
+    )
+    }
+
+    
+    /**
+     * Read back the traffic-shaping config currently applied to the established
+     * session (#9). `None` while still connecting (the session is not installed
+     * yet — the pending config set via [`set_traffic_shaping`](Self::set_traffic_shaping)
+     * will apply on install). FFI-exported.
+     */
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `trafficShaping`() : TrafficShapingConfig? {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping(
+                uniffiHandle,
+                
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterOptionalTypeTrafficShapingConfig.lift(it) },
         // Error FFI converter
         UniffiNullRustCallStatusErrorHandler,
     )
@@ -4295,6 +4336,38 @@ public object FfiConverterOptionalTypeResumptionHint: FfiConverterRustBuffer<Res
         } else {
             buf.put(1)
             FfiConverterTypeResumptionHint.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeTrafficShapingConfig: FfiConverterRustBuffer<TrafficShapingConfig?> {
+    override fun read(buf: ByteBuffer): TrafficShapingConfig? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeTrafficShapingConfig.read(buf)
+    }
+
+    override fun allocationSize(value: TrafficShapingConfig?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeTrafficShapingConfig.allocationSize(value)
+        }
+    }
+
+    override fun write(value: TrafficShapingConfig?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeTrafficShapingConfig.write(value, buf)
         }
     }
 }
