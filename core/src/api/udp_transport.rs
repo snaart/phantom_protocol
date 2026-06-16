@@ -1,7 +1,10 @@
-//! `SessionTransport` impls over raw UDP (PhantomUDP). `UdpClientTransport` is a connected-socket
-//! client; a later task adds `UdpServerTransport` (a per-session shim fed by the listener demux). Both
-//! add / strip the outer `[flags][cid]` envelope exactly as `TcpSessionTransport` adds / strips its
-//! 4-byte length prefix, so `run_data_pump` / `run_client_handshake` / `drive_server_handshake` are reused.
+//! `SessionTransport` impls over raw UDP (PhantomUDP). `UdpClientTransport` is an
+//! unconnected-socket client (it `send_to`s a tracked server address and `recv_from`s any
+//! source, so it can hear — and later follow — a server that migrates to a new address);
+//! `UdpServerTransport` is a per-session shim fed by the listener demux that can migrate its
+//! own send socket. Both add / strip the outer `[flags][cid]` envelope exactly as
+//! `TcpSessionTransport` adds / strips its 4-byte length prefix, so `run_data_pump` /
+//! `run_client_handshake` / `drive_server_handshake` are reused.
 
 use crate::api::session::{FramePhase, SessionTransport};
 use crate::errors::CoreError;
@@ -39,9 +42,11 @@ enum RecvAction {
 }
 
 /// Whether a UDP `recv` error is an ICMP-induced *advisory* condition (RFC 8085 §5.5 /
-/// RFC 9000 §14.2). On a connected socket the kernel surfaces a matching ICMP error
-/// (port/host/net-unreachable, reset) on the next `recv`; a single such error — which an
-/// off-path attacker can forge (the UDP analogue of a forged RST) — must NOT kill the session.
+/// RFC 9000 §14.2). The client socket is unconnected, so the kernel rarely attributes an
+/// ICMP error to a `recv_from` (it cannot map it to a specific unconnected send) — this
+/// handling is mostly dormant there but retained for the platforms that do surface one. A
+/// single such error — which an off-path attacker can forge (the UDP analogue of a forged
+/// RST) — must NOT kill the session.
 fn is_advisory_recv_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     // ConnectionRefused (ICMP port-unreachable — the audit's M-6 case) and ConnectionReset are
@@ -80,9 +85,12 @@ pub struct UdpClientTransport {
     /// (D7 / broken-rebind safety). `None` outside an overlap; dropped on the first
     /// frame received on the new socket.
     prev_socket: ArcSwap<Option<Arc<UdpSocket>>>,
-    /// The pinned server remote, captured at connect so `migrate()` can `connect` the
-    /// freshly-bound socket to the same destination.
-    server: SocketAddr,
+    /// The server remote this client `send_to`s. `ArcSwap` because the socket is
+    /// unconnected: the destination is explicit per send rather than a kernel-pinned
+    /// connect peer, and a later server-migration *follow* can atomically re-point it to a
+    /// validated new server address without re-handshake. In this build it is the pinned
+    /// connect target and never changes; it is read on every `send_bytes`.
+    server_addr: ArcSwap<SocketAddr>,
     /// The bootstrap (handshake) ConnId — a random lifetime id stamped until the
     /// session sets the rotating chain via [`set_outbound_cid`](SessionTransport::set_outbound_cid).
     cid: ConnId,
@@ -98,7 +106,11 @@ pub struct UdpClientTransport {
 }
 
 impl UdpClientTransport {
-    /// Connect a fresh UDP socket to `server`, choosing a random lifetime connection-ID.
+    /// Bind a fresh UNCONNECTED UDP socket for talking to `server`, choosing a random
+    /// lifetime connection-ID. The socket is left unconnected (no `socket.connect`) so the
+    /// client can `recv_from` any source — the precondition for hearing, and later
+    /// following, a server that migrates to a new address. Datagrams are sent with
+    /// `send_to(server_addr)`.
     pub async fn connect(server: SocketAddr) -> Result<Self, CoreError> {
         let bind = if server.is_ipv4() {
             "0.0.0.0:0"
@@ -108,16 +120,12 @@ impl UdpClientTransport {
         let socket = UdpSocket::bind(bind)
             .await
             .map_err(|e| CoreError::NetworkError(format!("udp bind: {e}")))?;
-        socket
-            .connect(server)
-            .await
-            .map_err(|e| CoreError::NetworkError(format!("udp connect: {e}")))?;
         let mut cid = [0u8; 8];
         getrandom::getrandom(&mut cid).map_err(|e| CoreError::RngError(e.to_string()))?;
         Ok(Self {
             socket: ArcSwap::from_pointee(socket),
             prev_socket: ArcSwap::from_pointee(None),
-            server,
+            server_addr: ArcSwap::from_pointee(server),
             cid,
             established_cid: ArcSwap::from_pointee(None),
             phase: AtomicU8::new(PHASE_HANDSHAKE),
@@ -129,9 +137,10 @@ impl UdpClientTransport {
 
     /// Rebind to a fresh local socket and route subsequent traffic through it
     /// (Phase 4 / P4.2b — embedder-triggered migration). Best-effort and
-    /// non-blocking on validation: it binds + `connect`s the new socket to the same
-    /// server, then atomically swaps it in as the active socket while KEEPING the old
-    /// one for the overlap (the recv loop listens on both until the new path shows
+    /// non-blocking on validation: it binds a fresh unconnected socket (sends still
+    /// `send_to` the tracked `server_addr`), then atomically swaps it in as the active
+    /// socket while KEEPING the old one for the overlap (the recv loop listens on both
+    /// until the new path shows
     /// life, then drops the old — broken-rebind safety / D7). Subsequent app data +
     /// L1 retransmits go out the new socket, so the server detects the new source
     /// (P4.1) and challenges → validates → swaps its peer. The caller is responsible
@@ -149,10 +158,9 @@ impl UdpClientTransport {
         let new_sock = UdpSocket::bind(new_local_addr)
             .await
             .map_err(|e| CoreError::NetworkError(format!("udp migrate bind: {e}")))?;
-        new_sock
-            .connect(self.server)
-            .await
-            .map_err(|e| CoreError::NetworkError(format!("udp migrate connect: {e}")))?;
+        // The socket stays UNCONNECTED (sends use `send_to(server_addr)`), so there is no
+        // `connect` step — the send target is the tracked `server_addr`, unchanged by a
+        // local rebind.
         let new_sock = Arc::new(new_sock);
         // Retain the old socket FIRST (so the recv loop never sees a gap), then swap
         // the active socket. The recv loop drops the retained socket on the first
@@ -192,8 +200,11 @@ impl SessionTransport for UdpClientTransport {
         // Snapshot the active socket (owned `Arc`, not a `Guard`) so we never hold an
         // `ArcSwap` guard across `.await` — `migrate()` can swap it concurrently.
         let sock = self.socket.load_full();
+        // Unconnected socket: the destination is explicit. `server_addr` is the tracked
+        // server remote (a later server-migration follow can re-point it without rebinding).
+        let dst = **self.server_addr.load();
         for d in &dgrams {
-            sock.send(d)
+            sock.send_to(d, dst)
                 .await
                 .map_err(|e| CoreError::NetworkError(format!("udp send: {e}")))?;
         }
@@ -204,8 +215,8 @@ impl SessionTransport for UdpClientTransport {
 
     async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
         // Sized at PATH_MTU + slack. We only ever emit datagrams <= PATH_MTU, so a legitimate peer
-        // never exceeds this; an oversized datagram is truncated by `recv` and then dropped by the
-        // `decode_header`/reassembly failure path below — intentional.
+        // never exceeds this; an oversized datagram is truncated by `recv_from` and then dropped by
+        // the `decode_header`/reassembly failure path below — intentional.
         let mut buf = vec![0u8; PATH_MTU + 64];
         // Second recv buffer, lazily sized only during a migration overlap; the common
         // no-migration path keeps the single `buf`.
@@ -221,6 +232,12 @@ impl SessionTransport for UdpClientTransport {
             let active = self.socket.load_full();
             let prev_arc = self.prev_socket.load_full();
             let prev_opt: Option<Arc<UdpSocket>> = (*prev_arc).clone();
+            // The tracked server remote, for the overlap drop decision below. The socket is
+            // unconnected, so `recv_from` returns the source of every datagram; we deliver
+            // from ANY source (the inner AEAD + replay window are the real guards, exactly
+            // as the server delivers any CID-matched datagram via its demux), but only treat
+            // life *from the established server* on the new socket as "the new path is up".
+            let server = **self.server_addr.load();
 
             // `from_prev` records which buffer the datagram landed in, so we slice the
             // right one AFTER the select — the recv future's `&mut buf` borrow is
@@ -238,7 +255,7 @@ impl SessionTransport for UdpClientTransport {
                     // MAX_HANDSHAKE_RETX and timing the handshake out. Biasing toward received data
                     // makes the RTO fire only when recv is genuinely pending.
                     biased;
-                    r = active.recv(&mut buf) => match classify_recv(r) {
+                    r = active.recv_from(&mut buf) => match classify_recv(r.map(|(n, _src)| n)) {
                         RecvAction::Got(n) => (n, false),
                         RecvAction::Retry => {
                             log::debug!("PhantomUDP: advisory recv error (ignored, RFC 8085 §5.5)");
@@ -254,7 +271,7 @@ impl SessionTransport for UdpClientTransport {
                             return Err(CoreError::Timeout);
                         }
                         for d in self.last_sent.lock().await.iter() {
-                            let _ = active.send(d).await;
+                            let _ = active.send_to(d, server).await;
                         }
                         continue;
                     }
@@ -264,23 +281,28 @@ impl SessionTransport for UdpClientTransport {
                     buf_prev.resize(PATH_MTU + 64, 0);
                 }
                 tokio::select! {
-                    r = active.recv(&mut buf) => {
-                        let n = match classify_recv(r) {
-                            RecvAction::Got(n) => n,
-                            RecvAction::Retry => {
+                    r = active.recv_from(&mut buf) => {
+                        let (n, src) = match r {
+                            Ok((n, src)) => (n, src),
+                            Err(e) if is_advisory_recv_error(&e) => {
                                 log::debug!("PhantomUDP: advisory recv error on new path (ignored)");
                                 continue;
                             }
-                            RecvAction::Fatal(e) => {
+                            Err(e) => {
                                 return Err(CoreError::NetworkError(format!("udp recv: {e}")))
                             }
                         };
-                        // First life on the new path: the server is now reaching us on
-                        // the new socket → drop the retained old socket (overlap done).
-                        self.prev_socket.store(Arc::new(None));
+                        // First life *from the established server* on the new path: the
+                        // server is now reaching us on the new socket → drop the retained
+                        // old socket (overlap done). A datagram from some other source does
+                        // not end the overlap (it is still delivered for the AEAD layer to
+                        // judge, but it is not the "new path is up" signal).
+                        if src == server {
+                            self.prev_socket.store(Arc::new(None));
+                        }
                         (n, false)
                     }
-                    r = prev_sock.recv(&mut buf_prev) => match classify_recv(r) {
+                    r = prev_sock.recv_from(&mut buf_prev) => match classify_recv(r.map(|(n, _src)| n)) {
                         RecvAction::Got(n) => (n, true),
                         RecvAction::Retry => {
                             log::debug!("PhantomUDP: advisory recv error on old path (ignored)");
@@ -292,7 +314,7 @@ impl SessionTransport for UdpClientTransport {
                     },
                 }
             } else {
-                match classify_recv(active.recv(&mut buf).await) {
+                match classify_recv(active.recv_from(&mut buf).await.map(|(n, _src)| n)) {
                     RecvAction::Got(n) => (n, false),
                     RecvAction::Retry => {
                         log::debug!("PhantomUDP: advisory recv error (ignored, RFC 8085 §5.5)");
@@ -552,6 +574,38 @@ mod tests {
             .expect("no timeout")
             .expect("recv");
         assert_eq!(&recv[..], &big[..]);
+    }
+
+    /// D1 (server migration): the client uses an UNCONNECTED socket, so it can hear a
+    /// datagram from a source *other* than its original connect target — the precondition
+    /// for following a server that has migrated its send address to a new socket. A
+    /// connected socket drops such a datagram at the kernel (wrong source); the unconnected
+    /// client must deliver it (the inner AEAD + replay window are the real guards).
+    #[tokio::test]
+    async fn client_hears_a_datagram_from_a_new_server_source() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpClientTransport::connect(server_addr).await.unwrap();
+        client.set_frame_phase(FramePhase::Established);
+
+        // The server learns the client's local address (so the new source can target it).
+        client.send_bytes(b"hello").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, client_addr) = server.recv_from(&mut buf).await.unwrap();
+
+        // A DIFFERENT source (a migrated server's freshly-bound socket) sends a framed
+        // datagram to the client. On a connected socket the kernel drops it; the
+        // unconnected client must deliver it up through `recv_bytes`.
+        let migrated = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for d in encode_datagrams(PacketType::OneRtt, &client.cid(), 1, b"from-new-source").unwrap()
+        {
+            migrated.send_to(&d, client_addr).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(2), client.recv_bytes())
+            .await
+            .expect("client must hear a new server source (unconnected socket)")
+            .expect("recv");
+        assert_eq!(&got[..], b"from-new-source");
     }
 
     /// While in Handshake phase, a dropped first datagram is retransmitted on RTO.
