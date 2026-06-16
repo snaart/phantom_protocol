@@ -273,6 +273,13 @@ impl<T: SessionTransport> SessionTransport for ObservedTransport<T> {
     ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
         self.inner.migrate(local_addr)
     }
+
+    fn migrate_server(
+        &self,
+        local_addr: String,
+    ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
+        self.inner.migrate_server(local_addr)
+    }
 }
 
 // ─── Session ────────────────────────────────────────────────────────────────
@@ -4187,6 +4194,7 @@ mod tests {
         confirm_authenticated_source: AtomicBool,
         promote_candidate: AtomicBool,
         migrate: std::sync::Mutex<Option<String>>,
+        migrate_server: std::sync::Mutex<Option<String>>,
     }
 
     struct RecordingTransport {
@@ -4229,6 +4237,10 @@ mod tests {
             *self.rec.migrate.lock().unwrap() = Some(local_addr);
             Ok(())
         }
+        async fn migrate_server(&self, local_addr: String) -> Result<(), CoreError> {
+            *self.rec.migrate_server.lock().unwrap() = Some(local_addr);
+            Ok(())
+        }
     }
 
     /// ε / WIRE v5 (audit V-3 / EPS-03 / EPS-04) — `ObservedTransport` must forward
@@ -4259,6 +4271,10 @@ mod tests {
             .migrate("127.0.0.1:0".to_string())
             .await
             .expect("migrate");
+        observed
+            .migrate_server("127.0.0.1:0".to_string())
+            .await
+            .expect("migrate_server");
 
         assert!(
             rec.set_frame_phase.load(Ordering::SeqCst),
@@ -4289,6 +4305,11 @@ mod tests {
             rec.migrate.lock().unwrap().as_deref(),
             Some("127.0.0.1:0"),
             "migrate not forwarded"
+        );
+        assert_eq!(
+            rec.migrate_server.lock().unwrap().as_deref(),
+            Some("127.0.0.1:0"),
+            "migrate_server not forwarded"
         );
     }
 
@@ -4529,6 +4550,7 @@ mod tests {
             server_sock.clone(),
             peer,
             [5u8; 8],
+            tx.clone(),
             rx,
         ));
         tx.send((Bytes::from(vec![0u8; 256]), cand_addr))
@@ -4634,6 +4656,7 @@ mod tests {
             server_sock.clone(),
             peer,
             [5u8; 8],
+            tx.clone(),
             rx,
         ));
         // A frame from the rebind source seeds the candidate + its 3× budget.

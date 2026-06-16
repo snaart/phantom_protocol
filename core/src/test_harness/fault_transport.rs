@@ -500,6 +500,9 @@ impl<T: SessionTransport> SessionTransport for LossyTransport<T> {
     async fn migrate(&self, local_addr: String) -> Result<(), CoreError> {
         self.inner.migrate(local_addr).await
     }
+    async fn migrate_server(&self, local_addr: String) -> Result<(), CoreError> {
+        self.inner.migrate_server(local_addr).await
+    }
 }
 
 impl<T: SessionTransport> LossyTransport<T> {
