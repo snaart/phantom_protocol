@@ -1017,7 +1017,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 29252.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8294.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625.toShort()) {
@@ -2443,8 +2443,8 @@ public interface PhantomSessionInterface {
     /**
      * Read back the traffic-shaping config currently applied to the established
      * session (#9). `None` while still connecting (the session is not installed
-     * yet — the pending config set via [`set_traffic_shaping`] will apply on
-     * install). FFI-exported.
+     * yet — the pending config set via [`set_traffic_shaping`](Self::set_traffic_shaping)
+     * will apply on install). FFI-exported.
      */
     suspend fun `trafficShaping`(): TrafficShapingConfig?
     
@@ -2978,8 +2978,8 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
     /**
      * Read back the traffic-shaping config currently applied to the established
      * session (#9). `None` while still connecting (the session is not installed
-     * yet — the pending config set via [`set_traffic_shaping`] will apply on
-     * install). FFI-exported.
+     * yet — the pending config set via [`set_traffic_shaping`](Self::set_traffic_shaping)
+     * will apply on install). FFI-exported.
      */
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
     override suspend fun `trafficShaping`() : TrafficShapingConfig? {

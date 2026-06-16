@@ -537,7 +537,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 29252:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8294:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -2587,8 +2587,8 @@ class PhantomSessionProtocol(typing.Protocol):
         """
         Read back the traffic-shaping config currently applied to the established
         session (#9). `None` while still connecting (the session is not installed
-        yet — the pending config set via [`set_traffic_shaping`] will apply on
-        install). FFI-exported.
+        yet — the pending config set via [`set_traffic_shaping`](Self::set_traffic_shaping)
+        will apply on install). FFI-exported.
 """
         raise NotImplementedError
 
@@ -3032,8 +3032,8 @@ class PhantomSession(PhantomSessionProtocol):
         """
         Read back the traffic-shaping config currently applied to the established
         session (#9). `None` while still connecting (the session is not installed
-        yet — the pending config set via [`set_traffic_shaping`] will apply on
-        install). FFI-exported.
+        yet — the pending config set via [`set_traffic_shaping`](Self::set_traffic_shaping)
+        will apply on install). FFI-exported.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),

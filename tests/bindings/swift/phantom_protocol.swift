@@ -1175,8 +1175,8 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
     /**
      * Read back the traffic-shaping config currently applied to the established
      * session (#9). `None` while still connecting (the session is not installed
-     * yet — the pending config set via [`set_traffic_shaping`] will apply on
-     * install). FFI-exported.
+     * yet — the pending config set via [`set_traffic_shaping`](Self::set_traffic_shaping)
+     * will apply on install). FFI-exported.
      */
     func trafficShaping() async  -> TrafficShapingConfig?
     
@@ -1645,8 +1645,8 @@ open func setTrafficShaping(config: TrafficShapingConfig)async  -> Bool  {
     /**
      * Read back the traffic-shaping config currently applied to the established
      * session (#9). `None` while still connecting (the session is not installed
-     * yet — the pending config set via [`set_traffic_shaping`] will apply on
-     * install). FFI-exported.
+     * yet — the pending config set via [`set_traffic_shaping`](Self::set_traffic_shaping)
+     * will apply on install). FFI-exported.
      */
 open func trafficShaping()async  -> TrafficShapingConfig?  {
     return
@@ -3046,7 +3046,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 29252) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8294) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625) {
