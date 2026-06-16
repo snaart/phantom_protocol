@@ -7,6 +7,10 @@ layout / endianness / discriminant regression in the hand-rolled packet codec
 (`PacketHeader::to_wire`) or in `borsh` (handshake messages) would move both ends
 together and pass silently.
 
+For a clean-room implementer's guide that ties these fixtures, the Python
+decoder, and the CAVP primitive KATs into a step-by-step conformance ladder, see
+[`docs/protocol/INTEROP.md`](../../../docs/protocol/INTEROP.md).
+
 ## What asserts them
 
 | Test | Vectors |
@@ -38,8 +42,12 @@ widths, endianness). Two non-obvious points, both reproduced by the Python
 decoder:
 
 - **packets** use a hand-rolled **big-endian** codec: `version` first, integers
-  network byte order, byte arrays as-is, and the body is
-  `header(45) || payload_len:u32be || payload || ext_len:u32be || extensions`.
+  network byte order, byte arrays as-is. WIRE v6 is a diet image —
+  `header(15) || payload`, with **no** length prefixes (the v5 cleartext
+  `payload_len` / `ext_len` `u32` prefixes were dropped as a structural
+  fingerprint, and `extensions` is no longer carried on the wire). On the wire
+  the whole 15-byte header is header-protection–masked; the AEAD AAD separately
+  reconstructs a 47-byte image (PROTOCOL.md §§ 4.1, 4.2, 5).
 - **borsh** (handshake) is canonical little-endian: fixed arrays raw, `Vec`
   length-prefixed with a `u32`, `Option` a 1-byte tag, `bool` a 1-byte value.
 
