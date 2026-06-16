@@ -53,6 +53,19 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Security
 
+- **Rekey hygiene — T5.5(b): re-advertised REKEY + a catch-up gate.** A mid-session rekey now
+  re-advertises `PacketFlags::REKEY` on **every** packet sent at the new epoch (not just the single
+  rotation-trigger packet) until the peer is observed at that epoch — so losing the trigger packet no
+  longer leaves later new-epoch packets (incl. reliable retransmits) unflagged. On the strength of that
+  guarantee the receive-side forward-rekey catch-up (`decrypt_packet_accepting_rekey`) now **gates** on
+  the flag: a forward-epoch packet **without** `REKEY` is cheap-rejected *before* the HKDF catch-up walk
+  runs, tightening the DoS bound (a spoofed forward epoch with the flag cleared forces zero key
+  derivation; the existing `MAX_REKEY_CATCHUP` = 16 HKDF-step cap still bounds the flagged case). An
+  honest not-yet-confirmed sender is unaffected (it always re-advertises). New `Session::rekey_unconfirmed`
+  state (`AtomicBool`, set in `rekey()`, cleared on an authenticated inbound packet at the current epoch).
+  Invariants 4 / 5 / 8 (replay-after-AEAD, epoch saturation, nonce-exhaustion) are preserved; no
+  wire-format change (`REKEY` is an existing flag bit). Also corrects the stale "single rekey owner /
+  single writer" comments — the receive task is a second epoch-writer, serialised through `rekey_lock`.
 - **Build-integrity / supply chain — T5.6 (SUPPLY-03/04).** The FIPS build no longer links the
   non-FIPS classical crypto crates. `ring` (AEAD) and `x25519-dalek` (classical KEM half) are moved
   behind a new `classical-crypto` Cargo feature (folded into `default`, intentionally *not* implied by

@@ -933,3 +933,115 @@ async fn udp_integration_passive_rebind_recovers_without_client_migrate() {
 
     server.await.unwrap();
 }
+
+/// T5.5(b) — a live, lossy, multi-rekey session must keep delivering through the
+/// receive-side catch-up GATE. With a low rekey high-watermark on BOTH ends, the
+/// session rekeys repeatedly mid-exchange; once the data plane is warm the relay
+/// drops every 3rd datagram in each direction, forcing reliable retransmits AT
+/// THE NEW EPOCH. Those retransmits only pass the gate (which rejects a forward
+/// epoch lacking the `REKEY` flag) because the sender RE-ADVERTISES `REKEY` on
+/// every new-epoch packet while the rekey is unconfirmed — the single trigger
+/// packet alone would be lost. If the sender did not re-advertise (or the gate
+/// rejected the unflagged retransmits), the reliable stream would stall and this
+/// would time out. We assert every echo is byte-exact and that a rekey fired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_rekey_under_loss_survives_the_catchup_gate() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    const MSGS: usize = 24;
+    const THRESH: u64 = 8;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .unwrap();
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    // Server: lower the rekey watermark on the established session, then echo
+    // exactly MSGS messages lock-step.
+    let server = tokio::spawn(async move {
+        let s = listener.accept().await.expect("accept").session();
+        assert!(
+            s.set_rekey_threshold(THRESH).await,
+            "server session established"
+        );
+        for _ in 0..MSGS {
+            let m = s.recv().await.expect("server recv");
+            s.send(m).await.expect("server echo");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+
+    // Lossy relay: client <-> relay <-> server. While `lossy` is set, drop every
+    // 3rd datagram in EACH direction (independent counters), forcing ARQ.
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    upstream.connect(server_addr).await.unwrap();
+    let lossy = Arc::new(AtomicBool::new(false));
+    let lossy_relay = lossy.clone();
+    tokio::spawn(async move {
+        let mut c2s = vec![0u8; 4096];
+        let mut s2c = vec![0u8; 4096];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        let c2s_n = AtomicU64::new(0);
+        let s2c_n = AtomicU64::new(0);
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s) => {
+                    let (n, from) = match r { Ok(x) => x, Err(_) => continue };
+                    client_addr = Some(from);
+                    let i = c2s_n.fetch_add(1, Ordering::Relaxed);
+                    if lossy_relay.load(Ordering::Relaxed) && i % 3 == 2 { continue; }
+                    let _ = upstream.send(&c2s[..n]).await;
+                }
+                r = upstream.recv(&mut s2c) => {
+                    let n = match r { Ok(x) => x, Err(_) => continue };
+                    let i = s2c_n.fetch_add(1, Ordering::Relaxed);
+                    if lossy_relay.load(Ordering::Relaxed) && i % 3 == 2 { continue; }
+                    if let Some(ca) = client_addr { let _ = relay.send_to(&s2c[..n], ca).await; }
+                }
+            }
+        }
+    });
+
+    let transport = UdpClientTransport::connect(relay_addr).await.unwrap();
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+
+    // Warm up cleanly (handshake + first echo) before enabling loss, so the
+    // handshake is not flaky and the loss lands on the data plane.
+    client.send(b"warmup".to_vec()).await.unwrap();
+    let echo = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo, b"warmup");
+    // Session is established now → lower the client watermark too.
+    assert!(
+        client.set_rekey_threshold(THRESH).await,
+        "client session established"
+    );
+
+    // Make the network lossy and push the rest through repeated mid-session rekeys.
+    lossy.store(true, Ordering::Relaxed);
+    for i in 1..MSGS {
+        let msg = format!("lossy-rekey-msg-{i:04}").into_bytes();
+        client.send(msg.clone()).await.unwrap();
+        let echo = timeout(Duration::from_secs(30), client.recv())
+            .await
+            .expect("no timeout — the gate must not strand retransmits at the new epoch")
+            .expect("client recv");
+        assert_eq!(echo, msg, "byte-exact echo #{i} under loss + rekey");
+    }
+
+    let epoch = client.current_epoch().await.expect("established");
+    assert!(
+        epoch > 0,
+        "the low watermark must have driven at least one mid-session rekey (epoch={epoch})"
+    );
+
+    server.await.unwrap();
+}
