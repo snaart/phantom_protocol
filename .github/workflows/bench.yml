@@ -1,0 +1,80 @@
+name: bench
+
+# Benchmark gate (#6). Two parts:
+#   1. A FAST compile gate: every criterion bench must still build (catches bench
+#      rot when an API changes — a common silent breakage).
+#   2. A same-runner PR-vs-base comparison: run the benches on the PR head and on
+#      the PR's base commit on the SAME runner (so the comparison is
+#      hardware-neutral — shared GitHub runners are too noisy for absolute
+#      thresholds), and FAIL on a gross (> 2x) regression. Fine-grained (< 2x)
+#      perf tracking stays the pinned-machine methodology in BENCHMARKS.md.
+#
+# Path-filtered + cancel-in-progress because the full run is heavy (the crypto /
+# transport benches use long criterion measurement windows). Not a branch-protection
+# required context yet — it reports on the PR; promote it to required once its
+# runtime/stability are proven on this repo's runners.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "core/src/**"
+      - "core/benches/**"
+      - "core/Cargo.toml"
+      - "scripts/bench_compare.py"
+      - ".github/workflows/bench.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  bench:
+    name: bench compile + regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Full history so the PR base commit is available for the comparison.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "."
+
+      # 1. Compile gate — every bench must still build (catches bench rot).
+      - name: Compile all benches
+        run: cargo bench --manifest-path core/Cargo.toml --features classical-crypto --no-run
+
+      # 2a. Run the PR head's benches into the `ci_pr` baseline.
+      - name: Bench (PR head)
+        run: cargo bench --manifest-path core/Cargo.toml --features classical-crypto -- --save-baseline ci_pr
+
+      # 2b. Check out the PR's base commit and run its benches into `ci_base`
+      #     (same runner → hardware-neutral). target/criterion persists the
+      #     baselines across the checkout.
+      - name: Bench (base commit)
+        run: |
+          git checkout --quiet --detach ${{ github.event.pull_request.base.sha }}
+          cargo bench --manifest-path core/Cargo.toml --features classical-crypto -- --save-baseline ci_base
+          git checkout --quiet --force ${{ github.sha }}
+
+      # 3. Compare; print the table to the job summary; fail on a > 2x regression.
+      - name: Compare base -> PR (fail on > 2x regression)
+        shell: bash
+        run: |
+          {
+            echo '## Benchmark regression (base → PR, same runner)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/bench_compare.py | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
