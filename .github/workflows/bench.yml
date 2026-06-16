@@ -28,6 +28,15 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Explicit [[bench]]-target list for the RUN steps. Bare `cargo bench` (and even
+  # `--benches`) ALSO runs the library's libtest harness ("Running unittests
+  # src/lib.rs"), which rejects criterion's `--save-baseline` flag with
+  # "Unrecognized option: 'save-baseline'". Selecting each criterion bench target
+  # explicitly is the only manifest-independent way to exclude the lib — and it has
+  # to be manifest-independent because the base-commit run below checks out `main`,
+  # whose Cargo.toml this PR cannot edit. Keep in sync with `core/Cargo.toml`'s
+  # `[[bench]]` entries (the `--no-run` compile gate below still covers ALL of them).
+  BENCH_TARGETS: "--bench transport_bench --bench buffer_pool_bench --bench syn_flood_bench --bench protocol_comparison --bench observability_bench"
 
 permissions:
   contents: read
@@ -57,7 +66,7 @@ jobs:
 
       # 2a. Run the PR head's benches into the `ci_pr` baseline.
       - name: Bench (PR head)
-        run: cargo bench --manifest-path core/Cargo.toml --features classical-crypto -- --save-baseline ci_pr
+        run: cargo bench --manifest-path core/Cargo.toml --features classical-crypto $BENCH_TARGETS -- --save-baseline ci_pr
 
       # 2b. Check out the PR's base commit and run its benches into `ci_base`
       #     (same runner → hardware-neutral). target/criterion persists the
@@ -65,7 +74,7 @@ jobs:
       - name: Bench (base commit)
         run: |
           git checkout --quiet --detach ${{ github.event.pull_request.base.sha }}
-          cargo bench --manifest-path core/Cargo.toml --features classical-crypto -- --save-baseline ci_base
+          cargo bench --manifest-path core/Cargo.toml --features classical-crypto $BENCH_TARGETS -- --save-baseline ci_base
           git checkout --quiet --force ${{ github.sha }}
 
       # 3. Compare; print the table to the job summary; fail on a > 2x regression.
