@@ -18,7 +18,7 @@
 //!   - Cookie tampering yields a `Retry` (not `Success`) on the server side.
 
 use bytes::Bytes;
-use phantom_protocol::crypto::adaptive_crypto::{CipherSuite, CryptoSession};
+use phantom_protocol::crypto::adaptive_crypto::{CipherSuite, CryptoSession, AEAD_OVERHEAD};
 use phantom_protocol::crypto::hybrid_sign::{HybridSigningKey, HybridVerifyingKey};
 use phantom_protocol::transport::handshake::{
     ClientHello, HandshakeClient, HandshakeError, HandshakeResponse, HandshakeServer, ServerHello,
@@ -27,6 +27,7 @@ use phantom_protocol::transport::path::PathStateKind;
 use phantom_protocol::transport::session::{
     CryptoState, Session, MAX_REKEY_CATCHUP, REBIND_VALIDATION_PATH_ID,
 };
+use phantom_protocol::transport::shaping::{self, PaddingPolicy, MAX_SHAPED_WIRE};
 use phantom_protocol::transport::stream::{Stream, INITIAL_STREAM_WINDOW};
 use phantom_protocol::transport::types::{
     PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
@@ -113,12 +114,12 @@ fn tampered_extensions_is_rejected_via_aad() {
     assert_eq!(pt, b"ext-bound payload");
 }
 
-/// T4.6 — header protection (QUIC RFC 9001 §5.4) masks the 14 variable header
-/// bytes (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖ path_id`, wire `[1..15]`
-/// in ε / WIRE v5) so a passive on-path observer reads neither the packet number
-/// nor the `PRIORITY` ("voice") flag; only the `version` byte stays cleartext
-/// (session_id is off-wire; routing is by the outer ConnId). The peer recovers
-/// the exact packet via `parse_protected`.
+/// Header protection (QUIC RFC 9001 §5.4) masks the header bytes so a passive
+/// on-path observer reads neither the packet number nor the `PRIORITY` ("voice")
+/// flag. **WIRE v6 (anti-fingerprint):** the masked region is the WHOLE 15-byte
+/// header `[0..15]` — the `version` byte is masked too, so there is no constant
+/// cleartext byte to fingerprint (session_id is off-wire; routing is by the outer
+/// ConnId). The peer recovers the exact packet via `parse_protected`.
 #[test]
 fn hp_masks_header_fields_on_the_wire() {
     let (client, server) = make_session_pair([0x71u8; 32]);
@@ -137,14 +138,17 @@ fn hp_masks_header_fields_on_the_wire() {
     let wire = client.protect_packet(&packet).expect("protect");
     let cleartext = packet.to_wire();
 
-    // The 14-byte protected region [1..15] is masked → not the cleartext bytes.
+    // The whole 15-byte header region [0..15] is masked → not the cleartext bytes.
     assert_ne!(
-        &wire[1..15],
-        &cleartext[1..15],
-        "pn/flags/stream_id/epoch/path_id must be masked on the wire"
+        &wire[0..15],
+        &cleartext[0..15],
+        "version/pn/flags/stream_id/epoch/path_id must all be masked on the wire"
     );
-    // Only the `version` byte stays cleartext (session_id is off-wire).
-    assert_eq!(&wire[..1], &cleartext[..1]);
+    // v6: the version byte is masked too — no constant cleartext fingerprint.
+    assert_ne!(
+        wire[0], cleartext[0],
+        "the version byte must be masked on the v6 wire"
+    );
     // The flags bytes (incl. the PRIORITY/voice bit) sit in the masked span, so
     // an observer cannot read the priority class off the wire.
     assert_ne!(
@@ -1285,6 +1289,95 @@ fn rekey_survives_loss_of_the_first_rekey_packet() {
         1,
         "receiver caught up despite the lost trigger packet"
     );
+}
+
+/// WIRE v6 (c) — anti-fingerprint size padding lives INSIDE the AEAD: a padded
+/// packet's plaintext gains a `‹zeros› ‖ pad_n:u16be` trailer before sealing, so
+/// (1) the padding is encrypted — a network observer sees only ciphertext, never
+/// the inner payload length, and (2) the on-wire packet lands on a PADÉ bucket.
+/// The receiver decrypts then strips the trailer to recover the EXACT inner bytes.
+#[test]
+fn size_padding_is_inside_the_aead_and_strips_to_inner() {
+    let (client, server) = make_session_pair([0x90u8; 32]);
+    let inner = b"application data of some particular, fingerprintable length".to_vec();
+
+    // Pad as the send path does: compute the trailer, append it, flag PADDED.
+    let trailer = shaping::padding_trailer_len(inner.len(), PaddingPolicy::Padme);
+    assert!(trailer >= 2, "a small packet must be padded to a bucket");
+    let mut pt = inner.clone();
+    shaping::append_padding(&mut pt, trailer);
+
+    let header = PacketHeader::new(
+        *server.id(),
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::PADDED),
+    );
+    let ct = client
+        .encrypt_packet(&header, &pt, &[])
+        .expect("encrypt padded");
+
+    // (1) The ciphertext covers the padded plaintext — the padding is inside the
+    // AEAD, not appended in the clear. The on-wire packet size is a PADÉ bucket.
+    let wire = PhantomPacket::new(header, ct.clone()).to_wire();
+    let expected =
+        shaping::padme(PacketHeader::SIZE + inner.len() + AEAD_OVERHEAD + 2).min(MAX_SHAPED_WIRE);
+    assert_eq!(
+        wire.len(),
+        expected,
+        "padded wire size lands on a PADÉ bucket"
+    );
+    // The cleartext inner bytes never appear on the wire (only ciphertext does).
+    assert!(
+        !wire.windows(inner.len()).any(|w| w == inner.as_slice()),
+        "inner plaintext must not appear on the wire"
+    );
+
+    // (2) The receiver decrypts then strips → exactly the inner bytes back.
+    let dec = server
+        .decrypt_packet(&header, &ct, &[])
+        .expect("decrypt padded");
+    let stripped = shaping::strip_padding(&dec).expect("strip padding");
+    assert_eq!(
+        stripped,
+        &inner[..],
+        "strip recovers the exact inner plaintext"
+    );
+}
+
+/// WIRE v6 (c) — the `PADDED` flag is AEAD-AAD-bound: it rides in the header image
+/// that is the AEAD AAD, so an attacker cannot flip it to make the receiver
+/// mis-strip (or skip stripping) a packet. Flipping PADDED after sealing fails the
+/// AEAD open, exactly like any other header tamper — no padding-specific oracle.
+#[test]
+fn padded_flag_is_aead_bound() {
+    let (client, server) = make_session_pair([0x91u8; 32]);
+    let inner = b"padded payload".to_vec();
+    let trailer = shaping::padding_trailer_len(inner.len(), PaddingPolicy::Padme);
+    let mut pt = inner.clone();
+    shaping::append_padding(&mut pt, trailer);
+
+    let padded_header = PacketHeader::new(
+        *server.id(),
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::PADDED),
+    );
+    let ct = client
+        .encrypt_packet(&padded_header, &pt, &[])
+        .expect("encrypt");
+
+    // Attacker clears the PADDED bit in the header used as AAD → wrong AAD → fail.
+    let stripped_flag = PacketHeader {
+        flags: PacketFlags::new(PacketFlags::ENCRYPTED),
+        ..padded_header
+    };
+    assert!(
+        server.decrypt_packet(&stripped_flag, &ct, &[]).is_err(),
+        "clearing the AEAD-bound PADDED flag must fail the open"
+    );
+    // The genuine PADDED header still opens (no desync from the failed attempt).
+    assert!(server.decrypt_packet(&padded_header, &ct, &[]).is_ok());
 }
 
 /// C1 concurrency: the data pump drives the send loop and the receive task

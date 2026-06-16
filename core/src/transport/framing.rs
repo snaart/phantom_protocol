@@ -257,93 +257,11 @@ impl From<std::io::Error> for FrameError {
     }
 }
 
-// ─── Adaptive Padding ───────────────────────────────────────────────────────
-
-/// Padding profile — mimics real-world traffic distributions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaddingProfile {
-    None,
-    DtlsSrtp,
-    HttpsTls,
-    FixedMtu,
-}
-
-const DTLS_SRTP_BUCKETS: &[usize] = &[64, 128, 256, 512, 1024, 1200];
-const HTTPS_TLS_BUCKETS: &[usize] = &[128, 256, 512, 1024, 2048, 4096, 8192];
-const DEFAULT_MTU: usize = 1400;
-
-pub fn adaptive_pad_size(payload_len: usize, profile: PaddingProfile) -> usize {
-    match profile {
-        PaddingProfile::None => payload_len,
-        PaddingProfile::DtlsSrtp => pad_to_bucket(payload_len, DTLS_SRTP_BUCKETS),
-        PaddingProfile::HttpsTls => pad_to_bucket(payload_len, HTTPS_TLS_BUCKETS),
-        PaddingProfile::FixedMtu => {
-            if payload_len <= DEFAULT_MTU {
-                DEFAULT_MTU
-            } else {
-                payload_len
-            }
-        }
-    }
-}
-
-pub fn apply_adaptive_padding(payload: &[u8], profile: PaddingProfile) -> Vec<u8> {
-    let orig_len = payload.len();
-    let padded_size = adaptive_pad_size(orig_len + 2, profile);
-
-    let mut buf = Vec::with_capacity(padded_size);
-    buf.extend_from_slice(&(orig_len as u16).to_be_bytes());
-    buf.extend_from_slice(payload);
-    buf.resize(padded_size, 0);
-    buf
-}
-
-pub fn strip_adaptive_padding(padded: &[u8]) -> Option<&[u8]> {
-    if padded.len() < 2 {
-        return None;
-    }
-    let orig_len = u16::from_be_bytes([padded[0], padded[1]]) as usize;
-    if 2 + orig_len > padded.len() {
-        return None;
-    }
-    Some(&padded[2..2 + orig_len])
-}
-
-fn pad_to_bucket(payload_len: usize, buckets: &[usize]) -> usize {
-    for &bucket in buckets {
-        if payload_len <= bucket {
-            return bucket;
-        }
-    }
-    payload_len
-}
-
-impl FrameWriter {
-    pub async fn write_frame_padded(
-        &self,
-        stream: &mut TcpStream,
-        session: &CryptoSession,
-        data: &[u8],
-        profile: PaddingProfile,
-    ) -> Result<usize, FrameError> {
-        let padded = apply_adaptive_padding(data, profile);
-        self.write_frame(stream, session, &padded).await
-    }
-}
-
-impl FrameReader {
-    pub async fn read_frame_padded(
-        &mut self,
-        stream: &mut TcpStream,
-        session: &CryptoSession,
-    ) -> Result<Vec<u8>, FrameError> {
-        let padded = self.read_frame(stream, session).await?;
-        match strip_adaptive_padding(&padded) {
-            Some(payload) => Ok(payload.to_vec()),
-            None => Ok(padded),
-        }
-    }
-}
+// NOTE: an earlier, never-wired "adaptive padding" scaffold (PaddingProfile /
+// adaptive_pad_size / apply_adaptive_padding / write_frame_padded) lived here. It
+// was dead code — only its own tests exercised it. Anti-fingerprint size padding
+// now ships, wired into the real data plane, as PADÉ bucketing in
+// `crate::transport::shaping` (WIRE v6, direction #4). The scaffold was removed.
 
 #[cfg(test)]
 mod tests {
@@ -440,50 +358,6 @@ mod tests {
         let payloads: Vec<&[u8]> = vec![b"Frame 1", b"Frame 2", b"Frame 3"];
         writer
             .write_frames_batch(&mut tcp, &cs, &payloads)
-            .await
-            .unwrap();
-
-        handle.await.unwrap();
-    }
-
-    #[test]
-    fn test_adaptive_padding_dtls() {
-        let padded_size = adaptive_pad_size(52, PaddingProfile::DtlsSrtp);
-        assert_eq!(padded_size, 64);
-        assert_eq!(adaptive_pad_size(100, PaddingProfile::DtlsSrtp), 128);
-        assert_eq!(adaptive_pad_size(1000, PaddingProfile::DtlsSrtp), 1024);
-    }
-
-    #[test]
-    fn test_padding_roundtrip() {
-        let original = b"Hello, adaptive padding!";
-        let padded = apply_adaptive_padding(original, PaddingProfile::DtlsSrtp);
-        assert!(padded.len() >= 64);
-        let stripped = strip_adaptive_padding(&padded).unwrap();
-        assert_eq!(stripped, original);
-    }
-
-    #[tokio::test]
-    async fn frame_padded_round_trip() {
-        let secret = [0xEFu8; 32];
-        let cs = Arc::new(CryptoSession::from_shared_secret(&secret).unwrap());
-        let ss = Arc::new(CryptoSession::from_shared_secret_peer(&secret).unwrap());
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let ss2 = ss.clone();
-        let handle = tokio::spawn(async move {
-            let (mut tcp, _) = listener.accept().await.unwrap();
-            let mut reader = FrameReader::new();
-            let data = reader.read_frame_padded(&mut tcp, &ss2).await.unwrap();
-            assert_eq!(&data, b"Padded message!");
-        });
-
-        let mut tcp = TcpStream::connect(addr).await.unwrap();
-        let writer = FrameWriter::new();
-        writer
-            .write_frame_padded(&mut tcp, &cs, b"Padded message!", PaddingProfile::DtlsSrtp)
             .await
             .unwrap();
 

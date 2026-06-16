@@ -10,6 +10,36 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **Anti-fingerprint wire diet + opt-in size padding (WIRE v6, direction #4).**
+  **BREAKING wire change (`WIRE_VERSION` 5 → 6).** Removes the last two structural
+  data-plane fingerprints and adds opt-in size hiding:
+  - **(a) Masked version byte.** Header protection now covers the WHOLE 15-byte
+    header (`HP_PROTECTED_OFFSET` 1 → 0), so the `version` byte is HP-masked too —
+    the data-plane wire has **no constant cleartext byte** to fingerprint. The recv
+    path recovers + checks the version after unmask; the AAD image is unchanged.
+  - **(b) Dropped length prefixes.** The two cleartext `u32` prefixes
+    (`payload_len` / `ext_len`) are gone — `payload` is the message remainder
+    (`SessionTransport::recv_bytes` is message-framed on every transport, so they
+    were pure redundancy and a verifiable invariant), and `extensions` leave the
+    data-plane wire (always empty; the AEAD AAD still binds an empty slice). −8
+    bytes/packet.
+  - **(c) Opt-in PADÉ size padding.** A new `PacketFlags::PADDED` (0x2000, masked)
+    + an encrypted plaintext trailer (`‹zeros› ‖ pad_n:u16be`, stripped after
+    decrypt) pad each packet up to a **PADÉ** bucket (bounded ≈ ≤12% worst-case
+    overhead) so the datagram size no longer tracks the payload size. **Off by
+    default**; enabled per session via the FFI-exported
+    `PhantomSession::set_traffic_shaping(TrafficShapingConfig { padding: Padme })`
+    (new `TrafficShapingConfig` record + `PaddingPolicy` enum on the UniFFI
+    surface). Padding lives inside the AEAD (authenticated, invisible); only the
+    bucketed datagram size is observable. Paced but does not inflate the congestion
+    window.
+
+    Regenerated the four packet wire-vector fixtures + the independent python
+    decoder + all UniFFI bindings; updated `docs/protocol/PROTOCOL.md` (§4.1/§4.2/
+    §4.3/§4.6 + new §4.8). Removed a dead, never-wired "adaptive padding" scaffold
+    from `transport/framing.rs`. Timing jitter (d) and cover traffic (e) are
+    separate later phases. No crypto/auth change; invariants preserved.
+
 - **Idle keep-alive PINGs — download-only liveness (Phase 4 / Direction #3):** a purely-passive,
   **download-only** path (the receiver sends only ACKs, so nothing is in flight) can now detect a
   silently-dead downstream. An otherwise-idle `Connected` session emits a small `ENCRYPTED | KEEPALIVE`

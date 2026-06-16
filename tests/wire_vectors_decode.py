@@ -18,8 +18,9 @@ What it covers:
 
   * **packet header + `PhantomPacket`** — the hand-rolled big-endian codec:
     `version` first, integers network byte order, byte arrays as-is, and the body
-    is `header(15) || payload_len:u32be || payload || ext_len:u32be || extensions`
-    (ε / WIRE v5: a 15-byte header — session_id is off-wire).
+    is just `header(15) || payload` (WIRE v6 anti-fingerprint diet: the two
+    cleartext `u32` length prefixes are GONE — `payload` is the message remainder —
+    and `extensions` are off the wire; the 15-byte header has session_id off-wire).
     Fully decoded **and** re-encoded, same as the borsh structs.
 
 Run: ``python3 tests/wire_vectors_decode.py`` (stdlib only; exits non-zero on
@@ -44,7 +45,7 @@ ML_DSA_SIG_LEN = 3309
 CLASSICAL_PK_LEN = 32
 PROTOCOL_VARIANT = b"phantom-default-1"
 PROTOCOL_VERSION = 3  # bumped 2->3 (T4.3): ServerHello server_key_package -> 32-byte server_nonce
-WIRE_VERSION = 5
+WIRE_VERSION = 6  # bumped 5->6 (v6 anti-fingerprint): masked version byte + dropped length prefixes
 
 
 def pat(seed: int, n: int) -> bytes:
@@ -265,22 +266,24 @@ def enc_hrr(w: BorshWriter, v):
 
 # ─── packet codec: hand-rolled, big-endian, version-first ───────────────────
 #
-# PacketHeader (15 bytes), WIRE_VERSION 5 layout (ε / CID-collapse — the 32-byte
-# inner session_id is OFF-WIRE; the 14 HP-protected bytes are contiguous at
-# [1:15], only the version byte stays cleartext; routing is by the outer rotating
-# ConnId):
-#   [0]     version       u8   (= WIRE_VERSION)            CLEARTEXT
+# PacketHeader (15 bytes), WIRE_VERSION 6 layout (anti-fingerprint diet — the
+# 32-byte inner session_id is OFF-WIRE; on the data-plane wire the WHOLE 15-byte
+# header [0:15] is HP-MASKED, version byte INCLUDED, so there is no constant
+# cleartext byte; routing is by the outer rotating ConnId):
+#   [0]     version       u8   (= WIRE_VERSION)            HP-MASKED (v6)
 #   [1:9]   packet_number u64 be                           HP-MASKED
 #   [9:11]  flags         u16 be                           HP-MASKED
 #   [11:13] stream_id     u16 be                           HP-MASKED
 #   [13]    epoch         u8                               HP-MASKED
 #   [14]    path_id       u8                               HP-MASKED
-# PhantomPacket: header || payload_len:u32be || payload || ext_len:u32be || ext.
-# NOTE: these fixtures freeze the *cleartext wire image* (the 15-byte header). The
-# AEAD AAD is a SEPARATE 47-byte v4-style image (version‖session_id‖the-14),
-# reconstructed off-wire — NOT what these vectors freeze. The on-wire [1:15] span
-# is XOR-masked by the per-session HeaderProtector (keyed crypto, verified in
-# Rust); this independent decoder stays crypto-free and decodes the cleartext.
+# PhantomPacket: header(15) || payload   (WIRE v6: no length prefixes; payload is
+# the message remainder; extensions are off the wire).
+# NOTE: these fixtures freeze the *cleartext wire image* (the 15-byte header +
+# payload). The AEAD AAD is a SEPARATE 47-byte v4-style image
+# (version‖session_id‖the-14), reconstructed off-wire — NOT what these vectors
+# freeze. The on-wire [0:15] span is XOR-masked by the per-session HeaderProtector
+# (keyed crypto, verified in Rust); this independent decoder stays crypto-free and
+# decodes the cleartext pre-mask image.
 
 HEADER_SIZE = 15
 
@@ -308,30 +311,17 @@ def enc_packet_header(h) -> bytes:
 
 
 def dec_phantom_packet(b: bytes):
+    # WIRE v6 (anti-fingerprint diet): no cleartext length prefixes — the payload
+    # is simply the message remainder after the 15-byte header; `extensions` are
+    # off the data-plane wire (always empty).
     header = dec_packet_header(b)
-    pos = HEADER_SIZE
-    payload_len = struct.unpack(">I", b[pos : pos + 4])[0]
-    pos += 4
-    payload = bytes(b[pos : pos + payload_len])
-    check(len(payload) == payload_len, "payload underrun")
-    pos += payload_len
-    ext_len = struct.unpack(">I", b[pos : pos + 4])[0]
-    pos += 4
-    extensions = bytes(b[pos : pos + ext_len])
-    check(len(extensions) == ext_len, "extensions underrun")
-    pos += ext_len
-    check(pos == len(b), f"trailing bytes: consumed {pos}/{len(b)}")
-    return {"header": header, "payload": payload, "extensions": extensions}
+    payload = bytes(b[HEADER_SIZE:])
+    return {"header": header, "payload": payload, "extensions": b""}
 
 
 def enc_phantom_packet(p) -> bytes:
-    return (
-        enc_packet_header(p["header"])
-        + struct.pack(">I", len(p["payload"]))
-        + p["payload"]
-        + struct.pack(">I", len(p["extensions"]))
-        + p["extensions"]
-    )
+    # WIRE v6: header(15) || payload  (no length prefixes, no extensions on wire).
+    return enc_packet_header(p["header"]) + p["payload"]
 
 
 # ─── per-vector checks ──────────────────────────────────────────────────────
@@ -497,8 +487,12 @@ def phantom_packet_ack():
 
 @vector
 def phantom_packet_extensions():
-    ext = bytes([0xFF, 0x01, 0x00, 0x04]) + b"test"
-    _packet_roundtrip("phantom_packet_extensions.bin", pat(0x11, 16), ext)
+    # WIRE v6 (D3): the struct that produced this fixture had extensions set, but
+    # they are DROPPED from the wire — the fixture is just header(15) ‖ payload(16),
+    # and decoding yields EMPTY extensions. This pins "extensions off the wire".
+    _packet_roundtrip("phantom_packet_extensions.bin", pat(0x11, 16), b"")
+    check(len(load("phantom_packet_extensions.bin")) == HEADER_SIZE + 16,
+          "v6 ext fixture is header || payload only (no extension bytes)")
 
 
 def main() -> int:

@@ -14,6 +14,7 @@ use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::packet_coalescer_codec::unwrap_coalesced_packet;
 use crate::transport::path_validation_codec::build_path_validation_packet;
 use crate::transport::session::{Session, SessionState};
+use crate::transport::shaping::{self, PaddingPolicy};
 use crate::transport::stream::Stream;
 use crate::transport::types::{
     LegType, PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
@@ -68,6 +69,23 @@ pub enum ConnectionState {
     /// The session is dead: the path stayed down past the migration idle-timeout
     /// with no recovery. Terminal — `recv()` errors instead of hanging (P4.3).
     Dead = 8,
+}
+
+/// Anti-fingerprint traffic-shaping configuration (WIRE v6, direction #4). Set on
+/// an established session via [`PhantomSession::set_traffic_shaping`]. **All
+/// shaping is opt-in** — the default (and the field defaults here) is no shaping,
+/// so a session pays nothing unless an embedder enables it.
+///
+/// Currently carries the size-padding policy (deliverable (c)); the timing-jitter
+/// (d) and cover-traffic (e) knobs will be added as further fields in later
+/// phases. Padding hides the datagram *size*; it costs bounded (≈ ≤12% worst-case)
+/// extra bandwidth.
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrafficShapingConfig {
+    /// Size-padding policy. [`PaddingPolicy::None`] (default) = no padding;
+    /// [`PaddingPolicy::Padme`] = pad each packet up to a PADÉ bucket.
+    pub padding: PaddingPolicy,
 }
 
 impl ConnectionState {
@@ -1667,6 +1685,32 @@ async fn send_app_data<T: SessionTransport>(
     // ① — Phase 4: draw the per-direction packet number at send time (so a
     // retransmit gets a fresh PN and the nonce is never reused).
     let packet_number = crypto_session.next_send_pn();
+    // Build the inner AEAD plaintext (owned so size-padding can extend it). For
+    // reliable data, prepend the gap-free per-stream `stream_offset` (A.5, 4
+    // big-endian bytes) so the receiver reassembles in send order regardless of
+    // `sequence` holes left by interleaved control frames. Unreliable / control
+    // frames carry no offset. This all lives inside the AEAD (authenticated,
+    // invisible on the wire).
+    let mut plaintext: Vec<u8> = match reliable_offset {
+        Some(off) => {
+            let mut v = Vec::with_capacity(4 + payload.len());
+            v.extend_from_slice(&off.to_be_bytes());
+            v.extend_from_slice(payload);
+            v
+        }
+        None => payload.to_vec(),
+    };
+    // Anti-fingerprint size padding (WIRE v6, deliverable (c)): when the session's
+    // padding policy is enabled, pad this packet up to a PADÉ bucket INSIDE the
+    // AEAD plaintext and flag it `PADDED`, so the on-wire datagram size no longer
+    // tracks the payload size. The receiver strips the trailer after a successful
+    // decrypt. Opt-in (default `None` → no-op, zero overhead). The `PADDED` flag
+    // rides in the AAD (and is HP-masked on the wire), so a tamper fails the AEAD.
+    let trailer = shaping::padding_trailer_len(plaintext.len(), crypto_session.padding_policy());
+    if trailer > 0 {
+        shaping::append_padding(&mut plaintext, trailer);
+        flag_bits |= PacketFlags::PADDED;
+    }
     let header = PacketHeader::new(
         session_id,
         stream_id,
@@ -1679,25 +1723,9 @@ async fn send_app_data<T: SessionTransport>(
     // the new path label so the peer detects the new path and issues a challenge.
     // Retransmits flow through here too, so ARQ re-carries on the new path (D7).
     .with_path_id(crypto_session.current_send_path_id());
-    // For reliable data, prepend the gap-free per-stream `stream_offset` (A.5, 4
-    // big-endian bytes) to the AEAD plaintext so the receiver reassembles in send
-    // order regardless of `sequence` holes left by interleaved control frames.
-    // Unreliable / control frames carry no offset. Lives inside the AEAD, so it is
-    // authenticated and invisible on the wire (no WIRE_VERSION change).
-    let prefixed_buf;
-    let plaintext: &[u8] = match reliable_offset {
-        Some(off) => {
-            let mut v = Vec::with_capacity(4 + payload.len());
-            v.extend_from_slice(&off.to_be_bytes());
-            v.extend_from_slice(payload);
-            prefixed_buf = v;
-            &prefixed_buf
-        }
-        None => payload,
-    };
     // The data-plane packet carries no `extensions` (TLV headroom stays empty),
     // so the AEAD AAD binds an empty extensions slice — matching the wire.
-    let ciphertext = match crypto_session.encrypt_packet(&header, plaintext, &[]) {
+    let ciphertext = match crypto_session.encrypt_packet(&header, &plaintext, &[]) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: encrypt_packet failed: {}", e);
@@ -2006,6 +2034,25 @@ async fn handle_packet<T: SessionTransport>(
             "PhantomSession: dropping unencrypted post-handshake packet (downgrade / forged FIN?)"
         );
         return;
+    };
+
+    // Strip anti-fingerprint size padding (WIRE v6, deliverable (c)): a PADDED
+    // packet's AEAD plaintext ends with a `‹zeros› ‖ pad_n:u16be` trailer. The
+    // PADDED flag is AEAD-authenticated (it is part of the header AAD verified
+    // above), so this only runs on genuine padded packets; a malformed trailer
+    // from a buggy peer is dropped without panic. Stripping here — before any
+    // downstream parse — means the SACK / keepalive / data paths all see the real
+    // inner plaintext, exactly as if no padding had been applied.
+    let plaintext: Vec<u8> = if packet.header.flags.contains(PacketFlags::PADDED) {
+        match shaping::strip_padding(&plaintext) {
+            Ok(inner) => inner.to_vec(),
+            Err(_) => {
+                log::warn!("PhantomSession: dropping packet with malformed padding trailer");
+                return;
+            }
+        }
+    } else {
+        plaintext
     };
 
     // Liveness (P4.3): an authenticated inbound packet (it passed AEAD above) proves
@@ -2679,6 +2726,23 @@ impl PhantomSession {
         match self.inner_session.lock().await.as_ref() {
             Some(s) => {
                 s.set_rekey_threshold(n);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Apply an anti-fingerprint traffic-shaping configuration to the established
+    /// session (WIRE v6, direction #4). Returns `false` if the session is still
+    /// connecting. All shaping is opt-in (default: none); enabling size padding
+    /// ([`PaddingPolicy::Padme`]) makes outbound packets pad up to a PADÉ bucket so
+    /// the datagram size no longer tracks the payload size, at a bounded (≈ ≤12%
+    /// worst-case) bandwidth cost. FFI-exported so mobile / other embedders can
+    /// tune it.
+    pub async fn set_traffic_shaping(&self, config: TrafficShapingConfig) -> bool {
+        match self.inner_session.lock().await.as_ref() {
+            Some(s) => {
+                s.set_padding_policy(config.padding);
                 true
             }
             None => false,
