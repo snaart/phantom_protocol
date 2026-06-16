@@ -59,6 +59,8 @@ pub mod session;
 #[cfg(feature = "std")]
 pub mod session_cache;
 #[cfg(feature = "std")]
+pub mod shaping;
+#[cfg(feature = "std")]
 pub mod stream;
 #[cfg(feature = "std")]
 pub mod types;
