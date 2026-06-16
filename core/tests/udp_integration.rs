@@ -387,6 +387,153 @@ async fn udp_integration_cid_rotates_on_the_wire_across_migration() {
     server.await.unwrap();
 }
 
+/// A2a (server migration, PR-1) — the SERVER changes its send path mid-session via
+/// `migrate_server`: it rebinds its send socket to a fresh local address (so its s2c
+/// egresses a NEW source the peer hears) and rotates the s2c `path_id` + CID in lock-step.
+/// A relay with an UNCONNECTED upstream socket (so it can hear the migrated server's new
+/// source — mirroring the client's D1 unconnected socket) records that BOTH the s2c source
+/// address AND the s2c ConnId rotate across the move, while the session survives byte-exact
+/// in both directions (c2s keeps flowing to the established listen address through the
+/// overlap). The c2s ConnId stays stable — the client follows the new s2c source but does
+/// NOT yet rotate its own c2s CID (the documented EPS-02 residual the security-core change
+/// closes next).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_server_migration_rotates_s2c_and_survives() {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::UdpSocket;
+
+    const POST: usize = 4;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .unwrap();
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    // Server: warmup echo, then migrate its send path, then echo POST post-migration
+    // rounds (so its rotated-CID s2c is observable AND we prove bidirectional survival).
+    let server = tokio::spawn(async move {
+        let s = listener.accept().await.expect("accept").session();
+        let m = s.recv().await.expect("recv warmup");
+        s.send(m).await.expect("echo warmup");
+        // Server-side migration: rebind the send socket + rotate s2c path_id/CID.
+        s.migrate_server("127.0.0.1:0".to_string())
+            .await
+            .expect("server migrate");
+        for _ in 0..POST {
+            let m = s.recv().await.expect("recv post");
+            s.send(m).await.expect("echo post");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+
+    // Relay (client <-> relay <-> server). The upstream socket is UNCONNECTED so it can
+    // still receive s2c after the server moves to a new source (a connected socket would
+    // drop it at the kernel — exactly the D1 fix, here on the relay standing in for the
+    // client's view of the server). c2s is always forwarded to the established listen
+    // address (the server keeps receiving there via the demux during the overlap).
+    let s2c_cids: Arc<Mutex<HashSet<[u8; 8]>>> = Arc::new(Mutex::new(HashSet::new()));
+    let s2c_srcs: Arc<Mutex<HashSet<std::net::SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
+    let c2s_cids: Arc<Mutex<HashSet<[u8; 8]>>> = Arc::new(Mutex::new(HashSet::new()));
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let s2c_c = s2c_cids.clone();
+    let s2c_s = s2c_srcs.clone();
+    let c2s_c = c2s_cids.clone();
+    tokio::spawn(async move {
+        let mut c2s = vec![0u8; 2048];
+        let mut s2c = vec![0u8; 2048];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s) => {
+                    let (n, from) = r.unwrap();
+                    client_addr = Some(from);
+                    if n >= 9 && (c2s[0] >> 6) == 1 {
+                        let mut cid = [0u8; 8];
+                        cid.copy_from_slice(&c2s[1..9]);
+                        c2s_c.lock().unwrap().insert(cid);
+                    }
+                    upstream.send_to(&c2s[..n], server_addr).await.unwrap();
+                }
+                r = upstream.recv_from(&mut s2c) => {
+                    let (n, src) = r.unwrap();
+                    if n >= 9 && (s2c[0] >> 6) == 1 {
+                        let mut cid = [0u8; 8];
+                        cid.copy_from_slice(&s2c[1..9]);
+                        s2c_c.lock().unwrap().insert(cid);
+                        s2c_s.lock().unwrap().insert(src);
+                    }
+                    if let Some(ca) = client_addr {
+                        relay.send_to(&s2c[..n], ca).await.unwrap();
+                    }
+                }
+            }
+        }
+    });
+
+    let transport = UdpClientTransport::connect(relay_addr).await.unwrap();
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+
+    // Warmup: establishes the session on s2c CID_0 from the listen address.
+    client.send(b"r0".to_vec()).await.unwrap();
+    let e0 = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(e0, b"r0");
+
+    // Post-migration: the server has rebound its send socket; each echo proves the c2s
+    // still reaches the listen address (demux overlap) AND the rotated-source/rotated-CID
+    // s2c reaches us — byte-exact, no re-handshake.
+    for i in 0..POST {
+        let msg = format!("p{i}").into_bytes();
+        client.send(msg.clone()).await.unwrap();
+        let echo = timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("no timeout through the server migration")
+            .expect("recv post-migration echo");
+        assert_eq!(
+            echo, msg,
+            "byte-exact bidirectional flow survives server migration"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The server sent s2c from the listen address (warmup) AND from the migrated socket
+    // (post-migration) — two distinct sources, impossible without a real send-socket
+    // rebind — and rotated its CID across the move. A no-op `migrate_server` would leave
+    // both at 1 source / would not change the source set.
+    let s2c_srcs_seen = s2c_srcs.lock().unwrap();
+    assert!(
+        s2c_srcs_seen.contains(&server_addr),
+        "the server's pre-migration s2c must come from the listen address"
+    );
+    assert!(
+        s2c_srcs_seen.len() >= 2,
+        "the s2c source address must change across server migration (saw {} distinct sources)",
+        s2c_srcs_seen.len()
+    );
+    drop(s2c_srcs_seen);
+    let s2c_cids_seen = s2c_cids.lock().unwrap().len();
+    assert!(
+        s2c_cids_seen >= 2,
+        "the on-wire s2c CID must rotate across server migration (saw {s2c_cids_seen} distinct OneRtt CIDs)"
+    );
+    // PR-1 residual (closed by the security-core change): the client follows the new s2c
+    // source but does NOT rotate its own c2s CID on detecting a server migration.
+    let c2s_cids_seen = c2s_cids.lock().unwrap().len();
+    assert_eq!(
+        c2s_cids_seen, 1,
+        "the client's c2s CID stays stable across a server migration in PR-1 (EPS-02 residual)"
+    );
+
+    server.await.unwrap();
+}
+
 /// ε / WIRE v5 (P4b) — the inbound CID demux window SLIDES as the client migrates,
 /// so a session keeps routing across MANY more than K=4 migrations (the
 /// pre-registered window covers only the first K). The client migrates HOPS >> K

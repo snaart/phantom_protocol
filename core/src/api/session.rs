@@ -273,6 +273,13 @@ impl<T: SessionTransport> SessionTransport for ObservedTransport<T> {
     ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
         self.inner.migrate(local_addr)
     }
+
+    fn migrate_server(
+        &self,
+        local_addr: String,
+    ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
+        self.inner.migrate_server(local_addr)
+    }
 }
 
 // ─── Session ────────────────────────────────────────────────────────────────
@@ -353,6 +360,13 @@ pub enum SessionCommand {
     /// the new local bind address as a `String`; the pump rebinds the transport and
     /// bumps the send `path_id` (best-effort, never fatal to the session).
     Migrate(String),
+    /// Migrate the SERVER's send path to a new local address (Rust-only, the server-side
+    /// mirror of [`Migrate`](Self::Migrate)). Carries the new local bind address as a
+    /// `String`; the pump rebinds the server's send socket (its receive keeps flowing on
+    /// the old address via the listener demux during the overlap) and rotates the s2c send
+    /// `path_id` + outbound CID in lock-step, so the client sees — and follows — a fresh
+    /// server source with a fresh, unlinkable ConnId. Best-effort, never fatal.
+    MigrateServer(String),
     /// Close the session
     Close,
 }
@@ -1328,6 +1342,37 @@ async fn run_data_pump<T: SessionTransport>(
                             Err(e) => {
                                 log::warn!(
                                     "PhantomSession: migrate rebind failed (staying on the old path): {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Some(SessionCommand::MigrateServer(local_addr)) => {
+                        // Server-side migration (the mirror of `Migrate`). Rebind the
+                        // server's SEND socket to the new local address FIRST (its receive
+                        // keeps flowing on the old address through the listener demux during
+                        // the overlap, so c2s never drops); only on a successful rebind
+                        // rotate the s2c send `path_id` + outbound CID in lock-step, so the
+                        // client sees a fresh server source with a fresh, unlinkable ConnId
+                        // and follows it (its unconnected socket hears the new source). Both
+                        // happen inside this `select!` arm, so no send interleaves between
+                        // them. Best-effort: a failed rebind leaves the session on the old
+                        // send socket — server migration never tears it down.
+                        match transport.migrate_server(local_addr).await {
+                            Ok(()) => {
+                                let new_path = crypto_session.next_migration_path_id();
+                                transport.set_outbound_cid(crypto_session.advance_outbound_cid());
+                                log::info!(
+                                    "PhantomSession: migrated server send path -> path_id {}, s2c CID rotated",
+                                    new_path
+                                );
+                                // Wake the send loop so the next s2c packet carries the new
+                                // source + path_id + CID immediately.
+                                crypto_session.notify_outbound_ready();
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "PhantomSession: server migrate rebind failed (staying on the old send socket): {}",
                                     e
                                 );
                             }
@@ -2992,6 +3037,31 @@ impl PhantomSession {
             None => false,
         }
     }
+
+    /// Migrate the **server side** of this session to a new local send address (the
+    /// server-side mirror of [`migrate`](Self::migrate)). Intended for an accepted server
+    /// session whose network path changes (failover, multi-homing, an egress NAT rebind):
+    /// the server rebinds its send socket to `local_addr` and rotates its server→client
+    /// `path_id` + connection-ID in lock-step, so the peer follows the fresh s2c source
+    /// (its unconnected socket hears it) and an observer cannot relink the session by the
+    /// s2c ConnId across the move. The keys and session persist — **no re-handshake**.
+    ///
+    /// The server keeps RECEIVING client→server traffic on the established (listen) address
+    /// through the overlap, so the session stays bidirectional immediately. Best-effort: a
+    /// failed rebind leaves the session on the old send socket and never tears it down.
+    /// `Err` here means only that the session was already closed.
+    ///
+    /// **Rust-only** (deliberately not on the UniFFI/FFI surface): server migration is a
+    /// native-deployment operation, not a mobile-client one. The peer's symmetric c2s
+    /// follow (switching its send target to the new server address once the old one is
+    /// unreachable) and the matching c2s CID rotation are added in the follow-up
+    /// security-core change.
+    pub async fn migrate_server(&self, local_addr: String) -> Result<(), CoreError> {
+        self.cmd_tx
+            .send(SessionCommand::MigrateServer(local_addr))
+            .await
+            .map_err(|_| CoreError::NetworkError("Session closed".into()))
+    }
 }
 
 impl std::fmt::Debug for PhantomSession {
@@ -4188,6 +4258,7 @@ mod tests {
         confirm_authenticated_source: AtomicBool,
         promote_candidate: AtomicBool,
         migrate: std::sync::Mutex<Option<String>>,
+        migrate_server: std::sync::Mutex<Option<String>>,
     }
 
     struct RecordingTransport {
@@ -4230,6 +4301,10 @@ mod tests {
             *self.rec.migrate.lock().unwrap() = Some(local_addr);
             Ok(())
         }
+        async fn migrate_server(&self, local_addr: String) -> Result<(), CoreError> {
+            *self.rec.migrate_server.lock().unwrap() = Some(local_addr);
+            Ok(())
+        }
     }
 
     /// ε / WIRE v5 (audit V-3 / EPS-03 / EPS-04) — `ObservedTransport` must forward
@@ -4260,6 +4335,10 @@ mod tests {
             .migrate("127.0.0.1:0".to_string())
             .await
             .expect("migrate");
+        observed
+            .migrate_server("127.0.0.1:0".to_string())
+            .await
+            .expect("migrate_server");
 
         assert!(
             rec.set_frame_phase.load(Ordering::SeqCst),
@@ -4290,6 +4369,11 @@ mod tests {
             rec.migrate.lock().unwrap().as_deref(),
             Some("127.0.0.1:0"),
             "migrate not forwarded"
+        );
+        assert_eq!(
+            rec.migrate_server.lock().unwrap().as_deref(),
+            Some("127.0.0.1:0"),
+            "migrate_server not forwarded"
         );
     }
 
@@ -4530,6 +4614,7 @@ mod tests {
             server_sock.clone(),
             peer,
             [5u8; 8],
+            tx.clone(),
             rx,
         ));
         tx.send((Bytes::from(vec![0u8; 256]), cand_addr))
@@ -4635,6 +4720,7 @@ mod tests {
             server_sock.clone(),
             peer,
             [5u8; 8],
+            tx.clone(),
             rx,
         ));
         // A frame from the rebind source seeds the candidate + its 3× budget.
