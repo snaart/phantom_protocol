@@ -1069,6 +1069,7 @@ async fn udp_integration_size_padding_delivers_byte_exact() {
         assert!(
             s.set_traffic_shaping(TrafficShapingConfig {
                 padding: PaddingPolicy::Padme,
+                jitter_ms: 0,
             })
             .await,
             "server session established"
@@ -1095,6 +1096,7 @@ async fn udp_integration_size_padding_delivers_byte_exact() {
         client
             .set_traffic_shaping(TrafficShapingConfig {
                 padding: PaddingPolicy::Padme,
+                jitter_ms: 0,
             })
             .await,
         "client session established"
@@ -1110,6 +1112,69 @@ async fn udp_integration_size_padding_delivers_byte_exact() {
             .expect("no timeout")
             .expect("client recv");
         assert_eq!(echo, msg, "byte-exact echo of a {len}-byte padded message");
+    }
+
+    server.await.unwrap();
+}
+
+/// WIRE v6 (d) — a live session with send-timing jitter enabled still delivers
+/// byte-exact (jitter only delays sends; it must not reorder, drop, or corrupt the
+/// stream). The jitter bound itself is unit-tested in `transport::shaping`; this
+/// proves the data plane survives the added per-packet delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_timing_jitter_delivers_byte_exact() {
+    use phantom_protocol::api::session::TrafficShapingConfig;
+    use phantom_protocol::transport::shaping::PaddingPolicy;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .unwrap();
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let server = tokio::spawn(async move {
+        let s = listener.accept().await.expect("accept").session();
+        // Jitter on the server side too (and padding, to exercise both together).
+        assert!(
+            s.set_traffic_shaping(TrafficShapingConfig {
+                padding: PaddingPolicy::Padme,
+                jitter_ms: 15,
+            })
+            .await
+        );
+        for _ in 0..5 {
+            let m = s.recv().await.expect("server recv");
+            s.send(m).await.expect("server echo");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let transport = UdpClientTransport::connect(addr).await.unwrap();
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+    client.send(b"warmup".to_vec()).await.unwrap();
+    let echo = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo, b"warmup");
+    assert!(
+        client
+            .set_traffic_shaping(TrafficShapingConfig {
+                padding: PaddingPolicy::None,
+                jitter_ms: 15,
+            })
+            .await
+    );
+
+    for i in 0..4 {
+        let msg = format!("jitter-msg-{i}").into_bytes();
+        client.send(msg.clone()).await.unwrap();
+        let echo = timeout(Duration::from_secs(15), client.recv())
+            .await
+            .expect("no timeout — jitter only delays, never drops")
+            .expect("client recv");
+        assert_eq!(echo, msg, "byte-exact echo #{i} with timing jitter on");
     }
 
     server.await.unwrap();
