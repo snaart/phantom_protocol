@@ -74,17 +74,20 @@ pub type PacketNumber = u64;
 /// Routing is by the outer (rotating) UDP `ConnId`. `4` (T4.6) added QUIC-style
 /// header protection (RFC 9001 §5.4) over a 47-byte header; `3` (Phase 4) widened
 /// the packet number to `u64`. See PROTOCOL.md § 4.2.
-pub const WIRE_VERSION: u8 = 5;
+pub const WIRE_VERSION: u8 = 6;
 
-/// Wire offset where the header-protected region begins — immediately after the
-/// single cleartext `version(1)` byte (ε / WIRE v5; was `33`, after the
-/// `version ‖ session_id` prefix, in v4). Everything at
+/// Wire offset where the header-protected region begins. **WIRE v6
+/// (anti-fingerprint): `0`** — the masked region now covers the WHOLE 15-byte
+/// header, INCLUDING the `version(1)` byte, so the data-plane wire has no
+/// constant cleartext byte to fingerprint. (Was `1` in v5, after the cleartext
+/// version byte; `33` in v4, after `version ‖ session_id`.) Everything at
 /// `[HP_PROTECTED_OFFSET..PacketHeader::SIZE]` is XOR-masked on the wire.
-pub const HP_PROTECTED_OFFSET: usize = 1;
+pub const HP_PROTECTED_OFFSET: usize = 0;
 
 /// Length of the header-protected region (`PacketHeader::SIZE - HP_PROTECTED_OFFSET`
-/// = 14 bytes: `packet_number ‖ flags ‖ stream_id ‖ epoch ‖ path_id`). Matches
-/// the HP mask length the [`HeaderProtector`] produces.
+/// = 15 bytes in v6: `version ‖ packet_number ‖ flags ‖ stream_id ‖ epoch ‖
+/// path_id`). The [`HeaderProtector`] produces a full 16-byte mask block; the
+/// first `HP_PROTECTED_LEN` bytes are used.
 ///
 /// [`HeaderProtector`]: crate::crypto::header_protection::HeaderProtector
 pub const HP_PROTECTED_LEN: usize = PacketHeader::SIZE - HP_PROTECTED_OFFSET;
@@ -431,30 +434,6 @@ impl fmt::Debug for PacketHeader {
     }
 }
 
-/// Read a `u32`-big-endian length prefix at `*pos`, then that many bytes,
-/// advancing `pos` past both. Bounds-checked (and overflow-safe on 32-bit
-/// targets) so a hostile length prefix yields [`WireError::Truncated`], never an
-/// out-of-bounds access.
-fn read_length_prefixed(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>, WireError> {
-    let start = *pos;
-    let len_end = start.checked_add(4).ok_or(WireError::Truncated)?;
-    if len_end > bytes.len() {
-        return Err(WireError::Truncated);
-    }
-    let len = u32::from_be_bytes([
-        bytes[start],
-        bytes[start + 1],
-        bytes[start + 2],
-        bytes[start + 3],
-    ]) as usize;
-    let data_end = len_end.checked_add(len).ok_or(WireError::Truncated)?;
-    if data_end > bytes.len() {
-        return Err(WireError::Truncated);
-    }
-    *pos = data_end;
-    Ok(bytes[len_end..data_end].to_vec())
-}
-
 /// Full packet with header and payload — the single on-wire data packet.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PhantomPacket {
@@ -492,44 +471,51 @@ impl PhantomPacket {
         }
     }
 
-    /// Total wire size including extensions and the two `u32` length prefixes.
+    /// Total wire size: the 15-byte header plus the payload (WIRE v6 — no length
+    /// prefixes, no `extensions` on the wire).
     pub fn wire_size(&self) -> usize {
-        PacketHeader::SIZE + 8 + self.payload.len() + self.extensions.len()
+        PacketHeader::SIZE + self.payload.len()
     }
 
-    /// Serialise to the on-wire bytes:
-    /// `header(15) || payload_len:u32be || payload || ext_len:u32be || extensions`.
+    /// Serialise to the on-wire bytes: `header(15) || payload`.
     ///
-    /// This is the **cleartext** wire image (ε / WIRE v5: a 15-byte header with
+    /// **WIRE v6 (anti-fingerprint diet):** the two cleartext `u32` length
+    /// prefixes (`payload_len` / `ext_len`) are GONE — `payload` is simply the
+    /// message remainder after the 15-byte header. `SessionTransport::recv_bytes`
+    /// is message-framed on every transport (UDP datagram / TCP 4-byte frame /
+    /// embedded frame), so the prefixes were pure redundancy *and* a verifiable
+    /// structural fingerprint (`ext_len == 0`, `payload_len == datagram − const`).
+    /// `extensions` is no longer carried on the data-plane wire (it was always
+    /// empty; the AEAD AAD still binds an empty extensions slice).
+    ///
+    /// This is the **cleartext** wire image (the 15-byte header still has
     /// `session_id` off-wire — the AEAD AAD is the separate 47-byte
     /// [`PacketHeader::to_aad_image`]). The data plane never puts these bytes on
     /// the wire directly — it calls [`Self::to_wire_masked`] to apply header
-    /// protection. `to_wire` is retained for the frozen wire-vectors and
-    /// handshake-adjacent / test paths.
+    /// protection (which now masks the whole 15-byte header, version included).
     pub fn to_wire(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(self.wire_size());
         b.extend_from_slice(&self.header.to_wire());
-        b.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
         b.extend_from_slice(&self.payload);
-        b.extend_from_slice(&(self.extensions.len() as u32).to_be_bytes());
-        b.extend_from_slice(&self.extensions);
         b
     }
 
-    /// Serialise with header protection applied (T4.6): identical to [`Self::to_wire`],
-    /// then the `[HP_PROTECTED_OFFSET..PacketHeader::SIZE]` region (the 14 bytes
-    /// `packet_number ‖ flags ‖ stream_id ‖ epoch ‖ path_id`) is XOR-masked with
-    /// the caller-supplied HP `mask`. The mask is computed from this packet's
-    /// `payload` ciphertext by the session's `HeaderProtector` (`mask_send`); the
-    /// cleartext `version` byte and the length-prefixed payload/extensions stay
-    /// in the clear so the recv path can locate the ciphertext sample before
-    /// unmasking (the demux routes on the outer ConnId). Only the first
+    /// Serialise with header protection applied: identical to [`Self::to_wire`],
+    /// then the **whole** `[HP_PROTECTED_OFFSET..PacketHeader::SIZE]` region (WIRE
+    /// v6: the 15 bytes `version ‖ packet_number ‖ flags ‖ stream_id ‖ epoch ‖
+    /// path_id`) is XOR-masked with the caller-supplied HP `mask`. The mask is
+    /// computed from this packet's `payload` ciphertext by the session's
+    /// `HeaderProtector` (`mask_send`); the `payload` itself stays cleartext on the
+    /// wire (it *is* the AEAD ciphertext) so the recv path can locate the sample —
+    /// at the fixed offset [`PacketHeader::SIZE`] — before unmasking (the demux
+    /// routes on the outer ConnId). With the version byte now masked too, the
+    /// data-plane wire has no constant cleartext byte. Only the first
     /// [`HP_PROTECTED_LEN`] bytes of `mask` are used; a shorter `mask` masks fewer
     /// bytes rather than panicking (the session always supplies a full 16-byte
     /// mask).
     pub fn to_wire_masked(&self, mask: &[u8]) -> Vec<u8> {
         let mut buf = self.to_wire();
-        // zip stops at the shorter of the 14-byte region and `mask`, so a short
+        // zip stops at the shorter of the 15-byte region and `mask`, so a short
         // mask masks fewer bytes rather than panicking.
         for (b, m) in buf[HP_PROTECTED_OFFSET..PacketHeader::SIZE]
             .iter_mut()
@@ -540,64 +526,65 @@ impl PhantomPacket {
         buf
     }
 
-    /// Parse a packet from its on-wire bytes — the inverse of [`Self::to_wire`].
-    /// Any bytes past `extensions` are ignored (forward-compatibility headroom).
+    /// Parse a packet from its on-wire bytes — the inverse of [`Self::to_wire`]
+    /// (WIRE v6): the 15-byte header, then `payload` is the whole remainder. A
+    /// buffer shorter than the header yields [`WireError::Truncated`]. `extensions`
+    /// is always empty (off the v6 data-plane wire).
     pub fn from_wire(bytes: &[u8]) -> Result<Self, WireError> {
         let header = PacketHeader::from_wire(bytes)?;
-        let mut pos = PacketHeader::SIZE;
-        let payload = read_length_prefixed(bytes, &mut pos)?;
-        let extensions = read_length_prefixed(bytes, &mut pos)?;
+        let payload = bytes[PacketHeader::SIZE..].to_vec();
         Ok(Self {
             header,
             payload,
-            extensions,
+            extensions: Vec::new(),
         })
     }
 }
 
-/// A partially-decoded v5 packet: the cleartext envelope (just the `version`
-/// byte, plus the length-prefixed `payload` / `extensions`) with the 14-byte
-/// header-protected region left **opaque**. The recv path produces this from the
-/// raw wire bytes *before* it has the per-session HP key — it locates the
-/// ciphertext sample (`payload`) from the cleartext length prefixes, then calls
+/// A partially-decoded v6 packet: the cleartext envelope with the **entire**
+/// 15-byte header-protected region (version included) left **opaque**, plus the
+/// `payload` (the message remainder). The recv path produces this from the raw
+/// wire bytes *before* it has the per-session HP key — it locates the ciphertext
+/// sample (`payload`, at the fixed offset 15) and calls
 /// [`RawPacket::unmask_header`] with the mask computed from `payload` to recover
-/// the [`PacketHeader`] (whose off-wire `session_id` is then set by
-/// [`Session::parse_protected`]). This is the codec half of T4.6's header
+/// the [`PacketHeader`] (including its `version` byte; the off-wire `session_id`
+/// is then set by [`Session::parse_protected`]). This is the codec half of header
 /// protection; the mask itself is computed by the session's `HeaderProtector`
 /// (this module stays crypto-free). Routing is by the outer (rotating) ConnId.
+///
+/// WIRE v6: no cleartext `version` byte and no length prefixes — the version is
+/// inside `masked_header`, and `payload` is everything after the 15-byte header.
 ///
 /// [`Session::parse_protected`]: crate::transport::session::Session::parse_protected
 #[derive(Clone, Debug)]
 pub struct RawPacket {
-    /// Cleartext wire version byte (`[0]`).
-    pub version: u8,
-    /// The still-masked header-protected region (wire `[1..15]`).
+    /// The still-masked header-protected region (the WHOLE wire `[0..15]`,
+    /// version included).
     masked_header: [u8; HP_PROTECTED_LEN],
-    /// AEAD ciphertext (length-prefixed; cleartext on the wire).
+    /// AEAD ciphertext = the message remainder after the 15-byte header (cleartext
+    /// on the wire; the payload itself is the AEAD ciphertext).
     pub payload: Vec<u8>,
-    /// Forward-compat TLV headroom (length-prefixed; cleartext on the wire).
+    /// Forward-compat headroom — always empty on the v6 data-plane wire (retained
+    /// for the AAD/codec shape; see [`PhantomPacket::to_wire`]).
     pub extensions: Vec<u8>,
 }
 
 impl RawPacket {
-    /// Parse the cleartext envelope of a v4 wire packet, leaving the 14-byte
-    /// HP-masked header region opaque. Bounds-checked exactly like
-    /// [`PhantomPacket::from_wire`] — a short / hostile buffer yields
-    /// [`WireError::Truncated`], never a panic.
+    /// Parse the cleartext envelope of a v6 wire packet, leaving the whole 15-byte
+    /// HP-masked header region opaque and taking `payload` as the remainder.
+    /// Bounds-checked exactly like [`PhantomPacket::from_wire`] — a short / hostile
+    /// buffer yields [`WireError::Truncated`], never a panic.
     pub fn from_wire(bytes: &[u8]) -> Result<Self, WireError> {
         if bytes.len() < PacketHeader::SIZE {
             return Err(WireError::Truncated);
         }
         let mut masked_header = [0u8; HP_PROTECTED_LEN];
         masked_header.copy_from_slice(&bytes[HP_PROTECTED_OFFSET..PacketHeader::SIZE]);
-        let mut pos = PacketHeader::SIZE;
-        let payload = read_length_prefixed(bytes, &mut pos)?;
-        let extensions = read_length_prefixed(bytes, &mut pos)?;
+        let payload = bytes[PacketHeader::SIZE..].to_vec();
         Ok(Self {
-            version: bytes[0],
             masked_header,
             payload,
-            extensions,
+            extensions: Vec::new(),
         })
     }
 
@@ -610,14 +597,16 @@ impl RawPacket {
         if mask.len() < HP_PROTECTED_LEN {
             return Err(WireError::Truncated);
         }
+        // WIRE v6: the masked region is the whole 15-byte header (offset 0), so the
+        // version byte is recovered here too — there is no cleartext prefix to copy.
         let mut hdr = [0u8; PacketHeader::SIZE];
-        hdr[0] = self.version;
         hdr[HP_PROTECTED_OFFSET..].copy_from_slice(&self.masked_header);
         for (h, m) in hdr[HP_PROTECTED_OFFSET..].iter_mut().zip(mask) {
             *h ^= *m;
         }
         // `session_id` is off-wire — PacketHeader::from_wire leaves it the
-        // placeholder zero; Session::parse_protected sets it from self.id().
+        // placeholder zero; Session::parse_protected sets it from self.id(). The
+        // recovered `version` (hdr[0]) is checked by the recv path.
         PacketHeader::from_wire(&hdr)
     }
 
@@ -883,12 +872,68 @@ mod tests {
         assert_eq!(decoded.payload, vec![0xCA, 0xFE, 0xBA, 0xBE]);
     }
 
-    /// WIRE_VERSION 5 (ε) drops `session_id` from the wire: the 14 HP-protected
-    /// bytes shift to a contiguous `[1..15]` span — `packet_number(8) ‖ flags(2)
-    /// ‖ stream_id(2) ‖ epoch(1) ‖ path_id(1)` — after only the cleartext
-    /// `version(1)`. The routing CID is now the outer (rotating) ConnId.
+    /// WIRE v6 (anti-fingerprint diet): the data-plane packet drops BOTH cleartext
+    /// `u32` length prefixes — `payload` is the message remainder after the 15-byte
+    /// header (`SessionTransport::recv_bytes` is message-framed, so the prefixes
+    /// were pure redundancy) — and carries no `extensions` on the wire. The version
+    /// byte also joins the HP-masked region (`HP_PROTECTED_OFFSET == 0`), so nothing
+    /// in the header is a constant cleartext fingerprint.
     #[test]
-    fn v5_header_layout_offsets() {
+    fn v6_packet_drops_length_prefixes_and_masks_version() {
+        // The masked region now starts at byte 0 (covers the version byte) and
+        // spans the whole 15-byte header.
+        assert_eq!(HP_PROTECTED_OFFSET, 0, "v6 masks from the version byte");
+        assert_eq!(
+            HP_PROTECTED_LEN,
+            PacketHeader::SIZE,
+            "v6 masks the whole 15-byte header"
+        );
+        assert_eq!(
+            WIRE_VERSION, 6,
+            "anti-fingerprint diet bumps the wire version"
+        );
+
+        let header = PacketHeader::new(
+            SessionId::from_bytes([0u8; 32]),
+            7,
+            42,
+            PacketFlags::new(PacketFlags::ENCRYPTED),
+        );
+        let payload = vec![0xCAu8; 40];
+        let packet = PhantomPacket::new(header, payload.clone());
+        let wire = packet.to_wire();
+        // No 8 bytes of length prefixes: wire == header(15) ‖ payload.
+        assert_eq!(
+            wire.len(),
+            PacketHeader::SIZE + payload.len(),
+            "v6: header ‖ payload, no length prefixes"
+        );
+        assert_eq!(
+            &wire[PacketHeader::SIZE..],
+            &payload[..],
+            "payload is the message remainder"
+        );
+        assert_eq!(
+            packet.wire_size(),
+            PacketHeader::SIZE + payload.len(),
+            "wire_size() drops the 8 prefix bytes"
+        );
+        // Round-trips: payload is everything after the header; extensions are gone.
+        let decoded = PhantomPacket::from_wire(&wire).expect("v6 roundtrip");
+        assert_eq!(decoded.payload, payload);
+        assert!(
+            decoded.extensions.is_empty(),
+            "extensions are off the v6 data-plane wire"
+        );
+    }
+
+    /// WIRE v6 carries a contiguous masked `[0..15]` header — `version(1) ‖
+    /// packet_number(8) ‖ flags(2) ‖ stream_id(2) ‖ epoch(1) ‖ path_id(1)` — after
+    /// the outer (rotating) ConnId. The `PacketHeader::to_wire` image itself is
+    /// unchanged from v5 (still version-first); the diet changes the *masking span*
+    /// and the surrounding `PhantomPacket` framing.
+    #[test]
+    fn v6_header_layout_offsets() {
         let header = PacketHeader::new(
             SessionId::from_bytes([0x5Au8; 32]),
             0x1122,             // stream_id
@@ -949,27 +994,34 @@ mod tests {
         let wire = packet.to_wire_masked(&mask);
         let cleartext = packet.to_wire();
 
-        // The masked region [1..15] on the wire hides the cleartext header bytes...
+        // WIRE v6: the masked region is the WHOLE 15-byte header [0..15] — every
+        // header byte, version INCLUDED, differs from the cleartext on the wire.
         assert_ne!(
             &wire[HP_PROTECTED_OFFSET..PacketHeader::SIZE],
             &cleartext[HP_PROTECTED_OFFSET..PacketHeader::SIZE],
-            "pn/flags/stream_id/epoch/path_id must be masked on the wire"
+            "version/pn/flags/stream_id/epoch/path_id must all be masked on the wire"
         );
-        // ...while only the cleartext `version` byte is untouched.
         assert_eq!(
-            &wire[..HP_PROTECTED_OFFSET],
-            &cleartext[..HP_PROTECTED_OFFSET]
+            HP_PROTECTED_OFFSET, 0,
+            "v6 masks from byte 0 (version included)"
         );
-        assert_eq!(HP_PROTECTED_OFFSET, 1, "only `version` is cleartext in v5");
+        assert_ne!(
+            wire[0], cleartext[0],
+            "the version byte is masked in v6 (no constant cleartext byte)"
+        );
 
-        // The envelope parses without the mask (version readable; payload located).
+        // The envelope parses without the mask (payload located at the fixed
+        // offset 15; the version is inside the masked region, not cleartext).
         let raw = RawPacket::from_wire(&wire).expect("raw parse");
-        assert_eq!(raw.version, WIRE_VERSION);
         assert_eq!(raw.payload, packet.payload);
 
-        // Unmasking recovers the 14 masked fields; session_id stays off-wire (the
-        // session layer sets it from `self.id()`), so compare field-wise.
+        // Unmasking recovers all 15 masked fields incl. version; session_id stays
+        // off-wire (the session layer sets it from `self.id()`), so compare field-wise.
         let recovered = raw.unmask_header(&mask).expect("unmask");
+        assert_eq!(
+            recovered.version, WIRE_VERSION,
+            "the masked version byte round-trips through unmask"
+        );
         assert_eq!(recovered.packet_number, header.packet_number);
         assert_eq!(recovered.flags, header.flags);
         assert_eq!(recovered.stream_id, header.stream_id);
@@ -1003,8 +1055,14 @@ mod tests {
         );
     }
 
+    /// WIRE v6 drops `extensions` from the data-plane wire (D3): the field was
+    /// always empty in practice and the AEAD AAD still binds an empty slice.
+    /// `to_wire` emits only `header ‖ payload`; any `extensions` set on the struct
+    /// are NOT serialised, and `from_wire` always yields empty extensions. (The
+    /// forward-compat headroom can return later via a reserved flag + an encrypted
+    /// TLV inside the padded plaintext — see the v6 anti-fingerprint design.)
     #[test]
-    fn extensions_preserved_on_roundtrip() {
+    fn extensions_are_dropped_from_the_v6_wire() {
         let session_id = SessionId::random();
         let mut packet = PhantomPacket::new(
             PacketHeader::new(
@@ -1018,10 +1076,13 @@ mod tests {
         packet.extensions = vec![0xFF, 0x01, 0x00, 0x04, b't', b'e', b's', b't'];
 
         let bytes = packet.to_wire();
+        // The wire is exactly header ‖ payload — the extensions bytes are absent.
+        assert_eq!(bytes.len(), PacketHeader::SIZE + 3, "header ‖ payload only");
         let deser = PhantomPacket::from_wire(&bytes).expect("deserialize failed");
-        assert_eq!(
-            deser.extensions,
-            vec![0xFF, 0x01, 0x00, 0x04, b't', b'e', b's', b't']
+        assert_eq!(deser.payload, vec![1, 2, 3]);
+        assert!(
+            deser.extensions.is_empty(),
+            "extensions are off the v6 data-plane wire"
         );
     }
 }

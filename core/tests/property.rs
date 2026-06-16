@@ -162,10 +162,13 @@ proptest! {
         prop_assert_eq!(decoded.payload, payload);
     }
 
-    /// The `extensions` TLV headroom also round-trips byte-for-byte alongside
-    /// the payload (both length-prefixed sections must be recovered).
+    /// WIRE v6 (anti-fingerprint, D3): the payload round-trips as the message
+    /// remainder, and any `extensions` set on the struct are DROPPED from the wire
+    /// (the wire is exactly `header(15) ‖ payload` — no length prefixes, no
+    /// extension bytes — and decode yields empty extensions). For ANY payload /
+    /// extensions the wire size is `15 + payload.len()` and the payload is exact.
     #[test]
-    fn wire_round_trip_preserves_payload_and_extensions(
+    fn wire_round_trip_drops_extensions_and_preserves_payload(
         sequence in any::<u64>(),
         payload in proptest::collection::vec(any::<u8>(), 0..1024),
         extensions in proptest::collection::vec(any::<u8>(), 0..512),
@@ -180,9 +183,10 @@ proptest! {
         packet.extensions = extensions.clone();
 
         let buf = packet.to_wire();
+        prop_assert_eq!(buf.len(), PacketHeader::SIZE + payload.len());
         let decoded = PhantomPacket::from_wire(&buf).expect("round-trip decode");
         prop_assert_eq!(decoded.payload, payload);
-        prop_assert_eq!(decoded.extensions, extensions);
+        prop_assert!(decoded.extensions.is_empty());
     }
 
     /// Robustness: `from_wire` on ARBITRARY bytes must return `Ok`/`Err`, never

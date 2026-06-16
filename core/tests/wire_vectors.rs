@@ -279,8 +279,10 @@ fn vector_packet_header() {
     assert_eq!(
         bytes.len(),
         PacketHeader::SIZE,
-        "v5 wire header must be exactly {} bytes (session_id is off-wire; the AAD \
-         is the separate 47-byte to_aad_image)",
+        "v6 wire header must be exactly {} bytes (session_id is off-wire; the AAD \
+         is the separate 47-byte to_aad_image). The on-wire data-plane masks this \
+         whole image incl. the version byte; this cleartext form is the pre-mask \
+         freeze.",
         PacketHeader::SIZE
     );
     let frozen = freeze("packet_header.bin", &bytes);
@@ -313,15 +315,27 @@ fn vector_phantom_packet_ack() {
     assert!(decoded.payload.is_empty());
 }
 
+/// WIRE v6 (anti-fingerprint, D3): `extensions` are DROPPED from the data-plane
+/// wire. A packet whose struct carries extensions still serialises to just
+/// `header ‖ payload` — the extension bytes never appear — and decodes back with
+/// EMPTY extensions. This vector freezes that "extensions off the wire" property.
 #[test]
-fn vector_phantom_packet_extensions() {
-    let p = sample_packet_ext();
-    let frozen = freeze("phantom_packet_extensions.bin", &ser_packet(&p));
-    let decoded = PhantomPacket::from_wire(&frozen).expect("decode ext packet");
-    assert_eq!(decoded, p);
+fn vector_phantom_packet_extensions_are_off_the_wire() {
+    let p = sample_packet_ext(); // struct has extensions set...
+    let wire = ser_packet(&p);
+    // ...but the wire is exactly header ‖ payload (no extension bytes).
     assert_eq!(
-        decoded.extensions,
-        vec![0xFF, 0x01, 0x00, 0x04, b't', b'e', b's', b't']
+        wire.len(),
+        PacketHeader::SIZE + 16,
+        "v6 wire is header(15) ‖ payload(16) — extensions are not serialised"
+    );
+    let frozen = freeze("phantom_packet_extensions.bin", &wire);
+    let decoded = PhantomPacket::from_wire(&frozen).expect("decode ext packet");
+    assert_eq!(decoded.header, p.header);
+    assert_eq!(decoded.payload, p.payload);
+    assert!(
+        decoded.extensions.is_empty(),
+        "extensions must not survive the v6 wire round-trip"
     );
 }
 
