@@ -280,6 +280,26 @@ known).
 - Criterion's own `-- --baseline <name>` flag is the recommended way to
   compare against a previously saved baseline locally.
 
+### CI gate (`.github/workflows/bench.yml`)
+
+Two automated checks run on PRs that touch `core/src`, `core/benches`, or
+`core/Cargo.toml`:
+
+1. **Compile gate** — `cargo bench --no-run` builds every criterion bench, so a
+   bench that rots when an API changes fails CI instead of silently breaking until
+   the next manual snapshot.
+2. **Regression gate** — the benches run on the PR head and on the PR's base commit
+   on the **same runner** (hardware-neutral), and `scripts/bench_compare.py` fails
+   the job if any benchmark's median is **> 2× slower** than base. The 2× bar is
+   deliberately coarse: shared GitHub runners have 5–30% run-to-run noise, so a
+   tight threshold would flake. It catches *gross* regressions automatically; the
+   **>5% / >10% policy above remains the pinned-hardware source of truth** for
+   fine-grained tracking (captured per the methodology, not on shared CI runners).
+   Tune the bar with the `BENCH_REGRESSION_THRESHOLD` env var.
+
+The gate is not yet a branch-protection *required* context — it reports on the PR;
+promote it once its runtime/stability are proven on this repo's runners.
+
 ## See also
 
 - `docs/operations/perf-tuning.md` — deployment-side tuning (sysctl, fd
