@@ -154,4 +154,21 @@ pub trait SessionTransport: Send + Sync + 'static {
     ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
         async { Ok(()) }
     }
+
+    /// Migrate the **server side** of this transport to a new local send address — the
+    /// mirror of [`migrate`](Self::migrate) for the accepting peer. The server binds a
+    /// fresh local socket, sends subsequent server→client datagrams from it (so the client
+    /// sees a new s2c source and follows it), and receives on it too (so once the client
+    /// switches its send target the c2s frames are delivered transparently). The address
+    /// crosses as a `String` to keep the trait `SocketAddr`-free / no_std-clean. Best-effort:
+    /// a parse / bind failure returns `Err` and the session keeps running on the old socket.
+    /// Default no-op `Ok(())` — only the native UDP server implements it. Kept distinct from
+    /// [`migrate`](Self::migrate) so the FFI-exported client `migrate()` cannot trigger a
+    /// server migration.
+    fn migrate_server(
+        &self,
+        _local_addr: String,
+    ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
+        async { Ok(()) }
+    }
 }
