@@ -179,6 +179,14 @@ impl UdpClientTransport {
         self.cid
     }
 
+    /// Whether a post-migration dual-socket overlap is currently active (test/inspection
+    /// helper): `true` between a `migrate_to` and the first well-formed datagram on the new
+    /// socket that retires the old one.
+    #[cfg(test)]
+    pub(crate) fn in_migration_overlap(&self) -> bool {
+        self.prev_socket.load().is_some()
+    }
+
     fn pkt_id(&self) -> u32 {
         self.next_packet_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -232,12 +240,11 @@ impl SessionTransport for UdpClientTransport {
             let active = self.socket.load_full();
             let prev_arc = self.prev_socket.load_full();
             let prev_opt: Option<Arc<UdpSocket>> = (*prev_arc).clone();
-            // The tracked server remote, for the overlap drop decision below. The socket is
-            // unconnected, so `recv_from` returns the source of every datagram; we deliver
-            // from ANY source (the inner AEAD + replay window are the real guards, exactly
-            // as the server delivers any CID-matched datagram via its demux), but only treat
-            // life *from the established server* on the new socket as "the new path is up".
-            let server = **self.server_addr.load();
+            // The socket is unconnected, so `recv_from` returns the source of every datagram;
+            // we deliver from ANY source (the inner AEAD + replay window are the real guards,
+            // exactly as the server delivers any CID-matched datagram via its demux). During a
+            // migration overlap, ANY well-formed datagram on the NEW socket means the path is
+            // up — the overlap-drop after `push_datagram` (below) retires the old socket then.
 
             // `from_prev` records which buffer the datagram landed in, so we slice the
             // right one AFTER the select — the recv future's `&mut buf` borrow is
@@ -245,6 +252,7 @@ impl SessionTransport for UdpClientTransport {
             let (n, from_prev): (usize, bool) = if in_handshake {
                 // Migration is post-handshake only, so there is never a `prev` socket
                 // here; keep the original single-socket + RTO-retransmit logic.
+                let server = **self.server_addr.load();
                 tokio::select! {
                     // `biased;` polls the recv arm first: the RTO must be a true
                     // "no data arrived for HANDSHAKE_RTO" timer, not a coin-flip against an
@@ -281,27 +289,16 @@ impl SessionTransport for UdpClientTransport {
                     buf_prev.resize(PATH_MTU + 64, 0);
                 }
                 tokio::select! {
-                    r = active.recv_from(&mut buf) => {
-                        let (n, src) = match r {
-                            Ok((n, src)) => (n, src),
-                            Err(e) if is_advisory_recv_error(&e) => {
-                                log::debug!("PhantomUDP: advisory recv error on new path (ignored)");
-                                continue;
-                            }
-                            Err(e) => {
-                                return Err(CoreError::NetworkError(format!("udp recv: {e}")))
-                            }
-                        };
-                        // First life *from the established server* on the new path: the
-                        // server is now reaching us on the new socket → drop the retained
-                        // old socket (overlap done). A datagram from some other source does
-                        // not end the overlap (it is still delivered for the AEAD layer to
-                        // judge, but it is not the "new path is up" signal).
-                        if src == server {
-                            self.prev_socket.store(Arc::new(None));
+                    r = active.recv_from(&mut buf) => match classify_recv(r.map(|(n, _src)| n)) {
+                        RecvAction::Got(n) => (n, false),
+                        RecvAction::Retry => {
+                            log::debug!("PhantomUDP: advisory recv error on new path (ignored)");
+                            continue;
                         }
-                        (n, false)
-                    }
+                        RecvAction::Fatal(e) => {
+                            return Err(CoreError::NetworkError(format!("udp recv: {e}")))
+                        }
+                    },
                     r = prev_sock.recv_from(&mut buf_prev) => match classify_recv(r.map(|(n, _src)| n)) {
                         RecvAction::Got(n) => (n, true),
                         RecvAction::Retry => {
@@ -328,7 +325,17 @@ impl SessionTransport for UdpClientTransport {
             retx = 0; // progress: reset the RTO budget
             let datagram = if from_prev { &buf_prev[..n] } else { &buf[..n] };
             let mut asm = self.reasm.lock().await;
-            match push_datagram(&mut asm, datagram) {
+            let decoded = push_datagram(&mut asm, datagram);
+            // Overlap-drop (D7): a well-formed datagram on the NEW (active) socket means the
+            // path is up, so retire the retained old socket — regardless of source, so it
+            // works whether the server is reaching us at the established address OR has
+            // itself migrated to a new one (a `src == server_addr` check would never fire in
+            // the latter case and strand the overlap). Garbage spray (a decode `Err`) does
+            // NOT end the overlap; data on the OLD socket (`from_prev`) never does either.
+            if !from_prev && prev_opt.is_some() && decoded.is_ok() {
+                self.prev_socket.store(Arc::new(None));
+            }
+            match decoded {
                 Ok((_hdr, Some(frame))) => return Ok(Bytes::from(frame)),
                 Ok((_hdr, None)) => continue, // partial fragment; keep receiving
                 Err(_) => continue,           // malformed datagram; drop and keep receiving
@@ -941,6 +948,94 @@ mod tests {
             .expect("c2s on the migrated server socket reaches recv_bytes")
             .expect("recv");
         assert_eq!(&got[..], b"c2s-after-server-move");
+    }
+
+    /// Review finding (overlap-drop robustness): a client mid-(local)-migration overlap must
+    /// retire its old socket on the first well-formed datagram on the NEW socket REGARDLESS
+    /// of source — including from a server that has itself migrated to a new address. A
+    /// `src == server_addr` check would never fire for a migrated server and strand the
+    /// overlap (an idle extra socket for the session's life).
+    #[tokio::test]
+    async fn overlap_ends_on_data_from_a_migrated_server_source() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpClientTransport::connect(server_addr).await.unwrap();
+        client.set_frame_phase(FramePhase::Established);
+
+        client.send_bytes(b"hi").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, _src_old) = server.recv_from(&mut buf).await.unwrap();
+
+        // Enter a (client-local) migration overlap.
+        client
+            .migrate_to("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            client.in_migration_overlap(),
+            "migrate_to enters the dual-socket overlap"
+        );
+
+        // Learn the new client socket's address (so a third party can target it).
+        client.send_bytes(b"probe").await.unwrap();
+        let (_n2, client_new_addr) = server.recv_from(&mut buf).await.unwrap();
+
+        // A datagram from a DIFFERENT source than the original server (a migrated server's
+        // fresh socket) arrives on the new socket — it must be delivered AND end the overlap.
+        let migrated_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for d in encode_datagrams(
+            PacketType::OneRtt,
+            &client.cid(),
+            1,
+            b"from-migrated-server",
+        )
+        .unwrap()
+        {
+            migrated_server.send_to(&d, client_new_addr).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(2), client.recv_bytes())
+            .await
+            .expect("no timeout")
+            .expect("recv");
+        assert_eq!(&got[..], b"from-migrated-server");
+        assert!(
+            !client.in_migration_overlap(),
+            "a well-formed datagram on the new socket (even from a migrated server source) \
+             must end the overlap"
+        );
+    }
+
+    /// Review finding (H-1 reaping, refutation + guard): adding a `tx` clone to
+    /// `UdpServerTransport` (so a server migration's recv loop can feed the same channel)
+    /// does NOT break the demux's route reaping. `mpsc::Sender::is_closed()` tracks the
+    /// RECEIVER being dropped, not the sender-clone count — so when the transport (which owns
+    /// the `rx`) is dropped at session end, a sibling `tx` clone the demux retains for routing
+    /// immediately observes `is_closed() == true` and the route is reclaimed.
+    #[tokio::test]
+    async fn dropping_the_transport_closes_the_demux_tx_clone() {
+        use tokio::sync::mpsc;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        // The RouteTable retains a sibling clone for routing; the transport gets another.
+        let demux_clone = tx.clone();
+        let st = UdpServerTransport::new(sock, peer, [1u8; 8], tx.clone(), rx);
+        assert!(
+            !demux_clone.is_closed(),
+            "a live session's route stays open"
+        );
+        // Session ends: the transport (holding `rx` + its own `tx` clone) is dropped.
+        drop(st);
+        assert!(
+            demux_clone.is_closed(),
+            "the demux's tx clone observes the dropped receiver (is_closed tracks the \
+             receiver, not the sender-clone count), so the route is reaped — the transport's \
+             extra tx clone does not strand it"
+        );
     }
 
     /// P4.2b: `migrate()` rebinds the client to a fresh local socket and `connect`s
