@@ -10,6 +10,22 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **Server-side connection migration — plumbing (A2a, part 1).** An accepted server
+  session can now move its network send path mid-session without a re-handshake via the
+  new **Rust-only** `PhantomSession::migrate_server(local_addr)` (deliberately not on the
+  UniFFI/FFI surface — server migration is a native-deployment operation). It rebinds the
+  server's send socket and rotates the server→client `path_id` + connection-ID in
+  lock-step, so the peer follows the fresh s2c source with a fresh, unlinkable ConnId
+  while client→server traffic keeps flowing to the established listen address through the
+  demux overlap (the session stays bidirectional, no re-handshake). To make this possible
+  the UDP **client socket is now unconnected** (`send_to` a tracked server address,
+  `recv_from` any source) instead of kernel-`connect`ed, so it can hear — and later follow
+  — a server that moves to a new address; the inner AEAD + replay window remain the
+  authenticity guards. No wire-format change (behavioural extension on WIRE v6). The peer's
+  symmetric c2s follow (path-validated failover when the old server address is unreachable)
+  and matching c2s CID rotation — closing the EPS-02 linkability residual for
+  server-initiated migration — land in the follow-up security-core change.
+
 - **Blocking C helpers for the FFI (`tests/bindings/c/phantom_helpers.h`, #14c).**
   A header-only, pure-C convenience layer that wraps the async future-poll
   boilerplate (`connect_pinned` / `send` / `recv` / `disconnect`) into plain
