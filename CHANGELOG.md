@@ -10,6 +10,17 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **Blocking C helpers for the FFI (`tests/bindings/c/phantom_helpers.h`, #14c).**
+  A header-only, pure-C convenience layer that wraps the async future-poll
+  boilerplate (`connect_pinned` / `send` / `recv` / `disconnect`) into plain
+  blocking calls — `phantom_blocking_connect_pinned` / `_send` / `_recv` /
+  `_disconnect` — so a synchronous C consumer no longer hand-rolls a poll loop.
+  No new Rust code or `unsafe` (it sits on the existing `extern "C"` ABI); the
+  wait is a 1 ms `nanosleep` on a C11 `_Atomic` flag (no `-lpthread`). Also
+  corrected the C header's stale `_pointer` future declarations to the real `_u64`
+  object-future ABI (UniFFI 0.31 represents objects as `u64` handles). The C
+  consumer smoke test now exercises the blocking path end-to-end.
+
 - **Traffic-shaping can be configured before the session establishes (#9).**
   `PhantomSession::set_traffic_shaping` may now be called **before** the (async)
   client handshake completes: the config is stored as pending and applied to the
