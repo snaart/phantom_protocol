@@ -2161,6 +2161,15 @@ public struct TrafficShapingConfig: Equatable, Hashable {
      * application's writes — at a cost of up to `jitter_ms` of added latency.
      */
     public var jitterMs: UInt32
+    /**
+     * Cover-traffic floor interval in milliseconds. `0`
+     * (default) = no cover traffic; otherwise the session maintains a minimum
+     * outbound packet rate of `1000 / cover_interval_ms` packets/sec, emitting an
+     * encrypted dummy (`COVER`) packet whenever no packet has gone out for
+     * `cover_interval_ms` — hiding idle/active patterns and volume, at a steady
+     * bandwidth cost. A typical value is 100–500 ms (10–2 packets/sec).
+     */
+    public var coverIntervalMs: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2174,9 +2183,18 @@ public struct TrafficShapingConfig: Equatable, Hashable {
          * = no jitter; otherwise each packet waits a uniform random `[0, jitter_ms]`
          * ms before it is sent, so the inter-packet timing no longer tracks the
          * application's writes — at a cost of up to `jitter_ms` of added latency.
-         */jitterMs: UInt32) {
+         */jitterMs: UInt32, 
+        /**
+         * Cover-traffic floor interval in milliseconds. `0`
+         * (default) = no cover traffic; otherwise the session maintains a minimum
+         * outbound packet rate of `1000 / cover_interval_ms` packets/sec, emitting an
+         * encrypted dummy (`COVER`) packet whenever no packet has gone out for
+         * `cover_interval_ms` — hiding idle/active patterns and volume, at a steady
+         * bandwidth cost. A typical value is 100–500 ms (10–2 packets/sec).
+         */coverIntervalMs: UInt32) {
         self.padding = padding
         self.jitterMs = jitterMs
+        self.coverIntervalMs = coverIntervalMs
     }
 
     
@@ -2196,13 +2214,15 @@ public struct FfiConverterTypeTrafficShapingConfig: FfiConverterRustBuffer {
         return
             try TrafficShapingConfig(
                 padding: FfiConverterTypePaddingPolicy.read(from: &buf), 
-                jitterMs: FfiConverterUInt32.read(from: &buf)
+                jitterMs: FfiConverterUInt32.read(from: &buf), 
+                coverIntervalMs: FfiConverterUInt32.read(from: &buf)
         )
     }
 
     public static func write(_ value: TrafficShapingConfig, into buf: inout [UInt8]) {
         FfiConverterTypePaddingPolicy.write(value.padding, into: &buf)
         FfiConverterUInt32.write(value.jitterMs, into: &buf)
+        FfiConverterUInt32.write(value.coverIntervalMs, into: &buf)
     }
 }
 
