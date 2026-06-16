@@ -71,10 +71,19 @@ jobs:
       # 2b. Check out the PR's base commit and run its benches into `ci_base`
       #     (same runner → hardware-neutral). target/criterion persists the
       #     baselines across the checkout.
+      #
+      #     The base commit is the *reference*, not the thing under test. If one of
+      #     its benches fails to run — a bench bug already on the base, or a bench
+      #     target this PR adds that the base lacks — do NOT fail the gate; the
+      #     compare step then just uses whatever base baselines were produced. The
+      #     *PR-head* bench run above stays hard: a bench that panics on the PR is
+      #     the PR's own regression (this is exactly how the gross-regression gate
+      #     earns its keep).
       - name: Bench (base commit)
         run: |
           git checkout --quiet --detach ${{ github.event.pull_request.base.sha }}
-          cargo bench --manifest-path core/Cargo.toml --features classical-crypto $BENCH_TARGETS -- --save-baseline ci_base
+          cargo bench --manifest-path core/Cargo.toml --features classical-crypto $BENCH_TARGETS -- --save-baseline ci_base \
+            || echo "::warning title=base bench::base-commit bench run did not complete; comparing only the benches that produced a ci_base baseline"
           git checkout --quiet --force ${{ github.sha }}
 
       # 3. Compare; print the table to the job summary; fail on a > 2x regression.
