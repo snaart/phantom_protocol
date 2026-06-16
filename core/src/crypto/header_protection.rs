@@ -39,12 +39,14 @@ use crate::crypto::kdf::derive_key_32;
 use crate::errors::CoreError;
 use zeroize::Zeroize;
 
-/// Bytes of the packet header protected by HP — the contiguous region at wire
-/// offset `[1..15]` (ε / WIRE v5; was `[33..47]` in v4): `packet_number(8) ‖
-/// flags(2) ‖ stream_id(2) ‖ epoch(1) ‖ path_id(1)`. Only the cleartext
-/// `version(1)` byte (offset `[0..1]`) is left in the clear; the inner
-/// `session_id` is off-wire and routing is by the outer (rotating) ConnId.
-pub const HP_MASK_LEN: usize = 14;
+/// Bytes of the packet header protected by HP — WIRE v6 (anti-fingerprint): the
+/// contiguous region at wire offset `[0..15]` — the WHOLE 15-byte header,
+/// `version(1) ‖ packet_number(8) ‖ flags(2) ‖ stream_id(2) ‖ epoch(1) ‖
+/// path_id(1)`. The version byte is now masked too (no constant cleartext byte);
+/// the inner `session_id` is off-wire and routing is by the outer (rotating)
+/// ConnId. (Was `[1..15]`/14 in v5, `[33..47]` in v4.) The mask itself is a full
+/// 16-byte block; the first `HP_MASK_LEN` bytes are applied.
+pub const HP_MASK_LEN: usize = 15;
 
 /// Bytes of AEAD ciphertext sampled to seed the mask cipher — one AES block
 /// (RFC 9001 §5.4.2). Always available: every data-plane packet carries at least

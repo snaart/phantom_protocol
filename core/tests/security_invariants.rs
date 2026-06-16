@@ -113,12 +113,12 @@ fn tampered_extensions_is_rejected_via_aad() {
     assert_eq!(pt, b"ext-bound payload");
 }
 
-/// T4.6 — header protection (QUIC RFC 9001 §5.4) masks the 14 variable header
-/// bytes (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖ path_id`, wire `[1..15]`
-/// in ε / WIRE v5) so a passive on-path observer reads neither the packet number
-/// nor the `PRIORITY` ("voice") flag; only the `version` byte stays cleartext
-/// (session_id is off-wire; routing is by the outer ConnId). The peer recovers
-/// the exact packet via `parse_protected`.
+/// Header protection (QUIC RFC 9001 §5.4) masks the header bytes so a passive
+/// on-path observer reads neither the packet number nor the `PRIORITY` ("voice")
+/// flag. **WIRE v6 (anti-fingerprint):** the masked region is the WHOLE 15-byte
+/// header `[0..15]` — the `version` byte is masked too, so there is no constant
+/// cleartext byte to fingerprint (session_id is off-wire; routing is by the outer
+/// ConnId). The peer recovers the exact packet via `parse_protected`.
 #[test]
 fn hp_masks_header_fields_on_the_wire() {
     let (client, server) = make_session_pair([0x71u8; 32]);
@@ -137,14 +137,17 @@ fn hp_masks_header_fields_on_the_wire() {
     let wire = client.protect_packet(&packet).expect("protect");
     let cleartext = packet.to_wire();
 
-    // The 14-byte protected region [1..15] is masked → not the cleartext bytes.
+    // The whole 15-byte header region [0..15] is masked → not the cleartext bytes.
     assert_ne!(
-        &wire[1..15],
-        &cleartext[1..15],
-        "pn/flags/stream_id/epoch/path_id must be masked on the wire"
+        &wire[0..15],
+        &cleartext[0..15],
+        "version/pn/flags/stream_id/epoch/path_id must all be masked on the wire"
     );
-    // Only the `version` byte stays cleartext (session_id is off-wire).
-    assert_eq!(&wire[..1], &cleartext[..1]);
+    // v6: the version byte is masked too — no constant cleartext fingerprint.
+    assert_ne!(
+        wire[0], cleartext[0],
+        "the version byte must be masked on the v6 wire"
+    );
     // The flags bytes (incl. the PRIORITY/voice bit) sit in the masked span, so
     // an observer cannot read the priority class off the wire.
     assert_ne!(
