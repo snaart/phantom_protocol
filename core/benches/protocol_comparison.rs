@@ -8,7 +8,7 @@
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // Phantom Protocol imports
@@ -93,17 +93,19 @@ fn phantom_throughput_bench(c: &mut Criterion) {
 
     // Different payload sizes.
     //
-    // V2 wire format (`encrypt_packet` / `decrypt_packet`) — header-
-    // derived AEAD nonce, so a sender/receiver pair cannot desync. Each
-    // iteration uses a fresh `header.sequence` from atomic counters that
-    // are hoisted outside the payload-size loop, so the sequence never
-    // collides with one that the per-stream replay window has already
-    // accepted on a previous payload-size iteration.
+    // The receiver's replay protection is a SINGLE per-direction sliding window
+    // over the u64 packet number — it is no longer keyed per stream id (see
+    // `Session::recv_replay`, which replaced the old per-`StreamId` map). So
+    // every decrypt across *all* of the sub-benchmarks below shares one window
+    // and must therefore see a strictly-increasing, never-repeated packet
+    // number, or the window rejects it as already-seen / too-old. One shared
+    // monotonic counter (hoisted outside the payload-size loop) gives every
+    // packet — encrypt-only, decrypt, and round-trip alike — a unique climbing
+    // number; that also keeps the header-derived AEAD nonce unique. The stream
+    // ids below are kept distinct only for realism; they don't gate replay.
     let session_id = *server_session.id();
     let flags = PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE);
-    let encrypt_seq = AtomicU32::new(1);
-    let decrypt_seq = AtomicU32::new(1);
-    let roundtrip_seq = AtomicU32::new(1);
+    let packet_number = AtomicU64::new(1);
 
     for size in [1024, 4096, 16384, 65536].iter() {
         let data = vec![0xAB; *size];
@@ -114,8 +116,8 @@ fn phantom_throughput_bench(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("phantom_encrypt", size), size, |b, _| {
             b.iter_batched(
                 || {
-                    let seq = encrypt_seq.fetch_add(1, Ordering::Relaxed);
-                    PacketHeader::new(session_id, 1, seq as u64, flags)
+                    let seq = packet_number.fetch_add(1, Ordering::Relaxed);
+                    PacketHeader::new(session_id, 1, seq, flags)
                 },
                 |header| {
                     let encrypted = server_session.encrypt_packet(&header, &data, &[]).unwrap();
@@ -128,8 +130,8 @@ fn phantom_throughput_bench(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("phantom_decrypt", size), size, |b, _| {
             b.iter_batched(
                 || {
-                    let seq = decrypt_seq.fetch_add(1, Ordering::Relaxed);
-                    let header = PacketHeader::new(session_id, 2, seq as u64, flags);
+                    let seq = packet_number.fetch_add(1, Ordering::Relaxed);
+                    let header = PacketHeader::new(session_id, 2, seq, flags);
                     let encrypted = server_session
                         .encrypt_packet(&header, &data, &[])
                         .expect("encrypt setup");
@@ -148,8 +150,8 @@ fn phantom_throughput_bench(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("phantom_roundtrip", size), size, |b, _| {
             b.iter_batched(
                 || {
-                    let seq = roundtrip_seq.fetch_add(1, Ordering::Relaxed);
-                    PacketHeader::new(session_id, 3, seq as u64, flags)
+                    let seq = packet_number.fetch_add(1, Ordering::Relaxed);
+                    PacketHeader::new(session_id, 3, seq, flags)
                 },
                 |header| {
                     let encrypted = server_session.encrypt_packet(&header, &data, &[]).unwrap();
@@ -354,14 +356,13 @@ fn encryption_bench(c: &mut Criterion) {
         .process_server_hello(&client_hello_retry, &server_hello, Some(&server_pk))
         .unwrap();
 
-    // V2 wire format — header-derived AEAD nonce, fresh sequence per iter to
-    // dodge the per-stream replay window. The atomic counter is hoisted
-    // outside the payload-size loop so the sequence keeps climbing across
-    // payload-size iterations and never collides with a previously-accepted
-    // sequence on the same stream.
+    // Header-derived AEAD nonce + a single per-direction replay window (keyed on
+    // the u64 packet number, not the stream id). One monotonic counter, hoisted
+    // outside the payload-size loop, gives every decrypt a strictly-increasing
+    // packet number so the window never rejects it as already-seen / too-old.
     let session_id = *server_session.id();
     let flags = PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE);
-    let seq_counter = AtomicU32::new(1);
+    let seq_counter = AtomicU64::new(1);
 
     for size in [64, 256, 1024, 4096, 16384, 65536, 262144, 1048576].iter() {
         let data = vec![0xAB; *size];
@@ -371,7 +372,7 @@ fn encryption_bench(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let seq = seq_counter.fetch_add(1, Ordering::Relaxed);
-                    PacketHeader::new(session_id, 1, seq as u64, flags)
+                    PacketHeader::new(session_id, 1, seq, flags)
                 },
                 |header| {
                     let encrypted = server_session.encrypt_packet(&header, &data, &[]).unwrap();
