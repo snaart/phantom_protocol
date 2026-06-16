@@ -214,13 +214,17 @@ PhantomRustBuffer ffi_phantom_protocol_rustbuffer_reserve(
  * can re-declare them following the pattern.
  */
 
-void ffi_phantom_protocol_rust_future_poll_pointer(
+/* `_u64` future variant. NOTE: UniFFI 0.31 represents an exported **object**
+ * (e.g. the `Arc<PhantomSession>` an async `connect_pinned` returns) as a `u64`
+ * handle — there is no `_pointer` future variant in the dylib. Complete returns
+ * the handle; cast it to the `void *` the object methods/free take. */
+void ffi_phantom_protocol_rust_future_poll_u64(
     uint64_t                                handle,
     PhantomRustFutureContinuationCallback   callback,
     uint64_t                                callback_data);
-void ffi_phantom_protocol_rust_future_cancel_pointer(uint64_t handle);
-void ffi_phantom_protocol_rust_future_free_pointer(uint64_t handle);
-void *ffi_phantom_protocol_rust_future_complete_pointer(
+void ffi_phantom_protocol_rust_future_cancel_u64(uint64_t handle);
+void ffi_phantom_protocol_rust_future_free_u64(uint64_t handle);
+uint64_t ffi_phantom_protocol_rust_future_complete_u64(
     uint64_t                                handle,
     PhantomRustCallStatus                  *call_status);
 
