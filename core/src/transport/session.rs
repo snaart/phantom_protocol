@@ -275,6 +275,13 @@ pub struct Session {
     /// longer tracks app writes. Read lock-free; set via
     /// [`set_jitter_ms`](Self::set_jitter_ms).
     jitter_max_ms: AtomicU32,
+    /// Anti-fingerprint cover-traffic floor interval, in milliseconds (WIRE v6,
+    /// deliverable (e)). `0` = off (default). When non-zero, the pump maintains a
+    /// minimum outbound packet rate: if no packet has gone out for this long, it
+    /// emits an `ENCRYPTED | COVER` dummy packet (idle-fill + a floor rate of
+    /// `1000 / this` packets/sec) so silence + volume no longer leak. Read
+    /// lock-free; set via [`set_cover_interval_ms`](Self::set_cover_interval_ms).
+    cover_min_interval_ms: AtomicU32,
     /// Which side of the handshake we are. Carried into every
     /// `CryptoState::new(...)` re-derivation so the per-direction keys are
     /// laid out the same way they were at session establishment.
@@ -396,6 +403,7 @@ impl Session {
             rekey_unconfirmed: AtomicBool::new(false),
             padding_policy: AtomicU8::new(0),
             jitter_max_ms: AtomicU32::new(0),
+            cover_min_interval_ms: AtomicU32::new(0),
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -450,6 +458,7 @@ impl Session {
             rekey_unconfirmed: AtomicBool::new(false),
             padding_policy: AtomicU8::new(0),
             jitter_max_ms: AtomicU32::new(0),
+            cover_min_interval_ms: AtomicU32::new(0),
             is_server,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -499,6 +508,7 @@ impl Session {
             rekey_unconfirmed: AtomicBool::new(false),
             padding_policy: AtomicU8::new(0),
             jitter_max_ms: AtomicU32::new(0),
+            cover_min_interval_ms: AtomicU32::new(0),
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
@@ -856,6 +866,21 @@ impl Session {
         self.jitter_max_ms.store(ms, Ordering::Relaxed);
     }
 
+    /// The cover-traffic floor interval as a `Duration` (WIRE v6, deliverable (e)).
+    /// `Duration::ZERO` = cover off (default).
+    pub fn cover_interval(&self) -> Duration {
+        Duration::from_millis(self.cover_min_interval_ms.load(Ordering::Relaxed) as u64)
+    }
+
+    /// Set the cover-traffic floor interval in milliseconds (`0` = off). When set,
+    /// the pump maintains a minimum outbound packet rate of `1000 / ms` packets/sec
+    /// by emitting an `ENCRYPTED | COVER` dummy packet whenever no packet has gone
+    /// out for `ms` — hiding idle/active patterns and volume, at a steady bandwidth
+    /// cost.
+    pub fn set_cover_interval_ms(&self, ms: u32) {
+        self.cover_min_interval_ms.store(ms, Ordering::Relaxed);
+    }
+
     /// True once the send direction has crossed the rekey high-watermark and the
     /// epoch has room to advance. The data pump checks this before each
     /// application send and, when set, rekeys + flags the packet `REKEY` so the
@@ -1177,6 +1202,13 @@ impl Session {
     /// send time, so the AEAD nonce is never reused.
     pub fn next_send_pn(&self) -> PacketNumber {
         self.send_packet_number.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Read the next send packet number **without** consuming it. Used by the cover-
+    /// traffic timer as a lock-free "did we send anything since last tick?" signal
+    /// (every outbound packet draws a fresh PN via [`next_send_pn`](Self::next_send_pn)).
+    pub fn peek_send_pn(&self) -> PacketNumber {
+        self.send_packet_number.load(Ordering::SeqCst)
     }
 
     /// The client-owned send-side `path_id` currently stamped on outbound packets

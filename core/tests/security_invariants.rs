@@ -1380,6 +1380,59 @@ fn padded_flag_is_aead_bound() {
     assert!(server.decrypt_packet(&padded_header, &ct, &[]).is_ok());
 }
 
+/// WIRE v6 (e) — a COVER (cover-traffic) packet is built like a real packet
+/// (ENCRYPTED, PADÉ-padded to a bucket) but carries an EMPTY inner plaintext, and
+/// the `COVER` flag is AEAD-AAD-bound. So (1) it authenticates exactly like a data
+/// packet (an off-path attacker cannot inject one), (2) after decrypt + strip its
+/// inner plaintext is empty — there is no data to leak even if the recv-side drop
+/// were missed — and (3) flipping the COVER flag fails the AEAD open (no oracle to
+/// turn a data packet into a "dropped" one or vice-versa).
+#[test]
+fn cover_packet_is_authenticated_padded_and_carries_no_data() {
+    let (client, server) = make_session_pair([0x92u8; 32]);
+
+    // Build a cover packet the way `send_cover` does: empty plaintext, PADÉ-padded,
+    // flagged ENCRYPTED | COVER | PADDED.
+    let trailer = shaping::padding_trailer_len(0, PaddingPolicy::Padme);
+    let mut pt = Vec::new();
+    shaping::append_padding(&mut pt, trailer);
+    let cover_header = PacketHeader::new(
+        *server.id(),
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::COVER | PacketFlags::PADDED),
+    );
+    let ct = client
+        .encrypt_packet(&cover_header, &pt, &[])
+        .expect("encrypt cover");
+
+    // The on-wire cover packet is a bucketed size (not a tiny tell), and decrypt +
+    // strip yields an EMPTY inner plaintext.
+    let wire = PhantomPacket::new(cover_header, ct.clone()).to_wire();
+    assert!(
+        wire.len() > PacketHeader::SIZE,
+        "cover packet is padded, not a tiny tell"
+    );
+    let dec = server
+        .decrypt_packet(&cover_header, &ct, &[])
+        .expect("decrypt cover");
+    let inner = shaping::strip_padding(&dec).expect("strip cover");
+    assert!(
+        inner.is_empty(),
+        "a cover packet carries no application data"
+    );
+
+    // The COVER flag is AEAD-AAD-bound: clearing it fails the open.
+    let no_cover = PacketHeader {
+        flags: PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::PADDED),
+        ..cover_header
+    };
+    assert!(
+        server.decrypt_packet(&no_cover, &ct, &[]).is_err(),
+        "clearing the AEAD-bound COVER flag must fail the open"
+    );
+}
+
 /// C1 concurrency: the data pump drives the send loop and the receive task
 /// concurrently over one `Arc<Session>`, so a send-side `rekey()` can race a
 /// receive-side ratchet. Every transition must be atomic — the installed key

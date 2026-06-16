@@ -1070,6 +1070,7 @@ async fn udp_integration_size_padding_delivers_byte_exact() {
             s.set_traffic_shaping(TrafficShapingConfig {
                 padding: PaddingPolicy::Padme,
                 jitter_ms: 0,
+                cover_interval_ms: 0,
             })
             .await,
             "server session established"
@@ -1097,6 +1098,7 @@ async fn udp_integration_size_padding_delivers_byte_exact() {
             .set_traffic_shaping(TrafficShapingConfig {
                 padding: PaddingPolicy::Padme,
                 jitter_ms: 0,
+                cover_interval_ms: 0,
             })
             .await,
         "client session established"
@@ -1140,6 +1142,7 @@ async fn udp_integration_timing_jitter_delivers_byte_exact() {
             s.set_traffic_shaping(TrafficShapingConfig {
                 padding: PaddingPolicy::Padme,
                 jitter_ms: 15,
+                cover_interval_ms: 0,
             })
             .await
         );
@@ -1163,6 +1166,7 @@ async fn udp_integration_timing_jitter_delivers_byte_exact() {
             .set_traffic_shaping(TrafficShapingConfig {
                 padding: PaddingPolicy::None,
                 jitter_ms: 15,
+                cover_interval_ms: 0,
             })
             .await
     );
@@ -1176,6 +1180,126 @@ async fn udp_integration_timing_jitter_delivers_byte_exact() {
             .expect("client recv");
         assert_eq!(echo, msg, "byte-exact echo #{i} with timing jitter on");
     }
+
+    server.await.unwrap();
+}
+
+/// WIRE v6 (e) — cover traffic: with a cover floor interval set, an otherwise-idle
+/// session emits encrypted COVER dummy packets (so silence no longer leaks), and
+/// those packets are DROPPED by the peer — they never surface in `recv()`. A real
+/// message after the idle window still delivers byte-exact (cover doesn't break the
+/// data plane).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_cover_traffic_fills_idle_and_is_dropped() {
+    use phantom_protocol::api::session::TrafficShapingConfig;
+    use phantom_protocol::transport::shaping::PaddingPolicy;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .unwrap();
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let server = tokio::spawn(async move {
+        let s = listener.accept().await.expect("accept").session();
+        // Server enables cover too; it must never deliver a client cover packet as
+        // application data (recv only ever returns the real message below).
+        assert!(
+            s.set_traffic_shaping(TrafficShapingConfig {
+                padding: PaddingPolicy::None,
+                jitter_ms: 0,
+                cover_interval_ms: 40,
+            })
+            .await
+        );
+        // The server's recv must only ever return the two REAL messages — never a
+        // (dropped) cover packet, even though cover is flowing both ways.
+        for expected in [b"warmup".to_vec(), b"after-idle".to_vec()] {
+            let m = s.recv().await.expect("server recv");
+            assert_eq!(
+                m, expected,
+                "server must only recv real messages, never cover"
+            );
+            s.send(m).await.expect("server echo");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    // Recording relay: count client->server datagrams while `recording` is set.
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    upstream.connect(server_addr).await.unwrap();
+    let recording = Arc::new(AtomicBool::new(false));
+    let c2s_count = Arc::new(AtomicUsize::new(0));
+    let rec = recording.clone();
+    let cnt = c2s_count.clone();
+    tokio::spawn(async move {
+        let mut c2s = vec![0u8; 4096];
+        let mut s2c = vec![0u8; 4096];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s) => {
+                    let (n, from) = match r { Ok(x) => x, Err(_) => continue };
+                    client_addr = Some(from);
+                    if rec.load(Ordering::Relaxed) { cnt.fetch_add(1, Ordering::Relaxed); }
+                    let _ = upstream.send(&c2s[..n]).await;
+                }
+                r = upstream.recv(&mut s2c) => {
+                    let n = match r { Ok(x) => x, Err(_) => continue };
+                    if let Some(ca) = client_addr { let _ = relay.send_to(&s2c[..n], ca).await; }
+                }
+            }
+        }
+    });
+
+    let transport = UdpClientTransport::connect(relay_addr).await.unwrap();
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+
+    // Warm up, then enable cover with a 40 ms floor (25 packets/sec).
+    client.send(b"warmup".to_vec()).await.unwrap();
+    let echo = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo, b"warmup");
+    assert!(
+        client
+            .set_traffic_shaping(TrafficShapingConfig {
+                padding: PaddingPolicy::None,
+                jitter_ms: 0,
+                cover_interval_ms: 40,
+            })
+            .await
+    );
+
+    // Go idle (send nothing) for ~300 ms while recording. The client must emit cover
+    // packets to maintain the floor rate → the relay sees client->server datagrams.
+    recording.store(true, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    recording.store(false, Ordering::Relaxed);
+    let covered = c2s_count.load(Ordering::Relaxed);
+    assert!(
+        covered > 0,
+        "cover traffic must fill the idle window with client->server packets (got {covered})"
+    );
+
+    // The data plane still works: a real message echoes byte-exact, and `recv()`
+    // returns exactly it — never a (dropped) cover packet.
+    client.send(b"after-idle".to_vec()).await.unwrap();
+    let echo = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(
+        echo, b"after-idle",
+        "recv must return the real message, never cover"
+    );
 
     server.await.unwrap();
 }

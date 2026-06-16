@@ -296,7 +296,8 @@ Source: `core/src/transport/types.rs:74-107`.
 | `0x0800` | `WINDOW_UPDATE` | Payload is a big-endian `u32` relative flow-control credit (per-stream; the receiver grants the sender an additional `u32` bytes that is added to the sender's send window, saturating at `MAX_SEND_WINDOW`) |
 | `0x1000` | `KEEPALIVE` | Idle keep-alive PING (empty payload); `KEEPALIVE \| ACK` is the PONG echo (download-only liveness — § 12.4) |
 | `0x2000` | `PADDED` | Anti-fingerprint size padding present: the AEAD plaintext ends with a `‹zeros› ‖ pad_n:u16be` trailer the receiver strips post-decrypt (§ 4.8) |
-| `0x4000` … `0x8000` | _reserved_ | Future amendments |
+| `0x4000` | `COVER` | Anti-fingerprint cover (dummy) traffic: empty inner plaintext (usually `PADDED`); authenticated then dropped by the peer, never reaches `recv()` (§ 4.8) |
+| `0x8000` | _reserved_ | Future amendments |
 
 `ENCRYPTED` is the post-handshake invariant flag — the API layer sets it on
 every application-data packet, and the receive loop drops any non-empty
@@ -558,7 +559,24 @@ Source: `transport/shaping.rs` (`padme`, `padding_trailer_len`, `append_padding`
 (strip). Tests: `transport::shaping` units (bounded overhead, idempotence,
 strip-is-inverse), `security_invariants` (padding inside the AEAD, bucketed, AAD-bound
 flag), live `udp_integration::udp_integration_size_padding_delivers_byte_exact`.
-Timing jitter (d) and cover traffic (e) are separate later phases.
+**Timing jitter (d).** Independently opt-in (`TrafficShapingConfig::jitter_ms`,
+`0` = off): the send path waits a uniform random `[0, jitter_ms]` ms before each
+packet (`pace_send`, ahead of the wire-rate pacer), so inter-packet timing no
+longer tracks the application's writes — at up to `jitter_ms` of added latency.
+Jitter only delays; it never reorders or drops.
+
+**Cover (dummy) traffic (e).** Independently opt-in
+(`TrafficShapingConfig::cover_interval_ms`, `0` = off): the session maintains a
+minimum outbound packet rate of `1000 / cover_interval_ms` packets/sec by emitting
+an `ENCRYPTED | COVER` dummy packet (empty inner plaintext, PADÉ-padded to a
+bucket) whenever no packet has gone out for `cover_interval_ms` — hiding the
+idle/active pattern and volume, at a steady bandwidth cost. A cover packet
+AEAD-authenticates like any packet (so it refreshes the peer's liveness and cannot
+be off-path injected), and the receiver **drops** it before the data path (it
+never reaches `recv()`). Source: `send_cover` / `maybe_send_cover` in
+`api/session.rs` (the cover timer reuses the send-PN counter as the "did we send
+anything?" signal). Tests: `security_invariants::cover_packet_is_authenticated_padded_and_carries_no_data`,
+live `udp_integration::udp_integration_cover_traffic_fills_idle_and_is_dropped`.
 
 ---
 

@@ -3616,6 +3616,16 @@ data class TrafficShapingConfig (
      * application's writes — at a cost of up to `jitter_ms` of added latency.
      */
     var `jitterMs`: kotlin.UInt
+    , 
+    /**
+     * Cover-traffic floor interval in milliseconds (deliverable (e)). `0`
+     * (default) = no cover traffic; otherwise the session maintains a minimum
+     * outbound packet rate of `1000 / cover_interval_ms` packets/sec, emitting an
+     * encrypted dummy (`COVER`) packet whenever no packet has gone out for
+     * `cover_interval_ms` — hiding idle/active patterns and volume, at a steady
+     * bandwidth cost. A typical value is 100–500 ms (10–2 packets/sec).
+     */
+    var `coverIntervalMs`: kotlin.UInt
     
 ){
     
@@ -3634,17 +3644,20 @@ public object FfiConverterTypeTrafficShapingConfig: FfiConverterRustBuffer<Traff
         return TrafficShapingConfig(
             FfiConverterTypePaddingPolicy.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
         )
     }
 
     override fun allocationSize(value: TrafficShapingConfig) = (
             FfiConverterTypePaddingPolicy.allocationSize(value.`padding`) +
-            FfiConverterUInt.allocationSize(value.`jitterMs`)
+            FfiConverterUInt.allocationSize(value.`jitterMs`) +
+            FfiConverterUInt.allocationSize(value.`coverIntervalMs`)
     )
 
     override fun write(value: TrafficShapingConfig, buf: ByteBuffer) {
             FfiConverterTypePaddingPolicy.write(value.`padding`, buf)
             FfiConverterUInt.write(value.`jitterMs`, buf)
+            FfiConverterUInt.write(value.`coverIntervalMs`, buf)
     }
 }
 

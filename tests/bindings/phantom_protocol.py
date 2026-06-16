@@ -1494,19 +1494,22 @@ class TrafficShapingConfig:
     phases. Padding hides the datagram *size*; it costs bounded (≈ ≤12% worst-case)
     extra bandwidth.
 """
-    def __init__(self, *, padding:PaddingPolicy, jitter_ms:int):
+    def __init__(self, *, padding:PaddingPolicy, jitter_ms:int, cover_interval_ms:int):
         self.padding = padding
         self.jitter_ms = jitter_ms
+        self.cover_interval_ms = cover_interval_ms
         
         
 
     
     def __str__(self):
-        return "TrafficShapingConfig(padding={}, jitter_ms={})".format(self.padding, self.jitter_ms)
+        return "TrafficShapingConfig(padding={}, jitter_ms={}, cover_interval_ms={})".format(self.padding, self.jitter_ms, self.cover_interval_ms)
     def __eq__(self, other):
         if self.padding != other.padding:
             return False
         if self.jitter_ms != other.jitter_ms:
+            return False
+        if self.cover_interval_ms != other.cover_interval_ms:
             return False
         return True
 
@@ -1516,17 +1519,20 @@ class _UniffiFfiConverterTypeTrafficShapingConfig(_UniffiConverterRustBuffer):
         return TrafficShapingConfig(
             padding=_UniffiFfiConverterTypePaddingPolicy.read(buf),
             jitter_ms=_UniffiFfiConverterUInt32.read(buf),
+            cover_interval_ms=_UniffiFfiConverterUInt32.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterTypePaddingPolicy.check_lower(value.padding)
         _UniffiFfiConverterUInt32.check_lower(value.jitter_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.cover_interval_ms)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterTypePaddingPolicy.write(value.padding, buf)
         _UniffiFfiConverterUInt32.write(value.jitter_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.cover_interval_ms, buf)
 
 
 

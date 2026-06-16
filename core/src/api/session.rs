@@ -91,6 +91,13 @@ pub struct TrafficShapingConfig {
     /// ms before it is sent, so the inter-packet timing no longer tracks the
     /// application's writes — at a cost of up to `jitter_ms` of added latency.
     pub jitter_ms: u32,
+    /// Cover-traffic floor interval in milliseconds (deliverable (e)). `0`
+    /// (default) = no cover traffic; otherwise the session maintains a minimum
+    /// outbound packet rate of `1000 / cover_interval_ms` packets/sec, emitting an
+    /// encrypted dummy (`COVER`) packet whenever no packet has gone out for
+    /// `cover_interval_ms` — hiding idle/active patterns and volume, at a steady
+    /// bandwidth cost. A typical value is 100–500 ms (10–2 packets/sec).
+    pub cover_interval_ms: u32,
 }
 
 impl ConnectionState {
@@ -1129,6 +1136,12 @@ async fn run_data_pump<T: SessionTransport>(
     // one per `keepalive_interval` (no 10 ms-heartbeat spam). Seeded at "now" so the
     // first PING waits a full interval after the data plane starts.
     let mut last_keepalive = std::time::Instant::now();
+    // Cover-traffic bookkeeping (WIRE v6, deliverable (e)): the send PN observed at
+    // the last cover check, and the instant of the last observed outbound activity.
+    // Any real packet advances the PN, resetting the idle window, so cover only
+    // fills genuine gaps (idle-fill + a floor rate). Seeded at "now"/current PN.
+    let mut last_outbound_pn = crypto_session.peek_send_pn();
+    let mut last_outbound_at = std::time::Instant::now();
     // Outbound WINDOW_UPDATE control packets are emitted on the send loop — the
     // sole outbound writer — so the encrypted control frame is always sealed under
     // the epoch live when it stamps. The epoch has two writers (this loop's own
@@ -1162,6 +1175,18 @@ async fn run_data_pump<T: SessionTransport>(
                 // already marked outstanding this tick.
                 maybe_send_keepalive(
                     &transport, &crypto_session, session_id, &mut last_keepalive,
+                )
+                .await;
+                // Cover traffic (WIRE v6, deliverable (e)): on this same heartbeat,
+                // maintain the minimum outbound packet rate — emit a COVER dummy when
+                // the outbound path has been idle past the floor interval. No-op when
+                // cover is disabled (default) or real traffic is flowing.
+                maybe_send_cover(
+                    &transport,
+                    &crypto_session,
+                    session_id,
+                    &mut last_outbound_pn,
+                    &mut last_outbound_at,
                 )
                 .await;
                 // Liveness sweep (P4.3): the 10 ms heartbeat is the reliable place to
@@ -1890,6 +1915,94 @@ async fn send_keepalive<T: SessionTransport>(
     true
 }
 
+/// Emit one anti-fingerprint COVER (dummy) packet (WIRE v6, deliverable (e)): an
+/// `ENCRYPTED | COVER` packet with **empty** inner plaintext, PADÉ-padded to a
+/// bucket so it is not a tiny distinctive size on the wire. It carries no stream
+/// data; the peer AEAD-authenticates it (which refreshes its liveness timer and
+/// makes off-path injection impossible) then drops it before the data path, so it
+/// never reaches `recv()`. Cover is always padded, independent of the session's
+/// data-padding policy.
+async fn send_cover<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+) -> bool {
+    let mut flag_bits = PacketFlags::ENCRYPTED | PacketFlags::COVER;
+    // Same direction-wide rekey discipline as any other send.
+    match rekey_before_stamp(crypto_session) {
+        Some(extra) => flag_bits |= extra,
+        None => return false,
+    }
+    let mut plaintext = Vec::new();
+    let trailer = shaping::padding_trailer_len(0, PaddingPolicy::Padme);
+    if trailer > 0 {
+        shaping::append_padding(&mut plaintext, trailer);
+        flag_bits |= PacketFlags::PADDED;
+    }
+    let packet_number = crypto_session.next_send_pn();
+    let header = PacketHeader::new(
+        session_id,
+        RAW_APP_STREAM_ID as TransportStreamId,
+        packet_number,
+        PacketFlags::new(flag_bits),
+    )
+    .with_epoch(crypto_session.current_epoch())
+    .with_path_id(crypto_session.current_send_path_id());
+    let ciphertext = match crypto_session.encrypt_packet(&header, &plaintext, &[]) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("PhantomSession: cover encrypt failed: {}", e);
+            return false;
+        }
+    };
+    let packet = PhantomPacket::new(header, ciphertext);
+    let buf = match crypto_session.protect_packet(&packet) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("PhantomSession: cover header protection failed: {}", e);
+            return false;
+        }
+    };
+    if let Err(e) = transport.send_bytes(&buf).await {
+        log::error!("PhantomSession: cover send failed: {}", e);
+        return false;
+    }
+    true
+}
+
+/// Maintain a minimum outbound packet rate with cover traffic (WIRE v6, deliverable
+/// (e)): when no packet has gone out for `cover_interval`, emit a COVER dummy so
+/// silence + volume no longer leak (idle-fill + a floor rate of `1000 / interval_ms`
+/// packets/sec). `last_pn` / `last_at` track the last observed outbound activity —
+/// any real packet advances the send PN, resetting the idle window, so cover only
+/// fills genuine gaps and never piles on top of active traffic.
+async fn maybe_send_cover<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    last_pn: &mut u64,
+    last_at: &mut std::time::Instant,
+) {
+    let interval = crypto_session.cover_interval();
+    if interval.is_zero() {
+        return;
+    }
+    if crypto_session.state() != SessionState::Connected {
+        return;
+    }
+    let pn = crypto_session.peek_send_pn();
+    if pn != *last_pn {
+        // Real (or prior cover) traffic went out since the last check — reset.
+        *last_pn = pn;
+        *last_at = std::time::Instant::now();
+        return;
+    }
+    if last_at.elapsed() >= interval && send_cover(transport, crypto_session, session_id).await {
+        *last_pn = crypto_session.peek_send_pn();
+        *last_at = std::time::Instant::now();
+    }
+}
+
 /// Emit a V2 PATH_VALIDATION packet on `path_id` carrying the given
 /// 32-byte challenge or response payload. Encrypted under the current
 /// session epoch.
@@ -2125,6 +2238,17 @@ async fn handle_packet<T: SessionTransport>(
             // means the peer re-PINGs next interval (its probe stays outstanding).
             let _ = send_keepalive(transport_send_ack, crypto_recv, session_id, true).await;
         }
+        return;
+    }
+
+    // Cover traffic (WIRE v6, deliverable (e)): a COVER packet carries no application
+    // data (its inner plaintext is empty after the padding strip above). Its only
+    // effect is the `update_activity()` already done above (it AEAD-authenticated, so
+    // it proves the peer is alive and cannot be off-path injected). Drop it here,
+    // before the SACK / data paths, so the empty payload never surfaces in `recv()`.
+    // (A cover packet is never an ACK — it is `ENCRYPTED | COVER | PADDED` — so this
+    // must precede the ACK branch below.)
+    if packet.header.flags.contains(PacketFlags::COVER) {
         return;
     }
 
@@ -2761,6 +2885,7 @@ impl PhantomSession {
             Some(s) => {
                 s.set_padding_policy(config.padding);
                 s.set_jitter_ms(config.jitter_ms);
+                s.set_cover_interval_ms(config.cover_interval_ms);
                 true
             }
             None => false,
