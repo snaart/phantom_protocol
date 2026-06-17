@@ -10,21 +10,32 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
-- **Server-side connection migration — plumbing (A2a, part 1).** An accepted server
-  session can now move its network send path mid-session without a re-handshake via the
-  new **Rust-only** `PhantomSession::migrate_server(local_addr)` (deliberately not on the
-  UniFFI/FFI surface — server migration is a native-deployment operation). It rebinds the
-  server's send socket and rotates the server→client `path_id` + connection-ID in
-  lock-step, so the peer follows the fresh s2c source with a fresh, unlinkable ConnId
-  while client→server traffic keeps flowing to the established listen address through the
-  demux overlap (the session stays bidirectional, no re-handshake). To make this possible
-  the UDP **client socket is now unconnected** (`send_to` a tracked server address,
-  `recv_from` any source) instead of kernel-`connect`ed, so it can hear — and later follow
-  — a server that moves to a new address; the inner AEAD + replay window remain the
-  authenticity guards. No wire-format change (behavioural extension on WIRE v6). The peer's
-  symmetric c2s follow (path-validated failover when the old server address is unreachable)
-  and matching c2s CID rotation — closing the EPS-02 linkability residual for
-  server-initiated migration — land in the follow-up security-core change.
+- **Server-side connection migration (A2a) — real, bidirectional, unlinkable.** An
+  accepted server session can now move its network path mid-session without a
+  re-handshake via the new **Rust-only** `PhantomSession::migrate_server(local_addr)`
+  (deliberately not on the UniFFI/FFI surface — server migration is a native-deployment
+  operation: failover, multi-homing, egress-NAT rebind). It rebinds the server's send
+  socket and rotates the server→client `path_id` + connection-ID in lock-step; the peer
+  follows the new s2c source automatically and, when the old server address is
+  unreachable, switches its own send target to the new one (path-validated failover).
+  To make this work:
+  - the UDP **client socket is now unconnected** (`send_to` a tracked server address,
+    `recv_from` any source) instead of kernel-`connect`ed, so it can hear — and follow —
+    a server that moves to a new address; the inner AEAD + replay window remain the
+    authenticity guards;
+  - the client mirrors the server's migration machinery (commit the new server source
+    only post-AEAD per M-1, path-validate it under a 3× anti-amplification cap, switch
+    its c2s target only on a valid `PATH_RESPONSE`), so the worst case for a spoofed /
+    replayed frame is a bounded reflection, never a c2s redirection;
+  - CID rotation is now **symmetric for migration by either peer (EPS-02 closed)**: on a
+    server migration the client reflects — it bumps its `path_id` and rotates its c2s
+    chain, which slides the server's c2s demux window so the rotated CID stays routable
+    (no stranding) with no ping-pong (the server's s2c re-rotation is `path_id`-silent).
+    So a client move **and** a server failover are both unlinkable in both directions to
+    a both-networks observer (the not-forward-secret CID-chain caveat is unchanged).
+
+  No wire-format change (a behavioural extension on WIRE v6 — `path_id`, the rotating
+  CID, and `PATH_VALIDATION` are all already on the wire).
 
 - **Blocking C helpers for the FFI (`tests/bindings/c/phantom_helpers.h`, #14c).**
   A header-only, pure-C convenience layer that wraps the async future-poll

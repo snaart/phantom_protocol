@@ -55,9 +55,8 @@ redundancy) and `extensions` left the data-plane wire — saving 8 bytes/packet
 (§ 4.1 / § 4.2 / § 4.6). v6 also adds opt-in **encrypted size padding** (PADÉ
 bucketing, the `PADDED` flag) so the datagram size no longer tracks the payload
 size (§ 4.8). The sole routing identifier is the outer 8-byte UDP `ConnId`,
-which **rotates** on each migration (§ 4.7) — symmetrically for a client migration
-(both directions, EPS-02 fix), with a residual on the rarer *server* migration
-(§ 12.5). The handshake (`PROTOCOL_VERSION`) is unchanged by T4.6, ε, or v6.
+which **rotates** on each migration (§ 4.7) — symmetrically for **both** a client- and
+a server-initiated migration (both directions, EPS-02 closed by A2a; § 12.5). The handshake (`PROTOCOL_VERSION`) is unchanged by T4.6, ε, or v6.
 `PROTOCOL_VERSION` is `3` (bumped
 `1 → 2` when the signed transcript began covering the 0-RTT verdict
 `early_data_accepted` (H2) and `ClientHello` gained the `resumption_binder`
@@ -439,36 +438,42 @@ outer wrapping; it adds no decryption oracle. Source:
 F.1.5, ChaCha20 HP vs RFC 9001 § A.5; live end-to-end via `udp_integration` /
 `tcp_integration`.
 
-**Residual (closed by ε for client migration).** T4.6 hid the *variable* per-packet
-metadata but left two stable cleartext identifiers — the 32-byte inner `session_id`
-and the outer 8-byte routing `ConnId`. ε removes the `session_id` from the wire
-(§ 4.2) and makes the routing `ConnId` **rotate** on each migration (§ 4.7). For a
-**client** migration the rotation is **symmetric** (EPS-02 fix): the client rotates
-its c2s chain on `migrate()` and the server rotates its s2c chain on authenticating
-the new `path_id`, so both directions are unlinkable. **Residual:** a *server*
-migration rotates s2c but not c2s (the socket-routed client does not rotate-on-detect
-— that would strand its CID outside the server's un-sliding c2s window for repeated
-server migrations), so a server move stays linkable in the c2s direction to a
-both-networks observer (threat model § 12.5; audit 2026-06-15 **EPS-02** — the full
-shared-epoch fix is tracked). The honest caveat: like the HP keys, the CID chain is
-session-stable and **not** forward-secret — a session-key compromise lets an attacker
-recompute the chain and link a *recorded* flow retroactively; the payload stays
-forward-secret.
+**Residual (closed by ε; EPS-02 now closed for *both* migration directions).** T4.6
+hid the *variable* per-packet metadata but left two stable cleartext identifiers —
+the 32-byte inner `session_id` and the outer 8-byte routing `ConnId`. ε removes the
+`session_id` from the wire (§ 4.2) and makes the routing `ConnId` **rotate** on each
+migration (§ 4.7), **symmetrically for both a client- and a server-initiated
+migration**: whichever peer moves rotates its own outbound chain, and the other peer
+rotates its return-direction chain in response, so **both directions are unlinkable
+across a move by either peer**. For a server migration the client *reflects* — it
+bumps its `path_id` and rotates its c2s chain — and that `path_id` bump is what makes
+the server slide its c2s demux window to the rotated CID (no stranding); the server's
+own s2c re-rotation is `path_id`-silent, so there is no ping-pong (audit 2026-06-15
+**EPS-02**, closed by A2a). The honest caveat that **remains**: like the HP keys, the
+CID chain is session-stable and **not** forward-secret — a session-key compromise lets
+an attacker recompute the chain and link a *recorded* flow retroactively; the payload
+stays forward-secret.
 
 ### 4.7 Rotating connection ID (ε / WIRE v5)
 
 After ε the **only** per-connection cleartext identifier is the outer 8-byte UDP
 `ConnId` (`transport/phantom_udp/envelope.rs`), and it **rotates** so an on-path
-observer sees independent-random values across a migration. For a **client
-migration** rotation is **symmetric** (EPS-02 fix): the client advances its c2s
-chain on `migrate()`, and the server, on authenticating the new `path_id`
-(post-AEAD), rotates its s2c chain too — the socket-routed client absorbs the new
-inbound CID without a window slide, and the server does not bump its own `path_id`,
-so there is no ping-pong. **Residual (audit 2026-06-15, EPS-02):** a *server*
-migration rotates s2c but not c2s (the socket-routed client does not rotate-on-detect
-— that would push its CID out of the server's un-sliding c2s window for repeated
-server migrations); the full fix (one shared authenticated migration epoch) is
-tracked. See § 12.5.
+observer sees independent-random values across a migration. Rotation is **symmetric
+for both migration directions** (EPS-02, closed by A2a):
+
+- **Client migration** — the client advances its c2s chain on `migrate()`, and the
+  server, on authenticating the new `path_id` (post-AEAD), rotates its s2c chain too;
+  the socket-routed client absorbs the new inbound CID without a window slide, and the
+  server does not bump its own `path_id`, so there is no ping-pong.
+- **Server migration** — the server advances its s2c chain on `migrate_server()`, and
+  the client, on authenticating the new server `path_id` (post-AEAD), *reflects*: it
+  bumps its own `path_id` and advances its c2s chain. The `path_id` bump makes the
+  server slide its c2s demux window to the rotated c2s CID (so it stays routable — no
+  stranding, the hazard the per-direction asymmetry previously avoided); the server's
+  matching s2c re-rotation is `path_id`-silent, so the client sees no new forward
+  server `path_id` and does not re-reflect — it terminates in one round.
+
+So a migration by **either** peer is unlinkable in **both** directions. See § 12.5.
 
 **Chain.** At session establishment each peer derives two per-direction secrets
 from the initial session secret (mirroring the HP / AEAD key swap):
@@ -1202,19 +1207,25 @@ PHANTOM_REGEN_WIRE_VECTORS=1 cargo test --manifest-path core/Cargo.toml --test w
 
 ## 12. Connection migration & liveness (Phase 4)
 
-One PQ-pinned identity survives a substrate change — Wi-Fi↔cellular, NAT-rebind —
-**without** re-running the kilobyte hybrid handshake. The session keeps the same
-`session_id` and the same AEAD keys; only the underlying network path changes. The
-connection loses **throughput** briefly, never **liveness**. This rides entirely on
-the **existing** wire — there is no migration-specific packet type and no wire bump
-beyond ① (§ 5); migration reuses the `PATH_VALIDATION` flag (§ 4.3), the `path_id`
-header byte (§ 4.2 / § 7), and the stable plaintext `session_id` (the demux key).
-One live path at a time — aggregation / simultaneous multipath is out of scope.
+One PQ-pinned identity survives a substrate change — Wi-Fi↔cellular, NAT-rebind, or a
+**server** failover / multi-homing / egress-NAT rebind — **without** re-running the
+kilobyte hybrid handshake. The session keeps the same internal `session_id` and the
+same AEAD keys; only the underlying network path changes. The connection loses
+**throughput** briefly, never **liveness**. This rides entirely on the **existing**
+wire — there is no migration-specific packet type and no wire bump beyond ① (§ 5);
+migration reuses the `PATH_VALIDATION` flag (§ 4.3), the `path_id` header byte
+(§ 4.2 / § 7), and the rotating routing `ConnId` (the demux key — § 4.7; the
+`session_id` is off-wire since ε). One live path at a time — aggregation / simultaneous
+multipath is out of scope.
 
-**SDK-boundary principle.** The product on top owns *when* to migrate (it has the
-best signal — `NWPathMonitor` / `ConnectivityManager`); the SDK owns *how* to
-survive it. So migration is **embedder-triggered** on the client (`migrate()`); the
-server is the universal detector / validator.
+**SDK-boundary principle.** The product on top owns *when* to migrate (it has the best
+signal — `NWPathMonitor` / `ConnectivityManager`, or a server-side failover decision);
+the SDK owns *how* to survive it. Migration is **embedder-triggered** and **symmetric**:
+the client triggers its own move with `migrate(new_local_addr)`, the server triggers its
+own with `migrate_server(new_local_addr)` (Rust-only — server migration is a
+native-deployment operation), and **each peer is the detector / validator / follower for
+the other's move** (§ 12.1 is written from the client-moves perspective; a server move is
+its exact mirror).
 
 ### 12.1 The switch (detect → challenge → validate → swap)
 
@@ -1260,6 +1271,20 @@ server is the universal detector / validator.
    estimator + congestion controller** (QUIC §9.4) — Wi-Fi→cellular is a different
    network, so the old bottleneck/RTT must not carry over and trigger a spurious
    retransmit storm.
+
+**Server-initiated migration (the mirror — A2a).** A server move is the same machinery
+with the roles swapped. `migrate_server(new_local_addr)` rebinds the server's *send*
+socket (keeping the old receive path — the listener demux — alive through the overlap,
+so c2s never drops) and bumps the server's send `path_id`, so the client sees a new s2c
+source. The **client** is then the detector/validator/follower: its socket is unconnected
+(so it can hear the new server source — it would otherwise be dropped at the kernel), it
+commits the new source as a candidate **only post-AEAD** (M-1), path-validates it under
+the 3× anti-amp cap (step 3), and on a valid echo switches its c2s send target to the new
+server address (step 4, mirrored). The client also **reflects** the CID rotation (§ 4.7):
+on authenticating the server's new `path_id` it bumps its own `path_id` + rotates its c2s
+chain, which makes the server slide its c2s demux window so the rotated CID stays routable
+(no stranding). So a server failover is followed seamlessly *and* unlinkably in both
+directions (§ 12.5).
 
 ### 12.2 PATH-001 — strict send-gate, relaxed recv-delivery (Invariant 6 / RFC 9000 §9.3)
 
@@ -1324,25 +1349,29 @@ silent ≥ interval, ≤ one PING per interval), so steady traffic pays nothing.
   Defences: path validation (an unguessable challenge that must be echoed *from* the
   claimed address), pinned-key AEAD (an attacker without the session keys can neither
   read nor inject app data), and the per-direction replay window (§ 5).
-- **Linkability — closed by ε for client migration; a server-migration residual
-  remains.** Header protection (T4.6, § 4.6) masks the variable per-packet metadata,
-  and ε (§ 4.2 / § 4.7) removed the inner 32-byte `session_id` from the wire
-  (off-wire in the AEAD AAD) and makes the routing `ConnId` **rotate** to an
-  independent-random value per migration. Rotation is **symmetric for a client
-  migration** (EPS-02 fix): the client advances its own c2s chain on `migrate()`,
-  and the server, on authenticating the new `path_id` (post-AEAD), rotates its s2c
-  chain too — the socket-routed client accepts any inbound CID, so no window slide
-  is needed and there is no ping-pong. So a **client** moving Wi-Fi→cellular is
-  **unlinkable in both directions** by an on-path / colluding observer. **Residual
-  (audit 2026-06-15, EPS-02):** a *server*-initiated migration rotates s2c (the
-  server's own `migrate()`) but **not** c2s — the socket-routed client does not
-  rotate-on-detect (doing so would push its CID out of the server's un-sliding c2s
-  window for repeated server migrations), so the client→server CID stays stable
-  across a *server* migration. Server migration is rare; the full fix (a shared
-  authenticated migration epoch) is tracked. The `version` byte (= 5) is a constant
-  protocol fingerprint shared by all connections, **not** a per-connection linker
-  (full anti-fingerprinting — version/length padding — is a separate future pass).
-  **Honest caveat (not forward-secret):** like the HP keys, the CID chain is
-  session-stable; a session-key compromise lets an attacker recompute the chain (and
-  unmask headers) to link a *recorded* flow retroactively — but the payload stays
-  forward-secret (the AEAD ratchets). Same posture as the HP core.
+- **Linkability — closed by ε + A2a for migration by *either* peer (EPS-02 closed).**
+  Header protection (T4.6, § 4.6) masks the variable per-packet metadata, and ε
+  (§ 4.2 / § 4.7) removed the inner 32-byte `session_id` from the wire (off-wire in the
+  AEAD AAD) and makes the routing `ConnId` **rotate** to an independent-random value
+  per migration. Rotation is **symmetric for both migration directions**:
+  - **client migration** — the client advances its c2s chain on `migrate()`, and the
+    server, on authenticating the new `path_id` (post-AEAD), rotates its s2c chain too
+    (the socket-routed client accepts any inbound CID — no window slide, no ping-pong);
+  - **server migration** — the server advances its s2c chain on `migrate_server()`, and
+    the client *reflects* on authenticating the new server `path_id`: it bumps its own
+    `path_id` and advances its c2s chain. The `path_id` bump makes the server slide its
+    c2s demux window to the rotated CID (so it stays routable — the no-stranding fix
+    that the earlier asymmetry avoided by *not* rotating c2s); the server's matching s2c
+    re-rotation is `path_id`-silent, so the client does not re-reflect (terminates in
+    one round). Anti-spoof is preserved exactly as on the server: the client commits the
+    new server source only post-AEAD (M-1), path-validates it under a 3× anti-amp cap,
+    and switches its c2s target only on a valid `PATH_RESPONSE` (§ 12.3).
+
+  So a migration by **either** peer (client moving Wi-Fi→cellular, or a server
+  failover / egress change) is **unlinkable in both directions** by an on-path /
+  colluding observer (audit 2026-06-15 **EPS-02**, closed by A2a). The `version` byte
+  is HP-masked as of WIRE v6 (no constant cleartext byte). **Honest caveat (not
+  forward-secret):** like the HP keys, the CID chain is session-stable; a session-key
+  compromise lets an attacker recompute the chain (and unmask headers) to link a
+  *recorded* flow retroactively — but the payload stays forward-secret (the AEAD
+  ratchets). Same posture as the HP core.
