@@ -2299,6 +2299,14 @@ async fn handle_packet<T: SessionTransport>(
             //    which the client sees no new forward server path_id → note_migration_path
             //    returns None → no re-reflection. The reflected c2s comes from the SAME client
             //    source, so the server's confirm_authenticated_source is a no-op for it.
+            //
+            // The `path_id` bump (session layer) and the CID rotation (transport layer)
+            // are not a single atomic step, so a send racing this rotation can stamp a
+            // one-step-skewed `(path_id=N, CID_{N-1})` or `(path_id=N-1, CID_N)` pair. That
+            // is harmless: the peer demux routes by CID against a window with `T = 2`
+            // trailing + `K = 16` leading slack (cid_chain), which absorbs a ±1 skew, so the
+            // skewed packet still routes and the L1 ARQ would re-carry it anyway — no strand.
+            // Same two-step shape as the `Migrate` / `migrate_server` pump arms above.
             if crypto_recv.is_server() {
                 transport_for_path.set_outbound_cid(crypto_recv.advance_outbound_cid());
             } else {
@@ -4461,6 +4469,51 @@ mod tests {
             client_session.current_send_path_id(),
             send_path_before,
             "the client must bump its send path_id so the server slides its c2s window (no stranding)"
+        );
+    }
+
+    /// EPS-02 closure, multi-step case — the client's c2s rotation is driven by ITS OWN
+    /// reflection count, NOT by the server's migration count `d`. When the client detects a
+    /// *forward* server `path_id` of `d > 1` (it missed intermediate server migrations under
+    /// loss), it reflects ONCE: `send_path_id` and `outbound_cid_index` each advance by 1 and
+    /// stay **1:1**. That 1:1 is exactly the invariant the server's c2s window slide relies on
+    /// — the server slides by the *client's* `path_id` delta (1) and routes the client's c2s
+    /// CID at index 1. So a `d > 1` server migration does NOT desync the c2s direction (the
+    /// `d` the client computes here is its *inbound* view of the server's s2c chain, which the
+    /// socket-routed client does not even use). Guards against an over-eager "bump by d" fix.
+    #[tokio::test]
+    async fn eps02_client_reflects_once_for_a_multi_step_server_migration() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+
+        assert!(!client_session.is_server(), "client side");
+
+        // The server migrated TWICE but the client only sees the second (the first s2c on
+        // path_id 1 was lost): deliver a server→client app frame on path_id = 2 (forward
+        // distance d = 2 from the client's view).
+        let stream_id: TransportStreamId = 1;
+        let frame = build_app_frame_on_path(
+            &server_session,
+            session_id,
+            stream_id,
+            0,
+            0,
+            2,
+            b"srv-moved-2x",
+        );
+        let pkt = decode_recv_frame(&frame, session_id);
+        run_recv(pkt, session_id, &client_session, &streams).await;
+
+        assert_eq!(
+            client_session.current_send_path_id(),
+            1,
+            "client reflects ONCE (not d = 2) — its c2s rotation is decoupled from the server's migration count"
+        );
+        assert_eq!(
+            client_session.outbound_cid_index(),
+            1,
+            "outbound CID index stays 1:1 with send_path_id, so the server (which slides its c2s window by the CLIENT's path_id delta) routes the rotated c2s CID — no desync on a d>1 server migration"
         );
     }
 
