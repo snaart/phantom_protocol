@@ -31,10 +31,11 @@ const MAX_HANDSHAKE_RETX: u32 = 6;
 const PHASE_HANDSHAKE: u8 = 0;
 const PHASE_ESTABLISHED: u8 = 1;
 
-/// Outcome of classifying a UDP `recv` result (M-6).
+/// Outcome of classifying a UDP `recv_from` result (M-6).
 enum RecvAction {
-    /// A datagram of this many bytes arrived.
-    Got(usize),
+    /// A datagram of this many bytes arrived from this source (the source is needed for
+    /// server-migration candidate detection — M-1).
+    Got(usize, SocketAddr),
     /// An ICMP-induced *advisory* error — retry, do not tear the session down.
     Retry,
     /// A genuine, fatal socket error.
@@ -66,10 +67,11 @@ fn is_advisory_recv_error(e: &std::io::Error) -> bool {
     false
 }
 
-/// Classify a `recv` result: an advisory ICMP error is retried, a genuine error is fatal (M-6).
-fn classify_recv(r: std::io::Result<usize>) -> RecvAction {
+/// Classify a `recv_from` result: an advisory ICMP error is retried, a genuine error is
+/// fatal (M-6); a datagram carries its source for migration-candidate detection.
+fn classify_recv(r: std::io::Result<(usize, SocketAddr)>) -> RecvAction {
     match r {
-        Ok(n) => RecvAction::Got(n),
+        Ok((n, src)) => RecvAction::Got(n, src),
         Err(e) if is_advisory_recv_error(&e) => RecvAction::Retry,
         Err(e) => RecvAction::Fatal(e),
     }
@@ -86,10 +88,11 @@ pub struct UdpClientTransport {
     /// frame received on the new socket.
     prev_socket: ArcSwap<Option<Arc<UdpSocket>>>,
     /// The server remote this client `send_to`s. `ArcSwap` because the socket is
-    /// unconnected: the destination is explicit per send rather than a kernel-pinned
-    /// connect peer, and a later server-migration *follow* can atomically re-point it to a
-    /// validated new server address without re-handshake. In this build it is the pinned
-    /// connect target and never changes; it is read on every `send_bytes`.
+    /// unconnected (the destination is explicit per send rather than a kernel-pinned connect
+    /// peer) AND because a server-migration *follow* re-points it to a validated new server
+    /// address without a re-handshake: when the server moves, the client path-validates the
+    /// new source and [`promote_candidate`](SessionTransport::promote_candidate) stores it
+    /// here, so subsequent c2s flows to the new address. Read on every `send_bytes`.
     server_addr: ArcSwap<SocketAddr>,
     /// The bootstrap (handshake) ConnId — a random lifetime id stamped until the
     /// session sets the rotating chain via [`set_outbound_cid`](SessionTransport::set_outbound_cid).
@@ -103,6 +106,23 @@ pub struct UdpClientTransport {
     /// Datagrams of the most recently sent frame, retransmitted on RTO during Handshake.
     last_sent: Mutex<Vec<Vec<u8>>>,
     reasm: Mutex<FragmentAssembler>,
+    /// Server-migration candidate (the mirror of the server's client-migration candidate): a
+    /// NEW server source (≠ `server_addr`) observed for this session. The session
+    /// path-validates it before any switch; `promote_candidate` then stores it as the new
+    /// `server_addr`. `None` until a migrated server's source appears.
+    candidate: ArcSwap<Option<SocketAddr>>,
+    /// Anti-amplification budget for the candidate (D9, RFC 9000 §8.2): bytes received from /
+    /// sent to the candidate, so a `PATH_CHALLENGE` to a possibly-spoofed new server source
+    /// never exceeds 3× what it sent us. Bounds the redirection/reflection an on-path
+    /// attacker (replaying a fresh frame with a spoofed source) could induce.
+    cand_recv: AtomicU64,
+    cand_sent: AtomicU64,
+    /// Source + byte length of the most recent `recv_bytes` frame (M-1). The candidate is
+    /// committed from this ONLY by `confirm_authenticated_source` on the post-decrypt path,
+    /// so a spoofed / replayed datagram (which fails AEAD or the replay window before
+    /// `confirm_authenticated_source` runs) can never clobber the candidate slot.
+    last_recv_src: ArcSwap<Option<SocketAddr>>,
+    last_frame_len: AtomicU64,
 }
 
 impl UdpClientTransport {
@@ -132,6 +152,11 @@ impl UdpClientTransport {
             next_packet_id: AtomicU32::new(0),
             last_sent: Mutex::new(Vec::new()),
             reasm: Mutex::new(FragmentAssembler::new()),
+            candidate: ArcSwap::from_pointee(None),
+            cand_recv: AtomicU64::new(0),
+            cand_sent: AtomicU64::new(0),
+            last_recv_src: ArcSwap::from_pointee(None),
+            last_frame_len: AtomicU64::new(0),
         })
     }
 
@@ -249,7 +274,7 @@ impl SessionTransport for UdpClientTransport {
             // `from_prev` records which buffer the datagram landed in, so we slice the
             // right one AFTER the select — the recv future's `&mut buf` borrow is
             // released when its arm wins, exactly as the single-socket path relied on.
-            let (n, from_prev): (usize, bool) = if in_handshake {
+            let (n, from_prev, src): (usize, bool, SocketAddr) = if in_handshake {
                 // Migration is post-handshake only, so there is never a `prev` socket
                 // here; keep the original single-socket + RTO-retransmit logic.
                 let server = **self.server_addr.load();
@@ -263,8 +288,8 @@ impl SessionTransport for UdpClientTransport {
                     // MAX_HANDSHAKE_RETX and timing the handshake out. Biasing toward received data
                     // makes the RTO fire only when recv is genuinely pending.
                     biased;
-                    r = active.recv_from(&mut buf) => match classify_recv(r.map(|(n, _src)| n)) {
-                        RecvAction::Got(n) => (n, false),
+                    r = active.recv_from(&mut buf) => match classify_recv(r) {
+                        RecvAction::Got(n, src) => (n, false, src),
                         RecvAction::Retry => {
                             log::debug!("PhantomUDP: advisory recv error (ignored, RFC 8085 §5.5)");
                             continue;
@@ -289,8 +314,8 @@ impl SessionTransport for UdpClientTransport {
                     buf_prev.resize(PATH_MTU + 64, 0);
                 }
                 tokio::select! {
-                    r = active.recv_from(&mut buf) => match classify_recv(r.map(|(n, _src)| n)) {
-                        RecvAction::Got(n) => (n, false),
+                    r = active.recv_from(&mut buf) => match classify_recv(r) {
+                        RecvAction::Got(n, src) => (n, false, src),
                         RecvAction::Retry => {
                             log::debug!("PhantomUDP: advisory recv error on new path (ignored)");
                             continue;
@@ -299,8 +324,8 @@ impl SessionTransport for UdpClientTransport {
                             return Err(CoreError::NetworkError(format!("udp recv: {e}")))
                         }
                     },
-                    r = prev_sock.recv_from(&mut buf_prev) => match classify_recv(r.map(|(n, _src)| n)) {
-                        RecvAction::Got(n) => (n, true),
+                    r = prev_sock.recv_from(&mut buf_prev) => match classify_recv(r) {
+                        RecvAction::Got(n, src) => (n, true, src),
                         RecvAction::Retry => {
                             log::debug!("PhantomUDP: advisory recv error on old path (ignored)");
                             continue;
@@ -311,8 +336,8 @@ impl SessionTransport for UdpClientTransport {
                     },
                 }
             } else {
-                match classify_recv(active.recv_from(&mut buf).await.map(|(n, _src)| n)) {
-                    RecvAction::Got(n) => (n, false),
+                match classify_recv(active.recv_from(&mut buf).await) {
+                    RecvAction::Got(n, src) => (n, false, src),
                     RecvAction::Retry => {
                         log::debug!("PhantomUDP: advisory recv error (ignored, RFC 8085 §5.5)");
                         continue;
@@ -336,7 +361,17 @@ impl SessionTransport for UdpClientTransport {
                 self.prev_socket.store(Arc::new(None));
             }
             match decoded {
-                Ok((_hdr, Some(frame))) => return Ok(Bytes::from(frame)),
+                Ok((_hdr, Some(frame))) => {
+                    // M-1 (server-migration candidate detection): record the source + frame
+                    // length of this still-AEAD-pending frame. The candidate is committed ONLY
+                    // by the post-decrypt `confirm_authenticated_source`, so a spoofed / replayed
+                    // datagram (rejected by AEAD or the replay window before that runs) can never
+                    // clobber the candidate slot. Mirrors `UdpServerTransport::recv_bytes`.
+                    self.last_recv_src.store(Arc::new(Some(src)));
+                    self.last_frame_len
+                        .store(frame.len() as u64, Ordering::Relaxed);
+                    return Ok(Bytes::from(frame));
+                }
                 Ok((_hdr, None)) => continue, // partial fragment; keep receiving
                 Err(_) => continue,           // malformed datagram; drop and keep receiving
             }
@@ -364,6 +399,91 @@ impl SessionTransport for UdpClientTransport {
             CoreError::NetworkError(format!("migrate: bad local addr '{local_addr}': {e}"))
         })?;
         self.migrate_to(addr).await
+    }
+
+    // ── Server-migration follow (the client side of A2a) ──────────────────────
+    //
+    // The exact mirror of `UdpServerTransport`'s client-migration candidate machinery,
+    // with the roles flipped: here the candidate is a NEW SERVER source, and a promotion
+    // re-points `server_addr` (the c2s send target). The shared recv-path
+    // (`handle_packet`) drives these the same way for both peers — it commits the
+    // candidate post-AEAD (`confirm_authenticated_source`), challenges it under the 3×
+    // anti-amplification cap (`send_to_candidate`), and promotes it on a valid
+    // PATH_RESPONSE (`promote_candidate`). Anti-spoof holds exactly as on the server: a
+    // spoofed / replayed datagram is rejected by AEAD or the replay window BEFORE
+    // `confirm_authenticated_source` runs, so it can never become the candidate; and the
+    // switch happens only after the candidate echoes a path-validation challenge, so an
+    // on-path attacker that rewrites a fresh frame's source to a victim can at most induce
+    // a bounded (≤3×) PATH_CHALLENGE to that victim, never a c2s redirection.
+
+    fn confirm_authenticated_source(&self) {
+        // M-1: the frame from `last_recv_src` just authenticated (AEAD-opened, non-replayed),
+        // so it really is the server — possibly at a NEW address (the server migrated). Commit
+        // it as the candidate the session path-validates before switching, and (re)seed its
+        // anti-amplification budget. A spoofed source never reaches here.
+        let src = match **self.last_recv_src.load() {
+            Some(s) => s,
+            None => return,
+        };
+        if src == **self.server_addr.load() {
+            return; // already the established server — not a new path
+        }
+        let len = self.last_frame_len.load(Ordering::Relaxed);
+        if self.candidate.load().as_ref() == &Some(src) {
+            self.cand_recv.fetch_add(len, Ordering::Relaxed);
+        } else {
+            self.candidate.store(Arc::new(Some(src)));
+            self.cand_recv.store(len, Ordering::Relaxed);
+            self.cand_sent.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn has_migration_candidate(&self) -> bool {
+        self.candidate.load().is_some()
+    }
+
+    async fn send_to_candidate(&self, data: &[u8]) -> Result<bool, CoreError> {
+        let cand = self.candidate.load();
+        let addr = match cand.as_ref() {
+            Some(a) => *a,
+            None => return Ok(false),
+        };
+        let pid = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
+        // Bootstrap cid (not the rotating `established_cid`): a challenge to a possibly-spoofed
+        // address must not leak the keyed rotating CID, mirroring the server.
+        let dgrams = encode_datagrams(PacketType::OneRtt, &self.cid, pid, data)
+            .map_err(|e| CoreError::NetworkError(format!("challenge too large: {e}")))?;
+        let wire: u64 = dgrams.iter().map(|d| d.len() as u64).sum();
+        // Anti-amplification (D9, RFC 9000 §8.2): never send > 3× what the candidate sent us.
+        let recv = self.cand_recv.load(Ordering::Relaxed);
+        if self.cand_sent.load(Ordering::Relaxed).saturating_add(wire) > recv.saturating_mul(3) {
+            return Ok(false);
+        }
+        let sock = self.socket.load_full();
+        for d in &dgrams {
+            sock.send_to(d, addr)
+                .await
+                .map_err(|e| CoreError::NetworkError(format!("udp send_to candidate: {e}")))?;
+        }
+        self.cand_sent.fetch_add(wire, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    fn promote_candidate(&self) -> bool {
+        let cand = self.candidate.load();
+        match cand.as_ref() {
+            Some(addr) => {
+                // The candidate's path validated: re-point the c2s send target to the new
+                // server address + clear the candidate / anti-amp budget. Subsequent
+                // `send_bytes` (and L1 retransmits) now flow to the migrated server.
+                self.server_addr.store(Arc::new(*addr));
+                self.candidate.store(Arc::new(None));
+                self.cand_recv.store(0, Ordering::Relaxed);
+                self.cand_sent.store(0, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -950,6 +1070,70 @@ mod tests {
         assert_eq!(&got[..], b"c2s-after-server-move");
     }
 
+    /// D3 (server-migration follow): the CLIENT mirrors the server's candidate machinery — a
+    /// NEW server source becomes a candidate ONLY post-authentication (M-1), a `PATH_CHALLENGE`
+    /// reaches it under the 3× anti-amplification cap, and `promote_candidate` re-points
+    /// `server_addr` so subsequent c2s flows to the migrated server.
+    #[tokio::test]
+    async fn client_detects_server_candidate_and_promotes_to_new_server_addr() {
+        let orig_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let orig_addr = orig_server.local_addr().unwrap();
+        let client = UdpClientTransport::connect(orig_addr).await.unwrap();
+        client.set_frame_phase(FramePhase::Established);
+
+        assert!(!client.has_migration_candidate());
+        assert!(
+            !client.send_to_candidate(b"x").await.unwrap(),
+            "no candidate => Ok(false)"
+        );
+
+        // Learn the client's local address so the migrated server can target it.
+        client.send_bytes(b"hi").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, client_addr) = orig_server.recv_from(&mut buf).await.unwrap();
+
+        // A migrated server (a new source) sends a framed datagram; recv_bytes records it.
+        let new_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for d in encode_datagrams(PacketType::OneRtt, &client.cid(), 1, b"0123456789").unwrap() {
+            new_server.send_to(&d, client_addr).await.unwrap();
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.recv_bytes())
+            .await
+            .expect("no timeout")
+            .expect("recv");
+        // M-1: a recv alone must NOT commit a candidate (it is not yet AEAD-verified).
+        assert!(
+            !client.has_migration_candidate(),
+            "recv alone must NOT commit a candidate (M-1)"
+        );
+        client.confirm_authenticated_source();
+        assert!(
+            client.has_migration_candidate(),
+            "an authenticated new server source sets the candidate"
+        );
+
+        // A challenge reaches the candidate (the migrated server) within the 3× budget.
+        assert!(
+            client.send_to_candidate(b"chal").await.unwrap(),
+            "first challenge is within the 3× budget"
+        );
+        let (cn, _) = new_server.recv_from(&mut buf).await.unwrap();
+        assert!(cn > 0, "the challenge must reach the new server socket");
+
+        // Promote → `server_addr` switches to the new server; subsequent send_bytes go there.
+        assert!(client.promote_candidate(), "candidate must be promoted");
+        assert!(
+            !client.has_migration_candidate(),
+            "candidate cleared after promotion"
+        );
+        client.send_bytes(b"after").await.unwrap();
+        let (an, _) = tokio::time::timeout(Duration::from_secs(1), new_server.recv_from(&mut buf))
+            .await
+            .expect("post-promote c2s reaches the migrated server")
+            .unwrap();
+        assert!(an > 0);
+    }
+
     /// Review finding (overlap-drop robustness): a client mid-(local)-migration overlap must
     /// retire its old socket on the first well-formed datagram on the NEW socket REGARDLESS
     /// of source — including from a server that has itself migrated to a new address. A
@@ -1180,10 +1364,10 @@ mod tests {
         );
     }
 
-    /// M-6 (audit 2026-06-11): an ICMP-induced recv error on a connected UDP socket (the
-    /// forged-RST analogue — a spoofed "port unreachable") must be treated as ADVISORY and
-    /// retried, never mapped to a fatal `NetworkError` that tears the session down bypassing the
-    /// liveness machinery (RFC 8085 §5.5 / RFC 9000 §14.2). A genuine error stays fatal.
+    /// M-6 (audit 2026-06-11): an ICMP-induced recv error (the forged-RST analogue — a spoofed
+    /// "port unreachable") must be treated as ADVISORY and retried, never mapped to a fatal
+    /// `NetworkError` that tears the session down bypassing the liveness machinery (RFC 8085
+    /// §5.5 / RFC 9000 §14.2). A genuine error stays fatal; a datagram carries its source.
     #[test]
     fn advisory_icmp_recv_errors_are_retried_not_fatal() {
         use std::io::{Error, ErrorKind};
@@ -1199,6 +1383,10 @@ mod tests {
             classify_recv(Err(Error::from(ErrorKind::PermissionDenied))),
             RecvAction::Fatal(_)
         ));
-        assert!(matches!(classify_recv(Ok(42)), RecvAction::Got(42)));
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert!(matches!(
+            classify_recv(Ok((42, addr))),
+            RecvAction::Got(42, s) if s == addr
+        ));
     }
 }
