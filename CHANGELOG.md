@@ -10,6 +10,23 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **0-RTT anti-replay controls for scaled deployments (A2b).** 0-RTT early-data is
+  replay-safe out of the box on a single node (one-shot ticket consumption, Invariant 9),
+  but a horizontally-scaled fleet with per-node caches could otherwise let a captured 0-RTT
+  `ClientHello` be replayed to a different node. Two new controls close this:
+  - **`ZeroRttAntiReplay` trait** + `PhantomListener::set_zero_rtt_anti_replay` /
+    `PhantomUdpListener::set_zero_rtt_anti_replay` (Rust-only): install a store shared by all
+    nodes whose atomic `check_and_set` makes the one-shot consume first-use **globally** (e.g.
+    Redis `SET NX`, a conditional DB write — the *store* is the embedder's infrastructure; the
+    transport ships only the seam, failing closed). Replay-safe 0-RTT at scale.
+  - **`set_early_data_enabled(false)`** on either listener: disable 0-RTT early-data entirely
+    (resumption still bypasses the cookie/PoW gate, but early-data is rejected and resent
+    1-RTT) — a one-line, zero-infrastructure defence, the recommended default for any multi-node
+    deployment that has not installed a distributed store.
+
+  Loud deploy guide at `docs/operations/zero-rtt.md`; threat-model updated (the scale-out
+  replay row is now *mitigable* rather than a residual). No wire-format change.
+
 - **Server-side connection migration (A2a) — real, bidirectional, unlinkable.** An
   accepted server session can now move its network path mid-session without a
   re-handshake via the new **Rust-only** `PhantomSession::migrate_server(local_addr)`
