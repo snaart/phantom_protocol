@@ -2375,13 +2375,22 @@ async fn handle_packet<T: SessionTransport>(
                     feed_bbr_on_ack(crypto_recv, sent_at, retired.size, sack.ack_delay_us as u64);
                 }
             }
-            // L1-B: feed the REAL loss signal to BBR for every segment the SACK gap
-            // detector just declared lost (previously `on_loss` fired only on RTO),
-            // then wake the send loop so its Pass-0 fast-retransmits them promptly.
+            // L1-B (#7 — congestion 4.4 fix): the SACK gap detector just declared
+            // segments lost; wake the send loop so Pass-0 fast-retransmits them promptly.
+            // We do NOT feed BBR's loss signal here. Loss is fed exactly ONCE per loss
+            // event, at the *retransmission* point (`drain_streams_priority_ordered`'s
+            // `if seg.retransmit { on_packet_lost(...) }`), which covers BOTH a SACK-gap
+            // fast-retransmit and an RTO-timeout retransmit. Feeding it again here would
+            // double-count: `on_packet_lost` decrements the purely-incremental
+            // `inflight_bytes`, so a SACK-gap-lost segment fed at both detection AND
+            // retransmission nets `+b −b −b +b −b = −b` over its send/loss/resend/ack
+            // lifecycle — a permanent inflight under-count that inflates the cwnd budget
+            // (`cwnd − inflight`) and accumulates with every SACK-gap loss → over-send,
+            // exactly when the controller should be backing off. Retransmits bypass the
+            // cwnd gate, so a lost segment is always retransmitted → the single feed at
+            // the retransmission point reliably fires (and a spurious gap that gets ACKed
+            // before retransmit correctly feeds no loss at all).
             if !result.lost.is_empty() {
-                for lost in &result.lost {
-                    crypto_recv.on_packet_lost(lost.size);
-                }
                 crypto_recv.notify_outbound_ready();
             }
         }
@@ -5106,6 +5115,55 @@ mod tests {
         assert!(
             stream.poll_send(u64::MAX).await.is_none(),
             "a forged SACK must not trigger a fast-retransmit (no segment flagged lost)"
+        );
+    }
+
+    /// **#7 (congestion 4.4 fix).** A SACK that declares segments lost must NOT itself feed
+    /// BBR's loss signal — loss is fed exactly once per loss event, at the *retransmission*
+    /// point (`drain_streams`'s `if seg.retransmit`), which covers both SACK-gap and RTO
+    /// retransmits. Feeding it again here, at SACK-gap detection, double-decrements the
+    /// purely-incremental `inflight_bytes`: a lost segment fed at both detection and
+    /// retransmission nets a permanent inflight under-count, inflating the cwnd budget
+    /// (`cwnd − inflight`) → over-send, accumulating with every SACK-gap loss. Here a sender
+    /// has six in-flight segments; an authenticated SACK acking offset {5} retires segment 5
+    /// and flags 0,1,2 lost. Afterward `inflight_bytes` must drop by ONLY the retired
+    /// segment — never by the three flagged-lost ones (which the bug would subtract here).
+    #[tokio::test]
+    async fn loss_declaring_sack_does_not_feed_bbr_loss_at_detection() {
+        tokio::time::pause();
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        // Stage six in-flight reliable segments on the sender, mirroring the pump's
+        // inflight accounting (`on_packet_sent` per sent segment).
+        let stream = Arc::new(TransportStream::new(stream_id));
+        let mut seg_size = 0u64;
+        for _ in 0..6u32 {
+            stream
+                .send_reliable(Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+            let seg = stream.poll_send(u64::MAX).await.expect("in-flight");
+            seg_size = seg.data.len() as u64;
+            server_session.on_packet_sent(seg_size);
+        }
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(stream_id as u32, stream.clone());
+        let inflight_before = server_session.bandwidth_snapshot().inflight_bytes;
+        assert_eq!(inflight_before, 6 * seg_size, "six segments in flight");
+
+        // Authenticated SACK acking offset {5}: retires segment 5, flags 0,1,2 lost.
+        let ack = build_encrypted_ack(&client_session, session_id, stream_id, 4242, 5);
+        let pkt = decode_recv_frame(&ack, session_id);
+        run_recv(pkt, session_id, &server_session, &streams).await;
+
+        let inflight_after = server_session.bandwidth_snapshot().inflight_bytes;
+        assert_eq!(
+            inflight_after,
+            inflight_before - seg_size,
+            "inflight must drop by ONLY the retired (acked) segment; double-feeding loss at \
+             SACK-gap detection would over-decrement it by the three flagged-lost segments (#7)"
         );
     }
 
