@@ -2221,3 +2221,90 @@ fn failed_decrypt_does_not_advance_recv_invocation_counter() {
         "a failed AEAD open must not advance the recv invocation counter (T5.5)"
     );
 }
+
+/// Anti-amplification + no-redirection (D9 / A2a server-migration follow). When the client
+/// follows a migrated server it mirrors the server's M-1 + 3× anti-amplification guarantees:
+///   (1) it must NOT send more than 3× the bytes it received from an unvalidated candidate
+///       (so an on-path attacker that replays a fresh server frame with a spoofed source —
+///       a victim's address — can induce at most a bounded reflection to that victim), AND
+///   (2) an unvalidated candidate is NEVER the c2s send target — application data keeps
+///       flowing to the ESTABLISHED server until a valid PATH_RESPONSE promotes the candidate.
+/// Worst case is therefore a bounded reflection, never a c2s redirection/hijack.
+#[tokio::test]
+async fn client_server_migration_candidate_is_anti_amp_capped_and_never_the_send_target() {
+    use phantom_protocol::api::session::{FramePhase, SessionTransport};
+    use phantom_protocol::api::udp_transport::UdpClientTransport;
+    use phantom_protocol::transport::phantom_udp::datagram::encode_datagrams;
+    use phantom_protocol::transport::phantom_udp::envelope::PacketType;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let client = UdpClientTransport::connect(server_addr).await.unwrap();
+    client.set_frame_phase(FramePhase::Established);
+
+    // Learn the client's local address so the candidate can target it.
+    client.send_bytes(b"hi").await.unwrap();
+    let mut buf = vec![0u8; 2048];
+    let (_n, client_addr) = server.recv_from(&mut buf).await.unwrap();
+
+    // A candidate (a NEW source — in the attack, a fresh frame an on-path attacker rewrote to
+    // a victim's address) sends ONE small (10-byte) framed datagram, seeding a small 3× budget.
+    // The cid is irrelevant to delivery (recv_bytes delivers from any source; AEAD is the guard).
+    let candidate = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for d in encode_datagrams(PacketType::OneRtt, &[0u8; 8], 1, b"0123456789").unwrap() {
+        candidate.send_to(&d, client_addr).await.unwrap();
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(2), client.recv_bytes())
+        .await
+        .expect("recv")
+        .expect("frame");
+
+    // M-1: a raw recv must NOT commit the candidate (only the post-AEAD confirm does).
+    assert!(
+        !client.has_migration_candidate(),
+        "a raw recv must not commit a server-migration candidate (M-1)"
+    );
+    client.confirm_authenticated_source();
+    assert!(client.has_migration_candidate());
+
+    // (1) Anti-amp: keep challenging until the 3× cap blocks, then drain everything the
+    // candidate received and assert it is bounded by 3× the 10 bytes it sent us.
+    let mut blocked = false;
+    for _ in 0..100 {
+        if !client.send_to_candidate(b"challenge-frame").await.unwrap() {
+            blocked = true;
+            break;
+        }
+    }
+    assert!(
+        blocked,
+        "the 3× anti-amplification cap must block excessive challenges to a candidate"
+    );
+    let mut total_to_candidate = 0u64;
+    while let Ok(Ok((n, _))) =
+        tokio::time::timeout(Duration::from_millis(100), candidate.recv_from(&mut buf)).await
+    {
+        total_to_candidate += n as u64;
+    }
+    assert!(
+        total_to_candidate <= 30,
+        "the client must not send > 3× (30 bytes) to an unvalidated candidate; sent {total_to_candidate}"
+    );
+
+    // (2) An unvalidated candidate is NEVER the c2s send target: app data flows to the
+    // ESTABLISHED server, and the candidate receives nothing further.
+    client.send_bytes(b"app-data-to-server").await.unwrap();
+    let (sn, _) = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buf))
+        .await
+        .expect("app data must reach the established server")
+        .unwrap();
+    assert!(sn > 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), candidate.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "an unvalidated candidate must never receive app data — it is not the c2s send target"
+    );
+}
