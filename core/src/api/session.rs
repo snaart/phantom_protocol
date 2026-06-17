@@ -2278,21 +2278,31 @@ async fn handle_packet<T: SessionTransport>(
         // for a path_id that is not newer (reorder / duplicate / passive rebind).
         if let Some(slide) = crypto_recv.note_migration_path(packet.header.path_id) {
             crypto_recv.signal_cid_slide(slide);
-            // EPS-02 (symmetric rotation): the peer migrated, so rotate our OWN
-            // outbound CID too — otherwise the return direction keeps a stable
-            // cleartext ConnId across the peer's migration and an observer seeing
-            // both networks relinks the session by it (ε §12.5 residual). Only the
-            // **server** rotates here: it is the demuxing side, and the peer (the
-            // socket-routed client) accepts any inbound CID, so this needs no
-            // client-side window slide and cannot strand. We deliberately do NOT
-            // bump our own send `path_id` (this is a CID rotation, not an address
-            // migration), so the peer's `note_migration_path` sees no forward step
-            // and there is no ping-pong. The client side is left untouched: it has
-            // no inbound demux to follow a rotation, and rotating its c2s CID off a
-            // server migration would push it out of the server's (un-sliding) c2s
-            // window for repeated server migrations — a documented residual
-            // (audit-report-2026-06-15 EPS-02) the server-migration path keeps.
+            // EPS-02 (symmetric rotation) — the peer migrated, so rotate our OWN outbound
+            // CID too; otherwise the return direction keeps a stable cleartext ConnId across
+            // the move and a both-networks observer relinks the session by it (§12.5). BOTH
+            // sides now act, but the mechanism differs by demux topology:
+            //
+            //  * SERVER detecting a CLIENT migration: rotate the s2c CID only, path_id-SILENT.
+            //    The client is socket-routed (accepts any inbound CID), so it needs no window
+            //    slide; and NOT bumping the server's send path_id is what prevents a ping-pong
+            //    (the client would otherwise see a forward server path_id and re-reflect).
+            //
+            //  * CLIENT detecting a SERVER migration (D4, the EPS-02 closure for server-
+            //    initiated migration): rotate the c2s CID AND bump our send path_id. The
+            //    server DOES demux c2s by a CID window keyed on the client path_id, so the
+            //    path_id bump is what makes it slide that window to the rotated c2s CID — the
+            //    no-stranding fix (rotating the CID alone, without the path_id bump, was the
+            //    hazard the old "client must not rotate" rule avoided). This terminates in one
+            //    round: the server, seeing the client's forward path_id, slides its c2s window
+            //    AND runs its own path_id-silent s2c re-rotation (the SERVER arm above), from
+            //    which the client sees no new forward server path_id → note_migration_path
+            //    returns None → no re-reflection. The reflected c2s comes from the SAME client
+            //    source, so the server's confirm_authenticated_source is a no-op for it.
             if crypto_recv.is_server() {
+                transport_for_path.set_outbound_cid(crypto_recv.advance_outbound_cid());
+            } else {
+                crypto_recv.next_migration_path_id();
                 transport_for_path.set_outbound_cid(crypto_recv.advance_outbound_cid());
             }
         }
@@ -4409,19 +4419,23 @@ mod tests {
         );
     }
 
-    /// EPS-02 companion — the **client** (socket-routed) must NOT rotate-on-detect.
-    /// It has no inbound CID demux, and rotating its outbound (c2s) CID off an
-    /// authenticated server `path_id` would push its CID out of the server's
-    /// (un-sliding) c2s window for repeated server migrations. So a client that
-    /// observes a server migration leaves its own outbound CID untouched.
+    /// EPS-02 CLOSURE (D4, symmetric rotation) — when the CLIENT detects a server
+    /// migration (a new authenticated server `path_id`, post-AEAD) it REFLECTS: it bumps
+    /// its OWN send path_id AND rotates its outbound (c2s) CID. The path_id bump is what
+    /// makes the server slide its c2s demux window so the rotated c2s CID stays routable
+    /// (no stranding — the reason the old "client must not rotate" rule existed); the CID
+    /// rotation closes the s2c/c2s linkability residual for SERVER-initiated migration.
+    /// The server's own s2c re-rotation (the test above) is path_id-silent, so the client
+    /// sees no new forward server path_id from it — no ping-pong, terminates in one round.
     #[tokio::test]
-    async fn eps02_client_does_not_rotate_on_detecting_server_migration() {
+    async fn eps02_client_rotates_c2s_on_server_migration() {
         let session_id = fixed_session_id();
         let (client_session, server_session) = paired_sessions(session_id);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
 
         assert!(!client_session.is_server(), "client side");
         let c2s_cid_before = client_session.current_outbound_cid();
+        let send_path_before = client_session.current_send_path_id();
 
         // The server migrates: build a server→client app frame on a new path_id and
         // deliver it to the client's recv path.
@@ -4438,10 +4452,15 @@ mod tests {
         let pkt = decode_recv_frame(&frame, session_id);
         run_recv(pkt, session_id, &client_session, &streams).await;
 
-        assert_eq!(
+        assert_ne!(
             client_session.current_outbound_cid(),
             c2s_cid_before,
-            "the socket-routed client must NOT rotate its outbound CID on detecting a server migration"
+            "the client must rotate its c2s CID on detecting a server migration (EPS-02 closure)"
+        );
+        assert_ne!(
+            client_session.current_send_path_id(),
+            send_path_before,
+            "the client must bump its send path_id so the server slides its c2s window (no stranding)"
         );
     }
 

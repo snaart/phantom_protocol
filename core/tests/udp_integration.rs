@@ -387,19 +387,20 @@ async fn udp_integration_cid_rotates_on_the_wire_across_migration() {
     server.await.unwrap();
 }
 
-/// A2a (server migration, PR-1) — the SERVER changes its send path mid-session via
+/// A2a (server migration, full) — the SERVER changes its send path mid-session via
 /// `migrate_server`: it rebinds its send socket to a fresh local address (so its s2c
 /// egresses a NEW source the peer hears) and rotates the s2c `path_id` + CID in lock-step.
 /// A relay with an UNCONNECTED upstream socket (so it can hear the migrated server's new
-/// source — mirroring the client's D1 unconnected socket) records that BOTH the s2c source
-/// address AND the s2c ConnId rotate across the move, while the session survives byte-exact
-/// in both directions (c2s keeps flowing to the established listen address through the
-/// overlap). The c2s ConnId stays stable — the client follows the new s2c source but does
-/// NOT yet rotate its own c2s CID (the documented EPS-02 residual the security-core change
-/// closes next).
+/// source — mirroring the client's D1 unconnected socket) records that the s2c source
+/// address AND **both** the s2c and c2s ConnIds rotate across the move, while the session
+/// survives byte-exact in both directions (c2s keeps flowing through the listen-address
+/// overlap). The c2s CID rotation is the EPS-02 closure for server-initiated migration: the
+/// client reflects the server's migration (bumps its path_id + rotates its c2s CID), so a
+/// both-networks observer cannot relink the session by EITHER direction's ConnId across a
+/// server move.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn udp_integration_server_migration_rotates_s2c_and_survives() {
+async fn udp_integration_server_migration_rotates_both_cids_and_survives() {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use tokio::net::UdpSocket;
@@ -523,12 +524,13 @@ async fn udp_integration_server_migration_rotates_s2c_and_survives() {
         s2c_cids_seen >= 2,
         "the on-wire s2c CID must rotate across server migration (saw {s2c_cids_seen} distinct OneRtt CIDs)"
     );
-    // PR-1 residual (closed by the security-core change): the client follows the new s2c
-    // source but does NOT rotate its own c2s CID on detecting a server migration.
+    // EPS-02 closure: the client reflects the server's migration — it bumps its path_id and
+    // rotates its c2s CID — so the c2s ConnId ALSO rotates across the move. With both
+    // directions rotating, a both-networks observer cannot relink the session by either CID.
     let c2s_cids_seen = c2s_cids.lock().unwrap().len();
-    assert_eq!(
-        c2s_cids_seen, 1,
-        "the client's c2s CID stays stable across a server migration in PR-1 (EPS-02 residual)"
+    assert!(
+        c2s_cids_seen >= 2,
+        "the client's c2s CID must rotate across a server migration (EPS-02 closure; saw {c2s_cids_seen})"
     );
 
     server.await.unwrap();
