@@ -8,7 +8,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use zeroize::ZeroizeOnDrop;
@@ -494,6 +494,34 @@ fn derive_resumption_binder(
 /// accepts the current hour and the immediately-previous hour, so a cookie
 /// or PoW solution captured at minute 59 of one hour is still honored at
 /// minute 5 of the next.
+/// Pluggable 0-RTT anti-replay hook — the distributed-deployment seam (A2b).
+///
+/// The built-in one-shot guarantee (Invariant 9) — a resumption ticket is consumed on first
+/// use, so a replayed 0-RTT `ClientHello` finds no ticket and falls back to 1-RTT — holds
+/// only under a **single coherent** [`SessionCache`]: one process, or routing that pins a
+/// resuming client to the node that minted its ticket. A horizontally-scaled deployment whose
+/// nodes each keep their own (or a replicated) cache lets an attacker replay a captured 0-RTT
+/// `ClientHello` to a **different** node, which still holds the ticket and would accept the
+/// early-data a second time.
+///
+/// To close that, such a deployment installs a `ZeroRttAntiReplay` backed by a store shared by
+/// all nodes (e.g. Redis `SET key NX`, a single-row compare-and-set, a DynamoDB conditional
+/// put) via [`HandshakeServer::set_zero_rtt_anti_replay`]. The transport does **not** ship a
+/// distributed store — it is the embedder's infrastructure. When none is installed the
+/// single-node `SessionCache` is the authority. The orthogonal escape hatch is to disable
+/// 0-RTT early-data entirely ([`HandshakeServer::set_early_data_enabled`]).
+pub trait ZeroRttAntiReplay: Send + Sync {
+    /// Atomically record the first use of resumption ticket `ticket_id` and report whether
+    /// THIS call is that first use: `true` if the id had not been seen before (0-RTT may
+    /// proceed), `false` if it was already consumed (a replay — the server rejects the
+    /// early-data and completes a normal 1-RTT handshake). The implementation MUST be atomic
+    /// across every node sharing the resumption cache, and SHOULD retain each consumed id for
+    /// at least the ticket lifetime (after which the ticket has expired anyway). Called only
+    /// after the resumption proof-of-possession binder has verified (HS-03), so only a holder
+    /// of the ticket secret reaches it.
+    fn check_and_set(&self, ticket_id: &[u8; 32]) -> bool;
+}
+
 #[derive(ZeroizeOnDrop)]
 pub struct HandshakeServer {
     // SAFETY: `HybridSigningKey` has its own ZeroizeOnDrop. The wrapping field
@@ -524,6 +552,21 @@ pub struct HandshakeServer {
     /// secrets, hence `#[zeroize(skip)]`.
     #[zeroize(skip)]
     reputation: Arc<ReputationTracker>,
+    /// Whether 0-RTT early-data is accepted (A2b). `true` by default. When `false`, the server
+    /// rejects every resuming client's early-data (`early_data_accepted = false`) so the
+    /// payload is only ever delivered 1-RTT — the simplest defence against 0-RTT replay for a
+    /// deployment that cannot guarantee a coherent/atomic resumption cache. Resumption itself
+    /// (the cookie/PoW bypass) is unaffected; it is replay-safe via the fresh hybrid KEM. Not
+    /// secret. Interior-mutable so the embedder can set it on the shared `Arc<HandshakeServer>`.
+    #[zeroize(skip)]
+    early_data_enabled: AtomicBool,
+    /// Optional distributed 0-RTT anti-replay store (A2b). `None` (default) ⇒ the single-node
+    /// `SessionCache` is the one-shot authority. `Some` ⇒ the consume is ALSO gated globally
+    /// via [`ZeroRttAntiReplay::check_and_set`]. Not secret; a `Mutex<Option<Arc<dyn ..>>>`
+    /// (ArcSwap can't hold an unsized `dyn`) so it is settable on the shared
+    /// `Arc<HandshakeServer>` — read once per resume (a brief, uncontended lock off the hot path).
+    #[zeroize(skip)]
+    anti_replay: parking_lot::Mutex<Option<Arc<dyn ZeroRttAntiReplay>>>,
 }
 
 impl HandshakeServer {
@@ -576,7 +619,35 @@ impl HandshakeServer {
             minute_start_unix_sec: AtomicU64::new(now_sec),
             session_cache: Arc::new(parking_lot::Mutex::new(SessionCache::new())),
             reputation: Arc::new(ReputationTracker::new()),
+            early_data_enabled: AtomicBool::new(true),
+            anti_replay: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// Enable or disable 0-RTT early-data acceptance (A2b). Default enabled. When disabled, the
+    /// server rejects every resuming client's early-data (`ServerHello.early_data_accepted =
+    /// false`) and completes a normal 1-RTT handshake, so the client resends the payload after
+    /// the handshake — the simplest, zero-infrastructure defence against 0-RTT replay for a
+    /// deployment that cannot guarantee a single coherent / atomically-consumed resumption
+    /// cache. Resumption (the cookie/PoW bypass) is unaffected. Settable on the shared
+    /// `Arc<HandshakeServer>` at any time.
+    pub fn set_early_data_enabled(&self, enabled: bool) {
+        self.early_data_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether 0-RTT early-data acceptance is currently enabled (A2b).
+    pub fn early_data_enabled(&self) -> bool {
+        self.early_data_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Install a distributed 0-RTT anti-replay store (A2b) — see [`ZeroRttAntiReplay`]. Once
+    /// installed, a resume is accepted only if the ticket id is first-use according to BOTH the
+    /// local `SessionCache` and this store, so a replay to a different node (whose local replica
+    /// still holds the ticket) is rejected globally. Required for replay-safe 0-RTT in a
+    /// horizontally-scaled deployment; the default (none) is correct for a single node / sticky
+    /// routing. Settable on the shared `Arc<HandshakeServer>`.
+    pub fn set_zero_rtt_anti_replay(&self, store: Arc<dyn ZeroRttAntiReplay>) {
+        *self.anti_replay.lock() = Some(store);
     }
 
     /// Increment the per-minute handshake-count counter and roll over the
@@ -788,7 +859,20 @@ impl HandshakeServer {
             }
             // Binder verified — consume now (race-free via `remove`'s bool).
             if !self.session_cache.lock().remove(&rid) {
-                return None; // a concurrent resume already consumed it
+                return None; // a concurrent resume already consumed it on THIS node
+            }
+            // A2b — when a distributed anti-replay store is installed, the consume must ALSO be
+            // first-use GLOBALLY across every node sharing the resumption cache. A replay to a
+            // different node, whose local replica still holds the ticket (so `remove` above
+            // returned `true`), is caught here and falls back to 1-RTT. (`check_and_set` is the
+            // authority; on a later handshake failure the local ticket is re-inserted as before,
+            // but the global one-shot is already recorded — a rare infra-failure retry then does
+            // 1-RTT, which is acceptable: the ticket is single-use either way.)
+            let store = self.anti_replay.lock().clone();
+            if let Some(store) = store {
+                if !store.check_and_set(&rid) {
+                    return None; // already consumed on another node (replay) → no resume
+                }
             }
             Some(ConsumedTicket {
                 rid,
@@ -815,12 +899,20 @@ impl HandshakeServer {
         // leaves `early_data_accepted = false` and completes a normal 1-RTT
         // handshake (Invariant 9). Forward secrecy of the post-handshake
         // session is preserved by the fresh hybrid KEM regardless.
-        let early_data_plaintext: Option<Vec<u8>> = match (&resumed, &client_hello.early_data) {
-            (Some(t), Some(blob)) => {
-                decrypt_early_data(&t.secret, &client_hello.nonce, &t.rid, blob)
-            }
-            _ => None,
-        };
+        // A2b — when 0-RTT early-data is disabled by config, reject it unconditionally:
+        // `early_data_accepted = false`, the resuming client resends the payload 1-RTT. The
+        // resume itself (cookie/PoW bypass) still stands; only the early-data is dropped.
+        let early_data_plaintext: Option<Vec<u8>> =
+            if self.early_data_enabled.load(Ordering::Relaxed) {
+                match (&resumed, &client_hello.early_data) {
+                    (Some(t), Some(blob)) => {
+                        decrypt_early_data(&t.secret, &client_hello.nonce, &t.rid, blob)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
         let early_data_accepted = early_data_plaintext.is_some();
 
         // Hybrid Key Exchange (PFS preserved — a fresh KEM secret even on the
