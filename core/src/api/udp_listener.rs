@@ -114,6 +114,26 @@ impl PhantomUdpListener {
         self.local_addr.to_string()
     }
 
+    /// Enable or disable 0-RTT early-data acceptance (A2b; default enabled). When disabled,
+    /// resuming clients' early-data is rejected and resent 1-RTT — the zero-infrastructure
+    /// defence against 0-RTT replay for a deployment that cannot guarantee a single coherent
+    /// resumption cache. See [`HandshakeServer::set_early_data_enabled`].
+    pub fn set_early_data_enabled(&self, enabled: bool) {
+        self.handshake_server.set_early_data_enabled(enabled);
+    }
+
+    /// Install a distributed 0-RTT anti-replay store (A2b) for replay-safe 0-RTT in a
+    /// horizontally-scaled deployment — see [`ZeroRttAntiReplay`]. The default (none) is
+    /// correct for a single node / sticky routing.
+    ///
+    /// [`ZeroRttAntiReplay`]: crate::transport::handshake::ZeroRttAntiReplay
+    pub fn set_zero_rtt_anti_replay(
+        &self,
+        store: Arc<dyn crate::transport::handshake::ZeroRttAntiReplay>,
+    ) {
+        self.handshake_server.set_zero_rtt_anti_replay(store);
+    }
+
     /// Number of live demux routes (one per in-flight handshake or established
     /// session). Bounded by reaping + a hard cap (H-1); exposed so a fresh-CID
     /// spray's failure to grow this without bound is observable/testable.
