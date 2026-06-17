@@ -307,6 +307,27 @@ impl PhantomListener {
         self.observability.clone()
     }
 
+    /// Enable or disable 0-RTT early-data acceptance (A2b; default enabled). When disabled,
+    /// resuming clients' early-data is rejected and resent 1-RTT — the zero-infrastructure
+    /// defence against 0-RTT replay for a deployment that cannot guarantee a single coherent
+    /// resumption cache. Resumption / early-data ride the transport-agnostic `ClientHello`, so
+    /// this applies to the TCP path too. Rust-only. See [`HandshakeServer::set_early_data_enabled`].
+    pub fn set_early_data_enabled(&self, enabled: bool) {
+        self.handshake_server.set_early_data_enabled(enabled);
+    }
+
+    /// Install a distributed 0-RTT anti-replay store (A2b) for replay-safe 0-RTT in a
+    /// horizontally-scaled deployment — see
+    /// [`ZeroRttAntiReplay`](crate::transport::handshake::ZeroRttAntiReplay). The default (none)
+    /// is correct for a single node / sticky routing. Rust-only (the store is a `dyn` trait
+    /// object, not a UniFFI type).
+    pub fn set_zero_rtt_anti_replay(
+        &self,
+        store: Arc<dyn crate::transport::handshake::ZeroRttAntiReplay>,
+    ) {
+        self.handshake_server.set_zero_rtt_anti_replay(store);
+    }
+
     /// Lazily spawn the single background acceptor task (idempotent). It owns the
     /// listening socket; for each inbound connection it acquires an in-flight
     /// permit (bounding concurrent handshakes) and spawns a deadline-bounded
