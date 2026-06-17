@@ -1855,6 +1855,106 @@ fn failed_resume_handshake_leaves_ticket_usable() {
     );
 }
 
+/// **A2b (Invariant 9 / T5.7 caveat).** A deployment that cannot guarantee a single coherent /
+/// atomically-consumed resumption cache can disable 0-RTT early-data entirely: a valid resume
+/// then still bypasses the cookie/PoW gate, but its early-data is rejected
+/// (`ServerHello.early_data_accepted = false`) so the payload is only ever delivered 1-RTT —
+/// the simplest, zero-infrastructure defence against 0-RTT replay.
+#[test]
+fn zero_rtt_early_data_can_be_disabled_by_config() {
+    let server = HandshakeServer::new().expect("server");
+    let server_pk = server.verifying_key().clone();
+    let ip: std::net::IpAddr = "127.0.0.1".parse().expect("ip");
+
+    // Two tickets so we can show the SAME resume shape is accepted while enabled and rejected
+    // while disabled (the config is the only difference — non-vacuous).
+    let c1 = HandshakeClient::new().expect("c1");
+    let (rid1, sec1) = first_handshake_mint_ticket(&server, &c1, &server_pk, ip);
+    let c2 = HandshakeClient::new().expect("c2");
+    let (rid2, sec2) = first_handshake_mint_ticket(&server, &c2, &server_pk, ip);
+
+    // Enabled (default): a valid resume with early-data is accepted.
+    let r1 = c1.create_client_hello_with_resume(rid1, &sec1, Some(b"0rtt-payload"));
+    let (_e1, sh1) = drive_handshake_to_success(&server, &r1, ip);
+    assert!(
+        sh1.early_data_accepted,
+        "0-RTT early-data is accepted by default"
+    );
+
+    // Disable 0-RTT early-data, then the same-shaped resume is rejected (1-RTT) — the resume
+    // bypass still works (Success at difficulty 0 with no cookie proves it), only the
+    // early-data is dropped.
+    server.set_early_data_enabled(false);
+    assert!(!server.early_data_enabled());
+    let r2 = c2.create_client_hello_with_resume(rid2, &sec2, Some(b"0rtt-payload"));
+    let (_e2, sh2) = drive_handshake_to_success(&server, &r2, ip);
+    assert!(
+        !sh2.early_data_accepted,
+        "disabling 0-RTT must reject early-data even on a valid resume"
+    );
+}
+
+/// **A2b (Invariant 9 / T5.7 caveat).** A horizontally-scaled deployment installs a distributed
+/// [`ZeroRttAntiReplay`] store so the one-shot consume is atomic across nodes. A replayed 0-RTT
+/// `ClientHello` reaching a *different* node — whose local cache still holds the ticket replica,
+/// and whose binder check passes — is blocked by the shared store (`check_and_set` returns
+/// `false`) and falls back to 1-RTT, instead of accepting the early-data a second time.
+#[test]
+fn distributed_anti_replay_store_blocks_a_cross_node_0rtt_replay() {
+    use phantom_protocol::transport::handshake::ZeroRttAntiReplay;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    // A store standing in for a single shared (e.g. Redis) authority across all nodes.
+    struct SharedStore {
+        consumed: Mutex<HashSet<[u8; 32]>>,
+    }
+    impl SharedStore {
+        /// Simulate a legitimate first use that happened on a SIBLING node.
+        fn mark_consumed_elsewhere(&self, id: [u8; 32]) {
+            self.consumed.lock().unwrap().insert(id);
+        }
+    }
+    impl ZeroRttAntiReplay for SharedStore {
+        fn check_and_set(&self, ticket_id: &[u8; 32]) -> bool {
+            // HashSet::insert returns true on first insertion (first use), false if already
+            // present (a replay) — exactly the check_and_set contract.
+            self.consumed.lock().unwrap().insert(*ticket_id)
+        }
+    }
+
+    let server = HandshakeServer::new().expect("server");
+    let server_pk = server.verifying_key().clone();
+    let ip: std::net::IpAddr = "127.0.0.1".parse().expect("ip");
+    let store = Arc::new(SharedStore {
+        consumed: Mutex::new(HashSet::new()),
+    });
+    server.set_zero_rtt_anti_replay(store.clone());
+
+    // Positive control: a genuine first-use resume is accepted (the store records it).
+    let c1 = HandshakeClient::new().expect("c1");
+    let (rid1, sec1) = first_handshake_mint_ticket(&server, &c1, &server_pk, ip);
+    let r1 = c1.create_client_hello_with_resume(rid1, &sec1, Some(b"first-use"));
+    let (_e1, sh1) = drive_handshake_to_success(&server, &r1, ip);
+    assert!(
+        sh1.early_data_accepted,
+        "the store must allow a genuine first-use 0-RTT"
+    );
+
+    // Negative: a ticket the shared store has ALREADY seen (consumed on a sibling node) but
+    // whose replica is still in THIS node's local cache must be blocked — the local cache's
+    // own one-shot would have accepted it, so only the distributed store catches the replay.
+    let c2 = HandshakeClient::new().expect("c2");
+    let (rid2, sec2) = first_handshake_mint_ticket(&server, &c2, &server_pk, ip);
+    store.mark_consumed_elsewhere(rid2);
+    let r2 = c2.create_client_hello_with_resume(rid2, &sec2, Some(b"replayed-0rtt"));
+    let (_e2, sh2) = drive_handshake_to_success(&server, &r2, ip);
+    assert!(
+        !sh2.early_data_accepted,
+        "the distributed store must block a 0-RTT replay across nodes"
+    );
+}
+
 // ── 1 (Phase 4): per-direction u64 packet-number invariants ─────────────────
 // These replace the deleted C1 per-stream-watermark tests: under model 1 the
 // AEAD nonce is `prefix || packet_number`, with `packet_number` a per-direction
