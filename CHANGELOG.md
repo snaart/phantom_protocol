@@ -333,6 +333,18 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **Congestion control: BBR loss signal was double-counted on SACK-gap losses (#7).** A segment the
+  SACK gap detector declared lost was fed to BBR's loss path twice — once at detection (the L1-B
+  feed in the ACK handler) and again at retransmission (the `seg.retransmit` feed in the send loop).
+  Because `inflight_bytes` is purely incremental, this permanently under-counted in-flight bytes
+  (`+b −b −b +b −b = −b` over a segment's send/loss/resend/ack lifecycle), inflating the cwnd budget
+  (`cwnd − inflight`) and accumulating with every SACK-gap loss → over-send exactly when the
+  controller should back off. Loss is now fed **exactly once per loss event, at the retransmission
+  point**, which covers both SACK-gap fast-retransmits and RTO-timeout retransmits (retransmits
+  bypass the cwnd gate, so the single feed reliably fires; a spurious gap that is ACKed before
+  retransmit now correctly feeds no loss). Regression test
+  `loss_declaring_sack_does_not_feed_bbr_loss_at_detection`.
+
 - Graceful session shutdown (outer handle drop or `disconnect()`) now flushes buffered `send()` data to the
   peer before closing, instead of potentially dropping a payload handed to `send()` immediately before
   shutdown. Affects all transports.
