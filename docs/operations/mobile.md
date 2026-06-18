@@ -196,15 +196,23 @@ trust model. Rotating the signing key requires an app update.
 TTL: **1 hour** (server `SessionCache` default). Check saved timestamp before
 reuse; expired hints fall back to 1-RTT automatically.
 
-**Connection migration (Wi-Fi ↔ LTE) — not yet supported in 1.0.** Live
-interface migration is future work: the path-validation primitives exist only on
-the internal `transport::Session`, not on `PhantomSession` or the UniFFI surface,
-and the data pump holds a single fixed transport with no rebind seam. On a
-network change, **reconnect** — register for `NWPathMonitor` (iOS) /
-`ConnectivityManager.NetworkCallback` (Android), then open a fresh session.
-Minimise the cost with **0-RTT resumption**: harvest a `ResumptionHint` after the
-first connect and reconnect via `connect_pinned_with_resumption`, which folds the
-first request into the new `ClientHello`.
+**Connection migration (Wi-Fi ↔ LTE) — reconnect with 0-RTT, not `migrate()`.**
+`PhantomSession.migrate(localAddr:)` is on the UniFFI surface (Phase 4), but it is
+**only effective on the native UDP transport** (`UdpClientTransport`), which is not
+yet exposed through the FFI/UniFFI surface. The FFI connect entry points
+(`connectPinned` / `connectPinnedWithResumption`) use the **TCP** transport
+(`TcpSessionTransport`), and TCP is connection-oriented — it cannot rebind its local
+address without a new connection. On every non-UDP transport `migrate()` falls back
+to its default **no-op** (`Ok(())`): it returns success but does *not* rebind the
+socket or move the path. So on a mobile network change, **reconnect** — register for
+`NWPathMonitor` (iOS) / `ConnectivityManager.NetworkCallback` (Android), then open a
+fresh session. Minimise the cost with **0-RTT resumption**: harvest a
+`ResumptionHint` after the first connect and reconnect via
+`connectPinnedWithResumption`, which folds the first request into the new
+`ClientHello`. (The sample apps in `examples/mobile/` implement exactly this
+reconnect-with-0-RTT model.) Seamless single-socket migration over the FFI surface
+— exposing the UDP transport, on which `migrate()` performs a real rebind+path
+validation without a re-handshake — is future work.
 
 ## Performance considerations
 
@@ -212,7 +220,9 @@ first request into the new `ClientHello`.
 on modern phone CPUs (TBD — measure with Instruments / Android Profiler on target
 devices). 0-RTT resumption skips keygen entirely.
 
-**Memory.** ~64 KiB per session (matches `perf-tuning.md` server numbers).
+**Memory.** Per-session footprint is small (buffers + crypto state) but has not been
+profiled on a device — measure with Instruments / Android Profiler before capacity
+planning. (`perf-tuning.md` covers server-side throughput, not per-session footprint.)
 
 **Binary size.** arm64 slice roughly **4–6 MiB** stripped (TBD — verify with
 `size` / APK Analyzer). Set `opt-level = "z"`, `lto = true`,
@@ -243,6 +253,10 @@ your threat model; clear tickets on detected compromise.
 
 ## See also
 
+- `examples/mobile/ios/` — runnable SwiftUI sample app (pinned connect, 0-RTT
+  resumption, reconnect-on-network-change). Built locally, not in CI.
+- `examples/mobile/android/` — runnable Jetpack Compose sample app (same surface,
+  foreground-service hosted). Built locally, not in CI.
 - `docs/operations/wasm.md` — browser client guide (companion to this one)
 - `docs/operations/kubernetes.md` — server-side cluster deployment
 - `docs/operations/perf-tuning.md` — server-side build flags and throughput numbers
