@@ -430,9 +430,16 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   Wi-Fi↔cellular handoff without re-handshake) → a DPI-mimicry transport mode.
   Bandwidth *aggregation* across transports is **not** planned — analysis showed
   it regresses for this workload and harms unobservability.
-- **Mobile connection migration (Wi-Fi ↔ LTE) is not yet supported.** The
-  path-validation primitives are internal-only; on a network change, reconnect
-  (use 0-RTT resumption via `connect_pinned_with_resumption` to minimise cost).
+- **Mobile connection migration (Wi-Fi ↔ LTE): reconnect with 0-RTT, not
+  `migrate()`.** `PhantomSession.migrate()` is on the FFI surface, but it is a
+  no-op over the TCP transport the bindings use (real single-socket migration is
+  UDP-only and not yet FFI-exposed). On a network change, reconnect — folding the
+  first request in via `connect_pinned_with_resumption` to minimise cost. The
+  [`examples/mobile/`](examples/mobile/) sample apps implement exactly this; see
+  [`docs/operations/mobile.md`](docs/operations/mobile.md).
+- **Work deferred past 0.2.0** — hermetic/reproducible builds, the `no-std` PQ
+  handshake, WASI server-side sessions, and ECN congestion feedback — is
+  consolidated with rationale in [`docs/DEFERRED_WORK.md`](docs/DEFERRED_WORK.md).
 - **Loss recovery is timeout-based (no SACK) and unproven over loss.** The code
   has an RFC-6298 RTO + retransmission + a BBR-style congestion window + mid-
   session rekey, but this machinery was built for reliable byte pipes and has
@@ -506,7 +513,7 @@ The `cli-compat` CI job requires that `core` API edits keep
 
 ## Acknowledgements
 
-Developed with AI assistance from Anthropic's **Claude Opus 4.6** via
+Developed with AI assistance from Anthropic's **Fable 5** via
 [Claude Code](https://claude.com/claude-code). All architectural decisions,
 security invariants, threat model, and FIPS / CC compliance artifacts are
 authored, reviewed, tested, and maintained by the human author.
