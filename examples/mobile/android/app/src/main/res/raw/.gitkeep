@@ -1,0 +1,10 @@
+Drop the pinned server verifying key here as a file named `phantom_server_pk`
+(no extension), containing the RAW bytes emitted by the CLI `pubkey` command —
+NOT hex text. It becomes `R.raw.phantom_server_pk` and is read by
+PhantomServerConfig.load(). See the repo-root README of this sample for the
+exact keygen/pubkey commands.
+
+NEVER fetch this key at runtime — baking it in at build time is what makes the
+server-pinning trust model (Security Invariant 1) sound. If the resource is
+absent, PhantomServerConfig falls back to a non-functional demo hex constant so
+the project still compiles.

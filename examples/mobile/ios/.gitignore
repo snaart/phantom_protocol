@@ -1,0 +1,17 @@
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+*.xcuserstate
+
+# Locally-built artifacts that are intentionally not committed (see README.md)
+Frameworks/PhantomProtocol.xcframework/
+Sources/PhantomProtocol/phantom_protocol.swift
+
+# macOS
+.DS_Store
