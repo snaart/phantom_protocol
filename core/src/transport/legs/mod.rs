@@ -33,3 +33,11 @@ pub use wasi::WasiLeg;
 // tests run there. Phase 3.4. no_std-clean, so it is NOT gated behind `std`.
 #[cfg(feature = "embedded")]
 pub mod embedded;
+
+// `MimicTlsLeg` — TLS-over-TCP active-mimicry `SessionTransport` (queue item #13).
+// Native-only (rides `tokio::net`), behind the off-by-default `mimicry` feature.
+// PR-1 lands the record layer (`mimic_tls::record`); the handshake theater and the
+// leg itself follow in later PRs. The outer TLS is anti-DPI obfuscation ONLY and is
+// detectable by active probing — see the module head.
+#[cfg(all(feature = "mimicry", not(target_arch = "wasm32")))]
+pub mod mimic_tls;

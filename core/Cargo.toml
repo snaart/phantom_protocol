@@ -156,6 +156,17 @@ fips = ["std", "dep:aws-lc-rs"]
 # explicitly.
 wasi-leg = ["std", "dep:wasi"]
 
+# `MimicTlsLeg` (queue item #13) — a TLS-over-TCP active-mimicry `SessionTransport`
+# that makes a Phantom flow look like ordinary HTTPS to an on-path observer (a
+# synthetic TLS 1.3 handshake "theater" prelude, then Phantom inside TLS
+# ApplicationData records). Off by default; native-only (the module is gated
+# `cfg(all(feature = "mimicry", not(target_arch = "wasm32")))` and rides
+# `tokio::net`). Framing-only, NO outer AEAD — the inner Phantom ciphertext is
+# already random-looking; the leg only adds TLS record framing. No `WIRE_VERSION`
+# change (outer, leg-local framing). The outer TLS is anti-DPI obfuscation ONLY,
+# and is DETECTABLE by active probing — see the module head + threat model.
+mimicry = ["std"]
+
 # OpenTelemetry pipeline (Phase 8). Off by default; the `core` library exposes
 # OTel `Counter` / `Histogram` / `UpDownCounter` instruments to the embedder
 # when this is on. The library never installs a `MeterProvider` /
