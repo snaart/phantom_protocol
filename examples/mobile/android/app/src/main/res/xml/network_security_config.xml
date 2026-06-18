@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Phantom session carries its own post-quantum authentication and
+  encryption (hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65), so the transport
+  socket itself is plain TCP. Android still routes the socket through this
+  network-security policy, so we must explicitly opt the demo host into
+  cleartext. Cleartext stays DENIED everywhere else.
+
+  Replace "10.0.2.2" (the host loopback as seen from the Android emulator) and
+  "phantom.example.com" with your real server host before shipping. For a
+  production deployment prefer fronting the server with a WebSocket+TLS
+  endpoint instead of permitting cleartext.
+-->
+<network-security-config>
+
+    <!-- Default: no cleartext anywhere. -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- Demo host only: permit the plain-TCP Phantom socket. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- Emulator host loopback. -->
+        <domain includeSubdomains="false">10.0.2.2</domain>
+        <!-- Local debugging on a device over LAN. -->
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <!-- Your real demo server. -->
+        <domain includeSubdomains="false">phantom.example.com</domain>
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </domain-config>
+
+</network-security-config>
