@@ -406,4 +406,51 @@ mod tests {
         };
         assert!(build_server_hello(&parsed, &OsRng).is_err());
     }
+
+    /// Wrap a raw extensions block in an otherwise-valid ClientHello handshake
+    /// message, so a malformed *inner* extension can be fed to the parser.
+    fn ch_with_raw_extensions(ext_block: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // legacy_session_id (len 0)
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites: TLS_AES_128_GCM
+        body.extend_from_slice(&[0x01, 0x00]); // compression: null
+        body.extend_from_slice(&(ext_block.len() as u16).to_be_bytes());
+        body.extend_from_slice(ext_block);
+        let mut msg = vec![HS_TYPE_CLIENT_HELLO];
+        let len = body.len() as u32;
+        msg.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// A key_share whose inner share length runs past the extension body is
+    /// rejected with a typed error (the `Cursor`'s `.get()` bound holds — no OOB).
+    /// Locks the bounds guarantee against a future raw-indexing refactor.
+    #[test]
+    fn rejects_inner_keyshare_length_overrun() {
+        // key_share ext: type 0x0033, ext_data = [shares_vec(len 4) = group x25519 ‖
+        // share_len 0xFFFF] — the share claims 65535 bytes that are not present.
+        let ext_block = [
+            0x00, 0x33, // EXT_KEY_SHARE
+            0x00, 0x06, // ext_data length
+            0x00, 0x04, // KeyShareClientHello.client_shares vec length
+            0x00, 0x1d, // group = x25519
+            0xFF, 0xFF, // key_exchange length = 65535 (overruns)
+        ];
+        let ch = ch_with_raw_extensions(&ext_block);
+        assert!(
+            parse_client_hello(&ch).is_err(),
+            "an inner key_share length overrun must be a typed error, not an OOB"
+        );
+    }
+
+    /// A 64 KiB junk ClientHello is rejected in bounded time without allocating
+    /// beyond the input (the `Cursor` rejects on the first inconsistent length).
+    #[test]
+    fn rejects_maximal_junk_in_bounded_time() {
+        let junk = vec![0x01u8; 64 * 1024];
+        assert!(parse_client_hello(&junk).is_err());
+    }
 }

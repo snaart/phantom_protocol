@@ -309,4 +309,12 @@ mod tests {
             assert!((TICKET_MIN..=TICKET_MAX).contains(&ticket_len));
         }
     }
+
+    /// The degenerate `min == max` case returns `min` (modulus is `% 1 == 0`), and
+    /// the `+ 1` keeps the divisor ≥ 1 — locking the precondition no live caller
+    /// exercises (all call sites pass `MIN < MAX`).
+    #[test]
+    fn rand_len_handles_min_equals_max() {
+        assert_eq!(rand_len(&OsRng, 42, 42), 42);
+    }
 }
