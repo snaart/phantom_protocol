@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!--
+  Info.plist for the Phantom Protocol iOS sample.
+
+  App Transport Security (ATS): iOS blocks cleartext (non-TLS) connections by
+  default. The Phantom Protocol transport is a raw TCP byte-pipe on port 4242 —
+  it is NOT wrapped in TLS, so ATS would block it. Confidentiality and
+  authentication are provided by the inner post-quantum hybrid session (server
+  pinning + ML-KEM-768 / ML-DSA-65), not by outer TLS, so it is sound to grant a
+  scoped ATS exception for the specific server host.
+
+  Below: a per-domain exception for the demo host. For a real deployment,
+  replace `phantom.example.com` with your server's hostname and prefer a named
+  domain over the development `NSAllowsLocalNetworking` route. Do NOT use the
+  blanket `NSAllowsArbitraryLoads = true` in a shipping app — it disables ATS
+  globally and triggers App Review scrutiny.
+
+  When connecting to a 127.0.0.1 / local-network dev server (as the default
+  config does), `NSAllowsLocalNetworking` covers it without naming a domain.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>PhantomDemoApp</string>
+    <key>CFBundleDisplayName</key>
+    <string>Phantom Chat</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.phantom.protocol.demo</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.2.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>UILaunchScreen</key>
+    <dict/>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+
+    <!-- App Transport Security exception for the non-TLS Phantom port. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <!-- Local-network dev servers (127.0.0.1 and .local). Covers the
+             default 127.0.0.1:4242 demo config without naming a domain. -->
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+
+        <!-- Scoped exception for the production server host. Replace the
+             hostname with your own. This permits a cleartext (no-TLS) TCP
+             connection to exactly this host — and only this host. -->
+        <key>NSExceptionDomains</key>
+        <dict>
+            <key>phantom.example.com</key>
+            <dict>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+                <key>NSIncludesSubdomains</key>
+                <false/>
+                <!-- The Phantom transport is not HTTP/TLS; forward-secrecy and
+                     minimum-TLS requirements do not apply to it. -->
+                <key>NSExceptionRequiresForwardSecrecy</key>
+                <false/>
+            </dict>
+        </dict>
+    </dict>
+</dict>
+</plist>

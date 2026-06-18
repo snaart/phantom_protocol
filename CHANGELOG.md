@@ -10,6 +10,18 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **Mobile sample apps (`examples/mobile/`).** Two runnable client samples embedding the SDK via
+  its UniFFI bindings: an iOS SwiftUI app (`examples/mobile/ios/`, SwiftPM) and an Android Jetpack
+  Compose app (`examples/mobile/android/`, Gradle). Both demonstrate pinned connect, 0-RTT
+  resumption with platform secure-storage of the `ResumptionHint` (iOS Keychain / Android
+  `EncryptedSharedPreferences`), encrypted send/recv, lock-free `connectionState()` surfacing
+  (incl. `Migrating`/`Dead`), and reconnect-with-0-RTT on a network change. They are **complete,
+  reviewed source but not built in CI** (no Xcode / Android SDK / NDK / server in CI) — each app's
+  `README.md` documents the local build+run steps. Honest about migration: `migrate()` is a no-op
+  over the TCP transport the FFI exposes (real path migration lives on the not-yet-FFI-exposed UDP
+  transport), so the working recovery pattern is reconnect-with-0-RTT. The canonical
+  `docs/operations/mobile.md` migration note was corrected to match.
+
 - **0-RTT anti-replay controls for scaled deployments (A2b).** 0-RTT early-data is
   replay-safe out of the box on a single node (one-shot ticket consumption, Invariant 9),
   but a horizontally-scaled fleet with per-node caches could otherwise let a captured 0-RTT

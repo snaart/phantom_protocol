@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Phantom Demo</string>
+
+    <!-- Foreground service notification. -->
+    <string name="notif_channel_name">Phantom session</string>
+    <string name="notif_channel_desc">Keeps the post-quantum transport session alive in the background.</string>
+    <string name="notif_title">Phantom session active</string>
+    <string name="notif_text">Maintaining the post-quantum secure channel.</string>
+
+    <!-- UI labels. -->
+    <string name="connect">Connect</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="reconnect_zero_rtt">Reconnect (0-RTT)</string>
+    <string name="call_migrate_api">Call migrate() API (no-op over TCP)</string>
+    <string name="message_hint">Type a message</string>
+    <string name="send">Send</string>
+</resources>
