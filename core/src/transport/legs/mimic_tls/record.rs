@@ -24,8 +24,11 @@
 //! the handshake, 4 MiB once established — checked **before** buffering the body).
 //! All parse failures map to a typed [`CoreError`]; the parser never panics, never
 //! indexes out of bounds, and never pre-allocates a buffer sized to an
-//! attacker-declared length. A flood of empty (`chunk_len == 0`) records that make
-//! no forward progress is bounded and rejected (livelock defense).
+//! attacker-declared length. The reassembly buffer is additionally bounded to
+//! `cap + slack` — a peer cannot stream unbounded valid chunks to balloon memory,
+//! matching the accumulator-bounded-by-cap guarantee `TcpSessionTransport` gets by
+//! reading exactly `len` bytes. A flood of empty (`chunk_len == 0`) records that
+//! make no forward progress is bounded and rejected (livelock defense).
 
 // PR-1 lands the record codec; its live consumer is `MimicTlsLeg` (PR-3). Until the
 // leg is wired, the encode/de-frame API is exercised only by this module's tests, so
@@ -74,6 +77,13 @@ const HANDSHAKE_FRAME_CAP: usize = 64 * 1024;
 
 /// Phase-gated inner-message cap once established, matching `TcpSessionTransport`.
 const STEADY_STATE_FRAME_CAP: usize = 4 * 1024 * 1024;
+
+/// Slack above the phase cap that the reassembly buffer (`stream`) may hold: one
+/// in-flight message (≤ cap) plus one socket read's worth of records not yet
+/// popped. Bounds the de-framer's memory to O(cap) no matter how the caller
+/// batches `push`es; comfortably above the leg's 64 KiB read granularity so a
+/// well-behaved peer is never falsely rejected.
+const STREAM_SLACK: usize = 256 * 1024;
 
 /// Max consecutive empty (zero forward-progress) records before the de-framer
 /// rejects the peer — a livelock / busy-spin defense. Legitimate cover/padding
@@ -250,6 +260,24 @@ impl RecordDeframer {
                 &fragment[INNER_CHUNK_HEADER_LEN..INNER_CHUNK_HEADER_LEN + chunk_len],
             );
             // fragment[INNER_CHUNK_HEADER_LEN + chunk_len ..] is padding — ignored.
+
+            // Bound the reassembly buffer to O(cap) regardless of how the caller
+            // batches `push`es. `next_message` caps the *declared* `msg_len`, but
+            // without this an attacker could stream unbounded valid chunks (e.g.
+            // declare a cap-sized message, then feed far more than cap bytes of
+            // records) and balloon `stream` before any message completes. This is
+            // the accumulator-bounded-by-cap guarantee `TcpSessionTransport` gets
+            // for free by reading exactly `len` bytes; here we enforce it
+            // explicitly. The slack admits one in-flight message (≤ cap) plus one
+            // socket read's worth of not-yet-popped records.
+            if self.stream.len() > self.cap.saturating_add(STREAM_SLACK) {
+                return Err(CoreError::NetworkError(format!(
+                    "inner reassembly buffer exceeded cap: {} > {} + {}",
+                    self.stream.len(),
+                    self.cap,
+                    STREAM_SLACK
+                )));
+            }
         }
     }
 
@@ -514,6 +542,56 @@ mod tests {
             .next_message()
             .expect_err("must reject inner chunk_len overrun");
         assert!(matches!(err, CoreError::NetworkError(_)));
+    }
+
+    /// The reassembly buffer is bounded by the phase cap + slack: a peer that
+    /// streams more valid chunk bytes than that (without a message completing) is
+    /// rejected with a typed error rather than ballooning memory. Mirrors
+    /// `TcpSessionTransport`'s accumulator-bounded-by-cap guarantee.
+    #[test]
+    fn reassembly_buffer_is_bounded_by_cap() {
+        // Handshake phase: cap 64 KiB + 256 KiB slack ≈ a 320 KiB stream ceiling.
+        let mut d = RecordDeframer::new();
+        let chunk = vec![0u8; 16_000];
+        let mut wire = Vec::new();
+        // 25 records × 16 000 = 400 KB of stream bytes, well over the ceiling.
+        for _ in 0..25 {
+            let mut frag = Vec::new();
+            frag.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+            frag.extend_from_slice(&chunk);
+            encode_record(CT_APPLICATION_DATA, VER_TLS12, &frag, &mut wire).expect("encode");
+        }
+        d.push(&wire);
+        let err = d
+            .next_message()
+            .expect_err("the reassembly buffer must be bounded by cap, not grow to the fed size");
+        assert!(matches!(err, CoreError::NetworkError(_)));
+    }
+
+    /// The 4-byte inner `msg_len` prefix may straddle a record/chunk boundary;
+    /// reassembly is record-boundary-independent and must still recover the message.
+    #[test]
+    fn msg_len_prefix_split_across_records() {
+        // Message "hi" → inner stream = [00 00 00 02 'h' 'i'] (6 bytes). Split so
+        // record A carries the first 3 bytes (part of the length prefix) and
+        // record B the remaining 3 (rest of the prefix + body).
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&2u32.to_be_bytes());
+        stream.extend_from_slice(b"hi");
+        let mut wire = Vec::new();
+        for part in [&stream[0..3], &stream[3..6]] {
+            let mut frag = Vec::new();
+            frag.extend_from_slice(&(part.len() as u16).to_be_bytes());
+            frag.extend_from_slice(part);
+            encode_record(CT_APPLICATION_DATA, VER_TLS12, &frag, &mut wire).expect("encode");
+        }
+        let mut d = RecordDeframer::new();
+        d.push(&wire);
+        let got = d
+            .next_message()
+            .expect("parse")
+            .expect("message across split prefix");
+        assert_eq!(&got[..], b"hi");
     }
 
     // Count how many TLS records a buffer holds (header-walk; test helper).
