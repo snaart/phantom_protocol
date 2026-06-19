@@ -531,9 +531,10 @@ In-tree, committed alongside the code:
   latency graph.
 - `docs/observability/prometheus/alerts.yml` — REPLACED the removed
   `docs/operations/prometheus/alerts.yml`. Rewritten under new naming.
-- `docs/observability/otel-collector/otel-collector-config.yaml` —
-  production-ready Collector config with `tail_sampling` processor for
-  failure-biased trace export.
+- `examples/observability-demo/otel-collector-config.yaml` — the
+  Collector config that backs the demo stack (an `otlp` receiver fanning
+  out to Prometheus + Tempo). No `tail_sampling` processor is wired; the
+  failure-biased-export idea remains a follow-up.
 - `examples/observability-demo/` — sibling crate (not a workspace member,
   matching `examples/wasm-demo` pattern). Brings up `phantom-server`, OTel
   Collector, Prometheus, Tempo, Grafana via `docker compose up`.

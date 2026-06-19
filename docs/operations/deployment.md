@@ -46,7 +46,7 @@ The relevant runtime-visible knobs are:
 | Listen address | `PhantomListener::bind(addr)` | "host:port" |
 | Adaptive PoW difficulty | automatic | Tiered by handshake rate; see Phase 1.14. |
 | Cipher suite | negotiated at handshake | AES-256-GCM or ChaCha20-Poly1305 — see `device_profile.rs` |
-| Wire format version | negotiated at handshake | V1 / V2 (V2 enabled by both sides) — see Phase 1.8 |
+| Wire format version | pinned constant (not negotiated) | `WIRE_VERSION = 6` — a single pinned value; the receive path drops any frame whose version differs. (`PROTOCOL_VERSION = 3` is the borsh handshake version.) |
 | Rekey trigger | `PhantomSession::rekey()` | Caller-driven (Phase 1.5). |
 | Tracing level | `RUST_LOG` | Standard `tracing_subscriber` filter syntax. |
 

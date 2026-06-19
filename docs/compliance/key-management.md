@@ -20,9 +20,11 @@ FIPS 204).
   pin it.
 
 **Stored in:** RAM only. There is no built-in persistence. Operators who
-need a stable pin across restarts must call a future
-`PhantomListener::bind_with_signing_key(...)` constructor (Phase 4.6 + 7
-follow-up — currently not exposed).
+need a stable pin across restarts call the public
+`PhantomListener::bind_with_signing_key(addr, signing_key)` constructor
+(and its `bind_with_signing_key_with_runtime` / `bind_with_signing_key_mimic`
+variants) to load a caller-supplied `HybridSigningKey` so the verifying
+identity persists across restarts. These are shipped in `api/listener.rs`.
 
 **Used for:**
 - Signing the handshake transcript (`HandshakeServer::generate_server_hello`).
@@ -81,7 +83,9 @@ finishes — and at that moment the bytes are zeroed.
 The epoch counter saturates at `u8::MAX`. Triggered by:
 
 - `Session::rekey()` API call (caller-driven).
-- Future: AEAD invocation watermark (Phase 1.7 — limit at 2^48).
+- AEAD invocation watermark: `CryptoError::NonceExhausted` fires at
+  `AEAD_MAX_INVOCATIONS = 2^48` per epoch (shipped, Security Invariant 8);
+  callers should `rekey()` before the watermark.
 
 ### 4. Per-direction AEAD keys
 
@@ -143,17 +147,27 @@ dropped when the function returns. The master secret is held by the
 **Rotation:** time-bucket window rolls automatically. Master secret
 rotates only when the listener is rebound.
 
-### 7. Resumption tickets — `ResumptionTicket` (Phase 4.1, not yet wired)
+### 7. Resumption tickets — `ResumptionTicket` (0-RTT resumption, shipped)
 
-**Future state.** When 0-RTT resumption lands:
+**Components:** a 32-byte `resumption_secret` (stored verbatim) plus
+`cipher_suite`, `created_at`, `expires_at`.
 
-- Server-side tickets stored in `SessionCache` (LRU, ~10K entries, TTL
-  24h). Encrypted with a ticket-encryption key derived from the master
-  secret.
-- Client-side: tuple of `(server_pk, ticket, master_secret)` per server.
+**Shipped end-to-end.** 0-RTT resumption is wired through the handshake:
 
-Not in the current build — `transport::session_cache::ResumptionTicket`
-type exists but is not exchanged on the wire.
+- Server-side tickets live in a bounded-LRU `SessionCache`
+  (`transport/session_cache.rs`; default 64 entries, 1-hour lifetime).
+  `try_resume` is **one-shot** — it removes the ticket on first lookup, the
+  anti-replay guarantee for 0-RTT.
+- Client-side: the `(session_id, resumption_secret)` record is surfaced via
+  `PhantomSession::resumption_hint()` for a later
+  `connect_with_resumption` / `connect_pinned_with_resumption`.
+- The early-data key is derived from the resumption secret via
+  `crypto::kdf::derive_early_data_keying` (HKDF-SHA-256). On the wire the
+  early-data is folded into `ClientHello.early_data`, and the server reports
+  its 0-RTT verdict in `ServerHello.early_data_accepted`.
+
+`ResumptionTicket` is `ZeroizeOnDrop` (the `resumption_secret` is zeroed on
+drop; see Security Invariant 9 for the one-shot anti-replay discipline).
 
 ## Storage classes and zeroize-on-drop coverage
 

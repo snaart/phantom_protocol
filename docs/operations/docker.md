@@ -9,7 +9,7 @@ small wrapper binary (`server-bin` in your workspace) that calls
 
 ```dockerfile
 # ── Build stage ──
-FROM rust:1.79-slim AS build
+FROM rust:1.93-slim AS build
 WORKDIR /src
 
 # Pre-cache dependencies for layer reuse on iterative builds.
@@ -46,7 +46,7 @@ docker run --rm -p 4242:4242 \
     --name phantom phantom-server:0.1.1
 ```
 
-For aarch64 hosts, prefix `--platform linux/arm64` and use `rust:1.79-slim`
+For aarch64 hosts, prefix `--platform linux/arm64` and use `rust:1.93-slim`
 on the corresponding architecture.
 
 ## Recommended container settings
@@ -60,9 +60,9 @@ on the corresponding architecture.
   throughput; otherwise the userspace NAT in Docker's bridge adds
   per-packet overhead.
 - **File descriptors.** Phantom Protocol sessions hold a single fd each
-  (TCP) or two (TCP + UDP for KCP). The default Docker ulimit (1024)
-  is sufficient for ~1k concurrent sessions; raise it for higher fan-
-  out:
+  — one TCP socket, or one UDP socket for the native reliable-UDP
+  (PhantomUDP) path. The default Docker ulimit (1024) is sufficient for
+  ~1k concurrent sessions; raise it for higher fan-out:
   ```
   docker run --ulimit nofile=65535:65535 …
   ```

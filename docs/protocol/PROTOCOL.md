@@ -31,9 +31,9 @@ that sees any other value drops the frame (packets) or rejects the handshake
 | Constant | Value | Source | Where it lives on the wire |
 | --- | --- | --- | --- |
 | `WIRE_VERSION` | `6` | `core/src/transport/types.rs` | `PacketHeader.version` byte (now HP-masked, inside the 15-byte header — § 4.2) |
-| `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs:56` | `ClientHello.version`, transcript-bound |
+| `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs` | `ClientHello.version`, transcript-bound |
 
-`WIRE_VERSION` is `4`: it went `1 → 2` when the packet codec moved from
+`WIRE_VERSION` is `6`: it went `1 → 2` when the packet codec moved from
 `alkahest` to the explicit big-endian layout in § 4.2, then `2 → 3` (Phase 4 /
 P4.0) when the AEAD packet identity became a single **per-direction monotonic
 `u64` packet number** — the header dropped the dead `ack_delay` field and widened
@@ -107,7 +107,7 @@ bare `PhantomPacket`; the handshake messages are bare borsh structs.
 | Classical KEM | X25519 | ECDH-P-256 | `x25519-dalek` / `aws-lc-rs` |
 | Post-quantum KEM | ML-KEM-768 (FIPS 203) | ML-KEM-768 (FIPS 203) | `ml-kem = 0.2` (RustCrypto pure-Rust) |
 | Classical signature | Ed25519 | Ed25519 | `ed25519-dalek` |
-| Post-quantum signature | ML-DSA-65 (FIPS 204) | ML-DSA-65 (FIPS 204) | `ml-dsa = 0.1.0` (RustCrypto pure-Rust) |
+| Post-quantum signature | ML-DSA-65 (FIPS 204) | ML-DSA-65 (FIPS 204) | `ml-dsa = 0.1.1` (RustCrypto pure-Rust) |
 | AEAD | AES-256-GCM or ChaCha20-Poly1305 | AES-256-GCM only | `ring` / `aws-lc-rs` |
 | Hash | SHA-256 | SHA-256 | `sha2` / `aws-lc-rs` |
 | KDF context | blake3 keyed-derivation | HKDF-SHA-256 | `blake3` / `hkdf` |
@@ -119,13 +119,13 @@ backend, the KDF substrate, and the RNG do (see `core/src/crypto/` and
 `docs/compliance/fips-readiness.md`). The
 KDF label `"HybridKEM_X25519_Kyber768"` (§ 3) is preserved verbatim as a
 wire-stable label string — it identifies the KDF domain, not the crate or FIPS
-encoding (`core/src/crypto/hybrid_kem.rs:63`). Under fips the combine label
-swaps to `"HybridKEM_P256_Kyber768"` (`hybrid_kem.rs:65`) because the classical
+encoding (`core/src/crypto/hybrid_kem.rs`). Under fips the combine label
+swaps to `"HybridKEM_P256_Kyber768"` (`hybrid_kem.rs`) because the classical
 input differs (65-byte uncompressed SEC1 P-256 point vs 32-byte X25519).
 
 The AEAD choice is auto-selected by `HwCaps::detect()` (AES-NI present → AES;
 otherwise ChaCha). Cipher is `CipherSuite::Aes256Gcm = 1` or
-`CipherSuite::ChaCha20Poly1305 = 2` (`core/src/crypto/adaptive_crypto.rs:56-68`).
+`CipherSuite::ChaCha20Poly1305 = 2` (`core/src/crypto/adaptive_crypto.rs`).
 Under fips only `Aes256Gcm` is selectable; the `ChaCha20Poly1305` enum variant
 is retained for wire-format stability but its selection returns
 `CoreError::CipherSuiteUnavailable`.
@@ -140,23 +140,27 @@ change.
 
 | Label | Construction | Purpose |
 | --- | --- | --- |
-| `"HybridKEM_X25519_Kyber768"` / `"HybridKEM_P256_Kyber768"` (fips) | `HKDF-SHA-256(classical_secret \|\| kyber_secret)` | hybrid KEM shared secret (`hybrid_kem.rs:63-65`) |
-| `b"phantom-transport-key"` | `HKDF-Expand(shared_secret)` | session AEAD master before per-direction derivation (`transport/session.rs:75`) |
-| `"phantom-aes-send-v1"` / `"phantom-aes-recv-v1"` | `derive_key_32` over `shared_secret` | AES-256-GCM per-direction subkeys (`adaptive_crypto.rs:266-276`) |
-| `"phantom-cc20-send-v1"` / `"phantom-cc20-recv-v1"` | `derive_key_32` | ChaCha20-Poly1305 per-direction subkeys (`adaptive_crypto.rs:267-276`) |
-| `"phantom-nonce-pfx-v1"` | `derive_key_32(shared_secret)` | 4-byte nonce prefix (`adaptive_crypto.rs:287`) |
-| `b"phantom-rekey-v1"` | `HKDF-Expand(current_traffic_secret)` | forward-derive the next per-epoch traffic secret (`transport/session.rs:397`) |
-| `b"phantom-resumption-secret-v1"` | `HKDF-Expand(shared_secret)` | 0-RTT resumption secret (`transport/handshake.rs:584`, `:787`) |
-| `b"phantom-session-id-v1"` | `SHA256(label \|\| shared_secret \|\| nonce)` | session id derivation (`transport/handshake.rs:830-836`) |
-| `b"phantom-early-data-key-v3"` | `HKDF-Expand(HKDF-Extract(client_nonce, resumption_secret))` | 0-RTT early-data AEAD key (`crypto/kdf.rs:45`, `:83`) |
-| `b"phantom-early-data-nonce-v3"` | `HKDF-Expand(HKDF-Extract(client_nonce, resumption_secret))` | 0-RTT early-data AEAD nonce (`crypto/kdf.rs:47`, `:86`) |
-| `"phantom-faketls-c2s-v1"` / `"phantom-faketls-s2c-v1"` | `derive_key_32` over `(SNI \|\| version)` public seed | FakeTLS outer obfuscation keys (`legs/faketls.rs:124-125`) |
-| `"phantom-faketls-pfx-v1"` | `derive_key_32` over the same public seed | FakeTLS outer nonce prefix (`legs/faketls.rs:126`) |
-| `b"phantom-pow-cookie-v1" \|\| hour_be` | `HKDF-Expand(master_secret)` | hour-rotated cookie / PoW HMAC key (`transport/handshake.rs:936-938`) |
+| `"HybridKEM_X25519_Kyber768"` / `"HybridKEM_P256_Kyber768"` (fips) | `HKDF-SHA-256(classical_secret \|\| kyber_secret)` | hybrid KEM shared secret (`hybrid_kem.rs`) |
+| `b"phantom-transport-key"` | `HKDF-Expand(shared_secret)` | session AEAD master before per-direction derivation (`transport/session.rs`) |
+| `"phantom-aes-send-v1"` / `"phantom-aes-recv-v1"` | `derive_key_32` over `shared_secret` | AES-256-GCM per-direction subkeys (`adaptive_crypto.rs`) |
+| `"phantom-cc20-send-v1"` / `"phantom-cc20-recv-v1"` | `derive_key_32` | ChaCha20-Poly1305 per-direction subkeys (`adaptive_crypto.rs`) |
+| `"phantom-nonce-pfx-v1"` | `derive_key_32(shared_secret)` | 4-byte nonce prefix (`adaptive_crypto.rs`) |
+| `b"phantom-rekey-v1"` | `HKDF-Expand(current_traffic_secret)` | forward-derive the next per-epoch traffic secret (`transport/session.rs`) |
+| `b"phantom-resumption-secret-v1"` | `HKDF-Expand(shared_secret)` | 0-RTT resumption secret (`transport/handshake.rs`) |
+| `b"phantom-session-id-v1"` | `SHA256(label \|\| shared_secret \|\| nonce)` | session id derivation (`transport/handshake.rs`) |
+| `b"phantom-early-data-key-v3"` | `HKDF-Expand(HKDF-Extract(client_nonce, resumption_secret))` | 0-RTT early-data AEAD key (`crypto/kdf.rs`) |
+| `b"phantom-early-data-nonce-v3"` | `HKDF-Expand(HKDF-Extract(client_nonce, resumption_secret))` | 0-RTT early-data AEAD nonce (`crypto/kdf.rs`) |
+| `b"phantom-pow-cookie-v1" \|\| hour_be` | `HKDF-Expand(master_secret)` | hour-rotated cookie / PoW HMAC key (`transport/handshake.rs`) |
+
+> **Removed — `"phantom-faketls-*-v1"` (vestigial).** The legacy FakeTLS leg that
+> derived these three outer-obfuscation labels (`c2s` / `s2c` / `pfx`) was deleted.
+> Its replacement, the optional `mimicry` feature (`MimicTlsLeg`, § 9.1), is
+> **framing-only with no outer AEAD**, so it derives **no** outer keys — there are
+> no `phantom-faketls-*` labels on any current build. Do not reintroduce them.
 
 `derive_key_32` is the side-agnostic helper that dispatches per build:
 `blake3::derive_key(label, ikm)` on the default build, `HKDF-SHA256(salt=∅,
-info=label)` under fips (`core/src/crypto/kdf.rs:26-42`). The `-v3` suffix on
+info=label)` under fips (`core/src/crypto/kdf.rs`). The `-v3` suffix on
 the early-data labels is historical naming; the labels are unchanged
 wire-format constants.
 
@@ -178,7 +182,7 @@ pub struct PhantomPacket {
 Source: `core/src/transport/types.rs`. There is no enum wrapper — the recv path
 deserializes a bare `PhantomPacket` directly (`PhantomPacket::from_wire`) and
 **drops** any frame whose `header.version != WIRE_VERSION`
-(`api/session.rs:679-687`). An unparseable frame is dropped, never panicked on.
+(`api/session.rs`). An unparseable frame is dropped, never panicked on.
 
 The packet is serialised by `PhantomPacket::to_wire` as an explicit image — no
 serialization library. **WIRE v6 (anti-fingerprint diet): no length prefixes.**
@@ -282,7 +286,7 @@ HP mask is keyed crypto, verified separately in Rust — § 4.6).
 
 ### 4.3 `PacketFlags` (u16 bitfield)
 
-Source: `core/src/transport/types.rs:74-107`.
+Source: `core/src/transport/types.rs`.
 
 | Bit | Constant | Meaning |
 | --- | --- | --- |
@@ -321,10 +325,10 @@ so the AEAD nonce never collides, and it obeys the §5 rekey discipline.
 
 ### 4.4 `SessionId`
 
-`SessionId` (`[u8; 32]`, 32 bytes; `types.rs:21`) is the negotiated session
+`SessionId` (`[u8; 32]`, 32 bytes; `types.rs`) is the negotiated session
 identifier, used as encryption salt and for migration across IP changes.
 Server-side it is derived as `SHA256(b"phantom-session-id-v1" || shared_secret
-|| client_nonce)` (`transport/handshake.rs:830-836`); the client adopts the
+|| client_nonce)` (`transport/handshake.rs`); the client adopts the
 `session_id` echoed in the `ServerHello`.
 
 ### 4.5 AEAD-plaintext payload codecs (SACK / reliable frame / COALESCED)
@@ -755,7 +759,7 @@ message encodings). The `ServerReject` marker is retained as an extra sanity che
 ```
 
 `HandshakeStage` (`Initial → ClassicalReady → Established | Failed`,
-`handshake.rs:57-67`) supports optimistic start. `process_client_hello`
+`handshake.rs`) supports optimistic start. `process_client_hello`
 returns `HandshakeResponse::{Success(ServerHello, Session, Option<Vec<u8>>),
 Retry(HelloRetryRequest), Reject(ServerReject), Fail(HandshakeError)}` — the
 `Option<Vec<u8>>` is the decrypted 0-RTT early-data plaintext, or `None`; the
@@ -791,7 +795,7 @@ original expiry if the handshake later fails (ZERORTT-2). Field order
 (`resume_session_id` → `resumption_binder` → `protocol_variant`) is borsh
 wire-load-bearing.
 
-Source: `core/src/transport/handshake.rs:75-106`.
+Source: `core/src/transport/handshake.rs`.
 
 ### 6.3 `ServerHello` (borsh)
 
@@ -823,7 +827,7 @@ pub struct HelloRetryRequest {
 }
 ```
 
-Source: `core/src/transport/handshake.rs:130-134`.
+Source: `core/src/transport/handshake.rs`.
 
 ### 6.5 Transcript signing
 
@@ -845,7 +849,7 @@ struct HandshakeTranscript<'a> {
 }
 ```
 
-Source: `core/src/transport/handshake.rs:166-174`. The hybrid signature is
+Source: `core/src/transport/handshake.rs`. The hybrid signature is
 `Ed25519.sign(hash) || ML-DSA-65.sign(hash)` — **both** halves must verify
 (`HandshakeError::KemFailed("Signature check failed: …")` otherwise). Because
 `client_hello.version`, `protocol_variant`, and the `early_data` ciphertext are
@@ -857,7 +861,7 @@ Server identity pinning is mandatory in production (Invariant 1):
 `process_server_hello` takes `expected_server_key: Option<&HybridVerifyingKey>`
 and the API layer always passes `Some(...)`; a mismatch is
 `HandshakeError::ServerIdentityMismatch` before the signature check
-(`handshake.rs:735-740`). Clients obtain the key via
+(`handshake.rs`). Clients obtain the key via
 `PhantomListener::verifying_key_bytes()` + `HybridVerifyingKey::from_bytes`.
 
 ### 6.6 0-RTT early-data (best-effort, one-shot)
@@ -868,7 +872,7 @@ payload reaches the server without a full handshake round trip.
 
 **Keying.** Both peers derive identical AEAD material from the prior session's
 `resumption_secret` and *this* connect's `client_nonce`
-(`core/src/crypto/kdf.rs:70-89`):
+(`core/src/crypto/kdf.rs`):
 
 ```
 PRK              = HKDF-Extract(salt = client_nonce, ikm = resumption_secret)
@@ -879,14 +883,14 @@ early_data_nonce = HKDF-Expand(PRK, "phantom-early-data-nonce-v3", 12)
 HKDF-SHA256 (not BLAKE3) keeps the path FIPS-eligible. The blob is sealed with
 **AES-256-GCM** (fixed — the cipher suite is not yet negotiated at ClientHello
 time). AAD = `resume_session_id || client_nonce` (64 bytes;
-`handshake.rs:866-868`, `:891-893`). The `(key, nonce)` pair is single-use: the
+`handshake.rs`). The `(key, nonce)` pair is single-use: the
 key is bound to one `client_nonce`, which is one-shot because the server
 consumes the resumption ticket on first sight.
 
 **Size cap.** Early-data plaintext is capped at `EARLY_DATA_MAX_LEN = 16 KiB`
-(`handshake.rs:32`). The client constructor refuses a larger payload; the
+(`handshake.rs`). The client constructor refuses a larger payload; the
 server checks `sealed.len() > EARLY_DATA_MAX_LEN + 16` **before** any crypto
-work (`handshake.rs:858`) and drops the blob, continuing 1-RTT — this caps the
+work (`handshake.rs`) and drops the blob, continuing 1-RTT — this caps the
 work an unauthenticated peer can force.
 
 **One-shot anti-replay (Invariant 9).** The defence is the resumption ticket
@@ -939,7 +943,7 @@ transport, expected_server_key, resumption_hint, early_data)` (Rust) /
 `connect_pinned_with_resumption` (native FFI); the `resumption_hint` tuple comes
 from a prior session's `resumption_hint().await -> Option<(session_id,
 resumption_secret)>` (each field 32 bytes). Server: `PhantomListener::accept()`
-returns `Arc<AcceptOutcome>` (`api/listener.rs:292-316`):
+returns `Arc<AcceptOutcome>` (`api/listener.rs`):
 
 ```rust
 let outcome = listener.accept().await?;
@@ -956,7 +960,7 @@ blob out once.
 ### 6.7 Build-variant tag (`PROTOCOL_VARIANT`) and FIPS interop
 
 `ClientHello.protocol_variant: Vec<u8>` carries the compile-time build-variant
-tag (`core/src/transport/handshake.rs:46-49`):
+tag (`core/src/transport/handshake.rs`):
 
 | Build | `PROTOCOL_VARIANT` |
 | --- | --- |
@@ -966,7 +970,7 @@ tag (`core/src/transport/handshake.rs:46-49`):
 It is (a) carried cleartext on every `ClientHello` and (b) the **leading
 field** of the signed transcript (§ 6.5). The server rejects a mismatch with
 `HandshakeError::ProtocolVariantMismatch` **before** any KEM / signature work
-(`handshake.rs:346-351`); an MITM that rewrites the cleartext field to match
+(`handshake.rs`); an MITM that rewrites the cleartext field to match
 the server's is still caught by the client's signature check, because the
 transcript binds each side's *own* real variant (Invariant 10).
 
@@ -993,7 +997,7 @@ cookie = HMAC-SHA-256(
 )
 ```
 
-Source: `core/src/transport/handshake.rs:943-998`.
+Source: `core/src/transport/handshake.rs`.
 
 - `current_hour = unix_secs / 3600`; validation accepts the current OR previous
   hour.
@@ -1023,7 +1027,7 @@ the server's max legitimate tier) **before** solving, and `solve` is bounded to
 error instead of pinning a CPU core forever.
 
 Adaptive difficulty (`HandshakeServer::adaptive_difficulty`,
-`handshake.rs:301-310`):
+`handshake.rs`):
 
 | Handshakes/min | Difficulty | Expected hash evals |
 | --- | --- | --- |
@@ -1114,7 +1118,9 @@ network attacker cannot learn anything from the shape of the failure.
 - The nonce's `packet_number` field is big-endian (§ 5); this is pinned
   independently of the header serialisation.
 - Every length-prefix on the wire (e.g. `TcpSessionTransport` framing) is a
-  4-byte big-endian `u32` length capped at `MAX_FRAME_BYTES = 16 MiB`.
+  4-byte big-endian `u32` length capped per phase: `HANDSHAKE_FRAME_CAP = 64 KiB`
+  before the session establishes, `STEADY_STATE_FRAME_CAP = 4 MiB` after
+  (`core/src/api/tcp_transport.rs`).
 - `SessionId`, `HybridKeyPackage`, `HybridVerifyingKey`, `HybridCiphertext`,
   `HybridSignature` derive `BorshSerialize + BorshDeserialize`; their on-wire
   bytes are the concatenation of their internal fields in declaration order.

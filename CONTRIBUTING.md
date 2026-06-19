@@ -41,7 +41,7 @@ not a replacement.
 - Rust 2021 edition.
 - `rustfmt` per [`.rustfmt.toml`](.rustfmt.toml). Every PR must pass `cargo fmt --check`.
 - `clippy` per [`.clippy.toml`](.clippy.toml). Every PR must pass
-  `cargo clippy --workspace --all-targets -- -D warnings`.
+  `cargo clippy --manifest-path core/Cargo.toml --lib -- -D warnings`.
 - No `.unwrap()` / `.expect()` / `panic!` / `unreachable!` / `todo!` / `unimplemented!`
   in production crates (the `#![deny(clippy::unwrap_used, ...)]` lints enforce
   this). Where unavoidable, justify with a `// PANIC-SAFETY:` comment.
@@ -54,8 +54,9 @@ Files in these paths require **codeowner review** before merge:
 
 - `core/src/crypto/`
 - `core/src/transport/handshake.rs`
-- `core/src/transport/legs/faketls.rs`
 - `core/src/transport/session.rs`
+- `core/src/transport/udp_transport.rs`
+- `core/src/transport/legs/mimic_tls/`
 - `core/src/security/`
 
 The documented security invariants in [`SECURITY.md`](SECURITY.md) and
@@ -75,7 +76,7 @@ The documented security invariants in [`SECURITY.md`](SECURITY.md) and
 
 - New public functions need at least one positive and one negative test.
 - Security invariants must be covered by tests in `core/tests/` (especially
-  `tcp_integration.rs` and the `security_invariants.rs` suite (28 always-on tests)).
+  `tcp_integration.rs` and the `security_invariants.rs` suite (58 always-on tests)).
 - Concurrency-sensitive code should have a loom test where practical.
 
 ## Commit messages

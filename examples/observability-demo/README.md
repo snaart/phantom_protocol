@@ -25,17 +25,26 @@ In Grafana → Explore:
   the OTel-translated counter from `phantom.session.packets`.
 - **Prometheus**: query
   `histogram_quantile(0.99, sum by (le) (rate(phantom_handshake_duration_seconds_bucket[1m])))`
-  — exemplars (trace_id markers) appear on the latency line.
+  for the handshake-latency P99. (Exemplar reservoirs are not wired, so
+  no trace_id markers attach to the latency line — see
+  `docs/observability/tracing-guide.md`.)
 - **Tempo**: search for `service.name = phantom-observability-demo`,
   then click any handshake span to see the full trace with attributes.
 
 ## What you'll see
 
-- `phantom.*` metrics from the demo binary, ~30s of synthetic load.
-- One AEAD failure injected at tick 13 (security-signal counter).
-- Replay rejection counter ticking every 5s.
-- `phantom.handshake.duration` histogram with exemplars linking to the
-  `phantom.handshake.process_*` spans visible in Tempo.
+The demo drives genuine pinned `PhantomListener` ↔ `PhantomSession`
+sessions over TCP loopback for ~30s — every metric comes from the real
+data path, not from synthetic `record_*` calls.
+
+- `phantom.*` metrics from real traffic: the handshake counter, the
+  per-packet / per-byte data-plane counters, and the `phantom.session.active`
+  gauge rising *and* falling as the four client workers reconnect.
+- A server-side metrics snapshot logged to the console every 5s
+  (active sessions, handshake outcomes, packet/byte totals).
+- `phantom.handshake.*` spans visible in Tempo. (No exemplars link the
+  handshake-latency histogram to those spans — exemplar reservoirs are
+  not wired; see `docs/observability/tracing-guide.md`.)
 
 ## Cleanup
 

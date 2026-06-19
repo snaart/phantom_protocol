@@ -136,11 +136,15 @@ interior is the responsibility of ring (FIPS-validated build).
 
 See `docs/compliance/self-tests.md`. Summary:
 
-- POST runs on first call to `PhantomListener::bind` /
-  `PhantomSession::connect` per process.
-- PCT runs after every keypair generation.
-- On failure: module enters error state, all API calls return
-  `CoreError::SelfTest`.
+- POST runs (via the cached `ensure_post_passed()`) on first call to
+  `PhantomListener::bind*` / `PhantomSession::connect*` / `connect_pinned*`
+  per process under `--features fips`.
+- On failure: the bootstrap short-circuits and the call returns
+  `CoreError::FipsSelfTestFailure(String)` instead of standing up a
+  listener / session over broken primitives.
+- Per-keygen PCTs wired into every keygen function are not yet shipped
+  (POST already covers KEM / signature pairwise consistency once at
+  startup).
 
 ## 9. Physical security
 
@@ -162,7 +166,7 @@ underlying CSPRNG (Linux kernel ≥ 5.18 in FIPS mode, or platform DRBG).
 | Cross-protocol confusion | Domain-separated HKDF labels per direction and per epoch (`phantom-traffic-v1`, `phantom-rekey-v1`, `phantom-faketls-c2s-v1`, etc.). |
 | Downgrade | Wire version is transcript-bound (Phase 1.8); FakeTLS outer AEAD is anti-DPI only and not the security boundary. |
 | Nonce exhaustion | `AEAD_MAX_INVOCATIONS = 2^48` per epoch; rekey before exhaustion (Phase 1.7). |
-| Replay of resumption / 0-RTT | Out of scope until Phase 4.1 — design includes replay-window inheritance. |
+| Replay of resumption / 0-RTT | 0-RTT resumption is shipped; `SessionCache::try_resume` is **one-shot** (the ticket is consumed on first lookup), so a replayed `ClientHello` finds no ticket and falls back to the normal 1-RTT cookie/PoW gate (Security Invariant 9). |
 
 ## 12. References
 

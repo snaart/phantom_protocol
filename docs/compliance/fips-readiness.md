@@ -156,10 +156,10 @@ Each of these is a separate file under `docs/compliance/`:
 
 | Doc | What it contains | Status |
 | --- | --- | --- |
-| `fips-security-policy.md` | Module boundary, approved security functions, modes of operation, lifecycle | scaffold pending |
-| `key-management.md` | Generation, distribution, storage, destruction, lifecycle per key type (signing, master, session, KEM ephemeral) | scaffold pending |
-| `self-tests.md` | POST inventory, conditional self-test inventory, error-state handling | scaffold pending |
-| `cc-st.md` | Common Criteria Security Target (PP, SFRs, SARs) | scaffold pending |
+| `fips-security-policy.md` | Module boundary, approved security functions, modes of operation, lifecycle | drafted (CMVP-validation submission still pending) |
+| `key-management.md` | Generation, distribution, storage, destruction, lifecycle per key type (signing, master, session, KEM ephemeral) | drafted |
+| `self-tests.md` | POST inventory, conditional self-test inventory, error-state handling | drafted (POST shipped + wired) |
+| `cc-pp-mapping.md` | Common Criteria PP mapping / Security Target skeleton (PP, SFRs, SARs) | drafted |
 
 These documents are what the CMVP / CC laboratory reads; their
 accuracy is enforced by the implementation. Drift between doc and code
@@ -214,17 +214,19 @@ Rough scoring against FIPS 140-3 Level 1 requirements after the
 | Approved primitive set | **100% under `--features fips`** | All KEM, signature, AEAD, KDF, RNG primitives match the FIPS approved set; AES + ECDH + RNG via AWS-LC-FIPS, HKDF-SHA-256 for every derivation, RustCrypto FIPS 203/204 for the PQ halves. Default build retains X25519/blake3/ChaCha20-Poly1305 for the non-FIPS deployment footprint. |
 | Implementation roles | n/a for L1 | Operator + Cryptographic-Officer split is L2+ |
 | Self-tests | **100% under `--features fips`** | `run_post` + `ensure_post_passed` wired into bind/connect (A7). Fault injection covered by `set_force_post_fail` test seam. |
-| Key management | partial | Generation + destruction are right; storage + lifecycle docs missing (`key-management.md` still scaffold). |
+| Key management | mostly complete | Generation + destruction are right; storage + lifecycle are documented in `key-management.md` (drafted). |
 | RNG | **CTR_DRBG under `--features fips`** | `aws-lc-rs::rand::SystemRandom` (SP 800-90A § 10.2.1) routed through `RngProvider for OsRng`. |
 | Constant-time properties | 80% | cookie path done (Phase 1.1); rest relies on ring / dalek / ml-kem / ml-dsa / aws-lc-rs upstream. |
-| Documentation | partial | This file + `self-tests.md` + `constant-time-audit.md` cover the primitive swap. `fips-security-policy.md` and `key-management.md` still need flesh for the CMVP submission. |
+| Documentation | mostly complete | This file + `self-tests.md` + `constant-time-audit.md` + `key-management.md` + `fips-security-policy.md` + `cc-pp-mapping.md` are all drafted and cover the primitive swap. Final polish for a formal CMVP submission remains. |
 
 **Overall: ~80%.** The code-level FIPS posture is functionally
-complete under `--features fips`. The remaining gap is the
-documentation track for a real CMVP submission
-(`fips-security-policy.md`, `key-management.md` flesh-out, etc.) —
-those are out of scope for this rollout and pinned in Section 5
-below.
+complete under `--features fips`, and the supporting compliance docs
+(`fips-security-policy.md`, `key-management.md`, `self-tests.md`,
+`constant-time-audit.md`, `cc-pp-mapping.md`) are drafted. The
+remaining gap is the **external CMVP validation track itself** — a
+formal submission to an accredited laboratory — which is a procurement
+/ business decision, not a code or documentation deliverable. This
+module is **not yet CMVP-validated**.
 
 ---
 

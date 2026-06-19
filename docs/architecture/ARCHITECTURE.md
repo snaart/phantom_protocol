@@ -83,7 +83,7 @@ connect_with_transport(addr, transport,           PhantomListener::bind(addr)  /
     ↓ process_server_hello(Some(expected_server_key)); pin + verify; derive Session
 ConnectionState = Connected
     ↓ spawn run_data_pump(crypto_session, ...)        spawn run_data_pump(server_session, ...)
-    ──── encrypted PhantomPacket frames (WIRE 3) ─────────►
+    ──── encrypted PhantomPacket frames (WIRE 6) ─────────►
     ◄──── encrypted PhantomPacket frames ──────────────────
     │
     └─ [optional] migrate(new_local_addr) → rebind + new path_id → server detects new source → PATH_CHALLENGE → validate → peer switch
@@ -134,7 +134,7 @@ Both client and server, after their handshakes, spawn the **same** `run_data_pum
 | `PathRegistry` | Per-session path lifecycle (`Unvalidated → Validating → Validated/Failed`), constant-time challenge/response (Invariant 6), `retire` for `path_id` reuse. |
 | `liveness` | Pure `liveness_verdict()` (PathDown / Recovered / Dead) + `LivenessConfig` thresholds. |
 | `PathRegistry`/`Scheduler` | Path selection / migration state (migration is **shipped** — see § 4; the `Scheduler` does per-leg RTT/loss tracking). |
-| `PacketHeader` / `PhantomPacket` | Wire types (47-byte header; § PROTOCOL.md). |
+| `PacketHeader` / `PhantomPacket` | Wire types (15-byte on-wire header / 47-byte AEAD AAD image; § PROTOCOL.md). |
 | `phantom_udp/{envelope,datagram}` | The PhantomUDP `[flags][cid]` envelope + fragmentation/reassembly to `PATH_MTU`. |
 | `legs/{websocket,wasi,embedded}` | `SessionTransport` impls (browser / WASI / bare-metal). |
 | `BufferPool`, `Pacer`, `PacketCoalescer`, `BandwidthEstimator` (BBR) | Performance infrastructure. |
@@ -142,7 +142,9 @@ Both client and server, after their handshakes, spawn the **same** `run_data_pum
 ### Encryption boundary
 
 Every byte that crosses `Session::encrypt_packet` / `decrypt_packet` is
-authenticated with the **47-byte** `PacketHeader` as AAD. The AEAD nonce is
+authenticated with the reconstructed **47-byte** `PacketHeader` AAD image
+(`to_aad_image()` — distinct from the 15-byte on-wire `to_wire()`; the 32-byte
+`session_id` is in the AAD but off the wire, § 8). The AEAD nonce is
 `nonce_prefix(4) ‖ packet_number(8)` — the per-direction monotonic `u64` packet
 number drawn at send time (① / P4.0). `epoch`/`stream_id`/`path_id` are in the
 AAD but **not** the nonce.
@@ -151,7 +153,7 @@ AAD but **not** the nonce.
 fn build_packet_nonce(prefix: [u8;4], header: &PacketHeader) -> [u8;12] // prefix ‖ packet_number_be
 pub fn encrypt_packet(&self, header: &PacketHeader, pt: &[u8]) -> Result<Vec<u8>, CoreError> {
     let nonce = Self::build_packet_nonce(self.crypto.load().nonce_prefix(), header);
-    // AAD = header.to_wire()  (47 bytes)
+    // AAD = header.to_aad_image()  (47 bytes; the on-wire header is 15 bytes)
 }
 ```
 
@@ -221,9 +223,13 @@ server detects a vanished client symmetrically.
 - **Stream layer:** the gap-free per-stream `u32` `stream_offset` in the reliable AEAD
   plaintext — feeds reassembly, SACK, loss detection, retransmit dedup.
 
-> Migration is **functional but linkable** via the stable plaintext CID (documented
-> honestly in PROTOCOL.md §12.5); unlinkable migration (header protection + CID rotation)
-> is a deferred hardening phase.
+> Migration is now **unlinkable in both directions** for a move by *either* peer: WIRE v6
+> header protection masks the whole 15-byte header (the `version` byte included), the inner
+> 32-byte `session_id` left the wire, and the routing `ConnId` **rotates** per migration
+> (the ε / A2a work — EPS-02 closed). The honest residual: the HP keys and CID chain are
+> session-stable (not forward-secret), so a session-key compromise can link a *recorded*
+> flow retroactively — the payload stays forward-secret. See PROTOCOL.md § 4.2 / § 4.6 /
+> § 4.7 / § 12.5.
 
 ---
 
@@ -241,9 +247,10 @@ server detects a vanished client symmetrically.
 | `pow` | `PoWChallenge`, `PoWSolution` | blake3 PoW + stateless cookie DoS gate (constant-time MAC compare). |
 
 `#![deny(unsafe_code)]` at the crate root; three audited, sound opt-ins:
-`transport/udp_transport.rs` (libc GSO/`recvmmsg`), `transport/legs/wasi.rs`
-(`unsafe impl Send/Sync` over WIT-bindgen handles), `transport/legs/websocket.rs`
-(wasm-bindgen JS glue). No `unsafe` in `crypto/`.
+`transport/udp_transport.rs` (a single `libc::setsockopt(SO_MAX_PACING_RATE)` call —
+the former GSO / `sendmmsg` / `recvmmsg` batch path was removed),
+`transport/legs/wasi.rs` (`unsafe impl Send/Sync` over WIT-bindgen handles),
+`transport/legs/websocket.rs` (wasm-bindgen JS glue). No `unsafe` in `crypto/`.
 
 ---
 
@@ -290,9 +297,10 @@ promoted peer to the authenticated challenge source.
 The lower-level `Session` flows from the handshake into the data-pump task as `Arc<Session>`.
 Migration state (`peer`/`socket`/`candidate`) lives behind `ArcSwap` inside the concrete UDP
 transport, swapped atomically without touching the generic pump. `CryptoState`,
-`HandshakeServer/Client`, and `Session.resumption_secret` are `ZeroizeOnDrop`. *(Audit gap:
-the `Session.traffic_secret` rekey-master and the handshake `shared_secret` copy are **not**
-yet zeroized — tracked in the pre-1.0 remediation plan.)*
+`HandshakeServer/Client`, and `Session.resumption_secret` are `ZeroizeOnDrop`. The
+`Session.traffic_secret` rekey-master is zeroized in `impl Drop for Session` (and in place
+on each rekey), and the handshake `shared_secret` copy lives in a `Zeroizing` wrapper — both
+are now wiped (T5.1), closing the former audit gap.
 
 ---
 
@@ -301,12 +309,17 @@ yet zeroized — tracked in the pre-1.0 remediation plan.)*
 - **PhantomUDP** (primary): `[flags: u8][cid: 8]` envelope + fragmentation to
   `PATH_MTU = 1200`; reassembled before parsing the inner `PhantomPacket`.
 - **TCP** (`TcpSessionTransport`): a 4-byte big-endian length prefix per `PhantomPacket`,
-  capped at `MAX_FRAME_BYTES = 16 MiB`; a tight `HANDSHAKE_FRAME_CAP` bounds the
-  unauthenticated handshake frame. *(The legacy KCP and FakeTLS legs were removed; FakeTLS
-  HTTP-mimicry will return as a dedicated transport mode.)*
+  capped per phase — `HANDSHAKE_FRAME_CAP = 64 KiB` bounds the unauthenticated handshake
+  frame, `STEADY_STATE_FRAME_CAP = 4 MiB` once established. *(The legacy KCP and FakeTLS
+  legs were removed; TLS HTTP-mimicry shipped as the optional `mimicry` feature —
+  `MimicTlsLeg` / `bind_mimic` / `connect_pinned_mimic` — a framing-only, anti-DPI-only
+  outer wrapper detectable by active probing; see PROTOCOL.md § 9.1.)*
 
-The inner `PhantomPacket` wire image is one bare packet (`header(47) ‖ payload_len:u32be ‖
-payload ‖ ext_len:u32be ‖ extensions`); `from_wire` is bounds-checked and overflow-safe.
+The inner `PhantomPacket` wire image (WIRE v6) is one bare packet, `header(15) ‖ payload`
+— there are **no** cleartext length prefixes (the v5 `payload_len` / `ext_len` `u32`
+prefixes were dropped as a structural fingerprint, and `extensions` is off the data-plane
+wire). The 47-byte figure is the reconstructed **AEAD AAD image** only, not the on-wire
+header (PROTOCOL.md § 4.1 / § 4.2). `from_wire` is bounds-checked and overflow-safe.
 
 ---
 
@@ -328,13 +341,15 @@ A wrong-key / wrong-AAD / wrong-PN failure all surface as a single opaque "decry
 | `run_data_pump` (recv) | Every inbound packet | Unbounded delivery-queue decoupling; authenticated SACK ACK; the 10 ms tick also runs the (cheap) liveness sweep |
 | `send_app_data` | Every outbound packet | Pre-sized buffers; PN drawn once at send (nonce never reused) |
 | `session.rs::encrypt/decrypt_packet` | Per packet | Lock-free `ArcSwap` `CryptoState` load; nonce from the authenticated header |
-| `udp_transport.rs` | UDP fast path | GSO / `sendmmsg` on Linux |
+| `udp_transport.rs` | UDP fast path | Pacing offload via `SO_MAX_PACING_RATE` (Linux `fq` qdisc) |
 | `adaptive_crypto.rs` | Per AEAD op | HW-AES detection; ring/aws-lc optimized paths |
 | `observability/atomics.rs` | Per packet record | Lock-free `CachePadded` atomics (~2.5 ns/call) |
 
-Per-packet overhead is 71 bytes (47-byte header incl. a 32-byte plaintext `session_id`, +8
-length, +16 AEAD tag) — heavy for small/voice payloads; the future header-protection phase
-(QUIC-style PN encryption + shorter/rotated CID) is the lever.
+Per-packet wire overhead is **31 bytes** (the 15-byte on-wire header + the 16-byte AEAD
+tag) — the 32-byte `session_id` is **off the wire** (AAD only, reconstructed from session
+context) and there are **no** cleartext length prefixes (WIRE v6, § 8). The
+header-protection phase that delivered this — QUIC-style header masking, the rotating CID
+chain, and the wire diet — is **shipped**, not future (PROTOCOL.md § 4.2 / § 4.6 / § 4.7).
 
 ---
 
@@ -380,8 +395,10 @@ trait, injected via the `_with_runtime` constructor variants (UniFFI stays on `T
 - **Phase 5** (`fips`): the aws-lc-rs FIPS-140-3 substrate swap — **shipped**.
 - **Phase 8** (observability): the OpenTelemetry refactor (`observability/`) replaced the
   Phase-4.5 hand-rolled metrics — **shipped**.
-- **Deferred hardening:** unlinkable migration (header protection / PN encryption + CID
-  rotation) — the `u64` PN and single PN space are HP-ready by design.
+- **Unlinkable migration (ε / WIRE v4→v5→v6):** header protection (whole-header XOR mask,
+  PN included), the inner `session_id` removed from the wire, and a rotating CID chain —
+  **shipped**, making a migration by either peer unlinkable in both directions (EPS-02
+  closed). See PROTOCOL.md § 4.2 / § 4.6 / § 4.7 / § 12.5.
 - **Pre-1.0 remediation backlog** (from the 2026-06-11 security audit + external spec review):
   PhantomUDP pre-auth DoS bounding (demux `routes` cap, cookie-before-slot, reorder-byte
   budget + `MAX_STREAMS`), authentication-ordering fixes (encrypted FIN, AEAD-bound migration

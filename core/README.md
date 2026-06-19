@@ -3,17 +3,19 @@
 [![crates.io](https://img.shields.io/crates/v/phantom-protocol.svg)](https://crates.io/crates/phantom-protocol)
 [![docs.rs](https://img.shields.io/docsrs/phantom-protocol)](https://docs.rs/phantom-protocol)
 [![license](https://img.shields.io/crates/l/phantom-protocol.svg)](https://github.com/snaart/phantom_protocol/blob/main/LICENSE)
-![MSRV](https://img.shields.io/badge/MSRV-1.75-blue)
+![MSRV](https://img.shields.io/badge/MSRV-1.93-blue)
 
 Post-quantum-secure **L4/L6 universal transport framework** in Rust.
 
 `phantom-protocol` gives applications an authenticated, confidential,
 post-quantum-secure byte pipe. It pairs a hybrid classical-plus-PQ handshake
 (X25519 + ML-KEM-768 KEM, Ed25519 + ML-DSA-65 signatures — FIPS 203 / FIPS 204,
-pure Rust) with a transport layer (TCP / WebSocket for sessions today; WASI and
-embedded byte-stream framing; KCP / FakeTLS / multipath as experimental legs)
-and adaptive fallback. Cross-language bindings via UniFFI (Python, Swift, Kotlin,
-C); native `wasm32` target; bare-metal `EmbeddedLeg` for `no_std`.
+pure Rust) with a transport layer: TCP / WebSocket sessions and a native
+reliable-UDP transport (PhantomUDP), plus WASI and embedded byte-stream framing
+legs, and an optional TLS-mimicry transport (`mimicry` feature — `MimicTlsLeg`).
+The earlier experimental KCP / FakeTLS legs and the unused `TransportLeg`
+multipath trait were removed. Cross-language bindings via UniFFI (Python, Swift,
+Kotlin, C); native `wasm32` target; bare-metal `EmbeddedLeg` for `no_std`.
 
 > **Pre-1.0 (`0.1.x`).** Wire format may break between minor versions; SemVer
 > stabilizes at 1.0. The Rust crate is `phantom-protocol`; the import path is
