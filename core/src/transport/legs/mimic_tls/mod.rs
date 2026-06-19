@@ -28,3 +28,16 @@
 /// denial-of-service discipline (phase-gated caps, incremental buffering, typed
 /// errors). Unit-tested in isolation, without sockets or the handshake prelude.
 pub mod record;
+
+/// Synthetic Chrome-shaped TLS 1.3 ClientHello generation (JA3/JA4 mimicry).
+/// The cleartext client side of the handshake theater.
+pub mod client_hello;
+
+/// Per-connection TLS 1.3 ServerHello synthesis (parses the inbound ClientHello,
+/// builds a self-consistent answer). The cleartext server side.
+pub mod server_hello;
+
+/// The handshake "theater": builds the one-time TLS 1.3 prelude flights (CCS,
+/// opaque records, lifecycle records) and consumes the counterpart's records.
+/// Assembled into the leg's connect/accept by [`leg`].
+pub mod theater;
