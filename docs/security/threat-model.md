@@ -155,7 +155,7 @@ for a real-time secure transport.
 | Plaintext leak via error message | Error variants carry only the error class, not the payload; no `format!("{:?}", plaintext)` anywhere | grep `format!.*plaintext\|payload` in `core/src/` â 0 results |
 | Memory disclosure of keys after session close | Key-bearing structs zeroize on drop: `ZeroizeOnDrop` on `CryptoState` (`session.rs`), `HandshakeServer` / `HandshakeClient` (`handshake.rs`), and `ResumptionTicket` (`session_cache.rs`, T5.1); the rekey master `Session.traffic_secret` is zeroized in `Session::drop` (T5.1) along with `resumption_secret`; the transient handshake KEM secret is held in `Zeroizing` (T5.1). Mid-session rekey also zeroizes each superseded epoch secret. | `session.rs` (`CryptoState`, `Session::drop`), `handshake.rs` (`HandshakeServer`/`HandshakeClient` + `Zeroizing` KEM secret), `session_cache.rs` (`ResumptionTicket`) |
 | Timing leak on cookie comparison | `subtle::ConstantTimeEq::ct_eq` â never branches on cookie content | `core/src/transport/handshake.rs:1065` |
-| DPI fingerprinting | **Partial (WIRE v6, direction #4):** the data-plane wire has **no constant cleartext byte** (the version byte is HP-masked) and **no cleartext length-prefix pattern** (dropped — §4.1/§4.6), removing the two structural tells a stateless DPI box keyed on; opt-in size padding / timing jitter / cover traffic (§4.8) blunt the statistical tells. **Residual:** the outer 8-byte `ConnId` + opaque-blob datagram *shape* is still recognizable; full active protocol-mimicry (looking like HTTP/TLS) is a separate future transport mode (FakeTLS leg removed in Phase 0). | PROTOCOL.md §4.1 / §4.6 / §4.8 |
+| DPI fingerprinting | **Partial (WIRE v6, direction #4) + opt-in TLS mimicry (`mimicry` feature):** the data-plane wire has **no constant cleartext byte** (the version byte is HP-masked) and **no cleartext length-prefix pattern** (dropped — §4.1/§4.6), removing the two structural tells a stateless DPI box keyed on; opt-in size padding / timing jitter / cover traffic (§4.8) blunt the statistical tells. The outer 8-byte `ConnId` + opaque-blob datagram *shape* is still recognizable on bare UDP — the **`mimicry` feature** (TLS-over-TCP `MimicTlsLeg`) makes a flow look like HTTPS instead. **Residual:** the mimicry defeats passive/light-stateful DPI but **not active probing** (§6.1). | PROTOCOL.md §4.1 / §4.6 / §4.8 ; threat-model §6.1 |
 
 ### D â Denial of service
 
@@ -183,10 +183,64 @@ expose any privileged operation. The library is a passive data conduit.
 | **L**inkability of one session across a network change (migration) | **Mitigated (ε + A2a) — migration by *either* peer is unlinkable both ways (EPS-02 closed)** | Header protection (T4.6, §4.6) masks the variable per-packet metadata (packet numbers, flags incl. PRIORITY, stream id, epoch, path id), and ε removed the inner 32-byte `session_id` from the wire (off-wire in the AEAD AAD — §4.2) and makes the routing `ConnId` **rotate** per migration via per-direction KDF chains + a sliding demux window (§4.7). Rotation is symmetric for **both** migration directions: the moving peer advances its outbound chain and the other peer advances its return chain in response. A **client** migration: the client advances c2s on `migrate()`, the server advances s2c on the new `path_id` (the socket-routed client absorbs the new inbound CID, no slide, no ping-pong). A **server** migration: the server advances s2c on `migrate_server()`, and the client *reflects* on authenticating the server's new `path_id` — it bumps its own `path_id` + advances c2s, which slides the server's c2s demux window so the rotated CID stays routable (the no-stranding fix that the earlier asymmetry avoided by not rotating c2s); the server's matching s2c re-rotation is `path_id`-silent, so the client does not re-reflect (one round). So a client moving Wi-Fi→cellular **and** a server failover/egress-change are both unlinkable in both directions (EPS-02 closed by A2a — `docs/security/audit-report-2026-06-15-wire-v5-epsilon.md`). **Honest caveat:** the CID chain is session-stable and **not** forward-secret — a session-key compromise lets an attacker recompute the chain and relink a *recorded* flow; the payload stays forward-secret. The constant `version` byte (a protocol, not per-connection, fingerprint) is now **HP-masked** as of WIRE v6 (direction #4), along with the cleartext length prefixes; opt-in size/timing/volume shaping is available (§4.8 — off by default, see the LINDDUN-D row). See `PROTOCOL.md` §4.1 / §4.2 / §4.6 / §4.7 / §4.8 / §12.5. |
 | **I**dentifiability of the client | No mitigation | Source IP is necessarily visible to the server. Client may use Tor / VPN externally. |
 | **N**on-repudiation | Intentionally out of scope (see STRIDE-R) |
-| **D**etectability that this is `phantom_protocol` | **Partially mitigated (WIRE v6) — active mimicry still planned** | WIRE v6 removed the structural tells (no constant cleartext version byte, no length-prefix pattern — §4.1/§4.6), and opt-in shaping (§4.8) blunts size/timing/volume tells. The datagram *shape* (8-byte `ConnId` + opaque blob) is still recognizable; full active protocol-mimicry (looking like HTTP/TLS) will return as a dedicated transport mode (FakeTLS leg removed in Phase 0). |
+| **D**etectability that this is `phantom_protocol` | **Partially mitigated (WIRE v6) + opt-in active mimicry (`mimicry` feature)** | WIRE v6 removed the structural tells on the bare UDP wire (no constant cleartext version byte, no length-prefix pattern — §4.1/§4.6), and opt-in shaping (§4.8) blunts size/timing/volume tells — but the UDP datagram *shape* (8-byte `ConnId` + opaque blob) is still recognizable. The **`mimicry` feature** (a TLS-over-TCP `MimicTlsLeg`: `bind_mimic` / `connect_pinned_mimic`) makes a flow look like ordinary HTTPS to passive DPI + JA3/JA4 fingerprinting + light stateful inspection. **It defeats parsers, not provers:** it is detectable by an active-probing censor (the handshake is theater — no real ECDHE / certificate) and is net-negative against one. Honest residuals + SAFE/UNSAFE deployment guidance in **§6.1**. |
 | **D**isclosure of metadata (sizes, timing) | **Opt-in mitigations (WIRE v6, direction #4) — OFF by default** | The data-plane wire no longer carries a structural size fingerprint: WIRE v6 dropped the cleartext `payload_len` / `ext_len` prefixes (PROTOCOL.md §4.1). On top of that, three **opt-in** anti-fingerprint controls are available via `TrafficShapingConfig` (PROTOCOL.md §4.8): **(c) PADÉ size padding** — pads each packet to a bounded (≈ ≤12% worst-case) size bucket inside the AEAD, so the datagram size no longer tracks the payload size; **(d) timing jitter** — a uniform `[0, jitter_ms]` ms per-packet send delay, so inter-packet timing no longer tracks app writes; **(e) cover traffic** — an `ENCRYPTED \| COVER` dummy packet maintains a floor outbound rate, so silence/volume no longer leak (authenticated, then dropped by the peer). **Honest residual:** all three are **off by default** (an embedder must enable them, trading bandwidth/latency); PADÉ reduces but does not eliminate size classes; and a global passive adversary doing statistical traffic analysis is still out of scope (as for any non-mix-network transport). |
 | **U**nawareness of data flows | Documented | This file. Operators must understand what does/doesn't leak. |
 | **N**on-compliance | Tracked | Phase 5 (FIPS 140-3 / CC) work covers regulatory compliance. |
+
+### 6.1 TLS-over-TCP active mimicry (the `mimicry` feature) — honest residuals
+
+The optional `mimicry` feature ships a `MimicTlsLeg` (`bind_mimic` /
+`connect_pinned_mimic`) that performs a **synthetic** TLS 1.3 handshake — a
+Chrome-shaped ClientHello, a per-connection ServerHello synthesized to be
+self-consistent with it, ChangeCipherSpec, opaque "encrypted" flight + lifecycle
+records — then carries the Phantom session inside TLS ApplicationData records. The
+handshake is **cryptographic theater**: there is no real ECDHE and no certificate;
+the records are framing only (no outer AEAD). All real authentication /
+confidentiality / integrity remains the inner Phantom post-quantum session. The
+outer TLS is **anti-DPI obfuscation only**.
+
+**The one-line model: it defeats parsers, not provers.** It is byte-for-byte a
+plausible TLS 1.3 flow to anything that *parses* the wire, but fails deterministically
+the moment something demands cryptographic *proof* of a real handshake.
+
+**SAFE against** (with every implementation requirement met — a current ClientHello
+template, the self-consistent ServerHello, per-connection-random fields, a
+non-default rotated cover SNI): stateless commercial DPI; passive JA3/JA4 ClientHello
+fingerprinting; light stateful protocol-conformance inspection (no active probing).
+
+**UNSAFE / do-not-rely-on against:**
+
+- **R1/R2 — active probing & cert-validation oracles.** A censor that runs a stock
+  TLS client to completion, or relays a real ClientHello and demands a CA-chainable
+  certificate for the cover SNI, fails in one round trip — the server has no real
+  ECDHE and no cert. This *positively* fingerprints the endpoint as a masquerade
+  (stronger than no obfuscation). The leg's black-hole posture (silent
+  hold-then-drop on a bad prelude, constant timing) is the best achievable here, but
+  the probe still learns TLS never completes. Closing R1/R2 needs a real-TLS tunnel
+  (shadow-tls / REALITY style), which is **explicitly out of scope** for this leg.
+  **Never serve a self-signed cert** (a stable, attributable blocklist artifact —
+  worse than opaque theater).
+- **R3 — template drift.** The Chrome ClientHello profile is a point-in-time capture
+  (`PROFILE_CAPTURED`); a frozen template ages out of the live-browser population
+  within ~1–2 Chrome releases and its JA3/JA4 then matches no real browser. The leg
+  logs a staleness warning past ~6 months; the durable fix (auto-refresh from real
+  captures, a rotating multi-browser pool) is deferred.
+- **R5 — SNI ↔ destination coherence.** The cover SNI is cleartext; a popular SNI on
+  a server IP outside that domain's CDN/AS, or many clients presenting one SNI to a
+  server that can't complete TLS for it, is a passively-visible cluster signal. The
+  operator must choose a plausible, rotated SNI consistent with the server's IP/AS —
+  this is unfixable at the transport layer.
+- **R7 — flow shape at scale.** The first post-prelude exchange is the large inner PQ
+  handshake (a few KB up, a few KB down) where real HTTPS shows a small immediate
+  request; passive flow-classification at scale can still distinguish it. The basic
+  record-shaper reduces but cannot eliminate this.
+
+**Bottom line:** the `mimicry` feature raises the bar against the *commercial /
+passive / light-stateful* DPI that blocks "unknown high-entropy traffic," but it is
+**not** a defense against a determined active-probing nation-state censor, and must
+not be presented as one. (Invariant parity: the outer layer holds no keys and
+changes no Phantom security invariant; the inner session is unchanged.)
 
 ---
 
