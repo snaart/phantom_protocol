@@ -21,11 +21,6 @@
 //! exact JA4 match against a specific live Chrome build must be capture-validated
 //! before relying on it in a hostile network (R3 in the design doc).
 
-// PR-2 lands the ClientHello builder; its live consumer is the leg's handshake
-// prelude (PR-3). Until then it is exercised only by this module's tests, so the
-// non-test lib build sees it as dead code. Removed when the prelude is wired.
-#![allow(dead_code)]
-
 use crate::crypto::rng::RngProvider;
 
 /// Marker for the Chrome shape this profile parrots (`YYYYMM`). Bump it when the

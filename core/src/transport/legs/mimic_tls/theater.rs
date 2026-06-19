@@ -22,10 +22,6 @@
 //! crypto. close_notify on graceful teardown is an opaque `0x17` record (a TLS 1.3
 //! Alert is encrypted, hence ApplicationData-typed on the wire).
 
-// PR-2 lands the prelude builders + the record consumer; the live driver (the
-// leg's connect/accept) is PR-3. Until then they are exercised only by tests.
-#![allow(dead_code)]
-
 use bytes::{Buf, Bytes, BytesMut};
 
 use super::client_hello;
@@ -47,7 +43,13 @@ const TICKET_MIN: usize = 150;
 const TICKET_MAX: usize = 300;
 const FINISHED_MIN: usize = 36;
 const FINISHED_MAX: usize = 64;
+// close_notify lifecycle theater (R6): built + tested, but not yet emitted on
+// teardown — the leg has no async close hook (Drop cannot await a socket write).
+// Wired when the transport gains a graceful-close seam; kept so the shape is ready
+// and frozen by tests.
+#[allow(dead_code)]
 const CLOSE_NOTIFY_MIN: usize = 19;
+#[allow(dead_code)]
 const CLOSE_NOTIFY_MAX: usize = 31;
 
 /// The fixed prelude record types per direction (used to validate the counterpart
@@ -124,7 +126,9 @@ pub(crate) fn client_finished_flight(rng: &dyn RngProvider) -> Result<Vec<u8>, C
     Ok(out)
 }
 
-/// Build an opaque close_notify-shaped record for graceful teardown.
+/// Build an opaque close_notify-shaped record for graceful teardown (R6 lifecycle
+/// theater). Not yet emitted — see the `CLOSE_NOTIFY_*` note above.
+#[allow(dead_code)]
 pub(crate) fn close_notify_record(rng: &dyn RngProvider) -> Result<Vec<u8>, CoreError> {
     opaque_record(
         CT_APPLICATION_DATA,

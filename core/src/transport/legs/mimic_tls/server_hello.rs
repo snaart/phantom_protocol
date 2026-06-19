@@ -10,10 +10,6 @@
 //! a matching ServerHello. Like the ClientHello, the `key_share` bytes are fresh
 //! random theater; the real key exchange is the inner Phantom session.
 
-// PR-2 lands the ServerHello synth; its live consumer is the leg's server prelude
-// (PR-3). Until then it is exercised only by this module's tests.
-#![allow(dead_code)]
-
 use crate::crypto::rng::RngProvider;
 use crate::errors::CoreError;
 
