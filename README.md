@@ -16,7 +16,9 @@ signatures — FIPS 203 / FIPS 204, pure Rust) with a transport layer: TCP /
 WebSocket sessions and a native reliable-UDP transport (PhantomUDP), plus
 WASI / embedded byte-stream framing. Cross-language bindings via UniFFI
 (Python, Swift, Kotlin, C); native WASM target; bare-metal `EmbeddedLeg` for
-no_std. (A DPI-mimicry transport mode is planned, not yet built.)
+no_std. (An optional TLS-over-TCP DPI-mimicry transport — `mimicry` feature —
+makes a flow look like HTTPS to passive DPI; anti-DPI obfuscation only, detectable
+by active probing — see [Status & limitations](#status--limitations).)
 
 > **Pre-1.0 (`0.1.1`).** Wire format may break between minors; SemVer kicks in at
 > 1.0. 0 workspace warnings, 0 `unsafe` outside three audited opt-ins, MSRV Rust
@@ -53,8 +55,11 @@ or `cargo add phantom-protocol`. API docs: <https://docs.rs/phantom-protocol>.
   congestion control, and connection migration with no extra crypto layer (see
   [Status & limitations](#status--limitations)). The earlier experimental
   KCP / FakeTLS legs and the unused `TransportLeg` multipath trait were removed
-  pending that work; FakeTLS-style HTTP traffic mimicry will return as a
-  dedicated mode.
+  pending that work. TLS traffic mimicry returned as the optional **`mimicry`
+  feature** — a TLS-over-TCP `MimicTlsLeg` (`connect_pinned_mimic` / `bind_mimic`)
+  that makes a flow look like HTTPS to passive DPI + JA3/JA4 fingerprinting. It is
+  anti-DPI obfuscation only and is **detectable by active probing** — see
+  [Status & limitations](#status--limitations).
 - **Multi-stream** — strict-priority scheduler, `WINDOW_UPDATE` per-stream
   flow control, BBRv2-inspired pacing (Startup / Drain / ProbeBW / ProbeRTT /
   FastRecovery).
@@ -427,9 +432,19 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   experimental KCP / FakeTLS legs and the unused `TransportLeg` multipath trait
   were removed (never wired into the data plane). Roadmap: prove single-path UDP
   loss recovery → seamless connection migration (one live path at a time, for
-  Wi-Fi↔cellular handoff without re-handshake) → a DPI-mimicry transport mode.
-  Bandwidth *aggregation* across transports is **not** planned — analysis showed
-  it regresses for this workload and harms unobservability.
+  Wi-Fi↔cellular handoff without re-handshake). Bandwidth *aggregation* across
+  transports is **not** planned — analysis showed it regresses for this workload
+  and harms unobservability.
+- **TLS-mimicry transport (`mimicry` feature, off by default).** A `MimicTlsLeg`
+  makes a Phantom flow look like ordinary HTTPS (a synthetic TLS 1.3 handshake,
+  then the session inside ApplicationData records) to defeat DPI that blocks
+  unknown/high-entropy traffic. **The outer TLS is anti-DPI obfuscation only** —
+  the handshake is theater (no real ECDHE/cert) and holds no keys; the inner
+  Phantom PQ session is the sole auth/conf. **It defeats parsers, not provers:** a
+  determined active-probing censor that completes a real TLS handshake detects it
+  in one round trip, and against such an adversary it is net-negative. Use only
+  where the threat is passive/commercial DPI, not active probing. Honest residuals
+  + SAFE/UNSAFE guidance in [`docs/security/threat-model.md`](docs/security/threat-model.md) §6.1.
 - **Mobile connection migration (Wi-Fi ↔ LTE): reconnect with 0-RTT, not
   `migrate()`.** `PhantomSession.migrate()` is on the FFI surface, but it is a
   no-op over the TCP transport the bindings use (real single-socket migration is

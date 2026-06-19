@@ -1118,13 +1118,40 @@ network attacker cannot learn anything from the shape of the failure.
 - `SessionId`, `HybridKeyPackage`, `HybridVerifyingKey`, `HybridCiphertext`,
   `HybridSignature` derive `BorshSerialize + BorshDeserialize`; their on-wire
   bytes are the concatenation of their internal fields in declaration order.
-> **Note (Phase 0):** the FakeTLS leg was removed; this section is retained for the planned HTTP-mimicry transport mode.
+> **Note (Phase 0 → mimicry feature):** the original FakeTLS leg was removed in
+> Phase 0. Active TLS mimicry returned as the optional **`mimicry` feature** — a
+> `MimicTlsLeg` (`bind_mimic` / `connect_pinned_mimic`) that wraps the Phantom
+> session in a *synthetic* TLS 1.3 flow (see below). The `"phantom-faketls-*-v1"`
+> KDF labels in § 3 are vestigial — the new leg is **framing-only with no outer
+> AEAD**, so it derives no outer keys.
 
-- FakeTLS outer obfuscation (Invariant 3) uses per-record counter nonces and
-  direction-keyed AEAD derived from a public `(SNI || version)` seed via the
-  `"phantom-faketls-*-v1"` labels (§ 3). It is anti-DPI obfuscation only — the
-  inner Phantom Protocol session provides real auth/conf; the seed is intentionally
-  public.
+### 9.1 TLS-mimicry leg (`mimicry` feature)
+
+Unlike the inner Phantom wire (a bare UDP `PhantomPacket`), the `MimicTlsLeg` is an
+**outer, leg-local framing over TCP** — it does **not** change `WIRE_VERSION` or the
+inner packet format. A connection looks like ordinary HTTPS:
+
+1. **Synthetic TLS 1.3 handshake (theater).** Client sends a Chrome-shaped
+   `ClientHello` (`0x16`, legacy_record_version `0x0301`; realistic JA3/JA4, GREASE,
+   per-connection-random `random` / `session_id` / `key_share` / extension order).
+   Server answers a `ServerHello` (`0x16` `0x0303`) **synthesized from the parsed
+   ClientHello** (echoes an offered cipher + an offered `key_share` group of the
+   correct point length, copies `legacy_session_id`, selects TLS 1.3 via
+   `supported_versions`), then `ChangeCipherSpec` (`14 03 03 00 01 01`), an opaque
+   "encrypted" server flight (`0x17`, random ~1.5–4 KB), and a NewSessionTicket-shaped
+   `0x17` record. Client replies `ChangeCipherSpec` + an opaque Finished (`0x17`).
+   **No real ECDHE, no certificate** — the bytes are theater.
+2. **Data phase.** Each Phantom message is framed `msg_len(4 BE) ‖ message` into a
+   byte-stream, chunked into TLS ApplicationData records (`0x17 0x0303 len fragment`,
+   `len ≤ 2^14`), each fragment `chunk_len(2 BE) ‖ chunk ‖ pad`. Records decouple from
+   message boundaries (a message may span records; a record may pad). The inner
+   Phantom ciphertext is already AEAD-sealed and indistinguishable from random — what
+   a TLS ApplicationData payload looks like — so there is **no second/outer AEAD**.
+
+The outer TLS is **anti-DPI obfuscation only** and is **detectable by active
+probing** (a probe that completes a real TLS handshake / validates a certificate
+fails in one RTT). See `docs/security/threat-model.md` §6.1 for the honest residuals
+(R1–R8) and SAFE/UNSAFE deployment guidance.
 
 ---
 
