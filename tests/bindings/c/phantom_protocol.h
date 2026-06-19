@@ -2,7 +2,7 @@
  * phantom_protocol.h — C-language FFI declarations for Phantom Protocol (libphantom_protocol)
  *
  * Phantom Protocol is a post-quantum-secure L4/L6 transport library (Rust).
- * It exposes a foreign-function-interface through Mozilla UniFFI 0.29's
+ * It exposes a foreign-function-interface through Mozilla UniFFI 0.31's
  * `setup_scaffolding!()` macro, which emits a stable `extern "C"` surface
  * in the produced `cdylib`. This file declares the symbols of that surface
  * for use from C / C++ programs that link against the produced
@@ -16,7 +16,7 @@
  * intended for low-level / embedded callers (or as a starting point for
  * a custom generator).
  *
- * The calling convention follows UniFFI 0.29 "contract version 29". The
+ * The calling convention follows UniFFI 0.31 "contract version 30". The
  * runtime contract version reported by the dylib MUST match what the
  * caller expects; check it via `ffi_phantom_protocol_uniffi_contract_version`
  * at startup.
@@ -580,7 +580,7 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(
  *    returns `uint16_t`; higher-level bindings invoke them at load
  *    time to detect ABI drift.
  *
- *  - The shape (UniFFI 0.29, contract 29) is current as of phantom_protocol
+ *  - The shape (UniFFI 0.31, contract 30) is current as of phantom_protocol
  *    0.1.1. If you bump the UniFFI dependency, regenerate this header.
  * ==================================================================== */
 

@@ -56,8 +56,9 @@ inside the `phantom.handshake.*` span, so the trace context is on
 recording site.
 
 **Reservoir configuration required.** Exemplar reservoirs are not enabled
-by default in `opentelemetry_sdk` 0.28. Until the embedder configures one
-on the `MeterProvider`, histograms record normally but emit no exemplars.
+by default in `opentelemetry_sdk` 0.32 (the version this crate pins, with
+`tracing-opentelemetry` 0.33). Until the embedder configures one on the
+`MeterProvider`, histograms record normally but emit no exemplars.
 The reference `server/src/telemetry.rs` does not yet configure a reservoir;
 treat exemplar drill-down as "available once the reservoir is wired", not
 as on-by-default. The Grafana dashboard's `exemplar: true` query flags are
@@ -82,14 +83,14 @@ Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(0.01)))
 
 The library never emits unbounded attribute values as span fields:
 
-- `client_ip` is the peer's IP address. **It is logged via `tracing`'s
-  field machinery (intended for human-readable structured logs)** but
-  must NOT be promoted to an OTel attribute that becomes a metric label.
-  The `OpenTelemetryLayer` honors this — span fields are span attributes,
-  not metric labels. If you write custom metrics in an embedder, do not
-  read `client_ip` as a label.
+- `client_ip` is the peer's IP address. The library deliberately **never
+  emits it on a span** — it is correlatable PII, and the always-on
+  handshake span omits it explicitly (the DoS gate already has the IP
+  in-band, so it never needs to leak into a trace). Naturally, it is also
+  never an OTel metric label. If you write custom metrics or spans in an
+  embedder, do not read `client_ip` as a label.
 
-- `session_id` is similarly span-scoped and never a metric attribute.
+- `session_id` is similarly never a span field or a metric attribute.
 
 See `docs/observability/refactor-plan.md` §4 "Cardinality contract" for the
 full policy.

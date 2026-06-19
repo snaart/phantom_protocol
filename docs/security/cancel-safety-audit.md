@@ -190,12 +190,18 @@ let server_hello = loop {
 
 **Verdict:** ✅ cancel-safe.
 
-### `transport/legs/faketls.rs::do_client_handshake` / `do_server_handshake`
+### `transport/legs/mimic_tls/leg.rs::connect` / `accept`
 
-Looking at the leg's handshake code (FakeTLS record exchange — pre-
-Phantom Protocol handshake): straight-line `read_exact` / `write_all`. No
-`select!`. Same logic as above — cancel mid-`.await` leaves the TCP
-connection in a state where the next handshake attempt will reset.
+The optional anti-DPI mimicry leg's prelude (a TLS-1.3-shaped record
+exchange that precedes the real Phantom handshake — anti-fingerprinting
+obfuscation only, not confidentiality). Both `MimicTlsLeg::connect` and
+`MimicTlsLeg::accept` are straight-line `write_all` / `flush` /
+`read_one_record` (which loops on `reader.read(..).await`); no `select!`.
+The whole prelude future is wrapped in a single `tokio::time::timeout`
+(`PRELUDE_DEADLINE`), which is itself cancel-safe — a dropped `timeout`
+future advances no state. Cancel mid-`.await` leaves the TCP connection
+in a state where the next attempt resets; the inner Phantom session has
+not yet been established, so no session state can be stranded.
 
 **Verdict:** ✅ cancel-safe.
 
