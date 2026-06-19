@@ -41,3 +41,9 @@ pub mod server_hello;
 /// opaque records, lifecycle records) and consumes the counterpart's records.
 /// PR-2 — assembled into the leg's connect/accept in PR-3.
 pub mod theater;
+
+/// `MimicTlsLeg` — the `SessionTransport` that ties the record layer and the
+/// handshake theater into a TLS-over-TCP active-mimicry transport. PR-3.
+pub mod leg;
+
+pub use leg::{MimicConfig, MimicTlsLeg};

@@ -3151,6 +3151,53 @@ pub async fn connect_pinned(
     Ok(Arc::new(session))
 }
 
+/// Connect to a pinned server over the **TLS-over-TCP active-mimicry** transport
+/// (`mimicry` feature) — the flow looks like an ordinary HTTPS handshake to an
+/// on-path observer, while the real authentication / confidentiality remains the
+/// inner Phantom post-quantum session.
+///
+/// `sni` is the cover domain presented in the synthetic ClientHello. It is
+/// **required and should be rotated** per connection and kept plausible for the
+/// server's IP/AS — a single network-wide default SNI is itself a blocklist key.
+///
+/// **The outer TLS is anti-DPI obfuscation only, and is detectable by active
+/// probing.** It defeats stateless DPI + passive JA3/JA4 fingerprinting + light
+/// stateful inspection, but a censor that completes a real TLS handshake or
+/// validates a certificate detects it in one round trip — do **not** use this
+/// where active probing is in the threat model. See `docs/security/threat-model.md`.
+///
+/// Rust-only and native-only, gated on the `mimicry` feature.
+#[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+pub async fn connect_pinned_mimic(
+    host: String,
+    port: u16,
+    pinned_key: Vec<u8>,
+    sni: String,
+) -> Result<Arc<PhantomSession>, CoreError> {
+    #[cfg(feature = "fips")]
+    crate::crypto::self_tests::ensure_post_passed()
+        .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
+
+    let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
+        .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
+
+    let addr = format!("{}:{}", host, port);
+    let stream = tokio::net::TcpStream::connect(&addr)
+        .await
+        .map_err(|e| CoreError::NetworkError(format!("connect {}: {}", addr, e)))?;
+
+    // Run the synthetic TLS prelude before handing the leg to the background
+    // handshake pump (the leg is ready for `send_bytes`/`recv_bytes` once this
+    // returns). A prelude failure (e.g. an unreachable / non-mimic server) aborts
+    // the connect.
+    let config = crate::transport::legs::mimic_tls::MimicConfig::new(sni);
+    let transport =
+        crate::transport::legs::mimic_tls::MimicTlsLeg::connect(stream, &config).await?;
+
+    let session = PhantomSession::connect_with_transport(&addr, transport, expected_server_key);
+    Ok(Arc::new(session))
+}
+
 /// Connect to a pinned server with a **0-RTT resumption attempt** — the
 /// resumption-aware analogue of [`connect_pinned`].
 ///
