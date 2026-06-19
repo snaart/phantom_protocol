@@ -10,6 +10,23 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **TLS-over-TCP active mimicry transport (`mimicry` cargo feature, off by default).** A new
+  `MimicTlsLeg` makes a Phantom flow look like ordinary HTTPS to an on-path observer: the client
+  (`connect_pinned_mimic`) and server (`PhantomListener::bind_mimic`) perform a *synthetic* TLS 1.3
+  handshake (a Chrome-shaped ClientHello with realistic JA3/JA4 + a per-connection ServerHello
+  synthesized to be self-consistent with it, ChangeCipherSpec, opaque flight + lifecycle records),
+  then carry the existing Phantom session inside TLS ApplicationData records. **No `WIRE_VERSION`
+  change** — it is outer, leg-local framing; the inner packet wire is untouched.
+  - **The outer TLS is anti-DPI obfuscation ONLY and is detectable by active probing.** The handshake
+    is cryptographic theater (no real ECDHE, no certificate) and holds no keys — all auth / conf /
+    integrity remain the inner Phantom post-quantum session; the records are framing-only (no second
+    AEAD, since the inner ciphertext is already indistinguishable from random). It **defeats parsers,
+    not provers**: SAFE against stateless DPI + passive JA3/JA4 fingerprinting + light stateful
+    inspection, but net-negative against a censor that completes a real TLS handshake / validates a
+    cert. The server uses a constant-timing black-hole for garbage/probe preludes. Native-only,
+    Rust-only entry points. Honest residuals (R1–R8) + SAFE/UNSAFE deployment guidance in
+    `docs/security/threat-model.md` §6.1; wire shape in `docs/protocol/PROTOCOL.md` §9.1.
+
 - **Mobile sample apps (`examples/mobile/`).** Two runnable client samples embedding the SDK via
   its UniFFI bindings: an iOS SwiftUI app (`examples/mobile/ios/`, SwiftPM) and an Android Jetpack
   Compose app (`examples/mobile/android/`, Gradle). Both demonstrate pinned connect, 0-RTT
