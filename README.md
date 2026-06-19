@@ -49,17 +49,18 @@ or `cargo add phantom-protocol`. API docs: <https://docs.rs/phantom-protocol>.
   ticket, best-effort fallback to a 1-RTT handshake when the ticket is
   unknown / expired or the blob fails to open.
 - **Mid-session rekey** — HKDF ratchet, `REKEY` flag + per-packet `epoch`.
-- **Transports** — `PhantomSession` runs an authenticated session over **TCP**
-  and **WebSocket** today (plus WASI and Embedded as framing legs). A native
-  reliable-UDP transport (**PhantomUDP**) is in development to add multi-path,
-  congestion control, and connection migration with no extra crypto layer (see
-  [Status & limitations](#status--limitations)). The earlier experimental
-  KCP / FakeTLS legs and the unused `TransportLeg` multipath trait were removed
-  pending that work. TLS traffic mimicry returned as the optional **`mimicry`
-  feature** — a TLS-over-TCP `MimicTlsLeg` (`connect_pinned_mimic` / `bind_mimic`)
-  that makes a flow look like HTTPS to passive DPI + JA3/JA4 fingerprinting. It is
-  anti-DPI obfuscation only and is **detectable by active probing** — see
-  [Status & limitations](#status--limitations).
+- **Transports** — `PhantomSession` runs an authenticated session over **TCP**,
+  **WebSocket**, and a native **reliable-UDP transport (PhantomUDP)**:
+  connection-ID demux, SACK loss recovery + RFC-9002 fast-retransmit, a BBR-style
+  congestion controller, and **seamless connection migration** (one live path at
+  a time — Wi-Fi↔cellular without a re-handshake), all with no extra crypto layer.
+  WASI and Embedded ride as framing legs. An optional **`mimicry`** feature
+  (a TLS-over-TCP `MimicTlsLeg` — `connect_pinned_mimic` / `bind_mimic`) makes a
+  flow look like HTTPS to passive DPI + JA3/JA4 fingerprinting; it is
+  **anti-DPI obfuscation only and is detectable by active probing**
+  (see [Status & limitations](#status--limitations)). Bandwidth *aggregation*
+  across transports is deliberately not pursued. The UDP data plane is validated
+  over a fault-injection rig but not yet soak-tested in the wild.
 - **Multi-stream** — strict-priority scheduler, `WINDOW_UPDATE` per-stream
   flow control, BBRv2-inspired pacing (Startup / Drain / ProbeBW / ProbeRTT /
   FastRecovery).
