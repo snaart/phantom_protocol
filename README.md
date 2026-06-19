@@ -4,7 +4,7 @@
 [![docs.rs](https://img.shields.io/docsrs/phantom-protocol)](https://docs.rs/phantom-protocol)
 [![CI](https://github.com/snaart/phantom_protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/snaart/phantom_protocol/actions/workflows/ci.yml)
 [![license](https://img.shields.io/crates/l/phantom-protocol.svg)](LICENSE)
-![MSRV](https://img.shields.io/badge/MSRV-1.75-blue)
+![MSRV](https://img.shields.io/badge/MSRV-1.93-blue)
 
 Post-quantum-secure L4/L6 universal transport framework in Rust.
 
@@ -22,7 +22,7 @@ by active probing — see [Status & limitations](#status--limitations).)
 
 > **Pre-1.0 (`0.1.1`).** Wire format may break between minors; SemVer kicks in at
 > 1.0. 0 workspace warnings, 0 `unsafe` outside three audited opt-ins, MSRV Rust
-> 1.75, CI green across the full cross-target matrix. See
+> 1.93, CI green across the full cross-target matrix. See
 > [Status & limitations](#status--limitations).
 
 ## Install
@@ -369,10 +369,11 @@ Full threat model, mitigations, and disclosure policy are in
 - **AEAD nonce-exhaustion guard** — `CryptoError::NonceExhausted` at
   `AEAD_MAX_INVOCATIONS = 2^48`.
 - **`ZeroizeOnDrop` on all key-bearing structs**; `#![deny(unsafe_code)]`
-  crate-wide with one audited opt-in (`transport/udp_transport.rs` for libc
-  GSO / `recvmmsg`).
+  crate-wide with three audited opt-ins (`transport/udp_transport.rs` libc
+  `setsockopt` pacing, `transport/legs/websocket.rs` wasm-bindgen glue,
+  `transport/legs/wasi.rs` WIT-bindgen `Send`/`Sync`).
 - Cancel-safety audit: zero bugs found across all `tokio::select!` sites.
-- 6 documented production panic sites with `PANIC-SAFETY:` invariants — see
+- Documented production panic sites with `PANIC-SAFETY:` invariants — see
   [`docs/security/panic-sites.md`](docs/security/panic-sites.md).
 
 ### FIPS 140-3 / Common Criteria — exploratory only, NOT validated
@@ -411,30 +412,32 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 ## Status & limitations
 
 > **Maturity: early. Not production-ready.** This is a single implementation
-> with **no external security audit**. The cryptographic handshake and identity
-> layer are implemented and well-tested; the **data plane is the unfinished
-> part** — the UDP transport's reliability (loss recovery) has **not yet been
-> exercised against real packet loss** (see below). Do not protect anything
-> high-risk with this until it has been independently audited and the loss-
-> recovery path is validated.
+> with **no external security audit**. The cryptographic handshake + identity
+> layer and the UDP data plane (SACK loss recovery, congestion control,
+> connection migration) are implemented and tested — the data plane against a
+> deterministic fault-injection transport (loss / reorder) and the
+> `udp_integration` loopback suite. The gating limitation is the **absence of an
+> independent security audit** and the pre-1.0 wire churn — **not** an unfinished
+> data plane. Do not protect anything high-risk with this until it has been
+> independently audited and soak-tested on real networks.
 
 - **Pre-1.0 (`0.1.1`).** Wire format may break between minors; SemVer applies
   once 1.0 ships. The current wire protocol is a single pinned version — the
   former V1/V2/V3 axes were collapsed pre-1.0 (no users, no negotiation, no
   fallback), so there are no cross-version migration guides.
-- **Native UDP transport (PhantomUDP): handshake + demux work; loss recovery is
-  the open piece.** `PhantomSession` runs an authenticated session over TCP,
-  WebSocket, and now raw UDP (connection-ID demux, server accept, fragmented
-  handshake) — proven end-to-end on a lossless loopback. What is **not** done:
-  the UDP data plane's loss recovery has only ever run over reliable pipes and
-  has not been validated over real loss; a deterministic lossy/reordering test
-  transport (needed to validate it) is being built first. The earlier
-  experimental KCP / FakeTLS legs and the unused `TransportLeg` multipath trait
-  were removed (never wired into the data plane). Roadmap: prove single-path UDP
-  loss recovery → seamless connection migration (one live path at a time, for
-  Wi-Fi↔cellular handoff without re-handshake). Bandwidth *aggregation* across
-  transports is **not** planned — analysis showed it regresses for this workload
-  and harms unobservability.
+- **Native UDP transport (PhantomUDP): handshake + demux + reliability shipped.**
+  `PhantomSession` runs an authenticated session over TCP, WebSocket, and raw UDP
+  (connection-ID demux, server accept, fragmented handshake). The UDP data plane
+  has SACK-based loss recovery (RFC-9002-style fast-retransmit) + an RFC-6298 RTO
+  + a BBR-style congestion controller + mid-session rekey, exercised over a
+  deterministic fault-injection transport (loss / reorder —
+  `test_harness/fault_transport.rs`) and the `udp_integration` suite. **Seamless
+  connection migration** (one live path at a time, Wi-Fi↔cellular without
+  re-handshake) shipped too. The earlier experimental KCP / FakeTLS legs and the
+  unused `TransportLeg` multipath trait were removed (never wired into the data
+  plane). Bandwidth *aggregation* across transports is **not** planned — analysis
+  showed it regresses for this workload and harms unobservability. What remains:
+  real-world soak + an external audit (not lab-rig coverage).
 - **TLS-mimicry transport (`mimicry` feature, off by default).** A `MimicTlsLeg`
   makes a Phantom flow look like ordinary HTTPS (a synthetic TLS 1.3 handshake,
   then the session inside ApplicationData records) to defeat DPI that blocks
@@ -455,26 +458,26 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 - **Work deferred past 0.2.0** — hermetic/reproducible builds, the `no-std` PQ
   handshake, WASI server-side sessions, and ECN congestion feedback — is
   consolidated with rationale in [`docs/DEFERRED_WORK.md`](docs/DEFERRED_WORK.md).
-- **Loss recovery is timeout-based (no SACK) and unproven over loss.** The code
-  has an RFC-6298 RTO + retransmission + a BBR-style congestion window + mid-
-  session rekey, but this machinery was built for reliable byte pipes and has
-  **never been exercised against real packet loss/reorder** — validating it
-  (and the lossy test rig that makes that possible) is the current priority.
-  SACK / dup-ACK fast-retransmit / PTO are the next work item and need
-  security-sensitive packet-number / ACK-range fields, i.e. a deliberate
-  `WIRE_VERSION` bump.
-- **Negative-security suite: 33 always-on tests** in
+- **Loss recovery: SACK + fast-retransmit, validated over a fault rig (not yet in
+  the wild).** The UDP data plane has RFC-9002-style SACK + dup-ACK
+  fast-retransmit, an RFC-6298 RTO, a BBR-style congestion window, and
+  mid-session rekey. It is exercised by `udp_integration` over
+  `test_harness/fault_transport.rs` (injected loss + reorder), but has **not**
+  been hardened against real-world adversarial network conditions or externally
+  reviewed — treat the data plane as functional-but-not-battle-tested.
+- **Negative-security suite: 58 always-on tests** in
   `core/tests/security_invariants.rs`, pinning every documented invariant.
   Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
-  282 library unit tests, and `#[ignore]`-gated loopback integration suites
-  (TCP, UDP, WASI). 0 workspace warnings, 0 clippy warnings. **Note:** broad
-  test coverage is *not* the same as a validated transport — none of these
-  exercise the data plane under real loss yet (see the loss-recovery item above).
+  400+ library unit tests, and `#[ignore]`-gated loopback integration suites
+  (TCP, UDP — including injected loss/reorder via the fault transport — WASI,
+  TLS-mimicry). 0 workspace warnings, 0 clippy warnings. **Note:** broad test
+  coverage + a fault-injection rig is *not* a substitute for an external security
+  audit or a real-world soak.
 - **Broad feature coverage across the planned phases, but not production-ready.**
-  The handshake/identity/observability/cross-target work is largely in place;
-  the data plane (UDP loss recovery) is the unfinished, unvalidated piece, and
-  there has been no external security audit or CMVP/CC validation. Formal
-  verification (ProVerif / Tamarin) and an external audit are open, not done.
+  The handshake / identity / data-plane / observability / cross-target work is in
+  place and tested; what remains open is an **external security audit**, CMVP/CC
+  validation, formal verification (ProVerif / Tamarin), and a real-world soak —
+  none done.
 - **`PhantomListener::bind()` generates a fresh signing key per process** —
   identities don't survive restart. Pin-stable production deployments must use
   `bind_with_signing_key()` with a key loaded from disk (`phantom-cli keygen`
@@ -482,8 +485,8 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 - **The library ships no HTTP server.** The library exposes OTel
   instruments; embedders configure the exporter. `server/src/telemetry.rs`
   is the reference OTLP/gRPC wiring.
-- **MSRV: Rust 1.75.** `cli/` uses edition 2024 and builds on stable but not
-  on the 1.75 gate.
+- **MSRV: Rust 1.93** (raised from 1.75 — the PQ crates pull `pkcs8 0.11` →
+  edition2024 → Rust ≥1.85; the CI gate is 1.93). `cli/` uses edition 2024.
 - **7 fuzz harnesses**, run in CI (`.github/workflows/fuzz.yml`: 60 s per target
   per PR, 600 s nightly). Fuzzing needs nightly; only `fuzz_embedded_framing`'s
   body also compiles on stable.

@@ -24,7 +24,7 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
     not provers**: SAFE against stateless DPI + passive JA3/JA4 fingerprinting + light stateful
     inspection, but net-negative against a censor that completes a real TLS handshake / validates a
     cert. The server uses a constant-timing black-hole for garbage/probe preludes. Native-only,
-    Rust-only entry points. Honest residuals (R1–R8) + SAFE/UNSAFE deployment guidance in
+    Rust-only entry points. Honest residuals + SAFE/UNSAFE deployment guidance in
     `docs/security/threat-model.md` §6.1; wire shape in `docs/protocol/PROTOCOL.md` §9.1.
 
 - **Mobile sample apps (`examples/mobile/`).** Two runnable client samples embedding the SDK via

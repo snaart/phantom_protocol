@@ -1151,7 +1151,8 @@ inner packet format. A connection looks like ordinary HTTPS:
 The outer TLS is **anti-DPI obfuscation only** and is **detectable by active
 probing** (a probe that completes a real TLS handshake / validates a certificate
 fails in one RTT). See `docs/security/threat-model.md` §6.1 for the honest residuals
-(R1–R8) and SAFE/UNSAFE deployment guidance.
+(active-probing, template-drift, SNI-coherence, flow-shape) and SAFE/UNSAFE
+deployment guidance.
 
 ---
 
