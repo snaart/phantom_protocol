@@ -85,7 +85,7 @@ fn opaque_record(
 
 /// Build the cleartext ClientHello record (`0x16`, legacy_record_version `0x0301`).
 pub(crate) fn client_hello_record(sni: &str, rng: &dyn RngProvider) -> Result<Vec<u8>, CoreError> {
-    let ch = client_hello::build_client_hello(sni, rng);
+    let ch = client_hello::build_client_hello(sni, rng)?;
     let mut out = Vec::with_capacity(TLS_RECORD_HEADER_LEN + ch.len());
     encode_record(CT_HANDSHAKE, VER_TLS10, &ch, &mut out)?;
     Ok(out)

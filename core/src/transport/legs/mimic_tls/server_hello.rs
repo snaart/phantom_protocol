@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn server_hello_is_consistent_with_the_client_hello() {
-        let ch = build_client_hello("consistency.test", &OsRng);
+        let ch = build_client_hello("consistency.test", &OsRng).expect("build");
         let parsed = parse_client_hello(&ch).expect("parse our own CH");
         let sh = build_server_hello(&parsed, &OsRng).expect("build SH");
         let (cipher, sid, version, group) = reparse_server_hello(&sh).expect("reparse SH");
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn rejects_a_truncated_client_hello() {
-        let ch = build_client_hello("x.test", &OsRng);
+        let ch = build_client_hello("x.test", &OsRng).expect("build");
         // Lop off the last 10 bytes — the length fields no longer close.
         let truncated = &ch[..ch.len() - 10];
         assert!(parse_client_hello(truncated).is_err());

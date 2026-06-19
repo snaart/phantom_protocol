@@ -22,6 +22,7 @@
 //! before relying on it in a hostile network (R3 in the design doc).
 
 use crate::crypto::rng::RngProvider;
+use crate::errors::CoreError;
 
 /// Marker for the Chrome shape this profile parrots (`YYYYMM`). Bump it when the
 /// profile is refreshed from a real capture; [`profile_is_fresh`] compares against
@@ -31,6 +32,13 @@ pub(crate) const PROFILE_CAPTURED: u32 = 202506;
 /// Cleartext TLS 1.3 legacy fields.
 const TLS_LEGACY_VERSION: u16 = 0x0303; // ClientHello.legacy_version
 const HS_TYPE_CLIENT_HELLO: u8 = 0x01;
+
+/// Max cover-SNI length (RFC 1035 §2.3.4 — a DNS name is ≤ 253 octets). The cover
+/// domain is operator-supplied (`MimicConfig`), not network input; this bound both
+/// keeps the ClientHello realistic and guarantees the `server_name` length never
+/// overflows the `u16` record/extension length fields (a longer SNI would either
+/// truncate to garbage or read as a non-browser fingerprint).
+const MAX_SNI_LEN: usize = 253;
 
 // ── Extension type codepoints (RFC 8446 / IANA) ─────────────────────────────
 const EXT_SERVER_NAME: u16 = 0x0000;
@@ -139,8 +147,17 @@ fn extension(ext_type: u16, data: &[u8]) -> Vec<u8> {
 }
 
 /// Build the synthetic ClientHello **handshake message** (`type ‖ u24 len ‖ body`)
-/// for `sni`. `rng` supplies every per-connection field.
-pub(crate) fn build_client_hello(sni: &str, rng: &dyn RngProvider) -> Vec<u8> {
+/// for `sni`. `rng` supplies every per-connection field. Errors if `sni` exceeds
+/// [`MAX_SNI_LEN`] — rather than silently truncating the `server_name` length
+/// field into a malformed (and instantly-fingerprintable) ClientHello.
+pub(crate) fn build_client_hello(sni: &str, rng: &dyn RngProvider) -> Result<Vec<u8>, CoreError> {
+    if sni.len() > MAX_SNI_LEN {
+        return Err(CoreError::ValidationError(format!(
+            "mimic cover SNI too long: {} > {} bytes",
+            sni.len(),
+            MAX_SNI_LEN
+        )));
+    }
     // Per-connection GREASE codepoints (distinct slots; Chrome reuses some — a
     // capture-refresh refinement).
     let grease_cipher = grease_value(rng);
@@ -316,7 +333,7 @@ pub(crate) fn build_client_hello(sni: &str, rng: &dyn RngProvider) -> Vec<u8> {
     msg.push((len >> 8) as u8);
     msg.push(len as u8);
     msg.extend_from_slice(&body);
-    msg
+    Ok(msg)
 }
 
 /// Padding extension to keep the ClientHello length out of the 256–511-byte F5 bug
@@ -476,7 +493,8 @@ mod tests {
     #[test]
     fn client_hello_is_structurally_self_consistent() {
         let (cs, groups, ks_groups, sid, ext_types) =
-            reparse(&build_client_hello("example.com", &OsRng)).expect("must re-parse cleanly");
+            reparse(&build_client_hello("example.com", &OsRng).expect("build"))
+                .expect("must re-parse cleanly");
         // Session id is the 32-byte TLS-1.3 value.
         assert_eq!(sid.len(), 32);
         // Every key_share group (minus GREASE) is offered in supported_groups.
@@ -512,8 +530,8 @@ mod tests {
 
     #[test]
     fn per_connection_fields_are_fresh() {
-        let a = build_client_hello("example.com", &OsRng);
-        let b = build_client_hello("example.com", &OsRng);
+        let a = build_client_hello("example.com", &OsRng).expect("build");
+        let b = build_client_hello("example.com", &OsRng).expect("build");
         // Two ClientHellos to the same SNI must differ (random / session_id /
         // key_share / GREASE / order are all per-connection) — no constant tell.
         assert_ne!(
@@ -525,7 +543,7 @@ mod tests {
     #[test]
     fn key_share_lengths_match_their_groups() {
         // Re-walk key_share and assert each share's length matches the group.
-        let msg = build_client_hello("a.test", &OsRng);
+        let msg = build_client_hello("a.test", &OsRng).expect("build");
         let mut p = Parser::new(&msg);
         p.u8().unwrap();
         p.u24().unwrap();
@@ -571,5 +589,18 @@ mod tests {
             !profile_is_fresh(stale, 6),
             "an 18-month-old profile must read stale"
         );
+    }
+
+    /// An oversized cover SNI is rejected with a typed error rather than silently
+    /// truncating the `server_name` length into a malformed ClientHello.
+    #[test]
+    fn rejects_oversized_sni() {
+        let huge = "a".repeat(MAX_SNI_LEN + 1);
+        assert!(
+            build_client_hello(&huge, &OsRng).is_err(),
+            "an SNI longer than {MAX_SNI_LEN} bytes must error"
+        );
+        // A realistic cover domain is accepted.
+        assert!(build_client_hello("www.example-cdn.com", &OsRng).is_ok());
     }
 }
