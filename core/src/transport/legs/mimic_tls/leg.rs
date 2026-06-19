@@ -173,6 +173,7 @@ impl MimicTlsLeg {
     /// connection open and silent until the prelude deadline, then drops it — the
     /// black-hole posture (no eager RST / alert that would distinguish the mimic).
     pub async fn accept(stream: TcpStream, config: &MimicConfig) -> Result<Self, CoreError> {
+        let started = std::time::Instant::now();
         let _ = stream.set_nodelay(true);
         let _ = config; // server does not present an SNI; kept for symmetry/future use
         let (mut reader, mut writer) = stream.into_split();
@@ -202,13 +203,17 @@ impl MimicTlsLeg {
                 deframer.push(&leftover);
                 Ok(Self::from_halves(reader, writer, deframer))
             }
-            // Prelude failed or timed out: black-hole. Drain silently until the
-            // deadline elapses, then drop — an unauthenticated probe sees a server
-            // that spoke its flight (if it got that far) then went idle, not a
-            // distinguishable error. Constant-ish hold regardless of which check
-            // failed (the design's best-achievable probe posture; residual R1).
+            // Prelude failed or timed out: black-hole. Drain silently until the same
+            // wall-clock deadline measured from connection start (NOT a fresh
+            // window), so the total time-to-drop is ~PRELUDE_DEADLINE regardless of
+            // WHERE the prelude failed — a fast garbage-CH reject and a slow trickle
+            // both hold ~10 s, not 10 s vs 20 s. That constant timing is the point:
+            // an unauthenticated probe sees a server that went idle after the same
+            // interval, not a distinguishable error. (Design's best-achievable
+            // probe posture; active probing is still the honest R1 residual.)
             Ok(Err(_)) | Err(_) => {
-                black_hole(reader).await;
+                let remaining = PRELUDE_DEADLINE.saturating_sub(started.elapsed());
+                black_hole(reader, remaining).await;
                 Err(CoreError::ConnectionClosed)
             }
         }
@@ -222,10 +227,12 @@ impl MimicTlsLeg {
     }
 }
 
-/// Drain the read half silently until the prelude deadline, then return (dropping
-/// the socket). No bytes are written — the connection simply goes idle and closes,
-/// the black-hole posture for an unauthenticated probe.
-async fn black_hole(mut reader: OwnedReadHalf) {
+/// Drain the read half silently for `remaining` (the budget left from the
+/// connection's prelude deadline), then return (dropping the socket). No bytes are
+/// ever written — the connection simply goes idle and closes, the black-hole
+/// posture for an unauthenticated probe. `remaining` is the *residual* budget so
+/// the total hold is constant regardless of when the prelude failed.
+async fn black_hole(mut reader: OwnedReadHalf, remaining: Duration) {
     let mut scratch = [0u8; 4096];
     let drain = async {
         // Read-and-discard until the peer closes; the outer timeout bounds it.
@@ -236,7 +243,7 @@ async fn black_hole(mut reader: OwnedReadHalf) {
             }
         }
     };
-    let _ = tokio::time::timeout(PRELUDE_DEADLINE, drain).await;
+    let _ = tokio::time::timeout(remaining, drain).await;
 }
 
 impl SessionTransport for MimicTlsLeg {
