@@ -30,12 +30,6 @@
 //! reading exactly `len` bytes. A flood of empty (`chunk_len == 0`) records that
 //! make no forward progress is bounded and rejected (livelock defense).
 
-// The record codec lands before its live consumer, `MimicTlsLeg`. Until the
-// leg is wired, the encode/de-frame API is exercised only by this module's tests, so
-// the non-test lib build sees it as dead code. This allow is removed when the leg
-// lands and these items gain a non-test caller.
-#![allow(dead_code)]
-
 use bytes::{Buf, Bytes, BytesMut};
 
 use crate::errors::CoreError;
