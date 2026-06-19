@@ -75,6 +75,12 @@ pub struct PhantomListener {
     /// The background acceptor task — lazily started on the first `accept()`,
     /// aborted on `Drop`. `Mutex<Option<_>>` makes the start one-shot.
     acceptor: parking_lot::Mutex<Option<SpawnHandle>>,
+    /// When `Some`, each accepted TCP stream is wrapped in a `MimicTlsLeg`
+    /// (TLS-over-TCP active mimicry) instead of a plain `TcpSessionTransport` — set
+    /// by [`bind_mimic`](Self::bind_mimic). The string is unused on the server side
+    /// of the leg (the server presents no SNI) but its presence selects the mimic
+    /// accept path. Always `None` unless the `mimicry` feature built it.
+    mimic_sni: Option<String>,
 }
 
 // Rust-only constructors that take a non-UniFFI type (`Arc<dyn Runtime>`).
@@ -88,7 +94,7 @@ impl PhantomListener {
         addr: String,
         runtime: Arc<dyn Runtime>,
     ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, runtime, None).await
+        Self::bind_inner(addr, runtime, None, None).await
     }
 
     /// Like [`bind`](Self::bind) but uses the caller-supplied long-lived
@@ -107,7 +113,7 @@ impl PhantomListener {
         addr: String,
         signing_key: HybridSigningKey,
     ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(signing_key)).await
+        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(signing_key), None).await
     }
 
     /// Composition of [`bind_with_signing_key`](Self::bind_with_signing_key)
@@ -118,7 +124,50 @@ impl PhantomListener {
         signing_key: HybridSigningKey,
         runtime: Arc<dyn Runtime>,
     ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, runtime, Some(signing_key)).await
+        Self::bind_inner(addr, runtime, Some(signing_key), None).await
+    }
+
+    /// Like [`bind`](Self::bind), but every accepted connection first runs the
+    /// **TLS-over-TCP active-mimicry** prelude (`mimicry` feature): to an on-path
+    /// observer each connection looks like an ordinary HTTPS handshake before the
+    /// inner Phantom session begins. Pairs with the client's
+    /// [`connect_pinned_mimic`](crate::api::session::connect_pinned_mimic) — both
+    /// ends must speak mimicry (this is not interop with a real TLS server).
+    ///
+    /// **The outer TLS is anti-DPI obfuscation only and is detectable by active
+    /// probing** (a probe that completes a real TLS handshake / validates a cert is
+    /// black-holed but still learns TLS never completes). Do not rely on it where
+    /// active probing is in the threat model. The server generates a fresh
+    /// signing key per process — use [`bind_with_signing_key_mimic`] for a pinned
+    /// persistent identity. Rust-only, native-only.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+    pub async fn bind_mimic(addr: String) -> Result<Arc<Self>, CoreError> {
+        // The server side of the leg presents no SNI; a non-empty marker selects
+        // the mimic accept path.
+        Self::bind_inner(
+            addr,
+            Arc::new(TokioRuntime),
+            None,
+            Some(String::from("mimic")),
+        )
+        .await
+    }
+
+    /// [`bind_mimic`](Self::bind_mimic) with a caller-supplied long-lived
+    /// [`HybridSigningKey`] so the server's pinned verifying identity persists
+    /// across restarts. Rust-only, native-only, `mimicry`-gated.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+    pub async fn bind_with_signing_key_mimic(
+        addr: String,
+        signing_key: HybridSigningKey,
+    ) -> Result<Arc<Self>, CoreError> {
+        Self::bind_inner(
+            addr,
+            Arc::new(TokioRuntime),
+            Some(signing_key),
+            Some(String::from("mimic")),
+        )
+        .await
     }
 
     /// Shared bind path. If `signing_key` is `Some`, the resulting
@@ -128,6 +177,7 @@ impl PhantomListener {
         addr: String,
         runtime: Arc<dyn Runtime>,
         signing_key: Option<HybridSigningKey>,
+        mimic_sni: Option<String>,
     ) -> Result<Arc<Self>, CoreError> {
         // Under `--features fips`, run the FIPS 140-3 §7.7 POST
         // before standing up the listener. A failure short-circuits
@@ -161,6 +211,7 @@ impl PhantomListener {
             accepted_tx,
             accepted_rx: Mutex::new(accepted_rx),
             acceptor: parking_lot::Mutex::new(None),
+            mimic_sni,
         }))
     }
 
@@ -227,7 +278,7 @@ impl PhantomListener {
     #[cfg_attr(feature = "bindings", uniffi::constructor)]
     #[tracing::instrument(name = "phantom.listener.bind", skip_all, fields(addr = %addr))]
     pub async fn bind(addr: String) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, Arc::new(TokioRuntime), None).await
+        Self::bind_inner(addr, Arc::new(TokioRuntime), None, None).await
     }
 
     /// The server's long-lived hybrid verifying key, serialized via
@@ -354,6 +405,7 @@ impl PhantomListener {
             self.shutdown_notify.clone(),
             self.runtime.clone(),
             self.observability.clone(),
+            self.mimic_sni.clone(),
         )));
         *guard = Some(handle);
     }
@@ -534,6 +586,7 @@ async fn run_acceptor(
     shutdown_notify: Arc<Notify>,
     runtime: Arc<dyn Runtime>,
     observability: Arc<Observability>,
+    mimic_sni: Option<String>,
 ) {
     let mut accept_count: u64 = 0;
     loop {
@@ -570,59 +623,112 @@ async fn run_acceptor(
         let accepted_tx = accepted_tx.clone();
         let task_runtime = runtime.clone();
         let observability = observability.clone();
+        let mimic_sni = mimic_sni.clone();
         // Drive THIS handshake in its own task so a stall never blocks the loop.
         runtime.spawn(Box::pin(async move {
             let _permit = permit; // released when this task ends
-            let transport = TcpSessionTransport::new(stream);
-            let started = Instant::now();
-            // (A) In-library handshake deadline via the Runtime clock — a stalled
-            // or byte-trickling peer is abandoned, never hanging a task forever.
-            // Scoped so the borrow of `transport` ends before it is moved into
-            // the session below.
-            let result = {
-                let hs_fut = drive_server_handshake(&transport, &hs, peer.ip());
-                let deadline = task_runtime.sleep(HANDSHAKE_DEADLINE);
-                tokio::pin!(hs_fut);
-                tokio::select! {
-                    r = &mut hs_fut => r,
-                    _ = deadline => Err(CoreError::Timeout),
+
+            // When the listener is in mimicry mode, first run the synthetic
+            // TLS-mimic prelude over the raw stream; a probe / garbage prelude is
+            // black-holed inside `accept` (silent hold-then-drop) and yields `Err`,
+            // which we drop here — no session, no distinguishable response.
+            #[cfg(feature = "mimicry")]
+            if mimic_sni.is_some() {
+                let cfg = crate::transport::legs::mimic_tls::MimicConfig::new(
+                    mimic_sni.unwrap_or_default(),
+                );
+                match crate::transport::legs::mimic_tls::MimicTlsLeg::accept(stream, &cfg).await {
+                    Ok(leg) => {
+                        serve_connection(
+                            leg,
+                            &hs,
+                            peer,
+                            &task_runtime,
+                            &observability,
+                            &accepted_tx,
+                            LegType::FakeTls,
+                        )
+                        .await
+                    }
+                    Err(_) => { /* black-holed in accept; drop silently */ }
                 }
-            };
-            match result {
-                Ok((server_session, early_data)) => {
-                    observability.record_handshake(
-                        started.elapsed(),
-                        HandshakeOutcome::Success,
-                        LegType::Tcp,
-                        AeadAlgorithm::Aes256Gcm,
-                        ProtocolVersion::Current,
-                    );
-                    let session = PhantomSession::from_accepted_server_session_with_runtime(
-                        peer.to_string(),
-                        transport,
-                        Arc::new(server_session),
-                        task_runtime.clone(),
-                        observability.clone(),
-                        LegType::Tcp,
-                    );
-                    let outcome = AcceptOutcome::new(session, early_data, peer);
-                    // Bounded hand-off; a send error means the listener was dropped.
-                    let _ = accepted_tx.send(outcome).await;
-                }
-                Err(e) => {
-                    observability.record_handshake(
-                        started.elapsed(),
-                        HandshakeOutcome::Failure,
-                        LegType::Tcp,
-                        AeadAlgorithm::Aes256Gcm,
-                        ProtocolVersion::Current,
-                    );
-                    // Dropped, not surfaced to accept(): DoS noise from a bad/
-                    // stalled peer must not block the embedder's accept loop.
-                    log::debug!("PhantomListener: server handshake failed: {}", e);
-                }
+                return;
             }
+            let _ = &mimic_sni; // (feature off: always None; silence unused)
+
+            let transport = TcpSessionTransport::new(stream);
+            serve_connection(
+                transport,
+                &hs,
+                peer,
+                &task_runtime,
+                &observability,
+                &accepted_tx,
+                LegType::Tcp,
+            )
+            .await;
         }));
+    }
+}
+
+/// Drive one accepted connection's server handshake (transport-agnostic) and, on
+/// success, hand the established session to `accept()`. Extracted so both the plain
+/// `TcpSessionTransport` and the mimicry `MimicTlsLeg` paths share one body. The
+/// in-library handshake deadline (via the `Runtime` clock) bounds a stalled peer.
+#[allow(clippy::too_many_arguments)]
+async fn serve_connection<T: SessionTransport>(
+    transport: T,
+    hs: &HandshakeServer,
+    peer: SocketAddr,
+    task_runtime: &Arc<dyn Runtime>,
+    observability: &Arc<Observability>,
+    accepted_tx: &mpsc::Sender<Arc<AcceptOutcome>>,
+    leg_type: LegType,
+) {
+    let started = Instant::now();
+    // Scoped so the borrow of `transport` ends before it is moved into the session.
+    let result = {
+        let hs_fut = drive_server_handshake(&transport, hs, peer.ip());
+        let deadline = task_runtime.sleep(HANDSHAKE_DEADLINE);
+        tokio::pin!(hs_fut);
+        tokio::select! {
+            r = &mut hs_fut => r,
+            _ = deadline => Err(CoreError::Timeout),
+        }
+    };
+    match result {
+        Ok((server_session, early_data)) => {
+            observability.record_handshake(
+                started.elapsed(),
+                HandshakeOutcome::Success,
+                leg_type,
+                AeadAlgorithm::Aes256Gcm,
+                ProtocolVersion::Current,
+            );
+            let session = PhantomSession::from_accepted_server_session_with_runtime(
+                peer.to_string(),
+                transport,
+                Arc::new(server_session),
+                task_runtime.clone(),
+                observability.clone(),
+                leg_type,
+            );
+            let outcome = AcceptOutcome::new(session, early_data, peer);
+            // Bounded hand-off; a send error means the listener was dropped.
+            let _ = accepted_tx.send(outcome).await;
+        }
+        Err(e) => {
+            observability.record_handshake(
+                started.elapsed(),
+                HandshakeOutcome::Failure,
+                leg_type,
+                AeadAlgorithm::Aes256Gcm,
+                ProtocolVersion::Current,
+            );
+            // Dropped, not surfaced to accept(): DoS noise from a bad/stalled peer
+            // must not block the embedder's accept loop.
+            log::debug!("PhantomListener: server handshake failed: {}", e);
+        }
     }
 }
 
