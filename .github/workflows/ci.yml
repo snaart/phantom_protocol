@@ -192,6 +192,11 @@ jobs:
           workspaces: "."
       - run: cargo test --manifest-path core/Cargo.toml --lib --features mimicry
       - run: cargo clippy --manifest-path core/Cargo.toml --lib --features mimicry -- -D warnings
+      # Live end-to-end loopback: bind_mimic ↔ connect_pinned_mimic, full prelude +
+      # inner PQ handshake + bidirectional data (the leg's own #[ignore] live tests
+      # ride in --lib above but are not executed without --ignored).
+      - run: cargo test --manifest-path core/Cargo.toml --features mimicry --test mimic_tls_integration -- --ignored
+      - run: cargo test --manifest-path core/Cargo.toml --features mimicry --lib mimic_tls::leg -- --ignored
 
   telemetry-otel-feature:
     name: cargo test + clippy (--features telemetry-otel)
