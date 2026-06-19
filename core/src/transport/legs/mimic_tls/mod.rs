@@ -28,3 +28,16 @@
 /// denial-of-service discipline (phase-gated caps, incremental buffering, typed
 /// errors). PR-1 — unit-tested in isolation, no sockets, no handshake prelude yet.
 pub mod record;
+
+/// Synthetic Chrome-shaped TLS 1.3 ClientHello generation (JA3/JA4 mimicry).
+/// PR-2 — the cleartext client side of the handshake theater.
+pub mod client_hello;
+
+/// Per-connection TLS 1.3 ServerHello synthesis (parses the inbound ClientHello,
+/// builds a self-consistent answer). PR-2 — the cleartext server side.
+pub mod server_hello;
+
+/// The handshake "theater": builds the one-time TLS 1.3 prelude flights (CCS,
+/// opaque records, lifecycle records) and consumes the counterpart's records.
+/// PR-2 — assembled into the leg's connect/accept in PR-3.
+pub mod theater;

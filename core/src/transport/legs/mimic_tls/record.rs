@@ -42,18 +42,19 @@ use crate::errors::CoreError;
 use crate::transport::session_transport::FramePhase;
 
 // ── TLS content types (RFC 8446 §5.1) ───────────────────────────────────────
-// The handshake/CCS/alert content types (0x16/0x14/0x15) and the 0x0301
-// ClientHello legacy_record_version belong to the handshake-theater layer and
-// land with it (PR-2); PR-1's record layer carries data, which is always
-// ApplicationData.
+/// `ChangeCipherSpec` (`0x14`) — the middlebox-compatibility record.
+pub(crate) const CT_CHANGE_CIPHER_SPEC: u8 = 0x14;
+/// `Handshake` (`0x16`) — the cleartext ClientHello / ServerHello records.
+pub(crate) const CT_HANDSHAKE: u8 = 0x16;
 /// `ApplicationData` (`0x17`) — carries the opaque server flight AND all Phantom
 /// data (in TLS 1.3 the post-ServerHello handshake is also ApplicationData-typed).
 pub(crate) const CT_APPLICATION_DATA: u8 = 0x17;
 
 // ── legacy_record_version values ────────────────────────────────────────────
-/// `0x0303` — the legacy_record_version on every record other than the initial
-/// ClientHello (ServerHello, CCS, ApplicationData), and the handshake-body
-/// legacy_version everywhere.
+/// `0x0301` — the legacy_record_version on the initial ClientHello record.
+pub(crate) const VER_TLS10: u16 = 0x0301;
+/// `0x0303` — the legacy_record_version on every other record (ServerHello, CCS,
+/// ApplicationData), and the handshake-body legacy_version everywhere.
 pub(crate) const VER_TLS12: u16 = 0x0303;
 
 /// TLS record header length: `content_type(1) + version(2) + length(2)`.
