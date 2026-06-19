@@ -18,11 +18,14 @@ Two pillars, OTel-native:
   `Histogram`s with exemplar correlation to traces.
 
 - **Traces** — `phantom.*` spans on listener bind/accept, handshake
-  (client and server sides), session rekey, path
-  validation. Span fields carry `client_ip`, `version` (single pinned
-  `v1`), `outcome`,
-  `cipher_suite`, etc. Bridged into the embedder's
-  `tracing_subscriber::Registry` via `tracing-opentelemetry`.
+  (client and server sides), session rekey, path validation. Span
+  fields carry handshake/path detail: `difficulty`, `has_cookie`,
+  `has_pow`, `resume`, `has_early_data` (server hello), `pinned` (client
+  hello), `path_id` (path validation), `addr` (bind). The peer IP is
+  deliberately **not** emitted on any span (it is correlatable PII; the
+  DoS gate already has it in-band). `version` / `outcome` /
+  `cipher_suite` are **metric labels**, not span fields. Bridged into the
+  embedder's `tracing_subscriber::Registry` via `tracing-opentelemetry`.
 
 Logs stay in `tracing` format (structured JSON or pretty); they are NOT in
 scope for the OTel pipeline of this release.
@@ -96,4 +99,9 @@ Phantom Protocol honors the OpenTelemetry SDK env-var spec where applicable:
 | `OTEL_TRACES_SAMPLER_ARG` | `0.01` | Trace sampling ratio |
 | `OTEL_RESOURCE_ATTRIBUTES` | — | `service.namespace=prod,deployment.environment=staging` |
 | `PHANTOM_TELEMETRY_NAMESPACE` | `phantom` | Instrument-name prefix (Phantom-specific) |
-| `PHANTOM_TELEMETRY_DISABLED` | `false` | Runtime kill-switch |
+
+`ObservabilityConfig::from_env` reads only `PHANTOM_TELEMETRY_NAMESPACE`;
+there is no runtime telemetry kill-switch. To disable telemetry, build
+without the `telemetry-otel` Cargo feature, or simply do not point
+`OTEL_EXPORTER_OTLP_ENDPOINT` at a reachable collector — the SDK's
+bounded export queue then drops telemetry at near-zero cost.

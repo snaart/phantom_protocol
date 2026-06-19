@@ -36,8 +36,9 @@ documented security invariant is affected and how it is preserved. Otherwise
 write "N/A".
   - core/src/crypto/
   - core/src/transport/handshake.rs
-  - core/src/transport/legs/faketls.rs
   - core/src/transport/session.rs
+  - core/src/transport/udp_transport.rs
+  - core/src/transport/legs/mimic_tls/
   - core/src/security/
 -->
 

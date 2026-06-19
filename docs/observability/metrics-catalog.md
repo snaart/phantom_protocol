@@ -16,7 +16,7 @@ These are read from lock-free atomics on each SDK collection cycle.
 
 | OTel name | Type | Unit | Attributes |
 |-----------|------|------|------------|
-| `phantom.session.packets` | ObservableCounter | `{packet}` | `direction` (send/recv), `leg` (kcp/tcp/faketls) |
+| `phantom.session.packets` | ObservableCounter | `{packet}` | `direction` (send/recv), `leg` (tcp/faketls/…) |
 | `phantom.session.io` | ObservableCounter | `By` | `direction`, `leg` |
 | `phantom.crypto.encrypt.duration_sum` | ObservableCounter | `ns` | — |
 | `phantom.crypto.encrypt.invocations` | ObservableCounter | `{op}` | — |
@@ -95,10 +95,12 @@ Indicative starting points — tune to your traffic profile and SLO.
 ## Attributes that are **traces-only** (not metric labels)
 
 These appear as span attributes (`tracing` field machinery) but are
-explicitly NOT in the metric label set. Use traces for drill-down on
-high-cardinality details.
+explicitly NOT in the metric label set. Use traces for drill-down.
 
-- `client_ip`
-- `session_id`
-- `peer_addr`
-- handshake details (cookie/PoW presence flags, resumption flag)
+- handshake details: `difficulty`, `has_cookie`, `has_pow`, `resume`,
+  `has_early_data` (server-side), `pinned` (client-side)
+- `path_id` (path-validation spans), `addr` (listener-bind span)
+
+The peer IP / `client_ip` is **never** emitted — neither as a span field
+nor as a metric label (it is correlatable PII; the DoS gate has it
+in-band). `session_id` is likewise never a span field or a metric label.

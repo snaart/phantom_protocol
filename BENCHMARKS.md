@@ -7,7 +7,7 @@ critical-path benches deserve a comment in the PR.
 ## Methodology
 
 - **Compiler:** Rust stable channel pinned via `rust-toolchain.toml`
-  (currently MSRV is 1.75; latest stable is preferred for tracking).
+  (MSRV is 1.93; latest stable is preferred for tracking).
 - **Build profile:** `cargo bench` uses the `bench` profile, which inherits
   from `release` (see workspace-root `Cargo.toml`). Release profile is
   `opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`.
@@ -21,6 +21,13 @@ critical-path benches deserve a comment in the PR.
   performance claim leaves the repo.
 - **Background noise:** quiesce the system (close browsers, disable
   background indexing) before capturing.
+- **Wire-version caveat:** the numbers below are a 2026-05-17 snapshot
+  captured under an **earlier wire version (WIRE_VERSION=2)**. The current
+  on-wire format is **WIRE_VERSION=6** — a 15-byte header-protected
+  (HP-masked) header with a 47-byte AEAD AAD image and a
+  `prefix(4) ‖ packet_number_u64(8)` nonce. The crypto/throughput
+  shape is broadly representative, but re-capture against the current
+  wire before quoting these as live figures.
 
 ## Reference hardware (snapshot of 2026-05-17, post bench-harness V2 fix)
 
@@ -107,8 +114,9 @@ lookup is microseconds — order ~10⁵ resumptions/sec/core).
 
 This is the full crate path including header-derived AEAD nonce, header-AAD
 binding, and per-stream sliding-window replay check on the decrypt side —
-NOT the raw `ring` AEAD measured above. The wire format is pinned to
-WIRE_VERSION=2 with nonces derived from authenticated header fields;
+NOT the raw `ring` AEAD measured above. This snapshot was captured under
+WIRE_VERSION=2 (an earlier wire version; the current format is
+WIRE_VERSION=6) with nonces derived from authenticated header fields;
 each iteration uses a fresh PacketHeader with incremented sequence to
 dodge the sliding-window replay guard.
 
@@ -132,7 +140,7 @@ caps the system long before crypto does on any standard host.
 
 | Bench               | Time     | Throughput   |
 | ------------------- | -------- | ------------ |
-| `1MB_roundtrip` (V2)| 391.5 µs | **5.0 GiB/s** |
+| `1MB_roundtrip`     | 391.5 µs | **5.0 GiB/s** |
 
 Throughput here doubles the payload bytes (encrypt + decrypt) so a higher
 number is normal — the work per direction is identical to the 64 KiB row
@@ -140,19 +148,20 @@ above, scaled by ~16× and amortising fixed overhead.
 
 ### Bench history
 
-The encryption/decryption benchmarks use WIRE_VERSION=2 pinned format
-(`encrypt_packet` / `decrypt_packet`) with nonces derived from
-authenticated header fields. Earlier internal builds used the V1 wire
-format with internal counter-derived nonces, which could desync under
-back-to-back iterations; the current format avoids this. Re-using a fixed `PacketHeader` across
+This snapshot's encryption/decryption benchmarks were captured under the
+WIRE_VERSION=2 format (`encrypt_packet` / `decrypt_packet`) with nonces
+derived from authenticated header fields. (The live wire is now
+WIRE_VERSION=6 — re-capture before quoting.) Earlier internal builds used the
+V1 wire format with internal counter-derived nonces, which could desync under
+back-to-back iterations; later formats avoid this. Re-using a fixed `PacketHeader` across
 iterations made the V1 throughput bench desync the counter on the
 sender vs the receiver and panic with `ReplayDetected` (1 MiB
 round-trip) or with `CryptoError("Decryption / authentication failed")`
 (decrypt-only on protocol_comparison). The decrypt-only row in
 transport_bench did not panic only because it omitted `.unwrap()`, so it
-silently measured the AEAD-verify failure path. V2 derives the nonce
-from the authenticated header fields, so a fresh `PacketHeader` with
-an incremented sequence per iteration round-trips cleanly. See
+silently measured the AEAD-verify failure path. Deriving the nonce
+from the authenticated header fields lets a fresh `PacketHeader` with
+an incremented sequence per iteration round-trip cleanly. See
 `core/benches/transport_bench.rs` and
 `core/benches/protocol_comparison.rs`.
 
@@ -206,9 +215,10 @@ floor on the pool itself.
 `cargo bench --manifest-path core/Cargo.toml --bench protocol_comparison`
 
 Cross-validation against `transport_bench` — separate compilation unit,
-independent timing. All groups use WIRE_VERSION=2 pinned format
-(`encrypt_packet` / `decrypt_packet`) with a per-iter
-header.sequence bump to ensure nonce uniqueness.
+independent timing. All groups were captured under the WIRE_VERSION=2
+format (`encrypt_packet` / `decrypt_packet`; the live wire is now
+WIRE_VERSION=6) with a per-iter header.sequence bump to ensure nonce
+uniqueness.
 
 | Bench                                          | Time                  | Notes                          |
 | ---------------------------------------------- | --------------------- | ------------------------------ |

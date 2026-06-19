@@ -5,8 +5,10 @@ each to its concrete OS / platform backend. The audit's purpose is twofold:
 
 1. Confirm that every cryptographic byte (key material, nonce, challenge,
    cookie salt, session ID) originates from a CSPRNG.
-2. Identify the changes required for an eventual FIPS 140-3 build, which
-   demands an SP 800-90A-validated DRBG.
+2. Document the FIPS 140-3 build's SP 800-90A-validated DRBG. The
+   `--features fips` build's DRBG swap (`aws_lc_rs::rand::SystemRandom`)
+   and the `thread_rng()` fallback gating are **shipped** — see the
+   "FIPS-mode requirements" section below.
 
 ## Backends per target
 
@@ -19,7 +21,7 @@ each to its concrete OS / platform backend. The audit's purpose is twofold:
 | `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` | `BCryptGenRandom(BCRYPT_USE_SYSTEM_PREFERRED_RNG)` via getrandom. | Cannot fail under normal operation. | CNG's system DRBG is SP 800-90A AES-CTR. |
 | `wasm32-unknown-unknown` (browser) | `window.crypto.getRandomValues` via `js-sys`. Enabled by the `getrandom = { features = ["js"] }` declaration in the wasm-only Cargo block. | Throws `QuotaExceededError` only for unreasonable lengths (`> 65536` per call). Phantom Protocol calls request `≤ 32` bytes per primitive — never hit. | Browser-provided CSPRNG (typically based on the platform PRNG). |
 | `wasm32-wasi` | WASI `random_get`. | Cannot fail in WASI snapshot 1. | Host-provided entropy. |
-| `thumbv7em-none-eabihf` (Cortex-M, embedded) | **Not currently supported** — Phase 3.4 must select between a hardware TRNG driver or a software DRBG seeded externally. | N/A today. | See "Embedded path" below. |
+| `thumbv7em-none-eabihf` (Cortex-M, embedded) | **OE-supplied** — the shipped `RngProvider` trait (`crypto/rng.rs`, Phase 3.8) is the seam; a downstream HAL plugs in a hardware TRNG driver or an externally-seeded software DRBG. | OE responsibility. | See "Embedded path" below. |
 
 ## RNG call sites
 
@@ -69,45 +71,44 @@ Sites that **propagate** RNG errors as `Result`:
   listener bind.
 - `handshake.rs:437` — client-side nonce, fatal at handshake start.
 
-Sites that **fall back to `thread_rng`**:
-- `types.rs:27` (session ID).
-- `faketls.rs:320,377-386` (TLS Hello random).
-- `path.rs:225` (path challenge — see comment in source).
+Sites that **fall back to `thread_rng`** (all gated behind
+`#[cfg(not(feature = "fips"))]` — the fips build cannot use them):
+- `transport/types.rs` (session ID).
+- `transport/legs/mimic_tls/` (TLS-Hello random — the fallback moved here
+  when the old FakeTLS leg was replaced by the shipped `MimicTlsLeg`).
+- `transport/path.rs` (path challenge — see comment in source).
 
 The fallback choice is intentional for non-key material where retrying the
 operation is more expensive than accepting a thread-RNG byte; the call sites
-are documented in source.
+are documented in source. Under `--features fips` the fallbacks are compiled
+out entirely.
 
-## FIPS-mode requirements (Phase 5)
+## FIPS-mode RNG (shipped under `--features fips`)
 
-For `cargo build --features fips` to be defensible:
+The `--features fips` build's RNG posture is **shipped**:
 
-1. **DRBG.** Replace the OS-direct backend with an SP 800-90A DRBG:
-   - **`aws-lc-rs`** offers `aws_lc_rs::rand::SystemRandom`, which on a
-     FIPS-validated build is a CTR_DRBG / HMAC_DRBG instantiated from
-     `/dev/urandom`. This is the recommended path in this codebase per
-     `docs/compliance/fips-readiness.md`.
-   - Alternative: `ring`'s system random when built against the FIPS-mode
-     BoringSSL fork.
+1. **DRBG.** The OS-direct backend is replaced by an SP 800-90A DRBG:
+   `crypto::rng::OsRng`'s `RngProvider` impl is cfg-split — `getrandom` on
+   the default build, `aws_lc_rs::rand::SystemRandom` under `--features
+   fips` (CTR_DRBG inside the AWS-LC-FIPS module, SP 800-90A § 10.2.1).
+   This is the recommended path in `docs/compliance/fips-readiness.md`.
 
-2. **Replace `OsRng` and `getrandom::getrandom` call sites.** Three
-   choices, in decreasing intrusiveness:
-   - Plumb a `RngCore` parameter through each construction site (most
-     invasive, cleanest for testing).
-   - Introduce a `crate::crypto::rng::system_rng()` function that returns
-     a static `&'static dyn RngCore` selected by feature flag (medium).
-   - Hard-cfg-swap `OsRng` for `aws_lc_rs::rand::SystemRandom` behind
-     `#[cfg(feature = "fips")]` (least invasive, fragile if APIs diverge).
+2. **Single seam for the swap.** The `RngProvider` trait
+   (`crypto/rng.rs`, Phase 3.8) is the abstraction seam — production call
+   sites route through `OsRng`, so the fips substitution is picked up
+   automatically without touching each construction site.
 
-3. **Remove all `thread_rng()` fallbacks** behind `#[cfg(not(feature
-   = "fips"))]`.
+3. **`thread_rng()` fallbacks removed under fips.** All `thread_rng()`
+   fallbacks are gated behind `#[cfg(not(feature = "fips"))]`; the fips
+   build cannot use them.
 
-4. **Power-on self-test.** Document and implement a startup self-test for
-   the DRBG (see `docs/compliance/self-tests.md`).
+4. **Power-on self-test.** The DRBG is exercised transitively by the
+   shipped POST (`crypto::self_tests::run_post` — hybrid KEM / sign keygen
+   pull from the RNG); see `docs/compliance/self-tests.md`.
 
 5. **Continuous health check.** SP 800-90B requires a continuous test on
-   the entropy source. `aws-lc-rs` provides this in its FIPS mode; ensure
-   the test failure is surfaced as a fatal error.
+   the entropy source. `aws-lc-rs` provides this in its FIPS mode; a test
+   failure surfaces as a fatal error.
 
 ## Embedded path
 
@@ -125,16 +126,17 @@ out of the box. Phase 3.4 (EmbeddedLeg) must select one of:
 The trait surface for this should be folded into the existing `Runtime`
 trait (Phase 3.1) or a sibling `RngBackend` trait.
 
-## Recommended near-term actions
+## Status of near-term actions
 
-1. ⏳ Wrap every RNG call site behind a `crate::crypto::rng` module so the
-   FIPS swap (Phase 5.3) is a one-file change.
-2. ⏳ Remove `thread_rng` fallbacks behind a feature gate so non-FIPS
-   builds still benefit from the fallback (deployability) but FIPS builds
-   cannot use it.
-3. ⏳ Add a CI smoke test that grep-checks for `rand::thread_rng` or
+1. ✅ Every RNG call site routes through the `crate::crypto::rng` module
+   (`RngProvider` / `OsRng`), so the FIPS swap is a single cfg-split in
+   that one file.
+2. ✅ `thread_rng` fallbacks are gated behind `#[cfg(not(feature =
+   "fips"))]` — non-FIPS builds keep the fallback for deployability; FIPS
+   builds compile it out.
+3. ⏳ A CI smoke test that grep-checks for `rand::thread_rng` /
    `rand::random` outside of `test_harness/` and the documented fallback
-   sites.
+   sites is not yet wired.
 
 ## References
 

@@ -4,7 +4,7 @@ FIPS 140-3 requires a cryptographic module to run **known-answer tests
 (KATs)** at startup ("power-on self-tests" / POST) and **pairwise
 consistency tests (PCTs)** whenever a new key pair is generated.
 
-This document describes the self-test implementation for Phantom Protocol. **Power-on self-tests (POST) are implemented** in `core/src/crypto/self_tests.rs` (Phase 5.5) and are wired into PhantomListener::bind and PhantomSession::connect under the `fips` feature. Pairwise consistency tests (PCTs) are in-progress.
+This document describes the self-test implementation for Phantom Protocol. **Power-on self-tests (POST) are shipped** in `core/src/crypto/self_tests.rs` and are auto-invoked from `PhantomListener::bind*` / `PhantomSession::connect*` / `connect_pinned*` under the `fips` feature via the cached `ensure_post_passed()` wrapper. The POST battery is pairwise-consistency-based for the asymmetric primitives (hybrid KEM encap/decap, hybrid sign/verify) plus AEAD round-trips and a fixed HKDF-SHA-256 KAT. Per-keygen pairwise consistency tests (PCTs) wired into every keygen function are not yet shipped.
 
 ## Test types
 
@@ -13,16 +13,16 @@ This document describes the self-test implementation for Phantom Protocol. **Pow
 | **POST** | At module initialization (first `PhantomListener::bind` / `PhantomSession::connect`). | Each primitive implementation matches its standardized test vectors — i.e. the code path is bug-free for at least the published KAT inputs. |
 | **PCT** | After every key-pair generation (`HybridSigningKey::generate`, `HybridKemSecret::generate`). | The newly generated key pair satisfies the algorithm's correctness property (e.g., `verify(sign(m, sk), pk, m) == OK`). Detects RAM corruption or fault injection during keygen. |
 | **CST** (continuous self-test) | On every cryptographic operation, on hot paths where allowed. | Entropy source has not regressed; cipher implementation continues to produce expected output for sentinel inputs. **Most CSTs are platform-provided** by `aws-lc-rs` / `ring`. |
-| **On-demand** | API: `phantom_protocol::fips::run_self_tests()`. | Operator can re-run POSTs without restarting. |
+| **On-demand** | API: `crypto::self_tests::run_post()` (re-runs the full battery) or `ensure_post_passed()` (cached single-shot). | Operator can run the POST explicitly; the `fips` bootstrap calls `ensure_post_passed()` automatically. |
 
-## POST plan (Phase 5.5)
+## POST (shipped)
 
 ### Primitives requiring KATs
 
 | Primitive | Vector source | Implementation today |
 | --- | --- | --- |
-| **AES-256-GCM** | NIST GCMVS (SP 800-38D). | `ring` (audited upstream). FIPS POST runs implicitly when `ring` initializes in FIPS mode. |
-| **ChaCha20-Poly1305** | RFC 8439 test vectors. | `ring`. Not FIPS-approved — disabled in `--features fips`. |
+| **AES-256-GCM** | NIST GCMVS (SP 800-38D). | `ring` (default build) / `aws-lc-rs` (under `--features fips`, ring-free). POST is **explicit**: `run_post` exercises an AES-256-GCM round-trip via `CryptoSession`, gated into bind/connect by `ensure_post_passed()`. |
+| **ChaCha20-Poly1305** | RFC 8439 test vectors. | `ring`. Not FIPS-approved — rejected with `CoreError::CipherSuiteUnavailable` in `--features fips`; only exercised by POST on non-fips builds. |
 | **SHA-256 / HKDF-SHA-256** | NIST SHAVS + RFC 5869 vectors. | `ring` / `hkdf` crate. |
 | **BLAKE3** | BLAKE3 official KAT. | `blake3` crate. Not FIPS-approved — disabled in `--features fips`. |
 | **Ed25519** | RFC 8032 test vectors §7.1. | `ed25519-dalek`. FIPS 186-5 approves Ed25519. |
@@ -31,31 +31,43 @@ This document describes the self-test implementation for Phantom Protocol. **Pow
 | **ML-DSA-65** | FIPS 204 published KATs. | `ml-dsa` crate (RustCrypto). |
 | **HMAC-SHA-256** | RFC 4231 + SP 800-198. | `hmac` crate. |
 
-### Proposed implementation
+### Shipped implementation
 
-A `core/src/crypto/self_tests.rs` module exposing:
+The `core/src/crypto/self_tests.rs` module exposes:
 
 ```rust
 pub fn run_post() -> Result<(), SelfTestError>;
+pub fn ensure_post_passed() -> Result<(), SelfTestError>;
+
 pub enum SelfTestError {
-    AesGcmKat,
-    Sha256Kat,
-    HkdfKat,
-    Ed25519Kat,
-    MlKemKat,
-    MlDsaKat,
-    HmacKat,
+    /// AEAD round-trip failed. `algorithm` is "AES-256-GCM" / "ChaCha20-Poly1305".
+    Aead { algorithm: &'static str, stage: AeadStage },
+    /// HKDF-SHA-256 produced output that did not match the bundled KAT.
+    Hkdf,
+    /// Hybrid KEM (X25519/P-256 + ML-KEM-768) round-trip failed.
+    HybridKem { stage: KemStage },
+    /// Hybrid signature (Ed25519 + ML-DSA-65) round-trip failed.
+    HybridSign { stage: SignStage },
+    /// Verification accepted a deliberately-tampered signature.
+    NegativeVerify,
 }
 ```
 
+`AeadStage` (`Init` / `Encrypt` / `Decrypt` / `Mismatch`), `KemStage`
+(`Generate` / `Encapsulate` / `Decapsulate` / `Mismatch`), and `SignStage`
+(`Generate` / `Verify`) carry the per-primitive failure context.
+
 Wired into:
 
-- `PhantomListener::bind` (first call) — runs POST and returns
-  `CoreError::SelfTest` on failure.
-- `PhantomSession::connect_with_transport` (first call per process).
-- `phantom_protocol::fips::run_self_tests()` — public API for on-demand.
+- `PhantomListener::bind*` (under `--features fips`) — runs POST via
+  `ensure_post_passed()` and returns `CoreError::FipsSelfTestFailure(String)`
+  on failure before any cryptographic work.
+- `PhantomSession::connect*` / `connect_pinned*` (under `--features fips`).
+- `crypto::self_tests::run_post()` — runs the full battery on demand;
+  `ensure_post_passed()` is the cached single-shot wrapper.
 
-A `std::sync::Once` ensures POST runs exactly once per process.
+A `std::sync::OnceLock` (`POST_RESULT`) caches the verdict so POST runs
+exactly once per process.
 
 ### Vector storage
 
@@ -90,9 +102,9 @@ material immediately. Caller is responsible for re-attempting keygen
 | Phase | Status | Deliverable |
 | --- | --- | --- |
 | Phase 5.4 | ✅ | CAVP vectors under `core/tests/cavp/`. (Implemented with ML-KEM-768, ML-DSA-65, AES-256-GCM, SHA-256, HMAC-SHA-256, HKDF-SHA-256, Ed25519 test vectors.) |
-| Phase 5.5 | ✅ | `core/src/crypto/self_tests.rs` + `ensure_post_passed()` API. (Implemented and wired into PhantomListener::bind and PhantomSession::connect under `fips` feature.) |
-| Phase 5.5 | ⏳ | PCTs wired into all four keygen functions. |
-| Phase 5.5 | ⏳ | CI job that runs `cargo test --features fips self_tests` on every PR. |
+| Phase 5.5 | ✅ | `core/src/crypto/self_tests.rs` + `run_post()` / `ensure_post_passed()` API. Shipped and wired into `PhantomListener::bind*` / `PhantomSession::connect*` / `connect_pinned*` under the `fips` feature; failure → `CoreError::FipsSelfTestFailure`. |
+| Phase 5.5 | ✅ | CI `fips-feature` job runs `cargo test --no-default-features --features fips,bindings,compression-zstd --lib` (which includes the `self_tests` module tests and the `set_force_post_fail` fault-injection seam) on every PR. |
+| Phase 5.5 | ⏳ | Per-keygen PCTs wired into all four keygen functions (the POST already covers KEM/sign pairwise consistency once at startup). |
 
 ## Failure-handling policy
 
@@ -107,13 +119,17 @@ FIPS 140-3 requires that on POST or CST failure:
 
 Mapping to Phantom Protocol:
 
-- POST failure → `PhantomListener::bind` / `PhantomSession::connect`
-  return `CoreError::SelfTest(SelfTestError)`.
+- POST failure → `PhantomListener::bind*` / `PhantomSession::connect*` /
+  `connect_pinned*` (under `--features fips`) return
+  `CoreError::FipsSelfTestFailure(String)`. The `String` carries the
+  `Debug` rendering of the underlying `SelfTestError` so the variant stays
+  UniFFI-exportable.
 - CST failure → propagate as `CoreError::Crypto(CryptoError::...)`,
   caller can recreate the listener/session for retry.
-- The current binary does not implement a global "error state" latch —
-  this is a Phase 5.5 deliverable. The simplest model is a process-wide
-  `AtomicBool` that all crypto entry points check.
+- The `OnceLock`-cached verdict means a failed POST short-circuits every
+  subsequent bind/connect in the process. A dedicated global "error state"
+  latch that inhibits *all* crypto API calls (not just bootstrap) remains a
+  future hardening item.
 
 ## See also
 

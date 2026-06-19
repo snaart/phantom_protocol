@@ -74,13 +74,17 @@ production canary before promoting.
 
 ### 4. Feature flags
 
+There is no `pqc-standard` feature: the post-quantum primitives
+(ML-KEM-768 / ML-DSA-65) are **unconditional** — every build links them.
+Default features are `["compression-zstd", "std", "bindings",
+"classical-crypto"]`.
+
 | Feature | Effect |
 | --- | --- |
-| `pqc-standard` (default) | Hybrid Kyber768 + Dilithium3 keys/sigs |
-| `--no-default-features` | Classical-only build (X25519 + Ed25519); smaller binary, but breaks the hybrid security guarantee — do not ship to production untouched. |
-
-(More feature flags will arrive with Phase 3 portability work and Phase 5
-FIPS mode.)
+| `classical-crypto` (default-on) | The classical AEAD + KEM substrate (`ring` AES-256-GCM / ChaCha20-Poly1305 + `x25519-dalek`). Combined with the always-on PQC crates this gives the full hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65 security guarantee. |
+| `--no-default-features` | Drops the `classical-crypto` substrate (and `std` / `bindings` / `compression-zstd`); the PQC half stays. Used by the bare-metal / cross-target rows and as the base for a FIPS build. Do not ship a classical-substrate-less build expecting the hybrid guarantee — re-add the substrate (or `fips`) you actually want. |
+| `fips` | FIPS-140-3 posture (shipped, off by default). Swaps the classical KEM half to ECDH-P-256, the AEAD to `aws-lc-rs` (ChaCha20-Poly1305 rejected), the KDF to HKDF-SHA256, and the RNG to a SP 800-90A CTR_DRBG. Native-only; built as `--no-default-features --features fips,bindings,compression-zstd`. |
+| `telemetry-otel` | Opt-in OpenTelemetry pipeline (Phase 8). |
 
 ---
 
@@ -112,7 +116,7 @@ net.ipv4.tcp_congestion_control = bbr
 net.core.somaxconn = 4096
 net.ipv4.tcp_max_syn_backlog = 4096
 
-# UDP buffer (KCP leg + future raw UDP path).
+# UDP buffer (PhantomUDP path).
 net.core.netdev_max_backlog = 5000
 ```
 
