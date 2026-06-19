@@ -2142,6 +2142,25 @@ async fn send_path_validation<T: SessionTransport>(
 /// Sized well above QUIC's ~100-stream default so real multiplexing is unaffected.
 const MAX_STREAMS: usize = 256;
 
+/// EPS-02 symmetric-rotation step — extracted from [`handle_packet`] so the role
+/// branch is unit-tested always-on (not only by the `#[ignore]` `udp_integration`
+/// suite). After the post-AEAD path detects a peer migration (`note_migration_path`
+/// returned a slide), rotate OUR OWN outbound CID so the return direction's
+/// cleartext ConnId does not stay stable across the peer's move (§12.5). A server
+/// (whose client migrated) rotates the s2c CID path-id-silent (the socket-routed
+/// client needs no window slide, and not bumping the send `path_id` prevents a
+/// ping-pong). A client (whose server migrated) bumps its send `path_id` and
+/// rotates the c2s CID (the path_id bump slides the server's c2s demux window onto
+/// the rotated CID — the no-stranding fix), ending the exchange in one round.
+fn apply_eps02_peer_migration_rotation<T: SessionTransport>(crypto: &Session, transport: &T) {
+    if crypto.is_server() {
+        transport.set_outbound_cid(crypto.advance_outbound_cid());
+    } else {
+        crypto.next_migration_path_id();
+        transport.set_outbound_cid(crypto.advance_outbound_cid());
+    }
+}
+
 /// Recv-side handler for a packet:
 /// - session-id guard → drop any frame not stamped with the negotiated
 ///   session id before touching any state (H1).
@@ -2307,12 +2326,7 @@ async fn handle_packet<T: SessionTransport>(
             // trailing + `K = 16` leading slack (cid_chain), which absorbs a ±1 skew, so the
             // skewed packet still routes and the L1 ARQ would re-carry it anyway — no strand.
             // Same two-step shape as the `Migrate` / `migrate_server` pump arms above.
-            if crypto_recv.is_server() {
-                transport_for_path.set_outbound_cid(crypto_recv.advance_outbound_cid());
-            } else {
-                crypto_recv.next_migration_path_id();
-                transport_for_path.set_outbound_cid(crypto_recv.advance_outbound_cid());
-            }
+            apply_eps02_peer_migration_rotation(crypto_recv, transport_for_path.as_ref());
         }
     }
 
@@ -4379,6 +4393,61 @@ mod tests {
             *self.rec.migrate_server.lock().unwrap() = Some(local_addr);
             Ok(())
         }
+    }
+
+    /// EPS-02 (audit L4) — the symmetric-rotation role branch, pinned ALWAYS-ON
+    /// (the live wire-level proof is `#[ignore]` `udp_integration`). On detecting a
+    /// peer migration, a **server** rotates its s2c CID but keeps its send `path_id`
+    /// (path-id-silent — prevents a ping-pong), while a **client** rotates its c2s
+    /// CID **and** bumps its send `path_id` (the window-slide / no-stranding fix).
+    /// Non-vacuous: flipping the `is_server` branch flips which side bumps `path_id`,
+    /// failing an assertion here.
+    #[test]
+    fn eps02_rotation_branch_is_role_correct() {
+        let session_id = fixed_session_id();
+        let (client, server) = paired_sessions(session_id);
+
+        // SERVER (its client migrated): rotate s2c CID, path_id SILENT.
+        let s_path_before = server.current_send_path_id();
+        let s_cid_before = server.current_outbound_cid();
+        let rec_s = Arc::new(ControlRecorder::default());
+        apply_eps02_peer_migration_rotation(&server, &RecordingTransport { rec: rec_s.clone() });
+        assert_ne!(
+            server.current_outbound_cid(),
+            s_cid_before,
+            "server must rotate its s2c CID on a peer (client) migration"
+        );
+        assert_eq!(
+            *rec_s.set_outbound_cid.lock().unwrap(),
+            Some(server.current_outbound_cid()),
+            "server stamps the rotated CID onto its transport"
+        );
+        assert_eq!(
+            server.current_send_path_id(),
+            s_path_before,
+            "server rotation is path-id-SILENT (bumping it would ping-pong the client)"
+        );
+
+        // CLIENT (its server migrated): rotate c2s CID AND bump send path_id.
+        let c_path_before = client.current_send_path_id();
+        let c_cid_before = client.current_outbound_cid();
+        let rec_c = Arc::new(ControlRecorder::default());
+        apply_eps02_peer_migration_rotation(&client, &RecordingTransport { rec: rec_c.clone() });
+        assert_ne!(
+            client.current_outbound_cid(),
+            c_cid_before,
+            "client must rotate its c2s CID on a peer (server) migration"
+        );
+        assert_eq!(
+            *rec_c.set_outbound_cid.lock().unwrap(),
+            Some(client.current_outbound_cid()),
+            "client stamps the rotated CID onto its transport"
+        );
+        assert_eq!(
+            client.current_send_path_id(),
+            c_path_before + 1,
+            "client bumps its send path_id (slides the server's c2s demux window — no stranding)"
+        );
     }
 
     /// ε / WIRE v5 (audit V-3 / EPS-03 / EPS-04) — `ObservedTransport` must forward
