@@ -36,8 +36,9 @@ at the commit that introduces this file.
 1. The OS RNG (`getrandom` / `OsRng`) produces cryptographically secure
    randomness. A compromised OS RNG defeats every primitive here.
 2. SHA-256, AES-256-GCM, X25519, Ed25519 retain their stated security
-   margins. Kyber768 and Dilithium3 are taken at NIST PQC Round-3 strength
-   pending the migration to ML-KEM / ML-DSA (Phase 5).
+   margins. The post-quantum half is ML-KEM-768 (FIPS 203) and ML-DSA-65
+   (FIPS 204) — the standardized successors to Kyber768 / Dilithium3, shipped
+   via the pure-Rust RustCrypto `ml-kem` / `ml-dsa` crates.
 3. Both peers know the server's `HybridVerifyingKey` out of band (TOFU,
    PKI, or app distribution). The library does NOT solve key distribution.
 4. Time is approximately monotonic on each peer; the cookie freshness

@@ -25,7 +25,7 @@ adversary doesn't already have.
 
 ### Cookie validation (Class A)
 
-`core/src/transport/handshake.rs:631-665` — `verify_cookie`. The cookie is
+`core/src/transport/handshake.rs` — `verify_cookie`. The cookie is
 an HMAC-SHA-256 tag bound to client IP + port + a rotating time-bucket secret.
 Validation accepts either the current bucket or the previous bucket
 (sliding-window freshness).
@@ -43,7 +43,7 @@ Compliance: ✅ class A satisfied.
 
 ### Path-validation challenge response (Class A)
 
-`core/src/transport/path.rs:236-265` — `Session::complete_path_validation`.
+`core/src/transport/path.rs` — `Session::complete_path_validation`.
 The 32-byte challenge is server-issued and unique per `(path_id, session)`.
 The response from the peer is attacker-controllable.
 
@@ -56,7 +56,7 @@ Compliance: ✅ class A satisfied.
 
 ### PoW solution verification (Class A)
 
-`core/src/crypto/pow.rs:44` — `Challenge::verify`. Solution is attacker-
+`core/src/crypto/pow.rs` — `Challenge::verify`. Solution is attacker-
 controllable (the client submits it).
 
 Discipline:
@@ -73,7 +73,7 @@ public server policy parameter; not on a secret.)
 
 ### PoW challenge-integrity MAC (Class A) — CRYPTO-2/HS-04
 
-`core/src/crypto/pow.rs:60` — `PoWChallenge::verify` compares the embedded
+`core/src/crypto/pow.rs` — `PoWChallenge::verify` compares the embedded
 24-byte challenge MAC (keyed by the server's per-hour secret) against the
 recomputed value. The submitted challenge bytes are attacker-controllable, so
 this is Class A.
@@ -87,7 +87,7 @@ Compliance: ✅ class A satisfied (since CRYPTO-2/HS-04).
 
 ### Server-identity pinning (Class C)
 
-`core/src/transport/handshake.rs:476-479` — `process_server_hello` compares
+`core/src/transport/handshake.rs` — `process_server_hello` compares
 the caller's pinned `HybridVerifyingKey` against the value advertised in
 `ServerHello`.
 
@@ -115,7 +115,7 @@ Compliance: ✅ delegated to ring (audited upstream).
 
 ### Hybrid signature verification
 
-`core/src/crypto/hybrid_sign.rs:140-167` — `HybridVerifyingKey::verify`.
+`core/src/crypto/hybrid_sign.rs` — `HybridVerifyingKey::verify`.
 Both Ed25519 (`ed25519-dalek`) and ML-DSA-65 (RustCrypto `ml-dsa`)
 implementations are CT for the verify path; they reject on any inconsistency
 without leaking which byte differed.

@@ -17,8 +17,8 @@ And one pinned constant that is **not** an evolving axis (see §3):
 
 | Constant | Identifier | Lives in | Value |
 | --- | --- | --- | --- |
-| Wire-format version | `WIRE_VERSION` (packet-header byte) | `core/src/transport/types.rs` | `2` |
-| Protocol version | `PROTOCOL_VERSION` (`ClientHello.version`) | `core/src/transport/handshake.rs` | `2` |
+| Wire-format version | `WIRE_VERSION` (packet-header byte) | `core/src/transport/types.rs` | `6` |
+| Protocol version | `PROTOCOL_VERSION` (`ClientHello.version`) | `core/src/transport/handshake.rs` | `3` |
 
 A single commit can move zero, one, or both of the live axes. Each axis has its
 own changelog entry (see `CHANGELOG.md`).
@@ -66,14 +66,36 @@ with, so there is nothing to negotiate against.
 
 Two constants pin the format:
 
-- `WIRE_VERSION = 2` — the leading byte of every `PacketHeader` (bumped from
-  `1` when the packet codec moved off `alkahest` to the hand-rolled big-endian
-  layout; see `docs/protocol/PROTOCOL.md` § 4.2)
-  (`transport/types.rs`). It leads the serialised bytes and the AEAD AAD.
-- `PROTOCOL_VERSION = 2` — `ClientHello.version` (`transport/handshake.rs`),
-  bound into the signed handshake transcript (bumped `1 → 2` when the transcript
-  began covering the 0-RTT verdict `early_data_accepted` and `ClientHello` gained
-  the `resumption_binder` proof-of-possession field; v1 ↔ v2 cannot interoperate).
+- `WIRE_VERSION = 6` — the packet-header version byte (`transport/types.rs`). It
+  is bound into the AEAD AAD; as of v6 it is itself header-protection–masked on the
+  wire (no constant cleartext byte). See `docs/protocol/PROTOCOL.md` § 1 / § 4.2.
+- `PROTOCOL_VERSION = 3` — `ClientHello.version` (`transport/handshake.rs`),
+  bound into the signed handshake transcript.
+
+Both bumped several times pre-1.0, as a hard cut each time (no negotiation, no
+deployed peers to keep compatible). The history, for the record:
+
+- **`WIRE_VERSION 1 → 2`** — the packet codec moved off `alkahest` to the
+  hand-rolled big-endian layout.
+- **`2 → 3`** — the AEAD packet identity became a single per-direction monotonic
+  `u64` `packet_number` (the dead `ack_delay` field dropped, `sequence: u32`
+  widened to `u64`).
+- **`3 → 4`** — header protection (QUIC RFC 9001 § 5.4): the header span was
+  reordered so the variable bytes form a contiguous XOR-masked region.
+- **`4 → 5`** — the ε / CID-collapse: the 32-byte inner `session_id` left the
+  data-plane wire (it stays in the AEAD AAD), and the routing `ConnId` became a
+  rotating per-direction chain (unlinkable migration).
+- **`5 → 6`** — the anti-fingerprint diet: the whole header is now HP-masked (the
+  `version` byte included) and the two cleartext `u32` length prefixes
+  (`payload_len` / `ext_len`) were dropped, with `extensions` moved off the
+  data-plane wire.
+
+`PROTOCOL_VERSION` bumped `1 → 2` (the signed transcript began covering the 0-RTT
+verdict `early_data_accepted` and `ClientHello` gained the `resumption_binder`
+proof-of-possession field) and `2 → 3` (`ServerHello`'s `server_key_package` was
+replaced by a 32-byte `server_nonce`, changing the signed-transcript content).
+Handshakes across any of these versions cannot interoperate. See PROTOCOL.md § 1
+for the authoritative narrative.
 
 Both are **tamper-check anchors**, not negotiated sets:
 
@@ -93,19 +115,21 @@ Both are **tamper-check anchors**, not negotiated sets:
 ### Adding bytes without a version bump
 
 The single `PhantomPacket { header, payload, extensions }` carries an
-`extensions: Vec<u8>` TLV field as forward-compatible headroom. New **forge-safe**
-TLV records can ride inside `extensions` without touching `WIRE_VERSION` — a peer
+`extensions: Vec<u8>` TLV field as forward-compatible headroom — reserved and
+empty for 1.0. As of WIRE v6 it no longer rides on the data-plane wire (it was
+always empty), but the AEAD AAD still binds an empty extensions slice. New TLV
+records can ride inside `extensions` without touching `WIRE_VERSION` — a peer
 that does not know a record deserialises it as an empty/ignored `Vec` (the
-ignored-on-read case is a documented contract; reserved and empty for 1.0).
+ignored-on-read case is a documented contract).
 
-**Crucially, `extensions` is _not_ covered by the AEAD AAD** (the AAD is the
-45-byte header only — see `PROTOCOL.md` § 4.1 / § 5), so its bytes are
-attacker-malleable on the wire. Only values that are *safe when forged* may go
-there. Security-sensitive amendments — anything an attacker could abuse by
-flipping it, e.g. **packet-number / SACK / ACK-range fields** that steer
-retransmission and congestion control — must instead live in the AAD-covered
-header, which is a deliberate `WIRE_VERSION` bump (see SACK in the deferred-work
-notes). Do not put them in `extensions`.
+`extensions` **is** covered by the AEAD AAD (T4.1 — the AAD is the reconstructed
+47-byte header image followed by the `extensions` TLV; see `PROTOCOL.md` § 4.1 /
+§ 5), so its bytes are integrity-protected, not attacker-malleable. Even so,
+security-sensitive amendments — anything that steers protocol behaviour, e.g.
+**packet-number / SACK / ACK-range fields** for retransmission and congestion
+control — belong in the structured header (a deliberate `WIRE_VERSION` bump),
+not in the unstructured TLV slot, so the codec validates them as first-class
+fields. Do not overload `extensions` for them.
 
 The same no-bump latitude applies to new `PacketFlags` bits (`0x1000 .. 0x8000`
 are reserved) — but note the flags **are** AAD-covered (they live in the header),
@@ -118,8 +142,9 @@ A change to any of the following requires bumping `WIRE_VERSION` /
 `PROTOCOL_VERSION`:
 
 - A new byte added to (or width change on) the on-wire `PacketHeader`.
-- A change to the AEAD nonce derivation (`nonce_prefix || epoch || stream_id ||
-  sequence || path_id`).
+- A change to the AEAD nonce derivation (`nonce_prefix(4) || packet_number(8)`;
+  since ① the `epoch` / `stream_id` / `path_id` fields are AAD-only, not in the
+  nonce — see `PROTOCOL.md` § 5).
 - A change to any KDF label string (e.g. `"phantom-rekey-v1"`).
 - A change to the borsh field order of `ClientHello` / `ServerHello` /
   `HelloRetryRequest`.
@@ -202,7 +227,7 @@ recent stable, not under the MSRV gate — the MSRV promise covers the
 ## 7. PQC and cryptographic dependency updates
 
 `ml-kem` and `ml-dsa` (the FIPS-203 / FIPS-204 RustCrypto crates) are
-optional dependencies, enabled by default via the `std` feature (`ml-kem = "0.2"`, `ml-dsa = "0.1.0"`). A bump of a
+optional dependencies, enabled by default via the `std` feature (`ml-kem = "0.2"`, `ml-dsa = "0.1.1"`). A bump of a
 cryptographic dependency is treated as a potential **wire-format change**:
 if the upgrade alters the serialised key-package / ciphertext / signature bytes
 or the KAT vectors, it is a coordinated `WIRE_VERSION` / `PROTOCOL_VERSION` bump

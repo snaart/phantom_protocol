@@ -31,7 +31,8 @@ protection is a core pre-1.0 requirement, not a deferred hardening. At a glance:
   data after handshake; downgrade resistance; DoS-resistance, including the
   pre-authentication PhantomUDP surface (a stateless address-validation cookie is required
   before any per-connection state, with bounded demux / reorder buffers and optional PoW);
-  outer anti-DPI obfuscation on the FakeTLS leg; and **resistance to passive linkability of a
+  optional anti-DPI obfuscation via the `mimicry` feature (framing-only, no second AEAD,
+  detectable by active probing — see `docs/security/threat-model.md` §6.1); and **resistance to passive linkability of a
   connection across network changes** — the committed pre-1.0 mechanism is QUIC-style header
   protection (encrypting the packet number and the variable header fields) plus
   connection-ID rotation, landing in the next wire-format revision.
@@ -55,7 +56,13 @@ protection is a core pre-1.0 requirement, not a deferred hardening. At a glance:
 | Symmetric AEAD (fallback) | ChaCha20-Poly1305 (`ring`) | No |
 | Hash / KDF | HKDF-SHA-256, blake3 KDF | SHA-256 yes; blake3 no |
 
-A FIPS-compliant build profile (`--features fips`) is on the roadmap.
+An opt-in `fips` Cargo feature (off by default) **ships today**. It provides a
+FIPS-140-3 *substrate* — `aws-lc-rs` (AWS-LC-FIPS) swaps the non-approved
+primitives toward ECDH-P-256 / AES-256-GCM / HKDF-SHA256 / CTR_DRBG and wires a
+power-on self-test gate into bind/connect. This is **not** a CMVP-validated
+cryptographic module, and no validation is in progress. The canonical ring-free
+build is `--no-default-features --features fips,bindings,compression-zstd`. See
+[`docs/compliance/fips-readiness.md`](docs/compliance/fips-readiness.md).
 
 ## Security invariants
 
@@ -70,11 +77,16 @@ The implementation enforces (and integration tests verify) the following invaria
    **All** unencrypted packets received post-handshake are dropped — including an
    empty-payload one whose only effect would be a forged standalone `FIN` (stripped-flag
    downgrade defense; the empty-FIN gap was closed as M-2).
-3. **FakeTLS uses per-record counter nonces.** The outer obfuscation layer derives
-   `send_key` / `recv_key` / `nonce_prefix` from a public seed
-   (`SNI + version`) via `blake3::derive_key` with direction-specific labels, and
-   increments a per-direction `u64` counter on each record (preventing the
-   Forbidden Attack on AES-GCM).
+3. **Anti-DPI obfuscation carries no confidentiality of its own.** The old
+   FakeTLS leg (per-record counter-nonce AEAD over a public seed) has been
+   **removed**. Anti-DPI obfuscation now lives behind the optional `mimicry`
+   Cargo feature (`MimicTlsLeg`, `connect_pinned_mimic` / `bind_mimic`): it is
+   **framing-only** — a synthetic TLS 1.3 wrapper with **no second AEAD and no
+   real ECDHE/cert** — so it defeats passive parsers but is **detectable by active
+   probing**. The inner Phantom PQ session remains the sole source of
+   authentication and confidentiality. See
+   [`docs/security/threat-model.md`](docs/security/threat-model.md) §6.1 for the
+   honest residuals and SAFE/UNSAFE guidance.
 
 Future edits must preserve these. See [`docs/security/threat-model.md`](docs/security/threat-model.md)
 for the full STRIDE / LINDDUN analysis and per-mitigation file:line traceability.

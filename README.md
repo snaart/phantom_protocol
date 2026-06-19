@@ -184,22 +184,26 @@ security invariants are catalogued in
 
 ## Transport features
 
-- **Single unified wire protocol.** One `PacketHeader` (45 bytes, with a
-  pinned `version` byte = `WIRE_VERSION`) wrapped in a bare `PhantomPacket`
-  (`header` + `payload` + TLV-headroom `extensions`) — no `VersionedPacket`
-  enum, no per-session wire-version negotiation. `epoch`, `REKEY`,
-  `PATH_VALIDATION`, `COALESCED`, `WINDOW_UPDATE` flags live in the one header;
-  the recv path deserializes `PhantomPacket` directly and drops any frame whose
-  `header.version` differs. Handshake messages are bare borsh structs (no
+- **Single unified wire protocol.** One `PacketHeader` (15 bytes on the wire,
+  fully header-protected — the variable header fields and the leading `version`
+  byte are HP-masked; the AEAD AAD image is 47 bytes) wrapped in a bare
+  `PhantomPacket` (`header` + `payload` + TLV-headroom `extensions`) — no
+  `VersionedPacket` enum, no per-session wire-version negotiation. `epoch`,
+  `REKEY`, `PATH_VALIDATION`, `COALESCED`, `WINDOW_UPDATE` flags live in the one
+  header; the recv path deserializes `PhantomPacket` directly and drops any frame
+  whose `header.version` differs. Handshake messages are bare borsh structs (no
   envelopes): one `ClientHello` (with the optional 0-RTT `early_data` blob folded
   in), one `ServerHello`, one `HelloRetryRequest`, one signed
-  `HandshakeTranscript` leading with `protocol_variant`. The pinned
-  `PROTOCOL_VERSION` / `WIRE_VERSION` bytes are tamper-check anchors and a hook
-  for a future deliberate bump.
-- **Path-validation primitive (internal).** `PathRegistry` + constant-time
-  challenge/response; path 0 pre-validated, secondary paths transition
-  `Unvalidated → Validating → Validated`. This is the building block for future
-  connection migration; it is not yet wired into a live multi-path data plane.
+  `HandshakeTranscript` leading with `protocol_variant`. `WIRE_VERSION` is `6`
+  (`PROTOCOL_VERSION` is `3`); both pinned bytes are tamper-check anchors and a
+  hook for a future deliberate bump.
+- **Path validation (wired into the live UDP data plane).** `PathRegistry` +
+  constant-time challenge/response; path 0 pre-validated, secondary paths
+  transition `Unvalidated → Validating → Validated`. It backs the PhantomUDP
+  data plane end-to-end — the PATH-001 send-gate + recv-relax, seamless
+  connection migration (one live path at a time), and passive-NAT-rebind
+  recovery. Only bandwidth *aggregation* / simultaneous multipath is unbuilt
+  (rejected for this workload — see [Status & limitations](#status--limitations)).
 
 ## Performance
 
@@ -526,7 +530,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). PRs must pass `cargo fmt --check`,
 `cargo clippy --lib -- -D warnings`, `cargo test --lib`, and `cargo deny check`.
-The `cli-compat` CI job requires that `core` API edits keep
+The `cli-check` CI job requires that `core` API edits keep
 `cli/` building.
 
 ## Acknowledgements
