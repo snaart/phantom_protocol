@@ -25,7 +25,7 @@ Kotlin, C); native `wasm32` target; bare-metal `EmbeddedLeg` for `no_std`.
 
 ```toml
 [dependencies]
-phantom-protocol = "0.1"
+phantom-protocol = "0.2"
 ```
 
 or `cargo add phantom-protocol`.

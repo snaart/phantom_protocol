@@ -62,7 +62,7 @@ These fire at the point of the event.
 | Attribute | Source | Example |
 |-----------|--------|---------|
 | `service.name` | embedder builder | `phantom-server` |
-| `service.version` | `CARGO_PKG_VERSION` | `0.1.1` |
+| `service.version` | `CARGO_PKG_VERSION` | `0.2.0` |
 | `service.instance.id` | hostname or UUID | `phantom-server-abc123` |
 | `phantom.role` | embedder | `server` / `client` |
 | `host.name`, `os.type`, `process.pid`, `process.runtime.name` | auto-detected | — |
