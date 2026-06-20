@@ -1,6 +1,6 @@
 [package]
 name = "phantom-protocol"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.93"
 description = "Post-quantum-secure L4/L6 universal transport framework — hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65, multi-path, UniFFI bindings"
