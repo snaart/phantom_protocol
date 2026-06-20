@@ -40,10 +40,10 @@ ENTRYPOINT ["/usr/local/bin/phantom-server"]
 ## Build and run
 
 ```sh
-docker build -t phantom-server:0.1.1 .
+docker build -t phantom-server:0.2.0 .
 docker run --rm -p 4242:4242 \
     -e RUST_LOG=info,phantom_protocol=debug \
-    --name phantom phantom-server:0.1.1
+    --name phantom phantom-server:0.2.0
 ```
 
 For aarch64 hosts, prefix `--platform linux/arm64` and use `rust:1.93-slim`
@@ -106,7 +106,7 @@ Then point Docker at the JSON driver in `docker-compose.yml`:
 ```yaml
 services:
   phantom:
-    image: phantom-server:0.1.1
+    image: phantom-server:0.2.0
     logging:
       driver: json-file
       options:
@@ -148,7 +148,7 @@ In `docker-compose.yml`, point the server at a Collector sidecar:
 ```yaml
 services:
   phantom:
-    image: phantom-server:0.1.1
+    image: phantom-server:0.2.0
     environment:
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
       OTEL_SERVICE_NAME: "phantom-server"
