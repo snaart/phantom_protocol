@@ -581,7 +581,7 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(
  *    time to detect ABI drift.
  *
  *  - The shape (UniFFI 0.31, contract 30) is current as of phantom_protocol
- *    0.1.1. If you bump the UniFFI dependency, regenerate this header.
+ *    0.2.0. If you bump the UniFFI dependency, regenerate this header.
  * ==================================================================== */
 
 #ifdef __cplusplus
