@@ -16,7 +16,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-phantom_protocol = { version = "0.1", default-features = false, features = ["std", "wasi-leg"] }
+phantom_protocol = { version = "0.2", default-features = false, features = ["std", "wasi-leg"] }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 
 [[bin]]
