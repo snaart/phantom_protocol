@@ -8,6 +8,22 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-21
+
+Documentation/metadata patch release. **No code, wire-format, public-API, or
+dependency changes** — binary- and wire-compatible with 0.2.0
+(`WIRE_VERSION = 6`, `PROTOCOL_VERSION = 3`).
+
+### Fixed
+
+- **Stale version references in the published README and deployment docs.** 0.2.0 was
+  published immediately before the version-reference refresh merged, so the README
+  rendered on crates.io / docs.rs still read `Pre-1.0 (0.1.1)` and advised
+  `phantom-protocol = "0.1"`. 0.2.1 re-publishes the corrected README and bumps the
+  remaining current-version references — the README pre-1.0 banner, Docker image tags,
+  Helm `appVersion` + chart version, the observability `service.version` example, the
+  C/Python binding packaging manifests, and the CLI version banner — to `0.2.1`.
+
 ## [0.2.0] - 2026-06-20
 
 ### Added
