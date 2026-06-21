@@ -1,8 +1,11 @@
 //! Stream Demultiplexer
 //!
-//! Routes incoming packets to their target streams based on `stream_id`
-//! extracted from `PhantomPacket` headers. Replaces the old smoltcp-based
-//! multiplexer with a lightweight, zero-copy routing table.
+//! Routes decrypted inbound payloads to their target streams based on the
+//! `stream_id` carried in the `PhantomPacket` header. A lightweight, zero-copy
+//! routing table (`DashMap<stream_id, mpsc::Sender>`) keyed by `u32` stream id:
+//! the recv pump looks up the sender and hands off the `Bytes` payload without
+//! copying. Stream id 0 is reserved for the session-level control channel;
+//! unknown stream ids are dropped with a log warning.
 
 use crate::transport::types::SequenceNumber;
 use bytes::Bytes;

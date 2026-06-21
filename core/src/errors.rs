@@ -149,7 +149,9 @@ impl core::fmt::Display for CoreError {
     }
 }
 
-// `core::error::Error` requires Rust 1.81; MSRV is 1.75. Gate the impl on the
-// `error_in_core` feature being available (compile-time check via cfg of the
-// rust version is not possible here, so simply omit — `Display` + `Debug` are
-// sufficient for the embedded subset's error-propagation needs).
+// No `core::error::Error` impl is provided on the no-std path. The std path
+// gets `std::error::Error` from the `thiserror::Error` derive (gated above);
+// the no-std path deliberately stops at `Display` + `Debug`, which is all the
+// embedded subset's error-propagation needs — there is no `?`-into-`dyn Error`
+// boundary in that build. (`core::error::Error` would be available at the
+// current 1.93 MSRV, but wiring it up buys the embedded path nothing.)

@@ -1,3 +1,14 @@
+//! Standalone input-validation helpers (DoS / malformed-input guards).
+//!
+//! [`InputValidator`] is a stateless bag of bounds checks — message size, a
+//! 16-byte group-id well-formedness check, and an epoch-drift window. They are
+//! generic guards, NOT bound to the live `PacketHeader` codec: the helpers here
+//! are not invoked on the production receive path (the wire `epoch` is a `u8`
+//! rekey selector validated inside `transport::session`, unrelated to the `u64`
+//! application-level epoch checked here). The module is kept as a reusable
+//! validation surface for embedders and for any caller that needs to bound
+//! untrusted input before handing it to the core.
+
 use anyhow::{bail, Result};
 
 pub struct InputValidator;

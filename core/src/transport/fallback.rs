@@ -1,7 +1,18 @@
 //! Phantom Protocol - Fallback State Machine
 //!
-//! Automatic transport mode degradation:
-//! Turbo (KCP) → Reliable (TCP) → Stealth (FakeTLS)
+//! A degrade/heal state machine over three abstract transport "modes"
+//! (`Turbo → Reliable → Stealth`): on repeated connection failures it walks one
+//! step toward the most-robust mode, and probes back up to the best mode when the
+//! path heals. The mode names predate the PhantomUDP rewrite — the concrete
+//! KCP / TCP / FakeTLS legs they referred to are gone (PhantomUDP is now the only
+//! production transport, with TCP/WebSocket/WASI/Embedded/MimicTls byte-pipes).
+//!
+//! **Vestigial.** The machine is still constructed inside `Session` (held behind
+//! `#[allow(dead_code)]`) but no longer steers a live transport — the project does
+//! single-path connection migration, not transport-mode switching. The logic and
+//! tests are kept intact in case mode-switching is rewired against the current
+//! transports; treat the `Turbo`/`Reliable`/`Stealth` names as opaque tiers, not
+//! as the retired legs.
 
 use crate::transport::scheduler::Scheduler;
 use parking_lot::RwLock;
@@ -9,14 +20,17 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Transport modes supported by the system
+/// Abstract transport-robustness tiers, most→least performant. The names are
+/// historical (they once mapped to the retired KCP / TCP / FakeTLS legs) and are
+/// now opaque ordering labels for the degrade/heal walk, not concrete transports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
-    /// High-performance Mode (KCP over UDP)
+    /// Most performant, least robust tier (the top of the fallback ladder).
     Turbo,
-    /// Reliable Mode (Standard TCP)
+    /// Middle tier — trades some performance for robustness.
     Reliable,
-    /// Stealth Mode (FakeTLS for DPI bypass)
+    /// Most robust, most obfuscated tier (the bottom of the ladder; the machine
+    /// degrades no further once here).
     Stealth,
 }
 
@@ -80,7 +94,9 @@ pub struct FallbackStateMachine {
     last_probe: RwLock<Instant>,
     /// Best available mode to aim for
     best_mode: TransportMode,
-    /// Reference to scheduler (to update mode)
+    /// Optional scheduler the machine would push mode changes into. Always `None`
+    /// today (the vestigial scheduler is not wired to mode switching) — kept as the
+    /// seam for re-wiring mode-switching against a live transport.
     #[allow(dead_code)]
     scheduler: Option<Arc<Scheduler>>,
 }

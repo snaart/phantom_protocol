@@ -6,26 +6,23 @@
 //! feature → `crypto.getRandomValues`, etc.).
 //!
 //! Embedders can swap in their own provider by implementing this trait and
-//! threading it into the relevant `_with_provider` entry points (the
-//! [`HybridSigningKey::generate_with_provider`] demonstration is wired up
-//! in this commit; the rest of the crate continues to call the
-//! `OsRng`-using default until a follow-up sweep lifts the abstraction
-//! through every call site).
+//! threading it into the relevant `_with_provider` entry points (e.g.
+//! `HybridSigningKey::generate_with_provider`, which mints a keypair from an
+//! injected RNG). The trait is the *seam*; all in-crate production code uses
+//! the [`OsRng`] default, and target-specific embedders (embedded HALs without
+//! a `getrandom`-shaped entropy source) supply their own provider.
 //!
-//! [`HybridSigningKey::generate_with_provider`]: crate::crypto::hybrid_sign::HybridSigningKey::generate_with_provider
+//! ## Module scope
 //!
-//! ## Phase 3.8 scope (this commit)
+//! Trait + default [`OsRng`] impl + tests. The `OsRng` substrate forks on the
+//! build: `getrandom` on the default build, AWS-LC's CTR_DRBG under
+//! `--features fips` (see the two `impl RngProvider for OsRng` blocks below).
+//! Beyond those, the module deliberately ships no other providers:
 //!
-//! Trait + default [`OsRng`] impl + tests. **No** new crate dependencies
-//! (this module uses only what already ships in `Cargo.toml`).
-//!
-//! What is intentionally NOT in scope here:
-//!
-//! - Refactoring every existing `thread_rng()` / `OsRng` call site to
-//!   thread an `Arc<dyn RngProvider>` through the codebase. That sweep is
-//!   a follow-up.
-//! - A real NIST SP 800-90A DRBG (e.g., HMAC-DRBG). The trait is shaped to
-//!   accept one, but the impl itself is Phase 5 (FIPS) work.
+//! - A software NIST SP 800-90A DRBG of our own (e.g. HMAC-DRBG). Not needed:
+//!   the `fips` build delegates to AWS-LC's FIPS-validated CTR_DRBG rather than
+//!   carrying an in-tree DRBG. The trait is still shaped to accept one — see
+//!   the illustrative skeleton below — for embedders who want a custom DRBG.
 //! - A hardware-RNG impl. Those are inherently target-specific and belong
 //!   in a downstream HAL adapter crate, not in `phantom_protocol` itself.
 //!
@@ -69,11 +66,14 @@
 //! (most TRNGs have a stuck-bit / continuous-test register) rather than
 //! returning silently-biased bytes.
 //!
-//! ### NIST-approved DRBG in FIPS mode
+//! ### Software DRBG provider (illustration)
 //!
-//! Phase 5 will add an internal `HmacDrbg` (SP 800-90A § 10.1.2) keyed
-//! from `getrandom` at boot and re-seeded on a request / time interval
-//! per SP 800-90A § 9. The skeleton:
+//! The shipped `--features fips` build does NOT use an in-tree DRBG — it
+//! delegates `OsRng` to AWS-LC's FIPS-validated CTR_DRBG (see the fips
+//! `impl RngProvider for OsRng` below). An embedder who wants their own
+//! software DRBG (e.g. an `HmacDrbg`, SP 800-90A § 10.1.2, keyed from
+//! `getrandom` at boot and re-seeded per SP 800-90A § 9) can shape it as a
+//! provider like this:
 //!
 //! ```ignore
 //! use phantom_protocol::crypto::rng::RngProvider;

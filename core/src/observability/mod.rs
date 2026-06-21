@@ -1,9 +1,9 @@
 //! Phantom Protocol observability subsystem.
 //!
-//! Replaces the Phase 4.5 hand-rolled metrics module (`transport::metrics`).
-//! Lock-free hot-path atomics for per-packet recording plus opt-in
-//! OpenTelemetry instruments (metrics + traces) gated behind the
-//! `telemetry-otel` Cargo feature.
+//! Replaced the Phase 4.5 hand-rolled metrics module (`transport::metrics`),
+//! which has since been deleted. Lock-free hot-path atomics for per-packet
+//! recording plus opt-in OpenTelemetry instruments (metrics + traces) gated
+//! behind the `telemetry-otel` Cargo feature.
 //!
 //! See `docs/observability/refactor-plan.md` for the full design and
 //! `docs/observability/metrics-catalog.md` for the instrument inventory.
@@ -42,8 +42,9 @@ use std::sync::Arc;
 
 /// Public observability facade.
 ///
-/// Wraps the lock-free atomic counters (always present) and — in later
-/// rollout steps — the feature-gated OpenTelemetry instrument holder.
+/// Wraps the lock-free atomic counters (always present) and the opt-in
+/// OpenTelemetry instrument holder — metrics + traces, active when the
+/// `telemetry-otel` Cargo feature is enabled and a zero-cost ZST otherwise.
 /// Recording sites in `transport`, `api`, and `crypto` call methods on this
 /// struct via an `Arc<Observability>` borrowed from `PhantomListener` /
 /// `PhantomSession`.
@@ -148,24 +149,27 @@ impl Observability {
         self.instruments.stream_closed();
     }
 
-    /// Record a successful handshake completion with its duration (ns).
+    /// Record a successful handshake completion with its duration (ns) into
+    /// the lock-free atomics only — no OTel attribution.
     ///
-    /// Transitional API — step 7 introduces a labeled `record_handshake`
-    /// that takes `(outcome, leg, cipher_suite, version)` and writes to an
-    /// OTel `Histogram`. Until then, the duration accumulates in atomic
-    /// sum+count fields surfaced via [`Self::snapshot`].
+    /// This is the snapshot-only path: the duration accumulates in atomic
+    /// sum+count fields surfaced via [`Self::snapshot`]. Callers that also
+    /// want the labeled OTel `Histogram` use [`Self::record_handshake`]
+    /// (which calls this internally for the success case).
     pub fn record_handshake_success(&self, duration_ns: u64) {
         self.atomics.record_handshake_success(duration_ns);
     }
 
-    /// Record a handshake failure. Cause attribution (cookie / signature /
-    /// transcript / KEM) lands with the labeled API in step 7.
+    /// Record a handshake failure into the lock-free atomics only.
+    ///
+    /// Cause attribution (cookie / signature / transcript / KEM) is carried
+    /// by the labeled OTel path in [`Self::record_handshake`], not here.
     #[inline]
     pub fn record_handshake_failure(&self) {
         self.atomics.record_handshake_failure();
     }
 
-    // --- Labeled OTel event recorders (step 7) ---
+    // --- Labeled OTel event recorders ---
 
     /// Record a handshake outcome and its latency with full OTel
     /// attribution. The lock-free atomic counters and the OTel

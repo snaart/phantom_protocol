@@ -138,7 +138,7 @@ impl PhantomListener {
     /// probing** (a probe that completes a real TLS handshake / validates a cert is
     /// black-holed but still learns TLS never completes). Do not rely on it where
     /// active probing is in the threat model. The server generates a fresh
-    /// signing key per process — use [`bind_with_signing_key_mimic`] for a pinned
+    /// signing key per process — use [`bind_with_signing_key_mimic`](Self::bind_with_signing_key_mimic) for a pinned
     /// persistent identity. Rust-only, native-only.
     #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
     pub async fn bind_mimic(addr: String) -> Result<Arc<Self>, CoreError> {

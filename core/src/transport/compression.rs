@@ -5,8 +5,9 @@
 //! - Standard tier: Zstd level 1 (~500 MB/s compress, ratio ~2.5x)
 //! - Constrained tier: off (CPU > bandwidth)
 //!
-//! Auto-probe: если compression ratio < threshold на первых N пакетах → отключить.
-//! Минимальный размер для сжатия = 64 байт (overhead не оправдан).
+//! Auto-probe: if the compression ratio stays below `probe_threshold` after the
+//! first `probe_samples` packets, compression self-disables (CPU not worth it).
+//! Minimum payload worth compressing = 64 bytes (below that the overhead dominates).
 
 /// Compression algorithm
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,12 +39,13 @@ impl CompressionAlgo {
 /// Minimum payload size worth compressing
 const MIN_COMPRESS_SIZE: usize = 64;
 
-/// Default upper bound on decompressed output (16 MiB — matches the
-/// established-session frame cap in `TcpSessionTransport`). Decompression is an
-/// asymmetric operation: a few KiB of crafted LZ4/Zstd can expand to gigabytes
-/// (a "decompression bomb"). [`AdaptiveCompressor::decompress`] enforces this
-/// cap unconditionally; callers that need a different bound use
-/// [`AdaptiveCompressor::decompress_with_limit`].
+/// Default upper bound on decompressed output (16 MiB). A conservative ceiling on
+/// the largest plaintext a single frame may expand to; the established-session
+/// `TcpSessionTransport` frame cap is tighter still (4 MiB), so this never gates
+/// legitimate traffic. Decompression is an asymmetric operation: a few KiB of
+/// crafted LZ4/Zstd can expand to gigabytes (a "decompression bomb").
+/// [`AdaptiveCompressor::decompress`] enforces this cap unconditionally; callers
+/// that need a different bound use [`AdaptiveCompressor::decompress_with_limit`].
 pub const MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
 
 /// Compression statistics for auto-probe

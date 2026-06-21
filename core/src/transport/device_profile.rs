@@ -1,11 +1,21 @@
 //! Device Profile System
 //!
-//! Три тира устройств с адаптивными параметрами:
-//! - Constrained: ESP32, дроны, IoT (520KB RAM, нет HW AES)
-//! - Standard: смартфоны, SBC, RPi (1-4GB RAM)
-//! - Performance: серверы, десктопы (8+ GB RAM, HW AES)
+//! Three device tiers with adaptive transport parameters (buffer sizes, stream
+//! limits, coalescing, compression, MTU):
+//! - Constrained: ESP32, drones, IoT (~520 KB RAM, no HW AES)
+//! - Standard: smartphones, SBCs, Raspberry Pi (1-4 GB RAM)
+//! - Performance: servers, desktops (8+ GB RAM, HW AES)
 //!
-//! PQ-безопасность обязательна для ВСЕХ tier'ов.
+//! Post-quantum security is mandatory for EVERY tier.
+//!
+//! NOTE: this module is **descriptive / not yet wired**. `DeviceProfile` and its
+//! `PqKemLevel` / `PqSignLevel` fields are not imported by the handshake or crypto
+//! layers — the live handshake uses a single fixed hybrid suite (X25519 + ML-KEM-768
+//! KEM, Ed25519 + ML-DSA-65 signatures), not a per-tier-selectable Kyber512 /
+//! Dilithium2. The `PqKemLevel` / `PqSignLevel` enums (Kyber/Dilithium are the
+//! pre-standardization names for ML-KEM / ML-DSA) describe the *intended* tiering
+//! but do not currently steer any wire negotiation. The non-crypto knobs
+//! (`buffer_size`, `max_streams`, `coalescing`, …) are likewise advisory defaults.
 
 use crate::crypto::adaptive_crypto::{CipherSuite, HwCaps};
 
@@ -160,12 +170,16 @@ impl DeviceProfile {
         } // 16-bit → definitely Constrained
     }
 
-    /// Whether this profile supports the full PQ handshake (Kyber768)
+    /// Whether this profile's *intended* PQ KEM level is the full Kyber768
+    /// (== ML-KEM-768). Advisory only — see the module note; the live handshake
+    /// always uses ML-KEM-768 regardless of this profile.
     pub fn is_full_pq(&self) -> bool {
         matches!(self.pq_kem, PqKemLevel::Kyber768)
     }
 
-    /// Byte for handshake encoding
+    /// Stable 1-byte tier discriminant (Constrained=0 / Standard=1 / Performance=2).
+    /// A convenience encoding for callers that want to serialize the tier; the live
+    /// wire protocol does not currently carry it.
     pub fn tier_byte(&self) -> u8 {
         match self.tier {
             DeviceTier::Constrained => 0,

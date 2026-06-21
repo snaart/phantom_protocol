@@ -78,7 +78,8 @@ pub(crate) struct HotPathAtomics {
     active_sessions: CachePadded<AtomicI64>,
     active_streams: CachePadded<AtomicI64>,
 
-    /// Handshake counters (transitional; full labeled API lands in step 7).
+    /// Handshake counters. These feed the cold-path snapshot only; the
+    /// labeled OTel attribution lives in the instrument holder, not here.
     handshake_success_count: CachePadded<AtomicU64>,
     handshake_failure_count: CachePadded<AtomicU64>,
     handshake_latency_ns_sum: CachePadded<AtomicU64>,
@@ -173,10 +174,10 @@ impl HotPathAtomics {
 
     /// Record a successful handshake completion with its duration (ns).
     ///
-    /// Transitional API — step 7 introduces a labeled `record_handshake`
-    /// that takes `(outcome, leg, cipher_suite, version)` and feeds an
-    /// OTel `Histogram`. Until then this is a sum+count pair that drives
-    /// the transitional Prometheus output and the live snapshot.
+    /// Maintains a success counter plus a latency sum+count pair, all
+    /// surfaced through the live snapshot. The labeled OTel `Histogram`
+    /// (`{ns}.handshake.duration`) is a separate path in the instrument
+    /// holder; the facade's `record_handshake` drives both together.
     pub(crate) fn record_handshake_success(&self, duration_ns: u64) {
         self.handshake_success_count.fetch_add(1, Ordering::Relaxed);
         self.handshake_latency_ns_sum
@@ -185,7 +186,8 @@ impl HotPathAtomics {
     }
 
     /// Record a handshake failure. Cause attribution (cookie / signature /
-    /// transcript / KEM) lands with the labeled API in step 7.
+    /// transcript / KEM) is not tracked here — that detail is carried by the
+    /// labeled OTel path in the facade's `record_handshake`.
     #[cold]
     pub(crate) fn record_handshake_failure(&self) {
         self.handshake_failure_count.fetch_add(1, Ordering::Relaxed);

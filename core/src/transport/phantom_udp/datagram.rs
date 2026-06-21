@@ -27,7 +27,8 @@ fn cid16(cid: &[u8; CID_LEN]) -> [u8; 16] {
 /// we surface the error here instead.
 ///
 /// Note: `MAX_INNER_FRAG_CHUNK` must remain ≤ the assembler's accepted chunk size
-/// (currently 1200 bytes) — a coupling to revisit if `PATH_MTU` rises in Phase 5.
+/// (`MAX_UDP_PAYLOAD`, currently 1200 bytes) — a coupling to revisit if `PATH_MTU`
+/// ever rises (e.g. via DPLPMTUD).
 pub fn encode_datagrams(
     ty: PacketType,
     cid: &[u8; CID_LEN],

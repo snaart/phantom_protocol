@@ -1,6 +1,14 @@
 //! Pre-allocated Buffer Pool
 //!
-//! Eliminates per-packet memory allocations for maximum throughput.
+//! Recycles I/O buffers to avoid a per-packet heap allocation. A two-level pool: a
+//! lock-free global `ArrayQueue` backed by a per-thread `LOCAL_POOL` cache, so the
+//! hot acquire/return path usually stays thread-local and contention-free, spilling
+//! to the global queue only in batches.
+//!
+//! Used by the low-level `transport::udp_transport` socket helper and the
+//! `buffer_pool_bench`. NOTE: the production `SessionTransport`-level recv path
+//! (`TcpSessionTransport`) uses a persistent `BytesMut` accumulator instead, so
+//! this pool is the alternate / lower-level path rather than the main data plane.
 
 use crossbeam_queue::ArrayQueue;
 use std::cell::RefCell;

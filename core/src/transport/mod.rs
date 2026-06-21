@@ -1,11 +1,17 @@
-//! Phantom Protocol
+//! Phantom Protocol transport internals.
 //!
-//! A meta-transport layer combining SCTP, QUIC, and KCP advantages:
-//! - Multi-homing (seamless Wi-Fi ↔ LTE)
-//! - Multi-streaming (independent streams, no HoL blocking)
-//! - 0-RTT connection establishment
-//! - Connection migration (session persists across IP changes)
-//! - Adaptive fallback (Turbo → Reliable → Stealth)
+//! The protocol layer beneath the public `crate::api` surface. PhantomUDP — a
+//! QUIC-class reliable transport over raw UDP — is the production transport;
+//! TCP / WebSocket / WASI / Embedded / TLS-mimicry byte-pipes also plug in via
+//! `SessionTransport`. Key properties:
+//! - Multi-streaming (independent streams, no head-of-line blocking)
+//! - 0-RTT connection establishment (resumption + early-data)
+//! - Seamless single-path connection migration (session survives IP changes)
+//! - Adaptive fallback tiers (`Turbo → Reliable → Stealth`, see `fallback`)
+//!
+//! NOTE: multipath bandwidth aggregation / multi-homing was deliberately rejected
+//! — migration moves one active path at a time, it does not bond paths. The
+//! `scheduler` module is consequently vestigial.
 
 // ── no_std-clean subset (Phase 3.6) ────────────────────────────────────
 // `session_transport` and `legs::embedded` compile on bare-metal and are the

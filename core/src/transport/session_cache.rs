@@ -1,11 +1,19 @@
 //! 0-RTT Session Resumption
 //!
-//! Аналог TLS Session Tickets / QUIC 0-RTT:
-//! - Первое подключение: полный PQC handshake → сохраняем ResumptionTicket
-//! - Повторное подключение: ticket → мгновенный 0-RTT (данные в первом пакете)
-//! - Periodic rekeying через resumption_secret для forward secrecy
+//! Analogous to TLS session tickets / QUIC 0-RTT:
+//! - First connection: a full PQC handshake establishes the session and stores a
+//!   `ResumptionTicket` (server-side) keyed by `session_id`.
+//! - Later connection: the client presents the ticket's session id + binder, and
+//!   the server can accept 0-RTT early-data folded into the first `ClientHello`.
 //!
-//! LRU eviction для ограничения памяти на IoT.
+//! Each ticket is **single-use** ([`SessionCache::try_resume`] / [`SessionCache::remove`]
+//! consume it), the anti-replay guarantee for 0-RTT early-data. Forward secrecy of
+//! the post-handshake session always comes from the fresh hybrid KEM run on every
+//! connect — never from the long-lived `resumption_secret`, which only seeds the
+//! best-effort early-data key.
+//!
+//! A bounded LRU cache (default 64 entries, 1-hour lifetime) caps memory — important
+//! for constrained / IoT servers.
 
 use crate::crypto::adaptive_crypto::CipherSuite;
 use std::collections::HashMap;

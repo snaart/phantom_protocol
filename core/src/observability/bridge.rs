@@ -1,10 +1,11 @@
 //! Bridge between lock-free hot-path atomics and OTel observable instruments.
 //!
 //! Approach: register observable callbacks at instrument-construction time.
-//! On every collection cycle (driven by the embedder's `PeriodicReader` —
-//! default 10s) the OTel SDK invokes our callback, which reads the atomic
-//! counters with `Ordering::Relaxed` and reports per-leg observations with
-//! the correct `direction` / `leg` labels.
+//! On every collection cycle (driven by the embedder's `PeriodicReader`,
+//! whose cadence comes from the OTel SDK default unless overridden by
+//! `OTEL_METRIC_EXPORT_INTERVAL`) the OTel SDK invokes our callback, which
+//! reads the atomic counters with `Ordering::Relaxed` and reports per-leg
+//! observations with the correct `direction` / `leg` labels.
 //!
 //! No background task of our own — the periodicity belongs to the SDK
 //! reader. This means one fewer lifecycle (no spawn / no JoinHandle to

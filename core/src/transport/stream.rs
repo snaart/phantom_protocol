@@ -1,7 +1,12 @@
 //! Phantom Protocol - Stream Management
 //!
-//! Multiplexed streams within a session.
-//! Each stream has independent sequence numbers (no Head-of-Line blocking).
+//! Independently-flow-controlled, reliability-segmented data channels multiplexed
+//! within one session. Each [`Stream`] owns its own send/receive buffers, gap-free
+//! reliable offset space (A.5), SACK-driven loss detection (RFC 9002), RFC-6298 RTO
+//! estimator, and credit-based flow-control windows. Per-stream sequencing means a
+//! stall or loss on one stream does not head-of-line-block any other stream (HoL
+//! blocking still applies *within* a stream — reliable data is delivered strictly
+//! in send order via `accept_in_order`).
 
 use crate::errors::CoreError;
 use crate::transport::sack::Sack;
