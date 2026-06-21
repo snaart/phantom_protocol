@@ -11,7 +11,9 @@ pub type ConnId = [u8; CID_LEN];
 
 /// Outer header length: flags byte + cid.
 pub const HDR_LEN: usize = 1 + CID_LEN;
-/// Conservative path-MTU payload budget for Phase 1 (DPLPMTUD to raise it is Phase 5).
+/// Conservative fixed path-MTU budget: 1200 bytes is the QUIC-style floor that
+/// survives almost every Internet path without IP fragmentation. Static today —
+/// dynamic DPLPMTUD to raise it is future work.
 pub const PATH_MTU: usize = 1200;
 /// Fragment subheader: packet_id u32be + chunk_index u16be + total_chunks u16be.
 pub const FRAG_SUBHDR_LEN: usize = 8;
@@ -22,15 +24,15 @@ pub const MAX_INNER_FRAG_CHUNK: usize = PATH_MTU - HDR_LEN - FRAG_SUBHDR_LEN;
 
 const TYPE_SHIFT: u8 = 6;
 const FRAG_BIT: u8 = 0b0010_0000;
-const RESERVED_MASK: u8 = 0b0001_1111; // bits 4..0 must be 0 in Phase 1
+const RESERVED_MASK: u8 = 0b0001_1111; // bits 4..0 are reserved and must be 0 (rejected if set)
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PacketType {
     /// Long header: inner = a borsh handshake message (ClientHello/ServerHello/HelloRetryRequest/ServerReject).
     Initial,
-    /// Short header: inner = a `PhantomPacket` (45-byte header + body).
+    /// Short header: inner = a header-protected `PhantomPacket` (15-byte masked header + body).
     OneRtt,
-    /// Server -> client stateless address-validation token (reserved; unused in Phase 1).
+    /// Server -> client stateless address-validation token (reserved; unused).
     Retry,
 }
 

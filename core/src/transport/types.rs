@@ -138,7 +138,8 @@ impl PacketFlags {
     /// Control message (handshake, migration)
     pub const CONTROL: u16 = 0x0080;
     /// Sender is rekeying — receiver must derive the next AEAD key from the
-    /// resumption-secret HKDF chain before decrypting this packet (Phase 1.5).
+    /// traffic-secret rekey chain (`HKDF-Expand(current, "phantom-rekey-v1", 32)`,
+    /// Invariant 5) before decrypting this packet (Phase 1.5).
     pub const REKEY: u16 = 0x0100;
     /// Path-validation challenge / response packet for multi-path migration
     /// (Phase 4.2). Payload carries the 32-byte challenge or response.
@@ -281,33 +282,38 @@ impl fmt::Debug for PacketFlags {
     }
 }
 
-/// Packet header — 47 bytes on the wire (the AEAD AAD).
+/// Packet header — 15 bytes on the wire ([`PacketHeader::SIZE`]); the AEAD AAD is
+/// the separate, larger 47-byte image ([`PacketHeader::AAD_SIZE`]).
 ///
 /// Serialised by [`PacketHeader::to_wire`] as an explicit, fixed **big-endian**
-/// (network byte order) image, `version` first. WIRE_VERSION 4 (T4.6) reorders
-/// the fields so the 14 HP-protected bytes are a contiguous span at `[33..47]`,
-/// after the cleartext routing prefix:
+/// (network byte order) image, `version` first (no serialization library). The
+/// WIRE v6 (anti-fingerprint) wire layout is a contiguous 15-byte span, the WHOLE
+/// of which is HP-masked on the wire (`HP_PROTECTED_OFFSET = 0` — no constant
+/// cleartext byte). The 32-byte `session_id` is **off-wire**: it is a struct field
+/// bound into the AEAD AAD but never transmitted (dropped from the wire in v5 / the
+/// ε CID collapse), reconstructed by the receiver from session context.
 ///
 /// ```text
-/// off  0  version        u8       (= WIRE_VERSION = 4)            CLEARTEXT
-/// off  1  session_id     [u8;32]  (routing CID)                  CLEARTEXT
-/// off 33  packet_number  u64 be   (① per-direction monotonic)    HP-MASKED ┐
-/// off 41  flags          u16 be                                  HP-MASKED │
-/// off 43  stream_id      u16 be                                  HP-MASKED │ [33..47]
-/// off 45  epoch          u8                                      HP-MASKED │
-/// off 46  path_id        u8                                      HP-MASKED ┘
+/// off  0  version        u8       (= WIRE_VERSION = 6)            HP-MASKED ┐
+/// off  1  packet_number  u64 be   (① per-direction monotonic)    HP-MASKED │
+/// off  9  flags          u16 be                                  HP-MASKED │ [0..15]
+/// off 11  stream_id      u16 be                                  HP-MASKED │
+/// off 13  epoch          u8                                      HP-MASKED │
+/// off 14  path_id        u8                                      HP-MASKED ┘
 /// ```
 ///
-/// The `to_wire` image (the **cleartext** 47-byte header) is the AEAD AAD, so
-/// flipping any byte (`version` included) fails decryption. On the wire the
-/// `[33..47]` span is XOR-masked by the per-session [`HeaderProtector`] (a wire
-/// mutation of the masked region unmasks to a wrong header → wrong AAD → AEAD
-/// fails — no new oracle); the recv path reconstructs the cleartext header via
-/// [`RawPacket::unmask_header`] before computing the AAD. `epoch`/`stream_id`/
-/// `path_id` are authenticated in the AAD but NOT in the nonce (which is
-/// `prefix‖packet_number`). The recv path also drops a frame whose
-/// `version != WIRE_VERSION`. Frozen by `core/tests/wire_vectors/packet_header.bin`;
-/// grammar in `docs/protocol/PROTOCOL.md` § 4.2.
+/// The 47-byte AEAD AAD image ([`Self::to_aad_image`]) is the cleartext header
+/// reconstructed off-wire (it additionally binds the off-wire `session_id`), so
+/// flipping any authenticated byte (`version` / `session_id` included) fails
+/// decryption. On the wire the whole `[0..15]` span is XOR-masked by the
+/// per-session [`HeaderProtector`] (a wire mutation of the masked region unmasks to
+/// a wrong header → wrong AAD → AEAD fails — no new oracle); the recv path
+/// reconstructs the cleartext header via [`RawPacket::unmask_header`] before
+/// computing the AAD. `epoch`/`stream_id`/`path_id` are authenticated in the AAD
+/// but NOT in the nonce (which is `prefix‖packet_number`). The recv path also drops
+/// a frame whose `version != WIRE_VERSION`. Frozen by
+/// `core/tests/wire_vectors/packet_header.bin`; grammar in
+/// `docs/protocol/PROTOCOL.md` § 4.2.
 ///
 /// [`HeaderProtector`]: crate::crypto::header_protection::HeaderProtector
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -328,7 +334,9 @@ pub struct PacketHeader {
     /// Rekey generation. Zero at session establishment, incremented in lock-
     /// step on each in-band rekey (Phase 1.5).
     pub epoch: u8,
-    /// Multi-path leg identifier (Phase 4.2). 0 = single-leg default.
+    /// Connection-migration path identifier (Phase 4.2). 0 = the implicit,
+    /// always-validated handshake path; bumped per `migrate()` so the peer
+    /// challenges the new path.
     pub path_id: u8,
 }
 
@@ -369,7 +377,8 @@ impl PacketHeader {
         self
     }
 
-    /// Set the path id — used by the multi-path scheduler (Phase 4.2).
+    /// Set the path id — stamped by the connection-migration path machinery
+    /// (Phase 4.2; 0 = the implicit handshake path).
     pub fn with_path_id(mut self, path_id: u8) -> Self {
         self.path_id = path_id;
         self
@@ -381,8 +390,9 @@ impl PacketHeader {
     pub fn to_wire(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
         b[0] = self.version;
-        // HP-protected region [1..15] — packet_number ‖ flags ‖ stream_id ‖
-        // epoch ‖ path_id (WIRE_VERSION 5 layout; see the struct doc grammar).
+        // Field layout after the version byte: packet_number ‖ flags ‖ stream_id ‖
+        // epoch ‖ path_id (see the struct doc grammar). This is the CLEARTEXT image;
+        // the WIRE v6 whole-header HP mask is applied separately by `to_wire_masked`.
         b[1..9].copy_from_slice(&self.packet_number.to_be_bytes());
         b[9..11].copy_from_slice(&self.flags.0.to_be_bytes());
         b[11..13].copy_from_slice(&self.stream_id.to_be_bytes());
@@ -425,8 +435,8 @@ impl PacketHeader {
             version: bytes[0],
             // Off-wire placeholder; reconstructed by Session::parse_protected.
             session_id: SessionId([0u8; 32]),
-            // HP-protected region [1..15] — packet_number ‖ flags ‖ stream_id ‖
-            // epoch ‖ path_id (WIRE_VERSION 5 layout).
+            // Field layout after the version byte: packet_number ‖ flags ‖
+            // stream_id ‖ epoch ‖ path_id (the inverse of `to_wire`).
             packet_number: u64::from_be_bytes([
                 bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
             ]),
@@ -459,9 +469,10 @@ pub struct PhantomPacket {
     pub header: PacketHeader,
     /// Encrypted payload (or coalesced bundle if `COALESCED` flag set)
     pub payload: Vec<u8>,
-    /// TLV headroom for forward-compatible amendments (packet-number / SACK
-    /// fields) without a layout change. Old peers deserialize this as an empty
-    /// `Vec` and ignore it.
+    /// Forward-compat TLV headroom — retained for the AEAD-AAD/codec shape but
+    /// **NOT serialised onto the WIRE v6 data-plane wire**: `to_wire` emits only
+    /// `header ‖ payload`, and `from_wire` always yields an empty `Vec` here (see
+    /// [`PhantomPacket::to_wire`]). Was a length-prefixed wire field pre-v6.
     pub extensions: Vec<u8>,
 }
 
@@ -649,7 +660,11 @@ impl fmt::Debug for PhantomPacket {
     }
 }
 
-/// Control message types for session management
+/// Legacy control-message enum for session management. NOTE: this is **not** the
+/// live handshake / control wire format — the real handshake uses the borsh structs
+/// in `transport::handshake` (`ClientHello` / `ServerHello` / …) and post-handshake
+/// control rides in `PacketFlags` (`REKEY` / `PATH_VALIDATION` / `KEEPALIVE` / …).
+/// This enum is currently unreferenced; retained as a definitional placeholder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 #[borsh(use_discriminant = true)]
 #[repr(u8)]
@@ -676,16 +691,27 @@ pub enum ControlMessage {
     Pong = 9,
 }
 
-/// Transport modes supported by the system
+/// Transport-leg discriminant, retained as the **metric/telemetry label** axis in
+/// `crate::observability` (the cardinality contract).
+///
+/// NOTE: this is *not* the live transport registry — the multipath `TransportLeg`
+/// trait and the KCP / FakeTLS / native-TCP-*leg* legs it named were removed in the
+/// PhantomUDP rewrite. `Kcp` and `FakeTls` survive only as stable label values so
+/// the observability layer's instrument set is wire-format-stable; they are never
+/// selected as a transport. The actual production transport is `Udp` (PhantomUDP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub enum LegType {
-    /// KCP over UDP - fast, reliable, primary transport
+    /// Retired KCP-over-UDP label (the KCP leg + `kcp-tokio` dep are gone). Kept as
+    /// a stable telemetry label value only.
     Kcp,
-    /// Raw TCP - reliable fallback
+    /// Raw TCP. The native multipath TCP *leg* was removed; `TcpSessionTransport`
+    /// (a `SessionTransport`) is the current TCP byte-pipe.
     Tcp,
-    /// FakeTLS over TCP - obfuscated for DPI bypass
+    /// Retired FakeTLS-over-TCP obfuscation label (the leg returned as the
+    /// off-by-default `mimicry` transport). Kept as a stable telemetry label only.
     FakeTls,
-    /// PhantomUDP — native reliable transport over raw UDP (Phase 1).
+    /// PhantomUDP — the native reliable transport over raw UDP (Phase 1); the
+    /// production transport.
     Udp,
 }
 
@@ -704,7 +730,11 @@ impl LegType {
     }
 }
 
-/// Scheduling strategies for multi-path transport
+/// Scheduling strategy for the `Scheduler`. NOTE: the scheduler is **vestigial** —
+/// the project does single-path connection migration, not multipath aggregation, so
+/// `select_paths` is never called on the live data path. This enum is constructed
+/// (defaulting to `LowLatency`) and threaded through `Session`/config but does not
+/// steer production traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub enum SchedulerMode {
     /// Aggressive optimization for minimum RTT

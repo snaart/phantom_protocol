@@ -1,7 +1,11 @@
-//! High-Performance UDP Transport
+//! Low-level UDP socket / pacing helper.
 //!
-//! Zero-copy, batched UDP I/O for maximum throughput.
-//! Uses ring AES-256-GCM with in-place encryption.
+//! Zero-copy `AesSession` AES-256-GCM with in-place encryption over a
+//! `tokio::net::UdpSocket`. (`send_batch` is now a plain per-packet loop — the
+//! old `sendmmsg(2)`/GSO batch path was removed; see the unsafe note below.)
+//! This is NOT the production `SessionTransport`-level UDP transport — that lives
+//! in `api/udp_transport.rs` (`UdpClientTransport` / `UdpServerTransport`). This
+//! module is the socket helper plus the `PacedSender` rate-limit wrapper.
 //!
 //! ## Paced Sending
 //!

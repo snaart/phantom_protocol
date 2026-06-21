@@ -1,8 +1,18 @@
 //! Client-First Transport Session
 //!
-//! `PhantomSession` provides instant connection establishment with
-//! automatic send queuing during handshake. This is the transport-level
-//! API that sits below MLS and above the raw UDP/TCP transport.
+//! `PhantomSession` is the user-facing client session: `connect_with_transport`
+//! returns instantly and spawns a background task that drives the hybrid
+//! post-quantum handshake and then the data pump, with `send()` calls queued
+//! in-memory until the handshake completes. It is the transport-level API that
+//! sits directly above a `SessionTransport` byte-pipe (PhantomUDP / TCP /
+//! WebSocket / WASI / Embedded / MimicTls) and below any application protocol an
+//! embedder layers on top of `send()` / `recv()`.
+//!
+//! This file also carries the shared client/server data pump (`run_data_pump`)
+//! and every per-packet build/parse helper (`send_app_data`, `handle_packet`,
+//! the keep-alive / cover / window-update / path-validation senders), so any
+//! change to encrypt/decrypt, framing, or stream routing happens here, in one
+//! place, for both sides.
 
 use crate::crypto::hybrid_sign::HybridVerifyingKey;
 use crate::errors::CoreError;
@@ -284,12 +294,18 @@ impl<T: SessionTransport> SessionTransport for ObservedTransport<T> {
 
 // ─── Session ────────────────────────────────────────────────────────────────
 
-/// Client-first session — instant `connect()`, non-blocking `send()`.
+/// Client-first session — instant construction, non-blocking `send()`.
 ///
 /// # Design
 ///
+/// The real entry point is `connect_with_transport` (NOT the inert legacy
+/// `connect()` constructor — see its doc): it returns instantly and runs the
+/// handshake + data pump in the background, so sends issued before the handshake
+/// finishes are buffered and auto-flushed once the channel is up.
+///
 /// ```text
-///   let session = PhantomSession::connect("server:443");  // instant!
+///   // instant — spawns the background handshake + pump:
+///   let session = PhantomSession::connect_with_transport(addr, transport, pinned_key);
 ///   session.send(data).await;   // queued until handshake completes
 ///   session.send(data2).await;  // also queued
 ///   // ... handshake completes in background ...
@@ -752,8 +768,10 @@ impl PhantomSession {
         log::debug!("PhantomSession: fully connected to {}", peer);
 
         // Wrap the (post-handshake) transport so every data-plane send/recv is
-        // recorded. The connectionless API rides TCP today (KCP / FakeTLS legs
-        // are not session-wired yet), so the leg label is fixed to TCP.
+        // recorded. The generic client path can ride any `SessionTransport`, but
+        // the observability leg label is not threaded through `connect_with_*`,
+        // so it is fixed to TCP here (the only metric this skews is the per-leg
+        // packet/byte slice; the totals are correct).
         // WIRE-001: the handshake is done — raise the frame cap from the tight
         // unauthenticated handshake limit to the steady-state application limit.
         transport.set_frame_phase(FramePhase::Established);
@@ -939,7 +957,7 @@ const RAW_APP_STREAM_ID: u32 = 1;
 ///   - listens for incoming packets and decrypts them,
 ///   - encrypts outgoing application/stream packets,
 ///   - sends ACKs for reliable packets.
-// The 11 parameters represent the complete session-identity and I/O surface.
+// The 12 parameters represent the complete session-identity and I/O surface.
 // Grouping them into a struct would require a generic struct (due to `T:
 // SessionTransport`), add indirection with no safety or clarity gain, and
 // constitute a public-API change. The function is private (`async fn`, no
@@ -1089,8 +1107,9 @@ async fn run_data_pump<T: SessionTransport>(
         // loop (Phase 2.3) so we don't pay a fresh `Vec::new()` allocation
         // for every ACK we emit on a busy reliable stream. 256 bytes is
         // comfortably larger than a serialized empty `PhantomPacket` (the
-        // 45-byte header plus a couple of length prefixes), so the underlying
-        // buffer is never reallocated after the first frame.
+        // 15-byte header plus the AEAD tag — no cleartext length prefixes
+        // since v6), so the underlying buffer is never reallocated after the
+        // first frame.
         let mut ack_buf: Vec<u8> = Vec::with_capacity(256);
         // Buffering ceiling: the delivery queue is unbounded so the reader
         // never blocks, but a peer that ignores flow control could flood it.
@@ -1119,9 +1138,11 @@ async fn run_data_pump<T: SessionTransport>(
 
             // Remove header protection (T4.6) and parse: a malformed / unparseable
             // / short-of-the-AEAD-tag frame (no legitimate peer produces one) is
-            // dropped — never a panic. The cleartext version + session_id stay
-            // readable; the [33..47] span is unmasked with this session's recv HP
-            // key before the header is interpreted.
+            // dropped — never a panic. Since WIRE v6 the WHOLE 15-byte header is
+            // HP-masked (`HP_PROTECTED_OFFSET == 0`, no cleartext header byte on
+            // the wire); `parse_protected` unmasks it with this session's recv HP
+            // key and reconstructs the off-wire 32-byte `session_id` from session
+            // context before the header is interpreted.
             let packet = match crypto_recv.parse_protected(&data) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -1676,11 +1697,10 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
 /// so the next outbound packet is paced at the freshly-estimated
 /// bottleneck bandwidth.
 ///
-/// `ack_delay_us` is the V2 header's `ack_delay` field (microseconds
-/// the receiver held the ACK before sending) — subtracted from the
-/// observed RTT to yield the propagation delay. For V1 ACKs there is
-/// no `ack_delay` field on the wire; pass 0 (the estimator treats
-/// this as "no peer-side delay reported").
+/// `ack_delay_us` is the `Sack::ack_delay_us` field carried in the ACK's AEAD
+/// plaintext (microseconds the receiver held the ACK before sending) —
+/// subtracted from the observed RTT to yield the propagation delay. Pass 0 when
+/// no peer-side delay is known (the estimator treats it as "no delay reported").
 fn feed_bbr_on_ack(
     crypto_session: &Arc<Session>,
     sent_at: tokio::time::Instant,
@@ -1849,8 +1869,9 @@ async fn send_app_data<T: SessionTransport>(
         }
     };
     let packet = PhantomPacket::new(header, ciphertext);
-    // Header protection (T4.6): mask the [33..47] header span before it hits the
-    // wire. Infallible in practice (the payload always carries the AEAD tag).
+    // Header protection (T4.6): XOR-mask the whole 15-byte header before it hits
+    // the wire (WIRE v6: `HP_PROTECTED_OFFSET == 0`, no cleartext header byte).
+    // Infallible in practice (the payload always carries the AEAD tag).
     let buf = match crypto_session.protect_packet(&packet) {
         Ok(b) => b,
         Err(e) => {
@@ -1868,11 +1889,11 @@ async fn send_app_data<T: SessionTransport>(
     // Inflight/cwnd accounting MUST use the same unit the ACK and loss paths
     // settle in. `Stream::ack` returns and `on_packet_lost` subtracts the
     // segment's *payload* length (`seg.data.len()`), so the send side has to add
-    // the payload length too — adding the full wire size here leaked ~69 bytes
-    // (header + length prefixes + AEAD tag) of phantom inflight per packet,
-    // which silently exhausted the congestion window after a few dozen packets
-    // and stalled long-lived sessions. (Bandwidth/BDP derive from acked bytes,
-    // so they stay in the same payload unit.)
+    // the payload length too — adding the full wire size here leaked the
+    // per-packet framing overhead (15-byte header + AEAD tag) as phantom
+    // inflight, which silently exhausted the congestion window after a few dozen
+    // packets and stalled long-lived sessions. (Bandwidth/BDP derive from acked
+    // bytes, so they stay in the same payload unit.)
     crypto_session.on_packet_sent(payload.len() as u64);
     true
 }
@@ -2975,10 +2996,10 @@ impl PhantomSession {
     }
 
     /// Override the automatic-rekey send-invocation high-watermark on the
-    /// established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
-    /// the session is still connecting. Rust-only — primarily for soak/load
-    /// harnesses that need to exercise mid-session rekey without sending `2^47`
-    /// packets.
+    /// established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
+    /// Returns `false` if the session is still connecting. Rust-only — primarily
+    /// for soak/load harnesses that need to exercise mid-session rekey without
+    /// sending `2^32` packets.
     pub async fn set_rekey_threshold(&self, n: u64) -> bool {
         match self.inner_session.lock().await.as_ref() {
             Some(s) => {

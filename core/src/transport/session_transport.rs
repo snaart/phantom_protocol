@@ -11,8 +11,8 @@
 //! bounded — `#[async_trait]` here would have failed to prove `Send`-ness
 //! at the generic impl site.
 //!
-//! Dependency-light (only `bytes` + `CoreError`) so it can compile in a
-//! future `no_std + alloc` build ahead of the rest of the crate.
+//! Dependency-light (only `bytes` + `CoreError`) so it compiles in the
+//! shipped `no_std + alloc` subset (Phase 3.6) alongside `legs::embedded`.
 //! Re-exported from [`crate::api::session`] so the historical import path
 //! stays stable.
 //!
@@ -43,10 +43,12 @@ pub enum FramePhase {
     Established,
 }
 
-/// Async transport trait for PhantomSession.
+/// Async transport trait for `PhantomSession`.
 ///
-/// Abstractions over UDP, TCP, FakeTLS, etc.
-/// Used by the background handshake task for I/O.
+/// The byte-pipe abstraction over every concrete physical transport — PhantomUDP
+/// (`UdpClientTransport` / `UdpServerTransport`), TCP (`TcpSessionTransport`),
+/// WebSocket, WASI, Embedded, and the off-by-default TLS-mimicry leg. Used by the
+/// background handshake + data-pump task for all message-oriented I/O.
 ///
 /// `recv_bytes` returns `Bytes` (Phase 2.8) so the recv pipeline can
 /// fan out the same buffer to multiple consumers via cheap refcount

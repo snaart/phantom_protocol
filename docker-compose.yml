@@ -22,7 +22,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: phantom-server:0.2.1
+    image: phantom-server:0.2.2
     container_name: phantom-server
     restart: unless-stopped
     ports:

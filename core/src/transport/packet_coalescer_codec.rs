@@ -1,22 +1,25 @@
-//! V2 wire-format bridge for the packet coalescer (Phase 2.5).
+//! Wire-format bridge for the packet coalescer (Phase 2.5).
+//!
+//! ("V2" below is the internal name for the current unified `PhantomPacket`
+//! wire format — the one carried over PhantomUDP, not a second protocol version.)
 //!
 //! [`crate::transport::packet_coalescer`] owns the byte layout for a
-//! batched bundle (`[count: u16][len1: u16][payload1]...`). The V2 wire
-//! format reserves [`PacketFlags::COALESCED`] to mark a packet whose
-//! payload **is** such a bundle. This module is the thin layer that:
+//! batched bundle (`[count: u16][len1: u16][payload1]...`). The wire format
+//! reserves [`PacketFlags::COALESCED`] to mark a packet whose payload **is**
+//! such a bundle. This module is the thin layer that:
 //!
 //! 1. Wraps a coalesced bundle into a `PhantomPacket` with
 //!    `COALESCED` set on the header.
-//! 2. Inversely, parses an incoming V2 packet — if `COALESCED` is set
+//! 2. Inversely, parses an incoming packet — if `COALESCED` is set
 //!    it hands back the decoded sub-payloads as a `Vec<Vec<u8>>` ready
 //!    to feed back into the normal per-stream demux.
 //!
-//! ## Sequence numbering
+//! ## Packet numbering
 //!
-//! A coalesced packet still occupies a slot in the sequence space.
-//! The outer header's `sequence` is the bundle's own sequence; the
-//! inner sub-packets are NOT re-numbered. Replay protection runs
-//! exactly once per bundle.
+//! A coalesced packet still consumes one slot in the per-direction packet-number
+//! space. The outer header's `packet_number` is the bundle's own PN; the inner
+//! sub-packets are NOT re-numbered. Replay protection therefore runs exactly once
+//! per bundle, against that single outer PN.
 //!
 //! ## Why a separate codec module
 //!

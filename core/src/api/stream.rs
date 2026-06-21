@@ -5,6 +5,15 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
+/// A single multiplexed stream inside an established [`PhantomSession`].
+///
+/// Created by the session's stream multiplexer (one per logical stream id).
+/// Outbound data is queued to the session's data pump over the `tx` command
+/// channel (`send_reliable` / `send_unreliable`); inbound demultiplexed data
+/// arrives on `rx`. The session owns all encryption and transport — a
+/// `PhantomStream` is just the per-stream send/recv handle exposed over FFI.
+///
+/// [`PhantomSession`]: crate::api::session::PhantomSession
 #[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct PhantomStream {
     stream_id: u32,
@@ -61,7 +70,12 @@ impl PhantomStream {
                         self.stream_id,
                         seq
                     );
-                    // Just log for now until ARQ is implemented
+                    // This `recv()` surfaces only application data to the caller.
+                    // Reliable delivery / retransmission (the L1 RTO + SACK
+                    // fast-retransmit path) lives in the data pump and the
+                    // reliable-stream layer (`transport/stream.rs`), not here, so
+                    // a stream-level ACK is informational at this surface: log it
+                    // and keep waiting for the next data frame.
                     continue;
                 }
                 Some(StreamMessage::Close) => {

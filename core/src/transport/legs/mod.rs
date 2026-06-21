@@ -1,15 +1,18 @@
 //! Transport Legs Module
 //!
-//! Pluggable physical transports. The browser `wasm32` target exposes a
-//! WebSocket leg (Phase 3.3) since browsers cannot open raw TCP/UDP sockets;
-//! WASI Preview 2 uses a TCP leg; bare-metal uses the `embedded` leg.
+//! Pluggable physical transports, each a `SessionTransport` impl. The browser
+//! `wasm32` target exposes a WebSocket leg (Phase 3.3) since browsers cannot open
+//! raw TCP/UDP sockets; WASI Preview 2 uses a TCP leg; bare-metal uses the
+//! `embedded` leg; the off-by-default `mimicry` feature adds a TLS-mimicry leg.
 //!
 //! The native KCP / TCP / FakeTLS legs and the `TransportLeg` multipath trait
 //! were removed in Phase 0 of the PhantomUDP rewrite — they were never wired
 //! into the session data plane (`PhantomSession` consumes `SessionTransport`,
-//! not `TransportLeg`) and are superseded by the forthcoming native
-//! reliable-UDP transport. FakeTLS-style traffic mimicry will return as a
-//! dedicated transport mode.
+//! not `TransportLeg`). The production reliable transport is now PhantomUDP
+//! (`UdpClientTransport` / `UdpServerTransport`, which live outside this module
+//! under `transport/phantom_udp/` + `api/udp_transport.rs`), and FakeTLS-style
+//! traffic mimicry has returned as the `MimicTlsLeg` (`mimic_tls`, below). The
+//! plain TCP byte-pipe is `TcpSessionTransport` (in `api/tcp_transport.rs`).
 
 #[cfg(all(feature = "std", target_arch = "wasm32", target_os = "unknown"))]
 pub mod websocket;
@@ -34,10 +37,11 @@ pub use wasi::WasiLeg;
 #[cfg(feature = "embedded")]
 pub mod embedded;
 
-// `MimicTlsLeg` — TLS-over-TCP active-mimicry `SessionTransport` (queue item #13).
-// Native-only (rides `tokio::net`), behind the off-by-default `mimicry` feature.
-// PR-1 lands the record layer (`mimic_tls::record`); the handshake theater and the
-// leg itself follow in later PRs. The outer TLS is anti-DPI obfuscation ONLY and is
-// detectable by active probing — see the module head.
+// `MimicTlsLeg` — TLS-over-TCP active-mimicry `SessionTransport`. Native-only
+// (rides `tokio::net`), behind the off-by-default `mimicry` feature. Comprises the
+// record layer (`mimic_tls::record`), a TLS-1.3 handshake "theater", and the leg
+// itself (`mimic_tls::leg`). The outer TLS is anti-DPI obfuscation ONLY (never a
+// confidentiality boundary) and is detectable by active probing — the inner Phantom
+// session provides the real auth/conf. See the module head and Security Invariant 3.
 #[cfg(all(feature = "mimicry", not(target_arch = "wasm32")))]
 pub mod mimic_tls;

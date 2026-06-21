@@ -1459,7 +1459,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phantom-protocol"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -1516,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-server"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",

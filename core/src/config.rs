@@ -1,5 +1,16 @@
 use std::time::Duration;
 
+/// Tunable parameters for a Phantom session / listener, exported across the
+/// UniFFI boundary as a plain record.
+///
+/// NOTE: this is a stable FFI config surface, but the core does not yet read
+/// most of these fields on the live data path — `PhantomConfig` is currently
+/// re-exported and FFI-exported only. The `auto_fallback` / `fallback_*` /
+/// `upgrade_delay` fields in particular describe the legacy multi-leg
+/// fallback model; transport-leg fallback / aggregation was deliberately
+/// dropped in favour of single-path connection migration, so those knobs are
+/// presently inert. Treat the presets below as documented intent, not as
+/// behaviour the core enforces today.
 #[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 #[derive(Debug, Clone)]
 // New tunables must not break downstream construction. Build via `mobile()` /
@@ -20,15 +31,16 @@ pub struct PhantomConfig {
     pub session_cache_capacity: u32,
     /// Lifetime of a session ticket
     pub session_ticket_lifetime: Duration,
-    /// Enable automatic transport fallback
+    /// Enable automatic transport fallback (legacy multi-leg model; inert —
+    /// see the struct-level note).
     pub auto_fallback: bool,
-    /// Packet loss percentage to trigger fallback
+    /// Packet loss percentage to trigger fallback (legacy multi-leg model; inert).
     pub fallback_loss_threshold: u8,
-    /// Connection failures to trigger fallback
+    /// Connection failures to trigger fallback (legacy multi-leg model; inert).
     pub fallback_failure_threshold: u32,
     /// Timeout for connection attempts
     pub connect_timeout: Duration,
-    /// Delay before attempting to upgrade transport
+    /// Delay before attempting to upgrade transport (legacy multi-leg model; inert).
     pub upgrade_delay: Duration,
 }
 

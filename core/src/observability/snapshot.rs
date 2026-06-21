@@ -5,10 +5,13 @@
 //! debugging. Per-leg breakdown is preserved so consumers can compute their
 //! own slices.
 //!
-//! In step 3 of the rollout this struct does NOT carry the security signal
-//! counters or histogram (those are added with the OTel instruments in
-//! later steps). It provides at least the same totals as the legacy
-//! `transport::metrics::MetricsSnapshot` so call sites can migrate.
+//! Scope: this struct mirrors the lock-free `HotPathAtomics` only — packet /
+//! byte / timing totals, the session/stream gauges, and the handshake
+//! sum+count fields. The security-signal counters and the latency histograms
+//! are OTel-instrument state (see `instruments.rs`), so they are NOT reflected
+//! here; consume those through the OTel pipeline. The snapshot is always
+//! available regardless of the `telemetry-otel` feature, since the atomics
+//! always exist.
 
 use crate::observability::atomics::{HotPathAtomics, DIR_RECV, DIR_SEND};
 use crate::transport::types::LegType;

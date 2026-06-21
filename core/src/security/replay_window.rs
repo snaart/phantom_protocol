@@ -6,15 +6,24 @@
 //!
 //! ## Why this exists if the AEAD already prevents replay
 //!
-//! The current AEAD construction (per-direction monotonic `AtomicU64` counter
-//! folded into the nonce) cryptographically rejects replays — a duplicated
-//! packet carries an old counter, so the receiver-derived nonce no longer
-//! matches and decryption fails. This module is **defense in depth**:
+//! The AEAD nonce is `nonce_prefix || header.packet_number` — derived from the
+//! authenticated `u64` packet number in the wire header, not an internal
+//! counter. A replayed packet therefore reuses a nonce + AAD that the receiver
+//! has already opened, but the AEAD open *itself* does not reject a duplicate
+//! (a faithfully-replayed ciphertext still verifies). This window is what makes
+//! replay an explicit, **observable** rejection:
 //!
-//! - Catches the replay *before* AEAD work (saves CPU under attack).
-//! - Yields an explicit, observable `ReplayDetected` error variant for metrics.
-//! - Survives future AEAD redesigns (e.g. moving the nonce derivation off the
-//!   strict counter onto `header.sequence` to support out-of-order delivery).
+//! - Yields the `CoreError::ReplayDetected` error variant and bumps the
+//!   `replay_rejected_total` counter (metrics / detection signal).
+//! - Enforces freshness on top of confidentiality + integrity: even an exact
+//!   re-injection of an authentic packet is dropped once.
+//! - Tolerates legitimate reordering within the window (out-of-order delivery
+//!   on the reliable transport) while still rejecting true duplicates.
+//!
+//! **Ordering (Invariant 4):** in `Session::decrypt_packet` the window is
+//! consulted *after* a successful AEAD open, never before — so the window never
+//! keys off an attacker-controlled (un-authenticated) packet number, and a
+//! spoofed counter cannot drive a timing channel.
 //!
 //! ## Window semantics
 //!

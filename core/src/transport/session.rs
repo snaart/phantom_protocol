@@ -1,7 +1,12 @@
 //! Phantom Protocol - Session Management
 //!
-//! Virtual association that persists across IP changes.
-//! Manages streams, encryption state, and multi-path scheduling.
+//! The `Session` is the virtual association between two endpoints that persists
+//! across IP changes (single-path seamless connection migration — not multipath
+//! aggregation). It owns the per-direction AEAD `CryptoState` (hot-swapped on rekey
+//! via `ArcSwap`), the header-protection keys, the rotating connection-ID chain, the
+//! per-direction replay window, the stream table, the pacer + BBR bandwidth
+//! estimator, and the migration / liveness state. The `Scheduler` it holds is
+//! vestigial (see `SchedulerMode`).
 
 use crate::crypto::adaptive_crypto::{CryptoSession, AEAD_MAX_INVOCATIONS};
 use crate::crypto::cid_chain::{CidChain, CID_LEN, CID_WINDOW_LEADING, CID_WINDOW_TRAILING};
@@ -133,9 +138,11 @@ impl CryptoState {
     }
 
     /// Encrypt with a caller-supplied 12-byte nonce. Used by
-    /// `Session::encrypt_packet`, which constructs the nonce from the
-    /// authenticated `(epoch, stream_id, sequence, path_id)` of the packet
-    /// header — so the receiver survives failed decrypts without desyncing.
+    /// `Session::encrypt_packet`, which constructs the nonce as
+    /// `nonce_prefix(4) ‖ packet_number(8)` (① — Phase 4; see
+    /// `Session::build_packet_nonce`) from the authenticated header — the
+    /// per-direction `u64` packet number is used once, so the nonce never repeats
+    /// and the receiver survives failed decrypts without desyncing.
     pub fn encrypt_with_nonce(
         &self,
         nonce: [u8; 12],
@@ -147,7 +154,8 @@ impl CryptoState {
             .map_err(|e| CoreError::CryptoError(e.to_string()))
     }
 
-    /// V2-path decrypt: caller supplies the 12-byte nonce explicitly.
+    /// Decrypt with a caller-supplied 12-byte nonce (the recv counterpart of
+    /// [`encrypt_with_nonce`](Self::encrypt_with_nonce)).
     pub fn decrypt_with_nonce(
         &self,
         nonce: [u8; 12],
@@ -206,8 +214,9 @@ pub struct Session {
     /// cipher suite and held stable for the session's lifetime — it does NOT
     /// rotate with `crypto`/`epoch` (QUIC §6.1: the hp key must be constant
     /// across key updates because `epoch` lives inside the masked header region;
-    /// see [`HeaderProtector`]). Masks the 14-byte `[33..47]` header span on the
-    /// wire via [`Self::protect_packet`] / unmasks it via [`Self::parse_protected`].
+    /// see [`HeaderProtector`]). Masks the WHOLE 15-byte header span on the wire
+    /// (WIRE v6: `HP_PROTECTED_OFFSET = 0`, version byte included) via
+    /// [`Self::protect_packet`] / unmasks it via [`Self::parse_protected`].
     header_protection: HeaderProtector,
     /// Per-direction, **session-stable** rotating connection-ID chain (ε / WIRE
     /// v5). Derived ONCE from the initial session secret (mirroring
@@ -290,7 +299,9 @@ pub struct Session {
     streams: RwLock<HashMap<StreamId, Arc<Stream>>>,
     /// Next stream ID counter
     next_stream_id: AtomicU32,
-    /// Multi-path scheduler
+    /// Path scheduler — **vestigial** (single-path connection migration, not
+    /// multipath aggregation): constructed and reachable via `scheduler()`, but
+    /// `select_paths` is never called on the live data path. See `SchedulerMode`.
     scheduler: Arc<Scheduler>,
     /// Resumption secret for 0-RTT
     resumption_secret: RwLock<Option<[u8; 32]>>,
@@ -722,8 +733,8 @@ impl Session {
     /// sessions are expected to reconnect rather than wrap).
     ///
     /// Wire signalling: callers that want the peer to follow this rekey
-    /// emit a V2 packet whose header carries the new epoch (and optionally
-    /// the `PacketFlags::REKEY` flag). Receivers respond by calling
+    /// emit a packet whose header carries the new epoch (with the
+    /// `PacketFlags::REKEY` flag set). Receivers respond by calling
     /// `rekey()` themselves once they see the bump — keeping both ends in
     /// lockstep.
     #[tracing::instrument(name = "phantom.session.rekey", skip_all)]
@@ -1013,8 +1024,9 @@ impl Session {
         // Authentic forward rekey — commit (still under the rekey lock; `cur` was
         // read under it, so `cur + steps == header.epoch` is the absolute, race-
         // free target), then drop the lock and apply the replay window AFTER the
-        // AEAD open (Invariant 4 — the window is per-(stream,sequence) and
-        // epoch-independent, so it needs no rekey serialisation).
+        // AEAD open (Invariant 4 — the single per-direction window keys on the
+        // `u64` packet number and is epoch-independent, so it needs no rekey
+        // serialisation).
         self.commit_forward_crypto(steps, final_secret, final_crypto);
         drop(_rekey);
         let accepted = self.recv_replay.lock().accept(header.packet_number);
@@ -1047,8 +1059,8 @@ impl Session {
 
     // ── Multi-path / migration (Phase 4.2) ────────────────────────────
 
-    /// Snapshot of currently `Validated` path ids. Useful for the
-    /// scheduler when picking an outbound path.
+    /// Snapshot of currently `Validated` path ids (those that completed a
+    /// challenge/response round trip, plus the always-validated path 0).
     pub fn validated_paths(&self) -> Vec<u8> {
         self.path_registry.validated_paths()
     }
@@ -1061,7 +1073,7 @@ impl Session {
 
     /// Register a new path id and immediately issue a 32-byte
     /// PATH_CHALLENGE for it. Returns the challenge bytes; the caller
-    /// must transmit them in a V2 packet with `PacketFlags::PATH_VALIDATION`
+    /// must transmit them in a packet with `PacketFlags::PATH_VALIDATION`
     /// set on the new path. Subsequent calls on an already-Validating
     /// path re-issue a fresh challenge.
     ///
@@ -1338,11 +1350,12 @@ impl Session {
             crypto.decrypt_with_nonce(nonce, aad, ciphertext)
         })?;
 
-        // Sliding-window guard. ReplayWindow keys on `(stream_id, sequence)`
-        // only — the `epoch` / `path_id` fields do NOT contribute to the
-        // replay identity because replay is a property of "is this sequence
-        // a duplicate", independent of which path it arrived over or which
-        // rekey generation produced it.
+        // Sliding-window guard (Invariant 4 — runs AFTER the AEAD open above).
+        // The single per-direction `ReplayWindow` keys on the `u64` packet_number
+        // only — the `epoch` / `path_id` fields do NOT contribute to the replay
+        // identity because replay is a property of "is this packet number a
+        // duplicate", independent of which path it arrived over or which rekey
+        // generation produced it.
         let accepted = self.recv_replay.lock().accept(header.packet_number);
         if !accepted {
             self.replay_rejected_total.fetch_add(1, Ordering::Relaxed);
@@ -1356,12 +1369,12 @@ impl Session {
 
     // ── Header protection (T4.6, QUIC RFC 9001 §5.4) ──────────────────────────
 
-    /// Serialise a packet to its **header-protected** on-wire bytes: the
-    /// `[1..15]` header span is XOR-masked with this session's send-direction HP
-    /// key, keyed by the packet's ciphertext sample (the first 16 bytes of
-    /// `packet.payload`). The data plane calls this instead of `to_wire` for
-    /// every post-handshake packet. `packet.payload` must be AEAD ciphertext
-    /// (>= the 16-byte tag) — always true for the output of
+    /// Serialise a packet to its **header-protected** on-wire bytes: the WHOLE
+    /// 15-byte header span (WIRE v6: `[0..15]`, version byte included) is XOR-masked
+    /// with this session's send-direction HP key, keyed by the packet's ciphertext
+    /// sample (the first 16 bytes of `packet.payload`). The data plane calls this
+    /// instead of `to_wire` for every post-handshake packet. `packet.payload` must be
+    /// AEAD ciphertext (>= the 16-byte tag) — always true for the output of
     /// [`encrypt_packet`](Self::encrypt_packet).
     pub fn protect_packet(&self, packet: &PhantomPacket) -> Result<Vec<u8>, CoreError> {
         let sample = Self::hp_sample(&packet.payload)?;
@@ -1370,13 +1383,13 @@ impl Session {
     }
 
     /// Parse a **header-protected** wire packet: recover the cleartext header by
-    /// unmasking the `[1..15]` span with this session's recv-direction HP key
-    /// (keyed by the cleartext ciphertext sample), reconstruct the off-wire
-    /// `session_id` from this session's id (ε / WIRE v5), then reassemble the
-    /// `PhantomPacket`. The caller still gates on `version` and runs AEAD on the
-    /// result — a wire mutation of the masked region unmasks to a wrong header, so
-    /// the subsequent AEAD open fails (no new oracle). A short / malformed frame
-    /// returns `Err` and is dropped by the recv loop.
+    /// unmasking the WHOLE 15-byte span (WIRE v6: `[0..15]`, version byte included)
+    /// with this session's recv-direction HP key (keyed by the cleartext ciphertext
+    /// sample), reconstruct the off-wire `session_id` from this session's id (ε /
+    /// WIRE v5), then reassemble the `PhantomPacket`. The caller still gates on
+    /// `version` and runs AEAD on the result — a wire mutation of the masked region
+    /// unmasks to a wrong header, so the subsequent AEAD open fails (no new oracle).
+    /// A short / malformed frame returns `Err` and is dropped by the recv loop.
     pub fn parse_protected(&self, bytes: &[u8]) -> Result<PhantomPacket, CoreError> {
         let raw = RawPacket::from_wire(bytes)
             .map_err(|e| CoreError::CryptoError(format!("HP: malformed wire packet: {e}")))?;
@@ -1407,7 +1420,9 @@ impl Session {
             })
     }
 
-    /// Get the scheduler
+    /// The path scheduler. **Vestigial** — single-path connection migration means
+    /// `select_paths` is never driven on the live data path; exposed for diagnostics
+    /// / per-leg RTT-loss inspection only. See `SchedulerMode`.
     pub fn scheduler(&self) -> &Arc<Scheduler> {
         &self.scheduler
     }

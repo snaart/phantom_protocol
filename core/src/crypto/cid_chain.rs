@@ -1,10 +1,11 @@
-//! Rotating connection-ID chain (WIRE v5 / ε).
+//! Rotating connection-ID chain (introduced in WIRE v5 / ε; current WIRE v6).
 //!
 //! After v4 header protection, the only per-connection cleartext left on the
-//! wire is the outer 8-byte routing `ConnId`. v5 collapses the two connection
+//! wire is the outer 8-byte routing `ConnId`. v5 collapsed the two connection
 //! identifiers (the redundant 32-byte inner `session_id` is dropped from the
 //! data-plane wire) into this single CID and **rotates** it on every migration,
-//! closing the stable-CID linkability residual (threat-model §12.5).
+//! closing the stable-CID linkability residual (threat-model §12.5). The v6
+//! anti-fingerprint pass did not touch this construction — it still holds.
 //!
 //! ## Construction
 //!

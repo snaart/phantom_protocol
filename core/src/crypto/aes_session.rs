@@ -41,14 +41,10 @@ pub struct AesSession {
 impl AesSession {
     /// Create from a 32-byte shared secret (derived from PQC handshake).
     /// This is the "initiator" side.
-    /// Create from a 32-byte shared secret (derived from PQC handshake).
-    /// This is the "initiator" side.
     pub fn from_shared_secret(shared_secret: &[u8; 32]) -> Result<Self, crate::CoreError> {
         Self::build(shared_secret, false)
     }
 
-    /// Create the "peer" (responder) side — send/recv keys are swapped so that
-    /// initiator's encrypt can be decrypted by peer's decrypt, and vice versa.
     /// Create the "peer" (responder) side — send/recv keys are swapped so that
     /// initiator's encrypt can be decrypted by peer's decrypt, and vice versa.
     pub fn from_shared_secret_peer(shared_secret: &[u8; 32]) -> Result<Self, crate::CoreError> {
@@ -168,7 +164,6 @@ mod tests {
     #[test]
     fn round_trip() {
         let secret = [0xABu8; 32];
-        // Two "peers" derived from the same secret, but with swapped keys
         // Two "peers" derived from the same secret, but with swapped keys
         let session_a = AesSession::from_shared_secret(&secret).unwrap();
         let session_b = AesSession::from_shared_secret_peer(&secret).unwrap();

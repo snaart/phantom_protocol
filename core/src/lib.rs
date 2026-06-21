@@ -3,11 +3,15 @@
 //! Post-quantum secure L4/L6 universal transport framework.
 //!
 //! Provides:
-//! - Hybrid key exchange (X25519 + Kyber768)
-//! - Hybrid signatures (Ed25519 + Dilithium3)
-//! - Multi-path transport (KCP, TCP, FakeTLS)
-//! - Connection migration and fallback
-//! - Stream multiplexing (reliable + unreliable)
+//! - Hybrid key exchange (X25519 + ML-KEM-768; X-Wing-style combiner). Under
+//!   `--features fips` the classical half swaps to ECDH-P-256.
+//! - Hybrid signatures (Ed25519 + ML-DSA-65) — both halves must verify.
+//! - PhantomUDP, a native reliable transport over raw UDP (the production
+//!   transport), plus byte-pipe `SessionTransport` impls for TCP, browser
+//!   WebSocket, WASI, embedded UART/USB, and an off-by-default TLS-mimicry leg.
+//! - Seamless single-path connection migration (not multipath aggregation —
+//!   that was deliberately rejected) with liveness detection and keep-alive PINGs.
+//! - Stream multiplexing (reliable + unreliable).
 //!
 //! The core transmits only `Vec<u8>` / `Bytes`.
 //! Serialization (JSON, Protobuf, etc.) is the user's responsibility.
@@ -23,6 +27,14 @@
 // `clippy::indexing_slicing` is deliberately omitted at this stage — it fires
 // on every constant-bounded array index and would generate too much noise.
 // It is tracked as a separate phase 1.13 item (bounds-check audit).
+//
+// On docs.rs — which sets `--cfg docsrs` on nightly via the
+// `[package.metadata.docs.rs]` table — auto-generate "Available on crate
+// feature X" badges for every `#[cfg(feature = …)]`-gated item. `doc_auto_cfg`
+// was merged into `doc_cfg` in Rust 1.92, which now carries the auto-cfg
+// behaviour. The attribute is inert on every normal (stable) build: `docsrs` is
+// never set there, so the unstable `doc_cfg` feature is never requested.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -111,8 +123,8 @@ mod errors;
 // The bare-metal subset (Phase 3.6) compiles only `errors` and the embedded
 // transport subset. Everything below is gated behind `std`: it either uses
 // `tokio`, `parking_lot`, `dashmap`, raw sockets, `std::time::Instant`,
-// `std::sync::*`, or a std-bound dep (e.g. `ring`, `ml-kem`, `x25519-dalek`)
-// that is itself only compiled when `std` is on.
+// `std::sync::*`, or a std-bound dep (e.g. `ml-kem`, the classical-crypto
+// `ring` / `x25519-dalek`) that is itself only compiled when `std` is on.
 
 #[cfg(feature = "std")]
 pub mod config;
@@ -123,8 +135,10 @@ pub mod security;
 #[cfg(feature = "std")]
 pub mod validation;
 
-// Crypto module (hybrid KEM, hybrid sign) — std-only: pulls `ring`,
-// `x25519-dalek`, `ed25519-dalek`, `ml-kem`, `ml-dsa`.
+// Crypto module (hybrid KEM, hybrid sign) — std-only: pulls `ed25519-dalek`,
+// `ml-kem`, `ml-dsa` unconditionally, plus `ring` + `x25519-dalek` via the
+// default-on `classical-crypto` feature. Under `--features fips` the classical
+// substrate swaps to `aws-lc-rs` (`ring` / `x25519-dalek` dropped entirely).
 #[cfg(feature = "std")]
 pub mod crypto;
 
@@ -134,8 +148,9 @@ pub mod crypto;
 pub mod transport;
 
 // Async runtime abstraction (Phase 3.1). `TokioRuntime` is the default
-// implementation; the trait surface is in place for follow-up commits
-// that introduce WASM / embedded backends.
+// implementation; `WasmRuntime` (browser), `EmbeddedRuntime` (host-thread
+// scaffold), and `WasiRuntime` (WASI Preview 2) are the shipped alternate
+// backends, injected via the `_with_runtime` API variants.
 #[cfg(feature = "std")]
 pub mod runtime;
 

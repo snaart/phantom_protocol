@@ -1,10 +1,13 @@
-//! Multi-path / connection migration state (Phase 4.2).
+//! Connection-migration path-validation state (Phase 4.2).
 //!
 //! Tracks the per-path lifecycle from "newly observed" through
 //! "validated" so the session can refuse to send application data over
 //! an unverified path. Each path is identified by the 1-byte
 //! `path_id` field in `PacketHeader` (Phase 3.3 / Phase 4.2 wire
-//! addition).
+//! addition). The framework does **single-path** connection migration
+//! (one live path at a time) — not multipath aggregation — but the
+//! registry can hold several `PathState`s at once during a migration
+//! switch (old path retiring, new path validating).
 //!
 //! ## Validation protocol
 //!
@@ -36,11 +39,11 @@
 //! ## Use against migration
 //!
 //! When a peer's source IP changes mid-session (mobile handoff,
-//! LTE↔Wi-Fi switch, multi-path), the session must NOT silently
-//! accept packets on the new path — that would let an attacker hijack
-//! by spoofing the source IP. Issuing a challenge on the new path
-//! before accepting traffic forces the attacker to also hold the
-//! AEAD key, which they don't.
+//! LTE↔Wi-Fi switch), the session must NOT silently accept packets on
+//! the new path — that would let an attacker hijack by spoofing the
+//! source IP. Issuing a challenge on the new path before accepting
+//! traffic forces the attacker to also hold the AEAD key, which they
+//! don't.
 
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::time::Instant;
@@ -77,10 +80,14 @@ pub enum PathStateKind {
 pub struct PathState {
     pub path_id: u8,
     state: AtomicU8, // PathStateKind as u8
-    /// EMA-smoothed RTT estimate for this path, in milliseconds.
-    /// Updated by the scheduler / data pump as ACKs land.
+    /// EMA-smoothed RTT estimate for this path, in milliseconds. Reserved
+    /// per-path telemetry slot — currently unwired: live RTT/loss for the
+    /// active path is tracked by the BBR `BandwidthEstimator`, not here (the
+    /// multipath `scheduler` that would have fed these is vestigial; the
+    /// project does single-path connection migration, not aggregation).
     pub rtt_ms: AtomicU32,
-    /// Smoothed loss percentage (0-100) for this path.
+    /// Smoothed loss percentage (0-100) for this path. Reserved, currently
+    /// unwired — see `rtt_ms` above.
     pub loss_pct: AtomicU8,
     /// Wall-clock instant of the most recent packet observed on this
     /// path. Used by the timeout sweep.
@@ -216,8 +223,8 @@ impl PathRegistry {
 
     /// Allocate a fresh challenge for the path and transition it to
     /// `Validating`. The caller is responsible for transmitting the
-    /// returned bytes (typically inside a `PATH_VALIDATION`-flagged V2
-    /// packet).
+    /// returned bytes (typically inside a `PATH_VALIDATION`-flagged
+    /// `PhantomPacket`).
     ///
     /// Returns `None` if the path is unknown or if it is already in
     /// `Validated` / `Failed` (re-issuing a challenge from those
