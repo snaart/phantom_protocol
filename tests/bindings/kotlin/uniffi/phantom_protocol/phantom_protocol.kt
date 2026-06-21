@@ -1011,7 +1011,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 8664.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 53836.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 44795.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675.toShort()) {
@@ -2284,12 +2284,18 @@ public object FfiConverterTypePhantomListener: FfiConverter<PhantomListener, Lon
 
 
 /**
- * Client-first session — instant `connect()`, non-blocking `send()`.
+ * Client-first session — instant construction, non-blocking `send()`.
  *
  * # Design
  *
+ * The real entry point is `connect_with_transport` (NOT the inert legacy
+ * `connect()` constructor — see its doc): it returns instantly and runs the
+ * handshake + data pump in the background, so sends issued before the handshake
+ * finishes are buffered and auto-flushed once the channel is up.
+ *
  * ```text
- * let session = PhantomSession::connect("server:443");  // instant!
+ * // instant — spawns the background handshake + pump:
+ * let session = PhantomSession::connect_with_transport(addr, transport, pinned_key);
  * session.send(data).await;   // queued until handshake completes
  * session.send(data2).await;  // also queued
  * // ... handshake completes in background ...
@@ -2422,10 +2428,10 @@ public interface PhantomSessionInterface {
     
     /**
      * Override the automatic-rekey send-invocation high-watermark on the
-     * established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
-     * the session is still connecting. Rust-only — primarily for soak/load
-     * harnesses that need to exercise mid-session rekey without sending `2^47`
-     * packets.
+     * established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
+     * Returns `false` if the session is still connecting. Rust-only — primarily
+     * for soak/load harnesses that need to exercise mid-session rekey without
+     * sending `2^32` packets.
      */
     suspend fun `setRekeyThreshold`(`n`: kotlin.ULong): kotlin.Boolean
     
@@ -2452,12 +2458,18 @@ public interface PhantomSessionInterface {
 }
 
 /**
- * Client-first session — instant `connect()`, non-blocking `send()`.
+ * Client-first session — instant construction, non-blocking `send()`.
  *
  * # Design
  *
+ * The real entry point is `connect_with_transport` (NOT the inert legacy
+ * `connect()` constructor — see its doc): it returns instantly and runs the
+ * handshake + data pump in the background, so sends issued before the handshake
+ * finishes are buffered and auto-flushed once the channel is up.
+ *
  * ```text
- * let session = PhantomSession::connect("server:443");  // instant!
+ * // instant — spawns the background handshake + pump:
+ * let session = PhantomSession::connect_with_transport(addr, transport, pinned_key);
  * session.send(data).await;   // queued until handshake completes
  * session.send(data2).await;  // also queued
  * // ... handshake completes in background ...
@@ -2921,10 +2933,10 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
     
     /**
      * Override the automatic-rekey send-invocation high-watermark on the
-     * established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
-     * the session is still connecting. Rust-only — primarily for soak/load
-     * harnesses that need to exercise mid-session rekey without sending `2^47`
-     * packets.
+     * established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
+     * Returns `false` if the session is still connecting. Rust-only — primarily
+     * for soak/load harnesses that need to exercise mid-session rekey without
+     * sending `2^32` packets.
      */
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
     override suspend fun `setRekeyThreshold`(`n`: kotlin.ULong) : kotlin.Boolean {
@@ -3181,6 +3193,17 @@ public object FfiConverterTypePhantomSession: FfiConverter<PhantomSession, Long>
 //
 
 
+/**
+ * A single multiplexed stream inside an established [`PhantomSession`].
+ *
+ * Created by the session's stream multiplexer (one per logical stream id).
+ * Outbound data is queued to the session's data pump over the `tx` command
+ * channel (`send_reliable` / `send_unreliable`); inbound demultiplexed data
+ * arrives on `rx`. The session owns all encryption and transport — a
+ * `PhantomStream` is just the per-stream send/recv handle exposed over FFI.
+ *
+ * [`PhantomSession`]: crate::api::session::PhantomSession
+ */
 public interface PhantomStreamInterface {
     
     /**
@@ -3203,6 +3226,17 @@ public interface PhantomStreamInterface {
     companion object
 }
 
+/**
+ * A single multiplexed stream inside an established [`PhantomSession`].
+ *
+ * Created by the session's stream multiplexer (one per logical stream id).
+ * Outbound data is queued to the session's data pump over the `tx` command
+ * channel (`send_reliable` / `send_unreliable`); inbound demultiplexed data
+ * arrives on `rx`. The session owns all encryption and transport — a
+ * `PhantomStream` is just the per-stream send/recv handle exposed over FFI.
+ *
+ * [`PhantomSession`]: crate::api::session::PhantomSession
+ */
 open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
 {
 
@@ -3446,6 +3480,19 @@ public object FfiConverterTypePhantomStream: FfiConverter<PhantomStream, Long> {
 
 
 
+/**
+ * Tunable parameters for a Phantom session / listener, exported across the
+ * UniFFI boundary as a plain record.
+ *
+ * NOTE: this is a stable FFI config surface, but the core does not yet read
+ * most of these fields on the live data path — `PhantomConfig` is currently
+ * re-exported and FFI-exported only. The `auto_fallback` / `fallback_*` /
+ * `upgrade_delay` fields in particular describe the legacy multi-leg
+ * fallback model; transport-leg fallback / aggregation was deliberately
+ * dropped in favour of single-path connection migration, so those knobs are
+ * presently inert. Treat the presets below as documented intent, not as
+ * behaviour the core enforces today.
+ */
 data class PhantomConfig (
     /**
      * Interval between keep-alive pings
@@ -3483,17 +3530,18 @@ data class PhantomConfig (
     var `sessionTicketLifetime`: java.time.Duration
     , 
     /**
-     * Enable automatic transport fallback
+     * Enable automatic transport fallback (legacy multi-leg model; inert —
+     * see the struct-level note).
      */
     var `autoFallback`: kotlin.Boolean
     , 
     /**
-     * Packet loss percentage to trigger fallback
+     * Packet loss percentage to trigger fallback (legacy multi-leg model; inert).
      */
     var `fallbackLossThreshold`: kotlin.UByte
     , 
     /**
-     * Connection failures to trigger fallback
+     * Connection failures to trigger fallback (legacy multi-leg model; inert).
      */
     var `fallbackFailureThreshold`: kotlin.UInt
     , 
@@ -3503,7 +3551,7 @@ data class PhantomConfig (
     var `connectTimeout`: java.time.Duration
     , 
     /**
-     * Delay before attempting to upgrade transport
+     * Delay before attempting to upgrade transport (legacy multi-leg model; inert).
      */
     var `upgradeDelay`: java.time.Duration
     
