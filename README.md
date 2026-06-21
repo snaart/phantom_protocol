@@ -20,7 +20,7 @@ no_std. (An optional TLS-over-TCP DPI-mimicry transport — `mimicry` feature �
 makes a flow look like HTTPS to passive DPI; anti-DPI obfuscation only, detectable
 by active probing — see [Status & limitations](#status--limitations).)
 
-> **Pre-1.0 (`0.2.0`).** Wire format may break between minors; SemVer kicks in at
+> **Pre-1.0 (`0.2.1`).** Wire format may break between minors; SemVer kicks in at
 > 1.0. 0 workspace warnings, 0 `unsafe` outside three audited opt-ins, MSRV Rust
 > 1.93, CI green across the full cross-target matrix. See
 > [Status & limitations](#status--limitations).
@@ -263,7 +263,7 @@ non-root `phantom` UID 65532, EXPOSE 4242 + 9090, signing-key volume at
 and TCP healthcheck.
 
 ```bash
-docker build -t phantom-server:0.2.0 .
+docker build -t phantom-server:0.2.1 .
 docker compose up -d
 ```
 
@@ -271,7 +271,7 @@ docker compose up -d
 
 Production-shape chart at
 [`docs/operations/helm/phantom-protocol/`](docs/operations/helm/phantom-protocol/).
-`appVersion: 0.2.0`, ClusterIP service on `4242`, 3 replicas,
+`appVersion: 0.2.1`, ClusterIP service on `4242`, 3 replicas,
 `tcpSocket` liveness / readiness. Raw manifests + walkthrough in
 [`docs/operations/kubernetes.md`](docs/operations/kubernetes.md).
 
@@ -426,7 +426,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 > data plane. Do not protect anything high-risk with this until it has been
 > independently audited and soak-tested on real networks.
 
-- **Pre-1.0 (`0.2.0`).** Wire format may break between minors; SemVer applies
+- **Pre-1.0 (`0.2.1`).** Wire format may break between minors; SemVer applies
   once 1.0 ships. The current wire protocol is a single pinned version — the
   former V1/V2/V3 axes were collapsed pre-1.0 (no users, no negotiation, no
   fallback), so there are no cross-version migration guides.
