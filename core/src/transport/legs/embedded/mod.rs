@@ -273,7 +273,12 @@ mod tests {
             self.write_notify.notify_waiters();
             Ok(data.len())
         }
-        // `flush` defaults to `Ok(())` — keep the default.
+        // `flush` became a required method in embedded-io-async 0.7. The mock
+        // pipe writes synchronously into the shared buffer, so there is nothing
+        // to flush — a no-op `Ok(())` matches the old 0.6 default.
+        async fn flush(&mut self) -> Result<(), Infallible> {
+            Ok(())
+        }
     }
 
     // ── Tests ───────────────────────────────────────────────────────────
@@ -561,6 +566,11 @@ mod tests {
         async fn write(&mut self, data: &[u8]) -> Result<usize, Infallible> {
             self.recorder.lock().await.extend_from_slice(data);
             self.inner.write(data).await
+        }
+        // `flush` became a required method in embedded-io-async 0.7; forward to
+        // the wrapped writer (which is itself a no-op).
+        async fn flush(&mut self) -> Result<(), Infallible> {
+            self.inner.flush().await
         }
     }
 

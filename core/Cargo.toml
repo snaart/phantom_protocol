@@ -223,7 +223,7 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # to `borsh` can silently shift the handshake bytes and break interop with no
 # `WIRE_VERSION` change, so it is pinned to an exact version — bump it only as a
 # deliberate wire change, paired with a vector regeneration.
-borsh = { version = "=1.6.1", default-features = false, optional = true, features = ["derive"] }
+borsh = { version = "=1.7.0", default-features = false, optional = true, features = ["derive"] }
 hex = { version = "0.4", default-features = false, optional = true, features = ["alloc"] }
 base64 = { version = "0.22", default-features = false, optional = true, features = ["alloc"] }
 anyhow = { version = "1", optional = true }
@@ -244,14 +244,16 @@ ring = { version = "0.17", optional = true }  # HW-accelerated AES-GCM (ARM64 AE
 # (`chacha20::ChaCha20`) for the per-packet header-protection mask — `ring` /
 # `aws-lc-rs` AEAD expose neither. Both are pure-Rust, `#![no_std]`, with a
 # constant-time soft fallback on every target (no `cpufeatures` off x86/aarch64),
-# so they cross-compile to wasm32 + thumbv7em unchanged. `aes 0.8` / `chacha20 0.9`
-# share one `cipher 0.4` / `crypto-common 0.1` generation (already in-tree via
-# ml-kem → digest 0.10). Pulled by the `header-protection` feature (folded into
+# so they cross-compile to wasm32 + thumbv7em unchanged. `aes 0.9` / `chacha20
+# 0.10` share one `cipher 0.5` / `crypto-common 0.2` generation (the dep-update
+# bump from `aes 0.8` / `chacha20 0.9`, which rode the older `cipher 0.4`; the
+# header-protection code was migrated to the cipher-0.5 API). Pulled by the
+# `header-protection` feature (folded into
 # `std`); under `--features fips` the AES mask routes through `aws_lc_rs::cipher`
 # instead and the ChaCha mask is unreachable (suite pinned to AES) — these crates
 # then link dead, exactly as `ring` does under fips.
-aes = { version = "0.8", default-features = false, optional = true }
-chacha20 = { version = "0.9", default-features = false, optional = true }
+aes = { version = "0.9", default-features = false, optional = true }
+chacha20 = { version = "0.10", default-features = false, optional = true, features = ["cipher"] }
 # Phase 5.1: switched from `pqcrypto-kyber` / `pqcrypto-dilithium` (which
 # wrap NIST PQC round-3 C reference impls and require libc) to the
 # RustCrypto pure-Rust FIPS-203 / FIPS-204 implementations. These compile
@@ -268,7 +270,7 @@ ml-dsa = { version = "0.1.1", optional = true }   # stable release; a release ca
 hkdf = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
 blake3 = { version = "1.5", optional = true }
-getrandom = { version = "0.2", optional = true }
+getrandom = { version = "0.4", optional = true }
 bitflags = { version = "2.13", optional = true }
 parking_lot = { version = "0.12", optional = true }  # Fast mutex for buffer pool
 arc-swap = { version = "1", optional = true }        # Lock-free atomic swap for the CryptoState rekey path (Phase 1.5)
@@ -307,8 +309,9 @@ dashmap = { version = "6.1.0", optional = true }
 # read/write handles (chosen over `embassy-sync`, which drags in `heapless` + a
 # link-time `critical-section` impl). The crate MSRV is now 1.93, so the prior
 # `async-lock < 3.4` cap (held only for the old 1.75 MSRV — 3.4 needs 1.85) is
-# dropped; `embedded-io-async` stays at 0.6 to avoid a 0.7 API migration for now.
-embedded-io-async = { version = "0.6", optional = true }
+# dropped. `embedded-io-async` is at 0.7 (was 0.6): the 0.7 bump made
+# `Write::flush` a required method, which only touched the test mock writers.
+embedded-io-async = { version = "0.7", optional = true }
 async-lock = { version = ">=3, <4", optional = true, default-features = false }
 
 [build-dependencies]
@@ -366,18 +369,24 @@ web-sys = { version = "0.3", features = [
     "MessageEvent",
     "WebSocket",
 ] }
-# Phase 3.8 partial: enable getrandom's "js" feature for wasm32-unknown-
-# unknown so it falls back to `crypto.getRandomValues` rather than
-# emitting a compile_error!. Non-wasm targets and WASI targets ignore
-# this — it's a no-op there.
-getrandom = { version = "0.2", features = ["js"] }
-# Force-enable the `wasm_js` feature on getrandom 0.4 for wasm32-unknown-
-# unknown. getrandom 0.4 is pulled in transitively by `ml-dsa →
-# crypto-common 0.2` and `uniffi → tempfile`. The wasm path requires the
-# `wasm_js` Cargo feature (not a --cfg rustflag) to compile in the
-# js-sys/wasm-bindgen backend. WASI builds get the default getrandom path
-# (which uses WASI's `random_get`).
-getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+# Phase 3.8 / dep-update: enable getrandom's wasm entropy backend for
+# wasm32-unknown-unknown so it routes to `crypto.getRandomValues` rather than
+# emitting a compile_error!. After the dep-update pass three getrandom majors
+# coexist in the graph and each needs its wasm backend force-enabled here (the
+# feature name differs per major):
+#
+#   - 0.4 — our DIRECT `dep:getrandom` (the crypto RNG seam; `getrandom::fill`),
+#     also pulled transitively by `aes`/`chacha20` → `crypto-common 0.2` and
+#     `uniffi → tempfile`. The wasm backend feature is `wasm_js`.
+#   - 0.2 — still pulled transitively via the rand_core-0.6 ecosystem
+#     (`rand 0.8`, `ed25519-dalek`, `x25519-dalek`, `ml-kem 0.2`, `argon2`).
+#     Its wasm backend feature is the older `js`; without this the 0.2 copy
+#     emits a `compile_error!` on wasm32-unknown-unknown.
+#
+# Non-wasm / WASI builds ignore both and get the default backend (WASI's
+# `random_get`).
+getrandom = { version = "0.4", features = ["wasm_js"] }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 
 # ─── WASI-only dependencies (Section B — wasi-leg) ────────────────────────
 # WASI Preview 2 bindings for the WasiLeg transport + WasiRuntime. Lives
@@ -393,7 +402,7 @@ blake3 = "1.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 uniffi = { version = "0.31", features = ["bindgen-tests"] }
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 tokio-test = "0.4"
 proptest = "1"  # property-based testing harness
 serde_json = "1"  # parse the committed NIST ACVP KAT vectors (core/tests/nist_kat.rs)

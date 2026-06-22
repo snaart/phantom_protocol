@@ -5,9 +5,8 @@
 //! - Raw TCP echo (no encryption)
 //! - Classical vs Post-Quantum cryptography
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
