@@ -36,14 +36,16 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-/// Generate a fresh 128-bit session identifier from the thread-local CSPRNG.
+/// Generate a fresh 128-bit session identifier from the OS CSPRNG.
 ///
-/// Replaces the historical `rand::random::<u32>()` (32 bits, insufficient to
-/// avoid birthday collisions at scale and not advertised as cryptographic).
-/// `rand::thread_rng` is seeded from the OS at thread startup and uses a
-/// modern stream cipher (ChaCha) — adequate for non-secret identifiers.
+/// This is a non-secret display/handle identifier, not key material; 128 bits
+/// is enough to avoid birthday collisions at scale. Sourced from the crate's
+/// `RngProvider` seam (`crate::crypto::rng::OsRng`, backed by `getrandom`) so
+/// the codebase carries no direct production `rand` dependency.
 fn new_session_id() -> String {
-    let bytes: [u8; 16] = rand::random();
+    use crate::crypto::rng::RngProvider;
+    let mut bytes = [0u8; 16];
+    crate::crypto::rng::OsRng.fill_bytes(&mut bytes);
     format!("phantom-{}", hex::encode(bytes))
 }
 

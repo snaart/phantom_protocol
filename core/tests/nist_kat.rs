@@ -15,7 +15,8 @@
 //! Coverage:
 //!   * **ML-KEM-768** — keyGen `(d,z) → (ek,dk)`, encaps `(ek,m) → (c,k)`, decaps
 //!     `(dk,c) → k` (incl. the implicit-reject VAL cases), all byte-exact, via the
-//!     `deterministic` feature. Plus a tamper guard.
+//!     `ml-kem` `hazmat` feature (which un-hides the deterministic encaps + the
+//!     seed/expanded-key encodings). Plus a tamper guard.
 //!   * **ML-DSA-65** — keyGen `seed → pk` byte-exact, and `verify` of real NIST
 //!     `(pk, msg, ctx, signature)` (accept) with a 1-byte-tampered signature
 //!     (reject). NB: `ml-dsa 0.1.0`'s `SigningKey` is seed-based and exposes no
@@ -23,20 +24,29 @@
 //!     byte-match a *generated* signature; the verify-side KAT consumes the real
 //!     NIST signature instead.
 
+// The ACVP decaps vectors carry the 2400-byte FIPS-203 *expanded* decapsulation
+// key, decoded via `ExpandedKeyEncoding::from_expanded_bytes` / encoded back via
+// `to_expanded_bytes` (`DecapsulationKey::to_seed` is the 64-byte seed form, not
+// the expanded ACVP form). Both are `#[deprecated]` in `ml-kem` 0.3 (the seed
+// form is preferred), but the published NIST vectors fix the expanded encoding,
+// so the KAT must keep exercising it.
+#![allow(deprecated)]
+
 use std::path::PathBuf;
 
 use ml_dsa::{
     EncodedSignature, EncodedVerifyingKey, Keypair, MlDsa65, Signature as MlDsaSignature,
     SigningKey as MlDsaSigningKey, VerifyingKey as MlDsaVerifyingKey, B32 as DsaB32,
 };
-use ml_kem::kem::Decapsulate;
+use ml_kem::array::Array;
+use ml_kem::kem::{Decapsulate, Key, KeyExport};
 use ml_kem::{
-    Ciphertext, EncapsulateDeterministic, Encoded, EncodedSizeUser, KemCore, MlKem768, B32,
+    Ciphertext, DecapsulationKey, EncapsulationKey, ExpandedKeyEncoding, Kem, MlKem768, Seed, B32,
 };
 use serde_json::Value;
 
-type EncapKey = <MlKem768 as KemCore>::EncapsulationKey;
-type DecapKey = <MlKem768 as KemCore>::DecapsulationKey;
+type EncapKey = <MlKem768 as Kem>::EncapsulationKey;
+type DecapKey = <MlKem768 as Kem>::DecapsulationKey;
 
 // ─── fixture / hex helpers ──────────────────────────────────────────────────
 
@@ -84,16 +94,26 @@ fn ml_kem_768_keygen_kat() {
     let doc = load("ml_kem_768_keygen.json");
     let mut n = 0;
     for (_g, t) in cases(&doc) {
+        // FIPS-203 keyGen is seeded by the 64-byte `(d ‖ z)` seed. `ml-kem` 0.3
+        // generates from the combined `Seed` (the 0.2 `generate_deterministic(d,
+        // z)` two-arg form is gone), so concatenate `d` (32) and `z` (32).
         let (d, z) = (hx(t, "d"), hx(t, "z"));
-        let (dk, ek) = MlKem768::generate_deterministic(&b32(&d), &b32(&z));
+        let mut seed_bytes = [0u8; 64];
+        seed_bytes[..32].copy_from_slice(&d);
+        seed_bytes[32..].copy_from_slice(&z);
+        let seed = Seed::try_from(seed_bytes.as_slice()).expect("64-byte seed");
+        let dk = DecapsulationKey::<MlKem768>::from_seed(seed);
+        let ek = dk.encapsulation_key();
         assert_eq!(
-            ek.as_bytes().as_slice(),
+            ek.to_bytes().as_slice(),
             hx(t, "ek").as_slice(),
             "ML-KEM-768 keyGen ek mismatch (tcId {})",
             t["tcId"]
         );
+        // The ACVP `dk` is the 2400-byte FIPS-203 expanded decapsulation key,
+        // not the 64-byte seed — compare against `to_expanded_bytes`.
         assert_eq!(
-            dk.as_bytes().as_slice(),
+            dk.to_expanded_bytes().as_slice(),
             hx(t, "dk").as_slice(),
             "ML-KEM-768 keyGen dk mismatch (tcId {})",
             t["tcId"]
@@ -111,13 +131,16 @@ fn ml_kem_768_encaps_kat() {
         if g["function"] != "encapsulation" {
             continue;
         }
-        let ek_enc = Encoded::<EncapKey>::try_from(hx(t, "ek").as_slice()).expect("ek size");
-        let ek = EncapKey::from_bytes(&ek_enc);
-        let (c, k) = ek
-            .encapsulate_deterministic(&b32(&hx(t, "m")))
-            .expect("ML-KEM-768 deterministic encaps");
+        // `EncapsulationKey::new` validates the encoded key and returns
+        // `Result` (the 0.2 infallible `from_bytes` is gone); the `Key<_>`
+        // newtype carries the size proof. `encapsulate_deterministic` (the
+        // `hazmat` feature) returns the `(Ciphertext, SharedKey)` tuple
+        // directly — no `Result`.
+        let ek_key = Key::<EncapKey>::try_from(hx(t, "ek").as_slice()).expect("ek size");
+        let ek = EncapsulationKey::<MlKem768>::new(&ek_key).expect("valid ek encoding");
+        let (c, k) = ek.encapsulate_deterministic(&b32(&hx(t, "m")));
         assert_eq!(
-            c.as_slice(),
+            AsRef::<[u8]>::as_ref(&c),
             hx(t, "c").as_slice(),
             "encaps c (tcId {})",
             t["tcId"]
@@ -144,10 +167,20 @@ fn ml_kem_768_decaps_kat() {
         if g["function"] != "decapsulation" {
             continue;
         }
-        let dk_enc = Encoded::<DecapKey>::try_from(hx(t, "dk").as_slice()).expect("dk size");
-        let dk = DecapKey::from_bytes(&dk_enc);
+        // The ACVP `dk` is the 2400-byte FIPS-203 expanded decap key. `ml-kem`
+        // 0.3 loads it through `ExpandedKeyEncoding::from_expanded_bytes`
+        // (validating, hence `Result`); the 0.2 `Encoded<_>` + `from_bytes`
+        // path is gone. `decapsulate` is infallible (`-> SharedKey`): the
+        // FIPS-203 implicit-reject path is exercised by the VAL cases whose
+        // expected `k` is the implicit-reject value.
+        let dk_bytes = hx(t, "dk");
+        let dk_arr = Array::<u8, <DecapKey as ExpandedKeyEncoding>::EncodedSize>::try_from(
+            dk_bytes.as_slice(),
+        )
+        .expect("expanded dk size");
+        let dk = DecapsulationKey::<MlKem768>::from_expanded_bytes(&dk_arr).expect("valid dk");
         let ct = Ciphertext::<MlKem768>::try_from(hx(t, "c").as_slice()).expect("ct size");
-        let k = dk.decapsulate(&ct).expect("ML-KEM-768 decaps");
+        let k = dk.decapsulate(&ct);
         assert_eq!(
             k.as_slice(),
             hx(t, "k").as_slice(),
@@ -165,11 +198,16 @@ fn ml_kem_768_kat_tamper_is_caught() {
     // proves the assertions are real, not vacuous.
     let doc = load("ml_kem_768_keygen.json");
     let (_g, t) = cases(&doc)[0];
-    let (dk, _ek) = MlKem768::generate_deterministic(&b32(&hx(t, "d")), &b32(&hx(t, "z")));
+    let (d, z) = (hx(t, "d"), hx(t, "z"));
+    let mut seed_bytes = [0u8; 64];
+    seed_bytes[..32].copy_from_slice(&d);
+    seed_bytes[32..].copy_from_slice(&z);
+    let seed = Seed::try_from(seed_bytes.as_slice()).expect("64-byte seed");
+    let dk = DecapsulationKey::<MlKem768>::from_seed(seed);
     let mut tampered = hx(t, "dk");
     tampered[0] ^= 0x01;
     assert_ne!(
-        dk.as_bytes().as_slice(),
+        dk.to_expanded_bytes().as_slice(),
         tampered.as_slice(),
         "a tampered expected dk must not match"
     );

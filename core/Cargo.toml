@@ -80,7 +80,6 @@ std = [
     "dep:once_cell",
     "dep:anyhow",
     "dep:thiserror",
-    "dep:rand",
     # NB: `ring` + `x25519-dalek` are NOT listed here — they live behind the
     # `classical-crypto` feature so the `fips` build (which also implies `std`)
     # can drop them. See the `classical-crypto` feature below (SUPPLY-03).
@@ -230,7 +229,14 @@ anyhow = { version = "1", optional = true }
 thiserror = { version = "2", optional = true }
 log = { version = "0.4", optional = true }
 env_logger = { version = "0.11", optional = true }
-rand = { version = "0.8", optional = true }
+# `rand` is NOT a production dependency. The ecosystem skipped `rand_core 0.9`
+# (rand went 0.6 → 0.10), so a clean major-bump target does not exist; instead
+# the production CSPRNG seam is `getrandom` via `crate::crypto::rng::OsRng`
+# (the `RngProvider` trait), and `ml-kem`'s `getrandom` feature covers the KEM
+# random path. `rand` remains a `[dev-dependencies]` entry below — tests,
+# benches, and fuzz harnesses (cavp.rs, fuzz_handshake.rs,
+# protocol_comparison.rs, syn_flood_bench.rs, the `test_harness` module) still
+# use it for non-production randomness.
 once_cell = { version = "1.18", optional = true }
 subtle = { version = "2.5", default-features = false, optional = true }  # Constant-time equality for secrets (cookies, tokens)
 tracing = { version = "0.1", optional = true }  # Structured spans / events for observability (Phase 4.5)
@@ -260,10 +266,17 @@ chacha20 = { version = "0.10", default-features = false, optional = true, featur
 # on every target (server, mobile, embedded, wasm32) without C bindings.
 # Wire-incompatible with the prior build — bytes laid out per FIPS, not
 # per NIST round-3.
-# `deterministic` exposes `generate_deterministic` / `encapsulate_deterministic`
-# (additive API; no change to the production random path). Used by the NIST KAT
-# test (`core/tests/nist_kat.rs`) to byte-match published FIPS-203 vectors.
-ml-kem = { version = "0.2", optional = true, features = ["deterministic"] }
+#
+# Feature selection (ml-kem 0.3; the 0.2 `deterministic` feature was removed):
+#   - `getrandom` gives the no-arg `MlKem768::generate_keypair()` /
+#     `EncapsulationKey::encapsulate()` that draw from the system CSPRNG
+#     directly, so the production KEM path needs no `rand` RNG handle (and the
+#     direct `rand` dep could be dropped — it stays a dev-dep only).
+#   - `hazmat` un-hides `EncapsulationKey::encapsulate_deterministic` +
+#     `DecapsulationKey::from_seed`/`from_expanded_bytes`, used by the NIST KAT
+#     test (`core/tests/nist_kat.rs`) to byte-match published FIPS-203 vectors.
+#   - `zeroize` keeps the secret-key material wiped on drop.
+ml-kem = { version = "0.3", optional = true, features = ["hazmat", "getrandom", "zeroize"] }
 ml-dsa = { version = "0.1.1", optional = true }   # stable release; a release candidate must not ship in a 1.0
 # `signature` traits are re-exported via `ml_dsa::{Signer, Verifier}` from
 # the version ml-dsa pins (3.x); we do not need a direct dependency here.
@@ -371,17 +384,25 @@ web-sys = { version = "0.3", features = [
 ] }
 # Phase 3.8 / dep-update: enable getrandom's wasm entropy backend for
 # wasm32-unknown-unknown so it routes to `crypto.getRandomValues` rather than
-# emitting a compile_error!. After the dep-update pass three getrandom majors
-# coexist in the graph and each needs its wasm backend force-enabled here (the
-# feature name differs per major):
+# emitting a compile_error!. Two getrandom majors coexist in the *production*
+# wasm32-unknown-unknown graph and each needs its wasm backend force-enabled
+# here (the feature name differs per major):
 #
-#   - 0.4 — our DIRECT `dep:getrandom` (the crypto RNG seam; `getrandom::fill`),
-#     also pulled transitively by `aes`/`chacha20` → `crypto-common 0.2` and
+#   - 0.4 — our DIRECT `dep:getrandom` (the crypto RNG seam;
+#     `crate::crypto::rng::OsRng` → `getrandom::fill`), also pulled transitively
+#     by `aes`/`chacha20` → `crypto-common 0.2`, by the `kem` crate (the
+#     `ml-kem` `getrandom` feature for `generate_keypair`/`encapsulate`), and by
 #     `uniffi → tempfile`. The wasm backend feature is `wasm_js`.
-#   - 0.2 — still pulled transitively via the rand_core-0.6 ecosystem
-#     (`rand 0.8`, `ed25519-dalek`, `x25519-dalek`, `ml-kem 0.2`, `argon2`).
-#     Its wasm backend feature is the older `js`; without this the 0.2 copy
-#     emits a `compile_error!` on wasm32-unknown-unknown.
+#   - 0.2 — still pulled by `ring` and by our DIRECT `getrandom02` alias below
+#     (and the rand_core-0.6 ecosystem: `ed25519-dalek`, `x25519-dalek`,
+#     `argon2`). Its wasm backend feature is the older `js`; without this the
+#     0.2 copy emits a `compile_error!` on wasm32-unknown-unknown.
+#
+# NB: `rand 0.8` is no longer a production dep (dev-only now) and `ml-kem` is
+# on 0.3 (which routes through getrandom 0.4 via the `kem` crate, not 0.2), so
+# neither contributes a getrandom 0.2 edge to the production graph any more.
+# (A getrandom 0.3 also appears in the *dev* graph via `proptest`/`rand 0.9`,
+# but never in a production build, so it needs no backend wiring here.)
 #
 # Non-wasm / WASI builds ignore both and get the default backend (WASI's
 # `random_get`).

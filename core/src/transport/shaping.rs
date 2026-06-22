@@ -129,10 +129,14 @@ pub fn random_jitter(max_ms: u32) -> Duration {
     if max_ms == 0 {
         return Duration::ZERO;
     }
-    use rand::Rng;
-    // Inclusive `[0, max_ms]` so both endpoints are reachable.
-    let ms = rand::thread_rng().gen_range(0..=max_ms);
-    Duration::from_millis(ms as u64)
+    use crate::crypto::rng::RngProvider;
+    // Non-cryptographic jitter: draw 8 random bytes from the crate's
+    // `RngProvider` seam (no direct `rand` production dep) and reduce them into
+    // the inclusive `[0, max_ms]` range. Modulo bias is irrelevant for a timing
+    // jitter and `max_ms + 1` cannot overflow (`max_ms: u32` widened to u64).
+    let r = crate::crypto::rng::OsRng.next_u64();
+    let ms = r % (u64::from(max_ms) + 1);
+    Duration::from_millis(ms)
 }
 
 #[cfg(test)]
