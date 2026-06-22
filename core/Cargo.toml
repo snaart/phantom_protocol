@@ -223,7 +223,7 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # to `borsh` can silently shift the handshake bytes and break interop with no
 # `WIRE_VERSION` change, so it is pinned to an exact version — bump it only as a
 # deliberate wire change, paired with a vector regeneration.
-borsh = { version = "=1.6.1", default-features = false, optional = true, features = ["derive"] }
+borsh = { version = "=1.7.0", default-features = false, optional = true, features = ["derive"] }
 hex = { version = "0.4", default-features = false, optional = true, features = ["alloc"] }
 base64 = { version = "0.22", default-features = false, optional = true, features = ["alloc"] }
 anyhow = { version = "1", optional = true }
