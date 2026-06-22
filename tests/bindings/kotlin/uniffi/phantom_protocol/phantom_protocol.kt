@@ -644,75 +644,75 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckApiChecksums(this)
     }
     external fun uniffi_phantom_protocol_checksum_func_connect_pinned(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_acceptoutcome_session(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomlistener_accept(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomlistener_is_shutting_down(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_connection_state(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_current_epoch(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_disconnect(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_id(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_migrate(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_open_stream(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_queued_count(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_recv(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_send(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_disconnect(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_recv(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_stream_id(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind(
-    ): Short
+    ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomsession_connect(
-    ): Short
+    ): Int
     external fun ffi_phantom_protocol_uniffi_contract_version(
     ): Int
 
@@ -832,7 +832,7 @@ external fun ffi_phantom_protocol_rust_future_cancel_u8(`handle`: Long,
 external fun ffi_phantom_protocol_rust_future_free_u8(`handle`: Long,
 ): Unit
 external fun ffi_phantom_protocol_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Byte
+): Int
 external fun ffi_phantom_protocol_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
 external fun ffi_phantom_protocol_rust_future_cancel_i8(`handle`: Long,
@@ -848,7 +848,7 @@ external fun ffi_phantom_protocol_rust_future_cancel_u16(`handle`: Long,
 external fun ffi_phantom_protocol_rust_future_free_u16(`handle`: Long,
 ): Unit
 external fun ffi_phantom_protocol_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Short
+): Int
 external fun ffi_phantom_protocol_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
 external fun ffi_phantom_protocol_rust_future_cancel_i16(`handle`: Long,
@@ -936,109 +936,109 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 48812.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 48812) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 60625.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 60625) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 13201.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 13201) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_session() != 25558.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_session() != 25558) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data() != 27328.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data() != 27328) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_accept() != 14433.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_accept() != 14433) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_is_shutting_down() != 8474.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_is_shutting_down() != 8474) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr() != 46930.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr() != 46930) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown() != 60837.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown() != 60837) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 14523.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 14523) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 25030.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 25030) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_current_epoch() != 39888.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_current_epoch() != 39888) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 34217.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 34217) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted() != 8121.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted() != 8121) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue() != 15985.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue() != 15985) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_id() != 42609.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_id() != 42609) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 63798.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 63798) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready() != 47934.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready() != 47934) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 22155.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 22155) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 25882.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 25882) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 58516.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 58516) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 50067.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 50067) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 45587.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 45587) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 8664.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 8664) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 44795.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 44795) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8294.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8294) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 28528.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 28528) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 50030.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 50030) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 38734.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 38734) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 28026.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 28026) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 14331.toShort()) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 14331) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1246,6 +1246,10 @@ public object FfiConverterUByte: FfiConverter<UByte, Byte> {
         return value.toUByte()
     }
 
+    fun lift(value: Int): UByte {
+        return value.toUByte()
+    }
+
     override fun read(buf: ByteBuffer): UByte {
         return lift(buf.get())
     }
@@ -1266,6 +1270,10 @@ public object FfiConverterUByte: FfiConverter<UByte, Byte> {
  */
 public object FfiConverterUShort: FfiConverter<UShort, Short> {
     override fun lift(value: Short): UShort {
+        return value.toUShort()
+    }
+
+    fun lift(value: Int): UShort {
         return value.toUShort()
     }
 
