@@ -17,13 +17,16 @@ use std::fmt;
 pub struct SessionId(pub [u8; 32]);
 
 impl SessionId {
-    /// Create a new random session ID
+    /// Create a new random session ID.
+    ///
+    /// Sourced from the crate's `RngProvider` seam (`crate::crypto::rng::OsRng`,
+    /// backed by `getrandom`). The provider panics if the OS CSPRNG itself
+    /// fails — there is no useful non-crypto fallback for a session salt, and
+    /// the codebase carries no direct production `rand` dependency.
     pub fn random() -> Self {
+        use crate::crypto::rng::RngProvider;
         let mut bytes = [0u8; 32];
-        if getrandom::fill(&mut bytes).is_err() {
-            // Fallback to thread_rng which is always available
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
-        }
+        crate::crypto::rng::OsRng.fill_bytes(&mut bytes);
         Self(bytes)
     }
 
