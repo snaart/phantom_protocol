@@ -218,12 +218,13 @@ fn crypto_comparison_bench(c: &mut Criterion) {
     });
 
     // Post-Quantum: ML-KEM-768 only (Phase 5.1 — was Kyber768 / pqcrypto)
-    use ml_kem::{KemCore, MlKem768};
+    // `ml-kem` 0.3: `generate_keypair()` (the `getrandom` feature) draws from
+    // the system CSPRNG directly (the 0.2 `generate(&mut rng)` form is gone).
+    use ml_kem::{Kem, MlKem768};
 
     group.bench_function("keygen_ml_kem_768", |b| {
         b.iter(|| {
-            let mut rng = OsRng;
-            let (dk, ek) = MlKem768::generate(&mut rng);
+            let (dk, ek) = MlKem768::generate_keypair();
             black_box((dk, ek))
         })
     });

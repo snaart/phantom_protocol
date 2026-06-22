@@ -17,12 +17,10 @@ use ml_dsa::{
     EncodedSignature, EncodedVerifyingKey, KeyInit, Keypair, MlDsa65, Signature as MlDsaSignature,
     SigningKey as MlDsaSigningKey, VerifyingKey as MlDsaVerifyingKey,
 };
-use ml_kem::kem::{Decapsulate, Encapsulate};
-use ml_kem::{KemCore, MlKem768};
+use ml_kem::kem::{Decapsulate, Encapsulate, Kem};
+use ml_kem::MlKem768;
 use phantom_protocol::crypto::hybrid_kem::HybridSecretKey;
 use phantom_protocol::crypto::hybrid_sign::HybridSigningKey;
-use rand::rngs::StdRng;
-use rand::SeedableRng;
 // AEAD backend mirrors the library's cfg dispatch (SUPPLY-03): `ring` on the
 // default build, `aws-lc-rs` under `--features fips` — `ring` is not linked on
 // the fips path, so importing it unconditionally here would break the fips
@@ -37,11 +35,11 @@ use sha2::{Digest, Sha256};
 
 /// Source: FIPS 203 §7.2 / §7.3 (ML-KEM.Encaps / ML-KEM.Decaps). The byte-exact
 /// NIST ACVP KAT for the raw primitive lives in `core/tests/nist_kat.rs` (which
-/// enables `ml-kem`'s `deterministic` feature). This test instead drives a
-/// seeded `StdRng` (ChaCha-based CSPRNG, `CryptoRngCore`) through the standard
-/// `KemCore::generate` + `Encapsulate` + `Decapsulate` path and asserts the
-/// encap and decap sides recover the same shared secret — the FIPS 203
-/// correctness invariant — and exercises Phantom Protocol's hybrid combiner end-to-end.
+/// enables `ml-kem`'s `hazmat` feature for the deterministic vectors). This test
+/// instead drives the system CSPRNG through the standard `Kem::generate_keypair`
+/// + `Encapsulate` + `Decapsulate` path and asserts the encap and decap sides
+/// recover the same shared secret — the FIPS 203 correctness invariant — and
+/// exercises Phantom Protocol's hybrid combiner end-to-end.
 ///
 /// The same primitive sits inside `HybridSecretKey` (the X25519 + ML-KEM-768
 /// hybrid that `crypto::hybrid_kem` builds the handshake on), and we also
@@ -52,10 +50,12 @@ use sha2::{Digest, Sha256};
 #[test]
 fn ml_kem_768_encap_decap_kat() {
     // ── Raw ML-KEM-768 KAT-shaped round trip ───────────────────────────
-    let mut rng = StdRng::from_seed([0xA5u8; 32]);
-    let (dk, ek) = MlKem768::generate(&mut rng);
-    let (ct, k_send) = ek.encapsulate(&mut rng).expect("ML-KEM-768 encapsulate");
-    let k_recv = dk.decapsulate(&ct).expect("ML-KEM-768 decapsulate");
+    // `ml-kem` 0.3: `generate_keypair()` (the `getrandom` feature) draws from
+    // the system CSPRNG, `encapsulate()` returns the `(Ciphertext, SharedKey)`
+    // tuple directly, and `decapsulate()` is infallible (`-> SharedKey`).
+    let (dk, ek) = MlKem768::generate_keypair();
+    let (ct, k_send) = ek.encapsulate();
+    let k_recv = dk.decapsulate(&ct);
     assert_eq!(
         k_send.as_slice(),
         k_recv.as_slice(),
@@ -64,7 +64,7 @@ fn ml_kem_768_encap_decap_kat() {
     // FIPS 203 ML-KEM-768 fixed sizes — ciphertext is 1088 bytes,
     // shared secret is 32 bytes.
     assert_eq!(
-        ct.as_slice().len(),
+        AsRef::<[u8]>::as_ref(&ct).len(),
         1088,
         "FIPS 203 ML-KEM-768 ciphertext length is 1088 bytes"
     );
