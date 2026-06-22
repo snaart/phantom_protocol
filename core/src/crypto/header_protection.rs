@@ -140,11 +140,16 @@ fn compute_mask(
 /// crate.
 #[cfg(not(feature = "fips"))]
 fn aes256_ecb_block(key: &[u8; 32], sample: &[u8; 16]) -> Result<[u8; 16], CoreError> {
-    use aes::cipher::generic_array::GenericArray;
-    use aes::cipher::{BlockEncrypt, KeyInit};
+    // RustCrypto `cipher` 0.5 (aes 0.9) renamed the block-cipher trait
+    // `BlockEncrypt` -> `BlockCipherEncrypt` and moved off `generic-array` to the
+    // `hybrid-array` `Array`. The slice-based `KeyInit::new_from_slice` + a
+    // default `Block` keep this construction array-type-agnostic.
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
 
-    let cipher = aes::Aes256::new(GenericArray::from_slice(key));
-    let mut block = *GenericArray::<u8, aes::cipher::consts::U16>::from_slice(sample);
+    let cipher = aes::Aes256::new_from_slice(key)
+        .map_err(|_| CoreError::CryptoError("HP: AES-256 key init failed".into()))?;
+    let mut block = aes::cipher::Block::<aes::Aes256>::default();
+    block.copy_from_slice(sample);
     cipher.encrypt_block(&mut block);
     let mut out = [0u8; 16];
     out.copy_from_slice(block.as_slice());
@@ -177,13 +182,15 @@ fn aes256_ecb_block(key: &[u8; 32], sample: &[u8; 16]) -> Result<[u8; 16], CoreE
 /// (the suite is pinned to AES there), but the code is suite-, not feature-,
 /// gated, so it always compiles.
 fn chacha20_mask(key: &[u8; 32], sample: &[u8; 16]) -> Result<[u8; 16], CoreError> {
-    use chacha20::cipher::generic_array::GenericArray;
+    // chacha20 0.10 gates the RustCrypto `StreamCipher` API (and the `ChaCha20`
+    // alias) behind its `cipher` feature, enabled in Cargo.toml. `new_from_slices`
+    // is the slice-based `KeyIvInit` constructor, avoiding the `generic-array` ->
+    // `hybrid-array` array-type churn.
     use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 
     let counter = u32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
-    let key_ga = GenericArray::from_slice(key);
-    let nonce_ga = GenericArray::from_slice(&sample[4..16]);
-    let mut cipher = chacha20::ChaCha20::new(key_ga, nonce_ga);
+    let mut cipher = chacha20::ChaCha20::new_from_slices(key, &sample[4..16])
+        .map_err(|_| CoreError::CryptoError("HP: ChaCha20 init failed".into()))?;
     // The QUIC "counter" is the 32-bit block counter; ChaCha20 blocks are 64
     // bytes, so seek to that block before pulling the keystream.
     cipher.seek(u64::from(counter) * 64);

@@ -617,8 +617,7 @@ impl HandshakeServer {
         let verifying_key = signing_key.verifying_key();
 
         let mut master_secret = [0u8; 32];
-        getrandom::getrandom(&mut master_secret)
-            .map_err(|e| HandshakeError::RngError(e.to_string()))?;
+        getrandom::fill(&mut master_secret).map_err(|e| HandshakeError::RngError(e.to_string()))?;
 
         let now_sec = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -948,7 +947,7 @@ impl HandshakeServer {
         // the server commits to a session-specific value beyond `session_id` + the client
         // nonce. Replaces the former discarded ephemeral KEM key package (~1.1 KB).
         let mut server_nonce = [0u8; 32];
-        if let Err(e) = getrandom::getrandom(&mut server_nonce) {
+        if let Err(e) = getrandom::fill(&mut server_nonce) {
             return self.fail_and_reinsert(
                 &resumed,
                 HandshakeResponse::Fail(HandshakeError::RngError(e.to_string())),
@@ -1203,7 +1202,7 @@ impl HandshakeClient {
         let (kem_secret, kem_public) = HybridSecretKey::generate();
         let (signing_key, verifying_key) = HybridSigningKey::generate();
         let mut nonce = [0u8; 32];
-        getrandom::getrandom(&mut nonce).map_err(|e| HandshakeError::RngError(e.to_string()))?;
+        getrandom::fill(&mut nonce).map_err(|e| HandshakeError::RngError(e.to_string()))?;
 
         Ok(Self {
             kem_secret,

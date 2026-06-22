@@ -100,7 +100,7 @@
 //! See `tests::CounterRng` below for a tiny in-tree example.
 
 #[cfg(not(feature = "fips"))]
-use getrandom::getrandom;
+use getrandom::fill;
 
 #[cfg(feature = "fips")]
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
@@ -176,7 +176,7 @@ impl RngProvider for OsRng {
         // or propagating a partially-filled buffer that the caller would treat
         // as good entropy.
         #[allow(clippy::expect_used)]
-        getrandom(dest).expect("OS RNG (getrandom) failed");
+        fill(dest).expect("OS RNG (getrandom) failed");
     }
 }
 
