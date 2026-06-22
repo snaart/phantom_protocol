@@ -1,6 +1,6 @@
 [package]
 name = "phantom-protocol"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.93"
 description = "Post-quantum-secure L4/L6 universal transport framework — hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65, multi-path, UniFFI bindings"
@@ -10,6 +10,18 @@ documentation = "https://docs.rs/phantom-protocol"
 readme = "README.md"
 keywords = ["post-quantum", "transport", "cryptography", "networking", "ml-kem"]
 categories = ["network-programming", "cryptography", "no-std"]
+
+# docs.rs builds default-features-only unless told otherwise, which hides the
+# opt-in `telemetry-otel` (OpenTelemetry), `mimicry`, and `embedded` surfaces
+# from the rendered docs. Build those additive, host-buildable features so the
+# full public API is documented. `all-features` is intentionally NOT used:
+# `fips` + `no-std` are mutually exclusive (compile_error! in lib.rs), `wasi-leg`
+# only compiles under `cfg(target_os = "wasi")`, and `fips` would pull aws-lc-rs
+# (cmake) into the doc build. `--cfg docsrs` turns on the `doc_auto_cfg`
+# nightly attr (see lib.rs) so every gated item gets an "Available on …" badge.
+[package.metadata.docs.rs]
+features = ["telemetry-otel", "mimicry", "embedded"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 # `classical-crypto` (SUPPLY-03) is folded into `default` so the normal

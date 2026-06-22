@@ -1,27 +1,16 @@
-//! Phantom Protocol - Public API
+//! Phantom Protocol — legacy transport-config / builder surface.
 //!
-//! Post-quantum secure transport layer with:
-//! - Hybrid key exchange (X25519 + Kyber768)
-//! - Hybrid signatures (Ed25519 + Dilithium3)  
-//! - Multi-path transport (KCP, TCP, FakeTLS)
-//! - Connection migration and fallback
+//! This module re-exports the low-level transport + crypto types and offers a
+//! `TransportConfig` / `PhantomBuilder` for constructing handshake handlers
+//! directly. It predates the unified PhantomUDP rewrite: several of its knobs
+//! (`SchedulerMode`, `max_packet_size`, `stealth_mode`) reflect the old
+//! multipath/KCP design and no longer steer the live data plane (the scheduler is
+//! vestigial — see `SchedulerMode`). It is retained for the handful of in-crate
+//! callers that build raw `HandshakeClient` / `HandshakeServer` instances.
 //!
-//! # Quick Start
-//!
-//! ```rust,ignore
-//! use phantom_protocol::transport::api::*;
-//!
-//! // Server
-//! let server = PhantomListener::bind("0.0.0.0:8080").await?;
-//! while let Ok(session) = server.accept().await {
-//!     // Session established with PQC keys
-//!     session.send(b"Hello, Phantom Protocol!").await?;
-//! }
-//!
-//! // Client
-//! let session = PhantomClient::connect("server:8080").await?;
-//! let data = session.recv().await?;
-//! ```
+//! The actual user-facing API is in [`crate::api`]: `PhantomListener::bind` /
+//! `accept` on the server, `PhantomSession::connect_with_transport` /
+//! `connect_pinned` on the client. New code should use those, not this module.
 
 // Re-export core types
 pub use crate::transport::scheduler::Scheduler;
@@ -47,7 +36,8 @@ pub struct TransportConfig {
     pub pqc_enabled: bool,
     /// Scheduler mode for path selection
     pub scheduler_mode: SchedulerMode,
-    /// Maximum packet size (default: 1400 bytes for KCP)
+    /// Maximum packet size hint (default: 1400 bytes). Legacy knob — the live
+    /// PhantomUDP path uses its own `PATH_MTU` (1200) and does not read this.
     pub max_packet_size: usize,
     /// Enable stealth mode for anti-DPI (default: false)
     pub stealth_mode: bool,

@@ -1,3 +1,19 @@
+//! UDP fragmentation and reassembly with anti-DoS bounds.
+//!
+//! A logical packet larger than `MAX_UDP_PAYLOAD` is split into [`CryptoFrame`] chunks
+//! by [`fragment_payload`] and reassembled by [`FragmentAssembler`]. Because the wire is
+//! unreliable, unordered UDP, the assembler buffers partial assemblies keyed on
+//! `(session_id, packet_id)` and completes a packet once every chunk index has arrived.
+//!
+//! The reassembler is the only stateful, attacker-reachable buffer in the fragmentation
+//! path, so every input is bounds-checked: a bad fragment is silently dropped (never an
+//! error). The three caps below (`MAX_REASSEMBLED_LEN`, `MAX_TOTAL_CHUNKS`,
+//! `MAX_CONCURRENT_ASSEMBLIES`) plus the M-7 insert-if-absent rule bound the memory a
+//! peer can pin and stop a spoofed-key attacker from corrupting a victim's reassembly.
+//!
+//! This module is target-agnostic; the production PhantomUDP transport reuses it via
+//! `transport::phantom_udp::datagram`.
+
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -21,10 +37,17 @@ pub const MAX_TOTAL_CHUNKS: u16 = (MAX_REASSEMBLED_LEN / MAX_UDP_PAYLOAD + 1) as
 /// `MAX_CONCURRENT_ASSEMBLIES * MAX_REASSEMBLED_LEN` (≈ 64 MiB).
 pub const MAX_CONCURRENT_ASSEMBLIES: usize = 256;
 
-/// Represents a single chunk of a fragmented logical packet
+/// A single chunk of a fragmented logical packet.
+///
+/// `(session_id, packet_id)` is the reassembly key. It is an opaque demux key, not a
+/// security boundary: a chunk's authenticity is established later by the inner AEAD, not
+/// here. In the production PhantomUDP path the assembler is fed `session_id` =
+/// the rotating 8-byte outer ConnId zero-extended to 16 bytes (see `phantom_udp::datagram`),
+/// which is cleartext and guessable — hence the insert-if-absent (M-7) and anti-DoS bounds
+/// in `FragmentAssembler::process_chunk`.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct CryptoFrame {
-    pub session_id: [u8; 16], // Derived from IP + Client ID hash or explicit cookie
+    pub session_id: [u8; 16],
     pub packet_id: u32,
     pub chunk_index: u16,
     pub total_chunks: u16,

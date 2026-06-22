@@ -1,6 +1,16 @@
-//! Phantom Protocol - Multi-Path Scheduler
+//! Phantom Protocol - Multi-Path Scheduler (vestigial)
 //!
-//! Round-robin and low-latency scheduling across multiple transport legs.
+//! A round-robin / low-latency path-selection table over multiple transport legs.
+//!
+//! **Vestigial — not on the live data path.** The project deliberately does
+//! single-path connection migration, not multipath aggregation (bandwidth bonding
+//! was evaluated and rejected). `Scheduler` is still constructed inside `Session`
+//! and reachable via `Session::scheduler()` for diagnostics, but `select_paths` is
+//! never called to steer production traffic; live per-path RTT / loss lives in
+//! `transport::path::PathState` plus the BBR `BandwidthEstimator`. The
+//! `HighThroughput` "multi-path bonding" branch below describes the rejected
+//! aggregation design and never runs against a real socket. Kept intact as the
+//! seam in case multi-path selection is ever rewired.
 
 use crate::transport::types::{LegType, SchedulerMode};
 use parking_lot::RwLock;

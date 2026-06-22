@@ -8,6 +8,38 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-06-22
+
+Documentation release. **No code, wire-format, public-API, or dependency changes** —
+binary- and wire-compatible with 0.2.x (`WIRE_VERSION = 6`, `PROTOCOL_VERSION = 3`).
+
+### Added
+
+- **docs.rs now documents the opt-in feature surfaces.** A `[package.metadata.docs.rs]`
+  table builds the `telemetry-otel` (OpenTelemetry), `mimicry`, and `embedded` features
+  and enables `doc_cfg`, so every feature-gated item carries an "Available on crate
+  feature `X`" badge. Previously docs.rs built default-features-only, which hid the
+  OpenTelemetry / mimicry / embedded APIs from the rendered documentation entirely.
+  (`all-features` is intentionally not used — `fips` + `no-std` are mutually exclusive.)
+
+### Fixed
+
+- **Crate-wide comment accuracy + clarity pass (~60 source files).** Corrected
+  doc-comments and inline comments that no longer matched the code, including: stale
+  wire-format descriptions (the 47-byte → 15-byte `PacketHeader`, the v4 `[33..47]`
+  header-protection span → v6 whole-header masking, the off-wire `session_id`); the
+  REKEY-flag key derivation (wrongly described as the resumption-secret chain → the
+  traffic-secret `HKDF-Expand(current, "phantom-rekey-v1", 32)` chain, Invariant 5);
+  transports removed long ago but still described as live (the KCP / FakeTLS legs, the
+  multipath `TransportLeg` trait); the `ServerReply` kind dispatch (trial-deserialization
+  → explicit discriminant byte); the AEAD nonce construction (stale per-stream
+  `(epoch, stream_id, sequence)` → `nonce_prefix(4) ‖ packet_number(8)`); the auto-rekey
+  watermark (`2^47` → `2^32`); the proof-of-work cookie (HMAC → keyed BLAKE3, 60 s →
+  120 s validity); and a nonexistent "sits below MLS" architectural claim. Also
+  translated stray non-English comments to English and removed duplicated doc blocks.
+- **Warning-clean docs.rs build.** Fixed 7 broken intra-doc links exposed by documenting
+  the previously-undocumented `mimicry` / `embedded` modules.
+
 ## [0.2.1] - 2026-06-21
 
 Documentation/metadata patch release. **No code, wire-format, public-API, or

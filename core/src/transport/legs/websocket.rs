@@ -28,16 +28,17 @@
 //!   the `onopen` event fires (or rejects on early `onerror` / `onclose`).
 //! - `send_bytes` queues bytes for the spawn_local task to flush.
 //! - `recv_bytes` reads the next message; returns
-//!   `CoreError::NetworkError` when the WebSocket closes.
-//! - `close()` triggers `ws.close()` and drops both channel halves.
+//!   `CoreError::ConnectionClosed` once the inbound channel ends (socket closed).
+//! - `close()` sets the shared `closed` flag; the spawn_local send-task then
+//!   observes it and calls `ws.close()` (it owns the WebSocket, not this method).
 //!
 //! ## Status
 //!
-//! Compile-only at the time of landing — the
-//! `wasm32-unknown-unknown` job in `cross.yml` is still
-//! `allow_failure: true` because other parts of the crate (TCP/UDP/KCP
-//! legs, `tokio::net::*`) still need feature-gating before a full WASM
-//! build links. That work is Phase 3.5.
+//! The `wasm32-unknown-unknown` build is a hard CI gate (no `allow_failure`
+//! rows remain in `cross.yml`) — the crate's native-only pieces (`tokio::net::*`,
+//! the UDP/TCP transports) are now cfg-gated off the wasm32 target, so this leg
+//! links and `cargo check`s green there. Runtime exercise still requires a real
+//! browser executor; the in-tree `examples/wasm-demo` crate is the demo.
 
 #![cfg(target_arch = "wasm32")]
 #![allow(unsafe_code)] // wasm-bindgen generates `unsafe` JS-boundary glue
@@ -215,9 +216,10 @@ impl WebSocketLeg {
         })
     }
 
-    /// Mark the leg as closed and stop accepting sends. The underlying
-    /// WebSocket is closed by the spawn_local task once its send queue
-    /// drains (we drop the last `send_tx` here via `mem::drop`).
+    /// Mark the leg as closed and stop accepting sends. Sets the shared `closed`
+    /// flag; subsequent `send_bytes` / `recv_bytes` calls return an error, and the
+    /// spawn_local send-task observes the flag on its next `send_rx.recv()` (or when
+    /// all `send_tx` clones drop, ending the channel) and calls `ws.close()`.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
     }

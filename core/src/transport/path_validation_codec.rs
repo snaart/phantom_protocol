@@ -2,19 +2,20 @@
 //!
 //! The path-validation state machine lives in [`crate::transport::path`].
 //! This module is the **wire encoder/decoder** that turns those state
-//! transitions into V2 packets ready to push through a `SessionTransport`
-//! and the inverse decode on the receive side.
+//! transitions into `PhantomPacket`s ready to push through a
+//! `SessionTransport`, and the inverse decode on the receive side.
 //!
 //! ## Frame layout
 //!
-//! A PATH_VALIDATION frame is a V2 `PhantomPacket` with:
+//! A PATH_VALIDATION frame is an ordinary `PhantomPacket` with:
 //!
 //! - `header.flags` ⊇ [`PacketFlags::PATH_VALIDATION`]
 //! - `header.path_id` = the path the validation is for
 //! - `header.stream_id` = 0 (control stream)
-//! - `header.sequence` = caller-chosen (typically a small monotonic
-//!   counter; not security-critical here because the payload itself is
-//!   the unique-per-attempt random challenge)
+//! - `header.packet_number` = caller-chosen (the per-direction monotonic
+//!   `u64`; not security-critical for the validation logic itself because
+//!   the payload is the unique-per-attempt random challenge, but it still
+//!   feeds the per-direction replay window so a retransmit is deduped)
 //! - `payload` = exactly 32 bytes (`PATH_CHALLENGE_LEN`) — either the
 //!   challenge (request) or the echoed challenge (response). Sender
 //!   role determines the interpretation.
@@ -48,7 +49,7 @@ pub enum PathValidationKind {
     Response,
 }
 
-/// Build a V2 PATH_VALIDATION packet carrying the given 32-byte
+/// Build a PATH_VALIDATION packet carrying the given 32-byte
 /// challenge/response payload on the supplied `path_id`.
 ///
 /// The control stream is hard-coded to id 0. The caller supplies the
@@ -79,12 +80,12 @@ pub struct ParsedPathValidation {
     pub payload: [u8; PATH_CHALLENGE_LEN],
 }
 
-/// Attempt to parse a V2 packet as a PATH_VALIDATION frame.
+/// Attempt to parse a `PhantomPacket` as a PATH_VALIDATION frame.
 ///
 /// Returns:
 /// - `Ok(Some(...))` when the packet is a well-formed PATH_VALIDATION
 ///   (correct flag + correct payload length).
-/// - `Ok(None)` when the packet is a valid V2 frame but NOT a
+/// - `Ok(None)` when the packet is a valid frame but NOT a
 ///   PATH_VALIDATION frame — the caller routes it normally.
 /// - `Err(...)` when the PATH_VALIDATION flag is set but the payload
 ///   length is wrong.

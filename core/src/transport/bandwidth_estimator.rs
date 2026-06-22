@@ -1,7 +1,10 @@
 //! BBR-like Bandwidth Estimator
 //!
 //! Implements a simplified BBR (Bottleneck Bandwidth and Round-trip propagation time)
-//! state machine on top of KCP's ACK feedback.
+//! congestion-control state machine. It consumes a `DeliverySample` per ACKed packet
+//! (fed from the PhantomUDP reliable-stream ACK path) and produces a recommended pacing
+//! rate (bytes/sec) plus a congestion window — the inputs the [`Pacer`](super::pacer)
+//! and the send loop use to decide how fast to put bytes on the wire.
 //!
 //! # BBR States
 //!
@@ -21,12 +24,16 @@
 //! - **Drain:** Reduce rate until inflight ≤ BDP (drain queues built during Startup)
 //! - **ProbeBW:** Cycle through pacing gains (1.25, 0.75, 1.0, 1.0) to probe bandwidth
 //! - **ProbeRTT:** Every 10s, reduce CWND to 4 packets for 200ms to measure true min RTT
+//! - **FastRecovery:** Entered on explicit packet loss (BBRv3-style) — back off pacing to
+//!   0.5x and tighten CWND to 1x BDP until the pipe drains; not shown in the diagram above
+//!   because any state except Startup/ProbeRTT can enter it on loss.
 //!
 //! # Integration
 //!
-//! The estimator feeds the `Pacer` with target rates:
+//! The estimator feeds the [`Pacer`](super::pacer::Pacer) with target rates; the pacer
+//! then meters bytes onto the PhantomUDP socket:
 //! ```text
-//!   BandwidthEstimator ──rate──▶ Pacer ──paced_send──▶ UdpTransport
+//!   BandwidthEstimator ──rate──▶ Pacer ──paced_send──▶ UdpClientTransport / UdpServerTransport
 //! ```
 
 use std::collections::VecDeque;
@@ -162,9 +169,9 @@ pub struct BandwidthEstimator {
     btl_bw: u64,
     /// Minimum observed RTT
     min_rtt: Duration,
-    /// Sliding window for max bandwidth (10 round-trips)
+    /// Sliding-window max filter for bandwidth (10-second window — see `new`)
     bw_filter: WindowFilter,
-    /// Sliding window for min RTT (10 seconds)
+    /// Sliding-window min filter for RTT (10-second window — see `new`)
     rtt_filter: WindowFilter,
     /// Total bytes delivered (monotonically increasing)
     delivered_bytes: u64,
@@ -444,8 +451,10 @@ impl BandwidthEstimator {
                 }
             }
             BbrState::FastRecovery => {
-                // Exit FastRecovery when inflight drops below BDP (pipe drained)
-                // or after one min_rtt has elapsed with no new losses
+                // Exit FastRecovery once inflight has drained to ≤ BDP (the pipe is no
+                // longer over-filled), or when BDP is still unknown (== 0). The exit is
+                // purely inflight-driven; `fast_recovery_entered` is recorded only for
+                // diagnostics, not consulted here.
                 let bdp = self.bdp();
                 let should_exit = self.inflight_bytes
                     <= (bdp as f64 * FAST_RECOVERY_EXIT_FRACTION) as u64

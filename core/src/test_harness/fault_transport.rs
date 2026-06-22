@@ -13,8 +13,9 @@
 //!   receiver's replay window / dedup path is exercised.
 //! - **Reorder** — hold the frame at a given index and release it *after* the
 //!   next forwarded frame (an adjacent swap), so out-of-order delivery is
-//!   exercised. A held frame is flushed by the following send, or explicitly via
-//!   [`LossyTransport::flush`]; reorder a non-final frame, or call `flush`.
+//!   exercised. A held frame is released by the following forwarded send; if the
+//!   reordered frame is the *last* one (no successor to release it), call
+//!   [`LossyTransport::flush`] to drain it explicitly.
 //! - **Delay** — sleep a fixed duration before forwarding every send, to inject
 //!   latency (RTT / RTO timing).
 //!

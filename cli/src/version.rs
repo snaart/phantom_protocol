@@ -6,9 +6,11 @@ pub fn run() -> Result<()> {
     // Compile-time target triple injected via build.rs.
     let target = env!("PHANTOM_CLI_TARGET");
 
-    // Compile-time features of the phantom_protocol dependency are not visible
-    // to this binary's cfg() — report the default set that a standard build
-    // enables (compression-zstd, std) as informational text.
+    // The `phantom_protocol` dependency's compile-time `cfg(feature = ...)`
+    // flags are not visible to this binary, so we cannot reflect the actual
+    // resolved feature set. Print a representative, non-exhaustive subset of the
+    // crate defaults (the full default set is
+    // `compression-zstd, std, bindings, classical-crypto`) as informational text.
     let features = "compression-zstd, std (phantom_protocol defaults)";
 
     println!("phantom-cli {}", cli_version);

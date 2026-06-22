@@ -1,11 +1,13 @@
 //! Packet Coalescer — UDP Datagram Batching
 //!
-//! Объединяет множество мелких пакетов в крупные UDP-датаграммы.
-//! Вместо N мелких пакетов (N syscalls) отправляем 1 большой (1 syscall).
+//! Bundles many small packets into one larger UDP datagram: instead of N small
+//! packets (N syscalls) we send one big datagram (1 syscall), cutting per-send
+//! overhead and improving wire efficiency.
 //!
-//! Формат: `[count: u16][len1: u16][payload1][len2: u16][payload2]...`
+//! Bundle format: `[count: u16][len1: u16][payload1][len2: u16][payload2]...`
 //!
-//! Шифрование одного крупного блока задействует HW AES на полной скорости.
+//! Encrypting a single large block lets hardware AES run at full speed rather
+//! than paying per-message AEAD setup on each tiny packet.
 
 use std::time::{Duration, Instant};
 
@@ -26,19 +28,19 @@ pub const MAX_ASSEMBLED_DATAGRAM: usize = 65507;
 /// this at runtime once the actual path MTU is probed.
 pub const DEFAULT_MAX_DATAGRAM: usize = 1200;
 
-/// Размер заголовка coalesced-пакета (2 байта count)
+/// Size of the bundle header (2-byte `count` prefix at the start of the datagram).
 const HEADER_SIZE: usize = 2;
-/// Размер заголовка каждого sub-пакета (2 байта length)
+/// Size of each sub-packet header (2-byte big-endian `length` before each payload).
 const SUB_HEADER_SIZE: usize = 2;
 
-/// Настройки coalescer
+/// Coalescer tuning parameters.
 #[derive(Debug, Clone)]
 pub struct CoalescerConfig {
-    /// Максимальный размер итоговой датаграммы
+    /// Maximum size of the emitted datagram (cap at the path MTU to avoid IP fragmentation).
     pub max_datagram_size: usize,
-    /// Максимальное время ожидания перед flush (µs)
+    /// Maximum time to wait before flushing a partially-filled batch (microseconds).
     pub flush_timeout_us: u64,
-    /// Максимальное количество sub-пакетов в одной датаграмме
+    /// Maximum number of sub-packets in a single datagram.
     pub max_packets: u16,
 }
 
@@ -46,20 +48,20 @@ impl Default for CoalescerConfig {
     fn default() -> Self {
         Self {
             max_datagram_size: DEFAULT_MAX_DATAGRAM,
-            flush_timeout_us: 500, // 0.5ms — агрессивный flush
+            flush_timeout_us: 500, // 0.5ms — aggressive flush to keep latency low
             max_packets: 256,
         }
     }
 }
 
-/// Батчер отправки: собирает пакеты, отдаёт готовые датаграммы
+/// Send-side batcher: accumulates packets and hands back full datagrams.
 pub struct PacketCoalescer {
     config: CoalescerConfig,
-    /// Буфер для накопления
+    /// Accumulation buffer (starts with a 2-byte placeholder for the `count` header).
     buf: Vec<u8>,
-    /// Количество пакетов в текущем буфере
+    /// Number of packets in the current buffer.
     count: u16,
-    /// Время первого добавленного пакета в текущем batch
+    /// Timestamp of the first packet added to the current batch (drives the flush timeout).
     batch_start: Option<Instant>,
 }
 
@@ -67,7 +69,7 @@ impl PacketCoalescer {
     pub fn new(config: CoalescerConfig) -> Self {
         let cap = config.max_datagram_size;
         let mut buf = Vec::with_capacity(cap);
-        // Резервируем место для заголовка count
+        // Reserve space for the count header; filled in by `flush`.
         buf.extend_from_slice(&[0u8; HEADER_SIZE]);
         Self {
             config,
@@ -77,12 +79,15 @@ impl PacketCoalescer {
         }
     }
 
-    /// Добавить пакет в batch. Возвращает `Some(datagram)` если batch полон.
+    /// Add a packet to the batch. Returns `Some(datagram)` if adding it filled the
+    /// current batch (the returned datagram is the *previous* batch; `data` starts a
+    /// fresh one).
     #[inline]
     pub fn push(&mut self, data: &[u8]) -> Option<Vec<u8>> {
         let needed = SUB_HEADER_SIZE + data.len();
 
-        // Если пакет не влезает — flush текущий batch, начать новый
+        // If the packet would overflow the datagram (or hit the packet cap), flush the
+        // current batch first, then start a new batch with this packet.
         if self.buf.len() + needed > self.config.max_datagram_size
             || self.count >= self.config.max_packets
         {
@@ -106,7 +111,7 @@ impl PacketCoalescer {
         }
     }
 
-    /// Проверить, нужно ли flush по таймауту
+    /// Whether the current batch is past its flush timeout and should be drained.
     #[inline]
     pub fn should_flush(&self) -> bool {
         if self.count == 0 {
@@ -118,20 +123,20 @@ impl PacketCoalescer {
         }
     }
 
-    /// Flush: вернуть готовую датаграмму, сбросить буфер
+    /// Flush: finalise and return the ready datagram, resetting the buffer for the next batch.
     pub fn flush(&mut self) -> Option<Vec<u8>> {
         if self.count == 0 {
             return None;
         }
 
-        // Записать count в заголовок
+        // Backfill the count into the reserved 2-byte header.
         let count_bytes = self.count.to_be_bytes();
         self.buf[0] = count_bytes[0];
         self.buf[1] = count_bytes[1];
 
-        // Забрать буфер, поставить новый
+        // Swap out the filled buffer for a fresh one (so no realloc per flush).
         let mut out = Vec::with_capacity(self.config.max_datagram_size);
-        out.extend_from_slice(&[0u8; HEADER_SIZE]); // placeholder для нового batch
+        out.extend_from_slice(&[0u8; HEADER_SIZE]); // placeholder header for the new batch
         std::mem::swap(&mut self.buf, &mut out);
 
         self.count = 0;
@@ -139,21 +144,20 @@ impl PacketCoalescer {
         Some(out)
     }
 
-    /// Количество пакетов в текущем batch
+    /// Number of packets in the current (unflushed) batch.
     #[inline]
     pub fn pending_count(&self) -> u16 {
         self.count
     }
 
-    /// Текущий размер буфера
+    /// Bytes of sub-packet data buffered so far (excludes the 2-byte count header).
     #[inline]
     pub fn pending_bytes(&self) -> usize {
         self.buf.len() - HEADER_SIZE
     }
 }
 
-/// Разборщик coalesced датаграммы.
-/// Принимает датаграмму, итерирует по sub-пакетам.
+/// Decoder for a coalesced datagram: takes a received datagram and iterates its sub-packets.
 pub struct Decoalescer<'a> {
     data: &'a [u8],
     offset: usize,
@@ -161,7 +165,7 @@ pub struct Decoalescer<'a> {
 }
 
 impl<'a> Decoalescer<'a> {
-    /// Создать из полученной датаграммы
+    /// Create a decoder from a received datagram (`None` if it is shorter than the count header).
     pub fn new(datagram: &'a [u8]) -> Option<Self> {
         if datagram.len() < HEADER_SIZE {
             return None;
@@ -174,7 +178,7 @@ impl<'a> Decoalescer<'a> {
         })
     }
 
-    /// Количество sub-пакетов
+    /// Number of sub-packets still remaining to yield.
     #[inline]
     pub fn count(&self) -> u16 {
         self.remaining

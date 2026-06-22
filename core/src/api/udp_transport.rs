@@ -51,9 +51,9 @@ enum RecvAction {
 fn is_advisory_recv_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     // ConnectionRefused (ICMP port-unreachable — the audit's M-6 case) and ConnectionReset are
-    // stable on MSRV 1.75. The HostUnreachable / NetworkUnreachable `ErrorKind`s only stabilised
-    // in Rust 1.83, so match their errno directly where the OS reports them that way (Linux:
-    // EHOSTUNREACH = 113, ENETUNREACH = 101).
+    // matched via the portable `ErrorKind`. Host/network-unreachable are matched by raw errno
+    // instead, so the check stays uniform across platforms regardless of whether the OS maps
+    // them to the named `ErrorKind`s (Linux: EHOSTUNREACH = 113, ENETUNREACH = 101).
     if matches!(
         e.kind(),
         ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
@@ -1222,10 +1222,10 @@ mod tests {
         );
     }
 
-    /// P4.2b: `migrate()` rebinds the client to a fresh local socket and `connect`s
-    /// it to the same server, so the client's source address changes — which is what
-    /// makes the server detect the new path (P4.1). The new socket becomes the active
-    /// send/recv socket; a reply to the new source is received.
+    /// P4.2b: `migrate()` rebinds the client to a fresh (still unconnected) local socket
+    /// that keeps `send_to`-ing the same `server_addr`, so the client's source address
+    /// changes — which is what makes the server detect the new path (P4.1). The new socket
+    /// becomes the active send/recv socket; a reply to the new source is received.
     #[tokio::test]
     async fn migrate_rebinds_to_a_new_local_socket() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();

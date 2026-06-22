@@ -1,7 +1,9 @@
 //! Header protection (QUIC RFC 9001 §5.4) — the per-packet mask that hides the
-//! variable header fields (`packet_number ‖ flags ‖ stream_id ‖ epoch ‖
-//! path_id`, the 14 bytes at wire offset `[1..15]` since ε / WIRE v5; `[33..47]`
-//! in v4) from a passive on-path observer.
+//! header fields from a passive on-path observer. Since WIRE v6 the WHOLE
+//! 15-byte header is masked — `version ‖ packet_number ‖ flags ‖ stream_id ‖
+//! epoch ‖ path_id`, the bytes at wire offset `[0..15]` (`HP_MASK_LEN = 15`; no
+//! constant cleartext byte). (Was `[1..15]`/14 bytes in WIRE v5, `[33..47]` in
+//! v4 — see the `HP_MASK_LEN` doc for the per-version history.)
 //!
 //! The mask is `cipher(hp_key, sample)` where `sample` is the first 16 bytes of
 //! the packet's AEAD ciphertext (the tag is always present, so a sample exists
@@ -28,7 +30,8 @@
 //! ## FIPS
 //!
 //! Header protection is anti-DPI obfuscation, **not** confidentiality (the same
-//! posture as the FakeTLS outer layer — see Security Invariant #3). Under
+//! posture as the `mimicry` transport's outer record layer — see Security
+//! Invariant #3). Under
 //! `--features fips` the AES mask still routes through the FIPS substrate
 //! (`aws_lc_rs::cipher` AES-256-ECB) so the masking primitive stays inside the
 //! validated module; the ChaCha20 mask is unreachable there because the cipher

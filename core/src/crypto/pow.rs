@@ -53,9 +53,14 @@ pub struct PoWSolution {
 }
 
 impl PoWChallenge {
-    /// Generate a new stateless challenge
+    /// Generate a new stateless challenge.
     ///
-    /// Nonce format: [Timestamp (8 bytes) | HMAC(Timestamp + ClientID, Secret) (24 bytes)]
+    /// The 32-byte `nonce` is a self-authenticating cookie:
+    /// `[timestamp (8 bytes, LE) | MAC(timestamp ‖ client_id) (24 bytes)]`,
+    /// where the MAC is a keyed BLAKE3 hash under the server's `secret`
+    /// (truncated to 24 bytes). Because the MAC binds the timestamp and the
+    /// client id, the server need keep no per-challenge state — `verify`
+    /// recomputes the MAC to confirm authenticity and freshness.
     pub fn new_stateless(difficulty: u8, client_id: &[u8], secret: &[u8; 32]) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -65,7 +70,7 @@ impl PoWChallenge {
         let mut nonce = [0u8; 32];
         nonce[0..8].copy_from_slice(&timestamp.to_le_bytes());
 
-        // HMAC binding
+        // Keyed-BLAKE3 MAC binding over `timestamp ‖ client_id`.
         let mut hasher = Hasher::new_keyed(secret);
         hasher.update(&timestamp.to_le_bytes());
         hasher.update(client_id);
@@ -100,7 +105,8 @@ impl PoWChallenge {
             return false;
         }
 
-        // 3. Verify expiration (e.g., 60 seconds validity)
+        // 3. Verify expiration: the challenge is valid for 120 seconds from
+        //    its embedded timestamp (and a future timestamp is rejected).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

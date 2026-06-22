@@ -1,3 +1,13 @@
+//! Per-IP reputation tracking for adaptive PoW-difficulty escalation (DOS-2).
+//!
+//! Pairs with the stateless cookie + proof-of-work gate in
+//! `transport::handshake`: an IP that repeatedly fails handshakes within a
+//! sliding window accrues violations and pays an exponentially escalating PoW
+//! difficulty (capped at `MAX_DIFFICULTY`), while clean / new IPs and resumption-
+//! ticket holders pay nothing extra. The tracking map is bounded
+//! ([`ReputationTracker::with_capacity`]) so a spoofed / varied-source-IP flood
+//! cannot turn this CPU-DoS defense into a memory-DoS.
+
 use dashmap::DashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

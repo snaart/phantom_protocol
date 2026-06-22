@@ -1,12 +1,15 @@
 //! OpenTelemetry instrument holder.
 //!
+//! Holds the *synchronous* OTel event instruments — `Counter`s for events,
+//! `UpDownCounter`s for the session/stream gauges, and the two latency
+//! `Histogram`s. The hot-path packet/byte counters do NOT live here: those
+//! are `ObservableCounter`s that read the lock-free atomics on each export
+//! tick, registered in `bridge.rs`.
+//!
 //! Two compilations:
 //!
-//! - **`telemetry-otel` ON**: holds concrete `opentelemetry::metrics::*`
-//!   instruments — `Counter`s for events, `UpDownCounter`s for gauges.
-//!   Step 8 of the rollout adds `ObservableCounter` / `ObservableGauge`
-//!   callbacks reading the hot-path atomics. Step 9 adds the
-//!   `phantom.handshake.duration` `Histogram` with exponential bucketing.
+//! - **`telemetry-otel` ON**: the real holder (`otel_on::PhantomInstruments`)
+//!   with the concrete `opentelemetry::metrics::*` instruments.
 //!
 //! - **`telemetry-otel` OFF**: zero-sized type with `#[inline(always)]`
 //!   no-op methods. The compiler eliminates every recording call at the

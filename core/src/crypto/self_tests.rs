@@ -11,9 +11,12 @@
 //! initialize at all; in that case **abort** rather than serve traffic
 //! with a broken cryptographic module.
 //!
-//! The library does *not* auto-invoke `run_post` — embedders pulling in
-//! `phantom_protocol` for non-FIPS deployments shouldn't pay the (~ms) startup
-//! cost. The CAVP-style canonical vectors live in `core/tests/cavp.rs`
+//! On the default (non-FIPS) build the library does *not* auto-invoke
+//! `run_post` — embedders for non-FIPS deployments shouldn't pay the (~ms)
+//! startup cost, so they call it manually if they want it. Under
+//! `--features fips` the bind/connect bootstrap auto-invokes it (once per
+//! process) via [`ensure_post_passed`]; see Security Invariant 11. The
+//! CAVP-style canonical vectors live in `core/tests/cavp.rs`
 //! (Phase 5.4); this module re-tests the same primitives via pairwise
 //! consistency + a fixed HKDF KAT, sufficient for a §7.7 POST without
 //! pulling the full CAVP corpus into the production binary.

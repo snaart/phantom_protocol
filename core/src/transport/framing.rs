@@ -1,9 +1,16 @@
 //! Zero-Copy TCP Framing Pipeline
 //!
-//! Проблема: старый подход делал `data.clone()` + `encrypt_in_place()` + `write(len)` + `write(data)` = 2 syscalls + 1 clone.
-//! TLS 1.3 (rustls) делает всё за 1 внутренний write.
+//! Problem: the old approach did `data.clone()` + `encrypt_in_place()` +
+//! `write(len)` + `write(data)` = 2 syscalls + 1 clone per message. TLS 1.3
+//! (rustls) does the equivalent in a single internal write.
 //!
-//! Решение: prepend 4-byte length header → encrypt payload in-place → single write_all().
+//! Solution: prepend a 4-byte length header, encrypt the payload in place into the
+//! same buffer, then issue a single `write_all()` — one syscall, no clone. Multiple
+//! chunks / frames are coalesced into one buffer before the write.
+//!
+//! NOTE: this is a helper for the native TCP path; the production `SessionTransport`
+//! over TCP is `TcpSessionTransport` (in `api/tcp_transport.rs`), which carries the
+//! same 4-byte big-endian length prefix. PhantomUDP does its own framing elsewhere.
 
 use crate::crypto::adaptive_crypto::{CryptoSession, AEAD_OVERHEAD};
 

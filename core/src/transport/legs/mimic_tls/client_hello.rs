@@ -14,8 +14,8 @@
 //! template drifts out of the live-browser population within ~1–2 Chrome releases
 //! and its JA4 then matches no real browser — a standalone anomaly (worse than no
 //! mimicry). The cipher-suite list, extension set/order policy, and groups are
-//! deliberately isolated in [`ChromeProfile`] so they are refreshed from a real
-//! browser capture; see [`profile_is_fresh`] and the module's tests. This module
+//! deliberately isolated in `ChromeProfile` so they are refreshed from a real
+//! browser capture; see `profile_is_fresh` and the module's tests. This module
 //! ships the *machinery* (RFC 8446 framing, GREASE per RFC 8701, per-connection
 //! randomization + extension shuffle) plus a current Chrome-shaped profile; an
 //! exact JA4 match against a specific live Chrome build must be capture-validated
@@ -25,7 +25,7 @@ use crate::crypto::rng::RngProvider;
 use crate::errors::CoreError;
 
 /// Marker for the Chrome shape this profile parrots (`YYYYMM`). Bump it when the
-/// profile is refreshed from a real capture; [`profile_is_fresh`] compares against
+/// profile is refreshed from a real capture; `profile_is_fresh` compares against
 /// it so a stale template is caught rather than silently drifting.
 pub(crate) const PROFILE_CAPTURED: u32 = 202506;
 
