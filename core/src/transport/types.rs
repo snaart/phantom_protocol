@@ -20,7 +20,7 @@ impl SessionId {
     /// Create a new random session ID
     pub fn random() -> Self {
         let mut bytes = [0u8; 32];
-        if getrandom::getrandom(&mut bytes).is_err() {
+        if getrandom::fill(&mut bytes).is_err() {
             // Fallback to thread_rng which is always available
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
         }
