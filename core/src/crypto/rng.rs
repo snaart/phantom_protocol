@@ -1,6 +1,6 @@
 //! `RngProvider` — the indirection through which Phantom Protocol obtains
 //! cryptographic randomness. Default is [`OsRng`], which delegates to
-//! [`getrandom::getrandom`] and therefore picks up the platform's CSPRNG on
+//! [`getrandom::fill`] and therefore picks up the platform's CSPRNG on
 //! every supported target (Linux `getrandom(2)`, macOS / iOS
 //! `CCRandomGenerateBytes`, Windows `BCryptGenRandom`, wasm32 via the `js`
 //! feature → `crypto.getRandomValues`, etc.).
