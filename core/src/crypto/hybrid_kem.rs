@@ -24,13 +24,14 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use hkdf::Hkdf;
-use ml_kem::array::Array;
-use ml_kem::kem::{Decapsulate, Encapsulate};
-use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
-use rand::rngs::OsRng;
+use ml_kem::kem::{Decapsulate, Encapsulate, Kem, Key, KeyExport};
+use ml_kem::{Ciphertext, EncapsulationKey, MlKem768};
 use sha2::Sha256;
 use std::fmt;
 use zeroize::ZeroizeOnDrop;
+
+#[cfg(not(feature = "fips"))]
+use crate::crypto::rng::RngProvider;
 
 #[cfg(not(feature = "fips"))]
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -41,8 +42,8 @@ use aws_lc_rs::{
     rand::SystemRandom,
 };
 
-type MlKem768DecapKey = <MlKem768 as KemCore>::DecapsulationKey;
-type MlKem768EncapKey = <MlKem768 as KemCore>::EncapsulationKey;
+type MlKem768DecapKey = <MlKem768 as Kem>::DecapsulationKey;
+type MlKem768EncapKey = <MlKem768 as Kem>::EncapsulationKey;
 
 /// Classical KEM public-key byte length on the wire.
 ///
@@ -92,14 +93,20 @@ pub struct HybridSecretKey {
 
 impl HybridSecretKey {
     pub fn generate() -> (Self, HybridKeyPackage) {
-        let mut rng = OsRng;
-
         // Classical (X25519 or ECDH-P-256) key generation + public key
         // derivation. Branch is fully cfg-gated; the build pulls in
         // exactly one path.
         #[cfg(not(feature = "fips"))]
         let (classical_sk, classical_pk_bytes) = {
-            let sk = StaticSecret::random_from_rng(rng);
+            // Draw a 32-byte X25519 secret scalar straight from the crate's
+            // `RngProvider` CSPRNG seam (was `StaticSecret::random_from_rng`
+            // over rand's `OsRng`; the direct `rand` production dep is gone).
+            // `StaticSecret: From<[u8; 32]>` (the `static_secrets` feature)
+            // applies the RFC 7748 clamp internally. The temporary seed is a
+            // secret — zeroize it on every exit path.
+            let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+            crate::crypto::rng::OsRng.fill_bytes(&mut seed[..]);
+            let sk = StaticSecret::from(*seed);
             let pk = X25519PublicKey::from(&sk);
             (sk, *pk.as_bytes())
         };
@@ -108,7 +115,7 @@ impl HybridSecretKey {
             // PANIC-SAFETY: `PrivateKey::generate` only fails when the
             // underlying AWS-LC random source is broken — same failure
             // mode as `getrandom` on the default build, where we also
-            // panic via `OsRng`. `compute_public_key` derives a
+            // panic via the `RngProvider` `OsRng`. `compute_public_key` derives a
             // P-256 public from a fresh, just-generated valid private,
             // which cannot fail. A failure here means the FIPS module
             // is in a non-recoverable state; loud panic is the correct
@@ -125,9 +132,11 @@ impl HybridSecretKey {
             (sk, bytes)
         };
 
-        // ML-KEM-768 (post-quantum, FIPS 203). Box the decap key so the
-        // ~2.4 KiB structure never lives on the stack.
-        let (dk, ek) = MlKem768::generate(&mut rng);
+        // ML-KEM-768 (post-quantum, FIPS 203). `generate_keypair()` (the
+        // `getrandom` feature of `ml-kem`/`kem`) draws from the system CSPRNG
+        // directly — no `rand` RNG handle to thread through. Box the decap key
+        // so the ~2.4 KiB structure never lives on the stack.
+        let (dk, ek) = MlKem768::generate_keypair();
 
         let secret_key = HybridSecretKey {
             classical_sk,
@@ -135,7 +144,7 @@ impl HybridSecretKey {
         };
         let key_package = HybridKeyPackage {
             classical_pk: classical_pk_bytes,
-            ml_kem_pk: ek.as_bytes().to_vec(),
+            ml_kem_pk: ek.to_bytes().to_vec(),
         };
         (secret_key, key_package)
     }
@@ -168,13 +177,13 @@ impl HybridSecretKey {
             )?
         };
 
-        // 2. ML-KEM-768 decapsulation.
+        // 2. ML-KEM-768 decapsulation. In `ml-kem` 0.3 `decapsulate` is
+        // infallible (`-> SharedKey`): the FIPS-203 implicit-reject path means
+        // a malformed/forged ciphertext yields a pseudo-random shared key
+        // rather than an error, so there is no `Result` to thread here.
         let ct_array = decode_ml_kem_ciphertext(&ciphertext.ml_kem_ct)
             .ok_or_else(|| anyhow::anyhow!("invalid ML-KEM-768 ciphertext length"))?;
-        let ml_kem_shared = self
-            .ml_kem_dk
-            .decapsulate(&ct_array)
-            .map_err(|e| anyhow::anyhow!("ML-KEM decapsulation failed: {:?}", e))?;
+        let ml_kem_shared = self.ml_kem_dk.decapsulate(&ct_array);
 
         // 3. Our own classical public key — bound into the combiner (T4.2). Derived
         // from the long-lived classical secret on each build path.
@@ -251,12 +260,16 @@ pub struct HybridKeyPackage {
 
 impl HybridKeyPackage {
     pub fn encapsulate(&self) -> Result<([u8; 32], HybridCiphertext), anyhow::Error> {
-        let mut rng = OsRng;
-
         // 1. Classical ECDH: fresh ephemeral on the sender side.
         #[cfg(not(feature = "fips"))]
         let (eph_pk_bytes, classical_shared) = {
-            let eph_sk = StaticSecret::random_from_rng(rng);
+            // Fresh ephemeral X25519 scalar from the crate's `RngProvider`
+            // CSPRNG seam (was `StaticSecret::random_from_rng`; the direct
+            // `rand` production dep is gone). The temporary seed is a secret —
+            // zeroize it on every exit path.
+            let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+            crate::crypto::rng::OsRng.fill_bytes(&mut seed[..]);
+            let eph_sk = StaticSecret::from(*seed);
             let eph_pk = X25519PublicKey::from(&eph_sk);
             let peer = X25519PublicKey::from(self.classical_pk);
             let shared = eph_sk.diffie_hellman(&peer);
@@ -287,12 +300,16 @@ impl HybridKeyPackage {
         };
 
         // 2. ML-KEM-768 encapsulation against the peer's encap key.
+        // `EncapsulationKey::new` validates the encoded key (rejects
+        // out-of-range / non-canonical encodings, a security hardening over the
+        // 0.2 infallible `from_bytes`); `encapsulate()` (the `getrandom`
+        // feature) draws its randomness from the system CSPRNG and returns the
+        // `(Ciphertext, SharedKey)` tuple directly (no `Result`).
         let ek_array = decode_ml_kem_encap_key(&self.ml_kem_pk)
             .ok_or_else(|| anyhow::anyhow!("invalid ML-KEM-768 public key length"))?;
-        let ek = MlKem768EncapKey::from_bytes(&ek_array);
-        let (ct, ml_kem_shared) = ek
-            .encapsulate(&mut rng)
-            .map_err(|e| anyhow::anyhow!("ML-KEM encapsulation failed: {:?}", e))?;
+        let ek = EncapsulationKey::<MlKem768>::new(&ek_array)
+            .map_err(|e| anyhow::anyhow!("invalid ML-KEM-768 encapsulation key: {:?}", e))?;
+        let (ct, ml_kem_shared) = ek.encapsulate();
 
         // 3. Combine via HKDF, binding the classical ciphertext (this ephemeral pk)
         // + the recipient classical pk (T4.2).
@@ -322,20 +339,21 @@ pub struct HybridCiphertext {
 
 // ─── Encoding helpers ─────────────────────────────────────────────────────
 //
-// `ml-kem` stores its byte-encoded keys and ciphertexts as `Encoded<T>`,
-// a `GenericArray<u8, N>` from the `hybrid-array` crate. We carry them on
-// the wire as `Vec<u8>` (borsh-friendly) and round-trip via these
-// helpers. Length mismatches return `None` so callers can map them to a
-// proper handshake / KEM error.
+// `ml-kem` 0.3 represents the byte-encoded encapsulation key as `Key<T>`
+// (an `Array<u8, KeySize>` from the `hybrid-array` crate; the 0.2 `Encoded<T>`
+// alias is gone) and the ciphertext as `Ciphertext<MlKem768>`. We carry them on
+// the wire as `Vec<u8>` (borsh-friendly) and round-trip via these helpers.
+// Length mismatches return `None` so callers can map them to a proper handshake
+// / KEM error. (The encap-key *content* validation — rejecting non-canonical
+// encodings — happens in `EncapsulationKey::new`, not here, which only checks
+// length.)
 
-fn decode_ml_kem_encap_key(bytes: &[u8]) -> Option<Encoded<MlKem768EncapKey>> {
-    Encoded::<MlKem768EncapKey>::try_from(bytes).ok()
+fn decode_ml_kem_encap_key(bytes: &[u8]) -> Option<Key<MlKem768EncapKey>> {
+    Key::<MlKem768EncapKey>::try_from(bytes).ok()
 }
 
-fn decode_ml_kem_ciphertext(
-    bytes: &[u8],
-) -> Option<Array<u8, <MlKem768 as KemCore>::CiphertextSize>> {
-    Array::<u8, <MlKem768 as KemCore>::CiphertextSize>::try_from(bytes).ok()
+fn decode_ml_kem_ciphertext(bytes: &[u8]) -> Option<Ciphertext<MlKem768>> {
+    Ciphertext::<MlKem768>::try_from(bytes).ok()
 }
 
 #[cfg(test)]
