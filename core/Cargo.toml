@@ -250,7 +250,7 @@ ring = { version = "0.17", optional = true }  # HW-accelerated AES-GCM (ARM64 AE
 # `std`); under `--features fips` the AES mask routes through `aws_lc_rs::cipher`
 # instead and the ChaCha mask is unreachable (suite pinned to AES) — these crates
 # then link dead, exactly as `ring` does under fips.
-aes = { version = "0.8", default-features = false, optional = true }
+aes = { version = "0.9", default-features = false, optional = true }
 chacha20 = { version = "0.9", default-features = false, optional = true }
 # Phase 5.1: switched from `pqcrypto-kyber` / `pqcrypto-dilithium` (which
 # wrap NIST PQC round-3 C reference impls and require libc) to the
