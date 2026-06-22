@@ -6,8 +6,13 @@ name: bench
 #   2. A same-runner PR-vs-base comparison: run the benches on the PR head and on
 #      the PR's base commit on the SAME runner (so the comparison is
 #      hardware-neutral — shared GitHub runners are too noisy for absolute
-#      thresholds), and FAIL on a gross (> 2x) regression. Fine-grained (< 2x)
-#      perf tracking stays the pinned-machine methodology in BENCHMARKS.md.
+#      thresholds), and FAIL on a gross (> 2x) regression. The ML-DSA-65 *signing*
+#      micro-benches are an exception: Dilithium signing uses rejection sampling, so
+#      their median swings 2-6x run-to-run on a noisy runner even with byte-identical
+#      binaries (a recurring false-positive on docs-only PRs). scripts/bench_compare.py
+#      gates just those against a higher catastrophic ceiling (default 10x) instead of
+#      2x — see its docstring. Fine-grained (< 2x) perf tracking stays the
+#      pinned-machine methodology in BENCHMARKS.md.
 #
 # Path-filtered + cancel-in-progress because the full run is heavy (the crypto /
 # transport benches use long criterion measurement windows). Not a branch-protection
