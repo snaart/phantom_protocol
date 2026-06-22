@@ -141,7 +141,7 @@ impl UdpClientTransport {
             .await
             .map_err(|e| CoreError::NetworkError(format!("udp bind: {e}")))?;
         let mut cid = [0u8; 8];
-        getrandom::getrandom(&mut cid).map_err(|e| CoreError::RngError(e.to_string()))?;
+        getrandom::fill(&mut cid).map_err(|e| CoreError::RngError(e.to_string()))?;
         Ok(Self {
             socket: ArcSwap::from_pointee(socket),
             prev_socket: ArcSwap::from_pointee(None),
