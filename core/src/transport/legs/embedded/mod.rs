@@ -6,7 +6,7 @@
 //! `EmbeddedLeg<R, W, const N: usize>` is **passive** — it holds the read/
 //! write halves of a pre-split transport behind two `async_lock` mutexes and
 //! exposes inherent generic `async fn` send/recv methods (with the framing
-//! logic from [`framing`]). The [`SessionTransport`] trait `impl` is
+//! logic from [`framing`]). The `SessionTransport` trait `impl` is
 //! **per-concrete (`R`, `W`)** rather than one generic blanket:
 //! `embedded-io-async`'s async-fn-in-trait futures are not `Send`-bounded, so
 //! a generic `impl<R, W>` cannot satisfy `SessionTransport`'s `+ Send` future
@@ -616,7 +616,7 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let client_ip = "127.0.0.1".parse().expect("parse loopback IP");
 
-            // 1. Receive the first ClientHello. Default client offers V12.
+            // 1. Receive the first ClientHello (carries version == PROTOCOL_VERSION).
             let client_hello_bytes =
                 tokio::time::timeout(Duration::from_secs(5), server_leg.recv_frame())
                     .await

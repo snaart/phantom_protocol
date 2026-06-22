@@ -1,7 +1,19 @@
 //! Unified Phantom Protocol Handshake
 //!
-//! Combines PQC security (Hybrid KEM/Sign) with Staged state machine
-//! for optimistic start, Early Data, and 0-RTT resumption.
+//! The post-quantum, mutually-authenticated key-establishment state machine.
+//! [`HandshakeClient`] and [`HandshakeServer`] exchange a `ClientHello` /
+//! `ServerHello` pair that runs a hybrid KEM (X25519 + ML-KEM-768; ECDH-P-256 +
+//! ML-KEM-768 under `--features fips`) and a hybrid signature (Ed25519 +
+//! ML-DSA-65) over a single SHA-256 transcript. The signed transcript binds the
+//! whole `ClientHello` plus the build-side [`PROTOCOL_VARIANT`], giving the
+//! downgrade / cross-mode resistance of Invariants 7 and 10.
+//!
+//! On top of the core exchange the module layers: a stateless cookie + adaptive
+//! proof-of-work DoS gate; per-IP reputation-driven difficulty (DOS-2); 0-RTT
+//! session resumption with a proof-of-possession binder (HS-03) and one-shot
+//! anti-replay (Invariant 9); and optional AEAD-sealed early-data folded into
+//! the single `ClientHello`. [`HandshakeStage`] tracks the staged progression
+//! (`Initial -> ClassicalReady -> Established | Failed`).
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use hmac::{Hmac, KeyInit, Mac};
@@ -32,7 +44,6 @@ use std::sync::Arc;
 /// completes.
 pub const EARLY_DATA_MAX_LEN: usize = 16 * 1024;
 
-/// Handshake processing stages
 /// Compile-time protocol-variant tag, baked into every `ClientHello`
 /// (cleartext field) **and** the signed handshake transcript. Peers
 /// reject mismatched variants up front with
@@ -55,10 +66,11 @@ pub const PROTOCOL_VARIANT: &[u8] = b"phantom-fips-1";
 /// deliberate version increment.
 pub const PROTOCOL_VERSION: u8 = 3;
 
-/// Marker leading a [`ServerReject`] frame. The client disambiguates the three
-/// possible server replies by trial-deserialization; the marker (plus the
-/// fixed, tiny size of a reject vs. the multi-KiB `ServerHello`) makes a reject
-/// unmistakable and immune to a false-positive parse as a `HelloRetryRequest`.
+/// Marker leading a [`ServerReject`] body. Reply *kind* dispatch is by the
+/// explicit [`ServerReply`] discriminant byte (`from_wire`), not by this marker
+/// — but the marker is a defense-in-depth integrity check inside the reject
+/// payload, so a malformed or confusable blob can never be silently mistaken for
+/// a genuine reject (see [`ServerReject::has_marker`]).
 pub const SERVER_REJECT_MARKER: [u8; 4] = *b"PRJ1";
 
 /// [`ServerReject::code`]: the client's `ClientHello.version` is one this server
@@ -78,7 +90,8 @@ pub const REJECT_UNSUPPORTED_VERSION: u8 = 1;
 /// reject is diagnostic only; protocol selection stays pinned.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServerReject {
-    /// Always [`SERVER_REJECT_MARKER`]; lets the client identify the frame.
+    /// Always [`SERVER_REJECT_MARKER`]; an in-body integrity tag the client
+    /// validates via [`ServerReject::has_marker`].
     pub marker: [u8; 4],
     /// Reject reason — see [`REJECT_UNSUPPORTED_VERSION`].
     pub code: u8,
@@ -97,8 +110,9 @@ impl ServerReject {
         }
     }
 
-    /// True iff the frame carries the reject marker — the client's guard
-    /// against treating a same-sized non-reject blob as a reject.
+    /// True iff the body carries the reject marker — a guard against treating a
+    /// malformed or confusable blob (one that nonetheless decoded structurally)
+    /// as a genuine reject.
     pub fn has_marker(&self) -> bool {
         self.marker == SERVER_REJECT_MARKER
     }
@@ -481,19 +495,6 @@ fn derive_resumption_binder(
     crate::crypto::kdf::derive_key_32("phantom-resume-binder-v1", &*ikm)
 }
 
-/// Handshake Server State Machine
-///
-/// Holds the server's long-lived signing key (via [`HybridSigningKey`], which
-/// itself zeroes on drop) and a *master* secret from which the actually-used
-/// per-hour PoW/cookie secret is derived on each call (see
-/// `derive_session_secret_for_hour`). On drop the master is zeroed via the
-/// derived `ZeroizeOnDrop`.
-///
-/// Rotation (Phase 1.11): the master itself rotates only on process restart,
-/// but the derived hour-bucketed secret rotates every hour. Validation
-/// accepts the current hour and the immediately-previous hour, so a cookie
-/// or PoW solution captured at minute 59 of one hour is still honored at
-/// minute 5 of the next.
 /// Pluggable 0-RTT anti-replay hook — the distributed-deployment seam (A2b).
 ///
 /// The built-in one-shot guarantee (Invariant 9) — a resumption ticket is consumed on first
@@ -522,6 +523,19 @@ pub trait ZeroRttAntiReplay: Send + Sync {
     fn check_and_set(&self, ticket_id: &[u8; 32]) -> bool;
 }
 
+/// Handshake Server State Machine
+///
+/// Holds the server's long-lived signing key (via [`HybridSigningKey`], which
+/// itself zeroes on drop) and a *master* secret from which the actually-used
+/// per-hour PoW/cookie secret is derived on each call (see
+/// `derive_session_secret_for_hour`). On drop the master is zeroed via the
+/// derived `ZeroizeOnDrop`.
+///
+/// Rotation (Phase 1.11): the master itself rotates only on process restart,
+/// but the derived hour-bucketed secret rotates every hour. Validation
+/// accepts the current hour and the immediately-previous hour, so a cookie
+/// or PoW solution captured at minute 59 of one hour is still honored at
+/// minute 5 of the next.
 #[derive(ZeroizeOnDrop)]
 pub struct HandshakeServer {
     // SAFETY: `HybridSigningKey` has its own ZeroizeOnDrop. The wrapping field
@@ -847,7 +861,8 @@ impl HandshakeServer {
         // consumed ticket is carried in `resumed` and re-inserted unchanged on
         // any later handshake failure (ZERORTT-2), so a corrupted resuming
         // `ClientHello` cannot burn a victim's ticket. The KEM round-trip still
-        // runs, so forward secrecy is preserved by the fresh X25519+ML-KEM secret.
+        // runs, so forward secrecy is preserved by the fresh hybrid-KEM secret
+        // (X25519+ML-KEM-768; ECDH-P-256+ML-KEM-768 under `--features fips`).
         let resumed: Option<ConsumedTicket> = client_hello.resume_session_id.and_then(|rid| {
             let (secret, suite, created_at, expires_at) = self.session_cache.lock().peek(&rid)?;
             // Proof-of-possession: only a holder of `resumption_secret` can
@@ -1766,8 +1781,9 @@ mod tests {
     }
 
     /// The reject frame survives a borsh round-trip and is shape-distinct from
-    /// a `HelloRetryRequest` (the client's trial-deserialization order relies
-    /// on this — a reject must not be mistaken for a retry, nor vice versa).
+    /// a `HelloRetryRequest`: even though reply *kind* is now dispatched by the
+    /// [`ServerReply`] discriminant byte, each body must still fail to decode as
+    /// the other type — a reject must not be mistaken for a retry, nor vice versa.
     #[test]
     fn server_reject_roundtrips_and_is_shape_distinct() {
         let reject = ServerReject::unsupported_version();

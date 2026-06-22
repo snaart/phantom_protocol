@@ -42,8 +42,15 @@ impl Direction {
     }
 }
 
-/// String labels for `LegType`. Stable strings used as OTel attribute
-/// values; never user-facing.
+/// Stable string label for a `LegType`, used as an OTel attribute value.
+///
+/// These strings are part of the metric cardinality contract and must stay
+/// stable across releases. `"kcp"` and `"faketls"` are retained label values
+/// for legs that no longer exist as transports (the KCP leg and the FakeTLS
+/// leg were removed in the PhantomUDP rewrite); they appear in the contract
+/// only so the instrument set is wire-format-stable. The live production
+/// transport reports as `"udp"` (PhantomUDP); `"tcp"` covers
+/// `TcpSessionTransport`.
 pub fn leg_str(leg: LegType) -> &'static str {
     match leg {
         LegType::Kcp => "kcp",
@@ -104,11 +111,14 @@ impl AeadAlgorithm {
 }
 
 /// Reason a replay-rejected packet was dropped.
+///
+/// Keyed on the per-direction `u64` packet number checked by the single
+/// `ReplayWindow` after a successful AEAD open (see `security::replay_window`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReplayReason {
-    /// Sequence number falls below the window's lower edge.
+    /// Packet number falls below the window's lower edge.
     Old,
-    /// Sequence number inside the window but already marked seen.
+    /// Packet number inside the window but already marked seen.
     Duplicate,
 }
 
@@ -209,7 +219,10 @@ impl PathValidationOutcome {
     }
 }
 
-/// Reason a multi-path fallback was triggered.
+/// Reason a transport fallback (switch from one leg to another) was
+/// triggered. Defined as a stable telemetry dimension; the library does no
+/// multipath aggregation (single-path connection migration only), so this is
+/// currently an unwired attribute surface awaiting a fallback-driving caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FallbackReason {
     LossThreshold,

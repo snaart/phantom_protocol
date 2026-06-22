@@ -1,11 +1,11 @@
 //! Adaptive Crypto Engine
 //!
-//! Автоматический выбор шифра в зависимости от HW capabilities:
+//! Picks the AEAD cipher automatically from the host's hardware capabilities:
 //! - AES-256-GCM (ring asm) → Apple Silicon (FEAT_AES), x86_64 (AES-NI)
-//! - ChaCha20-Poly1305 (ring asm) → ARM без AES, MIPS, RISC-V, IoT
+//! - ChaCha20-Poly1305 (ring asm) → ARM without AES, MIPS, RISC-V, IoT
 //!
-//! На устройствах без HW AES ChaCha20 в 3-4x быстрее.
-//! На устройствах с HW AES AES-GCM в ~1.3x быстрее ChaCha20.
+//! Without HW AES, ChaCha20 is ~3-4x faster; with HW AES, AES-GCM is ~1.3x
+//! faster than ChaCha20.
 //!
 //! Under `--features fips` the AEAD backend swaps to `aws-lc-rs`
 //! (FIPS-validated AWS-LC). The Rust API surface is identical to
@@ -35,10 +35,10 @@ pub const AEAD_OVERHEAD: usize = 16;
 /// prevents catastrophic key abuse if a counter ever rolls back or a callsite
 /// loops pathologically.
 ///
-/// When mid-session key rotation lands (Phase 1.5 in
-/// `docs/PRODUCTION_READINESS.md`) the rekey trigger will fire well before
-/// this limit so the error path here becomes a backstop, not a normal failure
-/// mode.
+/// Mid-session key rotation (`Session::rekey`, label `"phantom-rekey-v1"`) is
+/// implemented and fires its rekey trigger well below this limit, so in normal
+/// operation this error path is a backstop, not a reachable failure mode. It is
+/// pinned by Security Invariant #8.
 pub const AEAD_MAX_INVOCATIONS: u64 = 1u64 << 48;
 
 /// Supported cipher suites.
@@ -186,9 +186,6 @@ pub fn negotiate_cipher(
     }
 }
 
-/// Unified crypto session — works with any supported cipher suite.
-///
-/// Drop-in replacement for `AesSession` with auto cipher selection.
 /// Unified crypto session — works with any supported cipher suite.
 ///
 /// Drop-in replacement for `AesSession` with auto cipher selection.
@@ -383,8 +380,8 @@ impl CryptoSession {
     }
 
     /// Number of encryptions performed on this session (per-direction send counter).
-    /// Useful for emitting `aead_invocations_total` metrics and for rekey-trigger
-    /// logic when mid-session key rotation lands.
+    /// Useful for emitting AEAD-invocation metrics and for the mid-session
+    /// rekey-trigger logic in `Session::rekey`.
     #[inline]
     pub fn send_invocations(&self) -> u64 {
         self.inner.send_counter.load(Ordering::Relaxed)
@@ -419,10 +416,11 @@ impl CryptoSession {
     // track / cap invocation counts for telemetry.
 
     /// Encrypt with an explicit caller-supplied nonce. The caller MUST
-    /// ensure uniqueness of `(key, nonce)` — the V2 path derives the nonce
-    /// from `(nonce_prefix, epoch, stream_id, sequence)` so uniqueness
-    /// follows from the wire-format invariant that sender never reuses
-    /// `(stream_id, sequence)` within an epoch.
+    /// ensure uniqueness of `(key, nonce)`. The production caller
+    /// (`Session::build_packet_nonce`) derives the 12-byte nonce as
+    /// `nonce_prefix(4) ‖ packet_number(8, big-endian)`, so uniqueness
+    /// follows from the wire-format invariant that the per-direction `u64`
+    /// packet number is strictly monotonic and never reused within an epoch.
     #[inline]
     pub fn encrypt_with_nonce(
         &self,
@@ -475,7 +473,8 @@ impl CryptoSession {
     }
 
     /// Expose the 4-byte nonce prefix for the V2 nonce construction
-    /// (`prefix || epoch || stream_id_be || sequence_be`).
+    /// (`prefix(4) || packet_number(8, big-endian)`; see
+    /// `Session::build_packet_nonce`).
     #[inline]
     pub fn nonce_prefix(&self) -> [u8; 4] {
         self.inner.nonce_prefix
@@ -496,7 +495,7 @@ pub enum CryptoError {
     EncryptionFailed,
     DecryptionFailed,
     /// Per-direction AEAD counter would exceed [`AEAD_MAX_INVOCATIONS`].
-    /// Callers must rotate keys (Phase 1.5) or close the session.
+    /// Callers must rotate keys (`Session::rekey`) or close the session.
     NonceExhausted,
 }
 

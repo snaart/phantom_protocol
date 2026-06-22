@@ -533,7 +533,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 8664:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 53836:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 44795:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1273,6 +1273,19 @@ class _UniffiFfiConverterUInt8(_UniffiConverterPrimitiveInt):
 
 @dataclass
 class PhantomConfig:
+    """
+    Tunable parameters for a Phantom session / listener, exported across the
+    UniFFI boundary as a plain record.
+
+    NOTE: this is a stable FFI config surface, but the core does not yet read
+    most of these fields on the live data path — `PhantomConfig` is currently
+    re-exported and FFI-exported only. The `auto_fallback` / `fallback_*` /
+    `upgrade_delay` fields in particular describe the legacy multi-leg
+    fallback model; transport-leg fallback / aggregation was deliberately
+    dropped in favour of single-path connection migration, so those knobs are
+    presently inert. Treat the presets below as documented intent, not as
+    behaviour the core enforces today.
+"""
     def __init__(self, *, keepalive_interval:Duration, session_timeout:Duration, max_packet_size:int, send_buffer_size:int, recv_buffer_size:int, session_cache_capacity:int, session_ticket_lifetime:Duration, auto_fallback:bool, fallback_loss_threshold:int, fallback_failure_threshold:int, connect_timeout:Duration, upgrade_delay:Duration):
         self.keepalive_interval = keepalive_interval
         self.session_timeout = session_timeout
@@ -2208,6 +2221,17 @@ class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
 
 
 class PhantomStreamProtocol(typing.Protocol):
+    """
+    A single multiplexed stream inside an established [`PhantomSession`].
+
+    Created by the session's stream multiplexer (one per logical stream id).
+    Outbound data is queued to the session's data pump over the `tx` command
+    channel (`send_reliable` / `send_unreliable`); inbound demultiplexed data
+    arrives on `rx`. The session owns all encryption and transport — a
+    `PhantomStream` is just the per-stream send/recv handle exposed over FFI.
+
+    [`PhantomSession`]: crate::api::session::PhantomSession
+"""
     
     async def disconnect(self, ) -> None:
         """
@@ -2228,6 +2252,17 @@ class PhantomStreamProtocol(typing.Protocol):
         raise NotImplementedError
 
 class PhantomStream(PhantomStreamProtocol):
+    """
+    A single multiplexed stream inside an established [`PhantomSession`].
+
+    Created by the session's stream multiplexer (one per logical stream id).
+    Outbound data is queued to the session's data pump over the `tx` command
+    channel (`send_reliable` / `send_unreliable`); inbound demultiplexed data
+    arrives on `rx`. The session owns all encryption and transport — a
+    `PhantomStream` is just the per-stream send/recv handle exposed over FFI.
+
+    [`PhantomSession`]: crate::api::session::PhantomSession
+"""
     
     _handle: ctypes.c_uint64
     
@@ -2428,12 +2463,18 @@ class _UniffiFfiConverterOptionalTypeTrafficShapingConfig(_UniffiConverterRustBu
 
 class PhantomSessionProtocol(typing.Protocol):
     """
-    Client-first session — instant `connect()`, non-blocking `send()`.
+    Client-first session — instant construction, non-blocking `send()`.
 
     # Design
 
+    The real entry point is `connect_with_transport` (NOT the inert legacy
+    `connect()` constructor — see its doc): it returns instantly and runs the
+    handshake + data pump in the background, so sends issued before the handshake
+    finishes are buffered and auto-flushed once the channel is up.
+
     ```text
-    let session = PhantomSession::connect("server:443");  // instant!
+    // instant — spawns the background handshake + pump:
+    let session = PhantomSession::connect_with_transport(addr, transport, pinned_key);
     session.send(data).await;   // queued until handshake completes
     session.send(data2).await;  // also queued
     // ... handshake completes in background ...
@@ -2566,10 +2607,10 @@ class PhantomSessionProtocol(typing.Protocol):
     async def set_rekey_threshold(self, n: int) -> bool:
         """
         Override the automatic-rekey send-invocation high-watermark on the
-        established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
-        the session is still connecting. Rust-only — primarily for soak/load
-        harnesses that need to exercise mid-session rekey without sending `2^47`
-        packets.
+        established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
+        Returns `false` if the session is still connecting. Rust-only — primarily
+        for soak/load harnesses that need to exercise mid-session rekey without
+        sending `2^32` packets.
 """
         raise NotImplementedError
     async def set_traffic_shaping(self, config: TrafficShapingConfig) -> bool:
@@ -2594,12 +2635,18 @@ class PhantomSessionProtocol(typing.Protocol):
 
 class PhantomSession(PhantomSessionProtocol):
     """
-    Client-first session — instant `connect()`, non-blocking `send()`.
+    Client-first session — instant construction, non-blocking `send()`.
 
     # Design
 
+    The real entry point is `connect_with_transport` (NOT the inert legacy
+    `connect()` constructor — see its doc): it returns instantly and runs the
+    handshake + data pump in the background, so sends issued before the handshake
+    finishes are buffered and auto-flushed once the channel is up.
+
     ```text
-    let session = PhantomSession::connect("server:443");  // instant!
+    // instant — spawns the background handshake + pump:
+    let session = PhantomSession::connect_with_transport(addr, transport, pinned_key);
     session.send(data).await;   // queued until handshake completes
     session.send(data2).await;  // also queued
     // ... handshake completes in background ...
@@ -2981,10 +3028,10 @@ class PhantomSession(PhantomSessionProtocol):
     async def set_rekey_threshold(self, n: int) -> bool:
         """
         Override the automatic-rekey send-invocation high-watermark on the
-        established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
-        the session is still connecting. Rust-only — primarily for soak/load
-        harnesses that need to exercise mid-session rekey without sending `2^47`
-        packets.
+        established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
+        Returns `false` if the session is still connecting. Rust-only — primarily
+        for soak/load harnesses that need to exercise mid-session rekey without
+        sending `2^32` packets.
 """
         
         _UniffiFfiConverterUInt64.check_lower(n)

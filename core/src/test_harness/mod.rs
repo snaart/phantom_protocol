@@ -1,11 +1,17 @@
 //! Test Harness — Network Condition Simulator
 //!
 //! Provides tools for testing Phantom Protocol transport under various network conditions:
-//! - Enable/disable UDP transport
+//! - Enable/disable the UDP and TCP transports (`set_udp_enabled` / `set_tcp_enabled`)
 //! - Add artificial latency, with optional jitter (`latency + uniform[0, jitter]`)
 //! - Simulate packet loss
 //! - Throttle to a bandwidth limit (`bandwidth_delay` / `apply_bandwidth`)
-//! - Trigger IP address changes
+//! - Trigger IP address changes (a counter the migration tests observe)
+//!
+//! `NetworkSimulator` only models conditions and computes delays/drop decisions;
+//! the simulated values are atomics behind a shared `Arc`, so a single simulator
+//! can be cloned into both ends of a test. The companion [`fault_transport`]
+//! module is the per-frame, fault-injecting `SessionTransport` wrapper that the
+//! loss-recovery tests actually drive.
 
 use rand::Rng;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

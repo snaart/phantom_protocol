@@ -22,7 +22,7 @@
 //! Two attacker-declared lengths exist: the per-record `length` (≤ 2^14 + 256,
 //! rejected above that) and the inner `msg_len` (phase-gated cap — 64 KiB during
 //! the handshake, 4 MiB once established — checked **before** buffering the body).
-//! All parse failures map to a typed [`CoreError`]; the parser never panics, never
+//! All parse failures map to a typed `CoreError`; the parser never panics, never
 //! indexes out of bounds, and never pre-allocates a buffer sized to an
 //! attacker-declared length. The reassembly buffer is additionally bounded to
 //! `cap + slack` — a peer cannot stream unbounded valid chunks to balloon memory,

@@ -8,10 +8,11 @@
 //! (no executor at all without `embassy`/RTIC).
 //!
 //! This module introduces a small trait surface — `Runtime` — that the
-//! rest of the crate can use *in place of* direct tokio calls. The default
-//! implementation, [`TokioRuntime`], preserves today's behavior verbatim.
-//! Follow-up commits will gradually migrate call sites; this commit lands
-//! only the trait + the default impl + tests.
+//! rest of the crate uses *in place of* direct tokio calls. The default
+//! implementation, [`TokioRuntime`], preserves the historical behavior
+//! verbatim, so the UniFFI-stable surface (`connect_with_transport`,
+//! `bind`, …) keeps running on tokio; non-tokio embedders inject an
+//! alternative via the `_with_runtime` constructors.
 //!
 //! ## What the trait covers
 //!
@@ -28,20 +29,23 @@
 //! - **Channels** — `tokio::sync::mpsc` is portable enough across `tokio`
 //!   and `tokio` derivatives that we keep using it directly.
 //! - **Mutexes** — see above.
-//! - **Network I/O** — this is the [`crate::transport::legs`] trait's job.
-//!   `TcpStream` / `UdpSocket` are leg-impl details, not runtime-level.
+//! - **Network I/O** — this is the [`crate::transport::session_transport`]
+//!   `SessionTransport` impls' job (the byte-pipe abstraction). The concrete
+//!   `TcpStream` / `UdpSocket` are transport-impl details, not runtime-level.
 //!
 //! ## Implementations
 //!
 //! | Impl | Status | Target |
 //! | --- | --- | --- |
 //! | [`TokioRuntime`] | ✅ | Linux / macOS / Windows / iOS / Android servers and clients |
-//! | `WasmRuntime`    | ✅ (`cfg(target_arch = "wasm32")`) | `wasm32-unknown-unknown` browsers via `wasm-bindgen-futures` |
-//! | `EmbeddedRuntime` | scaffold | `embassy` / bare metal |
+//! | `WasmRuntime`    | ✅ (`cfg(target_arch = "wasm32", target_os = "unknown")`) | browser `wasm32-unknown-unknown` via `wasm-bindgen-futures` |
+//! | `WasiRuntime`    | ✅ (feature `wasi-leg`, `cfg(target_os = "wasi")`) | WASI Preview 2 single-task executor |
+//! | `EmbeddedRuntime` | scaffold (features `embedded` + `std`) | host-side stand-in; bare metal ships its own `embassy` / RTIC impl |
 //!
-//! The non-tokio implementations are scaffolded under future feature
-//! flags; this commit only ships the trait and the tokio default so the
-//! call-site migration can begin against a stable abstraction.
+//! Only `TokioRuntime` is unconditional; the other three are each gated to
+//! their target / feature (see the `cfg`s on the module declarations below).
+//! `EmbeddedRuntime` is a one-thread-per-future stand-in for host tests — see
+//! `embedded_runtime.rs` for why it is not a production bare-metal executor.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -85,8 +89,9 @@ pub use wasi_runtime::WasiRuntime;
 ///
 /// `'static` lifetime because spawned futures outlive any borrow at the
 /// call site; `Send` because the default tokio impl is multi-threaded and
-/// the futures cross thread boundaries. On future WASM impls the Send
-/// bound is harmless — single-threaded executors accept Send futures.
+/// the futures cross thread boundaries. On the single-threaded WASM / WASI
+/// impls the `Send` bound is harmless — a single-threaded executor still
+/// accepts `Send` futures.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 /// Async runtime abstraction.

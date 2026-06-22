@@ -1,7 +1,7 @@
 //! `MimicTlsLeg` — the TLS-over-TCP active-mimicry `SessionTransport`.
 //!
-//! Ties the record layer ([`super::record`]) and the handshake theater
-//! ([`super::theater`]) together: `connect` / `accept` run the one-time synthetic
+//! Ties the record layer (`super::record`) and the handshake theater
+//! (`super::theater`) together: `connect` / `accept` run the one-time synthetic
 //! TLS 1.3 prelude, after which `send_bytes` / `recv_bytes` carry Phantom messages
 //! inside TLS ApplicationData records. The outer TLS is anti-DPI obfuscation only —
 //! see the module head in [`super`].

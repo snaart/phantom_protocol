@@ -66,7 +66,7 @@ you have a backup of the key material.
 | Value | Default | Notes |
 |---|---|---|
 | `image.repository` | `phantom-server` | Override with your registry path |
-| `image.tag` | Chart appVersion (`0.2.1`) | Pin to a digest in production |
+| `image.tag` | Chart appVersion (`0.2.2`) | Pin to a digest in production |
 | `replicaCount` | `3` | Overridden by HPA when enabled |
 | `service.port` | `4242` | TCP port the server binary binds (matches the canonical port used in `kubernetes.md` + the `phantom-server` binary default) |
 | `telemetry.otlpEndpoint` | `""` | OTLP/gRPC Collector endpoint, rendered to the Deployment's `OTEL_EXPORTER_OTLP_ENDPOINT` (e.g. `http://otel-collector:4317`); empty = exporter uninstalled. The pods open no inbound telemetry port |

@@ -223,10 +223,10 @@ impl Sack {
     /// Serialise to wire bytes.
     ///
     /// Panics are structurally impossible: `ranges` is always non-empty (the
-    /// invariant is enforced by the private field — only `from_received` and
-    /// `from_wire` can construct a `Sack`, both of which guarantee at least one
-    /// range), and the arithmetic cannot overflow because all fields fit in
-    /// `u32`.
+    /// invariant is enforced by the private field — every constructor
+    /// (`from_received`, `from_inclusive_ranges`, `from_wire`) guarantees at
+    /// least one range), and the arithmetic cannot overflow because all fields
+    /// fit in `u32`.
     pub fn to_wire(&self) -> Vec<u8> {
         let range_count = self.ranges.len();
         // 10 bytes fixed header + 4 bytes first_len + 8 bytes per continuation.
@@ -248,13 +248,14 @@ impl Sack {
         // First range: [largest_acked - first_len, largest_acked].
         // `first_len` = high - low = range_width - 1.
         // PANIC-SAFETY: `ranges` is always non-empty — the field is private and
-        // only populated by `from_received` (which requires a non-empty input)
-        // and `from_wire` (which rejects range_count == 0).  This index cannot
-        // panic.
+        // only populated by `from_received` / `from_inclusive_ranges` (both
+        // require a non-empty result) and `from_wire` (which rejects
+        // range_count == 0).  This index cannot panic.
         let (first_low, first_high) = self.ranges[0];
-        // PANIC-SAFETY: `from_received` guarantees low ≤ high because ranges
-        // are built from sorted sequences; `from_wire` validates the same
-        // invariant before storing.  The subtraction cannot underflow.
+        // PANIC-SAFETY: `from_received` / `from_inclusive_ranges` guarantee
+        // low ≤ high because ranges are built from sorted, coalesced sequences;
+        // `from_wire` validates the same invariant before storing.  The
+        // subtraction cannot underflow.
         let first_len: u32 = first_high - first_low;
         buf.extend_from_slice(&first_len.to_be_bytes());
 

@@ -12,7 +12,7 @@ image:
   # IfNotPresent avoids pull rate-limits on restarts; use Always when tagging
   # non-immutably (e.g. "latest"). In production, pin to a digest.
   pullPolicy: IfNotPresent
-  # Defaults to the chart's appVersion (0.2.1). Set to a digest in production:
+  # Defaults to the chart's appVersion (0.2.2). Set to a digest in production:
   #   image.tag: "sha256:abc123..."
   tag: ""
 

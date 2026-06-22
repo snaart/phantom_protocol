@@ -1016,12 +1016,18 @@ public func FfiConverterTypePhantomListener_lower(_ value: PhantomListener) -> U
 
 
 /**
- * Client-first session — instant `connect()`, non-blocking `send()`.
+ * Client-first session — instant construction, non-blocking `send()`.
  *
  * # Design
  *
+ * The real entry point is `connect_with_transport` (NOT the inert legacy
+ * `connect()` constructor — see its doc): it returns instantly and runs the
+ * handshake + data pump in the background, so sends issued before the handshake
+ * finishes are buffered and auto-flushed once the channel is up.
+ *
  * ```text
- * let session = PhantomSession::connect("server:443");  // instant!
+ * // instant — spawns the background handshake + pump:
+ * let session = PhantomSession::connect_with_transport(addr, transport, pinned_key);
  * session.send(data).await;   // queued until handshake completes
  * session.send(data2).await;  // also queued
  * // ... handshake completes in background ...
@@ -1154,10 +1160,10 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
     
     /**
      * Override the automatic-rekey send-invocation high-watermark on the
-     * established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
-     * the session is still connecting. Rust-only — primarily for soak/load
-     * harnesses that need to exercise mid-session rekey without sending `2^47`
-     * packets.
+     * established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
+     * Returns `false` if the session is still connecting. Rust-only — primarily
+     * for soak/load harnesses that need to exercise mid-session rekey without
+     * sending `2^32` packets.
      */
     func setRekeyThreshold(n: UInt64) async  -> Bool
     
@@ -1182,12 +1188,18 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
     
 }
 /**
- * Client-first session — instant `connect()`, non-blocking `send()`.
+ * Client-first session — instant construction, non-blocking `send()`.
  *
  * # Design
  *
+ * The real entry point is `connect_with_transport` (NOT the inert legacy
+ * `connect()` constructor — see its doc): it returns instantly and runs the
+ * handshake + data pump in the background, so sends issued before the handshake
+ * finishes are buffered and auto-flushed once the channel is up.
+ *
  * ```text
- * let session = PhantomSession::connect("server:443");  // instant!
+ * // instant — spawns the background handshake + pump:
+ * let session = PhantomSession::connect_with_transport(addr, transport, pinned_key);
  * session.send(data).await;   // queued until handshake completes
  * session.send(data2).await;  // also queued
  * // ... handshake completes in background ...
@@ -1592,10 +1604,10 @@ open func send(data: Data)async throws   {
     
     /**
      * Override the automatic-rekey send-invocation high-watermark on the
-     * established session (default `REKEY_SOFT_LIMIT`). Returns `false` if
-     * the session is still connecting. Rust-only — primarily for soak/load
-     * harnesses that need to exercise mid-session rekey without sending `2^47`
-     * packets.
+     * established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
+     * Returns `false` if the session is still connecting. Rust-only — primarily
+     * for soak/load harnesses that need to exercise mid-session rekey without
+     * sending `2^32` packets.
      */
 open func setRekeyThreshold(n: UInt64)async  -> Bool  {
     return
@@ -1716,6 +1728,17 @@ public func FfiConverterTypePhantomSession_lower(_ value: PhantomSession) -> UIn
 
 
 
+/**
+ * A single multiplexed stream inside an established [`PhantomSession`].
+ *
+ * Created by the session's stream multiplexer (one per logical stream id).
+ * Outbound data is queued to the session's data pump over the `tx` command
+ * channel (`send_reliable` / `send_unreliable`); inbound demultiplexed data
+ * arrives on `rx`. The session owns all encryption and transport — a
+ * `PhantomStream` is just the per-stream send/recv handle exposed over FFI.
+ *
+ * [`PhantomSession`]: crate::api::session::PhantomSession
+ */
 public protocol PhantomStreamProtocol: AnyObject, Sendable {
     
     /**
@@ -1736,6 +1759,17 @@ public protocol PhantomStreamProtocol: AnyObject, Sendable {
     func streamId()  -> UInt32
     
 }
+/**
+ * A single multiplexed stream inside an established [`PhantomSession`].
+ *
+ * Created by the session's stream multiplexer (one per logical stream id).
+ * Outbound data is queued to the session's data pump over the `tx` command
+ * channel (`send_reliable` / `send_unreliable`); inbound demultiplexed data
+ * arrives on `rx`. The session owns all encryption and transport — a
+ * `PhantomStream` is just the per-stream send/recv handle exposed over FFI.
+ *
+ * [`PhantomSession`]: crate::api::session::PhantomSession
+ */
 open class PhantomStream: PhantomStreamProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
 
@@ -1920,6 +1954,19 @@ public func FfiConverterTypePhantomStream_lower(_ value: PhantomStream) -> UInt6
 
 
 
+/**
+ * Tunable parameters for a Phantom session / listener, exported across the
+ * UniFFI boundary as a plain record.
+ *
+ * NOTE: this is a stable FFI config surface, but the core does not yet read
+ * most of these fields on the live data path — `PhantomConfig` is currently
+ * re-exported and FFI-exported only. The `auto_fallback` / `fallback_*` /
+ * `upgrade_delay` fields in particular describe the legacy multi-leg
+ * fallback model; transport-leg fallback / aggregation was deliberately
+ * dropped in favour of single-path connection migration, so those knobs are
+ * presently inert. Treat the presets below as documented intent, not as
+ * behaviour the core enforces today.
+ */
 public struct PhantomConfig: Equatable, Hashable {
     /**
      * Interval between keep-alive pings
@@ -1950,15 +1997,16 @@ public struct PhantomConfig: Equatable, Hashable {
      */
     public var sessionTicketLifetime: TimeInterval
     /**
-     * Enable automatic transport fallback
+     * Enable automatic transport fallback (legacy multi-leg model; inert —
+     * see the struct-level note).
      */
     public var autoFallback: Bool
     /**
-     * Packet loss percentage to trigger fallback
+     * Packet loss percentage to trigger fallback (legacy multi-leg model; inert).
      */
     public var fallbackLossThreshold: UInt8
     /**
-     * Connection failures to trigger fallback
+     * Connection failures to trigger fallback (legacy multi-leg model; inert).
      */
     public var fallbackFailureThreshold: UInt32
     /**
@@ -1966,7 +2014,7 @@ public struct PhantomConfig: Equatable, Hashable {
      */
     public var connectTimeout: TimeInterval
     /**
-     * Delay before attempting to upgrade transport
+     * Delay before attempting to upgrade transport (legacy multi-leg model; inert).
      */
     public var upgradeDelay: TimeInterval
 
@@ -1995,19 +2043,20 @@ public struct PhantomConfig: Equatable, Hashable {
          * Lifetime of a session ticket
          */sessionTicketLifetime: TimeInterval, 
         /**
-         * Enable automatic transport fallback
+         * Enable automatic transport fallback (legacy multi-leg model; inert —
+         * see the struct-level note).
          */autoFallback: Bool, 
         /**
-         * Packet loss percentage to trigger fallback
+         * Packet loss percentage to trigger fallback (legacy multi-leg model; inert).
          */fallbackLossThreshold: UInt8, 
         /**
-         * Connection failures to trigger fallback
+         * Connection failures to trigger fallback (legacy multi-leg model; inert).
          */fallbackFailureThreshold: UInt32, 
         /**
          * Timeout for connection attempts
          */connectTimeout: TimeInterval, 
         /**
-         * Delay before attempting to upgrade transport
+         * Delay before attempting to upgrade transport (legacy multi-leg model; inert).
          */upgradeDelay: TimeInterval) {
         self.keepaliveInterval = keepaliveInterval
         self.sessionTimeout = sessionTimeout
@@ -3040,7 +3089,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomsession_send() != 8664) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 53836) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 44795) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675) {

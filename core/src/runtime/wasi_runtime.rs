@@ -12,7 +12,8 @@
 //! // ... spawn tasks via Runtime::spawn ...
 //! while rt.tasks_pending() > 0 {
 //!     rt.drive();
-//!     rt.poll_until_progress();   // poll_oneoff over registered Pollables
+//!     // bounded host-side block via wasi:io/poll; the Duration caps the wait
+//!     rt.poll_until_progress(std::time::Duration::from_millis(100));
 //! }
 //! ```
 //!
@@ -109,18 +110,21 @@ impl WasiRuntime {
         tasks.len()
     }
 
-    /// Block the host on `wasi::io::poll::poll` for at most
-    /// `max_wait`. Wakes when any Pollable currently registered by
-    /// a sleep / I/O future fires, OR when the timeout elapses
-    /// (whichever comes first). Returns immediately if there are
-    /// no Pollables to wait on.
+    /// Block the host (via `wasi::io::poll::poll`) for at most `max_wait`
+    /// instead of busy-spinning the drive loop. The current implementation
+    /// subscribes to a single timeout Pollable, so the call always returns
+    /// once `max_wait` elapses; `max_wait` therefore also bounds the worst-
+    /// case `WasiSleep` granularity (the sleep future does not register its
+    /// own Pollable — see the `WasiSleep` future below).
     ///
-    /// Bounded by `max_wait` to defend against a future that never
-    /// registers a Pollable but still returns `Poll::Pending` — the
-    /// drive loop must always make eventual progress.
+    /// The bound is deliberate: even a future that returns `Poll::Pending`
+    /// forever without registering any I/O Pollable cannot stall the loop —
+    /// the timeout always fires and the next `drive()` re-polls. A future
+    /// revision that wires real I/O readiness would extend `pollables` with
+    /// the per-future Pollables and wake early when one fires.
     pub fn poll_until_progress(&self, max_wait: Duration) {
-        // Always include a timeout Pollable so the call eventually
-        // returns even if no other Pollable is registered. WASI
+        // The timeout Pollable is the only thing we wait on today, so the
+        // call always returns by `max_wait` regardless of task state. WASI
         // Preview 2 `subscribe_duration` takes nanoseconds.
         let nanos = u64::try_from(max_wait.as_nanos()).unwrap_or(u64::MAX);
         let deadline = monotonic_clock::subscribe_duration(nanos);

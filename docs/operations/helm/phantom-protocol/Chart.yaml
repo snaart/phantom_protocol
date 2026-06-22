@@ -2,9 +2,9 @@ apiVersion: v2
 name: phantom-protocol
 description: "Post-quantum-secure L4/L6 transport server (Phantom Protocol)"
 type: application
-version: 0.2.1
+version: 0.2.2
 # appVersion tracks core/Cargo.toml package.version
-appVersion: "0.2.1"
+appVersion: "0.2.2"
 home: https://github.com/phantom-protocol
 sources:
   - https://github.com/phantom-protocol/phantom_protocol_rust
