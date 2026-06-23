@@ -320,9 +320,10 @@ PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomlistener_local_addr(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
-/* shutdown() -> async void. */
-uint64_t uniffi_phantom_protocol_fn_method_phantomlistener_shutdown(
-    void                    *ptr);
+/* shutdown() -> void (sync). Signals graceful shutdown; wakes parked accept() calls. */
+void uniffi_phantom_protocol_fn_method_phantomlistener_shutdown(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
 
 /* verifying_key_bytes() -> Vec<u8> (sync). Hand to clients for
  * server-identity pinning. */
