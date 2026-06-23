@@ -1732,22 +1732,16 @@ async fn udp_integration_ffi_migrate_actually_rebinds_through_relay() {
         let mut c2s = vec![0u8; 2048];
         let mut s2c = vec![0u8; 2048];
         let mut client_addr: Option<std::net::SocketAddr> = None;
-        let mut c2s_count = 0u32;
-        let mut s2c_count = 0u32;
         loop {
             tokio::select! {
                 r = relay.recv_from(&mut c2s) => {
                     let (n, from) = match r { Ok(x) => x, Err(_) => continue };
-                    c2s_count += 1;
-                    eprintln!("[relay] c2s #{c2s_count}: from={from}, n={n}, client_addr={client_addr:?}");
                     client_addr = Some(from);
                     srcs.lock().unwrap().insert(from);
                     let _ = upstream.send_to(&c2s[..n], server_addr).await;
                 }
                 r = upstream.recv_from(&mut s2c) => {
-                    let (n, src) = match r { Ok(x) => x, Err(_) => continue };
-                    s2c_count += 1;
-                    eprintln!("[relay] s2c #{s2c_count}: from={src}, n={n}, to={client_addr:?}");
+                    let (n, _src) = match r { Ok(x) => x, Err(_) => continue };
                     if let Some(ca) = client_addr {
                         let _ = relay.send_to(&s2c[..n], ca).await;
                     }
@@ -1780,14 +1774,11 @@ async fn udp_integration_ffi_migrate_actually_rebinds_through_relay() {
 
     for i in 1..ROUNDS {
         let m = format!("round-{i}-post-migration-{}", "x".repeat(i * 7)).into_bytes();
-        eprintln!("[test] round {i}: sending {} bytes", m.len());
         client.send(m.clone()).await.expect("send post-migration");
-        eprintln!("[test] round {i}: waiting for recv");
         let e = timeout(Duration::from_secs(10), client.recv())
             .await
             .expect("no timeout (the FFI session must survive the migration)")
             .expect("recv post-migration");
-        eprintln!("[test] round {i}: received {} bytes", e.len());
         assert_eq!(e, m, "post-migration echo must be byte-exact (round {i})");
     }
 
