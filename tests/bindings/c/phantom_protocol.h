@@ -263,8 +263,8 @@ uint8_t ffi_phantom_protocol_rust_future_complete_u8(
  *
  * Five UniFFI-exported objects:
  *
- *   PhantomListener     — TCP server. Constructor + 6 methods.
- *   PhantomUdpListener  — UDP server. Constructor + 5 methods.
+ *   PhantomListener     — TCP server. 2 constructors + 6 methods.
+ *   PhantomUdpListener  — UDP server. 2 constructors + 5 methods.
  *   PhantomSession      — connection. Constructor + 14 methods.
  *   PhantomStream       — substream. 4 methods (no public constructor —
  *                         obtained via PhantomSession::open_stream).
@@ -306,6 +306,17 @@ void uniffi_phantom_protocol_fn_free_phantomlistener(
 uint64_t uniffi_phantom_protocol_fn_constructor_phantomlistener_bind(
     PhantomRustBuffer        addr);
 
+/* Constructor: bind_with_signing_key_bytes(addr: string, signing_key: Vec<u8>) ->
+ *     async Result<PhantomListener, CoreError>.
+ * Binds a TCP listener with a caller-supplied persistent hybrid signing identity
+ * (64-byte `ed25519_seed || ml_dsa_seed` blob, as produced by
+ * `generate_signing_key()`). The server's verifying key is stable across restarts
+ * so clients can pin it. Returns a u64 future handle; complete via
+ * `_poll_u64` + `_complete_u64`. */
+uint64_t uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signing_key_bytes(
+    PhantomRustBuffer        addr,
+    PhantomRustBuffer        signing_key);
+
 /* accept() -> async AcceptOutcome (pointer result). */
 uint64_t uniffi_phantom_protocol_fn_method_phantomlistener_accept(
     void                    *ptr);
@@ -346,6 +357,17 @@ void uniffi_phantom_protocol_fn_free_phantomudplistener(
  * Returns a u64 future handle; complete via `_poll_u64` + `_complete_u64`. */
 uint64_t uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(
     PhantomRustBuffer        addr);
+
+/* Constructor: bind_udp_with_signing_key_bytes(addr: string, signing_key: Vec<u8>) ->
+ *     async Result<PhantomUdpListener, CoreError>.
+ * Binds a PhantomUDP listener with a caller-supplied persistent hybrid signing
+ * identity (64-byte `ed25519_seed || ml_dsa_seed` blob, as produced by
+ * `generate_signing_key()`). The server's verifying key is stable across restarts
+ * so clients can pin it. Returns a u64 future handle; complete via
+ * `_poll_u64` + `_complete_u64`. */
+uint64_t uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes(
+    PhantomRustBuffer        addr,
+    PhantomRustBuffer        signing_key);
 
 /* accept() -> async Result<AcceptOutcome, CoreError> (u64 future → pointer result).
  * Blocks until the next inbound UDP handshake completes. */
@@ -549,6 +571,28 @@ PhantomRustBuffer uniffi_phantom_protocol_fn_method_acceptoutcome_take_early_dat
     PhantomRustCallStatus   *call_status);
 
 /* ----------------------- Free (top-level) functions ----------------- */
+
+/* generate_signing_key() -> Result<Vec<u8>, CoreError> (sync).
+ *
+ * Generates a fresh hybrid signing key and returns the 64-byte seed as
+ * `ed25519_seed || ml_dsa_seed`. Write this blob to persistent storage
+ * (mode 0600) and pass it back to `bind_with_signing_key_bytes` /
+ * `bind_udp_with_signing_key_bytes` on every restart so the server's
+ * verifying key stays stable for client pinning. On error (RNG failure)
+ * the call_status code is set to 1. */
+PhantomRustBuffer uniffi_phantom_protocol_fn_func_generate_signing_key(
+    PhantomRustCallStatus   *call_status);
+
+/* verifying_key_from_signing_key(seed: Vec<u8>) -> Result<Vec<u8>, CoreError> (sync).
+ *
+ * Derives the hybrid verifying-key bytes from a 64-byte signing-key seed
+ * produced by `generate_signing_key()`. The returned bytes are the public
+ * half that clients pass to `connect_pinned*` for server-identity pinning.
+ * Returns `CoreError::CryptoError` if `seed` is not exactly 64 bytes or
+ * is otherwise malformed. */
+PhantomRustBuffer uniffi_phantom_protocol_fn_func_verifying_key_from_signing_key(
+    PhantomRustBuffer        seed,
+    PhantomRustCallStatus   *call_status);
 
 /* connect_pinned(host: string, port: u16, pinned_key: Vec<u8>) ->
  *     async Result<PhantomSession, CoreError>.
