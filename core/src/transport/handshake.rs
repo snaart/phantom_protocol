@@ -614,6 +614,19 @@ impl HandshakeServer {
     /// `HandshakeServer`'s [`ZeroizeOnDrop`] — the same memory-hygiene
     /// invariant as the auto-generated path.
     pub fn with_signing_key(signing_key: HybridSigningKey) -> Result<Self, HandshakeError> {
+        Self::with_signing_key_and_cache(signing_key, SessionCache::new())
+    }
+
+    /// Build a `HandshakeServer` from a caller-supplied [`HybridSigningKey`] and a
+    /// pre-sized [`SessionCache`] (e.g., from [`PhantomConfig::session_cache()`]).
+    ///
+    /// The `signing_key` is moved in under [`ZeroizeOnDrop`]; the `cache` is
+    /// immediately wrapped in its `Arc<Mutex>`. All other state initialises the same
+    /// way as [`with_signing_key`].
+    pub fn with_signing_key_and_cache(
+        signing_key: HybridSigningKey,
+        cache: SessionCache,
+    ) -> Result<Self, HandshakeError> {
         let verifying_key = signing_key.verifying_key();
 
         let mut master_secret = [0u8; 32];
@@ -630,7 +643,7 @@ impl HandshakeServer {
             master_secret,
             handshakes_this_minute: AtomicU64::new(0),
             minute_start_unix_sec: AtomicU64::new(now_sec),
-            session_cache: Arc::new(parking_lot::Mutex::new(SessionCache::new())),
+            session_cache: Arc::new(parking_lot::Mutex::new(cache)),
             reputation: Arc::new(ReputationTracker::new()),
             early_data_enabled: AtomicBool::new(true),
             anti_replay: parking_lot::Mutex::new(None),
