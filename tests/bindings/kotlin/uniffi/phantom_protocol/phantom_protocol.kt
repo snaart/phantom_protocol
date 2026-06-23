@@ -645,6 +645,10 @@ internal object IntegrityCheckingUniffiLib {
     }
     external fun uniffi_phantom_protocol_checksum_func_connect_pinned(
     ): Int
+    external fun uniffi_phantom_protocol_checksum_func_connect_pinned_udp(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption(
+    ): Int
     external fun uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data(
@@ -709,9 +713,21 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_stream_id(
     ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomudplistener_accept(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomudplistener_is_shutting_down(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes(
+    ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind(
     ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomsession_connect(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp(
     ): Int
     external fun ffi_phantom_protocol_uniffi_contract_version(
     ): Int
@@ -813,7 +829,27 @@ external fun uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable(`pt
 ): Long
 external fun uniffi_phantom_protocol_fn_method_phantomstream_stream_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
+external fun uniffi_phantom_protocol_fn_clone_phantomudplistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_phantom_protocol_fn_free_phantomudplistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(`addr`: RustBuffer.ByValue,
+): Long
+external fun uniffi_phantom_protocol_fn_method_phantomudplistener_accept(`ptr`: Long,
+): Long
+external fun uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_down(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
+external fun uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_phantom_protocol_fn_func_connect_pinned(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,
+): Long
+external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,
+): Long
+external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: RustBuffer.ByValue,`earlyData`: RustBuffer.ByValue,
 ): Long
 external fun uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: RustBuffer.ByValue,`earlyData`: RustBuffer.ByValue,
 ): Long
@@ -939,6 +975,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 48812) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 36316) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 47926) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 60625) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1035,10 +1077,28 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 28026) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_accept() != 58484) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_is_shutting_down() != 49450) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr() != 6213) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown() != 50351) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes() != 25697) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 14331) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 38982) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -3487,6 +3547,393 @@ public object FfiConverterTypePhantomStream: FfiConverter<PhantomStream, Long> {
 }
 
 
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+public interface PhantomUdpListenerInterface {
+    
+    /**
+     * Accept the next inbound connection and complete its handshake, returning the
+     * established session plus any 0-RTT early-data (see [`AcceptOutcome`]).
+     *
+     * Receiver is `self: Arc<Self>` (not `&self`): the lazily-spawned demux task
+     * needs an owned `Arc<Self>` to drive `run_udp_demux`, so an owned receiver is
+     * required here. FFI bindings clone the object handle and can loop `accept()`
+     * freely; a Rust caller that accepts more than once in the same scope must call
+     * `listener.clone().accept()`.
+     */
+    suspend fun `accept`(): AcceptOutcome
+    
+    /**
+     * Whether [`shutdown`](Self::shutdown) has been called.
+     */
+    fun `isShuttingDown`(): kotlin.Boolean
+    
+    /**
+     * Local socket address the listener is actually bound to (resolved at bind
+     * time) — useful when the caller passed `"host:0"`.
+     */
+    fun `localAddr`(): kotlin.String
+    
+    /**
+     * Signal graceful shutdown: wakes any parked `accept()` so it unwinds with
+     * `ConnectionClosed`. Idempotent. Already-accepted sessions are unaffected.
+     */
+    fun `shutdown`()
+    
+    /**
+     * The server's long-lived hybrid verifying key (`HybridVerifyingKey::to_bytes`).
+     * Clients MUST pin this before completing a handshake (security invariant 1).
+     */
+    fun `verifyingKeyBytes`(): kotlin.ByteArray
+    
+    companion object
+}
+
+open class PhantomUdpListener: Disposable, AutoCloseable, PhantomUdpListenerInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_phantom_protocol_fn_free_phantomudplistener(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_phantom_protocol_fn_clone_phantomudplistener(handle, status)
+        }
+    }
+
+    
+    /**
+     * Accept the next inbound connection and complete its handshake, returning the
+     * established session plus any 0-RTT early-data (see [`AcceptOutcome`]).
+     *
+     * Receiver is `self: Arc<Self>` (not `&self`): the lazily-spawned demux task
+     * needs an owned `Arc<Self>` to drive `run_udp_demux`, so an owned receiver is
+     * required here. FFI bindings clone the object handle and can loop `accept()`
+     * freely; a Rust caller that accepts more than once in the same scope must call
+     * `listener.clone().accept()`.
+     */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `accept`() : AcceptOutcome {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_accept(
+                uniffiHandle,
+                
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
+        // lift function
+        { FfiConverterTypeAcceptOutcome.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+    
+    /**
+     * Whether [`shutdown`](Self::shutdown) has been called.
+     */override fun `isShuttingDown`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_down(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Local socket address the listener is actually bound to (resolved at bind
+     * time) — useful when the caller passed `"host:0"`.
+     */override fun `localAddr`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Signal graceful shutdown: wakes any parked `accept()` so it unwinds with
+     * `ConnectionClosed`. Idempotent. Already-accepted sessions are unaffected.
+     */override fun `shutdown`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * The server's long-lived hybrid verifying key (`HybridVerifyingKey::to_bytes`).
+     * Clients MUST pin this before completing a handshake (security invariant 1).
+     */override fun `verifyingKeyBytes`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+
+    
+
+
+    
+    companion object {
+        
+    /**
+     * Bind a PhantomUDP listener on `addr` with a fresh per-process signing
+     * identity. For a persistent pinned identity across restarts use
+     * [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key) (Rust-only)
+     * or `bind_udp_with_signing_key_bytes` (FFI — see roadmap A2).
+     */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `bindUdp`(`addr`: kotlin.String) : PhantomUdpListener {
+        return uniffiRustCallAsync(
+        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(FfiConverterString.lower(`addr`),),
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
+        // lift function
+        { FfiConverterTypePhantomUdpListener.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+        
+    }
+    
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePhantomUdpListener: FfiConverter<PhantomUdpListener, Long> {
+    override fun lower(value: PhantomUdpListener): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): PhantomUdpListener {
+        return PhantomUdpListener(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): PhantomUdpListener {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: PhantomUdpListener) = 8UL
+
+    override fun write(value: PhantomUdpListener, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
 
 /**
  * Tunable parameters for a Phantom session / listener, exported across the
@@ -4440,6 +4887,68 @@ public object FfiConverterOptionalTypeTrafficShapingConfig: FfiConverterRustBuff
      suspend fun `connectPinned`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray) : PhantomSession {
         return uniffiRustCallAsync(
         UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),),
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
+        // lift function
+        { FfiConverterTypePhantomSession.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+        /**
+         * Connect to a pinned server over the production **PhantomUDP** transport — the
+         * reliable-UDP, migration-capable analogue of [`connect_pinned`].
+         *
+         * Unlike the TCP [`connect_pinned`], a session built here runs over
+         * [`UdpClientTransport`](crate::api::udp_transport::UdpClientTransport), so
+         * [`PhantomSession::migrate`] performs a real single-path connection migration
+         * (e.g. Wi-Fi ↔ LTE handover) instead of being a no-op, and liveness /
+         * `Migrating` / `Dead` transitions, path validation, and passive NAT-rebind
+         * recovery are all live for FFI consumers.
+         *
+         * `host` is resolved via the system resolver; the **first** returned address is
+         * used. Unlike the TCP [`connect_pinned`] (whose `TcpStream::connect` tries every
+         * resolved address in turn), this does **not** fall back to subsequent addresses
+         * if the first is unreachable — pass an IP literal or a single-family host when
+         * that matters. Server-key pinning is mandatory (security invariant 1).
+         * Native-only, like [`connect_pinned`].
+         */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `connectPinnedUdp`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray) : PhantomSession {
+        return uniffiRustCallAsync(
+        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),),
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
+        // lift function
+        { FfiConverterTypePhantomSession.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+        /**
+         * 0-RTT resumption analogue of [`connect_pinned_udp`] — the UDP sibling of
+         * [`connect_pinned_with_resumption`].
+         *
+         * `hint` is a [`ResumptionHint`] from a prior session's
+         * [`PhantomSession::resumption_hint`]; both of its fields must be exactly 32 bytes
+         * or the call fails with `ValidationError` before any socket is opened. `early_data`
+         * (≤ 16 KiB) is sealed into the resuming ClientHello — an oversized blob is likewise
+         * rejected before the UDP socket is bound. Acceptance is best-effort (security
+         * invariant 9): an unknown/stale ticket completes 1-RTT and the caller checks
+         * [`PhantomSession::early_data_accepted`] and re-sends when it is not `Some(true)`.
+         * Like [`connect_pinned_udp`], the first resolved address is used with no fallback.
+         * Native-only.
+         */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `connectPinnedUdpWithResumption`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray, `hint`: ResumptionHint, `earlyData`: kotlin.ByteArray) : PhantomSession {
+        return uniffiRustCallAsync(
+        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),FfiConverterTypeResumptionHint.lower(`hint`),FfiConverterByteArray.lower(`earlyData`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },

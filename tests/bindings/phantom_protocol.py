@@ -481,6 +481,10 @@ def _uniffi_check_contract_api_version(lib):
 def _uniffi_check_api_checksums(lib):
     if lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 48812:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 36316:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 47926:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 60625:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 13201:
@@ -548,6 +552,18 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 38734:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 28026:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 38982:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_accept() != 58484:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_is_shutting_down() != 49450:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr() != 6213:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown() != 50351:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes() != 25697:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
 
 # A ctypes library to expose the extern-C FFI definitions.
@@ -852,12 +868,36 @@ _UniffiLib.uniffi_phantom_protocol_fn_free_phantomstream.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_phantom_protocol_fn_free_phantomstream.restype = None
+_UniffiLib.uniffi_phantom_protocol_fn_clone_phantomudplistener.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_clone_phantomudplistener.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_free_phantomudplistener.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_free_phantomudplistener.restype = None
 _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned.argtypes = (
     _UniffiRustBuffer,
     ctypes.c_uint16,
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.c_uint16,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.c_uint16,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption.argtypes = (
     _UniffiRustBuffer,
     ctypes.c_uint16,
@@ -1019,12 +1059,46 @@ _UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_stream_id.argtypes = 
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_stream_id.restype = ctypes.c_uint32
+_UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp.argtypes = (
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_accept.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_accept.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_down.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_down.restype = ctypes.c_int8
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown.restype = None
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes.restype = _UniffiRustBuffer
 _UniffiLib.ffi_phantom_protocol_uniffi_contract_version.argtypes = (
 )
 _UniffiLib.ffi_phantom_protocol_uniffi_contract_version.restype = ctypes.c_uint32
 _UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption.restype = ctypes.c_uint16
@@ -1127,6 +1201,24 @@ _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_accept.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_accept.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_is_shutting_down.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_is_shutting_down.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes.restype = ctypes.c_uint16
 
 _uniffi_check_contract_api_version(_UniffiLib)
 # _uniffi_check_api_checksums(_UniffiLib)
@@ -3503,6 +3595,209 @@ class _UniffiFfiConverterTypePhantomListener:
     def write(cls, value: PhantomListener, buf: _UniffiRustBuffer):
         buf.write_u64(cls.lower(value))
 
+
+class PhantomUdpListenerProtocol(typing.Protocol):
+    
+    async def accept(self, ) -> AcceptOutcome:
+        """
+        Accept the next inbound connection and complete its handshake, returning the
+        established session plus any 0-RTT early-data (see [`AcceptOutcome`]).
+
+        Receiver is `self: Arc<Self>` (not `&self`): the lazily-spawned demux task
+        needs an owned `Arc<Self>` to drive `run_udp_demux`, so an owned receiver is
+        required here. FFI bindings clone the object handle and can loop `accept()`
+        freely; a Rust caller that accepts more than once in the same scope must call
+        `listener.clone().accept()`.
+"""
+        raise NotImplementedError
+    def is_shutting_down(self, ) -> bool:
+        """
+        Whether [`shutdown`](Self::shutdown) has been called.
+"""
+        raise NotImplementedError
+    def local_addr(self, ) -> str:
+        """
+        Local socket address the listener is actually bound to (resolved at bind
+        time) — useful when the caller passed `"host:0"`.
+"""
+        raise NotImplementedError
+    def shutdown(self, ) -> None:
+        """
+        Signal graceful shutdown: wakes any parked `accept()` so it unwinds with
+        `ConnectionClosed`. Idempotent. Already-accepted sessions are unaffected.
+"""
+        raise NotImplementedError
+    def verifying_key_bytes(self, ) -> bytes:
+        """
+        The server's long-lived hybrid verifying key (`HybridVerifyingKey::to_bytes`).
+        Clients MUST pin this before completing a handshake (security invariant 1).
+"""
+        raise NotImplementedError
+
+class PhantomUdpListener(PhantomUdpListenerProtocol):
+    
+    _handle: ctypes.c_uint64
+    @classmethod
+    async def bind_udp(cls, addr: str) -> PhantomUdpListener:
+        """
+        Bind a PhantomUDP listener on `addr` with a fresh per-process signing
+        identity. For a persistent pinned identity across restarts use
+        [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key) (Rust-only)
+        or `bind_udp_with_signing_key_bytes` (FFI — see roadmap A2).
+"""
+        
+        _UniffiFfiConverterString.check_lower(addr)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(addr),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypePhantomUdpListener.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_u64,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_u64,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_u64,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_phantom_protocol_fn_free_phantomudplistener, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_phantom_protocol_fn_clone_phantomudplistener, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    async def accept(self, ) -> AcceptOutcome:
+        """
+        Accept the next inbound connection and complete its handshake, returning the
+        established session plus any 0-RTT early-data (see [`AcceptOutcome`]).
+
+        Receiver is `self: Arc<Self>` (not `&self`): the lazily-spawned demux task
+        needs an owned `Arc<Self>` to drive `run_udp_demux`, so an owned receiver is
+        required here. FFI bindings clone the object handle and can loop `accept()`
+        freely; a Rust caller that accepts more than once in the same scope must call
+        `listener.clone().accept()`.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeAcceptOutcome.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_accept(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_u64,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_u64,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_u64,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+    def is_shutting_down(self, ) -> bool:
+        """
+        Whether [`shutdown`](Self::shutdown) has been called.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_down,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def local_addr(self, ) -> str:
+        """
+        Local socket address the listener is actually bound to (resolved at bind
+        time) — useful when the caller passed `"host:0"`.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterString.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def shutdown(self, ) -> None:
+        """
+        Signal graceful shutdown: wakes any parked `accept()` so it unwinds with
+        `ConnectionClosed`. Idempotent. Already-accepted sessions are unaffected.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def verifying_key_bytes(self, ) -> bytes:
+        """
+        The server's long-lived hybrid verifying key (`HybridVerifyingKey::to_bytes`).
+        Clients MUST pin this before completing a handshake (security invariant 1).
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBytes.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+
+
+
+
+
+class _UniffiFfiConverterTypePhantomUdpListener:
+    @staticmethod
+    def lift(value: int) -> PhantomUdpListener:
+        return PhantomUdpListener._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: PhantomUdpListener):
+        if not isinstance(value, PhantomUdpListener):
+            raise TypeError("Expected PhantomUdpListener instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: PhantomUdpListener) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> PhantomUdpListener:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: PhantomUdpListener, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
 class _UniffiFfiConverterUInt16(_UniffiConverterPrimitiveInt):
     CLASS_NAME = "u16"
     VALUE_MIN = 0
@@ -3531,6 +3826,88 @@ async def connect_pinned(host: str,port: int,pinned_key: bytes) -> PhantomSessio
     _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
     return await _uniffi_rust_call_async(
         _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned(*_uniffi_lowered_args),
+        _UniffiLib.ffi_phantom_protocol_rust_future_poll_u64,
+        _UniffiLib.ffi_phantom_protocol_rust_future_complete_u64,
+        _UniffiLib.ffi_phantom_protocol_rust_future_free_u64,
+        _uniffi_lift_return,
+        _uniffi_error_converter,
+    )
+async def connect_pinned_udp(host: str,port: int,pinned_key: bytes) -> PhantomSession:
+    """
+    Connect to a pinned server over the production **PhantomUDP** transport — the
+    reliable-UDP, migration-capable analogue of [`connect_pinned`].
+
+    Unlike the TCP [`connect_pinned`], a session built here runs over
+    [`UdpClientTransport`](crate::api::udp_transport::UdpClientTransport), so
+    [`PhantomSession::migrate`] performs a real single-path connection migration
+    (e.g. Wi-Fi ↔ LTE handover) instead of being a no-op, and liveness /
+    `Migrating` / `Dead` transitions, path validation, and passive NAT-rebind
+    recovery are all live for FFI consumers.
+
+    `host` is resolved via the system resolver; the **first** returned address is
+    used. Unlike the TCP [`connect_pinned`] (whose `TcpStream::connect` tries every
+    resolved address in turn), this does **not** fall back to subsequent addresses
+    if the first is unreachable — pass an IP literal or a single-family host when
+    that matters. Server-key pinning is mandatory (security invariant 1).
+    Native-only, like [`connect_pinned`].
+"""
+    
+    _UniffiFfiConverterString.check_lower(host)
+
+    _UniffiFfiConverterUInt16.check_lower(port)
+
+    _UniffiFfiConverterBytes.check_lower(pinned_key)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterString.lower(host),
+        _UniffiFfiConverterUInt16.lower(port),
+        _UniffiFfiConverterBytes.lower(pinned_key),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypePhantomSession.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
+    return await _uniffi_rust_call_async(
+        _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp(*_uniffi_lowered_args),
+        _UniffiLib.ffi_phantom_protocol_rust_future_poll_u64,
+        _UniffiLib.ffi_phantom_protocol_rust_future_complete_u64,
+        _UniffiLib.ffi_phantom_protocol_rust_future_free_u64,
+        _uniffi_lift_return,
+        _uniffi_error_converter,
+    )
+async def connect_pinned_udp_with_resumption(host: str,port: int,pinned_key: bytes,hint: ResumptionHint,early_data: bytes) -> PhantomSession:
+    """
+    0-RTT resumption analogue of [`connect_pinned_udp`] — the UDP sibling of
+    [`connect_pinned_with_resumption`].
+
+    `hint` is a [`ResumptionHint`] from a prior session's
+    [`PhantomSession::resumption_hint`]; both of its fields must be exactly 32 bytes
+    or the call fails with `ValidationError` before any socket is opened. `early_data`
+    (≤ 16 KiB) is sealed into the resuming ClientHello — an oversized blob is likewise
+    rejected before the UDP socket is bound. Acceptance is best-effort (security
+    invariant 9): an unknown/stale ticket completes 1-RTT and the caller checks
+    [`PhantomSession::early_data_accepted`] and re-sends when it is not `Some(true)`.
+    Like [`connect_pinned_udp`], the first resolved address is used with no fallback.
+    Native-only.
+"""
+    
+    _UniffiFfiConverterString.check_lower(host)
+
+    _UniffiFfiConverterUInt16.check_lower(port)
+
+    _UniffiFfiConverterBytes.check_lower(pinned_key)
+
+    _UniffiFfiConverterTypeResumptionHint.check_lower(hint)
+
+    _UniffiFfiConverterBytes.check_lower(early_data)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterString.lower(host),
+        _UniffiFfiConverterUInt16.lower(port),
+        _UniffiFfiConverterBytes.lower(pinned_key),
+        _UniffiFfiConverterTypeResumptionHint.lower(hint),
+        _UniffiFfiConverterBytes.lower(early_data),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypePhantomSession.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
+    return await _uniffi_rust_call_async(
+        _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(*_uniffi_lowered_args),
         _UniffiLib.ffi_phantom_protocol_rust_future_poll_u64,
         _UniffiLib.ffi_phantom_protocol_rust_future_complete_u64,
         _UniffiLib.ffi_phantom_protocol_rust_future_free_u64,
@@ -3593,6 +3970,8 @@ __all__ = [
     "ResumptionHint",
     "TrafficShapingConfig",
     "connect_pinned",
+    "connect_pinned_udp",
+    "connect_pinned_udp_with_resumption",
     "connect_pinned_with_resumption",
     "PhantomStream",
     "PhantomStreamProtocol",
@@ -3602,4 +3981,6 @@ __all__ = [
     "AcceptOutcomeProtocol",
     "PhantomListener",
     "PhantomListenerProtocol",
+    "PhantomUdpListener",
+    "PhantomUdpListenerProtocol",
 ]

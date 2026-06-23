@@ -1959,6 +1959,241 @@ public func FfiConverterTypePhantomStream_lower(_ value: PhantomStream) -> UInt6
 
 
 
+
+
+public protocol PhantomUdpListenerProtocol: AnyObject, Sendable {
+    
+    /**
+     * Accept the next inbound connection and complete its handshake, returning the
+     * established session plus any 0-RTT early-data (see [`AcceptOutcome`]).
+     *
+     * Receiver is `self: Arc<Self>` (not `&self`): the lazily-spawned demux task
+     * needs an owned `Arc<Self>` to drive `run_udp_demux`, so an owned receiver is
+     * required here. FFI bindings clone the object handle and can loop `accept()`
+     * freely; a Rust caller that accepts more than once in the same scope must call
+     * `listener.clone().accept()`.
+     */
+    func accept() async throws  -> AcceptOutcome
+    
+    /**
+     * Whether [`shutdown`](Self::shutdown) has been called.
+     */
+    func isShuttingDown()  -> Bool
+    
+    /**
+     * Local socket address the listener is actually bound to (resolved at bind
+     * time) — useful when the caller passed `"host:0"`.
+     */
+    func localAddr()  -> String
+    
+    /**
+     * Signal graceful shutdown: wakes any parked `accept()` so it unwinds with
+     * `ConnectionClosed`. Idempotent. Already-accepted sessions are unaffected.
+     */
+    func shutdown() 
+    
+    /**
+     * The server's long-lived hybrid verifying key (`HybridVerifyingKey::to_bytes`).
+     * Clients MUST pin this before completing a handshake (security invariant 1).
+     */
+    func verifyingKeyBytes()  -> Data
+    
+}
+open class PhantomUdpListener: PhantomUdpListenerProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_phantom_protocol_fn_clone_phantomudplistener(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_phantom_protocol_fn_free_phantomudplistener(handle, $0) }
+    }
+
+    
+    /**
+     * Bind a PhantomUDP listener on `addr` with a fresh per-process signing
+     * identity. For a persistent pinned identity across restarts use
+     * [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key) (Rust-only)
+     * or `bind_udp_with_signing_key_bytes` (FFI — see roadmap A2).
+     */
+public static func bindUdp(addr: String)async throws  -> PhantomUdpListener  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(FfiConverterString.lower(addr)
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
+            liftFunc: FfiConverterTypePhantomUdpListener_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+
+    
+    /**
+     * Accept the next inbound connection and complete its handshake, returning the
+     * established session plus any 0-RTT early-data (see [`AcceptOutcome`]).
+     *
+     * Receiver is `self: Arc<Self>` (not `&self`): the lazily-spawned demux task
+     * needs an owned `Arc<Self>` to drive `run_udp_demux`, so an owned receiver is
+     * required here. FFI bindings clone the object handle and can loop `accept()`
+     * freely; a Rust caller that accepts more than once in the same scope must call
+     * `listener.clone().accept()`.
+     */
+open func accept()async throws  -> AcceptOutcome  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_method_phantomudplistener_accept(
+                    self.uniffiCloneHandle()
+                    
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
+            liftFunc: FfiConverterTypeAcceptOutcome_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Whether [`shutdown`](Self::shutdown) has been called.
+     */
+open func isShuttingDown() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_down(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Local socket address the listener is actually bound to (resolved at bind
+     * time) — useful when the caller passed `"host:0"`.
+     */
+open func localAddr() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Signal graceful shutdown: wakes any parked `accept()` so it unwinds with
+     * `ConnectionClosed`. Idempotent. Already-accepted sessions are unaffected.
+     */
+open func shutdown()  {try! rustCall() {
+    uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * The server's long-lived hybrid verifying key (`HybridVerifyingKey::to_bytes`).
+     * Clients MUST pin this before completing a handshake (security invariant 1).
+     */
+open func verifyingKeyBytes() -> Data  {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePhantomUdpListener: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = PhantomUdpListener
+
+    public static func lift(_ handle: UInt64) throws -> PhantomUdpListener {
+        return PhantomUdpListener(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: PhantomUdpListener) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PhantomUdpListener {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: PhantomUdpListener, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePhantomUdpListener_lift(_ handle: UInt64) throws -> PhantomUdpListener {
+    return try FfiConverterTypePhantomUdpListener.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePhantomUdpListener_lower(_ value: PhantomUdpListener) -> UInt64 {
+    return FfiConverterTypePhantomUdpListener.lower(value)
+}
+
+
+
+
 /**
  * Tunable parameters for a Phantom session / listener, exported across the
  * UniFFI boundary as a plain record.
@@ -2972,6 +3207,66 @@ public func connectPinned(host: String, port: UInt16, pinnedKey: Data)async thro
         )
 }
 /**
+ * Connect to a pinned server over the production **PhantomUDP** transport — the
+ * reliable-UDP, migration-capable analogue of [`connect_pinned`].
+ *
+ * Unlike the TCP [`connect_pinned`], a session built here runs over
+ * [`UdpClientTransport`](crate::api::udp_transport::UdpClientTransport), so
+ * [`PhantomSession::migrate`] performs a real single-path connection migration
+ * (e.g. Wi-Fi ↔ LTE handover) instead of being a no-op, and liveness /
+ * `Migrating` / `Dead` transitions, path validation, and passive NAT-rebind
+ * recovery are all live for FFI consumers.
+ *
+ * `host` is resolved via the system resolver; the **first** returned address is
+ * used. Unlike the TCP [`connect_pinned`] (whose `TcpStream::connect` tries every
+ * resolved address in turn), this does **not** fall back to subsequent addresses
+ * if the first is unreachable — pass an IP literal or a single-family host when
+ * that matters. Server-key pinning is mandatory (security invariant 1).
+ * Native-only, like [`connect_pinned`].
+ */
+public func connectPinnedUdp(host: String, port: UInt16, pinnedKey: Data)async throws  -> PhantomSession  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_func_connect_pinned_udp(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey)
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
+            liftFunc: FfiConverterTypePhantomSession_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+/**
+ * 0-RTT resumption analogue of [`connect_pinned_udp`] — the UDP sibling of
+ * [`connect_pinned_with_resumption`].
+ *
+ * `hint` is a [`ResumptionHint`] from a prior session's
+ * [`PhantomSession::resumption_hint`]; both of its fields must be exactly 32 bytes
+ * or the call fails with `ValidationError` before any socket is opened. `early_data`
+ * (≤ 16 KiB) is sealed into the resuming ClientHello — an oversized blob is likewise
+ * rejected before the UDP socket is bound. Acceptance is best-effort (security
+ * invariant 9): an unknown/stale ticket completes 1-RTT and the caller checks
+ * [`PhantomSession::early_data_accepted`] and re-sends when it is not `Some(true)`.
+ * Like [`connect_pinned_udp`], the first resolved address is used with no fallback.
+ * Native-only.
+ */
+public func connectPinnedUdpWithResumption(host: String, port: UInt16, pinnedKey: Data, hint: ResumptionHint, earlyData: Data)async throws  -> PhantomSession  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey),FfiConverterTypeResumptionHint_lower(hint),FfiConverterData.lower(earlyData)
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
+            liftFunc: FfiConverterTypePhantomSession_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+/**
  * Connect to a pinned server with a **0-RTT resumption attempt** — the
  * resumption-aware analogue of [`connect_pinned`].
  *
@@ -3020,6 +3315,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_phantom_protocol_checksum_func_connect_pinned() != 48812) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 36316) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 47926) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 60625) {
@@ -3118,10 +3419,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 28026) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_accept() != 58484) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_is_shutting_down() != 49450) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr() != 6213) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown() != 50351) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes() != 25697) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 14331) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 38982) {
         return InitializationResult.apiChecksumMismatch
     }
 

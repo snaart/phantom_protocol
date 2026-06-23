@@ -261,13 +261,15 @@ uint8_t ffi_phantom_protocol_rust_future_complete_u8(
 /* ====================================================================
  * SECTION 4 — Domain API surface (Phantom Protocol exported objects)
  *
- * Four UniFFI-exported objects:
+ * Five UniFFI-exported objects:
  *
- *   PhantomListener  — server. Constructor + 6 methods.
- *   PhantomSession   — connection. Constructor + 14 methods.
- *   PhantomStream    — substream. 4 methods (no public constructor —
- *                      obtained via PhantomSession::open_stream).
- *   AcceptOutcome    — returned by PhantomListener::accept; 3 methods.
+ *   PhantomListener     — TCP server. Constructor + 6 methods.
+ *   PhantomUdpListener  — UDP server. Constructor + 5 methods.
+ *   PhantomSession      — connection. Constructor + 14 methods.
+ *   PhantomStream       — substream. 4 methods (no public constructor —
+ *                         obtained via PhantomSession::open_stream).
+ *   AcceptOutcome       — returned by PhantomListener::accept or
+ *                         PhantomUdpListener::accept; 3 methods.
  *
  * Convention:
  *   - Each object has a `_clone_*` (increment refcount) and `_free_*`
@@ -325,6 +327,47 @@ uint64_t uniffi_phantom_protocol_fn_method_phantomlistener_shutdown(
 /* verifying_key_bytes() -> Vec<u8> (sync). Hand to clients for
  * server-identity pinning. */
 PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomlistener_verifying_key_bytes(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+/* ----------------------- PhantomUdpListener ------------------------- */
+
+void *uniffi_phantom_protocol_fn_clone_phantomudplistener(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+void uniffi_phantom_protocol_fn_free_phantomudplistener(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+/* Constructor: bind_udp(addr: string) -> async Result<PhantomUdpListener, CoreError>.
+ * Binds a PhantomUDP listener with a fresh per-process hybrid signing identity.
+ * Returns a u64 future handle; complete via `_poll_u64` + `_complete_u64`. */
+uint64_t uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(
+    PhantomRustBuffer        addr);
+
+/* accept() -> async Result<AcceptOutcome, CoreError> (u64 future → pointer result).
+ * Blocks until the next inbound UDP handshake completes. */
+uint64_t uniffi_phantom_protocol_fn_method_phantomudplistener_accept(
+    void                    *ptr);
+
+/* is_shutting_down() -> bool (sync). True after shutdown() has been called. */
+int8_t uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_down(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+/* local_addr() -> string (sync; RustBuffer carries UTF-8). Resolved bind address. */
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+/* shutdown() -> void (sync). Signals graceful shutdown; wakes parked accept() calls. */
+void uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+/* verifying_key_bytes() -> Vec<u8> (sync). Server hybrid verifying key for client pinning. */
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
@@ -544,20 +587,56 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(
     PhantomRustBuffer        hint,
     PhantomRustBuffer        early_data);
 
+/* connect_pinned_udp(host: string, port: u16, pinned_key: Vec<u8>) ->
+ *     async Result<PhantomSession, CoreError>.
+ *
+ * Opens a PhantomUDP (raw-UDP) connection to `host:port`, wraps it in
+ * `UdpClientTransport`, parses `pinned_key` into a `HybridVerifyingKey`,
+ * and drives the hybrid PQC handshake in the background.
+ *
+ * Returns a u64 future handle; complete via `_poll_u64` + `_complete_u64`.
+ * Decode failures of `pinned_key` surface as `CoreError::CryptoError`;
+ * UDP connect failures as `CoreError::NetworkError`. */
+uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_udp(
+    PhantomRustBuffer        host,
+    uint16_t                 port,
+    PhantomRustBuffer        pinned_key);
+
+/* connect_pinned_udp_with_resumption(host: string, port: u16,
+ *     pinned_key: Vec<u8>, hint: ResumptionHint, early_data: Vec<u8>) ->
+ *     async Result<PhantomSession, CoreError>.
+ *
+ * Resumption-aware analogue of `connect_pinned_udp` — attempts a 0-RTT
+ * reconnect over PhantomUDP using the `ResumptionHint` from a prior session.
+ * `hint` is the lowered `ResumptionHint` record; `early_data` (<= 16 KiB)
+ * is sealed into the V3 ClientHello.
+ *
+ * Returns a u64 future handle yielding a `void *` PhantomSession pointer
+ * (use `_poll_u64` + `_complete_u64`). */
+uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(
+    PhantomRustBuffer        host,
+    uint16_t                 port,
+    PhantomRustBuffer        pinned_key,
+    PhantomRustBuffer        hint,
+    PhantomRustBuffer        early_data);
+
 /* ====================================================================
  * SECTION 5 — Caveats & non-exported items
  *
  *  - Pinned client connect is available on the FFI surface via
- *    `uniffi_phantom_protocol_fn_func_connect_pinned` (Phase 7.2 mobile
- *    bridge). The placeholder `_constructor_phantomsession_connect`
- *    above remains for backwards compatibility but does NOT perform
- *    a fully-pinned PQC handshake. Production C / mobile clients MUST
- *    use `connect_pinned` and supply the server's `HybridVerifyingKey`
- *    bytes (obtainable from `verifying_key_bytes()` on the listener).
+ *    `uniffi_phantom_protocol_fn_func_connect_pinned` (TCP, Phase 7.2 mobile
+ *    bridge) and `uniffi_phantom_protocol_fn_func_connect_pinned_udp` (UDP).
+ *    The placeholder `_constructor_phantomsession_connect` remains for
+ *    backwards compatibility but does NOT perform a fully-pinned PQC
+ *    handshake. Production C / mobile clients MUST use one of the
+ *    `connect_pinned*` free functions and supply the server's
+ *    `HybridVerifyingKey` bytes (obtainable from `verifying_key_bytes()`
+ *    on the listener).
  *
  *    0-RTT resumption is available via
- *    `uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption`. The
- *    generic `connect_with_resumption` and the `_with_runtime` overloads
+ *    `uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption` (TCP)
+ *    and `uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption`
+ *    (UDP). The generic `connect_with_resumption` and `_with_runtime` overloads
  *    remain Rust-only; callers needing those should build a similar shim.
  *
  *  - The `transport::SessionTransport` trait, `HybridSigningKey`,
@@ -581,7 +660,7 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(
  *    time to detect ABI drift.
  *
  *  - The shape (UniFFI 0.31, contract 30) is current as of phantom_protocol
- *    0.2.0. If you bump the UniFFI dependency, regenerate this header.
+ *    0.2.2. If you bump the UniFFI dependency, regenerate this header.
  * ==================================================================== */
 
 #ifdef __cplusplus
