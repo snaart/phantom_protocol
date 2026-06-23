@@ -22,6 +22,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   single-path connection migration (e.g. Wi-Fi ↔ LTE handover) instead of the no-op it
   is over TCP, and liveness / `Migrating` / `Dead` transitions, path validation, and
   passive NAT-rebind recovery are all live for FFI consumers.
+- **FFI server identity.** `generate_signing_key()` and `verifying_key_from_signing_key(seed)`
+  (free functions) plus the `PhantomListener::bind_with_signing_key_bytes` and
+  `PhantomUdpListener::bind_udp_with_signing_key_bytes` constructors let a pure-FFI
+  (mobile / C) embedder generate, persist, load, and pin a server's hybrid signing
+  identity, so a server keeps a stable pinned identity across restarts — previously key
+  generation and `bind_with_signing_key` were Rust/CLI-only. The 64-byte seed
+  (`ed25519_seed[32] || ml_dsa_seed[32]`, the same form `phantom-cli keygen` writes) is
+  secret key material and is **not** zeroized across the FFI boundary — persist it `0600`
+  and wipe the buffer after use.
 
 ### Fixed
 
