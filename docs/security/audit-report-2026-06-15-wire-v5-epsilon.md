@@ -1,8 +1,8 @@
 # Phantom Protocol — Security Audit: WIRE v5 / ε CID-Collapse Surface (PR #118)
 
 - **Date:** 2026-06-15
-- **Target:** `phantom_protocol` library (`core/`), at `main` @ `bb0452f` (post WIRE v5 CID-collapse, ε).
-- **Diff range:** `f246123..bb0452f` (PR #118, 9 commits).
+- **Target:** `phantom_protocol` library (`core/`), at `main` @ `a2dfd6f` (post WIRE v5 CID-collapse, ε).
+- **Diff range:** `c87fc98..a2dfd6f` (PR #118, 9 commits).
 - **Scope:** the ε change only — collapse the two connection-ID layers into a single rotating CID, drop the 32-byte inner `session_id` from the data-plane wire (reconstruct it into the AEAD AAD), shrink the packet header 47 B → 15 B, and make `ObservedTransport` fully transparent over `SessionTransport`. Files:
   - `core/src/crypto/cid_chain.rs` (**new**) — rotating-CID KDF chain + inbound-window primitive.
   - `core/src/transport/types.rs` — 15-byte header `to_wire`/`from_wire` + the 47-byte `to_aad_image` reconstruction; `RawPacket`/`HP_PROTECTED_OFFSET`.
