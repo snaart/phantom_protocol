@@ -889,6 +889,28 @@ public static func bind(addr: String)async throws  -> PhantomListener  {
         )
 }
     
+    /**
+     * Bind a TCP listener using a persisted 64-byte signing seed (from
+     * [`generate_signing_key`](crate::api::identity::generate_signing_key)) as the
+     * server's long-lived identity, so `verifying_key_bytes()` — the value clients pin
+     * — stays stable across restarts. The FFI analogue of the Rust-only
+     * [`bind_with_signing_key`](Self::bind_with_signing_key).
+     */
+public static func bindWithSigningKeyBytes(addr: String, signingKey: Data)async throws  -> PhantomListener  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signing_key_bytes(FfiConverterString.lower(addr),FfiConverterData.lower(signingKey)
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
+            liftFunc: FfiConverterTypePhantomListener_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
 
     
     /**
@@ -2054,13 +2076,35 @@ open class PhantomUdpListener: PhantomUdpListenerProtocol, @unchecked Sendable {
      * Bind a PhantomUDP listener on `addr` with a fresh per-process signing
      * identity. For a persistent pinned identity across restarts use
      * [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key) (Rust-only)
-     * or `bind_udp_with_signing_key_bytes` (FFI — see roadmap A2).
+     * or [`bind_udp_with_signing_key_bytes`](Self::bind_udp_with_signing_key_bytes) (FFI).
      */
 public static func bindUdp(addr: String)async throws  -> PhantomUdpListener  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(FfiConverterString.lower(addr)
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
+            liftFunc: FfiConverterTypePhantomUdpListener_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Bind a PhantomUDP listener using a persisted 64-byte signing seed (from
+     * [`generate_signing_key`](crate::api::identity::generate_signing_key)) as the
+     * server's long-lived identity, so `verifying_key_bytes()` stays stable across
+     * restarts. FFI analogue of the Rust-only
+     * [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key).
+     */
+public static func bindUdpWithSigningKeyBytes(addr: String, signingKey: Data)async throws  -> PhantomUdpListener  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes(FfiConverterString.lower(addr),FfiConverterData.lower(signingKey)
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
@@ -3192,6 +3236,35 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
         print("uniffiFutureContinuationCallback invalid handle")
     }
 }
+/**
+ * Generate a fresh hybrid (Ed25519 + ML-DSA-65) signing key and return its 64-byte
+ * seed (`ed25519_seed[32] || ml_dsa_seed[32]`). A pairwise-consistency check runs
+ * before the seed is returned, so a key that cannot verify its own signature is
+ * never handed out (matching `phantom-cli keygen`).
+ *
+ * **The returned `Vec<u8>` is secret key material.** It is not zeroized when it
+ * crosses the FFI boundary — persist it with restrictive permissions (0600) and wipe
+ * the buffer when done. Load it back into a listener with
+ * `bind_with_signing_key_bytes` / `bind_udp_with_signing_key_bytes`.
+ */
+public func generateSigningKey()throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_phantom_protocol_fn_func_generate_signing_key($0
+    )
+})
+}
+/**
+ * Derive the public verifying-key bytes (for client pinning) from a 64-byte signing
+ * seed produced by [`generate_signing_key`]. Returns the same bytes a server's
+ * `verifying_key_bytes()` would return after loading the seed.
+ */
+public func verifyingKeyFromSigningKey(seed: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_phantom_protocol_fn_func_verifying_key_from_signing_key(
+        FfiConverterData.lower(seed),$0
+    )
+})
+}
 public func connectPinned(host: String, port: UInt16, pinnedKey: Data)async throws  -> PhantomSession  {
     return
         try  await uniffiRustCallAsync(
@@ -3313,6 +3386,12 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_phantom_protocol_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_func_generate_signing_key() != 61525) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key() != 48109) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_func_connect_pinned() != 48812) {
         return InitializationResult.apiChecksumMismatch
@@ -3437,10 +3516,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 19213) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 14331) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 38982) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 57133) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes() != 18642) {
         return InitializationResult.apiChecksumMismatch
     }
 

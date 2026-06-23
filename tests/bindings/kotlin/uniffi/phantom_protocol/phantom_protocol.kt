@@ -643,6 +643,10 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckContractApiVersion(this)
         uniffiCheckApiChecksums(this)
     }
+    external fun uniffi_phantom_protocol_checksum_func_generate_signing_key(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key(
+    ): Int
     external fun uniffi_phantom_protocol_checksum_func_connect_pinned(
     ): Int
     external fun uniffi_phantom_protocol_checksum_func_connect_pinned_udp(
@@ -725,9 +729,13 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind(
     ): Int
+    external fun uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes(
+    ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomsession_connect(
     ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes(
     ): Int
     external fun ffi_phantom_protocol_uniffi_contract_version(
     ): Int
@@ -762,6 +770,8 @@ external fun uniffi_phantom_protocol_fn_clone_phantomlistener(`handle`: Long,uni
 external fun uniffi_phantom_protocol_fn_free_phantomlistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_phantom_protocol_fn_constructor_phantomlistener_bind(`addr`: RustBuffer.ByValue,
+): Long
+external fun uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signing_key_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,
 ): Long
 external fun uniffi_phantom_protocol_fn_method_phantomlistener_accept(`ptr`: Long,
 ): Long
@@ -835,6 +845,8 @@ external fun uniffi_phantom_protocol_fn_free_phantomudplistener(`handle`: Long,u
 ): Unit
 external fun uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(`addr`: RustBuffer.ByValue,
 ): Long
+external fun uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,
+): Long
 external fun uniffi_phantom_protocol_fn_method_phantomudplistener_accept(`ptr`: Long,
 ): Long
 external fun uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_down(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -844,6 +856,10 @@ external fun uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr(`pt
 external fun uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_phantom_protocol_fn_func_generate_signing_key(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_phantom_protocol_fn_func_verifying_key_from_signing_key(`seed`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_phantom_protocol_fn_func_connect_pinned(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,
 ): Long
@@ -972,6 +988,12 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_phantom_protocol_checksum_func_generate_signing_key() != 61525) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key() != 48109) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 48812) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1095,10 +1117,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 19213) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 14331) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 38982) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 57133) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes() != 18642) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -2216,6 +2244,29 @@ open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
      suspend fun `bind`(`addr`: kotlin.String) : PhantomListener {
         return uniffiRustCallAsync(
         UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind(FfiConverterString.lower(`addr`),),
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
+        // lift function
+        { FfiConverterTypePhantomListener.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+        
+    /**
+     * Bind a TCP listener using a persisted 64-byte signing seed (from
+     * [`generate_signing_key`](crate::api::identity::generate_signing_key)) as the
+     * server's long-lived identity, so `verifying_key_bytes()` — the value clients pin
+     * — stays stable across restarts. The FFI analogue of the Rust-only
+     * [`bind_with_signing_key`](Self::bind_with_signing_key).
+     */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `bindWithSigningKeyBytes`(`addr`: kotlin.String, `signingKey`: kotlin.ByteArray) : PhantomListener {
+        return uniffiRustCallAsync(
+        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signing_key_bytes(FfiConverterString.lower(`addr`),FfiConverterByteArray.lower(`signingKey`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -3887,13 +3938,36 @@ open class PhantomUdpListener: Disposable, AutoCloseable, PhantomUdpListenerInte
      * Bind a PhantomUDP listener on `addr` with a fresh per-process signing
      * identity. For a persistent pinned identity across restarts use
      * [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key) (Rust-only)
-     * or `bind_udp_with_signing_key_bytes` (FFI — see roadmap A2).
+     * or [`bind_udp_with_signing_key_bytes`](Self::bind_udp_with_signing_key_bytes) (FFI).
      */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `bindUdp`(`addr`: kotlin.String) : PhantomUdpListener {
         return uniffiRustCallAsync(
         UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(FfiConverterString.lower(`addr`),),
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
+        // lift function
+        { FfiConverterTypePhantomUdpListener.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+        
+    /**
+     * Bind a PhantomUDP listener using a persisted 64-byte signing seed (from
+     * [`generate_signing_key`](crate::api::identity::generate_signing_key)) as the
+     * server's long-lived identity, so `verifying_key_bytes()` stays stable across
+     * restarts. FFI analogue of the Rust-only
+     * [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key).
+     */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `bindUdpWithSigningKeyBytes`(`addr`: kotlin.String, `signingKey`: kotlin.ByteArray) : PhantomUdpListener {
+        return uniffiRustCallAsync(
+        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes(FfiConverterString.lower(`addr`),FfiConverterByteArray.lower(`signingKey`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -4881,6 +4955,44 @@ public object FfiConverterOptionalTypeTrafficShapingConfig: FfiConverterRustBuff
 
 
 
+
+        /**
+         * Generate a fresh hybrid (Ed25519 + ML-DSA-65) signing key and return its 64-byte
+         * seed (`ed25519_seed[32] || ml_dsa_seed[32]`). A pairwise-consistency check runs
+         * before the seed is returned, so a key that cannot verify its own signature is
+         * never handed out (matching `phantom-cli keygen`).
+         *
+         * **The returned `Vec<u8>` is secret key material.** It is not zeroized when it
+         * crosses the FFI boundary — persist it with restrictive permissions (0600) and wipe
+         * the buffer when done. Load it back into a listener with
+         * `bind_with_signing_key_bytes` / `bind_udp_with_signing_key_bytes`.
+         */
+    @Throws(CoreException::class) fun `generateSigningKey`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCallWithError(CoreException) { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_func_generate_signing_key(
+    
+        _status)
+}
+    )
+    }
+    
+
+        /**
+         * Derive the public verifying-key bytes (for client pinning) from a 64-byte signing
+         * seed produced by [`generate_signing_key`]. Returns the same bytes a server's
+         * `verifying_key_bytes()` would return after loading the seed.
+         */
+    @Throws(CoreException::class) fun `verifyingKeyFromSigningKey`(`seed`: kotlin.ByteArray): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCallWithError(CoreException) { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_func_verifying_key_from_signing_key(
+    
+        FfiConverterByteArray.lower(`seed`),_status)
+}
+    )
+    }
+    
 
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")

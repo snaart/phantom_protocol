@@ -487,6 +487,10 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 60625:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_func_generate_signing_key() != 61525:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key() != 48109:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 13201:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_session() != 25558:
@@ -494,6 +498,8 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data() != 27328:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 19213:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomlistener_accept() != 14433:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -553,7 +559,9 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 28026:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 38982:
+    if lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 57133:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes() != 18642:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_accept() != 58484:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -906,6 +914,15 @@ _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption.argtyp
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_func_generate_signing_key.argtypes = (
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_func_generate_signing_key.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_protocol_fn_func_verifying_key_from_signing_key.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_func_verifying_key_from_signing_key.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -925,6 +942,11 @@ _UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind.argtypes 
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signing_key_bytes.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signing_key_bytes.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_accept.argtypes = (
     ctypes.c_uint64,
 )
@@ -1063,6 +1085,11 @@ _UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp.ar
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp.restype = ctypes.c_uint64
+_UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_accept.argtypes = (
     ctypes.c_uint64,
 )
@@ -1102,6 +1129,12 @@ _UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumpt
 _UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_func_generate_signing_key.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_func_generate_signing_key.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data.restype = ctypes.c_uint16
@@ -1114,6 +1147,9 @@ _UniffiLib.uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data
 _UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomlistener_accept.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomlistener_accept.restype = ctypes.c_uint16
@@ -1204,6 +1240,9 @@ _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id.resty
 _UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_accept.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_accept.restype = ctypes.c_uint16
@@ -3451,6 +3490,33 @@ class PhantomListener(PhantomListenerProtocol):
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
+    @classmethod
+    async def bind_with_signing_key_bytes(cls, addr: str,signing_key: bytes) -> PhantomListener:
+        """
+        Bind a TCP listener using a persisted 64-byte signing seed (from
+        [`generate_signing_key`](crate::api::identity::generate_signing_key)) as the
+        server's long-lived identity, so `verifying_key_bytes()` — the value clients pin
+        — stays stable across restarts. The FFI analogue of the Rust-only
+        [`bind_with_signing_key`](Self::bind_with_signing_key).
+"""
+        
+        _UniffiFfiConverterString.check_lower(addr)
+
+        _UniffiFfiConverterBytes.check_lower(signing_key)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(addr),
+            _UniffiFfiConverterBytes.lower(signing_key),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypePhantomListener.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signing_key_bytes(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_u64,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_u64,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_u64,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
     
     def __init__(self, *args, **kwargs):
         raise ValueError("This class has no default constructor")
@@ -3643,7 +3709,7 @@ class PhantomUdpListener(PhantomUdpListenerProtocol):
         Bind a PhantomUDP listener on `addr` with a fresh per-process signing
         identity. For a persistent pinned identity across restarts use
         [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key) (Rust-only)
-        or `bind_udp_with_signing_key_bytes` (FFI — see roadmap A2).
+        or [`bind_udp_with_signing_key_bytes`](Self::bind_udp_with_signing_key_bytes) (FFI).
 """
         
         _UniffiFfiConverterString.check_lower(addr)
@@ -3654,6 +3720,33 @@ class PhantomUdpListener(PhantomUdpListenerProtocol):
         _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
         return await _uniffi_rust_call_async(
             _UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(*_uniffi_lowered_args),
+            _UniffiLib.ffi_phantom_protocol_rust_future_poll_u64,
+            _UniffiLib.ffi_phantom_protocol_rust_future_complete_u64,
+            _UniffiLib.ffi_phantom_protocol_rust_future_free_u64,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+    @classmethod
+    async def bind_udp_with_signing_key_bytes(cls, addr: str,signing_key: bytes) -> PhantomUdpListener:
+        """
+        Bind a PhantomUDP listener using a persisted 64-byte signing seed (from
+        [`generate_signing_key`](crate::api::identity::generate_signing_key)) as the
+        server's long-lived identity, so `verifying_key_bytes()` stays stable across
+        restarts. FFI analogue of the Rust-only
+        [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key).
+"""
+        
+        _UniffiFfiConverterString.check_lower(addr)
+
+        _UniffiFfiConverterBytes.check_lower(signing_key)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(addr),
+            _UniffiFfiConverterBytes.lower(signing_key),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypePhantomUdpListener.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes(*_uniffi_lowered_args),
             _UniffiLib.ffi_phantom_protocol_rust_future_poll_u64,
             _UniffiLib.ffi_phantom_protocol_rust_future_complete_u64,
             _UniffiLib.ffi_phantom_protocol_rust_future_free_u64,
@@ -3960,6 +4053,47 @@ async def connect_pinned_with_resumption(host: str,port: int,pinned_key: bytes,h
         _uniffi_lift_return,
         _uniffi_error_converter,
     )
+def generate_signing_key() -> bytes:
+    """
+    Generate a fresh hybrid (Ed25519 + ML-DSA-65) signing key and return its 64-byte
+    seed (`ed25519_seed[32] || ml_dsa_seed[32]`). A pairwise-consistency check runs
+    before the seed is returned, so a key that cannot verify its own signature is
+    never handed out (matching `phantom-cli keygen`).
+
+    **The returned `Vec<u8>` is secret key material.** It is not zeroized when it
+    crosses the FFI boundary — persist it with restrictive permissions (0600) and wipe
+    the buffer when done. Load it back into a listener with
+    `bind_with_signing_key_bytes` / `bind_udp_with_signing_key_bytes`.
+"""
+    _uniffi_lowered_args = (
+    )
+    _uniffi_lift_return = _UniffiFfiConverterBytes.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_phantom_protocol_fn_func_generate_signing_key,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def verifying_key_from_signing_key(seed: bytes) -> bytes:
+    """
+    Derive the public verifying-key bytes (for client pinning) from a 64-byte signing
+    seed produced by [`generate_signing_key`]. Returns the same bytes a server's
+    `verifying_key_bytes()` would return after loading the seed.
+"""
+    
+    _UniffiFfiConverterBytes.check_lower(seed)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterBytes.lower(seed),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterBytes.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeCoreError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_phantom_protocol_fn_func_verifying_key_from_signing_key,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
 
 __all__ = [
     "InternalError",
@@ -3973,6 +4107,8 @@ __all__ = [
     "connect_pinned_udp",
     "connect_pinned_udp_with_resumption",
     "connect_pinned_with_resumption",
+    "generate_signing_key",
+    "verifying_key_from_signing_key",
     "PhantomStream",
     "PhantomStreamProtocol",
     "PhantomSession",
