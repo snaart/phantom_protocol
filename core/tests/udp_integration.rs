@@ -1677,3 +1677,129 @@ async fn udp_integration_ffi_migrate_survives_mid_exchange() {
 
     server.await.unwrap();
 }
+
+/// Stronger headline regression: proves the FFI `connect_pinned_udp` `migrate()`
+/// performs a REAL local-socket rebind, not the silent no-op it would be over TCP
+/// (or if the migration control surface were swallowed before reaching
+/// `UdpClientTransport::migrate`). A relay between client and server records every
+/// distinct client source address; a real rebind makes the relay observe a NEW
+/// source after `migrate()` (a no-op would keep exactly one). The reliable byte
+/// stream also survives the migration byte-exact through the relay. The server-side
+/// migration-follow is covered separately by
+/// `udp_integration_migration_survives_mid_exchange`; here the relay masks the move
+/// from the server so the assertion isolates the CLIENT rebind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_ffi_migrate_actually_rebinds_through_relay() {
+    use phantom_protocol::api::session::connect_pinned_udp;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::UdpSocket;
+    const ROUNDS: usize = 6;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        for _ in 0..ROUNDS {
+            let m = session.recv().await.expect("server recv");
+            session.send(m).await.expect("server echo");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+
+    // Relay (client <-> relay <-> server) recording every DISTINCT client source
+    // address. A real migrate() rebinds the client's local socket -> a new source
+    // port -> a second distinct address here; a no-op migrate would keep one.
+    //
+    // Design: two UNCONNECTED sockets on the relay side. The inbound (facing client)
+    // socket `relay` records client source addresses and forwards c2s to server_addr.
+    // The outbound (facing server) socket `upstream` sends c2s using send_to and
+    // receives s2c using recv_from; all s2c arrives from server_addr and is routed
+    // back to the last-known client_addr. Unconnected sockets are used on both sides
+    // to ensure recv_from sees the actual source (no connected-socket filtering).
+    let client_srcs: Arc<Mutex<HashSet<std::net::SocketAddr>>> =
+        Arc::new(Mutex::new(HashSet::new()));
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let srcs = client_srcs.clone();
+    tokio::spawn(async move {
+        let mut c2s = vec![0u8; 2048];
+        let mut s2c = vec![0u8; 2048];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        let mut c2s_count = 0u32;
+        let mut s2c_count = 0u32;
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s) => {
+                    let (n, from) = match r { Ok(x) => x, Err(_) => continue };
+                    c2s_count += 1;
+                    eprintln!("[relay] c2s #{c2s_count}: from={from}, n={n}, client_addr={client_addr:?}");
+                    client_addr = Some(from);
+                    srcs.lock().unwrap().insert(from);
+                    let _ = upstream.send_to(&c2s[..n], server_addr).await;
+                }
+                r = upstream.recv_from(&mut s2c) => {
+                    let (n, src) = match r { Ok(x) => x, Err(_) => continue };
+                    s2c_count += 1;
+                    eprintln!("[relay] s2c #{s2c_count}: from={src}, n={n}, to={client_addr:?}");
+                    if let Some(ca) = client_addr {
+                        let _ = relay.send_to(&s2c[..n], ca).await;
+                    }
+                }
+            }
+        }
+    });
+
+    // Build the client THROUGH the FFI shim, pointed at the relay.
+    let client = connect_pinned_udp("127.0.0.1".to_string(), relay_addr.port(), key_bytes)
+        .await
+        .expect("connect_pinned_udp");
+
+    let m0 = b"round-0-pre-migration".to_vec();
+    client.send(m0.clone()).await.expect("send 0");
+    let e0 = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv 0");
+    assert_eq!(e0, m0, "pre-migration echo must be byte-exact");
+    let before = client_srcs.lock().unwrap().len();
+    assert!(before >= 1, "the client's original source must be seen pre-migration");
+
+    // The FFI-exported migrate() must perform a real local-socket rebind.
+    client.migrate("127.0.0.1:0".to_string()).await.expect("migrate");
+
+    // Give the new socket a moment to bind and the path validation to complete
+    // before the post-migration sends, so the relay sees the new source address.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for i in 1..ROUNDS {
+        let m = format!("round-{i}-post-migration-{}", "x".repeat(i * 7)).into_bytes();
+        eprintln!("[test] round {i}: sending {} bytes", m.len());
+        client.send(m.clone()).await.expect("send post-migration");
+        eprintln!("[test] round {i}: waiting for recv");
+        let e = timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("no timeout (the FFI session must survive the migration)")
+            .expect("recv post-migration");
+        eprintln!("[test] round {i}: received {} bytes", e.len());
+        assert_eq!(e, m, "post-migration echo must be byte-exact (round {i})");
+    }
+
+    // The relay observed a NEW client source address after migrate(): proof the FFI
+    // migrate() actually rebound the local socket (a no-op would keep exactly one).
+    let after = client_srcs.lock().unwrap().len();
+    assert!(
+        after >= 2 && after > before,
+        "FFI migrate() must rebind the client socket to a new source address \
+         (distinct client sources before {before}, after {after}); a no-op migrate \
+         would keep exactly one"
+    );
+
+    server.await.unwrap();
+}
