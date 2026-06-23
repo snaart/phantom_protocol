@@ -369,6 +369,17 @@ impl PhantomListener {
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::Acquire)
     }
+
+    /// Enable or disable 0-RTT early-data acceptance (default: enabled). When
+    /// disabled, resuming clients' early-data is rejected and resent in a 1-RTT
+    /// exchange — the zero-infrastructure defence against 0-RTT replay for a
+    /// deployment that cannot guarantee a single coherent resumption cache.
+    /// Resumption / early-data ride the transport-agnostic `ClientHello`, so
+    /// this applies to the TCP path too. See
+    /// [`HandshakeServer::set_early_data_enabled`].
+    pub fn set_early_data_enabled(&self, enabled: bool) {
+        self.handshake_server.set_early_data_enabled(enabled);
+    }
 }
 
 // Rust-only accessors (not UniFFI-exported because the return type
@@ -379,15 +390,6 @@ impl PhantomListener {
     /// to share the listener's counter set.
     pub fn observability(&self) -> Arc<Observability> {
         self.observability.clone()
-    }
-
-    /// Enable or disable 0-RTT early-data acceptance (A2b; default enabled). When disabled,
-    /// resuming clients' early-data is rejected and resent 1-RTT — the zero-infrastructure
-    /// defence against 0-RTT replay for a deployment that cannot guarantee a single coherent
-    /// resumption cache. Resumption / early-data ride the transport-agnostic `ClientHello`, so
-    /// this applies to the TCP path too. Rust-only. See [`HandshakeServer::set_early_data_enabled`].
-    pub fn set_early_data_enabled(&self, enabled: bool) {
-        self.handshake_server.set_early_data_enabled(enabled);
     }
 
     /// Install a distributed 0-RTT anti-replay store (A2b) for replay-safe 0-RTT in a
