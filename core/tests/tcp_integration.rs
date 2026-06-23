@@ -677,5 +677,9 @@ async fn tcp_bind_with_signing_key_bytes_is_stable_across_restart() {
     let l2 = PhantomListener::bind_with_signing_key_bytes("127.0.0.1:0".to_string(), seed)
         .await
         .expect("bind 2");
-    assert_eq!(vk1, l2.verifying_key_bytes(), "a persisted seed must yield a stable pinned identity");
+    assert_eq!(
+        vk1,
+        l2.verifying_key_bytes(),
+        "a persisted seed must yield a stable pinned identity"
+    );
 }
