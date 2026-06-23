@@ -321,6 +321,14 @@ impl SessionTransport for UdpClientTransport {
                 if buf_prev.len() < PATH_MTU + 64 {
                     buf_prev.resize(PATH_MTU + 64, 0);
                 }
+                // Also wake on a migration that happens while we are parked in the
+                // overlap select. This covers (a) a SECOND migrate_to() during an
+                // existing overlap, and (b) a torn read at the loop top that snapshotted
+                // a stale (active, prev) pair across migrate_to()'s two ArcSwap stores —
+                // both would otherwise block on stale/silent sockets. migrate_to()'s
+                // Notify permit (stored before we reach this select) lets us re-enter the
+                // loop and re-snapshot both sockets instead of hanging.
+                let migrate_notified = self.migrate_notify.notified();
                 tokio::select! {
                     r = active.recv_from(&mut buf) => match classify_recv(r) {
                         RecvAction::Got(n, src) => (n, false, src),
@@ -342,6 +350,11 @@ impl SessionTransport for UdpClientTransport {
                             return Err(CoreError::NetworkError(format!("udp recv: {e}")))
                         }
                     },
+                    _ = migrate_notified => {
+                        // Re-snapshot active/prev on the next iteration (closes the
+                        // overlap-arm migration hang and the loop-top torn-read race).
+                        continue;
+                    }
                 }
             } else {
                 let migrate_notified = self.migrate_notify.notified();
