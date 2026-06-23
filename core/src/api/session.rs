@@ -180,6 +180,22 @@ pub struct ResumptionHint {
     pub resumption_secret: Vec<u8>,
 }
 
+impl ResumptionHint {
+    /// Construct a `ResumptionHint` from raw byte vectors.
+    ///
+    /// Both `session_id` and `resumption_secret` must be 32 bytes; validation is
+    /// deferred to the caller (the `connect_pinned_*_with_resumption` free functions
+    /// or `PhantomSession::connect_with_resumption`). The constructor is provided so
+    /// external crates (integration tests, FFI consumers) can build a hint from
+    /// stored bytes without hitting the `#[non_exhaustive]` restriction.
+    pub fn new(session_id: Vec<u8>, resumption_secret: Vec<u8>) -> Self {
+        Self {
+            session_id,
+            resumption_secret,
+        }
+    }
+}
+
 // INFOLEAK-1: hand-written redacting `Debug` (not derived) so a mobile/FFI
 // consumer that logs the hint with `{:?}` cannot leak the 0-RTT `resumption_secret`
 // — the one secret-bearing type that crosses the FFI boundary. Mirrors the
@@ -3360,6 +3376,74 @@ pub async fn connect_pinned_udp(
     Ok(Arc::new(session))
 }
 
+/// 0-RTT resumption analogue of [`connect_pinned_udp`] — the UDP sibling of
+/// [`connect_pinned_with_resumption`].
+///
+/// `hint` is a [`ResumptionHint`] from a prior session's
+/// [`PhantomSession::resumption_hint`]; both of its fields must be exactly 32 bytes
+/// or the call fails with `ValidationError` before any socket is opened. `early_data`
+/// (≤ 16 KiB) is sealed into the resuming ClientHello — an oversized blob is likewise
+/// rejected before the UDP socket is bound. Acceptance is best-effort (security
+/// invariant 9): an unknown/stale ticket completes 1-RTT and the caller checks
+/// [`PhantomSession::early_data_accepted`] and re-sends when it is not `Some(true)`.
+/// Like [`connect_pinned_udp`], the first resolved address is used with no fallback.
+/// Native-only.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
+pub async fn connect_pinned_udp_with_resumption(
+    host: String,
+    port: u16,
+    pinned_key: Vec<u8>,
+    hint: ResumptionHint,
+    early_data: Vec<u8>,
+) -> Result<Arc<PhantomSession>, CoreError> {
+    #[cfg(feature = "fips")]
+    crate::crypto::self_tests::ensure_post_passed()
+        .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
+
+    let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
+        .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
+
+    let session_id: [u8; 32] = hint.session_id.as_slice().try_into().map_err(|_| {
+        CoreError::ValidationError(format!(
+            "resumption hint session_id must be 32 bytes, got {}",
+            hint.session_id.len()
+        ))
+    })?;
+    let resumption_secret: [u8; 32] =
+        hint.resumption_secret.as_slice().try_into().map_err(|_| {
+            CoreError::ValidationError(format!(
+                "resumption hint resumption_secret must be 32 bytes, got {}",
+                hint.resumption_secret.len()
+            ))
+        })?;
+
+    if early_data.len() > EARLY_DATA_MAX_LEN {
+        return Err(CoreError::ValidationError(format!(
+            "early_data is {} bytes, exceeds the {}-byte 0-RTT cap",
+            early_data.len(),
+            EARLY_DATA_MAX_LEN
+        )));
+    }
+
+    let addr = format!("{}:{}", host, port);
+    let server: std::net::SocketAddr = tokio::net::lookup_host(&addr)
+        .await
+        .map_err(|e| CoreError::NetworkError(format!("resolve {}: {}", addr, e)))?
+        .next()
+        .ok_or_else(|| CoreError::NetworkError(format!("no address for {}", addr)))?;
+
+    let transport = crate::api::udp_transport::UdpClientTransport::connect(server).await?;
+    let session = PhantomSession::connect_with_resumption(
+        &addr,
+        transport,
+        expected_server_key,
+        (session_id, resumption_secret),
+        early_data,
+    )?;
+    Ok(Arc::new(session))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6433,6 +6517,34 @@ mod tests {
         };
 
         let err = connect_pinned_with_resumption(
+            "127.0.0.1".to_string(),
+            9,
+            pinned,
+            bad_hint,
+            Vec::new(),
+        )
+        .await
+        .expect_err("a 5-byte session_id must be rejected");
+
+        assert!(
+            matches!(err, CoreError::ValidationError(_)),
+            "expected ValidationError, got {err:?}"
+        );
+    }
+
+    /// `connect_pinned_udp_with_resumption` validates the `ResumptionHint`
+    /// field lengths *before* resolving the host or binding a UDP socket — a
+    /// malformed hint is a caller bug and surfaces as `ValidationError`, never
+    /// a network round-trip. UDP sibling of
+    /// `connect_pinned_with_resumption_rejects_malformed_hint`.
+    #[tokio::test]
+    async fn connect_pinned_udp_with_resumption_rejects_malformed_hint() {
+        let server_hs = HandshakeServer::new().unwrap();
+        let pinned = server_hs.verifying_key().to_bytes();
+
+        let bad_hint = ResumptionHint::new(vec![0u8; 5], vec![0u8; 32]); // not 32 bytes
+
+        let err = connect_pinned_udp_with_resumption(
             "127.0.0.1".to_string(),
             9,
             pinned,

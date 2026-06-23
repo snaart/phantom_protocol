@@ -1551,3 +1551,56 @@ async fn udp_integration_shaping_set_before_establishment_applies() {
 
     server.await.unwrap();
 }
+
+/// Smoke-tests `connect_pinned_udp_with_resumption` over a live UDP loopback: an
+/// unknown (synthetic) hint forces the server to reject 0-RTT and fall back to a
+/// normal 1-RTT handshake (security invariant 9), and the byte-exact round-trip
+/// still succeeds. Empty early_data avoids the rejected-early-data re-queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_ffi_connect_pinned_udp_resumption_1rtt_fallback() {
+    use phantom_protocol::api::session::connect_pinned_udp_with_resumption;
+    use phantom_protocol::api::session::ResumptionHint;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let local: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        let msg = session.recv().await.expect("server recv");
+        assert_eq!(msg, b"ffi-udp-resume-hello");
+        session
+            .send(b"ffi-udp-resume-reply".to_vec())
+            .await
+            .expect("server send");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    // A synthetic (unknown) hint: the server has no matching ticket, so the
+    // handshake falls back to 1-RTT (security invariant 9). We pass empty
+    // early_data so nothing is re-queued on rejection (C3 retransmit contract).
+    // The test exercises the connect path over UDP, not 0-RTT acceptance.
+    let hint = ResumptionHint::new(vec![7u8; 32], vec![9u8; 32]);
+    let client = connect_pinned_udp_with_resumption(
+        "127.0.0.1".to_string(),
+        local.port(),
+        key_bytes,
+        hint,
+        vec![],
+    )
+    .await
+    .expect("connect_pinned_udp_with_resumption");
+    client
+        .send(b"ffi-udp-resume-hello".to_vec())
+        .await
+        .expect("client send");
+    let reply = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(reply, b"ffi-udp-resume-reply");
+    server.await.unwrap();
+}
