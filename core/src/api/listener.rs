@@ -304,6 +304,13 @@ impl PhantomListener {
         self.handshake_server.verifying_key().to_bytes()
     }
 
+    /// Flat snapshot of the listener's aggregated connection metrics (all
+    /// accepted sessions share this counter set). Lock-free read; available
+    /// with or without `telemetry-otel`.
+    pub fn metrics_snapshot(&self) -> crate::observability::MetricsSnapshotFfi {
+        self.observability.snapshot().into()
+    }
+
     /// Local socket address the listener is actually bound to (resolved at
     /// bind time). Useful when the caller passed `"host:0"` and needs to
     /// learn which port the OS assigned.

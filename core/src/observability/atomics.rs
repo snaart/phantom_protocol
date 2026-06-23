@@ -85,6 +85,14 @@ pub(crate) struct HotPathAtomics {
     handshake_latency_ns_sum: CachePadded<AtomicU64>,
     handshake_latency_count: CachePadded<AtomicU64>,
 
+    /// Security counters. These are always-on lock-free totals surfaced
+    /// through the cold-path snapshot regardless of whether the
+    /// `telemetry-otel` feature is enabled. The labeled OTel instruments
+    /// (in `instruments.rs`) record the same events with attribution; both
+    /// paths are driven together by the facade in `mod.rs`.
+    replay_rejected_total: CachePadded<AtomicU64>,
+    aead_failure_total: CachePadded<AtomicU64>,
+
     /// Process-start timestamp for uptime calculation. Set once at
     /// construction; the snapshot reader computes `elapsed()` on read.
     started_at: Instant,
@@ -110,6 +118,8 @@ impl HotPathAtomics {
             handshake_failure_count: CachePadded::new(AtomicU64::new(0)),
             handshake_latency_ns_sum: CachePadded::new(AtomicU64::new(0)),
             handshake_latency_count: CachePadded::new(AtomicU64::new(0)),
+            replay_rejected_total: CachePadded::new(AtomicU64::new(0)),
+            aead_failure_total: CachePadded::new(AtomicU64::new(0)),
             started_at: Instant::now(),
         }
     }
@@ -193,6 +203,24 @@ impl HotPathAtomics {
         self.handshake_failure_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment the always-on replay-rejected total. The facade's
+    /// `record_replay_rejected` calls this before forwarding to the OTel
+    /// instruments, so the counter is populated even when `telemetry-otel`
+    /// is off.
+    #[inline]
+    pub(crate) fn record_replay_rejected(&self) {
+        self.replay_rejected_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the always-on AEAD-failure total. The facade's
+    /// `record_aead_failure` calls this before forwarding to the OTel
+    /// instruments, so the counter is populated even when `telemetry-otel`
+    /// is off.
+    #[inline]
+    pub(crate) fn record_aead_failure(&self) {
+        self.aead_failure_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     // --- Read accessors (cold path) ---
 
     pub(crate) fn packets_total(&self, dir: usize) -> u64 {
@@ -262,6 +290,14 @@ impl HotPathAtomics {
 
     pub(crate) fn handshake_latency_count(&self) -> u64 {
         self.handshake_latency_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn replay_rejected_total(&self) -> u64 {
+        self.replay_rejected_total.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn aead_failure_total(&self) -> u64 {
+        self.aead_failure_total.load(Ordering::Relaxed)
     }
 
     pub(crate) fn uptime_secs(&self) -> u64 {
@@ -357,6 +393,20 @@ mod tests {
         h.stream_opened();
         h.stream_closed();
         assert_eq!(h.active_streams(), 1);
+    }
+
+    #[test]
+    fn security_counters_increment_independently() {
+        let h = HotPathAtomics::new();
+        assert_eq!(h.replay_rejected_total(), 0);
+        assert_eq!(h.aead_failure_total(), 0);
+
+        h.record_replay_rejected();
+        h.record_replay_rejected();
+        h.record_aead_failure();
+
+        assert_eq!(h.replay_rejected_total(), 2);
+        assert_eq!(h.aead_failure_total(), 1);
     }
 
     #[test]
