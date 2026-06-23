@@ -14,6 +14,7 @@
 //! `WasiRuntime`) for a TCP-shaped
 //! transport over WASI Preview 2 sockets.
 
+pub mod identity;
 pub mod session;
 pub mod stream;
 
