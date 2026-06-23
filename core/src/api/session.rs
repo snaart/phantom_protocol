@@ -444,7 +444,7 @@ impl PhantomSession {
         expected_server_key: HybridVerifyingKey,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
-        Self::spawn_client(peer_addr, transport, expected_server_key, runtime, None)
+        Self::spawn_client(peer_addr, transport, expected_server_key, runtime, None, None)
     }
 
     /// Connect with a **0-RTT resumption attempt**.
@@ -493,7 +493,48 @@ impl PhantomSession {
             expected_server_key,
             Arc::new(TokioRuntime),
             Some((resume_id, resume_secret, early_data)),
+            None,
         ))
+    }
+
+    /// Like [`connect_with_transport_with_runtime`](Self::connect_with_transport_with_runtime)
+    /// but also applies [`PhantomConfig`](crate::config::PhantomConfig) liveness settings to
+    /// the session once the handshake completes. Rust-only.
+    pub fn connect_with_transport_with_config<T: SessionTransport>(
+        peer_addr: &str,
+        transport: T,
+        expected_server_key: HybridVerifyingKey,
+        config: crate::config::PhantomConfig,
+    ) -> Self {
+        let liveness = config.liveness();
+        Self::spawn_client(
+            peer_addr,
+            transport,
+            expected_server_key,
+            Arc::new(TokioRuntime),
+            None,
+            Some(liveness),
+        )
+    }
+
+    /// Composition of [`connect_with_transport_with_config`](Self::connect_with_transport_with_config)
+    /// and a custom [`Runtime`] — supply both a config and a non-tokio runtime. Rust-only.
+    pub fn connect_with_transport_with_runtime_and_config<T: SessionTransport>(
+        peer_addr: &str,
+        transport: T,
+        expected_server_key: HybridVerifyingKey,
+        runtime: Arc<dyn Runtime>,
+        config: crate::config::PhantomConfig,
+    ) -> Self {
+        let liveness = config.liveness();
+        Self::spawn_client(
+            peer_addr,
+            transport,
+            expected_server_key,
+            runtime,
+            None,
+            Some(liveness),
+        )
     }
 
     /// Shared constructor body for [`connect_with_transport_with_runtime`]
@@ -506,6 +547,7 @@ impl PhantomSession {
         expected_server_key: HybridVerifyingKey,
         runtime: Arc<dyn Runtime>,
         resumption_request: Option<([u8; 32], [u8; 32], Vec<u8>)>,
+        liveness: Option<crate::transport::liveness::LivenessConfig>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (recv_tx, recv_rx) = mpsc::channel(256);
@@ -563,6 +605,7 @@ impl PhantomSession {
             shaping,
             resumption_request,
             observability,
+            liveness,
         )));
 
         session
@@ -688,6 +731,7 @@ impl PhantomSession {
         shaping: Arc<parking_lot::Mutex<TrafficShapingConfig>>,
         resumption_request: Option<([u8; 32], [u8; 32], Vec<u8>)>,
         observability: Arc<Observability>,
+        liveness: Option<crate::transport::liveness::LivenessConfig>,
     ) {
         // DEBUG: the peer address is correlatable; keep it off default logs.
         log::debug!("PhantomSession: starting handshake with {}", peer);
@@ -763,6 +807,9 @@ impl PhantomSession {
         // `set_traffic_shaping`. A later `set_traffic_shaping` re-applies live.
         apply_shaping(&crypto_session, *shaping.lock());
         *early_data_accepted.lock().await = ed_accepted;
+        if let Some(live) = liveness {
+            crypto_session.set_liveness_config(live);
+        }
 
         // C3 — 0-RTT rejection retransmission contract. If we sent early-data
         // and the server rejected it (`Some(false)`), it never reached the
@@ -3219,6 +3266,38 @@ pub async fn connect_pinned(
     Ok(Arc::new(session))
 }
 
+/// Like [`connect_pinned`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
+/// liveness settings to the session. FFI-exported.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
+pub async fn connect_pinned_with_config(
+    host: String,
+    port: u16,
+    pinned_key: Vec<u8>,
+    config: crate::config::PhantomConfig,
+) -> Result<Arc<PhantomSession>, CoreError> {
+    #[cfg(feature = "fips")]
+    crate::crypto::self_tests::ensure_post_passed()
+        .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
+    let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
+        .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
+    let addr = format!("{}:{}", host, port);
+    let stream = tokio::net::TcpStream::connect(&addr)
+        .await
+        .map_err(|e| CoreError::NetworkError(format!("connect {}: {}", addr, e)))?;
+    let transport = crate::api::tcp_transport::TcpSessionTransport::new(stream);
+    let liveness = config.liveness();
+    let session = PhantomSession::spawn_client(
+        &addr,
+        transport,
+        expected_server_key,
+        Arc::new(TokioRuntime),
+        None,
+        Some(liveness),
+    );
+    Ok(Arc::new(session))
+}
+
 /// Connect to a pinned server over the **TLS-over-TCP active-mimicry** transport
 /// (`mimicry` feature) — the flow looks like an ordinary HTTPS handshake to an
 /// on-path observer, while the real authentication / confidentiality remains the
@@ -3388,6 +3467,40 @@ pub async fn connect_pinned_udp(
 
     let transport = crate::api::udp_transport::UdpClientTransport::connect(server).await?;
     let session = PhantomSession::connect_with_transport(&addr, transport, expected_server_key);
+    Ok(Arc::new(session))
+}
+
+/// Like [`connect_pinned_udp`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
+/// liveness settings. FFI-exported.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
+pub async fn connect_pinned_udp_with_config(
+    host: String,
+    port: u16,
+    pinned_key: Vec<u8>,
+    config: crate::config::PhantomConfig,
+) -> Result<Arc<PhantomSession>, CoreError> {
+    #[cfg(feature = "fips")]
+    crate::crypto::self_tests::ensure_post_passed()
+        .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
+    let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
+        .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
+    let addr = format!("{}:{}", host, port);
+    let server: std::net::SocketAddr = tokio::net::lookup_host(&addr)
+        .await
+        .map_err(|e| CoreError::NetworkError(format!("resolve {}: {}", addr, e)))?
+        .next()
+        .ok_or_else(|| CoreError::NetworkError(format!("no address for {}", addr)))?;
+    let transport = crate::api::udp_transport::UdpClientTransport::connect(server).await?;
+    let liveness = config.liveness();
+    let session = PhantomSession::spawn_client(
+        &addr,
+        transport,
+        expected_server_key,
+        Arc::new(TokioRuntime),
+        None,
+        Some(liveness),
+    );
     Ok(Arc::new(session))
 }
 

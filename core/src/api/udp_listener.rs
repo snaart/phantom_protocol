@@ -59,6 +59,9 @@ pub struct PhantomUdpListener {
     /// Live gauge mirroring the demux `routes` table size (H-1 observability). The
     /// demux owns the table; this lets `active_route_count()` read it without a lock.
     active_routes: Arc<AtomicUsize>,
+    /// Optional liveness config derived from a `PhantomConfig` supplied at bind time.
+    /// When `Some`, applied to every accepted session immediately after the handshake.
+    liveness: Option<crate::transport::liveness::LivenessConfig>,
 }
 
 impl PhantomUdpListener {
@@ -73,13 +76,14 @@ impl PhantomUdpListener {
         addr: String,
         signing_key: HybridSigningKey,
     ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(signing_key)).await
+        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(signing_key), None).await
     }
 
     async fn bind_inner(
         addr: String,
         runtime: Arc<dyn Runtime>,
         signing_key: Option<HybridSigningKey>,
+        config: Option<crate::config::PhantomConfig>,
     ) -> Result<Arc<Self>, CoreError> {
         #[cfg(feature = "fips")]
         crate::crypto::self_tests::ensure_post_passed()
@@ -90,9 +94,16 @@ impl PhantomUdpListener {
         let local_addr = socket
             .local_addr()
             .map_err(|e| CoreError::NetworkError(format!("local_addr: {e}")))?;
-        let hs = match signing_key {
-            Some(sk) => HandshakeServer::with_signing_key(sk),
-            None => HandshakeServer::new(),
+        let hs = match (signing_key, config.as_ref()) {
+            (Some(sk), Some(cfg)) => {
+                HandshakeServer::with_signing_key_and_cache(sk, cfg.session_cache())
+            }
+            (Some(sk), None) => HandshakeServer::with_signing_key(sk),
+            (None, Some(cfg)) => {
+                let (sk, _vk) = HybridSigningKey::generate();
+                HandshakeServer::with_signing_key_and_cache(sk, cfg.session_cache())
+            }
+            (None, None) => HandshakeServer::new(),
         }
         .map_err(|e| CoreError::InternalError(e.to_string()))?;
         let (accepted_tx, accepted_rx) = mpsc::channel(MAX_INFLIGHT_HANDSHAKES);
@@ -109,6 +120,7 @@ impl PhantomUdpListener {
             accepted_rx: Mutex::new(accepted_rx),
             demux: parking_lot::Mutex::new(None),
             active_routes: Arc::new(AtomicUsize::new(0)),
+            liveness: config.map(|c| c.liveness()),
         }))
     }
 
@@ -149,7 +161,7 @@ impl PhantomUdpListener {
     /// or [`bind_udp_with_signing_key_bytes`](Self::bind_udp_with_signing_key_bytes) (FFI).
     #[cfg_attr(feature = "bindings", uniffi::constructor)]
     pub async fn bind_udp(addr: String) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, Arc::new(TokioRuntime), None).await
+        Self::bind_inner(addr, Arc::new(TokioRuntime), None, None).await
     }
 
     /// Bind a PhantomUDP listener using a persisted 64-byte signing seed (from
@@ -164,7 +176,22 @@ impl PhantomUdpListener {
     ) -> Result<Arc<Self>, CoreError> {
         let sk = HybridSigningKey::from_bytes(&signing_key)
             .map_err(|e| CoreError::CryptoError(format!("invalid signing key seed: {e}")))?;
-        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(sk)).await
+        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(sk), None).await
+    }
+
+    /// Bind a PhantomUDP listener using a persisted 64-byte signing seed and a
+    /// [`PhantomConfig`](crate::config::PhantomConfig) that controls liveness settings
+    /// and session-cache sizing. FFI analogue of the Rust-only
+    /// [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key) + config combination.
+    #[cfg_attr(feature = "bindings", uniffi::constructor)]
+    pub async fn bind_udp_with_config_bytes(
+        addr: String,
+        signing_key: Vec<u8>,
+        config: crate::config::PhantomConfig,
+    ) -> Result<Arc<Self>, CoreError> {
+        let sk = HybridSigningKey::from_bytes(&signing_key)
+            .map_err(|e| CoreError::CryptoError(format!("invalid signing key seed: {e}")))?;
+        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(sk), Some(config)).await
     }
 
     /// The server's long-lived hybrid verifying key (`HybridVerifyingKey::to_bytes`).
@@ -578,6 +605,7 @@ fn spawn_handshake_task(
     let runtime = listener.runtime.clone();
     let observability = listener.observability.clone();
     let accepted_tx = listener.accepted_tx.clone();
+    let liveness = listener.liveness;
     let task_runtime = runtime.clone();
     runtime.spawn(Box::pin(async move {
         let _permit = permit;
@@ -608,10 +636,14 @@ fn spawn_handshake_task(
                 // ε / WIRE v5 (P4b): give the session the demux slide channel so
                 // it can advance its inbound CID window as the peer migrates.
                 server_session.set_cid_slide_tx(slide_tx);
+                let arc_session = Arc::new(server_session);
+                if let Some(live) = liveness {
+                    arc_session.set_liveness_config(live);
+                }
                 let session = PhantomSession::from_accepted_server_session_with_runtime(
                     peer.to_string(),
                     transport,
-                    Arc::new(server_session),
+                    arc_session,
                     task_runtime.clone(),
                     observability.clone(),
                     LegType::Udp,
