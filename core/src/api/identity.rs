@@ -48,7 +48,10 @@ mod tests {
         let vk_from_seed = verifying_key_from_signing_key(seed.clone()).expect("derive vk");
         let sk = HybridSigningKey::from_bytes(&seed).expect("load");
         assert_eq!(vk_from_seed, sk.verifying_key().to_bytes());
-        assert_eq!(vk_from_seed, verifying_key_from_signing_key(seed).expect("derive again"));
+        assert_eq!(
+            vk_from_seed,
+            verifying_key_from_signing_key(seed).expect("derive again")
+        );
     }
 
     #[test]

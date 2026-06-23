@@ -1474,15 +1474,21 @@ mod tests {
 
         // Teach the server the new2 source address (send_bytes loads the active = new2 socket).
         client.send_bytes(b"probe-after-2nd-migrate").await.unwrap();
-        let (_pn, src_new2) = tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
-            .await
-            .expect("server hears the post-second-migrate probe source")
-            .unwrap();
+        let (_pn, src_new2) =
+            tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+                .await
+                .expect("server hears the post-second-migrate probe source")
+                .unwrap();
 
         // Deliver a real datagram to new2. With the fix recv (parked on new2) wakes and
         // returns it; without the fix recv is stuck on the old pair and this times out.
-        for d in
-            encode_datagrams(PacketType::OneRtt, &client.cid(), 9, b"after-double-migrate").unwrap()
+        for d in encode_datagrams(
+            PacketType::OneRtt,
+            &client.cid(),
+            9,
+            b"after-double-migrate",
+        )
+        .unwrap()
         {
             server.send_to(&d, src_new2).await.unwrap();
         }

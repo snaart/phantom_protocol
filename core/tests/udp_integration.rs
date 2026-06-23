@@ -1617,7 +1617,10 @@ async fn udp_integration_listener_shutdown_flag_is_observable() {
     listener.shutdown();
     assert!(listener.is_shutting_down());
     let result = listener.accept().await;
-    assert!(matches!(result, Err(phantom_protocol::CoreError::ConnectionClosed)));
+    assert!(matches!(
+        result,
+        Err(phantom_protocol::CoreError::ConnectionClosed)
+    ));
 }
 
 /// Headline regression: a session built through the FFI shim `connect_pinned_udp`
@@ -1763,10 +1766,16 @@ async fn udp_integration_ffi_migrate_actually_rebinds_through_relay() {
         .expect("recv 0");
     assert_eq!(e0, m0, "pre-migration echo must be byte-exact");
     let before = client_srcs.lock().unwrap().len();
-    assert!(before >= 1, "the client's original source must be seen pre-migration");
+    assert!(
+        before >= 1,
+        "the client's original source must be seen pre-migration"
+    );
 
     // The FFI-exported migrate() must perform a real local-socket rebind.
-    client.migrate("127.0.0.1:0".to_string()).await.expect("migrate");
+    client
+        .migrate("127.0.0.1:0".to_string())
+        .await
+        .expect("migrate");
 
     // Give the new socket a moment to bind and the path validation to complete
     // before the post-migration sends, so the relay sees the new source address.
@@ -1802,15 +1811,22 @@ async fn udp_bind_with_signing_key_bytes_is_stable_across_restart() {
     use phantom_protocol::api::identity::generate_signing_key;
 
     let seed = generate_signing_key().expect("generate");
-    let l1 = PhantomUdpListener::bind_udp_with_signing_key_bytes("127.0.0.1:0".to_string(), seed.clone())
-        .await
-        .expect("bind 1");
+    let l1 = PhantomUdpListener::bind_udp_with_signing_key_bytes(
+        "127.0.0.1:0".to_string(),
+        seed.clone(),
+    )
+    .await
+    .expect("bind 1");
     let vk1 = l1.verifying_key_bytes();
     drop(l1);
     let l2 = PhantomUdpListener::bind_udp_with_signing_key_bytes("127.0.0.1:0".to_string(), seed)
         .await
         .expect("bind 2");
-    assert_eq!(vk1, l2.verifying_key_bytes(), "persisted UDP identity must be stable");
+    assert_eq!(
+        vk1,
+        l2.verifying_key_bytes(),
+        "persisted UDP identity must be stable"
+    );
 }
 
 /// Headline A2 regression: the full FFI server-identity loop. A server generated from a
@@ -1827,10 +1843,17 @@ async fn udp_ffi_persistent_identity_loop_pin_survives_restart() {
     let pinned = verifying_key_from_signing_key(seed.clone()).expect("derive pin");
 
     // First server instance from the seed.
-    let l1 = PhantomUdpListener::bind_udp_with_signing_key_bytes("127.0.0.1:0".to_string(), seed.clone())
-        .await
-        .expect("bind 1");
-    assert_eq!(l1.verifying_key_bytes(), pinned, "bound identity matches the derived pin");
+    let l1 = PhantomUdpListener::bind_udp_with_signing_key_bytes(
+        "127.0.0.1:0".to_string(),
+        seed.clone(),
+    )
+    .await
+    .expect("bind 1");
+    assert_eq!(
+        l1.verifying_key_bytes(),
+        pinned,
+        "bound identity matches the derived pin"
+    );
     let port1 = {
         let a: std::net::SocketAddr = l1.local_addr().parse().unwrap();
         a.port()
@@ -1845,7 +1868,10 @@ async fn udp_ffi_persistent_identity_loop_pin_survives_restart() {
         .await
         .expect("client 1 connects against the pinned identity");
     c1.send(b"v1".to_vec()).await.expect("send");
-    let e1 = timeout(Duration::from_secs(10), c1.recv()).await.expect("no timeout").expect("recv");
+    let e1 = timeout(Duration::from_secs(10), c1.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv");
     assert_eq!(e1, b"v1");
     srv1.await.unwrap();
 
@@ -1868,7 +1894,10 @@ async fn udp_ffi_persistent_identity_loop_pin_survives_restart() {
         .await
         .expect("client reconnects with the SAME pin after restart");
     c2.send(b"v2".to_vec()).await.expect("send");
-    let e2 = timeout(Duration::from_secs(10), c2.recv()).await.expect("no timeout").expect("recv");
+    let e2 = timeout(Duration::from_secs(10), c2.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv");
     assert_eq!(e2, b"v2");
     srv2.await.unwrap();
 }
