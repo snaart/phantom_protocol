@@ -3318,6 +3318,48 @@ pub async fn connect_pinned_with_resumption(
     Ok(Arc::new(session))
 }
 
+/// Connect to a pinned server over the production **PhantomUDP** transport — the
+/// reliable-UDP, migration-capable analogue of [`connect_pinned`].
+///
+/// Unlike the TCP [`connect_pinned`], a session built here runs over
+/// [`UdpClientTransport`](crate::api::udp_transport::UdpClientTransport), so
+/// [`PhantomSession::migrate`] performs a real single-path connection migration
+/// (e.g. Wi-Fi ↔ LTE handover) instead of being a no-op, and liveness /
+/// `Migrating` / `Dead` transitions, path validation, and passive NAT-rebind
+/// recovery are all live for FFI consumers.
+///
+/// `host` is resolved via the system resolver; the **first** returned address is
+/// used. Unlike the TCP [`connect_pinned`] (whose `TcpStream::connect` tries every
+/// resolved address in turn), this does **not** fall back to subsequent addresses
+/// if the first is unreachable — pass an IP literal or a single-family host when
+/// that matters. Server-key pinning is mandatory (security invariant 1).
+/// Native-only, like [`connect_pinned`].
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
+pub async fn connect_pinned_udp(
+    host: String,
+    port: u16,
+    pinned_key: Vec<u8>,
+) -> Result<Arc<PhantomSession>, CoreError> {
+    #[cfg(feature = "fips")]
+    crate::crypto::self_tests::ensure_post_passed()
+        .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
+
+    let expected_server_key = HybridVerifyingKey::from_bytes(&pinned_key)
+        .map_err(|e| CoreError::CryptoError(format!("invalid pinned key: {}", e)))?;
+
+    let addr = format!("{}:{}", host, port);
+    let server: std::net::SocketAddr = tokio::net::lookup_host(&addr)
+        .await
+        .map_err(|e| CoreError::NetworkError(format!("resolve {}: {}", addr, e)))?
+        .next()
+        .ok_or_else(|| CoreError::NetworkError(format!("no address for {}", addr)))?;
+
+    let transport = crate::api::udp_transport::UdpClientTransport::connect(server).await?;
+    let session = PhantomSession::connect_with_transport(&addr, transport, expected_server_key);
+    Ok(Arc::new(session))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

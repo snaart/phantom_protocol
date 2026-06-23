@@ -1453,6 +1453,48 @@ async fn udp_integration_cover_traffic_fills_idle_and_is_dropped() {
     server.await.unwrap();
 }
 
+/// FFI shim smoke test — `connect_pinned_udp` is the UniFFI-exported free function
+/// that opens a UDP client session with key pinning, mirroring `connect_pinned` for TCP.
+/// Verifies the full handshake + encrypted data exchange over the production
+/// `UdpClientTransport` path, reachable by mobile / FFI callers with only
+/// `(host, port, pinned_key)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_ffi_connect_pinned_udp_roundtrip() {
+    use phantom_protocol::api::session::connect_pinned_udp;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let local: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        let msg = session.recv().await.expect("server recv");
+        assert_eq!(msg, b"ffi-udp-hello");
+        session
+            .send(b"ffi-udp-reply".to_vec())
+            .await
+            .expect("server send");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let client = connect_pinned_udp("127.0.0.1".to_string(), local.port(), key_bytes)
+        .await
+        .expect("connect_pinned_udp");
+    client
+        .send(b"ffi-udp-hello".to_vec())
+        .await
+        .expect("client send");
+    let reply = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(reply, b"ffi-udp-reply");
+    server.await.unwrap();
+}
+
 /// #9 — traffic-shaping config can be set BEFORE the (async) client handshake
 /// completes, and is applied when the session installs — so the very first data
 /// packets are already shaped (no "warm up then configure" gap). `set_traffic_shaping`
