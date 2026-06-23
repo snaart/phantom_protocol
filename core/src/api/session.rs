@@ -2922,6 +2922,14 @@ impl PhantomSession {
         Ok(bytes.to_vec())
     }
 
+    /// Flat snapshot of this session's connection metrics. For a client
+    /// session these are its own per-session counters; for a server-accepted
+    /// session they are the owning listener's aggregate (shared handle).
+    /// Lock-free read; available with or without `telemetry-otel`.
+    pub fn metrics_snapshot(&self) -> crate::observability::MetricsSnapshotFfi {
+        self.observability.snapshot().into()
+    }
+
     /// Get the current connection state (lock-free).
     pub fn connection_state(&self) -> ConnectionState {
         ConnectionState::from_u8(self.state.load(Ordering::Relaxed))

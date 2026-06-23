@@ -33,7 +33,7 @@ pub use attrs::{
     ResumptionMode,
 };
 pub use config::{HistogramConfig, ObservabilityConfig, ObservabilityConfigBuilder};
-pub use snapshot::MetricsSnapshot;
+pub use snapshot::{MetricsSnapshot, MetricsSnapshotFfi};
 
 use crate::transport::types::LegType;
 use atomics::HotPathAtomics;
@@ -215,11 +215,13 @@ impl Observability {
 
     #[inline]
     pub fn record_replay_rejected(&self, reason: ReplayReason) {
+        self.atomics.record_replay_rejected();
         self.instruments.record_replay_rejected(reason);
     }
 
     #[inline]
     pub fn record_aead_failure(&self, leg: LegType, algorithm: AeadAlgorithm) {
+        self.atomics.record_aead_failure();
         self.instruments.record_aead_failure(leg, algorithm);
     }
 
@@ -271,6 +273,22 @@ mod tests {
         // Cloning the Arc preserves identity.
         let obs2 = obs.clone();
         assert_eq!(obs2.config().namespace.as_ref(), "myapp");
+    }
+
+    #[test]
+    fn security_counters_surface_through_snapshot() {
+        let obs = Observability::new(ObservabilityConfig::default());
+        let s = obs.snapshot();
+        assert_eq!(s.replay_rejected_total, 0);
+        assert_eq!(s.aead_failure_total, 0);
+
+        obs.record_replay_rejected(ReplayReason::Duplicate);
+        obs.record_replay_rejected(ReplayReason::Duplicate);
+        obs.record_aead_failure(LegType::Tcp, AeadAlgorithm::Aes256Gcm);
+
+        let s = obs.snapshot();
+        assert_eq!(s.replay_rejected_total, 2);
+        assert_eq!(s.aead_failure_total, 1);
     }
 
     #[test]
