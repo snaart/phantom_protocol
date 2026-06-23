@@ -468,6 +468,14 @@ impl AcceptOutcome {
     pub fn has_early_data(&self) -> bool {
         self.early_data.lock().is_some()
     }
+
+    /// The remote socket address this session was accepted from, as a string
+    /// (e.g. `"203.0.113.4:51000"`) — for per-peer admission control / logging
+    /// from FFI consumers. The typed [`peer_addr`](Self::peer_addr) returning
+    /// [`SocketAddr`](std::net::SocketAddr) stays Rust-only.
+    pub fn peer_addr_string(&self) -> String {
+        self.peer_addr.to_string()
+    }
 }
 
 impl AcceptOutcome {
@@ -920,5 +928,24 @@ mod tests {
             "a pre-cookie variant mismatch must not escalate the (possibly spoofed) IP's \
              reputation (M-4)"
         );
+    }
+
+    /// `AcceptOutcome::peer_addr_string()` returns a non-empty address string in
+    /// `"ip:port"` form that round-trips back to a `SocketAddr` — confirms the FFI
+    /// admission-control accessor is wired to the real accepted `peer_addr`.
+    #[test]
+    fn accept_outcome_peer_addr_string_roundtrips() {
+        use crate::api::session::PhantomSession;
+        use std::net::SocketAddr;
+
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let session = PhantomSession::connect("127.0.0.1:54321".to_string());
+        let outcome = AcceptOutcome::new(session, None, peer);
+
+        let s = outcome.peer_addr_string();
+        assert!(!s.is_empty(), "peer_addr_string must not be empty");
+        assert!(s.contains(':'), "peer_addr_string must contain ':' (ip:port form)");
+        let parsed: SocketAddr = s.parse().expect("peer_addr_string must parse as SocketAddr");
+        assert_eq!(parsed, peer, "peer_addr_string must round-trip to the original SocketAddr");
     }
 }
