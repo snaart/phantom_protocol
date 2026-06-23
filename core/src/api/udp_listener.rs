@@ -67,8 +67,8 @@ impl PhantomUdpListener {
     /// fresh one per process — so the verifying-key material clients pin survives
     /// restarts. [`verifying_key_bytes`](Self::verifying_key_bytes) returns the
     /// verifying half of `signing_key`. Rust-only (not UniFFI-exported because
-    /// `HybridSigningKey` is not a UniFFI type; the FFI analogue
-    /// `bind_udp_with_signing_key_bytes` is roadmap A2).
+    /// `HybridSigningKey` is not a UniFFI type; the FFI analogue is
+    /// [`bind_udp_with_signing_key_bytes`](Self::bind_udp_with_signing_key_bytes)).
     pub async fn bind_udp_with_signing_key(
         addr: String,
         signing_key: HybridSigningKey,
@@ -154,7 +154,7 @@ impl PhantomUdpListener {
     /// Bind a PhantomUDP listener on `addr` with a fresh per-process signing
     /// identity. For a persistent pinned identity across restarts use
     /// [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key) (Rust-only)
-    /// or `bind_udp_with_signing_key_bytes` (FFI — see roadmap A2).
+    /// or [`bind_udp_with_signing_key_bytes`](Self::bind_udp_with_signing_key_bytes) (FFI).
     #[cfg_attr(feature = "bindings", uniffi::constructor)]
     pub async fn bind_udp(addr: String) -> Result<Arc<Self>, CoreError> {
         Self::bind_inner(addr, Arc::new(TokioRuntime), None).await

@@ -287,6 +287,7 @@ impl PhantomListener {
     /// — stays stable across restarts. The FFI analogue of the Rust-only
     /// [`bind_with_signing_key`](Self::bind_with_signing_key).
     #[cfg_attr(feature = "bindings", uniffi::constructor)]
+    #[tracing::instrument(name = "phantom.listener.bind_with_signing_key", skip_all, fields(addr = %addr))]
     pub async fn bind_with_signing_key_bytes(
         addr: String,
         signing_key: Vec<u8>,
