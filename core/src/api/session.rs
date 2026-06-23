@@ -2810,11 +2810,13 @@ impl PhantomSession {
     /// # ⚠️ This does not connect
     ///
     /// Despite the name, this constructor never opens a transport, never runs
-    /// the PQC handshake, and never spawns the background data pump. It returns
-    /// an inert shell stuck in [`ConnectionState::Connecting`]: any `send()`
-    /// only queues into an in-memory buffer that is never flushed, and `recv()`
-    /// never yields application bytes. **No bytes ever reach the network.** It
-    /// exists only as a pre-handshake placeholder from an earlier API shape.
+    /// the PQC handshake, and never spawns the background data pump. The
+    /// returned session immediately reports [`ConnectionState::Failed`] so
+    /// misuse is observable: any `connection_state()` check will see `Failed`
+    /// rather than an eternal `Connecting`. `send()` returns an error and
+    /// `recv()` never yields application bytes. **No bytes ever reach the
+    /// network.** It exists only as a pre-handshake placeholder from an earlier
+    /// API shape.
     ///
     /// **Deprecated — use a real entry point instead:**
     /// - [`PhantomSession::connect_with_transport`] (Rust) — supply a
@@ -2822,6 +2824,8 @@ impl PhantomSession {
     ///   the handshake + pump.
     /// - [`connect_pinned`] (native FFI / mobile) — one-shot TCP connect with a
     ///   pinned key.
+    /// - [`connect_pinned_udp`] (native FFI / mobile) — one-shot PhantomUDP
+    ///   connect with a pinned key.
     ///
     /// # Why no `#[deprecated]` attribute (T5.7)
     ///
@@ -2838,8 +2842,8 @@ impl PhantomSession {
     /// Python / Swift / Kotlin docstrings (the C header carries no docstrings),
     /// so they were regenerated and committed alongside this change — the
     /// `bindings` `drift` CI job stays green. See
-    /// `tests::deprecated_connect_is_inert_and_sends_no_bytes` for the regression
-    /// pinning the inert behaviour.
+    /// `tests::deprecated_connect_is_inert_and_reports_failed` for the
+    /// regression pinning the inert behaviour.
     #[cfg_attr(feature = "bindings", uniffi::constructor)]
     pub fn connect(peer_addr: String) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -2850,7 +2854,11 @@ impl PhantomSession {
         Arc::new(Self {
             id: new_session_id(),
             peer_addr,
-            state: Arc::new(AtomicU8::new(ConnectionState::Connecting as u8)),
+            // Start in `Failed` so callers can detect misuse via `connection_state()`.
+            // This constructor never establishes a transport or runs a handshake;
+            // `Failed` makes that observable rather than leaving the session in an
+            // eternal `Connecting` shell.
+            state: Arc::new(AtomicU8::new(ConnectionState::Failed as u8)),
             send_queue: Arc::new(Mutex::new(Vec::new())),
             cmd_tx,
             cmd_rx: Mutex::new(Some(cmd_rx)),
@@ -2860,8 +2868,7 @@ impl PhantomSession {
             inner_session: Arc::new(Mutex::new(None)),
             early_data_accepted: Arc::new(Mutex::new(None)),
             shaping: Arc::new(parking_lot::Mutex::new(TrafficShapingConfig::default())),
-            // Placeholder session (no transport / pump yet); a no-op holder
-            // until `connect_with_transport` spawns the real pump.
+            // Placeholder session (no transport / pump); a no-op holder.
             observability: Observability::new(ObservabilityConfig::default()),
         })
     }
@@ -3734,42 +3741,35 @@ mod tests {
     async fn test_phantom_session_instant_connect() {
         let session = PhantomSession::connect("example.com:443".to_string());
 
-        // Should be in Connecting state immediately
-        assert_eq!(session.connection_state(), ConnectionState::Connecting);
+        // The inert constructor reports Failed so misuse is observable.
+        assert_eq!(session.connection_state(), ConnectionState::Failed);
         assert!(!session.is_data_ready());
         assert_eq!(session.peer_addr(), "example.com:443");
     }
 
-    /// **T5.7 regression — the inert `connect()` performs no handshake and
-    /// sends no bytes.** The constructor is documented as deprecated (no
+    /// **T5.7 + A6/QW3 regression — the inert `connect()` performs no handshake
+    /// and sends no bytes.** The constructor is documented as deprecated (no
     /// `#[deprecated]` attribute is possible — see the doc-comment for why), so
-    /// this test pins the inert contract the doc promises: the session is stuck
-    /// in `Connecting`, every `send()` only piles into the in-memory queue (no
-    /// transport / pump exists to flush it), and `recv()` never yields. If a
-    /// future change ever wires a real pump into this constructor, this test
-    /// must be updated alongside the doc — the two must not drift apart.
+    /// this test pins the inert contract the doc promises: the session immediately
+    /// reports [`ConnectionState::Failed`] so misuse is observable, `send()`
+    /// returns an error (not a silent queue), and `recv()` never yields. If a
+    /// future change ever wires a real pump into this constructor, this test must
+    /// be updated alongside the doc — the two must not drift apart.
     #[tokio::test]
-    async fn deprecated_connect_is_inert_and_sends_no_bytes() {
+    async fn deprecated_connect_is_inert_and_reports_failed() {
         let session = PhantomSession::connect("example.com:443".to_string());
 
-        // Inert: never leaves the pre-handshake state on its own.
-        assert_eq!(session.connection_state(), ConnectionState::Connecting);
+        // Inert constructor immediately reports Failed — not an eternal Connecting.
+        assert_eq!(session.connection_state(), ConnectionState::Failed);
         assert!(!session.is_data_ready());
         assert!(!session.is_pqc_ready());
 
-        // Every send while inert only queues — it never reaches a transport,
-        // because no transport / data pump was ever spawned.
-        session.send(b"first".to_vec()).await.unwrap();
-        session.send(b"second".to_vec()).await.unwrap();
-        assert_eq!(
-            session.queued_count().await,
-            2,
-            "inert connect() must buffer sends in memory, never flush them to a wire"
+        // send() returns an error in Failed state — no silent buffering.
+        let send_err = session.send(b"first".to_vec()).await;
+        assert!(
+            send_err.is_err(),
+            "inert connect() must reject send() with an error in Failed state"
         );
-
-        // The session is STILL inert after sending — no background task moved
-        // the state forward, so the bytes are still sitting in the queue.
-        assert_eq!(session.connection_state(), ConnectionState::Connecting);
 
         // recv() must never deliver application bytes — no pump feeds the recv
         // channel, and the inert constructor drops the channel's sender at once,
@@ -3786,11 +3786,29 @@ mod tests {
         }
     }
 
+    /// `connect()` immediately reports `Failed` so a caller checking
+    /// `connection_state()` sees the no-op rather than blocking forever on
+    /// `Connecting`.
+    #[test]
+    fn deprecated_connect_reports_failed_state() {
+        let session = PhantomSession::connect("x:1".to_string());
+        assert_eq!(
+            session.connection_state(),
+            ConnectionState::Failed,
+            "inert connect() must report Failed, not Connecting"
+        );
+    }
+
     #[tokio::test]
     async fn test_phantom_session_send_queue() {
         let session = PhantomSession::connect("example.com:443".to_string());
 
-        // Send while still connecting — should queue
+        // Simulate the Connecting state that a real pump would set (the inert
+        // constructor reports Failed, but the queue mechanism is exercised by
+        // advancing the state to Connecting).
+        session.set_state(ConnectionState::Connecting);
+
+        // Send while connecting — should queue
         session.send(vec![1, 2, 3]).await.unwrap();
         session.send(vec![4, 5, 6]).await.unwrap();
         assert_eq!(session.queued_count().await, 2);
@@ -3809,6 +3827,8 @@ mod tests {
     async fn test_phantom_session_state_progression() {
         let session = PhantomSession::connect("example.com:443".to_string());
 
+        // Advance to Connecting to exercise the state-progression sequence.
+        session.set_state(ConnectionState::Connecting);
         assert_eq!(session.connection_state(), ConnectionState::Connecting);
         assert!(!session.is_data_ready());
 
