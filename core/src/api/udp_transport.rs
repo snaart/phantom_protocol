@@ -1419,4 +1419,210 @@ mod tests {
             RecvAction::Got(42, s) if s == addr
         ));
     }
+
+    /// F6 regression (commit 9b3d2cf6): a SECOND `migrate_to()` while `recv_bytes` is parked in
+    /// the dual-socket OVERLAP select must wake the recv future so it re-snapshots both sockets
+    /// onto the new path. Before the overlap-arm `migrate_notified` branch existed the second
+    /// migrate had no wake path: recv stayed blocked on the now-silent (first-new, original-old)
+    /// pair while live data flowed on the second-new socket, so the session hung forever.
+    ///
+    /// Teeth: with the overlap-arm `_ = migrate_notified => continue` branch removed, the post-
+    /// second-migrate datagram is never delivered and this test times out (the `expect` below
+    /// fires). With the branch present recv re-snapshots and delivers it well within the timeout.
+    #[tokio::test]
+    async fn f6_second_migrate_while_parked_in_overlap_wakes_recv() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Arc::new(UdpClientTransport::connect(server_addr).await.unwrap());
+        client.set_frame_phase(FramePhase::Established);
+
+        // Teach the server the client's ORIGINAL source address.
+        client.send_bytes(b"hi").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, _src0) = server.recv_from(&mut buf).await.unwrap();
+
+        // Park a single `recv_bytes` future in a background task. It starts on the
+        // non-overlap arm (no `prev` socket yet).
+        let recv_client = client.clone();
+        let recv = tokio::spawn(async move { recv_client.recv_bytes().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // First migrate: enters the dual-socket overlap (prev = Some(orig), active = new1).
+        // Its notify permit wakes the parked non-overlap recv, which re-snapshots and re-parks
+        // in the OVERLAP select listening on {new1 (active), orig (prev)}.
+        client
+            .migrate_to("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("first migrate binds a new socket");
+        assert!(
+            client.in_migration_overlap(),
+            "first migrate_to enters the overlap"
+        );
+        // Let recv re-enter and genuinely PARK in the overlap select (consuming the first
+        // migrate's notify permit) before the second migrate fires.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Second migrate WHILE recv is parked in the overlap select: prev = Some(new1),
+        // active = new2. Without the overlap-arm wake, recv stays blocked on the silent
+        // {new1, orig} pair and never sees data on new2 → hang.
+        client
+            .migrate_to("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("second migrate binds a new socket");
+        // Let recv re-snapshot onto {new2 (active), new1 (prev)}.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Teach the server the new2 source address (send_bytes loads the active = new2 socket).
+        client.send_bytes(b"probe-after-2nd-migrate").await.unwrap();
+        let (_pn, src_new2) = tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+            .await
+            .expect("server hears the post-second-migrate probe source")
+            .unwrap();
+
+        // Deliver a real datagram to new2. With the fix recv (parked on new2) wakes and
+        // returns it; without the fix recv is stuck on the old pair and this times out.
+        for d in
+            encode_datagrams(PacketType::OneRtt, &client.cid(), 9, b"after-double-migrate").unwrap()
+        {
+            server.send_to(&d, src_new2).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(5), recv)
+            .await
+            .expect("recv must make progress after a second migrate in the overlap (F6)")
+            .expect("recv task joined")
+            .expect("recv ok");
+        assert_eq!(&got[..], b"after-double-migrate");
+    }
+
+    /// F5 regression (commit 9b3d2cf6): the recv loop top reads the active socket and the prev
+    /// socket as two SEPARATE `ArcSwap` loads, while `migrate_to` stores `prev = Some(old)` then
+    /// `socket = new` then notifies. An interleave can make recv snapshot `active = old` AND
+    /// `prev = Some(old)` — entering the overlap arm on the OLD socket TWICE, which hangs once the
+    /// old socket goes silent. The notify permit (stored after both swaps) plus the overlap-arm
+    /// wake let recv re-enter the loop and re-snapshot a consistent pair.
+    ///
+    /// This drives a storm of rapid `migrate_to` calls concurrently with a live `recv_bytes` to
+    /// hit the loop-top torn-read window, asserting recv never hangs across many attempts.
+    ///
+    /// Teeth: with the overlap-arm `migrate_notified` branch removed, a torn-read snapshot strands
+    /// recv on the silent old socket and the per-attempt timeout fires. With the branch present
+    /// recv always re-snapshots and the final datagram is delivered every attempt.
+    #[tokio::test]
+    async fn f5_torn_read_storm_does_not_hang_recv() {
+        const ATTEMPTS: usize = 40;
+        const MIGRATES_PER_ATTEMPT: usize = 12;
+
+        for attempt in 0..ATTEMPTS {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let client = Arc::new(UdpClientTransport::connect(server_addr).await.unwrap());
+            client.set_frame_phase(FramePhase::Established);
+
+            // Park a single recv future for this attempt.
+            let recv_client = client.clone();
+            let mut recv = tokio::spawn(async move { recv_client.recv_bytes().await });
+
+            // Fire a storm of rapid migrate_to calls concurrently with the parked recv to hit
+            // the loop-top torn-read window (active read straddling migrate_to's two stores).
+            let storm_client = client.clone();
+            let storm = tokio::spawn(async move {
+                for _ in 0..MIGRATES_PER_ATTEMPT {
+                    // Ignore individual bind errors (ephemeral-port pressure) — the point is the
+                    // concurrency, not every single rebind succeeding.
+                    let _ = storm_client
+                        .migrate_to("127.0.0.1:0".parse().unwrap())
+                        .await;
+                    tokio::task::yield_now().await;
+                }
+            });
+            storm.await.unwrap();
+
+            // Settle on whatever the final active socket is, then teach the server its source.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.send_bytes(b"probe").await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let (_pn, src_final) =
+                tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| panic!("attempt {attempt}: server must hear the probe"))
+                    .unwrap();
+
+            // Deliver real datagrams to the final active socket. A torn-read snapshot that
+            // stranded recv on a silent socket (no fix) never wakes to read any of them and the
+            // timeout fires. With the fix recv re-snapshots and picks one up. Several copies are
+            // sent (each kernel-queued on the bound active socket) so a re-park between the
+            // re-snapshot and a single delivery cannot lose the only datagram — this only adds
+            // slack to the FIX path; a HUNG recv reads none of them regardless.
+            let resend = {
+                let server_addr_final = src_final;
+                let cid = client.cid();
+                async move {
+                    loop {
+                        for d in
+                            encode_datagrams(PacketType::OneRtt, &cid, 1, b"storm-payload").unwrap()
+                        {
+                            let _ = server.send_to(&d, server_addr_final).await;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            };
+
+            let delivered = tokio::select! {
+                joined = &mut recv => joined.expect("recv task joined").expect("recv ok"),
+                _ = resend => unreachable!("resend loops forever"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    panic!("attempt {attempt}: recv hung after migrate storm (F5)")
+                }
+            };
+            assert_eq!(&delivered[..], b"storm-payload", "attempt {attempt}");
+        }
+    }
+
+    /// Companion guard: a QUIET migration overlap (no datagrams, no further migrate) must stay
+    /// PENDING — the overlap select must not busy-loop or spuriously complete off the
+    /// `migrate_notified` arm (which would burn CPU or return a bogus frame). The single
+    /// migrate's notify permit is consumed by the first overlap re-park; thereafter the overlap
+    /// select must block quietly until real data or a real migrate arrives.
+    #[tokio::test]
+    async fn overlap_select_does_not_busy_loop_or_spuriously_complete() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Arc::new(UdpClientTransport::connect(server_addr).await.unwrap());
+        client.set_frame_phase(FramePhase::Established);
+
+        client.send_bytes(b"hi").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, _src0) = server.recv_from(&mut buf).await.unwrap();
+
+        // Enter the overlap and park a recv future in it.
+        client
+            .migrate_to("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("migrate binds a new socket");
+        assert!(client.in_migration_overlap());
+
+        let recv_client = client.clone();
+        let mut recv = tokio::spawn(async move { recv_client.recv_bytes().await });
+
+        // For ~400ms with no data and no further migrate, recv must stay pending (no spurious
+        // completion off the migrate arm, no spin returning an error).
+        tokio::select! {
+            r = &mut recv => panic!("overlap recv must stay pending while quiet, got {r:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(400)) => {}
+        }
+
+        // It is still alive and CAN still deliver real data afterwards.
+        client.send_bytes(b"probe").await.unwrap();
+        let (_pn, src_new) = server.recv_from(&mut buf).await.unwrap();
+        for d in encode_datagrams(PacketType::OneRtt, &client.cid(), 2, b"finally").unwrap() {
+            server.send_to(&d, src_new).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(2), recv)
+            .await
+            .expect("recv eventually delivers real data after a quiet overlap")
+            .expect("recv task joined")
+            .expect("recv ok");
+        assert_eq!(&got[..], b"finally");
+    }
 }
