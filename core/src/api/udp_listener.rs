@@ -1,6 +1,7 @@
 //! PhantomUDP server listener: one bound `UdpSocket`, a central demux task routing datagrams by the
 //! 8-byte connection-ID into per-session channels, and a decoupled accept queue mirroring
-//! `PhantomListener`. Rust-only in Phase 1 (no UniFFI surface yet).
+//! `PhantomListener`. Exposed through UniFFI via `bind_udp` / `accept` / `verifying_key_bytes` /
+//! `local_addr` / `shutdown` / `is_shutting_down`.
 //!
 //! Phase 1 uses a single shared `FragmentAssembler` for reassembly across all CIDs (bounded by the
 //! assembler's own anti-DoS caps); per-CID isolation is a Phase-2 refinement — see `run_udp_demux`.
@@ -42,6 +43,7 @@ const MAX_INFLIGHT_HANDSHAKES: usize = 256;
 /// unbounded buffering; a full channel drops the datagram (the peer retransmits).
 const SESSION_CHANNEL_DEPTH: usize = 256;
 
+#[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct PhantomUdpListener {
     socket: Arc<UdpSocket>,
     handshake_server: Arc<HandshakeServer>,
@@ -60,10 +62,13 @@ pub struct PhantomUdpListener {
 }
 
 impl PhantomUdpListener {
-    pub async fn bind_udp(addr: String) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, Arc::new(TokioRuntime), None).await
-    }
-
+    /// Like [`bind_udp`](Self::bind_udp) but uses the caller-supplied long-lived
+    /// [`HybridSigningKey`] as the server's signing identity instead of generating a
+    /// fresh one per process — so the verifying-key material clients pin survives
+    /// restarts. [`verifying_key_bytes`](Self::verifying_key_bytes) returns the
+    /// verifying half of `signing_key`. Rust-only (not UniFFI-exported because
+    /// `HybridSigningKey` is not a UniFFI type; the FFI analogue
+    /// `bind_udp_with_signing_key_bytes` is roadmap A2).
     pub async fn bind_udp_with_signing_key(
         addr: String,
         signing_key: HybridSigningKey,
@@ -107,13 +112,6 @@ impl PhantomUdpListener {
         }))
     }
 
-    pub fn verifying_key_bytes(&self) -> Vec<u8> {
-        self.handshake_server.verifying_key().to_bytes()
-    }
-    pub fn local_addr(&self) -> String {
-        self.local_addr.to_string()
-    }
-
     /// Enable or disable 0-RTT early-data acceptance (A2b; default enabled). When disabled,
     /// resuming clients' early-data is rejected and resent 1-RTT — the zero-infrastructure
     /// defence against 0-RTT replay for a deployment that cannot guarantee a single coherent
@@ -141,7 +139,48 @@ impl PhantomUdpListener {
         self.active_routes.load(Ordering::Relaxed)
     }
 
-    pub async fn accept(self: &Arc<Self>) -> Result<Arc<AcceptOutcome>, CoreError> {
+    fn ensure_demux(self: &Arc<Self>) {
+        let mut guard = self.demux.lock();
+        if guard.is_some() {
+            return;
+        }
+        let handle = self.runtime.spawn(Box::pin(run_udp_demux(self.clone())));
+        *guard = Some(handle);
+    }
+}
+
+#[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
+impl PhantomUdpListener {
+    /// Bind a PhantomUDP listener on `addr` with a fresh per-process signing
+    /// identity. For a persistent pinned identity across restarts use
+    /// [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key) (Rust-only)
+    /// or `bind_udp_with_signing_key_bytes` (FFI — see roadmap A2).
+    #[cfg_attr(feature = "bindings", uniffi::constructor)]
+    pub async fn bind_udp(addr: String) -> Result<Arc<Self>, CoreError> {
+        Self::bind_inner(addr, Arc::new(TokioRuntime), None).await
+    }
+
+    /// The server's long-lived hybrid verifying key (`HybridVerifyingKey::to_bytes`).
+    /// Clients MUST pin this before completing a handshake (security invariant 1).
+    pub fn verifying_key_bytes(&self) -> Vec<u8> {
+        self.handshake_server.verifying_key().to_bytes()
+    }
+
+    /// Local socket address the listener is actually bound to (resolved at bind
+    /// time) — useful when the caller passed `"host:0"`.
+    pub fn local_addr(&self) -> String {
+        self.local_addr.to_string()
+    }
+
+    /// Accept the next inbound connection and complete its handshake, returning the
+    /// established session plus any 0-RTT early-data (see [`AcceptOutcome`]).
+    ///
+    /// Receiver is `self: Arc<Self>` (not `&self`): the lazily-spawned demux task
+    /// needs an owned `Arc<Self>` to drive `run_udp_demux`, so an owned receiver is
+    /// required here. FFI bindings clone the object handle and can loop `accept()`
+    /// freely; a Rust caller that accepts more than once in the same scope must call
+    /// `listener.clone().accept()`.
+    pub async fn accept(self: Arc<Self>) -> Result<Arc<AcceptOutcome>, CoreError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(CoreError::ConnectionClosed);
         }
@@ -156,6 +195,8 @@ impl PhantomUdpListener {
         }
     }
 
+    /// Signal graceful shutdown: wakes any parked `accept()` so it unwinds with
+    /// `ConnectionClosed`. Idempotent. Already-accepted sessions are unaffected.
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();
@@ -164,13 +205,9 @@ impl PhantomUdpListener {
         }
     }
 
-    fn ensure_demux(self: &Arc<Self>) {
-        let mut guard = self.demux.lock();
-        if guard.is_some() {
-            return;
-        }
-        let handle = self.runtime.spawn(Box::pin(run_udp_demux(self.clone())));
-        *guard = Some(handle);
+    /// Whether [`shutdown`](Self::shutdown) has been called.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
     }
 }
 
