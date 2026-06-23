@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 /// Retransmit timeout for the Handshake phase stop-and-wait shim.
 const HANDSHAKE_RTO: Duration = Duration::from_millis(400);
@@ -123,6 +123,10 @@ pub struct UdpClientTransport {
     /// `confirm_authenticated_source` runs) can never clobber the candidate slot.
     last_recv_src: ArcSwap<Option<SocketAddr>>,
     last_frame_len: AtomicU64,
+    /// Notified by `migrate_to` after swapping the active socket, so a `recv_bytes` call
+    /// blocked on the OLD socket's `recv_from` wakes up and re-enters the loop on the new one
+    /// rather than staying stuck indefinitely.
+    migrate_notify: Arc<Notify>,
 }
 
 impl UdpClientTransport {
@@ -157,6 +161,7 @@ impl UdpClientTransport {
             cand_sent: AtomicU64::new(0),
             last_recv_src: ArcSwap::from_pointee(None),
             last_frame_len: AtomicU64::new(0),
+            migrate_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -193,6 +198,9 @@ impl UdpClientTransport {
         let old = self.socket.load_full();
         self.prev_socket.store(Arc::new(Some(old)));
         self.socket.store(new_sock);
+        // Wake any `recv_bytes` call that is blocked on `recv_from` on the OLD socket,
+        // so it re-enters the loop and picks up the new socket and `prev_opt`.
+        self.migrate_notify.notify_one();
         Ok(())
     }
 
@@ -336,14 +344,23 @@ impl SessionTransport for UdpClientTransport {
                     },
                 }
             } else {
-                match classify_recv(active.recv_from(&mut buf).await) {
-                    RecvAction::Got(n, src) => (n, false, src),
-                    RecvAction::Retry => {
-                        log::debug!("PhantomUDP: advisory recv error (ignored, RFC 8085 §5.5)");
+                let migrate_notified = self.migrate_notify.notified();
+                tokio::select! {
+                    biased;
+                    r = active.recv_from(&mut buf) => match classify_recv(r) {
+                        RecvAction::Got(n, src) => (n, false, src),
+                        RecvAction::Retry => {
+                            log::debug!("PhantomUDP: advisory recv error (ignored, RFC 8085 §5.5)");
+                            continue;
+                        }
+                        RecvAction::Fatal(e) => {
+                            return Err(CoreError::NetworkError(format!("udp recv: {e}")))
+                        }
+                    },
+                    _ = migrate_notified => {
+                        // migrate_to() swapped the active socket — re-enter the loop
+                        // so the next iteration picks up the new socket and prev_opt.
                         continue;
-                    }
-                    RecvAction::Fatal(e) => {
-                        return Err(CoreError::NetworkError(format!("udp recv: {e}")))
                     }
                 }
             };
