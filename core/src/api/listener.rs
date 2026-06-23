@@ -81,6 +81,9 @@ pub struct PhantomListener {
     /// of the leg (the server presents no SNI) but its presence selects the mimic
     /// accept path. Always `None` unless the `mimicry` feature built it.
     mimic_sni: Option<String>,
+    /// Optional liveness config derived from a `PhantomConfig` supplied at bind time.
+    /// When `Some`, applied to every accepted session immediately after the handshake.
+    liveness: Option<crate::transport::liveness::LivenessConfig>,
 }
 
 // Rust-only constructors that take a non-UniFFI type (`Arc<dyn Runtime>`).
@@ -94,7 +97,7 @@ impl PhantomListener {
         addr: String,
         runtime: Arc<dyn Runtime>,
     ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, runtime, None, None).await
+        Self::bind_inner(addr, runtime, None, None, None).await
     }
 
     /// Like [`bind`](Self::bind) but uses the caller-supplied long-lived
@@ -113,7 +116,7 @@ impl PhantomListener {
         addr: String,
         signing_key: HybridSigningKey,
     ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(signing_key), None).await
+        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(signing_key), None, None).await
     }
 
     /// Composition of [`bind_with_signing_key`](Self::bind_with_signing_key)
@@ -124,7 +127,7 @@ impl PhantomListener {
         signing_key: HybridSigningKey,
         runtime: Arc<dyn Runtime>,
     ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, runtime, Some(signing_key), None).await
+        Self::bind_inner(addr, runtime, Some(signing_key), None, None).await
     }
 
     /// Like [`bind`](Self::bind), but every accepted connection first runs the
@@ -149,6 +152,7 @@ impl PhantomListener {
             Arc::new(TokioRuntime),
             None,
             Some(String::from("mimic")),
+            None,
         )
         .await
     }
@@ -166,6 +170,7 @@ impl PhantomListener {
             Arc::new(TokioRuntime),
             Some(signing_key),
             Some(String::from("mimic")),
+            None,
         )
         .await
     }
@@ -173,11 +178,14 @@ impl PhantomListener {
     /// Shared bind path. If `signing_key` is `Some`, the resulting
     /// [`HandshakeServer`] uses that long-lived key. Otherwise the
     /// historical generate-internal-key behavior is preserved.
+    /// If `config` is `Some`, liveness settings and session-cache sizing are
+    /// derived from it and applied to each accepted session.
     async fn bind_inner(
         addr: String,
         runtime: Arc<dyn Runtime>,
         signing_key: Option<HybridSigningKey>,
         mimic_sni: Option<String>,
+        config: Option<crate::config::PhantomConfig>,
     ) -> Result<Arc<Self>, CoreError> {
         // Under `--features fips`, run the FIPS 140-3 §7.7 POST
         // before standing up the listener. A failure short-circuits
@@ -193,9 +201,16 @@ impl PhantomListener {
         let local_addr = listener
             .local_addr()
             .map_err(|e| CoreError::NetworkError(format!("local_addr: {}", e)))?;
-        let hs = match signing_key {
-            Some(sk) => HandshakeServer::with_signing_key(sk),
-            None => HandshakeServer::new(),
+        let hs = match (signing_key, config.as_ref()) {
+            (Some(sk), Some(cfg)) => {
+                HandshakeServer::with_signing_key_and_cache(sk, cfg.session_cache())
+            }
+            (Some(sk), None) => HandshakeServer::with_signing_key(sk),
+            (None, Some(cfg)) => {
+                let (sk, _vk) = HybridSigningKey::generate();
+                HandshakeServer::with_signing_key_and_cache(sk, cfg.session_cache())
+            }
+            (None, None) => HandshakeServer::new(),
         }
         .map_err(|e| CoreError::InternalError(e.to_string()))?;
         let (accepted_tx, accepted_rx) = mpsc::channel(MAX_INFLIGHT_HANDSHAKES);
@@ -212,6 +227,7 @@ impl PhantomListener {
             accepted_rx: Mutex::new(accepted_rx),
             acceptor: parking_lot::Mutex::new(None),
             mimic_sni,
+            liveness: config.map(|c| c.liveness()),
         }))
     }
 
@@ -278,7 +294,7 @@ impl PhantomListener {
     #[cfg_attr(feature = "bindings", uniffi::constructor)]
     #[tracing::instrument(name = "phantom.listener.bind", skip_all, fields(addr = %addr))]
     pub async fn bind(addr: String) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, Arc::new(TokioRuntime), None, None).await
+        Self::bind_inner(addr, Arc::new(TokioRuntime), None, None, None).await
     }
 
     /// Bind a TCP listener using a persisted 64-byte signing seed (from
@@ -294,7 +310,23 @@ impl PhantomListener {
     ) -> Result<Arc<Self>, CoreError> {
         let sk = HybridSigningKey::from_bytes(&signing_key)
             .map_err(|e| CoreError::CryptoError(format!("invalid signing key seed: {e}")))?;
-        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(sk), None).await
+        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(sk), None, None).await
+    }
+
+    /// Bind a TCP listener using a persisted 64-byte signing seed and a
+    /// [`PhantomConfig`](crate::config::PhantomConfig) that controls liveness settings
+    /// and session-cache sizing. The FFI analogue of the Rust-only
+    /// [`bind_with_signing_key`](Self::bind_with_signing_key) + config combination.
+    #[cfg_attr(feature = "bindings", uniffi::constructor)]
+    #[tracing::instrument(name = "phantom.listener.bind_with_config", skip_all, fields(addr = %addr))]
+    pub async fn bind_with_config_bytes(
+        addr: String,
+        signing_key: Vec<u8>,
+        config: crate::config::PhantomConfig,
+    ) -> Result<Arc<Self>, CoreError> {
+        let sk = HybridSigningKey::from_bytes(&signing_key)
+            .map_err(|e| CoreError::CryptoError(format!("invalid signing key seed: {e}")))?;
+        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(sk), None, Some(config)).await
     }
 
     /// The server's long-lived hybrid verifying key, serialized via
@@ -431,6 +463,7 @@ impl PhantomListener {
             self.runtime.clone(),
             self.observability.clone(),
             self.mimic_sni.clone(),
+            self.liveness,
         )));
         *guard = Some(handle);
     }
@@ -620,6 +653,7 @@ async fn run_acceptor(
     runtime: Arc<dyn Runtime>,
     observability: Arc<Observability>,
     mimic_sni: Option<String>,
+    liveness: Option<crate::transport::liveness::LivenessConfig>,
 ) {
     let mut accept_count: u64 = 0;
     loop {
@@ -680,6 +714,7 @@ async fn run_acceptor(
                             &observability,
                             &accepted_tx,
                             LegType::FakeTls,
+                            liveness,
                         )
                         .await
                     }
@@ -698,6 +733,7 @@ async fn run_acceptor(
                 &observability,
                 &accepted_tx,
                 LegType::Tcp,
+                liveness,
             )
             .await;
         }));
@@ -717,6 +753,7 @@ async fn serve_connection<T: SessionTransport>(
     observability: &Arc<Observability>,
     accepted_tx: &mpsc::Sender<Arc<AcceptOutcome>>,
     leg_type: LegType,
+    liveness: Option<crate::transport::liveness::LivenessConfig>,
 ) {
     let started = Instant::now();
     // Scoped so the borrow of `transport` ends before it is moved into the session.
@@ -738,10 +775,14 @@ async fn serve_connection<T: SessionTransport>(
                 AeadAlgorithm::Aes256Gcm,
                 ProtocolVersion::Current,
             );
+            let arc_session = Arc::new(server_session);
+            if let Some(live) = liveness {
+                arc_session.set_liveness_config(live);
+            }
             let session = PhantomSession::from_accepted_server_session_with_runtime(
                 peer.to_string(),
                 transport,
-                Arc::new(server_session),
+                arc_session,
                 task_runtime.clone(),
                 observability.clone(),
                 leg_type,
