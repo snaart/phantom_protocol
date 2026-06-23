@@ -8,6 +8,36 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+### Added
+
+- **PhantomUDP is now reachable through the FFI surface.** New UniFFI exports make the
+  production, migration-capable transport usable from every binding (Python / Swift /
+  Kotlin / C), where previously only the TCP transport was reachable:
+  - free functions `connect_pinned_udp(host, port, pinned_key)` and
+    `connect_pinned_udp_with_resumption(host, port, pinned_key, hint, early_data)` (the
+    0-RTT analogue);
+  - the `PhantomUdpListener` object — constructor `bind_udp` plus `accept`,
+    `verifying_key_bytes`, `local_addr`, `shutdown`, and `is_shutting_down`.
+  Over a `connect_pinned_udp` session the exported `migrate()` now performs a real
+  single-path connection migration (e.g. Wi-Fi ↔ LTE handover) instead of the no-op it
+  is over TCP, and liveness / `Migrating` / `Dead` transitions, path validation, and
+  passive NAT-rebind recovery are all live for FFI consumers.
+
+### Fixed
+
+- **Connection migration could hang the client receive loop.** `UdpClientTransport::recv_bytes`
+  did not wake when `migrate_to()` rebound the local socket: a receive parked on the old
+  socket (which goes silent once the server follows the client) would block forever. Both
+  the single-socket and the dual-socket migration-overlap receive paths now wake on a
+  migration and re-snapshot the active/previous sockets, also closing a loop-top torn-read
+  race (a migration interleaved between the two socket loads) and a hang on a second
+  migration during an overlap. Regression-tested (each guard verified to fail without the
+  fix).
+- **C ABI declaration for `PhantomListener::shutdown` was wrong.** The hand-curated C
+  header declared the synchronous `shutdown()` as an async future handle
+  (`uint64_t ...(void *ptr)`); it is now correctly `void ...(void *ptr, RustCallStatus *)`,
+  matching the actual ABI and the other bindings.
+
 ## [0.2.2] - 2026-06-22
 
 Documentation release. **No code, wire-format, public-API, or dependency changes** —
@@ -133,7 +163,7 @@ dependency changes** — binary- and wire-compatible with 0.2.0
   No wire-format change (a behavioural extension on WIRE v6 — `path_id`, the rotating
   CID, and `PATH_VALIDATION` are all already on the wire).
 
-- **Blocking C helpers for the FFI (`tests/bindings/c/phantom_helpers.h`, #14c).**
+- **Blocking C helpers for the FFI (`tests/bindings/c/phantom_helpers.h`).**
   A header-only, pure-C convenience layer that wraps the async future-poll
   boilerplate (`connect_pinned` / `send` / `recv` / `disconnect`) into plain
   blocking calls — `phantom_blocking_connect_pinned` / `_send` / `_recv` /
@@ -144,7 +174,7 @@ dependency changes** — binary- and wire-compatible with 0.2.0
   object-future ABI (UniFFI 0.31 represents objects as `u64` handles). The C
   consumer smoke test now exercises the blocking path end-to-end.
 
-- **Traffic-shaping can be configured before the session establishes (#9).**
+- **Traffic-shaping can be configured before the session establishes.**
   `PhantomSession::set_traffic_shaping` may now be called **before** the (async)
   client handshake completes: the config is stored as pending and applied to the
   negotiated session the moment the background task installs it, so the **first
@@ -166,7 +196,7 @@ dependency changes** — binary- and wire-compatible with 0.2.0
   `TrafficShapingConfig` (FFI-exported; `0` = off, the default). The cover timer
   reuses the send packet-number counter as a lock-free "did we send anything?"
   signal, so cover only fills genuine idle gaps. Bindings regenerated. (This
-  completes the direction-#4 shaping suite: (a) masked version + (b) length-prefix
+  completes the WIRE v6 shaping suite: (a) masked version + (b) length-prefix
   diet + (c) PADÉ padding + (d) timing jitter + (e) cover traffic.)
 
 - **Anti-fingerprint send-timing jitter (WIRE v6, shaping control (d)).**
@@ -412,7 +442,7 @@ dependency changes** — binary- and wire-compatible with 0.2.0
 
 ### Fixed
 
-- **Congestion control: BBR loss signal was double-counted on SACK-gap losses (#7).** A segment the
+- **Congestion control: BBR loss signal was double-counted on SACK-gap losses.** A segment the
   SACK gap detector declared lost was fed to BBR's loss path twice — once at detection (the L1-B
   feed in the ACK handler) and again at retransmission (the `seg.retransmit` feed in the send loop).
   Because `inflight_bytes` is purely incremental, this permanently under-counted in-flight bytes
