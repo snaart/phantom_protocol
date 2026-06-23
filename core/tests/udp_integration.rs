@@ -1619,3 +1619,61 @@ async fn udp_integration_listener_shutdown_flag_is_observable() {
     let result = listener.accept().await;
     assert!(matches!(result, Err(phantom_protocol::CoreError::ConnectionClosed)));
 }
+
+/// Headline regression: a session built through the FFI shim `connect_pinned_udp`
+/// performs a REAL single-path connection migration mid-exchange. Over the TCP
+/// `connect_pinned` shim `migrate()` is a no-op; this proves the UDP FFI path wires
+/// `migrate()` through to a genuine socket rebind, with the reliable byte stream
+/// surviving byte-exact and no re-handshake. Faithful FFI-path analogue of
+/// `udp_integration_migration_survives_mid_exchange`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_ffi_migrate_survives_mid_exchange() {
+    use phantom_protocol::api::session::connect_pinned_udp;
+    const ROUNDS: usize = 8;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let local: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        for _ in 0..ROUNDS {
+            let m = session.recv().await.expect("server recv");
+            session.send(m).await.expect("server echo");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let client = connect_pinned_udp("127.0.0.1".to_string(), local.port(), key_bytes)
+        .await
+        .expect("connect_pinned_udp");
+
+    let m0 = b"round-0-pre-migration".to_vec();
+    client.send(m0.clone()).await.expect("send 0");
+    let e0 = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("recv 0");
+    assert_eq!(e0, m0, "pre-migration echo must be byte-exact");
+
+    // The FFI-exported migrate() must perform a real rebind (not the TCP no-op).
+    client
+        .migrate("127.0.0.1:0".to_string())
+        .await
+        .expect("migrate");
+
+    for i in 1..ROUNDS {
+        let m = format!("round-{i}-post-migration-{}", "x".repeat(i * 7)).into_bytes();
+        client.send(m.clone()).await.expect("send post-migration");
+        let e = timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("no timeout (the FFI session must survive the migration)")
+            .expect("recv post-migration");
+        assert_eq!(e, m, "post-migration echo must be byte-exact (round {i})");
+    }
+
+    server.await.unwrap();
+}
