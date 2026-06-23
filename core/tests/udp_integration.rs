@@ -1812,3 +1812,63 @@ async fn udp_bind_with_signing_key_bytes_is_stable_across_restart() {
         .expect("bind 2");
     assert_eq!(vk1, l2.verifying_key_bytes(), "persisted UDP identity must be stable");
 }
+
+/// Headline A2 regression: the full FFI server-identity loop. A server generated from a
+/// persisted seed serves a pinned client; after a "restart" (rebind from the same seed)
+/// the SAME pin still authenticates — exactly what a pure-FFI VPN server needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_ffi_persistent_identity_loop_pin_survives_restart() {
+    use phantom_protocol::api::identity::{generate_signing_key, verifying_key_from_signing_key};
+    use phantom_protocol::api::session::connect_pinned_udp;
+
+    let seed = generate_signing_key().expect("generate");
+    // The pin a client would store, derived from the seed WITHOUT binding.
+    let pinned = verifying_key_from_signing_key(seed.clone()).expect("derive pin");
+
+    // First server instance from the seed.
+    let l1 = PhantomUdpListener::bind_udp_with_signing_key_bytes("127.0.0.1:0".to_string(), seed.clone())
+        .await
+        .expect("bind 1");
+    assert_eq!(l1.verifying_key_bytes(), pinned, "bound identity matches the derived pin");
+    let port1 = {
+        let a: std::net::SocketAddr = l1.local_addr().parse().unwrap();
+        a.port()
+    };
+    let srv1 = tokio::spawn(async move {
+        let s = l1.accept().await.expect("accept").session();
+        let m = s.recv().await.expect("recv");
+        s.send(m).await.expect("echo");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    });
+    let c1 = connect_pinned_udp("127.0.0.1".to_string(), port1, pinned.clone())
+        .await
+        .expect("client 1 connects against the pinned identity");
+    c1.send(b"v1".to_vec()).await.expect("send");
+    let e1 = timeout(Duration::from_secs(10), c1.recv()).await.expect("no timeout").expect("recv");
+    assert_eq!(e1, b"v1");
+    srv1.await.unwrap();
+
+    // "Restart": a fresh server instance from the SAME seed. The client's ORIGINAL pin
+    // must still authenticate it — the whole point of a persisted identity.
+    let l2 = PhantomUdpListener::bind_udp_with_signing_key_bytes("127.0.0.1:0".to_string(), seed)
+        .await
+        .expect("bind 2");
+    let port2 = {
+        let a: std::net::SocketAddr = l2.local_addr().parse().unwrap();
+        a.port()
+    };
+    let srv2 = tokio::spawn(async move {
+        let s = l2.accept().await.expect("accept").session();
+        let m = s.recv().await.expect("recv");
+        s.send(m).await.expect("echo");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    });
+    let c2 = connect_pinned_udp("127.0.0.1".to_string(), port2, pinned)
+        .await
+        .expect("client reconnects with the SAME pin after restart");
+    c2.send(b"v2".to_vec()).await.expect("send");
+    let e2 = timeout(Duration::from_secs(10), c2.recv()).await.expect("no timeout").expect("recv");
+    assert_eq!(e2, b"v2");
+    srv2.await.unwrap();
+}
