@@ -109,7 +109,7 @@ async fn udp_integration_two_sessions_one_client_socket_is_not_required_but_two_
 
     let server = tokio::spawn(async move {
         for _ in 0..2 {
-            let s = listener.accept().await.expect("accept").session();
+            let s = listener.clone().accept().await.expect("accept").session();
             let m = s.recv().await.expect("recv");
             s.send(m).await.expect("echo"); // echo back
         }
@@ -1603,4 +1603,19 @@ async fn udp_integration_ffi_connect_pinned_udp_resumption_1rtt_fallback() {
         .expect("client recv");
     assert_eq!(reply, b"ffi-udp-resume-reply");
     server.await.unwrap();
+}
+
+/// `is_shutting_down` reflects `shutdown()`, and `accept()` after shutdown returns
+/// `ConnectionClosed` — exercises the newly UniFFI-exported listener surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_listener_shutdown_flag_is_observable() {
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    assert!(!listener.is_shutting_down());
+    listener.shutdown();
+    assert!(listener.is_shutting_down());
+    let result = listener.accept().await;
+    assert!(matches!(result, Err(phantom_protocol::CoreError::ConnectionClosed)));
 }
