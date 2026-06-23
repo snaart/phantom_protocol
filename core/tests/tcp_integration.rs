@@ -659,3 +659,23 @@ async fn tcp_integration_stalled_peer_does_not_block_accept() {
 
     drop(staller);
 }
+
+/// FFI persistent identity (A2): binding with the SAME signing seed twice yields the
+/// SAME verifying key — the property a pinned client depends on across a server restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn tcp_bind_with_signing_key_bytes_is_stable_across_restart() {
+    use phantom_protocol::api::identity::generate_signing_key;
+    use phantom_protocol::api::listener::PhantomListener;
+
+    let seed = generate_signing_key().expect("generate");
+    let l1 = PhantomListener::bind_with_signing_key_bytes("127.0.0.1:0".to_string(), seed.clone())
+        .await
+        .expect("bind 1");
+    let vk1 = l1.verifying_key_bytes();
+    drop(l1);
+    let l2 = PhantomListener::bind_with_signing_key_bytes("127.0.0.1:0".to_string(), seed)
+        .await
+        .expect("bind 2");
+    assert_eq!(vk1, l2.verifying_key_bytes(), "a persisted seed must yield a stable pinned identity");
+}

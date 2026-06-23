@@ -281,6 +281,21 @@ impl PhantomListener {
         Self::bind_inner(addr, Arc::new(TokioRuntime), None, None).await
     }
 
+    /// Bind a TCP listener using a persisted 64-byte signing seed (from
+    /// [`generate_signing_key`](crate::api::identity::generate_signing_key)) as the
+    /// server's long-lived identity, so `verifying_key_bytes()` — the value clients pin
+    /// — stays stable across restarts. The FFI analogue of the Rust-only
+    /// [`bind_with_signing_key`](Self::bind_with_signing_key).
+    #[cfg_attr(feature = "bindings", uniffi::constructor)]
+    pub async fn bind_with_signing_key_bytes(
+        addr: String,
+        signing_key: Vec<u8>,
+    ) -> Result<Arc<Self>, CoreError> {
+        let sk = HybridSigningKey::from_bytes(&signing_key)
+            .map_err(|e| CoreError::CryptoError(format!("invalid signing key seed: {e}")))?;
+        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(sk), None).await
+    }
+
     /// The server's long-lived hybrid verifying key, serialized via
     /// `HybridVerifyingKey::to_bytes`. Clients MUST pin this value before
     /// completing a handshake to defeat MITM (see Vuln 1 in security review).
