@@ -160,6 +160,21 @@ impl PhantomUdpListener {
         Self::bind_inner(addr, Arc::new(TokioRuntime), None).await
     }
 
+    /// Bind a PhantomUDP listener using a persisted 64-byte signing seed (from
+    /// [`generate_signing_key`](crate::api::identity::generate_signing_key)) as the
+    /// server's long-lived identity, so `verifying_key_bytes()` stays stable across
+    /// restarts. FFI analogue of the Rust-only
+    /// [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key).
+    #[cfg_attr(feature = "bindings", uniffi::constructor)]
+    pub async fn bind_udp_with_signing_key_bytes(
+        addr: String,
+        signing_key: Vec<u8>,
+    ) -> Result<Arc<Self>, CoreError> {
+        let sk = HybridSigningKey::from_bytes(&signing_key)
+            .map_err(|e| CoreError::CryptoError(format!("invalid signing key seed: {e}")))?;
+        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(sk)).await
+    }
+
     /// The server's long-lived hybrid verifying key (`HybridVerifyingKey::to_bytes`).
     /// Clients MUST pin this before completing a handshake (security invariant 1).
     pub fn verifying_key_bytes(&self) -> Vec<u8> {

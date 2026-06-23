@@ -1794,3 +1794,21 @@ async fn udp_integration_ffi_migrate_actually_rebinds_through_relay() {
 
     server.await.unwrap();
 }
+
+/// FFI persistent identity over UDP (A2): two binds with the same seed → same verifying key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_bind_with_signing_key_bytes_is_stable_across_restart() {
+    use phantom_protocol::api::identity::generate_signing_key;
+
+    let seed = generate_signing_key().expect("generate");
+    let l1 = PhantomUdpListener::bind_udp_with_signing_key_bytes("127.0.0.1:0".to_string(), seed.clone())
+        .await
+        .expect("bind 1");
+    let vk1 = l1.verifying_key_bytes();
+    drop(l1);
+    let l2 = PhantomUdpListener::bind_udp_with_signing_key_bytes("127.0.0.1:0".to_string(), seed)
+        .await
+        .expect("bind 2");
+    assert_eq!(vk1, l2.verifying_key_bytes(), "persisted UDP identity must be stable");
+}
