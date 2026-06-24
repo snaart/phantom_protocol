@@ -169,6 +169,9 @@ mod tests {
         // Wait for ticket to expire
         std::thread::sleep(Duration::from_millis(5));
         // try_resume returns None for expired tickets
-        assert!(cache.try_resume(&sid).is_none(), "expired ticket should not resume");
+        assert!(
+            cache.try_resume(&sid).is_none(),
+            "expired ticket should not resume"
+        );
     }
 }

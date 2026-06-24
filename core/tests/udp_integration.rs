@@ -1930,14 +1930,21 @@ async fn udp_ffi_with_config_roundtrip() {
         let session = listener.accept().await.expect("accept").session();
         let msg = session.recv().await.expect("server recv");
         assert_eq!(msg, b"cfg-hello");
-        session.send(b"cfg-reply".to_vec()).await.expect("server send");
+        session
+            .send(b"cfg-reply".to_vec())
+            .await
+            .expect("server send");
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
 
-    let client = connect_pinned_udp_with_config("127.0.0.1".to_string(), local.port(), key_bytes, cfg)
+    let client =
+        connect_pinned_udp_with_config("127.0.0.1".to_string(), local.port(), key_bytes, cfg)
+            .await
+            .expect("connect_pinned_udp_with_config");
+    client
+        .send(b"cfg-hello".to_vec())
         .await
-        .expect("connect_pinned_udp_with_config");
-    client.send(b"cfg-hello".to_vec()).await.expect("client send");
+        .expect("client send");
     let reply = timeout(Duration::from_secs(10), client.recv())
         .await
         .expect("no timeout")

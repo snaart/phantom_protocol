@@ -444,7 +444,14 @@ impl PhantomSession {
         expected_server_key: HybridVerifyingKey,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
-        Self::spawn_client(peer_addr, transport, expected_server_key, runtime, None, None)
+        Self::spawn_client(
+            peer_addr,
+            transport,
+            expected_server_key,
+            runtime,
+            None,
+            None,
+        )
     }
 
     /// Connect with a **0-RTT resumption attempt**.

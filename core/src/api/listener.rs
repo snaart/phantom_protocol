@@ -987,8 +987,16 @@ mod tests {
 
         let s = outcome.peer_addr_string();
         assert!(!s.is_empty(), "peer_addr_string must not be empty");
-        assert!(s.contains(':'), "peer_addr_string must contain ':' (ip:port form)");
-        let parsed: SocketAddr = s.parse().expect("peer_addr_string must parse as SocketAddr");
-        assert_eq!(parsed, peer, "peer_addr_string must round-trip to the original SocketAddr");
+        assert!(
+            s.contains(':'),
+            "peer_addr_string must contain ':' (ip:port form)"
+        );
+        let parsed: SocketAddr = s
+            .parse()
+            .expect("peer_addr_string must parse as SocketAddr");
+        assert_eq!(
+            parsed, peer,
+            "peer_addr_string must round-trip to the original SocketAddr"
+        );
     }
 }
