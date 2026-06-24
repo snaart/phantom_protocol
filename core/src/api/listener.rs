@@ -206,10 +206,10 @@ impl PhantomListener {
                 HandshakeServer::with_signing_key_and_cache(sk, cfg.session_cache())
             }
             (Some(sk), None) => HandshakeServer::with_signing_key(sk),
-            (None, Some(cfg)) => {
-                let (sk, _vk) = HybridSigningKey::generate();
-                HandshakeServer::with_signing_key_and_cache(sk, cfg.session_cache())
-            }
+            // Fresh per-process identity WITH a config-sized cache. Use new_with_cache
+            // (not an inline generate) so the FIPS pairwise-consistency check `new()`
+            // runs is preserved on the auto-generated signing key.
+            (None, Some(cfg)) => HandshakeServer::new_with_cache(cfg.session_cache()),
             (None, None) => HandshakeServer::new(),
         }
         .map_err(|e| CoreError::InternalError(e.to_string()))?;

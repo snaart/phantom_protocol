@@ -617,6 +617,24 @@ impl HandshakeServer {
         Self::with_signing_key_and_cache(signing_key, SessionCache::new())
     }
 
+    /// Like [`new`](Self::new) — mints a fresh per-process server identity and runs the
+    /// FIPS pairwise-consistency check on it — but installs a caller-sized resumption
+    /// [`SessionCache`] (from [`PhantomConfig`](crate::PhantomConfig)). Used by the
+    /// `bind_*_with_config` path when no persisted signing key is supplied but a custom
+    /// cache capacity / lifetime is. Without this, the config-with-fresh-key arm would
+    /// skip the startup pairwise-consistency check that `new()` performs.
+    pub fn new_with_cache(cache: SessionCache) -> Result<Self, HandshakeError> {
+        let (signing_key, verifying_key) = HybridSigningKey::generate();
+        signing_key
+            .pairwise_consistency_check(&verifying_key)
+            .map_err(|e| {
+                HandshakeError::RngError(format!(
+                    "server signing identity failed its pairwise-consistency test: {e:?}"
+                ))
+            })?;
+        Self::with_signing_key_and_cache(signing_key, cache)
+    }
+
     /// Build a `HandshakeServer` from a caller-supplied [`HybridSigningKey`] and a
     /// pre-sized [`SessionCache`] (e.g., from [`PhantomConfig::session_cache()`]).
     ///
