@@ -1901,3 +1901,47 @@ async fn udp_ffi_persistent_identity_loop_pin_survives_restart() {
     assert_eq!(e2, b"v2");
     srv2.await.unwrap();
 }
+
+/// End-to-end: the `_with_config` FFI entry points (server `bind_udp_with_config_bytes`
+/// + client `connect_pinned_udp_with_config`) establish a working pinned session. Guards
+/// that threading a `PhantomConfig` through both sides does not break the connect path
+/// (the config's liveness is installed before the pump; the server cache is sized from it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_ffi_with_config_roundtrip() {
+    use phantom_protocol::api::identity::generate_signing_key;
+    use phantom_protocol::api::session::connect_pinned_udp_with_config;
+    use phantom_protocol::PhantomConfig;
+
+    let seed = generate_signing_key().expect("generate");
+    let cfg = PhantomConfig::mobile();
+
+    let listener = PhantomUdpListener::bind_udp_with_config_bytes(
+        "127.0.0.1:0".to_string(),
+        seed,
+        cfg.clone(),
+    )
+    .await
+    .expect("bind_udp_with_config_bytes");
+    let local: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key_bytes = listener.verifying_key_bytes();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        let msg = session.recv().await.expect("server recv");
+        assert_eq!(msg, b"cfg-hello");
+        session.send(b"cfg-reply".to_vec()).await.expect("server send");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let client = connect_pinned_udp_with_config("127.0.0.1".to_string(), local.port(), key_bytes, cfg)
+        .await
+        .expect("connect_pinned_udp_with_config");
+    client.send(b"cfg-hello".to_vec()).await.expect("client send");
+    let reply = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(reply, b"cfg-reply");
+    server.await.unwrap();
+}
