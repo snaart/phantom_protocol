@@ -61,7 +61,7 @@ jobs:
           workspaces: "fuzz"
           key: fuzz-${{ matrix.target }}
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
+        uses: taiki-e/install-action@682e7d9e49c5e653d371fc6adbda67653461378a # v2
         with:
           tool: cargo-fuzz
       # Copy the committed seeds into the (otherwise empty) corpus dir so the
