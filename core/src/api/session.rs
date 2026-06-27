@@ -1028,6 +1028,22 @@ async fn run_client_handshake<T: SessionTransport>(
 /// well-formed, consistent header.
 const RAW_APP_STREAM_ID: u32 = 1;
 
+/// Items routed from the reader task to the delivery task via the internal
+/// UNBOUNDED channel.
+///
+/// Using an explicit enum (rather than `(u32, Bytes)`) lets FIN signals be
+/// ordered after any data frames for the same stream, and lets the delivery task
+/// dispatch without a separate close channel.
+enum DeliverItem {
+    /// Inbound data payload `(stream_id, bytes)`. The reader adds the byte
+    /// length to `undelivered_bytes` on enqueue; the delivery task subtracts it
+    /// once the frame is forwarded to a bounded downstream channel.
+    Data(u32, Bytes),
+    /// Peer sent FIN on `stream_id`. Ordered after any `Data` items already
+    /// queued for that stream so the consumer sees EOF last.
+    Close(u32),
+}
+
 /// Shared client/server data pump.
 ///
 /// After the handshake completes (client side) or after the server `Session` is
@@ -1106,62 +1122,142 @@ async fn run_data_pump<T: SessionTransport>(
         }
     }
 
-    // ── Receive-delivery decoupling ──
-    // The reader task hands decrypted application data to a dedicated delivery
-    // task over an UNBOUNDED channel and never blocks on app delivery, so a slow
-    // `recv()` consumer cannot head-of-line-stall inbound ACK / WINDOW_UPDATE /
-    // control processing. The delivery task does the app-paced `recv_tx.send()`
-    // and credits the flow-control window on *real* consumption; enforced
-    // send-side flow control (`Stream::poll_send`) bounds the in-flight backlog
-    // to ~one window, and `undelivered_bytes` + `RECV_DELIVERY_HARD_CAP` guard
-    // against a peer that ignores flow control.
-    let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+    // ── Receive-delivery decoupling (lossless backpressured per-stream recv) ──
+    //
+    // Three-task delivery pipeline with provably isolated paths:
+    //
+    //   Reader → deliver_tx (UNBOUNDED, DeliverItem) → Router task
+    //               │                         ├─ id 0/1 → raw_deliver_tx (UNBOUNDED)
+    //               │                         └─ id ≥ 2 → streams_deliver_tx (UNBOUNDED)
+    //               │
+    //               Task A: raw_deliver_rx   → recv_tx.send().await
+    //               Task B: streams_deliver_rx → demux.route_data_async().await
+    //
+    // The Router forwards items to TWO separate UNBOUNDED downstream channels;
+    // since both targets are UNBOUNDED, the Router NEVER blocks — no HOL stall.
+    // Task A and Task B drain their channels independently: a slow opened-stream
+    // consumer stalling Task B has ZERO effect on Task A (raw-app isolation).
+    //
+    // `undelivered_bytes` is incremented by the reader and decremented by Task A
+    // or Task B on dequeue — BEFORE the blocking downstream send — so the
+    // hard-cap check in the reader is accurate and no byte is leaked on failure.
+    //
+    // Flow-control credit is issued in Task A / Task B immediately on dequeue
+    // (one item of look-ahead, cancel-safe: mpsc send drops the item on cancel
+    // but cannot double-count because we already subtracted from undelivered_bytes
+    // before the blocking send).
+    //
+    // HoL among opened streams (id ≥ 2): Task B is a single sequential task, so
+    // a consumer that never calls PhantomStream::recv() will eventually fill the
+    // per-stream bounded channel and backpressure Task B → streams_deliver_tx
+    // (UNBOUNDED, can grow). This is accepted behaviour; per-stream independent
+    // tasks are future work. The raw-app path is NOT affected.
+
+    // Downstream UNBOUNDED channels (the Router → Tasks A/B paths never block).
+    let (raw_deliver_tx, mut raw_deliver_rx) = mpsc::unbounded_channel::<Bytes>();
+    let (streams_deliver_tx, mut streams_deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
+
     let undelivered_bytes = Arc::new(AtomicU64::new(0));
+
+    // Task A — raw-app (id 0 / 1) delivery. Semantics unchanged by the decoupling.
     {
         let recv_tx_deliver = recv_tx; // move the session recv channel here
-        let demux_deliver = demux.clone();
-        let streams_deliver = streams.clone();
-        let crypto_deliver = crypto_session.clone();
-        let undelivered_deliver = undelivered_bytes.clone();
+        let streams_a = streams.clone();
+        let crypto_a = crypto_session.clone();
+        let undelivered_a = undelivered_bytes.clone();
         runtime.spawn(Box::pin(async move {
-            while let Some((stream_id, bytes)) = deliver_rx.recv().await {
+            while let Some(bytes) = raw_deliver_rx.recv().await {
                 let len = bytes.len() as u64;
-                // Best-effort, non-blocking notification to the (vestigial) demux.
-                demux_deliver.route_data(stream_id, bytes.clone());
-                // Account the item the instant it leaves the UNBOUNDED delivery
-                // queue (which the reader's HARD_CAP guards) — BEFORE the
-                // app-paced `recv_tx.send()` below, which can block for a long
-                // time on a slow consumer. Decrementing (and crediting) only
-                // after a successful send would (a) keep this item counted
-                // against the cap while it sits in the bounded recv pipeline,
-                // inflating `undelivered_bytes`, and (b) leak the count entirely
-                // if the send then fails. The byte is now in the bounded
-                // recv-channel pipeline (capacity-limited, its own backpressure),
-                // so it no longer belongs to the unbounded backlog.
-                undelivered_deliver.fetch_sub(len, Ordering::AcqRel);
-                // Credit the flow-control window: the item has been pulled into
-                // the app-delivery pipeline (matching the inline ACK's "accepted
-                // into my in-memory delivery queue" semantics). The pull rate is
-                // still paced by `recv_tx.send()` completing below, so credit
-                // tracks app consumption (one item of look-ahead) — backpressure
-                // is preserved. Wake the send loop to flush the WINDOW_UPDATE
-                // (emitted there — the sole outbound writer — so it is sealed
-                // under the live epoch; the epoch's two writers both serialise
-                // through `rekey_lock`, so the flush is always epoch-consistent).
-                if let Some(stream) = streams_deliver.get(&stream_id) {
+                // Decrement backlog counter before the blocking send — see comment
+                // on `undelivered_bytes` above.
+                undelivered_a.fetch_sub(len, Ordering::AcqRel);
+                // Credit the flow-control window for the raw-app stream (id 1).
+                if let Some(stream) = streams_a.get(&RAW_APP_STREAM_ID) {
                     if let Some(credit) = stream.record_app_consumed(len as u32) {
                         stream.stage_window_update_credit(credit);
-                        crypto_deliver.notify_outbound_ready();
+                        crypto_a.notify_outbound_ready();
                     }
                 }
-                // Real, app-paced delivery to the session recv channel. A closed
-                // channel means the consumer is gone → session ending; stop. The
-                // item was already removed from the backlog accounting above, so
-                // breaking here leaks nothing.
+                // App-paced delivery to the session recv channel. A closed channel
+                // means the consumer is gone → session ending; stop.
                 if recv_tx_deliver.send(bytes).await.is_err() {
                     break;
                 }
             }
+        }));
+    }
+
+    // Task B — opened-stream (id ≥ 2) delivery. Independent of Task A.
+    {
+        let demux_b = demux.clone();
+        let streams_b = streams.clone();
+        let crypto_b = crypto_session.clone();
+        let undelivered_b = undelivered_bytes.clone();
+        runtime.spawn(Box::pin(async move {
+            while let Some(item) = streams_deliver_rx.recv().await {
+                match item {
+                    DeliverItem::Data(stream_id, bytes) => {
+                        let len = bytes.len() as u64;
+                        undelivered_b.fetch_sub(len, Ordering::AcqRel);
+                        // Credit flow-control for this opened stream.
+                        if let Some(stream) = streams_b.get(&stream_id) {
+                            if let Some(credit) = stream.record_app_consumed(len as u32) {
+                                stream.stage_window_update_credit(credit);
+                                crypto_b.notify_outbound_ready();
+                            }
+                        }
+                        // Blocking, lossless delivery to the per-stream demux channel.
+                        if !demux_b.route_data_async(stream_id, bytes).await {
+                            log::debug!(
+                                "PhantomSession: opened-stream delivery: stream {} not \
+                                 registered, frame discarded",
+                                stream_id
+                            );
+                        }
+                    }
+                    DeliverItem::Close(stream_id) => {
+                        // Lossless FIN delivery (ordered after any data above).
+                        if !demux_b.route_close_async(stream_id).await {
+                            log::debug!(
+                                "PhantomSession: opened-stream delivery: FIN for \
+                                 unregistered stream {}",
+                                stream_id
+                            );
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    // Router task — dispatches items from the UNBOUNDED deliver_tx to Task A or B.
+    // Both targets are UNBOUNDED so every send succeeds immediately (no .await);
+    // errors only occur when the receiver is dropped (session shutting down).
+    // Router exits when the reader drops deliver_tx, allowing Tasks A/B to drain.
+    let (deliver_tx, mut deliver_router_rx) = mpsc::unbounded_channel::<DeliverItem>();
+    {
+        let raw_tx_r = raw_deliver_tx;
+        let streams_tx_r = streams_deliver_tx;
+        runtime.spawn(Box::pin(async move {
+            while let Some(item) = deliver_router_rx.recv().await {
+                match item {
+                    DeliverItem::Data(stream_id, bytes) => {
+                        if stream_id <= RAW_APP_STREAM_ID {
+                            // UNBOUNDED → never blocks; error only if Task A dropped.
+                            let _ = raw_tx_r.send(bytes);
+                        } else {
+                            let _ = streams_tx_r.send(DeliverItem::Data(stream_id, bytes));
+                        }
+                    }
+                    DeliverItem::Close(stream_id) => {
+                        if stream_id > RAW_APP_STREAM_ID {
+                            let _ = streams_tx_r.send(DeliverItem::Close(stream_id));
+                        }
+                        // Close on id 0/1 is not used in the current protocol; discard.
+                    }
+                }
+            }
+            // Router done: Tasks A/B will drain remaining items and exit naturally.
         }));
     }
 
@@ -2290,10 +2386,11 @@ async fn handle_packet<T: SessionTransport>(
     demux_recv: &Arc<StreamDemultiplexer>,
     transport_send_ack: &Arc<T>,
     transport_for_path: &Arc<T>,
-    // The reader hands decrypted application data to the delivery task via
-    // this unbounded channel instead of blocking on `recv_tx`/the demux — so a
-    // slow `recv()` consumer can never head-of-line-stall inbound ACK/control.
-    deliver_tx: &mpsc::UnboundedSender<(u32, Bytes)>,
+    // The reader hands decrypted application data and FIN signals to the
+    // delivery task via this unbounded channel instead of blocking on
+    // `recv_tx`/the demux — so a slow `recv()` consumer can never
+    // head-of-line-stall inbound ACK/control.
+    deliver_tx: &mpsc::UnboundedSender<DeliverItem>,
     undelivered_bytes: &AtomicU64,
     ack_buf: &mut Vec<u8>,
     observability: &Observability,
@@ -2513,13 +2610,12 @@ async fn handle_packet<T: SessionTransport>(
                 crypto_recv.notify_outbound_ready();
             }
         }
-        // Best-effort, non-blocking: the demux/PhantomStream path is vestigial;
-        // routing the ACK/close notification to it must never block the reader.
-        // Route `largest_acked` to preserve the existing close/notify semantics
-        // (the waiter only needs *an* ACK signal for the stream).
+        // Route ACK signal non-blocking (informational for the stream table, not
+        // delivery). Route FIN through the delivery channel so it is ordered
+        // after any in-flight data frames and is delivered losslessly for id ≥ 2.
         demux_recv.route_ack(stream_id, sack.largest_acked);
         if packet.header.flags.contains(PacketFlags::FIN) {
-            demux_recv.route_close(stream_id);
+            let _ = deliver_tx.send(DeliverItem::Close(stream_id));
         }
         return;
     }
@@ -2805,7 +2901,9 @@ async fn handle_packet<T: SessionTransport>(
         deliver_in_order_run(delivered, stream_id, deliver_tx, undelivered_bytes);
 
         if packet.header.flags.contains(PacketFlags::FIN) {
-            demux_recv.route_close(stream_id);
+            // Route FIN through the same delivery channel so it is ordered
+            // AFTER any data frames queued for this stream.
+            let _ = deliver_tx.send(DeliverItem::Close(stream_id));
         }
         return;
     }
@@ -2816,25 +2914,29 @@ async fn handle_packet<T: SessionTransport>(
     // a successful enqueue (a dead delivery task can't inflate `undelivered_bytes`).
     if !plaintext.is_empty() {
         let len = plaintext.len() as u64;
-        if deliver_tx.send((stream_id, Bytes::from(plaintext))).is_ok() {
+        if deliver_tx
+            .send(DeliverItem::Data(stream_id, Bytes::from(plaintext)))
+            .is_ok()
+        {
             undelivered_bytes.fetch_add(len, Ordering::AcqRel);
         }
     }
 
     if packet.header.flags.contains(PacketFlags::FIN) {
-        demux_recv.route_close(stream_id);
+        // Route FIN through the delivery channel (ordered after any data above).
+        let _ = deliver_tx.send(DeliverItem::Close(stream_id));
     }
 }
 
 /// Hand an in-order run of reliable payloads (as released by
 /// [`Stream::accept_in_order`]) to the single FIFO delivery task, in order. Each
 /// non-empty chunk is counted toward the `undelivered_bytes` backlog only on a
-/// successful enqueue, so a dead delivery task (consumer gone, `deliver_rx`
+/// successful enqueue, so a dead delivery task (consumer gone, `deliver_tx`
 /// dropped) cannot inflate the counter for data that was discarded.
 fn deliver_in_order_run(
     run: Vec<Bytes>,
     stream_id: u32,
-    deliver_tx: &mpsc::UnboundedSender<(u32, Bytes)>,
+    deliver_tx: &mpsc::UnboundedSender<DeliverItem>,
     undelivered_bytes: &AtomicU64,
 ) {
     for chunk in run {
@@ -2842,7 +2944,7 @@ fn deliver_in_order_run(
             continue;
         }
         let len = chunk.len() as u64;
-        if deliver_tx.send((stream_id, chunk)).is_ok() {
+        if deliver_tx.send(DeliverItem::Data(stream_id, chunk)).is_ok() {
             undelivered_bytes.fetch_add(len, Ordering::AcqRel);
         }
     }
@@ -4406,7 +4508,7 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
         let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
@@ -4434,7 +4536,11 @@ mod tests {
 
         // The decrypted plaintext must have been handed to the delivery task,
         // tagged with its stream id, and counted toward the undelivered backlog.
-        let (sid, received) = deliver_rx.recv().await.expect("delivery hand-off");
+        let item = deliver_rx.recv().await.expect("delivery hand-off");
+        let (sid, received) = match item {
+            DeliverItem::Data(sid, bytes) => (sid, bytes),
+            DeliverItem::Close(sid) => panic!("unexpected Close({sid}) in deliver channel"),
+        };
         assert_eq!(sid, stream_id as u32);
         assert_eq!(&received[..], b"hello-v2");
         assert_eq!(
@@ -4455,7 +4561,7 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let attempts = MAX_STREAMS as u32 + 64;
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(attempts as usize + 16);
@@ -4518,7 +4624,7 @@ mod tests {
         // Register stream 2 — an open_stream()-style stream (ids 2+), the M-2 target.
         let mut handle = demux.register_stream(2, 8);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
         let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
@@ -5047,7 +5153,7 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
         let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
@@ -5075,11 +5181,15 @@ mod tests {
 
         // Recv-relax (D10b): the authenticated frame IS delivered, even though
         // path 7 is not validated.
-        let (sid, received) =
+        let item =
             tokio::time::timeout(std::time::Duration::from_secs(1), deliver_rx.recv())
                 .await
                 .expect("recv-relax must deliver promptly (no drop / hang)")
                 .expect("delivery channel open");
+        let (sid, received) = match item {
+            DeliverItem::Data(sid, bytes) => (sid, bytes),
+            DeliverItem::Close(sid) => panic!("unexpected Close({sid}) in deliver channel"),
+        };
         assert_eq!(sid, stream_id as u32);
         assert_eq!(&received[..], b"on-new-path");
         // The new path is registered Unvalidated for a later challenge. (The
@@ -5142,7 +5252,7 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
@@ -5256,7 +5366,7 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
@@ -5386,7 +5496,7 @@ mod tests {
     ) {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
-        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
         let transport: Arc<ChannelTransport> = Arc::new(ChannelTransport {
@@ -5733,7 +5843,7 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
         let transport: Arc<ChannelTransport> = Arc::new(ChannelTransport {
@@ -5838,7 +5948,7 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
         let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
@@ -5901,7 +6011,7 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
         let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
@@ -5930,9 +6040,18 @@ mod tests {
         // Each sub-payload is handed off IN ORDER through the single FIFO
         // delivery channel, every one tagged with the outer stream id, and the
         // total counted toward the undelivered backlog.
-        let (sa, a) = deliver_rx.recv().await.expect("alpha");
-        let (sb, b) = deliver_rx.recv().await.expect("bravo");
-        let (sc, c) = deliver_rx.recv().await.expect("charlie");
+        let (sa, a) = match deliver_rx.recv().await.expect("alpha") {
+            DeliverItem::Data(sid, bytes) => (sid, bytes),
+            DeliverItem::Close(sid) => panic!("unexpected Close({sid}) for alpha"),
+        };
+        let (sb, b) = match deliver_rx.recv().await.expect("bravo") {
+            DeliverItem::Data(sid, bytes) => (sid, bytes),
+            DeliverItem::Close(sid) => panic!("unexpected Close({sid}) for bravo"),
+        };
+        let (sc, c) = match deliver_rx.recv().await.expect("charlie") {
+            DeliverItem::Data(sid, bytes) => (sid, bytes),
+            DeliverItem::Close(sid) => panic!("unexpected Close({sid}) for charlie"),
+        };
         assert_eq!(
             (sa, sb, sc),
             (stream_id as u32, stream_id as u32, stream_id as u32)
@@ -5984,7 +6103,7 @@ mod tests {
         let (demux, _ctrl) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(8);
         let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
@@ -6014,8 +6133,10 @@ mod tests {
 
         // Drain the FIFO delivery channel — order must be exactly A, B, C, D.
         let mut got: Vec<Bytes> = Vec::new();
-        while let Ok((_sid, b)) = deliver_rx.try_recv() {
-            got.push(b);
+        while let Ok(item) = deliver_rx.try_recv() {
+            if let DeliverItem::Data(_sid, b) = item {
+                got.push(b);
+            }
         }
         let seen: Vec<&[u8]> = got.iter().map(|b| &b[..]).collect();
         assert_eq!(seen, vec![&b"A"[..], b"B", b"C", b"D"]);
@@ -6044,7 +6165,7 @@ mod tests {
         let (demux, _ctrl) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(8);
         let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
@@ -6074,8 +6195,10 @@ mod tests {
         }
 
         let mut got: Vec<Bytes> = Vec::new();
-        while let Ok((_sid, b)) = deliver_rx.try_recv() {
-            got.push(b);
+        while let Ok(item) = deliver_rx.try_recv() {
+            if let DeliverItem::Data(_sid, b) = item {
+                got.push(b);
+            }
         }
         let seen: Vec<&[u8]> = got.iter().map(|b| &b[..]).collect();
         assert_eq!(
@@ -6111,7 +6234,7 @@ mod tests {
         let (demux, _ctrl) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(8);
         let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
@@ -6140,8 +6263,10 @@ mod tests {
         }
 
         let mut got: Vec<Bytes> = Vec::new();
-        while let Ok((_sid, x)) = deliver_rx.try_recv() {
-            got.push(x);
+        while let Ok(item) = deliver_rx.try_recv() {
+            if let DeliverItem::Data(_sid, x) = item {
+                got.push(x);
+            }
         }
         let seen: Vec<&[u8]> = got.iter().map(|b| &b[..]).collect();
         assert_eq!(
@@ -6499,7 +6624,7 @@ mod tests {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
-        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
         // Server's outbound transport — captures the echo back.
         let (echo_tx, mut echo_rx) = mpsc::channel::<Vec<u8>>(4);
@@ -6810,6 +6935,325 @@ mod tests {
         assert!(
             !client_ids.contains(&1) && !server_ids.contains(&1),
             "stream id 1 (raw-app) must never be allocated by open_stream"
+        );
+    }
+
+    // ── Lossless backpressured per-stream recv tests ─────────────────────────────
+
+    /// LOSSLESS: opened-stream (id ≥ 2) delivery is LOSSLESS even when
+    /// the consumer pauses and more than the per-stream channel capacity (1024)
+    /// frames are in flight.
+    ///
+    /// The test sends N_FRAMES > 1024 reliable frames, waits until at least the
+    /// first `streams_deliver_rx`-deep batches have reached Task B (Task B
+    /// backpressures after 1024 on `route_data_async`), then drains the
+    /// PhantomStream and asserts zero loss + correct order.
+    #[tokio::test]
+    async fn opened_stream_delivery_is_lossless_beyond_channel_capacity() {
+        const N_FRAMES: u32 = 1100; // > per-stream channel capacity of 1024
+
+        let session_id = fixed_session_id();
+        let (client_inner, server_inner) = paired_sessions(session_id);
+        let (client_t, server_t) = ChannelTransport::pair();
+
+        // Full server-side session with a running pump.
+        let server = PhantomSession::from_accepted_server_session(
+            "lossless-test".to_string(),
+            server_t,
+            server_inner,
+        );
+
+        // Open a stream (id ≥ 2) on the server so the demux is registered.
+        let stream = server.open_stream();
+        let stream_id = stream.stream_id() as TransportStreamId;
+
+        // Drain ACKs from the server so its reader never wedges.
+        let drain_t = Arc::new(client_t);
+        let drain_t2 = drain_t.clone();
+        let _drainer = tokio::spawn(async move { while drain_t2.recv_bytes().await.is_ok() {} });
+
+        // Send N_FRAMES reliable frames from the "client" side WITHOUT consuming.
+        // Each frame is tagged with its sequence number as payload so we can verify
+        // order after draining.
+        for seq in 0..N_FRAMES {
+            let wire = encrypt_outgoing(&client_inner, session_id, stream_id, seq, &seq.to_be_bytes());
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                drain_t.send_bytes(&wire),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                _ => panic!("send failed at frame {seq}"),
+            }
+        }
+
+        // Give the pump time to receive and route all frames. Task B will block
+        // after filling the per-stream bounded channel (capacity 1024) but
+        // streams_deliver_rx keeps buffering — all N_FRAMES are enqueued.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Drain the opened stream — Task B unblocks once the consumer reads.
+        let mut received: Vec<u32> = Vec::new();
+        let timeout = std::time::Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout(timeout, stream.recv()).await {
+                Ok(Ok(bytes)) if bytes.len() == 4 => {
+                    received.push(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+                    if received.len() == N_FRAMES as usize {
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => {} // unexpected length, skip
+                Ok(Err(_)) => break,
+                Err(_) => panic!("timeout waiting for frame {}", received.len()),
+            }
+        }
+
+        assert_eq!(
+            received.len(),
+            N_FRAMES as usize,
+            "zero loss: all {N_FRAMES} frames must arrive; got {}",
+            received.len()
+        );
+        let expected: Vec<u32> = (0..N_FRAMES).collect();
+        assert_eq!(
+            received, expected,
+            "frames must arrive in sequence order (lossless + ordered)"
+        );
+    }
+
+    /// RAW-APP ISOLATION: while an opened-stream (id ≥ 2) consumer is
+    /// NOT draining (Task B stalled on the per-stream bounded channel), the
+    /// raw-app path (session.send/recv on stream id 1) must still work.
+    ///
+    /// This is the make-or-break property: opened-stream backpressure must NOT
+    /// head-of-line block the raw-app recv path.
+    #[tokio::test]
+    async fn raw_app_path_unblocked_while_opened_stream_is_backed_up() {
+        let session_id = fixed_session_id();
+        let (client_inner, server_inner) = paired_sessions(session_id);
+        let (client_t, server_t) = ChannelTransport::pair();
+
+        // Full server-side session with a running pump.
+        let server = PhantomSession::from_accepted_server_session(
+            "hol-test".to_string(),
+            server_t,
+            server_inner.clone(),
+        );
+
+        // Open an id-≥2 stream on the server and NEVER consume it.
+        let _unopened = server.open_stream();
+        let unopened_id = _unopened.stream_id() as TransportStreamId;
+
+        let drain_t = Arc::new(client_t);
+        let drain_t2 = drain_t.clone();
+        // Drain ACK/WINDOW_UPDATE frames the server sends back.
+        let _drainer = tokio::spawn(async move { while drain_t2.recv_bytes().await.is_ok() {} });
+
+        // Flood the opened stream to fill Task B's per-stream channel (capacity 1024)
+        // and back up streams_deliver_rx, so Task B is stalled.
+        for seq in 0..1100u32 {
+            let wire = encrypt_outgoing(
+                &client_inner,
+                session_id,
+                unopened_id,
+                seq,
+                b"backpressure-filler",
+            );
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                drain_t.send_bytes(&wire),
+            )
+            .await;
+        }
+
+        // Let the pump process those and stall Task B.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Now send a raw-app (stream id 1) frame. The session.recv() path goes
+        // through Task A, which is COMPLETELY INDEPENDENT of Task B.
+        // Must use client_inner so HP keys match what the server pump expects
+        // (client send HP == server recv HP).
+        // packet_number=1100 avoids the replay window (flood used 0..1099);
+        // stream_offset=0 (in plaintext prefix) releases the frame immediately
+        // from the reorder buffer (no gap stall for the fresh stream-1 state).
+        let raw_wire = {
+            let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
+            let hdr = PacketHeader::new(session_id, 1, 1100, PacketFlags::new(flag_bits))
+                .with_epoch(client_inner.current_epoch());
+            let mut pt = Vec::with_capacity(4 + b"raw-app-works".len());
+            pt.extend_from_slice(&0u32.to_be_bytes()); // stream_offset = 0
+            pt.extend_from_slice(b"raw-app-works");
+            let ct = client_inner
+                .encrypt_packet(&hdr, &pt, &[])
+                .expect("encrypt raw-app frame");
+            let pkt = PhantomPacket::new(hdr, ct);
+            client_inner.protect_packet(&pkt).expect("protect raw-app frame")
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drain_t.send_bytes(&raw_wire),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            _ => panic!("raw-app send failed"),
+        }
+
+        // Expect to receive the raw-app message within 2 s even though the opened
+        // stream's Task B is stalled — proving Tasks A and B are truly independent.
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.recv(),
+        )
+        .await
+        .expect("raw-app recv timed out — Task B stall is blocking Task A (HoL regression)")
+        .expect("recv returned error");
+
+        assert_eq!(
+            received, b"raw-app-works",
+            "raw-app payload must pass through undisturbed"
+        );
+    }
+
+    /// NO DOUBLE-DELIVERY: frames sent on an opened stream (id ≥ 2) must
+    /// NOT appear in session.recv(); frames sent on the raw-app stream (id 1) must
+    /// NOT appear in any PhantomStream's rx.
+    ///
+    /// We drive handle_packet directly (no full pump) so we can inspect the
+    /// deliver_tx channel before it is routed, and inspect the demux separately.
+    #[tokio::test]
+    async fn no_double_delivery_between_raw_app_and_opened_streams() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+
+        // A registered opened stream (id 2).
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let mut stream_handle = demux.register_stream(2, 64);
+
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(16);
+        let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let mut ack_buf = Vec::with_capacity(256);
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        // --- Part 1: opened-stream frame (id=2) must NOT arrive as raw-app ---
+        let opened_frame = decode_recv_frame(
+            &build_app_frame(&client_session, session_id, 2, 0, b"opened-only"),
+            session_id,
+        );
+        handle_packet(
+            opened_frame,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &transport_send,
+            &transport_send,
+            &deliver_tx,
+            &undelivered,
+            &mut ack_buf,
+            &obs,
+            LegType::Tcp,
+        )
+        .await;
+
+        // The item in deliver_tx must be tagged as id=2 (opened stream).
+        let item = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            deliver_rx.recv(),
+        )
+        .await
+        .expect("deliver channel must have item")
+        .expect("channel open");
+        match &item {
+            DeliverItem::Data(sid, _) => assert_eq!(
+                *sid, 2,
+                "opened-stream frame must be tagged stream_id=2, not raw-app"
+            ),
+            DeliverItem::Close(sid) => panic!("unexpected Close({sid})"),
+        }
+        // Nothing else — no second copy.
+        assert!(
+            deliver_rx.try_recv().is_err(),
+            "opened-stream frame must produce exactly ONE DeliverItem, not two"
+        );
+        // The direct demux path (route_data/non-async) was dropped from the old
+        // Task A; the stream_handle's channel must be empty (delivery goes via
+        // DeliverItem::Data, not route_data). This confirms no double-delivery at
+        // the handle_packet level — the router task (in the live pump) decides the
+        // final destination.
+        assert!(
+            stream_handle.rx.try_recv().is_err(),
+            "opened-stream frame must NOT arrive on the demux handle synchronously \
+             (delivery is async via Task B)"
+        );
+
+        // --- Part 2: raw-app frame (id=1) must be tagged id=1, not sent to demux ---
+        // packet_number=1 (unique; 0 was used by Part 1), stream_offset=0
+        // (first data on stream 1 → reorder buffer delivers immediately, no gap).
+        let raw_frame = decode_recv_frame(
+            &build_app_frame_with_offset(&client_session, session_id, 1, 1, 0, b"raw-only"),
+            session_id,
+        );
+        handle_packet(
+            raw_frame,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &transport_send,
+            &transport_send,
+            &deliver_tx,
+            &undelivered,
+            &mut ack_buf,
+            &obs,
+            LegType::Tcp,
+        )
+        .await;
+
+        let raw_item = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            deliver_rx.recv(),
+        )
+        .await
+        .expect("deliver channel must have item for raw-app")
+        .expect("channel open");
+        match &raw_item {
+            DeliverItem::Data(sid, bytes) => {
+                assert_eq!(
+                    *sid,
+                    1,
+                    "raw-app frame must be tagged stream_id=1"
+                );
+                // The RELIABLE path in handle_packet strips the 4-byte stream_offset
+                // prefix before handing data to deliver_in_order_run, so the
+                // DeliverItem::Data bytes are the raw application payload directly.
+                assert_eq!(
+                    &bytes[..],
+                    b"raw-only",
+                    "raw-app payload must match"
+                );
+            }
+            DeliverItem::Close(sid) => panic!("unexpected Close({sid}) for raw-app"),
+        }
+        // Nothing else in the channel.
+        assert!(
+            deliver_rx.try_recv().is_err(),
+            "raw-app frame must produce exactly ONE DeliverItem"
+        );
+        // The opened-stream demux handle must remain empty — raw-app data must
+        // never be routed to an opened stream's channel.
+        assert!(
+            stream_handle.rx.try_recv().is_err(),
+            "raw-app frame must NOT arrive on any opened-stream handle"
         );
     }
 }
