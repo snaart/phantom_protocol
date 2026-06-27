@@ -37,13 +37,28 @@ pub enum StreamMessage {
 ///
 /// Each stream is identified by a `u32` stream ID extracted from the packet header.
 /// Unrecognized stream IDs are dropped (with a log warning).
+///
+/// # Stream-ID allocation
+///
+/// Stream IDs 0 and 1 are reserved (`0` = session control channel, `1` = raw-app
+/// stream used by `PhantomSession::send`/`recv`). To avoid collisions when both
+/// peers open streams independently (QUIC-style), allocation is role-stratified:
+///
+/// - **Client** allocates **odd** ids: 3, 5, 7, …
+/// - **Server** allocates **even** ids: 2, 4, 6, …
+///
+/// Neither side will ever produce an id the other produces, so concurrent
+/// `open_stream()` calls on both ends never clash.
 pub struct StreamDemultiplexer {
     /// Active stream senders: stream_id → sender channel
     streams: DashMap<u32, mpsc::Sender<StreamMessage>>,
     /// Control channel for session-level messages (stream_id = 0)
     control_tx: mpsc::Sender<Bytes>,
-    /// Next stream ID to allocate
+    /// Next stream ID to allocate (always steps by 2, starting at 3 for clients
+    /// and 2 for servers; 0 and 1 are permanently reserved).
     next_stream_id: AtomicU32,
+    /// Step between consecutive allocations (always 2 — stored for clarity).
+    id_step: u32,
 }
 
 /// Handle returned when a stream is registered with the demultiplexer.
@@ -59,12 +74,31 @@ impl StreamDemultiplexer {
     ///
     /// The control channel (stream_id = 0) receives session-level packets
     /// such as keepalives, migration signals, and stream management.
+    ///
+    /// Stream-id allocation defaults to the *server* role (even ids starting
+    /// at 2). Use [`StreamDemultiplexer::new_with_role`] when the calling side
+    /// is known at construction time.
     pub fn new(control_buffer: usize) -> (Self, mpsc::Receiver<Bytes>) {
+        Self::new_with_role(control_buffer, false)
+    }
+
+    /// Create a new demultiplexer with an explicit peer role.
+    ///
+    /// - `is_client = true`  → allocates **odd** ids (3, 5, 7, …)
+    /// - `is_client = false` → allocates **even** ids (2, 4, 6, …)
+    ///
+    /// Stream IDs 0 (control) and 1 (raw-app) are permanently reserved and
+    /// will never be returned by [`open_stream`](Self::open_stream).
+    pub fn new_with_role(control_buffer: usize, is_client: bool) -> (Self, mpsc::Receiver<Bytes>) {
         let (control_tx, control_rx) = mpsc::channel(control_buffer);
+        // client → first user-visible id = 3 (odd), server → 2 (even).
+        // Step is always 2 so parity is maintained for every subsequent call.
+        let first_id = if is_client { 3 } else { 2 };
         let mux = Self {
             streams: DashMap::new(),
             control_tx,
-            next_stream_id: AtomicU32::new(2), // 0 = control, 1 = raw-app session channel
+            next_stream_id: AtomicU32::new(first_id),
+            id_step: 2,
         };
         (mux, control_rx)
     }
@@ -72,21 +106,25 @@ impl StreamDemultiplexer {
     /// Register a new stream and get back a handle with the assigned ID.
     ///
     /// `buffer_size` controls the depth of the per-stream receive buffer.
+    ///
+    /// The allocated id respects the role set at construction time:
+    /// clients get odd ids (≥ 3), servers get even ids (≥ 2). Id 1 (the
+    /// raw-app stream) is never returned here.
     pub fn open_stream(&self, buffer_size: usize) -> StreamHandle {
-        let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
+        let stream_id = self.next_stream_id.fetch_add(self.id_step, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(buffer_size);
         self.streams.insert(stream_id, tx);
         StreamHandle { stream_id, rx }
     }
 
     /// Register a stream with a specific ID (e.g., for accepting remote-initiated streams).
+    ///
+    /// Does **not** advance `next_stream_id`: the registered id belongs to the
+    /// remote peer (opposite parity) and has no bearing on our own allocation
+    /// sequence, which already cannot collide with it.
     pub fn register_stream(&self, stream_id: u32, buffer_size: usize) -> StreamHandle {
         let (tx, rx) = mpsc::channel(buffer_size);
         self.streams.insert(stream_id, tx);
-        // Update next_stream_id if necessary to avoid collisions
-        let _ = self
-            .next_stream_id
-            .fetch_max(stream_id + 1, Ordering::Relaxed);
         StreamHandle { stream_id, rx }
     }
 
