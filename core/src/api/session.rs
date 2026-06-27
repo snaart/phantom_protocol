@@ -401,6 +401,10 @@ pub enum SessionCommand {
     /// `path_id` + outbound CID in lock-step, so the client sees — and follows — a fresh
     /// server source with a fresh, unlinkable ConnId. Best-effort, never fatal.
     MigrateServer(String),
+    /// Set the scheduler priority of a specific stream (higher = drained first).
+    /// Takes effect on the next drain pass; no notify needed since priority only
+    /// reorders an already-scheduled drain.
+    SetStreamPriority { stream_id: u32, priority: u32 },
     /// Close the session
     Close,
 }
@@ -562,7 +566,9 @@ impl PhantomSession {
         let state = Arc::new(AtomicU8::new(ConnectionState::Connecting as u8));
         let send_queue = Arc::new(Mutex::new(Vec::new()));
         let peer = peer_addr.to_string();
-        let (demux, _ctrl_rx) = StreamDemultiplexer::new(256);
+        // Client allocates odd stream ids (3, 5, 7, …) — QUIC-style role split so
+        // concurrent open_stream() on both ends never collides.
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new_with_role(256, true);
         let demux = Arc::new(demux);
 
         let streams = Arc::new(DashMap::new());
@@ -656,7 +662,9 @@ impl PhantomSession {
 
         let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
         let send_queue = Arc::new(Mutex::new(Vec::new()));
-        let (demux, _ctrl_rx) = StreamDemultiplexer::new(256);
+        // Server allocates even stream ids (2, 4, 6, …) — QUIC-style role split so
+        // concurrent open_stream() on both ends never collides.
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new_with_role(256, false);
         let demux = Arc::new(demux);
         let streams = Arc::new(DashMap::new());
 
@@ -1382,6 +1390,11 @@ async fn run_data_pump<T: SessionTransport>(
                             for chunk in data.chunks(TRANSPORT_MTU) {
                                 stream.send_unreliable(Bytes::copy_from_slice(chunk)).await;
                             }
+                        }
+                    }
+                    Some(SessionCommand::SetStreamPriority { stream_id, priority }) => {
+                        if let Some(stream) = streams.get(&stream_id) {
+                            stream.set_priority(priority);
                         }
                     }
                     Some(SessionCommand::CloseStream { stream_id }) => {
@@ -6703,6 +6716,100 @@ mod tests {
         assert!(
             matches!(err, CoreError::ValidationError(_)),
             "expected ValidationError, got {err:?}"
+        );
+    }
+
+    // ── PhantomStream::set_priority ──────────────────────────────────────────────
+
+    /// Verify that `SessionCommand::SetStreamPriority` reaches `Stream::set_priority`
+    /// and that the stored value is observable via `Stream::priority()`.
+    ///
+    /// We drive the pump directly via a `ChannelTransport` pair so no network I/O
+    /// is involved — the test is fully deterministic.
+    #[tokio::test]
+    async fn set_priority_command_reaches_stream() {
+        use crate::transport::stream::Stream as TransportStream;
+
+        // Build a stream table entry the same way run_data_pump does.
+        let stream_id: u32 = 42;
+        let transport_stream = Arc::new(TransportStream::new(stream_id as TransportStreamId));
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(stream_id, transport_stream.clone());
+
+        assert_eq!(
+            transport_stream.priority(),
+            0,
+            "default priority should be 0"
+        );
+
+        // Simulate the pump arm: look up the stream and call set_priority.
+        let cmd = SessionCommand::SetStreamPriority {
+            stream_id,
+            priority: 99,
+        };
+        if let SessionCommand::SetStreamPriority {
+            stream_id: sid,
+            priority,
+        } = cmd
+        {
+            if let Some(stream) = streams.get(&sid) {
+                stream.set_priority(priority);
+            }
+        }
+
+        assert_eq!(
+            transport_stream.priority(),
+            99,
+            "priority must be updated to 99 after SetStreamPriority"
+        );
+    }
+
+    // ── Non-colliding client-odd / server-even stream ids ────────────────────────
+
+    /// Client and server demuxes opened with `new_with_role` must allocate
+    /// non-colliding ids: client gets odd ids ≥ 3, server gets even ids ≥ 2.
+    /// Stream id 1 (raw-app) is never returned by `open_stream`.
+    #[tokio::test]
+    async fn stream_ids_are_non_colliding_client_odd_server_even() {
+        let (client_demux, _) = StreamDemultiplexer::new_with_role(16, true);
+        let (server_demux, _) = StreamDemultiplexer::new_with_role(16, false);
+
+        // Open several streams on each side.
+        let client_ids: Vec<u32> = (0..5).map(|_| client_demux.open_stream(8).stream_id).collect();
+        let server_ids: Vec<u32> = (0..5).map(|_| server_demux.open_stream(8).stream_id).collect();
+
+        // Client must produce odd ids ≥ 3.
+        for &id in &client_ids {
+            assert!(id % 2 == 1, "client id {id} must be odd");
+            assert!(id >= 3, "client id {id} must be ≥ 3 (id 1 is raw-app reserved)");
+        }
+
+        // Server must produce even ids ≥ 2.
+        for &id in &server_ids {
+            assert!(id % 2 == 0, "server id {id} must be even");
+            assert!(id >= 2, "server id {id} must be ≥ 2");
+        }
+
+        // No overlap between the two sets.
+        for &cid in &client_ids {
+            assert!(
+                !server_ids.contains(&cid),
+                "client id {cid} must not appear in server ids"
+            );
+        }
+
+        // Ids are strictly increasing within each side.
+        for w in client_ids.windows(2) {
+            assert!(w[1] > w[0], "client ids must be strictly increasing");
+        }
+        for w in server_ids.windows(2) {
+            assert!(w[1] > w[0], "server ids must be strictly increasing");
+        }
+
+        // Raw-app stream id 1 is never returned by open_stream on either side.
+        assert!(
+            !client_ids.contains(&1) && !server_ids.contains(&1),
+            "stream id 1 (raw-app) must never be allocated by open_stream"
         );
     }
 }

@@ -88,6 +88,18 @@ impl PhantomStream {
         }
     }
 
+    /// Set this stream's scheduler priority (higher = drained first). Takes
+    /// effect on the next drain pass.
+    pub async fn set_priority(&self, priority: u32) -> Result<(), CoreError> {
+        self.tx
+            .send(SessionCommand::SetStreamPriority {
+                stream_id: self.stream_id,
+                priority,
+            })
+            .await
+            .map_err(|_| CoreError::NetworkError("Session closed".into()))
+    }
+
     /// Close this stream; the peer will see EOF on its read half.
     ///
     /// Named `disconnect` rather than `close` for the same reason as
