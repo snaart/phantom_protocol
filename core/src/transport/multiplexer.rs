@@ -160,14 +160,21 @@ impl StreamDemultiplexer {
             return self.control_tx.send(payload).await.is_ok();
         }
 
-        if let Some(sender) = self.streams.get(&stream_id) {
-            sender.send(StreamMessage::Data(payload)).await.is_ok()
-        } else {
-            log::warn!(
-                "StreamDemultiplexer: dropping data for unknown stream_id={}",
-                stream_id
-            );
-            false
+        // Clone the per-stream `Sender` out and DROP the DashMap read guard BEFORE the
+        // (potentially blocking) `.await`. Holding a per-shard guard across the await
+        // would block any same-shard map write — `open_stream()` (a sync public API on
+        // the app thread) or the pump's `close_stream()` — for as long as this send is
+        // backpressured, which an unread peer-flooded stream can hold open indefinitely.
+        let sender = self.streams.get(&stream_id).map(|r| r.value().clone());
+        match sender {
+            Some(sender) => sender.send(StreamMessage::Data(payload)).await.is_ok(),
+            None => {
+                log::warn!(
+                    "StreamDemultiplexer: dropping data for unknown stream_id={}",
+                    stream_id
+                );
+                false
+            }
         }
     }
 
@@ -204,14 +211,17 @@ impl StreamDemultiplexer {
             return false;
         }
 
-        if let Some(sender) = self.streams.get(&stream_id) {
-            sender.send(StreamMessage::Ack(seq)).await.is_ok()
-        } else {
-            log::warn!(
-                "StreamDemultiplexer: dropping ACK for unknown stream_id={}",
-                stream_id
-            );
-            false
+        // Drop the DashMap guard before the await (see route_data_async).
+        let sender = self.streams.get(&stream_id).map(|r| r.value().clone());
+        match sender {
+            Some(sender) => sender.send(StreamMessage::Ack(seq)).await.is_ok(),
+            None => {
+                log::warn!(
+                    "StreamDemultiplexer: dropping ACK for unknown stream_id={}",
+                    stream_id
+                );
+                false
+            }
         }
     }
 
@@ -221,14 +231,17 @@ impl StreamDemultiplexer {
             return false;
         }
 
-        if let Some(sender) = self.streams.get(&stream_id) {
-            sender.send(StreamMessage::Close).await.is_ok()
-        } else {
-            log::warn!(
-                "StreamDemultiplexer: dropping CLOSE for unknown stream_id={}",
-                stream_id
-            );
-            false
+        // Drop the DashMap guard before the await (see route_data_async).
+        let sender = self.streams.get(&stream_id).map(|r| r.value().clone());
+        match sender {
+            Some(sender) => sender.send(StreamMessage::Close).await.is_ok(),
+            None => {
+                log::warn!(
+                    "StreamDemultiplexer: dropping CLOSE for unknown stream_id={}",
+                    stream_id
+                );
+                false
+            }
         }
     }
 
@@ -298,6 +311,45 @@ mod tests {
         demux.close_stream(sid);
         assert!(!demux.has_stream(sid));
         assert_eq!(demux.active_stream_count(), 0);
+    }
+
+    /// Regression: a backpressured `route_data_async` (parked on a full per-stream
+    /// channel) must NOT hold the DashMap shard guard across its `.await`, or a
+    /// same-key map write (`close_stream` / `open_stream`) would deadlock — which
+    /// would let an unread, peer-flooded stream wedge `open_stream()` (a sync public
+    /// API) and the pump's `close_stream`. With the guard-held-across-await bug this
+    /// test times out; with the clone-then-drop fix `close_stream` returns promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backpressured_route_data_async_does_not_block_same_key_map_write() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+
+        // Stream id=2 with a single-slot channel whose consumer never reads.
+        let handle = demux.register_stream(2, 1);
+        let _rx_never_read = handle.rx; // keep the channel open but undrained
+        assert!(demux.route_data_async(2, Bytes::from_static(b"fill")).await); // fills the slot
+
+        // A second async send blocks forever on the full channel (consumer idle).
+        let d_parked = demux.clone();
+        let parked =
+            tokio::spawn(async move { d_parked.route_data_async(2, Bytes::from_static(b"x")).await });
+        tokio::time::sleep(Duration::from_millis(50)).await; // let it reach the .await
+
+        // Same-key DashMap write must not be blocked by the parked send.
+        let d_close = demux.clone();
+        let closed = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || d_close.close_stream(2)),
+        )
+        .await;
+        assert!(
+            closed.is_ok(),
+            "close_stream(2) deadlocked behind a backpressured route_data_async on the same stream"
+        );
+        parked.abort();
     }
 
     #[tokio::test]
