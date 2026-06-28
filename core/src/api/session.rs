@@ -378,6 +378,16 @@ pub struct PhantomSession {
     /// records send/recv, the security drops, and the session lifecycle
     /// (open/close) against it. A ZST no-op when `telemetry-otel` is off.
     observability: Arc<Observability>,
+    /// Receive channel for peer-initiated streams (`accept_stream()`).
+    ///
+    /// When the remote peer opens a new stream (stream id ≥ 2 that the pump
+    /// has not seen before), the recv task registers it in the demux, wraps it
+    /// in an `Arc<PhantomStream>`, and sends it here. The embedder calls
+    /// `accept_stream()` to pick it up. Bounded at 128 so a peer that opens
+    /// many unaccepted streams does not grow this buffer unboundedly (the
+    /// stream still exists in the demux; only the *accept* notification is
+    /// dropped if the embedder is not consuming).
+    incoming_stream_rx: Arc<Mutex<mpsc::Receiver<Arc<crate::api::stream::PhantomStream>>>>,
 }
 
 /// Commands for the background session task
@@ -562,6 +572,8 @@ impl PhantomSession {
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (recv_tx, recv_rx) = mpsc::channel(256);
+        // Channel for peer-initiated streams exposed via accept_stream().
+        let (incoming_stream_tx, incoming_stream_rx) = mpsc::channel(128);
 
         let state = Arc::new(AtomicU8::new(ConnectionState::Connecting as u8));
         let send_queue = Arc::new(Mutex::new(Vec::new()));
@@ -594,6 +606,7 @@ impl PhantomSession {
             early_data_accepted: early_data_accepted.clone(),
             shaping: shaping.clone(),
             observability: observability.clone(),
+            incoming_stream_rx: Arc::new(Mutex::new(incoming_stream_rx)),
         };
 
         // Spawn the background handshake + data pump task on the supplied
@@ -604,7 +617,7 @@ impl PhantomSession {
         let _detached = runtime.spawn(Box::pin(Self::background_task(
             state,
             send_queue,
-            cmd_tx,
+            cmd_tx.clone(),
             cmd_rx,
             recv_tx,
             transport,
@@ -619,6 +632,8 @@ impl PhantomSession {
             resumption_request,
             observability,
             liveness,
+            cmd_tx,
+            incoming_stream_tx,
         )));
 
         session
@@ -659,6 +674,8 @@ impl PhantomSession {
     ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (recv_tx, recv_rx) = mpsc::channel(256);
+        // Channel for peer-initiated streams exposed via accept_stream().
+        let (incoming_stream_tx, incoming_stream_rx) = mpsc::channel(128);
 
         let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
         let send_queue = Arc::new(Mutex::new(Vec::new()));
@@ -676,7 +693,7 @@ impl PhantomSession {
             peer_addr: peer_addr.clone(),
             state: state.clone(),
             send_queue: send_queue.clone(),
-            cmd_tx,
+            cmd_tx: cmd_tx.clone(),
             cmd_rx: Mutex::new(None),
             recv_rx: Mutex::new(recv_rx),
             demux: demux.clone(),
@@ -691,6 +708,7 @@ impl PhantomSession {
             // Shares the listener's instance so its `snapshot()` aggregates
             // every accepted session.
             observability: observability.clone(),
+            incoming_stream_rx: Arc::new(Mutex::new(incoming_stream_rx)),
         });
 
         let session_id = *server_session.id();
@@ -722,6 +740,8 @@ impl PhantomSession {
             runtime_for_pump,
             observability,
             leg,
+            cmd_tx,
+            incoming_stream_tx,
         )));
 
         session
@@ -747,6 +767,8 @@ impl PhantomSession {
         resumption_request: Option<([u8; 32], [u8; 32], Vec<u8>)>,
         observability: Arc<Observability>,
         liveness: Option<crate::transport::liveness::LivenessConfig>,
+        cmd_tx_for_stream: mpsc::Sender<SessionCommand>,
+        incoming_stream_tx: mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
     ) {
         // DEBUG: the peer address is correlatable; keep it off default logs.
         log::debug!("PhantomSession: starting handshake with {}", peer);
@@ -877,6 +899,8 @@ impl PhantomSession {
             runtime,
             observability,
             LegType::Tcp,
+            cmd_tx_for_stream,
+            incoming_stream_tx,
         )
         .await;
     }
@@ -1052,7 +1076,7 @@ enum DeliverItem {
 ///   - listens for incoming packets and decrypts them,
 ///   - encrypts outgoing application/stream packets,
 ///   - sends ACKs for reliable packets.
-// The 12 parameters represent the complete session-identity and I/O surface.
+// The parameters represent the complete session-identity and I/O surface.
 // Grouping them into a struct would require a generic struct (due to `T:
 // SessionTransport`), add indirection with no safety or clarity gain, and
 // constitute a public-API change. The function is private (`async fn`, no
@@ -1071,6 +1095,11 @@ async fn run_data_pump<T: SessionTransport>(
     runtime: Arc<dyn Runtime>,
     observability: Arc<Observability>,
     leg: LegType,
+    // Command channel cloned for building `PhantomStream` handles on
+    // peer-initiated streams (passed through to `handle_packet` → new-stream branch).
+    cmd_tx_for_stream: mpsc::Sender<SessionCommand>,
+    // Sink for newly-registered peer-initiated streams (`accept_stream()`).
+    incoming_stream_tx: mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
 ) {
     // Session is now established and active — bump the active-session gauge.
     // The matching `session_closed` at teardown (below) lets the gauge fall,
@@ -1269,6 +1298,9 @@ async fn run_data_pump<T: SessionTransport>(
     let streams_recv = streams.clone();
     let undelivered_reader = undelivered_bytes.clone();
     let observability_recv = observability.clone();
+    // Clones moved into the recv task for new-stream registration.
+    let cmd_tx_recv = cmd_tx_for_stream.clone();
+    let incoming_stream_tx_recv = incoming_stream_tx.clone();
     // Completion signal for the receive task. `SpawnHandle` from the
     // runtime trait does not expose a `Future` for `.await` directly
     // (different runtimes provide different join futures), so we wire a
@@ -1340,6 +1372,8 @@ async fn run_data_pump<T: SessionTransport>(
                 &mut ack_buf,
                 &observability_recv,
                 leg,
+                &cmd_tx_recv,
+                &incoming_stream_tx_recv,
             )
             .await;
         }
@@ -2395,6 +2429,13 @@ async fn handle_packet<T: SessionTransport>(
     ack_buf: &mut Vec<u8>,
     observability: &Observability,
     leg: LegType,
+    // Session command channel used to build `PhantomStream` for
+    // newly-registered peer-initiated streams (same sender the embedder uses
+    // for `send_reliable` / `close_stream` etc.).
+    cmd_tx_for_stream: &mpsc::Sender<SessionCommand>,
+    // Sink where newly-registered peer-initiated streams are
+    // pushed so `accept_stream()` can hand them to the embedder.
+    incoming_stream_tx: &mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
 ) {
     let stream_id: u32 = packet.header.stream_id.into();
     let path_id = packet.header.path_id;
@@ -2846,10 +2887,36 @@ async fn handle_packet<T: SessionTransport>(
                     );
                     return;
                 }
-                streams_recv
-                    .entry(stream_id)
-                    .or_insert_with(|| Arc::new(Stream::new(stream_id as TransportStreamId)))
-                    .clone()
+                let new_stream = Arc::new(Stream::new(stream_id as TransportStreamId));
+                streams_recv.insert(stream_id, new_stream.clone());
+
+                // For peer-initiated user streams (id ≥ 2), register in
+                // the demux so Task B can route data to this stream, then push a
+                // PhantomStream handle onto the incoming-stream channel so the
+                // embedder can pick it up via `accept_stream()`. `try_send` is
+                // non-blocking: if the 128-slot channel is full the push is silently
+                // dropped (the stream is still in `streams_recv` and the demux, so
+                // data continues to flow — only the *accept notification* is lost;
+                // consistent with the MAX_STREAMS cap semantics). Only streams with
+                // id ≥ 2 are user-visible; id 1 is the raw-app reserved stream
+                // (never accepted via this path). Registration happens exactly ONCE
+                // per stream_id (the `None` arm here), guarded by the DashMap entry.
+                if stream_id > RAW_APP_STREAM_ID {
+                    let handle = demux_recv.register_stream(stream_id, 1024);
+                    let phantom_stream = Arc::new(crate::api::stream::PhantomStream::new(
+                        handle,
+                        cmd_tx_for_stream.clone(),
+                    ));
+                    // Non-blocking push: a full incoming channel is a backpressure
+                    // signal from the embedder (not consuming); don't block the reader.
+                    if incoming_stream_tx.try_send(phantom_stream).is_err() {
+                        log::debug!(
+                            "PhantomSession: incoming_stream_tx full or closed; \
+                             accept notification for stream {stream_id} dropped"
+                        );
+                    }
+                }
+                new_stream
             }
         };
         // Accept into the reorder buffer FIRST so the SACK derived next reflects it.
@@ -3015,6 +3082,7 @@ impl PhantomSession {
     pub fn connect(peer_addr: String) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (_recv_tx, recv_rx) = mpsc::channel(256);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(128);
 
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(256);
         let streams = Arc::new(DashMap::new());
@@ -3037,6 +3105,7 @@ impl PhantomSession {
             shaping: Arc::new(parking_lot::Mutex::new(TrafficShapingConfig::default())),
             // Placeholder session (no transport / pump); a no-op holder.
             observability: Observability::new(ObservabilityConfig::default()),
+            incoming_stream_rx: Arc::new(Mutex::new(incoming_rx)),
         })
     }
 
@@ -3052,6 +3121,32 @@ impl PhantomSession {
             handle,
             self.cmd_tx.clone(),
         ))
+    }
+
+    /// Accept the next peer-initiated stream.
+    ///
+    /// Blocks until the remote peer opens a new stream (one with an id ≥ 2 that
+    /// we haven't seen yet). The returned [`PhantomStream`] is already registered
+    /// in the session's demux and ready for `recv()` / `send_reliable()`.
+    ///
+    /// Returns `Err(CoreError::ConnectionClosed)` when the session has ended and no
+    /// further streams will arrive (the internal channel was dropped by the pump).
+    ///
+    /// # Stream-ID parity
+    ///
+    /// Peer-initiated streams have the *opposite* parity from locally-opened ones
+    /// (QUIC-style): if the local side is the client (odd ids) the peer uses even
+    /// ids, and vice versa.
+    ///
+    /// # Concurrency
+    ///
+    /// Only one caller should call `accept_stream()` at a time. The receiver is
+    /// protected by an async `Mutex`; a concurrent call will wait for the lock.
+    pub async fn accept_stream(
+        &self,
+    ) -> Result<Arc<crate::api::stream::PhantomStream>, CoreError> {
+        let mut rx = self.incoming_stream_rx.lock().await;
+        rx.recv().await.ok_or(CoreError::ConnectionClosed)
     }
 
     /// Send data through the session.
@@ -3695,6 +3790,20 @@ pub async fn connect_pinned_udp_with_resumption(
 mod tests {
     use super::*;
     use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+
+    // ── No-op sinks for handle_packet calls in tests that don't exercise accept_stream ──
+
+    /// Return a no-op cmd_tx and incoming_stream_tx for test handle_packet calls.
+    /// The receivers are immediately dropped so `try_send` silently fails — which is
+    /// fine; tests that do not exercise `accept_stream()` do not care about these channels.
+    fn noop_accept_sinks() -> (
+        mpsc::Sender<SessionCommand>,
+        mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
+    ) {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let (inc_tx, _inc_rx) = mpsc::channel(1);
+        (cmd_tx, inc_tx)
+    }
 
     // ── Mock transport for testing ──
 
@@ -4518,6 +4627,7 @@ mod tests {
 
         let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             v2,
             session_id,
@@ -4531,6 +4641,8 @@ mod tests {
             &mut ack_buf,
             &obs,
             LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
         )
         .await;
 
@@ -4585,6 +4697,7 @@ mod tests {
                 b"x",
             );
             let v2 = decode_recv_frame(&frame, session_id);
+            let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
             handle_packet(
                 v2,
                 session_id,
@@ -4598,6 +4711,8 @@ mod tests {
                 &mut ack_buf,
                 &obs,
                 LegType::Tcp,
+                &no_cmd_tx,
+                &no_inc_tx,
             )
             .await;
         }
@@ -4638,6 +4753,7 @@ mod tests {
         let header = PacketHeader::new(session_id, 2, 0, PacketFlags::new(PacketFlags::FIN));
         let forged = PhantomPacket::new(header, Vec::new());
 
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             forged,
             session_id,
@@ -4651,6 +4767,8 @@ mod tests {
             &mut ack_buf,
             &obs,
             LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
         )
         .await;
 
@@ -5163,6 +5281,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
 
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             frame,
             session_id,
@@ -5176,6 +5295,8 @@ mod tests {
             &mut ack_buf,
             &obs,
             LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
         )
         .await;
 
@@ -5257,6 +5378,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
 
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             frame,
             session_id,
@@ -5270,6 +5392,8 @@ mod tests {
             &mut ack_buf,
             &obs,
             LegType::Udp,
+            &no_cmd_tx,
+            &no_inc_tx,
         )
         .await;
 
@@ -5371,6 +5495,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
 
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             frame,
             session_id,
@@ -5384,6 +5509,8 @@ mod tests {
             &mut ack_buf,
             &obs,
             LegType::Udp,
+            &no_cmd_tx,
+            &no_inc_tx,
         )
         .await;
 
@@ -5505,6 +5632,7 @@ mod tests {
         });
         let mut ack_buf = Vec::with_capacity(64);
         let obs = Observability::new(ObservabilityConfig::default());
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             pkt,
             session_id,
@@ -5518,6 +5646,8 @@ mod tests {
             &mut ack_buf,
             &obs,
             LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
         )
         .await;
     }
@@ -5852,6 +5982,7 @@ mod tests {
         });
         let mut ack_buf = Vec::with_capacity(64);
         let obs = Observability::new(ObservabilityConfig::default());
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             data_pkt,
             session_id,
@@ -5865,6 +5996,8 @@ mod tests {
             &mut ack_buf,
             &obs,
             LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
         )
         .await;
 
@@ -5958,6 +6091,7 @@ mod tests {
 
         let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             bad_packet,
             session_id,
@@ -5971,6 +6105,8 @@ mod tests {
             &mut ack_buf,
             &obs,
             LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
         )
         .await;
 
@@ -6021,6 +6157,7 @@ mod tests {
 
         let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             v2,
             session_id,
@@ -6034,6 +6171,8 @@ mod tests {
             &mut ack_buf,
             &obs,
             LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
         )
         .await;
 
@@ -6114,6 +6253,7 @@ mod tests {
         let obs = Observability::new(ObservabilityConfig::default());
 
         for pkt in [coalesced, normal] {
+            let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
             handle_packet(
                 pkt,
                 session_id,
@@ -6127,6 +6267,8 @@ mod tests {
                 &mut ack_buf,
                 &obs,
                 LegType::Tcp,
+                &no_cmd_tx,
+                &no_inc_tx,
             )
             .await;
         }
@@ -6177,6 +6319,7 @@ mod tests {
 
         // Deliver OUT OF ORDER on the wire: seq 1 first, then seq 0.
         for pkt in [f1, f0] {
+            let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
             handle_packet(
                 pkt,
                 session_id,
@@ -6190,6 +6333,8 @@ mod tests {
                 &mut ack_buf,
                 &obs,
                 LegType::Tcp,
+                &no_cmd_tx,
+                &no_inc_tx,
             )
             .await;
         }
@@ -6245,6 +6390,7 @@ mod tests {
         let obs = Observability::new(ObservabilityConfig::default());
 
         for pkt in [a, b] {
+            let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
             handle_packet(
                 pkt,
                 session_id,
@@ -6258,6 +6404,8 @@ mod tests {
                 &mut ack_buf,
                 &obs,
                 LegType::Tcp,
+                &no_cmd_tx,
+                &no_inc_tx,
             )
             .await;
         }
@@ -6638,6 +6786,7 @@ mod tests {
         let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
 
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             v2,
             session_id,
@@ -6651,6 +6800,8 @@ mod tests {
             &mut ack_buf,
             &obs,
             LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
         )
         .await;
 
@@ -7150,6 +7301,7 @@ mod tests {
             &build_app_frame(&client_session, session_id, 2, 0, b"opened-only"),
             session_id,
         );
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             opened_frame,
             session_id,
@@ -7163,6 +7315,8 @@ mod tests {
             &mut ack_buf,
             &obs,
             LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
         )
         .await;
 
@@ -7204,6 +7358,7 @@ mod tests {
             &build_app_frame_with_offset(&client_session, session_id, 1, 1, 0, b"raw-only"),
             session_id,
         );
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             raw_frame,
             session_id,
@@ -7217,6 +7372,8 @@ mod tests {
             &mut ack_buf,
             &obs,
             LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
         )
         .await;
 
@@ -7255,6 +7412,92 @@ mod tests {
         assert!(
             stream_handle.rx.try_recv().is_err(),
             "raw-app frame must NOT arrive on any opened-stream handle"
+        );
+    }
+
+    // ── Peer-initiated stream accept tests ───────────────────────────────────
+
+    /// When a client sends data on a NEW stream (one the server has
+    /// not seen before), the server-side `accept_stream()` returns an
+    /// `Arc<PhantomStream>` for that stream, and `recv()` on it yields the data.
+    ///
+    /// Uses `PhantomSession::from_accepted_server_session` (the full pump) with an
+    /// in-memory `ChannelTransport` pair. The client side is a bare `Session` +
+    /// `encrypt_outgoing` so the test does not require a real handshake.
+    #[tokio::test]
+    async fn accept_stream_delivers_peer_initiated_stream() {
+        let session_id = fixed_session_id();
+        let (client_inner, server_inner) = paired_sessions(session_id);
+
+        let (client_t, server_t) = ChannelTransport::pair();
+
+        // Server session with a running data pump (even ids).
+        let server = PhantomSession::from_accepted_server_session(
+            "accept-test".to_string(),
+            server_t,
+            server_inner,
+        );
+
+        // Drain any ACK/WINDOW_UPDATE frames the server sends back.
+        let client_t = Arc::new(client_t);
+        let drain_t = client_t.clone();
+        let _drainer = tokio::spawn(async move { while drain_t.recv_bytes().await.is_ok() {} });
+
+        // Client opens stream id 3 (odd = client-allocated) and sends one frame.
+        // stream_offset 0, payload b"hello-from-peer".
+        let stream_id: TransportStreamId = 3;
+        let wire = encrypt_outgoing(&client_inner, session_id, stream_id, 0, b"hello-from-peer");
+        client_t.send_bytes(&wire).await.expect("send frame");
+
+        // Server should surface the new stream via accept_stream().
+        let accepted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.accept_stream(),
+        )
+        .await
+        .expect("timeout waiting for accept_stream")
+        .expect("accept_stream returned Err");
+
+        assert_eq!(accepted.stream_id(), 3, "stream id must be 3 (client-allocated)");
+
+        // The first frame should arrive on recv().
+        let data = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            accepted.recv(),
+        )
+        .await
+        .expect("timeout waiting for recv")
+        .expect("recv returned Err");
+
+        assert_eq!(
+            data,
+            Some(b"hello-from-peer".to_vec()),
+            "recv must return the payload sent by the client"
+        );
+    }
+
+    /// `accept_stream()` returns `Err(ConnectionClosed)` once the
+    /// session is torn down (the internal channel is dropped).
+    #[tokio::test]
+    async fn accept_stream_returns_connection_closed_on_session_teardown() {
+        // Use the inert `connect()` placeholder: its incoming_stream_rx is
+        // backed by a channel whose sender is immediately dropped (no pump
+        // running), so `accept_stream()` should return `Err(ConnectionClosed)`.
+        let session = PhantomSession::connect("none".into());
+        // The sender half was immediately dropped in `connect()` (stored in a
+        // local `_incoming_tx` that is dropped at end of the fn). So the
+        // channel is closed → recv() returns None → Ok → map_err gives
+        // ConnectionClosed.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.accept_stream(),
+        )
+        .await
+        .expect("should not time out — channel is already closed");
+
+        assert!(
+            matches!(result, Err(CoreError::ConnectionClosed)),
+            "expected ConnectionClosed on a closed channel"
         );
     }
 }
