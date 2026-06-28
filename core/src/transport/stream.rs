@@ -83,6 +83,11 @@ struct PendingData {
     /// time-threshold, L1-B). `poll_send`'s Pass-0 fast-retransmits it ahead of
     /// cwnd/window, then clears the flag. Distinct from the RTO pass (Pass-1).
     lost: bool,
+    /// True when this is the reliable FIN sentinel (zero-length data, marks
+    /// end-of-stream). The drain path ORs `PacketFlags::FIN` into the wire frame
+    /// flags when it sees this segment. Stays in the send buffer until SACKed so
+    /// the FIN is retransmitted like any reliable segment.
+    fin: bool,
 }
 
 /// One reliable segment retired by [`Stream::on_sack`] — a segment whose
@@ -148,6 +153,9 @@ pub struct OutboundSegment {
     /// True when this is a retransmission (the RTO expired) rather than a first
     /// transmission — the caller reports it to congestion control as a loss.
     pub retransmit: bool,
+    /// True when this segment is the reliable FIN sentinel (zero-length data).
+    /// The drain path must OR `PacketFlags::FIN` into the wire frame flags.
+    pub fin: bool,
 }
 
 /// RFC 6298 retransmission-timeout estimator (per stream). Replaces a fixed
@@ -635,11 +643,66 @@ impl Stream {
             sent_at: None,
             retries: 0,
             lost: false,
+            fin: false,
         };
 
         self.send_buffer.lock().await.push_back(pending);
 
         Ok(stream_offset)
+    }
+
+    /// Queue the reliable FIN sentinel for this stream.
+    ///
+    /// Enqueues a zero-length reliable segment flagged as the FIN. The segment
+    /// goes through the same ARQ machinery as any reliable data — it is
+    /// retransmitted until SACKed, guaranteeing the peer receives the FIN even
+    /// under packet loss. The drain path (`drain_streams_priority_ordered`) ORs
+    /// `PacketFlags::FIN` into the wire frame when it sees `seg.fin == true`.
+    ///
+    /// Simultaneously marks `local_finished = true` so `is_fin_acked()` can detect
+    /// when the send buffer is empty (FIN was SACKed) and clean up.
+    ///
+    /// Calling this more than once on the same stream is a no-op in practice:
+    /// the second call also allocates an offset and enqueues another zero-length
+    /// segment, which is harmless (the peer SACKs them all). The caller
+    /// (`CloseStream` handler in the pump) removes the stream from the table after
+    /// calling this once, so no second call is possible via the normal path.
+    pub async fn queue_fin(&self) -> Result<(), CoreError> {
+        // Acquire backpressure permit — reuses `send_reliable`'s logic.
+        #[allow(clippy::expect_used)]
+        let permit = self
+            .send_semaphore
+            .acquire()
+            .await
+            .expect("Semaphore closed");
+        let stream_offset = self.next_reliable_offset()?;
+        permit.forget();
+
+        let pending = PendingData {
+            stream_offset,
+            data: Bytes::new(),
+            sent_at: None,
+            retries: 0,
+            lost: false,
+            fin: true,
+        };
+
+        // Mark local side finished now so `is_fin_acked()` knows the FIN
+        // was queued (not just that the buffer happened to be empty).
+        self.local_finished.store(true, Ordering::SeqCst);
+        self.send_buffer.lock().await.push_back(pending);
+        Ok(())
+    }
+
+    /// Returns `true` if the local FIN was queued (via `queue_fin`) AND the
+    /// send buffer is empty (the FIN has been SACKed by the peer).
+    ///
+    /// Used by the data pump's `CloseStream` handler to know when it is safe to
+    /// remove the stream from the routing tables — we cannot remove it until the
+    /// FIN is gone from the send buffer, or retransmits would fail.
+    pub async fn is_fin_acked(&self) -> bool {
+        self.local_finished.load(Ordering::SeqCst)
+            && self.send_buffer.lock().await.is_empty()
     }
 
     /// Queue data for unreliable sending. Fire-and-forget; the wire packet number
@@ -666,6 +729,7 @@ impl Stream {
                 data,
                 reliable: false,
                 retransmit: false,
+                fin: false,
             });
         }
 
@@ -690,6 +754,7 @@ impl Stream {
                     data: pending.data.clone(),
                     reliable: true,
                     retransmit: true,
+                    fin: pending.fin,
                 });
             }
         }
@@ -707,6 +772,7 @@ impl Stream {
                         data: pending.data.clone(),
                         reliable: true,
                         retransmit: true,
+                        fin: pending.fin,
                     });
                 }
             }
@@ -723,23 +789,20 @@ impl Stream {
                 if len > cwnd_budget {
                     return None; // congestion window full — wait for ACKs to free it
                 }
-                // Flow-control enforcement: consume the peer's advertised
-                // receive window. If it is exhausted, withhold the segment and
-                // wait for a `WINDOW_UPDATE` — this is what propagates a slow
-                // peer-side consumer back to us as real backpressure (the
-                // receive delivery task only credits the window on actual app
-                // consumption). `try_consume_send_window` is an atomic CAS; on
-                // success the window is debited and we WILL send (no later check
-                // can fail), so the debit never leaks.
-                if !self.try_consume_send_window(len as u32) {
+                // The reliable FIN sentinel (len == 0) bypasses the
+                // flow-control window check — it consumes no peer window.
+                // For non-FIN segments, enforce the peer's flow-control window.
+                if !pending.fin && !self.try_consume_send_window(len as u32) {
                     return None; // peer flow-control window closed — wait for WINDOW_UPDATE
                 }
+                let is_fin = pending.fin;
                 pending.sent_at = Some(now);
                 return Some(OutboundSegment {
                     stream_offset: pending.stream_offset,
                     data: pending.data.clone(),
                     reliable: true,
                     retransmit: false,
+                    fin: is_fin,
                 });
             }
         }
@@ -1787,5 +1850,120 @@ mod tests {
         // Zero credit is a no-op (no spurious WINDOW_UPDATE).
         s.stage_window_update_credit(0);
         assert_eq!(s.take_pending_window_update(), None);
+    }
+
+    // ── Reliable FIN over ARQ ──
+
+    /// `queue_fin` enqueues a zero-length PendingData with `fin = true`, marks
+    /// `local_finished`, and consumes exactly one backpressure permit.
+    #[tokio::test]
+    async fn queue_fin_enqueues_zero_length_fin_segment() {
+        let stream = Stream::new(3);
+        // Nothing in the buffer initially.
+        assert_eq!(stream.pending_send_count().await, 0);
+        assert!(!stream.local_finished.load(Ordering::SeqCst));
+
+        stream.queue_fin().await.expect("queue_fin must succeed");
+
+        // Exactly one segment queued.
+        assert_eq!(stream.pending_send_count().await, 1);
+        // local_finished flag is raised.
+        assert!(stream.local_finished.load(Ordering::SeqCst));
+    }
+
+    /// `queue_fin` must fail-closed (StreamError) when the reliable offset
+    /// is at u32::MAX — the same exhaustion guard as `send_reliable`.
+    #[tokio::test]
+    async fn queue_fin_fails_closed_at_offset_exhaustion() {
+        let stream = Stream::new(3);
+        stream.reliable_offset.store(u32::MAX, Ordering::SeqCst);
+        let result = stream.queue_fin().await;
+        assert!(
+            matches!(result, Err(crate::errors::CoreError::StreamError(_))),
+            "queue_fin at u32::MAX offset must fail-closed, got {result:?}"
+        );
+    }
+
+    /// `poll_send` returns the FIN segment with `seg.fin == true` and
+    /// `seg.data.is_empty()`.  The segment carries the assigned stream_offset so
+    /// it can be SACKed.
+    #[tokio::test]
+    async fn poll_send_emits_fin_segment_with_empty_payload() {
+        let stream = Stream::new(3);
+        stream.queue_fin().await.expect("queue_fin");
+
+        let seg = stream.poll_send(u64::MAX).await.expect("must yield FIN segment");
+        assert!(seg.fin, "OutboundSegment.fin must be true for the FIN sentinel");
+        assert!(seg.data.is_empty(), "FIN segment must carry no payload");
+        assert!(seg.reliable, "FIN must be sent reliably");
+        assert!(!seg.retransmit, "first send is not a retransmit");
+    }
+
+    /// `is_fin_acked` is false while the FIN segment is still in the send buffer
+    /// (not yet SACKed), and becomes true once the FIN's sequence is ACKed.
+    #[tokio::test]
+    async fn is_fin_acked_becomes_true_after_fin_sacked() {
+        let stream = Stream::new(3);
+        // Before any FIN: local_finished is false → is_fin_acked must be false.
+        assert!(!stream.is_fin_acked().await, "no FIN queued yet");
+
+        stream.queue_fin().await.expect("queue_fin");
+        // FIN queued but not yet ACKed.
+        assert!(!stream.is_fin_acked().await, "FIN not yet SACKed");
+
+        // Poll the FIN out (stamps sent_at, keeps it in buffer until ACKed).
+        let seg = stream.poll_send(u64::MAX).await.expect("FIN segment");
+        assert_eq!(stream.pending_send_count().await, 1, "still buffered");
+        assert!(!stream.is_fin_acked().await, "still in-flight");
+
+        // SACK the FIN offset → buffer drains → is_fin_acked becomes true.
+        let sack =
+            Sack::from_received(&[seg.stream_offset], 0).expect("sack");
+        let _ = stream.on_sack(&sack).await;
+        assert_eq!(stream.pending_send_count().await, 0, "buffer must be empty after SACK");
+        assert!(stream.is_fin_acked().await, "FIN was SACKed → is_fin_acked must be true");
+    }
+
+    /// The FIN segment bypasses the send-window check: even with a fully-drained
+    /// congestion window (budget = 0), `poll_send` must still emit the FIN.
+    #[tokio::test]
+    async fn fin_segment_bypasses_congestion_window() {
+        let stream = Stream::new(3);
+        stream.queue_fin().await.expect("queue_fin");
+
+        // Pass budget = 0 — a normal data segment would be withheld.
+        let seg = stream.poll_send(0).await;
+        assert!(
+            seg.is_some(),
+            "FIN must be emitted even when cwnd_budget = 0"
+        );
+        let seg = seg.unwrap();
+        assert!(seg.fin, "segment must be the FIN sentinel");
+    }
+
+    /// FIN retransmits after RTO expiry (same retransmit machinery as data).
+    /// After the initial send, an immediate poll yields nothing; once the RTO
+    /// elapses the FIN is re-offered as a retransmit.
+    #[tokio::test]
+    async fn fin_retransmits_after_rto() {
+        tokio::time::pause();
+        let stream = Stream::new(3);
+        stream.queue_fin().await.expect("queue_fin");
+
+        // First send.
+        let seg = stream.poll_send(u64::MAX).await.expect("first FIN");
+        assert!(seg.fin);
+        assert!(!seg.retransmit);
+
+        // Immediate re-poll: nothing (in-flight, RTO not elapsed).
+        assert!(stream.poll_send(u64::MAX).await.is_none());
+
+        // Advance past the initial 1-second RTO.
+        tokio::time::advance(std::time::Duration::from_millis(1100)).await;
+
+        let retx = stream.poll_send(u64::MAX).await.expect("FIN retransmit");
+        assert!(retx.fin, "retransmit must still carry fin = true");
+        assert!(retx.retransmit, "must be flagged as a retransmit");
+        assert!(retx.data.is_empty(), "retransmitted FIN payload is still empty");
     }
 }

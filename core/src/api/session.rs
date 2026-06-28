@@ -1528,20 +1528,50 @@ async fn run_data_pump<T: SessionTransport>(
                         }
                     }
                     Some(SessionCommand::CloseStream { stream_id }) => {
+                        // Reliable FIN over ARQ: enqueue a zero-length reliable
+                        // FIN sentinel rather than firing a bare (unreliable) FIN.
+                        // The sentinel goes through the same send buffer + retransmit
+                        // machinery as all other reliable data, so it is guaranteed to
+                        // be delivered in order and acknowledged by the peer even under
+                        // packet loss. The stream stays in `streams` and `demux` until
+                        // `is_fin_acked()` confirms the SACK covered the FIN offset;
+                        // the next drain pass detects that and tears it down (see below).
+                        //
+                        // Invariant 2 is preserved: the FIN packet is sealed with
+                        // ENCRYPTED | RELIABLE | FIN — a forged unencrypted one is
+                        // dropped at the AEAD gate before FIN processing (the existing
+                        // "must have ENCRYPTED" gate in handle_packet). The security
+                        // invariant test `forged_unencrypted_fin_does_not_close_a_stream`
+                        // continues to pass because the drop happens before any FIN logic.
                         if let Some(stream) = streams.get(&stream_id) {
-                            stream.finish().await;
-                            let _ = send_app_data(
-                                &transport,
-                                &crypto_session,
-                                session_id,
-                                stream_id as TransportStreamId,
-                                &[],
-                                PacketFlags::FIN,
-                                None, // bare FIN is a control frame — no reliable offset
-                            ).await;
+                            if let Err(e) = stream.queue_fin().await {
+                                // queue_fin can only fail on u32 offset exhaustion
+                                // (astronomically rare). Fall back to bare FIN.
+                                log::error!(
+                                    "PhantomSession: queue_fin failed for stream {stream_id}: {e}; \
+                                     sending bare FIN (best-effort)"
+                                );
+                                let _ = send_app_data(
+                                    &transport,
+                                    &crypto_session,
+                                    session_id,
+                                    stream_id as TransportStreamId,
+                                    &[],
+                                    PacketFlags::FIN,
+                                    None,
+                                )
+                                .await;
+                                streams.remove(&stream_id);
+                                demux.close_stream(stream_id);
+                            }
+                            // Otherwise: stream stays until the FIN is SACKed.
+                            // Wake the send loop so the FIN is put on the wire
+                            // on the very next drain pass rather than after a 10 ms tick.
+                            crypto_session.notify_outbound_ready();
+                        } else {
+                            // Stream not in our table — maybe already removed.
+                            demux.close_stream(stream_id);
                         }
-                        streams.remove(&stream_id);
-                        demux.close_stream(stream_id);
                     }
                     Some(SessionCommand::Migrate(local_addr)) => {
                         // Embedder-triggered connection migration (Phase 4 / P4.2).
@@ -1867,11 +1897,17 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
             if seg.retransmit {
                 crypto_session.on_packet_lost(seg.data.len() as u64);
             }
-            let base = if seg.reliable {
+            let mut base = if seg.reliable {
                 PacketFlags::RELIABLE
             } else {
                 PacketFlags::UNRELIABLE
             };
+            // The reliable FIN sentinel carries PacketFlags::FIN so the
+            // receiver orders EOF after all preceding data (the SACK path
+            // delivers it strictly in stream-offset order via accept_in_order).
+            if seg.fin {
+                base |= PacketFlags::FIN;
+            }
             // Reliable segments carry their gap-free `stream_offset` in the AEAD
             // plaintext (A.5) for in-order reassembly; unreliable segments do not.
             let reliable_offset = if seg.reliable {
@@ -2649,6 +2685,20 @@ async fn handle_packet<T: SessionTransport>(
             // before retransmit correctly feeds no loss at all).
             if !result.lost.is_empty() {
                 crypto_recv.notify_outbound_ready();
+            }
+            // Reliable FIN teardown: if the stream was locally closed (via
+            // `queue_fin`) AND its send buffer is now empty (the FIN was SACKed
+            // by the peer), remove it from the send-path tables. We drop the
+            // DashMap guard FIRST (by cloning what we need) before the async
+            // `is_fin_acked()` call to avoid holding a shard lock across an await.
+            let stream_clone = stream.clone();
+            drop(stream); // release the DashMap guard
+            if stream_clone.is_fin_acked().await {
+                streams_recv.remove(&stream_id);
+                demux_recv.close_stream(stream_id);
+                log::debug!(
+                    "PhantomSession: stream {stream_id} FIN acked — removed from routing tables"
+                );
             }
         }
         // Route ACK signal non-blocking (informational for the stream table, not
