@@ -6998,14 +6998,15 @@ mod tests {
         let timeout = std::time::Duration::from_secs(10);
         loop {
             match tokio::time::timeout(timeout, stream.recv()).await {
-                Ok(Ok(bytes)) if bytes.len() == 4 => {
+                Ok(Ok(Some(bytes))) if bytes.len() == 4 => {
                     received.push(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
                     if received.len() == N_FRAMES as usize {
                         break;
                     }
                 }
-                Ok(Ok(_)) => {} // unexpected length, skip
-                Ok(Err(_)) => break,
+                Ok(Ok(Some(_))) => {} // unexpected length, skip
+                Ok(Ok(None)) => break, // clean EOF
+                Ok(Err(_)) => break,   // session ended
                 Err(_) => panic!("timeout waiting for frame {}", received.len()),
             }
         }

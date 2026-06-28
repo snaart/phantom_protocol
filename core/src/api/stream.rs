@@ -59,11 +59,20 @@ impl PhantomStream {
             .map_err(|_| CoreError::NetworkError("Session closed".into()))
     }
 
-    pub async fn recv(&self) -> Result<Vec<u8>, CoreError> {
+    /// Receive the next data frame from this stream.
+    ///
+    /// Returns:
+    /// - `Ok(Some(bytes))` — a data payload arrived.
+    /// - `Ok(None)` — the peer sent a clean FIN; the stream is half-closed
+    ///   for reading. No more data will arrive on this stream.
+    /// - `Err(CoreError::ConnectionClosed)` — the underlying session ended
+    ///   (the mpsc channel was dropped) before a clean EOF was signalled.
+    ///   This indicates an abnormal termination rather than a graceful close.
+    pub async fn recv(&self) -> Result<Option<Vec<u8>>, CoreError> {
         let mut rx = self.rx.lock().await;
         loop {
             match rx.recv().await {
-                Some(StreamMessage::Data(b)) => return Ok(b.to_vec()),
+                Some(StreamMessage::Data(b)) => return Ok(Some(b.to_vec())),
                 Some(StreamMessage::Ack(seq)) => {
                     log::debug!(
                         "PhantomStream {}: received ACK for seq {}",
@@ -79,10 +88,14 @@ impl PhantomStream {
                     continue;
                 }
                 Some(StreamMessage::Close) => {
-                    return Err(CoreError::NetworkError("Stream closed by peer".into()));
+                    // Peer sent a clean FIN — EOF, not an error.
+                    return Ok(None);
                 }
                 None => {
-                    return Err(CoreError::NetworkError("Stream closed locally".into()));
+                    // The mpsc sender was dropped without a Close signal, meaning
+                    // the session ended abnormally (e.g. network failure, session
+                    // close before stream teardown).
+                    return Err(CoreError::ConnectionClosed);
                 }
             }
         }
@@ -112,5 +125,87 @@ impl PhantomStream {
             })
             .await
             .map_err(|_| CoreError::NetworkError("Session closed".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::multiplexer::StreamHandle;
+    use tokio::sync::mpsc;
+
+    /// Build a minimal PhantomStream with a test-controlled channel.
+    fn make_stream(
+        stream_id: u32,
+        buffer: usize,
+    ) -> (PhantomStream, mpsc::Sender<StreamMessage>, mpsc::Sender<SessionCommand>) {
+        let (stream_msg_tx, stream_msg_rx) = mpsc::channel::<StreamMessage>(buffer);
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>(16);
+        let handle = StreamHandle { stream_id, rx: stream_msg_rx };
+        let ps = PhantomStream::new(handle, cmd_tx.clone());
+        (ps, stream_msg_tx, cmd_tx)
+    }
+
+    /// `recv()` returns `Ok(Some(bytes))` for a Data message.
+    #[tokio::test]
+    async fn recv_returns_some_data() {
+        let (ps, tx, _cmd) = make_stream(3, 8);
+        tx.send(StreamMessage::Data(Bytes::from_static(b"hello"))).await.unwrap();
+        let result = ps.recv().await.unwrap();
+        assert_eq!(result, Some(b"hello".to_vec()));
+    }
+
+    /// `recv()` returns `Ok(None)` on a clean `StreamMessage::Close`.
+    #[tokio::test]
+    async fn recv_returns_none_on_clean_close() {
+        let (ps, tx, _cmd) = make_stream(3, 8);
+        tx.send(StreamMessage::Close).await.unwrap();
+        let result = ps.recv().await;
+        assert!(
+            matches!(result, Ok(None)),
+            "clean FIN must return Ok(None), got {:?}",
+            result
+        );
+    }
+
+    /// `recv()` returns `Err(ConnectionClosed)` when the sender is dropped
+    /// without sending a Close signal.
+    #[tokio::test]
+    async fn recv_returns_connection_closed_on_channel_drop() {
+        let (ps, tx, _cmd) = make_stream(3, 8);
+        drop(tx); // abnormal: session gone, no FIN sent
+        let result = ps.recv().await;
+        assert!(
+            matches!(result, Err(CoreError::ConnectionClosed)),
+            "channel drop must return Err(ConnectionClosed), got {:?}",
+            result
+        );
+    }
+
+    /// `StreamMessage::Ack` messages are skipped transparently.
+    /// After one Ack and then a Data frame, `recv()` returns the data.
+    #[tokio::test]
+    async fn recv_skips_ack_messages() {
+        let (ps, tx, _cmd) = make_stream(3, 8);
+        tx.send(StreamMessage::Ack(42)).await.unwrap();
+        tx.send(StreamMessage::Data(Bytes::from_static(b"after ack"))).await.unwrap();
+        let result = ps.recv().await.unwrap();
+        assert_eq!(result, Some(b"after ack".to_vec()));
+    }
+
+    /// Data followed by Close — first call returns data, second returns None.
+    #[tokio::test]
+    async fn recv_data_then_clean_close_in_sequence() {
+        let (ps, tx, _cmd) = make_stream(3, 8);
+        tx.send(StreamMessage::Data(Bytes::from_static(b"payload"))).await.unwrap();
+        tx.send(StreamMessage::Close).await.unwrap();
+        let first = ps.recv().await.unwrap();
+        assert_eq!(first, Some(b"payload".to_vec()));
+        let second = ps.recv().await;
+        assert!(
+            matches!(second, Ok(None)),
+            "second recv after Close must return Ok(None), got {:?}",
+            second
+        );
     }
 }
