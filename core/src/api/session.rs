@@ -3480,6 +3480,34 @@ impl std::fmt::Debug for PhantomSession {
     }
 }
 
+/// Signal the data pump to flush-and-close when the public session
+/// handle is dropped without an explicit `disconnect()` call.
+///
+/// Before peer-initiated streams existed, the pump detected handle-drop via
+/// `cmd_rx.recv() → None` because the struct's `cmd_tx` clone was the ONLY
+/// sender. Accepting peer-initiated streams added extra `cmd_tx` clones inside
+/// the pump and recv task (needed to build `PhantomStream` handles for them),
+/// so `cmd_rx` no longer goes to `None` on struct-drop alone and the pump
+/// would linger with an open transport
+/// indefinitely — blocking the remote peer's next `recv()`.
+///
+/// The Drop impl sends `SessionCommand::Close` (non-blocking `try_send`) which
+/// is processed in-order through `cmd_rx` — AFTER any pending `send()` data
+/// — so a fire-and-forget `send(x); drop(session)` idiom still delivers `x`
+/// before the pump exits. `disconnect().await` (which also sends `Close`) is
+/// the cooperative path for callers who can await; Drop is the best-effort
+/// fallback (the pump may not be running, or the channel may be momentarily
+/// full — in either case the loss is acceptable since the session is being
+/// abandoned anyway).
+impl Drop for PhantomSession {
+    fn drop(&mut self) {
+        // Best-effort: if the channel is full (capacity 256) or the pump is
+        // gone, the send fails silently. The liveness dead-timer or transport
+        // close will tear down the pump eventually.
+        let _ = self.cmd_tx.try_send(SessionCommand::Close);
+    }
+}
+
 // ─── Pinned-Connect Shim (Phase 7.2 mobile bridge) ──────────────────────────
 //
 // `connect_with_transport` itself can't cross the UniFFI boundary directly —
