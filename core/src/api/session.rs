@@ -3017,9 +3017,16 @@ async fn handle_packet<T: SessionTransport>(
         // segment filled a future hole — it waits for the gap to close).
         deliver_in_order_run(delivered, stream_id, deliver_tx, undelivered_bytes);
 
+        // Record a FIN's reliable offset; emit the per-stream Close (EOF) ONLY once
+        // the reorder buffer has released that offset IN ORDER (after all preceding
+        // data). Checked on every reliable packet so a FIN that arrived over a gap
+        // surfaces its EOF only when the gap-filling segment finally closes it —
+        // never ahead of the data it was waiting on (otherwise a reader trusting
+        // `recv() -> Ok(None)` would stop and silently lose the trailing data).
         if packet.header.flags.contains(PacketFlags::FIN) {
-            // Route FIN through the same delivery channel so it is ordered
-            // AFTER any data frames queued for this stream.
+            local.note_remote_fin(stream_offset);
+        }
+        if local.take_in_order_fin() {
             let _ = deliver_tx.send(DeliverItem::Close(stream_id));
         }
         return;

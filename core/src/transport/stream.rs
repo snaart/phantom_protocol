@@ -326,6 +326,11 @@ pub struct Stream {
     local_finished: AtomicBool,
     /// Whether stream is finished remotely
     remote_finished: AtomicBool,
+    /// The peer's FIN reliable offset once seen (`u32::MAX` = none). The per-stream
+    /// Close (EOF) is emitted only once the reorder buffer releases this offset
+    /// in order (see [`Stream::take_in_order_fin`]), so a FIN that arrives over a
+    /// gap never delivers EOF ahead of the gap-filling data.
+    remote_fin_offset: AtomicU32,
     /// Priority (higher = more important)
     priority: AtomicU32,
     /// Backpressure semaphore
@@ -381,6 +386,7 @@ impl Stream {
             recv_notify: Notify::new(),
             local_finished: AtomicBool::new(false),
             remote_finished: AtomicBool::new(false),
+            remote_fin_offset: AtomicU32::new(u32::MAX),
             priority: AtomicU32::new(0),
             send_semaphore: Arc::new(Semaphore::new(MAX_PENDING_PACKETS)),
             peer_send_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
@@ -703,6 +709,31 @@ impl Stream {
     pub async fn is_fin_acked(&self) -> bool {
         self.local_finished.load(Ordering::SeqCst)
             && self.send_buffer.lock().await.is_empty()
+    }
+
+    /// Record the peer's FIN reliable offset (set-once; idempotent under FIN
+    /// retransmits). The Close/EOF is NOT emitted here — see
+    /// [`take_in_order_fin`](Self::take_in_order_fin).
+    pub fn note_remote_fin(&self, stream_offset: u32) {
+        let _ = self.remote_fin_offset.compare_exchange(
+            u32::MAX,
+            stream_offset,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Returns `true` exactly once — when a previously-noted remote FIN has been
+    /// released by the reorder buffer **in order** (the in-order receive cursor has
+    /// advanced past the FIN's offset, so every preceding data byte was delivered
+    /// first). The recv path then emits the per-stream Close (EOF). Call it on every
+    /// reliable packet so a late gap-filling segment is what finally surfaces the
+    /// EOF — never ahead of the data it was waiting on.
+    pub fn take_in_order_fin(&self) -> bool {
+        let fin = self.remote_fin_offset.load(Ordering::SeqCst);
+        fin != u32::MAX
+            && self.recv_sequence.load(Ordering::SeqCst) > fin
+            && !self.remote_finished.swap(true, Ordering::SeqCst)
     }
 
     /// Queue data for unreliable sending. Fire-and-forget; the wire packet number
@@ -1965,5 +1996,43 @@ mod tests {
         assert!(retx.fin, "retransmit must still carry fin = true");
         assert!(retx.retransmit, "must be flagged as a retransmit");
         assert!(retx.data.is_empty(), "retransmitted FIN payload is still empty");
+    }
+
+    /// Regression: a remote FIN that arrives OVER A GAP (an earlier reliable
+    /// offset still missing, as happens on a reordering/lossy UDP path) must NOT
+    /// surface EOF until the gap closes — otherwise a reader trusting
+    /// `recv() -> Ok(None)` stops and silently loses the trailing data.
+    #[tokio::test]
+    async fn remote_fin_eof_surfaces_only_after_in_order_release() {
+        let s = Stream::new(2);
+
+        // data@0 arrives in order and is released.
+        let run0 = s.accept_in_order(0, vec![Bytes::from_static(b"zero")]).await;
+        assert!(run0.iter().any(|b| b.as_ref() == b"zero"));
+        assert!(!s.take_in_order_fin(), "no FIN seen yet");
+
+        // FIN sentinel @2 (zero-length) arrives BEFORE data@1 — a gap at offset 1.
+        s.note_remote_fin(2);
+        let run_fin = s.accept_in_order(2, vec![Bytes::new()]).await;
+        assert!(
+            run_fin.is_empty(),
+            "a FIN over a gap must be buffered, not released"
+        );
+        assert!(
+            !s.take_in_order_fin(),
+            "EOF must NOT surface while offset 1 is still missing"
+        );
+
+        // The gap-filling data@1 arrives, releasing [data@1, FIN@2] in order.
+        let run1 = s.accept_in_order(1, vec![Bytes::from_static(b"one")]).await;
+        assert!(
+            run1.iter().any(|b| b.as_ref() == b"one"),
+            "the gap-filling data must be released"
+        );
+        assert!(
+            s.take_in_order_fin(),
+            "EOF surfaces now — strictly AFTER the gap-filling data"
+        );
+        assert!(!s.take_in_order_fin(), "EOF is one-shot");
     }
 }
