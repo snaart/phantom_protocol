@@ -31,6 +31,28 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   (`ed25519_seed[32] || ml_dsa_seed[32]`, the same form `phantom-cli keygen` writes) is
   secret key material and is **not** zeroized across the FFI boundary — persist it `0600`
   and wipe the buffer after use.
+- **In-app metrics over FFI.** `metrics_snapshot()` on `PhantomSession` and
+  `PhantomListener` returns a flat `MetricsSnapshotFfi` record (packets/bytes,
+  encrypt/decrypt timing, RTT, handshakes, active sessions/streams, uptime, and — newly
+  promoted into the lock-free atomics so they're available without an OpenTelemetry
+  collector — `replay_rejected_total` / `aead_failure_total`). A server-accepted session
+  reports the owning listener's aggregate (shared handle).
+- **Working tunables via `PhantomConfig`.** `PhantomConfig` was an FFI-exported struct
+  whose fields nothing read; it is now an honest 4-field record
+  (`keepalive_interval`, `session_timeout`, `session_cache_capacity`,
+  `session_ticket_lifetime`) consumed through new `connect_pinned_with_config` /
+  `connect_pinned_udp_with_config` and `bind_with_config_bytes` /
+  `bind_udp_with_config_bytes`. Keepalive/timeout map to the live `LivenessConfig`;
+  cache fields size the server resumption cache. (`session_timeout` is the
+  Migrating→Dead reap window, not a general idle-disconnect.) The 8 inert legacy fields
+  (fallback/buffer/MTU/connect_timeout) were removed.
+- **Multi-stream is usable.** `PhantomSession::accept_stream()` surfaces peer-initiated
+  streams; `PhantomStream::set_priority()` sets scheduler priority; `PhantomStream::recv()`
+  now returns `Option<Vec<u8>>` (`None` = clean peer EOF) instead of a stringly-typed
+  error. Stream ids are allocated client-odd / server-even so concurrent opens never
+  collide.
+- **FFI ergonomics.** `AcceptOutcome::peer_addr_string()` (per-peer admission control),
+  and `set_early_data_enabled(bool)` is now exported on both listeners.
 
 ### Fixed
 
@@ -46,6 +68,23 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   header declared the synchronous `shutdown()` as an async future handle
   (`uint64_t ...(void *ptr)`); it is now correctly `void ...(void *ptr, RustCallStatus *)`,
   matching the actual ABI and the other bindings.
+- **Per-stream receive was lossy and could deliver EOF before data.** Inbound data on
+  an opened stream (id ≥ 2) was double-delivered — once losslessly to `session.recv()`
+  and once via a best-effort `try_send` that **dropped** on a full/unknown channel — so
+  `PhantomStream::recv()` lost bytes under load. Opened-stream delivery is now lossless
+  and backpressured via a dedicated delivery task that never blocks the raw-app path, and
+  a reliable in-order FIN (carried over the ARQ path, retransmitted until SACKed) now
+  surfaces clean EOF strictly **after** all data — so a FIN arriving over a gap on a
+  lossy/reordering path no longer truncates the stream. (Two bugs in this area were caught
+  in review: a DashMap shard guard held across an `await` that could stall
+  `open_stream()` / the pump, and the premature-EOF ordering — both fixed and
+  regression-tested.)
+- **Inert legacy `connect()` now reports `Failed`** instead of an eternal `Connecting`
+  shell, so misuse is observable via `connection_state()` (use `connect_pinned` /
+  `connect_pinned_udp`).
+- **Dropping the last `PhantomSession` handle now closes the session** (sends an in-order
+  `Close` so the peer sees EOF), fixing a regression where extra internal command
+  senders kept the pump alive after the handle was dropped.
 
 ## [0.2.2] - 2026-06-22
 
