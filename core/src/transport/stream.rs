@@ -707,8 +707,7 @@ impl Stream {
     /// remove the stream from the routing tables — we cannot remove it until the
     /// FIN is gone from the send buffer, or retransmits would fail.
     pub async fn is_fin_acked(&self) -> bool {
-        self.local_finished.load(Ordering::SeqCst)
-            && self.send_buffer.lock().await.is_empty()
+        self.local_finished.load(Ordering::SeqCst) && self.send_buffer.lock().await.is_empty()
     }
 
     /// Record the peer's FIN reliable offset (set-once; idempotent under FIN
@@ -1923,8 +1922,14 @@ mod tests {
         let stream = Stream::new(3);
         stream.queue_fin().await.expect("queue_fin");
 
-        let seg = stream.poll_send(u64::MAX).await.expect("must yield FIN segment");
-        assert!(seg.fin, "OutboundSegment.fin must be true for the FIN sentinel");
+        let seg = stream
+            .poll_send(u64::MAX)
+            .await
+            .expect("must yield FIN segment");
+        assert!(
+            seg.fin,
+            "OutboundSegment.fin must be true for the FIN sentinel"
+        );
         assert!(seg.data.is_empty(), "FIN segment must carry no payload");
         assert!(seg.reliable, "FIN must be sent reliably");
         assert!(!seg.retransmit, "first send is not a retransmit");
@@ -1948,11 +1953,17 @@ mod tests {
         assert!(!stream.is_fin_acked().await, "still in-flight");
 
         // SACK the FIN offset → buffer drains → is_fin_acked becomes true.
-        let sack =
-            Sack::from_received(&[seg.stream_offset], 0).expect("sack");
+        let sack = Sack::from_received(&[seg.stream_offset], 0).expect("sack");
         let _ = stream.on_sack(&sack).await;
-        assert_eq!(stream.pending_send_count().await, 0, "buffer must be empty after SACK");
-        assert!(stream.is_fin_acked().await, "FIN was SACKed → is_fin_acked must be true");
+        assert_eq!(
+            stream.pending_send_count().await,
+            0,
+            "buffer must be empty after SACK"
+        );
+        assert!(
+            stream.is_fin_acked().await,
+            "FIN was SACKed → is_fin_acked must be true"
+        );
     }
 
     /// The FIN segment bypasses the send-window check: even with a fully-drained
@@ -1995,7 +2006,10 @@ mod tests {
         let retx = stream.poll_send(u64::MAX).await.expect("FIN retransmit");
         assert!(retx.fin, "retransmit must still carry fin = true");
         assert!(retx.retransmit, "must be flagged as a retransmit");
-        assert!(retx.data.is_empty(), "retransmitted FIN payload is still empty");
+        assert!(
+            retx.data.is_empty(),
+            "retransmitted FIN payload is still empty"
+        );
     }
 
     /// Regression: a remote FIN that arrives OVER A GAP (an earlier reliable
@@ -2007,7 +2021,9 @@ mod tests {
         let s = Stream::new(2);
 
         // data@0 arrives in order and is released.
-        let run0 = s.accept_in_order(0, vec![Bytes::from_static(b"zero")]).await;
+        let run0 = s
+            .accept_in_order(0, vec![Bytes::from_static(b"zero")])
+            .await;
         assert!(run0.iter().any(|b| b.as_ref() == b"zero"));
         assert!(!s.take_in_order_fin(), "no FIN seen yet");
 

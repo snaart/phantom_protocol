@@ -3183,8 +3183,8 @@ impl PhantomSession {
     /// Accept the next peer-initiated stream.
     ///
     /// Blocks until the remote peer opens a new stream (one with an id ≥ 2 that
-    /// we haven't seen yet). The returned [`PhantomStream`] is already registered
-    /// in the session's demux and ready for `recv()` / `send_reliable()`.
+    /// we haven't seen yet). The returned [`PhantomStream`](crate::api::stream::PhantomStream)
+    /// is already registered in the session's demux and ready for `recv()` / `send_reliable()`.
     ///
     /// Returns `Err(CoreError::ConnectionClosed)` when the session has ended and no
     /// further streams will arrive (the internal channel was dropped by the pump).
@@ -3199,9 +3199,7 @@ impl PhantomSession {
     ///
     /// Only one caller should call `accept_stream()` at a time. The receiver is
     /// protected by an async `Mutex`; a concurrent call will wait for the lock.
-    pub async fn accept_stream(
-        &self,
-    ) -> Result<Arc<crate::api::stream::PhantomStream>, CoreError> {
+    pub async fn accept_stream(&self) -> Result<Arc<crate::api::stream::PhantomStream>, CoreError> {
         let mut rx = self.incoming_stream_rx.lock().await;
         rx.recv().await.ok_or(CoreError::ConnectionClosed)
     }
@@ -5387,11 +5385,10 @@ mod tests {
 
         // Recv-relax (D10b): the authenticated frame IS delivered, even though
         // path 7 is not validated.
-        let item =
-            tokio::time::timeout(std::time::Duration::from_secs(1), deliver_rx.recv())
-                .await
-                .expect("recv-relax must deliver promptly (no drop / hang)")
-                .expect("delivery channel open");
+        let item = tokio::time::timeout(std::time::Duration::from_secs(1), deliver_rx.recv())
+            .await
+            .expect("recv-relax must deliver promptly (no drop / hang)")
+            .expect("delivery channel open");
         let (sid, received) = match item {
             DeliverItem::Data(sid, bytes) => (sid, bytes),
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) in deliver channel"),
@@ -7136,13 +7133,20 @@ mod tests {
         let (server_demux, _) = StreamDemultiplexer::new_with_role(16, false);
 
         // Open several streams on each side.
-        let client_ids: Vec<u32> = (0..5).map(|_| client_demux.open_stream(8).stream_id).collect();
-        let server_ids: Vec<u32> = (0..5).map(|_| server_demux.open_stream(8).stream_id).collect();
+        let client_ids: Vec<u32> = (0..5)
+            .map(|_| client_demux.open_stream(8).stream_id)
+            .collect();
+        let server_ids: Vec<u32> = (0..5)
+            .map(|_| server_demux.open_stream(8).stream_id)
+            .collect();
 
         // Client must produce odd ids ≥ 3.
         for &id in &client_ids {
             assert!(id % 2 == 1, "client id {id} must be odd");
-            assert!(id >= 3, "client id {id} must be ≥ 3 (id 1 is raw-app reserved)");
+            assert!(
+                id >= 3,
+                "client id {id} must be ≥ 3 (id 1 is raw-app reserved)"
+            );
         }
 
         // Server must produce even ids ≥ 2.
@@ -7212,12 +7216,15 @@ mod tests {
         // Each frame is tagged with its sequence number as payload so we can verify
         // order after draining.
         for seq in 0..N_FRAMES {
-            let wire = encrypt_outgoing(&client_inner, session_id, stream_id, seq, &seq.to_be_bytes());
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                drain_t.send_bytes(&wire),
-            )
-            .await
+            let wire = encrypt_outgoing(
+                &client_inner,
+                session_id,
+                stream_id,
+                seq,
+                &seq.to_be_bytes(),
+            );
+            match tokio::time::timeout(std::time::Duration::from_secs(5), drain_t.send_bytes(&wire))
+                .await
             {
                 Ok(Ok(())) => {}
                 _ => panic!("send failed at frame {seq}"),
@@ -7240,7 +7247,7 @@ mod tests {
                         break;
                     }
                 }
-                Ok(Ok(Some(_))) => {} // unexpected length, skip
+                Ok(Ok(Some(_))) => {}  // unexpected length, skip
                 Ok(Ok(None)) => break, // clean EOF
                 Ok(Err(_)) => break,   // session ended
                 Err(_) => panic!("timeout waiting for frame {}", received.len()),
@@ -7298,11 +7305,9 @@ mod tests {
                 seq,
                 b"backpressure-filler",
             );
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                drain_t.send_bytes(&wire),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), drain_t.send_bytes(&wire))
+                    .await;
         }
 
         // Let the pump process those and stall Task B.
@@ -7326,7 +7331,9 @@ mod tests {
                 .encrypt_packet(&hdr, &pt, &[])
                 .expect("encrypt raw-app frame");
             let pkt = PhantomPacket::new(hdr, ct);
-            client_inner.protect_packet(&pkt).expect("protect raw-app frame")
+            client_inner
+                .protect_packet(&pkt)
+                .expect("protect raw-app frame")
         };
         match tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -7340,13 +7347,10 @@ mod tests {
 
         // Expect to receive the raw-app message within 2 s even though the opened
         // stream's Task B is stalled — proving Tasks A and B are truly independent.
-        let received = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            server.recv(),
-        )
-        .await
-        .expect("raw-app recv timed out — Task B stall is blocking Task A (HoL regression)")
-        .expect("recv returned error");
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), server.recv())
+            .await
+            .expect("raw-app recv timed out — Task B stall is blocking Task A (HoL regression)")
+            .expect("recv returned error");
 
         assert_eq!(
             received, b"raw-app-works",
@@ -7406,13 +7410,10 @@ mod tests {
         .await;
 
         // The item in deliver_tx must be tagged as id=2 (opened stream).
-        let item = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            deliver_rx.recv(),
-        )
-        .await
-        .expect("deliver channel must have item")
-        .expect("channel open");
+        let item = tokio::time::timeout(std::time::Duration::from_millis(100), deliver_rx.recv())
+            .await
+            .expect("deliver channel must have item")
+            .expect("channel open");
         match &item {
             DeliverItem::Data(sid, _) => assert_eq!(
                 *sid, 2,
@@ -7462,28 +7463,18 @@ mod tests {
         )
         .await;
 
-        let raw_item = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            deliver_rx.recv(),
-        )
-        .await
-        .expect("deliver channel must have item for raw-app")
-        .expect("channel open");
+        let raw_item =
+            tokio::time::timeout(std::time::Duration::from_millis(100), deliver_rx.recv())
+                .await
+                .expect("deliver channel must have item for raw-app")
+                .expect("channel open");
         match &raw_item {
             DeliverItem::Data(sid, bytes) => {
-                assert_eq!(
-                    *sid,
-                    1,
-                    "raw-app frame must be tagged stream_id=1"
-                );
+                assert_eq!(*sid, 1, "raw-app frame must be tagged stream_id=1");
                 // The RELIABLE path in handle_packet strips the 4-byte stream_offset
                 // prefix before handing data to deliver_in_order_run, so the
                 // DeliverItem::Data bytes are the raw application payload directly.
-                assert_eq!(
-                    &bytes[..],
-                    b"raw-only",
-                    "raw-app payload must match"
-                );
+                assert_eq!(&bytes[..], b"raw-only", "raw-app payload must match");
             }
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) for raw-app"),
         }
@@ -7535,24 +7526,23 @@ mod tests {
         client_t.send_bytes(&wire).await.expect("send frame");
 
         // Server should surface the new stream via accept_stream().
-        let accepted = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            server.accept_stream(),
-        )
-        .await
-        .expect("timeout waiting for accept_stream")
-        .expect("accept_stream returned Err");
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(5), server.accept_stream())
+                .await
+                .expect("timeout waiting for accept_stream")
+                .expect("accept_stream returned Err");
 
-        assert_eq!(accepted.stream_id(), 3, "stream id must be 3 (client-allocated)");
+        assert_eq!(
+            accepted.stream_id(),
+            3,
+            "stream id must be 3 (client-allocated)"
+        );
 
         // The first frame should arrive on recv().
-        let data = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            accepted.recv(),
-        )
-        .await
-        .expect("timeout waiting for recv")
-        .expect("recv returned Err");
+        let data = tokio::time::timeout(std::time::Duration::from_secs(5), accepted.recv())
+            .await
+            .expect("timeout waiting for recv")
+            .expect("recv returned Err");
 
         assert_eq!(
             data,
@@ -7573,12 +7563,10 @@ mod tests {
         // local `_incoming_tx` that is dropped at end of the fn). So the
         // channel is closed → recv() returns None → Ok → map_err gives
         // ConnectionClosed.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            session.accept_stream(),
-        )
-        .await
-        .expect("should not time out — channel is already closed");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), session.accept_stream())
+                .await
+                .expect("should not time out — channel is already closed");
 
         assert!(
             matches!(result, Err(CoreError::ConnectionClosed)),

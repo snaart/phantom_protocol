@@ -506,8 +506,8 @@ impl AcceptOutcome {
 
     /// The remote socket address this session was accepted from, as a string
     /// (e.g. `"203.0.113.4:51000"`) — for per-peer admission control / logging
-    /// from FFI consumers. The typed [`peer_addr`](Self::peer_addr) returning
-    /// [`SocketAddr`](std::net::SocketAddr) stays Rust-only.
+    /// from FFI consumers. The typed [`peer_addr`](Self::peer_addr) returning a
+    /// `SocketAddr` stays Rust-only.
     pub fn peer_addr_string(&self) -> String {
         self.peer_addr.to_string()
     }

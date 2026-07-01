@@ -636,11 +636,11 @@ impl HandshakeServer {
     }
 
     /// Build a `HandshakeServer` from a caller-supplied [`HybridSigningKey`] and a
-    /// pre-sized [`SessionCache`] (e.g., from [`PhantomConfig::session_cache()`]).
+    /// pre-sized [`SessionCache`] (e.g., from `PhantomConfig::session_cache()`).
     ///
-    /// The `signing_key` is moved in under [`ZeroizeOnDrop`]; the `cache` is
+    /// The `signing_key` is moved in under `ZeroizeOnDrop`; the `cache` is
     /// immediately wrapped in its `Arc<Mutex>`. All other state initialises the same
-    /// way as [`with_signing_key`].
+    /// way as [`with_signing_key`](Self::with_signing_key).
     pub fn with_signing_key_and_cache(
         signing_key: HybridSigningKey,
         cache: SessionCache,

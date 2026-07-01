@@ -111,7 +111,9 @@ impl StreamDemultiplexer {
     /// clients get odd ids (≥ 3), servers get even ids (≥ 2). Id 1 (the
     /// raw-app stream) is never returned here.
     pub fn open_stream(&self, buffer_size: usize) -> StreamHandle {
-        let stream_id = self.next_stream_id.fetch_add(self.id_step, Ordering::Relaxed);
+        let stream_id = self
+            .next_stream_id
+            .fetch_add(self.id_step, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(buffer_size);
         self.streams.insert(stream_id, tx);
         StreamHandle { stream_id, rx }
@@ -335,7 +337,9 @@ mod tests {
         // A second async send blocks forever on the full channel (consumer idle).
         let d_parked = demux.clone();
         let parked =
-            tokio::spawn(async move { d_parked.route_data_async(2, Bytes::from_static(b"x")).await });
+            tokio::spawn(
+                async move { d_parked.route_data_async(2, Bytes::from_static(b"x")).await },
+            );
         tokio::time::sleep(Duration::from_millis(50)).await; // let it reach the .await
 
         // Same-key DashMap write must not be blocked by the parked send.

@@ -138,10 +138,17 @@ mod tests {
     fn make_stream(
         stream_id: u32,
         buffer: usize,
-    ) -> (PhantomStream, mpsc::Sender<StreamMessage>, mpsc::Sender<SessionCommand>) {
+    ) -> (
+        PhantomStream,
+        mpsc::Sender<StreamMessage>,
+        mpsc::Sender<SessionCommand>,
+    ) {
         let (stream_msg_tx, stream_msg_rx) = mpsc::channel::<StreamMessage>(buffer);
         let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>(16);
-        let handle = StreamHandle { stream_id, rx: stream_msg_rx };
+        let handle = StreamHandle {
+            stream_id,
+            rx: stream_msg_rx,
+        };
         let ps = PhantomStream::new(handle, cmd_tx.clone());
         (ps, stream_msg_tx, cmd_tx)
     }
@@ -150,7 +157,9 @@ mod tests {
     #[tokio::test]
     async fn recv_returns_some_data() {
         let (ps, tx, _cmd) = make_stream(3, 8);
-        tx.send(StreamMessage::Data(Bytes::from_static(b"hello"))).await.unwrap();
+        tx.send(StreamMessage::Data(Bytes::from_static(b"hello")))
+            .await
+            .unwrap();
         let result = ps.recv().await.unwrap();
         assert_eq!(result, Some(b"hello".to_vec()));
     }
@@ -188,7 +197,9 @@ mod tests {
     async fn recv_skips_ack_messages() {
         let (ps, tx, _cmd) = make_stream(3, 8);
         tx.send(StreamMessage::Ack(42)).await.unwrap();
-        tx.send(StreamMessage::Data(Bytes::from_static(b"after ack"))).await.unwrap();
+        tx.send(StreamMessage::Data(Bytes::from_static(b"after ack")))
+            .await
+            .unwrap();
         let result = ps.recv().await.unwrap();
         assert_eq!(result, Some(b"after ack".to_vec()));
     }
@@ -197,7 +208,9 @@ mod tests {
     #[tokio::test]
     async fn recv_data_then_clean_close_in_sequence() {
         let (ps, tx, _cmd) = make_stream(3, 8);
-        tx.send(StreamMessage::Data(Bytes::from_static(b"payload"))).await.unwrap();
+        tx.send(StreamMessage::Data(Bytes::from_static(b"payload")))
+            .await
+            .unwrap();
         tx.send(StreamMessage::Close).await.unwrap();
         let first = ps.recv().await.unwrap();
         assert_eq!(first, Some(b"payload".to_vec()));
