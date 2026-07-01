@@ -196,23 +196,27 @@ trust model. Rotating the signing key requires an app update.
 TTL: **1 hour** (server `SessionCache` default). Check saved timestamp before
 reuse; expired hints fall back to 1-RTT automatically.
 
-**Connection migration (Wi-Fi ↔ LTE) — reconnect with 0-RTT, not `migrate()`.**
-`PhantomSession.migrate(localAddr:)` is on the UniFFI surface (Phase 4), but it is
-**only effective on the native UDP transport** (`UdpClientTransport`), which is not
-yet exposed through the FFI/UniFFI surface. The FFI connect entry points
-(`connectPinned` / `connectPinnedWithResumption`) use the **TCP** transport
-(`TcpSessionTransport`), and TCP is connection-oriented — it cannot rebind its local
-address without a new connection. On every non-UDP transport `migrate()` falls back
-to its default **no-op** (`Ok(())`): it returns success but does *not* rebind the
-socket or move the path. So on a mobile network change, **reconnect** — register for
-`NWPathMonitor` (iOS) / `ConnectivityManager.NetworkCallback` (Android), then open a
-fresh session. Minimise the cost with **0-RTT resumption**: harvest a
+**Connection migration (Wi-Fi ↔ LTE) — use the UDP transport + `migrate()`.**
+`PhantomSession.migrate(localAddr:)` (Phase 4) performs a **real seamless
+single-socket migration — a local-socket rebind + path validation without a
+re-handshake — when the session runs over the production PhantomUDP transport**,
+which **is** exposed through the FFI/UniFFI surface. Build a UDP-backed session with
+the UDP connect entry points `connectPinnedUdp` / `connectPinnedUdpWithResumption` /
+`connectPinnedUdpWithConfig` (server side: `PhantomUdpListener.bindUdp` /
+`bindUdpWithSigningKeyBytes`). On a network change, register for `NWPathMonitor`
+(iOS) / `ConnectivityManager.NetworkCallback` (Android) and call
+`migrate(localAddr: "0.0.0.0:0")` from the callback — the session follows the
+handover with no re-handshake and no new session.
+
+The **TCP** connect entry points (`connectPinned` / `connectPinnedWithResumption`)
+use the connection-oriented `TcpSessionTransport`, which cannot rebind its local
+address; on a TCP session `migrate()` is a **no-op** that returns `Ok(())` without
+moving the socket. If you must use TCP (e.g. a UDP-hostile network), handle a network
+change by **reconnecting** and minimise the cost with **0-RTT resumption**: harvest a
 `ResumptionHint` after the first connect and reconnect via
 `connectPinnedWithResumption`, which folds the first request into the new
-`ClientHello`. (The sample apps in `examples/mobile/` implement exactly this
-reconnect-with-0-RTT model.) Seamless single-socket migration over the FFI surface
-— exposing the UDP transport, on which `migrate()` performs a real rebind+path
-validation without a re-handshake — is future work.
+`ClientHello`. (The sample apps in `examples/mobile/` show the reconnect-with-0-RTT
+model; prefer the UDP path when seamless migration matters.)
 
 ## Performance considerations
 
