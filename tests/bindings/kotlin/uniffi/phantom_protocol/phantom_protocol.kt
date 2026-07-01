@@ -651,11 +651,17 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_phantom_protocol_checksum_func_connect_pinned_udp(
     ): Int
+    external fun uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config(
+    ): Int
     external fun uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_func_connect_pinned_with_config(
     ): Int
     external fun uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_method_acceptoutcome_peer_addr_string(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_acceptoutcome_session(
     ): Int
@@ -667,9 +673,15 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr(
     ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomlistener_metrics_snapshot(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomlistener_set_early_data_enabled(
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_connection_state(
     ): Int
@@ -686,6 +698,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_migrate(
     ): Int
@@ -715,6 +729,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable(
     ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomstream_set_priority(
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomstream_stream_id(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomudplistener_accept(
@@ -723,17 +739,23 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr(
     ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomudplistener_set_early_data_enabled(
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomudplistener_verifying_key_bytes(
     ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind(
     ): Int
+    external fun uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_config_bytes(
+    ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes(
     ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomsession_connect(
     ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_config_bytes(
     ): Int
     external fun uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes(
     ): Int
@@ -761,6 +783,8 @@ external fun uniffi_phantom_protocol_fn_free_acceptoutcome(`handle`: Long,uniffi
 ): Unit
 external fun uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
+external fun uniffi_phantom_protocol_fn_method_acceptoutcome_peer_addr_string(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_phantom_protocol_fn_method_acceptoutcome_session(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_phantom_protocol_fn_method_acceptoutcome_take_early_data(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -771,6 +795,8 @@ external fun uniffi_phantom_protocol_fn_free_phantomlistener(`handle`: Long,unif
 ): Unit
 external fun uniffi_phantom_protocol_fn_constructor_phantomlistener_bind(`addr`: RustBuffer.ByValue,
 ): Long
+external fun uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_config_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
+): Long
 external fun uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signing_key_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,
 ): Long
 external fun uniffi_phantom_protocol_fn_method_phantomlistener_accept(`ptr`: Long,
@@ -779,6 +805,10 @@ external fun uniffi_phantom_protocol_fn_method_phantomlistener_is_shutting_down(
 ): Byte
 external fun uniffi_phantom_protocol_fn_method_phantomlistener_local_addr(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+external fun uniffi_phantom_protocol_fn_method_phantomlistener_metrics_snapshot(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_phantom_protocol_fn_method_phantomlistener_set_early_data_enabled(`ptr`: Long,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_phantom_protocol_fn_method_phantomlistener_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_phantom_protocol_fn_method_phantomlistener_verifying_key_bytes(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -788,6 +818,8 @@ external fun uniffi_phantom_protocol_fn_clone_phantomsession(`handle`: Long,unif
 external fun uniffi_phantom_protocol_fn_free_phantomsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_phantom_protocol_fn_constructor_phantomsession_connect(`peerAddr`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_phantom_protocol_fn_method_phantomsession_accept_stream(`ptr`: Long,
 ): Long
 external fun uniffi_phantom_protocol_fn_method_phantomsession_connection_state(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -805,6 +837,8 @@ external fun uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready(`ptr
 ): Byte
 external fun uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
+external fun uniffi_phantom_protocol_fn_method_phantomsession_metrics_snapshot(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_phantom_protocol_fn_method_phantomsession_migrate(`ptr`: Long,`localAddr`: RustBuffer.ByValue,
 ): Long
 external fun uniffi_phantom_protocol_fn_method_phantomsession_open_stream(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -837,6 +871,8 @@ external fun uniffi_phantom_protocol_fn_method_phantomstream_send_reliable(`ptr`
 ): Long
 external fun uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable(`ptr`: Long,`data`: RustBuffer.ByValue,
 ): Long
+external fun uniffi_phantom_protocol_fn_method_phantomstream_set_priority(`ptr`: Long,`priority`: Int,
+): Long
 external fun uniffi_phantom_protocol_fn_method_phantomstream_stream_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
 external fun uniffi_phantom_protocol_fn_clone_phantomudplistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -844,6 +880,8 @@ external fun uniffi_phantom_protocol_fn_clone_phantomudplistener(`handle`: Long,
 external fun uniffi_phantom_protocol_fn_free_phantomudplistener(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(`addr`: RustBuffer.ByValue,
+): Long
+external fun uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_config_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
 ): Long
 external fun uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_signing_key_bytes(`addr`: RustBuffer.ByValue,`signingKey`: RustBuffer.ByValue,
 ): Long
@@ -853,6 +891,8 @@ external fun uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_do
 ): Byte
 external fun uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+external fun uniffi_phantom_protocol_fn_method_phantomudplistener_set_early_data_enabled(`ptr`: Long,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -865,7 +905,11 @@ external fun uniffi_phantom_protocol_fn_func_connect_pinned(`host`: RustBuffer.B
 ): Long
 external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,
 ): Long
+external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_config(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
+): Long
 external fun uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: RustBuffer.ByValue,`earlyData`: RustBuffer.ByValue,
+): Long
+external fun uniffi_phantom_protocol_fn_func_connect_pinned_with_config(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`config`: RustBuffer.ByValue,
 ): Long
 external fun uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(`host`: RustBuffer.ByValue,`port`: Short,`pinnedKey`: RustBuffer.ByValue,`hint`: RustBuffer.ByValue,`earlyData`: RustBuffer.ByValue,
 ): Long
@@ -1000,13 +1044,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 36316) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 19062) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 47926) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 17324) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 60625) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 13201) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_peer_addr_string() != 64037) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_session() != 25558) {
@@ -1024,10 +1077,19 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr() != 46930) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_metrics_snapshot() != 63186) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_set_early_data_enabled() != 39659) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown() != 60837) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 14523) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream() != 13703) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 25030) {
@@ -1052,6 +1114,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready() != 47934) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot() != 36430) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 22155) {
@@ -1087,13 +1152,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 28528) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 18540) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 50030) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 38734) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 56290) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 28026) {
@@ -1108,6 +1176,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr() != 6213) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_set_early_data_enabled() != 49550) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown() != 50351) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1117,13 +1188,19 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_config_bytes() != 10908) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 19213) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 14331) {
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 40022) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 57133) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_config_bytes() != 28985) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes() != 18642) {
@@ -1429,6 +1506,29 @@ public object FfiConverterULong: FfiConverter<ULong, Long> {
 /**
  * @suppress
  */
+public object FfiConverterLong: FfiConverter<Long, Long> {
+    override fun lift(value: Long): Long {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Long {
+        return buf.getLong()
+    }
+
+    override fun lower(value: Long): Long {
+        return value
+    }
+
+    override fun allocationSize(value: Long) = 8UL
+
+    override fun write(value: Long, buf: ByteBuffer) {
+        buf.putLong(value)
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
     override fun lift(value: Byte): Boolean {
         return value.toInt() != 0
@@ -1680,6 +1780,14 @@ public interface AcceptOutcomeInterface {
     fun `hasEarlyData`(): kotlin.Boolean
     
     /**
+     * The remote socket address this session was accepted from, as a string
+     * (e.g. `"203.0.113.4:51000"`) — for per-peer admission control / logging
+     * from FFI consumers. The typed [`peer_addr`](Self::peer_addr) returning
+     * [`SocketAddr`](std::net::SocketAddr) stays Rust-only.
+     */
+    fun `peerAddrString`(): kotlin.String
+    
+    /**
      * The accepted, fully-established session.
      */
     fun `session`(): PhantomSession
@@ -1809,6 +1917,25 @@ open class AcceptOutcome: Disposable, AutoCloseable, AcceptOutcomeInterface
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * The remote socket address this session was accepted from, as a string
+     * (e.g. `"203.0.113.4:51000"`) — for per-peer admission control / logging
+     * from FFI consumers. The typed [`peer_addr`](Self::peer_addr) returning
+     * [`SocketAddr`](std::net::SocketAddr) stays Rust-only.
+     */override fun `peerAddrString`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_method_acceptoutcome_peer_addr_string(
         it,
         _status)
 }
@@ -2012,6 +2139,24 @@ public interface PhantomListenerInterface {
     fun `localAddr`(): kotlin.String
     
     /**
+     * Flat snapshot of the listener's aggregated connection metrics (all
+     * accepted sessions share this counter set). Lock-free read; available
+     * with or without `telemetry-otel`.
+     */
+    fun `metricsSnapshot`(): MetricsSnapshotFfi
+    
+    /**
+     * Enable or disable 0-RTT early-data acceptance (default: enabled). When
+     * disabled, resuming clients' early-data is rejected and resent in a 1-RTT
+     * exchange — the zero-infrastructure defence against 0-RTT replay for a
+     * deployment that cannot guarantee a single coherent resumption cache.
+     * Resumption / early-data ride the transport-agnostic `ClientHello`, so
+     * this applies to the TCP path too. See
+     * [`HandshakeServer::set_early_data_enabled`].
+     */
+    fun `setEarlyDataEnabled`(`enabled`: kotlin.Boolean)
+    
+    /**
      * Signal graceful shutdown (Phase 4.6).
      *
      * Sets the `shutting_down` flag and wakes any `accept()` call currently
@@ -2194,6 +2339,45 @@ open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
 
     
     /**
+     * Flat snapshot of the listener's aggregated connection metrics (all
+     * accepted sessions share this counter set). Lock-free read; available
+     * with or without `telemetry-otel`.
+     */override fun `metricsSnapshot`(): MetricsSnapshotFfi {
+            return FfiConverterTypeMetricsSnapshotFfi.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_metrics_snapshot(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Enable or disable 0-RTT early-data acceptance (default: enabled). When
+     * disabled, resuming clients' early-data is rejected and resent in a 1-RTT
+     * exchange — the zero-infrastructure defence against 0-RTT replay for a
+     * deployment that cannot guarantee a single coherent resumption cache.
+     * Resumption / early-data ride the transport-agnostic `ClientHello`, so
+     * this applies to the TCP path too. See
+     * [`HandshakeServer::set_early_data_enabled`].
+     */override fun `setEarlyDataEnabled`(`enabled`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_method_phantomlistener_set_early_data_enabled(
+        it,
+        FfiConverterBoolean.lower(`enabled`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Signal graceful shutdown (Phase 4.6).
      *
      * Sets the `shutting_down` flag and wakes any `accept()` call currently
@@ -2244,6 +2428,28 @@ open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
      suspend fun `bind`(`addr`: kotlin.String) : PhantomListener {
         return uniffiRustCallAsync(
         UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind(FfiConverterString.lower(`addr`),),
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
+        // lift function
+        { FfiConverterTypePhantomListener.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+        
+    /**
+     * Bind a TCP listener using a persisted 64-byte signing seed and a
+     * [`PhantomConfig`](crate::config::PhantomConfig) that controls liveness settings
+     * and session-cache sizing. The FFI analogue of the Rust-only
+     * [`bind_with_signing_key`](Self::bind_with_signing_key) + config combination.
+     */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `bindWithConfigBytes`(`addr`: kotlin.String, `signingKey`: kotlin.ByteArray, `config`: PhantomConfig) : PhantomListener {
+        return uniffiRustCallAsync(
+        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_config_bytes(FfiConverterString.lower(`addr`),FfiConverterByteArray.lower(`signingKey`),FfiConverterTypePhantomConfig.lower(`config`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -2427,6 +2633,29 @@ public object FfiConverterTypePhantomListener: FfiConverter<PhantomListener, Lon
 public interface PhantomSessionInterface {
     
     /**
+     * Accept the next peer-initiated stream.
+     *
+     * Blocks until the remote peer opens a new stream (one with an id ≥ 2 that
+     * we haven't seen yet). The returned [`PhantomStream`] is already registered
+     * in the session's demux and ready for `recv()` / `send_reliable()`.
+     *
+     * Returns `Err(CoreError::ConnectionClosed)` when the session has ended and no
+     * further streams will arrive (the internal channel was dropped by the pump).
+     *
+     * # Stream-ID parity
+     *
+     * Peer-initiated streams have the *opposite* parity from locally-opened ones
+     * (QUIC-style): if the local side is the client (odd ids) the peer uses even
+     * ids, and vice versa.
+     *
+     * # Concurrency
+     *
+     * Only one caller should call `accept_stream()` at a time. The receiver is
+     * protected by an async `Mutex`; a concurrent call will wait for the lock.
+     */
+    suspend fun `acceptStream`(): PhantomStream
+    
+    /**
      * Get the current connection state (lock-free).
      */
     fun `connectionState`(): ConnectionState
@@ -2478,6 +2707,14 @@ public interface PhantomSessionInterface {
      * Whether the session has full PQC protection.
      */
     fun `isPqcReady`(): kotlin.Boolean
+    
+    /**
+     * Flat snapshot of this session's connection metrics. For a client
+     * session these are its own per-session counters; for a server-accepted
+     * session they are the owning listener's aggregate (shared handle).
+     * Lock-free read; available with or without `telemetry-otel`.
+     */
+    fun `metricsSnapshot`(): MetricsSnapshotFfi
     
     /**
      * Migrate the session to a new local network address (Phase 4 — embedder-
@@ -2696,6 +2933,48 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
 
     
     /**
+     * Accept the next peer-initiated stream.
+     *
+     * Blocks until the remote peer opens a new stream (one with an id ≥ 2 that
+     * we haven't seen yet). The returned [`PhantomStream`] is already registered
+     * in the session's demux and ready for `recv()` / `send_reliable()`.
+     *
+     * Returns `Err(CoreError::ConnectionClosed)` when the session has ended and no
+     * further streams will arrive (the internal channel was dropped by the pump).
+     *
+     * # Stream-ID parity
+     *
+     * Peer-initiated streams have the *opposite* parity from locally-opened ones
+     * (QUIC-style): if the local side is the client (odd ids) the peer uses even
+     * ids, and vice versa.
+     *
+     * # Concurrency
+     *
+     * Only one caller should call `accept_stream()` at a time. The receiver is
+     * protected by an async `Mutex`; a concurrent call will wait for the lock.
+     */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `acceptStream`() : PhantomStream {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_accept_stream(
+                uniffiHandle,
+                
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
+        // lift function
+        { FfiConverterTypePhantomStream.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+    
+    /**
      * Get the current connection state (lock-free).
      */override fun `connectionState`(): ConnectionState {
             return FfiConverterTypeConnectionState.lift(
@@ -2858,6 +3137,25 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Flat snapshot of this session's connection metrics. For a client
+     * session these are its own per-session counters; for a server-accepted
+     * session they are the owning listener's aggregate (shared handle).
+     * Lock-free read; available with or without `telemetry-otel`.
+     */override fun `metricsSnapshot`(): MetricsSnapshotFfi {
+            return FfiConverterTypeMetricsSnapshotFfi.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_metrics_snapshot(
         it,
         _status)
 }
@@ -3146,11 +3444,13 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
      * # ⚠️ This does not connect
      *
      * Despite the name, this constructor never opens a transport, never runs
-     * the PQC handshake, and never spawns the background data pump. It returns
-     * an inert shell stuck in [`ConnectionState::Connecting`]: any `send()`
-     * only queues into an in-memory buffer that is never flushed, and `recv()`
-     * never yields application bytes. **No bytes ever reach the network.** It
-     * exists only as a pre-handshake placeholder from an earlier API shape.
+     * the PQC handshake, and never spawns the background data pump. The
+     * returned session immediately reports [`ConnectionState::Failed`] so
+     * misuse is observable: any `connection_state()` check will see `Failed`
+     * rather than an eternal `Connecting`. `send()` returns an error and
+     * `recv()` never yields application bytes. **No bytes ever reach the
+     * network.** It exists only as a pre-handshake placeholder from an earlier
+     * API shape.
      *
      * **Deprecated — use a real entry point instead:**
      * - [`PhantomSession::connect_with_transport`] (Rust) — supply a
@@ -3158,6 +3458,8 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
      * the handshake + pump.
      * - [`connect_pinned`] (native FFI / mobile) — one-shot TCP connect with a
      * pinned key.
+     * - [`connect_pinned_udp`] (native FFI / mobile) — one-shot PhantomUDP
+     * connect with a pinned key.
      *
      * # Why no `#[deprecated]` attribute (T5.7)
      *
@@ -3173,8 +3475,8 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
      * loudly here instead, and UniFFI copies this doc-comment into the generated
      * Python / Swift / Kotlin docstrings (the C header carries no docstrings), so
      * foreign-language callers see it too. See
-     * `tests::deprecated_connect_is_inert_and_sends_no_bytes` for the regression
-     * pinning the inert behaviour.
+     * `tests::deprecated_connect_is_inert_and_reports_failed` for the
+     * regression pinning the inert behaviour.
      */ fun `connect`(`peerAddr`: kotlin.String): PhantomSession {
             return FfiConverterTypePhantomSession.lift(
     uniffiRustCall() { _status ->
@@ -3333,11 +3635,28 @@ public interface PhantomStreamInterface {
      */
     suspend fun `disconnect`()
     
-    suspend fun `recv`(): kotlin.ByteArray
+    /**
+     * Receive the next data frame from this stream.
+     *
+     * Returns:
+     * - `Ok(Some(bytes))` — a data payload arrived.
+     * - `Ok(None)` — the peer sent a clean FIN; the stream is half-closed
+     * for reading. No more data will arrive on this stream.
+     * - `Err(CoreError::ConnectionClosed)` — the underlying session ended
+     * (the mpsc channel was dropped) before a clean EOF was signalled.
+     * This indicates an abnormal termination rather than a graceful close.
+     */
+    suspend fun `recv`(): kotlin.ByteArray?
     
     suspend fun `sendReliable`(`data`: kotlin.ByteArray)
     
     suspend fun `sendUnreliable`(`data`: kotlin.ByteArray)
+    
+    /**
+     * Set this stream's scheduler priority (higher = drained first). Takes
+     * effect on the next drain pass.
+     */
+    suspend fun `setPriority`(`priority`: kotlin.UInt)
     
     fun `streamId`(): kotlin.UInt
     
@@ -3481,9 +3800,20 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
     }
 
     
+    /**
+     * Receive the next data frame from this stream.
+     *
+     * Returns:
+     * - `Ok(Some(bytes))` — a data payload arrived.
+     * - `Ok(None)` — the peer sent a clean FIN; the stream is half-closed
+     * for reading. No more data will arrive on this stream.
+     * - `Err(CoreError::ConnectionClosed)` — the underlying session ended
+     * (the mpsc channel was dropped) before a clean EOF was signalled.
+     * This indicates an abnormal termination rather than a graceful close.
+     */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
-    override suspend fun `recv`() : kotlin.ByteArray {
+    override suspend fun `recv`() : kotlin.ByteArray? {
         return uniffiRustCallAsync(
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_recv(
@@ -3495,7 +3825,7 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_rust_buffer(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_rust_buffer(future) },
         // lift function
-        { FfiConverterByteArray.lift(it) },
+        { FfiConverterOptionalByteArray.lift(it) },
         // Error FFI converter
         CoreException.ErrorHandler,
     )
@@ -3532,6 +3862,32 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
             UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable(
                 uniffiHandle,
                 FfiConverterByteArray.lower(`data`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_void(future) },
+        // lift function
+        { Unit },
+        
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+    
+    /**
+     * Set this stream's scheduler priority (higher = drained first). Takes
+     * effect on the next drain pass.
+     */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `setPriority`(`priority`: kotlin.UInt) {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_phantom_protocol_fn_method_phantomstream_set_priority(
+                uniffiHandle,
+                FfiConverterUInt.lower(`priority`),
             )
         },
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_void(future, callback, continuation) },
@@ -3718,6 +4074,15 @@ public interface PhantomUdpListenerInterface {
     fun `localAddr`(): kotlin.String
     
     /**
+     * Enable or disable 0-RTT early-data acceptance (default: enabled). When
+     * disabled, resuming clients' early-data is rejected and resent in a 1-RTT
+     * exchange — the zero-infrastructure defence against 0-RTT replay for a
+     * deployment that cannot guarantee a single coherent resumption cache. See
+     * [`HandshakeServer::set_early_data_enabled`].
+     */
+    fun `setEarlyDataEnabled`(`enabled`: kotlin.Boolean)
+    
+    /**
      * Signal graceful shutdown: wakes any parked `accept()` so it unwinds with
      * `ConnectionClosed`. Idempotent. Already-accepted sessions are unaffected.
      */
@@ -3894,6 +4259,25 @@ open class PhantomUdpListener: Disposable, AutoCloseable, PhantomUdpListenerInte
 
     
     /**
+     * Enable or disable 0-RTT early-data acceptance (default: enabled). When
+     * disabled, resuming clients' early-data is rejected and resent in a 1-RTT
+     * exchange — the zero-infrastructure defence against 0-RTT replay for a
+     * deployment that cannot guarantee a single coherent resumption cache. See
+     * [`HandshakeServer::set_early_data_enabled`].
+     */override fun `setEarlyDataEnabled`(`enabled`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_set_early_data_enabled(
+        it,
+        FfiConverterBoolean.lower(`enabled`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Signal graceful shutdown: wakes any parked `accept()` so it unwinds with
      * `ConnectionClosed`. Idempotent. Already-accepted sessions are unaffected.
      */override fun `shutdown`()
@@ -3944,6 +4328,28 @@ open class PhantomUdpListener: Disposable, AutoCloseable, PhantomUdpListenerInte
      suspend fun `bindUdp`(`addr`: kotlin.String) : PhantomUdpListener {
         return uniffiRustCallAsync(
         UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp(FfiConverterString.lower(`addr`),),
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
+        // lift function
+        { FfiConverterTypePhantomUdpListener.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+        
+    /**
+     * Bind a PhantomUDP listener using a persisted 64-byte signing seed and a
+     * [`PhantomConfig`](crate::config::PhantomConfig) that controls liveness settings
+     * and session-cache sizing. FFI analogue of the Rust-only
+     * [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key) + config combination.
+     */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `bindUdpWithConfigBytes`(`addr`: kotlin.String, `signingKey`: kotlin.ByteArray, `config`: PhantomConfig) : PhantomUdpListener {
+        return uniffiRustCallAsync(
+        UniffiLib.uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_config_bytes(FfiConverterString.lower(`addr`),FfiConverterByteArray.lower(`signingKey`),FfiConverterTypePhantomConfig.lower(`config`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
@@ -4009,79 +4415,179 @@ public object FfiConverterTypePhantomUdpListener: FfiConverter<PhantomUdpListene
 
 
 /**
+ * Flat, UniFFI-representable subset of [`MetricsSnapshot`].
+ *
+ * Per-leg arrays are dropped because UniFFI `Record` fields must be plain
+ * scalars or UniFFI-representable types — fixed-size arrays of tuples
+ * containing non-`Record` enums (`LegType`) are not supported. All aggregate
+ * scalar fields are preserved.
+ *
+ * Always available regardless of whether the `telemetry-otel` feature is
+ * enabled, because the underlying atomics are always present. On a
+ * server-accepted session the counters are the owning listener's aggregate
+ * (shared `Arc<Observability>` handle), not per-connection.
+ */
+data class MetricsSnapshotFfi (
+    var `packetsSent`: kotlin.ULong
+    , 
+    var `packetsRecv`: kotlin.ULong
+    , 
+    var `bytesSent`: kotlin.ULong
+    , 
+    var `bytesRecv`: kotlin.ULong
+    , 
+    var `avgEncryptNs`: kotlin.ULong
+    , 
+    var `avgDecryptNs`: kotlin.ULong
+    , 
+    var `encryptCount`: kotlin.ULong
+    , 
+    var `decryptCount`: kotlin.ULong
+    , 
+    var `rttUsPath0`: kotlin.ULong
+    , 
+    var `activeSessions`: kotlin.Long
+    , 
+    var `activeStreams`: kotlin.Long
+    , 
+    var `handshakesSuccess`: kotlin.ULong
+    , 
+    var `handshakesFailure`: kotlin.ULong
+    , 
+    var `handshakeLatencyNsSum`: kotlin.ULong
+    , 
+    var `handshakeLatencyCount`: kotlin.ULong
+    , 
+    var `replayRejectedTotal`: kotlin.ULong
+    , 
+    var `aeadFailureTotal`: kotlin.ULong
+    , 
+    var `uptimeSecs`: kotlin.ULong
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<MetricsSnapshotFfi> {
+    override fun read(buf: ByteBuffer): MetricsSnapshotFfi {
+        return MetricsSnapshotFfi(
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MetricsSnapshotFfi) = (
+            FfiConverterULong.allocationSize(value.`packetsSent`) +
+            FfiConverterULong.allocationSize(value.`packetsRecv`) +
+            FfiConverterULong.allocationSize(value.`bytesSent`) +
+            FfiConverterULong.allocationSize(value.`bytesRecv`) +
+            FfiConverterULong.allocationSize(value.`avgEncryptNs`) +
+            FfiConverterULong.allocationSize(value.`avgDecryptNs`) +
+            FfiConverterULong.allocationSize(value.`encryptCount`) +
+            FfiConverterULong.allocationSize(value.`decryptCount`) +
+            FfiConverterULong.allocationSize(value.`rttUsPath0`) +
+            FfiConverterLong.allocationSize(value.`activeSessions`) +
+            FfiConverterLong.allocationSize(value.`activeStreams`) +
+            FfiConverterULong.allocationSize(value.`handshakesSuccess`) +
+            FfiConverterULong.allocationSize(value.`handshakesFailure`) +
+            FfiConverterULong.allocationSize(value.`handshakeLatencyNsSum`) +
+            FfiConverterULong.allocationSize(value.`handshakeLatencyCount`) +
+            FfiConverterULong.allocationSize(value.`replayRejectedTotal`) +
+            FfiConverterULong.allocationSize(value.`aeadFailureTotal`) +
+            FfiConverterULong.allocationSize(value.`uptimeSecs`)
+    )
+
+    override fun write(value: MetricsSnapshotFfi, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`packetsSent`, buf)
+            FfiConverterULong.write(value.`packetsRecv`, buf)
+            FfiConverterULong.write(value.`bytesSent`, buf)
+            FfiConverterULong.write(value.`bytesRecv`, buf)
+            FfiConverterULong.write(value.`avgEncryptNs`, buf)
+            FfiConverterULong.write(value.`avgDecryptNs`, buf)
+            FfiConverterULong.write(value.`encryptCount`, buf)
+            FfiConverterULong.write(value.`decryptCount`, buf)
+            FfiConverterULong.write(value.`rttUsPath0`, buf)
+            FfiConverterLong.write(value.`activeSessions`, buf)
+            FfiConverterLong.write(value.`activeStreams`, buf)
+            FfiConverterULong.write(value.`handshakesSuccess`, buf)
+            FfiConverterULong.write(value.`handshakesFailure`, buf)
+            FfiConverterULong.write(value.`handshakeLatencyNsSum`, buf)
+            FfiConverterULong.write(value.`handshakeLatencyCount`, buf)
+            FfiConverterULong.write(value.`replayRejectedTotal`, buf)
+            FfiConverterULong.write(value.`aeadFailureTotal`, buf)
+            FfiConverterULong.write(value.`uptimeSecs`, buf)
+    }
+}
+
+
+
+/**
  * Tunable parameters for a Phantom session / listener, exported across the
  * UniFFI boundary as a plain record.
  *
- * NOTE: this is a stable FFI config surface, but the core does not yet read
- * most of these fields on the live data path — `PhantomConfig` is currently
- * re-exported and FFI-exported only. The `auto_fallback` / `fallback_*` /
- * `upgrade_delay` fields in particular describe the legacy multi-leg
- * fallback model; transport-leg fallback / aggregation was deliberately
- * dropped in favour of single-path connection migration, so those knobs are
- * presently inert. Treat the presets below as documented intent, not as
- * behaviour the core enforces today.
+ * These four fields are actively consumed by the core:
+ * - `keepalive_interval` → `LivenessConfig.keepalive_interval` (idle keep-alive PING interval)
+ * - `session_timeout` → `LivenessConfig.idle_timeout` (Migrating→Dead reap window)
+ * - `session_cache_capacity` → `SessionCache` max entries (server-only; client ignores)
+ * - `session_ticket_lifetime` → `SessionCache` ticket lifetime (server-only; client ignores)
+ *
+ * Build via `mobile()` / `server()` / `iot()` / `default()` then mutate fields;
+ * `#[non_exhaustive]` lets future tunables be added without a breaking change.
  */
 data class PhantomConfig (
     /**
-     * Interval between keep-alive pings
+     * Interval between idle keep-alive PINGs (maps to `LivenessConfig.keepalive_interval`).
+     * When the session is `Connected` and has been idle this long with nothing in flight,
+     * the data pump emits a small encrypted KEEPALIVE packet so a download-only path can
+     * detect a silently-dead peer via the same probe-timeout sweep.
      */
     var `keepaliveInterval`: java.time.Duration
     , 
     /**
-     * Session inactivity timeout
+     * Liveness reap window (maps to `LivenessConfig.idle_timeout`).
+     *
+     * **Note:** this is the `Migrating → Dead` timeout, not a general idle-disconnect timer.
+     * Keep-alive PINGs keep a `Connected` session alive indefinitely; this bounds how long
+     * a session that has gone unresponsive (entered `Migrating`) is retried before being
+     * declared `Dead`.
      */
     var `sessionTimeout`: java.time.Duration
     , 
     /**
-     * Maximum packet size (MTU)
-     */
-    var `maxPacketSize`: kotlin.UInt
-    , 
-    /**
-     * Send buffer size in packets
-     */
-    var `sendBufferSize`: kotlin.UInt
-    , 
-    /**
-     * Receive buffer size in packets
-     */
-    var `recvBufferSize`: kotlin.UInt
-    , 
-    /**
-     * Maximum tickets in session cache
+     * Maximum 0-RTT resumption tickets the server keeps in memory (server-only; ignored by
+     * clients). Maps to `SessionCache` capacity; excess entries are evicted LRU.
      */
     var `sessionCacheCapacity`: kotlin.UInt
     , 
     /**
-     * Lifetime of a session ticket
+     * Server-side resumption-ticket lifetime (server-only; ignored by clients). Maps to
+     * `SessionCache` ticket lifetime.
      */
     var `sessionTicketLifetime`: java.time.Duration
-    , 
-    /**
-     * Enable automatic transport fallback (legacy multi-leg model; inert —
-     * see the struct-level note).
-     */
-    var `autoFallback`: kotlin.Boolean
-    , 
-    /**
-     * Packet loss percentage to trigger fallback (legacy multi-leg model; inert).
-     */
-    var `fallbackLossThreshold`: kotlin.UByte
-    , 
-    /**
-     * Connection failures to trigger fallback (legacy multi-leg model; inert).
-     */
-    var `fallbackFailureThreshold`: kotlin.UInt
-    , 
-    /**
-     * Timeout for connection attempts
-     */
-    var `connectTimeout`: java.time.Duration
-    , 
-    /**
-     * Delay before attempting to upgrade transport (legacy multi-leg model; inert).
-     */
-    var `upgradeDelay`: java.time.Duration
     
 ){
     
@@ -4101,14 +4607,6 @@ public object FfiConverterTypePhantomConfig: FfiConverterRustBuffer<PhantomConfi
             FfiConverterDuration.read(buf),
             FfiConverterDuration.read(buf),
             FfiConverterUInt.read(buf),
-            FfiConverterUInt.read(buf),
-            FfiConverterUInt.read(buf),
-            FfiConverterUInt.read(buf),
-            FfiConverterDuration.read(buf),
-            FfiConverterBoolean.read(buf),
-            FfiConverterUByte.read(buf),
-            FfiConverterUInt.read(buf),
-            FfiConverterDuration.read(buf),
             FfiConverterDuration.read(buf),
         )
     }
@@ -4116,31 +4614,15 @@ public object FfiConverterTypePhantomConfig: FfiConverterRustBuffer<PhantomConfi
     override fun allocationSize(value: PhantomConfig) = (
             FfiConverterDuration.allocationSize(value.`keepaliveInterval`) +
             FfiConverterDuration.allocationSize(value.`sessionTimeout`) +
-            FfiConverterUInt.allocationSize(value.`maxPacketSize`) +
-            FfiConverterUInt.allocationSize(value.`sendBufferSize`) +
-            FfiConverterUInt.allocationSize(value.`recvBufferSize`) +
             FfiConverterUInt.allocationSize(value.`sessionCacheCapacity`) +
-            FfiConverterDuration.allocationSize(value.`sessionTicketLifetime`) +
-            FfiConverterBoolean.allocationSize(value.`autoFallback`) +
-            FfiConverterUByte.allocationSize(value.`fallbackLossThreshold`) +
-            FfiConverterUInt.allocationSize(value.`fallbackFailureThreshold`) +
-            FfiConverterDuration.allocationSize(value.`connectTimeout`) +
-            FfiConverterDuration.allocationSize(value.`upgradeDelay`)
+            FfiConverterDuration.allocationSize(value.`sessionTicketLifetime`)
     )
 
     override fun write(value: PhantomConfig, buf: ByteBuffer) {
             FfiConverterDuration.write(value.`keepaliveInterval`, buf)
             FfiConverterDuration.write(value.`sessionTimeout`, buf)
-            FfiConverterUInt.write(value.`maxPacketSize`, buf)
-            FfiConverterUInt.write(value.`sendBufferSize`, buf)
-            FfiConverterUInt.write(value.`recvBufferSize`, buf)
             FfiConverterUInt.write(value.`sessionCacheCapacity`, buf)
             FfiConverterDuration.write(value.`sessionTicketLifetime`, buf)
-            FfiConverterBoolean.write(value.`autoFallback`, buf)
-            FfiConverterUByte.write(value.`fallbackLossThreshold`, buf)
-            FfiConverterUInt.write(value.`fallbackFailureThreshold`, buf)
-            FfiConverterDuration.write(value.`connectTimeout`, buf)
-            FfiConverterDuration.write(value.`upgradeDelay`, buf)
     }
 }
 
@@ -5042,6 +5524,25 @@ public object FfiConverterOptionalTypeTrafficShapingConfig: FfiConverterRustBuff
     }
 
         /**
+         * Like [`connect_pinned_udp`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
+         * liveness settings. FFI-exported.
+         */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `connectPinnedUdpWithConfig`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray, `config`: PhantomConfig) : PhantomSession {
+        return uniffiRustCallAsync(
+        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_config(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),FfiConverterTypePhantomConfig.lower(`config`),),
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
+        // lift function
+        { FfiConverterTypePhantomSession.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+        /**
          * 0-RTT resumption analogue of [`connect_pinned_udp`] — the UDP sibling of
          * [`connect_pinned_with_resumption`].
          *
@@ -5060,6 +5561,25 @@ public object FfiConverterOptionalTypeTrafficShapingConfig: FfiConverterRustBuff
      suspend fun `connectPinnedUdpWithResumption`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray, `hint`: ResumptionHint, `earlyData`: kotlin.ByteArray) : PhantomSession {
         return uniffiRustCallAsync(
         UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),FfiConverterTypeResumptionHint.lower(`hint`),FfiConverterByteArray.lower(`earlyData`),),
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
+        // lift function
+        { FfiConverterTypePhantomSession.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+        /**
+         * Like [`connect_pinned`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
+         * liveness settings to the session. FFI-exported.
+         */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `connectPinnedWithConfig`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray, `config`: PhantomConfig) : PhantomSession {
+        return uniffiRustCallAsync(
+        UniffiLib.uniffi_phantom_protocol_fn_func_connect_pinned_with_config(FfiConverterString.lower(`host`),FfiConverterUShort.lower(`port`),FfiConverterByteArray.lower(`pinnedKey`),FfiConverterTypePhantomConfig.lower(`config`),),
         { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_u64(future, callback, continuation) },
         { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_u64(future, continuation) },
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },

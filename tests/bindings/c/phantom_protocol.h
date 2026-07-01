@@ -259,17 +259,60 @@ uint8_t ffi_phantom_protocol_rust_future_complete_u8(
     PhantomRustCallStatus                  *call_status);
 
 /* ====================================================================
+ * SECTION 3b — Record types (lowered into RustBuffer at the FFI)
+ * ==================================================================== */
+
+/*
+ * MetricsSnapshotFfi — flat, UniFFI-representable metrics snapshot.
+ *
+ * Returned by `metrics_snapshot()` on both PhantomSession and
+ * PhantomListener (sync, no RustCallStatus failure path — always
+ * succeeds). Lowered into a RustBuffer by UniFFI's record codec and
+ * lifted by the caller using the generated language binding; the fields
+ * are declared here for C callers that walk the buffer manually.
+ *
+ * Per-leg arrays are intentionally absent from the FFI form (fixed-size
+ * arrays of tuples containing non-Record enums are not supported by
+ * UniFFI); all aggregate scalars are preserved.
+ *
+ * NOTE: The struct is NOT directly accessed via a C pointer; it exists
+ * inside a RustBuffer returned by the `_metrics_snapshot` thunks. The
+ * typedef below documents the logical layout for manual decoding.
+ */
+typedef struct PhantomMetricsSnapshotFfi {
+    uint64_t packets_sent;
+    uint64_t packets_recv;
+    uint64_t bytes_sent;
+    uint64_t bytes_recv;
+    uint64_t avg_encrypt_ns;
+    uint64_t avg_decrypt_ns;
+    uint64_t encrypt_count;
+    uint64_t decrypt_count;
+    uint64_t rtt_us_path_0;
+    int64_t  active_sessions;
+    int64_t  active_streams;
+    uint64_t handshakes_success;
+    uint64_t handshakes_failure;
+    uint64_t handshake_latency_ns_sum;
+    uint64_t handshake_latency_count;
+    uint64_t replay_rejected_total;
+    uint64_t aead_failure_total;
+    uint64_t uptime_secs;
+} PhantomMetricsSnapshotFfi;
+
+/* ====================================================================
  * SECTION 4 — Domain API surface (Phantom Protocol exported objects)
  *
  * Five UniFFI-exported objects:
  *
- *   PhantomListener     — TCP server. 2 constructors + 6 methods.
- *   PhantomUdpListener  — UDP server. 2 constructors + 5 methods.
- *   PhantomSession      — connection. Constructor + 14 methods.
- *   PhantomStream       — substream. 4 methods (no public constructor —
- *                         obtained via PhantomSession::open_stream).
+ *   PhantomListener     — TCP server. 3 constructors + 8 methods.
+ *   PhantomUdpListener  — UDP server. 3 constructors + 6 methods.
+ *   PhantomSession      — connection. Constructor + 16 methods.
+ *   PhantomStream       — substream. 6 methods (no public constructor —
+ *                         obtained via PhantomSession::open_stream or
+ *                         PhantomSession::accept_stream).
  *   AcceptOutcome       — returned by PhantomListener::accept or
- *                         PhantomUdpListener::accept; 3 methods.
+ *                         PhantomUdpListener::accept; 4 methods.
  *
  * Convention:
  *   - Each object has a `_clone_*` (increment refcount) and `_free_*`
@@ -317,6 +360,18 @@ uint64_t uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_signin
     PhantomRustBuffer        addr,
     PhantomRustBuffer        signing_key);
 
+/* Constructor: bind_with_config_bytes(addr: string, signing_key: Vec<u8>,
+ *     config: PhantomConfig) -> async Result<PhantomListener, CoreError>.
+ * Like bind_with_signing_key_bytes but also applies a PhantomConfig that controls
+ * liveness settings (keepalive_interval, session_timeout) and session-cache
+ * sizing (session_cache_capacity, session_ticket_lifetime). The config record is
+ * lowered into a RustBuffer. Returns a u64 future handle; complete via
+ * `_poll_u64` + `_complete_u64`. */
+uint64_t uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_config_bytes(
+    PhantomRustBuffer        addr,
+    PhantomRustBuffer        signing_key,
+    PhantomRustBuffer        config);
+
 /* accept() -> async AcceptOutcome (pointer result). */
 uint64_t uniffi_phantom_protocol_fn_method_phantomlistener_accept(
     void                    *ptr);
@@ -340,6 +395,23 @@ void uniffi_phantom_protocol_fn_method_phantomlistener_shutdown(
  * server-identity pinning. */
 PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomlistener_verifying_key_bytes(
     void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+/* metrics_snapshot() -> MetricsSnapshotFfi (sync). Lock-free aggregate of all
+ * accepted sessions' counters. The returned RustBuffer contains the lowered
+ * PhantomMetricsSnapshotFfi record; decode with the generated binding or
+ * walk manually per the field order in the struct typedef above. */
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomlistener_metrics_snapshot(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+/* set_early_data_enabled(enabled: bool) -> void (sync). Enable or disable 0-RTT
+ * early-data acceptance server-wide (default: enabled). When disabled, resuming
+ * clients' early-data is rejected and a 1-RTT exchange is forced. Safe to call
+ * at any time; affects only subsequent handshakes. */
+void uniffi_phantom_protocol_fn_method_phantomlistener_set_early_data_enabled(
+    void                    *ptr,
+    int8_t                   enabled,
     PhantomRustCallStatus   *call_status);
 
 /* ----------------------- PhantomUdpListener ------------------------- */
@@ -369,6 +441,17 @@ uint64_t uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with
     PhantomRustBuffer        addr,
     PhantomRustBuffer        signing_key);
 
+/* Constructor: bind_udp_with_config_bytes(addr: string, signing_key: Vec<u8>,
+ *     config: PhantomConfig) -> async Result<PhantomUdpListener, CoreError>.
+ * Like bind_udp_with_signing_key_bytes but also applies a PhantomConfig for
+ * liveness + session-cache settings. The config record is lowered into a
+ * RustBuffer. Returns a u64 future handle; complete via `_poll_u64` +
+ * `_complete_u64`. */
+uint64_t uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_config_bytes(
+    PhantomRustBuffer        addr,
+    PhantomRustBuffer        signing_key,
+    PhantomRustBuffer        config);
+
 /* accept() -> async Result<AcceptOutcome, CoreError> (u64 future → pointer result).
  * Blocks until the next inbound UDP handshake completes. */
 uint64_t uniffi_phantom_protocol_fn_method_phantomudplistener_accept(
@@ -392,6 +475,15 @@ void uniffi_phantom_protocol_fn_method_phantomudplistener_shutdown(
 /* verifying_key_bytes() -> Vec<u8> (sync). Server hybrid verifying key for client pinning. */
 PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomudplistener_verifying_key_bytes(
     void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+/* set_early_data_enabled(enabled: bool) -> void (sync). Enable or disable 0-RTT
+ * early-data acceptance server-wide (default: enabled). When disabled, resuming
+ * clients' early-data is rejected and a 1-RTT exchange is forced. Safe to call
+ * at any time; affects only subsequent handshakes. */
+void uniffi_phantom_protocol_fn_method_phantomudplistener_set_early_data_enabled(
+    void                    *ptr,
+    int8_t                   enabled,
     PhantomRustCallStatus   *call_status);
 
 /* --------------------------- PhantomSession ------------------------- */
@@ -462,8 +554,19 @@ uint64_t uniffi_phantom_protocol_fn_method_phantomsession_migrate(
     void                    *ptr,
     PhantomRustBuffer        local_addr);
 
-/* open_stream() -> async PhantomStream (pointer result). */
+/* open_stream() -> async PhantomStream (pointer result). Opens a new locally-
+ * initiated multiplexed stream. Complete via `_poll_u64` + `_complete_u64`
+ * then cast to `void *` for the returned PhantomStream handle. */
 uint64_t uniffi_phantom_protocol_fn_method_phantomsession_open_stream(
+    void                    *ptr);
+
+/* accept_stream() -> async Result<PhantomStream, CoreError> (u64 future →
+ * pointer result). Blocks until the remote peer opens a new stream (peer-
+ * initiated streams have opposite ID parity from locally-opened ones, QUIC-
+ * style). Returns Err(ConnectionClosed) when the session ends. Only one
+ * concurrent caller is supported. Complete via `_poll_u64` + `_complete_u64`
+ * then cast to `void *` for the returned PhantomStream handle. */
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_accept_stream(
     void                    *ptr);
 
 /* peer_addr() -> string (sync). */
@@ -476,7 +579,9 @@ uint64_t uniffi_phantom_protocol_fn_method_phantomsession_queued_count(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
-/* recv() -> async Vec<u8> (rust_buffer result). */
+/* recv() -> async Result<Vec<u8>, CoreError> (rust_buffer result).
+ * Blocks until the next application-data payload arrives on the session's
+ * default stream. Returns Err(NetworkError) on abnormal session close. */
 uint64_t uniffi_phantom_protocol_fn_method_phantomsession_recv(
     void                    *ptr);
 
@@ -489,6 +594,15 @@ uint64_t uniffi_phantom_protocol_fn_method_phantomsession_resumption_hint(
 uint64_t uniffi_phantom_protocol_fn_method_phantomsession_send(
     void                    *ptr,
     PhantomRustBuffer        data);
+
+/* metrics_snapshot() -> MetricsSnapshotFfi (sync). Lock-free snapshot of
+ * this session's connection metrics. For a client session these are its
+ * own per-session counters; for a server-accepted session they are the
+ * owning listener's aggregate. Returns a RustBuffer containing the lowered
+ * PhantomMetricsSnapshotFfi record. */
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomsession_metrics_snapshot(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
 
 /* set_rekey_threshold(threshold: u64) -> async bool. Lowers the
  * per-direction AEAD-invocation count that triggers automatic rekey;
@@ -522,11 +636,16 @@ void uniffi_phantom_protocol_fn_free_phantomstream(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
-/* disconnect() -> async void. Closes this multiplexed stream. */
+/* disconnect() -> async void. Closes this multiplexed stream; the peer sees EOF. */
 uint64_t uniffi_phantom_protocol_fn_method_phantomstream_disconnect(
     void                    *ptr);
 
-/* recv() -> async Vec<u8>. */
+/* recv() -> async Result<Option<Vec<u8>>, CoreError> (rust_buffer result).
+ * Blocks until the next data frame arrives on this stream.
+ *   Ok(Some(bytes)) — a data payload arrived.
+ *   Ok(None)        — the peer sent a clean FIN; stream is EOF for reading.
+ *   Err(ConnectionClosed) — session ended abnormally before a clean EOF.
+ * The ABI return is a RustBuffer carrying the lowered Option<Vec<u8>>. */
 uint64_t uniffi_phantom_protocol_fn_method_phantomstream_recv(
     void                    *ptr);
 
@@ -539,6 +658,14 @@ uint64_t uniffi_phantom_protocol_fn_method_phantomstream_send_reliable(
 uint64_t uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable(
     void                    *ptr,
     PhantomRustBuffer        data);
+
+/* set_priority(priority: u32) -> async Result<(), CoreError>. Sets this
+ * stream's scheduler drain priority (higher = drained first). Takes effect
+ * on the next pump drain pass. Returns Err(NetworkError) if the session
+ * is closed. */
+uint64_t uniffi_phantom_protocol_fn_method_phantomstream_set_priority(
+    void                    *ptr,
+    uint32_t                 priority);
 
 /* stream_id() -> u32 (sync). */
 uint32_t uniffi_phantom_protocol_fn_method_phantomstream_stream_id(
@@ -557,6 +684,13 @@ void uniffi_phantom_protocol_fn_free_acceptoutcome(
 
 /* has_early_data() -> bool (sync). */
 int8_t uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
+/* peer_addr_string() -> string (sync). The remote socket address this session
+ * was accepted from (e.g. "203.0.113.4:51000") as a UTF-8 RustBuffer. Useful
+ * for per-peer admission control and logging from FFI consumers. */
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_acceptoutcome_peer_addr_string(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
@@ -632,6 +766,20 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_with_resumption(
     PhantomRustBuffer        hint,
     PhantomRustBuffer        early_data);
 
+/* connect_pinned_with_config(host: string, port: u16, pinned_key: Vec<u8>,
+ *     config: PhantomConfig) -> async Result<PhantomSession, CoreError>.
+ *
+ * Like `connect_pinned` but also applies a PhantomConfig that controls liveness
+ * settings (keepalive_interval, session_timeout). The config record is lowered
+ * into a RustBuffer by the caller.
+ *
+ * Returns a u64 future handle; complete via `_poll_u64` + `_complete_u64`. */
+uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_with_config(
+    PhantomRustBuffer        host,
+    uint16_t                 port,
+    PhantomRustBuffer        pinned_key,
+    PhantomRustBuffer        config);
+
 /* connect_pinned_udp(host: string, port: u16, pinned_key: Vec<u8>) ->
  *     async Result<PhantomSession, CoreError>.
  *
@@ -646,6 +794,20 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_udp(
     PhantomRustBuffer        host,
     uint16_t                 port,
     PhantomRustBuffer        pinned_key);
+
+/* connect_pinned_udp_with_config(host: string, port: u16, pinned_key: Vec<u8>,
+ *     config: PhantomConfig) -> async Result<PhantomSession, CoreError>.
+ *
+ * Like `connect_pinned_udp` but also applies a PhantomConfig that controls
+ * liveness settings (keepalive_interval, session_timeout). The config record is
+ * lowered into a RustBuffer by the caller.
+ *
+ * Returns a u64 future handle; complete via `_poll_u64` + `_complete_u64`. */
+uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_config(
+    PhantomRustBuffer        host,
+    uint16_t                 port,
+    PhantomRustBuffer        pinned_key,
+    PhantomRustBuffer        config);
 
 /* connect_pinned_udp_with_resumption(host: string, port: u16,
  *     pinned_key: Vec<u8>, hint: ResumptionHint, early_data: Vec<u8>) ->
@@ -684,9 +846,14 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(
  *    (UDP). The generic `connect_with_resumption` and `_with_runtime` overloads
  *    remain Rust-only; callers needing those should build a similar shim.
  *
- *  - The `transport::SessionTransport` trait, `HybridSigningKey`,
- *    `HybridVerifyingKey`, `PhantomConfig`, runtime injection, and the
- *    network simulator are NOT on the FFI surface.
+ *  - `PhantomConfig` IS on the FFI surface (as a UniFFI Record): it is
+ *    accepted by `bind_with_config_bytes`, `bind_udp_with_config_bytes`,
+ *    `connect_pinned_with_config`, and `connect_pinned_udp_with_config`.
+ *    It has four fields: `keepalive_interval` (Duration), `session_timeout`
+ *    (Duration), `session_cache_capacity` (u32), `session_ticket_lifetime`
+ *    (Duration). The `transport::SessionTransport` trait, `HybridSigningKey`,
+ *    `HybridVerifyingKey`, runtime injection, and the network simulator are
+ *    NOT on the FFI surface.
  *
  *  - All async methods are driven by the tokio runtime that
  *    PhantomListener::bind / PhantomSession::connect set up internally.
@@ -705,7 +872,8 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(
  *    time to detect ABI drift.
  *
  *  - The shape (UniFFI 0.31, contract 30) is current as of phantom_protocol
- *    0.2.2. If you bump the UniFFI dependency, regenerate this header.
+ *    0.2.2. If you bump the UniFFI dependency,
+ *    regenerate this header.
  * ==================================================================== */
 
 #ifdef __cplusplus

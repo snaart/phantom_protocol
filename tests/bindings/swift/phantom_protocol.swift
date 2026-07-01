@@ -483,6 +483,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
+    typealias FfiType = Int64
+    typealias SwiftType = Int64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int64, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -617,6 +633,14 @@ public protocol AcceptOutcomeProtocol: AnyObject, Sendable {
     func hasEarlyData()  -> Bool
     
     /**
+     * The remote socket address this session was accepted from, as a string
+     * (e.g. `"203.0.113.4:51000"`) — for per-peer admission control / logging
+     * from FFI consumers. The typed [`peer_addr`](Self::peer_addr) returning
+     * [`SocketAddr`](std::net::SocketAddr) stays Rust-only.
+     */
+    func peerAddrString()  -> String
+    
+    /**
      * The accepted, fully-established session.
      */
     func session()  -> PhantomSession
@@ -699,6 +723,20 @@ open class AcceptOutcome: AcceptOutcomeProtocol, @unchecked Sendable {
 open func hasEarlyData() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_phantom_protocol_fn_method_acceptoutcome_has_early_data(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * The remote socket address this session was accepted from, as a string
+     * (e.g. `"203.0.113.4:51000"`) — for per-peer admission control / logging
+     * from FFI consumers. The typed [`peer_addr`](Self::peer_addr) returning
+     * [`SocketAddr`](std::net::SocketAddr) stays Rust-only.
+     */
+open func peerAddrString() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_phantom_protocol_fn_method_acceptoutcome_peer_addr_string(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -805,6 +843,24 @@ public protocol PhantomListenerProtocol: AnyObject, Sendable {
     func localAddr()  -> String
     
     /**
+     * Flat snapshot of the listener's aggregated connection metrics (all
+     * accepted sessions share this counter set). Lock-free read; available
+     * with or without `telemetry-otel`.
+     */
+    func metricsSnapshot()  -> MetricsSnapshotFfi
+    
+    /**
+     * Enable or disable 0-RTT early-data acceptance (default: enabled). When
+     * disabled, resuming clients' early-data is rejected and resent in a 1-RTT
+     * exchange — the zero-infrastructure defence against 0-RTT replay for a
+     * deployment that cannot guarantee a single coherent resumption cache.
+     * Resumption / early-data ride the transport-agnostic `ClientHello`, so
+     * this applies to the TCP path too. See
+     * [`HandshakeServer::set_early_data_enabled`].
+     */
+    func setEarlyDataEnabled(enabled: Bool) 
+    
+    /**
      * Signal graceful shutdown (Phase 4.6).
      *
      * Sets the `shutting_down` flag and wakes any `accept()` call currently
@@ -890,6 +946,27 @@ public static func bind(addr: String)async throws  -> PhantomListener  {
 }
     
     /**
+     * Bind a TCP listener using a persisted 64-byte signing seed and a
+     * [`PhantomConfig`](crate::config::PhantomConfig) that controls liveness settings
+     * and session-cache sizing. The FFI analogue of the Rust-only
+     * [`bind_with_signing_key`](Self::bind_with_signing_key) + config combination.
+     */
+public static func bindWithConfigBytes(addr: String, signingKey: Data, config: PhantomConfig)async throws  -> PhantomListener  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_constructor_phantomlistener_bind_with_config_bytes(FfiConverterString.lower(addr),FfiConverterData.lower(signingKey),FfiConverterTypePhantomConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
+            liftFunc: FfiConverterTypePhantomListener_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Bind a TCP listener using a persisted 64-byte signing seed (from
      * [`generate_signing_key`](crate::api::identity::generate_signing_key)) as the
      * server's long-lived identity, so `verifying_key_bytes()` — the value clients pin
@@ -961,6 +1038,36 @@ open func localAddr() -> String  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Flat snapshot of the listener's aggregated connection metrics (all
+     * accepted sessions share this counter set). Lock-free read; available
+     * with or without `telemetry-otel`.
+     */
+open func metricsSnapshot() -> MetricsSnapshotFfi  {
+    return try!  FfiConverterTypeMetricsSnapshotFfi_lift(try! rustCall() {
+    uniffi_phantom_protocol_fn_method_phantomlistener_metrics_snapshot(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Enable or disable 0-RTT early-data acceptance (default: enabled). When
+     * disabled, resuming clients' early-data is rejected and resent in a 1-RTT
+     * exchange — the zero-infrastructure defence against 0-RTT replay for a
+     * deployment that cannot guarantee a single coherent resumption cache.
+     * Resumption / early-data ride the transport-agnostic `ClientHello`, so
+     * this applies to the TCP path too. See
+     * [`HandshakeServer::set_early_data_enabled`].
+     */
+open func setEarlyDataEnabled(enabled: Bool)  {try! rustCall() {
+    uniffi_phantom_protocol_fn_method_phantomlistener_set_early_data_enabled(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
 }
     
     /**
@@ -1067,6 +1174,29 @@ public func FfiConverterTypePhantomListener_lower(_ value: PhantomListener) -> U
 public protocol PhantomSessionProtocol: AnyObject, Sendable {
     
     /**
+     * Accept the next peer-initiated stream.
+     *
+     * Blocks until the remote peer opens a new stream (one with an id ≥ 2 that
+     * we haven't seen yet). The returned [`PhantomStream`] is already registered
+     * in the session's demux and ready for `recv()` / `send_reliable()`.
+     *
+     * Returns `Err(CoreError::ConnectionClosed)` when the session has ended and no
+     * further streams will arrive (the internal channel was dropped by the pump).
+     *
+     * # Stream-ID parity
+     *
+     * Peer-initiated streams have the *opposite* parity from locally-opened ones
+     * (QUIC-style): if the local side is the client (odd ids) the peer uses even
+     * ids, and vice versa.
+     *
+     * # Concurrency
+     *
+     * Only one caller should call `accept_stream()` at a time. The receiver is
+     * protected by an async `Mutex`; a concurrent call will wait for the lock.
+     */
+    func acceptStream() async throws  -> PhantomStream
+    
+    /**
      * Get the current connection state (lock-free).
      */
     func connectionState()  -> ConnectionState
@@ -1118,6 +1248,14 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      * Whether the session has full PQC protection.
      */
     func isPqcReady()  -> Bool
+    
+    /**
+     * Flat snapshot of this session's connection metrics. For a client
+     * session these are its own per-session counters; for a server-accepted
+     * session they are the owning listener's aggregate (shared handle).
+     * Lock-free read; available with or without `telemetry-otel`.
+     */
+    func metricsSnapshot()  -> MetricsSnapshotFfi
     
     /**
      * Migrate the session to a new local network address (Phase 4 — embedder-
@@ -1294,11 +1432,13 @@ open class PhantomSession: PhantomSessionProtocol, @unchecked Sendable {
      * # ⚠️ This does not connect
      *
      * Despite the name, this constructor never opens a transport, never runs
-     * the PQC handshake, and never spawns the background data pump. It returns
-     * an inert shell stuck in [`ConnectionState::Connecting`]: any `send()`
-     * only queues into an in-memory buffer that is never flushed, and `recv()`
-     * never yields application bytes. **No bytes ever reach the network.** It
-     * exists only as a pre-handshake placeholder from an earlier API shape.
+     * the PQC handshake, and never spawns the background data pump. The
+     * returned session immediately reports [`ConnectionState::Failed`] so
+     * misuse is observable: any `connection_state()` check will see `Failed`
+     * rather than an eternal `Connecting`. `send()` returns an error and
+     * `recv()` never yields application bytes. **No bytes ever reach the
+     * network.** It exists only as a pre-handshake placeholder from an earlier
+     * API shape.
      *
      * **Deprecated — use a real entry point instead:**
      * - [`PhantomSession::connect_with_transport`] (Rust) — supply a
@@ -1306,6 +1446,8 @@ open class PhantomSession: PhantomSessionProtocol, @unchecked Sendable {
      * the handshake + pump.
      * - [`connect_pinned`] (native FFI / mobile) — one-shot TCP connect with a
      * pinned key.
+     * - [`connect_pinned_udp`] (native FFI / mobile) — one-shot PhantomUDP
+     * connect with a pinned key.
      *
      * # Why no `#[deprecated]` attribute (T5.7)
      *
@@ -1321,8 +1463,8 @@ open class PhantomSession: PhantomSessionProtocol, @unchecked Sendable {
      * loudly here instead, and UniFFI copies this doc-comment into the generated
      * Python / Swift / Kotlin docstrings (the C header carries no docstrings), so
      * foreign-language callers see it too. See
-     * `tests::deprecated_connect_is_inert_and_sends_no_bytes` for the regression
-     * pinning the inert behaviour.
+     * `tests::deprecated_connect_is_inert_and_reports_failed` for the
+     * regression pinning the inert behaviour.
      */
 public static func connect(peerAddr: String) -> PhantomSession  {
     return try!  FfiConverterTypePhantomSession_lift(try! rustCall() {
@@ -1333,6 +1475,44 @@ public static func connect(peerAddr: String) -> PhantomSession  {
 }
     
 
+    
+    /**
+     * Accept the next peer-initiated stream.
+     *
+     * Blocks until the remote peer opens a new stream (one with an id ≥ 2 that
+     * we haven't seen yet). The returned [`PhantomStream`] is already registered
+     * in the session's demux and ready for `recv()` / `send_reliable()`.
+     *
+     * Returns `Err(CoreError::ConnectionClosed)` when the session has ended and no
+     * further streams will arrive (the internal channel was dropped by the pump).
+     *
+     * # Stream-ID parity
+     *
+     * Peer-initiated streams have the *opposite* parity from locally-opened ones
+     * (QUIC-style): if the local side is the client (odd ids) the peer uses even
+     * ids, and vice versa.
+     *
+     * # Concurrency
+     *
+     * Only one caller should call `accept_stream()` at a time. The receiver is
+     * protected by an async `Mutex`; a concurrent call will wait for the lock.
+     */
+open func acceptStream()async throws  -> PhantomStream  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_method_phantomsession_accept_stream(
+                    self.uniffiCloneHandle()
+                    
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
+            liftFunc: FfiConverterTypePhantomStream_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
     
     /**
      * Get the current connection state (lock-free).
@@ -1468,6 +1648,20 @@ open func isDataReady() -> Bool  {
 open func isPqcReady() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Flat snapshot of this session's connection metrics. For a client
+     * session these are its own per-session counters; for a server-accepted
+     * session they are the owning listener's aggregate (shared handle).
+     * Lock-free read; available with or without `telemetry-otel`.
+     */
+open func metricsSnapshot() -> MetricsSnapshotFfi  {
+    return try!  FfiConverterTypeMetricsSnapshotFfi_lift(try! rustCall() {
+    uniffi_phantom_protocol_fn_method_phantomsession_metrics_snapshot(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -1776,11 +1970,28 @@ public protocol PhantomStreamProtocol: AnyObject, Sendable {
      */
     func disconnect() async throws 
     
-    func recv() async throws  -> Data
+    /**
+     * Receive the next data frame from this stream.
+     *
+     * Returns:
+     * - `Ok(Some(bytes))` — a data payload arrived.
+     * - `Ok(None)` — the peer sent a clean FIN; the stream is half-closed
+     * for reading. No more data will arrive on this stream.
+     * - `Err(CoreError::ConnectionClosed)` — the underlying session ended
+     * (the mpsc channel was dropped) before a clean EOF was signalled.
+     * This indicates an abnormal termination rather than a graceful close.
+     */
+    func recv() async throws  -> Data?
     
     func sendReliable(data: Data) async throws 
     
     func sendUnreliable(data: Data) async throws 
+    
+    /**
+     * Set this stream's scheduler priority (higher = drained first). Takes
+     * effect on the next drain pass.
+     */
+    func setPriority(priority: UInt32) async throws 
     
     func streamId()  -> UInt32
     
@@ -1873,7 +2084,18 @@ open func disconnect()async throws   {
         )
 }
     
-open func recv()async throws  -> Data  {
+    /**
+     * Receive the next data frame from this stream.
+     *
+     * Returns:
+     * - `Ok(Some(bytes))` — a data payload arrived.
+     * - `Ok(None)` — the peer sent a clean FIN; the stream is half-closed
+     * for reading. No more data will arrive on this stream.
+     * - `Err(CoreError::ConnectionClosed)` — the underlying session ended
+     * (the mpsc channel was dropped) before a clean EOF was signalled.
+     * This indicates an abnormal termination rather than a graceful close.
+     */
+open func recv()async throws  -> Data?  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
@@ -1885,7 +2107,7 @@ open func recv()async throws  -> Data  {
             pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
             completeFunc: ffi_phantom_protocol_rust_future_complete_rust_buffer,
             freeFunc: ffi_phantom_protocol_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterData.lift,
+            liftFunc: FfiConverterOptionData.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -1914,6 +2136,27 @@ open func sendUnreliable(data: Data)async throws   {
                 uniffi_phantom_protocol_fn_method_phantomstream_send_unreliable(
                     self.uniffiCloneHandle(),
                     FfiConverterData.lower(data)
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_void,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_void,
+            freeFunc: ffi_phantom_protocol_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Set this stream's scheduler priority (higher = drained first). Takes
+     * effect on the next drain pass.
+     */
+open func setPriority(priority: UInt32)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_method_phantomstream_set_priority(
+                    self.uniffiCloneHandle(),
+                    FfiConverterUInt32.lower(priority)
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_void,
@@ -2008,6 +2251,15 @@ public protocol PhantomUdpListenerProtocol: AnyObject, Sendable {
     func localAddr()  -> String
     
     /**
+     * Enable or disable 0-RTT early-data acceptance (default: enabled). When
+     * disabled, resuming clients' early-data is rejected and resent in a 1-RTT
+     * exchange — the zero-infrastructure defence against 0-RTT replay for a
+     * deployment that cannot guarantee a single coherent resumption cache. See
+     * [`HandshakeServer::set_early_data_enabled`].
+     */
+    func setEarlyDataEnabled(enabled: Bool) 
+    
+    /**
      * Signal graceful shutdown: wakes any parked `accept()` so it unwinds with
      * `ConnectionClosed`. Idempotent. Already-accepted sessions are unaffected.
      */
@@ -2093,6 +2345,27 @@ public static func bindUdp(addr: String)async throws  -> PhantomUdpListener  {
 }
     
     /**
+     * Bind a PhantomUDP listener using a persisted 64-byte signing seed and a
+     * [`PhantomConfig`](crate::config::PhantomConfig) that controls liveness settings
+     * and session-cache sizing. FFI analogue of the Rust-only
+     * [`bind_udp_with_signing_key`](Self::bind_udp_with_signing_key) + config combination.
+     */
+public static func bindUdpWithConfigBytes(addr: String, signingKey: Data, config: PhantomConfig)async throws  -> PhantomUdpListener  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_constructor_phantomudplistener_bind_udp_with_config_bytes(FfiConverterString.lower(addr),FfiConverterData.lower(signingKey),FfiConverterTypePhantomConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
+            liftFunc: FfiConverterTypePhantomUdpListener_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Bind a PhantomUDP listener using a persisted 64-byte signing seed (from
      * [`generate_signing_key`](crate::api::identity::generate_signing_key)) as the
      * server's long-lived identity, so `verifying_key_bytes()` stays stable across
@@ -2167,6 +2440,21 @@ open func localAddr() -> String  {
 }
     
     /**
+     * Enable or disable 0-RTT early-data acceptance (default: enabled). When
+     * disabled, resuming clients' early-data is rejected and resent in a 1-RTT
+     * exchange — the zero-infrastructure defence against 0-RTT replay for a
+     * deployment that cannot guarantee a single coherent resumption cache. See
+     * [`HandshakeServer::set_early_data_enabled`].
+     */
+open func setEarlyDataEnabled(enabled: Bool)  {try! rustCall() {
+    uniffi_phantom_protocol_fn_method_phantomudplistener_set_early_data_enabled(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
+    
+    /**
      * Signal graceful shutdown: wakes any parked `accept()` so it unwinds with
      * `ConnectionClosed`. Idempotent. Already-accepted sessions are unaffected.
      */
@@ -2238,121 +2526,206 @@ public func FfiConverterTypePhantomUdpListener_lower(_ value: PhantomUdpListener
 
 
 /**
+ * Flat, UniFFI-representable subset of [`MetricsSnapshot`].
+ *
+ * Per-leg arrays are dropped because UniFFI `Record` fields must be plain
+ * scalars or UniFFI-representable types — fixed-size arrays of tuples
+ * containing non-`Record` enums (`LegType`) are not supported. All aggregate
+ * scalar fields are preserved.
+ *
+ * Always available regardless of whether the `telemetry-otel` feature is
+ * enabled, because the underlying atomics are always present. On a
+ * server-accepted session the counters are the owning listener's aggregate
+ * (shared `Arc<Observability>` handle), not per-connection.
+ */
+public struct MetricsSnapshotFfi: Equatable, Hashable {
+    public var packetsSent: UInt64
+    public var packetsRecv: UInt64
+    public var bytesSent: UInt64
+    public var bytesRecv: UInt64
+    public var avgEncryptNs: UInt64
+    public var avgDecryptNs: UInt64
+    public var encryptCount: UInt64
+    public var decryptCount: UInt64
+    public var rttUsPath0: UInt64
+    public var activeSessions: Int64
+    public var activeStreams: Int64
+    public var handshakesSuccess: UInt64
+    public var handshakesFailure: UInt64
+    public var handshakeLatencyNsSum: UInt64
+    public var handshakeLatencyCount: UInt64
+    public var replayRejectedTotal: UInt64
+    public var aeadFailureTotal: UInt64
+    public var uptimeSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(packetsSent: UInt64, packetsRecv: UInt64, bytesSent: UInt64, bytesRecv: UInt64, avgEncryptNs: UInt64, avgDecryptNs: UInt64, encryptCount: UInt64, decryptCount: UInt64, rttUsPath0: UInt64, activeSessions: Int64, activeStreams: Int64, handshakesSuccess: UInt64, handshakesFailure: UInt64, handshakeLatencyNsSum: UInt64, handshakeLatencyCount: UInt64, replayRejectedTotal: UInt64, aeadFailureTotal: UInt64, uptimeSecs: UInt64) {
+        self.packetsSent = packetsSent
+        self.packetsRecv = packetsRecv
+        self.bytesSent = bytesSent
+        self.bytesRecv = bytesRecv
+        self.avgEncryptNs = avgEncryptNs
+        self.avgDecryptNs = avgDecryptNs
+        self.encryptCount = encryptCount
+        self.decryptCount = decryptCount
+        self.rttUsPath0 = rttUsPath0
+        self.activeSessions = activeSessions
+        self.activeStreams = activeStreams
+        self.handshakesSuccess = handshakesSuccess
+        self.handshakesFailure = handshakesFailure
+        self.handshakeLatencyNsSum = handshakeLatencyNsSum
+        self.handshakeLatencyCount = handshakeLatencyCount
+        self.replayRejectedTotal = replayRejectedTotal
+        self.aeadFailureTotal = aeadFailureTotal
+        self.uptimeSecs = uptimeSecs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MetricsSnapshotFfi: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MetricsSnapshotFfi {
+        return
+            try MetricsSnapshotFfi(
+                packetsSent: FfiConverterUInt64.read(from: &buf), 
+                packetsRecv: FfiConverterUInt64.read(from: &buf), 
+                bytesSent: FfiConverterUInt64.read(from: &buf), 
+                bytesRecv: FfiConverterUInt64.read(from: &buf), 
+                avgEncryptNs: FfiConverterUInt64.read(from: &buf), 
+                avgDecryptNs: FfiConverterUInt64.read(from: &buf), 
+                encryptCount: FfiConverterUInt64.read(from: &buf), 
+                decryptCount: FfiConverterUInt64.read(from: &buf), 
+                rttUsPath0: FfiConverterUInt64.read(from: &buf), 
+                activeSessions: FfiConverterInt64.read(from: &buf), 
+                activeStreams: FfiConverterInt64.read(from: &buf), 
+                handshakesSuccess: FfiConverterUInt64.read(from: &buf), 
+                handshakesFailure: FfiConverterUInt64.read(from: &buf), 
+                handshakeLatencyNsSum: FfiConverterUInt64.read(from: &buf), 
+                handshakeLatencyCount: FfiConverterUInt64.read(from: &buf), 
+                replayRejectedTotal: FfiConverterUInt64.read(from: &buf), 
+                aeadFailureTotal: FfiConverterUInt64.read(from: &buf), 
+                uptimeSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MetricsSnapshotFfi, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.packetsSent, into: &buf)
+        FfiConverterUInt64.write(value.packetsRecv, into: &buf)
+        FfiConverterUInt64.write(value.bytesSent, into: &buf)
+        FfiConverterUInt64.write(value.bytesRecv, into: &buf)
+        FfiConverterUInt64.write(value.avgEncryptNs, into: &buf)
+        FfiConverterUInt64.write(value.avgDecryptNs, into: &buf)
+        FfiConverterUInt64.write(value.encryptCount, into: &buf)
+        FfiConverterUInt64.write(value.decryptCount, into: &buf)
+        FfiConverterUInt64.write(value.rttUsPath0, into: &buf)
+        FfiConverterInt64.write(value.activeSessions, into: &buf)
+        FfiConverterInt64.write(value.activeStreams, into: &buf)
+        FfiConverterUInt64.write(value.handshakesSuccess, into: &buf)
+        FfiConverterUInt64.write(value.handshakesFailure, into: &buf)
+        FfiConverterUInt64.write(value.handshakeLatencyNsSum, into: &buf)
+        FfiConverterUInt64.write(value.handshakeLatencyCount, into: &buf)
+        FfiConverterUInt64.write(value.replayRejectedTotal, into: &buf)
+        FfiConverterUInt64.write(value.aeadFailureTotal, into: &buf)
+        FfiConverterUInt64.write(value.uptimeSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMetricsSnapshotFfi_lift(_ buf: RustBuffer) throws -> MetricsSnapshotFfi {
+    return try FfiConverterTypeMetricsSnapshotFfi.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMetricsSnapshotFfi_lower(_ value: MetricsSnapshotFfi) -> RustBuffer {
+    return FfiConverterTypeMetricsSnapshotFfi.lower(value)
+}
+
+
+/**
  * Tunable parameters for a Phantom session / listener, exported across the
  * UniFFI boundary as a plain record.
  *
- * NOTE: this is a stable FFI config surface, but the core does not yet read
- * most of these fields on the live data path — `PhantomConfig` is currently
- * re-exported and FFI-exported only. The `auto_fallback` / `fallback_*` /
- * `upgrade_delay` fields in particular describe the legacy multi-leg
- * fallback model; transport-leg fallback / aggregation was deliberately
- * dropped in favour of single-path connection migration, so those knobs are
- * presently inert. Treat the presets below as documented intent, not as
- * behaviour the core enforces today.
+ * These four fields are actively consumed by the core:
+ * - `keepalive_interval` → `LivenessConfig.keepalive_interval` (idle keep-alive PING interval)
+ * - `session_timeout` → `LivenessConfig.idle_timeout` (Migrating→Dead reap window)
+ * - `session_cache_capacity` → `SessionCache` max entries (server-only; client ignores)
+ * - `session_ticket_lifetime` → `SessionCache` ticket lifetime (server-only; client ignores)
+ *
+ * Build via `mobile()` / `server()` / `iot()` / `default()` then mutate fields;
+ * `#[non_exhaustive]` lets future tunables be added without a breaking change.
  */
 public struct PhantomConfig: Equatable, Hashable {
     /**
-     * Interval between keep-alive pings
+     * Interval between idle keep-alive PINGs (maps to `LivenessConfig.keepalive_interval`).
+     * When the session is `Connected` and has been idle this long with nothing in flight,
+     * the data pump emits a small encrypted KEEPALIVE packet so a download-only path can
+     * detect a silently-dead peer via the same probe-timeout sweep.
      */
     public var keepaliveInterval: TimeInterval
     /**
-     * Session inactivity timeout
+     * Liveness reap window (maps to `LivenessConfig.idle_timeout`).
+     *
+     * **Note:** this is the `Migrating → Dead` timeout, not a general idle-disconnect timer.
+     * Keep-alive PINGs keep a `Connected` session alive indefinitely; this bounds how long
+     * a session that has gone unresponsive (entered `Migrating`) is retried before being
+     * declared `Dead`.
      */
     public var sessionTimeout: TimeInterval
     /**
-     * Maximum packet size (MTU)
-     */
-    public var maxPacketSize: UInt32
-    /**
-     * Send buffer size in packets
-     */
-    public var sendBufferSize: UInt32
-    /**
-     * Receive buffer size in packets
-     */
-    public var recvBufferSize: UInt32
-    /**
-     * Maximum tickets in session cache
+     * Maximum 0-RTT resumption tickets the server keeps in memory (server-only; ignored by
+     * clients). Maps to `SessionCache` capacity; excess entries are evicted LRU.
      */
     public var sessionCacheCapacity: UInt32
     /**
-     * Lifetime of a session ticket
+     * Server-side resumption-ticket lifetime (server-only; ignored by clients). Maps to
+     * `SessionCache` ticket lifetime.
      */
     public var sessionTicketLifetime: TimeInterval
-    /**
-     * Enable automatic transport fallback (legacy multi-leg model; inert —
-     * see the struct-level note).
-     */
-    public var autoFallback: Bool
-    /**
-     * Packet loss percentage to trigger fallback (legacy multi-leg model; inert).
-     */
-    public var fallbackLossThreshold: UInt8
-    /**
-     * Connection failures to trigger fallback (legacy multi-leg model; inert).
-     */
-    public var fallbackFailureThreshold: UInt32
-    /**
-     * Timeout for connection attempts
-     */
-    public var connectTimeout: TimeInterval
-    /**
-     * Delay before attempting to upgrade transport (legacy multi-leg model; inert).
-     */
-    public var upgradeDelay: TimeInterval
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
-         * Interval between keep-alive pings
+         * Interval between idle keep-alive PINGs (maps to `LivenessConfig.keepalive_interval`).
+         * When the session is `Connected` and has been idle this long with nothing in flight,
+         * the data pump emits a small encrypted KEEPALIVE packet so a download-only path can
+         * detect a silently-dead peer via the same probe-timeout sweep.
          */keepaliveInterval: TimeInterval, 
         /**
-         * Session inactivity timeout
+         * Liveness reap window (maps to `LivenessConfig.idle_timeout`).
+         *
+         * **Note:** this is the `Migrating → Dead` timeout, not a general idle-disconnect timer.
+         * Keep-alive PINGs keep a `Connected` session alive indefinitely; this bounds how long
+         * a session that has gone unresponsive (entered `Migrating`) is retried before being
+         * declared `Dead`.
          */sessionTimeout: TimeInterval, 
         /**
-         * Maximum packet size (MTU)
-         */maxPacketSize: UInt32, 
-        /**
-         * Send buffer size in packets
-         */sendBufferSize: UInt32, 
-        /**
-         * Receive buffer size in packets
-         */recvBufferSize: UInt32, 
-        /**
-         * Maximum tickets in session cache
+         * Maximum 0-RTT resumption tickets the server keeps in memory (server-only; ignored by
+         * clients). Maps to `SessionCache` capacity; excess entries are evicted LRU.
          */sessionCacheCapacity: UInt32, 
         /**
-         * Lifetime of a session ticket
-         */sessionTicketLifetime: TimeInterval, 
-        /**
-         * Enable automatic transport fallback (legacy multi-leg model; inert —
-         * see the struct-level note).
-         */autoFallback: Bool, 
-        /**
-         * Packet loss percentage to trigger fallback (legacy multi-leg model; inert).
-         */fallbackLossThreshold: UInt8, 
-        /**
-         * Connection failures to trigger fallback (legacy multi-leg model; inert).
-         */fallbackFailureThreshold: UInt32, 
-        /**
-         * Timeout for connection attempts
-         */connectTimeout: TimeInterval, 
-        /**
-         * Delay before attempting to upgrade transport (legacy multi-leg model; inert).
-         */upgradeDelay: TimeInterval) {
+         * Server-side resumption-ticket lifetime (server-only; ignored by clients). Maps to
+         * `SessionCache` ticket lifetime.
+         */sessionTicketLifetime: TimeInterval) {
         self.keepaliveInterval = keepaliveInterval
         self.sessionTimeout = sessionTimeout
-        self.maxPacketSize = maxPacketSize
-        self.sendBufferSize = sendBufferSize
-        self.recvBufferSize = recvBufferSize
         self.sessionCacheCapacity = sessionCacheCapacity
         self.sessionTicketLifetime = sessionTicketLifetime
-        self.autoFallback = autoFallback
-        self.fallbackLossThreshold = fallbackLossThreshold
-        self.fallbackFailureThreshold = fallbackFailureThreshold
-        self.connectTimeout = connectTimeout
-        self.upgradeDelay = upgradeDelay
     }
 
     
@@ -2373,32 +2746,16 @@ public struct FfiConverterTypePhantomConfig: FfiConverterRustBuffer {
             try PhantomConfig(
                 keepaliveInterval: FfiConverterDuration.read(from: &buf), 
                 sessionTimeout: FfiConverterDuration.read(from: &buf), 
-                maxPacketSize: FfiConverterUInt32.read(from: &buf), 
-                sendBufferSize: FfiConverterUInt32.read(from: &buf), 
-                recvBufferSize: FfiConverterUInt32.read(from: &buf), 
                 sessionCacheCapacity: FfiConverterUInt32.read(from: &buf), 
-                sessionTicketLifetime: FfiConverterDuration.read(from: &buf), 
-                autoFallback: FfiConverterBool.read(from: &buf), 
-                fallbackLossThreshold: FfiConverterUInt8.read(from: &buf), 
-                fallbackFailureThreshold: FfiConverterUInt32.read(from: &buf), 
-                connectTimeout: FfiConverterDuration.read(from: &buf), 
-                upgradeDelay: FfiConverterDuration.read(from: &buf)
+                sessionTicketLifetime: FfiConverterDuration.read(from: &buf)
         )
     }
 
     public static func write(_ value: PhantomConfig, into buf: inout [UInt8]) {
         FfiConverterDuration.write(value.keepaliveInterval, into: &buf)
         FfiConverterDuration.write(value.sessionTimeout, into: &buf)
-        FfiConverterUInt32.write(value.maxPacketSize, into: &buf)
-        FfiConverterUInt32.write(value.sendBufferSize, into: &buf)
-        FfiConverterUInt32.write(value.recvBufferSize, into: &buf)
         FfiConverterUInt32.write(value.sessionCacheCapacity, into: &buf)
         FfiConverterDuration.write(value.sessionTicketLifetime, into: &buf)
-        FfiConverterBool.write(value.autoFallback, into: &buf)
-        FfiConverterUInt8.write(value.fallbackLossThreshold, into: &buf)
-        FfiConverterUInt32.write(value.fallbackFailureThreshold, into: &buf)
-        FfiConverterDuration.write(value.connectTimeout, into: &buf)
-        FfiConverterDuration.write(value.upgradeDelay, into: &buf)
     }
 }
 
@@ -3311,6 +3668,24 @@ public func connectPinnedUdp(host: String, port: UInt16, pinnedKey: Data)async t
         )
 }
 /**
+ * Like [`connect_pinned_udp`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
+ * liveness settings. FFI-exported.
+ */
+public func connectPinnedUdpWithConfig(host: String, port: UInt16, pinnedKey: Data, config: PhantomConfig)async throws  -> PhantomSession  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_config(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey),FfiConverterTypePhantomConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
+            liftFunc: FfiConverterTypePhantomSession_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+/**
  * 0-RTT resumption analogue of [`connect_pinned_udp`] — the UDP sibling of
  * [`connect_pinned_with_resumption`].
  *
@@ -3329,6 +3704,24 @@ public func connectPinnedUdpWithResumption(host: String, port: UInt16, pinnedKey
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey),FfiConverterTypeResumptionHint_lower(hint),FfiConverterData.lower(earlyData)
+                )
+            },
+            pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
+            completeFunc: ffi_phantom_protocol_rust_future_complete_u64,
+            freeFunc: ffi_phantom_protocol_rust_future_free_u64,
+            liftFunc: FfiConverterTypePhantomSession_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+/**
+ * Like [`connect_pinned`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
+ * liveness settings to the session. FFI-exported.
+ */
+public func connectPinnedWithConfig(host: String, port: UInt16, pinnedKey: Data, config: PhantomConfig)async throws  -> PhantomSession  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_phantom_protocol_fn_func_connect_pinned_with_config(FfiConverterString.lower(host),FfiConverterUInt16.lower(port),FfiConverterData.lower(pinnedKey),FfiConverterTypePhantomConfig_lower(config)
                 )
             },
             pollFunc: ffi_phantom_protocol_rust_future_poll_u64,
@@ -3398,13 +3791,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 36316) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 19062) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 47926) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 17324) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 60625) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 13201) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_acceptoutcome_peer_addr_string() != 64037) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_acceptoutcome_session() != 25558) {
@@ -3422,10 +3824,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomlistener_local_addr() != 46930) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_metrics_snapshot() != 63186) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_phantomlistener_set_early_data_enabled() != 39659) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_phantom_protocol_checksum_method_phantomlistener_shutdown() != 60837) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 14523) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream() != 13703) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 25030) {
@@ -3450,6 +3861,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready() != 47934) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot() != 36430) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 22155) {
@@ -3485,13 +3899,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 28528) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 18540) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 50030) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 38734) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 56290) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomstream_stream_id() != 28026) {
@@ -3506,6 +3923,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr() != 6213) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_set_early_data_enabled() != 49550) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_phantom_protocol_checksum_method_phantomudplistener_shutdown() != 50351) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3515,13 +3935,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind() != 60148) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_config_bytes() != 10908) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_phantom_protocol_checksum_constructor_phantomlistener_bind_with_signing_key_bytes() != 19213) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 14331) {
+    if (uniffi_phantom_protocol_checksum_constructor_phantomsession_connect() != 40022) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp() != 57133) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_config_bytes() != 28985) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_constructor_phantomudplistener_bind_udp_with_signing_key_bytes() != 18642) {
