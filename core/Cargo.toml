@@ -421,7 +421,7 @@ wasi = { version = "0.14", optional = true }
 [dev-dependencies]
 blake3 = "1.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand = "0.8"
+rand = "0.10"
 uniffi = { version = "0.31", features = ["bindgen-tests"] }
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 tokio-test = "0.4"
