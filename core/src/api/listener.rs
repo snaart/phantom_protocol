@@ -818,6 +818,82 @@ impl Drop for PhantomListener {
     }
 }
 
+impl PhantomListener {
+    /// Create a [`ListenerBuilder`] for constructing a TCP listener.
+    ///
+    /// The builder collects configuration (optional signing key, runtime, config)
+    /// and then `.bind().await` stands up the listener. This is the ergonomic
+    /// alternative to calling [`bind_with_signing_key`](Self::bind_with_signing_key)
+    /// or [`bind_with_runtime`](Self::bind_with_runtime) with multiple arguments.
+    pub fn builder(addr: impl Into<String>) -> ListenerBuilder {
+        ListenerBuilder {
+            addr: addr.into(),
+            signing_key: None,
+            config: None,
+            runtime: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+            mimic_sni: None,
+        }
+    }
+}
+
+// ─── ListenerBuilder ────────────────────────────────────────────────────────
+
+/// Builder for [`PhantomListener`].
+///
+/// Created via [`PhantomListener::builder`]. Collects configuration, then
+/// `.bind().await` stands up the listener.
+pub struct ListenerBuilder {
+    addr: String,
+    signing_key: Option<HybridSigningKey>,
+    config: Option<crate::config::PhantomConfig>,
+    runtime: Option<Arc<dyn Runtime>>,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+    mimic_sni: Option<String>,
+}
+
+impl ListenerBuilder {
+    /// Use a long-lived [`HybridSigningKey`] so the server's verifying identity
+    /// persists across restarts (clients can pin it).
+    pub fn signing_key(mut self, key: HybridSigningKey) -> Self {
+        self.signing_key = Some(key);
+        self
+    }
+
+    /// Apply a [`PhantomConfig`](crate::config::PhantomConfig) (liveness, session-cache).
+    pub fn config(mut self, config: crate::config::PhantomConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Use a custom [`Runtime`] instead of the default [`TokioRuntime`].
+    pub fn runtime(mut self, runtime: Arc<dyn Runtime>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// Enable TLS-over-TCP active-mimicry (anti-DPI obfuscation; `mimicry` feature).
+    /// **Obfuscation only** — see [`PhantomListener::bind_mimic`] for the security caveat.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+    pub fn mimic_sni(mut self, sni: impl Into<String>) -> Self {
+        self.mimic_sni = Some(sni.into());
+        self
+    }
+
+    /// Bind the listener and return it.
+    pub async fn bind(self) -> Result<Arc<PhantomListener>, CoreError> {
+        let runtime = self
+            .runtime
+            .unwrap_or_else(|| Arc::new(TokioRuntime) as Arc<dyn Runtime>);
+        #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
+        let mimic_sni = self.mimic_sni;
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "mimicry")))]
+        let mimic_sni: Option<String> = None;
+        PhantomListener::bind_inner(self.addr, runtime, self.signing_key, mimic_sni, self.config)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,6 +1073,46 @@ mod tests {
         assert_eq!(
             parsed, peer,
             "peer_addr_string must round-trip to the original SocketAddr"
+        );
+    }
+
+    // ── ListenerBuilder tests ─────────────────────────────────────────────────
+
+    /// Verify `PhantomListener::builder` constructs a `ListenerBuilder` that can be
+    /// used to bind (smoke — just checks the builder wires through to `bind_inner`).
+    #[tokio::test]
+    async fn listener_builder_binds_successfully() {
+        let _guard = crate::crypto::self_tests::tests_serial_guard()
+            .lock()
+            .unwrap();
+        crate::crypto::self_tests::set_force_post_fail(false);
+        let listener = PhantomListener::builder("127.0.0.1:0")
+            .bind()
+            .await
+            .expect("builder bind should succeed");
+        assert!(
+            listener.local_addr().starts_with("127.0.0.1:"),
+            "bound address must be on 127.0.0.1"
+        );
+    }
+
+    /// Builder with a signing key persists the verifying identity.
+    #[tokio::test]
+    async fn listener_builder_with_signing_key_pins_identity() {
+        let _guard = crate::crypto::self_tests::tests_serial_guard()
+            .lock()
+            .unwrap();
+        crate::crypto::self_tests::set_force_post_fail(false);
+        let (signing_key, verifying_key) = HybridSigningKey::generate();
+        let listener = PhantomListener::builder("127.0.0.1:0")
+            .signing_key(signing_key)
+            .bind()
+            .await
+            .expect("builder bind with signing_key should succeed");
+        assert_eq!(
+            listener.verifying_key_bytes(),
+            verifying_key.to_bytes(),
+            "builder with signing_key must pin that key's verifying half"
         );
     }
 }

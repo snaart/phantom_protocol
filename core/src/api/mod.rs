@@ -31,15 +31,15 @@ pub mod udp_transport;
 mod loss_recovery_tests;
 
 // Cross-target re-exports
-pub use session::{ConnectionState, PhantomSession, SessionTransport};
+pub use session::{ConnectionState, NoTransport, PhantomSession, SessionBuilder, SessionTransport};
 pub use stream::PhantomStream;
 
 // Native-only re-exports
 #[cfg(not(target_arch = "wasm32"))]
-pub use listener::PhantomListener;
+pub use listener::{ListenerBuilder, PhantomListener};
 #[cfg(not(target_arch = "wasm32"))]
 pub use tcp_transport::TcpSessionTransport;
 #[cfg(not(target_arch = "wasm32"))]
-pub use udp_listener::PhantomUdpListener;
+pub use udp_listener::{PhantomUdpListener, UdpListenerBuilder};
 #[cfg(not(target_arch = "wasm32"))]
 pub use udp_transport::UdpClientTransport;

@@ -151,6 +151,19 @@ impl PhantomUdpListener {
         let handle = self.runtime.spawn(Box::pin(run_udp_demux(self.clone())));
         *guard = Some(handle);
     }
+
+    /// Create a [`UdpListenerBuilder`] for constructing a PhantomUDP listener.
+    ///
+    /// The builder collects configuration (optional signing key, runtime, config)
+    /// and then `.bind().await` stands up the listener.
+    pub fn builder(addr: impl Into<String>) -> UdpListenerBuilder {
+        UdpListenerBuilder {
+            addr: addr.into(),
+            signing_key: None,
+            config: None,
+            runtime: None,
+        }
+    }
 }
 
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
@@ -674,6 +687,48 @@ fn spawn_handshake_task(
     }));
 }
 
+// ─── UdpListenerBuilder ─────────────────────────────────────────────────────
+
+/// Builder for [`PhantomUdpListener`].
+///
+/// Created via [`PhantomUdpListener::builder`]. Collects configuration, then
+/// `.bind().await` stands up the listener.
+pub struct UdpListenerBuilder {
+    addr: String,
+    signing_key: Option<HybridSigningKey>,
+    config: Option<crate::config::PhantomConfig>,
+    runtime: Option<Arc<dyn Runtime>>,
+}
+
+impl UdpListenerBuilder {
+    /// Use a long-lived [`HybridSigningKey`] so the server's verifying identity
+    /// persists across restarts.
+    pub fn signing_key(mut self, key: HybridSigningKey) -> Self {
+        self.signing_key = Some(key);
+        self
+    }
+
+    /// Apply a [`PhantomConfig`](crate::config::PhantomConfig) (liveness, session-cache).
+    pub fn config(mut self, config: crate::config::PhantomConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Use a custom [`Runtime`] instead of the default [`TokioRuntime`].
+    pub fn runtime(mut self, runtime: Arc<dyn Runtime>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// Bind the listener and return it.
+    pub async fn bind(self) -> Result<Arc<PhantomUdpListener>, CoreError> {
+        let runtime = self
+            .runtime
+            .unwrap_or_else(|| Arc::new(TokioRuntime) as Arc<dyn Runtime>);
+        PhantomUdpListener::bind_inner(self.addr, runtime, self.signing_key, self.config).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,6 +792,18 @@ mod tests {
             .await
             .unwrap();
         assert!(!listener.verifying_key_bytes().is_empty());
+        assert!(listener.local_addr().starts_with("127.0.0.1:"));
+    }
+
+    // ── UdpListenerBuilder tests ──────────────────────────────────────────────
+
+    /// Verify `PhantomUdpListener::builder` can bind a listener.
+    #[tokio::test]
+    async fn udp_listener_builder_binds_successfully() {
+        let listener = PhantomUdpListener::builder("127.0.0.1:0")
+            .bind()
+            .await
+            .expect("builder bind should succeed");
         assert!(listener.local_addr().starts_with("127.0.0.1:"));
     }
 }

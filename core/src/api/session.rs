@@ -36,6 +36,14 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+/// Marker type for a [`SessionBuilder`] that has not yet been given a transport.
+///
+/// The builder's `.transport(t)` method consumes a `SessionBuilder<NoTransport>`
+/// and produces a `SessionBuilder<T>` where `T: SessionTransport`. Only
+/// `SessionBuilder<T: SessionTransport>` exposes `.connect()`, so the type
+/// system prevents calling connect without a transport.
+pub struct NoTransport;
+
 /// Generate a fresh 128-bit session identifier from the OS CSPRNG.
 ///
 /// This is a non-secret display/handle identifier, not key material; 128 bits
@@ -556,6 +564,24 @@ impl PhantomSession {
             None,
             Some(liveness),
         )
+    }
+
+    /// Create a [`SessionBuilder`] for constructing a client session.
+    ///
+    /// The builder collects configuration (pinned key, optional resumption hint,
+    /// optional config / runtime) and then `.transport(t).connect().await` drives the
+    /// handshake and returns the session. This is the ergonomic alternative to calling
+    /// [`connect_with_transport_with_runtime_and_config`](Self::connect_with_transport_with_runtime_and_config)
+    /// with many positional arguments.
+    pub fn builder(addr: impl Into<String>) -> SessionBuilder {
+        SessionBuilder {
+            peer_addr: addr.into(),
+            transport: None,
+            pinned_key: None,
+            resumption: None,
+            config: None,
+            runtime: None,
+        }
     }
 
     /// Shared constructor body for [`connect_with_transport_with_runtime`]
@@ -3867,6 +3893,127 @@ pub async fn connect_pinned_udp_with_resumption(
         early_data,
     )?;
     Ok(Arc::new(session))
+}
+
+// ─── SessionBuilder ─────────────────────────────────────────────────────────
+
+/// Builder for [`PhantomSession`] client connections.
+///
+/// Created via [`PhantomSession::builder`]. Call setters to configure, then
+/// call `.transport(t)` to supply a [`SessionTransport`], then `.connect().await`
+/// to perform the handshake and return a session.
+///
+/// ```rust,no_run
+/// # use phantom_protocol::api::{PhantomSession, TcpSessionTransport};
+/// # async fn example() -> Result<(), phantom_protocol::errors::CoreError> {
+/// # let my_key = phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey::from_bytes(&[]).unwrap();
+/// let stream = tokio::net::TcpStream::connect("127.0.0.1:4242").await.unwrap();
+/// let transport = TcpSessionTransport::new(stream);
+/// let session = PhantomSession::builder("127.0.0.1:4242")
+///     .pinned_key(my_key)
+///     .transport(transport)
+///     .connect()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct SessionBuilder<T = NoTransport> {
+    peer_addr: String,
+    transport: Option<T>,
+    pinned_key: Option<HybridVerifyingKey>,
+    resumption: Option<([u8; 32], [u8; 32], Vec<u8>)>,
+    config: Option<crate::config::PhantomConfig>,
+    runtime: Option<Arc<dyn Runtime>>,
+}
+
+impl<T> SessionBuilder<T> {
+    /// Pin the expected server verifying key (required before calling `.connect()`).
+    pub fn pinned_key(mut self, key: HybridVerifyingKey) -> Self {
+        self.pinned_key = Some(key);
+        self
+    }
+
+    /// Attach a [`ResumptionHint`] for 0-RTT resumption.
+    ///
+    /// Both `hint.session_id` and `hint.resumption_secret` must be exactly 32 bytes;
+    /// oversized `early_data` (> [`EARLY_DATA_MAX_LEN`]) is rejected at `.connect()` time.
+    pub fn resumption(mut self, hint: ResumptionHint, early_data: Vec<u8>) -> Self {
+        let mut session_id = [0u8; 32];
+        let mut resumption_secret = [0u8; 32];
+        let sid_len = hint.session_id.len().min(32);
+        let sec_len = hint.resumption_secret.len().min(32);
+        session_id[..sid_len].copy_from_slice(&hint.session_id[..sid_len]);
+        resumption_secret[..sec_len].copy_from_slice(&hint.resumption_secret[..sec_len]);
+        self.resumption = Some((session_id, resumption_secret, early_data));
+        self
+    }
+
+    /// Apply a [`PhantomConfig`](crate::config::PhantomConfig) (liveness settings, session-cache size).
+    pub fn config(mut self, config: crate::config::PhantomConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Use a custom [`Runtime`] instead of the default [`TokioRuntime`].
+    pub fn runtime(mut self, runtime: Arc<dyn Runtime>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// Supply the `SessionTransport` implementation, transitioning the builder to a
+    /// concrete type ready for `.connect()`.
+    pub fn transport<U: SessionTransport>(self, transport: U) -> SessionBuilder<U> {
+        SessionBuilder {
+            peer_addr: self.peer_addr,
+            transport: Some(transport),
+            pinned_key: self.pinned_key,
+            resumption: self.resumption,
+            config: self.config,
+            runtime: self.runtime,
+        }
+    }
+}
+
+impl<T: SessionTransport> SessionBuilder<T> {
+    /// Perform the handshake and return the established session.
+    ///
+    /// Returns `Err(CoreError::ConfigError(...))` if no pinned key was supplied via
+    /// `.pinned_key(...)`. The transport must have been supplied via `.transport(...)`.
+    pub async fn connect(self) -> Result<Arc<PhantomSession>, CoreError> {
+        let pinned_key = self.pinned_key.ok_or_else(|| {
+            CoreError::ConfigError("SessionBuilder: pinned_key is required".into())
+        })?;
+        // Transport is always Some when T != NoTransport (type-state), but we store
+        // it as Option<T> so the type-converting `.transport()` setter compiles.
+        let transport = self.transport.ok_or_else(|| {
+            CoreError::ConfigError("SessionBuilder: transport is required".into())
+        })?;
+        if let Some((_, _, ref ed)) = self.resumption {
+            if ed.len() > EARLY_DATA_MAX_LEN {
+                return Err(CoreError::ValidationError(format!(
+                    "early_data is {} bytes, exceeds the {}-byte 0-RTT cap",
+                    ed.len(),
+                    EARLY_DATA_MAX_LEN
+                )));
+            }
+        }
+        #[cfg(feature = "fips")]
+        crate::crypto::self_tests::ensure_post_passed()
+            .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
+        let runtime = self
+            .runtime
+            .unwrap_or_else(|| Arc::new(TokioRuntime) as Arc<dyn Runtime>);
+        let liveness = self.config.map(|c| c.liveness());
+        let session = PhantomSession::spawn_client(
+            &self.peer_addr,
+            transport,
+            pinned_key,
+            runtime,
+            self.resumption,
+            liveness,
+        );
+        Ok(Arc::new(session))
+    }
 }
 
 #[cfg(test)]
@@ -7572,5 +7719,83 @@ mod tests {
             matches!(result, Err(CoreError::ConnectionClosed)),
             "expected ConnectionClosed on a closed channel"
         );
+    }
+
+    // ── SessionBuilder tests ──────────────────────────────────────────────────
+
+    /// `SessionBuilder::connect()` returns `ConfigError` when no pinned key was
+    /// supplied — the builder type-state allows calling `.connect()` on a
+    /// `SessionBuilder<T>` where T is a concrete transport, but the missing
+    /// key must be caught at runtime.
+    #[tokio::test]
+    async fn session_builder_missing_pinned_key_errors() {
+        let (client_t, _server_t) = ChannelTransport::pair();
+        let result = PhantomSession::builder("test:9000")
+            .transport(client_t)
+            .connect()
+            .await;
+        assert!(
+            matches!(result, Err(CoreError::ConfigError(_))),
+            "expected ConfigError when pinned_key is not set, got {result:?}"
+        );
+    }
+
+    /// `SessionBuilder` end-to-end: connect with pinned_key set, drive the server
+    /// side inline with `HandshakeServer`, verify the session reaches `Connected`.
+    #[tokio::test]
+    async fn session_builder_e2e_handshake() {
+        use crate::transport::handshake::ServerReply;
+
+        let server_hs = HandshakeServer::new().unwrap();
+        let server_pinned_key = server_hs.verifying_key().clone();
+        let client_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        let (client_t, server_t) = ChannelTransport::pair();
+
+        // Drive the builder-constructed client in the background.
+        let session_fut = tokio::spawn(async move {
+            PhantomSession::builder("test:9000")
+                .pinned_key(server_pinned_key)
+                .transport(client_t)
+                .connect()
+                .await
+        });
+
+        // Server side: drive handshake inline (with cookie retry).
+        let hello_bytes = server_t.recv_bytes().await.unwrap();
+        let ch = borsh::from_slice::<ClientHello>(&hello_bytes).unwrap();
+        let retry = match server_hs.process_client_hello(&ch, 0, client_ip) {
+            HandshakeResponse::Retry(r) => r,
+            _ => panic!("expected Retry"),
+        };
+        server_t
+            .send_bytes(
+                &ServerReply::Retry(retry).to_wire().unwrap(),
+            )
+            .await
+            .unwrap();
+        let next = server_t.recv_bytes().await.unwrap();
+        let ch2 = borsh::from_slice::<ClientHello>(&next).unwrap();
+        match server_hs.process_client_hello(&ch2, 0, client_ip) {
+            HandshakeResponse::Success(sh, _session, _) => {
+                server_t
+                    .send_bytes(
+                        &ServerReply::Hello(sh).to_wire().unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            _ => panic!("expected Success"),
+        }
+
+        let session = session_fut.await.unwrap().expect("builder connect failed");
+        // Wait briefly for the background pump to install the session.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            session.connection_state(),
+            ConnectionState::Connected,
+            "builder-constructed session must reach Connected after a successful handshake"
+        );
+        drop(server_t);
     }
 }
