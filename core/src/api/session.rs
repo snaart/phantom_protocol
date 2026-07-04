@@ -480,9 +480,10 @@ impl PhantomSession {
     ///
     /// The builder collects configuration (pinned key, optional resumption hint,
     /// optional config / runtime) and then `.transport(t).connect().await` drives the
-    /// handshake and returns the session. This is the ergonomic alternative to calling
-    /// [`connect_with_transport_with_runtime_and_config`](Self::connect_with_transport_with_runtime_and_config)
-    /// with many positional arguments.
+    /// handshake and returns the session. This is the ergonomic alternative to the
+    /// `connect_with_transport*` family — every option (runtime, config, resumption,
+    /// mimicry) is an orthogonal `SessionBuilder` setter instead of a positional
+    /// argument or a `_with_*` name suffix.
     pub fn builder(addr: impl Into<String>) -> SessionBuilder {
         SessionBuilder {
             peer_addr: addr.into(),
@@ -3835,7 +3836,7 @@ pub struct SessionBuilder<T = NoTransport> {
     peer_addr: String,
     transport: Option<T>,
     pinned_key: Option<HybridVerifyingKey>,
-    resumption: Option<([u8; 32], [u8; 32], Vec<u8>)>,
+    resumption: Option<(ResumptionHint, Vec<u8>)>,
     config: Option<crate::config::PhantomConfig>,
     runtime: Option<Arc<dyn Runtime>>,
 }
@@ -3852,13 +3853,10 @@ impl<T> SessionBuilder<T> {
     /// Both `hint.session_id` and `hint.resumption_secret` must be exactly 32 bytes;
     /// oversized `early_data` (> [`EARLY_DATA_MAX_LEN`]) is rejected at `.connect()` time.
     pub fn resumption(mut self, hint: ResumptionHint, early_data: Vec<u8>) -> Self {
-        let mut session_id = [0u8; 32];
-        let mut resumption_secret = [0u8; 32];
-        let sid_len = hint.session_id.len().min(32);
-        let sec_len = hint.resumption_secret.len().min(32);
-        session_id[..sid_len].copy_from_slice(&hint.session_id[..sid_len]);
-        resumption_secret[..sec_len].copy_from_slice(&hint.resumption_secret[..sec_len]);
-        self.resumption = Some((session_id, resumption_secret, early_data));
+        // Stored raw; the exact-32-byte length is validated at `.connect()` time
+        // (matching the strict FFI `connect_pinned_*_with_resumption` path), so a
+        // malformed hint is a clean `ValidationError` rather than a silent truncation.
+        self.resumption = Some((hint, early_data));
         self
     }
 
@@ -3902,15 +3900,34 @@ impl<T: SessionTransport> SessionBuilder<T> {
         let transport = self.transport.ok_or_else(|| {
             CoreError::ConfigError("SessionBuilder: transport is required".into())
         })?;
-        if let Some((_, _, ref ed)) = self.resumption {
-            if ed.len() > EARLY_DATA_MAX_LEN {
-                return Err(CoreError::ValidationError(format!(
-                    "early_data is {} bytes, exceeds the {}-byte 0-RTT cap",
-                    ed.len(),
-                    EARLY_DATA_MAX_LEN
-                )));
+        // Validate the resumption hint to exactly 32-byte fields here (the strict
+        // path the FFI `connect_pinned_*_with_resumption` shims use), before any I/O.
+        let resumption = match self.resumption {
+            Some((hint, early_data)) => {
+                if early_data.len() > EARLY_DATA_MAX_LEN {
+                    return Err(CoreError::ValidationError(format!(
+                        "early_data is {} bytes, exceeds the {}-byte 0-RTT cap",
+                        early_data.len(),
+                        EARLY_DATA_MAX_LEN
+                    )));
+                }
+                let session_id: [u8; 32] = hint.session_id.as_slice().try_into().map_err(|_| {
+                    CoreError::ValidationError(format!(
+                        "resumption hint session_id must be 32 bytes, got {}",
+                        hint.session_id.len()
+                    ))
+                })?;
+                let resumption_secret: [u8; 32] =
+                    hint.resumption_secret.as_slice().try_into().map_err(|_| {
+                        CoreError::ValidationError(format!(
+                            "resumption hint resumption_secret must be 32 bytes, got {}",
+                            hint.resumption_secret.len()
+                        ))
+                    })?;
+                Some((session_id, resumption_secret, early_data))
             }
-        }
+            None => None,
+        };
         #[cfg(feature = "fips")]
         crate::crypto::self_tests::ensure_post_passed()
             .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
@@ -3923,7 +3940,7 @@ impl<T: SessionTransport> SessionBuilder<T> {
             transport,
             pinned_key,
             runtime,
-            self.resumption,
+            resumption,
             liveness,
         );
         Ok(Arc::new(session))
@@ -7648,6 +7665,26 @@ mod tests {
         );
     }
 
+    /// `SessionBuilder::resumption()` validates the hint to exactly 32-byte fields at
+    /// `.connect()` time (the strict FFI path), not a silent truncation — a malformed
+    /// hint is a clean `ValidationError` before any I/O.
+    #[tokio::test]
+    async fn session_builder_rejects_malformed_resumption_hint() {
+        let (client_t, _server_t) = ChannelTransport::pair();
+        let (_sk, vk) = crate::crypto::hybrid_sign::HybridSigningKey::generate();
+        let bad_hint = ResumptionHint::new(vec![0u8; 5], vec![0u8; 32]); // 5 != 32
+        let result = PhantomSession::builder("test:9000")
+            .pinned_key(vk)
+            .resumption(bad_hint, Vec::new())
+            .transport(client_t)
+            .connect()
+            .await;
+        assert!(
+            matches!(result, Err(CoreError::ValidationError(_))),
+            "a 5-byte session_id must be rejected, got {result:?}"
+        );
+    }
+
     /// `SessionBuilder` end-to-end: connect with pinned_key set, drive the server
     /// side inline with `HandshakeServer`, verify the session reaches `Connected`.
     #[tokio::test]
@@ -7677,9 +7714,7 @@ mod tests {
             _ => panic!("expected Retry"),
         };
         server_t
-            .send_bytes(
-                &ServerReply::Retry(retry).to_wire().unwrap(),
-            )
+            .send_bytes(&ServerReply::Retry(retry).to_wire().unwrap())
             .await
             .unwrap();
         let next = server_t.recv_bytes().await.unwrap();
@@ -7687,9 +7722,7 @@ mod tests {
         match server_hs.process_client_hello(&ch2, 0, client_ip) {
             HandshakeResponse::Success(sh, _session, _) => {
                 server_t
-                    .send_bytes(
-                        &ServerReply::Hello(sh).to_wire().unwrap(),
-                    )
+                    .send_bytes(&ServerReply::Hello(sh).to_wire().unwrap())
                     .await
                     .unwrap();
             }
