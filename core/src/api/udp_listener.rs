@@ -72,11 +72,13 @@ impl PhantomUdpListener {
     /// verifying half of `signing_key`. Rust-only (not UniFFI-exported because
     /// `HybridSigningKey` is not a UniFFI type; the FFI analogue is
     /// [`bind_udp_with_signing_key_bytes`](Self::bind_udp_with_signing_key_bytes)).
+    ///
+    /// Thin shim over [`PhantomUdpListener::builder`] + `.signing_key(key).bind()`.
     pub async fn bind_udp_with_signing_key(
         addr: String,
         signing_key: HybridSigningKey,
     ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(signing_key), None).await
+        Self::builder(addr).signing_key(signing_key).bind().await
     }
 
     async fn bind_inner(

@@ -110,24 +110,14 @@ impl PhantomListener {
     /// listener's [`verifying_key_bytes`](Self::verifying_key_bytes)
     /// will return the verifying half of `signing_key`.
     ///
+    /// Thin shim over [`PhantomListener::builder`] + `.signing_key(key).bind()`.
     /// Rust-only (not UniFFI-exported because `HybridSigningKey` is
     /// not in the UniFFI surface).
     pub async fn bind_with_signing_key(
         addr: String,
         signing_key: HybridSigningKey,
     ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, Arc::new(TokioRuntime), Some(signing_key), None, None).await
-    }
-
-    /// Composition of [`bind_with_signing_key`](Self::bind_with_signing_key)
-    /// and [`bind_with_runtime`](Self::bind_with_runtime): supply both a
-    /// long-lived signing key and a non-tokio [`Runtime`]. Rust-only.
-    pub async fn bind_with_signing_key_with_runtime(
-        addr: String,
-        signing_key: HybridSigningKey,
-        runtime: Arc<dyn Runtime>,
-    ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(addr, runtime, Some(signing_key), None, None).await
+        Self::builder(addr).signing_key(signing_key).bind().await
     }
 
     /// Like [`bind`](Self::bind), but every accepted connection first runs the
@@ -141,38 +131,12 @@ impl PhantomListener {
     /// probing** (a probe that completes a real TLS handshake / validates a cert is
     /// black-holed but still learns TLS never completes). Do not rely on it where
     /// active probing is in the threat model. The server generates a fresh
-    /// signing key per process — use [`bind_with_signing_key_mimic`](Self::bind_with_signing_key_mimic) for a pinned
-    /// persistent identity. Rust-only, native-only.
+    /// signing key per process — use [`ListenerBuilder::signing_key`] via
+    /// [`PhantomListener::builder`] for a pinned persistent identity with mimicry.
+    /// Rust-only, native-only.
     #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
     pub async fn bind_mimic(addr: String) -> Result<Arc<Self>, CoreError> {
-        // The server side of the leg presents no SNI; a non-empty marker selects
-        // the mimic accept path.
-        Self::bind_inner(
-            addr,
-            Arc::new(TokioRuntime),
-            None,
-            Some(String::from("mimic")),
-            None,
-        )
-        .await
-    }
-
-    /// [`bind_mimic`](Self::bind_mimic) with a caller-supplied long-lived
-    /// [`HybridSigningKey`] so the server's pinned verifying identity persists
-    /// across restarts. Rust-only, native-only, `mimicry`-gated.
-    #[cfg(all(not(target_arch = "wasm32"), feature = "mimicry"))]
-    pub async fn bind_with_signing_key_mimic(
-        addr: String,
-        signing_key: HybridSigningKey,
-    ) -> Result<Arc<Self>, CoreError> {
-        Self::bind_inner(
-            addr,
-            Arc::new(TokioRuntime),
-            Some(signing_key),
-            Some(String::from("mimic")),
-            None,
-        )
-        .await
+        Self::builder(addr).mimic_sni("mimic").bind().await
     }
 
     /// Shared bind path. If `signing_key` is `Some`, the resulting

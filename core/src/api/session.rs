@@ -193,7 +193,7 @@ impl ResumptionHint {
     ///
     /// Both `session_id` and `resumption_secret` must be 32 bytes; validation is
     /// deferred to the caller (the `connect_pinned_*_with_resumption` free functions
-    /// or `PhantomSession::connect_with_resumption`). The constructor is provided so
+    /// or [`PhantomSession::builder`] + `.resumption()`). The constructor is provided so
     /// external crates (integration tests, FFI consumers) can build a hint from
     /// stored bytes without hitting the `#[non_exhaustive]` restriction.
     pub fn new(session_id: Vec<u8>, resumption_secret: Vec<u8>) -> Self {
@@ -476,96 +476,6 @@ impl PhantomSession {
         )
     }
 
-    /// Connect with a **0-RTT resumption attempt**.
-    ///
-    /// `resumption_hint` is the `(session_id, resumption_secret)` tuple
-    /// from a prior session's [`PhantomSession::resumption_hint`].
-    /// `early_data` (≤ [`EARLY_DATA_MAX_LEN`] bytes) is sealed and carried
-    /// inside the resuming ClientHello so it reaches the server on the very
-    /// first flight — saving a round-trip versus 1-RTT.
-    ///
-    /// Acceptance is best-effort: a stale/unknown ticket or an AEAD failure
-    /// leaves [`early_data_accepted`](Self::early_data_accepted) at
-    /// `Some(false)` and the handshake completes as a normal 1-RTT exchange —
-    /// the caller must then send that payload over the normal channel.
-    /// Returns `Err` only when `early_data` exceeds the cap.
-    ///
-    /// Runs on the default [`TokioRuntime`].
-    pub fn connect_with_resumption<T: SessionTransport>(
-        peer_addr: &str,
-        transport: T,
-        expected_server_key: HybridVerifyingKey,
-        resumption_hint: ([u8; 32], [u8; 32]),
-        early_data: Vec<u8>,
-    ) -> Result<Self, CoreError> {
-        // fips bootstrap POST gate. `connect_with_resumption`
-        // returns `Result`, so unlike the infallible `connect_with_transport*`
-        // entry points we can surface the POST failure directly to the
-        // caller (mirrors the `PhantomListener::bind*` and
-        // `connect_pinned*` convention). The same POST is also checked
-        // in `background_task` as a defense-in-depth backstop.
-        #[cfg(feature = "fips")]
-        crate::crypto::self_tests::ensure_post_passed()
-            .map_err(|e| CoreError::FipsSelfTestFailure(format!("{e:?}")))?;
-
-        if early_data.len() > EARLY_DATA_MAX_LEN {
-            return Err(CoreError::ValidationError(format!(
-                "early_data is {} bytes, exceeds the {}-byte 0-RTT cap",
-                early_data.len(),
-                EARLY_DATA_MAX_LEN
-            )));
-        }
-        let (resume_id, resume_secret) = resumption_hint;
-        Ok(Self::spawn_client(
-            peer_addr,
-            transport,
-            expected_server_key,
-            Arc::new(TokioRuntime),
-            Some((resume_id, resume_secret, early_data)),
-            None,
-        ))
-    }
-
-    /// Like [`connect_with_transport_with_runtime`](Self::connect_with_transport_with_runtime)
-    /// but also applies [`PhantomConfig`](crate::config::PhantomConfig) liveness settings to
-    /// the session once the handshake completes. Rust-only.
-    pub fn connect_with_transport_with_config<T: SessionTransport>(
-        peer_addr: &str,
-        transport: T,
-        expected_server_key: HybridVerifyingKey,
-        config: crate::config::PhantomConfig,
-    ) -> Self {
-        let liveness = config.liveness();
-        Self::spawn_client(
-            peer_addr,
-            transport,
-            expected_server_key,
-            Arc::new(TokioRuntime),
-            None,
-            Some(liveness),
-        )
-    }
-
-    /// Composition of [`connect_with_transport_with_config`](Self::connect_with_transport_with_config)
-    /// and a custom [`Runtime`] — supply both a config and a non-tokio runtime. Rust-only.
-    pub fn connect_with_transport_with_runtime_and_config<T: SessionTransport>(
-        peer_addr: &str,
-        transport: T,
-        expected_server_key: HybridVerifyingKey,
-        runtime: Arc<dyn Runtime>,
-        config: crate::config::PhantomConfig,
-    ) -> Self {
-        let liveness = config.liveness();
-        Self::spawn_client(
-            peer_addr,
-            transport,
-            expected_server_key,
-            runtime,
-            None,
-            Some(liveness),
-        )
-    }
-
     /// Create a [`SessionBuilder`] for constructing a client session.
     ///
     /// The builder collects configuration (pinned key, optional resumption hint,
@@ -585,9 +495,9 @@ impl PhantomSession {
     }
 
     /// Shared constructor body for [`connect_with_transport_with_runtime`]
-    /// and [`connect_with_resumption`]. `resumption_request` is `None`
-    /// for a plain handshake, `Some((id, secret, early_data))` to attempt a
-    /// 0-RTT resumption.
+    /// and the [`SessionBuilder`] `connect()` method. `resumption_request` is
+    /// `None` for a plain handshake, `Some((id, secret, early_data))` to
+    /// attempt a 0-RTT resumption.
     fn spawn_client<T: SessionTransport>(
         peer_addr: &str,
         transport: T,
@@ -801,7 +711,7 @@ impl PhantomSession {
 
         // fips bootstrap POST gate, mirroring the listener and
         // `connect_pinned*` paths: the synchronous Rust-only entry
-        // points (`connect_with_transport*` / `connect_with_resumption`)
+        // points (`connect_with_transport*` / `SessionBuilder::connect`)
         // also need to honor FIPS 140-3 §7.7 before any cryptographic
         // work. Cached `OnceLock` makes the second+ call an atomic
         // read; the first call runs the full POST battery.
@@ -3722,8 +3632,7 @@ pub async fn connect_pinned_with_resumption(
         })?;
 
     // APIFFI-03: reject oversized early-data BEFORE opening a socket, so a caller
-    // bug (or oversized blob) never wastes a TCP connection establishment. The
-    // inner `connect_with_resumption` enforces the same cap as defense-in-depth.
+    // bug (or oversized blob) never wastes a TCP connection establishment.
     if early_data.len() > EARLY_DATA_MAX_LEN {
         return Err(CoreError::ValidationError(format!(
             "early_data is {} bytes, exceeds the {}-byte 0-RTT cap",
@@ -3738,16 +3647,17 @@ pub async fn connect_pinned_with_resumption(
         .map_err(|e| CoreError::NetworkError(format!("connect {}: {}", addr, e)))?;
     let transport = crate::api::tcp_transport::TcpSessionTransport::new(stream);
 
-    // Reuses the Rust-only `connect_with_resumption` — no new crypto and
-    // no new wire format. That path enforces the `EARLY_DATA_MAX_LEN`
-    // cap and keeps 0-RTT one-shot / best-effort (security invariant 9).
-    let session = PhantomSession::connect_with_resumption(
+    // All validation (key pin, hint size, early-data cap) is done above.
+    // Delegates directly to `spawn_client` to keep 0-RTT one-shot /
+    // best-effort (security invariant 9).
+    let session = PhantomSession::spawn_client(
         &addr,
         transport,
         expected_server_key,
-        (session_id, resumption_secret),
-        early_data,
-    )?;
+        Arc::new(TokioRuntime),
+        Some((session_id, resumption_secret, early_data)),
+        None,
+    );
     Ok(Arc::new(session))
 }
 
@@ -3885,13 +3795,17 @@ pub async fn connect_pinned_udp_with_resumption(
         .ok_or_else(|| CoreError::NetworkError(format!("no address for {}", addr)))?;
 
     let transport = crate::api::udp_transport::UdpClientTransport::connect(server).await?;
-    let session = PhantomSession::connect_with_resumption(
+    // All validation (key pin, hint size, early-data cap) is done above.
+    // Delegates directly to `spawn_client` to keep 0-RTT one-shot /
+    // best-effort (security invariant 9).
+    let session = PhantomSession::spawn_client(
         &addr,
         transport,
         expected_server_key,
-        (session_id, resumption_secret),
-        early_data,
-    )?;
+        Arc::new(TokioRuntime),
+        Some((session_id, resumption_secret, early_data)),
+        None,
+    );
     Ok(Arc::new(session))
 }
 
@@ -7108,26 +7022,20 @@ mod tests {
             .resumption_hint()
             .await
             .expect("phase 1 produced a resumption hint");
-        // The Rust-only `connect_with_resumption` takes the raw tuple;
-        // `resumption_hint()` now yields the UniFFI `ResumptionHint`
-        // record, so rebuild the tuple from its 32-byte fields.
-        let hint = (
-            <[u8; 32]>::try_from(hint.session_id.as_slice()).expect("session_id is 32 bytes"),
-            <[u8; 32]>::try_from(hint.resumption_secret.as_slice())
-                .expect("resumption_secret is 32 bytes"),
-        );
 
         // ── Step 2: resume — the ClientHello carries sealed early-data ──
+        // Use the builder API: `.resumption(hint, early_data)` is the
+        // canonical path now that the removed `connect_with_resumption`
+        // method is no longer available.
         let early_payload = b"zero-rtt application bytes".to_vec();
         let (c2, s2) = ChannelTransport::pair();
-        let phase2_session = PhantomSession::connect_with_resumption(
-            "test:9000",
-            c2,
-            server_pinned_key.clone(),
-            hint,
-            early_payload.clone(),
-        )
-        .expect("early_data is within the size cap");
+        let phase2_session = PhantomSession::builder("test:9000")
+            .transport(c2)
+            .pinned_key(server_pinned_key.clone())
+            .resumption(hint, early_payload.clone())
+            .connect()
+            .await
+            .expect("early_data is within the size cap");
 
         let hello_bytes = s2.recv_bytes().await.unwrap();
         let ch3 = borsh::from_slice::<ClientHello>(&hello_bytes).unwrap();
