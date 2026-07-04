@@ -1627,7 +1627,22 @@ pub enum HandshakeError {
 
 impl From<HandshakeError> for CoreError {
     fn from(err: HandshakeError) -> Self {
-        CoreError::InternalError(err.to_string())
+        match err {
+            // Server identity mismatch maps to the typed variant so callers can
+            // branch on it without string-matching (Security Invariant 1).
+            HandshakeError::ServerIdentityMismatch => CoreError::ServerIdentityMismatch,
+            // Protocol variant mismatch maps to ProtocolRejected so callers can
+            // distinguish "update your client" from generic handshake failures.
+            HandshakeError::ProtocolVariantMismatch { expected, received } => {
+                CoreError::ProtocolRejected(format!(
+                    "protocol variant mismatch (expected {:?}, received {:?})",
+                    String::from_utf8_lossy(&expected),
+                    String::from_utf8_lossy(&received)
+                ))
+            }
+            // All other handshake errors surface as the opaque HandshakeError string.
+            other => CoreError::HandshakeError(other.to_string()),
+        }
     }
 }
 

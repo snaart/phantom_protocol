@@ -12,9 +12,25 @@ use alloc::string::String;
 use thiserror::Error;
 
 /// Universal Core Error Enum compatible with FFI exports
+///
+/// # Retryability guide
+///
+/// | Variant                  | Retryable? | Suggested action                              |
+/// |--------------------------|------------|-----------------------------------------------|
+/// | `NetworkError`           | Yes        | Retry with backoff                            |
+/// | `Timeout`                | Yes        | Retry with backoff                            |
+/// | `ConnectionClosed`       | Yes        | Reconnect                                     |
+/// | `ServerIdentityMismatch` | No         | Update pinned key or contact server admin     |
+/// | `ProtocolRejected`       | No         | Update client library to a compatible version |
+/// | `Unsupported`            | No         | Use the correct transport type                |
+/// | `HandshakeError`         | Maybe      | Check server logs; may be transient           |
+/// | `CryptoError`            | No         | Internal error; report bug                    |
+/// | `ValidationError`        | No         | Fix the input and retry                       |
+/// | `ConfigError`            | No         | Fix the configuration and retry               |
+/// | `FipsSelfTestFailure`    | No         | Fatal POST failure — binary is broken         |
 #[cfg_attr(feature = "std", derive(Error))]
 #[cfg_attr(feature = "bindings", derive(uniffi::Error))]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 // Adding a variant must not be a SemVer-major break for downstream `match`es
 // (FIPS / migration / flow-control errors are expected to land post-1.0).
 #[non_exhaustive]
@@ -78,6 +94,40 @@ pub enum CoreError {
     /// feature configurations.
     #[cfg_attr(feature = "std", error("cipher suite unavailable: {0}"))]
     CipherSuiteUnavailable(String),
+
+    /// The server's signing key did not match the pinned key supplied by the
+    /// caller. **Fatal — do not retry without updating the pinned key.**
+    ///
+    /// This is a distinct, typed variant rather than a string so callers can
+    /// branch on it without fragile string matching:
+    ///
+    /// ```rust,ignore
+    /// match session.await_ready().await {
+    ///     Err(CoreError::ServerIdentityMismatch) => { /* update pinned key */ }
+    ///     Err(e) => { /* other failure */ }
+    ///     Ok(()) => { /* connected */ }
+    /// }
+    /// ```
+    #[cfg_attr(feature = "std", error("server identity mismatch: the server's signing key did not match the pinned key"))]
+    ServerIdentityMismatch,
+
+    /// The server explicitly rejected the connection — the client and server
+    /// speak incompatible protocol versions or build variants (e.g., fips vs
+    /// non-fips). **Fatal — do not retry with the same client binary.**
+    ///
+    /// The payload contains a human-readable diagnostic string (e.g., which
+    /// versions were expected vs received).
+    #[cfg_attr(feature = "std", error("protocol rejected by server: {0}"))]
+    ProtocolRejected(String),
+
+    /// The requested operation is not supported by this transport or
+    /// configuration. For example, calling `migrate()` on a TCP-backed session
+    /// (which does not support seamless migration) returns this variant.
+    ///
+    /// **Not retryable** — use the correct transport type (e.g.,
+    /// `UdpClientTransport` for migration support).
+    #[cfg_attr(feature = "std", error("unsupported operation: {0}"))]
+    Unsupported(String),
 
     /// FIPS 140-3 §7.7 power-on self-test failed at process start.
     /// Surfaced by [`crate::api::PhantomListener::bind`] /
@@ -145,6 +195,12 @@ impl core::fmt::Display for CoreError {
             Self::Timeout => write!(f, "Timeout"),
             Self::ReplayDetected(s) => write!(f, "replay protection rejected packet: {s}"),
             Self::CipherSuiteUnavailable(s) => write!(f, "cipher suite unavailable: {s}"),
+            Self::ServerIdentityMismatch => write!(
+                f,
+                "server identity mismatch: the server's signing key did not match the pinned key"
+            ),
+            Self::ProtocolRejected(s) => write!(f, "protocol rejected by server: {s}"),
+            Self::Unsupported(s) => write!(f, "unsupported operation: {s}"),
         }
     }
 }
