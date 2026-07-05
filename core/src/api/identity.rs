@@ -16,6 +16,9 @@ use crate::errors::CoreError;
 /// crosses the FFI boundary — persist it with restrictive permissions (0600) and wipe
 /// the buffer when done. Load it back into a listener with
 /// `bind_with_signing_key_bytes` / `bind_udp_with_signing_key_bytes`.
+///
+/// For Rust embedders keeping the seed in memory, prefer [`generate_signing_key_secure`]
+/// which returns the bytes wrapped in `Zeroizing` for automatic clearing.
 #[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn generate_signing_key() -> Result<Vec<u8>, CoreError> {
     let (signing_key, verifying_key) = HybridSigningKey::generate();
@@ -25,6 +28,30 @@ pub fn generate_signing_key() -> Result<Vec<u8>, CoreError> {
             CoreError::CryptoError(format!("generated key failed pairwise consistency: {e:?}"))
         })?;
     Ok(signing_key.to_bytes())
+}
+
+/// Generate a fresh hybrid signing key and return its 64-byte seed wrapped in
+/// [`zeroize::Zeroizing`] so it is automatically wiped from memory when it goes
+/// out of scope.
+///
+/// This is the preferred variant for Rust embedders that keep the seed in
+/// memory before writing it to disk. For FFI consumers (Swift / Kotlin / Python)
+/// use [`generate_signing_key`] instead — the `Zeroizing` wrapper cannot cross
+/// UniFFI's foreign-function boundary, and the foreign-language runtime will
+/// copy the bytes anyway.
+///
+/// # Errors
+///
+/// Returns [`CoreError::CryptoError`] if key generation or the mandatory
+/// pairwise-consistency check fails.
+pub fn generate_signing_key_secure() -> Result<zeroize::Zeroizing<Vec<u8>>, CoreError> {
+    let (signing_key, verifying_key) = HybridSigningKey::generate();
+    signing_key
+        .pairwise_consistency_check(&verifying_key)
+        .map_err(|e| {
+            CoreError::CryptoError(format!("generated key failed pairwise consistency: {e:?}"))
+        })?;
+    Ok(zeroize::Zeroizing::new(signing_key.to_bytes()))
 }
 
 /// Derive the public verifying-key bytes (for client pinning) from a 64-byte signing
@@ -40,6 +67,20 @@ pub fn verifying_key_from_signing_key(seed: Vec<u8>) -> Result<Vec<u8>, CoreErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generate_signing_key_secure_returns_64_byte_zeroizing_seed() {
+        let seed = generate_signing_key_secure().expect("generate_secure");
+        assert_eq!(seed.len(), 64, "seed is ed25519[32] || ml_dsa[32]");
+        // Verify the plain variant also produces a 64-byte seed (both valid, not equal)
+        let plain_seed = generate_signing_key().expect("generate_plain");
+        assert_eq!(plain_seed.len(), 64);
+        // Verify the secure seed loads as a valid signing key
+        let sk = HybridSigningKey::from_bytes(&seed[..]).expect("load secure seed");
+        let vk = sk.verifying_key();
+        let vk_from_fn = verifying_key_from_signing_key(seed.to_vec()).expect("derive vk");
+        assert_eq!(vk.to_bytes(), vk_from_fn);
+    }
 
     #[test]
     fn generate_then_derive_pubkey_round_trips() {
