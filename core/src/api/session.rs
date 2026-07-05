@@ -559,8 +559,7 @@ impl PhantomSession {
         // watch channel starts at `Connecting` (== 0); background_task publishes
         // the resolved state once the handshake succeeds (Connected) or fails
         // (Failed / Dead). `await_ready()` subscribes on the Receiver.
-        let (ready_tx, ready_rx) =
-            watch::channel(ConnectionState::Connecting as u8);
+        let (ready_tx, ready_rx) = watch::channel(ConnectionState::Connecting as u8);
         let ready_tx = Arc::new(ready_tx);
 
         let session = Self {
@@ -666,8 +665,7 @@ impl PhantomSession {
 
         // Server-side sessions are already Connected — publish that in the
         // watch channel immediately so `await_ready()` resolves at once.
-        let (ready_tx, ready_rx) =
-            watch::channel(ConnectionState::Connected as u8);
+        let (ready_tx, ready_rx) = watch::channel(ConnectionState::Connected as u8);
 
         let session = Arc::new(Self {
             id: new_session_id(),
@@ -3262,9 +3260,10 @@ impl PhantomSession {
         let mut rx = self.recv_rx.lock().await;
         let bytes = rx.recv().await.ok_or_else(|| {
             // Surface the captured terminal error on channel-closed.
-            self.terminal_error.lock().clone().unwrap_or_else(|| {
-                CoreError::NetworkError("Session closed".into())
-            })
+            self.terminal_error
+                .lock()
+                .clone()
+                .unwrap_or_else(|| CoreError::NetworkError("Session closed".into()))
         })?;
         Ok(bytes.to_vec())
     }
@@ -3314,15 +3313,19 @@ impl PhantomSession {
         rx.wait_for(|&v| v != ConnectionState::Connecting as u8)
             .await
             .map_err(|_| CoreError::NetworkError("readiness channel closed".into()))?;
-        // Now check the resolved state.
+        // Now check the resolved state. Anything that is NOT a terminal failure
+        // (Connected, but also Migrating / the established sub-states) counts as
+        // ready; only a genuine failure surfaces the captured terminal error.
         match self.connection_state() {
-            ConnectionState::Connected => Ok(()),
-            _ => {
+            ConnectionState::Failed | ConnectionState::Dead | ConnectionState::Closed => {
                 // Surface the captured terminal error, or a generic fallback.
-                Err(self.terminal_error.lock().clone().unwrap_or(
-                    CoreError::NetworkError("session failed".into()),
-                ))
+                Err(self
+                    .terminal_error
+                    .lock()
+                    .clone()
+                    .unwrap_or(CoreError::NetworkError("session failed".into())))
             }
+            _ => Ok(()),
         }
     }
 
@@ -7897,7 +7900,7 @@ mod tests {
     /// to a generic `NetworkError("session not established")`.
     #[tokio::test]
     async fn wrong_pinned_key_await_ready_returns_server_identity_mismatch() {
-        use crate::transport::handshake::{HandshakeServer, HandshakeResponse, ServerReply};
+        use crate::transport::handshake::{HandshakeResponse, HandshakeServer, ServerReply};
         use std::net::IpAddr;
 
         let (client_transport, server_transport) = ChannelTransport::pair();
@@ -7965,10 +7968,7 @@ mod tests {
         );
         match ready_result.unwrap_err() {
             CoreError::ServerIdentityMismatch => { /* expected */ }
-            other => panic!(
-                "expected ServerIdentityMismatch, got: {:?}",
-                other
-            ),
+            other => panic!("expected ServerIdentityMismatch, got: {:?}", other),
         }
 
         // 2. last_error() must return the same typed variant.
@@ -7984,10 +7984,7 @@ mod tests {
         let send_err = session.send(b"hello".to_vec()).await.unwrap_err();
         match send_err {
             CoreError::ServerIdentityMismatch => { /* expected */ }
-            other => panic!(
-                "send() expected ServerIdentityMismatch, got: {:?}",
-                other
-            ),
+            other => panic!("send() expected ServerIdentityMismatch, got: {:?}", other),
         }
 
         server_task.await.expect("server task must not panic");
@@ -7998,7 +7995,7 @@ mod tests {
     /// 2. Leave `last_error()` returning `None`.
     #[tokio::test]
     async fn successful_handshake_await_ready_returns_ok() {
-        use crate::transport::handshake::{HandshakeServer, HandshakeResponse, ServerReply};
+        use crate::transport::handshake::{HandshakeResponse, HandshakeServer, ServerReply};
         use std::net::IpAddr;
 
         let (client_transport, server_transport) = ChannelTransport::pair();
@@ -8049,7 +8046,10 @@ mod tests {
         });
 
         // 1. await_ready() must return Ok(()) on a good handshake.
-        session.await_ready().await.expect("await_ready must succeed with correct pinned key");
+        session
+            .await_ready()
+            .await
+            .expect("await_ready must succeed with correct pinned key");
 
         // 2. last_error() must be None on success.
         assert!(
@@ -8079,8 +8079,14 @@ mod tests {
             received: b"phantom-fips-1".to_vec(),
         }) {
             CoreError::ProtocolRejected(msg) => {
-                assert!(msg.contains("phantom-default-1"), "message should contain expected: {msg}");
-                assert!(msg.contains("phantom-fips-1"), "message should contain received: {msg}");
+                assert!(
+                    msg.contains("phantom-default-1"),
+                    "message should contain expected: {msg}"
+                );
+                assert!(
+                    msg.contains("phantom-fips-1"),
+                    "message should contain received: {msg}"
+                );
             }
             other => panic!("expected ProtocolRejected, got: {other:?}"),
         }
