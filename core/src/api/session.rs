@@ -34,7 +34,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 /// Marker type for a [`SessionBuilder`] that has not yet been given a transport.
 ///
@@ -396,6 +396,30 @@ pub struct PhantomSession {
     /// stream still exists in the demux; only the *accept* notification is
     /// dropped if the embedder is not consuming).
     incoming_stream_rx: Arc<Mutex<mpsc::Receiver<Arc<crate::api::stream::PhantomStream>>>>,
+    /// Captured terminal error from a failed handshake. Written once by the
+    /// background task on `Err(e)`, then readable via `last_error()`. Never
+    /// written on the success path. `None` on a live or clean-closed session.
+    ///
+    /// `parking_lot::Mutex` is used so the lock is never held across an `.await`
+    /// (the background task writes it once, synchronously, before changing
+    /// `state` to `Failed`; readers only call `.lock().clone()`).
+    terminal_error: Arc<parking_lot::Mutex<Option<CoreError>>>,
+    /// Watch channel for handshake readiness. The background task publishes
+    /// the terminal `ConnectionState` (as a `u8`) once the session reaches
+    /// `Connected`, `Failed`, or `Dead`. `await_ready()` subscribes and
+    /// blocks until the value changes from its initial `Connecting` sentinel.
+    ///
+    /// Using `watch` avoids the lost-notification race that `Notify` has when
+    /// the signal fires before the subscriber registers — `watch` always
+    /// delivers the *current* value on subscribe, so a late `await_ready()`
+    /// caller immediately sees the already-resolved state.
+    ///
+    /// `ready_tx` is retained on the struct to keep the channel open (while
+    /// senders exist `wait_for` will not prematurely error). The background
+    /// task holds an `Arc<watch::Sender<u8>>` clone and publishes to it.
+    #[allow(dead_code)]
+    ready_tx: Arc<watch::Sender<u8>>,
+    ready_rx: watch::Receiver<u8>,
 }
 
 /// Commands for the background session task
@@ -529,6 +553,16 @@ impl PhantomSession {
         // instance (its `snapshot()` reflects just this connection).
         let observability = Observability::new(ObservabilityConfig::default());
 
+        // Terminal-error capture + readiness signal.
+        let terminal_error: Arc<parking_lot::Mutex<Option<CoreError>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        // watch channel starts at `Connecting` (== 0); background_task publishes
+        // the resolved state once the handshake succeeds (Connected) or fails
+        // (Failed / Dead). `await_ready()` subscribes on the Receiver.
+        let (ready_tx, ready_rx) =
+            watch::channel(ConnectionState::Connecting as u8);
+        let ready_tx = Arc::new(ready_tx);
+
         let session = Self {
             id: new_session_id(),
             peer_addr: peer.clone(),
@@ -544,6 +578,9 @@ impl PhantomSession {
             shaping: shaping.clone(),
             observability: observability.clone(),
             incoming_stream_rx: Arc::new(Mutex::new(incoming_stream_rx)),
+            terminal_error: terminal_error.clone(),
+            ready_tx: ready_tx.clone(),
+            ready_rx,
         };
 
         // Spawn the background handshake + data pump task on the supplied
@@ -571,6 +608,8 @@ impl PhantomSession {
             liveness,
             cmd_tx,
             incoming_stream_tx,
+            terminal_error,
+            ready_tx,
         )));
 
         session
@@ -625,6 +664,11 @@ impl PhantomSession {
         let inner_session: Arc<Mutex<Option<Arc<Session>>>> =
             Arc::new(Mutex::new(Some(server_session.clone())));
 
+        // Server-side sessions are already Connected — publish that in the
+        // watch channel immediately so `await_ready()` resolves at once.
+        let (ready_tx, ready_rx) =
+            watch::channel(ConnectionState::Connected as u8);
+
         let session = Arc::new(Self {
             id: new_session_id(),
             peer_addr: peer_addr.clone(),
@@ -646,6 +690,11 @@ impl PhantomSession {
             // every accepted session.
             observability: observability.clone(),
             incoming_stream_rx: Arc::new(Mutex::new(incoming_stream_rx)),
+            // Server-side sessions never go through client-side handshake;
+            // terminal_error stays None (no failure), ready is already Connected.
+            terminal_error: Arc::new(parking_lot::Mutex::new(None)),
+            ready_tx: Arc::new(ready_tx),
+            ready_rx,
         });
 
         let session_id = *server_session.id();
@@ -706,6 +755,9 @@ impl PhantomSession {
         liveness: Option<crate::transport::liveness::LivenessConfig>,
         cmd_tx_for_stream: mpsc::Sender<SessionCommand>,
         incoming_stream_tx: mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
+        // Terminal-error capture + readiness signal
+        terminal_error: Arc<parking_lot::Mutex<Option<CoreError>>>,
+        ready_tx: Arc<watch::Sender<u8>>,
     ) {
         // DEBUG: the peer address is correlatable; keep it off default logs.
         log::debug!("PhantomSession: starting handshake with {}", peer);
@@ -727,7 +779,11 @@ impl PhantomSession {
                 "PhantomSession: FIPS POST self-test failed; refusing to handshake: {:?}",
                 e
             );
+            let core_err = CoreError::FipsSelfTestFailure(format!("{e:?}"));
+            *terminal_error.lock() = Some(core_err);
             state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
+            // Signal awaiting callers (await_ready) that we have reached a terminal state.
+            let _ = ready_tx.send(ConnectionState::Failed as u8);
             return;
         }
 
@@ -761,7 +817,14 @@ impl PhantomSession {
             Ok((session, accepted)) => (Arc::new(session), accepted),
             Err(e) => {
                 log::error!("PhantomSession: handshake failed: {}", e);
+                // Capture the terminal error BEFORE setting state so
+                // await_ready() readers that wake on the state transition always
+                // see the error already in place.
+                *terminal_error.lock() = Some(e);
                 state.store(ConnectionState::Failed as u8, Ordering::Relaxed);
+                // Signal awaiting callers (await_ready) that we have reached a
+                // terminal Failed state.
+                let _ = ready_tx.send(ConnectionState::Failed as u8);
                 return;
             }
         };
@@ -804,6 +867,9 @@ impl PhantomSession {
 
         let session_id = *crypto_session.id();
         state.store(ConnectionState::Connected as u8, Ordering::Relaxed);
+        // Signal readiness — handshake succeeded. The watch fires once;
+        // late `await_ready()` callers see the already-resolved Connected value.
+        let _ = ready_tx.send(ConnectionState::Connected as u8);
         log::debug!("PhantomSession: fully connected to {}", peer);
 
         // Wrap the (post-handshake) transport so every data-plane send/recv is
@@ -908,9 +974,9 @@ async fn run_client_handshake<T: SessionTransport>(
                 Ok(r) => r,
                 Err(e) => {
                     // No further responses: surface a remembered reject (a genuine version
-                    // mismatch) over the raw transport error.
+                    // mismatch) over the raw transport error using the typed variant.
                     return match &remembered_reject {
-                        Some(r) => Err(CoreError::HandshakeError(format!(
+                        Some(r) => Err(CoreError::ProtocolRejected(format!(
                             "server rejected the handshake: unsupported protocol version \
                              (client speaks v{}, server speaks v{})",
                             hello.version, r.supported_version
@@ -935,7 +1001,9 @@ async fn run_client_handshake<T: SessionTransport>(
                     if reject.has_marker() {
                         reject_rounds += 1;
                         if reject_rounds > MAX_CLIENT_REJECT_ROUNDS {
-                            return Err(CoreError::HandshakeError(format!(
+                            // Use the typed ProtocolRejected variant so callers can branch
+                            // without string-matching ("update your client").
+                            return Err(CoreError::ProtocolRejected(format!(
                                 "server rejected the handshake: unsupported protocol version \
                                  (client speaks v{}, server speaks v{})",
                                 hello.version, reject.supported_version
@@ -3080,6 +3148,9 @@ impl PhantomSession {
 
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(256);
         let streams = Arc::new(DashMap::new());
+        // Inert constructor — immediately Failed; publish Failed in the watch so
+        // await_ready() resolves immediately with an error.
+        let (ready_tx, ready_rx) = watch::channel(ConnectionState::Failed as u8);
         Arc::new(Self {
             id: new_session_id(),
             peer_addr,
@@ -3100,6 +3171,10 @@ impl PhantomSession {
             // Placeholder session (no transport / pump); a no-op holder.
             observability: Observability::new(ObservabilityConfig::default()),
             incoming_stream_rx: Arc::new(Mutex::new(incoming_rx)),
+            // No handshake failure — just inert; no terminal error.
+            terminal_error: Arc::new(parking_lot::Mutex::new(None)),
+            ready_tx: Arc::new(ready_tx),
+            ready_rx,
         })
     }
 
@@ -3145,6 +3220,10 @@ impl PhantomSession {
     ///
     /// - If the session is connected: sends immediately
     /// - If still handshaking: queues the data for auto-flush later
+    /// - If the session is `Failed` or `Dead`: returns the captured terminal
+    ///   error (from the handshake or the data pump) so the caller gets the
+    ///   *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
+    ///   than the generic `"Cannot send in state Failed"` message.
     pub async fn send(&self, data: Vec<u8>) -> Result<(), CoreError> {
         let state = self.connection_state();
 
@@ -3158,10 +3237,11 @@ impl PhantomSession {
             // Still handshaking — queue
             self.send_queue.lock().await.push(data);
         } else {
-            return Err(CoreError::NetworkError(format!(
-                "Cannot send in state {:?}",
-                state
-            )));
+            // Surface the captured terminal error (e.g. ServerIdentityMismatch)
+            // instead of the generic "Cannot send in state …" message.
+            return Err(self.terminal_error.lock().clone().unwrap_or_else(|| {
+                CoreError::NetworkError(format!("Cannot send in state {state:?}"))
+            }));
         }
 
         Ok(())
@@ -3174,13 +3254,76 @@ impl PhantomSession {
     /// FFI surface still hands callers a `Vec<u8>`; if this is the last
     /// refcount the Vec is moved out of the underlying buffer, otherwise
     /// `Bytes::to_vec` copies.
+    ///
+    /// When the session is `Failed` or `Dead` and the recv channel has been
+    /// dropped, returns the captured terminal error (if any) rather than the
+    /// generic `"Session closed"` message.
     pub async fn recv(&self) -> Result<Vec<u8>, CoreError> {
         let mut rx = self.recv_rx.lock().await;
-        let bytes = rx
-            .recv()
-            .await
-            .ok_or_else(|| CoreError::NetworkError("Session closed".into()))?;
+        let bytes = rx.recv().await.ok_or_else(|| {
+            // Surface the captured terminal error on channel-closed.
+            self.terminal_error.lock().clone().unwrap_or_else(|| {
+                CoreError::NetworkError("Session closed".into())
+            })
+        })?;
         Ok(bytes.to_vec())
+    }
+
+    /// Returns the terminal error from a failed handshake or a dead session,
+    /// or `None` if the session has not failed (still connecting, connected, or
+    /// cleanly closed).
+    ///
+    /// The error is written once by the background task immediately before the
+    /// state transitions to `Failed` or `Dead`, so callers that read this after
+    /// receiving `ConnectionState::Failed` from `connection_state()` or
+    /// `Err(…)` from `await_ready()` always see the populated value.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let _ = session.await_ready().await;  // wait for outcome
+    /// if let Some(e) = session.last_error().await {
+    ///     eprintln!("session failed: {e}");
+    /// }
+    /// ```
+    pub async fn last_error(&self) -> Option<CoreError> {
+        self.terminal_error.lock().clone()
+    }
+
+    /// Wait until the session reaches `Connected` (handshake succeeded) or
+    /// `Failed`/`Dead` (handshake or pump failure).
+    ///
+    /// Returns `Ok(())` on successful connection, or `Err(cause)` with the
+    /// captured terminal error on failure. This is the preferred alternative
+    /// to polling `connection_state()` in a loop.
+    ///
+    /// Because the readiness signal is carried on a `watch` channel, a call
+    /// made *after* the handshake has already resolved (either direction)
+    /// returns immediately — there is no lost-notification race.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// session.await_ready().await?;   // returns Err(ServerIdentityMismatch) if key wrong
+    /// session.send(b"hello".to_vec()).await?;
+    /// ```
+    pub async fn await_ready(&self) -> Result<(), CoreError> {
+        // Clone the receiver so we can wait on it without holding a lock on self.
+        let mut rx = self.ready_rx.clone();
+        // Wait until the value is anything other than Connecting (== 0).
+        rx.wait_for(|&v| v != ConnectionState::Connecting as u8)
+            .await
+            .map_err(|_| CoreError::NetworkError("readiness channel closed".into()))?;
+        // Now check the resolved state.
+        match self.connection_state() {
+            ConnectionState::Connected => Ok(()),
+            _ => {
+                // Surface the captured terminal error, or a generic fallback.
+                Err(self.terminal_error.lock().clone().unwrap_or(
+                    CoreError::NetworkError("session failed".into()),
+                ))
+            }
+        }
     }
 
     /// Flat snapshot of this session's connection metrics. For a client
@@ -7738,5 +7881,214 @@ mod tests {
             "builder-constructed session must reach Connected after a successful handshake"
         );
         drop(server_t);
+    }
+
+    // ── Typed client failure regression tests: last_error / await_ready ────────────
+
+    /// **Wrong-pin regression.** A client connecting against a *wrong* pinned
+    /// key must:
+    /// 1. Resolve `await_ready()` with `Err(CoreError::ServerIdentityMismatch)` —
+    ///    the specific typed variant, not the generic string.
+    /// 2. Expose the same error from `last_error()` after the failure.
+    /// 3. Surface that error from `send()` rather than the generic "Cannot send in
+    ///    state Failed" message.
+    ///
+    /// This pins the `phantom-cli ping` wrong-key case so it can never regress
+    /// to a generic `NetworkError("session not established")`.
+    #[tokio::test]
+    async fn wrong_pinned_key_await_ready_returns_server_identity_mismatch() {
+        use crate::transport::handshake::{HandshakeServer, HandshakeResponse, ServerReply};
+        use std::net::IpAddr;
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        let server_hs = HandshakeServer::new().expect("server hs");
+        let _real_server_key = server_hs.verifying_key().clone();
+
+        // Generate a WRONG key that the client will pin (different from the server's).
+        let wrong_hs = HandshakeServer::new().expect("wrong hs");
+        let wrong_pinned_key = wrong_hs.verifying_key().clone();
+
+        // Client connects but pins the wrong key.
+        let session = PhantomSession::connect_with_transport(
+            "test-peer:9999",
+            client_transport,
+            wrong_pinned_key,
+        );
+
+        let client_ip: IpAddr = "127.0.0.1".parse().expect("ip");
+
+        // Run the server handshake in the background.
+        let server_task = tokio::spawn(async move {
+            // Read the ClientHello.
+            let hello_bytes = server_transport.recv_bytes().await.unwrap();
+            let client_hello: crate::transport::handshake::ClientHello =
+                borsh::from_slice(&hello_bytes).unwrap();
+            // Drive to Success (server side is valid; only the client's pin is wrong).
+            match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+                HandshakeResponse::Success(sh, _sess, _) => {
+                    server_transport
+                        .send_bytes(&ServerReply::Hello(sh).to_wire().unwrap())
+                        .await
+                        .unwrap();
+                }
+                HandshakeResponse::Retry(r) => {
+                    // Cookie retry: answer once then re-read + process.
+                    server_transport
+                        .send_bytes(&ServerReply::Retry(r).to_wire().unwrap())
+                        .await
+                        .unwrap();
+                    let next = server_transport.recv_bytes().await.unwrap();
+                    let ch2: crate::transport::handshake::ClientHello =
+                        borsh::from_slice(&next).unwrap();
+                    match server_hs.process_client_hello(&ch2, 0, client_ip) {
+                        HandshakeResponse::Success(sh, _sess, _) => {
+                            server_transport
+                                .send_bytes(&ServerReply::Hello(sh).to_wire().unwrap())
+                                .await
+                                .unwrap();
+                        }
+                        other => panic!("unexpected second response: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+            // Keep the transport alive briefly so the client can read.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Drop to close the channel.
+        });
+
+        // 1. await_ready() must return Err(ServerIdentityMismatch).
+        let ready_result = session.await_ready().await;
+        assert!(
+            ready_result.is_err(),
+            "await_ready must fail with wrong pinned key"
+        );
+        match ready_result.unwrap_err() {
+            CoreError::ServerIdentityMismatch => { /* expected */ }
+            other => panic!(
+                "expected ServerIdentityMismatch, got: {:?}",
+                other
+            ),
+        }
+
+        // 2. last_error() must return the same typed variant.
+        match session.last_error().await {
+            Some(CoreError::ServerIdentityMismatch) => { /* expected */ }
+            other => panic!(
+                "last_error() expected Some(ServerIdentityMismatch), got: {:?}",
+                other
+            ),
+        }
+
+        // 3. send() must surface the same error (not "Cannot send in state Failed").
+        let send_err = session.send(b"hello".to_vec()).await.unwrap_err();
+        match send_err {
+            CoreError::ServerIdentityMismatch => { /* expected */ }
+            other => panic!(
+                "send() expected ServerIdentityMismatch, got: {:?}",
+                other
+            ),
+        }
+
+        server_task.await.expect("server task must not panic");
+    }
+
+    /// **Typed-readiness regression.** A successful handshake must:
+    /// 1. Resolve `await_ready()` with `Ok(())`.
+    /// 2. Leave `last_error()` returning `None`.
+    #[tokio::test]
+    async fn successful_handshake_await_ready_returns_ok() {
+        use crate::transport::handshake::{HandshakeServer, HandshakeResponse, ServerReply};
+        use std::net::IpAddr;
+
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        let server_hs = HandshakeServer::new().expect("server hs");
+        let server_pinned_key = server_hs.verifying_key().clone();
+
+        let session = PhantomSession::connect_with_transport(
+            "test-peer:9999",
+            client_transport,
+            server_pinned_key,
+        );
+
+        let client_ip: IpAddr = "127.0.0.1".parse().expect("ip");
+
+        let server_task = tokio::spawn(async move {
+            let hello_bytes = server_transport.recv_bytes().await.unwrap();
+            let client_hello: crate::transport::handshake::ClientHello =
+                borsh::from_slice(&hello_bytes).unwrap();
+            match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+                HandshakeResponse::Success(sh, _sess, _) => {
+                    server_transport
+                        .send_bytes(&ServerReply::Hello(sh).to_wire().unwrap())
+                        .await
+                        .unwrap();
+                }
+                HandshakeResponse::Retry(r) => {
+                    server_transport
+                        .send_bytes(&ServerReply::Retry(r).to_wire().unwrap())
+                        .await
+                        .unwrap();
+                    let next = server_transport.recv_bytes().await.unwrap();
+                    let ch2: crate::transport::handshake::ClientHello =
+                        borsh::from_slice(&next).unwrap();
+                    match server_hs.process_client_hello(&ch2, 0, client_ip) {
+                        HandshakeResponse::Success(sh, _sess, _) => {
+                            server_transport
+                                .send_bytes(&ServerReply::Hello(sh).to_wire().unwrap())
+                                .await
+                                .unwrap();
+                        }
+                        other => panic!("unexpected second response: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+            // Keep server alive for the data pump.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+
+        // 1. await_ready() must return Ok(()) on a good handshake.
+        session.await_ready().await.expect("await_ready must succeed with correct pinned key");
+
+        // 2. last_error() must be None on success.
+        assert!(
+            session.last_error().await.is_none(),
+            "last_error() must be None after a successful handshake"
+        );
+
+        server_task.abort();
+    }
+
+    /// **Typed-error regression.** The `CoreError` variants `ServerIdentityMismatch`,
+    /// `ProtocolRejected`, and `Unsupported` must be distinct from each other and
+    /// from `HandshakeError` — verify the `From<HandshakeError>` mapping is correct.
+    #[test]
+    fn handshake_error_mapping_to_typed_variants() {
+        use crate::transport::handshake::HandshakeError;
+
+        // ServerIdentityMismatch maps to the typed variant.
+        match CoreError::from(HandshakeError::ServerIdentityMismatch) {
+            CoreError::ServerIdentityMismatch => { /* correct */ }
+            other => panic!("expected ServerIdentityMismatch, got: {other:?}"),
+        }
+
+        // ProtocolVariantMismatch maps to ProtocolRejected.
+        match CoreError::from(HandshakeError::ProtocolVariantMismatch {
+            expected: b"phantom-default-1".to_vec(),
+            received: b"phantom-fips-1".to_vec(),
+        }) {
+            CoreError::ProtocolRejected(msg) => {
+                assert!(msg.contains("phantom-default-1"), "message should contain expected: {msg}");
+                assert!(msg.contains("phantom-fips-1"), "message should contain received: {msg}");
+            }
+            other => panic!("expected ProtocolRejected, got: {other:?}"),
+        }
+
+        // Other errors map to HandshakeError (not the typed variants).
+        match CoreError::from(HandshakeError::KemFailed("test".into())) {
+            CoreError::HandshakeError(_) => { /* correct */ }
+            other => panic!("expected HandshakeError, got: {other:?}"),
+        }
     }
 }
