@@ -9,6 +9,10 @@ use std::time::Duration;
 /// - `session_cache_capacity` → `SessionCache` max entries (server-only; client ignores)
 /// - `session_ticket_lifetime` → `SessionCache` ticket lifetime (server-only; client ignores)
 ///
+/// **Note:** `session_cache_capacity` and `session_ticket_lifetime` are consumed only on the
+/// server path (`PhantomListener`); client `connect_*` entry points read only
+/// `keepalive_interval` and `session_timeout` from this struct.
+///
 /// Build via `mobile()` / `server()` / `iot()` / `default()` then mutate fields;
 /// `#[non_exhaustive]` lets future tunables be added without a breaking change.
 #[cfg_attr(feature = "bindings", derive(uniffi::Record))]
@@ -27,11 +31,28 @@ pub struct PhantomConfig {
     /// a session that has gone unresponsive (entered `Migrating`) is retried before being
     /// declared `Dead`.
     pub session_timeout: Duration,
-    /// Maximum 0-RTT resumption tickets the server keeps in memory (server-only; ignored by
-    /// clients). Maps to `SessionCache` capacity; excess entries are evicted LRU.
+    /// Maximum 0-RTT resumption tickets the server keeps in memory.
+    ///
+    /// **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`] (via
+    /// [`PhantomListener::bind_with_config_bytes`] or equivalent). When a
+    /// [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
+    /// is silently ignored — the client does not own a session cache.
+    ///
+    /// Maps to [`SessionCache`] capacity; excess entries are evicted LRU.
+    ///
+    /// [`PhantomListener`]: crate::api::listener::PhantomListener
+    /// [`SessionCache`]: crate::transport::session_cache::SessionCache
     pub session_cache_capacity: u32,
-    /// Server-side resumption-ticket lifetime (server-only; ignored by clients). Maps to
-    /// `SessionCache` ticket lifetime.
+    /// Lifetime of 0-RTT resumption tickets on the server.
+    ///
+    /// **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`]. When
+    /// a [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
+    /// is silently ignored — the client does not own a session cache.
+    ///
+    /// Maps to [`SessionCache`] ticket lifetime.
+    ///
+    /// [`PhantomListener`]: crate::api::listener::PhantomListener
+    /// [`SessionCache`]: crate::transport::session_cache::SessionCache
     pub session_ticket_lifetime: Duration,
 }
 
