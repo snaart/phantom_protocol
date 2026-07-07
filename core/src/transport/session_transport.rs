@@ -141,20 +141,42 @@ pub trait SessionTransport: Send + Sync + 'static {
         false
     }
 
+    /// Whether this transport supports seamless connection migration without a
+    /// re-handshake. Returns `true` only for address-aware UDP transports
+    /// ([`UdpClientTransport`] / [`UdpServerTransport`]); all stream transports
+    /// (TCP, WebSocket, WASI, Embedded) return `false`.
+    ///
+    /// Use this to guard calls to [`migrate`](Self::migrate) at runtime.
+    ///
+    /// [`UdpClientTransport`]: crate::api::udp_transport::UdpClientTransport
+    /// [`UdpServerTransport`]: crate::api::udp_transport::UdpServerTransport
+    fn supports_migration(&self) -> bool {
+        false
+    }
+
     /// Migrate this transport to a new local address (Phase 4 / P4.2c — embedder-
     /// triggered connection migration). The address crosses as a `String` (parsed
     /// inside the concrete native transport) so the
     /// trait stays `SocketAddr`-free and no_std-clean — `std::net::SocketAddr` does
     /// not exist in `core`/`alloc`. Best-effort: a parse / bind / connect failure
     /// returns `Err` and the session is expected to keep running on its existing
-    /// socket — migration never tears it down. Default no-op `Ok(())` for transports
-    /// without migration (TCP / WebSocket / WASI / Embedded / the in-memory test
-    /// pipe); only the native UDP client implements it.
+    /// socket — migration never tears it down.
+    ///
+    /// Default: returns [`CoreError::Unsupported`] for transports without migration
+    /// (TCP / WebSocket / WASI / Embedded / the in-memory test pipe); only the native
+    /// UDP client ([`UdpClientTransport`]) overrides this with the real implementation.
+    /// Call [`supports_migration`](Self::supports_migration) before calling this method
+    /// to avoid receiving `Unsupported` on non-UDP sessions.
     fn migrate(
         &self,
         _local_addr: String,
     ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
-        async { Ok(()) }
+        async {
+            Err(CoreError::Unsupported(
+                "this transport does not support connection migration; use a UDP-backed session"
+                    .into(),
+            ))
+        }
     }
 
     /// Migrate the **server side** of this transport to a new local send address — the
@@ -164,13 +186,19 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// switches its send target the c2s frames are delivered transparently). The address
     /// crosses as a `String` to keep the trait `SocketAddr`-free / no_std-clean. Best-effort:
     /// a parse / bind failure returns `Err` and the session keeps running on the old socket.
-    /// Default no-op `Ok(())` — only the native UDP server implements it. Kept distinct from
-    /// [`migrate`](Self::migrate) so the FFI-exported client `migrate()` cannot trigger a
-    /// server migration.
+    ///
+    /// Default: returns [`CoreError::Unsupported`] — only the native UDP server
+    /// ([`UdpServerTransport`]) implements it. Kept distinct from [`migrate`](Self::migrate)
+    /// so the FFI-exported client `migrate()` cannot trigger a server migration.
     fn migrate_server(
         &self,
         _local_addr: String,
     ) -> impl core::future::Future<Output = Result<(), CoreError>> + Send {
-        async { Ok(()) }
+        async {
+            Err(CoreError::Unsupported(
+                "this transport does not support server-side migration; use a UDP-backed session"
+                    .into(),
+            ))
+        }
     }
 }

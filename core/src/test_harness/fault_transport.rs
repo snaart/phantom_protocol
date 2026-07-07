@@ -480,6 +480,9 @@ impl<T: SessionTransport> SessionTransport for LossyTransport<T> {
     // every control call (the exact bug ε fixed in `ObservedTransport`, where it
     // made the FFI `migrate()` vacuous). Fault injection only concerns the send
     // path, so these are pure pass-throughs to the inner transport.
+    fn supports_migration(&self) -> bool {
+        self.inner.supports_migration()
+    }
     fn set_frame_phase(&self, phase: FramePhase) {
         self.inner.set_frame_phase(phase);
     }

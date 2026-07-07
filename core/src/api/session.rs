@@ -276,6 +276,10 @@ impl<T: SessionTransport> SessionTransport for ObservedTransport<T> {
     // pre-ε code only forwarded send/recv, so the FFI `migrate()` and the
     // server-side migration detection were no-ops once wrapped; ε needs them live
     // to rotate the CID on migration, so the wrapper is made fully transparent.)
+    fn supports_migration(&self) -> bool {
+        self.inner.supports_migration()
+    }
+
     fn set_frame_phase(&self, phase: FramePhase) {
         self.inner.set_frame_phase(phase);
     }
@@ -420,6 +424,12 @@ pub struct PhantomSession {
     #[allow(dead_code)]
     ready_tx: Arc<watch::Sender<u8>>,
     ready_rx: watch::Receiver<u8>,
+    /// Whether the underlying transport supports seamless connection migration.
+    /// Set at construction from [`SessionTransport::supports_migration`].
+    /// `true` only when the session is backed by `UdpClientTransport` /
+    /// `UdpServerTransport`; `false` for TCP, WebSocket, WASI, Embedded, and
+    /// the in-memory test pipe.
+    migration_capable: bool,
 }
 
 /// Commands for the background session task
@@ -562,6 +572,9 @@ impl PhantomSession {
         let (ready_tx, ready_rx) = watch::channel(ConnectionState::Connecting as u8);
         let ready_tx = Arc::new(ready_tx);
 
+        // Query before moving `transport` into the background task.
+        let migration_capable = transport.supports_migration();
+
         let session = Self {
             id: new_session_id(),
             peer_addr: peer.clone(),
@@ -580,6 +593,7 @@ impl PhantomSession {
             terminal_error: terminal_error.clone(),
             ready_tx: ready_tx.clone(),
             ready_rx,
+            migration_capable,
         };
 
         // Spawn the background handshake + data pump task on the supplied
@@ -667,6 +681,9 @@ impl PhantomSession {
         // watch channel immediately so `await_ready()` resolves at once.
         let (ready_tx, ready_rx) = watch::channel(ConnectionState::Connected as u8);
 
+        // Query before moving `transport` into the data pump below.
+        let migration_capable = transport.supports_migration();
+
         let session = Arc::new(Self {
             id: new_session_id(),
             peer_addr: peer_addr.clone(),
@@ -693,6 +710,7 @@ impl PhantomSession {
             terminal_error: Arc::new(parking_lot::Mutex::new(None)),
             ready_tx: Arc::new(ready_tx),
             ready_rx,
+            migration_capable,
         });
 
         let session_id = *server_session.id();
@@ -3173,6 +3191,8 @@ impl PhantomSession {
             terminal_error: Arc::new(parking_lot::Mutex::new(None)),
             ready_tx: Arc::new(ready_tx),
             ready_rx,
+            // Inert constructor has no transport; migration is not possible.
+            migration_capable: false,
         })
     }
 
@@ -3477,6 +3497,17 @@ impl PhantomSession {
             })
     }
 
+    /// Whether this session's transport supports seamless connection migration
+    /// (i.e., [`migrate`](Self::migrate) will succeed for UDP sessions).
+    ///
+    /// Returns `true` only when the session is backed by `UdpClientTransport`.
+    /// On TCP, WebSocket, WASI, or Embedded sessions, [`migrate`](Self::migrate)
+    /// returns [`CoreError::Unsupported`] — use reconnection with 0-RTT resumption
+    /// instead.
+    pub fn supports_migration(&self) -> bool {
+        self.migration_capable
+    }
+
     /// Migrate the session to a new local network address (Phase 4 — embedder-
     /// triggered connection migration). The embedder calls this when the OS reports a
     /// network change (Wi-Fi↔cellular, NAT rebind); `local_addr` is the new local
@@ -3491,6 +3522,12 @@ impl PhantomSession {
     /// on the existing socket (broken-rebind safety). `Err` here means only that the
     /// session was already closed (the command channel is gone).
     pub async fn migrate(&self, local_addr: String) -> Result<(), CoreError> {
+        if !self.migration_capable {
+            return Err(CoreError::Unsupported(
+                "this session does not support connection migration; use a UDP-backed session"
+                    .into(),
+            ));
+        }
         self.cmd_tx
             .send(SessionCommand::Migrate(local_addr))
             .await
@@ -3551,6 +3588,12 @@ impl PhantomSession {
     /// symmetrically: it path-validates the new server source, re-points its send target
     /// there, and rotates its c2s CID to match.
     pub async fn migrate_server(&self, local_addr: String) -> Result<(), CoreError> {
+        if !self.migration_capable {
+            return Err(CoreError::Unsupported(
+                "this session does not support server-side migration; use a UDP-backed session"
+                    .into(),
+            ));
+        }
         self.cmd_tx
             .send(SessionCommand::MigrateServer(local_addr))
             .await
@@ -5178,6 +5221,7 @@ mod tests {
     /// for the [`observed_transport_forwards_all_control_methods`] tripwire.
     #[derive(Default)]
     struct ControlRecorder {
+        supports_migration: AtomicBool,
         set_frame_phase: AtomicBool,
         set_outbound_cid: std::sync::Mutex<Option<[u8; 8]>>,
         has_migration_candidate: AtomicBool,
@@ -5198,6 +5242,10 @@ mod tests {
         }
         async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
             Ok(Bytes::new())
+        }
+        fn supports_migration(&self) -> bool {
+            self.rec.supports_migration.store(true, Ordering::SeqCst);
+            true
         }
         fn set_frame_phase(&self, _phase: FramePhase) {
             self.rec.set_frame_phase.store(true, Ordering::SeqCst);
@@ -5304,6 +5352,7 @@ mod tests {
             LegType::Udp,
         );
 
+        assert!(observed.supports_migration(), "supports_migration not forwarded at the call site");
         observed.set_frame_phase(FramePhase::Established);
         observed.set_outbound_cid([7u8; 8]);
         assert!(observed.has_migration_candidate());
@@ -5322,6 +5371,10 @@ mod tests {
             .await
             .expect("migrate_server");
 
+        assert!(
+            rec.supports_migration.load(Ordering::SeqCst),
+            "supports_migration not forwarded"
+        );
         assert!(
             rec.set_frame_phase.load(Ordering::SeqCst),
             "set_frame_phase not forwarded"
@@ -8096,5 +8149,87 @@ mod tests {
             CoreError::HandshakeError(_) => { /* correct */ }
             other => panic!("expected HandshakeError, got: {other:?}"),
         }
+    }
+
+    /// `ChannelTransport` is an in-memory test pipe, not a UDP socket, so
+    /// `supports_migration()` must return `false` (the trait default).
+    #[test]
+    fn channel_transport_does_not_support_migration() {
+        let (client_transport, _server_transport) = ChannelTransport::pair();
+        assert!(
+            !client_transport.supports_migration(),
+            "ChannelTransport is not address-aware; supports_migration must be false"
+        );
+    }
+
+    /// Calling `migrate()` on a `ChannelTransport`-backed `SessionTransport`
+    /// must return `Err(Unsupported)` — not panic or silently no-op.
+    #[tokio::test]
+    async fn migrate_on_channel_transport_returns_unsupported() {
+        let (client_transport, _server_transport) = ChannelTransport::pair();
+        let err = client_transport
+            .migrate("127.0.0.1:0".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::Unsupported(_)),
+            "expected CoreError::Unsupported, got {err:?}"
+        );
+    }
+
+    /// Calling `migrate_server()` on a `ChannelTransport` must also return
+    /// `Err(Unsupported)`.
+    #[tokio::test]
+    async fn migrate_server_on_channel_transport_returns_unsupported() {
+        let (_client_transport, server_transport) = ChannelTransport::pair();
+        let err = server_transport
+            .migrate_server("127.0.0.1:0".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::Unsupported(_)),
+            "expected CoreError::Unsupported, got {err:?}"
+        );
+    }
+
+    /// A `PhantomSession` built on a `ChannelTransport` must expose
+    /// `supports_migration() == false`.
+    #[tokio::test]
+    async fn phantom_session_on_channel_transport_reports_no_migration() {
+        let (client_transport, _server_transport) = ChannelTransport::pair();
+        let server_hs = HandshakeServer::new().unwrap();
+        let server_pinned_key = server_hs.verifying_key().clone();
+        let session = PhantomSession::connect_with_transport(
+            "test-server:9000",
+            client_transport,
+            server_pinned_key,
+        );
+        assert!(
+            !session.supports_migration(),
+            "session backed by ChannelTransport must not support migration"
+        );
+    }
+
+    /// A `PhantomSession` built on a `ChannelTransport` must return
+    /// `Err(Unsupported)` from the public `migrate()` API without even touching
+    /// the command channel.
+    #[tokio::test]
+    async fn phantom_session_migrate_on_non_udp_returns_unsupported() {
+        let (client_transport, _server_transport) = ChannelTransport::pair();
+        let server_hs = HandshakeServer::new().unwrap();
+        let server_pinned_key = server_hs.verifying_key().clone();
+        let session = PhantomSession::connect_with_transport(
+            "test-server:9000",
+            client_transport,
+            server_pinned_key,
+        );
+        let err = session
+            .migrate("127.0.0.1:0".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::Unsupported(_)),
+            "PhantomSession::migrate on a non-UDP session must return Unsupported; got {err:?}"
+        );
     }
 }

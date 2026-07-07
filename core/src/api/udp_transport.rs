@@ -408,6 +408,10 @@ impl SessionTransport for UdpClientTransport {
         }
     }
 
+    fn supports_migration(&self) -> bool {
+        true
+    }
+
     fn set_frame_phase(&self, phase: FramePhase) {
         let v = match phase {
             FramePhase::Handshake => PHASE_HANDSHAKE,
@@ -778,6 +782,10 @@ impl SessionTransport for UdpServerTransport {
             }
             None => false,
         }
+    }
+
+    fn supports_migration(&self) -> bool {
+        true
     }
 
     fn set_frame_phase(&self, phase: FramePhase) {
