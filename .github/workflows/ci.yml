@@ -117,6 +117,13 @@ jobs:
       - run: cargo doc --manifest-path core/Cargo.toml --no-deps --lib
         env:
           RUSTDOCFLAGS: "-D warnings"
+      - name: Check for UTF-8 mojibake in docs
+        run: |
+          if grep -rPl '\xc3\xa2\xc2|\xc3\x82\xc2\xb1' docs/ 2>/dev/null | grep -q .; then
+            echo "UTF-8 mojibake detected in docs/ - run the mojibake repair script"
+            grep -rPl '\xc3\xa2\xc2|\xc3\x82\xc2\xb1' docs/
+            exit 1
+          fi
 
   deny:
     name: cargo deny

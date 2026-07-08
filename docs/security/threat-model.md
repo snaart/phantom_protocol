@@ -1,6 +1,6 @@
 # Phantom Protocol Threat Model
 
-Methodology: STRIDE for security, LINDDUN for privacy. Audit-friendly format â
+Methodology: STRIDE for security, LINDDUN for privacy. Audit-friendly format —
 each finding maps to a concrete mitigation with file:line traceability.
 
 Document status: **draft**. Living document; updates with each substantive
@@ -42,7 +42,7 @@ at the commit that introduces this file.
 3. Both peers know the server's `HybridVerifyingKey` out of band (TOFU,
    PKI, or app distribution). The library does NOT solve key distribution.
 4. Time is approximately monotonic on each peer; the cookie freshness
-   buckets (Phase 1.10) tolerate Â±5 minutes of clock skew naturally.
+   buckets (Phase 1.10) tolerate ±5 minutes of clock skew naturally.
 5. Memory is not extractable from a running process by external means.
    `ZeroizeOnDrop` (Phase 1.2) protects against post-process forensic
    recovery, NOT against live introspection.
@@ -52,35 +52,35 @@ at the commit that introduces this file.
 ## 2. Trust boundaries
 
 ```
-       ââââââââââââââââââââââââââââââââ                ââââââââââââââââââââââââââââââââ
-       â  Client process              â                â  Server process              â
-       â ââââââââââââââââââââââââââââ â                â ââââââââââââââââââââââââââââ â
-       â â Application code (caller)â â                â â Application code (caller)â â
-       â ââââââââââââ¬ââââââââââââââââ â                â ââââââââââââ¬ââââââââââââââââ â
-       â            â¼                 â                â            â¼                 â
-       â ââââââââââââââââââââââââââ   â                â   ââââââââââââââââââââââââââ â
-       â â phantom_protocol API       â   â                â   â phantom_protocol API       â â
-       â â (PhantomSession,       â   â                â   â (PhantomListener,      â â
-       â â  PhantomStream, ...)   â   â                â   â  PhantomSession, ...)  â â
-       â âââââââââââ¤âââââââââââââââ   â                â   âââââââââââ¤âââââââââââââââ â
-       â           â FFI boundary     â                â             â FFI boundary   â
-       â           â¼                  â                â             â¼                â
-       â ââââââââââââââââââââââââââ   â                â   ââââââââââââââââââââââââââ â
-       â â transport / crypto     â   â                â   â transport / crypto     â â
-       â âââââââââââ¤âââââââââââââââ   â                â   âââââââââââ¤âââââââââââââââ â
-       â           â¼                  â                â             â¼                â
-       ââââââââââââââââââââââââââââââââ                ââââââââââââââââââââââââââââââââ
-                   â                                                 â
-                   â   ââââââââââº   active adversary   ââââââ         â
-                   â     ââââââââº   passive observer   ââââ           â
-                   ââââââââââââââââââº hostile network âââââââââââââââââ
+       ┌──────────────────────────────┐                ┌──────────────────────────────┐
+       │  Client process              │                │  Server process              │
+       │ ┌──────────────────────────┐ │                │ ┌──────────────────────────┐ │
+       │ │ Application code (caller)│ │                │ │ Application code (caller)│ │
+       │ └──────────┬───────────────┘ │                │ └──────────┬───────────────┘ │
+       │            ▼                 │                │            ▼                 │
+       │ ╔════════════════════════╗   │                │   ╔════════════════════════╗ │
+       │ ║ phantom_protocol API       ║   │                │   ║ phantom_protocol API       ║ │
+       │ ║ (PhantomSession,       ║   │                │   ║ (PhantomListener,      ║ │
+       │ ║  PhantomStream, ...)   ║   │                │   ║  PhantomSession, ...)  ║ │
+       │ ╚═════════╤══════════════╝   │                │   ╚═════════╤══════════════╝ │
+       │           │ FFI boundary     │                │             │ FFI boundary   │
+       │           ▼                  │                │             ▼                │
+       │ ╔════════════════════════╗   │                │   ╔════════════════════════╗ │
+       │ ║ transport / crypto     ║   │                │   ║ transport / crypto     ║ │
+       │ ╚═════════╤══════════════╝   │                │   ╚═════════╤══════════════╝ │
+       │           ▼                  │                │             ▼                │
+       └───────────│──────────────────┘                └─────────────│────────────────┘
+                   │                                                 │
+                   │   ─────────►   active adversary   ◄─────         │
+                   │     ───────►   passive observer   ◄───           │
+                   └────────────────► hostile network ◄───────────────┘
 ```
 
 The double-line boxes inside each process (`phantom_protocol API` and
 `transport / crypto`) are this library's responsibility. Everything outside
 is the caller's.
 
-The **strongest** boundary in the diagram is the network â every byte that
+The **strongest** boundary in the diagram is the network — every byte that
 crosses it is subject to active mutation. The FFI boundary inside each
 process is a weaker boundary (we trust the caller and the OS).
 
@@ -90,9 +90,9 @@ process is a weaker boundary (we trust the caller and the OS).
 
 | # | Asset | Where | Loss impact |
 | --- | --- | --- | --- |
-| A1 | Server long-lived `HybridSigningKey` | `HandshakeServer.signing_key` | Catastrophic â attackers can impersonate the server for all future handshakes; no forward secrecy mitigates retroactive reads. |
+| A1 | Server long-lived `HybridSigningKey` | `HandshakeServer.signing_key` | Catastrophic — attackers can impersonate the server for all future handshakes; no forward secrecy mitigates retroactive reads. |
 | A2 | Server master secret (cookie / PoW HMAC key root) | `HandshakeServer.master_secret` | Attacker can forge cookies, bypass PoW, mount IP-spoofing amplification. Hourly HKDF rotation (Phase 1.11) bounds compromise window. |
-| A3 | Hybrid KEM private keys (ephemeral, per-handshake) | `HandshakeClient.kem_secret` | Compromise of one session's KEM key leaks that session's symmetric keys â all traffic from that session decryptable. Mitigated by ephemeral generation per handshake + `ZeroizeOnDrop`. |
+| A3 | Hybrid KEM private keys (ephemeral, per-handshake) | `HandshakeClient.kem_secret` | Compromise of one session's KEM key leaks that session's symmetric keys → all traffic from that session decryptable. Mitigated by ephemeral generation per handshake + `ZeroizeOnDrop`. |
 | A4 | Session AEAD keys | `CryptoState.session_key`, ring `LessSafeKey` inside `CryptoSessionInner` | Compromise leaks the **current epoch's** packets in that direction. Mitigated by `ZeroizeOnDrop` (Phase 1.2) and the **shipped** mid-session HKDF rekey — **past-epoch forward secrecy only, no post-compromise security** (a live `traffic_secret` yields all future epochs; healing needs a re-handshake — see §8). |
 | A5 | Application plaintext | passed in/out via `Vec<u8>` / `Bytes` | The whole point of the transport. |
 | A6 | Session identity / linkability metadata | the inner 32-byte session_id is **off-wire** (ε §4.2, in the AEAD AAD only); stream id, packet numbers, flags, epoch, path id (**HP-masked** — T4.6 §4.6); the single routing 8-byte `ConnId` is the only per-connection cleartext and it **rotates per migration** (ε §4.7) | **Closed by ε + A2a for migration by *either* peer** (LINDDUN-L, PROTOCOL.md §12.5; EPS-02 closed): a migration rotates **both** directions' ConnId regardless of which peer moves. A *client* move rotates c2s (`migrate()`) and the server rotates s2c on the new `path_id`; a *server* move rotates s2c (`migrate_server()`) and the client *reflects* — it bumps its `path_id` + rotates c2s, which slides the server's c2s window so the rotated CID stays routable (no stranding) and there is no ping-pong (the server's matching s2c re-rotation is `path_id`-silent). So a client moving Wi-Fi→cellular **and** a server failover/egress-change are both unlinkable in both directions. Caveat: the CID chain is not forward-secret (a session-key compromise relinks a recorded flow). **WIRE v6 shipped the remaining wire-diet anti-fingerprinting:** the constant `version` byte is now HP-masked and the cleartext length prefixes are dropped (PROTOCOL.md §4.1/§4.6), and opt-in PADÉ size padding / timing jitter / cover traffic are available (§4.8, off by default — see the LINDDUN-D row). |
@@ -115,63 +115,63 @@ process is a weaker boundary (we trust the caller and the OS).
 | Quantum computer (CRQC) attacker | Yes | Hybrid PQ + classical KEM and signatures. Drop-classical degradation harmless until classical is broken; drop-PQ degradation harmless until CRQC arrives. |
 | Endpoint compromise (root on peer) | **No** | Out of scope; defender problem. |
 | OS RNG compromise | **No** | Out of scope; we treat `getrandom` as a trusted oracle. |
-| Long-lived signing-key theft | **No** (post-compromise) | Phantom Protocol relies on the server signing key for authentication â once leaked, attacker can serve as the server. Key revocation is an out-of-band concern (PKI / OOB re-pinning). |
+| Long-lived signing-key theft | **No** (post-compromise) | Phantom Protocol relies on the server signing key for authentication — once leaked, attacker can serve as the server. Key revocation is an out-of-band concern (PKI / OOB re-pinning). |
 
 ---
 
 ## 5. STRIDE analysis
 
-### S â Spoofing identity
+### S — Spoofing identity
 
 | Threat | Mitigation | Code |
 | --- | --- | --- |
-| Adversary presents a fake server key in `ServerHello` | Client pins `expected_server_key`; mismatch â `HandshakeError::ServerIdentityMismatch` | `core/src/transport/handshake.rs:283-286` |
+| Adversary presents a fake server key in `ServerHello` | Client pins `expected_server_key`; mismatch → `HandshakeError::ServerIdentityMismatch` | `core/src/transport/handshake.rs:283-286` |
 | Adversary forges a `ClientHello` to spoof an IP | Cookie + adaptive PoW; cookie is HMAC(rotating-secret, ip, bucket) so forgery requires the secret | `core/src/transport/handshake.rs:402-475` |
 | Replay of an old, captured `ServerHello` to a fresh client | Transcript signature binds `client_hello.nonce` and `session_id_bytes`; replay fails signature check | `core/src/transport/handshake.rs:201-204, 320-326` |
 | Connection-migration hijack: a known (plaintext) `session_id`/CID replayed from a spoofed source to steal the session | Path validation — a fresh unguessable 32-byte challenge must be echoed *from* the claimed address (only the session-key holder can), constant-time verified, before the server switches its peer; pinned-key AEAD blocks read/inject. Worst achievable is a **redirection-DoS**, **never** hijack/decrypt (the QUIC §9 boundary) | `core/src/transport/path.rs`, `core/src/api/session.rs`, `PROTOCOL.md` §12 |
 | 0-RTT early-data replay against a **single** server | `SessionCache::try_resume` removes the resumption ticket on first lookup (Invariant 9), so a replayed `ClientHello` finds no ticket and the server falls back to a 1-RTT handshake that ignores the early-data | `core/src/transport/session_cache.rs::try_resume`, `PROTOCOL.md` §6.6 |
 | 0-RTT early-data replay against a **different node** (horizontal scale-out) | **Mitigable — the library provides the controls (A2b); the embedder picks a posture.** The built-in one-shot guarantee holds only under a *single coherent* `SessionCache` (an in-process LRU, not replicated), so a horizontally-scaled deployment with per-node caches would otherwise let an attacker replay a captured 0-RTT `ClientHello` against a node that still holds an unconsumed copy of the ticket (the classic TLS-1.3 0-RTT-across-a-server-farm replay). The library now offers two controls: **(1)** install a distributed `ZeroRttAntiReplay` store (`set_zero_rtt_anti_replay`) whose atomic `check_and_set` makes the consume first-use **globally** across the fleet — replay-safe 0-RTT at scale (the *store* is the embedder's infra, e.g. Redis `SET NX`; the transport ships only the seam, failing closed on store errors); or **(2)** disable 0-RTT early-data entirely (`set_early_data_enabled(false)`) so the payload is only ever delivered 1-RTT — the zero-infrastructure default. Sticky/hashed routing or idempotent early-data also suffice. The post-handshake session's PFS + auth are unaffected regardless. See `docs/operations/zero-rtt.md`. | `core/src/transport/handshake.rs` (`ZeroRttAntiReplay`, `set_early_data_enabled`), `core/src/transport/session_cache.rs`, `PROTOCOL.md` §6.6 |
 
-### T â Tampering with data
+### T — Tampering with data
 
 | Threat | Mitigation | Code |
 | --- | --- | --- |
-| Bit-flip in ciphertext | AEAD tag check fails â packet dropped | `core/src/crypto/adaptive_crypto.rs:255-260` |
+| Bit-flip in ciphertext | AEAD tag check fails → packet dropped | `core/src/crypto/adaptive_crypto.rs:255-260` |
 | Mutation of header on the wire | Header is serialized via `PacketHeader::to_wire` (47-byte big-endian image) and used as AEAD AAD; any mutation invalidates the tag | `core/src/transport/session.rs` |
 | Tampering with handshake messages | Transcript signature covers every field of `ClientHello`/`ServerHello` | `core/src/transport/handshake.rs:201-204, 320-326` |
 | Packet-number mutation (replay or skip) | After AEAD verify, `Session::decrypt_packet` consults a single per-direction `ReplayWindow` (keyed on the `u64` packet number) and rejects duplicates / out-of-window-old | `core/src/transport/session.rs`, `core/src/security/replay_window.rs` |
 
-### R â Repudiation
+### R — Repudiation
 
 Not in scope. The protocol does not provide non-repudiation: there is no
 externally-verifiable proof of which peer sent which message. Adding
-non-repudiation would require persistent per-message signing â out of scope
+non-repudiation would require persistent per-message signing — out of scope
 for a real-time secure transport.
 
-### I â Information disclosure
+### I — Information disclosure
 
 | Threat | Mitigation | Code |
 | --- | --- | --- |
 | Plaintext leak on the wire | AEAD encryption (post-handshake invariant `PacketFlags::ENCRYPTED`); unencrypted post-handshake packets dropped | `core/src/api/session.rs:1415-1422` |
-| Plaintext leak via error message | Error variants carry only the error class, not the payload; no `format!("{:?}", plaintext)` anywhere | grep `format!.*plaintext\|payload` in `core/src/` â 0 results |
+| Plaintext leak via error message | Error variants carry only the error class, not the payload; no `format!("{:?}", plaintext)` anywhere | grep `format!.*plaintext\|payload` in `core/src/` → 0 results |
 | Memory disclosure of keys after session close | Key-bearing structs zeroize on drop: `ZeroizeOnDrop` on `CryptoState` (`session.rs`), `HandshakeServer` / `HandshakeClient` (`handshake.rs`), and `ResumptionTicket` (`session_cache.rs`, T5.1); the rekey master `Session.traffic_secret` is zeroized in `Session::drop` (T5.1) along with `resumption_secret`; the transient handshake KEM secret is held in `Zeroizing` (T5.1). Mid-session rekey also zeroizes each superseded epoch secret. | `session.rs` (`CryptoState`, `Session::drop`), `handshake.rs` (`HandshakeServer`/`HandshakeClient` + `Zeroizing` KEM secret), `session_cache.rs` (`ResumptionTicket`) |
-| Timing leak on cookie comparison | `subtle::ConstantTimeEq::ct_eq` â never branches on cookie content | `core/src/transport/handshake.rs:1065` |
+| Timing leak on cookie comparison | `subtle::ConstantTimeEq::ct_eq` — never branches on cookie content | `core/src/transport/handshake.rs:1065` |
 | DPI fingerprinting | **Partial (WIRE v6) + opt-in TLS mimicry (`mimicry` feature):** the data-plane wire has **no constant cleartext byte** (the version byte is HP-masked) and **no cleartext length-prefix pattern** (dropped — §4.1/§4.6), removing the two structural tells a stateless DPI box keyed on; opt-in size padding / timing jitter / cover traffic (§4.8) blunt the statistical tells. The outer 8-byte `ConnId` + opaque-blob datagram *shape* is still recognizable on bare UDP — the **`mimicry` feature** (TLS-over-TCP `MimicTlsLeg`) makes a flow look like HTTPS instead. **Residual:** the mimicry defeats passive/light-stateful DPI but **not active probing** (§6.1). | PROTOCOL.md §4.1 / §4.6 / §4.8 ; threat-model §6.1 |
 
-### D â Denial of service
+### D — Denial of service
 
 | Threat | Mitigation | Code |
 | --- | --- | --- |
 | Handshake flood / IP spoof amplification | Stateless cookie (HMAC over rotating secret + IP + bucket) forces attacker to receive a packet at the spoofed IP before consuming server resources | `core/src/transport/handshake.rs::generate_cookie`, `validate_cookie` |
-| CPU-exhaustion via cheap handshake attempts | Adaptive PoW difficulty tiers from 0 â 16 (~64k hash evals) based on per-minute load | `core/src/transport/handshake.rs::adaptive_difficulty` (Phase 1.14) |
+| CPU-exhaustion via cheap handshake attempts | Adaptive PoW difficulty tiers from 0 → 16 (~64k hash evals) based on per-minute load | `core/src/transport/handshake.rs::adaptive_difficulty` (Phase 1.14) |
 | Panic-on-malformed input | `#![warn(clippy::unwrap_used, expect_used, panic, unreachable, todo, unimplemented)]`; no `.unwrap()` on the recv/handshake hot path; fuzz harnesses in `fuzz/` | Phase 1.3, 6.4 |
-| AEAD nonce exhaustion (theoretical) | Hard ceiling `AEAD_MAX_INVOCATIONS = 1 << 48` â `CryptoError::NonceExhausted` | `core/src/crypto/adaptive_crypto.rs:24-44` |
+| AEAD nonce exhaustion (theoretical) | Hard ceiling `AEAD_MAX_INVOCATIONS = 1 << 48` → `CryptoError::NonceExhausted` | `core/src/crypto/adaptive_crypto.rs:24-44` |
 | Replay-window memory amplification | One per-direction `ReplayWindow` (~144 bytes) per session — no per-stream growth | `core/src/security/replay_window.rs` |
 | Connection-migration amplification: known CID + spoofed source used as a reflector toward a victim | To an unvalidated address the server is **challenge-only** and caps bytes sent to **≤ 3× bytes received** (RFC 9000 §8.2); a spoofed address never echoes the challenge so it is never switched-to | `core/src/api/udp_transport.rs` (anti-amp budget), `PROTOCOL.md` §12.3 |
 
-### E â Elevation of privilege
+### E — Elevation of privilege
 
-Out of scope â `phantom_protocol` does not run with elevated privileges or
+Out of scope — `phantom_protocol` does not run with elevated privileges or
 expose any privileged operation. The library is a passive data conduit.
 
 ---
@@ -250,12 +250,12 @@ changes no Phantom security invariant; the inner session is unchanged.)
 Each mitigation listed above is implemented or documented in the codebase
 and the specialist docs in this directory. Cross-reference quick map:
 
-- STRIDE-S (server identity) â Phase 1.1, 1.2, May 2026 Vuln-1 fix.
-- STRIDE-T (tampering) â AEAD AAD construction in `transport::session`,
+- STRIDE-S (server identity) → Phase 1.1, 1.2, May 2026 Vuln-1 fix.
+- STRIDE-T (tampering) → AEAD AAD construction in `transport::session`,
   Phase 1.4 replay window.
-- STRIDE-I (info disclosure) â Phase 1.2 zeroize, Phase 1.1 constant-time.
-- STRIDE-D (DoS) â Phase 1.10, 1.11, 1.14 cookie/PoW rotation + adaptive.
-- LINDDUN â partially mitigated; full anonymity is out of scope.
+- STRIDE-I (info disclosure) → Phase 1.2 zeroize, Phase 1.1 constant-time.
+- STRIDE-D (DoS) → Phase 1.10, 1.11, 1.14 cookie/PoW rotation + adaptive.
+- LINDDUN — partially mitigated; full anonymity is out of scope.
 - Connection migration (Phase 4) -> path validation (path.rs, Invariant 6), 3x
   anti-amplification (udp_transport.rs), PATH-001 strict send-gate + relaxed
   recv-delivery, and PTO-based liveness. See PROTOCOL.md §12.
