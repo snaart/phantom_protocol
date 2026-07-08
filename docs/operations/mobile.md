@@ -27,7 +27,7 @@ xcodebuild -create-xcframework \
 
 Auto-generated Swift sources in `tests/bindings/swift/`: `phantom_protocol.swift`,
 `phantom_protocolFFI.h`, `phantom_protocolFFI.modulemap`. Regenerate via
-`core/src/bin/uniffi-bindgen.rs` (uniffi 0.29 cli) after any surface change.
+`core/src/bin/uniffi-bindgen.rs` (uniffi 0.31 cli) after any surface change.
 
 **SwiftPM integration.**
 
@@ -129,7 +129,7 @@ import uniffi.phantom_protocol.*
 val pinnedKeyBytes = resources.openRawResource(R.raw.phantom_server_pk).use { it.readBytes() }
 
 // Shim: connectPinned(host, port, pinnedKey) — wraps connect_with_transport
-val session = PhantomProtocolKt.connectPinned(
+val session = connectPinned(
     host = "phantom.example.com", port = 4242u,
     pinnedKey = pinnedKeyBytes   // from PhantomListener::verifying_key_bytes()
 )
@@ -210,7 +210,7 @@ handover with no re-handshake and no new session.
 
 The **TCP** connect entry points (`connectPinned` / `connectPinnedWithResumption`)
 use the connection-oriented `TcpSessionTransport`, which cannot rebind its local
-address; on a TCP session `migrate()` is a **no-op** that returns `Ok(())` without
+address; on a TCP session `migrate()` returns `Err(CoreError::Unsupported)` without
 moving the socket. If you must use TCP (e.g. a UDP-hostile network), handle a network
 change by **reconnecting** and minimise the cost with **0-RTT resumption**: harvest a
 `ResumptionHint` after the first connect and reconnect via

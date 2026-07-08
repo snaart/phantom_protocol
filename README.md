@@ -37,6 +37,46 @@ phantom-protocol = "0.2"
 
 or `cargo add phantom-protocol`. API docs: <https://docs.rs/phantom-protocol>.
 
+## Getting started
+
+**Loopback demo (30 seconds):**
+
+```bash
+cargo run --manifest-path core/Cargo.toml --example loopback_demo
+```
+
+**Server + CLI ping (2 minutes):**
+
+```bash
+# Generate a persistent server identity
+cargo run --manifest-path cli/Cargo.toml -- keygen --out ./server.key
+# Start the reference server
+cargo run --manifest-path server/Cargo.toml -- --bind 0.0.0.0:4242 --signing-key-file ./server.key
+# In another terminal: get the public key and ping
+cargo run --manifest-path cli/Cargo.toml -- pubkey --in ./server.key
+cargo run --manifest-path cli/Cargo.toml -- ping --host 127.0.0.1 --port 4242 \
+    --pinned-key-hex <hex-from-pubkey> --msg hello
+```
+
+**Language bindings (15 minutes):** see
+[`tests/bindings/PACKAGING.md`](tests/bindings/PACKAGING.md) for Swift, Kotlin,
+Python, and C packaging workflows.
+
+### Choosing a transport
+
+| Transport | Entry points | `migrate()`? | Firewall-friendly? |
+|---|---|---|---|
+| TCP | `connect_pinned` / `PhantomListener::bind` | No — returns `Err(Unsupported)`; reconnect with 0-RTT | Yes |
+| PhantomUDP | `connect_pinned_udp` / `PhantomUdpListener::bind_udp` | Yes | Mostly |
+| WebSocket | `WebSocketLeg` (wasm32 only) | No | Yes (port 443) |
+| Embedded | `EmbeddedLeg` | No | N/A |
+
+### Two ways to send data
+
+**`session.send()` / `session.recv()`** operate on a single implicit stream
+(simplest). **`session.open_stream()` / `session.accept_stream()`** give you
+independent multiplexed streams with per-stream flow control.
+
 ## Highlights
 
 - **Hybrid post-quantum handshake** — X25519 + ML-KEM-768 KEM, Ed25519 + ML-DSA-65
@@ -66,7 +106,7 @@ or `cargo add phantom-protocol`. API docs: <https://docs.rs/phantom-protocol>.
   FastRecovery).
 - **DoS-resistant handshake** — stateless HMAC-SHA-256 cookie (hourly-rotated
   master) + adaptive blake3 proof-of-work (load-tiered difficulty 0–16).
-- **Per-stream replay protection** — RFC 4303 §3.4.3 sliding-window bitmap,
+- **Per-direction replay protection** — RFC 4303 §3.4.3 sliding-window bitmap,
   default 1024 bits, checked _after_ AEAD verify.
 - **Observability** — OpenTelemetry metrics + traces (opt-in
   `telemetry-otel` feature). Lock-free hot-path atomics (≤ 2.5 ns / call),
@@ -98,41 +138,75 @@ cargo test --manifest-path core/Cargo.toml --test tcp_integration -- --ignored
 More commands (benches, fuzz, miri, cross-targets, embedded) are in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
-### Minimal client / server
+### Minimal client / server (UDP — production path)
 
 Server identity must be pinned — `connect_with_transport` requires a
 `HybridVerifyingKey`; there is no skip path (Security Invariant 1).
+PhantomUDP is the recommended transport: it supports seamless `migrate()`.
 
-```rust
-use phantom_protocol::api::{PhantomListener, PhantomSession, TcpSessionTransport};
-use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
-use tokio::net::TcpStream;
+```rust,no_run
+use std::sync::Arc;
+use phantom_protocol::api::{PhantomUdpListener, PhantomSession};
 
+# #[tokio::main]
+# async fn main() -> Result<(), phantom_protocol::CoreError> {
 // ── Server ────────────────────────────────────────────────────────────────
-let listener = PhantomListener::bind("127.0.0.1:0".to_string()).await?;
-let server_addr = listener.local_addr();
-let pinned_key  = listener.verifying_key_bytes();   // share out-of-band
+let listener = PhantomUdpListener::builder("127.0.0.1:0").bind().await?;
+let server_addr = listener.local_addr();                // e.g. "127.0.0.1:54321"
+let pinned_key  = listener.verifying_key_bytes();       // share out-of-band
 
+let listener = Arc::clone(&listener);
 tokio::spawn(async move {
     let outcome = listener.accept().await?;
     let session = outcome.session();
-    let req = session.recv().await?;
+    let _req = session.recv().await?;
     session.send(b"hello, post-quantum world".to_vec()).await?;
     Ok::<_, phantom_protocol::CoreError>(())
 });
 
-// ── Client (one-shot helper used by mobile / FFI consumers) ───────────────
-let session = phantom_protocol::api::session::connect_pinned(
-    "127.0.0.1".into(), 4242, pinned_key,
+// ── Client ────────────────────────────────────────────────────────────────
+let port: u16 = server_addr.parse::<std::net::SocketAddr>().unwrap().port();
+let session = phantom_protocol::connect_pinned_udp(
+    "127.0.0.1".into(), port, pinned_key,
+).await?;
+session.await_ready().await?;
+session.send(b"ping".to_vec()).await?;
+let _reply = session.recv().await?;
+# Ok(())
+# }
+```
+
+### Minimal client / server (TCP — simpler, no `migrate()`)
+
+```rust,no_run
+use std::sync::Arc;
+use phantom_protocol::api::{PhantomListener, PhantomSession, TcpSessionTransport};
+use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
+
+# #[tokio::main]
+# async fn main() -> Result<(), phantom_protocol::CoreError> {
+let listener = PhantomListener::builder("127.0.0.1:0").bind().await?;
+let server_addr = listener.local_addr();
+let pinned_key  = listener.verifying_key_bytes();
+
+let listener = Arc::clone(&listener);
+tokio::spawn(async move {
+    let outcome = listener.accept().await?;
+    let session = outcome.session();
+    let _req = session.recv().await?;
+    session.send(b"hello, post-quantum world".to_vec()).await?;
+    Ok::<_, phantom_protocol::CoreError>(())
+});
+
+let session = phantom_protocol::connect_pinned(
+    "127.0.0.1".into(),
+    server_addr.parse::<std::net::SocketAddr>().unwrap().port(),
+    pinned_key,
 ).await?;
 session.send(b"ping".to_vec()).await?;
-let reply = session.recv().await?;
-
-// ── Or, explicit transport (TCP / WebSocket today; WASI / Embedded framing) ─
-let stream    = TcpStream::connect(&server_addr).await?;
-let transport = TcpSessionTransport::new(stream);
-let key       = HybridVerifyingKey::from_bytes(&pinned_key)?;
-let session   = PhantomSession::connect_with_transport(&server_addr, transport, key);
+let _reply = session.recv().await?;
+# Ok(())
+# }
 ```
 
 Runnable forms: [`core/examples/loopback_demo.rs`](core/examples/loopback_demo.rs),
@@ -150,13 +224,13 @@ Runnable forms: [`core/examples/loopback_demo.rs`](core/examples/loopback_demo.r
 | KDF | HKDF-SHA-256 | RFC 5869 |
 | Hash / MAC | SHA-256, HMAC-SHA-256, blake3 (keyed) | FIPS 180-4 / FIPS 198-1 + non-FIPS |
 
-Phase 5.1 moved the PQ primitives off the C-bound `pqcrypto-*` crates to the
+The PQ primitives moved off the C-bound `pqcrypto-*` crates to the
 RustCrypto FIPS-203 / FIPS-204 implementations. The crate compiles on
 `wasm32-unknown-unknown` and `thumbv7em-none-eabihf` without C bindings.
 
 ## Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │  Public API   (core/src/api/)                                   │
 │  PhantomSession · PhantomListener · TcpSessionTransport         │
@@ -169,10 +243,10 @@ RustCrypto FIPS-203 / FIPS-204 implementations. The crate compiles on
 │  hybrid_kem · hybrid_sign · adaptive_crypto · kdf · pow · rng   │
 ├─────────────────────────────────────────────────────────────────┤
 │  Security     (core/src/security/)                              │
-│  ReplayWindow · ReplayProtection                                │
+│  ReplayWindow                                                   │
 ├─────────────────────────────────────────────────────────────────┤
 │  Runtime      (core/src/runtime/)                               │
-│  TokioRuntime (native) · WasmRuntime · (EmbeddedRuntime TODO)   │
+│  TokioRuntime (native) · WasmRuntime · EmbeddedRuntime (scaffold) · WasiRuntime │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -284,8 +358,8 @@ Hardened unit text in [`docs/operations/systemd.md`](docs/operations/systemd.md)
 
 ### Observability
 
-OpenTelemetry metrics + traces over OTLP/gRPC (Phase 8 — replaces the
-Phase 4.5 hand-rolled Prometheus endpoint). The reference server pushes to
+OpenTelemetry metrics + traces over OTLP/gRPC (replacing an earlier
+hand-rolled Prometheus endpoint). The reference server pushes to
 `OTEL_EXPORTER_OTLP_ENDPOINT`; backends supported include OTel Collector
 (→ Prometheus / Tempo / Loki), Datadog, Honeycomb, Grafana Cloud, AWS
 CloudWatch — anything OTLP-compatible. Pre-built Grafana dashboard at
@@ -318,18 +392,18 @@ cargo run --manifest-path cli/Cargo.toml -- version
 | `x86_64-apple-darwin` / `aarch64-apple-darwin` | hard gate |
 | `aarch64-apple-ios` (device) / `aarch64-apple-ios-sim` | hard gate |
 | `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` | hard gate |
-| `wasm32-unknown-unknown` | hard gate (Phase 3.3 / 3.5) |
-| `thumbv7em-none-eabihf` | hard gate (Phase 3.6; `--no-default-features --features embedded,no-std`) |
+| `wasm32-unknown-unknown` | hard gate |
+| `thumbv7em-none-eabihf` | hard gate (`--no-default-features --features embedded,no-std`) |
 | `wasm32-wasip2` | hard gate (compile + host round-trip; WASI is client-side framing-only — see [`docs/operations/wasi.md`](docs/operations/wasi.md)) |
 
 ### Language bindings (`tests/bindings/`)
 
 | Binding | Maturity | Notes |
 | --- | --- | --- |
-| **Swift** | Production-shape | Auto-gen via UniFFI 0.29; iOS XCFramework recipe in [`docs/operations/mobile.md`](docs/operations/mobile.md) |
+| **Swift** | Production-shape | Auto-gen via UniFFI 0.31; iOS XCFramework recipe in [`docs/operations/mobile.md`](docs/operations/mobile.md) |
 | **Kotlin** | Production-shape | Auto-gen; Android NDK + Gradle `jniLibs` recipe in `mobile.md` |
-| **Python** | UniFFI surface auto-gen | Demo harness `tests/run_test.py` is stale and references a previous API |
-| **C** | Experimental | **Hand-curated** header — UniFFI 0.29 has no C generator. Covers `connect_pinned` but not `HybridSigningKey` or `PhantomConfig`. README recommends Swift / Kotlin / Python instead |
+| **Python** | UniFFI surface auto-gen | Demo harness `tests/run_test.py` |
+| **C** | Experimental | **Hand-curated** header — UniFFI 0.31 has no C generator. Covers `connect_pinned` but not `HybridSigningKey` or `PhantomConfig`. README recommends Swift / Kotlin / Python instead |
 | **WASM (browser)** | Demo shipped | [`examples/wasm-demo/`](examples/wasm-demo/) pairs with [`docs/operations/wasm.md`](docs/operations/wasm.md); uses `WebSocketLeg` + `WasmRuntime` |
 
 Regen: `tests/bindings/{generate_swift,generate_kotlin,generate_c}.sh`.
@@ -364,7 +438,7 @@ Full threat model, mitigations, and disclosure policy are in
 - **Forward secrecy** — ephemeral hybrid KEM per handshake + HKDF-based
   mid-session rekey (epoch saturates at `u8::MAX`, never wraps).
 - **Replay rejection happens _after_ AEAD verify** — RFC 4303 §3.4.3
-  sliding-window bitmap, per-stream.
+  sliding-window bitmap, per-direction.
 - **Downgrade resistance** — the pinned protocol version and `protocol_variant`
   are signed under the handshake transcript; stripped-`ENCRYPTED` post-handshake
   packets are dropped.
@@ -453,13 +527,15 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   in one round trip, and against such an adversary it is net-negative. Use only
   where the threat is passive/commercial DPI, not active probing. Honest residuals
   + SAFE/UNSAFE guidance in [`docs/security/threat-model.md`](docs/security/threat-model.md) §6.1.
-- **Mobile connection migration (Wi-Fi ↔ LTE): reconnect with 0-RTT, not
-  `migrate()`.** `PhantomSession.migrate()` is on the FFI surface, but it is a
-  no-op over the TCP transport the bindings use (real single-socket migration is
-  UDP-only and not yet FFI-exposed). On a network change, reconnect — folding the
-  first request in via `connect_pinned_with_resumption` to minimise cost. The
-  [`examples/mobile/`](examples/mobile/) sample apps implement exactly this; see
-  [`docs/operations/mobile.md`](docs/operations/mobile.md).
+- **Mobile connection migration (Wi-Fi ↔ LTE): use the UDP transport for real
+  migration, or reconnect with 0-RTT on TCP.** `PhantomSession.migrate()` performs
+  real single-path seamless migration when the session is backed by
+  `UdpClientTransport` (via `connect_pinned_udp`). On TCP-backed sessions it returns
+  `Err(CoreError::Unsupported)`. On a network change with TCP, reconnect — folding
+  the first request in via `connect_pinned_with_resumption` to minimise cost. The
+  [`examples/mobile/`](examples/mobile/) sample apps demonstrate the reconnect-with-0-RTT
+  model; see [`docs/operations/mobile.md`](docs/operations/mobile.md) for the UDP
+  migration path.
 - **Work deferred past 0.2.0** — hermetic/reproducible builds, the `no-std` PQ
   handshake, WASI server-side sessions, and ECN congestion feedback — is
   consolidated with rationale in [`docs/DEFERRED_WORK.md`](docs/DEFERRED_WORK.md).
