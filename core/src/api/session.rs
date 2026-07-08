@@ -16,7 +16,7 @@
 
 use crate::crypto::hybrid_sign::HybridVerifyingKey;
 use crate::errors::CoreError;
-use crate::observability::attrs::{AeadAlgorithm, ReplayReason};
+use crate::observability::attrs::{AeadAlgorithm, HandshakeOutcome, ProtocolVersion, ReplayReason};
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN};
@@ -817,6 +817,7 @@ impl PhantomSession {
         // TIMER is `runtime.sleep` (NOT raw tokio::time) so it stays correct
         // under WasmRuntime/EmbeddedRuntime; `select!` is just the combinator.
         const CLIENT_HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+        let handshake_started = std::time::Instant::now();
         // Scoped so the handshake future's borrow of `transport` ends before
         // `transport` is moved into the data pump below.
         let handshake_result = {
@@ -833,6 +834,13 @@ impl PhantomSession {
             Ok((session, accepted)) => (Arc::new(session), accepted),
             Err(e) => {
                 log::error!("PhantomSession: handshake failed: {}", e);
+                observability.record_handshake(
+                    handshake_started.elapsed(),
+                    HandshakeOutcome::Failure,
+                    LegType::Tcp,
+                    AeadAlgorithm::Aes256Gcm,
+                    ProtocolVersion::Current,
+                );
                 // Capture the terminal error BEFORE setting state so
                 // await_ready() readers that wake on the state transition always
                 // see the error already in place.
@@ -845,6 +853,13 @@ impl PhantomSession {
             }
         };
         log::info!("PhantomSession: Handshake complete — hybrid channel ready");
+        observability.record_handshake(
+            handshake_started.elapsed(),
+            HandshakeOutcome::Success,
+            LegType::Tcp,
+            AeadAlgorithm::Aes256Gcm,
+            ProtocolVersion::Current,
+        );
 
         // Phase 4.1 — publish the negotiated Session + the 0-RTT
         // verdict via the outer PhantomSession so `resumption_hint()`
@@ -4707,6 +4722,77 @@ mod tests {
         // Receive server reply — now returns DECRYPTED plaintext payload.
         let reply = session.recv().await.unwrap();
         assert_eq!(reply, b"server-reply");
+
+        server_handle.await.unwrap();
+        session.disconnect().await.unwrap();
+    }
+
+    /// After a successful handshake via `ChannelTransport`, the client session's
+    /// observability must record at least one handshake success.
+    #[tokio::test]
+    async fn client_session_records_handshake_success_metric() {
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        let server_hs = HandshakeServer::new().unwrap();
+        let server_pinned_key = server_hs.verifying_key().clone();
+
+        let session = PhantomSession::connect_with_transport(
+            "test-server:9001",
+            client_transport,
+            server_pinned_key,
+        );
+
+        // Drive the server handshake in a background task. Keep `server_transport`
+        // alive until after we've checked the metric so the client pump doesn't
+        // get a premature EOF that races with the handshake outcome.
+        let server_handle = tokio::spawn(async move {
+            let client_ip = "127.0.0.1".parse().unwrap();
+            let client_hello_bytes = server_transport.recv_bytes().await.unwrap();
+            let client_hello =
+                borsh::from_slice::<ClientHello>(&client_hello_bytes).unwrap();
+            let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
+            match response {
+                HandshakeResponse::Success(server_hello, _server_session, _) => {
+                    let reply_bytes = ServerReply::Hello(server_hello).to_wire().unwrap();
+                    server_transport.send_bytes(&reply_bytes).await.unwrap();
+                    // Keep the transport alive (holding the channel open) while the
+                    // client reads and processes the ServerHello.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    drop(server_transport);
+                }
+                HandshakeResponse::Retry(retry) => {
+                    let retry_bytes = ServerReply::Retry(retry).to_wire().unwrap();
+                    server_transport.send_bytes(&retry_bytes).await.unwrap();
+                    let next_bytes = server_transport.recv_bytes().await.unwrap();
+                    let next_hello = borsh::from_slice::<ClientHello>(&next_bytes).unwrap();
+                    let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
+                    match resp2 {
+                        HandshakeResponse::Success(server_hello, _server_session, _) => {
+                            let reply_bytes =
+                                ServerReply::Hello(server_hello).to_wire().unwrap();
+                            server_transport.send_bytes(&reply_bytes).await.unwrap();
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            drop(server_transport);
+                        }
+                        _ => panic!("expected success after retry"),
+                    }
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        });
+
+        // Wait long enough for the handshake to complete (mirrors existing tests).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let snap = session.observability().snapshot();
+        assert!(
+            snap.handshakes_success >= 1,
+            "client session must record at least one handshake success; got {}",
+            snap.handshakes_success
+        );
+        assert_eq!(
+            snap.handshakes_failure, 0,
+            "no handshake failures expected"
+        );
 
         server_handle.await.unwrap();
         session.disconnect().await.unwrap();
