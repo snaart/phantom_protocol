@@ -167,6 +167,19 @@ pub mod test_harness;
 pub use config::PhantomConfig;
 pub use errors::CoreError;
 
+// Re-export the one-shot connect helpers at the crate root so callers can write
+// `phantom_protocol::connect_pinned_udp(...)` without qualifying the module path.
+// Native-only: the free functions live behind `cfg(not(target_arch = "wasm32"))`.
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+pub use api::session::{
+    connect_pinned,
+    connect_pinned_udp,
+    connect_pinned_udp_with_config,
+    connect_pinned_with_config,
+    connect_pinned_with_resumption,
+    connect_pinned_udp_with_resumption,
+};
+
 // UniFFI scaffolding. Gated on the `bindings` feature so the WASI
 // guest build (which sets `--features wasi-leg` without `bindings`)
 // skips it — UniFFI's exported-symbol metadata is incompatible with

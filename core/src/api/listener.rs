@@ -39,6 +39,37 @@ const MAX_SERVER_RETRY_ROUNDS: u32 = 2;
 /// before the listener back-pressures to not accepting new TCP.
 const MAX_INFLIGHT_HANDSHAKES: usize = 256;
 
+/// TCP server listener — drives the hybrid PQC handshake on each accepted
+/// `TcpStream` and returns established [`PhantomSession`] handles via
+/// [`accept()`](Self::accept).
+///
+/// Use [`PhantomUdpListener`](crate::api::PhantomUdpListener) instead when
+/// clients need seamless connection migration (Wi-Fi ↔ LTE via
+/// [`PhantomSession::migrate`](crate::api::PhantomSession::migrate)).
+/// TCP sessions return [`CoreError::Unsupported`] from `migrate()`.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), phantom_protocol::CoreError> {
+/// use std::sync::Arc;
+/// use phantom_protocol::api::PhantomListener;
+///
+/// let listener = PhantomListener::builder("0.0.0.0:4242").bind().await?;
+/// let pinned_key = listener.verifying_key_bytes();   // share out-of-band
+///
+/// loop {
+///     let outcome = listener.accept().await?;
+///     let session = outcome.session();
+///     tokio::spawn(async move {
+///         let _req = session.recv().await?;
+///         session.send(b"pong".to_vec()).await?;
+///         Ok::<_, phantom_protocol::CoreError>(())
+///     });
+/// }
+/// # }
+/// ```
 #[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct PhantomListener {
     /// Listening socket, owned by the background acceptor task (H4 decouple).
@@ -317,10 +348,10 @@ impl PhantomListener {
     /// Accept the next inbound connection and complete its handshake.
     ///
     /// Returns an [`AcceptOutcome`] — the established session plus any
-    /// 0-RTT early-data the client carried on a V3 ClientHello. Use
+    /// 0-RTT early-data the client carried in its `ClientHello`. Use
     /// `.session()` for the session and `.take_early_data()` for the
-    /// early-data (the latter is `None` for a plain V1/V2 handshake or
-    /// when the server rejected the early-data).
+    /// early-data (the latter is `None` for a standard 1-RTT handshake
+    /// or when the server rejected the early-data).
     #[tracing::instrument(name = "phantom.listener.accept", skip_all)]
     pub async fn accept(&self) -> Result<Arc<AcceptOutcome>, CoreError> {
         // Cheap fast-path: if shutdown was already signalled before this
@@ -433,14 +464,16 @@ impl PhantomListener {
     }
 }
 
-/// Outcome of a successful [`PhantomListener::accept`] — the accepted
-/// session plus any 0-RTT early-data the client carried on its V3
-/// ClientHello (wire V3, Phase 4.1).
+/// Outcome of a successful [`PhantomListener::accept`] — the established
+/// [`PhantomSession`] with any 0-RTT early-data the client carried in its
+/// `ClientHello`.
 ///
-/// A `uniffi::Object` rather than a record: it returns an
-/// `Arc<PhantomSession>` (itself a `uniffi::Object`) from a method,
-/// the same known-good pattern `accept()` used before V3. `take_*`
-/// is take-once so a ≤16 KiB blob is moved out, not cloned.
+/// Use [`session()`](Self::session) for the session and
+/// [`take_early_data()`](Self::take_early_data) for the optional 0-RTT
+/// payload. Both accessors are take-once — `take_early_data` returns `None`
+/// on the second call, and the session handle is `Arc`-cloned on each call.
+/// A `uniffi::Object` rather than a record so it can return an
+/// `Arc<PhantomSession>` (itself a `uniffi::Object`) from a method.
 #[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct AcceptOutcome {
     session: Arc<PhantomSession>,

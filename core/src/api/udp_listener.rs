@@ -43,6 +43,36 @@ const MAX_INFLIGHT_HANDSHAKES: usize = 256;
 /// unbounded buffering; a full channel drops the datagram (the peer retransmits).
 const SESSION_CHANNEL_DEPTH: usize = 256;
 
+/// UDP server listener — one bound `UdpSocket`, a central demux task routing
+/// datagrams by the 8-byte connection-ID into per-session channels, and a
+/// decoupled accept queue mirroring `PhantomListener`.
+///
+/// Prefer this over the TCP `PhantomListener` when clients need seamless
+/// connection migration (`migrate()` returns `Err(Unsupported)` on TCP-backed
+/// sessions but performs a real path-switch on UDP-backed ones).
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), phantom_protocol::CoreError> {
+/// use std::sync::Arc;
+/// use phantom_protocol::api::PhantomUdpListener;
+///
+/// let listener = PhantomUdpListener::builder("0.0.0.0:4242").bind().await?;
+/// let pinned_key = listener.verifying_key_bytes();   // share out-of-band
+///
+/// loop {
+///     let outcome = listener.accept().await?;
+///     let session = outcome.session();
+///     tokio::spawn(async move {
+///         let _req = session.recv().await?;
+///         session.send(b"pong".to_vec()).await?;
+///         Ok::<_, phantom_protocol::CoreError>(())
+///     });
+/// }
+/// # }
+/// ```
 #[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct PhantomUdpListener {
     socket: Arc<UdpSocket>,

@@ -344,6 +344,41 @@ impl<T: SessionTransport> SessionTransport for ObservedTransport<T> {
 ///
 /// The session progresses through states:
 /// `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), phantom_protocol::CoreError> {
+/// use std::sync::Arc;
+/// use phantom_protocol::api::{PhantomUdpListener, PhantomSession};
+///
+/// // Start a UDP server (production path — supports migrate())
+/// let listener = PhantomUdpListener::builder("127.0.0.1:0").bind().await?;
+/// let server_addr = listener.local_addr();
+/// let pinned_key = listener.verifying_key_bytes();
+///
+/// // Accept in the background
+/// let listener = Arc::clone(&listener);
+/// tokio::spawn(async move {
+///     let outcome = listener.accept().await?;
+///     let session = outcome.session();
+///     let _req = session.recv().await?;
+///     session.send(b"hello, post-quantum world".to_vec()).await?;
+///     Ok::<_, phantom_protocol::CoreError>(())
+/// });
+///
+/// // Connect a UDP client
+/// let port: u16 = server_addr.parse::<std::net::SocketAddr>().unwrap().port();
+/// let session = phantom_protocol::connect_pinned_udp(
+///     "127.0.0.1".into(), port, pinned_key,
+/// ).await?;
+/// session.await_ready().await?;
+/// session.send(b"ping".to_vec()).await?;
+/// let _reply = session.recv().await?;
+/// # Ok(())
+/// # }
+/// ```
 #[cfg_attr(feature = "bindings", derive(uniffi::Object))]
 pub struct PhantomSession {
     /// Session identifier
@@ -3536,6 +3571,13 @@ impl PhantomSession {
     /// re-handshake**. A failed rebind never tears the session down: it keeps running
     /// on the existing socket (broken-rebind safety). `Err` here means only that the
     /// session was already closed (the command channel is gone).
+    ///
+    /// **Transport requirement:** seamless migration (Wi-Fi ↔ LTE without
+    /// re-handshake) requires the session to be backed by
+    /// `UdpClientTransport`. Calling `migrate()` on a TCP, WebSocket, WASI,
+    /// or Embedded session returns [`CoreError::Unsupported`]. Check
+    /// [`supports_migration`](Self::supports_migration) first, or use
+    /// `connect_pinned_udp` to ensure UDP backing.
     pub async fn migrate(&self, local_addr: String) -> Result<(), CoreError> {
         if !self.migration_capable {
             return Err(CoreError::Unsupported(
@@ -3602,6 +3644,10 @@ impl PhantomSession {
     /// native-deployment operation, not a mobile-client one. The peer follows
     /// symmetrically: it path-validates the new server source, re-points its send target
     /// there, and rotates its c2s CID to match.
+    ///
+    /// **Transport requirement:** requires the session to be backed by
+    /// `UdpServerTransport`. Returns [`CoreError::Unsupported`] on TCP,
+    /// WebSocket, WASI, or Embedded sessions.
     pub async fn migrate_server(&self, local_addr: String) -> Result<(), CoreError> {
         if !self.migration_capable {
             return Err(CoreError::Unsupported(
@@ -3655,18 +3701,36 @@ impl Drop for PhantomSession {
 }
 
 // ─── Pinned-Connect Shim (Phase 7.2 mobile bridge) ──────────────────────────
-//
-// `connect_with_transport` itself can't cross the UniFFI boundary directly —
-// it takes a generic `T: SessionTransport` trait object and a typed
-// `HybridVerifyingKey`, neither of which is a UniFFI primitive. Mobile
-// callers (iOS / Android) need a single async entry point that opens a TCP
-// connection, wraps it in `TcpSessionTransport`, parses the pinned key from
-// bytes (per security invariant 1 in SECURITY.md), and hands back an
-// `Arc<PhantomSession>` ready for `send` / `recv`.
-//
-// Native-only: `TcpSessionTransport` lives behind `cfg(not(target_arch =
-// "wasm32"))`, mirroring `crate::api::tcp_transport`. Wasm consumers use
-// the in-tree `WebSocketLeg` instead.
+
+/// Connect to a server over **TCP**, pinning its identity to `pinned_key`.
+///
+/// Opens a `TcpSessionTransport`, parses the pinned [`HybridVerifyingKey`]
+/// from raw bytes (Security Invariant 1 — mandatory), and starts the
+/// background handshake + data pump.
+///
+/// Use [`connect_pinned_udp`] instead when you need seamless
+/// connection migration (Wi-Fi ↔ LTE via [`PhantomSession::migrate`]).
+/// TCP sessions return [`CoreError::Unsupported`] from `migrate()`.
+///
+/// Native-only (not available on `wasm32-unknown-unknown`); FFI-exported.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), phantom_protocol::CoreError> {
+/// // `pinned_key` bytes come from `PhantomListener::verifying_key_bytes()`,
+/// // baked into the app bundle — never fetched at runtime.
+/// let pinned_key: Vec<u8> = vec![/* ... */];
+/// let session = phantom_protocol::connect_pinned(
+///     "phantom.example.com".into(), 4242, pinned_key,
+/// ).await?;
+/// session.await_ready().await?;
+/// session.send(b"hello".to_vec()).await?;
+/// let _reply = session.recv().await?;
+/// # Ok(())
+/// # }
+/// ```
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 pub async fn connect_pinned(
@@ -3872,9 +3936,10 @@ pub async fn connect_pinned_with_resumption(
 /// Unlike the TCP [`connect_pinned`], a session built here runs over
 /// [`UdpClientTransport`](crate::api::udp_transport::UdpClientTransport), so
 /// [`PhantomSession::migrate`] performs a real single-path connection migration
-/// (e.g. Wi-Fi ↔ LTE handover) instead of being a no-op, and liveness /
-/// `Migrating` / `Dead` transitions, path validation, and passive NAT-rebind
-/// recovery are all live for FFI consumers.
+/// (e.g. Wi-Fi ↔ LTE handover) instead of returning
+/// [`CoreError::Unsupported`], and liveness / `Migrating` / `Dead` transitions,
+/// path validation, and passive NAT-rebind recovery are all live for FFI
+/// consumers.
 ///
 /// `host` is resolved via the system resolver; the **first** returned address is
 /// used. Unlike the TCP [`connect_pinned`] (whose `TcpStream::connect` tries every
@@ -3882,6 +3947,27 @@ pub async fn connect_pinned_with_resumption(
 /// if the first is unreachable — pass an IP literal or a single-family host when
 /// that matters. Server-key pinning is mandatory (security invariant 1).
 /// Native-only, like [`connect_pinned`].
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), phantom_protocol::CoreError> {
+/// // `pinned_key` bytes come from `PhantomUdpListener::verifying_key_bytes()`,
+/// // baked into the app bundle — never fetched at runtime.
+/// let pinned_key: Vec<u8> = vec![/* ... */];
+/// let session = phantom_protocol::connect_pinned_udp(
+///     "phantom.example.com".into(), 4242, pinned_key,
+/// ).await?;
+/// session.await_ready().await?;
+/// session.send(b"hello".to_vec()).await?;
+/// let _reply = session.recv().await?;
+///
+/// // On a network change (iOS NWPathMonitor / Android NetworkCallback):
+/// session.migrate("0.0.0.0:0".into()).await?;  // rebind to new interface
+/// # Ok(())
+/// # }
+/// ```
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 pub async fn connect_pinned_udp(
