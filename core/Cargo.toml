@@ -243,7 +243,7 @@ tracing = { version = "0.1", optional = true }  # Structured spans / events for 
 
 # --- Crypto (std-only) ---
 x25519-dalek = { version = "2", optional = true, features = ["static_secrets", "zeroize"] }
-ed25519-dalek = { version = "2", optional = true, features = ["zeroize", "rand_core"] }
+ed25519-dalek = { version = "3", optional = true, features = ["zeroize", "rand_core"] }
 ring = { version = "0.17", optional = true }  # HW-accelerated AES-GCM (ARM64 AES intrinsics / x86 AES-NI) + ChaCha20-Poly1305
 # --- Header protection (QUIC RFC 9001 §5.4) primitives, T4.6 ---
 # Raw AES-256-ECB single-block (`aes::Aes256`) + ChaCha20 keystream
