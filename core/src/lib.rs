@@ -177,12 +177,8 @@ pub use errors::CoreError;
 // Native-only: the free functions live behind `cfg(not(target_arch = "wasm32"))`.
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub use api::session::{
-    connect_pinned,
-    connect_pinned_udp,
-    connect_pinned_udp_with_config,
-    connect_pinned_with_config,
-    connect_pinned_with_resumption,
-    connect_pinned_udp_with_resumption,
+    connect_pinned, connect_pinned_udp, connect_pinned_udp_with_config,
+    connect_pinned_udp_with_resumption, connect_pinned_with_config, connect_pinned_with_resumption,
 };
 
 // UniFFI scaffolding. Gated on the `bindings` feature so the WASI

@@ -48,10 +48,6 @@ pub use udp_transport::UdpClientTransport;
 // works as an alternative to the `phantom_protocol::connect_pinned*` crate-root path.
 #[cfg(not(target_arch = "wasm32"))]
 pub use session::{
-    connect_pinned,
-    connect_pinned_udp,
-    connect_pinned_udp_with_config,
-    connect_pinned_with_config,
-    connect_pinned_with_resumption,
-    connect_pinned_udp_with_resumption,
+    connect_pinned, connect_pinned_udp, connect_pinned_udp_with_config,
+    connect_pinned_udp_with_resumption, connect_pinned_with_config, connect_pinned_with_resumption,
 };

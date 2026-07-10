@@ -4833,8 +4833,7 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let client_ip = "127.0.0.1".parse().unwrap();
             let client_hello_bytes = server_transport.recv_bytes().await.unwrap();
-            let client_hello =
-                borsh::from_slice::<ClientHello>(&client_hello_bytes).unwrap();
+            let client_hello = borsh::from_slice::<ClientHello>(&client_hello_bytes).unwrap();
             let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
             match response {
                 HandshakeResponse::Success(server_hello, _server_session, _) => {
@@ -4853,8 +4852,7 @@ mod tests {
                     let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
                     match resp2 {
                         HandshakeResponse::Success(server_hello, _server_session, _) => {
-                            let reply_bytes =
-                                ServerReply::Hello(server_hello).to_wire().unwrap();
+                            let reply_bytes = ServerReply::Hello(server_hello).to_wire().unwrap();
                             server_transport.send_bytes(&reply_bytes).await.unwrap();
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                             drop(server_transport);
@@ -4875,10 +4873,7 @@ mod tests {
             "client session must record at least one handshake success; got {}",
             snap.handshakes_success
         );
-        assert_eq!(
-            snap.handshakes_failure, 0,
-            "no handshake failures expected"
-        );
+        assert_eq!(snap.handshakes_failure, 0, "no handshake failures expected");
 
         server_handle.await.unwrap();
         session.disconnect().await.unwrap();
@@ -5524,7 +5519,10 @@ mod tests {
             LegType::Udp,
         );
 
-        assert!(observed.supports_migration(), "supports_migration not forwarded at the call site");
+        assert!(
+            observed.supports_migration(),
+            "supports_migration not forwarded at the call site"
+        );
         observed.set_frame_phase(FramePhase::Established);
         observed.set_outbound_cid([7u8; 8]);
         assert!(observed.has_migration_candidate());
