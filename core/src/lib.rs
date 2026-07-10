@@ -34,6 +34,11 @@
 // behaviour. The attribute is inert on every normal (stable) build: `docsrs` is
 // never set there, so the unstable `doc_cfg` feature is never requested.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// Pull the repository README into the crate-level rustdoc so docs.rs shows the
+// full README rather than a thin stub. All code fences in the README use
+// ```rust,no_run```, ```bash```, or ```text``` so they are not executed as
+// doctests (they require a live peer and cannot run standalone).
+#![doc = include_str!("../../README.md")]
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,

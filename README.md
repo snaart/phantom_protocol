@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/phantom-protocol.svg)](https://crates.io/crates/phantom-protocol)
 [![docs.rs](https://img.shields.io/docsrs/phantom-protocol)](https://docs.rs/phantom-protocol)
 [![CI](https://github.com/snaart/phantom_protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/snaart/phantom_protocol/actions/workflows/ci.yml)
-[![license](https://img.shields.io/crates/l/phantom-protocol.svg)](LICENSE)
+[![license](https://img.shields.io/crates/l/phantom-protocol.svg)](https://github.com/snaart/phantom_protocol/blob/main/LICENSE)
 ![MSRV](https://img.shields.io/badge/MSRV-1.93-blue)
 
 Post-quantum-secure L4/L6 universal transport framework in Rust.
@@ -619,4 +619,4 @@ authored, reviewed, tested, and maintained by the human author.
 
 ## License
 
-Apache License 2.0. See [`LICENSE`](LICENSE).
+Apache License 2.0. See [LICENSE](https://github.com/snaart/phantom_protocol/blob/main/LICENSE).
