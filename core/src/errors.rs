@@ -108,7 +108,10 @@ pub enum CoreError {
     ///     Ok(()) => { /* connected */ }
     /// }
     /// ```
-    #[cfg_attr(feature = "std", error("server identity mismatch: the server's signing key did not match the pinned key"))]
+    #[cfg_attr(
+        feature = "std",
+        error("server identity mismatch: the server's signing key did not match the pinned key")
+    )]
     ServerIdentityMismatch,
 
     /// The server explicitly rejected the connection — the client and server

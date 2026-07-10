@@ -63,7 +63,7 @@ const SESSION_CHANNEL_DEPTH: usize = 256;
 /// let pinned_key = listener.verifying_key_bytes();   // share out-of-band
 ///
 /// loop {
-///     let outcome = listener.accept().await?;
+///     let outcome = Arc::clone(&listener).accept().await?;
 ///     let session = outcome.session();
 ///     tokio::spawn(async move {
 ///         let _req = session.recv().await?;

@@ -4110,7 +4110,7 @@ pub async fn connect_pinned_udp_with_resumption(
 ///
 /// ```rust,no_run
 /// # use phantom_protocol::api::{PhantomSession, TcpSessionTransport};
-/// # async fn example() -> Result<(), phantom_protocol::errors::CoreError> {
+/// # async fn example() -> Result<(), phantom_protocol::CoreError> {
 /// # let my_key = phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey::from_bytes(&[]).unwrap();
 /// let stream = tokio::net::TcpStream::connect("127.0.0.1:4242").await.unwrap();
 /// let transport = TcpSessionTransport::new(stream);
