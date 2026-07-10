@@ -34,7 +34,7 @@ pub struct PhantomConfig {
     /// Maximum 0-RTT resumption tickets the server keeps in memory.
     ///
     /// **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`] (via
-    /// [`PhantomListener::bind_with_config_bytes`] or equivalent). When a
+    /// `PhantomListener::bind_with_config_bytes` or equivalent). When a
     /// [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
     /// is silently ignored — the client does not own a session cache.
     ///

@@ -164,7 +164,7 @@ pub trait SessionTransport: Send + Sync + 'static {
     ///
     /// Default: returns [`CoreError::Unsupported`] for transports without migration
     /// (TCP / WebSocket / WASI / Embedded / the in-memory test pipe); only the native
-    /// UDP client ([`UdpClientTransport`]) overrides this with the real implementation.
+    /// UDP client (`UdpClientTransport`) overrides this with the real implementation.
     /// Call [`supports_migration`](Self::supports_migration) before calling this method
     /// to avoid receiving `Unsupported` on non-UDP sessions.
     fn migrate(
@@ -188,7 +188,7 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// a parse / bind failure returns `Err` and the session keeps running on the old socket.
     ///
     /// Default: returns [`CoreError::Unsupported`] — only the native UDP server
-    /// ([`UdpServerTransport`]) implements it. Kept distinct from [`migrate`](Self::migrate)
+    /// (`UdpServerTransport`) implements it. Kept distinct from [`migrate`](Self::migrate)
     /// so the FFI-exported client `migrate()` cannot trigger a server migration.
     fn migrate_server(
         &self,
