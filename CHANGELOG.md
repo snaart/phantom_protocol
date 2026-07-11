@@ -53,6 +53,40 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   collide.
 - **FFI ergonomics.** `AcceptOutcome::peer_addr_string()` (per-peer admission control),
   and `set_early_data_enabled(bool)` is now exported on both listeners.
+- **Builder API (Rust).** `PhantomSession::builder(addr)` / `PhantomListener::builder(addr)` /
+  `PhantomUdpListener::builder(addr)` with orthogonal chained setters
+  (`.transport()` / `.pinned_key()` / `.resumption()` / `.config()` / `.runtime()` /
+  `.mimic()` → `.connect()`; `.signing_key()` / `.config()` / `.runtime()` → `.bind()`)
+  replace the combinatorial `connect_with_transport_with_*` / `bind_*_with_runtime`
+  variant explosion. A builder cannot produce an unpinned session (Security Invariant 1).
+- **Typed client failure.** `PhantomSession::last_error()` and `await_ready()` (both
+  FFI-exported) let an embedder learn *why* a connect failed (the background handshake
+  task now captures the terminal `CoreError`) and wait for readiness; `send()`/`recv()`
+  surface the captured cause instead of a generic "session closed". New structured
+  `CoreError` variants — `ServerIdentityMismatch` (fatal pinning failure),
+  `ProtocolRejected`, `Unsupported` — with a retryable-vs-fatal classification in the
+  rustdoc, so callers can build correct retry/backoff logic without string-matching.
+- **Migration discoverability.** `PhantomSession::supports_migration()` reports whether a
+  session can migrate (true only for UDP-backed sessions); client-side handshake outcome
+  metrics are now recorded (a client `metrics_snapshot()` no longer always shows 0
+  handshakes).
+- **Secure seed default for Rust.** `generate_signing_key_secure()` returns the 64-byte
+  seed wrapped in `Zeroizing` (wiped on drop); the FFI `generate_signing_key()` (which
+  cannot carry `Zeroizing` across UniFFI) now documents the secure variant.
+- **Documentation.** README is now the docs.rs landing page with a UDP-first runnable
+  quickstart, a "Getting started" / "Choosing a transport" / "Two ways to send" guide,
+  and runnable rustdoc examples on the session/listener types; a PyPI-wheel packaging
+  path (maturin) + a manual CI smoke job were added.
+
+### Changed
+
+- **`migrate()` on a non-migration transport now returns `Err(CoreError::Unsupported)`**
+  instead of a silent `Ok(())` no-op. Real migration requires a UDP-backed session
+  (`connect_pinned_udp*`); on TCP / WebSocket / WASI / Embedded it now errors honestly.
+- **Combinatorial `connect_with_transport_with_*` / `bind_*_with_runtime` Rust
+  constructors were removed** in favour of the builder (the UniFFI-exported free functions
+  and constructors are unchanged). `PhantomStream::recv()` returns `Option<Vec<u8>>`
+  (`None` = clean EOF). All breaking, within the pre-1.0 0.2.x window.
 
 ### Fixed
 
