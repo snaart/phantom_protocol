@@ -20,8 +20,49 @@ follow-up beyond the scope of these configs.
 
 ## Python — PyPI wheel
 
-The wheel bundles `phantom_protocol.py`; the native library is platform-specific
-and must be staged next to the module before the build.
+There are **two** Python packaging configs in the repo:
+
+| Config | Purpose | Bundles native lib? |
+|---|---|---|
+| `tests/bindings/pyproject.toml` | Pure-Python wheel (setuptools) for dev use / manual staging | No — caller must stage `libphantom_protocol.{so,dylib,dll}` next to the `.py` |
+| `python/pyproject.toml` | Platform-specific wheel (**maturin**) for PyPI distribution | Yes — cdylib is compiled and bundled automatically |
+
+### Recommended: maturin wheel (bundles native library)
+
+`python/pyproject.toml` uses [maturin](https://github.com/PyO3/maturin) in
+`uniffi` bindings mode. maturin compiles the Rust cdylib, runs `uniffi-bindgen`
+to generate the Python glue, and bundles both into a single platform-specific
+wheel. The result is installable with a plain `pip install`.
+
+```sh
+# Prerequisites
+pip install "maturin>=1.6,<2.0"
+
+# Build a wheel for the current platform (from the repo root):
+cd python
+maturin build --release --manifest-path ../core/Cargo.toml --features bindings --out ../target/wheels
+
+# Install it (no extra steps — cdylib is inside the wheel):
+pip install --no-index --find-links ../target/wheels phantom-protocol
+
+# Verify:
+python -c "import phantom_protocol; print('ok')"
+
+# Publish to PyPI (manual — needs MATURIN_PYPI_TOKEN):
+maturin publish --manifest-path ../core/Cargo.toml
+```
+
+For a real multi-platform PyPI release (manylinux, macOS, Windows) wrap
+the build with **`cibuildwheel`** targeting the `python/pyproject.toml`. A
+CI job (`build-python-wheel` in `.github/workflows/release.yml`, manually
+triggered via `workflow_dispatch`) demonstrates the single-platform
+smoke-test flow.
+
+### Legacy: setuptools wheel (manual native-lib staging)
+
+The `tests/bindings/pyproject.toml` (setuptools) is kept for local development
+and CI drift checking. It does NOT bundle the native library and is NOT suitable
+for PyPI distribution without extra staging:
 
 ```sh
 cd tests/bindings
@@ -32,11 +73,7 @@ python -m build --wheel        # produces dist/phantom_protocol-0.2.2-*.whl
 twine upload dist/*.whl        # manual — needs PyPI credentials
 ```
 
-The wheel produced by `python -m build` includes `phantom_protocol.py` but does
-**not** automatically bundle the native library — `MANIFEST.in` covers the
-sdist, not the wheel. For a real PyPI release across OS/arch combinations
-wrap this config with **`cibuildwheel`** or **`maturin`**; each tool
-builds and bundles per-platform wheels in a matrix.
+Use this flow only for local testing or the `bindings/drift` CI job.
 
 ---
 

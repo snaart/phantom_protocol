@@ -11,6 +11,9 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # Manual trigger for the Python wheel smoke-test job. Does not trigger on
+  # every push; run from the GitHub Actions "Run workflow" button.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -171,3 +174,59 @@ jobs:
             dist/*.tar.gz
             dist/*.tar.gz.sha256
             dist/*.intoto.jsonl
+
+  # ── Python wheel build + smoke test ───────────────────────────────
+  # Manually triggered only (workflow_dispatch). Builds a maturin wheel that
+  # bundles the cdylib + UniFFI-generated Python glue, installs it in a
+  # fresh venv, and verifies `import phantom_protocol` succeeds.
+  #
+  # A full multi-platform cibuildwheel matrix is a documented follow-up;
+  # this job proves the config is correct on a single platform.
+  #
+  # To publish to PyPI after this job succeeds:
+  #   maturin publish --manifest-path core/Cargo.toml
+  # (requires MATURIN_PYPI_TOKEN in repository secrets — not wired here).
+  build-python-wheel:
+    name: Build Python wheel (manual smoke test)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "."
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install maturin
+        run: pip install "maturin>=1.6,<2.0"
+      - name: Build wheel
+        # Run from python/ so maturin picks up python/pyproject.toml, which
+        # sets manifest-path, bindings = "uniffi", and python-source. maturin
+        # will:
+        #   1. Compile the cdylib (phantom_protocol) with --features bindings.
+        #   2. Compile the uniffi-bindgen binary (auto-enables uniffi-cli).
+        #   3. Run uniffi-bindgen to generate phantom_protocol.py.
+        #   4. Bundle cdylib + generated .py into a platform wheel.
+        # The --manifest-path in pyproject.toml is relative to the pyproject dir,
+        # so we need to override here with the absolute-from-cwd form; the --out
+        # flag lands the wheel in the repo-root target/wheels directory.
+        run: |
+          maturin build --release \
+            --manifest-path ../core/Cargo.toml \
+            --features bindings \
+            --out ../target/wheels
+        working-directory: python
+      - name: Smoke-test wheel
+        run: |
+          python -m venv /tmp/phantom-smoke-venv
+          /tmp/phantom-smoke-venv/bin/pip install --no-index --find-links target/wheels phantom-protocol
+          /tmp/phantom-smoke-venv/bin/python -c "import phantom_protocol; print(getattr(phantom_protocol, '__doc__', None) or 'import OK')"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-wheel-linux-x86_64
+          path: target/wheels/*.whl
+          if-no-files-found: error
