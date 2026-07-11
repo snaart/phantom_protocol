@@ -307,7 +307,7 @@ typedef struct PhantomMetricsSnapshotFfi {
  *
  *   PhantomListener     — TCP server. 3 constructors + 8 methods.
  *   PhantomUdpListener  — UDP server. 3 constructors + 6 methods.
- *   PhantomSession      — connection. Constructor + 16 methods.
+ *   PhantomSession      — connection. Constructor + 19 methods.
  *   PhantomStream       — substream. 6 methods (no public constructor —
  *                         obtained via PhantomSession::open_stream or
  *                         PhantomSession::accept_stream).
@@ -626,6 +626,52 @@ uint64_t uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping(
 uint64_t uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping(
     void                    *ptr);
 
+/* last_error() -> async Option<CoreError> (rust_buffer result).
+ *
+ * Returns the terminal error from a failed handshake or a dead session,
+ * or None if the session has not failed (still connecting, connected, or
+ * cleanly closed). The error is written once by the background task
+ * immediately before the state transitions to Failed or Dead, so callers
+ * that read this after receiving ConnectionState::Failed from
+ * connection_state() or Err(...) from await_ready() always see the
+ * populated value.
+ *
+ * The returned RustBuffer contains a lowered Option<CoreError>; drive
+ * the future with ffi_phantom_protocol_rust_future_poll_rust_buffer +
+ * ffi_phantom_protocol_rust_future_complete_rust_buffer. */
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_last_error(
+    void                    *ptr);
+
+/* await_ready() -> async Result<(), CoreError> (void result).
+ *
+ * Waits until the session reaches Connected (handshake succeeded) or
+ * Failed/Dead (handshake or pump failure). Returns Ok(()) on success;
+ * on failure the call_status code is 1 and error_buf carries the typed
+ * CoreError (e.g. ServerIdentityMismatch, NetworkError). Because the
+ * readiness signal is carried on a watch channel, a call made *after*
+ * the handshake has already resolved returns immediately — no
+ * lost-notification race.
+ *
+ * Drive the future with ffi_phantom_protocol_rust_future_poll_void +
+ * ffi_phantom_protocol_rust_future_complete_void; errors surface through
+ * the call_status out-parameter of the complete call. */
+uint64_t uniffi_phantom_protocol_fn_method_phantomsession_await_ready(
+    void                    *ptr);
+
+/* supports_migration() -> bool (sync).
+ *
+ * Returns true when this session's transport supports seamless connection
+ * migration (i.e. migrate() will succeed). True only for sessions backed
+ * by UdpClientTransport (created via connect_pinned_udp* functions). On
+ * TCP, WebSocket, WASI, or Embedded sessions this returns false and
+ * migrate() returns CoreError::Unsupported.
+ *
+ * This is a synchronous call: the result is returned directly as an int8_t
+ * (0 = false, 1 = true) and errors surface through call_status. */
+int8_t uniffi_phantom_protocol_fn_method_phantomsession_supports_migration(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
 /* --------------------------- PhantomStream -------------------------- */
 
 void *uniffi_phantom_protocol_fn_clone_phantomstream(
@@ -870,6 +916,19 @@ uint64_t uniffi_phantom_protocol_fn_func_connect_pinned_udp_with_resumption(
  *    callable but not declared here. Each takes no arguments and
  *    returns `uint16_t`; higher-level bindings invoke them at load
  *    time to detect ABI drift.
+ *
+ *  - `CoreError` carries three typed variants:
+ *      ServerIdentityMismatch  — the server's hybrid verifying key did not
+ *                                match the caller-pinned key; update the
+ *                                pinned key or contact the server admin.
+ *      ProtocolRejected(msg)   — the server rejected the protocol variant
+ *                                or version (e.g. FIPS vs non-FIPS mismatch);
+ *                                update the client library.
+ *      Unsupported(msg)        — the requested operation is not available on
+ *                                this transport type (e.g. migrate() on TCP);
+ *                                use the appropriate transport.
+ *    These map to error discriminant codes 18, 19, and 20 respectively in
+ *    the lowered RustBuffer carried by a call_status code of 1.
  *
  *  - The shape (UniFFI 0.31, contract 30) is current as of phantom_protocol
  *    0.2.2. If you bump the UniFFI dependency,

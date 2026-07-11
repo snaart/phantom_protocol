@@ -683,6 +683,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream(
     ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomsession_await_ready(
+    ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_connection_state(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_current_epoch(
@@ -698,6 +700,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomsession_last_error(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot(
     ): Int
@@ -718,6 +722,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping(
+    ): Int
+    external fun uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration(
     ): Int
     external fun uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping(
     ): Int
@@ -821,6 +827,8 @@ external fun uniffi_phantom_protocol_fn_constructor_phantomsession_connect(`peer
 ): Long
 external fun uniffi_phantom_protocol_fn_method_phantomsession_accept_stream(`ptr`: Long,
 ): Long
+external fun uniffi_phantom_protocol_fn_method_phantomsession_await_ready(`ptr`: Long,
+): Long
 external fun uniffi_phantom_protocol_fn_method_phantomsession_connection_state(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_phantom_protocol_fn_method_phantomsession_current_epoch(`ptr`: Long,
@@ -837,6 +845,8 @@ external fun uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready(`ptr
 ): Byte
 external fun uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
+external fun uniffi_phantom_protocol_fn_method_phantomsession_last_error(`ptr`: Long,
+): Long
 external fun uniffi_phantom_protocol_fn_method_phantomsession_metrics_snapshot(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_phantom_protocol_fn_method_phantomsession_migrate(`ptr`: Long,`localAddr`: RustBuffer.ByValue,
@@ -857,6 +867,8 @@ external fun uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshol
 ): Long
 external fun uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping(`ptr`: Long,`config`: RustBuffer.ByValue,
 ): Long
+external fun uniffi_phantom_protocol_fn_method_phantomsession_supports_migration(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 external fun uniffi_phantom_protocol_fn_method_phantomsession_traffic_shaping(`ptr`: Long,
 ): Long
 external fun uniffi_phantom_protocol_fn_clone_phantomstream(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1032,16 +1044,16 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_phantom_protocol_checksum_func_generate_signing_key() != 61525) {
+    if (lib.uniffi_phantom_protocol_checksum_func_generate_signing_key() != 61598) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key() != 48109) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 48812) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 16773) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 36316) {
+    if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 51918) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 19062) {
@@ -1059,7 +1071,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 13201) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_peer_addr_string() != 64037) {
+    if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_peer_addr_string() != 47588) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_session() != 25558) {
@@ -1068,7 +1080,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_acceptoutcome_take_early_data() != 27328) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_accept() != 14433) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_accept() != 8307) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_is_shutting_down() != 8474) {
@@ -1089,7 +1101,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomlistener_verifying_key_bytes() != 14523) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream() != 13703) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_accept_stream() != 52368) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_await_ready() != 6822) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 25030) {
@@ -1116,10 +1131,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready() != 47934) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_last_error() != 3339) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot() != 36430) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 22155) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_migrate() != 5135) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_open_stream() != 25882) {
@@ -1131,19 +1149,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 50067) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 45587) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 44409) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 8664) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 53770) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 44795) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_supports_migration() != 60201) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8294) {
@@ -1763,14 +1784,16 @@ public object FfiConverterDuration: FfiConverterRustBuffer<java.time.Duration> {
 
 
 /**
- * Outcome of a successful [`PhantomListener::accept`] — the accepted
- * session plus any 0-RTT early-data the client carried on its V3
- * ClientHello (wire V3, Phase 4.1).
+ * Outcome of a successful [`PhantomListener::accept`] — the established
+ * [`PhantomSession`] with any 0-RTT early-data the client carried in its
+ * `ClientHello`.
  *
- * A `uniffi::Object` rather than a record: it returns an
- * `Arc<PhantomSession>` (itself a `uniffi::Object`) from a method,
- * the same known-good pattern `accept()` used before V3. `take_*`
- * is take-once so a ≤16 KiB blob is moved out, not cloned.
+ * Use [`session()`](Self::session) for the session and
+ * [`take_early_data()`](Self::take_early_data) for the optional 0-RTT
+ * payload. Both accessors are take-once — `take_early_data` returns `None`
+ * on the second call, and the session handle is `Arc`-cloned on each call.
+ * A `uniffi::Object` rather than a record so it can return an
+ * `Arc<PhantomSession>` (itself a `uniffi::Object`) from a method.
  */
 public interface AcceptOutcomeInterface {
     
@@ -1782,8 +1805,8 @@ public interface AcceptOutcomeInterface {
     /**
      * The remote socket address this session was accepted from, as a string
      * (e.g. `"203.0.113.4:51000"`) — for per-peer admission control / logging
-     * from FFI consumers. The typed [`peer_addr`](Self::peer_addr) returning
-     * [`SocketAddr`](std::net::SocketAddr) stays Rust-only.
+     * from FFI consumers. The typed [`peer_addr`](Self::peer_addr) returning a
+     * `SocketAddr` stays Rust-only.
      */
     fun `peerAddrString`(): kotlin.String
     
@@ -1804,14 +1827,16 @@ public interface AcceptOutcomeInterface {
 }
 
 /**
- * Outcome of a successful [`PhantomListener::accept`] — the accepted
- * session plus any 0-RTT early-data the client carried on its V3
- * ClientHello (wire V3, Phase 4.1).
+ * Outcome of a successful [`PhantomListener::accept`] — the established
+ * [`PhantomSession`] with any 0-RTT early-data the client carried in its
+ * `ClientHello`.
  *
- * A `uniffi::Object` rather than a record: it returns an
- * `Arc<PhantomSession>` (itself a `uniffi::Object`) from a method,
- * the same known-good pattern `accept()` used before V3. `take_*`
- * is take-once so a ≤16 KiB blob is moved out, not cloned.
+ * Use [`session()`](Self::session) for the session and
+ * [`take_early_data()`](Self::take_early_data) for the optional 0-RTT
+ * payload. Both accessors are take-once — `take_early_data` returns `None`
+ * on the second call, and the session handle is `Arc`-cloned on each call.
+ * A `uniffi::Object` rather than a record so it can return an
+ * `Arc<PhantomSession>` (itself a `uniffi::Object`) from a method.
  */
 open class AcceptOutcome: Disposable, AutoCloseable, AcceptOutcomeInterface
 {
@@ -1929,8 +1954,8 @@ open class AcceptOutcome: Disposable, AutoCloseable, AcceptOutcomeInterface
     /**
      * The remote socket address this session was accepted from, as a string
      * (e.g. `"203.0.113.4:51000"`) — for per-peer admission control / logging
-     * from FFI consumers. The typed [`peer_addr`](Self::peer_addr) returning
-     * [`SocketAddr`](std::net::SocketAddr) stays Rust-only.
+     * from FFI consumers. The typed [`peer_addr`](Self::peer_addr) returning a
+     * `SocketAddr` stays Rust-only.
      */override fun `peerAddrString`(): kotlin.String {
             return FfiConverterString.lift(
     callWithHandle {
@@ -2113,16 +2138,49 @@ public object FfiConverterTypeAcceptOutcome: FfiConverter<AcceptOutcome, Long> {
 //
 
 
+/**
+ * TCP server listener — drives the hybrid PQC handshake on each accepted
+ * `TcpStream` and returns established [`PhantomSession`] handles via
+ * [`accept()`](Self::accept).
+ *
+ * Use [`PhantomUdpListener`](crate::api::PhantomUdpListener) instead when
+ * clients need seamless connection migration (Wi-Fi ↔ LTE via
+ * [`PhantomSession::migrate`](crate::api::PhantomSession::migrate)).
+ * TCP sessions return [`CoreError::Unsupported`] from `migrate()`.
+ *
+ * # Example
+ *
+ * ```rust,no_run
+ * # #[tokio::main]
+ * # async fn main() -> Result<(), phantom_protocol::CoreError> {
+ * use std::sync::Arc;
+ * use phantom_protocol::api::PhantomListener;
+ *
+ * let listener = PhantomListener::builder("0.0.0.0:4242").bind().await?;
+ * let pinned_key = listener.verifying_key_bytes();   // share out-of-band
+ *
+ * loop {
+ * let outcome = listener.accept().await?;
+ * let session = outcome.session();
+ * tokio::spawn(async move {
+ * let _req = session.recv().await?;
+ * session.send(b"pong".to_vec()).await?;
+ * Ok::<_, phantom_protocol::CoreError>(())
+ * });
+ * }
+ * # }
+ * ```
+ */
 public interface PhantomListenerInterface {
     
     /**
      * Accept the next inbound connection and complete its handshake.
      *
      * Returns an [`AcceptOutcome`] — the established session plus any
-     * 0-RTT early-data the client carried on a V3 ClientHello. Use
+     * 0-RTT early-data the client carried in its `ClientHello`. Use
      * `.session()` for the session and `.take_early_data()` for the
-     * early-data (the latter is `None` for a plain V1/V2 handshake or
-     * when the server rejected the early-data).
+     * early-data (the latter is `None` for a standard 1-RTT handshake
+     * or when the server rejected the early-data).
      */
     suspend fun `accept`(): AcceptOutcome
     
@@ -2177,6 +2235,39 @@ public interface PhantomListenerInterface {
     companion object
 }
 
+/**
+ * TCP server listener — drives the hybrid PQC handshake on each accepted
+ * `TcpStream` and returns established [`PhantomSession`] handles via
+ * [`accept()`](Self::accept).
+ *
+ * Use [`PhantomUdpListener`](crate::api::PhantomUdpListener) instead when
+ * clients need seamless connection migration (Wi-Fi ↔ LTE via
+ * [`PhantomSession::migrate`](crate::api::PhantomSession::migrate)).
+ * TCP sessions return [`CoreError::Unsupported`] from `migrate()`.
+ *
+ * # Example
+ *
+ * ```rust,no_run
+ * # #[tokio::main]
+ * # async fn main() -> Result<(), phantom_protocol::CoreError> {
+ * use std::sync::Arc;
+ * use phantom_protocol::api::PhantomListener;
+ *
+ * let listener = PhantomListener::builder("0.0.0.0:4242").bind().await?;
+ * let pinned_key = listener.verifying_key_bytes();   // share out-of-band
+ *
+ * loop {
+ * let outcome = listener.accept().await?;
+ * let session = outcome.session();
+ * tokio::spawn(async move {
+ * let _req = session.recv().await?;
+ * session.send(b"pong".to_vec()).await?;
+ * Ok::<_, phantom_protocol::CoreError>(())
+ * });
+ * }
+ * # }
+ * ```
+ */
 open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
 {
 
@@ -2278,10 +2369,10 @@ open class PhantomListener: Disposable, AutoCloseable, PhantomListenerInterface
      * Accept the next inbound connection and complete its handshake.
      *
      * Returns an [`AcceptOutcome`] — the established session plus any
-     * 0-RTT early-data the client carried on a V3 ClientHello. Use
+     * 0-RTT early-data the client carried in its `ClientHello`. Use
      * `.session()` for the session and `.take_early_data()` for the
-     * early-data (the latter is `None` for a plain V1/V2 handshake or
-     * when the server rejected the early-data).
+     * early-data (the latter is `None` for a standard 1-RTT handshake
+     * or when the server rejected the early-data).
      */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
@@ -2629,6 +2720,41 @@ public object FfiConverterTypePhantomListener: FfiConverter<PhantomListener, Lon
  *
  * The session progresses through states:
  * `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
+ *
+ * # Example
+ *
+ * ```rust,no_run
+ * # #[tokio::main]
+ * # async fn main() -> Result<(), phantom_protocol::CoreError> {
+ * use std::sync::Arc;
+ * use phantom_protocol::api::{PhantomUdpListener, PhantomSession};
+ *
+ * // Start a UDP server (production path — supports migrate())
+ * let listener = PhantomUdpListener::builder("127.0.0.1:0").bind().await?;
+ * let server_addr = listener.local_addr();
+ * let pinned_key = listener.verifying_key_bytes();
+ *
+ * // Accept in the background
+ * let listener = Arc::clone(&listener);
+ * tokio::spawn(async move {
+ * let outcome = listener.accept().await?;
+ * let session = outcome.session();
+ * let _req = session.recv().await?;
+ * session.send(b"hello, post-quantum world".to_vec()).await?;
+ * Ok::<_, phantom_protocol::CoreError>(())
+ * });
+ *
+ * // Connect a UDP client
+ * let port: u16 = server_addr.parse::<std::net::SocketAddr>().unwrap().port();
+ * let session = phantom_protocol::connect_pinned_udp(
+ * "127.0.0.1".into(), port, pinned_key,
+ * ).await?;
+ * session.await_ready().await?;
+ * session.send(b"ping".to_vec()).await?;
+ * let _reply = session.recv().await?;
+ * # Ok(())
+ * # }
+ * ```
  */
 public interface PhantomSessionInterface {
     
@@ -2636,8 +2762,8 @@ public interface PhantomSessionInterface {
      * Accept the next peer-initiated stream.
      *
      * Blocks until the remote peer opens a new stream (one with an id ≥ 2 that
-     * we haven't seen yet). The returned [`PhantomStream`] is already registered
-     * in the session's demux and ready for `recv()` / `send_reliable()`.
+     * we haven't seen yet). The returned [`PhantomStream`](crate::api::stream::PhantomStream)
+     * is already registered in the session's demux and ready for `recv()` / `send_reliable()`.
      *
      * Returns `Err(CoreError::ConnectionClosed)` when the session has ended and no
      * further streams will arrive (the internal channel was dropped by the pump).
@@ -2654,6 +2780,27 @@ public interface PhantomSessionInterface {
      * protected by an async `Mutex`; a concurrent call will wait for the lock.
      */
     suspend fun `acceptStream`(): PhantomStream
+    
+    /**
+     * Wait until the session reaches `Connected` (handshake succeeded) or
+     * `Failed`/`Dead` (handshake or pump failure).
+     *
+     * Returns `Ok(())` on successful connection, or `Err(cause)` with the
+     * captured terminal error on failure. This is the preferred alternative
+     * to polling `connection_state()` in a loop.
+     *
+     * Because the readiness signal is carried on a `watch` channel, a call
+     * made *after* the handshake has already resolved (either direction)
+     * returns immediately — there is no lost-notification race.
+     *
+     * # Example
+     *
+     * ```rust,ignore
+     * session.await_ready().await?;   // returns Err(ServerIdentityMismatch) if key wrong
+     * session.send(b"hello".to_vec()).await?;
+     * ```
+     */
+    suspend fun `awaitReady`()
     
     /**
      * Get the current connection state (lock-free).
@@ -2709,6 +2856,27 @@ public interface PhantomSessionInterface {
     fun `isPqcReady`(): kotlin.Boolean
     
     /**
+     * Returns the terminal error from a failed handshake or a dead session,
+     * or `None` if the session has not failed (still connecting, connected, or
+     * cleanly closed).
+     *
+     * The error is written once by the background task immediately before the
+     * state transitions to `Failed` or `Dead`, so callers that read this after
+     * receiving `ConnectionState::Failed` from `connection_state()` or
+     * `Err(…)` from `await_ready()` always see the populated value.
+     *
+     * # Example
+     *
+     * ```rust,ignore
+     * let _ = session.await_ready().await;  // wait for outcome
+     * if let Some(e) = session.last_error().await {
+     * eprintln!("session failed: {e}");
+     * }
+     * ```
+     */
+    suspend fun `lastError`(): CoreException?
+    
+    /**
      * Flat snapshot of this session's connection metrics. For a client
      * session these are its own per-session counters; for a server-accepted
      * session they are the owning listener's aggregate (shared handle).
@@ -2730,6 +2898,13 @@ public interface PhantomSessionInterface {
      * re-handshake**. A failed rebind never tears the session down: it keeps running
      * on the existing socket (broken-rebind safety). `Err` here means only that the
      * session was already closed (the command channel is gone).
+     *
+     * **Transport requirement:** seamless migration (Wi-Fi ↔ LTE without
+     * re-handshake) requires the session to be backed by
+     * `UdpClientTransport`. Calling `migrate()` on a TCP, WebSocket, WASI,
+     * or Embedded session returns [`CoreError::Unsupported`]. Check
+     * [`supports_migration`](Self::supports_migration) first, or use
+     * `connect_pinned_udp` to ensure UDP backing.
      */
     suspend fun `migrate`(`localAddr`: kotlin.String)
     
@@ -2756,6 +2931,10 @@ public interface PhantomSessionInterface {
      * FFI surface still hands callers a `Vec<u8>`; if this is the last
      * refcount the Vec is moved out of the underlying buffer, otherwise
      * `Bytes::to_vec` copies.
+     *
+     * When the session is `Failed` or `Dead` and the recv channel has been
+     * dropped, returns the captured terminal error (if any) rather than the
+     * generic `"Session closed"` message.
      */
     suspend fun `recv`(): kotlin.ByteArray
     
@@ -2779,6 +2958,10 @@ public interface PhantomSessionInterface {
      *
      * - If the session is connected: sends immediately
      * - If still handshaking: queues the data for auto-flush later
+     * - If the session is `Failed` or `Dead`: returns the captured terminal
+     * error (from the handshake or the data pump) so the caller gets the
+     * *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
+     * than the generic `"Cannot send in state Failed"` message.
      */
     suspend fun `send`(`data`: kotlin.ByteArray)
     
@@ -2801,6 +2984,17 @@ public interface PhantomSessionInterface {
      * tune it.
      */
     suspend fun `setTrafficShaping`(`config`: TrafficShapingConfig): kotlin.Boolean
+    
+    /**
+     * Whether this session's transport supports seamless connection migration
+     * (i.e., [`migrate`](Self::migrate) will succeed for UDP sessions).
+     *
+     * Returns `true` only when the session is backed by `UdpClientTransport`.
+     * On TCP, WebSocket, WASI, or Embedded sessions, [`migrate`](Self::migrate)
+     * returns [`CoreError::Unsupported`] — use reconnection with 0-RTT resumption
+     * instead.
+     */
+    fun `supportsMigration`(): kotlin.Boolean
     
     /**
      * Read back the traffic-shaping config currently applied to the established
@@ -2834,6 +3028,41 @@ public interface PhantomSessionInterface {
  *
  * The session progresses through states:
  * `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
+ *
+ * # Example
+ *
+ * ```rust,no_run
+ * # #[tokio::main]
+ * # async fn main() -> Result<(), phantom_protocol::CoreError> {
+ * use std::sync::Arc;
+ * use phantom_protocol::api::{PhantomUdpListener, PhantomSession};
+ *
+ * // Start a UDP server (production path — supports migrate())
+ * let listener = PhantomUdpListener::builder("127.0.0.1:0").bind().await?;
+ * let server_addr = listener.local_addr();
+ * let pinned_key = listener.verifying_key_bytes();
+ *
+ * // Accept in the background
+ * let listener = Arc::clone(&listener);
+ * tokio::spawn(async move {
+ * let outcome = listener.accept().await?;
+ * let session = outcome.session();
+ * let _req = session.recv().await?;
+ * session.send(b"hello, post-quantum world".to_vec()).await?;
+ * Ok::<_, phantom_protocol::CoreError>(())
+ * });
+ *
+ * // Connect a UDP client
+ * let port: u16 = server_addr.parse::<std::net::SocketAddr>().unwrap().port();
+ * let session = phantom_protocol::connect_pinned_udp(
+ * "127.0.0.1".into(), port, pinned_key,
+ * ).await?;
+ * session.await_ready().await?;
+ * session.send(b"ping".to_vec()).await?;
+ * let _reply = session.recv().await?;
+ * # Ok(())
+ * # }
+ * ```
  */
 open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
 {
@@ -2936,8 +3165,8 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
      * Accept the next peer-initiated stream.
      *
      * Blocks until the remote peer opens a new stream (one with an id ≥ 2 that
-     * we haven't seen yet). The returned [`PhantomStream`] is already registered
-     * in the session's demux and ready for `recv()` / `send_reliable()`.
+     * we haven't seen yet). The returned [`PhantomStream`](crate::api::stream::PhantomStream)
+     * is already registered in the session's demux and ready for `recv()` / `send_reliable()`.
      *
      * Returns `Err(CoreError::ConnectionClosed)` when the session has ended and no
      * further streams will arrive (the internal channel was dropped by the pump).
@@ -2968,6 +3197,47 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
         { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_u64(future) },
         // lift function
         { FfiConverterTypePhantomStream.lift(it) },
+        // Error FFI converter
+        CoreException.ErrorHandler,
+    )
+    }
+
+    
+    /**
+     * Wait until the session reaches `Connected` (handshake succeeded) or
+     * `Failed`/`Dead` (handshake or pump failure).
+     *
+     * Returns `Ok(())` on successful connection, or `Err(cause)` with the
+     * captured terminal error on failure. This is the preferred alternative
+     * to polling `connection_state()` in a loop.
+     *
+     * Because the readiness signal is carried on a `watch` channel, a call
+     * made *after* the handshake has already resolved (either direction)
+     * returns immediately — there is no lost-notification race.
+     *
+     * # Example
+     *
+     * ```rust,ignore
+     * session.await_ready().await?;   // returns Err(ServerIdentityMismatch) if key wrong
+     * session.send(b"hello".to_vec()).await?;
+     * ```
+     */
+    @Throws(CoreException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `awaitReady`() {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_await_ready(
+                uniffiHandle,
+                
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_void(future) },
+        // lift function
+        { Unit },
+        
         // Error FFI converter
         CoreException.ErrorHandler,
     )
@@ -3147,6 +3417,45 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
 
     
     /**
+     * Returns the terminal error from a failed handshake or a dead session,
+     * or `None` if the session has not failed (still connecting, connected, or
+     * cleanly closed).
+     *
+     * The error is written once by the background task immediately before the
+     * state transitions to `Failed` or `Dead`, so callers that read this after
+     * receiving `ConnectionState::Failed` from `connection_state()` or
+     * `Err(…)` from `await_ready()` always see the populated value.
+     *
+     * # Example
+     *
+     * ```rust,ignore
+     * let _ = session.await_ready().await;  // wait for outcome
+     * if let Some(e) = session.last_error().await {
+     * eprintln!("session failed: {e}");
+     * }
+     * ```
+     */
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `lastError`() : CoreException? {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_last_error(
+                uniffiHandle,
+                
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_phantom_protocol_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.ffi_phantom_protocol_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterOptionalTypeCoreError.lift(it) },
+        // Error FFI converter
+        UniffiNullRustCallStatusErrorHandler,
+    )
+    }
+
+    
+    /**
      * Flat snapshot of this session's connection metrics. For a client
      * session these are its own per-session counters; for a server-accepted
      * session they are the owning listener's aggregate (shared handle).
@@ -3179,6 +3488,13 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
      * re-handshake**. A failed rebind never tears the session down: it keeps running
      * on the existing socket (broken-rebind safety). `Err` here means only that the
      * session was already closed (the command channel is gone).
+     *
+     * **Transport requirement:** seamless migration (Wi-Fi ↔ LTE without
+     * re-handshake) requires the session to be backed by
+     * `UdpClientTransport`. Calling `migrate()` on a TCP, WebSocket, WASI,
+     * or Embedded session returns [`CoreError::Unsupported`]. Check
+     * [`supports_migration`](Self::supports_migration) first, or use
+     * `connect_pinned_udp` to ensure UDP backing.
      */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
@@ -3265,6 +3581,10 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
      * FFI surface still hands callers a `Vec<u8>`; if this is the last
      * refcount the Vec is moved out of the underlying buffer, otherwise
      * `Bytes::to_vec` copies.
+     *
+     * When the session is `Failed` or `Dead` and the recv channel has been
+     * dropped, returns the captured terminal error (if any) rather than the
+     * generic `"Session closed"` message.
      */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
@@ -3325,6 +3645,10 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
      *
      * - If the session is connected: sends immediately
      * - If still handshaking: queues the data for auto-flush later
+     * - If the session is `Failed` or `Dead`: returns the captured terminal
+     * error (from the handshake or the data pump) so the caller gets the
+     * *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
+     * than the generic `"Cannot send in state Failed"` message.
      */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
@@ -3402,6 +3726,28 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
         UniffiNullRustCallStatusErrorHandler,
     )
     }
+
+    
+    /**
+     * Whether this session's transport supports seamless connection migration
+     * (i.e., [`migrate`](Self::migrate) will succeed for UDP sessions).
+     *
+     * Returns `true` only when the session is backed by `UdpClientTransport`.
+     * On TCP, WebSocket, WASI, or Embedded sessions, [`migrate`](Self::migrate)
+     * returns [`CoreError::Unsupported`] — use reconnection with 0-RTT resumption
+     * instead.
+     */override fun `supportsMigration`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_supports_migration(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
 
     
     /**
@@ -4048,6 +4394,38 @@ public object FfiConverterTypePhantomStream: FfiConverter<PhantomStream, Long> {
 //
 
 
+/**
+ * UDP server listener — one bound `UdpSocket`, a central demux task routing
+ * datagrams by the 8-byte connection-ID into per-session channels, and a
+ * decoupled accept queue mirroring `PhantomListener`.
+ *
+ * Prefer this over the TCP `PhantomListener` when clients need seamless
+ * connection migration (`migrate()` returns `Err(Unsupported)` on TCP-backed
+ * sessions but performs a real path-switch on UDP-backed ones).
+ *
+ * # Example
+ *
+ * ```rust,no_run
+ * # #[tokio::main]
+ * # async fn main() -> Result<(), phantom_protocol::CoreError> {
+ * use std::sync::Arc;
+ * use phantom_protocol::api::PhantomUdpListener;
+ *
+ * let listener = PhantomUdpListener::builder("0.0.0.0:4242").bind().await?;
+ * let pinned_key = listener.verifying_key_bytes();   // share out-of-band
+ *
+ * loop {
+ * let outcome = Arc::clone(&listener).accept().await?;
+ * let session = outcome.session();
+ * tokio::spawn(async move {
+ * let _req = session.recv().await?;
+ * session.send(b"pong".to_vec()).await?;
+ * Ok::<_, phantom_protocol::CoreError>(())
+ * });
+ * }
+ * # }
+ * ```
+ */
 public interface PhantomUdpListenerInterface {
     
     /**
@@ -4097,6 +4475,38 @@ public interface PhantomUdpListenerInterface {
     companion object
 }
 
+/**
+ * UDP server listener — one bound `UdpSocket`, a central demux task routing
+ * datagrams by the 8-byte connection-ID into per-session channels, and a
+ * decoupled accept queue mirroring `PhantomListener`.
+ *
+ * Prefer this over the TCP `PhantomListener` when clients need seamless
+ * connection migration (`migrate()` returns `Err(Unsupported)` on TCP-backed
+ * sessions but performs a real path-switch on UDP-backed ones).
+ *
+ * # Example
+ *
+ * ```rust,no_run
+ * # #[tokio::main]
+ * # async fn main() -> Result<(), phantom_protocol::CoreError> {
+ * use std::sync::Arc;
+ * use phantom_protocol::api::PhantomUdpListener;
+ *
+ * let listener = PhantomUdpListener::builder("0.0.0.0:4242").bind().await?;
+ * let pinned_key = listener.verifying_key_bytes();   // share out-of-band
+ *
+ * loop {
+ * let outcome = Arc::clone(&listener).accept().await?;
+ * let session = outcome.session();
+ * tokio::spawn(async move {
+ * let _req = session.recv().await?;
+ * session.send(b"pong".to_vec()).await?;
+ * Ok::<_, phantom_protocol::CoreError>(())
+ * });
+ * }
+ * # }
+ * ```
+ */
 open class PhantomUdpListener: Disposable, AutoCloseable, PhantomUdpListenerInterface
 {
 
@@ -4555,6 +4965,10 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
  * - `session_cache_capacity` → `SessionCache` max entries (server-only; client ignores)
  * - `session_ticket_lifetime` → `SessionCache` ticket lifetime (server-only; client ignores)
  *
+ * **Note:** `session_cache_capacity` and `session_ticket_lifetime` are consumed only on the
+ * server path (`PhantomListener`); client `connect_*` entry points read only
+ * `keepalive_interval` and `session_timeout` from this struct.
+ *
  * Build via `mobile()` / `server()` / `iot()` / `default()` then mutate fields;
  * `#[non_exhaustive]` lets future tunables be added without a breaking change.
  */
@@ -4578,14 +4992,31 @@ data class PhantomConfig (
     var `sessionTimeout`: java.time.Duration
     , 
     /**
-     * Maximum 0-RTT resumption tickets the server keeps in memory (server-only; ignored by
-     * clients). Maps to `SessionCache` capacity; excess entries are evicted LRU.
+     * Maximum 0-RTT resumption tickets the server keeps in memory.
+     *
+     * **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`] (via
+     * `PhantomListener::bind_with_config_bytes` or equivalent). When a
+     * [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
+     * is silently ignored — the client does not own a session cache.
+     *
+     * Maps to [`SessionCache`] capacity; excess entries are evicted LRU.
+     *
+     * [`PhantomListener`]: crate::api::listener::PhantomListener
+     * [`SessionCache`]: crate::transport::session_cache::SessionCache
      */
     var `sessionCacheCapacity`: kotlin.UInt
     , 
     /**
-     * Server-side resumption-ticket lifetime (server-only; ignored by clients). Maps to
-     * `SessionCache` ticket lifetime.
+     * Lifetime of 0-RTT resumption tickets on the server.
+     *
+     * **SERVER-SIDE ONLY.** This field is consumed only by [`PhantomListener`]. When
+     * a [`PhantomConfig`] is passed to any `connect_*` client entry point, this field
+     * is silently ignored — the client does not own a session cache.
+     *
+     * Maps to [`SessionCache`] ticket lifetime.
+     *
+     * [`PhantomListener`]: crate::api::listener::PhantomListener
+     * [`SessionCache`]: crate::transport::session_cache::SessionCache
      */
     var `sessionTicketLifetime`: java.time.Duration
     
@@ -4843,6 +5274,22 @@ public object FfiConverterTypeConnectionState: FfiConverterRustBuffer<Connection
 
 /**
  * Universal Core Error Enum compatible with FFI exports
+ *
+ * # Retryability guide
+ *
+ * | Variant                  | Retryable? | Suggested action                              |
+ * |--------------------------|------------|-----------------------------------------------|
+ * | `NetworkError`           | Yes        | Retry with backoff                            |
+ * | `Timeout`                | Yes        | Retry with backoff                            |
+ * | `ConnectionClosed`       | Yes        | Reconnect                                     |
+ * | `ServerIdentityMismatch` | No         | Update pinned key or contact server admin     |
+ * | `ProtocolRejected`       | No         | Update client library to a compatible version |
+ * | `Unsupported`            | No         | Use the correct transport type                |
+ * | `HandshakeError`         | Maybe      | Check server logs; may be transient           |
+ * | `CryptoError`            | No         | Internal error; report bug                    |
+ * | `ValidationError`        | No         | Fix the input and retry                       |
+ * | `ConfigError`            | No         | Fix the configuration and retry               |
+ * | `FipsSelfTestFailure`    | No         | Fatal POST failure — binary is broken         |
  */
 sealed class CoreException: kotlin.Exception() {
     
@@ -4987,6 +5434,59 @@ sealed class CoreException: kotlin.Exception() {
             get() = "v1=${ v1 }"
     }
     
+    /**
+     * The server's signing key did not match the pinned key supplied by the
+     * caller. **Fatal — do not retry without updating the pinned key.**
+     *
+     * This is a distinct, typed variant rather than a string so callers can
+     * branch on it without fragile string matching:
+     *
+     * ```rust,ignore
+     * match session.await_ready().await {
+     * Err(CoreError::ServerIdentityMismatch) => { /* update pinned key */ }
+     * Err(e) => { /* other failure */ }
+     * Ok(()) => { /* connected */ }
+     * }
+     * ```
+     */
+    class ServerIdentityMismatch(
+        ) : CoreException() {
+        override val message
+            get() = ""
+    }
+    
+    /**
+     * The server explicitly rejected the connection — the client and server
+     * speak incompatible protocol versions or build variants (e.g., fips vs
+     * non-fips). **Fatal — do not retry with the same client binary.**
+     *
+     * The payload contains a human-readable diagnostic string (e.g., which
+     * versions were expected vs received).
+     */
+    class ProtocolRejected(
+        
+        val v1: kotlin.String
+        ) : CoreException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
+    /**
+     * The requested operation is not supported by this transport or
+     * configuration. For example, calling `migrate()` on a TCP-backed session
+     * (which does not support seamless migration) returns this variant.
+     *
+     * **Not retryable** — use the correct transport type (e.g.,
+     * `UdpClientTransport` for migration support).
+     */
+    class Unsupported(
+        
+        val v1: kotlin.String
+        ) : CoreException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
 
     
 
@@ -5047,6 +5547,13 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
                 FfiConverterString.read(buf),
                 )
             17 -> CoreException.CipherSuiteUnavailable(
+                FfiConverterString.read(buf),
+                )
+            18 -> CoreException.ServerIdentityMismatch()
+            19 -> CoreException.ProtocolRejected(
+                FfiConverterString.read(buf),
+                )
+            20 -> CoreException.Unsupported(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
@@ -5136,6 +5643,20 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
                 4UL
                 + FfiConverterString.allocationSize(value.v1)
             )
+            is CoreException.ServerIdentityMismatch -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+            is CoreException.ProtocolRejected -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
+            is CoreException.Unsupported -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
         }
     }
 
@@ -5219,6 +5740,20 @@ public object FfiConverterTypeCoreError : FfiConverterRustBuffer<CoreException> 
             }
             is CoreException.CipherSuiteUnavailable -> {
                 buf.putInt(17)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is CoreException.ServerIdentityMismatch -> {
+                buf.putInt(18)
+                Unit
+            }
+            is CoreException.ProtocolRejected -> {
+                buf.putInt(19)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is CoreException.Unsupported -> {
+                buf.putInt(20)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }
@@ -5433,6 +5968,38 @@ public object FfiConverterOptionalTypeTrafficShapingConfig: FfiConverterRustBuff
 
 
 
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeCoreError: FfiConverterRustBuffer<CoreException?> {
+    override fun read(buf: ByteBuffer): CoreException? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeCoreError.read(buf)
+    }
+
+    override fun allocationSize(value: CoreException?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeCoreError.allocationSize(value)
+        }
+    }
+
+    override fun write(value: CoreException?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeCoreError.write(value, buf)
+        }
+    }
+}
+
+
+
+
 
 
 
@@ -5447,6 +6014,9 @@ public object FfiConverterOptionalTypeTrafficShapingConfig: FfiConverterRustBuff
          * crosses the FFI boundary — persist it with restrictive permissions (0600) and wipe
          * the buffer when done. Load it back into a listener with
          * `bind_with_signing_key_bytes` / `bind_udp_with_signing_key_bytes`.
+         *
+         * For Rust embedders keeping the seed in memory, prefer [`generate_signing_key_secure`]
+         * which returns the bytes wrapped in `Zeroizing` for automatic clearing.
          */
     @Throws(CoreException::class) fun `generateSigningKey`(): kotlin.ByteArray {
             return FfiConverterByteArray.lift(
@@ -5475,6 +6045,37 @@ public object FfiConverterOptionalTypeTrafficShapingConfig: FfiConverterRustBuff
     }
     
 
+        /**
+         * Connect to a server over **TCP**, pinning its identity to `pinned_key`.
+         *
+         * Opens a `TcpSessionTransport`, parses the pinned [`HybridVerifyingKey`]
+         * from raw bytes (Security Invariant 1 — mandatory), and starts the
+         * background handshake + data pump.
+         *
+         * Use [`connect_pinned_udp`] instead when you need seamless
+         * connection migration (Wi-Fi ↔ LTE via [`PhantomSession::migrate`]).
+         * TCP sessions return [`CoreError::Unsupported`] from `migrate()`.
+         *
+         * Native-only (not available on `wasm32-unknown-unknown`); FFI-exported.
+         *
+         * # Example
+         *
+         * ```rust,no_run
+         * # #[tokio::main]
+         * # async fn main() -> Result<(), phantom_protocol::CoreError> {
+         * // `pinned_key` bytes come from `PhantomListener::verifying_key_bytes()`,
+         * // baked into the app bundle — never fetched at runtime.
+         * let pinned_key: Vec<u8> = vec![/* ... */];
+         * let session = phantom_protocol::connect_pinned(
+         * "phantom.example.com".into(), 4242, pinned_key,
+         * ).await?;
+         * session.await_ready().await?;
+         * session.send(b"hello".to_vec()).await?;
+         * let _reply = session.recv().await?;
+         * # Ok(())
+         * # }
+         * ```
+         */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `connectPinned`(`host`: kotlin.String, `port`: kotlin.UShort, `pinnedKey`: kotlin.ByteArray) : PhantomSession {
@@ -5497,9 +6098,10 @@ public object FfiConverterOptionalTypeTrafficShapingConfig: FfiConverterRustBuff
          * Unlike the TCP [`connect_pinned`], a session built here runs over
          * [`UdpClientTransport`](crate::api::udp_transport::UdpClientTransport), so
          * [`PhantomSession::migrate`] performs a real single-path connection migration
-         * (e.g. Wi-Fi ↔ LTE handover) instead of being a no-op, and liveness /
-         * `Migrating` / `Dead` transitions, path validation, and passive NAT-rebind
-         * recovery are all live for FFI consumers.
+         * (e.g. Wi-Fi ↔ LTE handover) instead of returning
+         * [`CoreError::Unsupported`], and liveness / `Migrating` / `Dead` transitions,
+         * path validation, and passive NAT-rebind recovery are all live for FFI
+         * consumers.
          *
          * `host` is resolved via the system resolver; the **first** returned address is
          * used. Unlike the TCP [`connect_pinned`] (whose `TcpStream::connect` tries every
@@ -5507,6 +6109,27 @@ public object FfiConverterOptionalTypeTrafficShapingConfig: FfiConverterRustBuff
          * if the first is unreachable — pass an IP literal or a single-family host when
          * that matters. Server-key pinning is mandatory (security invariant 1).
          * Native-only, like [`connect_pinned`].
+         *
+         * # Example
+         *
+         * ```rust,no_run
+         * # #[tokio::main]
+         * # async fn main() -> Result<(), phantom_protocol::CoreError> {
+         * // `pinned_key` bytes come from `PhantomUdpListener::verifying_key_bytes()`,
+         * // baked into the app bundle — never fetched at runtime.
+         * let pinned_key: Vec<u8> = vec![/* ... */];
+         * let session = phantom_protocol::connect_pinned_udp(
+         * "phantom.example.com".into(), 4242, pinned_key,
+         * ).await?;
+         * session.await_ready().await?;
+         * session.send(b"hello".to_vec()).await?;
+         * let _reply = session.recv().await?;
+         *
+         * // On a network change (iOS NWPathMonitor / Android NetworkCallback):
+         * session.migrate("0.0.0.0:0".into()).await?;  // rebind to new interface
+         * # Ok(())
+         * # }
+         * ```
          */
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
