@@ -155,10 +155,9 @@ async fn main() -> Result<()> {
     // `HandshakeServer` around our key — the listener's
     // `verifying_key_bytes()` is the SAME bytes we just logged from
     // disk, so we only need to surface one value to operators.
-    let listener =
-        PhantomListener::bind_with_signing_key(cfg.bind.to_string(), signing_key)
-            .await
-            .context("PhantomListener::bind_with_signing_key")?;
+    let listener = PhantomListener::bind_with_signing_key(cfg.bind.to_string(), signing_key)
+        .await
+        .context("PhantomListener::bind_with_signing_key")?;
     debug_assert_eq!(
         hex::encode(listener.verifying_key_bytes()),
         vk_hex,
