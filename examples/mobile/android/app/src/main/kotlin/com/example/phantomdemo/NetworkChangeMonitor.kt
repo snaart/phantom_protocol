@@ -14,11 +14,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * Over the TCP transport exposed by the `connectPinned` FFI surface, a TCP
  * socket cannot rebind its local address without reconnecting — and
- * `session.migrate()` is a no-op there. So when the OS hands the app a new
- * usable network we trigger a **reconnect-with-0-RTT** ([PhantomClient.reconnectUsingLastConfig]),
- * which opens a fresh session and folds the first request into the new
- * ClientHello as 0-RTT early-data. When the active network drops we surface
- * that so the UI can show the session entering MIGRATING.
+ * `session.migrate()` returns `Err(Unsupported)` on TCP. So when the OS hands
+ * the app a new usable network we trigger a **reconnect-with-0-RTT**
+ * ([PhantomClient.reconnectUsingLastConfig]), which opens a fresh session and
+ * folds the first request into the new ClientHello as 0-RTT early-data. For
+ * real in-place migration use `connectPinnedUdp`. When the active network drops
+ * we surface that so the UI can show the session entering MIGRATING.
  */
 class NetworkChangeMonitor(
     context: Context,

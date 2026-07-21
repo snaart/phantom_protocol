@@ -40,14 +40,14 @@ migration** (local-socket rebind + path validation, no re-handshake) — but **o
 a session built over the production PhantomUDP transport**, which **is** exposed
 through the FFI surface as `connectPinnedUdp` (+ `…WithResumption` / `…WithConfig`;
 server side `PhantomUdpListener.bindUdp`). On a **TCP** session (`connectPinned` /
-`connectPinnedWithResumption`, `TcpSessionTransport`) `migrate()` is a **no-op** that
-returns `Ok` without rebinding — TCP is connection-oriented and cannot move its local
-endpoint without a new connection.
+`connectPinnedWithResumption`, `TcpSessionTransport`) `migrate()` returns
+`Err(Unsupported)` — TCP is connection-oriented and cannot move its local endpoint
+without a new connection, so migration is rejected rather than silently skipped.
 
 These particular sample apps were built on the **TCP** path, so they demonstrate
 **reconnect-with-0-RTT resumption** on a Wi-Fi ↔ cellular handover (the working
-pattern for a TCP session) and keep a `migrate()` button behind a clearly-labelled
-"no-op over TCP" note. **For seamless single-socket migration, build the client over
+pattern for a TCP session). The `migrate()` demo button shows the error the TCP
+transport now returns. **For seamless single-socket migration, build the client over
 the UDP path (`connectPinnedUdp`) and call `migrate()` from the network-change
 callback** — see `docs/operations/mobile.md`.
 

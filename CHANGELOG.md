@@ -19,9 +19,10 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   - the `PhantomUdpListener` object — constructor `bind_udp` plus `accept`,
     `verifying_key_bytes`, `local_addr`, `shutdown`, and `is_shutting_down`.
   Over a `connect_pinned_udp` session the exported `migrate()` now performs a real
-  single-path connection migration (e.g. Wi-Fi ↔ LTE handover) instead of the no-op it
-  is over TCP, and liveness / `Migrating` / `Dead` transitions, path validation, and
-  passive NAT-rebind recovery are all live for FFI consumers.
+  single-path connection migration (e.g. Wi-Fi ↔ LTE handover); over a TCP session
+  (`connect_pinned`) it now returns `Err(Unsupported)` rather than silently succeeding.
+  Liveness / `Migrating` / `Dead` transitions, path validation, and passive NAT-rebind
+  recovery are all live for FFI consumers on the UDP path.
 - **FFI server identity.** `generate_signing_key()` and `verifying_key_from_signing_key(seed)`
   (free functions) plus the `PhantomListener::bind_with_signing_key_bytes` and
   `PhantomUdpListener::bind_udp_with_signing_key_bytes` constructors let a pure-FFI

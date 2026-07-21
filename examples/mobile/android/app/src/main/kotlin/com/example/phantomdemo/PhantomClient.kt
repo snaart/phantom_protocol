@@ -47,30 +47,29 @@ data class UiState(
  * connection-state poller, and the resumption-ticket lifecycle. All UI reads a
  * single [StateFlow] of [UiState].
  *
- * ## Mobile recovery model: reconnect-with-0-RTT, not migrate()
+ * ## Mobile recovery model: reconnect-with-0-RTT (TCP path in this app)
  *
- * The UniFFI surface this app talks to exposes only [connectPinned] /
- * [connectPinnedWithResumption], and BOTH establish the session over the TCP
- * transport (`TcpSessionTransport`). On the `SessionTransport` trait,
- * `migrate(localAddr)` has a default no-op implementation that simply returns
- * `Ok(())` for every transport EXCEPT the native UDP client — and the UDP
- * transport is NOT exposed through the FFI/UniFFI surface. So on this mobile
- * path, [PhantomSession.migrate] is a silent no-op: it reports success but does
- * NOT rebind the socket or perform any real path migration (TCP is
- * connection-oriented and cannot rebind its local address without
- * reconnecting).
+ * The UniFFI surface exposes BOTH TCP and UDP entry points. This app uses
+ * [connectPinned] / [connectPinnedWithResumption], which establish sessions over
+ * the TCP transport (`TcpSessionTransport`). On a TCP session,
+ * [PhantomSession.migrate] returns `Err(Unsupported)` — a TCP socket cannot
+ * rebind its local address without reconnecting, so migration is rejected rather
+ * than silently skipped.
  *
- * The genuinely-working mobile recovery pattern over the TCP FFI surface is
- * therefore **reconnect with 0-RTT resumption**: while a session is alive we
- * harvest a fresh [ResumptionHint], persist it, and on a network change (or on
- * an observed `MIGRATING`/`DEAD`/recv failure) we tear the old session down and
+ * For real seamless path migration use `connectPinnedUdp` /
+ * `connectPinnedUdpWithResumption` (now on the FFI surface): on a UDP session
+ * `migrate()` performs a real path rebind (path validation + connection-ID
+ * continuity, no re-handshake).
+ *
+ * Because this app uses TCP, network-change recovery is modelled as
+ * **reconnect with 0-RTT resumption**: while a session is alive we harvest a
+ * fresh [ResumptionHint], persist it, and on a network change (or on an
+ * observed `MIGRATING`/`DEAD`/recv failure) we tear the old session down and
  * open a brand-new session via [connectPinnedWithResumption], folding the first
  * request into the new ClientHello as 0-RTT early-data. See [reconnect].
  *
- * Seamless single-socket migration that retains keys + connection id does exist
- * on the native (Rust) UDP transport, but it is not yet on the FFI surface, so
- * this app cannot use it. The [migrate] method below is retained purely for
- * API-completeness and is documented as a no-op over TCP.
+ * The [migrate] method below is retained to demonstrate the API call and the
+ * `Unsupported` error it returns on TCP.
  *
  * Threading: every coroutine runs on [Dispatchers.IO] under one
  * [SupervisorJob], so a failure in (say) the recv loop cannot tear down the
@@ -315,17 +314,17 @@ class PhantomClient(
     }
 
     /**
-     * Demonstrates the `session.migrate(localAddr)` API for completeness.
+     * Demonstrates the `session.migrate(localAddr)` API.
      *
-     * IMPORTANT: over the TCP transport exposed by [connectPinned] /
-     * [connectPinnedWithResumption], `migrate()` is a **no-op** — it returns
-     * success but does NOT rebind the socket or move the path. Real seamless
-     * path migration requires the native UDP transport, which is not yet on the
-     * FFI surface. On a real network change this app reconnects with 0-RTT (see
-     * [reconnect]) rather than relying on this call.
+     * Over the TCP transport exposed by [connectPinned] /
+     * [connectPinnedWithResumption], `migrate()` returns `Err(Unsupported)` —
+     * a TCP socket cannot rebind its local address without reconnecting.
+     * For real seamless path migration use `connectPinnedUdp` (now on the FFI
+     * surface); on a UDP session `migrate()` performs a real path rebind.
+     * On a real network change this app reconnects with 0-RTT instead (see
+     * [reconnect]).
      *
-     * [localAddr] is the *local* bind address the native UDP client would use;
-     * "0.0.0.0:0" lets the OS pick an ephemeral port. It is ignored on TCP.
+     * [localAddr] is the local bind address ("0.0.0.0:0" = OS-chosen port).
      */
     suspend fun migrate(localAddr: String = "0.0.0.0:0") {
         val active = sessionMutex.withLock { session }
@@ -336,16 +335,18 @@ class PhantomClient(
         appendSystem("Calling session.migrate($localAddr)…")
         try {
             active.migrate(localAddr)
+            // Unexpected success on a TCP session — report it.
+            appendSystem(
+                "migrate() returned success (unexpected on TCP). " +
+                    "Use connectPinnedUdp for real seamless path migration.",
+            )
         } catch (e: CoreException) {
-            appendSystem("migrate() returned an error: ${describe(e)}")
-            return
+            // Expected: TCP migrate() returns Unsupported.
+            appendSystem(
+                "migrate() returned an error (expected on TCP): ${describe(e)}. " +
+                    "Use connectPinnedUdp for real seamless path migration.",
+            )
         }
-        appendSystem(
-            "migrate() is a no-op over the TCP transport exposed by connectPinned; " +
-                "real path migration requires the native UDP transport, which is not yet " +
-                "on the FFI surface. On a real network change this app reconnects with " +
-                "0-RTT instead.",
-        )
     }
 
     /** Graceful shutdown: persist a final ticket, close the session, stop loops. */
@@ -383,7 +384,8 @@ class PhantomClient(
                     // recv() failed while we still meant to be connected. Over
                     // the TCP FFI path this usually means the underlying socket
                     // died on a network change — recover by reconnecting with
-                    // 0-RTT rather than by migrate() (which is a TCP no-op).
+                    // 0-RTT (TCP migrate() returns Unsupported, so reconnect
+                    // is the working pattern for this app).
                     appendSystem("Receive loop ended: ${describe(e)}")
                     triggerReconnect("recv() failed — ${describe(e)}")
                     break
@@ -451,9 +453,9 @@ class PhantomClient(
 
         when (current) {
             ConnectionState.MIGRATING -> {
-                // The active path went silent. We surface MIGRATING in the UI,
-                // but the recovery action over the TCP FFI surface is a
-                // reconnect-with-0-RTT (migrate() is a no-op on TCP).
+                // The active path went silent. We surface MIGRATING in the UI.
+                // On the TCP FFI path the recovery action is reconnect-with-0-RTT
+                // (TCP migrate() returns Unsupported, so reconnect is the pattern).
                 appendSystem("Active path went silent — recovering with a 0-RTT reconnect.")
                 triggerReconnect("path went silent (MIGRATING)")
             }

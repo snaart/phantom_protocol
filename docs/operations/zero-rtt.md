@@ -8,7 +8,8 @@
 
 Phantom Protocol supports TLS-1.3-style **0-RTT**: a resuming client can fold an encrypted
 `early_data` payload into its `ClientHello`, so the server processes it before the handshake
-finishes (`connect_with_resumption` / `connect_pinned_with_resumption`). This saves a
+finishes (Rust builder: `PhantomSession::builder(addr).resumption(...).connect()`; FFI:
+`connect_pinned_with_resumption` / `connect_pinned_udp_with_resumption`). This saves a
 round-trip, but — like every 0-RTT design — the early-data is **replayable**: an on-path
 attacker who captures the resuming `ClientHello` can resend it, and a server that has not
 recorded the ticket as already-used will process the early-data a second time.

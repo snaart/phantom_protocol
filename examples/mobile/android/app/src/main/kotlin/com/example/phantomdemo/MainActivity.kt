@@ -104,8 +104,9 @@ class PhantomViewModel(app: android.app.Application) : AndroidViewModel(app) {
     /**
      * Recover from a (simulated) network change the way this app does in
      * production over the TCP FFI surface: tear the session down and open a
-     * fresh one with 0-RTT resumption. This is the genuinely-working pattern —
-     * unlike [migrate], which is a no-op over TCP.
+     * fresh one with 0-RTT resumption. This is the genuinely-working pattern
+     * for TCP — unlike [migrate], which returns Unsupported on TCP (use
+     * connectPinnedUdp for real seamless migration).
      */
     fun reconnect() {
         viewModelScope.launch {
@@ -115,9 +116,9 @@ class PhantomViewModel(app: android.app.Application) : AndroidViewModel(app) {
 
     /**
      * Calls the `session.migrate(...)` API for demonstration. Over the TCP
-     * transport exposed by `connectPinned` this is a no-op (it returns success
-     * but does not move the path); the client surfaces that plainly as a system
-     * message. Kept for API-completeness only.
+     * transport exposed by `connectPinned` this returns Err(Unsupported);
+     * the client surfaces the error as a system message. For real seamless
+     * migration use `connectPinnedUdp`.
      */
     fun migrate() {
         viewModelScope.launch { client.migrate("0.0.0.0:0") }
@@ -182,12 +183,12 @@ fun ChatScreen(vm: PhantomViewModel) {
                     enabled = ui.connected,
                 ) { Text("Reconnect (0-RTT)") }
 
-                // Demonstrates the migrate() API. It is a no-op over TCP — the
-                // client appends a system message saying so.
+                // Demonstrates the migrate() API. It returns Unsupported over
+                // TCP — the client appends the error as a system message.
                 OutlinedButton(
                     onClick = { vm.migrate() },
                     enabled = ui.connected,
-                ) { Text("Call migrate() API (no-op over TCP)") }
+                ) { Text("Call migrate() API (TCP → Unsupported)") }
             }
 
             // Message list.

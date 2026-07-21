@@ -938,12 +938,19 @@ connect's early-data — the standard TLS-1.3-style 0-RTT gap. The
 hybrid KEM (X25519 + ML-KEM-768, or ECDH-P-256 + ML-KEM-768 under fips)
 regardless of the 0-RTT path.
 
-**API surface.** Client: `PhantomSession::connect_with_resumption(addr,
-transport, expected_server_key, resumption_hint, early_data)` (Rust) /
-`connect_pinned_with_resumption` (native FFI); the `resumption_hint` tuple comes
-from a prior session's `resumption_hint().await -> Option<(session_id,
-resumption_secret)>` (each field 32 bytes). Server: `PhantomListener::accept()`
-returns `Arc<AcceptOutcome>` (`api/listener.rs`):
+**API surface.** Client (Rust):
+```rust
+PhantomSession::builder(addr)
+    .pinned_key(expected_server_key)
+    .resumption(resumption_hint, early_data)
+    .transport(transport)
+    .connect()
+    .await?
+```
+Client (native FFI): `connect_pinned_with_resumption` / `connect_pinned_udp_with_resumption`.
+The `resumption_hint` comes from a prior session's
+`resumption_hint().await -> Option<ResumptionHint>` (each field 32 bytes).
+Server: `PhantomListener::accept()` returns `Arc<AcceptOutcome>` (`api/listener.rs`):
 
 ```rust
 let outcome = listener.accept().await?;

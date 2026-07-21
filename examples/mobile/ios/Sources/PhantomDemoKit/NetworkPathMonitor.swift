@@ -3,9 +3,9 @@
 // NetworkPathMonitor — a thin wrapper over Network.framework's NWPathMonitor
 // that reports the active interface type and fires a callback whenever the path
 // changes (e.g. Wi-Fi <-> cellular). The ViewModel uses this to drive a
-// reconnect-with-0-RTT on an interface switch. (It does NOT migrate the live
-// socket: the FFI surface rides TCP, where `migrate()` is a no-op — see
-// PhantomChatViewModel's file header.)
+// reconnect-with-0-RTT on an interface switch. (This sample uses the TCP
+// transport, where `migrate()` returns Unsupported — see PhantomChatViewModel's
+// file header. For real seamless migration use connectPinnedUdp.)
 
 import Foundation
 import Network
