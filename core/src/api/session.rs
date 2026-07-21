@@ -658,6 +658,7 @@ impl PhantomSession {
             incoming_stream_tx,
             terminal_error,
             ready_tx,
+            migration_capable,
         )));
 
         session
@@ -809,7 +810,17 @@ impl PhantomSession {
         // Terminal-error capture + readiness signal
         terminal_error: Arc<parking_lot::Mutex<Option<CoreError>>>,
         ready_tx: Arc<watch::Sender<u8>>,
+        // True when the transport supports connection migration (UDP); used to
+        // label the handshake metric and ObservedTransport with the correct leg.
+        migration_capable: bool,
     ) {
+        // Derive the leg label once from migration_capable so every metric
+        // and ObservedTransport inside this task uses the right leg type.
+        let leg = if migration_capable {
+            LegType::Udp
+        } else {
+            LegType::Tcp
+        };
         // DEBUG: the peer address is correlatable; keep it off default logs.
         log::debug!("PhantomSession: starting handshake with {}", peer);
 
@@ -872,7 +883,7 @@ impl PhantomSession {
                 observability.record_handshake(
                     handshake_started.elapsed(),
                     HandshakeOutcome::Failure,
-                    LegType::Tcp,
+                    leg,
                     AeadAlgorithm::Aes256Gcm,
                     ProtocolVersion::Current,
                 );
@@ -891,7 +902,7 @@ impl PhantomSession {
         observability.record_handshake(
             handshake_started.elapsed(),
             HandshakeOutcome::Success,
-            LegType::Tcp,
+            leg,
             AeadAlgorithm::Aes256Gcm,
             ProtocolVersion::Current,
         );
@@ -939,10 +950,8 @@ impl PhantomSession {
         log::debug!("PhantomSession: fully connected to {}", peer);
 
         // Wrap the (post-handshake) transport so every data-plane send/recv is
-        // recorded. The generic client path can ride any `SessionTransport`, but
-        // the observability leg label is not threaded through `connect_with_*`,
-        // so it is fixed to TCP here (the only metric this skews is the per-leg
-        // packet/byte slice; the totals are correct).
+        // recorded. `leg` (derived from `migration_capable` at task entry) correctly
+        // labels UDP sessions as Udp and TCP sessions as Tcp.
         // WIRE-001: the handshake is done — raise the frame cap from the tight
         // unauthenticated handshake limit to the steady-state application limit.
         transport.set_frame_phase(FramePhase::Established);
@@ -953,7 +962,7 @@ impl PhantomSession {
         let observed = Arc::new(ObservedTransport::new(
             transport,
             observability.clone(),
-            LegType::Tcp,
+            leg,
         ));
         run_data_pump(
             crypto_session,
@@ -967,7 +976,7 @@ impl PhantomSession {
             streams,
             runtime,
             observability,
-            LegType::Tcp,
+            leg,
             cmd_tx_for_stream,
             incoming_stream_tx,
         )
