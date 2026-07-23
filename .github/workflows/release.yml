@@ -32,7 +32,7 @@ concurrency:
 jobs:
   # ── SemVer hygiene ────────────────────────────────────────────────
   # `cargo-semver-checks` compares the current branch's public surface
-  # against the latest published version of `phantom_protocol` on crates.io.
+  # against the latest published version of `phantom-protocol` on crates.io.
   # Failures here mean the PR introduces a breaking change that would
   # require a major-version bump. Run on PRs only; tag pushes are
   # post-bump and so are expected to legitimately change the API.
@@ -51,10 +51,10 @@ jobs:
         with:
           workspaces: "."
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
-        # The crate is not yet published to crates.io, so there is no baseline
-        # to diff the public API against — the action errors with "not found in
-        # registry". Keep the check visible but non-blocking during pre-1.0
-        # iteration; it becomes a hard gate once the first version ships.
+        # A crates.io baseline now exists (0.2.x is published), so this check is
+        # meaningful. It stays non-blocking during pre-1.0 iteration — the 0.x
+        # line breaks the Rust API deliberately while the FFI shims stay stable.
+        # Promote it to a hard gate at 1.0.
         continue-on-error: true
         with:
           manifest-path: core/Cargo.toml
@@ -77,8 +77,8 @@ jobs:
       - run: cargo publish --manifest-path core/Cargo.toml --dry-run --allow-dirty
 
   # ── Build release artifacts ───────────────────────────────────────
-  # Produces a tarball with the static library + license, plus a
-  # sigstore-backed in-toto v1 SLSA build-provenance statement
+  # Produces a tarball with the library artifacts (.rlib + cdylib) + license,
+  # plus a sigstore-backed in-toto v1 SLSA build-provenance statement
   # (.intoto.jsonl) per artifact — verifiable with:
   #   gh attestation verify --owner <org> <artifact>
   #   cosign verify-blob-attestation <artifact>
@@ -125,10 +125,19 @@ jobs:
           mkdir -p dist
           NAME="phantom_protocol-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "dist/${NAME}"
-          # The crate is a library — ship the .rlib + headers + license.
-          # For dynamic library variants this would also copy .so/.dylib;
-          # phantom_protocol is statically linked, so .rlib is sufficient.
-          cp core/target/${{ matrix.target }}/release/*.rlib "dist/${NAME}/" 2>/dev/null || true
+          # crate-type = ["lib", "cdylib"] — ship the .rlib (Rust consumers) AND
+          # the cdylib (.so on Linux, .dylib on macOS), which is what every
+          # UniFFI / C consumer links against. `core` is the root workspace's
+          # only member, so cargo's target dir is the repo-root `target/`, not
+          # `core/target/`. No `|| true` on the library copies: a missing library
+          # must fail the release loudly rather than ship an empty tarball.
+          LIBDIR="target/${{ matrix.target }}/release"
+          cp "${LIBDIR}/libphantom_protocol.rlib" "dist/${NAME}/"
+          if [ -f "${LIBDIR}/libphantom_protocol.so" ]; then
+            cp "${LIBDIR}/libphantom_protocol.so" "dist/${NAME}/"
+          else
+            cp "${LIBDIR}/libphantom_protocol.dylib" "dist/${NAME}/"
+          fi
           cp LICENSE "dist/${NAME}/" 2>/dev/null || true
           cp README.md "dist/${NAME}/" 2>/dev/null || true
           tar -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
