@@ -56,6 +56,15 @@ spec:
               containerPort: {{ .Values.service.port }}
               protocol: TCP
           env:
+            # Server config (see server/src/config.rs): PHANTOM_BIND is a full
+            # SocketAddr, and PHANTOM_SIGNING_KEY_FILE must point at the mounted
+            # Secret — the rootfs is read-only, so the binary's default
+            # /etc/phantom-server/signing.key could not be created, and every
+            # pod would otherwise mint a fresh identity and break client pinning.
+            - name: PHANTOM_BIND
+              value: "0.0.0.0:{{ .Values.service.port }}"
+            - name: PHANTOM_SIGNING_KEY_FILE
+              value: {{ printf "%s/%s" .Values.signingKey.mountPath .Values.signingKey.fileName | quote }}
             # OTLP push config (telemetry section). The server reads these env
             # vars; an empty otlpEndpoint leaves the exporter uninstalled.
             {{- with .Values.telemetry }}
@@ -105,7 +114,8 @@ spec:
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           volumeMounts:
-            # Signing key mounted read-only; path must match what the server binary reads.
+            # Signing key mounted read-only; PHANTOM_SIGNING_KEY_FILE above is
+            # rendered from these same values, so the paths always match.
             - name: signing-key
               mountPath: {{ .Values.signingKey.mountPath }}
               readOnly: true

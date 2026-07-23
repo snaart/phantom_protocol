@@ -1,8 +1,11 @@
 # Kubernetes deployment
 
 Reference Kubernetes manifests and configuration patterns for running a Phantom Protocol server
-binary on a Kubernetes cluster. Phantom Protocol is a library; manifests assume a wrapper binary
-(`server-bin`) calling `PhantomListener::bind` and `accept`.
+on a Kubernetes cluster. The manifests below target the in-tree reference binary `phantom-server`
+(the `server/` crate, built by the repo-root `Dockerfile`), so its flags and `PHANTOM_*` / `OTEL_*`
+environment variables are what they configure. Embedders shipping their own binary around
+`PhantomListener::bind` / `accept` can reuse the same shapes with their own configuration surface.
+A packaged chart with these manifests ships at `docs/operations/helm/phantom-protocol/`.
 
 ## Deployment vs StatefulSet
 
@@ -57,10 +60,18 @@ spec:
             capabilities: {drop: ["ALL"]}
           env:
             - {name: RUST_LOG, value: "info,phantom_protocol=info"}
+            # PHANTOM_BIND is a full SocketAddr; PHANTOM_SIGNING_KEY_FILE must point at the
+            # mounted Secret — the rootfs is read-only, so the binary's default
+            # /etc/phantom-server/signing.key cannot be created, and without it every pod
+            # would mint a fresh identity and break client pinning.
+            - {name: PHANTOM_BIND,             value: "0.0.0.0:4242"}
+            - {name: PHANTOM_SIGNING_KEY_FILE, value: "/etc/phantom/keys/signing_key.bin"}
             # phantom-server pushes OTLP/gRPC to an OpenTelemetry Collector; it opens no metrics port.
             - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.monitoring.svc:4317"}
             - {name: OTEL_SERVICE_NAME,           value: "phantom-protocol"}
-            - {name: OTEL_TRACES_SAMPLER_ARG,     value: "0.1"}   # head-sampling ratio
+            # Head-sampling ratio for root spans; effective on its own (no OTEL_TRACES_SAMPLER
+            # needed). Server default is 1.0 = export everything.
+            - {name: OTEL_TRACES_SAMPLER_ARG,     value: "0.1"}
           volumeMounts:
             - {name: signing-key, mountPath: /etc/phantom/keys, readOnly: true}
             - {name: tmp,         mountPath: /tmp}

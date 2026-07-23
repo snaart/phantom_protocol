@@ -9,14 +9,16 @@ data:
   # Non-secret server configuration. Keep sensitive values (keys, tokens) out
   # of ConfigMaps — use Secrets or external-secrets-operator instead.
   #
-  # The Phantom Protocol library is configured entirely via the server binary's
-  # environment and the signing key Secret. Extend this ConfigMap if your
-  # wrapper binary reads a config file.
+  # `phantom-server` is configured entirely from its environment plus the
+  # signing key Secret; the authoritative env-var names are in
+  # server/src/config.rs. The Deployment already sets PHANTOM_BIND and
+  # PHANTOM_SIGNING_KEY_FILE on the container directly, so this ConfigMap is a
+  # reference copy — wire it with `envFrom` only if you drop those inline
+  # entries. Extend it if your own wrapper binary reads more configuration.
   #
-  # Example:
-  #   PHANTOM_BIND_ADDR: "0.0.0.0:{{ .Values.service.port }}"
-  PHANTOM_BIND_PORT: {{ .Values.service.port | quote }}
+  # PHANTOM_BIND is a full SocketAddr, not a bare port.
+  PHANTOM_BIND: "0.0.0.0:{{ .Values.service.port }}"
   # Telemetry is pushed over OTLP/gRPC to a Collector — there is no inbound
   # metrics port. The OTEL_* push config is rendered into the Deployment's
   # container env from the `telemetry` values block, not from this ConfigMap.
-  PHANTOM_SIGNING_KEY_PATH: {{ printf "%s/%s" .Values.signingKey.mountPath .Values.signingKey.fileName | quote }}
+  PHANTOM_SIGNING_KEY_FILE: {{ printf "%s/%s" .Values.signingKey.mountPath .Values.signingKey.fileName | quote }}

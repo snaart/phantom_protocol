@@ -159,7 +159,12 @@ signingKey:
 # ---------------------------------------------------------------------------
 # Environment variables passed to the container
 # ---------------------------------------------------------------------------
-# Override RUST_LOG or add PHANTOM_BIND_PORT etc. as required by your wrapper binary.
+# Override RUST_LOG, or add PHANTOM_MAX_SESSIONS / PHANTOM_MAX_SESSIONS_PER_IP /
+# PHANTOM_LOG_JSON as required — see server/src/config.rs and .env.example.
+# PHANTOM_BIND (a full SocketAddr, e.g. "0.0.0.0:4242") and
+# PHANTOM_SIGNING_KEY_FILE are rendered by the Deployment from `service.port`
+# and the `signingKey` block; override those values rather than duplicating the
+# env vars here.
 # Telemetry is configured separately via the `telemetry` section below, which the
 # chart renders into OTEL_* env vars on the container.
 env:
