@@ -224,7 +224,7 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # deliberate wire change, paired with a vector regeneration.
 borsh = { version = "=1.7.0", default-features = false, optional = true, features = ["derive"] }
 hex = { version = "0.4", default-features = false, optional = true, features = ["alloc"] }
-base64 = { version = "0.22", default-features = false, optional = true, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, optional = true, features = ["alloc"] }
 anyhow = { version = "1", optional = true }
 thiserror = { version = "2", optional = true }
 log = { version = "0.4", optional = true }
