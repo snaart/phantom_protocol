@@ -9,13 +9,18 @@
  *                            ->  connection_state()      (sync accessor)
  *                            ->  free_phantomsession
  *
- * This is NOT a handshake test — `connect` is the pre-handshake placeholder
- * constructor. A real encrypted round-trip lives in tests/run_test.py and
- * the Swift / Kotlin loopback harnesses.
+ * This is NOT a handshake test — `connect` opens no transport and runs no
+ * handshake; it constructs the session straight into `ConnectionState::Failed`
+ * so the misuse is observable. A real encrypted round-trip lives in
+ * tests/run_test.py and the Swift / Kotlin loopback harnesses; the pinned
+ * client entry points are the `connect_pinned*` free functions.
  *
- * Build (see c/README.md):
- *   cc -I tests/bindings/c -L target/release -lphantom_protocol \
- *      tests/bindings/c/consumer_smoke.c -o consumer_smoke
+ * Build (see c/README.md). The source must precede `-lphantom_protocol`:
+ * GNU ld resolves symbols left-to-right and discards a library's symbols if
+ * nothing seen so far needs them, so putting the library first reports every
+ * `uniffi_phantom_protocol_*` reference as undefined.
+ *   cc -I tests/bindings/c tests/bindings/c/consumer_smoke.c \
+ *      -L target/release -lphantom_protocol -o consumer_smoke
  */
 
 #include <stdint.h>
