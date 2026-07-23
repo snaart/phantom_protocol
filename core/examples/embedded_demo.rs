@@ -145,6 +145,12 @@ impl Write for MockWriter {
         self.notify.notify_waiters();
         Ok(data.len())
     }
+
+    async fn flush(&mut self) -> Result<(), Infallible> {
+        // `write` pushes straight into the shared in-memory pipe under the
+        // lock, so nothing is ever buffered on this side — flush is a no-op.
+        Ok(())
+    }
 }
 
 // `SessionTransport` for the demo leg. The `impl_embedded_session_transport!`
