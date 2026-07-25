@@ -323,7 +323,8 @@ dashmap = { version = "6.1.0", optional = true }
 # link-time `critical-section` impl). The crate MSRV is now 1.93, so the prior
 # `async-lock < 3.4` cap (held only for the old 1.75 MSRV — 3.4 needs 1.85) is
 # dropped. `embedded-io-async` is at 0.7 (was 0.6): the 0.7 bump made
-# `Write::flush` a required method, which only touched the test mock writers.
+# `Write::flush` a required method — every in-tree `impl Write` (unit-test mocks
+# *and* `core/examples/embedded_demo.rs`) must define it.
 embedded-io-async = { version = "0.7", optional = true }
 async-lock = { version = ">=3, <4", optional = true, default-features = false }
 
@@ -484,4 +485,25 @@ required-features = ["classical-crypto"]
 
 [lib]
 name = "phantom_protocol"
+# `lib`       — the rlib every Rust consumer (cli/, server/, benches) links.
+# `cdylib`    — the UniFFI delivery vehicle: libphantom_protocol.{so,dylib,dll},
+#               loaded by the Python / Kotlin / C bindings.
+#
+# `staticlib` is deliberately NOT listed. The iOS XCFramework flow does need a
+# `libphantom_protocol.a`, but a `staticlib` is a *final* artifact, so adding it
+# here makes cargo demand a `#[panic_handler]` and a `#[global_allocator]` on
+# bare-metal targets — which this library does not (and must not) provide, since
+# the embedder supplies them. It breaks the `thumbv7em-none-eabihf` row of
+# cross.yml outright:
+#
+#     error: no global memory allocator found but one is required
+#     error: `#[panic_handler]` function required, but not found
+#
+# The archive is therefore produced on demand, per target, without perturbing
+# the manifest or any other build:
+#
+#     cargo rustc --manifest-path core/Cargo.toml --release \
+#         --target aarch64-apple-ios --crate-type staticlib
+#
+# That is what `tests/bindings/swift/build-xcframework.sh` runs.
 crate-type = ["lib", "cdylib"]

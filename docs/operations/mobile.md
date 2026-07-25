@@ -5,13 +5,21 @@ apps via UniFFI bindings.
 
 ## iOS (Swift)
 
-**Build setup.** Compile three slices then assemble an XCFramework:
+**Build setup.** Compile three slices then assemble an XCFramework.
+
+> **Why `cargo rustc --crate-type staticlib`.** `core`'s `[lib] crate-type` is
+> `["lib", "cdylib"]`, so a plain `cargo build` emits no `.a` and `lipo` would
+> have no input. `"staticlib"` is not added to the manifest on purpose: a
+> staticlib is a *final* artifact, so declaring it crate-wide makes cargo demand
+> a `#[panic_handler]` and a `#[global_allocator]` from the library on bare-metal
+> targets and breaks the `thumbv7em-none-eabihf` row of `cross.yml`. Requesting
+> it per invocation produces the same archive and leaves every other build alone.
 
 ```sh
 # Device (arm64), Apple Silicon simulator, Intel simulator
-cargo build --release --target aarch64-apple-ios        --manifest-path core/Cargo.toml
-cargo build --release --target aarch64-apple-ios-sim    --manifest-path core/Cargo.toml
-cargo build --release --target x86_64-apple-ios         --manifest-path core/Cargo.toml
+cargo rustc --release --target aarch64-apple-ios     --manifest-path core/Cargo.toml --crate-type staticlib
+cargo rustc --release --target aarch64-apple-ios-sim --manifest-path core/Cargo.toml --crate-type staticlib
+cargo rustc --release --target x86_64-apple-ios      --manifest-path core/Cargo.toml --crate-type staticlib
 
 # Merge simulator slices; then build the XCFramework
 lipo -create \
@@ -241,9 +249,11 @@ Internally: parses `pinned_key: Vec<u8>` into a `HybridVerifyingKey`,
 opens a `TcpSessionTransport` via `tokio::net::TcpStream::connect`, and
 delegates to `PhantomSession::connect_with_transport` — Security
 Invariant 1 (server pinning) is enforced unconditionally. Available
-in all four binding languages (Swift, Kotlin, Python, C). The
-placeholder `connect(addr)` is still on the surface as the unpinned
-back-compat path — do NOT use it in production.
+in all four binding languages (Swift, Kotlin, Python, C). The legacy
+`connect(addr)` constructor is **inert**: it opens no transport, runs no
+handshake, and returns a session already in `ConnectionState::Failed`, so
+every `send`/`recv` on it errors immediately. Use `connectPinned` /
+`connectPinnedUdp` (or the Rust `PhantomSession::builder`) instead.
 
 **Resumption secret access.** Keychain / EncryptedSharedPreferences secrets are
 accessible to apps sharing the same team ID (iOS) or user ID (Android). Assess

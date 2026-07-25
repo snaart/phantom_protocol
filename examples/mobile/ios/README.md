@@ -41,6 +41,15 @@ You need a macOS host with Xcode and the iOS Rust targets:
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 ```
 
+> **Note:** `core/Cargo.toml` declares `crate-type = ["lib", "cdylib"]`, so a
+> plain `cargo build` emits `libphantom_protocol.dylib` + `.rlib` but no
+> `libphantom_protocol.a`. The iOS slices are therefore built with
+> `cargo rustc … --crate-type staticlib`, which requests the archive per
+> invocation. It is kept out of the manifest deliberately: a staticlib is a final
+> artifact, so a crate-wide declaration makes cargo require a `#[panic_handler]`
+> and a `#[global_allocator]` from the library and breaks the bare-metal
+> `thumbv7em-none-eabihf` build. `build-xcframework.sh` already does this.
+
 The repository ships a ready-made script that compiles the three iOS slices,
 `lipo`s the simulator slices together, and assembles the XCFramework with the
 UniFFI C headers bundled:
@@ -53,10 +62,11 @@ UniFFI C headers bundled:
 Equivalently, by hand:
 
 ```sh
-# Device (arm64), Apple-silicon simulator, Intel simulator
-cargo build --release --target aarch64-apple-ios     --manifest-path core/Cargo.toml
-cargo build --release --target aarch64-apple-ios-sim --manifest-path core/Cargo.toml
-cargo build --release --target x86_64-apple-ios      --manifest-path core/Cargo.toml
+# Device (arm64), Apple-silicon simulator, Intel simulator.
+# `cargo rustc --crate-type staticlib` is what produces the .a — see the note above.
+cargo rustc --release --target aarch64-apple-ios     --manifest-path core/Cargo.toml --crate-type staticlib
+cargo rustc --release --target aarch64-apple-ios-sim --manifest-path core/Cargo.toml --crate-type staticlib
+cargo rustc --release --target x86_64-apple-ios      --manifest-path core/Cargo.toml --crate-type staticlib
 
 # Merge the two simulator slices into one fat library
 mkdir -p target/universal-ios-sim/release
