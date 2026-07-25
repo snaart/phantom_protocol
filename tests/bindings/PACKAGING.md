@@ -106,7 +106,9 @@ rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-and
 ./build-jnilibs.sh             # cross-compiles + stages jniLibs/{arm64-v8a,armeabi-v7a,x86_64}
 ../generate_kotlin.sh          # regenerates uniffi/phantom_protocol/phantom_protocol.kt
 gradle :assembleRelease        # produces build/outputs/aar/phantom_protocol-release.aar
-gradle :publishToMavenLocal    # or :publish to push to your Maven repo
+# NOTE: publishing is not wired up — build.gradle.kts applies neither the
+# `maven-publish` plugin nor a `version =`, so `:publishToMavenLocal` /
+# `:publish` do not exist as tasks. Add both before publishing to Maven.
 ```
 
 The Android NDK setup is the load-bearing prerequisite — the Gradle
@@ -135,11 +137,16 @@ to a GitHub Release.
 
 `phantom-protocol` is at version **0.2.2** — every binding artifact carries the
 same version. The `core/Cargo.toml` version is the single source of truth;
-when it bumps, update each binding's manifest in lock step:
+when it bumps, update every version-locked manifest in lock step:
 
-- `tests/bindings/pyproject.toml` (`version = ...`)
-- `tests/bindings/c/phantom_protocol.pc.in` (`Version: ...`)
-- `tests/bindings/c/package.sh` (`VERSION=...`)
+- `tests/bindings/pyproject.toml` (`version = ...`) — enforced by `check_versions.sh`
+- `python/pyproject.toml` (`version = ...`) — the maturin/PyPI manifest;
+  enforced by `check_versions.sh`
+- `tests/bindings/c/phantom_protocol.pc.in` (`Version: ...`) — enforced by `check_versions.sh`
+- `server/Cargo.toml` (`version = ...`) — enforced by `check_versions.sh`
+- `cli/Cargo.toml` (`version = ...`) — enforced by `check_versions.sh`
+- `tests/bindings/c/package.sh` (`VERSION=...`) — **not** enforced by
+  `check_versions.sh`; bump it by hand.
 - `tests/bindings/swift/Package.swift` — no version field, but git-tag
   the release at the same SemVer.
 - `tests/bindings/kotlin/build.gradle.kts` — add a `version =` if you

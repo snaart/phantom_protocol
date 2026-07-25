@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Drift-check: every published binding manifest must report the same
-# version as the source-of-truth `core/Cargo.toml`. Catches release-time
-# version skew before it ships to PyPI / a pkg-config consumer / Cargo.
+# Drift-check: the version-locked manifests (tests/bindings/pyproject.toml,
+# python/pyproject.toml, c/phantom_protocol.pc.in, server/Cargo.toml,
+# cli/Cargo.toml) must report the same version as the source-of-truth
+# `core/Cargo.toml`. Catches release-time version skew before it ships to
+# PyPI / a pkg-config consumer / Cargo.
+#
+# NOTE: tests/bindings/c/package.sh hardcodes its own `VERSION=` (it names
+# the released C tarball) and is NOT covered here — bump it by hand.
 #
 # Wired into .github/workflows/bindings.yml's `drift` job. Run locally:
 #
@@ -52,6 +57,12 @@ PC_VERSION="$(
 )"
 check "c/phantom_protocol.pc.in" "${SCRIPT_DIR}/c/phantom_protocol.pc.in" "${PC_VERSION}"
 
+# python/pyproject.toml (maturin — the PyPI distribution manifest)
+MATURIN_VERSION="$(
+    awk -F '"' '/^version = "/ { print $2; exit }' "${REPO_ROOT}/python/pyproject.toml"
+)"
+check "python/pyproject.toml" "${REPO_ROOT}/python/pyproject.toml" "${MATURIN_VERSION}"
+
 # Sibling Rust crates (server, cli) publish the same version as core.
 for MANIFEST in "${REPO_ROOT}/server/Cargo.toml" "${REPO_ROOT}/cli/Cargo.toml"; do
     NAME="$(basename "$(dirname "${MANIFEST}")")"
@@ -64,7 +75,7 @@ if [ "${fail}" -ne 0 ]; then
     echo "Version drift detected. Bump every manifest in sync, e.g.:"
     echo "  sed -i.bak 's/^version = \"${CORE_VERSION}\"/version = \"<NEW>\"/' \\"
     echo "    core/Cargo.toml server/Cargo.toml cli/Cargo.toml \\"
-    echo "    tests/bindings/pyproject.toml"
+    echo "    tests/bindings/pyproject.toml python/pyproject.toml"
     echo "  sed -i.bak 's/^Version: ${CORE_VERSION}/Version: <NEW>/' \\"
     echo "    tests/bindings/c/phantom_protocol.pc.in"
     exit 1
