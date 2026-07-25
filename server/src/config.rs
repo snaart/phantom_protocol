@@ -41,9 +41,19 @@ pub struct Config {
     )]
     pub otlp_endpoint: String,
 
-    /// Trace sampling ratio (0.0 — 1.0). Default 1% baseline; bump to 1.0
-    /// when investigating an incident, or set to 0 to disable trace export.
-    #[arg(long, env = "OTEL_TRACES_SAMPLER_ARG", default_value = "0.01")]
+    /// Trace sampling ratio (0.0 — 1.0), applied to **root** spans.
+    ///
+    /// Installed directly as `Sampler::ParentBased(TraceIdRatioBased(ratio))`
+    /// in [`crate::telemetry`], so both the flag and its `OTEL_TRACES_SAMPLER_ARG`
+    /// env fallback take effect without also having to set `OTEL_TRACES_SAMPLER`.
+    /// `ParentBased` means an upstream sampling decision is honored, so a trace
+    /// sampled by a caller is never truncated here; the ratio gates root spans
+    /// only. Values outside `0.0..=1.0` are clamped.
+    ///
+    /// Defaults to `1.0` (sample everything) to match the behaviour that shipped
+    /// while this flag was inert — lower it deliberately, e.g. `0.01` for a 1%
+    /// production baseline.
+    #[arg(long, env = "OTEL_TRACES_SAMPLER_ARG", default_value = "1.0")]
     pub otel_trace_sample_ratio: f64,
 
     /// Service name reported via OTel Resource. Defaults to the binary

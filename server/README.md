@@ -33,8 +33,8 @@ verifying-key value** — clients pin it via
 
 ## Configuration
 
-Every flag has both a CLI and an environment form. Env wins precedence
-when both are set (clap default).
+Every flag has both a CLI and an environment form. The CLI flag wins when
+both are set; the env var is the fallback (clap default).
 
 | CLI flag              | Env var                     | Default                            | Purpose                                                    |
 | --------------------- | --------------------------- | ---------------------------------- | ---------------------------------------------------------- |
@@ -42,7 +42,7 @@ when both are set (clap default).
 | `--signing-key-file`       | `PHANTOM_SIGNING_KEY_FILE`     | `/etc/phantom-server/signing.key` | On-disk path for the long-lived hybrid signing key.                  |
 | `--otlp-endpoint`          | `OTEL_EXPORTER_OTLP_ENDPOINT`  | `http://localhost:4317`           | OTLP/gRPC endpoint for OpenTelemetry metrics + traces export.        |
 | `--otel-service-name`      | `OTEL_SERVICE_NAME`            | `phantom-server`                  | `service.name` reported via the OTel Resource.                       |
-| `--otel-trace-sample-ratio`| `OTEL_TRACES_SAMPLER_ARG`      | `0.01`                            | Trace sampling ratio (0.0–1.0); `0` disables trace export.           |
+| `--otel-trace-sample-ratio`| `OTEL_TRACES_SAMPLER_ARG`      | `1.0` (sample everything)         | Head-sampling ratio for **root** spans, installed as `ParentBased(TraceIdRatioBased(ratio))`. Either form works on its own — no `OTEL_TRACES_SAMPLER` needed. Values outside `0.0..=1.0` are clamped. |
 | `--max-sessions`           | `PHANTOM_MAX_SESSIONS`         | `1024`                            | Global concurrent-session cap (backpressure, not drop); `0` = unbounded. |
 | `--max-sessions-per-ip`    | `PHANTOM_MAX_SESSIONS_PER_IP`  | `64`                              | Per-source-IP concurrent-session cap; `0` disables it.               |
 | `--log-json`               | `PHANTOM_LOG_JSON`             | `false` (pretty)                  | Emit structured JSON logs.                                           |
@@ -53,7 +53,7 @@ when both are set (clap default).
 The startup banner contains:
 
 ```
-WARN phantom_server: listener verifying key (pin this on clients): <hex>
+WARN phantom_server: server verifying key (pin this on clients): <hex>
 ```
 
 Clients **MUST** pin this exact value:
@@ -97,7 +97,7 @@ Kubernetes `terminationGracePeriodSeconds`. Tune
 
 ## OpenTelemetry (OTel) metrics and traces export
 
-When `--otlp-endpoint` is set (default `http://localhost:4317`), the server pushes OpenTelemetry metrics and traces to the configured OTLP/gRPC collector endpoint. There is no inbound Prometheus scrape endpoint — the server uses an outbound OTLP push model suitable for Datadog, Honeycomb, Grafana Cloud, or a local OTel Collector. Configure authentication via the `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer ...` environment variable if the endpoint requires it, and set `--otel-trace-sample-ratio 0` to disable trace export entirely.
+When `--otlp-endpoint` is set (default `http://localhost:4317`), the server pushes OpenTelemetry metrics and traces to the configured OTLP/gRPC collector endpoint. There is no inbound Prometheus scrape endpoint — the server uses an outbound OTLP push model suitable for Datadog, Honeycomb, Grafana Cloud, or a local OTel Collector. Configure authentication via the `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer ...` environment variable if the endpoint requires it. To change trace sampling, set `--otel-trace-sample-ratio=<ratio>` or its `OTEL_TRACES_SAMPLER_ARG=<ratio>` environment fallback (`0` = no traces) — the server installs `ParentBased(TraceIdRatioBased(ratio))` on the `TracerProvider` itself, so neither form needs `OTEL_TRACES_SAMPLER` to be set. The default is `1.0` (every trace exported); `ParentBased` honors an upstream sampling decision, so the ratio gates root spans only and a trace sampled by a caller is never truncated here.
 
 ## Deployment pointers
 

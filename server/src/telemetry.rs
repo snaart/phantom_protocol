@@ -26,7 +26,7 @@ use opentelemetry_otlp::{
     Compression, MetricExporter, SpanExporter, WithExportConfig, WithTonicConfig,
 };
 use opentelemetry_sdk::metrics::{SdkMeterProvider, Temporality};
-use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use opentelemetry_sdk::Resource;
 
 /// Handle to OpenTelemetry providers. `shutdown` flushes any buffered
@@ -56,10 +56,7 @@ impl TelemetryHandle {
         let resource = Resource::builder()
             .with_service_name(cfg.service_name.clone())
             .with_attribute(KeyValue::new("phantom.role", "server"))
-            .with_attribute(KeyValue::new(
-                "service.version",
-                env!("CARGO_PKG_VERSION"),
-            ))
+            .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
             .build();
 
         // --- Metrics pipeline ---------------------------------------------
@@ -86,18 +83,29 @@ impl TelemetryHandle {
             .with_endpoint(&cfg.otlp_endpoint)
             .with_compression(Compression::Gzip)
             .build()?;
+        // Sampling: install the ratio explicitly rather than relying on the
+        // SDK's env-var path. clap's `env = "OTEL_TRACES_SAMPLER_ARG"` only
+        // *reads* that variable as a fallback for the flag — it never sets it
+        // in the process environment — so `--otel-trace-sample-ratio` used to
+        // be silently discarded, and the SDK's own env path additionally
+        // requires `OTEL_TRACES_SAMPLER=parentbased_traceidratio` to consult
+        // the ratio at all. Wiring the sampler here makes both the flag and
+        // the env form authoritative and self-consistent.
+        //
+        // `ParentBased` keeps a sampling decision already made upstream, so a
+        // request sampled by a caller stays sampled end-to-end and traces are
+        // not truncated mid-path; only root spans consult the ratio. The
+        // default is `1.0` (sample everything), matching the behaviour that
+        // shipped while the flag was inert — lower it deliberately.
+        let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+            cfg.trace_sample_ratio.clamp(0.0, 1.0),
+        )));
         let tracer_provider = SdkTracerProvider::builder()
             .with_resource(resource)
             .with_batch_exporter(span_exporter)
+            .with_sampler(sampler)
             .build();
         global::set_tracer_provider(tracer_provider.clone());
-
-        // Note on sampling: the SDK reads `OTEL_TRACES_SAMPLER` and
-        // `OTEL_TRACES_SAMPLER_ARG` from the environment, so we surface
-        // `trace_sample_ratio` to the operator via that env path rather
-        // than coupling our config to the Sampler builder API. The CLI
-        // flag plumbs into `OTEL_TRACES_SAMPLER_ARG` directly.
-        let _ = cfg.trace_sample_ratio;
 
         Ok(Self {
             meter_provider,
