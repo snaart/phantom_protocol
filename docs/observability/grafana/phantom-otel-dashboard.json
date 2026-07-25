@@ -87,6 +87,7 @@
       "id": 12,
       "type": "stat",
       "title": "Active streams",
+      "description": "User-visible streams currently open, from the balanced per-session StreamGauge (api/session.rs). Reserved stream ids 0 (control) and 1 (raw-app default) are excluded, and the gauge drains at session teardown, so it returns to zero. Unlabeled by design — stream_id is never a metric attribute.",
       "datasource": "$datasource",
       "gridPos": { "h": 5, "w": 6, "x": 6, "y": 10 },
       "targets": [
@@ -198,6 +199,7 @@
       "id": 31,
       "type": "timeseries",
       "title": "Cookie outcomes / sec",
+      "description": "Stateless-cookie address-validation events, recorded by udp_admit (the UDP demux pre-gate) and cookie_pow_gate in transport/handshake.rs. validated_ok / validated_mismatch come from a cookie the client actually presented; issued comes from the retry path. A hello with no cookie is not a validation event.",
       "datasource": "$datasource",
       "gridPos": { "h": 7, "w": 8, "x": 0, "y": 35 },
       "targets": [
@@ -211,6 +213,7 @@
       "id": 32,
       "type": "timeseries",
       "title": "PoW outcomes / sec",
+      "description": "Proof-of-work DoS-gate outcomes, recorded by cookie_pow_gate in transport/handshake.rs when the per-IP adaptive difficulty is above zero. Only a solution the client actually presented is counted (solved / rejected); a hello with no solution just gets a challenge issued, so first contact does not inflate the rejection rate. The PhantomPoWRejectionStorm alert reads this same series.",
       "datasource": "$datasource",
       "gridPos": { "h": 7, "w": 8, "x": 8, "y": 35 },
       "targets": [
@@ -224,6 +227,7 @@
       "id": 33,
       "type": "timeseries",
       "title": "Early-data outcomes / sec",
+      "description": "0-RTT early-data outcomes, recorded by process_client_hello (transport/handshake.rs) once per hello that carried a sealed blob: accepted, rejected_unknown_ticket, rejected_oversized, rejected_aead, rejected_replay. Known gap: a server running with set_early_data_enabled(false) emits NO sample for an offered blob — EarlyDataOutcome has no 'disabled by policy' variant — so a flat line here can mean the kill switch is on rather than that no client is offering 0-RTT.",
       "datasource": "$datasource",
       "gridPos": { "h": 7, "w": 8, "x": 16, "y": 35 },
       "targets": [
@@ -236,13 +240,14 @@
     {
       "id": 40,
       "type": "row",
-      "title": "Multi-path & paths",
+      "title": "Paths & migration",
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 }
     },
     {
       "id": 41,
       "type": "timeseries",
       "title": "Path migrations / sec",
+      "description": "Connection-migration events, recorded at four call sites in api/session.rs: the client Migrate command, the MigrateServer command, peer-migration detection on an authenticated forward path_id, and the M-3 passive NAT-rebind promotion. to_path 1..=254 is an active migration (the id wraps 254 to 1, skipping 0 and 255); to_path 255 is the reserved rebind-validation id and marks a passive NAT rebind.",
       "datasource": "$datasource",
       "gridPos": { "h": 7, "w": 12, "x": 0, "y": 43 },
       "targets": [
@@ -256,6 +261,7 @@
       "id": 42,
       "type": "timeseries",
       "title": "Path RTT (μs) by path_id",
+      "description": "Latest observed RTT per path, recorded by feed_bbr_on_ack (api/session.rs) from the authenticated-SACK path. Karn-gated: an ACK for a retransmit is not sampled, and a zero-microsecond sample is skipped. The label is the inbound header.path_id, so it stays 0 until the peer migrates; only slots 0..=15 are stored (MAX_PATHS = 16) and only paths with a non-zero last sample are observed.",
       "datasource": "$datasource",
       "gridPos": { "h": 7, "w": 12, "x": 12, "y": 43 },
       "fieldConfig": { "defaults": { "unit": "µs" } },

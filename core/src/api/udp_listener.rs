@@ -126,6 +126,10 @@ impl PhantomUdpListener {
         let local_addr = socket
             .local_addr()
             .map_err(|e| CoreError::NetworkError(format!("local_addr: {e}")))?;
+        // Built before the `HandshakeServer` so the same shared handle can be installed
+        // as its metrics sink. On UDP this also covers `udp_admit`, the stateless
+        // cookie pre-gate that runs on the demux thread.
+        let observability = Observability::new(ObservabilityConfig::default());
         let hs = match (signing_key, config.as_ref()) {
             (Some(sk), Some(cfg)) => {
                 HandshakeServer::with_signing_key_and_cache(sk, cfg.session_cache())
@@ -137,7 +141,8 @@ impl PhantomUdpListener {
             (None, Some(cfg)) => HandshakeServer::new_with_cache(cfg.session_cache()),
             (None, None) => HandshakeServer::new(),
         }
-        .map_err(|e| CoreError::InternalError(e.to_string()))?;
+        .map_err(|e| CoreError::InternalError(e.to_string()))?
+        .with_observability(observability.clone());
         let (accepted_tx, accepted_rx) = mpsc::channel(MAX_INFLIGHT_HANDSHAKES);
         Ok(Arc::new(Self {
             socket: Arc::new(socket),
@@ -146,7 +151,7 @@ impl PhantomUdpListener {
             shutting_down: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             runtime,
-            observability: Observability::new(ObservabilityConfig::default()),
+            observability,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
             accepted_tx,
             accepted_rx: Mutex::new(accepted_rx),

@@ -16,7 +16,10 @@
 
 use crate::crypto::hybrid_sign::HybridVerifyingKey;
 use crate::errors::CoreError;
-use crate::observability::attrs::{AeadAlgorithm, HandshakeOutcome, ProtocolVersion, ReplayReason};
+use crate::observability::attrs::{
+    AeadAlgorithm, Direction, HandshakeOutcome, PathValidationOutcome, ProtocolVersion,
+    ReplayReason,
+};
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN};
@@ -32,7 +35,7 @@ use crate::transport::types::{
 };
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
@@ -465,6 +468,11 @@ pub struct PhantomSession {
     /// `UdpServerTransport`; `false` for TCP, WebSocket, WASI, Embedded, and
     /// the in-memory test pipe.
     migration_capable: bool,
+    /// Balanced `active_streams` gauge for this session (see [`StreamGauge`]).
+    /// Shared with the data pump: `open_stream()` counts here, the pump's
+    /// receive path counts peer-initiated streams, and both the pump exit and
+    /// `Drop for PhantomSession` drain whatever is still open.
+    stream_gauge: Arc<StreamGauge>,
 }
 
 /// Commands for the background session task
@@ -597,6 +605,8 @@ impl PhantomSession {
         // Client sessions have no listener, so they own their observability
         // instance (its `snapshot()` reflects just this connection).
         let observability = Observability::new(ObservabilityConfig::default());
+        // Balanced active-streams gauge, shared with the pump (see StreamGauge).
+        let stream_gauge = StreamGauge::new(observability.clone());
 
         // Terminal-error capture + readiness signal.
         let terminal_error: Arc<parking_lot::Mutex<Option<CoreError>>> =
@@ -629,6 +639,7 @@ impl PhantomSession {
             ready_tx: ready_tx.clone(),
             ready_rx,
             migration_capable,
+            stream_gauge: stream_gauge.clone(),
         };
 
         // Spawn the background handshake + data pump task on the supplied
@@ -659,6 +670,7 @@ impl PhantomSession {
             terminal_error,
             ready_tx,
             migration_capable,
+            stream_gauge,
         )));
 
         session
@@ -709,6 +721,11 @@ impl PhantomSession {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new_with_role(256, false);
         let demux = Arc::new(demux);
         let streams = Arc::new(DashMap::new());
+        // Balanced active-streams gauge, shared with the pump (see StreamGauge).
+        // Note the observability handle here is the *listener's* aggregate, so
+        // the gauge it feeds is "streams open across every accepted session" —
+        // which is why the per-session drain below has to be exact.
+        let stream_gauge = StreamGauge::new(observability.clone());
 
         let inner_session: Arc<Mutex<Option<Arc<Session>>>> =
             Arc::new(Mutex::new(Some(server_session.clone())));
@@ -747,6 +764,7 @@ impl PhantomSession {
             ready_tx: Arc::new(ready_tx),
             ready_rx,
             migration_capable,
+            stream_gauge: stream_gauge.clone(),
         });
 
         let session_id = *server_session.id();
@@ -780,6 +798,7 @@ impl PhantomSession {
             leg,
             cmd_tx,
             incoming_stream_tx,
+            stream_gauge,
         )));
 
         session
@@ -813,6 +832,8 @@ impl PhantomSession {
         // True when the transport supports connection migration (UDP); used to
         // label the handshake metric and ObservedTransport with the correct leg.
         migration_capable: bool,
+        // Balanced active-streams gauge shared with the outer `PhantomSession`.
+        stream_gauge: Arc<StreamGauge>,
     ) {
         // Derive the leg label once from migration_capable so every metric
         // and ObservedTransport inside this task uses the right leg type.
@@ -979,6 +1000,7 @@ impl PhantomSession {
             leg,
             cmd_tx_for_stream,
             incoming_stream_tx,
+            stream_gauge,
         )
         .await;
     }
@@ -1132,6 +1154,152 @@ async fn run_client_handshake<T: SessionTransport>(
 /// well-formed, consistent header.
 const RAW_APP_STREAM_ID: u32 = 1;
 
+/// Per-session bookkeeping for the `active_streams` gauge.
+///
+/// The gauge is an `UpDownCounter` (and a signed atomic in the hot-path
+/// snapshot), so every `stream_opened()` MUST be matched by exactly one
+/// `stream_closed()` — an unbalanced gauge is the exact defect
+/// `core/tests/observability_e2e.rs` pins for *sessions*, and this type is what
+/// keeps it from reappearing for *streams*.
+///
+/// Discipline:
+/// - Only **user-visible** streams are counted. Ids `0` (control) and
+///   [`RAW_APP_STREAM_ID`] (the reserved raw-app `send()`/`recv()` stream the
+///   pump creates for every session) are internal plumbing, not streams the
+///   embedder opened, so they are filtered out here rather than at each call
+///   site.
+/// - [`Self::opened`] is called where a user stream enters the session's stream
+///   table: `PhantomSession::open_stream` (local) and the receive path's
+///   new-peer-stream branch (remote, surfaced via `accept_stream`).
+/// - [`Self::closed`] is called where one leaves it (FIN acknowledged, or the
+///   `queue_fin` fallback teardown).
+/// - [`Self::drain`] retires whatever is still open when the session ends. It
+///   runs both at data-pump exit **and** in `Drop for PhantomSession` — the
+///   `swap(0)` is atomic, so whichever runs first retires the streams and the
+///   other one sees zero. That covers every abnormal exit (transport death,
+///   liveness `Dead`, handle drop, a session whose pump never started, and an
+///   `open_stream()` issued after the pump already ended). The pump drain is the
+///   prompt one; the `Drop` drain is the backstop that also mops up the narrow
+///   race where the (aborted, possibly still-running) receive task registers a
+///   peer-initiated stream concurrently with the pump's drain.
+/// - [`Self::closed`] never decrements below zero, so a removal racing a drain
+///   cannot push the gauge negative.
+#[derive(Debug)]
+pub(crate) struct StreamGauge {
+    /// User-visible streams currently reported open by this session.
+    open: AtomicI64,
+    observability: Arc<Observability>,
+}
+
+impl StreamGauge {
+    fn new(observability: Arc<Observability>) -> Arc<Self> {
+        Arc::new(Self {
+            open: AtomicI64::new(0),
+            observability,
+        })
+    }
+
+    /// Count a newly-opened user-visible stream. No-op for the internal ids.
+    fn opened(&self, stream_id: u32) {
+        if stream_id <= RAW_APP_STREAM_ID {
+            return;
+        }
+        self.open.fetch_add(1, Ordering::AcqRel);
+        self.observability.stream_opened();
+    }
+
+    /// Retire a stream previously counted by [`Self::opened`]. No-op for the
+    /// internal ids and for a stream this session never counted (or already
+    /// retired via [`Self::drain`]).
+    fn closed(&self, stream_id: u32) {
+        if stream_id <= RAW_APP_STREAM_ID {
+            return;
+        }
+        if self
+            .open
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                (v > 0).then_some(v - 1)
+            })
+            .is_ok()
+        {
+            self.observability.stream_closed();
+        }
+    }
+
+    /// Retire every stream still counted (session teardown). Idempotent.
+    fn drain(&self) {
+        let still_open = self.open.swap(0, Ordering::AcqRel);
+        for _ in 0..still_open {
+            self.observability.stream_closed();
+        }
+    }
+}
+
+/// Receive-task-local scratch space and observability bookkeeping.
+///
+/// Owned exclusively by the single reader task (passed as `&mut`), so nothing
+/// in here needs synchronisation and no lock is ever held across an `.await`.
+struct RecvScratch {
+    /// Reusable ACK-frame serialization buffer. Hoisted out of the read loop so
+    /// a busy reliable stream doesn't pay a fresh allocation per emitted ACK.
+    ack_buf: Vec<u8>,
+    /// Issue instant of each PATH_CHALLENGE this side currently has
+    /// outstanding, keyed by path id — the start stamp for
+    /// [`Observability::record_path_validation`]. The path registry itself
+    /// keeps no timestamp, and only this task issues challenges, so the map is
+    /// the authoritative start time. Bounded by the 256-value `path_id` space;
+    /// entries are removed the moment the challenge resolves.
+    challenge_started: std::collections::HashMap<u8, std::time::Instant>,
+    /// Most recent peer `path_id` observed to move forward. Seeded at 0 (the
+    /// implicit handshake path) and updated on each detected peer migration, so
+    /// `record_path_migration` can report a real `from` → `to` pair.
+    last_peer_path: u8,
+    /// Shared user-visible-stream gauge (see [`StreamGauge`]).
+    stream_gauge: Arc<StreamGauge>,
+}
+
+impl RecvScratch {
+    fn new(ack_buf_capacity: usize, stream_gauge: Arc<StreamGauge>) -> Self {
+        Self {
+            ack_buf: Vec::with_capacity(ack_buf_capacity),
+            challenge_started: std::collections::HashMap::new(),
+            last_peer_path: 0,
+            stream_gauge,
+        }
+    }
+}
+
+/// Seal one packet through the session AEAD, timing **only** the AEAD call and
+/// folding the duration into the always-on encrypt aggregate
+/// (`MetricsSnapshotFfi::avg_encrypt_ns` / `encrypt_count`).
+///
+/// Recording is a pair of relaxed atomic adds and cannot fail, block, or change
+/// the result: the `Result` is returned untouched. Only successful seals are
+/// recorded, so `encrypt_count` stays "packets actually sealed" — every caller
+/// aborts the send on `Err`, so a failed seal never becomes a packet.
+#[inline]
+fn timed_encrypt(
+    crypto_session: &Session,
+    observability: &Observability,
+    header: &PacketHeader,
+    plaintext: &[u8],
+    extensions: &[u8],
+) -> Result<Vec<u8>, CoreError> {
+    let started = std::time::Instant::now();
+    let sealed = crypto_session.encrypt_packet(header, plaintext, extensions);
+    if sealed.is_ok() {
+        observability.record_encrypt_ns(duration_ns(started));
+    }
+    sealed
+}
+
+/// Elapsed nanoseconds since `started`, saturating instead of wrapping on the
+/// (unreachable) >584-year overflow. Shared by the encrypt/decrypt timers.
+#[inline]
+fn duration_ns(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// Items routed from the reader task to the delivery task via the internal
 /// UNBOUNDED channel.
 ///
@@ -1180,6 +1348,10 @@ async fn run_data_pump<T: SessionTransport>(
     cmd_tx_for_stream: mpsc::Sender<SessionCommand>,
     // Sink for newly-registered peer-initiated streams (`accept_stream()`).
     incoming_stream_tx: mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
+    // Balanced active-streams gauge shared with the outer `PhantomSession`
+    // (see `StreamGauge`): the receive path counts peer-initiated streams, the
+    // close paths retire them, and the teardown below drains the remainder.
+    stream_gauge: Arc<StreamGauge>,
 ) {
     // Session is now established and active — bump the active-session gauge.
     // The matching `session_closed` at teardown (below) lets the gauge fall,
@@ -1378,6 +1550,7 @@ async fn run_data_pump<T: SessionTransport>(
     let streams_recv = streams.clone();
     let undelivered_reader = undelivered_bytes.clone();
     let observability_recv = observability.clone();
+    let stream_gauge_recv = stream_gauge.clone();
     // Clones moved into the recv task for new-stream registration.
     let cmd_tx_recv = cmd_tx_for_stream.clone();
     let incoming_stream_tx_recv = incoming_stream_tx.clone();
@@ -1390,14 +1563,14 @@ async fn run_data_pump<T: SessionTransport>(
     let (recv_done_tx, mut recv_done_rx) = oneshot::channel::<()>();
     let transport_for_path = transport.clone();
     let recv_handle = runtime.spawn(Box::pin(async move {
-        // Reusable buffer for ACK frame serialization. Hoisted out of the
-        // loop (Phase 2.3) so we don't pay a fresh `Vec::new()` allocation
-        // for every ACK we emit on a busy reliable stream. 256 bytes is
-        // comfortably larger than a serialized empty `PhantomPacket` (the
-        // 15-byte header plus the AEAD tag — no cleartext length prefixes
-        // since v6), so the underlying buffer is never reallocated after the
-        // first frame.
-        let mut ack_buf: Vec<u8> = Vec::with_capacity(256);
+        // Reader-local scratch: the reusable ACK frame serialization buffer
+        // (hoisted out of the loop since Phase 2.3 so we don't pay a fresh
+        // `Vec::new()` allocation for every ACK we emit on a busy reliable
+        // stream — 256 bytes is comfortably larger than a serialized empty
+        // `PhantomPacket`, the 15-byte header plus the AEAD tag, so the
+        // underlying buffer is never reallocated after the first frame) plus
+        // the observability bookkeeping the receive path needs.
+        let mut scratch = RecvScratch::new(256, stream_gauge_recv);
         // Buffering ceiling: the delivery queue is unbounded so the reader
         // never blocks, but a peer that ignores flow control could flood it.
         // Compliant senders are bounded by ~one window per stream (enforced
@@ -1449,7 +1622,7 @@ async fn run_data_pump<T: SessionTransport>(
                 &transport_for_path,
                 &deliver_tx,
                 &undelivered_reader,
-                &mut ack_buf,
+                &mut scratch,
                 &observability_recv,
                 leg,
                 &cmd_tx_recv,
@@ -1510,7 +1683,7 @@ async fn run_data_pump<T: SessionTransport>(
         tokio::select! {
             _ = poll_interval.tick() => {
                 flush_pending_window_updates(
-                    &transport, &crypto_session, session_id, &streams,
+                    &transport, &crypto_session, session_id, &streams, &observability,
                 )
                 .await;
                 drain_streams_priority_ordered(
@@ -1518,6 +1691,7 @@ async fn run_data_pump<T: SessionTransport>(
                     &crypto_session,
                     session_id,
                     &streams,
+                    &observability,
                 )
                 .await;
                 // Idle keep-alive (download-only liveness): on an
@@ -1527,7 +1701,7 @@ async fn run_data_pump<T: SessionTransport>(
                 // its activity timer. Runs before the sweep so a just-emitted PING is
                 // already marked outstanding this tick.
                 maybe_send_keepalive(
-                    &transport, &crypto_session, session_id, &mut last_keepalive,
+                    &transport, &crypto_session, session_id, &mut last_keepalive, &observability,
                 )
                 .await;
                 // Cover traffic (WIRE v6): on this same heartbeat,
@@ -1540,6 +1714,7 @@ async fn run_data_pump<T: SessionTransport>(
                     session_id,
                     &mut last_outbound_pn,
                     &mut last_outbound_at,
+                    &observability,
                 )
                 .await;
                 // Liveness sweep (P4.3): the 10 ms heartbeat is the reliable place to
@@ -1554,7 +1729,7 @@ async fn run_data_pump<T: SessionTransport>(
                 // Same drain logic as the tick arm — fast-wake path. Also flush
                 // any flow-control credit the delivery task staged.
                 flush_pending_window_updates(
-                    &transport, &crypto_session, session_id, &streams,
+                    &transport, &crypto_session, session_id, &streams, &observability,
                 )
                 .await;
                 drain_streams_priority_ordered(
@@ -1562,6 +1737,7 @@ async fn run_data_pump<T: SessionTransport>(
                     &crypto_session,
                     session_id,
                     &streams,
+                    &observability,
                 )
                 .await;
             }
@@ -1639,10 +1815,16 @@ async fn run_data_pump<T: SessionTransport>(
                                     &[],
                                     PacketFlags::FIN,
                                     None,
+                                    &observability,
                                 )
                                 .await;
                                 streams.remove(&stream_id);
                                 demux.close_stream(stream_id);
+                                // The stream leaves the routing tables here, so
+                                // retire it from the active-streams gauge (the
+                                // FIN-acked path below does the same for the
+                                // normal teardown).
+                                stream_gauge.closed(stream_id);
                             }
                             // Otherwise: stream stays until the FIN is SACKed.
                             // Wake the send loop so the FIN is put on the wire
@@ -1667,7 +1849,11 @@ async fn run_data_pump<T: SessionTransport>(
                         // (broken-rebind safety) — migration never tears it down.
                         match transport.migrate(local_addr).await {
                             Ok(()) => {
+                                let from_path = crypto_session.current_send_path_id();
                                 let new_path = crypto_session.next_migration_path_id();
+                                // Real migration event: the local send path moved
+                                // from `from_path` to `new_path`.
+                                observability.record_path_migration(from_path, new_path);
                                 // ε / WIRE v5: rotate the outbound CID so every
                                 // post-migration datagram stamps an
                                 // independent-random ConnId an observer cannot link
@@ -1705,7 +1891,10 @@ async fn run_data_pump<T: SessionTransport>(
                         // send socket — server migration never tears it down.
                         match transport.migrate_server(local_addr).await {
                             Ok(()) => {
+                                let from_path = crypto_session.current_send_path_id();
                                 let new_path = crypto_session.next_migration_path_id();
+                                // Real migration event: the server's send path moved.
+                                observability.record_path_migration(from_path, new_path);
                                 transport.set_outbound_cid(crypto_session.advance_outbound_cid());
                                 log::info!(
                                     "PhantomSession: migrated server send path -> path_id {}, s2c CID rotated",
@@ -1732,11 +1921,11 @@ async fn run_data_pump<T: SessionTransport>(
                         // reaches the peer: `session.send(x); session.disconnect()`
                         // must not lose `x`, just like `send(x); drop(session)`.
                         flush_pending_window_updates(
-                            &transport, &crypto_session, session_id, &streams,
+                            &transport, &crypto_session, session_id, &streams, &observability,
                         )
                         .await;
                         drain_streams_priority_ordered(
-                            &transport, &crypto_session, session_id, &streams,
+                            &transport, &crypto_session, session_id, &streams, &observability,
                         )
                         .await;
                         break;
@@ -1752,11 +1941,11 @@ async fn run_data_pump<T: SessionTransport>(
                         // server session that does `recv(); send(echo)` then drops loses
                         // the echo, and the client's `recv()` hangs to its timeout.
                         flush_pending_window_updates(
-                            &transport, &crypto_session, session_id, &streams,
+                            &transport, &crypto_session, session_id, &streams, &observability,
                         )
                         .await;
                         drain_streams_priority_ordered(
-                            &transport, &crypto_session, session_id, &streams,
+                            &transport, &crypto_session, session_id, &streams, &observability,
                         )
                         .await;
                         break;
@@ -1778,6 +1967,13 @@ async fn run_data_pump<T: SessionTransport>(
     if !died {
         state.store(ConnectionState::Closed as u8, Ordering::Relaxed);
     }
+    // Retire every stream still open on this session so the active-streams gauge
+    // comes back down on EVERY pump exit — graceful close, handle drop, transport
+    // death, and the liveness `Dead` verdict alike. `drain()` swaps the counter to
+    // zero atomically, so the identical drain in `Drop for PhantomSession` (which
+    // covers an `open_stream()` issued after the pump already ended) cannot
+    // double-retire.
+    stream_gauge.drain();
     // Session torn down — drop the active-session gauge back down.
     observability.session_closed(leg);
 }
@@ -1857,6 +2053,7 @@ async fn maybe_send_keepalive<T: SessionTransport>(
     crypto_session: &Arc<Session>,
     session_id: SessionId,
     last_keepalive: &mut std::time::Instant,
+    observability: &Observability,
 ) {
     use crate::transport::liveness::should_send_keepalive;
     let cfg = crypto_session.liveness_config();
@@ -1883,7 +2080,7 @@ async fn maybe_send_keepalive<T: SessionTransport>(
         return;
     }
     // PING (not a PONG): a bare KEEPALIVE that the peer echoes back as KEEPALIVE|ACK.
-    if send_keepalive(transport, crypto_session, session_id, false).await {
+    if send_keepalive(transport, crypto_session, session_id, false, observability).await {
         crypto_session.mark_keepalive_outstanding();
         *last_keepalive = std::time::Instant::now();
     }
@@ -1906,6 +2103,7 @@ async fn flush_pending_window_updates<T: SessionTransport>(
     crypto_session: &Arc<Session>,
     session_id: SessionId,
     streams: &Arc<DashMap<u32, Arc<Stream>>>,
+    observability: &Observability,
 ) {
     let pending: Vec<(u32, u32, Arc<Stream>)> = streams
         .iter()
@@ -1922,6 +2120,7 @@ async fn flush_pending_window_updates<T: SessionTransport>(
             session_id,
             stream_id as TransportStreamId,
             credit,
+            observability,
         )
         .await
         {
@@ -1950,6 +2149,7 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
     crypto_session: &Arc<Session>,
     session_id: SessionId,
     streams: &Arc<DashMap<u32, Arc<Stream>>>,
+    observability: &Observability,
 ) {
     // Snapshot the stream set so we can sort without holding DashMap
     // shard locks across awaits. Each entry is (priority, stream_id,
@@ -2003,6 +2203,7 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
                 &seg.data,
                 base,
                 reliable_offset,
+                observability,
             )
             .await
             {
@@ -2031,16 +2232,48 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
 /// plaintext (microseconds the receiver held the ACK before sending) —
 /// subtracted from the observed RTT to yield the propagation delay. Pass 0 when
 /// no peer-side delay is known (the estimator treats it as "no delay reported").
+///
+/// This is also the RTT-sampling site: the same `acked_at − sent_at − ack_delay`
+/// propagation figure the estimator folds into its `min_rtt` filter is published
+/// to `Observability::record_rtt_us` for `path_id`. `sampled_rtt` gates that
+/// publication — pass `false` for a retransmitted segment so the per-path RTT
+/// gauge obeys Karn's algorithm exactly like `Stream`'s own srtt (an ACK for a
+/// retransmit is ambiguous about which copy it acknowledges). Only the single
+/// `Instant::now()` the `DeliverySample` already needed is read.
+///
+/// `path_id` is the **inbound** `header.path_id` (the id the ACK arrived under),
+/// which is the same id space `mark_path_seen` / `begin_path_validation` /
+/// `record_path_validation` key on. It stays 0 until the *peer* migrates, which
+/// is what keeps `MetricsSnapshotFfi::rtt_us_path_0` — the only per-path RTT
+/// slot the FFI snapshot exposes — populated across a local `migrate()`.
 fn feed_bbr_on_ack(
     crypto_session: &Arc<Session>,
     sent_at: tokio::time::Instant,
     packet_bytes: u64,
     ack_delay_us: u64,
+    observability: &Observability,
+    path_id: u8,
+    sampled_rtt: bool,
 ) {
+    let acked_at = std::time::Instant::now();
+    let sent_at_std = sent_at.into_std();
+    if sampled_rtt {
+        // Mirror `BandwidthEstimator::on_ack`: propagation = elapsed − peer ack
+        // delay, saturating so a peer-reported delay larger than the observed
+        // elapsed time yields 0 rather than wrapping. A zero sample carries no
+        // information for a "last observed RTT" gauge, so it is skipped.
+        let rtt_us = acked_at
+            .saturating_duration_since(sent_at_std)
+            .saturating_sub(std::time::Duration::from_micros(ack_delay_us))
+            .as_micros() as u64;
+        if rtt_us > 0 {
+            observability.record_rtt_us(rtt_us, path_id);
+        }
+    }
     let sample = crate::transport::bandwidth_estimator::DeliverySample {
         delivered_bytes: 0, // BandwidthEstimator tracks its own counter
-        sent_at: sent_at.into_std(),
-        acked_at: std::time::Instant::now(),
+        sent_at: sent_at_std,
+        acked_at,
         packet_bytes,
         is_app_limited: false,
         ack_delay_us,
@@ -2104,7 +2337,7 @@ async fn pace_send(crypto_session: &Arc<Session>, bytes: u64) {
 /// [`Session::decrypt_packet_accepting_rekey`] safe: a lost rotation-trigger
 /// packet no longer strands the peer, because the next new-epoch packet (incl. a
 /// reliable retransmit) still carries REKEY and drives the catch-up.
-fn rekey_before_stamp(crypto_session: &Arc<Session>) -> Option<u16> {
+fn rekey_before_stamp(crypto_session: &Arc<Session>, observability: &Observability) -> Option<u16> {
     if crypto_session.send_needs_rekey() {
         // Crossed the high-watermark: rotate now. `rekey()` marks the session
         // `rekey_unconfirmed`, so the flag below re-arms automatically.
@@ -2112,6 +2345,8 @@ fn rekey_before_stamp(crypto_session: &Arc<Session>) -> Option<u16> {
             log::error!("PhantomSession: mid-session rekey failed: {}", e);
             return None;
         }
+        // A local (send-direction) key rotation actually committed.
+        observability.record_rekey(Direction::Send);
     }
     // Re-advertise REKEY while our last rekey is still unacknowledged — even when
     // no rotation happened on this packet (the trigger may have rotated several
@@ -2135,6 +2370,7 @@ async fn send_app_data<T: SessionTransport>(
     payload: &[u8],
     base_flags: u16,
     reliable_offset: Option<u32>,
+    observability: &Observability,
 ) -> bool {
     // Always OR in ENCRYPTED for application data.
     let mut flag_bits = base_flags | PacketFlags::ENCRYPTED;
@@ -2142,7 +2378,7 @@ async fn send_app_data<T: SessionTransport>(
     // direction-wide AEAD high-watermark is crossed, so the header carries the new
     // epoch (+ the REKEY flag). The peer follows on the authenticated epoch bump
     // (it trial-decrypts under the next key).
-    match rekey_before_stamp(crypto_session) {
+    match rekey_before_stamp(crypto_session, observability) {
         Some(extra) => flag_bits |= extra,
         // Epoch saturated (u8::MAX): can't rotate further. Surface as a failed
         // send so the caller re-offers; the session reconnects rather than wrap.
@@ -2191,7 +2427,7 @@ async fn send_app_data<T: SessionTransport>(
     .with_path_id(crypto_session.current_send_path_id());
     // The data-plane packet carries no `extensions` (TLV headroom stays empty),
     // so the AEAD AAD binds an empty extensions slice — matching the wire.
-    let ciphertext = match crypto_session.encrypt_packet(&header, &plaintext, &[]) {
+    let ciphertext = match timed_encrypt(crypto_session, observability, &header, &plaintext, &[]) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: encrypt_packet failed: {}", e);
@@ -2237,10 +2473,11 @@ async fn send_window_update<T: SessionTransport>(
     session_id: SessionId,
     stream_id: TransportStreamId,
     new_window: u32,
+    observability: &Observability,
 ) -> bool {
     let mut flag_bits = PacketFlags::ENCRYPTED | PacketFlags::WINDOW_UPDATE;
     // WINDOW_UPDATE obeys the same direction-wide rekey discipline before stamping.
-    match rekey_before_stamp(crypto_session) {
+    match rekey_before_stamp(crypto_session, observability) {
         Some(extra) => flag_bits |= extra,
         None => return false,
     }
@@ -2253,7 +2490,7 @@ async fn send_window_update<T: SessionTransport>(
     )
     .with_epoch(crypto_session.current_epoch());
     let payload = new_window.to_be_bytes();
-    let ciphertext = match crypto_session.encrypt_packet(&header, &payload, &[]) {
+    let ciphertext = match timed_encrypt(crypto_session, observability, &header, &payload, &[]) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: WINDOW_UPDATE encrypt failed: {}", e);
@@ -2296,13 +2533,14 @@ async fn send_keepalive<T: SessionTransport>(
     crypto_session: &Arc<Session>,
     session_id: SessionId,
     is_pong: bool,
+    observability: &Observability,
 ) -> bool {
     let mut flag_bits = PacketFlags::ENCRYPTED | PacketFlags::KEEPALIVE;
     if is_pong {
         flag_bits |= PacketFlags::ACK;
     }
     // Obey the same direction-wide rekey discipline before stamping the header.
-    match rekey_before_stamp(crypto_session) {
+    match rekey_before_stamp(crypto_session, observability) {
         Some(extra) => flag_bits |= extra,
         None => return false,
     }
@@ -2318,7 +2556,7 @@ async fn send_keepalive<T: SessionTransport>(
     )
     .with_epoch(crypto_session.current_epoch())
     .with_path_id(crypto_session.current_send_path_id());
-    let ciphertext = match crypto_session.encrypt_packet(&header, &[], &[]) {
+    let ciphertext = match timed_encrypt(crypto_session, observability, &header, &[], &[]) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: keep-alive encrypt failed: {}", e);
@@ -2351,10 +2589,11 @@ async fn send_cover<T: SessionTransport>(
     transport: &Arc<T>,
     crypto_session: &Arc<Session>,
     session_id: SessionId,
+    observability: &Observability,
 ) -> bool {
     let mut flag_bits = PacketFlags::ENCRYPTED | PacketFlags::COVER;
     // Same direction-wide rekey discipline as any other send.
-    match rekey_before_stamp(crypto_session) {
+    match rekey_before_stamp(crypto_session, observability) {
         Some(extra) => flag_bits |= extra,
         None => return false,
     }
@@ -2373,7 +2612,7 @@ async fn send_cover<T: SessionTransport>(
     )
     .with_epoch(crypto_session.current_epoch())
     .with_path_id(crypto_session.current_send_path_id());
-    let ciphertext = match crypto_session.encrypt_packet(&header, &plaintext, &[]) {
+    let ciphertext = match timed_encrypt(crypto_session, observability, &header, &plaintext, &[]) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: cover encrypt failed: {}", e);
@@ -2407,6 +2646,7 @@ async fn maybe_send_cover<T: SessionTransport>(
     session_id: SessionId,
     last_pn: &mut u64,
     last_at: &mut std::time::Instant,
+    observability: &Observability,
 ) {
     let interval = crypto_session.cover_interval();
     if interval.is_zero() {
@@ -2422,7 +2662,9 @@ async fn maybe_send_cover<T: SessionTransport>(
         *last_at = std::time::Instant::now();
         return;
     }
-    if last_at.elapsed() >= interval && send_cover(transport, crypto_session, session_id).await {
+    if last_at.elapsed() >= interval
+        && send_cover(transport, crypto_session, session_id, observability).await
+    {
         *last_pn = crypto_session.peek_send_pn();
         *last_at = std::time::Instant::now();
     }
@@ -2440,6 +2682,7 @@ fn encrypt_path_validation(
     session_id: SessionId,
     path_id: u8,
     payload: [u8; crate::transport::path::PATH_CHALLENGE_LEN],
+    observability: &Observability,
 ) -> Option<Vec<u8>> {
     let packet_number = crypto_session.next_send_pn();
     let mut packet = build_path_validation_packet(session_id, path_id, packet_number, payload);
@@ -2447,7 +2690,13 @@ fn encrypt_path_validation(
     packet.header.flags = PacketFlags::new(flag_bits);
     packet.header.epoch = crypto_session.current_epoch();
     let plaintext = std::mem::take(&mut packet.payload);
-    let ciphertext = match crypto_session.encrypt_packet(&packet.header, &plaintext, &[]) {
+    let ciphertext = match timed_encrypt(
+        crypto_session,
+        observability,
+        &packet.header,
+        &plaintext,
+        &[],
+    ) {
         Ok(c) => c,
         Err(e) => {
             log::error!("PhantomSession: PATH_VALIDATION encrypt failed: {}", e);
@@ -2474,8 +2723,15 @@ async fn send_path_validation<T: SessionTransport>(
     session_id: SessionId,
     path_id: u8,
     payload: [u8; crate::transport::path::PATH_CHALLENGE_LEN],
+    observability: &Observability,
 ) -> bool {
-    let buf = match encrypt_path_validation(crypto_session, session_id, path_id, payload) {
+    let buf = match encrypt_path_validation(
+        crypto_session,
+        session_id,
+        path_id,
+        payload,
+        observability,
+    ) {
         Some(b) => b,
         None => return false,
     };
@@ -2542,7 +2798,9 @@ async fn handle_packet<T: SessionTransport>(
     // head-of-line-stall inbound ACK/control.
     deliver_tx: &mpsc::UnboundedSender<DeliverItem>,
     undelivered_bytes: &AtomicU64,
-    ack_buf: &mut Vec<u8>,
+    // Reader-task-local scratch: the reusable ACK buffer plus the observability
+    // bookkeeping (path-challenge start instants, last peer path, stream gauge).
+    scratch: &mut RecvScratch,
     observability: &Observability,
     leg: LegType,
     // Session command channel used to build `PhantomStream` for
@@ -2581,15 +2839,39 @@ async fn handle_packet<T: SessionTransport>(
     // data — a non-empty unencrypted V2 application-data packet is a
     // downgrade indicator and is dropped (same posture as V1).
     let plaintext: Vec<u8> = if packet.header.flags.contains(PacketFlags::ENCRYPTED) {
+        // Read the epoch we are on BEFORE the open (one relaxed atomic load) so a
+        // forward-epoch packet that the catch-up path actually accepts can be
+        // reported as a receive-direction rekey below. Comparing the packet's own
+        // epoch against this (rather than re-reading ours afterwards) keeps an
+        // ordinary send-side rotation out of the `Recv` count. A send-side
+        // rotation landing *inside* this window can still over-count by one — it
+        // is a counter, never control flow, so the skew is accepted rather than
+        // paid for with a lock on the receive hot path.
+        let epoch_before = crypto_recv.current_epoch();
         // Accept a single authenticated forward rekey step (C1): if this
         // packet's epoch is one ahead, the peer rekeyed — trial-decrypt under
         // the next key and only commit the ratchet on AEAD success, so a forged
         // epoch can't desync us. Same-epoch packets take the ordinary path.
-        match crypto_recv.decrypt_packet_accepting_rekey(
+        let decrypt_started = std::time::Instant::now();
+        let opened = crypto_recv.decrypt_packet_accepting_rekey(
             &packet.header,
             &packet.payload,
             &packet.extensions,
-        ) {
+        );
+        // Time only the AEAD call itself (the timer stops before any routing).
+        // Successful opens only, so `decrypt_count` stays "packets actually
+        // opened" and a rejected forgery cannot skew the average.
+        if opened.is_ok() {
+            observability.record_decrypt_ns(duration_ns(decrypt_started));
+            // The open succeeded at a forward epoch → the catch-up path derived
+            // and committed `header.epoch - epoch_before` rotations. Report one
+            // rekey per committed step (bounded by `MAX_REKEY_CATCHUP`).
+            let steps = packet.header.epoch.saturating_sub(epoch_before);
+            for _ in 0..steps {
+                observability.record_rekey(Direction::Recv);
+            }
+        }
+        match opened {
             Ok(pt) => pt,
             Err(e) => {
                 // Distinguish the two drop reasons for the security metrics: a
@@ -2656,6 +2938,13 @@ async fn handle_packet<T: SessionTransport>(
         // for a path_id that is not newer (reorder / duplicate / passive rebind).
         if let Some(slide) = crypto_recv.note_migration_path(packet.header.path_id) {
             crypto_recv.signal_cid_slide(slide);
+            // The PEER migrated: an authenticated packet arrived on a forward
+            // path id. This is the counterpart of the local `Migrate` /
+            // `MigrateServer` records — without it a server (which never issues
+            // `Migrate` itself) would report no migrations at all. `note_migration_path`
+            // CASes exactly once per migration, so this records once too.
+            observability.record_path_migration(scratch.last_peer_path, packet.header.path_id);
+            scratch.last_peer_path = packet.header.path_id;
             // EPS-02 (symmetric rotation) — the peer migrated, so rotate our OWN outbound
             // CID too; otherwise the return direction keeps a stable cleartext ConnId across
             // the move and a both-networks observer relinks the session by it (§12.5). BOTH
@@ -2701,7 +2990,14 @@ async fn handle_packet<T: SessionTransport>(
         if !packet.header.flags.contains(PacketFlags::ACK) {
             // PING → reply with a PONG (KEEPALIVE | ACK). Best-effort; a drop just
             // means the peer re-PINGs next interval (its probe stays outstanding).
-            let _ = send_keepalive(transport_send_ack, crypto_recv, session_id, true).await;
+            let _ = send_keepalive(
+                transport_send_ack,
+                crypto_recv,
+                session_id,
+                true,
+                observability,
+            )
+            .await;
         }
         return;
     }
@@ -2745,7 +3041,18 @@ async fn handle_packet<T: SessionTransport>(
             let result = stream.on_sack(&sack).await;
             for retired in result.retired {
                 if let Some(sent_at) = retired.sent_at {
-                    feed_bbr_on_ack(crypto_recv, sent_at, retired.size, sack.ack_delay_us as u64);
+                    // `!was_retransmit` is Karn's condition — the same gate
+                    // `Stream::on_sack` uses for its own srtt sample — so the
+                    // per-path RTT gauge never records an ambiguous sample.
+                    feed_bbr_on_ack(
+                        crypto_recv,
+                        sent_at,
+                        retired.size,
+                        sack.ack_delay_us as u64,
+                        observability,
+                        path_id,
+                        !retired.was_retransmit,
+                    );
                 }
             }
             // L1-B: the SACK gap detector just declared
@@ -2776,6 +3083,10 @@ async fn handle_packet<T: SessionTransport>(
             if stream_clone.is_fin_acked().await {
                 streams_recv.remove(&stream_id);
                 demux_recv.close_stream(stream_id);
+                // The stream just left the routing tables — retire it from the
+                // active-streams gauge (matched with the `opened` below / in
+                // `PhantomSession::open_stream`).
+                scratch.stream_gauge.closed(stream_id);
                 log::debug!(
                     "PhantomSession: stream {stream_id} FIN acked — removed from routing tables"
                 );
@@ -2837,9 +3148,25 @@ async fn handle_packet<T: SessionTransport>(
                 // and reset RTT/cwnd for the new network (D8) — no re-handshake,
                 // keys persist; subsequent app data + ARQ retransmits flow to the
                 // new peer. (P4.1 only challenged; P4.2 performs the switch.)
-                if crypto_recv.complete_path_validation(path_id, &payload_buf)
-                    && transport_for_path.promote_candidate()
-                {
+                let validated = crypto_recv.complete_path_validation(path_id, &payload_buf);
+                // Resolve the outstanding challenge's latency. The start stamp is
+                // recorded where we issued the challenge (below); a missing entry
+                // means this side never issued one, so there is nothing to time.
+                // Note the registry has no expiry sweep, so a challenge that is
+                // never answered records neither outcome — only a real response
+                // (matching or not) produces a sample.
+                if let Some(started) = scratch.challenge_started.remove(&path_id) {
+                    observability.record_path_validation(
+                        started.elapsed(),
+                        path_id,
+                        if validated {
+                            PathValidationOutcome::Success
+                        } else {
+                            PathValidationOutcome::Failure
+                        },
+                    );
+                }
+                if validated && transport_for_path.promote_candidate() {
                     crypto_recv.reset_congestion();
                     for s in streams_recv.iter() {
                         s.value().reset_rto();
@@ -2852,6 +3179,13 @@ async fn handle_packet<T: SessionTransport>(
                     // ids are left intact (they are retired by their own lifecycle).
                     if path_id == crate::transport::session::REBIND_VALIDATION_PATH_ID {
                         crypto_recv.retire_path(path_id);
+                        // M-3 passive NAT rebind: the peer's ADDRESS moved without it
+                        // bumping `path_id`, so the peer-migration record above never
+                        // fired — but the active peer really did just switch. Report it
+                        // with the reserved validation id as the destination, which is
+                        // exactly what distinguishes a passive rebind from an active
+                        // `migrate()` on a dashboard.
+                        observability.record_path_migration(scratch.last_peer_path, path_id);
                     }
                 }
                 return;
@@ -2872,6 +3206,7 @@ async fn handle_packet<T: SessionTransport>(
                     session_id,
                     path_id,
                     payload_buf,
+                    observability,
                 )
                 .await;
                 return;
@@ -2900,9 +3235,18 @@ async fn handle_packet<T: SessionTransport>(
     ) {
         if transport_for_path.has_migration_candidate() {
             if let Some(challenge) = crypto_recv.begin_path_validation(path_id) {
-                if let Some(buf) =
-                    encrypt_path_validation(crypto_recv, session_id, path_id, challenge)
-                {
+                // Start (or restart, on a re-issued challenge) the validation
+                // timer for this path. The completion branch above resolves it.
+                scratch
+                    .challenge_started
+                    .insert(path_id, std::time::Instant::now());
+                if let Some(buf) = encrypt_path_validation(
+                    crypto_recv,
+                    session_id,
+                    path_id,
+                    challenge,
+                    observability,
+                ) {
                     // To the candidate, NOT the peer; capped at 3× by the transport.
                     let _ = transport_for_path.send_to_candidate(&buf).await;
                 }
@@ -2932,9 +3276,17 @@ async fn handle_packet<T: SessionTransport>(
         // challenge (the PATH_VALIDATION completion branch above).
         let rebind_path = crate::transport::session::REBIND_VALIDATION_PATH_ID;
         if let Some(challenge) = crypto_recv.begin_path_validation(rebind_path) {
-            if let Some(buf) =
-                encrypt_path_validation(crypto_recv, session_id, rebind_path, challenge)
-            {
+            // Same validation timer as the active-migration challenge above.
+            scratch
+                .challenge_started
+                .insert(rebind_path, std::time::Instant::now());
+            if let Some(buf) = encrypt_path_validation(
+                crypto_recv,
+                session_id,
+                rebind_path,
+                challenge,
+                observability,
+            ) {
                 let _ = transport_for_path.send_to_candidate(&buf).await;
             }
         }
@@ -3032,6 +3384,11 @@ async fn handle_packet<T: SessionTransport>(
                 // (never accepted via this path). Registration happens exactly ONCE
                 // per stream_id (the `None` arm here), guarded by the DashMap entry.
                 if stream_id > RAW_APP_STREAM_ID {
+                    // Peer-initiated user stream — count it on the active-streams
+                    // gauge exactly once (this `None` arm runs once per stream id,
+                    // guarded by the DashMap entry). The matching retire is the
+                    // FIN-acked removal above, or the session-teardown drain.
+                    scratch.stream_gauge.opened(stream_id);
                     let handle = demux_recv.register_stream(stream_id, 1024);
                     let phantom_stream = Arc::new(crate::api::stream::PhantomStream::new(
                         handle,
@@ -3059,7 +3416,7 @@ async fn handle_packet<T: SessionTransport>(
             return;
         };
         let mut ack_flag_bits = PacketFlags::ENCRYPTED | PacketFlags::ACK;
-        match rekey_before_stamp(crypto_recv) {
+        match rekey_before_stamp(crypto_recv, observability) {
             Some(extra) => ack_flag_bits |= extra,
             // Epoch saturated — drop this ACK rather than reuse a nonce; the
             // sender retransmits and the session is expected to reconnect.
@@ -3075,15 +3432,17 @@ async fn handle_packet<T: SessionTransport>(
         .with_epoch(crypto_recv.current_epoch())
         .with_path_id(path_id);
         let ack_payload = sack.to_wire();
-        match crypto_recv.encrypt_packet(&ack_header, &ack_payload, &[]) {
+        match timed_encrypt(crypto_recv, observability, &ack_header, &ack_payload, &[]) {
             Ok(ct) => {
                 let ack_packet = PhantomPacket::new(ack_header, ct);
                 match crypto_recv.protect_packet(&ack_packet) {
                     Ok(buf) => {
-                        ack_buf.clear();
-                        ack_buf.extend_from_slice(&buf);
-                        let size = ack_buf.len();
-                        let _ = transport_send_ack.send_bytes(&ack_buf[..size]).await;
+                        scratch.ack_buf.clear();
+                        scratch.ack_buf.extend_from_slice(&buf);
+                        let size = scratch.ack_buf.len();
+                        let _ = transport_send_ack
+                            .send_bytes(&scratch.ack_buf[..size])
+                            .await;
                     }
                     Err(e) => {
                         log::error!("PhantomSession: ACK header protection failed: {}", e)
@@ -3223,6 +3582,8 @@ impl PhantomSession {
 
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(256);
         let streams = Arc::new(DashMap::new());
+        // Placeholder observability (no transport / pump); a no-op holder.
+        let observability = Observability::new(ObservabilityConfig::default());
         // Inert constructor — immediately Failed; publish Failed in the watch so
         // await_ready() resolves immediately with an error.
         let (ready_tx, ready_rx) = watch::channel(ConnectionState::Failed as u8);
@@ -3243,8 +3604,6 @@ impl PhantomSession {
             inner_session: Arc::new(Mutex::new(None)),
             early_data_accepted: Arc::new(Mutex::new(None)),
             shaping: Arc::new(parking_lot::Mutex::new(TrafficShapingConfig::default())),
-            // Placeholder session (no transport / pump); a no-op holder.
-            observability: Observability::new(ObservabilityConfig::default()),
             incoming_stream_rx: Arc::new(Mutex::new(incoming_rx)),
             // No handshake failure — just inert; no terminal error.
             terminal_error: Arc::new(parking_lot::Mutex::new(None)),
@@ -3252,6 +3611,9 @@ impl PhantomSession {
             ready_rx,
             // Inert constructor has no transport; migration is not possible.
             migration_capable: false,
+            // Inert constructor: no pump, so only `Drop` ever drains this.
+            stream_gauge: StreamGauge::new(observability.clone()),
+            observability,
         })
     }
 
@@ -3262,6 +3624,11 @@ impl PhantomSession {
 
         let transport_stream = Arc::new(Stream::new(stream_id as TransportStreamId));
         self.streams.insert(stream_id, transport_stream);
+        // Count the stream on the active-streams gauge. The matching retire is
+        // the pump's FIN-acked teardown, or — for a stream still open when the
+        // session ends (including one opened after the pump already exited) —
+        // the drain in `Drop for PhantomSession` / at pump exit.
+        self.stream_gauge.opened(stream_id);
 
         Arc::new(crate::api::stream::PhantomStream::new(
             handle,
@@ -3706,6 +4073,13 @@ impl Drop for PhantomSession {
         // gone, the send fails silently. The liveness dead-timer or transport
         // close will tear down the pump eventually.
         let _ = self.cmd_tx.try_send(SessionCommand::Close);
+        // Retire any stream still counted on the active-streams gauge. The pump
+        // drains too (that is the normal path, and it fires promptly); this
+        // covers the cases the pump cannot — a session whose pump never started
+        // (failed handshake, the inert `connect()`), and an `open_stream()`
+        // issued after the pump already exited. `drain()` swaps the counter to
+        // zero atomically, so exactly one of the two drains does the work.
+        self.stream_gauge.drain();
     }
 }
 
@@ -4265,6 +4639,12 @@ mod tests {
         (cmd_tx, inc_tx)
     }
 
+    /// Reader-task scratch for a direct `handle_packet` call in a test, wired to
+    /// `obs` so any stream the packet opens lands on that handle's gauge.
+    fn test_recv_scratch(obs: &Arc<Observability>, ack_capacity: usize) -> RecvScratch {
+        RecvScratch::new(ack_capacity, StreamGauge::new(obs.clone()))
+    }
+
     // ── Mock transport for testing ──
 
     /// In-memory transport using channels (simulates a loopback pipe).
@@ -4333,10 +4713,11 @@ mod tests {
             false,
         ));
         session.set_rekey_threshold(2);
+        let obs = Observability::new(ObservabilityConfig::default());
 
         // Below the watermark: no rekey, no flag.
         assert_eq!(
-            rekey_before_stamp(&session),
+            rekey_before_stamp(&session, &obs),
             Some(0),
             "below threshold: no flag"
         );
@@ -4363,13 +4744,13 @@ mod tests {
         assert!(session.send_needs_rekey());
 
         // The rotation-trigger stamp flags REKEY and bumps the epoch.
-        assert_eq!(rekey_before_stamp(&session), Some(PacketFlags::REKEY));
+        assert_eq!(rekey_before_stamp(&session, &obs), Some(PacketFlags::REKEY));
         assert_eq!(session.current_epoch(), 1);
         assert!(session.rekey_unconfirmed());
 
         // The NEXT stamp re-advertises REKEY even though no further rekey happens —
         // the peer has not confirmed yet.
-        assert_eq!(rekey_before_stamp(&session), Some(PacketFlags::REKEY));
+        assert_eq!(rekey_before_stamp(&session, &obs), Some(PacketFlags::REKEY));
         assert_eq!(
             session.current_epoch(),
             1,
@@ -4992,14 +5373,15 @@ mod tests {
 
         let (client_t, _server_t) = ChannelTransport::pair();
         let transport = Arc::new(client_t);
+        let obs = Observability::new(ObservabilityConfig::default());
 
         // First drain: the initial transmission — not a loss.
-        drain_streams_priority_ordered(&transport, &client, sid, &streams).await;
+        drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
         assert_ne!(client.bbr_state(), BbrState::FastRecovery);
 
         // The RTO expires; the next drain retransmits and must report the loss.
         tokio::time::advance(std::time::Duration::from_millis(1100)).await;
-        drain_streams_priority_ordered(&transport, &client, sid, &streams).await;
+        drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
         assert_eq!(
             client.bbr_state(),
             BbrState::FastRecovery,
@@ -5026,8 +5408,9 @@ mod tests {
 
         let (client_t, _server_t) = ChannelTransport::pair();
         let transport = Arc::new(client_t);
+        let obs = Observability::new(ObservabilityConfig::default());
 
-        drain_streams_priority_ordered(&transport, &client, sid, &streams).await;
+        drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
 
         // No new segment was transmitted — inflight is unchanged (a send would
         // have grown it via on_packet_sent).
@@ -5151,8 +5534,8 @@ mod tests {
             rx: Mutex::new(ack_b),
         });
 
-        let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
         let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             v2,
@@ -5164,7 +5547,7 @@ mod tests {
             &transport_send,
             &deliver_tx,
             &undelivered,
-            &mut ack_buf,
+            &mut scratch,
             &obs,
             LegType::Tcp,
             &no_cmd_tx,
@@ -5207,8 +5590,8 @@ mod tests {
             tx: ack_a,
             rx: Mutex::new(ack_b),
         });
-        let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
 
         // A peer opens far more receive streams than the cap. Each frame uses a distinct
         // `sequence` (the per-direction packet number, else they replay-reject) but
@@ -5234,7 +5617,7 @@ mod tests {
                 &transport_send,
                 &deliver_tx,
                 &undelivered,
-                &mut ack_buf,
+                &mut scratch,
                 &obs,
                 LegType::Tcp,
                 &no_cmd_tx,
@@ -5272,8 +5655,8 @@ mod tests {
             tx: ack_a,
             rx: Mutex::new(ack_b),
         });
-        let mut ack_buf = Vec::with_capacity(64);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 64);
 
         // Forged: UNENCRYPTED, empty payload, FIN flag, valid session_id, stream 2.
         let header = PacketHeader::new(session_id, 2, 0, PacketFlags::new(PacketFlags::FIN));
@@ -5290,7 +5673,7 @@ mod tests {
             &transport_send,
             &deliver_tx,
             &undelivered,
-            &mut ack_buf,
+            &mut scratch,
             &obs,
             LegType::Tcp,
             &no_cmd_tx,
@@ -5738,6 +6121,7 @@ mod tests {
         let (client_session, _server_session) = paired_sessions(session_id);
         let (client_t, server_t) = ChannelTransport::pair();
         let client_t = Arc::new(client_t);
+        let obs = Observability::new(ObservabilityConfig::default());
 
         // Default: app data is stamped on the implicit path 0.
         assert!(
@@ -5749,6 +6133,7 @@ mod tests {
                 b"pre-migration",
                 PacketFlags::RELIABLE,
                 Some(0),
+                &obs,
             )
             .await
         );
@@ -5770,6 +6155,7 @@ mod tests {
                 b"post-migration",
                 PacketFlags::RELIABLE,
                 Some(13),
+                &obs,
             )
             .await
         );
@@ -5817,8 +6203,8 @@ mod tests {
             tx: ack_a,
             rx: Mutex::new(ack_b),
         });
-        let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
 
         let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
@@ -5831,7 +6217,7 @@ mod tests {
             &transport_send,
             &deliver_tx,
             &undelivered,
-            &mut ack_buf,
+            &mut scratch,
             &obs,
             LegType::Tcp,
             &no_cmd_tx,
@@ -5913,8 +6299,8 @@ mod tests {
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
-        let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
 
         let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
@@ -5927,7 +6313,7 @@ mod tests {
             &ust,
             &deliver_tx,
             &undelivered,
-            &mut ack_buf,
+            &mut scratch,
             &obs,
             LegType::Udp,
             &no_cmd_tx,
@@ -6030,8 +6416,8 @@ mod tests {
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
         let undelivered = AtomicU64::new(0);
-        let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
 
         let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
@@ -6044,7 +6430,7 @@ mod tests {
             &ust,
             &deliver_tx,
             &undelivered,
-            &mut ack_buf,
+            &mut scratch,
             &obs,
             LegType::Udp,
             &no_cmd_tx,
@@ -6152,13 +6538,15 @@ mod tests {
     }
 
     /// Drive a single inbound packet through `handle_packet` against
-    /// `server_session` with throwaway delivery/transport/observability wiring.
+    /// `server_session` with throwaway delivery/transport wiring. Returns the
+    /// throwaway `Observability` handle so a caller can assert on what the
+    /// receive path recorded.
     async fn run_recv(
         pkt: PhantomPacket,
         session_id: SessionId,
         server_session: &Arc<InnerSession>,
         streams: &Arc<DashMap<u32, Arc<TransportStream>>>,
-    ) {
+    ) -> Arc<Observability> {
         let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
         let demux = Arc::new(demux);
         let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
@@ -6168,8 +6556,8 @@ mod tests {
             tx: ack_a,
             rx: Mutex::new(ack_b),
         });
-        let mut ack_buf = Vec::with_capacity(64);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 64);
         let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             pkt,
@@ -6181,13 +6569,14 @@ mod tests {
             &transport,
             &deliver_tx,
             &undelivered,
-            &mut ack_buf,
+            &mut scratch,
             &obs,
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
         )
         .await;
+        obs
     }
 
     /// Stage a stream with one in-flight reliable segment; returns the stream,
@@ -6393,6 +6782,31 @@ mod tests {
         );
     }
 
+    /// The per-path RTT gauge behind `MetricsSnapshotFfi::rtt_us_path_0` must be
+    /// fed from the SACK path — it was a registered-but-never-recorded
+    /// instrument before this wiring. The sample is labelled with the inbound
+    /// `header.path_id` (the same id space the path registry and
+    /// `record_path_validation` use), which is why it lands on path 0 here.
+    #[tokio::test]
+    async fn authenticated_sack_publishes_an_rtt_sample() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let (_stream, streams, seq) = staged_pending_segment().await;
+        let stream_id: TransportStreamId = 1;
+
+        // Give the segment a measurable age so the propagation sample is > 0.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        let frame = build_encrypted_ack(&client_session, session_id, stream_id, 777, seq);
+        let ack_pkt = decode_recv_frame(&frame, session_id);
+        let obs = run_recv(ack_pkt, session_id, &server_session, &streams).await;
+
+        assert!(
+            obs.snapshot().rtt_us_path_0 > 0,
+            "retiring a never-retransmitted segment must publish an RTT sample"
+        );
+    }
+
     /// **L1-A SACK end-to-end (gap retire).** Stage segments 0..=5 on the sender,
     /// deliver one authenticated `ENCRYPTED | ACK` carrying a SACK over the
     /// received set {0,1,2,4,5} (gap at 3), and assert the sender retires exactly
@@ -6518,8 +6932,8 @@ mod tests {
             tx: ack_a,
             rx: Mutex::new(ack_b),
         });
-        let mut ack_buf = Vec::with_capacity(64);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 64);
         let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             data_pkt,
@@ -6531,7 +6945,7 @@ mod tests {
             &transport,
             &deliver_tx,
             &undelivered,
-            &mut ack_buf,
+            &mut scratch,
             &obs,
             LegType::Tcp,
             &no_cmd_tx,
@@ -6627,8 +7041,8 @@ mod tests {
             rx: Mutex::new(ack_b),
         });
 
-        let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
         let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             bad_packet,
@@ -6640,7 +7054,7 @@ mod tests {
             &transport_send,
             &deliver_tx,
             &undelivered,
-            &mut ack_buf,
+            &mut scratch,
             &obs,
             LegType::Tcp,
             &no_cmd_tx,
@@ -6693,8 +7107,8 @@ mod tests {
             rx: Mutex::new(ack_b),
         });
 
-        let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
         let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
             v2,
@@ -6706,7 +7120,7 @@ mod tests {
             &transport_send,
             &deliver_tx,
             &undelivered,
-            &mut ack_buf,
+            &mut scratch,
             &obs,
             LegType::Tcp,
             &no_cmd_tx,
@@ -6787,8 +7201,8 @@ mod tests {
             tx: ack_a,
             rx: Mutex::new(ack_b),
         });
-        let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
 
         for pkt in [coalesced, normal] {
             let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
@@ -6802,7 +7216,7 @@ mod tests {
                 &transport_send,
                 &deliver_tx,
                 &undelivered,
-                &mut ack_buf,
+                &mut scratch,
                 &obs,
                 LegType::Tcp,
                 &no_cmd_tx,
@@ -6852,8 +7266,8 @@ mod tests {
             tx: ack_a,
             rx: Mutex::new(ack_b),
         });
-        let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
 
         // Deliver OUT OF ORDER on the wire: seq 1 first, then seq 0.
         for pkt in [f1, f0] {
@@ -6868,7 +7282,7 @@ mod tests {
                 &transport_send,
                 &deliver_tx,
                 &undelivered,
-                &mut ack_buf,
+                &mut scratch,
                 &obs,
                 LegType::Tcp,
                 &no_cmd_tx,
@@ -6924,8 +7338,8 @@ mod tests {
             tx: ack_a,
             rx: Mutex::new(ack_b),
         });
-        let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
 
         for pkt in [a, b] {
             let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
@@ -6939,7 +7353,7 @@ mod tests {
                 &transport_send,
                 &deliver_tx,
                 &undelivered,
-                &mut ack_buf,
+                &mut scratch,
                 &obs,
                 LegType::Tcp,
                 &no_cmd_tx,
@@ -7152,11 +7566,13 @@ mod tests {
             rx: Mutex::new(back_rx),
         });
         let _keep = back_tx;
+        let obs = Observability::new(ObservabilityConfig::default());
         flush_pending_window_updates(
             &server_outbound,
             &server_session,
             session_id,
             &server_streams,
+            &obs,
         )
         .await;
 
@@ -7190,6 +7606,7 @@ mod tests {
             &server_session,
             session_id,
             &server_streams,
+            &obs,
         )
         .await;
         assert!(
@@ -7241,7 +7658,9 @@ mod tests {
         hi.send_reliable(Bytes::from_static(b"H2")).await.unwrap();
         streams.insert(22, hi);
 
-        drain_streams_priority_ordered(&transport, &client_session, session_id, &streams).await;
+        let obs = Observability::new(ObservabilityConfig::default());
+        drain_streams_priority_ordered(&transport, &client_session, session_id, &streams, &obs)
+            .await;
 
         // Pull all packets off the channel and verify their order:
         // the three H* chunks must come before any L* chunk.
@@ -7321,8 +7740,8 @@ mod tests {
         });
         let _back_tx_keepalive = back_tx; // keep the recv side alive
 
-        let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
 
         let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
         handle_packet(
@@ -7335,7 +7754,7 @@ mod tests {
             &transport_send,
             &deliver_tx,
             &undelivered,
-            &mut ack_buf,
+            &mut scratch,
             &obs,
             LegType::Tcp,
             &no_cmd_tx,
@@ -7832,8 +8251,8 @@ mod tests {
             tx: ack_a,
             rx: Mutex::new(ack_b),
         });
-        let mut ack_buf = Vec::with_capacity(256);
         let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
 
         // --- Part 1: opened-stream frame (id=2) must NOT arrive as raw-app ---
         let opened_frame = decode_recv_frame(
@@ -7851,7 +8270,7 @@ mod tests {
             &transport_send,
             &deliver_tx,
             &undelivered,
-            &mut ack_buf,
+            &mut scratch,
             &obs,
             LegType::Tcp,
             &no_cmd_tx,
@@ -7905,7 +8324,7 @@ mod tests {
             &transport_send,
             &deliver_tx,
             &undelivered,
-            &mut ack_buf,
+            &mut scratch,
             &obs,
             LegType::Tcp,
             &no_cmd_tx,
@@ -7998,6 +8417,200 @@ mod tests {
             data,
             Some(b"hello-from-peer".to_vec()),
             "recv must return the payload sent by the client"
+        );
+    }
+
+    /// The `active_streams` gauge must be balanced: `opened` counts only
+    /// user-visible ids, `closed` never drives it negative, and `drain` retires
+    /// exactly what is still open (and is idempotent, because the pump exit and
+    /// `Drop for PhantomSession` both call it).
+    #[test]
+    fn stream_gauge_is_balanced_and_never_negative() {
+        let obs = Observability::new(ObservabilityConfig::default());
+        let gauge = StreamGauge::new(obs.clone());
+
+        // Internal ids (0 = control, 1 = raw-app) are not user streams.
+        gauge.opened(0);
+        gauge.opened(RAW_APP_STREAM_ID);
+        assert_eq!(obs.snapshot().active_streams, 0);
+
+        gauge.opened(3);
+        gauge.opened(5);
+        assert_eq!(obs.snapshot().active_streams, 2);
+
+        gauge.closed(3);
+        assert_eq!(obs.snapshot().active_streams, 1);
+
+        // Retiring an id we never counted must not double-decrement.
+        gauge.closed(99);
+        gauge.closed(5);
+        gauge.closed(5);
+        assert_eq!(
+            obs.snapshot().active_streams,
+            0,
+            "closed() must floor at zero — a stray retire cannot make the gauge negative"
+        );
+
+        // Drain of an empty gauge is a no-op; drain of a live one retires all.
+        gauge.drain();
+        assert_eq!(obs.snapshot().active_streams, 0);
+        gauge.opened(7);
+        gauge.opened(9);
+        assert_eq!(obs.snapshot().active_streams, 2);
+        gauge.drain();
+        gauge.drain();
+        assert_eq!(
+            obs.snapshot().active_streams,
+            0,
+            "drain must be idempotent — pump exit and Drop both call it"
+        );
+    }
+
+    /// Locally-opened streams raise the gauge and it comes back down when the
+    /// session handle is dropped — including for a session that never had a
+    /// running pump.
+    #[tokio::test]
+    async fn open_stream_gauge_returns_to_zero_on_session_drop() {
+        let session = PhantomSession::connect("gauge-test".to_string());
+        let obs = session.observability();
+        assert_eq!(obs.snapshot().active_streams, 0);
+
+        let _a = session.open_stream();
+        let _b = session.open_stream();
+        assert_eq!(
+            obs.snapshot().active_streams,
+            2,
+            "each open_stream() must raise the active-streams gauge"
+        );
+
+        drop(session);
+        assert_eq!(
+            obs.snapshot().active_streams,
+            0,
+            "dropping the session must retire every stream it still had open"
+        );
+    }
+
+    /// A peer-initiated stream raises the gauge on the receive path and is
+    /// retired when the session tears down (the pump-exit / Drop drain).
+    #[tokio::test]
+    async fn peer_initiated_stream_gauge_returns_to_zero_at_teardown() {
+        let session_id = fixed_session_id();
+        let (client_inner, server_inner) = paired_sessions(session_id);
+        let (client_t, server_t) = ChannelTransport::pair();
+
+        let server = PhantomSession::from_accepted_server_session(
+            "gauge-accept".to_string(),
+            server_t,
+            server_inner,
+        );
+        let obs = server.observability();
+
+        let client_t = Arc::new(client_t);
+        let drain_t = client_t.clone();
+        let _drainer = tokio::spawn(async move { while drain_t.recv_bytes().await.is_ok() {} });
+
+        let wire = encrypt_outgoing(&client_inner, session_id, 3, 0, b"peer-opened");
+        client_t.send_bytes(&wire).await.expect("send frame");
+
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(5), server.accept_stream())
+                .await
+                .expect("timeout waiting for accept_stream")
+                .expect("accept_stream returned Err");
+        assert_eq!(accepted.stream_id(), 3);
+        assert_eq!(
+            obs.snapshot().active_streams,
+            1,
+            "a peer-initiated stream must raise the active-streams gauge"
+        );
+
+        drop(accepted);
+        drop(server);
+        assert_eq!(
+            obs.snapshot().active_streams,
+            0,
+            "session teardown must retire the peer-initiated stream"
+        );
+    }
+
+    /// The always-on encrypt/decrypt aggregates behind `MetricsSnapshotFfi`
+    /// must actually be fed by the pump's send and receive paths (they were
+    /// registered but never recorded before this wiring).
+    #[tokio::test]
+    async fn encrypt_and_decrypt_timings_reach_the_snapshot() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let (client_t, server_t) = ChannelTransport::pair();
+        let client_t = Arc::new(client_t);
+
+        // Big enough that the AEAD call is far above any platform's `Instant`
+        // granularity, so `avg_*_ns > 0` is not a timing race.
+        let payload = vec![0xA5u8; 4096];
+
+        let send_obs = Observability::new(ObservabilityConfig::default());
+        assert_eq!(send_obs.snapshot().encrypt_count, 0);
+        assert!(
+            send_app_data(
+                &client_t,
+                &client_session,
+                session_id,
+                7,
+                &payload,
+                PacketFlags::RELIABLE,
+                Some(0),
+                &send_obs,
+            )
+            .await
+        );
+        let sent = send_obs.snapshot();
+        assert_eq!(sent.encrypt_count, 1, "one AEAD seal, one sample");
+        assert!(sent.avg_encrypt_ns > 0, "the seal must be timed");
+        assert_eq!(sent.decrypt_count, 0, "the send path opens nothing");
+
+        // Receive it on the server side through the real recv path.
+        let wire = server_t.recv_bytes().await.expect("frame on the wire");
+        let pkt = server_session
+            .parse_protected(&wire)
+            .expect("parse_protected");
+
+        let recv_obs = Observability::new(ObservabilityConfig::default());
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
+        let ack_transport: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let mut scratch = test_recv_scratch(&recv_obs, 256);
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        handle_packet(
+            pkt,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &ack_transport,
+            &ack_transport,
+            &deliver_tx,
+            &undelivered,
+            &mut scratch,
+            &recv_obs,
+            LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
+        )
+        .await;
+
+        let received = recv_obs.snapshot();
+        assert_eq!(received.decrypt_count, 1, "one AEAD open, one sample");
+        assert!(received.avg_decrypt_ns > 0, "the open must be timed");
+        assert_eq!(
+            received.encrypt_count, 1,
+            "the reliable frame's inline SACK ACK is itself a timed seal"
         );
     }
 
