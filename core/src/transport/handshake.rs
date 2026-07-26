@@ -1058,28 +1058,36 @@ impl HandshakeServer {
             self.observe(|o| o.record_resumption(mode, accepted));
         }
         // One early-data event per hello that carried a sealed blob, attributed to the
-        // reason it was not used. `early_data_enabled == false` (A2b, the server-wide
-        // 0-RTT kill switch) is deliberately NOT recorded: it is an operator policy
-        // decision, not a client-attributable outcome, and `EarlyDataOutcome` models no
-        // such variant.
-        if early_data_enabled {
-            if let Some(blob) = &client_hello.early_data {
-                let outcome = if early_data_accepted {
-                    EarlyDataOutcome::Accepted
-                } else if resumed.is_none() {
-                    // No usable ticket. `resume_reject` carries the attribution from the
-                    // resume path above; the fallback covers "early-data offered with no
-                    // `resume_session_id` at all", which is likewise no usable ticket.
-                    resume_reject.unwrap_or(EarlyDataOutcome::RejectedUnknownTicket)
-                } else if blob.len() > EARLY_DATA_MAX_LEN + 16 {
-                    // Mirrors `decrypt_early_data`'s pre-crypto size gate. Read-only —
-                    // the decision was already made above.
-                    EarlyDataOutcome::RejectedOversized
-                } else {
-                    EarlyDataOutcome::RejectedAead
-                };
-                self.observe(|o| o.record_early_data(outcome));
-            }
+        // reason it was not used. The gate is `client_hello.early_data.is_some()` and
+        // nothing else: a hello that offered no blob is not a 0-RTT decision at all and
+        // must never inflate the series.
+        //
+        // `early_data_enabled == false` (A2b, the server-wide 0-RTT kill switch) is an
+        // operator policy decision rather than a client-attributable failure, but it IS
+        // recorded — as its own `rejected_disabled` attribution. Without it a flat
+        // early-data line on a dashboard is ambiguous between "no client is offering
+        // 0-RTT" and "the kill switch is on here", which is exactly the question an
+        // operator debugging a 0-RTT-less deployment is asking.
+        if let Some(blob) = &client_hello.early_data {
+            let outcome = if !early_data_enabled {
+                // Checked first: with the switch off the blob was never looked up or
+                // opened, so no other attribution has been computed for it.
+                EarlyDataOutcome::RejectedDisabled
+            } else if early_data_accepted {
+                EarlyDataOutcome::Accepted
+            } else if resumed.is_none() {
+                // No usable ticket. `resume_reject` carries the attribution from the
+                // resume path above; the fallback covers "early-data offered with no
+                // `resume_session_id` at all", which is likewise no usable ticket.
+                resume_reject.unwrap_or(EarlyDataOutcome::RejectedUnknownTicket)
+            } else if blob.len() > EARLY_DATA_MAX_LEN + 16 {
+                // Mirrors `decrypt_early_data`'s pre-crypto size gate. Read-only —
+                // the decision was already made above.
+                EarlyDataOutcome::RejectedOversized
+            } else {
+                EarlyDataOutcome::RejectedAead
+            };
+            self.observe(|o| o.record_early_data(outcome));
         }
 
         // Hybrid Key Exchange (PFS preserved — a fresh KEM secret even on the
@@ -2540,6 +2548,7 @@ mod tests {
     /// installed. Covers each `EarlyDataOutcome` the server can attribute:
     /// `Accepted`, `RejectedUnknownTicket`, `RejectedAead`, `RejectedOversized`,
     /// plus the one-shot `RejectedReplay` on a second use of the same ticket.
+    /// (`RejectedDisabled` has its own test below — it needs the kill switch off.)
     #[tokio::test]
     async fn observability_sink_does_not_perturb_resumption_or_early_data() {
         let server = server_with_observability();
@@ -2594,6 +2603,76 @@ mod tests {
                 assert!(early.is_none());
             }
             o => panic!("expected Success, got {o:?}"),
+        }
+    }
+
+    /// A2b kill switch: with `set_early_data_enabled(false)` an offered blob is
+    /// refused by policy. The resume itself still stands (the ticket's binder is
+    /// valid, so the cookie/PoW bypass applies) and the handshake completes 1-RTT
+    /// with `early_data_accepted = false` — the record-site restructuring that
+    /// introduced `EarlyDataOutcome::RejectedDisabled` must not have moved any
+    /// decision. The metric itself is OTel-only, so its emission is pinned by
+    /// `core/tests/observability_instrument_wiring.rs`; what this test guards is
+    /// that the now-unconditional record site is reached on a path that still
+    /// behaves exactly as before.
+    #[tokio::test]
+    async fn disabled_early_data_still_completes_a_1rtt_resume() {
+        let server = server_with_observability();
+        let ip: IpAddr = "198.51.100.12".parse().unwrap();
+
+        let (rid, secret) = first_handshake_for_hint(&server, ip);
+        server.set_early_data_enabled(false);
+        assert!(!server.early_data_enabled());
+
+        let client = HandshakeClient::new().unwrap();
+        let hello = client.create_client_hello_with_resume(rid, &secret, Some(b"denied"));
+        assert!(
+            hello.early_data.is_some(),
+            "the client must actually have offered a sealed blob"
+        );
+        let sh = match server.process_client_hello(&hello, 0, ip) {
+            HandshakeResponse::Success(sh, _, early) => {
+                assert!(
+                    !sh.early_data_accepted,
+                    "the kill switch must refuse the blob"
+                );
+                assert!(early.is_none(), "no early-data plaintext may surface");
+                sh
+            }
+            o => panic!("the resume itself must still complete, got {o:?}"),
+        };
+        // Invariant 7/H2 unchanged: the client still verifies the transcript, which
+        // ends with the (false) `early_data_accepted` verdict.
+        client
+            .process_server_hello(&hello, &sh, Some(server.verifying_key()))
+            .expect("client verifies the ServerHello");
+    }
+
+    /// A hello that offers **no** early-data must not produce an early-data sample at
+    /// all, kill switch or not — a client that never asked for 0-RTT is not a
+    /// rejection, and counting it would swamp the series with every plain handshake.
+    /// Asserted structurally: the record site's sole gate is
+    /// `client_hello.early_data.is_some()`.
+    #[tokio::test]
+    async fn a_hello_without_early_data_is_not_an_early_data_event() {
+        let server = server_with_observability();
+        let ip: IpAddr = "198.51.100.13".parse().unwrap();
+        server.set_early_data_enabled(false);
+
+        let client = HandshakeClient::new().unwrap();
+        let mut hello = client.create_client_hello();
+        assert!(hello.early_data.is_none());
+        let retry = match server.process_client_hello(&hello, 0, ip) {
+            HandshakeResponse::Retry(r) => r,
+            o => panic!("expected a cookie Retry on first contact, got {o:?}"),
+        };
+        hello.cookie = Some(retry.cookie.expect("retry demands a cookie"));
+        match server.process_client_hello(&hello, 0, ip) {
+            HandshakeResponse::Success(sh, _, early) => {
+                assert!(!sh.early_data_accepted);
+                assert!(early.is_none());
+            }
+            o => panic!("expected Success with a valid cookie, got {o:?}"),
         }
     }
 

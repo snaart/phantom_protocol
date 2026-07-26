@@ -96,10 +96,16 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   recorders required plumbing an optional `Arc<Observability>` into `HandshakeServer` via a
   purely additive `with_observability(...)` builder — every existing constructor keeps its
   signature and gets a no-op sink. `record_fallback` remains unrecorded: the
-  `FallbackStateMachine` it would observe is itself inert. Two gaps are documented rather
-  than papered over — a server with early data disabled by policy emits no early-data
-  sample (`EarlyDataOutcome` models no such variant), and an unanswered path-validation
-  challenge emits neither outcome (the pump has no timeout sweep).
+  `FallbackStateMachine` it would observe is itself inert.
+  Two attribute values are new: `EarlyDataOutcome::RejectedDisabled` (`rejected_disabled`)
+  so a server running the 0-RTT kill switch is distinguishable from one simply seeing no
+  0-RTT traffic, and `PathValidationOutcome::Timeout` (`timeout`) so an abandoned path
+  challenge is distinguishable from one answered wrongly. The latter is backed by an
+  expiry sweep on the pump's existing 10 ms heartbeat, budgeted from the session's own
+  `LivenessConfig` and BBR `min_rtt` — the same threshold at which that heartbeat already
+  declares a path down — so a challenge yields exactly one `success`, `failure` or
+  `timeout` sample and never leaks its bookkeeping. The sweep is metrics-only; it does not
+  change `PathRegistry` state.
 
 ### Changed
 

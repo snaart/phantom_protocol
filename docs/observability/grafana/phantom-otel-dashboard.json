@@ -227,7 +227,7 @@
       "id": 33,
       "type": "timeseries",
       "title": "Early-data outcomes / sec",
-      "description": "0-RTT early-data outcomes, recorded by process_client_hello (transport/handshake.rs) once per hello that carried a sealed blob: accepted, rejected_unknown_ticket, rejected_oversized, rejected_aead, rejected_replay. Known gap: a server running with set_early_data_enabled(false) emits NO sample for an offered blob — EarlyDataOutcome has no 'disabled by policy' variant — so a flat line here can mean the kill switch is on rather than that no client is offering 0-RTT.",
+      "description": "0-RTT early-data outcomes, recorded by process_client_hello (transport/handshake.rs) once per hello that carried a sealed blob: accepted, rejected_unknown_ticket, rejected_oversized, rejected_aead, rejected_replay, rejected_disabled. A hello that offers no blob is not a 0-RTT decision and emits nothing, so this panel is blank only when no client is offering early data. rejected_disabled is the A2b operator kill switch (set_early_data_enabled(false)) — checked before any ticket lookup or AEAD work, so a disabled server never mis-attributes a blob to a client-side cause. If the whole panel is flat, check rejected_disabled before concluding that no client wants 0-RTT.",
       "datasource": "$datasource",
       "gridPos": { "h": 7, "w": 8, "x": 16, "y": 35 },
       "targets": [
@@ -269,6 +269,20 @@
         {
           "expr": "phantom_path_rtt_us{instance=~\"$instance\"}",
           "legendFormat": "path {{path_id}}"
+        }
+      ]
+    },
+    {
+      "id": 43,
+      "type": "timeseries",
+      "title": "Path validation outcomes / sec",
+      "description": "PATH_CHALLENGE resolutions, one sample per issued challenge. success/failure come from handle_packet's PATH_VALIDATION arm when the peer answers; timeout comes from the pump's heartbeat sweep (sweep_path_validation_timeouts in api/session.rs) when it never does. Read them differently: a failure is a wrong echo from something that holds the session key, a timeout is a path carrying nothing at all (blackholed migration, NAT never opened, peer gone). The timeout budget is the session's own path-down threshold — path_down_ptos x max(min_pto, 3 x min_rtt) from LivenessConfig — so it scales with the measured RTT. The sweep is metrics-only: it does not move the path registry out of Validating. path_id 255 is the reserved M-3 passive-rebind validation id; 1..=254 are active migrations.",
+      "datasource": "$datasource",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 50 },
+      "targets": [
+        {
+          "expr": "sum by (outcome, path_id) (rate(phantom_path_validation_duration_seconds_count{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{outcome}} — path {{path_id}}"
         }
       ]
     }

@@ -173,6 +173,15 @@ pub enum EarlyDataOutcome {
     RejectedOversized,
     RejectedAead,
     RejectedReplay,
+    /// The server-wide 0-RTT kill switch is on
+    /// (`HandshakeServer::set_early_data_enabled(false)` / A2b), so an offered
+    /// blob was refused by policy before any ticket lookup or AEAD work.
+    ///
+    /// Distinguished from the other rejections because it is an *operator*
+    /// decision, not a client-attributable failure: without it a flat
+    /// early-data series is ambiguous between "no client is offering 0-RTT"
+    /// and "0-RTT is switched off here".
+    RejectedDisabled,
 }
 
 impl EarlyDataOutcome {
@@ -183,6 +192,7 @@ impl EarlyDataOutcome {
             Self::RejectedOversized => "rejected_oversized",
             Self::RejectedAead => "rejected_aead",
             Self::RejectedReplay => "rejected_replay",
+            Self::RejectedDisabled => "rejected_disabled",
         }
     }
 }
@@ -206,8 +216,19 @@ impl ResumptionMode {
 /// Outcome of a `PATH_VALIDATION` exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PathValidationOutcome {
+    /// The peer echoed the challenge and it verified — path is `Validated`.
     Success,
+    /// The peer answered with the wrong bytes — path is `Failed`.
     Failure,
+    /// The challenge was never answered: the pump's expiry sweep abandoned it
+    /// after the path-down threshold elapsed.
+    ///
+    /// Materially different from [`Self::Failure`]: a failure means *something*
+    /// on the new path talked back with the session key and got the bytes
+    /// wrong, whereas a timeout means the new path is simply not carrying
+    /// traffic (blackholed, NAT never opened, peer gone). Operators tune
+    /// different things for the two.
+    Timeout,
 }
 
 impl PathValidationOutcome {
@@ -215,6 +236,7 @@ impl PathValidationOutcome {
         match self {
             Self::Success => "success",
             Self::Failure => "failure",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -263,5 +285,33 @@ mod tests {
     #[test]
     fn protocol_version_strings() {
         assert_eq!(ProtocolVersion::Current.as_str(), "v1");
+    }
+
+    /// The label values are the metric contract — a dashboard/alert breaks
+    /// silently if one is renamed, so every variant is pinned by string here.
+    #[test]
+    fn early_data_outcome_strings_are_stable() {
+        assert_eq!(EarlyDataOutcome::Accepted.as_str(), "accepted");
+        assert_eq!(
+            EarlyDataOutcome::RejectedUnknownTicket.as_str(),
+            "rejected_unknown_ticket"
+        );
+        assert_eq!(
+            EarlyDataOutcome::RejectedOversized.as_str(),
+            "rejected_oversized"
+        );
+        assert_eq!(EarlyDataOutcome::RejectedAead.as_str(), "rejected_aead");
+        assert_eq!(EarlyDataOutcome::RejectedReplay.as_str(), "rejected_replay");
+        assert_eq!(
+            EarlyDataOutcome::RejectedDisabled.as_str(),
+            "rejected_disabled"
+        );
+    }
+
+    #[test]
+    fn path_validation_outcome_strings_are_stable() {
+        assert_eq!(PathValidationOutcome::Success.as_str(), "success");
+        assert_eq!(PathValidationOutcome::Failure.as_str(), "failure");
+        assert_eq!(PathValidationOutcome::Timeout.as_str(), "timeout");
     }
 }

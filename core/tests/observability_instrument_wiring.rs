@@ -39,24 +39,36 @@
 //!   the same attribute set, which no idle task does).
 //! - No sleep is used as synchronisation; the only sleeps are inside the server
 //!   helper tasks keeping a session alive, and every wait is a bounded
-//!   `tokio::time::timeout`.
+//!   `tokio::time::timeout`. The one event that is inherently a *timer* — the
+//!   path-validation expiry sweep — is still not slept on: the challenge itself
+//!   is confirmed through a channel, and the sweep's result is then observed by
+//!   polling the meter under a deadline with ~15× slack over the budget, so the
+//!   test exits the instant the sample lands rather than after a fixed wait.
+//! - Assertions are `>=` deltas with two deliberate exceptions
+//!   (`rejected_disabled` and the `failure`-must-not-move check), each justified
+//!   at the assertion: those exact attribute sets are unreachable from any other
+//!   test in this binary, and exactness is what pins the *negative* half of the
+//!   contract.
 
 #![cfg(feature = "telemetry-otel")]
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
 use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
 
+use bytes::Bytes;
 use phantom_protocol::api::listener::PhantomListener;
 use phantom_protocol::api::session::{
-    connect_pinned, connect_pinned_udp, connect_pinned_with_resumption, PhantomSession,
+    connect_pinned, connect_pinned_udp, connect_pinned_with_resumption, FramePhase, PhantomSession,
+    SessionTransport,
 };
 use phantom_protocol::api::tcp_transport::TcpSessionTransport;
 use phantom_protocol::api::udp_listener::PhantomUdpListener;
@@ -65,7 +77,10 @@ use phantom_protocol::observability::{Observability, ObservabilityConfig};
 use phantom_protocol::transport::handshake::{
     HandshakeClient, HandshakeResponse, HandshakeServer, EARLY_DATA_MAX_LEN,
 };
+use phantom_protocol::transport::liveness::LivenessConfig;
+use phantom_protocol::CoreError;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -250,6 +265,11 @@ where
             .expect("build test runtime");
         rt.block_on(body());
     })
+}
+
+/// Growth of one instrument series across the gated section.
+fn delta(before: &Series, after: &Series, suffix: &str, want: &[(&str, &str)]) -> i64 {
+    total(after, suffix, want) - total(before, suffix, want)
 }
 
 /// Assert an instrument series grew by at least `min` across the gated section.
@@ -675,6 +695,108 @@ fn malformed_early_data_records_oversized_and_aead_rejections() {
     );
 }
 
+/// The A2b 0-RTT kill switch (`set_early_data_enabled(false)`).
+///
+/// A server with early data disabled that still receives a hello **offering** a
+/// sealed blob emits `outcome=rejected_disabled`. Before this was wired, that
+/// case produced no sample at all, so a flat `phantom.session.early_data` line
+/// was ambiguous between "no client is offering 0-RTT" and "the operator turned
+/// 0-RTT off here" — two very different answers to "why is my 0-RTT hit-rate
+/// zero?".
+///
+/// The delta is asserted **exactly**, not `>=`: this is the only test in the
+/// binary that ever disables early data, and no production listener starts
+/// disabled, so no background task can contribute a stray `rejected_disabled`.
+/// Exactness is what pins the *negative* half of the contract — the plain hello
+/// in step (b) offers no blob, is not a 0-RTT decision, and must not add a
+/// second sample.
+#[test]
+fn disabled_early_data_records_rejected_disabled_only_for_an_offered_blob() {
+    let (before, after) = gated(|| {
+        let obs = Observability::new(ObservabilityConfig::default());
+        let server = HandshakeServer::new()
+            .expect("HandshakeServer::new")
+            .with_observability(obs);
+        let ip: IpAddr = "203.0.113.19".parse().expect("ip");
+
+        // A full 1-RTT handshake so there is a genuine ticket to resume with —
+        // the kill switch must be what refuses the blob, not a missing ticket.
+        let client = HandshakeClient::new().expect("HandshakeClient::new");
+        let mut mint = client.create_client_hello();
+        let retry = match server.process_client_hello(&mint, 0, ip) {
+            HandshakeResponse::Retry(r) => r,
+            other => panic!("expected Retry on first contact, got {other:?}"),
+        };
+        mint.cookie = Some(retry.cookie.expect("retry must demand a cookie"));
+        let sh = match server.process_client_hello(&mint, 0, ip) {
+            HandshakeResponse::Success(sh, _, _) => sh,
+            other => panic!("expected Success with a valid cookie, got {other:?}"),
+        };
+        let (session, _) = client
+            .process_server_hello(&mint, &sh, Some(server.verifying_key()))
+            .expect("client verifies the ServerHello");
+        let (rid, secret) = session.resumption_hint().expect("ticket minted");
+
+        server.set_early_data_enabled(false);
+
+        // (a) Offered blob + valid ticket → exactly one `rejected_disabled`, and
+        //     the resume itself still completes 1-RTT.
+        let c2 = HandshakeClient::new().expect("HandshakeClient::new");
+        let offered = c2.create_client_hello_with_resume(rid, &secret, Some(b"denied"));
+        assert!(
+            offered.early_data.is_some(),
+            "the client must actually have sealed a blob"
+        );
+        match server.process_client_hello(&offered, 0, ip) {
+            HandshakeResponse::Success(sh, _, early) => {
+                assert!(
+                    !sh.early_data_accepted,
+                    "the kill switch must refuse the blob"
+                );
+                assert!(early.is_none(), "no early-data plaintext may surface");
+            }
+            other => panic!("the resume itself must still complete, got {other:?}"),
+        }
+
+        // (b) A plain hello offering nothing → NOT an early-data event.
+        let c3 = HandshakeClient::new().expect("HandshakeClient::new");
+        let mut plain = c3.create_client_hello();
+        assert!(plain.early_data.is_none());
+        let retry = match server.process_client_hello(&plain, 0, ip) {
+            HandshakeResponse::Retry(r) => r,
+            other => panic!("expected Retry on first contact, got {other:?}"),
+        };
+        plain.cookie = Some(retry.cookie.expect("retry must demand a cookie"));
+        assert!(matches!(
+            server.process_client_hello(&plain, 0, ip),
+            HandshakeResponse::Success(..)
+        ));
+    });
+
+    assert_eq!(
+        delta(
+            &before,
+            &after,
+            ".session.early_data",
+            &[("outcome", "rejected_disabled")]
+        ),
+        1,
+        "exactly one sample: the offered blob is a rejection, the plain hello is not"
+    );
+    // The switch is checked before any ticket lookup or AEAD work, so the blob is
+    // never attributed to a client-side cause.
+    assert_eq!(
+        delta(
+            &before,
+            &after,
+            ".session.early_data",
+            &[("outcome", "accepted")]
+        ),
+        0,
+        "a disabled server must never record an acceptance"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // record_rekey
 // ───────────────────────────────────────────────────────────────────────────
@@ -847,5 +969,224 @@ fn udp_migration_records_path_migration_and_validation() {
         ".path.validation.duration",
         &[("outcome", "success"), ("path_id", "1")],
         1,
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// record_path_validation — the unanswered-challenge (timeout) arm
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A `SessionTransport` decorator that makes the pump believe an unvalidated
+/// migration candidate exists and then swallows the `PATH_CHALLENGE` sent to it.
+///
+/// That is exactly the shape of a real blackholed migration: the peer's new
+/// address is committed as a candidate (post-AEAD, M-1), the challenge goes out
+/// to it, and nothing ever comes back. Doing it with a decorator instead of a
+/// cut network keeps the test hermetic and instant — the production challenge is
+/// really issued by `handle_packet`, really stamped in the pump's challenge map,
+/// and really expired by `sweep_path_validation_timeouts`.
+///
+/// Forwards the **entire** control surface (EPS-04 wrapper contract) — only
+/// `has_migration_candidate` / `send_to_candidate` are overridden.
+struct BlackholeCandidate {
+    inner: TcpSessionTransport,
+    /// Flipped off once the challenge is out, so subsequent inbound frames
+    /// cannot re-issue (and thereby re-stamp) it.
+    candidate: AtomicBool,
+    /// Fires when the pump hands us a challenge for the candidate.
+    issued: mpsc::UnboundedSender<()>,
+}
+
+impl SessionTransport for BlackholeCandidate {
+    fn send_bytes(&self, data: &[u8]) -> impl Future<Output = Result<(), CoreError>> + Send {
+        self.inner.send_bytes(data)
+    }
+
+    fn recv_bytes(&self) -> impl Future<Output = Result<Bytes, CoreError>> + Send {
+        self.inner.recv_bytes()
+    }
+
+    fn set_frame_phase(&self, phase: FramePhase) {
+        self.inner.set_frame_phase(phase);
+    }
+
+    fn set_outbound_cid(&self, cid: [u8; 8]) {
+        self.inner.set_outbound_cid(cid);
+    }
+
+    fn has_migration_candidate(&self) -> bool {
+        self.candidate.load(Ordering::Acquire)
+    }
+
+    fn send_to_candidate(
+        &self,
+        _data: &[u8],
+    ) -> impl Future<Output = Result<bool, CoreError>> + Send {
+        // One challenge is enough to prove the point; stop advertising the
+        // candidate so the next inbound frame does not restart the clock.
+        self.candidate.store(false, Ordering::Release);
+        let _ = self.issued.send(());
+        // Report a successful send: the challenge left the building and simply
+        // never gets an answer, which is the blackhole we are modelling.
+        async { Ok(true) }
+    }
+
+    fn confirm_authenticated_source(&self) {
+        self.inner.confirm_authenticated_source();
+    }
+
+    fn promote_candidate(&self) -> bool {
+        self.inner.promote_candidate()
+    }
+
+    fn supports_migration(&self) -> bool {
+        self.inner.supports_migration()
+    }
+
+    fn migrate(&self, local_addr: String) -> impl Future<Output = Result<(), CoreError>> + Send {
+        self.inner.migrate(local_addr)
+    }
+
+    fn migrate_server(
+        &self,
+        local_addr: String,
+    ) -> impl Future<Output = Result<(), CoreError>> + Send {
+        self.inner.migrate_server(local_addr)
+    }
+}
+
+/// A `PATH_CHALLENGE` the peer never answers must record
+/// `outcome=timeout` — the second of the two documented gaps.
+///
+/// Previously an unanswered challenge recorded nothing at all: only a real
+/// response (matching → `success`, mismatched → `failure`) produced a sample, so
+/// a migration into a blackhole was invisible and its start stamp leaked. The
+/// pump's heartbeat now expires it after the same `path_down_ptos × PTO` budget
+/// it already uses to declare a path down.
+///
+/// Determinism: the challenge is confirmed **through a channel**, not a sleep,
+/// and the timeout is then observed by polling the meter under a generous
+/// deadline. The polling loop is bounded at 30 s with a 2 s budget, so a loaded
+/// CI runner has ~15× slack; the loop exits as soon as the sample lands.
+#[test]
+fn an_unanswered_path_challenge_records_a_timeout() {
+    // Reserved M-3 rebind-validation path id: the challenge the M-3 branch issues
+    // when an authenticated frame arrives on the (Validated) path 0 while a
+    // migration candidate is outstanding.
+    const REBIND_PATH: &str = "255";
+    // 2 × max(500 ms, 3 × min_rtt): comfortably longer than a loopback round trip
+    // (so a live validation would never be swept) and short enough that the test
+    // finishes promptly.
+    let liveness = LivenessConfig {
+        min_pto: Duration::from_millis(500),
+        path_down_ptos: 2,
+        ..LivenessConfig::default()
+    };
+
+    let (before, after) = gated(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+
+        // Establish the session and hold it (plus the runtime) alive while the
+        // pump's heartbeat runs; the sweep only ticks on a live pump.
+        let client = rt.block_on(async {
+            let listener = PhantomListener::bind("127.0.0.1:0".to_string())
+                .await
+                .expect("bind listener");
+            let addr = listener.local_addr();
+            let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes())
+                .expect("verifying key");
+
+            // Echo until the client goes away; keeps the TCP peer (and therefore
+            // the client's reader task, and therefore its pump) alive.
+            tokio::spawn(async move {
+                let session = listener.accept().await.expect("accept").session();
+                while let Ok(msg) = session.recv().await {
+                    if session.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let (issued_tx, mut issued_rx) = mpsc::unbounded_channel::<()>();
+            let tcp = TcpStream::connect(&addr).await.expect("tcp connect");
+            let transport = BlackholeCandidate {
+                inner: TcpSessionTransport::new(tcp),
+                candidate: AtomicBool::new(true),
+                issued: issued_tx,
+            };
+            let client = PhantomSession::connect_with_transport(&addr, transport, key);
+            timeout(Duration::from_secs(15), client.await_ready())
+                .await
+                .expect("handshake timed out")
+                .expect("handshake failed");
+            assert!(
+                client.set_liveness_config(liveness).await,
+                "session must be established before the liveness override"
+            );
+
+            // One echo. The inbound reply is an authenticated app frame on the
+            // pre-validated path 0 with a migration candidate outstanding, which
+            // is precisely the M-3 branch that issues a challenge on path 255.
+            client
+                .send(b"provoke-a-challenge".to_vec())
+                .await
+                .expect("send");
+            let echo = timeout(Duration::from_secs(15), client.recv())
+                .await
+                .expect("echo timed out")
+                .expect("recv");
+            assert_eq!(echo, b"provoke-a-challenge");
+
+            timeout(Duration::from_secs(15), issued_rx.recv())
+                .await
+                .expect("the pump never issued a PATH_CHALLENGE to the candidate")
+                .expect("challenge channel closed");
+            client
+        });
+
+        // The challenge is outstanding and unanswerable. Poll the meter (from
+        // outside the runtime — `force_flush` blocks) until the sweep reports it.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            let now = collect();
+            if total(
+                &now,
+                ".path.validation.duration",
+                &[("outcome", "timeout"), ("path_id", REBIND_PATH)],
+            ) > 0
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        rt.block_on(async {
+            let _ = client.disconnect().await;
+        });
+    });
+
+    assert_grew(
+        &before,
+        &after,
+        ".path.validation.duration",
+        &[("outcome", "timeout"), ("path_id", REBIND_PATH)],
+        1,
+    );
+    // A timeout is NOT a failure: nothing answered, so nothing was wrong-answered.
+    // Operators alert differently on the two, so the sweep must not borrow the
+    // `failure` label.
+    assert_eq!(
+        delta(
+            &before,
+            &after,
+            ".path.validation.duration",
+            &[("outcome", "failure"), ("path_id", REBIND_PATH)]
+        ),
+        0,
+        "an unanswered challenge must not be reported as a validation failure"
     );
 }

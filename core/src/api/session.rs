@@ -1235,21 +1235,94 @@ impl StreamGauge {
     }
 }
 
+/// Issue instant of every PATH_CHALLENGE this side currently has outstanding,
+/// keyed by path id — the start stamp for
+/// [`Observability::record_path_validation`].
+///
+/// The path registry itself keeps no timestamp, so this map is the authoritative
+/// start time. Bounded by the 256-value `path_id` space; an entry leaves the map
+/// exactly once, either when the peer's response resolves it (reader task) or
+/// when the pump's expiry sweep abandons it (send loop) — so a challenge
+/// produces exactly one `success` / `failure` / `timeout` sample, never two.
+///
+/// Shared between the reader task (which issues and resolves challenges) and the
+/// pump's heartbeat (which expires them), hence the mutex. Every method locks,
+/// finishes its map work, and releases before returning; the lock is never held
+/// across an `.await`, and no recording happens under it.
+#[derive(Default)]
+struct PathChallenges {
+    started: parking_lot::Mutex<std::collections::HashMap<u8, std::time::Instant>>,
+}
+
+impl PathChallenges {
+    /// Stamp (or re-stamp, on a re-issued challenge) the start of a validation
+    /// attempt on `path_id`.
+    fn start(&self, path_id: u8) {
+        self.started
+            .lock()
+            .insert(path_id, std::time::Instant::now());
+    }
+
+    /// Take the start stamp for `path_id` if this side has an outstanding
+    /// challenge there. `None` means we never issued one (or the sweep already
+    /// timed it out), in which case there is nothing to time.
+    fn resolve(&self, path_id: u8) -> Option<std::time::Instant> {
+        self.started.lock().remove(&path_id)
+    }
+
+    /// Whether nothing is outstanding. The overwhelmingly common case on a
+    /// steady session, so the pump's heartbeat checks this before doing any
+    /// budget arithmetic.
+    fn is_empty(&self) -> bool {
+        self.started.lock().is_empty()
+    }
+
+    /// Remove and return every challenge that has been outstanding longer than
+    /// `timeout`, as `(path_id, waited)` pairs. The caller records the samples
+    /// *after* this returns, so the lock is released first.
+    fn expire(&self, timeout: std::time::Duration) -> Vec<(u8, std::time::Duration)> {
+        let now = std::time::Instant::now();
+        let mut expired = Vec::new();
+        let mut guard = self.started.lock();
+        guard.retain(|path_id, started| {
+            let waited = now.saturating_duration_since(*started);
+            if waited > timeout {
+                expired.push((*path_id, waited));
+                false
+            } else {
+                true
+            }
+        });
+        drop(guard);
+        expired
+    }
+
+    #[cfg(test)]
+    fn outstanding(&self) -> usize {
+        self.started.lock().len()
+    }
+
+    /// Backdate a challenge's start stamp so the expiry sweep can be tested
+    /// without sleeping (an injected clock, not a wall-clock race).
+    #[cfg(test)]
+    fn start_at(&self, path_id: u8, at: std::time::Instant) {
+        self.started.lock().insert(path_id, at);
+    }
+}
+
 /// Receive-task-local scratch space and observability bookkeeping.
 ///
-/// Owned exclusively by the single reader task (passed as `&mut`), so nothing
-/// in here needs synchronisation and no lock is ever held across an `.await`.
+/// Owned exclusively by the single reader task (passed as `&mut`), so nothing in
+/// here needs synchronisation — with the single, explicitly-shared exception of
+/// [`PathChallenges`], whose entries the pump's heartbeat also expires. No lock
+/// is ever held across an `.await`.
 struct RecvScratch {
     /// Reusable ACK-frame serialization buffer. Hoisted out of the read loop so
     /// a busy reliable stream doesn't pay a fresh allocation per emitted ACK.
     ack_buf: Vec<u8>,
-    /// Issue instant of each PATH_CHALLENGE this side currently has
-    /// outstanding, keyed by path id — the start stamp for
-    /// [`Observability::record_path_validation`]. The path registry itself
-    /// keeps no timestamp, and only this task issues challenges, so the map is
-    /// the authoritative start time. Bounded by the 256-value `path_id` space;
-    /// entries are removed the moment the challenge resolves.
-    challenge_started: std::collections::HashMap<u8, std::time::Instant>,
+    /// Outstanding PATH_CHALLENGE start stamps. Shared with the pump loop, which
+    /// sweeps unanswered challenges — see [`PathChallenges`].
+    challenges: Arc<PathChallenges>,
     /// Most recent peer `path_id` observed to move forward. Seeded at 0 (the
     /// implicit handshake path) and updated on each detected peer migration, so
     /// `record_path_migration` can report a real `from` → `to` pair.
@@ -1259,10 +1332,14 @@ struct RecvScratch {
 }
 
 impl RecvScratch {
-    fn new(ack_buf_capacity: usize, stream_gauge: Arc<StreamGauge>) -> Self {
+    fn new(
+        ack_buf_capacity: usize,
+        stream_gauge: Arc<StreamGauge>,
+        challenges: Arc<PathChallenges>,
+    ) -> Self {
         Self {
             ack_buf: Vec::with_capacity(ack_buf_capacity),
-            challenge_started: std::collections::HashMap::new(),
+            challenges,
             last_peer_path: 0,
             stream_gauge,
         }
@@ -1562,6 +1639,12 @@ async fn run_data_pump<T: SessionTransport>(
     // closure.
     let (recv_done_tx, mut recv_done_rx) = oneshot::channel::<()>();
     let transport_for_path = transport.clone();
+    // Outstanding PATH_CHALLENGE start stamps. Created here (not inside the
+    // reader task) because BOTH halves of the pump touch it: the reader issues
+    // and resolves challenges, and the send loop's heartbeat expires the ones
+    // that are never answered (`sweep_path_validation_timeouts`).
+    let path_challenges = Arc::new(PathChallenges::default());
+    let path_challenges_recv = path_challenges.clone();
     let recv_handle = runtime.spawn(Box::pin(async move {
         // Reader-local scratch: the reusable ACK frame serialization buffer
         // (hoisted out of the loop since Phase 2.3 so we don't pay a fresh
@@ -1570,7 +1653,7 @@ async fn run_data_pump<T: SessionTransport>(
         // `PhantomPacket`, the 15-byte header plus the AEAD tag, so the
         // underlying buffer is never reallocated after the first frame) plus
         // the observability bookkeeping the receive path needs.
-        let mut scratch = RecvScratch::new(256, stream_gauge_recv);
+        let mut scratch = RecvScratch::new(256, stream_gauge_recv, path_challenges_recv);
         // Buffering ceiling: the delivery queue is unbounded so the reader
         // never blocks, but a peer that ignores flow control could flood it.
         // Compliant senders are bounded by ~one window per stream (enforced
@@ -1717,6 +1800,14 @@ async fn run_data_pump<T: SessionTransport>(
                     &observability,
                 )
                 .await;
+                // Path-validation expiry sweep: abandon (and report) any
+                // PATH_CHALLENGE the peer never answered. Runs on the same
+                // heartbeat as the liveness sweep because it is the same class of
+                // question — "is this path carrying traffic?" — and shares its
+                // threshold. Metrics + bookkeeping only; no session state moves.
+                sweep_path_validation_timeouts(
+                    &crypto_session, &path_challenges, &observability,
+                );
                 // Liveness sweep (P4.3): the 10 ms heartbeat is the reliable place to
                 // evaluate inbound silence vs. outstanding data and surface
                 // Migrating / recover / Dead. A `Dead` verdict ends the pump.
@@ -2037,6 +2128,76 @@ fn apply_liveness(
             true
         }
         LivenessVerdict::Unchanged => false,
+    }
+}
+
+/// How long an unanswered PATH_CHALLENGE is allowed to stay outstanding before
+/// the pump abandons it and records a `timeout` sample.
+///
+/// Deliberately **not** a fresh constant: it is exactly the threshold at which
+/// this same heartbeat already declares the whole path down —
+/// `path_down_ptos × PTO`, with `PTO = max(min_pto, 3 × min_rtt)` (see
+/// `transport::liveness`). Rationale:
+///
+/// - It is RTT-adaptive. `min_rtt` comes from the live BBR estimator, so a
+///   satellite path gets a proportionally longer budget than loopback. Before
+///   the first RTT sample the estimator's own conservative 100 ms seed governs
+///   (`3 × 100 ms = 300 ms`, above the 200 ms `min_pto` floor), which errs on
+///   the generous side — exactly the right direction for a metric that must not
+///   steal a sample from a validation that was merely slow.
+/// - It is already the operator's tuning knob for "this path stopped
+///   responding". A challenge that has been silent that long is silent by the
+///   session's own definition, so a second, independent timeout would just be a
+///   knob that can disagree with the first.
+/// - It is more generous than the QUIC analogue (RFC 9000 §8.2.4 abandons a
+///   path validation after `3 × PTO`); the default config is `5 × PTO`, so the
+///   sweep never fires ahead of a validation QUIC would still consider live.
+///
+/// `path_down_ptos` is floored at 1 so a hand-built `LivenessConfig` with a zero
+/// there cannot collapse the budget to "expire on the next tick".
+fn path_validation_timeout(crypto_session: &Arc<Session>) -> std::time::Duration {
+    let cfg = crypto_session.liveness_config();
+    let min_rtt = crypto_session.bandwidth_snapshot().min_rtt;
+    let pto = cfg.min_pto.max(min_rtt.saturating_mul(3));
+    pto.saturating_mul(cfg.path_down_ptos.max(1))
+}
+
+/// Expire every PATH_CHALLENGE that has gone unanswered past
+/// [`path_validation_timeout`], recording one
+/// [`PathValidationOutcome::Timeout`] sample each.
+///
+/// Without this, `phantom.path.validation.duration` only ever saw an *answered*
+/// challenge: a validation into a blackhole produced neither `success` nor
+/// `failure`, and its start stamp was never reclaimed. `Timeout` is kept
+/// distinct from `Failure` because they mean different things operationally — a
+/// failure is a wrong echo from something that holds the session key, a timeout
+/// is a path that carries nothing at all.
+///
+/// **Metrics + bookkeeping only.** The `PathRegistry` entry is deliberately left
+/// in `Validating`: `issue_challenge` is idempotent while a challenge is in
+/// flight (PATH-003) and refuses to re-issue from the terminal `Failed` state,
+/// so driving the path to `Failed` here would permanently burn that `path_id`
+/// for the session and break a migration whose challenge was merely lost. The
+/// registry is bounded by the 256-value `path_id` space either way.
+fn sweep_path_validation_timeouts(
+    crypto_session: &Arc<Session>,
+    challenges: &PathChallenges,
+    observability: &Observability,
+) {
+    // Fast path for the steady state: no challenge outstanding means no budget
+    // to compute (and no `liveness_config` / `bandwidth_snapshot` locks to take)
+    // on a heartbeat that fires every 10 ms. A challenge registered between this
+    // check and the next tick is simply swept one tick later.
+    if challenges.is_empty() {
+        return;
+    }
+    let timeout = path_validation_timeout(crypto_session);
+    for (path_id, waited) in challenges.expire(timeout) {
+        log::debug!(
+            "PhantomSession: PATH_CHALLENGE on path {path_id} unanswered after {waited:?} \
+             (budget {timeout:?}) — abandoning validation"
+        );
+        observability.record_path_validation(waited, path_id, PathValidationOutcome::Timeout);
     }
 }
 
@@ -3151,11 +3312,11 @@ async fn handle_packet<T: SessionTransport>(
                 let validated = crypto_recv.complete_path_validation(path_id, &payload_buf);
                 // Resolve the outstanding challenge's latency. The start stamp is
                 // recorded where we issued the challenge (below); a missing entry
-                // means this side never issued one, so there is nothing to time.
-                // Note the registry has no expiry sweep, so a challenge that is
-                // never answered records neither outcome — only a real response
-                // (matching or not) produces a sample.
-                if let Some(started) = scratch.challenge_started.remove(&path_id) {
+                // means either this side never issued one, or the pump's expiry
+                // sweep (`sweep_path_validation_timeouts`) already abandoned it
+                // and recorded a `timeout` sample — either way there is nothing
+                // left to time, and the one-entry-one-sample rule is preserved.
+                if let Some(started) = scratch.challenges.resolve(path_id) {
                     observability.record_path_validation(
                         started.elapsed(),
                         path_id,
@@ -3236,10 +3397,9 @@ async fn handle_packet<T: SessionTransport>(
         if transport_for_path.has_migration_candidate() {
             if let Some(challenge) = crypto_recv.begin_path_validation(path_id) {
                 // Start (or restart, on a re-issued challenge) the validation
-                // timer for this path. The completion branch above resolves it.
-                scratch
-                    .challenge_started
-                    .insert(path_id, std::time::Instant::now());
+                // timer for this path. The completion branch above resolves it;
+                // the pump's heartbeat expires it if the peer never answers.
+                scratch.challenges.start(path_id);
                 if let Some(buf) = encrypt_path_validation(
                     crypto_recv,
                     session_id,
@@ -3277,9 +3437,7 @@ async fn handle_packet<T: SessionTransport>(
         let rebind_path = crate::transport::session::REBIND_VALIDATION_PATH_ID;
         if let Some(challenge) = crypto_recv.begin_path_validation(rebind_path) {
             // Same validation timer as the active-migration challenge above.
-            scratch
-                .challenge_started
-                .insert(rebind_path, std::time::Instant::now());
+            scratch.challenges.start(rebind_path);
             if let Some(buf) = encrypt_path_validation(
                 crypto_recv,
                 session_id,
@@ -4642,7 +4800,11 @@ mod tests {
     /// Reader-task scratch for a direct `handle_packet` call in a test, wired to
     /// `obs` so any stream the packet opens lands on that handle's gauge.
     fn test_recv_scratch(obs: &Arc<Observability>, ack_capacity: usize) -> RecvScratch {
-        RecvScratch::new(ack_capacity, StreamGauge::new(obs.clone()))
+        RecvScratch::new(
+            ack_capacity,
+            StreamGauge::new(obs.clone()),
+            Arc::new(PathChallenges::default()),
+        )
     }
 
     // ── Mock transport for testing ──
@@ -5123,42 +5285,41 @@ mod tests {
             let client_hello_bytes = server_transport.recv_bytes().await.unwrap();
             let client_hello = borsh::from_slice::<ClientHello>(&client_hello_bytes).unwrap();
 
-            // 2. Process — may retry with cookie/PoW.
-            let server_session = loop {
-                let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
-                match response {
-                    HandshakeResponse::Retry(retry) => {
-                        let retry_bytes = ServerReply::Retry(retry).to_wire().unwrap();
-                        server_transport.send_bytes(&retry_bytes).await.unwrap();
-                        // Receive retried client hello
-                        let next_bytes = server_transport.recv_bytes().await.unwrap();
-                        let next_hello = borsh::from_slice::<ClientHello>(&next_bytes).unwrap();
-                        let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
-                        match resp2 {
-                            HandshakeResponse::Success(server_hello, session, _) => {
-                                let server_hello_bytes =
-                                    ServerReply::Hello(server_hello).to_wire().unwrap();
-                                server_transport
-                                    .send_bytes(&server_hello_bytes)
-                                    .await
-                                    .unwrap();
-                                break session;
-                            }
-                            _ => panic!("Expected success after retry"),
+            // 2. Process. The DoS gate answers at most ONE hello with a
+            //    cookie/PoW `Retry` — the re-sent, cookie-bearing hello is
+            //    admitted — so this is a straight-line match, not a loop.
+            let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
+            let server_session = match response {
+                HandshakeResponse::Retry(retry) => {
+                    let retry_bytes = ServerReply::Retry(retry).to_wire().unwrap();
+                    server_transport.send_bytes(&retry_bytes).await.unwrap();
+                    // Receive retried client hello
+                    let next_bytes = server_transport.recv_bytes().await.unwrap();
+                    let next_hello = borsh::from_slice::<ClientHello>(&next_bytes).unwrap();
+                    let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
+                    match resp2 {
+                        HandshakeResponse::Success(server_hello, session, _) => {
+                            let server_hello_bytes =
+                                ServerReply::Hello(server_hello).to_wire().unwrap();
+                            server_transport
+                                .send_bytes(&server_hello_bytes)
+                                .await
+                                .unwrap();
+                            session
                         }
+                        _ => panic!("Expected success after retry"),
                     }
-                    HandshakeResponse::Success(server_hello, session, _) => {
-                        let server_hello_bytes =
-                            ServerReply::Hello(server_hello).to_wire().unwrap();
-                        server_transport
-                            .send_bytes(&server_hello_bytes)
-                            .await
-                            .unwrap();
-                        break session;
-                    }
-                    HandshakeResponse::Reject(r) => panic!("unexpected reject: {:?}", r),
-                    HandshakeResponse::Fail(e) => panic!("handshake failed: {:?}", e),
                 }
+                HandshakeResponse::Success(server_hello, session, _) => {
+                    let server_hello_bytes = ServerReply::Hello(server_hello).to_wire().unwrap();
+                    server_transport
+                        .send_bytes(&server_hello_bytes)
+                        .await
+                        .unwrap();
+                    session
+                }
+                HandshakeResponse::Reject(r) => panic!("unexpected reject: {r:?}"),
+                HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
             };
 
             let session_id = *server_session.id();
@@ -5298,31 +5459,30 @@ mod tests {
             let client_hello_bytes = server_transport.recv_bytes().await.unwrap();
             let client_hello = borsh::from_slice::<ClientHello>(&client_hello_bytes).unwrap();
 
-            // Drive the handshake to completion (may take one cookie/PoW retry).
-            let server_session = loop {
-                match server_hs.process_client_hello(&client_hello, 0, client_ip) {
-                    HandshakeResponse::Retry(retry) => {
-                        let retry_bytes = ServerReply::Retry(retry).to_wire().unwrap();
-                        server_transport.send_bytes(&retry_bytes).await.unwrap();
-                        let next_bytes = server_transport.recv_bytes().await.unwrap();
-                        let next_hello = borsh::from_slice::<ClientHello>(&next_bytes).unwrap();
-                        match server_hs.process_client_hello(&next_hello, 0, client_ip) {
-                            HandshakeResponse::Success(server_hello, session, _) => {
-                                let b = ServerReply::Hello(server_hello).to_wire().unwrap();
-                                server_transport.send_bytes(&b).await.unwrap();
-                                break session;
-                            }
-                            _ => panic!("expected success after retry"),
+            // Drive the handshake to completion. The DoS gate takes at most one
+            // cookie/PoW retry round, so this is a match rather than a loop.
+            let server_session = match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+                HandshakeResponse::Retry(retry) => {
+                    let retry_bytes = ServerReply::Retry(retry).to_wire().unwrap();
+                    server_transport.send_bytes(&retry_bytes).await.unwrap();
+                    let next_bytes = server_transport.recv_bytes().await.unwrap();
+                    let next_hello = borsh::from_slice::<ClientHello>(&next_bytes).unwrap();
+                    match server_hs.process_client_hello(&next_hello, 0, client_ip) {
+                        HandshakeResponse::Success(server_hello, session, _) => {
+                            let b = ServerReply::Hello(server_hello).to_wire().unwrap();
+                            server_transport.send_bytes(&b).await.unwrap();
+                            session
                         }
+                        _ => panic!("expected success after retry"),
                     }
-                    HandshakeResponse::Success(server_hello, session, _) => {
-                        let b = ServerReply::Hello(server_hello).to_wire().unwrap();
-                        server_transport.send_bytes(&b).await.unwrap();
-                        break session;
-                    }
-                    HandshakeResponse::Reject(r) => panic!("unexpected reject: {:?}", r),
-                    HandshakeResponse::Fail(e) => panic!("handshake failed: {:?}", e),
                 }
+                HandshakeResponse::Success(server_hello, session, _) => {
+                    let b = ServerReply::Hello(server_hello).to_wire().unwrap();
+                    server_transport.send_bytes(&b).await.unwrap();
+                    session
+                }
+                HandshakeResponse::Reject(r) => panic!("unexpected reject: {r:?}"),
+                HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
             };
 
             // The reliable data frame was dropped on first transmission; it can
@@ -5733,6 +5893,145 @@ mod tests {
         assert_eq!(client_session.current_send_path_id(), 1);
         assert_eq!(client_session.next_migration_path_id(), 2);
         assert_eq!(client_session.current_send_path_id(), 2);
+    }
+
+    // ── Path-validation expiry sweep ────────────────────────────────────────
+
+    /// `expire` must take exactly the challenges past the budget, leave the rest
+    /// outstanding, and hand back the real wait so the histogram sample is the
+    /// true latency and not the budget. Deterministic — the start stamps are
+    /// injected via `start_at`, no sleeping.
+    #[test]
+    fn expire_takes_only_challenges_past_the_budget() {
+        let challenges = PathChallenges::default();
+        let now = std::time::Instant::now();
+        // Path 1: outstanding for 5 s → past a 1 s budget.
+        challenges.start_at(1, now - std::time::Duration::from_secs(5));
+        // Path 2: outstanding for 100 ms → well inside it.
+        challenges.start_at(2, now - std::time::Duration::from_millis(100));
+
+        let expired = challenges.expire(std::time::Duration::from_secs(1));
+        assert_eq!(expired.len(), 1, "exactly one challenge is past the budget");
+        assert_eq!(expired[0].0, 1);
+        assert!(
+            expired[0].1 >= std::time::Duration::from_secs(5),
+            "the sample must carry the ACTUAL wait ({:?}), not the budget",
+            expired[0].1
+        );
+        assert_eq!(challenges.outstanding(), 1, "path 2 must still be pending");
+        assert!(
+            challenges.resolve(2).is_some(),
+            "the in-budget challenge is still resolvable by a late response"
+        );
+    }
+
+    /// One entry ⇒ exactly one sample. After the sweep abandons a challenge, a
+    /// response that finally arrives must NOT also record a `success` — the
+    /// entry is gone, so `resolve` returns `None` and `handle_packet` skips the
+    /// recording. This is the double-count regression the shared map prevents.
+    #[test]
+    fn a_swept_challenge_cannot_also_record_a_response() {
+        let challenges = PathChallenges::default();
+        challenges.start_at(
+            3,
+            std::time::Instant::now() - std::time::Duration::from_secs(30),
+        );
+        assert_eq!(
+            challenges.expire(std::time::Duration::from_secs(1)).len(),
+            1
+        );
+        assert!(
+            challenges.resolve(3).is_none(),
+            "a swept challenge must leave nothing for the response path to time"
+        );
+        assert_eq!(challenges.outstanding(), 0);
+    }
+
+    /// A re-issued challenge (PATH-003 returns the same bytes) restarts the
+    /// clock rather than accumulating a second entry, so a path being
+    /// re-challenged every heartbeat is never swept out from under itself.
+    #[test]
+    fn restarting_a_challenge_replaces_its_stamp() {
+        let challenges = PathChallenges::default();
+        challenges.start_at(
+            4,
+            std::time::Instant::now() - std::time::Duration::from_secs(60),
+        );
+        challenges.start(4);
+        assert_eq!(challenges.outstanding(), 1, "no duplicate entry");
+        assert!(
+            challenges
+                .expire(std::time::Duration::from_secs(1))
+                .is_empty(),
+            "the re-issue must have reset the clock"
+        );
+    }
+
+    /// The budget is the session's own path-down threshold —
+    /// `path_down_ptos × max(min_pto, 3 × min_rtt)` — read live from the
+    /// `LivenessConfig`, not a private constant. On a session with no RTT sample
+    /// yet the estimator's conservative 100 ms seed governs, so the PTO is
+    /// `3 × 100 ms = 300 ms` in every case below.
+    #[test]
+    fn path_validation_timeout_tracks_the_liveness_config() {
+        use crate::transport::liveness::LivenessConfig;
+        let (session, _peer) = paired_sessions(fixed_session_id());
+        let pto = std::time::Duration::from_millis(300);
+        assert_eq!(
+            session.bandwidth_snapshot().min_rtt,
+            std::time::Duration::from_millis(100),
+            "the estimator seeds min_rtt conservatively; the arithmetic below assumes it"
+        );
+
+        // Defaults: 5 × max(200 ms, 300 ms) = 1.5 s.
+        session.set_liveness_config(LivenessConfig::default());
+        assert_eq!(path_validation_timeout(&session), pto * 5);
+
+        // A shrunk config shrinks the budget with it: 3 × max(10 ms, 300 ms).
+        session.set_liveness_config(LivenessConfig::for_test());
+        assert_eq!(path_validation_timeout(&session), pto * 3);
+
+        // `path_down_ptos = 0` must not collapse the budget to zero (which would
+        // expire every challenge on the very next 10 ms heartbeat).
+        session.set_liveness_config(LivenessConfig {
+            path_down_ptos: 0,
+            ..LivenessConfig::for_test()
+        });
+        assert_eq!(
+            path_validation_timeout(&session),
+            pto,
+            "path_down_ptos is floored at 1"
+        );
+    }
+
+    /// End-to-end shape of the pump-side call: an over-budget challenge is
+    /// reclaimed and reported, an in-budget one is untouched. The recording
+    /// itself is OTel-only (a no-op ZST in this build), so what is asserted here
+    /// is the bookkeeping; the metric emission is pinned by
+    /// `core/tests/observability_instrument_wiring.rs`.
+    #[test]
+    fn sweep_reclaims_only_expired_challenges() {
+        use crate::transport::liveness::LivenessConfig;
+        let (session, _peer) = paired_sessions(fixed_session_id());
+        session.set_liveness_config(LivenessConfig::default()); // 1 s budget
+        let obs = Observability::new(ObservabilityConfig::default());
+        let challenges = PathChallenges::default();
+
+        let now = std::time::Instant::now();
+        challenges.start_at(1, now - std::time::Duration::from_secs(10));
+        challenges.start_at(2, now);
+
+        sweep_path_validation_timeouts(&session, &challenges, &obs);
+
+        assert_eq!(challenges.outstanding(), 1);
+        assert!(
+            challenges.resolve(1).is_none(),
+            "the stale challenge must have been reclaimed"
+        );
+        assert!(
+            challenges.resolve(2).is_some(),
+            "the fresh challenge must survive the sweep"
+        );
     }
 
     /// ε / WIRE v5 (audit V-1 / Invariant 4) — the inbound CID-window slide is

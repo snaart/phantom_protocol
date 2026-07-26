@@ -20,10 +20,13 @@ Two pillars, OTel-native:
   path-validation latency as explicit-boundary `Histogram`s. **20 of the 21
   registered instruments have a live recording call site**; only
   `phantom.transport.fallback` is unfed, because the fallback state machine
-  it would report on is never driven. Two partial gaps to know about: no
-  early-data sample is emitted when a server has 0-RTT disabled by policy,
-  and an unanswered path-validation challenge records no outcome (there is
-  no timeout sweep). Per-instrument detail is in the **Status** column of
+  it would report on is never driven. The two former partial gaps are
+  closed: a server with 0-RTT disabled by policy records
+  `early_data{outcome="rejected_disabled"}` for a blob it refuses, and a
+  path-validation challenge the peer never answers is expired by the pump's
+  heartbeat as `path.validation.duration{outcome="timeout"}` (budget = the
+  session's own path-down threshold; the sweep is metrics-only and leaves
+  the path registry alone). Per-instrument detail is in the **Status** column of
   [`metrics-catalog.md`](metrics-catalog.md). Exemplar correlation requires
   an exemplar reservoir the embedder must configure; the reference server
   does not.

@@ -18,17 +18,17 @@ the tables below carry a **Status** column naming that call site. The one
 exception is `phantom.transport.fallback`, which has no possible source —
 see its row under *Path & migration*.
 
-Two honest partial gaps survive inside otherwise-live instruments, called
-out in the rows themselves and worth knowing before you build an alert on
-them:
+The two partial gaps that used to sit inside otherwise-live instruments are
+now closed, each with its own attribution:
 
-- **`phantom.session.early_data`** emits nothing when the server has
-  `set_early_data_enabled(false)` and a client still offers early data.
-  `EarlyDataOutcome` models no "disabled by policy" variant, so that case
-  produces no sample at all rather than a rejection sample.
-- **`phantom.path.validation.duration`** has no timeout sweep behind it.
-  Only an actual response to a challenge produces a sample; a challenge
-  that is never answered records neither `success` nor `failure`.
+- **`phantom.session.early_data`** records `outcome="rejected_disabled"`
+  when the server has `set_early_data_enabled(false)` and a client still
+  offers early data, so a flat line no longer conflates "nobody is
+  offering 0-RTT" with "the kill switch is on". A hello that offers *no*
+  blob is still not an early-data event and emits nothing.
+- **`phantom.path.validation.duration`** records `outcome="timeout"` for a
+  challenge the peer never answers. The pump's heartbeat expires it after
+  the session's own path-down budget (see the row below).
 
 Whether recorded values reach a backend depends on whether the embedder
 installs a `MeterProvider` with an OTLP exporter. Note also that the
@@ -62,7 +62,7 @@ These fire at the point of the event.
 |-----------|------|------|------------|--------|
 | `phantom.handshake.duration` | Histogram (explicit latency buckets) | `s` | `outcome` (success/failure), `leg` (`tcp`/`udp`, plus `faketls` on mimicry builds), `cipher_suite` (always `aes-256-gcm` today — every call site passes `AeadAlgorithm::Aes256Gcm`), `version` (v1) | live |
 | `phantom.handshake.resumptions` | Counter | — (no unit set) | `mode` (1rtt/0rtt), `accepted` (bool) | live — `process_client_hello` (`transport/handshake.rs`), one sample per hello carrying a `resume_session_id`. `mode` is what the client *asked* for (a sealed early-data blob ⇒ `0rtt`); `accepted` is whether the server honored exactly that |
-| `phantom.session.early_data` | Counter | — (no unit set) | `outcome` (accepted / rejected_unknown_ticket / rejected_oversized / rejected_aead / rejected_replay) — all five variants are reachable | live — `process_client_hello`, one sample per hello carrying a sealed blob. **Partial gap:** the sample is emitted only while the server has early data enabled. Under `set_early_data_enabled(false)` (the A2b 0-RTT kill switch) an offered blob produces **no** sample — that is an operator policy decision, and `EarlyDataOutcome` models no "disabled by policy" variant |
+| `phantom.session.early_data` | Counter | — (no unit set) | `outcome` (accepted / rejected_unknown_ticket / rejected_oversized / rejected_aead / rejected_replay / rejected_disabled) — all six variants are reachable | live — `process_client_hello` (`transport/handshake.rs`), one sample per hello **carrying a sealed blob**; a hello that offers no early data is not a 0-RTT decision and emits nothing. `rejected_disabled` is the A2b kill switch (`set_early_data_enabled(false)`): it is checked first, before any ticket lookup or AEAD work, so an operator-disabled server never mis-attributes a blob to a client-side cause. Use it to tell "0-RTT is off here" from "no client is offering 0-RTT" |
 | `phantom.session.rekey` | Counter | — (no unit set) | `direction` (send/recv) | live — `send` from `rekey_before_stamp` on a **committed** local rotation; `recv` once per **committed** catch-up step in `handle_packet` (bounded by `MAX_REKEY_CATCHUP`). Nothing is counted for a rotation that failed or a forward epoch that failed AEAD |
 | `phantom.session.active` | UpDownCounter | — (no unit set) | `leg` | live (opened/closed by `run_data_pump`) |
 | `phantom.session.streams.active` | UpDownCounter | — (no unit set) | — | live — via the balanced per-session `StreamGauge` (`api/session.rs`). Reserved ids **0** (control) and **1** (raw-app default) are excluded, so this counts user-visible streams only; the gauge drains at session teardown, so it returns to zero |
@@ -87,7 +87,7 @@ leftover — is the one instrument in the whole catalog with no source.
 | OTel name | Type | Unit | Attributes | Status |
 |-----------|------|------|------------|--------|
 | `phantom.path.migrations` | Counter | — (no unit set) | `from_path`, `to_path` (int path ids). `to_path` is `1..=254` for an active migration (`next_migration_path_id` wraps 254 → 1, skipping 0 and 255) and **255** for an M-3 passive NAT rebind — which is exactly what distinguishes the two on a dashboard | live — four call sites in `api/session.rs`: the `Migrate` command arm (local client migration), the `MigrateServer` arm, peer-migration detection on an authenticated forward `path_id`, and the M-3 passive-rebind promotion |
-| `phantom.path.validation.duration` | Histogram (explicit latency buckets) | `s` | `path_id`, `outcome` (success/failure) | live — recorded in `handle_packet`'s `PATH_VALIDATION` arm when an outstanding challenge this side issued resolves. **Partial gap:** there is no timeout sweep in the pump, so a challenge that is never answered records **neither** outcome — only a real response (matching or not) produces a sample |
+| `phantom.path.validation.duration` | Histogram (explicit latency buckets) | `s` | `path_id`, `outcome` (success/failure/timeout) | live — `success` / `failure` in `handle_packet`'s `PATH_VALIDATION` arm when a response resolves an outstanding challenge; `timeout` from `sweep_path_validation_timeouts` on the pump's 10 ms heartbeat when the peer never answers. Every issued challenge yields **exactly one** sample: whichever of the two paths reaches its start stamp first removes it. The timeout budget is not a new tunable — it is the session's own path-down threshold, `path_down_ptos × max(min_pto, 3 × min_rtt)` from `LivenessConfig` (1.5 s at defaults before the first RTT sample, since the estimator seeds `min_rtt` at 100 ms), i.e. RTT-adaptive and more generous than QUIC's `3 × PTO` (RFC 9000 §8.2.4). `timeout` and `failure` mean different things: a failure is a wrong echo from something holding the session key, a timeout is a path carrying nothing at all. The sweep is metrics-only — it does **not** drive the `PathRegistry` entry to `Failed` (that would permanently burn the `path_id` for a challenge that was merely lost) |
 | `phantom.transport.fallback` | Counter | — (no unit set) | `from_leg`, `to_leg`, `reason` (loss_threshold/rtt_threshold/path_failure/explicit) | **not emitted — no possible source.** `transport/fallback.rs`'s `FallbackStateMachine` is constructed into every `Session` but none of its mutators is ever called, so there is no fallback *event* to record. The instrument and `attrs.rs::FallbackReason` are kept as a stable, pre-declared telemetry surface |
 
 ## Always-on snapshot (no `telemetry-otel` required)
