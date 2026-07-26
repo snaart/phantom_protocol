@@ -5,6 +5,16 @@ binary. Phantom Protocol itself is a library — the example below assumes a
 small wrapper binary (`server-bin` in your workspace) that calls
 `PhantomListener::bind` and `accept`.
 
+> **The repo already ships one.** `Dockerfile` at the repo root builds the
+> in-tree `server/` crate (`phantom-server`) on `rust:1-slim-bookworm`, runs as
+> a non-root user, exposes 4242, and presets `PHANTOM_BIND`,
+> `PHANTOM_SIGNING_KEY_FILE`, `PHANTOM_LOG_JSON`,
+> `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` and `RUST_LOG`;
+> `docker-compose.yml` wires it up with a persistent signing-key volume, and
+> `.env.example` documents every environment variable. Use those unless you are
+> embedding the SDK in your own binary — the Dockerfile below is a from-scratch
+> template for that case.
+
 ## Minimal Dockerfile
 
 ```dockerfile
@@ -59,10 +69,11 @@ on the corresponding architecture.
 - **Networking.** Use host network mode (`--network host`) for highest
   throughput; otherwise the userspace NAT in Docker's bridge adds
   per-packet overhead.
-- **File descriptors.** Phantom Protocol sessions hold a single fd each
-  — one TCP socket, or one UDP socket for the native reliable-UDP
-  (PhantomUDP) path. The default Docker ulimit (1024) is sufficient for
-  ~1k concurrent sessions; raise it for higher fan-out:
+- **File descriptors.** A TCP session holds one fd each. On the PhantomUDP
+  server every session shares the listener's single UDP socket (CID demux),
+  so fd pressure there comes from the listener, not the session count. The
+  default Docker ulimit (1024) is sufficient for ~1k concurrent TCP
+  sessions; raise it for higher fan-out:
   ```
   docker run --ulimit nofile=65535:65535 …
   ```
@@ -140,7 +151,7 @@ container env):
 |------|-----|---------|
 | `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector address, e.g. `http://otel-collector:4317` |
 | `--otel-service-name` | `OTEL_SERVICE_NAME` | `service.name` resource attribute |
-| | `OTEL_TRACES_SAMPLER_ARG` | Head-sampling ratio |
+| `--otel-trace-sample-ratio` | `OTEL_TRACES_SAMPLER_ARG` | Head-sampling ratio for root spans (default `1.0` = export everything); either form works on its own |
 | | `OTEL_EXPORTER_OTLP_HEADERS` | Auth headers for SaaS backends |
 
 In `docker-compose.yml`, point the server at a Collector sidecar:

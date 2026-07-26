@@ -104,8 +104,9 @@ independent multiplexed streams with per-stream flow control.
 - **Multi-stream** — strict-priority scheduler, `WINDOW_UPDATE` per-stream
   flow control, BBRv2-inspired pacing (Startup / Drain / ProbeBW / ProbeRTT /
   FastRecovery).
-- **DoS-resistant handshake** — stateless HMAC-SHA-256 cookie (hourly-rotated
-  master) + adaptive blake3 proof-of-work (load-tiered difficulty 0–16).
+- **DoS-resistant handshake** — stateless HMAC-SHA-256 cookie (per-process
+  master → hourly-rotated derived secret, 5-minute validity buckets) + adaptive
+  blake3 proof-of-work (load-tiered difficulty 0–16).
 - **Per-direction replay protection** — RFC 4303 §3.4.3 sliding-window bitmap,
   default 1024 bits, checked _after_ AEAD verify.
 - **Observability** — OpenTelemetry metrics + traces (opt-in
@@ -135,8 +136,9 @@ Loopback integration tests are `#[ignore]`-gated:
 cargo test --manifest-path core/Cargo.toml --test tcp_integration -- --ignored
 ```
 
-More commands (benches, fuzz, miri, cross-targets, embedded) are in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+More commands (benches, fuzz, miri, cross-targets, embedded) live in the CI
+workflow files under [`.github/workflows/`](.github/workflows/); the PR
+checklist is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Minimal client / server (UDP — production path)
 
@@ -221,7 +223,7 @@ Runnable forms: [`core/examples/loopback_demo.rs`](core/examples/loopback_demo.r
 | Signatures | Ed25519 + ML-DSA-65 | FIPS 186-5 + FIPS 204 (RustCrypto `ml-dsa`) |
 | AEAD (primary) | AES-256-GCM | `ring`, HW-accelerated (AES-NI / ARMv8 PMULL) |
 | AEAD (fallback) | ChaCha20-Poly1305 | RFC 8439, auto-selected without AES intrinsics |
-| KDF | HKDF-SHA-256 | RFC 5869 |
+| KDF | HKDF-SHA-256 + keyed BLAKE3 | RFC 5869 for the KEM combine / rekey / 0-RTT keying; `crypto::kdf::derive_key_32` label derivations use `blake3::derive_key`, swapping to HKDF-SHA-256 under `--features fips` |
 | Hash / MAC | SHA-256, HMAC-SHA-256, blake3 (keyed) | FIPS 180-4 / FIPS 198-1 + non-FIPS |
 
 The PQ primitives moved off the C-bound `pqcrypto-*` crates to the
@@ -266,10 +268,11 @@ security invariants are catalogued in
   `VersionedPacket` enum, no per-session wire-version negotiation. `epoch`,
   `REKEY`, `PATH_VALIDATION`, `COALESCED`, `WINDOW_UPDATE` flags live in the one
   header; the recv path deserializes `PhantomPacket` directly and drops any frame
-  whose `header.version` differs. Handshake messages are bare borsh structs (no
-  envelopes): one `ClientHello` (with the optional 0-RTT `early_data` blob folded
-  in), one `ServerHello`, one `HelloRetryRequest`, one signed
-  `HandshakeTranscript` leading with `protocol_variant`. `WIRE_VERSION` is `6`
+  whose `header.version` differs. Handshake messages are borsh structs: one
+  `ClientHello` (with the optional 0-RTT `early_data` blob folded in) and three
+  server replies — `ServerHello`, `HelloRetryRequest`, `ServerReject` — carried
+  under a one-byte-discriminant `ServerReply` wrapper; one signed
+  `HandshakeTranscript` leads with `protocol_variant`. `WIRE_VERSION` is `6`
   (`PROTOCOL_VERSION` is `3`); both pinned bytes are tamper-check anchors and a
   hook for a future deliberate bump.
 - **Path validation (wired into the live UDP data plane).** `PathRegistry` +
@@ -284,7 +287,10 @@ security invariants are catalogued in
 
 Reference numbers on **Apple M1 Pro (8P + 2E, 16 GiB), macOS 26.0, rustc 1.93.0,
 `ring` with ARMv8 AES-PMULL** (snapshot 2026-05-17, criterion `--quick`, default
-`target-cpu`):
+`target-cpu`). The snapshot predates the current wire — it was captured under
+`WIRE_VERSION = 2`, whereas the shipped format is `WIRE_VERSION = 6` — so the
+crypto / throughput shape is representative but re-capture before quoting these
+as live figures (see [`BENCHMARKS.md`](BENCHMARKS.md)):
 
 | Path | Number | Notes |
 | --- | --- | --- |
@@ -318,10 +324,12 @@ pushes OTLP telemetry to an OTel Collector / SaaS backend, handles SIGTERM
 | `--bind` | `PHANTOM_BIND` | `0.0.0.0:4242` |
 | `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` |
 | `--otel-service-name` | `OTEL_SERVICE_NAME` | `phantom-server` |
-| `--otel-trace-sample-ratio` | `OTEL_TRACES_SAMPLER_ARG` | `0.01` |
+| `--otel-trace-sample-ratio` | `OTEL_TRACES_SAMPLER_ARG` | `1.0` (root-span head sampling; `0` = no traces) |
 | `--signing-key-file` | `PHANTOM_SIGNING_KEY_FILE` | `/etc/phantom-server/signing.key` (0600, auto-created) |
 | `--log-json` | `PHANTOM_LOG_JSON` | `false` |
 | `--log-filter` | `RUST_LOG` | `info,phantom_protocol=debug` |
+| `--max-sessions` | `PHANTOM_MAX_SESSIONS` | `1024` (`0` = unbounded) |
+| `--max-sessions-per-ip` | `PHANTOM_MAX_SESSIONS_PER_IP` | `64` (`0` = off) |
 
 ```bash
 cargo run --manifest-path server/Cargo.toml -- \
@@ -332,7 +340,8 @@ cargo run --manifest-path server/Cargo.toml -- \
 ### Docker / docker-compose
 
 Multi-stage `Dockerfile` (`rust:1-slim-bookworm` → `debian:bookworm-slim`),
-non-root `phantom` UID 65532, EXPOSE 4242 + 9090, signing-key volume at
+non-root `phantom` UID 65532, EXPOSE 4242 (no inbound metrics port — telemetry
+is OTLP push), signing-key volume at
 `/etc/phantom-server`. `docker-compose.yml` is ready to run with a named volume
 and TCP healthcheck.
 
@@ -403,10 +412,10 @@ cargo run --manifest-path cli/Cargo.toml -- version
 | **Swift** | Production-shape | Auto-gen via UniFFI 0.31; iOS XCFramework recipe in [`docs/operations/mobile.md`](docs/operations/mobile.md) |
 | **Kotlin** | Production-shape | Auto-gen; Android NDK + Gradle `jniLibs` recipe in `mobile.md` |
 | **Python** | UniFFI surface auto-gen | Demo harness `tests/run_test.py` |
-| **C** | Experimental | **Hand-curated** header — UniFFI 0.31 has no C generator. Covers `connect_pinned` but not `HybridSigningKey` or `PhantomConfig`. README recommends Swift / Kotlin / Python instead |
+| **C** | Experimental | **Hand-curated** header — UniFFI 0.31 has no C generator. Covers `connect_pinned` / `connect_pinned_udp` (incl. `_with_config` / `_with_resumption`), the `bind*_with_signing_key_bytes` / `bind*_with_config_bytes` constructors, `generate_signing_key`, and `PhantomConfig`; the typed `HybridSigningKey` / `HybridVerifyingKey` objects and runtime injection stay Rust-only. README recommends Swift / Kotlin / Python instead |
 | **WASM (browser)** | Demo shipped | [`examples/wasm-demo/`](examples/wasm-demo/) pairs with [`docs/operations/wasm.md`](docs/operations/wasm.md); uses `WebSocketLeg` + `WasmRuntime` |
 
-Regen: `tests/bindings/{generate_swift,generate_kotlin,generate_c}.sh`.
+Regen: `tests/bindings/{generate_python,generate_swift,generate_kotlin,generate_c}.sh`.
 
 ### Embedded (`embedded` feature, default off)
 
@@ -417,7 +426,7 @@ only** — `EmbeddedLeg` and its length-prefix codec. The PQ handshake,
 and runs it over the leg. PQ-on-bare-metal is descoped for 1.0 (see
 [Status & limitations](#status--limitations)).
 
-`EmbeddedLeg<R, W, const N: usize>` wraps any `embedded-io-async = 0.6` byte
+`EmbeddedLeg<R, W, const N: usize>` wraps any `embedded-io-async = 0.7` byte
 stream (UART, USB-CDC, …) with 4-byte BE length-prefix framing — the same wire
 shape as `TcpSessionTransport`. Pure-Rust, no_std + alloc, target-arch-agnostic
 (builds on host x86_64 for unit tests _and_ on bare-metal `thumbv7em-none-eabihf`).
@@ -442,9 +451,11 @@ Full threat model, mitigations, and disclosure policy are in
 - **Downgrade resistance** — the pinned protocol version and `protocol_variant`
   are signed under the handshake transcript; stripped-`ENCRYPTED` post-handshake
   packets are dropped.
-- **0-RTT anti-replay** — `SessionCache::try_resume` consumes the resumption
-  ticket on first lookup; oversized / expired / AEAD-failing early-data is
-  best-effort and never fatal to the handshake.
+- **0-RTT anti-replay** — the server `peek()`s the ticket, verifies the
+  `ClientHello.resumption_binder` in constant time (proof-of-possession), then
+  eagerly `remove()`s it, so a ticket is strictly one-shot (and is re-inserted
+  unchanged if the handshake later fails); oversized / expired / AEAD-failing
+  early-data is best-effort and never fatal to the handshake.
 - **AEAD nonce-exhaustion guard** — `CryptoError::NonceExhausted` at
   `AEAD_MAX_INVOCATIONS = 2^48`.
 - **`ZeroizeOnDrop` on all key-bearing structs**; `#![deny(unsafe_code)]`
@@ -476,15 +487,14 @@ Full threat model, mitigations, and disclosure policy are in
 ### Disclosure
 
 Report privately, **not** via public issues. Embargo SLA 90 days; ack within
-5 business days, triage within 14. Contact in [`SECURITY.md`](SECURITY.md)
-(the email there is a placeholder pending crate publication).
+5 business days, triage within 14. Contact in [`SECURITY.md`](SECURITY.md).
 
 ### Supply chain
 
 `cargo deny` (permissive-license allowlist, `yanked = "deny"`,
 `unknown-registry = "deny"`) and `cargo audit` run in CI. Release artifacts
 carry **SLSA-3 OIDC build-provenance attestations** via
-`actions/attest-build-provenance@v2`. Verify with
+`actions/attest-build-provenance@v4` (SHA-pinned). Verify with
 `gh attestation verify --owner <org> <artifact>` or
 `cosign verify-blob-attestation`.
 
@@ -546,7 +556,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   `test_harness/fault_transport.rs` (injected loss + reorder), but has **not**
   been hardened against real-world adversarial network conditions or externally
   reviewed — treat the data plane as functional-but-not-battle-tested.
-- **Negative-security suite: 58 always-on tests** in
+- **Negative-security suite: 60 always-on tests** in
   `core/tests/security_invariants.rs`, pinning every documented invariant.
   Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
   400+ library unit tests, and `#[ignore]`-gated loopback integration suites
@@ -598,7 +608,8 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   `fips-security-policy.md`
 - **Operations:** [`docs/operations/`](docs/operations/) —
   `perf-tuning.md`, `deployment.md`, `docker.md`, `systemd.md`,
-  `kubernetes.md` (+ `helm/`), `mobile.md`, `wasm.md`, `wasi.md`
+  `kubernetes.md` (+ `helm/`), `mobile.md`, `wasm.md`, `wasi.md`,
+  `zero-rtt.md`
 - **Policy:** [`docs/policy/versioning.md`](docs/policy/versioning.md)
 - **Performance:** [`BENCHMARKS.md`](BENCHMARKS.md)
 - **Change log:** [`CHANGELOG.md`](CHANGELOG.md)

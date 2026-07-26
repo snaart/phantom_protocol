@@ -17,7 +17,7 @@ Phantom Protocol uses GitHub Security Advisories for public CVE coordination.
 | Version | Status |
 | --- | --- |
 | `main` | Active development; security fixes land here first. |
-| `0.1.x` | Latest pre-1.0 release; security fixes backported. |
+| `0.2.x` | Latest pre-1.0 release (currently `0.2.2`); security fixes backported. |
 | Earlier | Unsupported. |
 
 ## Threat model (summary)
@@ -33,15 +33,17 @@ protection is a core pre-1.0 requirement, not a deferred hardening. At a glance:
   before any per-connection state, with bounded demux / reorder buffers and optional PoW);
   optional anti-DPI obfuscation via the `mimicry` feature (framing-only, no second AEAD,
   detectable by active probing — see `docs/security/threat-model.md` §6.1); and **resistance to passive linkability of a
-  connection across network changes** — the committed pre-1.0 mechanism is QUIC-style header
-  protection (encrypting the packet number and the variable header fields) plus
-  connection-ID rotation, landing in the next wire-format revision.
-- **Currently a known gap (being closed):** the on-wire header is presently cleartext, so a
-  passive observer can link a connection by its stable connection-ID and classify each
-  packet's purpose. The transport is functional but **linkable** until header protection
-  ships; see `docs/protocol/PROTOCOL.md` §12.5.
+  connection across network changes** — shipped as of `WIRE_VERSION = 6`: QUIC-style header
+  protection XOR-masks the **whole** 15-byte packet header (`HP_MASK_LEN = 15`,
+  `HP_PROTECTED_OFFSET = 0` — no constant cleartext byte), plus connection-ID rotation.
+- **Closed (was a known gap):** the on-wire packet header is no longer cleartext, and the
+  8-byte routing connection ID rotates on migration in both directions, so a passive
+  observer can no longer link a connection by a stable connection-ID across a network
+  change or classify each packet's purpose; see `docs/protocol/PROTOCOL.md` §12.5.
 - **Out of scope:** non-repudiation; full traffic-shape unobservability (timing / size
-  correlation — length-hiding padding is not yet wired); endpoint compromise; compromise of
+  correlation — length-hiding padding IS implemented (`PaddingPolicy::Padme`, the `PADDED`
+  flag) but is **opt-in and off by default**, and timing correlation is unaddressed);
+  endpoint compromise; compromise of
   long-lived server signing keys; supply-chain attacks against the build toolchain.
 
 ## Cryptographic primitives

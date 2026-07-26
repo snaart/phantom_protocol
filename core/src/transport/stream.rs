@@ -675,6 +675,10 @@ impl Stream {
     /// calling this once, so no second call is possible via the normal path.
     pub async fn queue_fin(&self) -> Result<(), CoreError> {
         // Acquire backpressure permit — reuses `send_reliable`'s logic.
+        // PANIC-SAFETY: identical to the site in `send_reliable` above —
+        // `Semaphore::acquire` only errors after `close()`, and `send_semaphore`
+        // is a private field constructed in `Stream::new` and never closed
+        // anywhere in the crate, so the variant is structurally unreachable.
         #[allow(clippy::expect_used)]
         let permit = self
             .send_semaphore

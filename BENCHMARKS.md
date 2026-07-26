@@ -13,9 +13,10 @@ critical-path benches deserve a comment in the PR.
   `opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`.
 - **Target CPU:** default. Re-run with `RUSTFLAGS="-C target-cpu=native"`
   for tuned-build numbers — typically ±5-10%.
-- **Bench harness:** `criterion = "0.5"` for `transport_bench`,
-  `protocol_comparison`, `buffer_pool_bench`, `syn_flood_bench`. Hand-
-  rolled timing for `examples/crypto_bench.rs`.
+- **Bench harness:** `criterion = "0.8"` for `transport_bench`,
+  `protocol_comparison`, `buffer_pool_bench`, `syn_flood_bench`,
+  `observability_bench`. Hand-rolled timing for
+  `core/examples/crypto_bench.rs`.
 - **Runs:** captured with `--quick` (criterion) for tracking-grade
   estimates. Re-run without `--quick` (≥3 back-to-back) before any
   performance claim leaves the repo.
@@ -113,7 +114,8 @@ lookup is microseconds — order ~10⁵ resumptions/sec/core).
 ### Application-data encrypt/decrypt (`encrypt_packet` / `decrypt_packet`)
 
 This is the full crate path including header-derived AEAD nonce, header-AAD
-binding, and per-stream sliding-window replay check on the decrypt side —
+binding, and the single per-direction sliding-window replay check (keyed on the
+u64 packet number) on the decrypt side —
 NOT the raw `ring` AEAD measured above. This snapshot was captured under
 WIRE_VERSION=2 (an earlier wire version; the current format is
 WIRE_VERSION=6) with nonces derived from authenticated header fields;
@@ -270,6 +272,7 @@ RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml -
 RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml --bench buffer_pool_bench     -- --quick          2>&1 | tee /tmp/buffer.log
 RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml --bench syn_flood_bench       -- --quick          2>&1 | tee /tmp/synflood.log
 RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml --bench protocol_comparison   -- --quick          2>&1 | tee /tmp/proto.log
+RUSTFLAGS="-C target-cpu=native" cargo bench   --manifest-path core/Cargo.toml --bench observability_bench   -- --quick          2>&1 | tee /tmp/observability.log
 ```
 
 Distill point-estimates from each log into the tables above. Commit the
@@ -292,15 +295,18 @@ known).
 
 ### CI gate (`.github/workflows/bench.yml`)
 
-Two automated checks run on PRs that touch `core/src`, `core/benches`, or
-`core/Cargo.toml`:
+Two automated checks run on PRs that touch `core/src`, `core/benches`,
+`core/Cargo.toml`, `scripts/bench_compare.py`, or `.github/workflows/bench.yml`:
 
 1. **Compile gate** — `cargo bench --no-run` builds every criterion bench, so a
    bench that rots when an API changes fails CI instead of silently breaking until
    the next manual snapshot.
 2. **Regression gate** — the benches run on the PR head and on the PR's base commit
    on the **same runner** (hardware-neutral), and `scripts/bench_compare.py` fails
-   the job if any benchmark's median is **> 2× slower** than base. The 2× bar is
+   the job if any benchmark's median is **> 2× slower** than base — except the
+   ML-DSA-65 *signing* micro-benches, whose rejection-sampling jitter is gated
+   against a higher catastrophic ceiling (**10×**, tunable via
+   `BENCH_SOFT_REGRESSION_THRESHOLD`). The 2× bar is
    deliberately coarse: shared GitHub runners have 5–30% run-to-run noise, so a
    tight threshold would flake. It catches *gross* regressions automatically; the
    **>5% / >10% policy above remains the pinned-hardware source of truth** for

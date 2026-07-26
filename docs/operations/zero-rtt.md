@@ -20,10 +20,12 @@ property of the 0-RTT payload is at stake.
 
 ## The single-node guarantee (Invariant 9)
 
-The built-in defence is one-shot ticket consumption. `SessionCache::try_resume` (and the
-resume fast path in `HandshakeServer::process_client_hello`) removes the resumption ticket on
-the **first** lookup, so a replayed `ClientHello` finds no ticket and the server falls back to
-a normal 1-RTT handshake that ignores the early-data. This is exact and automatic **as long as
+The built-in defence is one-shot ticket consumption. The resume fast path in
+`HandshakeServer::process_client_hello` **peeks** the ticket, verifies the client's
+`resumption_binder` (constant-time proof-of-possession), then **consumes** it with
+`SessionCache::remove` — whose boolean return makes the consume race-free — so a replayed
+`ClientHello` finds no ticket and the server falls back to a normal 1-RTT handshake that
+ignores the early-data. This is exact and automatic **as long as
 every resume for a given ticket hits the same coherent cache** — i.e. a single process, or
 routing that pins a resuming client to the node that minted its ticket.
 
@@ -98,8 +100,10 @@ request in early-data.
 
 ### (d) Disable 0-RTT entirely — the zero-infrastructure default for scale-out
 
-If none of the above fits, turn 0-RTT off. Resuming clients still skip the cookie/PoW gate
-(resumption itself is replay-safe via the fresh hybrid KEM), but their early-data is rejected
+If none of the above fits, turn 0-RTT off. Resuming clients still skip the cookie/PoW gate on
+TCP (resumption itself is replay-safe via the fresh hybrid KEM); over PhantomUDP the stateless-
+cookie pre-gate (`udp_admit`) always runs, since the UDP source is unproven. Either way their
+early-data is rejected
 (`ServerHello.early_data_accepted = false`) and the SDK delivers the payload 1-RTT instead:
 
 ```rust

@@ -184,8 +184,9 @@ Practice:
 
 ## 5. Cargo features vs. version bumps
 
-Feature flags (`compression-zstd`, `std`, `bindings`, `embedded`, `no-std`,
-`telemetry-otel`, `fips`, `wasi-leg`) are not versioned independently. A feature
+Feature flags (`compression-zstd`, `std`, `bindings`, `classical-crypto`,
+`header-protection`, `embedded`, `no-std`, `mimicry`, `telemetry-otel`,
+`fips`, `wasi-leg`, `uniffi-cli`) are not versioned independently. A feature
 toggle:
 
 - Adding a feature: SemVer-minor (additive).
@@ -196,8 +197,8 @@ toggle:
   change is purely additive at the feature's exported API.
 
 Default features are part of the API contract: changing the default set
-(`["compression-zstd", "std", "bindings"]`) is breaking, since consumers may
-have implicitly relied on the included dependency.
+(`["compression-zstd", "std", "bindings", "classical-crypto"]`) is breaking,
+since consumers may have implicitly relied on the included dependency.
 
 ---
 
@@ -227,7 +228,9 @@ recent stable, not under the MSRV gate — the MSRV promise covers the
 ## 7. PQC and cryptographic dependency updates
 
 `ml-kem` and `ml-dsa` (the FIPS-203 / FIPS-204 RustCrypto crates) are
-optional dependencies, enabled by default via the `std` feature (`ml-kem = "0.2"`, `ml-dsa = "0.1.1"`). A bump of a
+optional dependencies, enabled by default via the `std` feature
+(`ml-kem = "0.3"` with features `hazmat`/`getrandom`/`zeroize`,
+`ml-dsa = "0.1.1"`). A bump of a
 cryptographic dependency is treated as a potential **wire-format change**:
 if the upgrade alters the serialised key-package / ciphertext / signature bytes
 or the KAT vectors, it is a coordinated `WIRE_VERSION` / `PROTOCOL_VERSION` bump

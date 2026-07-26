@@ -31,9 +31,9 @@ downgrade). Pin these first:
 
 | Constant | Value (default build) | Source of truth | Wire role |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `6` | `core/src/transport/types.rs:79` | `PacketHeader.version` (byte 0, HP-masked) |
-| `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs:56` | `ClientHello.version`, transcript-bound |
-| `PROTOCOL_VARIANT` | `b"phantom-default-1"` | `core/src/transport/handshake.rs:48` | leading field of the signed transcript |
+| `WIRE_VERSION` | `6` | `core/src/transport/types.rs:82` | `PacketHeader.version` (byte 0, HP-masked) |
+| `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs:67` | `ClientHello.version`, transcript-bound |
+| `PROTOCOL_VARIANT` | `b"phantom-default-1"` | `core/src/transport/handshake.rs:59` | leading field of the signed transcript |
 
 A receiver **drops** any data frame whose `header.version != WIRE_VERSION`
 (`api/session.rs`), and the server rejects a `ClientHello` whose

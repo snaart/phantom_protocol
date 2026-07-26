@@ -13,24 +13,26 @@ containerized, packaged, or daemonized.
 | --- | --- | --- |
 | Docker | `docs/operations/docker.md` | Distroless / alpine variants; multi-arch builds. |
 | systemd | `docs/operations/systemd.md` | Hardening profile, sysctl tuning, multi-instance template. |
-| Kubernetes | [`kubernetes.md`](kubernetes.md) | Deployment + Service + probes + Secrets + PDB + HPA + NetworkPolicy. Helm chart + operator remain a follow-up. |
+| Kubernetes | [`kubernetes.md`](kubernetes.md) | Deployment + Service + probes + Secrets + PDB + HPA + NetworkPolicy. Operator remains a follow-up. |
+| Helm | [`helm/phantom-protocol/`](helm/phantom-protocol/README.md) | Production chart (appVersion 0.2.2) implementing every pattern in `kubernetes.md`. |
 | AWS EC2 / bare metal | use `systemd` guide | Same unit file applies. |
 
 ## Client-side
 
 Clients link `phantom_protocol` directly (Rust) or through the UniFFI-
-generated bindings (Python today; Swift / Kotlin / C are
-Phase 3.9 work).
+generated bindings (Python, Swift, Kotlin, and hand-curated C headers —
+all four regenerated and CI-gated by `.github/workflows/bindings.yml`).
 
 | Platform | Status |
 | --- | --- |
 | Linux server / desktop client | ✅ supported |
 | macOS desktop client | ✅ supported |
 | Windows desktop client | ✅ supported (CI cross-build) |
-| iOS / iPadOS | ⏳ Phase 3.9 — Swift binding pending |
-| Android | ⏳ Phase 3.9 — Kotlin binding pending |
-| Browser WASM | 🔄 Phase 3.3 — `WebSocketLeg` lands, full crate-level wasm build pending |
-| Embedded (Cortex-M) | ⏳ Phase 3.4 |
+| iOS / iPadOS | ✅ supported — Swift binding + `examples/mobile/ios/` sample app |
+| Android | ✅ supported — Kotlin binding + `examples/mobile/android/` sample app |
+| Browser WASM | ✅ supported — `wasm32-unknown-unknown` is a hard CI gate (`WebSocketLeg` + `WasmRuntime`); see `wasm.md` |
+| WASI Preview 2 | ✅ supported — `wasm32-wasip2` hard CI gate (`wasi-leg`); see `wasi.md` |
+| Embedded (Cortex-M) | ✅ supported — `thumbv7em-none-eabihf` hard CI gate (`embedded,no-std`) |
 
 ## Configuration
 
@@ -45,9 +47,9 @@ The relevant runtime-visible knobs are:
 | --- | --- | --- |
 | Listen address | `PhantomListener::bind(addr)` | "host:port" |
 | Adaptive PoW difficulty | automatic | Tiered by handshake rate; see Phase 1.14. |
-| Cipher suite | negotiated at handshake | AES-256-GCM or ChaCha20-Poly1305 — see `device_profile.rs` |
+| Cipher suite | not negotiated | AES-256-GCM is pinned for every session (the `ClientHello` carries no suite field). `ChaCha20Poly1305` survives as an enum variant for wire stability and is rejected outright under `--features fips`. |
 | Wire format version | pinned constant (not negotiated) | `WIRE_VERSION = 6` — a single pinned value; the receive path drops any frame whose version differs. (`PROTOCOL_VERSION = 3` is the borsh handshake version.) |
-| Rekey trigger | `PhantomSession::rekey()` | Caller-driven (Phase 1.5). |
+| Rekey trigger | automatic (`REKEY_SOFT_LIMIT` = 2^32 AEAD invocations) | The data pump rotates the traffic secret itself; `PhantomSession::set_rekey_threshold(u64)` (Rust-only) lowers the watermark for tests. |
 | Tracing level | `RUST_LOG` | Standard `tracing_subscriber` filter syntax. |
 
 ## Pre-deployment checklist
@@ -137,7 +139,8 @@ inbound port and serves no `/metrics` endpoint. The reference server
 OTLP/gRPC exporter and **pushes** to an OpenTelemetry Collector. Point it at the
 collector with `--otlp-endpoint` / `OTEL_EXPORTER_OTLP_ENDPOINT` (e.g.
 `http://otel-collector:4317`); `--otel-service-name` / `OTEL_SERVICE_NAME` and
-`OTEL_TRACES_SAMPLER_ARG` (head-sampling ratio) tune the export, and
+`--otel-trace-sample-ratio` / `OTEL_TRACES_SAMPLER_ARG` (head-sampling ratio for
+root spans, default `1.0` = export everything) tune the export, and
 `OTEL_EXPORTER_OTLP_HEADERS` carries auth headers for SaaS backends.
 
 Data flow:

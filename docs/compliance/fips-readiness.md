@@ -23,17 +23,17 @@ submission, not code.
 | Operation | Default build | `--features fips` build | Status |
 | --- | --- | --- | --- |
 | Classical KEM | X25519 (`x25519-dalek`) | ECDH P-256 via `aws-lc-rs::agreement` | ✅ A4 (commit `67ef976`). Wire-incompatible across modes; gated by `PROTOCOL_VARIANT`. |
-| Post-quantum KEM | ML-KEM-768 (`ml-kem = 0.2`, FIPS 203 RustCrypto pure-Rust) | identical | ✅ Phase 5.1, commit `7c7bde7`. CAVP vectors in `core/tests/cavp.rs`. |
+| Post-quantum KEM | ML-KEM-768 (`ml-kem = 0.3`, FIPS 203 RustCrypto pure-Rust) | identical | ✅ Phase 5.1, commit `7c7bde7`. CAVP vectors in `core/tests/cavp.rs`. |
 | Classical signature | Ed25519 (`ed25519-dalek`) | identical | ✅ FIPS 186-5 approves EdDSA(Ed25519) out of the box. |
-| Post-quantum signature | ML-DSA-65 (`ml-dsa = 0.1.0`, FIPS 204 RustCrypto pure-Rust) | identical | ✅ Phase 5.1, commit `7c7bde7`. CAVP vectors in `core/tests/cavp.rs`. |
+| Post-quantum signature | ML-DSA-65 (`ml-dsa = 0.1.1`, FIPS 204 RustCrypto pure-Rust) | identical | ✅ Phase 5.1, commit `7c7bde7`. CAVP vectors in `core/tests/cavp.rs`. |
 | Symmetric AEAD | AES-256-GCM via `ring` | AES-256-GCM via `aws-lc-rs::aead` (AWS-LC-FIPS) | ✅ A2 (commit `d691573`). Identical API surface; backend swap only. |
 | Symmetric AEAD (alt) | ChaCha20-Poly1305 | rejected at handshake with `CoreError::CipherSuiteUnavailable` | ✅ A3 (commit `cd79cbd`). Enum variant stays for wire-format stability. |
 | Hash | SHA-256 (`sha2`) | identical | ✅ FIPS 180-4. |
-| Hash (KDF context) | `blake3::derive_key` | `HKDF-SHA-256.expand(label.as_bytes())` | ✅ A5 (commit `c2fa013`). All 9 KDF call sites swapped via `crypto::kdf::derive_key_32`. PoW `blake3::hash` stays (not KDF). |
+| Hash (KDF context) | `blake3::derive_key` | `HKDF-SHA-256.expand(label.as_bytes())` | ✅ A5 (commit `c2fa013`). Every KDF call site (12 today) is swapped via `crypto::kdf::derive_key_32`. PoW `blake3` stays (not KDF). |
 | KDF (HKDF) | HKDF-SHA-256 (`hkdf`) | identical | ✅ NIST SP 800-56C. |
 | HMAC | HMAC-SHA-256 (`hmac`) | identical | ✅ FIPS 198-1. |
 | RNG | `getrandom` → OS DRBG | `aws-lc-rs::rand::SystemRandom` (CTR_DRBG inside AWS-LC-FIPS module, SP 800-90A § 10.2.1) | ✅ A6 (commit `2ec02b7`). Routed through the `RngProvider for OsRng` impl so production call sites pick up the swap automatically. |
-| Power-on self-test | not invoked | `crypto::self_tests::run_post` wired into `PhantomListener::bind*` / `connect_pinned*` via `ensure_post_passed` (cached `OnceLock`) | ✅ A7 (commit `782ea3d`). Failure returns `CoreError::FipsSelfTestFailure`. |
+| Power-on self-test | not invoked | `crypto::self_tests::run_post` wired into `PhantomListener::bind*`, `PhantomUdpListener::bind_udp*`, `SessionBuilder::connect`, the seven `connect_pinned*` free functions and the shared client background task via `ensure_post_passed` (cached `OnceLock`) | ✅ A7 (commit `782ea3d`). Failure returns `CoreError::FipsSelfTestFailure`. |
 
 Bottom line: under `--features fips`, **all primitive-level gaps from
 the original gap analysis are closed**. The build is FIPS-substrate
@@ -75,14 +75,20 @@ Mechanics, by item:
 - `crypto::kdf::derive_key_32(label, ikm)` — cfg-dispatched helper:
   `blake3::derive_key` by default, `HKDF-SHA256.expand(label_bytes)`
   under fips. Adopted by `crypto::adaptive_crypto`,
-  `crypto::aes_session`. (A5.)
+  `crypto::aes_session`, `crypto::header_protection`,
+  `crypto::cid_chain`, and `transport::handshake` (resumption
+  binder). (A5.)
 - `crypto::rng::OsRng`'s `RngProvider` impl is cfg-split:
   `getrandom` default, `aws_lc_rs::rand::SystemRandom` under fips
   (CTR_DRBG SP 800-90A § 10.2.1 inside the FIPS module). (A6.)
 - `crypto::self_tests::ensure_post_passed` — process-global single-
-  shot wrapper around `run_post`. Wired into `bind_inner` and
-  `connect_pinned*` under fips; failure surfaces as
-  `CoreError::FipsSelfTestFailure(String)`. (A7.)
+  shot wrapper around `run_post`. Wired into `bind_inner`,
+  `PhantomUdpListener`'s shared bind path, `SessionBuilder::connect`,
+  the seven `connect_pinned*` entrypoints and the shared client
+  background task under fips; failure surfaces as
+  `CoreError::FipsSelfTestFailure(String)` (or, in the background
+  task, is stored in the session's `terminal_error` slot because that
+  path is infallible by signature). (A7.)
 
 ---
 
@@ -111,11 +117,12 @@ pub fn ensure_post_passed() -> Result<(), SelfTestError>;
 
 `ensure_post_passed` caches the verdict in a `OnceLock` so subsequent
 bind/connect calls in the same process pay only an atomic read.
-`PhantomListener::bind_inner` and the UniFFI `connect_pinned*`
-entrypoints invoke it under `cfg(feature = "fips")` before any
-cryptographic work; a failure short-circuits to
-`CoreError::FipsSelfTestFailure(String)` instead of standing up a
-session over broken primitives.
+`PhantomListener::bind_inner`, `PhantomUdpListener`'s shared bind path,
+`SessionBuilder::connect`, the seven `connect_pinned*` entrypoints and
+the shared client background task invoke it under
+`cfg(feature = "fips")` before any cryptographic work; a failure
+short-circuits to `CoreError::FipsSelfTestFailure(String)` instead of
+standing up a session over broken primitives.
 
 Fault injection is exercised in CI via the `set_force_post_fail` test
 seam (`crypto::self_tests::tests::force_post_fail_returns_error_via_ensure_post_passed`
@@ -136,11 +143,14 @@ in `core/tests/cavp.rs`. Coverage:
 core/tests/cavp.rs
     ML-KEM-768  (FIPS 203 §7.2/§7.3 — Encaps / Decaps round-trip + hybrid wiring)
     ML-DSA-65   (FIPS 204 — Sign / Verify round-trip + hybrid wiring)
-    AES-256-GCM (encrypt + decrypt via ring)
-    SHA-256     (deterministic digest)
-    HMAC-SHA-256
-    HKDF-SHA-256 (RFC 5869 + NIST SP 800-56C)
-    Ed25519     (sign / verify via ed25519-dalek)
+    AES-256-GCM (encrypt + decrypt; `ring` on the default build,
+                 `aws-lc-rs` under fips)
+    HKDF-SHA-256 (RFC 5869 A.1)
+    SHA-256     (deterministic digest, FIPS 180-4)
+
+core/tests/nist_kat.rs
+    ML-KEM-768 / ML-DSA-65 byte-exact NIST ACVP vectors
+    (fixtures: core/tests/nist_kat/*.json, read at runtime)
 ```
 
 These run on every `cargo test --manifest-path core/Cargo.toml`

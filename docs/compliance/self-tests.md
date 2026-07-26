@@ -4,7 +4,7 @@ FIPS 140-3 requires a cryptographic module to run **known-answer tests
 (KATs)** at startup ("power-on self-tests" / POST) and **pairwise
 consistency tests (PCTs)** whenever a new key pair is generated.
 
-This document describes the self-test implementation for Phantom Protocol. **Power-on self-tests (POST) are shipped** in `core/src/crypto/self_tests.rs` and are auto-invoked from `PhantomListener::bind*` / `PhantomSession::connect*` / `connect_pinned*` under the `fips` feature via the cached `ensure_post_passed()` wrapper. The POST battery is pairwise-consistency-based for the asymmetric primitives (hybrid KEM encap/decap, hybrid sign/verify) plus AEAD round-trips and a fixed HKDF-SHA-256 KAT. Per-keygen pairwise consistency tests (PCTs) wired into every keygen function are not yet shipped.
+This document describes the self-test implementation for Phantom Protocol. **Power-on self-tests (POST) are shipped** in `core/src/crypto/self_tests.rs` and are auto-invoked from `PhantomListener::bind*` / `PhantomUdpListener::bind_udp*` / `SessionBuilder::connect` / `connect_pinned*` under the `fips` feature via the cached `ensure_post_passed()` wrapper. The POST battery is pairwise-consistency-based for the asymmetric primitives (hybrid KEM encap/decap, hybrid sign/verify) plus AEAD round-trips and a fixed HKDF-SHA-256 KAT. The signing-key pairwise-consistency test **is shipped**: `HybridSigningKey::pairwise_consistency_check()` runs at every long-term-identity generation site (`HandshakeServer` construction, `api/identity.rs`, `phantom-cli keygen`, `phantom-server`'s load-or-create). It is deliberately not run in `HybridSigningKey::generate()`, which mints the client's ephemeral per-handshake key. The remaining gap is a PCT on the KEM keypair (`HybridSecretKey::generate`), which today is only covered once at startup by the POST.
 
 ## Test types
 
@@ -24,9 +24,9 @@ This document describes the self-test implementation for Phantom Protocol. **Pow
 | **AES-256-GCM** | NIST GCMVS (SP 800-38D). | `ring` (default build) / `aws-lc-rs` (under `--features fips`, ring-free). POST is **explicit**: `run_post` exercises an AES-256-GCM round-trip via `CryptoSession`, gated into bind/connect by `ensure_post_passed()`. |
 | **ChaCha20-Poly1305** | RFC 8439 test vectors. | `ring`. Not FIPS-approved — rejected with `CoreError::CipherSuiteUnavailable` in `--features fips`; only exercised by POST on non-fips builds. |
 | **SHA-256 / HKDF-SHA-256** | NIST SHAVS + RFC 5869 vectors. | `ring` / `hkdf` crate. |
-| **BLAKE3** | BLAKE3 official KAT. | `blake3` crate. Not FIPS-approved — disabled in `--features fips`. |
+| **BLAKE3** | BLAKE3 official KAT. | `blake3` crate. Not FIPS-approved. Every **KDF** call site routes through `crypto::kdf::derive_key_32`, which swaps to HKDF-SHA-256 under `--features fips`; BLAKE3 remains linked and is still used non-KDF in `crypto/pow.rs` (keyed-BLAKE3 challenge MAC + the unkeyed PoW work function), which is a DoS gate rather than an approved security function. |
 | **Ed25519** | RFC 8032 test vectors §7.1. | `ed25519-dalek`. FIPS 186-5 approves Ed25519. |
-| **X25519** | RFC 7748 §6.1 test vectors. | `x25519-dalek`. Not directly FIPS-approved as a KEM — must be replaced or supplemented in `--features fips`. |
+| **X25519** | RFC 7748 §6.1 test vectors. | `x25519-dalek` (default build only). Not directly FIPS-approved as a KEM — **already replaced** under `--features fips` by ECDH-P-256 via `aws-lc-rs::agreement` (`CLASSICAL_PK_BYTES` 32 → 65); the ring-free fips build does not link `x25519-dalek`. |
 | **ML-KEM-768** | FIPS 203 published KATs (NIST PQC round 4). | `ml-kem` crate (RustCrypto). |
 | **ML-DSA-65** | FIPS 204 published KATs. | `ml-dsa` crate (RustCrypto). |
 | **HMAC-SHA-256** | RFC 4231 + SP 800-198. | `hmac` crate. |
@@ -59,10 +59,14 @@ pub enum SelfTestError {
 
 Wired into:
 
-- `PhantomListener::bind*` (under `--features fips`) — runs POST via
-  `ensure_post_passed()` and returns `CoreError::FipsSelfTestFailure(String)`
-  on failure before any cryptographic work.
-- `PhantomSession::connect*` / `connect_pinned*` (under `--features fips`).
+- `PhantomListener::bind*` and `PhantomUdpListener::bind_udp*` (under
+  `--features fips`) — run POST via `ensure_post_passed()` and return
+  `CoreError::FipsSelfTestFailure(String)` on failure before any
+  cryptographic work.
+- `SessionBuilder::connect` / the seven `connect_pinned*` free functions
+  (under `--features fips`), plus the shared client background task,
+  which stores the failure in the session's `terminal_error` slot
+  because it is infallible by signature.
 - `crypto::self_tests::run_post()` — runs the full battery on demand;
   `ensure_post_passed()` is the cached single-shot wrapper.
 
@@ -71,17 +75,21 @@ exactly once per process.
 
 ### Vector storage
 
-KATs land under `tests/cavp/` (Phase 5.4) and are pulled into the build via
-`include_bytes!`. Format: NIST-style `.rsp` files for KAT-friendly
-primitives; for ML-KEM / ML-DSA, the JSON-format vectors published with
-FIPS 203 / 204.
+`core/tests/cavp.rs` carries its vectors inline as `const` byte arrays (no
+fixture files). The byte-exact external NIST ACVP vectors for the raw
+ML-KEM-768 / ML-DSA-65 primitives live in `core/tests/nist_kat/` as four
+trimmed `.json` files (`ml_kem_768_keygen.json`,
+`ml_kem_768_encap_decap.json`, `ml_dsa_65_keygen.json`,
+`ml_dsa_65_siggen.json`) and are read at **runtime** by
+`core/tests/nist_kat.rs` via `std::fs::read` + `serde_json` — they are not
+`include_bytes!`-ed into the binary.
 
 ## PCT plan
 
 | Key | Test |
 | --- | --- |
-| Ed25519 keypair | Sign a fixed 32-byte message with `sk`; verify with `pk`. Both must succeed before `HybridSigningKey::generate` returns. |
-| ML-DSA-65 keypair | Same: sign + verify a fixed buffer. |
+| Ed25519 keypair | Sign a fixed message with `sk`; verify with `pk`. **Shipped** as `HybridSigningKey::pairwise_consistency_check()`, called at every long-term-identity generation site — deliberately *not* inside `HybridSigningKey::generate`, which mints the client's ephemeral per-handshake key. |
+| ML-DSA-65 keypair | Same: sign + verify a fixed buffer, in the same shipped hybrid check. |
 | X25519 keypair | Compute `dh = X25519(sk, base_point)`. Compare against `pk` for consistency. |
 | ML-KEM-768 keypair | `encap(pk)` to produce `(ss, ct)`; `decap(sk, ct)` must yield `ss`. |
 
@@ -101,10 +109,10 @@ material immediately. Caller is responsible for re-attempting keygen
 
 | Phase | Status | Deliverable |
 | --- | --- | --- |
-| Phase 5.4 | ✅ | CAVP vectors under `core/tests/cavp/`. (Implemented with ML-KEM-768, ML-DSA-65, AES-256-GCM, SHA-256, HMAC-SHA-256, HKDF-SHA-256, Ed25519 test vectors.) |
+| Phase 5.4 | ✅ | CAVP-style KATs in `core/tests/cavp.rs` (ML-KEM-768, ML-DSA-65, AES-256-GCM, HKDF-SHA-256 (RFC 5869 A.1), SHA-256) plus byte-exact NIST ACVP vectors in `core/tests/nist_kat.rs` + `core/tests/nist_kat/*.json`. |
 | Phase 5.5 | ✅ | `core/src/crypto/self_tests.rs` + `run_post()` / `ensure_post_passed()` API. Shipped and wired into `PhantomListener::bind*` / `PhantomSession::connect*` / `connect_pinned*` under the `fips` feature; failure → `CoreError::FipsSelfTestFailure`. |
 | Phase 5.5 | ✅ | CI `fips-feature` job runs `cargo test --no-default-features --features fips,bindings,compression-zstd --lib` (which includes the `self_tests` module tests and the `set_force_post_fail` fault-injection seam) on every PR. |
-| Phase 5.5 | ⏳ | Per-keygen PCTs wired into all four keygen functions (the POST already covers KEM/sign pairwise consistency once at startup). |
+| Phase 5.5 | ⏳ | PCT on the KEM keypair (`HybridSecretKey::generate`). The signing-key PCT is shipped; the POST already covers KEM pairwise consistency once at startup. |
 
 ## Failure-handling policy
 

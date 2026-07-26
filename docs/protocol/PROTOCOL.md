@@ -10,8 +10,8 @@ tamper-check anchor and a hook for a future, deliberate bump. (*Connection*
 migration — one session surviving a network-path change without re-handshaking
 — is a separate axis on the **same** wire; see § 12.)
 
-Audit-friendly format: every field has its Rust source-of-truth pinned with
-`file:line`. The canonical wire bytes are the byte-frozen vectors in
+Audit-friendly format: every field names the Rust file that is its source of
+truth. The canonical wire bytes are the byte-frozen vectors in
 `core/tests/wire_vectors/` (§ 11) — the Rust types produce them and this doc
 narrates the grammar; all three are checked against each other in CI.
 
@@ -105,7 +105,7 @@ bare `PhantomPacket`; the handshake messages are bare borsh structs.
 | Role | Primitive (default build) | Primitive (`--features fips`) | Crate |
 | --- | --- | --- | --- |
 | Classical KEM | X25519 | ECDH-P-256 | `x25519-dalek` / `aws-lc-rs` |
-| Post-quantum KEM | ML-KEM-768 (FIPS 203) | ML-KEM-768 (FIPS 203) | `ml-kem = 0.2` (RustCrypto pure-Rust) |
+| Post-quantum KEM | ML-KEM-768 (FIPS 203) | ML-KEM-768 (FIPS 203) | `ml-kem = 0.3` (RustCrypto pure-Rust) |
 | Classical signature | Ed25519 | Ed25519 | `ed25519-dalek` |
 | Post-quantum signature | ML-DSA-65 (FIPS 204) | ML-DSA-65 (FIPS 204) | `ml-dsa = 0.1.1` (RustCrypto pure-Rust) |
 | AEAD | AES-256-GCM or ChaCha20-Poly1305 | AES-256-GCM only | `ring` / `aws-lc-rs` |
@@ -141,7 +141,7 @@ change.
 | Label | Construction | Purpose |
 | --- | --- | --- |
 | `"HybridKEM_X25519_Kyber768"` / `"HybridKEM_P256_Kyber768"` (fips) | `HKDF-SHA-256(classical_secret \|\| kyber_secret)` | hybrid KEM shared secret (`hybrid_kem.rs`) |
-| `b"phantom-transport-key"` | `HKDF-Expand(shared_secret)` | session AEAD master before per-direction derivation (`transport/session.rs`) |
+| `b"phantom-transport-key"` | `HKDF-Expand(shared_secret)` | auxiliary `CryptoState.session_key` — **not** on the AEAD key path (the per-direction AEAD subkeys derive straight from `shared_secret` via the `phantom-aes-*` / `phantom-cc20-*` labels below); derived but read by nothing today (`transport/session.rs`) |
 | `"phantom-aes-send-v1"` / `"phantom-aes-recv-v1"` | `derive_key_32` over `shared_secret` | AES-256-GCM per-direction subkeys (`adaptive_crypto.rs`) |
 | `"phantom-cc20-send-v1"` / `"phantom-cc20-recv-v1"` | `derive_key_32` | ChaCha20-Poly1305 per-direction subkeys (`adaptive_crypto.rs`) |
 | `"phantom-nonce-pfx-v1"` | `derive_key_32(shared_secret)` | 4-byte nonce prefix (`adaptive_crypto.rs`) |
@@ -151,6 +151,10 @@ change.
 | `b"phantom-early-data-key-v3"` | `HKDF-Expand(HKDF-Extract(client_nonce, resumption_secret))` | 0-RTT early-data AEAD key (`crypto/kdf.rs`) |
 | `b"phantom-early-data-nonce-v3"` | `HKDF-Expand(HKDF-Extract(client_nonce, resumption_secret))` | 0-RTT early-data AEAD nonce (`crypto/kdf.rs`) |
 | `b"phantom-pow-cookie-v1" \|\| hour_be` | `HKDF-Expand(master_secret)` | hour-rotated cookie / PoW HMAC key (`transport/handshake.rs`) |
+| `"phantom-hp-send-v1"` / `"phantom-hp-recv-v1"` | `derive_key_32(label, initial_secret)` | per-direction, session-stable header-protection keys (§ 4.6; `crypto/header_protection.rs`) |
+| `"phantom-cid-c2s-v1"` / `"phantom-cid-s2c-v1"` | `derive_key_32(label, initial_secret)` | per-direction rotating-CID chain secrets (§ 4.7; `crypto/cid_chain.rs`) |
+| `"phantom-cid-v1"` | `derive_key_32(label, cid_secret \|\| i.to_be_bytes())[0..8]` | the 8-byte routing CID at migration index `i` (§ 4.7; `crypto/cid_chain.rs`) |
+| `"phantom-resume-binder-v1"` | `derive_key_32(label, resumption_secret \|\| resume_session_id \|\| client_nonce)` | 0-RTT resumption proof-of-possession binder (§ 6.2; `transport/handshake.rs`) |
 
 > **Removed — `"phantom-faketls-*-v1"` (vestigial).** The legacy FakeTLS leg that
 > derived these three outer-obfuscation labels (`c2s` / `s2c` / `pfx`) was deleted.
@@ -173,8 +177,8 @@ wire-format constants.
 ```rust
 pub struct PhantomPacket {
     pub header: PacketHeader,   // 15 bytes on the wire (§ 4.2); session_id is off-wire
-    pub payload: Vec<u8>,       // AEAD ciphertext (+16-byte tag) when ENCRYPTED;
-                                // raw bytes for control/ACK; coalesced bundle when COALESCED
+    pub payload: Vec<u8>,       // AEAD ciphertext (+16-byte tag) — ENCRYPTED is set on every
+                                // post-handshake frame; coalesced bundle when COALESCED
     pub extensions: Vec<u8>,    // TLV headroom; empty today, ignored if non-empty
 }
 ```
@@ -200,9 +204,12 @@ payload       the message remainder (all bytes after the 15-byte header)
 never an out-of-bounds read). `extensions` is no longer carried on the data-plane
 wire (it was always empty; the AEAD AAD still binds an empty extensions slice).
 
-`payload` is the AEAD ciphertext when `PacketFlags::ENCRYPTED` is set,
-otherwise raw bytes (control / ACK / path-validation). The AAD is the
-reconstructed 47-byte header image (§ 5).
+`payload` is the AEAD ciphertext (plus its 16-byte tag) — and on the live wire it
+always is: every post-handshake packet, including the `ACK`, `PATH_VALIDATION`,
+`WINDOW_UPDATE`, `KEEPALIVE` and `COVER` control frames, sets
+`PacketFlags::ENCRYPTED`, and the recv loop **drops** any post-handshake frame
+without it (Invariant 2). The unencrypted `PhantomPacket` constructors are
+non-production. The AAD is the reconstructed 47-byte header image (§ 5).
 
 > **Security note.** The AEAD AAD is the reconstructed 47-byte header image
 > followed by `extensions` (§ 5). With `extensions` empty (always, on the v6
@@ -296,7 +303,7 @@ Source: `core/src/transport/types.rs`.
 | `0x0008` | `UNRELIABLE` | Fire-and-forget |
 | `0x0010` | `PRIORITY` | Voice/video frame priority hint |
 | `0x0020` | `ENCRYPTED` | Payload is AEAD ciphertext |
-| `0x0040` | `COMPRESSED` | Payload is compressed (`AdaptiveCompressor`) |
+| `0x0040` | `COMPRESSED` | _Defined but unused_ — no send path sets it and the recv path never decompresses (`transport/compression.rs`'s `AdaptiveCompressor` is not wired to the packet path). Treat as reserved; do not emit |
 | `0x0080` | `CONTROL` | Handshake / migration control message |
 | `0x0100` | `REKEY` | Sender rekeyed; receiver trial-decrypts at `header.epoch` and commits the ratchet on AEAD success (§ 5) |
 | `0x0200` | `PATH_VALIDATION` | Payload is a 32-byte challenge / response (multi-path) |
@@ -326,8 +333,10 @@ so the AEAD nonce never collides, and it obeys the §5 rekey discipline.
 ### 4.4 `SessionId`
 
 `SessionId` (`[u8; 32]`, 32 bytes; `types.rs`) is the negotiated session
-identifier, used as encryption salt and for migration across IP changes.
-Server-side it is derived as `SHA256(b"phantom-session-id-v1" || shared_secret
+identifier. It is bound into the AEAD AAD (§ 4.2) but is **off-wire** since v5 —
+migration and demux routing are by the outer rotating `ConnId` (§ 4.7), not by
+`session_id`. Server-side it is derived as
+`SHA256(b"phantom-session-id-v1" || shared_secret
 || client_nonce)` (`transport/handshake.rs`); the client adopts the
 `session_id` echoed in the `ServerHello`.
 
@@ -592,6 +601,42 @@ never reaches `recv()`). Source: `send_cover` / `maybe_send_cover` in
 anything?" signal). Tests: `security_invariants::cover_packet_is_authenticated_padded_and_carries_no_data`,
 live `udp_integration::udp_integration_cover_traffic_fills_idle_and_is_dropped`.
 
+### 4.9 PhantomUDP outer datagram envelope (transport framing)
+
+Every PhantomUDP datagram is prefixed with a 9-byte cleartext envelope
+(`transport/phantom_udp/envelope.rs`) that the demux routes on. It is **transport
+framing, not the frozen inner wire**: it lives outside `core/tests/wire_vectors`
+and changing it does not bump `WIRE_VERSION` (same status as
+`TcpSessionTransport`'s 4-byte length prefix; TCP / embedded carry no envelope at
+all).
+
+| Offset | Field | Width | Encoding |
+| --- | --- | --- | --- |
+| 0 | `flags` | 1 | bits 7..6 = packet type (`0b00` = `Initial`, inner is a borsh handshake message; `0b01` = `OneRtt`, inner is the HP-masked `PhantomPacket` of § 4.1; `0b10` = `Retry`, defined but never emitted; `0b11` rejected as `ReservedType`). Bit 5 = `FRAG_BIT` (`0x20`). Bits 4..0 are reserved and **must be zero** — a datagram with any of them set is rejected (`ReservedBitsSet`) |
+| 1 | `cid` | 8 | the rotating routing `ConnId` (§ 4.7), raw bytes |
+| 9 | body | remainder | the inner frame; when `FRAG_BIT` is set, an 8-byte fragment subheader followed by this datagram's chunk |
+
+Fragment subheader (present iff `FRAG_BIT` is set):
+
+| Offset | Field | Width | Encoding |
+| --- | --- | --- | --- |
+| 9 | `packet_id` | 4 | u32 big-endian — disambiguates concurrently-fragmented frames from the same `cid` |
+| 13 | `chunk_index` | 2 | u16 big-endian — 0-based |
+| 15 | `total_chunks` | 2 | u16 big-endian |
+
+`PATH_MTU = 1200`: a frame of at most `1200 − 9 = 1191` bytes ships unfragmented;
+a larger frame is split into `1200 − 9 − 8 = 1183`-byte chunks sharing one
+`packet_id`. The reassembler is keyed on `(cid, packet_id)` and caps a logical
+packet at `MAX_REASSEMBLED_LEN = 256 KiB` (hence `MAX_TOTAL_CHUNKS`, derived from
+that cap) with at most `MAX_CONCURRENT_ASSEMBLIES = 256` in-flight assemblies;
+anything beyond is dropped silently (`transport/fragmentation.rs`). A datagram
+shorter than the 9-byte envelope — or than the fragment subheader it claims — is
+`Truncated`, never an out-of-bounds read.
+
+The envelope is **unauthenticated** — it is a routing label only. All
+authenticity and confidentiality rest on the inner AEAD (Invariants 2 / 4), and
+the CID is never transcript-bound.
+
 ---
 
 ## 5. AEAD construction
@@ -671,7 +716,7 @@ carrying the same `stream_offset`) is deduped at the stream layer.
 (`adaptive_crypto.rs`). The per-direction invocation count reaching this ceiling
 yields `CryptoError::NonceExhausted` — a defensive ceiling far below any practical
 AEAD safety boundary, and far below where a `u64` packet number could itself be a
-concern (the `2^47` rekey soft-limit fires long first).
+concern (the `2^32` rekey soft-limit fires long first).
 
 **Mid-session rekey (Invariant 5).** `Session::rekey()`:
 
@@ -690,7 +735,9 @@ installed key depth diverge from the `epoch` counter.
 
 **Automatic rekey.** The data pump triggers a rekey on the send path, *before
 stamping a packet's header*, once a direction's AEAD invocation count crosses
-`REKEY_SOFT_LIMIT` (default `2^48 / 2 = 2^47`), well below the hard
+`REKEY_SOFT_LIMIT` (default `2^32`; T5.3 lowered it from `2^47` — the
+AES-256-GCM IND-CPA advantage at `2^32` records is ~`2^-33`, inside the CFRG /
+QUIC confidentiality margins), far below the hard
 `AEAD_MAX_INVOCATIONS = 2^48` ceiling. The old per-stream `SEQ_REKEY_WATERMARK`
 forced-rekey threshold (the C1 crutch) is **gone**: with a per-direction `u64`
 packet number there is no sequence to wrap, so the invocation soft-limit is the
@@ -702,7 +749,14 @@ session is expected to reconnect rather than continue. Both data (`send_app_data
 and `WINDOW_UPDATE` (`send_window_update`) sends obey this discipline.
 
 Wire signalling: the sender emits a packet whose header carries the new `epoch`
-and the `PacketFlags::REKEY` flag. The receiver follows via
+and the `PacketFlags::REKEY` flag — and **re-advertises `REKEY` on every packet
+it sends at the new epoch** until an authenticated inbound packet arrives at that
+epoch (T5.5(b)), so a lost rotation-trigger packet cannot strand the peer behind
+the catch-up gate. Correspondingly the receiver **rejects a forward-epoch packet
+that does not carry `REKEY`** cheaply, before taking the rekey lock or doing any
+HKDF work — an honest sender always sets it, so an unflagged forward epoch is
+forged or corrupt, and rejecting it early bounds the key-derivation work a
+spoofed packet can force. The receiver follows via
 `Session::decrypt_packet_accepting_rekey`: if `header.epoch` is ahead of its
 local epoch (by up to `MAX_REKEY_CATCHUP = 16` steps, which absorbs the small
 divergence when both directions rekey at slightly different cadences), it
@@ -894,7 +948,11 @@ work (`handshake.rs`) and drops the blob, continuing 1-RTT — this caps the
 work an unauthenticated peer can force.
 
 **One-shot anti-replay (Invariant 9).** The defence is the resumption ticket
-itself: `SessionCache::try_resume` **removes** the ticket on first lookup. A
+itself: the server `peek()`s the ticket (no consume), verifies the
+`ClientHello.resumption_binder` against it in constant time, then **eagerly
+`remove()`s** it — `remove` returns `true` for exactly one of two racing
+duplicates, so the consume is race-free — and re-inserts it unchanged
+(`reinsert_with_expiry`) only if a later handshake step fails. A
 replayed ClientHello carrying the same `resume_session_id` finds no ticket → no
 cookie/PoW bypass → the server falls back to a normal 1-RTT handshake and
 ignores the early-data. Each ticket authorises exactly one 0-RTT attempt.
@@ -910,12 +968,16 @@ early-data.
 > deployment where each node keeps its **own** cache, an attacker who captures a
 > 0-RTT `ClientHello` can replay it against a *different* node that still holds an
 > unconsumed copy of the same ticket, and that node will accept the early-data a
-> second time — the classic TLS-1.3 0-RTT-across-a-server-farm replay. Mitigations
-> (all deployment-side, none enforced by this library): (a) consistently route a
-> given `resume_session_id` to the same node (sticky / hashed load-balancing); (b)
-> back the cache with a single shared store that performs an atomic
-> compare-and-remove on resume; or (c) accept the residual and keep early-data
-> strictly idempotent. The forward secrecy and authentication of the resulting
+> second time — the classic TLS-1.3 0-RTT-across-a-server-farm replay. Mitigations:
+> (a) consistently route a given `resume_session_id` to the same node (sticky /
+> hashed load-balancing); (b) install a distributed anti-replay store — the library
+> ships the seam: implement `transport::handshake::ZeroRttAntiReplay` (a single
+> `check_and_set(ticket_id) -> bool` first-use check against your shared store) and
+> register it via `PhantomListener::set_zero_rtt_anti_replay` /
+> `PhantomUdpListener::set_zero_rtt_anti_replay`, after which ticket consumption is
+> one-shot **globally** (A2b); the backing store itself is yours to operate; or (c)
+> accept the residual and keep early-data strictly idempotent. The forward
+> secrecy and authentication of the resulting
 > *post-handshake* session are unaffected — only the at-most-once property of the
 > 0-RTT early-data payload degrades. See the threat-model (STRIDE-S / LINDDUN).
 
@@ -1020,10 +1082,14 @@ A valid one-shot resumption ticket (§ 6.6) bypasses the cookie/PoW gate.
 ### 6.9 PoW format
 
 `PoWChallenge { nonce: [u8; 32], difficulty: u8 }`. The client must find a
-solution such that the blake3-based hash of `(challenge.nonce || client_ip ||
-solution)` has at least `difficulty` leading zero bits. The challenge is
-regenerated deterministically from the rotating per-hour secret — stateless
-server-side, accepting the current or previous hour's derivation. The
+`solution: u64` such that the unkeyed BLAKE3 hash of `(challenge.nonce ||
+solution.to_le_bytes())` has at least `difficulty` leading zero bits. The client
+IP is **not** an input to the solution hash — it is bound into the 32-byte
+`challenge.nonce`, which is itself a self-authenticating stateless cookie
+`[timestamp: u64 LE (8 B) | keyed-BLAKE3(secret; timestamp ‖ client_ip)[0..24]]`;
+the server re-MACs it on verify and rejects a challenge older than 120 s. The
+challenge is regenerated deterministically from the rotating per-hour secret —
+stateless server-side, accepting the current or previous hour's derivation. The
 challenge-integrity MAC is compared in constant time (`subtle::ConstantTimeEq`,
 CRYPTO-2/HS-04).
 
@@ -1074,8 +1140,10 @@ three messages — it leaves the frozen wire vectors (§11) untouched.
 
 ## 7. Reserved / forward-compatibility surface
 
-- `PacketHeader.path_id`: the client-owned connection-migration path label
-  (Phase 4, § 12); `epoch`: the rekey generation (Phase 1.5). Both default to 0.
+- `PacketHeader.path_id`: the sender-owned connection-migration path label —
+  each peer bumps it on its own send direction (`migrate()` for the client,
+  `migrate_server()` for the server; Phase 4, § 12); `epoch`: the rekey
+  generation (Phase 1.5). Both default to 0.
   Since P4.0 (§ 5) `path_id` no longer feeds the AEAD nonce — it is AAD-only — so a
   `path_id` becomes safely reusable once its path is retired.
 - `PhantomPacket.extensions`: TLV headroom, empty today. A decoder ignores it;
@@ -1083,7 +1151,8 @@ three messages — it leaves the frozen wire vectors (§11) untouched.
 - `ServerHello.server_nonce`: a 32-byte server-contributed, transcript-bound
   value (T4.3, replacing the old discarded ~1184 B ephemeral `server_key_package`).
   A future second-KEM ring could repurpose this slot for real key material.
-- `PacketFlags 0x2000 … 0x8000`: reserved bits (`0x1000` = `KEEPALIVE`, § 4.3 / § 12.4).
+- `PacketFlags 0x8000`: the sole remaining reserved bit (`0x1000` = `KEEPALIVE`
+  § 4.3 / § 12.4, `0x2000` = `PADDED` and `0x4000` = `COVER` § 4.8 are assigned).
 
 A future protocol revision that needs more than this headroom increments
 `WIRE_VERSION` / `PROTOCOL_VERSION` (§ 1) as a deliberate, code-gated bump.
@@ -1134,9 +1203,9 @@ network attacker cannot learn anything from the shape of the failure.
 > **Note (Phase 0 → mimicry feature):** the original FakeTLS leg was removed in
 > Phase 0. Active TLS mimicry returned as the optional **`mimicry` feature** — a
 > `MimicTlsLeg` (`bind_mimic` / `connect_pinned_mimic`) that wraps the Phantom
-> session in a *synthetic* TLS 1.3 flow (see below). The `"phantom-faketls-*-v1"`
-> KDF labels in § 3 are vestigial — the new leg is **framing-only with no outer
-> AEAD**, so it derives no outer keys.
+> session in a *synthetic* TLS 1.3 flow (see below). It is **framing-only with no
+> outer AEAD**, so it derives no outer keys — the old `"phantom-faketls-*-v1"`
+> labels are gone from § 3 and from every build.
 
 ### 9.1 TLS-mimicry leg (`mimicry` feature)
 
@@ -1178,7 +1247,7 @@ this spec as follows:
 | --- | --- |
 | 1 — Server identity pinning | § 6.1 / § 6.3 / § 6.5 |
 | 2 — Post-handshake ENCRYPTED flag | § 4.3 / § 5 |
-| 3 — FakeTLS per-record counter nonces (anti-Forbidden-Attack) | § 3 / § 9 |
+| 3 — Anti-DPI obfuscation carries no confidentiality of its own (framing-only `mimicry` leg) | § 9.1 |
 | 4 — Replay rejection after AEAD verify | § 5 |
 | 5 — Rekey via HKDF `"phantom-rekey-v1"`, saturating epoch | § 5 |
 | 6 — Constant-time path-validation responses | § 4.3 (`PATH_VALIDATION`) / § 12.1 |

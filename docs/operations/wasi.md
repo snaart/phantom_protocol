@@ -15,7 +15,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-phantom_protocol = { version = "0.2", default-features = false, features = ["std", "wasi-leg"] }
+phantom-protocol = { version = "0.2", default-features = false, features = ["std", "wasi-leg", "classical-crypto"] }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 
 [[bin]]
@@ -67,7 +67,7 @@ The Cargo feature itself implies `std`; it is mutually exclusive with
 the `WebSocketLeg` + `WasmRuntime` surface that the browser path
 already provides.
 
-## Why `--no-default-features --features std,wasi-leg`?
+## Why `--no-default-features --features std,wasi-leg,classical-crypto`?
 
 The `bindings` Cargo feature (default-on) pulls in UniFFI's
 `setup_scaffolding!` and the `#[uniffi::export]` derives that the
@@ -75,10 +75,12 @@ native Swift / Kotlin / Python / C bindings consume. UniFFI's
 exported-symbol metadata is incompatible with `wasm-component-ld`
 (the wasm32-wasip2 linker — it expects a Wasm component, not a
 bag of named exports). WASI guests therefore drop `bindings` and
-re-add only the features they need:
+re-add only the features they need. `classical-crypto` must be named
+explicitly — it is deliberately not implied by `std` so a FIPS build can
+drop `ring` / `x25519-dalek`:
 
 ```toml
-phantom_protocol = { ..., default-features = false, features = ["std", "wasi-leg"] }
+phantom-protocol = { ..., default-features = false, features = ["std", "wasi-leg", "classical-crypto"] }
 ```
 
 The `bindings` feature is irrelevant inside a WASI guest anyway —
@@ -129,7 +131,7 @@ These are deliberate omissions, not bugs:
   `start_listen` / `finish_listen` / `accept` exist; wiring them to
   `PhantomListener` requires a `WasiListener` mirror that doesn't
   exist yet; running `phantom-server` as a WASI guest is deliberately
-  deferred.
+  deferred (see `docs/DEFERRED_WORK.md` §3).
 - **Full `PhantomSession` over `WasiLeg`.** The host integration
   test exercises `WasiLeg::connect / send / recv`, not a complete
   handshake. The session machinery needs

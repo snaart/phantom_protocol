@@ -17,7 +17,7 @@ policy) by detailing the internal-facing steps.
             │ within 5 business days                    │
             │  • Acknowledge receipt                    │
             │  • Assign CVE-track number internally     │
-            │  • Confirm in-scope (see SECURITY.md §1)  │
+            │  • Confirm in-scope (see SECURITY.md)     │
             └─────────────────────┬─────────────────────┘
                                   │
             ┌─────────────────────┴─────────────────────┐
@@ -74,7 +74,8 @@ Severity buckets used in the timeline above:
 | 0.1-3.9 | Low | 90 days |
 
 A finding that breaks one of the three documented invariants
-(`SECURITY.md` §3) is always **at least** High regardless of CVSS arithmetic.
+(`SECURITY.md`, "Security invariants") is always **at least** High regardless of
+CVSS arithmetic.
 
 ---
 
@@ -84,7 +85,7 @@ A finding that breaks one of the three documented invariants
 | --- | --- |
 | Triage Lead | Acknowledges report, runs initial reproduction, assigns severity. |
 | Fix Author | Writes the patch + tests; usually the same person as Triage Lead unless deep expertise is needed. |
-| Reviewer | Independent code review by another maintainer. Required for any fix that touches `core/src/crypto/` or `core/src/transport/handshake.rs`. |
+| Reviewer | Independent code review by another maintainer. Required for any fix that touches one of the six codeowner paths (`CONTRIBUTING.md` "Security-sensitive changes" / `.github/CODEOWNERS`): `core/src/crypto/`, `core/src/transport/handshake.rs`, `core/src/transport/session.rs`, `core/src/transport/udp_transport.rs`, `core/src/transport/legs/mimic_tls/`, `core/src/security/`. |
 | Release Captain | Cuts the release, drafts CHANGELOG entry, files the GHSA / CVE. |
 
 For solo-maintainer operation, all four roles collapse into one person —
@@ -187,19 +188,19 @@ post-mortem required.
 
 (Maintainer roster — update when the project changes hands.)
 
-- Primary contact: `security@phantom-protocol.invalid` (PGP-signed mail
-  preferred; key fingerprint in `SECURITY.md`).
+- Primary contact: `ceo@snaart.com` (the address published in `SECURITY.md`).
 - Backup contact: ditto.
 - Out-of-band escalation: see organisation directory.
 
-PGP key rotation: at least every 24 months. The previous key remains
-valid for verification for 12 months after rotation.
+PGP is not currently offered — no key is published in `SECURITY.md`. If one is
+added, rotate it at least every 24 months; the previous key remains valid for
+verification for 12 months after rotation.
 
 ---
 
 ## 9. Tools and references
 
-- GHSA filing: https://github.com/<org>/phantom-protocol/security/advisories/new
+- GHSA filing: https://github.com/snaart/phantom_protocol/security/advisories/new
 - CVE search: https://nvd.nist.gov/vuln/search
 - CVSS 4.0 calculator: https://www.first.org/cvss/calculator/4-0
 - Fuzz harness: `fuzz/` (Phase 6.4) — reproduce known crashing inputs.
