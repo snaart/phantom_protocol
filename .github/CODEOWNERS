@@ -10,11 +10,14 @@
 *                                       @snaart
 
 # ── Security-sensitive cryptography & transport core ────────────────────────
+# Keep this block in lockstep with CONTRIBUTING.md ("Security-sensitive
+# changes"); it is the same six paths, in the same order.
 /core/src/crypto/                       @snaart
-/core/src/security/                     @snaart
 /core/src/transport/handshake.rs        @snaart
 /core/src/transport/session.rs          @snaart
-/core/src/transport/legs/faketls.rs     @snaart
+/core/src/transport/udp_transport.rs    @snaart
+/core/src/transport/legs/mimic_tls/     @snaart
+/core/src/security/                     @snaart
 
 # ── Supply chain: CI, release, and dependency policy ────────────────────────
 /.github/                               @snaart

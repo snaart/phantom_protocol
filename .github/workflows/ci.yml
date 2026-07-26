@@ -35,8 +35,18 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --manifest-path core/Cargo.toml --check
+      # The sibling crates are not workspace members, so `core`'s check never
+      # saw them and both had drifted from the repo-root `.rustfmt.toml`.
+      - run: cargo fmt --manifest-path server/Cargo.toml --check
+      - run: cargo fmt --manifest-path cli/Cargo.toml --check
 
   clippy:
+    # NOTE: "warn-only" in this `name:` is legacy wording — the audit lints are
+    # `deny` in core/src/lib.rs and the file-scope `RUSTFLAGS: -D warnings`
+    # makes this a hard gate. The string is kept verbatim because it is a pinned
+    # branch-protection required-status-check context — renaming it makes the
+    # required context never report and blocks every merge (same rule as the
+    # `integration` job below).
     name: cargo clippy (audit lints, warn-only)
     runs-on: ubuntu-latest
     steps:
@@ -47,10 +57,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "."
-      # Audit-friendly lints (`clippy::unwrap_used`, `expect_used`,
-      # `indexing_slicing`, etc.) are configured at `warn` level in `lib.rs`
-      # so they surface as TODO markers in CI output without breaking the
-      # build. A follow-up phase will tighten them to `deny`.
+      # The audit lints (`clippy::unwrap_used`, `expect_used`, `panic`,
+      # `unreachable`, `todo`, `unimplemented`, `missing_safety_doc`) are
+      # `deny` at the crate root (core/src/lib.rs) — every surviving production
+      # panic-shaped call carries an inline `// PANIC-SAFETY:` comment plus a
+      # statement-scoped `#[allow(...)]` (inventory: docs/security/panic-sites.md).
+      # `clippy::indexing_slicing` is deliberately NOT enabled (too noisy on
+      # constant-bounded indexing). With the file-scope `RUSTFLAGS: -D warnings`
+      # above, any remaining warning is a hard failure — this job is a gate.
       - run: cargo clippy --manifest-path core/Cargo.toml --lib
 
   test:
@@ -77,9 +91,15 @@ jobs:
       # crate-encoding regression that a self-referential round-trip cannot.
       - run: cargo test --manifest-path core/Cargo.toml --test nist_kat
       # End-to-end observability wiring: a real TCP session must populate the
-      # handshake/packet/byte metrics and drive the active-session gauge up AND
-      # back down. Runs on the default (no-otel) atomics path.
+      # handshake/packet/byte metrics, the encrypt/decrypt timings and the RTT
+      # sample, and drive the active-session AND active-stream gauges up and
+      # back down (including on an abnormal close). Runs on the default
+      # (no-otel) atomics path.
       - run: cargo test --manifest-path core/Cargo.toml --test observability_e2e
+      # Facade-level contracts the recording call sites depend on (gauge
+      # balance, sum-over-count averages, per-path RTT slots, and the pin that
+      # the OTel-only recorders touch no atomic).
+      - run: cargo test --manifest-path core/Cargo.toml --test observability_atomics
 
   # MSRV gate (M-8): the crate documents a Rust 1.93 MSRV (rust-version /
   # .clippy.toml / docs/policy/versioning.md) but nothing enforced it. Pin the
@@ -184,6 +204,11 @@ jobs:
         with:
           workspaces: "."
       - run: cargo test --manifest-path core/Cargo.toml --lib --features embedded
+      # `--lib` above never builds `core/examples/`, so `embedded_demo` (the only
+      # example that needs this feature) could rot unnoticed — an
+      # `embedded-io-async` trait bump once left it failing to compile. Check the
+      # examples explicitly.
+      - run: cargo check --manifest-path core/Cargo.toml --features embedded --examples
       - run: cargo clippy --manifest-path core/Cargo.toml --lib --features embedded -- -D warnings
 
   mimicry-feature:
@@ -218,6 +243,14 @@ jobs:
           workspaces: "."
       - run: cargo test --manifest-path core/Cargo.toml --lib --features telemetry-otel
       - run: cargo test --manifest-path core/Cargo.toml --test observability_otel --features telemetry-otel
+      # Regression pins for the seven OTel-ONLY recorders (cookie / pow /
+      # early_data / resumption / rekey / path_migration / path_validation).
+      # They touch no atomic, so `Observability::snapshot()` can never show
+      # them — this suite installs an in-memory SdkMeterProvider, drives real
+      # loopback code paths, and asserts the counter series actually moved.
+      # Only meaningful under this feature (the instruments are a ZST no-op
+      # otherwise), which is why it lives in this job.
+      - run: cargo test --manifest-path core/Cargo.toml --test observability_instrument_wiring --features telemetry-otel
       - run: cargo clippy --manifest-path core/Cargo.toml --lib --features telemetry-otel -- -D warnings
 
   fips-feature:

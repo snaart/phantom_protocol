@@ -38,7 +38,7 @@ not a replacement.
 
 ## Style
 
-- Rust 2021 edition.
+- Rust 2021 edition for `core/` and `server/`; `cli/` is edition 2024 (allowed by the 1.93 MSRV).
 - `rustfmt` per [`.rustfmt.toml`](.rustfmt.toml). Every PR must pass `cargo fmt --check`.
 - `clippy` per [`.clippy.toml`](.clippy.toml). Every PR must pass
   `cargo clippy --manifest-path core/Cargo.toml --lib -- -D warnings`.
@@ -76,7 +76,7 @@ The documented security invariants in [`SECURITY.md`](SECURITY.md) and
 
 - New public functions need at least one positive and one negative test.
 - Security invariants must be covered by tests in `core/tests/` (especially
-  `tcp_integration.rs` and the `security_invariants.rs` suite (58 always-on tests)).
+  `tcp_integration.rs` and the `security_invariants.rs` suite (60 always-on tests)).
 - Concurrency-sensitive code should have a loom test where practical.
 
 ## Commit messages

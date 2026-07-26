@@ -1,4 +1,4 @@
-# Pre-commit hooks for phantom_protocol (Phase 0.5).
+# Pre-commit hooks for phantom_protocol.
 #
 # Optional local gate that mirrors the cheapest CI checks. Install once with:
 #
@@ -23,9 +23,9 @@ repos:
         # Don't touch the auto-generated bindings — they get regenerated
         # by `generate_*.sh` and a whitespace tweak here would just drift
         # back next CI run.
-        exclude: ^tests/bindings/(phantom_protocol\.py|swift/phantom_protocol\.swift|swift/phantom_protocolFFI\.h|kotlin/uniffi/phantom_protocol/phantom_protocol\.kt)$
+        exclude: ^tests/bindings/(phantom_protocol\.py|swift/phantom_protocol\.swift|swift/phantom_protocolFFI\.h|swift/phantom_protocolFFI\.modulemap|kotlin/uniffi/phantom_protocol/phantom_protocol\.kt)$
       - id: end-of-file-fixer
-        exclude: ^tests/bindings/(phantom_protocol\.py|swift/phantom_protocol\.swift|swift/phantom_protocolFFI\.h|kotlin/uniffi/phantom_protocol/phantom_protocol\.kt)$
+        exclude: ^tests/bindings/(phantom_protocol\.py|swift/phantom_protocol\.swift|swift/phantom_protocolFFI\.h|swift/phantom_protocolFFI\.modulemap|kotlin/uniffi/phantom_protocol/phantom_protocol\.kt)$
       - id: check-yaml
         # GitHub Actions workflows use multi-document anchors and YAML that
         # tripped strict parsers; allow them.
@@ -56,7 +56,7 @@ repos:
         # can break a lint two files over, so we don't pass filenames.
         pass_filenames: false
 
-      # ── Binding manifest version sync (Phase 8.1) ─────────────────────
+      # ── Binding manifest version sync ─────────────────────────────────
       - id: check-binding-versions
         name: bindings — manifest version sync
         entry: tests/bindings/check_versions.sh

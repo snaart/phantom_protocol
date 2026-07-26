@@ -40,8 +40,10 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: Generate coverage report
-        # `--workspace` would also include cli/tests siblings — we want
-        # only the `core` crate.
+        # Scope to the `core` manifest explicitly. (`core` is the root
+        # workspace's only member — `cli` / `tests` / `fuzz` / `server` are
+        # excluded siblings with their own manifests, and `tests/` is not a
+        # cargo crate at all.)
         run: |
           cargo llvm-cov \
               --manifest-path core/Cargo.toml \
