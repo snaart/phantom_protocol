@@ -321,7 +321,7 @@ mod tests {
             let mut reader = FrameReader::new();
             let mut received_data = Vec::new();
 
-            let num_chunks = (data_clone.len() + MAX_FRAME_PAYLOAD - 1) / MAX_FRAME_PAYLOAD;
+            let num_chunks = data_clone.len().div_ceil(MAX_FRAME_PAYLOAD);
             for _ in 0..num_chunks {
                 let chunk = reader.read_frame(&mut tcp, &ss2).await.unwrap();
                 received_data.extend_from_slice(&chunk);

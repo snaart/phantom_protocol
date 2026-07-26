@@ -34,10 +34,11 @@ use sha2::{Digest, Sha256};
 /// Source: FIPS 203 §7.2 / §7.3 (ML-KEM.Encaps / ML-KEM.Decaps). The byte-exact
 /// NIST ACVP KAT for the raw primitive lives in `core/tests/nist_kat.rs` (which
 /// enables `ml-kem`'s `hazmat` feature for the deterministic vectors). This test
-/// instead drives the system CSPRNG through the standard `Kem::generate_keypair`
-/// + `Encapsulate` + `Decapsulate` path and asserts the encap and decap sides
-/// recover the same shared secret — the FIPS 203 correctness invariant — and
-/// exercises Phantom Protocol's hybrid combiner end-to-end.
+/// instead drives the system CSPRNG through the standard
+/// `Kem::generate_keypair` + `Encapsulate` + `Decapsulate` path and asserts the
+/// encap and decap sides recover the same shared secret — the FIPS 203
+/// correctness invariant — and exercises Phantom Protocol's hybrid combiner
+/// end-to-end.
 ///
 /// The same primitive sits inside `HybridSecretKey` (the X25519 + ML-KEM-768
 /// hybrid that `crypto::hybrid_kem` builds the handshake on), and we also

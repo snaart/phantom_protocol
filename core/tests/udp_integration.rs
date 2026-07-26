@@ -1,6 +1,12 @@
 //! End-to-end UDP integration for `PhantomUdpListener` <-> `PhantomSession` over `UdpClientTransport`.
 //! `#[ignore]`-gated (run with `-- --ignored`).
 
+// Tests `.unwrap()` freely so failures surface as readable diagnostics; the
+// disallowed-methods list in `.clippy.toml` is for production code, not the test
+// harness. (Integration-test crates are their own crate and therefore do not
+// inherit `core/src/lib.rs`'s `#![cfg_attr(test, allow(...))]`.)
+#![allow(clippy::disallowed_methods)]
+
 use phantom_protocol::api::session::PhantomSession;
 use phantom_protocol::api::udp_listener::PhantomUdpListener;
 use phantom_protocol::api::udp_transport::UdpClientTransport;
@@ -119,7 +125,6 @@ async fn udp_integration_two_sessions_one_client_socket_is_not_required_but_two_
     let mut handles = Vec::new();
     for i in 0u8..2 {
         let key = key.clone();
-        let addr = addr;
         handles.push(tokio::spawn(async move {
             let t = UdpClientTransport::connect(addr).await.unwrap();
             let c = PhantomSession::connect_with_transport(&addr.to_string(), t, key);
@@ -508,17 +513,21 @@ async fn udp_integration_server_migration_rotates_both_cids_and_survives() {
     // (post-migration) — two distinct sources, impossible without a real send-socket
     // rebind — and rotated its CID across the move. A no-op `migrate_server` would leave
     // both at 1 source / would not change the source set.
-    let s2c_srcs_seen = s2c_srcs.lock().unwrap();
+    // Snapshot the collected facts inside a block so the `std::sync::MutexGuard`
+    // is released here and never stays live across the `server.await` below
+    // (clippy::await_holding_lock — a real hazard shape, so it gets a real fix).
+    let (saw_listen_addr_src, s2c_src_count) = {
+        let s2c_srcs_seen = s2c_srcs.lock().unwrap();
+        (s2c_srcs_seen.contains(&server_addr), s2c_srcs_seen.len())
+    };
     assert!(
-        s2c_srcs_seen.contains(&server_addr),
+        saw_listen_addr_src,
         "the server's pre-migration s2c must come from the listen address"
     );
     assert!(
-        s2c_srcs_seen.len() >= 2,
-        "the s2c source address must change across server migration (saw {} distinct sources)",
-        s2c_srcs_seen.len()
+        s2c_src_count >= 2,
+        "the s2c source address must change across server migration (saw {s2c_src_count} distinct sources)"
     );
-    drop(s2c_srcs_seen);
     let s2c_cids_seen = s2c_cids.lock().unwrap().len();
     assert!(
         s2c_cids_seen >= 2,

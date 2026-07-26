@@ -27,6 +27,12 @@
 //! `wasm32-wasip2` rustup target installed. CONTRIBUTING.md
 //! documents the install step.
 
+// Tests `.unwrap()` freely so failures surface as readable diagnostics; the
+// disallowed-methods list in `.clippy.toml` is for production code, not the test
+// harness. (Integration-test crates are their own crate and therefore do not
+// inherit `core/src/lib.rs`'s `#![cfg_attr(test, allow(...))]`.)
+#![allow(clippy::disallowed_methods)]
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;

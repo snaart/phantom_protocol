@@ -279,6 +279,6 @@ mod tests {
         .unwrap();
 
         // global pool should have received the flushed buffers
-        assert!(pool.buffers.len() > 0);
+        assert!(!pool.buffers.is_empty());
     }
 }

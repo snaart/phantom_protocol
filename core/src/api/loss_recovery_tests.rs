@@ -107,8 +107,9 @@
 //! was measured as NOT required to meet the L1 ceiling/cliff goal and is left as a
 //! future optimisation. `loss_recovery_high_loss_recovers_but_is_slow` keeps the
 //! RTO-only synchronous baseline as an `#[ignore]`d reference.
-
-#![cfg(test)]
+//!
+//! The module is declared `#[cfg(test)]` in `api/mod.rs`, so it carries no
+//! inner `#![cfg(test)]` of its own.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -209,50 +210,52 @@ async fn run_lossy_round_trips(
         let client_hello =
             borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize ClientHello");
 
-        // Process — may retry with cookie/PoW.
-        let inner_session = loop {
-            match server_hs.process_client_hello(&client_hello, 0, client_ip) {
-                HandshakeResponse::Retry(retry) => {
-                    let retry_bytes = ServerReply::Retry(retry)
-                        .to_wire()
-                        .expect("serialize retry");
-                    server_channel
-                        .send_bytes(&retry_bytes)
-                        .await
-                        .expect("server send retry");
-                    let next_bytes = server_channel
-                        .recv_bytes()
-                        .await
-                        .expect("server recv retry ClientHello");
-                    let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
-                        .expect("deserialize retry ClientHello");
-                    match server_hs.process_client_hello(&next_hello, 0, client_ip) {
-                        HandshakeResponse::Success(server_hello, session, _) => {
-                            let b = ServerReply::Hello(server_hello)
-                                .to_wire()
-                                .expect("serialize ServerHello");
-                            server_channel
-                                .send_bytes(&b)
-                                .await
-                                .expect("server send ServerHello");
-                            break session;
-                        }
-                        other => panic!("expected Success after retry, got {:?}", other),
+        // Process. The DoS gate may answer the first hello with a cookie/PoW
+        // `Retry`; the client then re-sends with the cookie and that second
+        // hello is admitted. That is at most ONE retry round — the gate never
+        // challenges a cookie-bearing hello again — so this is a straight-line
+        // match, not a loop.
+        let inner_session = match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let retry_bytes = ServerReply::Retry(retry)
+                    .to_wire()
+                    .expect("serialize retry");
+                server_channel
+                    .send_bytes(&retry_bytes)
+                    .await
+                    .expect("server send retry");
+                let next_bytes = server_channel
+                    .recv_bytes()
+                    .await
+                    .expect("server recv retry ClientHello");
+                let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
+                    .expect("deserialize retry ClientHello");
+                match server_hs.process_client_hello(&next_hello, 0, client_ip) {
+                    HandshakeResponse::Success(server_hello, session, _) => {
+                        let b = ServerReply::Hello(server_hello)
+                            .to_wire()
+                            .expect("serialize ServerHello");
+                        server_channel
+                            .send_bytes(&b)
+                            .await
+                            .expect("server send ServerHello");
+                        session
                     }
+                    other => panic!("expected Success after retry, got {other:?}"),
                 }
-                HandshakeResponse::Success(server_hello, session, _) => {
-                    let b = ServerReply::Hello(server_hello)
-                        .to_wire()
-                        .expect("serialize ServerHello");
-                    server_channel
-                        .send_bytes(&b)
-                        .await
-                        .expect("server send ServerHello");
-                    break session;
-                }
-                HandshakeResponse::Reject(r) => panic!("unexpected Reject: {:?}", r),
-                HandshakeResponse::Fail(e) => panic!("handshake failed: {:?}", e),
             }
+            HandshakeResponse::Success(server_hello, session, _) => {
+                let b = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("serialize ServerHello");
+                server_channel
+                    .send_bytes(&b)
+                    .await
+                    .expect("server send ServerHello");
+                session
+            }
+            HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
         };
 
         // Wrap the negotiated inner Session in a full PhantomSession so the real
@@ -347,50 +350,49 @@ async fn run_pipelined_echo(
         let client_hello =
             borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize ClientHello");
         // The server's DoS gate may answer the first hello with a cookie Retry;
-        // handle that round before Success (mirrors `run_lossy_round_trips`).
-        let inner = loop {
-            match server_hs.process_client_hello(&client_hello, 0, client_ip) {
-                HandshakeResponse::Retry(retry) => {
-                    let retry_bytes = ServerReply::Retry(retry)
-                        .to_wire()
-                        .expect("serialize retry");
-                    server_channel
-                        .send_bytes(&retry_bytes)
-                        .await
-                        .expect("server send retry");
-                    let next_bytes = server_channel
-                        .recv_bytes()
-                        .await
-                        .expect("server recv retry ClientHello");
-                    let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
-                        .expect("deserialize retry ClientHello");
-                    match server_hs.process_client_hello(&next_hello, 0, client_ip) {
-                        HandshakeResponse::Success(server_hello, session, _) => {
-                            let b = ServerReply::Hello(server_hello)
-                                .to_wire()
-                                .expect("serialize ServerHello");
-                            server_channel
-                                .send_bytes(&b)
-                                .await
-                                .expect("server send ServerHello");
-                            break session;
-                        }
-                        other => panic!("expected Success after retry, got {other:?}"),
+        // handle that one round before Success (mirrors `run_lossy_round_trips`).
+        // At most one retry is possible, so this is a match, not a loop.
+        let inner = match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let retry_bytes = ServerReply::Retry(retry)
+                    .to_wire()
+                    .expect("serialize retry");
+                server_channel
+                    .send_bytes(&retry_bytes)
+                    .await
+                    .expect("server send retry");
+                let next_bytes = server_channel
+                    .recv_bytes()
+                    .await
+                    .expect("server recv retry ClientHello");
+                let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
+                    .expect("deserialize retry ClientHello");
+                match server_hs.process_client_hello(&next_hello, 0, client_ip) {
+                    HandshakeResponse::Success(server_hello, session, _) => {
+                        let b = ServerReply::Hello(server_hello)
+                            .to_wire()
+                            .expect("serialize ServerHello");
+                        server_channel
+                            .send_bytes(&b)
+                            .await
+                            .expect("server send ServerHello");
+                        session
                     }
+                    other => panic!("expected Success after retry, got {other:?}"),
                 }
-                HandshakeResponse::Success(server_hello, session, _) => {
-                    let b = ServerReply::Hello(server_hello)
-                        .to_wire()
-                        .expect("serialize ServerHello");
-                    server_channel
-                        .send_bytes(&b)
-                        .await
-                        .expect("server send ServerHello");
-                    break session;
-                }
-                HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
-                HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
             }
+            HandshakeResponse::Success(server_hello, session, _) => {
+                let b = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("serialize ServerHello");
+                server_channel
+                    .send_bytes(&b)
+                    .await
+                    .expect("server send ServerHello");
+                session
+            }
+            HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
         };
         let server = PhantomSession::from_accepted_server_session(
             "test-client".into(),

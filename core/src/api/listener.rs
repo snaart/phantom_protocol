@@ -909,9 +909,7 @@ mod tests {
     async fn bind_with_signing_key_pins_verifying_identity() {
         // Serialise vs. the fips fault-injection test that flips
         // POST_RESULT. Harmless overhead on non-fips builds.
-        let _guard = crate::crypto::self_tests::tests_serial_guard()
-            .lock()
-            .unwrap();
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().await;
         crate::crypto::self_tests::set_force_post_fail(false);
         let (signing_key, verifying_key) = HybridSigningKey::generate();
         let expected_vk_bytes = verifying_key.to_bytes();
@@ -933,9 +931,7 @@ mod tests {
     /// identity the on-disk key encodes.
     #[tokio::test]
     async fn bind_with_signing_key_round_trips_via_bytes() {
-        let _guard = crate::crypto::self_tests::tests_serial_guard()
-            .lock()
-            .unwrap();
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().await;
         crate::crypto::self_tests::set_force_post_fail(false);
         let (orig_signing_key, orig_verifying_key) = HybridSigningKey::generate();
         let on_disk = orig_signing_key.to_bytes();
@@ -960,9 +956,7 @@ mod tests {
     /// verifying key. Pins the back-compat guarantee.
     #[tokio::test]
     async fn bind_still_generates_fresh_key_per_call() {
-        let _guard = crate::crypto::self_tests::tests_serial_guard()
-            .lock()
-            .unwrap();
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().await;
         crate::crypto::self_tests::set_force_post_fail(false);
         let l1 = PhantomListener::bind("127.0.0.1:0".to_string())
             .await
@@ -985,9 +979,7 @@ mod tests {
     async fn fips_post_failure_aborts_bind() {
         // Serialise with sibling fault-injection tests via the same
         // mutex they use.
-        let _guard = crate::crypto::self_tests::tests_serial_guard()
-            .lock()
-            .unwrap();
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().await;
         crate::crypto::self_tests::set_force_post_fail(true);
         let result = PhantomListener::bind("127.0.0.1:0".to_string()).await;
         crate::crypto::self_tests::set_force_post_fail(false);
@@ -1085,9 +1077,7 @@ mod tests {
     /// used to bind (smoke — just checks the builder wires through to `bind_inner`).
     #[tokio::test]
     async fn listener_builder_binds_successfully() {
-        let _guard = crate::crypto::self_tests::tests_serial_guard()
-            .lock()
-            .unwrap();
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().await;
         crate::crypto::self_tests::set_force_post_fail(false);
         let listener = PhantomListener::builder("127.0.0.1:0")
             .bind()
@@ -1102,9 +1092,7 @@ mod tests {
     /// Builder with a signing key persists the verifying identity.
     #[tokio::test]
     async fn listener_builder_with_signing_key_pins_identity() {
-        let _guard = crate::crypto::self_tests::tests_serial_guard()
-            .lock()
-            .unwrap();
+        let _guard = crate::crypto::self_tests::tests_serial_guard().lock().await;
         crate::crypto::self_tests::set_force_post_fail(false);
         let (signing_key, verifying_key) = HybridSigningKey::generate();
         let listener = PhantomListener::builder("127.0.0.1:0")

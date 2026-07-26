@@ -17,6 +17,12 @@
 //!     synthetic counter-bump and yields `NonceExhausted`.
 //!   - Cookie tampering yields a `Retry` (not `Success`) on the server side.
 
+// Tests `.unwrap()` freely so failures surface as readable diagnostics; the
+// disallowed-methods list in `.clippy.toml` is for production code, not the test
+// harness. (Integration-test crates are their own crate and therefore do not
+// inherit `core/src/lib.rs`'s `#![cfg_attr(test, allow(...))]`.)
+#![allow(clippy::disallowed_methods)]
+
 use bytes::Bytes;
 use phantom_protocol::crypto::adaptive_crypto::{CipherSuite, CryptoSession, AEAD_OVERHEAD};
 use phantom_protocol::crypto::hybrid_sign::{HybridSigningKey, HybridVerifyingKey};

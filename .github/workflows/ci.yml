@@ -66,6 +66,17 @@ jobs:
       # constant-bounded indexing). With the file-scope `RUSTFLAGS: -D warnings`
       # above, any remaining warning is a hard failure — this job is a gate.
       - run: cargo clippy --manifest-path core/Cargo.toml --lib
+      # `--lib` compiles ONE target: the production library WITHOUT `cfg(test)`.
+      # It never builds the in-lib `#[cfg(test)]` modules, `core/tests/`,
+      # `core/benches/` or `core/examples/` — which is exactly how a
+      # non-compiling example and 267 findings (263 warnings + 4 `never_loop`
+      # errors) accumulated in this tree unnoticed while this job stayed green.
+      # `--all-targets` builds the lib a second time WITH `cfg(test)` plus every
+      # integration test, bench and example, so that debt cannot silently
+      # return. It reuses the artifacts the `--lib` step above just produced, so
+      # keeping that step costs almost nothing and preserves a fast, precise,
+      # production-code-only first failure.
+      - run: cargo clippy --manifest-path core/Cargo.toml --all-targets
 
   test:
     name: cargo test
@@ -204,12 +215,16 @@ jobs:
         with:
           workspaces: "."
       - run: cargo test --manifest-path core/Cargo.toml --lib --features embedded
-      # `--lib` above never builds `core/examples/`, so `embedded_demo` (the only
-      # example that needs this feature) could rot unnoticed — an
-      # `embedded-io-async` trait bump once left it failing to compile. Check the
-      # examples explicitly.
-      - run: cargo check --manifest-path core/Cargo.toml --features embedded --examples
       - run: cargo clippy --manifest-path core/Cargo.toml --lib --features embedded -- -D warnings
+      # `--lib` above never builds `core/examples/` nor the leg's own
+      # `#[cfg(test)]` module, so both could rot unnoticed — an
+      # `embedded-io-async` trait bump once left `embedded_demo` (the only
+      # example needing this feature) failing to compile, and a `never_loop`
+      # error plus a `type_complexity` warning had since accumulated in exactly
+      # those two blind spots. `--all-targets` compiles AND lints the examples,
+      # tests and benches, so it strictly subsumes the `cargo check --examples`
+      # step it replaces here.
+      - run: cargo clippy --manifest-path core/Cargo.toml --all-targets --features embedded -- -D warnings
 
   mimicry-feature:
     name: cargo test + clippy (--features mimicry)
@@ -224,6 +239,11 @@ jobs:
           workspaces: "."
       - run: cargo test --manifest-path core/Cargo.toml --lib --features mimicry
       - run: cargo clippy --manifest-path core/Cargo.toml --lib --features mimicry -- -D warnings
+      # Widened for the same reason as the main `clippy` job: `--lib` never sees
+      # the leg's own `#[cfg(test)]` modules (`record.rs`, `client_hello.rs`) or
+      # `core/tests/mimic_tls_integration.rs`, and three lint findings had
+      # collected there unnoticed.
+      - run: cargo clippy --manifest-path core/Cargo.toml --all-targets --features mimicry -- -D warnings
       # Live end-to-end loopback: bind_mimic ↔ connect_pinned_mimic, full prelude +
       # inner PQ handshake + bidirectional data (the leg's own #[ignore] live tests
       # ride in --lib above but are not executed without --ignored).
@@ -252,6 +272,12 @@ jobs:
       # otherwise), which is why it lives in this job.
       - run: cargo test --manifest-path core/Cargo.toml --test observability_instrument_wiring --features telemetry-otel
       - run: cargo clippy --manifest-path core/Cargo.toml --lib --features telemetry-otel -- -D warnings
+      # `--lib` does not lint `core/tests/observability_otel.rs` or
+      # `observability_instrument_wiring.rs` — the two suites this job exists to
+      # run, and the only place the OTel-only recorders are exercised at all.
+      # `--all-targets` covers them (plus `observability_bench`, whose OTel path
+      # nothing else compiles under this feature).
+      - run: cargo clippy --manifest-path core/Cargo.toml --all-targets --features telemetry-otel -- -D warnings
 
   fips-feature:
     name: cargo test + clippy (--features fips)
@@ -279,6 +305,11 @@ jobs:
       - run: cargo test --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd --test cavp
       - run: cargo test --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd --test nist_kat
       - run: cargo clippy --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd --lib -- -D warnings
+      # `--lib` misses every test target this feature set still compiles —
+      # including the `cavp` / `nist_kat` suites run above and the in-lib
+      # `#[cfg(test)]` modules, whose fips-only branches nothing else lints.
+      # Verified clean when this gate was added; keeps them from rotting.
+      - run: cargo clippy --manifest-path core/Cargo.toml --no-default-features --features fips,bindings,compression-zstd --all-targets -- -D warnings
       # Supply-chain guard (SUPPLY-03): the FIPS build must NOT link the
       # non-FIPS `ring` / `x25519-dalek` crates. `cargo tree -i` exits
       # non-zero ("did not match any packages") when the crate is absent,
@@ -324,10 +355,18 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "."
       - run: cargo check --manifest-path cli/Cargo.toml
+      # The CLI is a shipped, operator-facing artifact (it writes long-term
+      # signing keys), but it was the one crate in the tree with no lint gate at
+      # all — `server-check` has linted with `--all-targets` all along, and this
+      # job only ever ran `cargo check`. A `collapsible_if` in `keygen.rs` had
+      # accumulated there unnoticed as a result. Mirror the server job.
+      - run: cargo clippy --manifest-path cli/Cargo.toml --all-targets -- -D warnings
 
   server-check:
     name: server compiles + tests against core

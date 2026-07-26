@@ -66,20 +66,28 @@ static FORCE_POST_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// MSRV 1.81 — too new for this crate). The cache is exercised by
 /// production builds, not by tests.
 pub fn ensure_post_passed() -> Result<(), SelfTestError> {
-    #[cfg(test)]
-    {
-        if FORCE_POST_FAIL.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(SelfTestError::Aead {
-                algorithm: "AES-256-GCM",
-                stage: AeadStage::Decrypt,
-            });
-        }
-        return run_post();
+    post_verdict()
+}
+
+/// Production verdict: run the POST at most once per process and
+/// return the cached result forever after.
+#[cfg(not(test))]
+fn post_verdict() -> Result<(), SelfTestError> {
+    *POST_RESULT.get_or_init(run_post)
+}
+
+/// Test verdict: honour the [`FORCE_POST_FAIL`] fault-injection switch,
+/// otherwise re-run the POST on every call (no process-global cache to
+/// reset between tests).
+#[cfg(test)]
+fn post_verdict() -> Result<(), SelfTestError> {
+    if FORCE_POST_FAIL.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(SelfTestError::Aead {
+            algorithm: "AES-256-GCM",
+            stage: AeadStage::Decrypt,
+        });
     }
-    #[cfg(not(test))]
-    {
-        *POST_RESULT.get_or_init(run_post)
-    }
+    run_post()
 }
 
 /// Test-only — flip the [`FORCE_POST_FAIL`] switch. Tests that flip
@@ -95,10 +103,19 @@ pub fn set_force_post_fail(enable: bool) {
 /// reject-path test in `api::listener::tests`) acquire this mutex
 /// for the duration of their fault injection so parallel runners
 /// do not interleave flips.
+///
+/// It is a `tokio::sync::Mutex` (not a `std` one) on purpose: the
+/// `api::listener` / `api::session` callers are `#[tokio::test]`s that
+/// must keep the guard held across `.await` points (the whole bind /
+/// connect they are fault-injecting). A `std` guard held across an
+/// await blocks the worker thread and trips
+/// `clippy::await_holding_lock`; the async mutex yields instead.
+/// Synchronous `#[test]` callers use [`tokio::sync::Mutex::blocking_lock`],
+/// which is safe here because they never run inside a reactor.
 #[cfg(test)]
-pub fn tests_serial_guard() -> &'static std::sync::Mutex<()> {
-    static G: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    G.get_or_init(|| std::sync::Mutex::new(()))
+pub fn tests_serial_guard() -> &'static tokio::sync::Mutex<()> {
+    static G: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    G.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Stage at which a per-algorithm self-test failed. Lets the caller log
@@ -375,7 +392,7 @@ mod tests {
     /// result. On a clean build, `Ok(())`.
     #[test]
     fn ensure_post_passed_succeeds_on_clean_build() {
-        let _guard = tests_serial_guard().lock().unwrap();
+        let _guard = tests_serial_guard().blocking_lock();
         set_force_post_fail(false);
         assert!(ensure_post_passed().is_ok());
     }
@@ -385,7 +402,7 @@ mod tests {
     /// `listener::bind*` / `session::connect*` reject-path tests.
     #[test]
     fn force_post_fail_returns_error_via_ensure_post_passed() {
-        let _guard = tests_serial_guard().lock().unwrap();
+        let _guard = tests_serial_guard().blocking_lock();
         set_force_post_fail(true);
         let result = ensure_post_passed();
         set_force_post_fail(false);

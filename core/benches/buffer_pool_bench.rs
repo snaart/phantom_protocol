@@ -1,3 +1,7 @@
+// Dev-only bench harness: the `.clippy.toml` disallowed-methods ban governs production
+// code, not benches — same rationale as the crate-root `cfg_attr(test, allow(..))`.
+#![allow(clippy::disallowed_methods)]
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use parking_lot::Mutex;
 use phantom_protocol::transport::buffer_pool::BufferPool;

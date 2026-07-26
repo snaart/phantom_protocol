@@ -636,65 +636,66 @@ mod tests {
             let client_hello = borsh::from_slice::<ClientHello>(&client_hello_bytes)
                 .expect("deserialize ClientHello");
 
-            // 2. Process — may retry with a cookie/PoW challenge.
-            let server_session = loop {
-                let response = server_hs.process_client_hello(&client_hello, 0, client_ip);
-                match response {
-                    HandshakeResponse::Retry(retry) => {
-                        // T4.4: the client dispatches on the ServerReply discriminant
-                        // byte, so the server must frame its reply the same way.
-                        let retry_bytes = ServerReply::Retry(retry)
-                            .to_wire()
-                            .expect("serialize retry");
-                        tokio::time::timeout(
-                            Duration::from_secs(5),
-                            server_leg.send_frame(&retry_bytes),
-                        )
-                        .await
-                        .expect("send retry within 5s")
-                        .expect("send retry frame");
+            // 2. Process. The DoS gate may answer the first hello with a
+            //    cookie/PoW `Retry`; the client re-sends with the cookie and
+            //    that second hello is admitted. That is at most ONE retry
+            //    round — the gate never challenges a cookie-bearing hello
+            //    again — so this is a straight-line match, not a loop.
+            let server_session = match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+                HandshakeResponse::Retry(retry) => {
+                    // T4.4: the client dispatches on the ServerReply discriminant
+                    // byte, so the server must frame its reply the same way.
+                    let retry_bytes = ServerReply::Retry(retry)
+                        .to_wire()
+                        .expect("serialize retry");
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        server_leg.send_frame(&retry_bytes),
+                    )
+                    .await
+                    .expect("send retry within 5s")
+                    .expect("send retry frame");
 
-                        let next_bytes =
-                            tokio::time::timeout(Duration::from_secs(5), server_leg.recv_frame())
-                                .await
-                                .expect("recv retried ClientHello within 5s")
-                                .expect("recv retried ClientHello frame");
-                        let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
-                            .expect("deserialize retried ClientHello");
-                        let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
-                        match resp2 {
-                            HandshakeResponse::Success(server_hello, session, _) => {
-                                let server_hello_bytes = ServerReply::Hello(server_hello)
-                                    .to_wire()
-                                    .expect("serialize ServerHello");
-                                tokio::time::timeout(
-                                    Duration::from_secs(5),
-                                    server_leg.send_frame(&server_hello_bytes),
-                                )
-                                .await
-                                .expect("send ServerHello within 5s")
-                                .expect("send ServerHello frame");
-                                break session;
-                            }
-                            other => panic!("expected success after retry, got {other:?}"),
+                    let next_bytes =
+                        tokio::time::timeout(Duration::from_secs(5), server_leg.recv_frame())
+                            .await
+                            .expect("recv retried ClientHello within 5s")
+                            .expect("recv retried ClientHello frame");
+                    let next_hello = borsh::from_slice::<ClientHello>(&next_bytes)
+                        .expect("deserialize retried ClientHello");
+                    let resp2 = server_hs.process_client_hello(&next_hello, 0, client_ip);
+                    match resp2 {
+                        HandshakeResponse::Success(server_hello, session, _) => {
+                            let server_hello_bytes = ServerReply::Hello(server_hello)
+                                .to_wire()
+                                .expect("serialize ServerHello");
+                            tokio::time::timeout(
+                                Duration::from_secs(5),
+                                server_leg.send_frame(&server_hello_bytes),
+                            )
+                            .await
+                            .expect("send ServerHello within 5s")
+                            .expect("send ServerHello frame");
+                            session
                         }
+                        other => panic!("expected success after retry, got {other:?}"),
                     }
-                    HandshakeResponse::Success(server_hello, session, _) => {
-                        let server_hello_bytes = ServerReply::Hello(server_hello)
-                            .to_wire()
-                            .expect("serialize ServerHello");
-                        tokio::time::timeout(
-                            Duration::from_secs(5),
-                            server_leg.send_frame(&server_hello_bytes),
-                        )
-                        .await
-                        .expect("send ServerHello within 5s")
-                        .expect("send ServerHello frame");
-                        break session;
-                    }
-                    HandshakeResponse::Reject(r) => panic!("unexpected reject: {r:?}"),
-                    HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
                 }
+                HandshakeResponse::Success(server_hello, session, _) => {
+                    let server_hello_bytes = ServerReply::Hello(server_hello)
+                        .to_wire()
+                        .expect("serialize ServerHello");
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        server_leg.send_frame(&server_hello_bytes),
+                    )
+                    .await
+                    .expect("send ServerHello within 5s")
+                    .expect("send ServerHello frame");
+                    session
+                }
+                HandshakeResponse::Reject(r) => panic!("unexpected reject: {r:?}"),
+                HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
             };
 
             let session_id = *server_session.id();
