@@ -56,10 +56,13 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   and `set_early_data_enabled(bool)` is now exported on both listeners.
 - **Builder API (Rust).** `PhantomSession::builder(addr)` / `PhantomListener::builder(addr)` /
   `PhantomUdpListener::builder(addr)` with orthogonal chained setters
-  (`.transport()` / `.pinned_key()` / `.resumption()` / `.config()` / `.runtime()` /
-  `.mimic()` → `.connect()`; `.signing_key()` / `.config()` / `.runtime()` → `.bind()`)
-  replace the combinatorial `connect_with_transport_with_*` / `bind_*_with_runtime`
-  variant explosion. A builder cannot produce an unpinned session (Security Invariant 1).
+  (`.transport()` / `.pinned_key()` / `.resumption()` / `.config()` / `.runtime()` →
+  `.connect()`; `.signing_key()` / `.config()` / `.runtime()` → `.bind()`, plus
+  `.mimic_sni()` on `ListenerBuilder`) replace the combinatorial
+  `connect_with_resumption` / `bind_with_signing_key_with_runtime` /
+  `bind_with_signing_key_mimic` variant explosion (the
+  `connect_with_transport_with_runtime` and `bind_with_runtime` runtime-injection
+  shims survive). A builder cannot produce an unpinned session (Security Invariant 1).
 - **Typed client failure.** `PhantomSession::last_error()` and `await_ready()` (both
   FFI-exported) let an embedder learn *why* a connect failed (the background handshake
   task now captures the terminal `CoreError`) and wait for readiness; `send()`/`recv()`
@@ -67,6 +70,10 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `CoreError` variants — `ServerIdentityMismatch` (fatal pinning failure),
   `ProtocolRejected`, `Unsupported` — with a retryable-vs-fatal classification in the
   rustdoc, so callers can build correct retry/backoff logic without string-matching.
+  Handshake failures also stop collapsing into `CoreError::InternalError`: the
+  `From<HandshakeError>` conversion now yields `ServerIdentityMismatch` /
+  `ProtocolRejected` for those two cases and `CoreError::HandshakeError(..)` for the
+  rest, so `match`es on `InternalError` for handshake errors must be updated.
 - **Migration discoverability.** `PhantomSession::supports_migration()` reports whether a
   session can migrate (true only for UDP-backed sessions); client-side handshake outcome
   metrics are now recorded (a client `metrics_snapshot()` no longer always shows 0
@@ -78,16 +85,38 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   quickstart, a "Getting started" / "Choosing a transport" / "Two ways to send" guide,
   and runnable rustdoc examples on the session/listener types; a PyPI-wheel packaging
   path (maturin) + a manual CI smoke job were added.
+- **Observability instruments that were registered but never recorded are now live.**
+  Twelve instruments existed in the registry with no call site anywhere in the library, so
+  the corresponding Grafana panels and the `PhantomPoWRejectionStorm` alert were silently
+  empty and `MetricsSnapshotFfi`'s encrypt/decrypt-timing and RTT fields were always zero.
+  Now recorded: AEAD encrypt/decrypt durations, RTT samples (per `path_id`, Karn-gated),
+  rekey events per direction, path migrations (active, server-initiated, peer-detected and
+  passive NAT-rebind), path-validation outcomes, a balanced active-stream gauge, and the
+  handshake-side cookie / proof-of-work / early-data / resumption outcomes. The handshake
+  recorders required plumbing an optional `Arc<Observability>` into `HandshakeServer` via a
+  purely additive `with_observability(...)` builder — every existing constructor keeps its
+  signature and gets a no-op sink. `record_fallback` remains unrecorded: the
+  `FallbackStateMachine` it would observe is itself inert. Two gaps are documented rather
+  than papered over — a server with early data disabled by policy emits no early-data
+  sample (`EarlyDataOutcome` models no such variant), and an unanswered path-validation
+  challenge emits neither outcome (the pump has no timeout sweep).
 
 ### Changed
 
 - **`migrate()` on a non-migration transport now returns `Err(CoreError::Unsupported)`**
   instead of a silent `Ok(())` no-op. Real migration requires a UDP-backed session
   (`connect_pinned_udp*`); on TCP / WebSocket / WASI / Embedded it now errors honestly.
-- **Combinatorial `connect_with_transport_with_*` / `bind_*_with_runtime` Rust
-  constructors were removed** in favour of the builder (the UniFFI-exported free functions
-  and constructors are unchanged). `PhantomStream::recv()` returns `Option<Vec<u8>>`
-  (`None` = clean EOF). All breaking, within the pre-1.0 0.2.x window.
+- **Combinatorial Rust constructors were removed** in favour of the builder:
+  `PhantomSession::connect_with_resumption`,
+  `PhantomListener::bind_with_signing_key_with_runtime`, and
+  `PhantomListener::bind_with_signing_key_mimic`. The runtime-injection shims
+  `PhantomSession::connect_with_transport_with_runtime` and
+  `PhantomListener::bind_with_runtime` survive, as do `connect_with_transport` and the
+  UniFFI-exported free functions and constructors. `PhantomStream::recv()` returns
+  `Option<Vec<u8>>` (`None` = clean EOF). All breaking, within the pre-1.0 0.2.x window.
+- **`PhantomUdpListener::accept()` now takes an owned receiver** (`self: Arc<Self>`
+  instead of `self: &Arc<Self>`) — required by its new UniFFI export. Rust callers
+  write `listener.clone().accept().await`. Breaking, within the pre-1.0 0.2.x window.
 
 ### Fixed
 
@@ -120,6 +149,64 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 - **Dropping the last `PhantomSession` handle now closes the session** (sends an in-order
   `Close` so the peer sees EOF), fixing a regression where extra internal command
   senders kept the pump alive after the handle was dropped.
+- **Release tarballs contained no library.** The packaging step copied from
+  `core/target/<triple>/release/` — a path that does not exist, since `core` is the only
+  workspace member and cargo's target directory is the repository root — and the copy was
+  guarded by `2>/dev/null || true`, so every published `0.1.0`–`0.2.2` artifact silently
+  shipped `LICENSE` + `README.md` only. The path is corrected, the `cdylib` (the actual
+  FFI delivery vehicle) is shipped alongside the `rlib`, and a missing library now fails
+  the job loudly instead of producing an empty tarball.
+- **The Helm chart ignored the mounted signing-key Secret**, so every pod minted a fresh
+  identity on restart and broke client key pinning. The chart published `PHANTOM_BIND_PORT`
+  and `PHANTOM_SIGNING_KEY_PATH`, neither of which `phantom-server` reads, and the
+  Deployment never set `PHANTOM_SIGNING_KEY_FILE` at all. It now emits `PHANTOM_BIND`
+  (a full `SocketAddr`) and `PHANTOM_SIGNING_KEY_FILE` pointing at the mounted key. The
+  sample manifest in `docs/operations/kubernetes.md` had the same defect.
+- **`--otel-trace-sample-ratio` was parsed and then discarded** (`let _ = cfg.trace_sample_ratio;`),
+  so no sampler was ever installed and the effective trace rate was 100% regardless of the
+  flag. The ratio is now applied as `Sampler::ParentBased(TraceIdRatioBased(ratio))`, which
+  also makes it effective from the `OTEL_TRACES_SAMPLER_ARG` env form without additionally
+  setting `OTEL_TRACES_SAMPLER`. The default changed `0.01` → `1.0` so shipped behaviour is
+  unchanged — lower it deliberately.
+- **`core/examples/embedded_demo.rs` did not compile** under `--features embedded`: the
+  `embedded-io-async` 0.6 → 0.7 bump made `Write::flush` a required method and the example's
+  `MockWriter` never gained one (`E0046`). It went unnoticed because the `embedded-feature`
+  CI job runs `cargo test --lib`, and `--lib` never builds examples; the job now checks them.
+- **The iOS static-library flow could not work.** `build-xcframework.sh` and the by-hand
+  `lipo` recipes feed `libphantom_protocol.a` to `xcodebuild -create-xcframework`, but
+  `[lib] crate-type = ["lib", "cdylib"]` never emits a static archive. The slices are now
+  built with `cargo rustc --crate-type staticlib`. (Adding `staticlib` to the manifest is
+  *not* a valid fix: a staticlib is a final artifact, so it makes cargo demand a
+  `#[panic_handler]` and a `#[global_allocator]` from the library and breaks the
+  `thumbv7em-none-eabihf` bare-metal build.)
+- **Several hand-curated C ABI declarations were wrong**, so a C consumer following the
+  header got undefined behaviour rather than a compile error: `open_stream` was declared
+  async although it is synchronous, `flush_queue` was declared to complete to `void`
+  although it yields `u32`, a `_pointer` future poll/complete family was documented that
+  does not exist in the cdylib (objects complete through `_u64`), and the `ConnectionState`
+  discriminant comment named five states that do not exist. The maximum-datagram macro
+  advertised 65507 bytes where PhantomUDP's path MTU is 1200, and a comment still described
+  the replay window as per-stream.
+- **`phantom_helpers.h`'s blocking wrappers could not work.** `Vec<u8>` arguments were
+  passed as raw bytes although UniFFI lowers them as a RustBuffer of
+  `[i32 big-endian length][payload]` (only a top-level `String` is raw UTF-8), so
+  `phantom_blocking_connect_pinned` failed unconditionally with `RustCallStatus.code == 2`;
+  and the helpers passed the caller's handle straight to the scaffolding, but a UniFFI
+  method **consumes** its receiver — every generated binding clones per call — so the second
+  call on a session was a use-after-free. Both are fixed with explicit lowering and
+  clone-per-call helpers.
+- **`phantom_protocol.h` was unusable from C++** even though it guards its declarations
+  with `extern "C"`: `PhantomRustBuffer` was defined *inside* `PhantomRustCallStatus`, which
+  C gives file scope but C++ scopes to the enclosing class, leaving the type incomplete for
+  every C++ translation unit. Hoisted; layout and ABI unchanged.
+- **`check_versions.sh` did not cover `python/pyproject.toml`**, the maturin manifest that
+  `PACKAGING.md` designates as the recommended PyPI path and which carries its own hardcoded
+  version — so it could drift from `core/Cargo.toml` undetected. Six manifests are now
+  drift-checked, not five.
+- **`.github/CODEOWNERS` had drifted from `CONTRIBUTING.md`'s touch-with-care set**: it still
+  routed the deleted `transport/legs/faketls.rs` (matching nothing, so the rule was inert)
+  and omitted `transport/udp_transport.rs` and `transport/legs/mimic_tls/`, which therefore
+  never requested codeowner review.
 
 ## [0.2.2] - 2026-06-22
 
