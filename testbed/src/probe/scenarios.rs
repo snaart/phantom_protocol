@@ -73,6 +73,10 @@ impl ScenarioOutput {
     }
 }
 
+/// Per-frame bytes a `SINK` costs on top of its payload: the framing length
+/// prefix plus the verb and sequence number.
+const SINK_FRAME_OVERHEAD: u64 = 4 + 1 + 8;
+
 /// Rolling one-second throughput window.
 ///
 /// Reporting only a run-level average would hide a stall entirely — a 10-second
@@ -550,11 +554,21 @@ pub async fn upload(
                 local.bytes, local.frames, local.megabits_per_sec,
                 bytes, frames, server_tp.megabits_per_sec, server_span / 1_000_000
             ));
-            if bytes < win.cumulative {
-                out.note(format!(
-                    "server observed {} fewer bytes than the client enqueued — in-flight at teardown, or loss",
-                    win.cumulative - bytes
-                ));
+            // Compare like with like. The client counts wire bytes (length
+            // prefix + verb + seq + payload); the server counts payload only.
+            // Subtracting the known per-frame header is what makes a real
+            // shortfall visible — without it every clean run looked like it had
+            // lost a few kilobytes.
+            let client_payload = win
+                .cumulative
+                .saturating_sub(win.total_frames.saturating_mul(SINK_FRAME_OVERHEAD));
+            match client_payload.checked_sub(bytes) {
+                Some(0) | None => out.note(format!(
+                    "no loss: every one of the {frames} frames arrived, {bytes} B of payload"
+                )),
+                Some(missing) => out.note(format!(
+                    "{missing} B of payload never reached the server — in flight at teardown, or lost"
+                )),
             }
         }
         Err((why, e)) => {
