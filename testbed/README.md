@@ -55,6 +55,12 @@ Probe:
 ./phantom-probe --host <server> --pin-hex <hex> --profile smoke
 ```
 
+Or through the wrapper, which fills in the flags and keeps a transcript:
+
+```bash
+PHANTOM_HOST=<server> ./run-test.sh smoke        # pin read from ./pin.hex
+```
+
 | Profile | Wall clock | Contents |
 |---|---|---|
 | `smoke` | ~6 min | enough to answer "is it alive and roughly sane" |
