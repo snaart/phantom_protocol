@@ -91,6 +91,15 @@ pub enum Leg {
     Tcp,
     /// mimic-TLS over TCP (obfuscation only).
     Mimic,
+    /// QUIC via `quinn`. **Reference leg** — not the protocol under test.
+    ///
+    /// A mature implementation of the same class (reliable, encrypted,
+    /// multiplexed, over UDP), driven over the same path in the same run so
+    /// that "how does this compare" is a measurement rather than an opinion.
+    /// Its cryptography is classical TLS 1.3, so its handshake latency is not
+    /// comparable like-for-like with a hybrid post-quantum one; its throughput
+    /// and loss behaviour are.
+    Quic,
     /// Raw TCP echo, no Phantom. Control group.
     RawTcp,
     /// Raw UDP echo, no Phantom. Control group.
@@ -103,15 +112,22 @@ impl Leg {
             Self::Udp => "udp",
             Self::Tcp => "tcp",
             Self::Mimic => "mimic",
+            Self::Quic => "quic",
             Self::RawTcp => "raw_tcp",
             Self::RawUdp => "raw_udp",
         }
     }
 
-    /// True for the legs that run a real Phantom session (as opposed to the
-    /// raw-socket control group).
+    /// True for the legs that run a real Phantom session — the protocol under
+    /// test. False for both the raw-socket controls and the QUIC reference.
     pub fn is_phantom(self) -> bool {
         matches!(self, Self::Udp | Self::Tcp | Self::Mimic)
+    }
+
+    /// True for a leg that carries a full transport protocol other than the one
+    /// under test, so its numbers are a yardstick rather than a result.
+    pub fn is_reference(self) -> bool {
+        matches!(self, Self::Quic)
     }
 
     /// Only PhantomUDP supports `migrate()`; every other leg answers
@@ -250,6 +266,17 @@ pub struct MessageIntegritySample {
 /// and the two call for opposite responses. This series is what separates them:
 /// if `cwnd_bytes` never rises while `inflight_bytes` sits against it, the
 /// sender is the bottleneck, whatever the link can do.
+///
+/// **On the `quic` reference leg most of these fields are zero.** quinn exposes
+/// `cwnd` and a smoothed RTT and nothing else of this shape, so only
+/// `cwnd_bytes` and `min_rtt_us` carry values there — and `min_rtt_us` holds
+/// quinn's *smoothed* RTT, which is a different statistic from Phantom's
+/// windowed minimum. `inflight_bytes`, `bottleneck_bw_bps`, `pacing_rate_bps`,
+/// `delivered_bytes` and `app_limited` stay zero/false rather than being filled
+/// with an approximation, and `state` reads `quic:cubic` — quinn's default
+/// controller is loss-based, so it has no BBR phase to report and its window
+/// shape is not comparable with a BBR one. Compare the two on outcomes
+/// (throughput, loss, recovery), not on the shape of the curve.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowSample {
     pub leg: Leg,
@@ -390,7 +417,11 @@ pub struct ErrorRecord {
 }
 
 /// Client-side view of the session's own counters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` is all-zero, which is what the QUIC reference leg reports: these
+/// are Phantom's own instruments and no equivalent exists there. A row of zeros
+/// under `listener: "quic"` means "not instrumented", not "nothing happened".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientMetrics {
     pub packets_sent: u64,
     pub packets_recv: u64,
@@ -732,7 +763,14 @@ mod tests {
     /// keeps them from drifting apart again.
     #[test]
     fn leg_serialises_exactly_as_it_names_its_directory() {
-        for leg in [Leg::Udp, Leg::Tcp, Leg::Mimic, Leg::RawTcp, Leg::RawUdp] {
+        for leg in [
+            Leg::Udp,
+            Leg::Tcp,
+            Leg::Mimic,
+            Leg::Quic,
+            Leg::RawTcp,
+            Leg::RawUdp,
+        ] {
             let json = serde_json::to_string(&leg).expect("serialize");
             assert_eq!(
                 json,
@@ -747,6 +785,7 @@ mod tests {
         // half-broken data set.
         assert_eq!(Leg::RawTcp.as_str(), "raw_tcp");
         assert_eq!(Leg::RawUdp.as_str(), "raw_udp");
+        assert_eq!(Leg::Quic.as_str(), "quic");
     }
 
     #[test]
@@ -754,8 +793,21 @@ mod tests {
         assert!(Leg::Udp.supports_migration());
         assert!(!Leg::Tcp.supports_migration());
         assert!(!Leg::Mimic.supports_migration());
+        assert!(!Leg::Quic.supports_migration());
         assert!(Leg::Udp.is_phantom() && Leg::Tcp.is_phantom() && Leg::Mimic.is_phantom());
         assert!(!Leg::RawTcp.is_phantom() && !Leg::RawUdp.is_phantom());
+
+        // The reference leg is neither the protocol under test nor a raw
+        // control: mixing it into either bucket would put a QUIC number under a
+        // Phantom heading, or drop it from the comparison entirely.
+        assert!(
+            !Leg::Quic.is_phantom(),
+            "QUIC is not the protocol under test"
+        );
+        assert!(Leg::Quic.is_reference());
+        for other in [Leg::Udp, Leg::Tcp, Leg::Mimic, Leg::RawTcp, Leg::RawUdp] {
+            assert!(!other.is_reference(), "{other} is not a reference leg");
+        }
     }
 
     #[test]

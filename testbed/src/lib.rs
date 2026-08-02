@@ -3,10 +3,15 @@
 //! Two binaries share this library:
 //!
 //! - `phantom-testd` — the daemon. Binds every network-testable leg (PhantomUDP,
-//!   Phantom-over-TCP, mimic-TLS) plus raw TCP/UDP echo controls, and records
-//!   server-side statistics.
+//!   Phantom-over-TCP, mimic-TLS), a QUIC reference leg, and raw TCP/UDP echo
+//!   controls, and records server-side statistics.
 //! - `phantom-probe` — the client. Drives a scenario matrix across those legs
 //!   and writes raw per-operation samples.
+//!
+//! Three kinds of leg, and confusing them is how a result gets misread: the
+//! Phantom legs are the protocol under test, the raw legs are controls carrying
+//! no protocol at all, and the QUIC leg is a *reference* — a mature
+//! implementation of the same class, on the same path, in the same run.
 //!
 //! Everything here is a consumer of the published `phantom-protocol` API. The
 //! harness never reaches into protocol internals, so a result it produces is a
@@ -24,6 +29,7 @@ pub mod clock;
 pub mod framing;
 pub mod probe;
 pub mod proto;
+pub mod quic;
 pub mod report;
 pub mod stats;
 pub mod sysinfo;
