@@ -106,6 +106,12 @@ over the Phantom session itself — best-effort, and deliberately last: if the
 transport is what is broken, that upload is exactly what fails, and the local
 copy is the system of record.
 
+The daemon acknowledges each uploaded file after writing and verifying it, and
+the client waits for that before sending the next one, so the printed count is
+files confirmed on the server's disk rather than frames handed to a session. The
+distinction is not academic: without it a bundle reported 45 files uploaded
+while two had actually landed, the rest discarded when the session closed.
+
 ## Two properties worth knowing before reading any result
 
 Both were found by this harness measuring itself, and both silently corrupt
