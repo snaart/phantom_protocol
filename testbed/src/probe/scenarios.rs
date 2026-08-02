@@ -1860,6 +1860,24 @@ pub async fn raw_tcp_rtt(ep: &Endpoints, sizes: &[usize], per_size: usize) -> Sc
     out
 }
 
+/// Ask the kernel for larger socket buffers and report what it granted.
+///
+/// The grant matters more than the request: operating systems clamp, and a
+/// silently clamped buffer is exactly how a control measures itself.
+fn set_socket_buffers(sock: &TcpStream, want: usize) -> (usize, usize) {
+    use std::os::fd::{AsRawFd, BorrowedFd};
+    // SAFETY: the fd is owned by `sock` and outlives the borrow; socket2 only
+    // reads and sets options on it, and does not take ownership.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(sock.as_raw_fd()) };
+    let s2 = socket2::SockRef::from(&borrowed);
+    let _ = s2.set_send_buffer_size(want);
+    let _ = s2.set_recv_buffer_size(want);
+    (
+        s2.send_buffer_size().unwrap_or(0),
+        s2.recv_buffer_size().unwrap_or(0),
+    )
+}
+
 /// Raw TCP bulk throughput — the capacity denominator.
 ///
 /// Saturates the length-prefixed echo control while draining it concurrently,
@@ -1886,6 +1904,17 @@ pub async fn raw_tcp_throughput(
         }
     };
     let _ = sock.set_nodelay(true);
+    // Size the socket buffers for the bandwidth-delay product. TCP cannot keep
+    // more in flight than its send buffer holds, so with the OS default this
+    // probe measures `buffer / rtt` — on a 200 ms path a 128 KB default caps it
+    // near 5 Mbit/s regardless of the link. An earlier version of this control
+    // reported 4.65 Mbit/s as "the path", which was the kernel's default.
+    let (snd, rcv) = set_socket_buffers(&sock, 8 * 1024 * 1024);
+    out.note(format!(
+        "socket buffers: send {} KiB, receive {} KiB (asked for 8192 KiB) — this bounds TCP at buffer/RTT, so it must exceed the path's bandwidth-delay product for the number below to mean anything",
+        snd / 1024,
+        rcv / 1024
+    ));
     let (mut rd, mut wr) = sock.into_split();
 
     let payload = PayloadGen::new(160).fill(frame_size);
@@ -1976,14 +2005,21 @@ pub async fn raw_udp_throughput(ep: &Endpoints, per_rate: Duration) -> ScenarioO
     }
     let sock = Arc::new(sock);
 
-    // Payload sized to the measured path MTU rather than the theoretical one.
     let payload = PayloadGen::new(170).fill(1200);
     let mut best = 0.0f64;
+    let mut ceiling_suspected = false;
 
-    for &kbps in &[500u64, 2_000, 8_000, 32_000] {
-        let per_frame_ns = (payload.len() as u64 * 8 * 1_000_000) / kbps.max(1);
+    for &kbps in &[1_000u64, 5_000, 20_000, 60_000, 200_000] {
+        // Pace in bursts on a 1 ms tick rather than sleeping between frames.
+        // A per-frame sleep cannot outrun the timer's granularity: at 1200 B
+        // per frame a ~1 ms floor caps the offered rate near 9.6 Mbit/s, so
+        // the "path ceiling" such a loop reports is really its own clock. That
+        // is exactly what an earlier version of this probe measured.
+        const TICK: Duration = Duration::from_millis(1);
+        let bytes_per_tick = (kbps * 1000 / 8) / 1000; // bytes per millisecond
+        let per_burst = ((bytes_per_tick as usize) / payload.len()).max(1);
+
         let deadline = tokio::time::Instant::now() + per_rate;
-
         let rx = sock.clone();
         let reader = tokio::spawn(async move {
             let mut buf = vec![0u8; 65_536];
@@ -2001,11 +2037,15 @@ pub async fn raw_udp_throughput(ep: &Endpoints, per_rate: Duration) -> ScenarioO
 
         let mut sent = 0u64;
         let started = Instant::now();
+        let mut tick = tokio::time::interval(TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
         while tokio::time::Instant::now() < deadline {
-            if sock.send(&payload).await.is_ok() {
-                sent += payload.len() as u64;
+            tick.tick().await;
+            for _ in 0..per_burst {
+                if sock.send(&payload).await.is_ok() {
+                    sent += payload.len() as u64;
+                }
             }
-            tokio::time::sleep(Duration::from_nanos(per_frame_ns)).await;
         }
         let elapsed = started.elapsed().as_secs_f64().max(1e-9);
         let got = reader.await.unwrap_or(0);
@@ -2020,7 +2060,8 @@ pub async fn raw_udp_throughput(ep: &Endpoints, per_rate: Duration) -> ScenarioO
         best = best.max(returned);
         out.summary.ok_count += 1;
         out.note(format!(
-            "offered {kbps} kbit/s → sent {offered:.2} Mbit/s, echoed {returned:.2} Mbit/s, round-trip loss {loss:.1}%"
+            "asked {} kbit/s -> actually offered {offered:.2} Mbit/s, echoed back {returned:.2} Mbit/s, round-trip loss {loss:.1}%",
+            kbps
         ));
         out.sink.push(&ThroughputSample {
             leg,
@@ -2031,10 +2072,22 @@ pub async fn raw_udp_throughput(ep: &Endpoints, per_rate: Duration) -> ScenarioO
             window_ns: (elapsed * 1e9) as u64,
             cumulative_bytes: sent,
         });
+
+        // Only a rate the sender genuinely reached, met by loss, indicates the
+        // path's limit. Falling short of the ask means the *sender* ran out of
+        // room, which says nothing about the link.
+        if offered >= kbps as f64 / 1000.0 * 0.8 && loss > 2.0 {
+            ceiling_suspected = true;
+        }
     }
 
     out.note(format!(
-        "best sustained datagram echo: {best:.2} Mbit/s — the ceiling PhantomUDP is working against"
+        "best sustained datagram echo: {best:.2} Mbit/s{}",
+        if ceiling_suspected {
+            " — met loss at a rate the sender did reach, so this is the path"
+        } else {
+            " — NOT confirmed as the path's limit: no offered rate was both reached and met with loss, so this may still be the sender's own ceiling"
+        }
     ));
     out
 }

@@ -37,6 +37,10 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
+# Needed only to size the raw TCP control's socket buffers: with the OS default
+# a 200 ms path caps at roughly buffer/RTT, so the "path ceiling" such a probe
+# reports is really the kernel's default and not the link.
+socket2 = { version = "0.5", features = ["all"] }
 
 [profile.release]
 # The probe records timestamps around tight send/recv loops; debug symbols cost

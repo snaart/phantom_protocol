@@ -18,6 +18,18 @@ use tokio::net::{TcpListener, UdpSocket};
 /// Matches the established-phase frame cap of `TcpSessionTransport`.
 const MAX_FRAME: u32 = 4 * 1024 * 1024;
 
+/// Request larger socket buffers; the kernel may clamp, and that is fine — the
+/// point is not to be the bottleneck, not to hit an exact number.
+fn size_socket_buffers(sock: &tokio::net::TcpStream, want: usize) {
+    use std::os::fd::{AsRawFd, BorrowedFd};
+    // SAFETY: the fd is owned by `sock` and outlives this borrow; socket2 only
+    // sets options on it and never takes ownership.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(sock.as_raw_fd()) };
+    let s2 = socket2::SockRef::from(&borrowed);
+    let _ = s2.set_send_buffer_size(want);
+    let _ = s2.set_recv_buffer_size(want);
+}
+
 #[derive(Default)]
 pub struct BaselineStats {
     pub tcp_conns: AtomicU64,
@@ -51,6 +63,11 @@ pub async fn serve_tcp(listener: TcpListener, stats: Arc<BaselineStats>) -> std:
         // Nagle off: the baseline measures the path, and coalescing small
         // frames would flatter it relative to a protocol that paces explicitly.
         let _ = sock.set_nodelay(true);
+        // Size the buffers for the bandwidth-delay product. A control that
+        // leaves them at the OS default measures `default / rtt` and reports it
+        // as the link — which is how this probe once produced a "path ceiling"
+        // that was really the kernel's.
+        size_socket_buffers(&sock, 8 * 1024 * 1024);
         stats.tcp_conns.fetch_add(1, Ordering::Relaxed);
         let stats = stats.clone();
 
