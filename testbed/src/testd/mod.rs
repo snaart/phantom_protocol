@@ -22,6 +22,11 @@ use crate::report::{unix_nanos, PerLegCounters, ServerStats};
 use crate::testd::collector::CollectorHandle;
 use crate::testd::handler::{Counters, SessionCtx};
 
+/// How long shutdown waits for the collector to drain before giving up.
+///
+/// Shutdown must not be able to block on a session that never ends.
+const COLLECTOR_DRAIN_GRACE: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone)]
 pub struct TestdConfig {
     pub tcp_bind: SocketAddr,
@@ -317,7 +322,24 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
     );
     let dropped = collector.dropped();
     drop(collector);
-    let _ = collector_task.await;
+
+    // Bounded. Every live session handler holds a `CollectorHandle` clone, and
+    // handlers are not tracked — one parked in `session.recv()` on a peer that
+    // went away keeps the channel open, so an unbounded await here waits for
+    // that peer forever. The daemon then never exits, `systemctl restart` hangs
+    // until its stop timeout, and the box sits with a dead listener. That
+    // happened.
+    //
+    // Records already on disk are safe regardless: the collector flushes on a
+    // 2-second timer, so abandoning it costs at most that much.
+    match tokio::time::timeout(COLLECTOR_DRAIN_GRACE, collector_task).await {
+        Ok(_) => tracing::info!("collector drained"),
+        Err(_) => tracing::warn!(
+            grace_s = COLLECTOR_DRAIN_GRACE.as_secs(),
+            "collector did not drain in time — a session handler is still holding it; \
+             exiting anyway, at most the last flush interval is unwritten"
+        ),
+    }
     if dropped > 0 {
         tracing::warn!(dropped, "collector dropped records under load");
     }
