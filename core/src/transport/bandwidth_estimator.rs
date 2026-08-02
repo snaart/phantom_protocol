@@ -34,9 +34,11 @@
 //! controller scaled that way leaves Startup and spins its gain cycle before it
 //! has probed anything at all.
 //! - **ProbeRTT:** Every 10s, reduce CWND to 4 packets for 200ms to measure true min RTT
-//! - **FastRecovery:** Entered on explicit packet loss (BBRv3-style) — back off pacing to
-//!   0.5x and tighten CWND to 1x BDP until the pipe drains; not shown in the diagram above
-//!   because any state except Startup/ProbeRTT can enter it on loss.
+//!
+//! Loss is deliberately *not* a state. BBRv2 and BBRv3 respond to it with a
+//! volume bound — `inflight_hi` — that the congestion window is capped by
+//! ([`BandwidthEstimator::adapt_inflight_bound`] carries the reasoning); the
+//! phase the connection is in never changes because a packet went missing.
 //!
 //! # Integration
 //!
@@ -60,8 +62,6 @@ pub enum BbrState {
     Drain,
     /// Probe for shorter RTT (reduce CWND to 4 packets for 200ms)
     ProbeRTT,
-    /// Explicit packet loss detected — reduce rate and CWND proportionally
-    FastRecovery,
 }
 
 impl BbrState {
@@ -75,7 +75,6 @@ impl BbrState {
             Self::ProbeBW => "probe_bw",
             Self::Drain => "drain",
             Self::ProbeRTT => "probe_rtt",
-            Self::FastRecovery => "fast_recovery",
         }
     }
 }
@@ -216,11 +215,44 @@ const PROBE_RTT_CWND_PACKETS: u64 = 4;
 /// Minimum packet size assumption (bytes)
 const MIN_PACKET_SIZE: u64 = 1400;
 
-/// FastRecovery: pacing gain during loss recovery (BBRv3: backs off to 0.5)
-const FAST_RECOVERY_PACING_GAIN: f64 = 0.5;
+/// Loss rate over one round trip past which the round counts as congested —
+/// BBRv2/v3's `BBRLossThresh`, and the same 2% they use.
+///
+/// Below it, loss is treated as the path's own noise and the sender does not
+/// react at all. That is the whole point of a threshold: a link that drops a
+/// couple of percent independently of how hard it is driven gives no
+/// information about where its knee is, and a sender that backs off for it
+/// simply hands the capacity away.
+const LOSS_THRESH: f64 = 0.02;
 
-/// FastRecovery: exit when inflight < BDP * this fraction  
-const FAST_RECOVERY_EXIT_FRACTION: f64 = 1.0;
+/// Multiplicative decrease applied to [`BandwidthEstimator::inflight_hi`] on a
+/// round that lost more than [`LOSS_THRESH`] — BBRv2/v3's `BBRBeta`, and the
+/// same 0.7.
+const INFLIGHT_HI_BETA: f64 = 0.7;
+
+/// Floor on [`BandwidthEstimator::inflight_hi`], as a multiple of the
+/// bandwidth-delay product. **Load-bearing, and the reason this file changed.**
+///
+/// A sender's measurable delivery rate is bounded by what it has in flight:
+/// `rate ≤ inflight / rtt`. Cap inflight at exactly one BDP — `btl_bw ×
+/// min_rtt` — and the best sample it can ever produce is `btl_bw`, which a
+/// maximum filter discards as no news. Any cap at or below the BDP is therefore
+/// not a back-off but an absorbing state: it removes the mechanism by which the
+/// sender could discover that the path is faster than it thinks.
+///
+/// 1.25 rather than some arbitrary margin because that is [`PROBE_BW_GAINS`]'s
+/// probe phase — the phase whose entire job is to ask the path for a quarter
+/// more than the current estimate. A bound that squeezed below it would leave
+/// the probe unable to probe.
+const INFLIGHT_HI_FLOOR_GAIN: f64 = 1.25;
+
+/// Multiplicative increase applied to [`BandwidthEstimator::inflight_hi`] on a
+/// round that stayed under [`LOSS_THRESH`], until it clears the window the
+/// gains alone would allow and is dropped entirely.
+///
+/// Without it the bound is a one-way ratchet and a connection that saw one bad
+/// minute carries the cap for the rest of its life.
+const INFLIGHT_HI_RELAX_GAIN: f64 = 1.25;
 
 // ─── Estimator ──────────────────────────────────────────────────────────────
 
@@ -285,6 +317,13 @@ pub struct BandwidthEstimator {
     // ── Inflight tracking ──
     /// Current bytes in flight
     inflight_bytes: u64,
+    /// Upper bound on inflight imposed by observed loss — BBRv2/v3's
+    /// `inflight_hi`. `None` means the path has given no reason for one and the
+    /// window is whatever [`Self::cwnd_gain`] asks for.
+    ///
+    /// This, not the gain, is where the loss response belongs. See
+    /// [`Self::adapt_inflight_bound`].
+    inflight_hi: Option<u64>,
 
     // ── ProbeRTT timer ──
     /// Timestamp of last ProbeRTT exit (or Startup start)
@@ -300,11 +339,16 @@ pub struct BandwidthEstimator {
     /// Delivered bytes at the time app-limited was last set
     app_limited_at_delivered: u64,
 
-    // ── FastRecovery ──
-    /// When we entered FastRecovery (for duration-based exit)
-    fast_recovery_entered: Option<Instant>,
-    /// Total bytes lost during this recovery window
-    recovery_lost_bytes: u64,
+    // ── Loss accounting ──
+    /// Bytes reported lost since the current round trip opened. Reset by
+    /// [`Self::adapt_inflight_bound`] once the round has been judged.
+    round_bytes_lost: u64,
+    /// [`Self::delivered_bytes`] as it stood when the current round opened —
+    /// the denominator half of the round's loss rate.
+    round_delivered_mark: u64,
+    /// Bytes reported lost over the life of the connection. Diagnostics, and
+    /// the observable that proves the send path reports loss at all.
+    bytes_lost: u64,
 }
 
 impl BandwidthEstimator {
@@ -329,13 +373,15 @@ impl BandwidthEstimator {
             full_bw: 0,
             rounds_without_growth: 0,
             inflight_bytes: 0,
+            inflight_hi: None,
             last_probe_rtt_time: now,
             probe_rtt_entered: None,
             prior_state: BbrState::ProbeBW,
             app_limited: false,
             app_limited_at_delivered: 0,
-            fast_recovery_entered: None,
-            recovery_lost_bytes: 0,
+            round_bytes_lost: 0,
+            round_delivered_mark: 0,
+            bytes_lost: 0,
         }
     }
 
@@ -517,6 +563,13 @@ impl BandwidthEstimator {
             self.app_limited = false;
         }
 
+        // A round trip has closed, so the loss booked against it is now a rate
+        // and can be judged. This runs after the filters above so the bound is
+        // sized against the freshest bandwidth-delay product this endpoint has.
+        if self.round_start {
+            self.adapt_inflight_bound(sample.is_app_limited);
+        }
+
         // Run state machine
         self.update_state(now, sample.is_app_limited);
 
@@ -524,20 +577,25 @@ impl BandwidthEstimator {
         self.pacing_rate()
     }
 
-    /// Notify a packet loss — triggers BBRv3 Fast Recovery.
+    /// Notify a packet loss — BBRv2/v3's `BBRHandleLostPacket`.
     ///
-    /// Unlike earlier BBR versions that ignored loss, BBRv3 immediately
-    /// backs off pacing rate and CWND relative to the lost bytes fraction.
+    /// This books the loss against the round trip in progress and does nothing
+    /// else. In particular it does not change the state machine's phase, does
+    /// not touch a gain, and does not move the congestion window: the response
+    /// is decided once per round trip, over the round's *loss rate*, in
+    /// [`Self::adapt_inflight_bound`].
+    ///
+    /// The granularity matters more than it looks. `drain_streams_priority_ordered`
+    /// calls this once per retransmitted segment, and on a path losing a few
+    /// percent with a few hundred segments in flight that is several calls per
+    /// round trip, every round trip, forever. A response scaled per call fires
+    /// continuously and carries no information; the draft's `BBRLossThresh`
+    /// exists precisely so that a rate — not an event — is what the sender
+    /// reacts to.
     pub fn on_loss(&mut self, bytes: u64) {
         self.inflight_bytes = self.inflight_bytes.saturating_sub(bytes);
-        self.recovery_lost_bytes = self.recovery_lost_bytes.saturating_add(bytes);
-
-        // Only enter FastRecovery if not already in it or ProbeRTT
-        if self.state != BbrState::FastRecovery && self.state != BbrState::ProbeRTT {
-            self.prior_state = self.state;
-            self.fast_recovery_entered = Some(Instant::now());
-            self.transition_to(BbrState::FastRecovery);
-        }
+        self.round_bytes_lost = self.round_bytes_lost.saturating_add(bytes);
+        self.bytes_lost = self.bytes_lost.saturating_add(bytes);
     }
 
     /// Mark the sender as application-limited (not sending at line rate).
@@ -562,13 +620,27 @@ impl BandwidthEstimator {
     }
 
     /// Get recommended congestion window size (bytes).
+    ///
+    /// Two separate things decide it, and keeping them separate is the point:
+    ///
+    /// - [`Self::cwnd_gain`] governs *growth*. It is the headroom above the
+    ///   bandwidth-delay product that lets a delivery-rate sample come back
+    ///   larger than the current estimate, which is the only way the estimate
+    ///   ever rises. Loss must not touch it.
+    /// - [`Self::inflight_hi`] governs the *level*. It is where the loss
+    ///   response lives, and it is floored above the BDP so that backing off
+    ///   never costs the sender its ability to probe.
     pub fn cwnd(&self) -> u64 {
         if self.state == BbrState::ProbeRTT {
             // During ProbeRTT, reduce CWND to minimum
             return PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE;
         }
-        let bdp = self.bdp();
-        (bdp as f64 * self.cwnd_gain).max((PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE) as f64) as u64
+        let target = (self.bdp() as f64 * self.cwnd_gain) as u64;
+        let bounded = match self.inflight_hi {
+            Some(hi) => target.min(hi),
+            None => target,
+        };
+        bounded.max(PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE)
     }
 
     /// Get the Bandwidth-Delay Product (BDP) in bytes.
@@ -579,6 +651,23 @@ impl BandwidthEstimator {
     /// Get current bytes in flight.
     pub fn inflight_bytes(&self) -> u64 {
         self.inflight_bytes
+    }
+
+    /// The loss-imposed upper bound on inflight, if the path has earned one.
+    /// `None` means no round trip has yet lost more than [`LOSS_THRESH`] (or the
+    /// bound has since been relaxed away).
+    pub fn inflight_hi(&self) -> Option<u64> {
+        self.inflight_hi
+    }
+
+    /// Bytes reported lost over the life of the connection.
+    ///
+    /// This is the observable for "the send path told congestion control about
+    /// a retransmission". It is deliberately a counter and not a state: loss no
+    /// longer moves the state machine, so asking which phase the connection is
+    /// in answers a different question.
+    pub fn bytes_lost(&self) -> u64 {
+        self.bytes_lost
     }
 
     /// Get estimated bottleneck bandwidth (bytes/sec).
@@ -662,6 +751,94 @@ impl BandwidthEstimator {
         }
     }
 
+    /// The loss response, run once per round trip — BBRv2/v3's
+    /// `BBRAdaptLowerBounds` / `BBRHandleInflightTooHigh`, reduced to the part
+    /// that earns its keep here.
+    ///
+    /// Three decisions, each of which the previous version got wrong:
+    ///
+    /// **Loss is a rate, judged per round trip.** The draft compares the bytes
+    /// lost in a round against the bytes that round put in flight, and reacts
+    /// only past `BBRLossThresh` (2%). Reacting per lost segment instead is not
+    /// a stricter version of the same rule, it is a different rule: on a path
+    /// losing a few percent the sender retransmits several times per round trip
+    /// and so is permanently in the reacting condition, which conveys nothing.
+    ///
+    /// **The response is a bound on the volume, not a change to the gain.** The
+    /// two are not interchangeable. A gain of 1.0 holds inflight at exactly the
+    /// bandwidth-delay product, and a sender holding a BDP delivers `btl_bw ×
+    /// min_rtt` bytes per round trip by construction — so every sample it takes
+    /// reports exactly the rate it already believes, and `btl_bw`, a maximum
+    /// filter, never moves. The connection stops being able to find out that
+    /// the path is faster than it thinks, and no amount of running gives it back:
+    /// growth needs headroom, and the back-off consumed the headroom. Capping
+    /// the *level* while leaving the gain alone backs the sender off without
+    /// taking away the instrument.
+    ///
+    /// **The bound is floored above the BDP, and it relaxes.** The floor is
+    /// [`INFLIGHT_HI_FLOOR_GAIN`] — strictly above one BDP, so the fixed point
+    /// above cannot be reached by the bound either. The relaxation is what stops
+    /// it being a ratchet: rounds that stay under the threshold lift it back
+    /// until it no longer binds, and it is dropped entirely.
+    ///
+    /// The two constants are the draft's: decrease by `BBRBeta` (0.7) on a
+    /// congested round, at most once per round.
+    ///
+    /// What this deliberately does not implement: `bw_lo`/`bw_hi`, the
+    /// short-term *bandwidth* bounds. They exist to bound the pacing rate, and
+    /// this crate's pacer is inert on the live path (`Pacer::unlimited()` at
+    /// every `Session` construction, `set_enabled` never called), so a second
+    /// bound there would be a knob wired to nothing. The congestion window is
+    /// the only limiter the drain loop actually consults.
+    fn adapt_inflight_bound(&mut self, is_app_limited: bool) {
+        let round_delivered = self
+            .delivered_bytes
+            .saturating_sub(self.round_delivered_mark);
+        let round_lost = self.round_bytes_lost;
+
+        // Open the next round's accounting before any early return, or a round
+        // that declined to judge would fold its bytes into its successor.
+        self.round_delivered_mark = self.delivered_bytes;
+        self.round_bytes_lost = 0;
+
+        let round_total = round_delivered.saturating_add(round_lost);
+        if round_total == 0 {
+            return;
+        }
+
+        // Two kinds of round say nothing about where the path's knee is, and
+        // the draft skips both.
+        //
+        // An app-limited round delivered less because the application had
+        // nothing to send, so its loss *rate* has a small denominator it did
+        // not earn — one retransmit against a nearly idle round reads as
+        // heavy congestion. ProbeRTT is worse: the window there is pinned to
+        // four packets on purpose, so both halves of the ratio are the
+        // controller's own doing rather than the path's.
+        if is_app_limited || self.state == BbrState::ProbeRTT {
+            return;
+        }
+
+        // The window the gains alone would allow, and the floor the bound may
+        // not go under. Both track the current estimate, so a bound set when
+        // the path looked slow does not stay tight once it opens up.
+        let target = (self.bdp() as f64 * self.cwnd_gain) as u64;
+        let floor = (self.bdp() as f64 * INFLIGHT_HI_FLOOR_GAIN) as u64;
+
+        if (round_lost as f64) > (round_total as f64) * LOSS_THRESH {
+            let base = self.inflight_hi.unwrap_or(target);
+            let reduced = (base as f64 * INFLIGHT_HI_BETA) as u64;
+            self.inflight_hi = Some(reduced.max(floor));
+        } else if let Some(hi) = self.inflight_hi {
+            let relaxed = (hi as f64 * INFLIGHT_HI_RELAX_GAIN) as u64;
+            self.inflight_hi = if relaxed >= target {
+                None
+            } else {
+                Some(relaxed.max(floor))
+            };
+        }
+    }
+
     /// BBR's `BBRCheckStartupFullBandwidth`: has the pipe stopped filling?
     ///
     /// ```text
@@ -713,7 +890,7 @@ impl BandwidthEstimator {
 
     /// Run BBR state machine transitions.
     fn update_state(&mut self, now: Instant, is_app_limited: bool) {
-        // ── ProbeRTT check: global timer, any state can enter except Startup and FastRecovery ──
+        // ── ProbeRTT check: global timer, any state can enter except Startup ──
         //
         // Both ProbeRTT bounds below are wall clock — `Instant` differences
         // against `sample.acked_at`, which is a real timestamp — and the draft
@@ -734,7 +911,6 @@ impl BandwidthEstimator {
         // are left for a change that measures them.
         if self.state != BbrState::ProbeRTT
             && self.state != BbrState::Startup
-            && self.state != BbrState::FastRecovery
             && now.duration_since(self.last_probe_rtt_time) >= PROBE_RTT_INTERVAL
         {
             self.prior_state = self.state;
@@ -783,22 +959,6 @@ impl BandwidthEstimator {
                     self.transition_to(BbrState::ProbeBW);
                 }
             }
-            BbrState::FastRecovery => {
-                // Exit FastRecovery once inflight has drained to ≤ BDP (the pipe is no
-                // longer over-filled), or when BDP is still unknown (== 0). The exit is
-                // purely inflight-driven; `fast_recovery_entered` is recorded only for
-                // diagnostics, not consulted here.
-                let bdp = self.bdp();
-                let should_exit = self.inflight_bytes
-                    <= (bdp as f64 * FAST_RECOVERY_EXIT_FRACTION) as u64
-                    || bdp == 0;
-
-                if should_exit {
-                    self.recovery_lost_bytes = 0;
-                    self.fast_recovery_entered = None;
-                    self.transition_to(self.prior_state);
-                }
-            }
         }
     }
 
@@ -819,12 +979,10 @@ impl BandwidthEstimator {
             }
             BbrState::ProbeRTT => {
                 self.pacing_gain = 1.0;
-                self.cwnd_gain = 1.0;
-            }
-            BbrState::FastRecovery => {
-                // BBRv3 recovery: drop pacing to 50% of bottleneck bandwidth,
-                // and tighten CWND to 1x BDP instead of 2x (no inflating).
-                self.pacing_gain = FAST_RECOVERY_PACING_GAIN;
+                // The only state that legitimately runs at a gain of 1.0, and
+                // only because `cwnd()` short-circuits it to the four-packet
+                // floor anyway: ProbeRTT is not trying to measure bandwidth, it
+                // is deliberately emptying the pipe to time the path.
                 self.cwnd_gain = 1.0;
             }
         }
@@ -847,7 +1005,9 @@ impl std::fmt::Debug for BandwidthEstimator {
             .field("round_count", &self.round_count)
             .field("pacing_gain", &self.pacing_gain)
             .field("inflight_bytes", &self.inflight_bytes)
+            .field("inflight_hi", &self.inflight_hi)
             .field("delivered_bytes", &self.delivered_bytes)
+            .field("bytes_lost", &self.bytes_lost)
             .field("app_limited", &self.app_limited)
             .finish()
     }
@@ -1861,6 +2021,257 @@ mod tests {
             "ProbeRTT CWND should be {} (4 packets), got {}",
             PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE,
             cwnd
+        );
+    }
+
+    // ── The loss response ───────────────────────────────────────────────────
+
+    /// Segment size for the closed-loop simulations below.
+    const SIM_PACKET: u64 = 1200;
+
+    /// One round trip of a closed-loop bulk transfer over a path with a fixed
+    /// bottleneck rate and a fixed loss fraction.
+    ///
+    /// This is the shape the estimator actually runs in and the shape the tests
+    /// above do not have: the window it produces is fed straight back to it as
+    /// the next flight's size. An open-loop test can assert what a controller
+    /// *says*; only a closed loop can catch it saying something that stops it
+    /// from ever learning better.
+    ///
+    /// One round: the sender puts a full congestion window on the wire at `t0`,
+    /// the path clocks it out at no more than `true_bw` bytes per second,
+    /// `loss_per_mille` of the segments never arrive, and the survivors are
+    /// acknowledged together — receivers batch, and the estimator's own
+    /// interval bound (`send_elapsed.max(ack_elapsed)`) is what keeps that
+    /// honest.
+    ///
+    /// The bytes that were lost are *returned* rather than reported here: the
+    /// live drain loop reports a loss at the point it retransmits, which is the
+    /// top of the next pass, and that one round of lag is exactly what makes the
+    /// difference between a response that clamps the window the sender is about
+    /// to use and one that does not.
+    fn closed_loop_round(
+        est: &mut BandwidthEstimator,
+        t0: Instant,
+        rtt: Duration,
+        true_bw: u64,
+        loss_per_mille: u64,
+        carry_lost: u64,
+    ) -> (u64, Duration) {
+        // Retransmissions go out first, and `drain_streams_priority_ordered`
+        // reports each of them to congestion control as it does.
+        if carry_lost > 0 {
+            est.on_loss(carry_lost);
+        }
+
+        let window = est.cwnd();
+        let packets = (window / SIM_PACKET).max(1);
+        let sent = packets * SIM_PACKET;
+        for _ in 0..packets {
+            est.on_send(SIM_PACKET);
+        }
+
+        // Round to nearest, so a few-percent loss fraction is not quantised
+        // away on a small flight.
+        let lost_packets = ((packets * loss_per_mille + 500) / 1000).min(packets);
+        let delivered_packets = packets - lost_packets;
+
+        // The bottleneck needs `sent / true_bw` to clock the flight out, and no
+        // acknowledgement can come back sooner than one propagation delay. Past
+        // that point the window is buying queue, not throughput — which is the
+        // physical fact that makes the delivery rate saturate.
+        let round = rtt.max(Duration::from_secs_f64(sent as f64 / true_bw as f64));
+        let acked_at = t0 + round;
+
+        let mark = est.delivered_bytes();
+        let mark_time = est.delivered_time();
+        for _ in 0..delivered_packets {
+            est.on_ack(DeliverySample {
+                delivered_bytes: mark,
+                delivered_at: mark_time,
+                sent_at: t0,
+                acked_at,
+                packet_bytes: SIM_PACKET,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: true,
+            });
+        }
+
+        (lost_packets * SIM_PACKET, round)
+    }
+
+    /// A sender on a lossy path must still be able to find out that the path is
+    /// faster than it currently believes.
+    ///
+    /// This is the fixed point, and it is worth stating as arithmetic rather
+    /// than as a state name. The delivery rate a sender can measure is bounded
+    /// by what it has in flight: `rate ≤ inflight / rtt`. Hold inflight at
+    /// exactly one bandwidth-delay product — `cwnd = btl_bw × min_rtt`, which is
+    /// what a congestion-window gain of 1.0 means — and the best rate any sample
+    /// can report is `btl_bw` itself. `btl_bw` is a *maximum* filter, so a
+    /// sample that merely equals it changes nothing. The estimate becomes its
+    /// own ceiling: the only mechanism by which it could discover more bandwidth
+    /// is the very headroom that was just taken away, and no amount of time on
+    /// the path recovers it.
+    ///
+    /// That is not a back-off, it is an absorbing state, and on a path that
+    /// loses continuously the sender re-enters it on every retransmitted
+    /// segment. The path this came from carries 9.34 Mbit/s at 2.7% loss
+    /// measured with raw sockets; the protocol sustained 1.2 Mbit/s on it, with
+    /// a window that had room for roughly 13 Mbit/s at the measured 200 ms round
+    /// trip. The window was not the limit. The estimate was, and it was pinned
+    /// by its own output.
+    ///
+    /// Here the estimate is walked up a clean path to a fraction of the truth,
+    /// and then the path starts losing. It has to keep climbing.
+    #[test]
+    fn a_lossy_path_can_still_discover_bandwidth_above_its_own_estimate() {
+        const RTT: Duration = Duration::from_millis(200);
+        // 9.34 Mbit/s and 2.7%: both measured on the path this change came from.
+        const TRUE_BW: u64 = 1_167_500;
+        const LOSS_PER_MILLE: u64 = 27;
+        const WARMUP_ROUNDS: u32 = 4;
+        const LOSSY_ROUNDS: u32 = 18;
+
+        let mut est = BandwidthEstimator::new();
+        let mut t = Instant::now();
+
+        // A clean start, stopped well short of the path's real rate.
+        for _ in 0..WARMUP_ROUNDS {
+            let (_, took) = closed_loop_round(&mut est, t, RTT, TRUE_BW, 0, 0);
+            t += took;
+        }
+        let bw_onset = est.bottleneck_bandwidth();
+        let cwnd_onset = est.cwnd();
+        assert!(
+            bw_onset > 0 && bw_onset < TRUE_BW / 4,
+            "precondition: the warm-up should leave the estimate ({bw_onset} B/s) \
+             well below the path's {TRUE_BW} B/s, with room left to discover"
+        );
+
+        // Now the path loses 2.7% of everything, round after round.
+        let mut carry = 0;
+        for _ in 0..LOSSY_ROUNDS {
+            let (lost, took) = closed_loop_round(&mut est, t, RTT, TRUE_BW, LOSS_PER_MILLE, carry);
+            carry = lost;
+            t += took;
+        }
+
+        let bw = est.bottleneck_bandwidth();
+        assert!(
+            bw >= bw_onset * 3,
+            "the estimate went into the lossy stretch at {bw_onset} B/s and came \
+             out at {bw} B/s — it is pinned by its own output, not by the path"
+        );
+        assert!(
+            bw >= TRUE_BW * 3 / 4,
+            "after {LOSSY_ROUNDS} round trips the estimate is {bw} B/s on a path \
+             that carries {TRUE_BW} B/s"
+        );
+        assert!(
+            est.cwnd() >= cwnd_onset * 3,
+            "the window went in at {cwnd_onset} B and came out at {} B — an \
+             estimate that cannot climb takes the window with it",
+            est.cwnd()
+        );
+    }
+
+    /// The other direction, and the one that stops the fix above from being
+    /// "delete the loss response".
+    ///
+    /// Loss still has to cost the sender something. A path that loses steadily
+    /// must end up operating at a materially smaller window than the same path
+    /// operating cleanly — and then, when the loss stops, must get that window
+    /// back. A one-way ratchet would satisfy the first half and quietly cap
+    /// every connection that ever saw a bad minute.
+    #[test]
+    fn sustained_loss_shrinks_the_window_and_a_clean_path_gives_it_back() {
+        const RTT: Duration = Duration::from_millis(100);
+        const TRUE_BW: u64 = 1_167_500;
+        const LOSS_PER_MILLE: u64 = 27;
+
+        let mut est = BandwidthEstimator::new();
+        let mut t = Instant::now();
+
+        // Fill the pipe on a clean path.
+        for _ in 0..9 {
+            let (_, took) = closed_loop_round(&mut est, t, RTT, TRUE_BW, 0, 0);
+            t += took;
+        }
+        let clean_cwnd = est.cwnd();
+        assert!(
+            clean_cwnd > 100_000,
+            "precondition: the pipe should be open before loss starts ({clean_cwnd} B)"
+        );
+
+        // The path starts losing 2.7%.
+        let mut carry = 0;
+        for _ in 0..8 {
+            let (lost, took) = closed_loop_round(&mut est, t, RTT, TRUE_BW, LOSS_PER_MILLE, carry);
+            carry = lost;
+            t += took;
+        }
+        let lossy_cwnd = est.cwnd();
+        assert!(
+            lossy_cwnd * 4 <= clean_cwnd * 3,
+            "sustained loss left the window at {lossy_cwnd} B against {clean_cwnd} B \
+             on the clean path — the loss response is not costing the sender anything"
+        );
+
+        // ...and the loss stops.
+        for _ in 0..6 {
+            let (_, took) = closed_loop_round(&mut est, t, RTT, TRUE_BW, 0, 0);
+            t += took;
+        }
+        let recovered_cwnd = est.cwnd();
+        assert!(
+            recovered_cwnd * 10 >= clean_cwnd * 9,
+            "the window came back to {recovered_cwnd} B against the {clean_cwnd} B \
+             it held before — a loss response that never releases is a ratchet"
+        );
+    }
+
+    /// One lost segment is not a congestion signal.
+    ///
+    /// Loss on a real path is a rate, not an event: at 2.7% a sender with a few
+    /// hundred segments in flight retransmits several times per round trip, and
+    /// a response scaled per segment fires continuously and means nothing. BBRv2
+    /// and v3 both judge loss over a round trip and against a threshold
+    /// (`BBRLossThresh`, 2%) for exactly that reason.
+    ///
+    /// Here a healthy flight loses a single segment — a loss rate of a fraction
+    /// of a percent. The window the sender gets to use for its next flight must
+    /// be unchanged.
+    #[test]
+    fn a_single_lost_segment_is_not_a_congestion_signal() {
+        const RTT: Duration = Duration::from_millis(100);
+        const TRUE_BW: u64 = 1_167_500;
+
+        let mut est = BandwidthEstimator::new();
+        let mut t = Instant::now();
+        for _ in 0..9 {
+            let (_, took) = closed_loop_round(&mut est, t, RTT, TRUE_BW, 0, 0);
+            t += took;
+        }
+
+        let healthy = est.cwnd();
+        let in_flight = healthy / SIM_PACKET;
+        assert!(
+            in_flight > 100,
+            "precondition: the flight should be big enough for one segment to be \
+             a fraction of a percent of it ({in_flight} segments)"
+        );
+
+        // The drain retransmits one segment and reports it.
+        est.on_loss(SIM_PACKET);
+
+        assert_eq!(
+            est.cwnd(),
+            healthy,
+            "one lost segment out of {in_flight} took the window from {healthy} B \
+             to {} B",
+            est.cwnd()
         );
     }
 }
