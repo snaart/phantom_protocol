@@ -36,6 +36,7 @@ pub const VERB_UPLOAD_CHUNK: u8 = 0x0C;
 pub const VERB_UPLOAD_END: u8 = 0x0D;
 pub const VERB_MARK: u8 = 0x0E;
 pub const VERB_ECHO_REPLY: u8 = 0x0F;
+pub const VERB_UPLOAD_ACK: u8 = 0x10;
 
 /// Upper bound on a single decoded frame body.
 ///
@@ -146,6 +147,12 @@ pub enum Msg {
     UploadChunk { data: Vec<u8> },
     /// Client → server. End of file; carries a checksum over the whole file.
     UploadEnd { checksum: u64 },
+    /// Server → client. One file was written and verified.
+    ///
+    /// Load-bearing: without it the client can only count frames it handed to
+    /// the session, which is not the same as bytes that arrived — and closing
+    /// the session discards whatever is still in flight.
+    UploadAck { written: u64, ok: bool },
     /// Client → server. Timestamped marker in the server journal.
     ///
     /// Load-bearing for analysis: this is what lets a server-side periodic
@@ -172,6 +179,7 @@ impl Msg {
             Self::UploadBegin { .. } => VERB_UPLOAD_BEGIN,
             Self::UploadChunk { .. } => VERB_UPLOAD_CHUNK,
             Self::UploadEnd { .. } => VERB_UPLOAD_END,
+            Self::UploadAck { .. } => VERB_UPLOAD_ACK,
             Self::Mark { .. } => VERB_MARK,
         }
     }
@@ -258,6 +266,10 @@ impl Msg {
             }
             Self::UploadChunk { data } => out.extend_from_slice(data),
             Self::UploadEnd { checksum } => out.extend_from_slice(&checksum.to_be_bytes()),
+            Self::UploadAck { written, ok } => {
+                out.extend_from_slice(&written.to_be_bytes());
+                out.push(u8::from(*ok));
+            }
             Self::Mark { label } => out.extend_from_slice(label.as_bytes()),
         }
         out
@@ -277,6 +289,7 @@ impl Msg {
             Self::UploadBegin { name, .. } => 12 + name.len(),
             Self::UploadChunk { data } => data.len(),
             Self::UploadEnd { .. } => 8,
+            Self::UploadAck { .. } => 9,
             Self::Mark { label } => label.len(),
         }
     }
@@ -344,6 +357,10 @@ impl Msg {
             }
             VERB_UPLOAD_CHUNK => Self::UploadChunk { data: c.rest() },
             VERB_UPLOAD_END => Self::UploadEnd { checksum: c.u64()? },
+            VERB_UPLOAD_ACK => Self::UploadAck {
+                written: c.u64()?,
+                ok: c.take(1)?[0] != 0,
+            },
             VERB_MARK => {
                 let n = c.remaining();
                 Self::Mark { label: c.utf8(n)? }
@@ -370,6 +387,7 @@ pub fn verb_name(v: u8) -> &'static str {
         VERB_UPLOAD_BEGIN => "UPLOAD_BEGIN",
         VERB_UPLOAD_CHUNK => "UPLOAD_CHUNK",
         VERB_UPLOAD_END => "UPLOAD_END",
+        VERB_UPLOAD_ACK => "UPLOAD_ACK",
         VERB_MARK => "MARK",
         _ => "UNKNOWN",
     }
@@ -553,6 +571,14 @@ mod tests {
             data: vec![3; 4096],
         });
         round_trip(Msg::UploadEnd { checksum: 0xDEAD });
+        round_trip(Msg::UploadAck {
+            written: 4096,
+            ok: true,
+        });
+        round_trip(Msg::UploadAck {
+            written: 0,
+            ok: false,
+        });
         round_trip(Msg::Mark {
             label: "scenario:rtt_sweep:begin".to_string(),
         });
@@ -584,6 +610,7 @@ mod tests {
             VERB_SOURCE_END,
             VERB_UPLOAD_BEGIN,
             VERB_UPLOAD_END,
+            VERB_UPLOAD_ACK,
         ] {
             for body_len in 0..8usize {
                 let mut frame = vec![verb];

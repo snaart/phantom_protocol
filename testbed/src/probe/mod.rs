@@ -484,7 +484,13 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
     if cfg.upload_results {
         println!("\n  uploading the result bundle over the Phantom session itself…");
         match upload_bundle(&cfg, &dir).await {
-            Ok(n) => println!("  uploaded {n} files"),
+            Ok((acked, total)) if acked == total => {
+                println!("  uploaded and confirmed {acked}/{total} files")
+            }
+            Ok((acked, total)) => println!(
+                "  only {acked}/{total} files were confirmed written — the local copy in {} is complete and is the system of record",
+                dir.display()
+            ),
             Err(e) => println!(
                 "  upload failed ({e}) — the local copy in {} is complete and is the system of record",
                 dir.display()
@@ -538,7 +544,7 @@ fn git_sha() -> Option<String> {
 /// Best-effort and deliberately last: the local copy is already complete and is
 /// the system of record. If the transport is the thing that is broken, this is
 /// exactly what fails, and losing it costs nothing.
-async fn upload_bundle(cfg: &ProbeConfig, dir: &Path) -> Result<usize> {
+async fn upload_bundle(cfg: &ProbeConfig, dir: &Path) -> Result<(usize, usize)> {
     let leg = cfg
         .legs
         .iter()
@@ -557,8 +563,11 @@ async fn upload_bundle(cfg: &ProbeConfig, dir: &Path) -> Result<usize> {
         .unwrap_or("unknown")
         .to_string();
 
-    let mut count = 0usize;
-    for file in collect_files(dir) {
+    let files = collect_files(dir);
+    let total = files.len();
+    let mut acked = 0usize;
+
+    for file in files {
         let rel = file
             .strip_prefix(dir)
             .unwrap_or(&file)
@@ -570,12 +579,12 @@ async fn upload_bundle(cfg: &ProbeConfig, dir: &Path) -> Result<usize> {
         conn::send_msg(
             &framed,
             Msg::UploadBegin {
-                name,
+                name: name.clone(),
                 total_len: data.len() as u64,
             },
         )
         .await
-        .map_err(|e| anyhow::anyhow!("upload begin: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("upload begin {name}: {e:?}"))?;
 
         for chunk in data.chunks(UPLOAD_CHUNK_SIZE) {
             conn::send_msg(
@@ -585,7 +594,7 @@ async fn upload_bundle(cfg: &ProbeConfig, dir: &Path) -> Result<usize> {
                 },
             )
             .await
-            .map_err(|e| anyhow::anyhow!("upload chunk: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("upload chunk {name}: {e:?}"))?;
         }
 
         conn::send_msg(
@@ -595,13 +604,48 @@ async fn upload_bundle(cfg: &ProbeConfig, dir: &Path) -> Result<usize> {
             },
         )
         .await
-        .map_err(|e| anyhow::anyhow!("upload end: {e:?}"))?;
-        count += 1;
+        .map_err(|e| anyhow::anyhow!("upload end {name}: {e:?}"))?;
+
+        // Wait for the server to confirm the file is on its disk before moving
+        // on. Without this the loop only measures how fast frames are accepted
+        // into the session, and closing the session afterwards discards
+        // everything still in flight — which is how a "45 files uploaded"
+        // report came to mean two files actually written.
+        match wait_upload_ack(&framed).await {
+            Ok(true) => acked += 1,
+            Ok(false) => println!("    · server rejected {name}"),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "no acknowledgement for {name} after {acked}/{total} files: {e:?}"
+                ))
+            }
+        }
     }
 
     let _ = conn::send_msg(&framed, Msg::Bye).await;
     conn::close_session(framed.session()).await;
-    Ok(count)
+    Ok((acked, total))
+}
+
+/// Wait for the server's `UPLOAD_ACK`, ignoring anything else in flight.
+async fn wait_upload_ack(
+    framed: &crate::framing::Framed,
+) -> Result<bool, phantom_protocol::CoreError> {
+    // Generous: a bundle upload runs at whatever the link sustains, and the
+    // acknowledgement sits behind the file's own bytes.
+    let deadline = std::time::Instant::now() + conn::DRAIN_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(phantom_protocol::CoreError::Timeout);
+        }
+        let (msg, _) = tokio::time::timeout(remaining, framed.recv())
+            .await
+            .map_err(|_| phantom_protocol::CoreError::Timeout)??;
+        if let Msg::UploadAck { ok, .. } = msg {
+            return Ok(ok);
+        }
+    }
 }
 
 fn collect_files(dir: &Path) -> Vec<PathBuf> {

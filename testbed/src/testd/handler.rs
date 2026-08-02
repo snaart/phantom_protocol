@@ -296,6 +296,12 @@ async fn reader_loop(
 
             Msg::UploadBegin { name, total_len } => {
                 if let Some(prev) = upload.take() {
+                    let _ = tx_out
+                        .send(OutCmd::Frame(encode_framed(&Msg::UploadAck {
+                            written: prev.written,
+                            ok: false,
+                        })))
+                        .await;
                     // An unterminated previous upload: keep what arrived, note
                     // the truncation rather than discarding it.
                     collector.event(
@@ -314,6 +320,12 @@ async fn reader_loop(
                         Some(ctx.uid),
                         format!("{name}: declared {total_len} over cap"),
                     );
+                    let _ = tx_out
+                        .send(OutCmd::Frame(encode_framed(&Msg::UploadAck {
+                            written: 0,
+                            ok: false,
+                        })))
+                        .await;
                     continue;
                 }
                 match open_upload(&ctx.upload_root, &name, total_len).await {
@@ -373,6 +385,15 @@ async fn reader_loop(
                     let _ = st.file.flush().await;
                     let actual = checksum(&st.hasher_input);
                     let ok = actual == declared_sum && st.written == st.declared;
+                    // Acknowledge before anything else: the client cannot know a
+                    // file arrived from its own send() returning, and it will
+                    // close the session as soon as it thinks the bundle is done.
+                    let _ = tx_out
+                        .send(OutCmd::Frame(encode_framed(&Msg::UploadAck {
+                            written: st.written,
+                            ok,
+                        })))
+                        .await;
                     collector.event(
                         &ctx.listener,
                         if ok { "upload_ok" } else { "upload_mismatch" },
