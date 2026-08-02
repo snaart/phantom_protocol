@@ -10,6 +10,49 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **BBR had no concept of a round trip, so the sender left its only growth phase within
+  the first one and then stopped probing for bandwidth entirely.** Both of the estimator's
+  round-scaled rules — the Startup exit test and the ProbeBW gain cycle — were driven off
+  a counter incremented once per *acknowledged packet*, because `update_state` runs at the
+  end of `on_ack`. Nothing in the file tracked round trips at all.
+  The Startup exit rule itself is canonical: three consecutive rounds whose bandwidth grew
+  by less than 25% mean the pipe is full. Evaluated per acknowledgement it is meaningless.
+  Dozens of acknowledgements arrive inside one round trip, and between two of them
+  microseconds apart a max-filtered estimate essentially never grows a quarter — it cannot,
+  there is no new information between them. The three-strike counter therefore ran out
+  inside the very first flight, and the connection left the one phase that grows its window
+  exponentially before that window had doubled even once, carrying out whatever estimate
+  the opening flight happened to produce. The same counter indexed the ProbeBW gain cycle
+  `[1.25, 0.75, 1.0, 1.0]`, whose whole purpose is that the 1.25 phase asks the path for a
+  quarter more than the current estimate and lasts long enough — one `min_rtt` — for the
+  answer to come back and be measured. Advanced per acknowledgement it turned over ten
+  times inside a single round trip in the regression test that now pins it, so the probe
+  covered roughly one packet in four and never probed anything. Between the two, the
+  estimate could not climb during Startup and could not climb after it.
+  Round trips are now counted the way the BBR draft defines them
+  (`BBRUpdateRound`), against the delivered-bytes counter rather than a timer: the sender
+  records the current `delivered` when a round opens, and an acknowledgement for a packet
+  whose delivered-at-send mark is at or beyond that value means every packet in flight when
+  the round opened has been answered — one round trip. The mark was already threaded end to
+  end for the delivery-rate fix (`Stream::poll_send` stamps it from the estimator's own
+  snapshot, `RetiredSegment` carries it back), so this reads a field that was already
+  correct. Counting in delivered bytes rather than wall clock is deliberate: it needs no
+  RTT estimate to be right first, and it stays right across an idle application or a moving
+  RTT.
+  Two further deviations from the draft's `BBRCheckStartupFullBandwidth` are corrected
+  while the rule is being rewritten, both of which also end Startup early. The growth
+  comparison is now against BBR's `full_bw` plateau — a high-water mark raised only when a
+  round beats it by the threshold — instead of against the immediately preceding round;
+  measured round-to-round, a path growing a steady 20% per round reads as a plateau and the
+  sender quits while the path is still opening up. And an application-limited round no
+  longer counts as evidence that the pipe is full: its sample never reached the bandwidth
+  filter in the first place, so its "growth" is flat by construction, and an idle moment
+  could end Startup on its own.
+  ProbeRTT was audited for the same confusion and does **not** have it: `PROBE_RTT_INTERVAL`
+  and `PROBE_RTT_DURATION` are compared as wall-clock `Instant` differences, which is what
+  the draft specifies for both, and they are left alone.
+  **Sender-local congestion control only: no wire-format, handshake or key-schedule change,
+  and old and new peers interoperate unchanged.**
 - **A peer could set the local congestion window by reporting a false acknowledgement
   delay.** `Sack::ack_delay_us` is the receiver's own claim about how long it held an
   acknowledgement before sending it, and the sender subtracted it from the round trip it
