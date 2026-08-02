@@ -391,18 +391,18 @@ async fn a_saturating_upload_does_not_starve_the_download() {
     // the application handed it never reach the wire. Measured on this harness:
     // 5–10 KB with the defect present, 200–300 KB without.
     //
-    // The bound was 96 KiB while a fixed 64 KiB receive window held the download to 43% of
-    // the link. Receive-window auto-tuning removed that accidental throttle — the download
-    // now runs at 96% of the link — and the upload's acknowledgements and flow-control
-    // credit return over that same saturated direction, behind whatever standing queue the
-    // sender's inflight allows. The upload consequently lands at 38–124 KB here (measured
-    // over sixteen runs) with no change to the pump at all: capping the tuned window at
-    // 128 KiB restores it to 197 KB and costs the download 1%, which places the cause in
-    // how much data congestion control keeps in flight, not in the pump's fairness. 24 KiB
-    // still separates a draining pump from a parked one by 2.5–5×; raise it again when the
-    // sender's inflight is bounded to something near the bandwidth-delay product.
+    // This bound has moved twice. It was 96 KiB while a fixed 64 KiB receive window held
+    // the download to 43% of the link; receive-window auto-tuning removed that accidental
+    // throttle and the upload fell to 38–124 KB, because the upload's acknowledgements and
+    // flow-control credit return over the saturated direction behind whatever standing
+    // queue the download sender's inflight builds. It was lowered to 24 KiB with a note to
+    // raise it again once inflight was bounded near the bandwidth-delay product — which is
+    // what pacing does: the download sender now meters onto the wire at the estimated
+    // bottleneck rate instead of releasing a whole congestion window at once, so the queue
+    // the upload's acknowledgements queue behind is the residue of one round trip rather
+    // than a window's worth.
     assert!(
-        up_bytes > 24 * 1024,
+        up_bytes > 96 * 1024,
         "the upload stalled ({up_bytes} B reached the peer) — the pump stopped draining"
     );
     // The two directions are independent on this link, so a fair pump keeps most

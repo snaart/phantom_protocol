@@ -195,7 +195,38 @@ impl WindowFilter {
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 /// Probe cycle gains for ProbeBW phase (BBR cycle: 1.25, 0.75, 1.0, 1.0)
+///
+/// The average is exactly 1.0, so a converged flow paces at the bottleneck
+/// rate. The 1.25 phase is not decoration: once the sender is paced, its own
+/// delivery-rate samples are bounded by the rate it is pacing at, so a maximum
+/// filter fed only by 1.0-gain rounds can never rise. This quarter, one round in
+/// four, is the entire mechanism by which the estimate discovers that the path
+/// got faster.
+///
+/// Four phases rather than the draft's eight is a deliberate trade, and it is
+/// paid for in utilisation. The 0.75 round genuinely under-runs the link, while
+/// the 1.25 round cannot over-run it — a link-limited path just queues the
+/// excess — so the achieved average is `(1 + 0.75 + 1 + 1)/4` ≈ 94%, against
+/// ≈ 97% for eight. What the shorter cycle buys is probing twice as often, and
+/// probing is now the only route upward: the sender lost the ability to
+/// discover bandwidth by overshooting the moment the pacer started governing.
+/// Recovering three points of a link the sender might be measuring 35% low is
+/// the wrong side of that trade.
 const PROBE_BW_GAINS: [f64; 4] = [1.25, 0.75, 1.0, 1.0];
+
+/// Pacing gain for Startup.
+///
+/// The draft's `high_gain` is `2/ln 2` ≈ 2.885, on the argument that a *paced*
+/// sender needs that to double its delivery rate each round where a purely
+/// window-clocked one doubles with 2.0. Once pacing became live that argument
+/// applies here for the first time, so it was tried: eight measured runs at
+/// each value on the in-crate 2 MiB/s, 200 ms harness were indistinguishable
+/// (1.92–2.02 MB/s at 2.885 against 1.87–2.03 MB/s at 2.0). It is left at 2.0
+/// because nothing measured says otherwise, and because the cwnd gain is also
+/// 2.0 — with the two equal, one round trip of pacing at this gain delivers
+/// exactly one congestion window, so pacing cannot slow the ramp it governs.
+/// That equality is the load-bearing part; change one and check the other.
+const STARTUP_PACING_GAIN: f64 = 2.0;
 
 /// Startup growth threshold — if BW growth < 25%, consider pipe filled
 const STARTUP_GROWTH_THRESHOLD: f64 = 0.25;
@@ -364,7 +395,7 @@ impl BandwidthEstimator {
             rtt_filter_seeded: false,
             delivered_bytes: 0,
             last_delivery: now,
-            pacing_gain: 2.0, // Startup: double the rate
+            pacing_gain: STARTUP_PACING_GAIN,
             cwnd_gain: 2.0,
             round_count: 0,
             next_round_delivered: 0,
@@ -614,9 +645,44 @@ impl BandwidthEstimator {
     }
 
     /// Get current recommended pacing rate (bytes/sec).
+    ///
+    /// `btl_bw × pacing_gain` — the estimate scaled by whatever the current
+    /// phase is trying to do to it. In ProbeBW the four gains average to
+    /// exactly 1.0, so a converged flow paces at the bottleneck rate and the
+    /// 1.25 phase is the mechanism by which it finds out the path got faster.
+    ///
+    /// Floored at [`Self::pacing_rate_floor`], which is what makes it safe to
+    /// hand this to a live rate limiter. Two ways the unfloored figure is not a
+    /// rate anyone should be metered against: before the first acknowledgement
+    /// `btl_bw` is zero, and the old `btl_bw.max(1)` turned that into two bytes
+    /// per second; and a single early under-estimate would otherwise meter the
+    /// sender below what its own congestion window already permits, which is a
+    /// throttle no measurement asked for.
     pub fn pacing_rate(&self) -> u64 {
-        let base = self.btl_bw.max(1);
-        (base as f64 * self.pacing_gain) as u64
+        let base = (self.btl_bw as f64 * self.pacing_gain) as u64;
+        base.max(self.pacing_rate_floor())
+    }
+
+    /// The rate below which pacing would be stricter than the congestion window
+    /// already is: the smallest window this controller will ever use, released
+    /// once per minimum round trip.
+    ///
+    /// A window of `W` bytes admits `W / rtt` bytes per second by construction —
+    /// that is what a window *is*. So a pacer set below `cwnd_floor / min_rtt`
+    /// is not shaping the window's release, it is refusing to release a window
+    /// the controller has already decided is safe. Pacing may smooth what
+    /// congestion control permits; it may not overrule it downward.
+    ///
+    /// This never binds on a flow with a real estimate — `btl_bw × gain` is
+    /// far above it the moment Startup has a sample — which is the point: it is
+    /// a floor under the bootstrap, not a term in the steady state.
+    fn pacing_rate_floor(&self) -> u64 {
+        let rtt = self.min_rtt.as_secs_f64();
+        if rtt <= 0.0 {
+            return u64::MAX;
+        }
+        let floor_window = (PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE) as f64;
+        (floor_window / rtt) as u64
     }
 
     /// Get recommended congestion window size (bytes).
@@ -785,11 +851,15 @@ impl BandwidthEstimator {
     /// congested round, at most once per round.
     ///
     /// What this deliberately does not implement: `bw_lo`/`bw_hi`, the
-    /// short-term *bandwidth* bounds. They exist to bound the pacing rate, and
-    /// this crate's pacer is inert on the live path (`Pacer::unlimited()` at
-    /// every `Session` construction, `set_enabled` never called), so a second
-    /// bound there would be a knob wired to nothing. The congestion window is
-    /// the only limiter the drain loop actually consults.
+    /// short-term *bandwidth* bounds. They bound the pacing rate on a shorter
+    /// horizon than `btl_bw`'s max filter, and the drain now does consult the
+    /// pacer, so unlike the inflight bound they would be wired to something.
+    /// They are still left out: this controller already answers loss with a
+    /// volume bound, and adding a second, faster response to the same signal
+    /// without a measurement to size it against is how a controller acquires
+    /// two knobs that fight. The congestion window remains the bound that
+    /// decides how much may be outstanding; the pacer decides how fast it
+    /// leaves.
     fn adapt_inflight_bound(&mut self, is_app_limited: bool) {
         let round_delivered = self
             .delivered_bytes
@@ -966,7 +1036,16 @@ impl BandwidthEstimator {
     fn transition_to(&mut self, new_state: BbrState) {
         match new_state {
             BbrState::Startup => {
-                self.pacing_gain = 2.0;
+                // The pacing gain deliberately exceeds the cwnd gain here. That
+                // makes the *window* the binding constraint during the ramp and
+                // leaves the pacer doing what it is good at — spreading the
+                // window across the round trip instead of releasing it in one
+                // piece — which is the right division of labour for a phase
+                // whose whole job is to grow the window as fast as the path
+                // will tolerate. Raising the cwnd gain to match would widen the
+                // volume bound, and the volume bound is what decides how much a
+                // burst can be if pacing ever stops governing.
+                self.pacing_gain = STARTUP_PACING_GAIN;
                 self.cwnd_gain = 2.0;
             }
             BbrState::Drain => {

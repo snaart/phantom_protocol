@@ -10,6 +10,56 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **The congestion window was released as a burst, because nothing on the send path read
+  the pacing rate.** BBR computed one for every session ever opened, and every `Session`
+  was constructed with `Pacer::unlimited()`, which sets `enabled = false`. `set_rate`
+  stored a number; `set_enabled` was never called from outside the pacer's own tests; the
+  drain's only gate was `budget = min(cwnd, window) − inflight`. A congestion window is a
+  volume, and a volume released without a rate is a burst: everything the window allows
+  goes out back to back and the sender then waits a round trip. That is not what BBR's
+  gains describe — Startup's 2.0 and ProbeBW's 1.25/0.75 are instructions to a rate
+  limiter, and with no limiter to instruct, the ProbeBW cycle that is supposed to probe
+  for more bandwidth was performing arithmetic nobody read.
+  It went unnoticed while the window was small. Three congestion-control fixes since have
+  moved it from a pinned 5600 bytes to peaks of 690–938 KB with estimates of
+  11.8–16.4 Mbit/s, and a path whose raw-socket profile is 0.6% loss at 9.6 Mbit/s but
+  41% at 57.6 Mbit/s does not absorb most of a megabyte arriving at line rate. The
+  measured symptom was the reverse direction: downstream during a bidirectional run held
+  0.93–1.15 Mbit/s while the upload moved 2.5–4.2 MB over the same interval, because the
+  upload's acknowledgements and flow-control credit queued behind the download sender's
+  standing burst.
+  The drain now consults the pacer before every segment and settles the true on-wire size
+  after it, so the two budgets it enforces are the window's volume and the estimate's
+  rate. The wait is not taken on the send path: a pass with no pacing credit *returns*,
+  and the pump arms a `sleep_until` branch of its own `select!`. Sleeping inside the
+  drain would park the whole pump — no flow-control credit, no commands, no liveness
+  sweep — which is the shape that starved the download in the first place, so
+  implementing pacing that way would have traded one direction's collapse for the other's.
+  Acknowledgements, `WINDOW_UPDATE`, keep-alives and path validation stay unpaced for the
+  same reason.
+  The bucket's burst allowance is a fixed duration of the current rate (4 ms, clamped to
+  16 KiB–512 KiB) rather than a constant. A pacer is consulted by a task that wakes on a
+  timer, and a timer's granularity is about a millisecond, so a constant allowance is a
+  constant ceiling: one packet's worth — a pacer that slept between every packet — caps
+  at about 9.6 Mbit/s at this MTU, and the previous fixed 64 KB at about 512 Mbit/s. The
+  clamps state where the reasoning holds; the ceiling this pacer can sustain is 512 KiB
+  per 4 ms, about 1.07 Gbit/s. The bucket is signed, so a send authorised before its size
+  was known carries the overshoot as debt instead of having it forgiven.
+  Pacing stays off until the estimator has measured a bottleneck bandwidth, which is the
+  answer to the bootstrap: before the first acknowledgement `btl_bw` is zero and any rate
+  derived from it is invented — the old `btl_bw.max(1)` made that two bytes per second,
+  which on the first segment is a deadlock, since the first segment is what produces the
+  acknowledgement that would fix it. A congestion reset on migration switches it back off
+  with the estimate it belonged to. `pacing_rate()` is additionally floored at the
+  smallest window this controller will ever use divided by the minimum round trip:
+  pacing may smooth what congestion control permits, it may not overrule it downward.
+  Measured on the in-crate 512 KiB/s, 200 ms full-duplex harness: upload under a
+  saturating download rose from 76 KB to 188–285 KB per window, restoring an assertion
+  that had been lowered from 96 KiB to 24 KiB pending exactly this change, while the
+  download was unchanged. On the 2 MiB/s, 200 ms harness a unidirectional download costs
+  about 2% of link utilisation (2.03 → 1.99 MB/s median), which is the ProbeBW cycle's
+  0.75 phase being real for the first time.
+
 - **BBR's loss response removed the mechanism by which the sender could recover from
   loss, so a lossy path pinned the bandwidth estimate at whatever it happened to hold.**
   Every retransmitted segment reported a loss, which put the estimator into a
