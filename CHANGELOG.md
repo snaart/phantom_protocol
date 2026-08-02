@@ -10,6 +10,37 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **A saturating send in one direction starved the other, collapsing the download to
+  roughly a tenth of what the same path carried when nothing was being uploaded.** The
+  data pump admitted application writes from inside its `select!` loop by pushing them
+  straight into the target stream's send buffer — a call that parks on the stream's
+  backpressure semaphore until an acknowledgement frees a slot. Parking there parks the
+  whole pump: the 10 ms heartbeat stops, the drain stops, the command channel stops
+  being read, and, decisively, the receive side's `WINDOW_UPDATE` credit stops being
+  emitted. The peer then exhausts its initial 64 KiB flow-control window and has nothing
+  to refill it with. Measured over a ~200 ms WAN path, downstream during a bidirectional
+  transfer: 0.07 Mbit/s on PhantomUDP and mimic-TLS and 0.32 Mbit/s over TCP, against
+  0.84-1.07 Mbit/s for the same download with the upload idle — and identical byte
+  counts on three different transports, because the cause was above all of them. Every
+  leg also failed to hand its closing control frame to the session inside 60 seconds.
+  An in-crate reproduction over a 200 ms simulated path pins it at 65,536 bytes in each
+  direction — exactly one window, credit never issued once.
+  Writes the send buffer refuses are now queued in the pump and re-offered as slots
+  free, in FIFO order so byte ordering and the reliable FIN's position are unchanged.
+  While that queue is non-empty the pump stops taking commands, which puts the
+  backpressure where it belongs — on the application's own `send()` — instead of on the
+  session's scheduler. The same admission path replaces the pre-handshake queue flush,
+  which ran *before* the loop that transmits and before the receive task existed, so an
+  application that wrote more than the buffer holds while still connecting stalled the
+  session permanently with no acknowledgement able to reach it. One drain pass is also
+  now bounded at 32 segments and re-arms the outbound notify, so a stream with a full
+  congestion window can no longer hold the pump for most of a round trip while inbound
+  credit waits; and a SACK that retires segments wakes the loop, since it has both
+  freed congestion window and returned a buffer slot.
+  **Scheduling only: no wire-format, handshake or key-schedule change, and congestion
+  and flow control are untouched — new data is still bounded by `min(cwnd, window)` and
+  retransmits still bypass both.**
+
 - **An acknowledgement for a retransmitted segment poisoned the minimum-RTT filter,
   pinning the congestion window on its floor for the life of the connection.** A sender
   restamps a segment's send time when it resends it, so an acknowledgement for the

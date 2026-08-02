@@ -675,6 +675,70 @@ impl Stream {
         Ok(stream_offset)
     }
 
+    /// Non-blocking twin of [`send_reliable`](Self::send_reliable).
+    ///
+    /// Returns `Ok(true)` when `data` was admitted into the send buffer and
+    /// `Ok(false)` when the buffer is full — the caller keeps ownership and
+    /// re-offers the same chunk later, so ordering is preserved. `Err` is the
+    /// same fail-closed offset exhaustion `send_reliable` reports.
+    ///
+    /// This exists because the data pump admits application writes from inside
+    /// its `select!` loop. `send_reliable` parks on the backpressure semaphore
+    /// until an acknowledgement frees a slot, and a parked pump is a pump that
+    /// has stopped emitting the *receive* side's flow-control credit and
+    /// stopped draining its command channel — so a saturating send in one
+    /// direction silently strangles the other. Refusing the write and letting
+    /// the pump loop keep turning replaces that with real, visible
+    /// backpressure: the pump stops reading commands, so the application's own
+    /// `send()` blocks instead of the session's scheduler.
+    pub async fn try_send_reliable(&self, data: &Bytes) -> Result<bool, CoreError> {
+        let Ok(permit) = self.send_semaphore.try_acquire() else {
+            return Ok(false);
+        };
+        // Offset assigned before the permit is forgotten so a fail-closed
+        // exhaustion releases the slot instead of leaking backpressure capacity
+        // (same discipline as `send_reliable`).
+        let stream_offset = self.next_reliable_offset()?;
+        permit.forget();
+
+        self.send_buffer.lock().await.push_back(PendingData {
+            stream_offset,
+            data: data.clone(),
+            sent_at: None,
+            delivered_at_send: 0,
+            delivered_time_at_send: None,
+            retries: 0,
+            lost: false,
+            fin: false,
+        });
+        Ok(true)
+    }
+
+    /// Non-blocking twin of [`queue_fin`](Self::queue_fin) — see
+    /// [`try_send_reliable`](Self::try_send_reliable) for why the pump needs one.
+    /// Returns `Ok(false)` when the send buffer is full; the caller re-offers the
+    /// FIN later, so it still lands after every byte queued before it.
+    pub async fn try_queue_fin(&self) -> Result<bool, CoreError> {
+        let Ok(permit) = self.send_semaphore.try_acquire() else {
+            return Ok(false);
+        };
+        let stream_offset = self.next_reliable_offset()?;
+        permit.forget();
+
+        self.local_finished.store(true, Ordering::SeqCst);
+        self.send_buffer.lock().await.push_back(PendingData {
+            stream_offset,
+            data: Bytes::new(),
+            sent_at: None,
+            delivered_at_send: 0,
+            delivered_time_at_send: None,
+            retries: 0,
+            lost: false,
+            fin: true,
+        });
+        Ok(true)
+    }
+
     /// Queue the reliable FIN sentinel for this stream.
     ///
     /// Enqueues a zero-length reliable segment flagged as the FIN. The segment

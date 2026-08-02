@@ -28,6 +28,8 @@ pub mod udp_listener;
 pub mod udp_transport;
 
 #[cfg(test)]
+mod full_duplex_tests;
+#[cfg(test)]
 mod loss_recovery_tests;
 
 // Cross-target re-exports
