@@ -127,6 +127,17 @@ therefore carries its own length prefix and is reassembled in
 [`framing`](src/framing.rs); the `message_integrity` scenario turns the
 behaviour into a measurement rather than a trap.
 
+## Reading a run
+
+```bash
+./analyze.py results/<run-id>                          # client half
+./analyze.py results/<run-id> --server-dir <data-dir>  # joined with the server's
+```
+
+Recomputes everything from the raw JSONL rather than trusting `summary.json`,
+using the same nearest-rank percentile definition as the Rust side. Standard
+library only.
+
 ## Tests
 
 ```bash
