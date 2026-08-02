@@ -100,9 +100,16 @@ pub struct DeliverySample {
     pub packet_bytes: u64,
     /// Whether the sender was application-limited when this packet was sent
     pub is_app_limited: bool,
-    /// ACK delay reported by the receiver (microseconds).
-    /// The receiver measures time between packet receipt and ACK send;
-    /// subtracting this from the observed RTT gives the propagation delay.
+    /// ACK delay reported by the receiver (microseconds) — the time it says it
+    /// spent between receiving the packet and sending this acknowledgement.
+    ///
+    /// This is the one figure in the sample the local endpoint did not measure,
+    /// so [`BandwidthEstimator::on_ack`] treats it as untrusted input rather
+    /// than as a measurement: it is bounded by the observed round trip, and
+    /// subtracted only where RFC 9002 §5.3 allows, which is where the result
+    /// still lands at or above the running `min_rtt`. See the commentary there
+    /// for why an unconditional subtraction let a peer choose the local
+    /// congestion window.
     pub ack_delay_us: u64,
     /// Whether this sample's round trip is a usable RTT measurement — Karn's
     /// algorithm. `false` for a segment that had been retransmitted before this
@@ -219,6 +226,16 @@ pub struct BandwidthEstimator {
     bw_filter: WindowFilter,
     /// Sliding-window min filter for RTT (10-second window — see `new`)
     rtt_filter: WindowFilter,
+    /// Whether [`Self::rtt_filter`] has ever been fed a sample — i.e. whether
+    /// [`Self::min_rtt`] reflects an observation rather than the opening guess.
+    ///
+    /// RFC 9002 §5.2: "min_rtt MUST be set to the latest_rtt on the first RTT
+    /// sample." The ack-delay guard in [`Self::on_ack`] compares against
+    /// `min_rtt`, and until a round trip has actually been timed that value is
+    /// a 100 ms placeholder nobody measured — a guard anchored on it would be
+    /// defending a number the peer could subtract its way down to on the very
+    /// first acknowledgement.
+    rtt_filter_seeded: bool,
     /// Total bytes delivered (monotonically increasing)
     delivered_bytes: u64,
     /// When [`Self::delivered_bytes`] last advanced. Read back out through
@@ -274,6 +291,7 @@ impl BandwidthEstimator {
             min_rtt: Duration::from_millis(100), // Conservative initial RTT
             bw_filter: WindowFilter::new(Duration::from_secs(10)),
             rtt_filter: WindowFilter::new(Duration::from_secs(10)),
+            rtt_filter_seeded: false,
             delivered_bytes: 0,
             last_delivery: now,
             pacing_gain: 2.0, // Startup: double the rate
@@ -313,14 +331,85 @@ impl BandwidthEstimator {
         self.delivered_bytes += sample.packet_bytes;
         self.last_delivery = now;
 
-        // Calculate delivery rate for this sample.
-        // `send_elapsed` is the full observed RTT. We subtract the receiver's ack_delay
-        // to get the true propagation delay (RTprop), matching QUIC RFC 9002 §5.3.
+        // `send_elapsed` is the full round trip, timed entirely by this
+        // endpoint's own clock: `sent_at` and `acked_at` are both its own
+        // readings. It doubles as the lower bound on the delivery-rate interval
+        // further down.
         let send_elapsed = sample.acked_at.duration_since(sample.sent_at);
-        let ack_delay = Duration::from_micros(sample.ack_delay_us);
-        let rtt_propagation = send_elapsed.saturating_sub(ack_delay);
 
-        // Update min RTT using the propagation delay (RTprop), but only from a
+        // ── The peer's reported ack delay ───────────────────────────────────
+        //
+        // `sample.ack_delay_us` rides in `Sack`, inside the AEAD plaintext — it
+        // is the receiver's claim about how long it held the acknowledgement
+        // before sending it, and it is the only figure in this sample the local
+        // side did not measure.
+        //
+        // Subtracting it unconditionally, which is what this used to do, put
+        // the peer in charge of the local congestion window. `cwnd = 2 × btl_bw
+        // × min_rtt`, floored at 5600 bytes, and the consumer below is a
+        // *minimum* filter: `update_min` back-pops every entry at or above a
+        // new value, so one poisoned sample does not merely sit at the head for
+        // the window duration — it discards the accumulated honest history and
+        // restarts the expiry clock. A peer reporting 199.9 ms of delay on a
+        // 200 ms path drives the sample to 100 µs and pins the window on its
+        // floor for as long as it keeps reporting. Being inside the AEAD means
+        // an on-path attacker cannot reach it, but the authenticated peer can,
+        // and "a malicious or defective server throttles every client it
+        // serves" is a real hazard rather than a theoretical one.
+        //
+        // RFC 9002 §5.2 states the rule for the minimum plainly: an endpoint
+        // "uses only locally observed times in computing the min_rtt and does
+        // not adjust for acknowledgment delays reported by the peer", and
+        // "min_rtt MUST be set to the latest_rtt on the first RTT sample".
+        // §5.3 then permits the adjustment only where it cannot undercut that
+        // minimum — "MUST NOT subtract the acknowledgment delay from the RTT
+        // sample if the resulting value is smaller than the min_rtt" — which is
+        // the published pseudocode:
+        //
+        //     adjusted_rtt = latest_rtt
+        //     if (latest_rtt >= min_rtt + ack_delay):
+        //       adjusted_rtt = latest_rtt - ack_delay
+        //
+        // The invariant that buys, inductively: every value entering the filter
+        // is either a raw locally observed round trip, or a value at or above
+        // the filter's current minimum. A peer-supplied number can therefore
+        // never lower `min_rtt` below what this endpoint's own clock saw. The
+        // worst a hostile report achieves is declining to lower it further —
+        // exactly what reporting nothing at all would achieve.
+        let latest_rtt = send_elapsed;
+
+        // §5.3 also says to use "the lesser of the acknowledgment delay and the
+        // peer's max_ack_delay". Phantom negotiates no max_ack_delay; there is
+        // no transport parameter to compare against, so the only ceiling this
+        // endpoint can know for itself is the round trip it just timed — a peer
+        // cannot have spent longer holding the acknowledgement than the entire
+        // trip took, so anything above that is nonsense on its face.
+        //
+        // The guard below already renders an absurd value harmless (it simply
+        // fails, and the raw sample is used), so this clamp is defence in depth
+        // rather than the load-bearing check. It is kept for two reasons: it
+        // makes the bound local to the arithmetic instead of an emergent
+        // property of a comparison someone might later refactor, and it stops a
+        // nonsense report from *suppressing* an honest measurement — the old
+        // `saturating_sub` turned any delay past the round trip into a zero
+        // sample, which the `rtt_us > 0` check below then dropped, discarding a
+        // perfectly good local RTT on the peer's say-so.
+        let observed_us = u64::try_from(latest_rtt.as_micros()).unwrap_or(u64::MAX);
+        let ack_delay = Duration::from_micros(sample.ack_delay_us.min(observed_us));
+
+        let adjusted_rtt = if !self.rtt_filter_seeded {
+            // §5.2, first sample: seed the minimum from the raw round trip. The
+            // 100 ms this estimator opens with is a guess, not an observation,
+            // and using it as the guard's reference would let a peer on a
+            // slower path subtract down to it before any measurement existed.
+            latest_rtt
+        } else if latest_rtt >= self.min_rtt.saturating_add(ack_delay) {
+            latest_rtt.saturating_sub(ack_delay)
+        } else {
+            latest_rtt
+        };
+
+        // Update min RTT using that adjusted sample, but only from a
         // sample whose round trip is unambiguous — Karn's algorithm.
         //
         // A retransmitted segment carries the send time of its *latest* copy,
@@ -337,10 +426,11 @@ impl BandwidthEstimator {
         // gated: `sent_at`, `delivered_bytes` and `delivered_at` are restamped
         // together, so the rate still measures bytes delivered since the resend
         // over the time since the resend — a short interval, but an honest one.
-        let rtt_us = rtt_propagation.as_micros() as u64;
+        let rtt_us = u64::try_from(adjusted_rtt.as_micros()).unwrap_or(u64::MAX);
         if sample.rtt_sampled && rtt_us > 0 {
             let min_rtt_us = self.rtt_filter.update_min(now, rtt_us);
             self.min_rtt = Duration::from_micros(min_rtt_us);
+            self.rtt_filter_seeded = true;
         }
 
         // Delivery rate over the interval this packet spanned, per BBR: the
@@ -892,6 +982,272 @@ mod tests {
             est.min_rtt(),
             Duration::from_millis(150),
             "a never-retransmitted segment's round trip must still lower min_rtt"
+        );
+    }
+
+    /// A peer must not get to choose the local congestion window.
+    ///
+    /// `Sack::ack_delay_us` is the receiver's own claim about how long it held
+    /// an acknowledgement before sending it, and the sender subtracts it from
+    /// the round trip it measured. Subtracting it unconditionally hands the
+    /// peer a dial on `min_rtt`, and through `cwnd = 2 × btl_bw × min_rtt` a
+    /// dial on the window.
+    ///
+    /// The lever is not subtle, because the consumer is a *minimum* filter.
+    /// `WindowFilter::update_min` back-pops every entry at or above a new
+    /// value, so one sample does not merely sit at the head for the window
+    /// duration — it discards the accumulated honest history and restarts the
+    /// expiry clock. A peer reporting 199.9 ms of "ack delay" on a 200 ms path
+    /// drives the sample to 100 µs, wipes the filter, and pins the window on
+    /// its 5600-byte floor for as long as it keeps reporting. A real WAN
+    /// transfer that peaked near a 128 KB window fell to exactly that floor and
+    /// then sustained 4.7–7.6% of a link whose raw-socket control measured
+    /// 6.63 Mbit/s at zero loss.
+    ///
+    /// The `Sack` rides inside the AEAD plaintext, so an on-path attacker
+    /// cannot reach this — it needs the authenticated peer. That is less of a
+    /// mitigation than it sounds: a malicious or merely defective server can
+    /// throttle every client it serves for the life of each connection, and a
+    /// client can do the same to a server. A reported delay is untrusted input
+    /// to be bounded, not a measurement to be believed.
+    #[test]
+    fn a_peers_reported_ack_delay_cannot_collapse_the_min_rtt() {
+        const PACKETS: u64 = 100;
+        const PACKET: u64 = 1200;
+        const RTT_MS: u64 = 200;
+
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+        let floor = PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE;
+
+        // An ordinary bulk transfer on a 200 ms path, the peer reporting no
+        // delay at all.
+        for _ in 0..PACKETS {
+            est.on_send(PACKET);
+        }
+        for _ in 0..PACKETS {
+            est.on_ack(DeliverySample {
+                delivered_bytes: 0,
+                delivered_at: start,
+                sent_at: start,
+                acked_at: start + Duration::from_millis(RTT_MS),
+                packet_bytes: PACKET,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: true,
+            });
+        }
+
+        let healthy_rtt = est.min_rtt();
+        assert_eq!(healthy_rtt, Duration::from_millis(RTT_MS));
+        assert!(
+            est.cwnd() > 10 * floor,
+            "precondition: the window should be open before the peer starts \
+             reporting ({} B)",
+            est.cwnd()
+        );
+
+        // The peer now claims it sat on the acknowledgement for 199.9 ms of the
+        // 200 ms round trip. Believed, that leaves a 100 µs "propagation
+        // delay" — a path three orders of magnitude faster than the one this
+        // endpoint just timed with its own clock, twice.
+        let attack_at = start + Duration::from_millis(RTT_MS);
+        est.on_send(PACKET);
+        est.on_ack(DeliverySample {
+            delivered_bytes: est.delivered_bytes(),
+            delivered_at: attack_at,
+            sent_at: attack_at,
+            acked_at: attack_at + Duration::from_millis(RTT_MS),
+            packet_bytes: PACKET,
+            is_app_limited: false,
+            ack_delay_us: 199_900,
+            rtt_sampled: true,
+        });
+
+        assert_eq!(
+            est.min_rtt(),
+            healthy_rtt,
+            "a peer-reported ack delay must not lower min_rtt below what the \
+             local clock observed; it dropped min_rtt to {:?}",
+            est.min_rtt()
+        );
+        assert!(
+            est.cwnd() > 10 * floor,
+            "cwnd collapsed to {} B (floor {} B) on one peer-reported ack delay",
+            est.cwnd(),
+            floor
+        );
+
+        // And it does not become true by repetition — a peer that keeps
+        // reporting it must not get anywhere either.
+        for i in 0..20u64 {
+            let at = start + Duration::from_millis(2 * RTT_MS + i);
+            est.on_send(PACKET);
+            est.on_ack(DeliverySample {
+                delivered_bytes: est.delivered_bytes(),
+                delivered_at: at,
+                sent_at: at,
+                acked_at: at + Duration::from_millis(RTT_MS),
+                packet_bytes: PACKET,
+                is_app_limited: false,
+                ack_delay_us: 199_900,
+                rtt_sampled: true,
+            });
+        }
+        assert_eq!(
+            est.min_rtt(),
+            healthy_rtt,
+            "a sustained ack-delay report collapsed min_rtt to {:?}",
+            est.min_rtt()
+        );
+        assert!(
+            est.cwnd() > 10 * floor,
+            "cwnd collapsed to {} B (floor {} B) under a sustained ack-delay report",
+            est.cwnd(),
+            floor
+        );
+
+        // A report larger than the whole round trip is nonsense on its face,
+        // and must be bounded rather than either believed or allowed to
+        // suppress the sample: the 150 ms elapsed here is a genuine local
+        // observation of a faster path and has to land. This is also the
+        // two-sided half of the test — a controller that simply stopped
+        // tracking RTT to dodge the assertions above would fail here.
+        let absurd_at = start + Duration::from_millis(700);
+        est.on_send(PACKET);
+        est.on_ack(DeliverySample {
+            delivered_bytes: est.delivered_bytes(),
+            delivered_at: absurd_at,
+            sent_at: absurd_at,
+            acked_at: absurd_at + Duration::from_millis(150),
+            packet_bytes: PACKET,
+            is_app_limited: false,
+            ack_delay_us: 2_000_000, // ten times the round trip it rides on
+            rtt_sampled: true,
+        });
+        assert_eq!(
+            est.min_rtt(),
+            Duration::from_millis(150),
+            "an ack delay past the round trip must neither be subtracted nor \
+             discard the honest 150 ms the local clock measured"
+        );
+
+        // ...and an ordinary clean sample still moves the filter.
+        let clean_at = start + Duration::from_millis(900);
+        est.on_send(PACKET);
+        est.on_ack(DeliverySample {
+            delivered_bytes: est.delivered_bytes(),
+            delivered_at: clean_at,
+            sent_at: clean_at,
+            acked_at: clean_at + Duration::from_millis(120),
+            packet_bytes: PACKET,
+            is_app_limited: false,
+            ack_delay_us: 0,
+            rtt_sampled: true,
+        });
+        assert_eq!(
+            est.min_rtt(),
+            Duration::from_millis(120),
+            "a clean round trip must still lower min_rtt"
+        );
+    }
+
+    /// The estimator opens with a conservative 100 ms *guess* for `min_rtt`,
+    /// which is not a measurement of anything. Anchoring RFC 9002 §5.3's guard
+    /// on that guess would let a peer on a slower path subtract its way down to
+    /// it on the very first acknowledgement and hold the window at half the
+    /// bandwidth-delay product the path can actually carry — the guard would
+    /// be defending a number the peer got to pick the moment the connection
+    /// opened.
+    ///
+    /// §5.2 says what to do instead: "min_rtt MUST be set to the latest_rtt on
+    /// the first RTT sample" — raw, unadjusted. From then on the running
+    /// minimum is something this endpoint has seen, and the guard has real
+    /// ground to stand on.
+    #[test]
+    fn the_first_round_trip_is_measured_raw_not_against_the_opening_guess() {
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+
+        // A 200 ms path. The peer claims a hold of exactly the estimator's
+        // 100 ms opening guess, which is the largest claim a guard anchored on
+        // that guess would still accept.
+        est.on_send(1200);
+        est.on_ack(DeliverySample {
+            delivered_bytes: 0,
+            delivered_at: start,
+            sent_at: start,
+            acked_at: start + Duration::from_millis(200),
+            packet_bytes: 1200,
+            is_app_limited: false,
+            ack_delay_us: 100_000,
+            rtt_sampled: true,
+        });
+
+        assert_eq!(
+            est.min_rtt(),
+            Duration::from_millis(200),
+            "the first RTT sample must seed min_rtt from the raw round trip; \
+             it came out as {:?}",
+            est.min_rtt()
+        );
+    }
+
+    /// The guard is RFC 9002's condition, not a blanket refusal to use the
+    /// peer's figure — dropping the correction outright would break the feature
+    /// rather than fix it.
+    ///
+    /// Receivers really do batch acknowledgements, and a reported hold that
+    /// fits inside the round trip is a real correction. It earns its keep
+    /// exactly where a minimum filter is weakest: once the old measurement ages
+    /// out of the ten-second window the next sample sets the minimum on its
+    /// own, and without the subtraction the receiver's own delay would be
+    /// baked into the path's propagation time and inflate the BDP from there.
+    #[test]
+    fn a_genuine_ack_delay_is_still_subtracted_from_the_round_trip() {
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+
+        // A 100 ms path, measured cleanly.
+        est.on_send(1200);
+        est.on_ack(DeliverySample {
+            delivered_bytes: 0,
+            delivered_at: start,
+            sent_at: start,
+            acked_at: start + Duration::from_millis(100),
+            packet_bytes: 1200,
+            is_app_limited: false,
+            ack_delay_us: 0,
+            rtt_sampled: true,
+        });
+        assert_eq!(est.min_rtt(), Duration::from_millis(100));
+
+        // Eleven seconds on, that measurement has aged out of the ten-second
+        // filter window, so whatever arrives next sets the minimum by itself.
+        // The round trip reads 150 ms, of which the receiver reports it spent
+        // 30 ms holding the acknowledgement. 150 ms clears `min_rtt +
+        // ack_delay` (130 ms), so §5.3 permits the subtraction: the path
+        // propagates in 120 ms, and recording 150 would overstate it forever
+        // after.
+        let later = start + Duration::from_secs(11);
+        est.on_send(1200);
+        est.on_ack(DeliverySample {
+            delivered_bytes: est.delivered_bytes(),
+            delivered_at: later,
+            sent_at: later,
+            acked_at: later + Duration::from_millis(150),
+            packet_bytes: 1200,
+            is_app_limited: false,
+            ack_delay_us: 30_000,
+            rtt_sampled: true,
+        });
+
+        assert_eq!(
+            est.min_rtt(),
+            Duration::from_millis(120),
+            "a reported ack delay that leaves the sample at or above min_rtt \
+             must still be subtracted; min_rtt came out as {:?}",
+            est.min_rtt()
         );
     }
 
