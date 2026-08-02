@@ -79,6 +79,15 @@ impl Framed {
         self.session.send(encode_framed(msg)).await
     }
 
+    /// Send bytes already produced by [`encode_framed`].
+    ///
+    /// Lets a saturating send loop encode once and reuse both the buffer and
+    /// its length, instead of encoding a second time just to learn how many
+    /// bytes it offered.
+    pub async fn send_encoded(&self, framed: Vec<u8>) -> Result<(), CoreError> {
+        self.session.send(framed).await
+    }
+
     /// Receive one complete message, reassembling across transport reads.
     ///
     /// Also returns how the message arrived, so a caller can observe splitting

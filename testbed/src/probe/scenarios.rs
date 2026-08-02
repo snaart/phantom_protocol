@@ -499,12 +499,12 @@ pub async fn upload(
     let mut stalled = false;
 
     while Instant::now() < deadline {
-        let frame = Msg::Sink {
+        let wire = crate::framing::encode_framed(&Msg::Sink {
             seq,
             payload: payload.clone(),
-        };
-        let n = crate::framing::encode_framed(&frame).len();
-        match tokio::time::timeout(OP_TIMEOUT, framed.send(&frame)).await {
+        });
+        let n = wire.len();
+        match tokio::time::timeout(OP_TIMEOUT, framed.send_encoded(wire)).await {
             Ok(Ok(())) => {
                 if let Some(s) = win.add(n) {
                     out.sink.push(&s);
@@ -737,12 +737,12 @@ pub async fn bidir(
         let mut seq = 0u64;
         let mut bytes = 0u64;
         while !up_stop.load(Ordering::Relaxed) && bytes < up_budget {
-            let frame = Msg::Sink {
+            let wire = crate::framing::encode_framed(&Msg::Sink {
                 seq,
                 payload: payload.clone(),
-            };
-            let n = crate::framing::encode_framed(&frame).len() as u64;
-            match tokio::time::timeout(OP_TIMEOUT, up_framed.send(&frame)).await {
+            });
+            let n = wire.len() as u64;
+            match tokio::time::timeout(OP_TIMEOUT, up_framed.send_encoded(wire)).await {
                 Ok(Ok(())) => {
                     bytes += n;
                     seq += 1;
