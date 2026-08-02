@@ -81,6 +81,17 @@ impl core::fmt::Display for BbrState {
 pub struct DeliverySample {
     /// Bytes delivered at time of sending
     pub delivered_bytes: u64,
+    /// When [`Self::delivered_bytes`] was reached — i.e. the instant the
+    /// connection's delivered counter last advanced, as of this packet's send.
+    ///
+    /// Together with the counter value above this pins down *both* ends of the
+    /// interval the sample measures: `delivered_bytes` bytes had been delivered
+    /// by `delivered_at`, and the total has since grown to whatever it is when
+    /// this acknowledgement lands. Without the timestamp only the numerator of
+    /// the rate is known and the denominator has to be guessed from the packet's
+    /// own round trip — which is how a burst of acknowledgements ends up read as
+    /// a whole window delivered inside one packet's RTT.
+    pub delivered_at: Instant,
     /// Timestamp when packet was sent
     pub sent_at: Instant,
     /// Timestamp when ACK was received
@@ -197,7 +208,10 @@ pub struct BandwidthEstimator {
     rtt_filter: WindowFilter,
     /// Total bytes delivered (monotonically increasing)
     delivered_bytes: u64,
-    /// Timestamp of last delivery
+    /// When [`Self::delivered_bytes`] last advanced. Read back out through
+    /// [`Self::delivered_time`] and stamped onto every outgoing segment, so the
+    /// acknowledgement can be divided by the interval the delivery actually
+    /// took rather than by the acknowledged packet's own round trip.
     last_delivery: Instant,
     /// Pacing gain multiplier (1.0 = 100%, 1.25 = probe, 0.75 = drain)
     pacing_gain: f64,
@@ -312,8 +326,30 @@ impl BandwidthEstimator {
         // invisible on loopback, where an RTT near zero makes even that floor
         // look fast.
         let delivered_during = self.delivered_bytes.saturating_sub(sample.delivered_bytes);
-        let delivery_rate = if !send_elapsed.is_zero() && delivered_during > 0 {
-            (delivered_during as f64 / send_elapsed.as_secs_f64()) as u64
+
+        // The interval is bounded from below by BOTH ends of the sample, which
+        // is the half that was missing. `send_elapsed` measures from when the
+        // packet left; `ack_elapsed` measures from when the delivered counter
+        // last stood at the value the packet was stamped with — that is, from
+        // the moment the bytes in the numerator actually started accumulating.
+        //
+        // Those bytes began accruing at `delivered_at`, which is at or before
+        // the send, so the acknowledgement interval is the wider of the two and
+        // in practice the one that governs. Measuring a numerator over the wide
+        // interval and a denominator over the narrow one is what let an ack
+        // burst read high: acknowledgements do not arrive spread out the way
+        // the data was sent, so when a cumulative SACK retires a window at once
+        // the last packet in it contributes the whole window's bytes against
+        // its own short round trip. Taking the max is canonical BBR (and the
+        // same guard RFC 9002-era stacks use), and it is what keeps a sample
+        // from claiming a rate no interval in the connection ever sustained.
+        let ack_elapsed = sample
+            .acked_at
+            .saturating_duration_since(sample.delivered_at);
+        let interval = send_elapsed.max(ack_elapsed);
+
+        let delivery_rate = if !interval.is_zero() && delivered_during > 0 {
+            (delivered_during as f64 / interval.as_secs_f64()) as u64
         } else {
             0
         };
@@ -412,6 +448,17 @@ impl BandwidthEstimator {
     /// Get total bytes delivered.
     pub fn delivered_bytes(&self) -> u64 {
         self.delivered_bytes
+    }
+
+    /// When [`Self::delivered_bytes`] last advanced — the companion timestamp to
+    /// that counter. Both are stamped onto an outgoing segment so its
+    /// acknowledgement carries the two ends of the interval it measures.
+    ///
+    /// Before the first acknowledgement this is the estimator's creation time,
+    /// which makes the first sample's interval the age of the connection — an
+    /// under-estimate of the rate, never an over-estimate.
+    pub fn delivered_time(&self) -> Instant {
+        self.last_delivery
     }
 
     /// Get the round count.
@@ -559,6 +606,10 @@ mod tests {
     fn make_sample(sent_at: Instant, rtt_ms: u64, packet_bytes: u64) -> DeliverySample {
         DeliverySample {
             delivered_bytes: 0,
+            // Nothing delivered yet as of the send, and the counter was last at
+            // that value when the packet left — so the interval is the packet's
+            // own round trip, which is what these single-packet tests intend.
+            delivered_at: sent_at,
             sent_at,
             acked_at: sent_at + Duration::from_millis(rtt_ms),
             packet_bytes,
@@ -570,6 +621,7 @@ mod tests {
     fn make_app_limited_sample(sent_at: Instant, rtt_ms: u64, packet_bytes: u64) -> DeliverySample {
         DeliverySample {
             delivered_bytes: 0,
+            delivered_at: sent_at,
             sent_at,
             acked_at: sent_at + Duration::from_millis(rtt_ms),
             packet_bytes,
@@ -608,6 +660,7 @@ mod tests {
         for _ in 0..PACKETS {
             est.on_ack(DeliverySample {
                 delivered_bytes: 0,
+                delivered_at: start,
                 sent_at: start,
                 acked_at: start + Duration::from_millis(RTT_MS),
                 packet_bytes: PACKET,
@@ -632,6 +685,69 @@ mod tests {
             "cwnd {} B is still pinned near the {} B floor",
             est.cwnd(),
             floor
+        );
+    }
+
+    /// The mirror image of the test above. Counting a whole window's bytes is
+    /// only half of a delivery-rate sample; the other half is the interval they
+    /// were delivered over, and a packet's own round trip is not that interval.
+    ///
+    /// Acknowledgements do not arrive spread out the way the data was sent —
+    /// receivers batch them, and one cumulative SACK retires everything it
+    /// covers at once. When that burst lands, the last packet in it has a short
+    /// round trip while the delivered counter has just jumped by the whole
+    /// window, so dividing one by the other reads a full window as having been
+    /// delivered inside a single packet's flight time. Here that misreads a
+    /// 4 Mbit/s transfer as roughly 24 Mbit/s, and the window opens to match a
+    /// path that was never there.
+    #[test]
+    fn an_aggregated_ack_burst_does_not_outrun_the_interval_it_spans() {
+        const PACKETS: u64 = 500;
+        const PACKET: u64 = 1200;
+        // Spacing between sends: 500 × 1200 B over a second is ~4.8 Mbit/s.
+        const SEND_GAP_MS: u64 = 2;
+        const RTT_MS: u64 = 200;
+
+        let start = Instant::now();
+        let send_spread_ms = PACKETS * SEND_GAP_MS;
+        let burst_at = start + Duration::from_millis(send_spread_ms + RTT_MS);
+
+        let mut est = BandwidthEstimator::new();
+        for _ in 0..PACKETS {
+            est.on_send(PACKET);
+        }
+        // Every packet left before anything came back, so all of them carry the
+        // same delivery mark: nothing delivered, as of the start.
+        for i in 0..PACKETS {
+            est.on_ack(DeliverySample {
+                delivered_bytes: 0,
+                delivered_at: start,
+                sent_at: start + Duration::from_millis(i * SEND_GAP_MS),
+                acked_at: burst_at,
+                packet_bytes: PACKET,
+                is_app_limited: false,
+                ack_delay_us: 0,
+            });
+        }
+
+        // The connection put PACKETS × PACKET bytes on the wire and had them all
+        // acknowledged by `burst_at`. Nothing about that run supports a rate
+        // above that many bytes over that much time, whatever any single
+        // packet's round trip looked like.
+        let supported = PACKETS * PACKET * 1000 / (send_spread_ms + RTT_MS);
+        assert!(
+            est.bottleneck_bandwidth() <= supported + supported / 10,
+            "bandwidth estimate {} B/s exceeds the {} B/s the ack interval supports",
+            est.bottleneck_bandwidth(),
+            supported
+        );
+        // ...and it must still find the rate, or a controller that simply
+        // refused to estimate anything would pass the assertion above.
+        assert!(
+            est.bottleneck_bandwidth() >= supported - supported / 10,
+            "bandwidth estimate {} B/s undershoots the {} B/s actually delivered",
+            est.bottleneck_bandwidth(),
+            supported
         );
     }
 
