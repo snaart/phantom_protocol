@@ -135,6 +135,19 @@ impl WindowRecorder {
 /// Summarise a window series into notes: where it started, where it got to, and
 /// which phase it ended in.
 fn note_window(out: &mut ScenarioOutput, samples: &[crate::report::WindowSample]) {
+    note_window_as(out, samples, true)
+}
+
+/// `is_sender` says whether this series belongs to the side actually sending
+/// the bulk data. On a download it does not: the client transmits almost
+/// nothing, so its window sitting at the floor is the expected shape and says
+/// nothing about the transfer. Drawing a "sender-bound" conclusion from it
+/// would be a confident statement about the wrong endpoint.
+fn note_window_as(
+    out: &mut ScenarioOutput,
+    samples: &[crate::report::WindowSample],
+    is_sender: bool,
+) {
     for w in samples {
         out.window.push(w);
     }
@@ -158,6 +171,12 @@ fn note_window(out: &mut ScenarioOutput, samples: &[crate::report::WindowSample]
         last.state,
         if last.app_limited { ", app-limited" } else { "" }
     ));
+    if !is_sender {
+        out.note(
+            "this is the receiving side's own window — near-idle by design; the window that governs this transfer is the server's, reported separately",
+        );
+        return;
+    }
     // 5600 B is `PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE` — the floor a window
     // sits on when the bandwidth estimate never rises.
     if peak <= 5600 {
@@ -790,6 +809,11 @@ pub async fn download(
     let mut win = WindowTracker::new(leg, "download");
     let overall_deadline = Instant::now() + cap;
     let mut capped = false;
+    let mut server_windows: Vec<crate::report::WindowSample> = Vec::new();
+    // One STATS request per second, interleaved with the inbound stream. Cheap
+    // (a few hundred bytes) against a transfer, and it is the only way to see
+    // the window on the side that is actually sending.
+    let mut next_stats = Instant::now();
 
     loop {
         if Instant::now() > overall_deadline {
@@ -798,6 +822,11 @@ pub async fn download(
             // being measured; only the total is short.
             capped = true;
             break;
+        }
+        if Instant::now() >= next_stats {
+            next_stats = Instant::now() + Duration::from_secs(1);
+            // Best-effort: a dropped request just means one missing sample.
+            let _ = conn::send_msg(&framed, Msg::StatsReq).await;
         }
         let b = match tokio::time::timeout(OP_TIMEOUT, framed.recv()).await {
             Ok(Ok((m, _))) => m,
@@ -811,6 +840,19 @@ pub async fn download(
             }
         };
         match b {
+            Msg::Stats { json } => {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&json) {
+                    if let Some(w) = v.get("sender_window") {
+                        if let Ok(mut w) =
+                            serde_json::from_value::<crate::report::WindowSample>(w.clone())
+                        {
+                            w.phase = "download:server".to_string();
+                            w.elapsed_ms = win.started.elapsed().as_millis() as u64;
+                            server_windows.push(w);
+                        }
+                    }
+                }
+            }
             Msg::SourceData { payload, .. } => {
                 out.summary.ok_count += 1;
                 if let Some(s) = win.add(payload.len()) {
@@ -843,7 +885,41 @@ pub async fn download(
         ));
     }
     out.summary.throughput = Some(tp);
-    note_window(&mut out, &recorder.finish().await);
+    note_window_as(&mut out, &recorder.finish().await, false);
+    // The server's window is the one that governs a download. Summarise what
+    // its STATS replies reported over the transfer.
+    if server_windows.is_empty() {
+        out.note(
+            "no server-side window samples — STATS replies did not arrive during the transfer",
+        );
+    } else {
+        let peak = server_windows
+            .iter()
+            .map(|w| w.cwnd_bytes)
+            .max()
+            .unwrap_or(0);
+        let peak_bw = server_windows
+            .iter()
+            .map(|w| w.bottleneck_bw_bps)
+            .max()
+            .unwrap_or(0);
+        let last = &server_windows[server_windows.len() - 1];
+        out.note(format!(
+            "SERVER window (the sender here): peak {} B, bottleneck estimate peaked at {:.2} Mbit/s, ended in {} over {} samples",
+            peak,
+            peak_bw as f64 * 8.0 / 1e6,
+            last.state,
+            server_windows.len()
+        ));
+        if peak <= 5600 {
+            out.note(
+                "the server's window never left its 5600 B floor: this download is sender-bound",
+            );
+        }
+        for w in &server_windows {
+            out.window.push(w);
+        }
+    }
     mark(&framed, "download:end").await;
     conn::close_session(framed.session()).await;
     out
