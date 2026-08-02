@@ -28,14 +28,24 @@ const MAX_PENDING_PACKETS: usize = 1024;
 /// sender retransmits it — no SACK-without-data hazard, bounded memory).
 const MAX_RECV_REORDER: usize = 2048;
 
-/// Per-stream byte budget for the out-of-order reorder buffer (H-3), tied to the flow-control
-/// window. A compliant peer keeps in-flight (hence reorderable) data within ~one
-/// [`INITIAL_STREAM_WINDOW`]; the 2× headroom absorbs a boundary segment. A future hole that
-/// would push the buffered total past this is refused (dropped → retransmitted via the
-/// "refused segment is not SACKed" contract), so per-stream reorder memory is bounded
-/// regardless of the per-entry frame size (~253 KiB UDP / 4 MiB TCP) — the entry cap alone is
-/// not, since one entry can dwarf the window.
+/// Per-stream byte budget for the out-of-order reorder buffer (H-3) **at the initial
+/// window**, tied to the flow-control window. A compliant peer keeps in-flight (hence
+/// reorderable) data within one advertised window; the [`INITIAL_STREAM_WINDOW`] of headroom
+/// absorbs a boundary segment. A future hole that would push the buffered total past the
+/// budget is refused (dropped → retransmitted via the "refused segment is not SACKed"
+/// contract), so per-stream reorder memory is bounded regardless of the per-entry frame size
+/// (~253 KiB UDP / 4 MiB TCP) — the entry cap alone is not, since one entry can dwarf the
+/// window.
+///
+/// Since the advertised window auto-tunes (see [`Stream::advertised_recv_window`]) the live
+/// budget is [`Stream::recv_reorder_byte_limit`], which tracks it; this constant is that
+/// function's value before any tuning, and [`MAX_RECV_REORDER_BYTES_CEILING`] is its maximum.
 pub const MAX_RECV_REORDER_BYTES: usize = 2 * INITIAL_STREAM_WINDOW as usize;
+
+/// Absolute per-stream ceiling on reorder-buffer bytes, reached only by a stream whose
+/// advertised window has auto-tuned all the way to [`MAX_RECV_WINDOW`].
+pub const MAX_RECV_REORDER_BYTES_CEILING: usize =
+    MAX_RECV_WINDOW as usize + INITIAL_STREAM_WINDOW as usize;
 
 /// RFC 9002 §6.1.1 packet-threshold: a still-unacked segment is declared lost
 /// once a segment at least this many offsets *newer* has been SACK-acked.
@@ -49,10 +59,41 @@ pub const INITIAL_STREAM_WINDOW: u32 = 64 * 1024;
 /// Hard ceiling on the credit-based send window. `WINDOW_UPDATE` frames add
 /// *relative* credit; this caps the accumulated window so a peer that floods
 /// inflated credits cannot overflow the counter. A compliant peer never grants
-/// more than ~one [`INITIAL_STREAM_WINDOW`] of outstanding credit, so the cap is
-/// only a misbehaving-peer guard (the receiver's own delivery HARD_CAP is the
-/// real bound on buffering).
+/// more outstanding credit than its own advertised window, itself capped at
+/// [`MAX_RECV_WINDOW`] — the same value — so the cap is only a misbehaving-peer
+/// guard (the receiver's own delivery HARD_CAP is the real bound on buffering).
 pub const MAX_SEND_WINDOW: u32 = 8 * INITIAL_STREAM_WINDOW;
+
+/// Ceiling on the **receiver's** auto-tuned advertised window (see
+/// [`Stream::advertised_recv_window`]). Deliberately equal to [`MAX_SEND_WINDOW`]: the two
+/// ends of the same credit ledger must agree, or a receiver would grant credit its peer
+/// silently discards. 512 KiB carries ~21 Mbit/s on a 200 ms path, which is above the
+/// measured capacity of the paths this transport targets.
+pub const MAX_RECV_WINDOW: u32 = MAX_SEND_WINDOW;
+
+/// RTT reference used by receive-window auto-tuning when the stream has no RTT sample of
+/// its own. A stream that only *receives* never puts a reliable segment on the wire, so its
+/// RFC-6298 estimator is never fed — and a pure download is precisely the case auto-tuning
+/// exists for. [`RtoEstimator::MIN_RTO`] is the transport's own "no measurement yet" floor,
+/// so reusing it keeps one answer to "how long is a round trip when we have not measured
+/// one". Erring high here would make growth *easier*, so the floor is the safe direction.
+const AUTOTUNE_RTT_FALLBACK: Duration = RtoEstimator::MIN_RTO;
+
+/// Shortest measurement interval auto-tuning will draw a conclusion from. Below this the
+/// interval is dominated by scheduler jitter rather than by the application, and a rate
+/// computed over it is not evidence of anything.
+const AUTOTUNE_MIN_INTERVAL: Duration = Duration::from_millis(10);
+
+/// One measurement interval of the receive-window auto-tuner: how many bytes the
+/// application consumed since `started_at`.
+#[derive(Debug, Default)]
+struct RecvWindowProbe {
+    /// Start of the open interval. `None` until the application consumes its first byte —
+    /// a stream nobody reads from never opens an interval and so never grows.
+    started_at: Option<tokio::time::Instant>,
+    /// Bytes the application has consumed since `started_at`.
+    bytes: u64,
+}
 
 /// Stream state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +222,12 @@ pub struct OutboundSegment {
 struct RtoEstimator {
     /// Smoothed RTT; `None` until the first measurement.
     srtt: Option<Duration>,
+    /// Smallest RTT ever sampled on this stream — the path's propagation delay, with
+    /// whatever queue happened to be standing at the time excluded. `None` until the first
+    /// measurement. The RTO does not use it (RFC 6298 is a smoothed estimator by design);
+    /// receive-window auto-tuning does, because sizing a buffer from an RTT that the buffer
+    /// itself inflated is a feedback loop that ends at the cap.
+    min_rtt: Option<Duration>,
     /// RTT variation estimate.
     rttvar: Duration,
     /// Number of consecutive timeouts (RTO is doubled `backoff_shift` times).
@@ -202,6 +249,7 @@ impl RtoEstimator {
     fn new() -> Self {
         Self {
             srtt: None,
+            min_rtt: None,
             rttvar: Duration::ZERO,
             backoff_shift: 0,
         }
@@ -209,6 +257,10 @@ impl RtoEstimator {
 
     /// Feed a fresh (non-retransmitted, per Karn) RTT measurement.
     fn on_rtt_sample(&mut self, r: Duration) {
+        self.min_rtt = Some(match self.min_rtt {
+            Some(m) => m.min(r),
+            None => r,
+        });
         match self.srtt {
             None => {
                 // RFC 6298 (2.2): first measurement.
@@ -251,6 +303,7 @@ impl RtoEstimator {
     /// Wired by the P4.2 migration switch (`Stream::reset_rto`).
     fn reset(&mut self) {
         self.srtt = None;
+        self.min_rtt = None;
         self.rttvar = Duration::ZERO;
         self.backoff_shift = 0;
     }
@@ -360,6 +413,13 @@ pub struct Stream {
     /// the application drains `recv_ready`. We periodically emit a
     /// `WINDOW_UPDATE` carrying the new absolute window.
     local_recv_window: AtomicU32,
+    /// The window this side is currently *advertising*: how many bytes the peer may hold
+    /// unacknowledged-by-the-application at once. Auto-tuned upward by
+    /// [`Stream::tune_recv_window`] and never above [`MAX_RECV_WINDOW`].
+    advertised_recv_window: AtomicU32,
+    /// Measurement interval backing the auto-tuner. A plain sync mutex — taken only by the
+    /// single delivery task that credits this stream, and never held across an `.await`.
+    recv_window_probe: std::sync::Mutex<RecvWindowProbe>,
     /// Total bytes the local side has consumed since the last
     /// emitted `WINDOW_UPDATE`. Used to decide when to send the
     /// next update (avoid flooding the wire with tiny updates).
@@ -407,6 +467,8 @@ impl Stream {
             send_semaphore: Arc::new(Semaphore::new(MAX_PENDING_PACKETS)),
             peer_send_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
             local_recv_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
+            advertised_recv_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
+            recv_window_probe: std::sync::Mutex::new(RecvWindowProbe::default()),
             bytes_since_last_update: AtomicU32::new(0),
             pending_window_update: AtomicU32::new(0),
             rto: std::sync::Mutex::new(RtoEstimator::new()),
@@ -441,6 +503,16 @@ impl Stream {
         match self.rto.lock() {
             Ok(g) => g.srtt,
             Err(poisoned) => poisoned.into_inner().srtt,
+        }
+    }
+
+    /// Smallest RTT sampled on this stream, or `None` before the first measurement — the
+    /// path's propagation delay rather than the queue-inflated smoothed estimate. Feeds
+    /// receive-window auto-tuning; see [`Self::tune_recv_window`].
+    fn min_rtt(&self) -> Option<Duration> {
+        match self.rto.lock() {
+            Ok(g) => g.min_rtt,
+            Err(poisoned) => poisoned.into_inner().min_rtt,
         }
     }
 
@@ -547,6 +619,148 @@ impl Stream {
         self.local_recv_window.load(Ordering::Acquire)
     }
 
+    /// The window this side currently advertises: the most bytes the peer may hold in our
+    /// buffers before it must stop and wait for the application to consume. Starts at
+    /// [`INITIAL_STREAM_WINDOW`] and is auto-tuned upward by [`Self::tune_recv_window`],
+    /// never past [`MAX_RECV_WINDOW`].
+    pub fn advertised_recv_window(&self) -> u32 {
+        self.advertised_recv_window.load(Ordering::Acquire)
+    }
+
+    /// Live per-stream reorder-buffer byte budget (H-3). Tracks the advertised window,
+    /// because that window is what bounds in-flight — hence reorderable — data: a fixed
+    /// budget smaller than the window would refuse legitimate out-of-order segments on a
+    /// lossy path and force them to be retransmitted, collapsing throughput exactly where
+    /// a large window is most needed. Equals [`MAX_RECV_REORDER_BYTES`] before any tuning
+    /// and [`MAX_RECV_REORDER_BYTES_CEILING`] at [`MAX_RECV_WINDOW`].
+    pub fn recv_reorder_byte_limit(&self) -> usize {
+        self.advertised_recv_window() as usize + INITIAL_STREAM_WINDOW as usize
+    }
+
+    /// Receive-window auto-tuning. Returns the **extra** relative credit to hand the peer
+    /// because the advertised window just grew (`0` when it did not).
+    ///
+    /// ## Why the window has to move at all
+    ///
+    /// A credit window of `W` bytes returned one round trip after the data was consumed is
+    /// a hard rate ceiling of `W / RTT`, whatever congestion control decides. A fixed 64 KiB
+    /// window on a 200 ms path is 2.6 Mbit/s per stream — below the capacity of any path
+    /// worth measuring — so on a long path flow control, not the network, is the limiter.
+    /// TCP window auto-tuning and QUIC flow-control auto-tuning both exist for this reason,
+    /// and this is the same mechanism: notice that the window is the binding constraint and
+    /// double it.
+    ///
+    /// ## What the growth is tied to
+    ///
+    /// **Application consumption, never arrival.** `n` reaches this function only from the
+    /// delivery task, which counts bytes it has handed onward to the application, and the
+    /// interval is opened by the first such byte. A peer that sends fast to an application
+    /// that never reads calls this function zero times and moves nothing. That is the whole
+    /// memory-safety argument, and it is why the trigger may not be moved to the receive
+    /// path, where "bytes arrived" is entirely the peer's choice.
+    ///
+    /// The rule: over a closed interval of `2 × RTT`, if the application consumed more than
+    /// **four fifths of a window** — a rate above `0.4 × window / RTT` — the window is close
+    /// enough to binding to double it. Equivalently the window converges on
+    /// `2.5 × (application consumption rate) × RTT`, two and a half bandwidth-delay products,
+    /// and stops there: the advertised window is a measurement of the application, clamped to
+    /// [`MAX_RECV_WINDOW`]. The neighbourhood of two BDPs is the target Linux receive-window
+    /// auto-tuning aims at too, and it is deliberately not far above it — the point is to
+    /// stop being the binding constraint, not to hand out buffer nobody needs.
+    ///
+    /// Why `0.4` and not the round `0.5`: credit is returned a round trip *after* the
+    /// application consumed, so a flow that really is window-limited does not achieve
+    /// `window / RTT` — it achieves about half of that, which is exactly what the measurement
+    /// that prompted this work showed (1.2 Mbit/s against a 2.62 Mbit/s window ceiling, 46%).
+    /// A threshold sitting on that same figure would never fire on the flow it exists for.
+    ///
+    /// Measuring over a *time* interval rather than a byte count is deliberate. The delivery
+    /// pipeline in front of the application is a bounded queue, so a stalled reader still
+    /// absorbs one queue's worth of bytes in a burst; a byte-triggered test would read that
+    /// one-off burst as a sustained rate and climb the whole ladder on it. An interval no
+    /// shorter than a round trip cannot be satisfied by a transient.
+    ///
+    /// ## What a hostile but authenticated peer gets
+    ///
+    /// Nothing it does not have to buy. Moving this stream's window from 64 KiB to the
+    /// 512 KiB cap costs it three doublings, and each one requires the local application to
+    /// consume four fifths of the *current* window inside one round-trip-length interval —
+    /// ~360 KiB of genuinely consumed data in total, at a rate the peer cannot supply on its
+    /// own because the application has to keep up with it. If the application stops, the
+    /// window stops where it is.
+    ///
+    /// Having paid, the peer may hold 512 KiB of unconsumed data on this stream and up to
+    /// 576 KiB of reorder buffer ([`Self::recv_reorder_byte_limit`]), against 64 KiB and
+    /// 128 KiB before. Session-wide, the number that bounds buffered-but-undelivered bytes
+    /// is unchanged: the pump's `RECV_DELIVERY_HARD_CAP` still tears the session down at
+    /// 4 MiB of backlog. What auto-tuning changes is how few streams it takes to reach that
+    /// cap when an application stalls after running fast — eight rather than sixty-four —
+    /// and the per-stream reorder ceiling, whose `MAX_STREAMS`-wide worst case rises from
+    /// 32 MiB to 144 MiB, reachable only by an attacker who has already induced 256 separate
+    /// applications' worth of sustained consumption.
+    fn tune_recv_window(&self, n: u32) -> u32 {
+        let window = self.advertised_recv_window.load(Ordering::Acquire);
+        if window >= MAX_RECV_WINDOW {
+            return 0;
+        }
+        // The path's propagation delay, NOT the smoothed estimate: a saturated forward
+        // path inflates smoothed RTT, a longer RTT lowers the rate a window has to beat to
+        // grow, and a bigger window queues more — a loop that ends at the cap regardless of
+        // what the application is doing. `min_rtt` is what the queue cannot move. A stream
+        // that only receives never feeds its own estimator at all, so the fallback is the
+        // common case on exactly the flows auto-tuning exists for.
+        let rtt = self.min_rtt().unwrap_or(AUTOTUNE_RTT_FALLBACK);
+        let interval = rtt.saturating_mul(2).max(AUTOTUNE_MIN_INTERVAL);
+
+        let now = tokio::time::Instant::now();
+        let mut probe = match self.recv_window_probe.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        probe.bytes = probe.bytes.saturating_add(u64::from(n));
+        let Some(started_at) = probe.started_at else {
+            // First consumption on this stream opens the interval; there is no elapsed
+            // time yet to draw a rate from.
+            probe.started_at = Some(now);
+            return 0;
+        };
+        let elapsed = now.duration_since(started_at);
+        if elapsed < interval {
+            return 0; // interval still open — keep accumulating
+        }
+        let bytes = probe.bytes;
+        probe.bytes = 0;
+        probe.started_at = Some(now);
+        drop(probe);
+
+        // `bytes / elapsed > (4/5) * window / interval` (recall `interval == 2 × RTT`),
+        // cross-multiplied so there is no division and no float. u128 because
+        // `window * elapsed_ns` overflows u64 for a 512 KiB window past ~35 s, and a long
+        // idle interval is ordinary.
+        let lhs = u128::from(bytes)
+            .saturating_mul(5)
+            .saturating_mul(interval.as_nanos());
+        let rhs = u128::from(window)
+            .saturating_mul(4)
+            .saturating_mul(elapsed.as_nanos());
+        if lhs <= rhs {
+            return 0; // the application is not keeping up with the window we already gave it
+        }
+
+        let next = window.saturating_mul(2).min(MAX_RECV_WINDOW);
+        match self.advertised_recv_window.compare_exchange(
+            window,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => next - window,
+            // Lost a race with a concurrent grower: its increase stands, ours is dropped
+            // rather than compounded.
+            Err(_) => 0,
+        }
+    }
+
     /// Record that the application has actually consumed `n` bytes from this
     /// stream (called by the receive *delivery* task on real drainage, not
     /// on routing). Accumulates the consumed bytes and, once the unreported
@@ -554,21 +768,33 @@ impl Stream {
     /// **relative credit** to advertise in a `WINDOW_UPDATE` (the peer *adds*
     /// it to its send window). The half-window threshold trades update frequency
     /// against peer stalls.
+    ///
+    /// The credit also carries any growth [`Self::tune_recv_window`] just decided. Because
+    /// `WINDOW_UPDATE` is relative, opening the window wider is simply extra credit — the
+    /// wire format expresses it as it stands, and a window increase needs no new frame.
+    /// Growth is emitted immediately even when the consumption credit is still below the
+    /// update threshold: it is precisely the case where the peer is stalled waiting.
     pub fn record_app_consumed(&self, n: u32) -> Option<u32> {
+        let growth = self.tune_recv_window(n);
         let pending = self.bytes_since_last_update.fetch_add(n, Ordering::AcqRel) + n;
         let threshold = INITIAL_STREAM_WINDOW / 2;
-        if pending >= threshold {
+        let consumed_credit = if pending >= threshold {
             // Grant exactly the bytes we accumulated since the last update and
             // reset the accumulator. Use a CAS-free `fetch_sub` of the granted
             // amount rather than `store(0)` so a concurrent consume isn't lost.
             self.bytes_since_last_update
                 .fetch_sub(pending, Ordering::AcqRel);
-            // Keep the (now informational) local_recv_window in step for stats.
-            self.local_recv_window.fetch_add(pending, Ordering::AcqRel);
-            Some(pending)
+            pending
         } else {
-            None
+            0
+        };
+        let credit = consumed_credit.saturating_add(growth);
+        if credit == 0 {
+            return None;
         }
+        // Keep the (now informational) local_recv_window in step for stats.
+        self.local_recv_window.fetch_add(credit, Ordering::AcqRel);
+        Some(credit)
     }
 
     /// Stage relative flow-control credit to be flushed by the send loop.
@@ -1205,7 +1431,7 @@ impl Stream {
                 .recv_buffer_bytes
                 .load(Ordering::Relaxed)
                 .saturating_add(seg_bytes)
-                <= MAX_RECV_REORDER_BYTES;
+                <= self.recv_reorder_byte_limit();
             if !already && buf.len() < MAX_RECV_REORDER && within_byte_budget {
                 buf.push_back((sequence, payloads));
                 self.recv_buffer_bytes
@@ -1238,7 +1464,7 @@ impl Stream {
     }
 
     /// Total payload bytes currently held in the out-of-order reorder buffer (H-3). Bounded
-    /// by `MAX_RECV_REORDER_BYTES`; exposed so the byte bound is observable/testable.
+    /// by [`Self::recv_reorder_byte_limit`]; exposed so the byte bound is observable/testable.
     pub fn recv_reorder_bytes(&self) -> usize {
         self.recv_buffer_bytes.load(Ordering::Relaxed)
     }
@@ -2081,6 +2307,162 @@ mod tests {
         // Saturates at the hard cap (misbehaving-peer guard).
         s.apply_peer_window_update(u32::MAX);
         assert_eq!(s.peer_send_window(), MAX_SEND_WINDOW);
+    }
+
+    // ── Receive-window auto-tuning ──
+    //
+    // The measurement interval is `2 × AUTOTUNE_RTT_FALLBACK` = 400 ms (these streams never
+    // send, so they have no RTT sample of their own), and a window doubles when the
+    // application consumed more than four fifths of a window across a closed interval — that
+    // is, more than 51.2 KiB per 400 ms at the 64 KiB initial window, 128 KiB/s. The clock is
+    // paused, so every number below is exact rather than a race with the scheduler.
+
+    /// The safety direction, and the reason the feature is defensible: bytes *arriving* move
+    /// nothing. Only the delivery task, handing bytes onward to the application, calls
+    /// `record_app_consumed` — so a peer that floods a reader that never reads cannot make
+    /// the receiver widen its own buffer by one byte, no matter how long it keeps it up.
+    #[tokio::test]
+    async fn arrival_without_consumption_never_grows_the_window() {
+        tokio::time::pause();
+        let s = Stream::new(1);
+        assert_eq!(s.advertised_recv_window(), INITIAL_STREAM_WINDOW);
+
+        // A peer pushes a full window of in-order data as fast as it can; nothing reads it.
+        for seq in 0..64 {
+            let _ = s
+                .accept_in_order(seq, vec![Bytes::from(vec![0u8; 1024])])
+                .await;
+            tokio::time::advance(Duration::from_millis(10)).await;
+        }
+        tokio::time::advance(Duration::from_secs(30)).await;
+
+        assert_eq!(
+            s.advertised_recv_window(),
+            INITIAL_STREAM_WINDOW,
+            "the advertised window must be a function of what the application consumed, \
+             never of what the peer chose to send"
+        );
+        assert_eq!(s.recv_reorder_byte_limit(), MAX_RECV_REORDER_BYTES);
+    }
+
+    /// An application consuming below `window / (4 × RTT)` is not window-limited — the window
+    /// it already has is more than it can use — so it must not be given a larger one.
+    #[tokio::test]
+    async fn slow_consumption_never_grows_the_window() {
+        tokio::time::pause();
+        let s = Stream::new(1);
+        s.record_app_consumed(1); // opens the first interval
+
+        // 16 KiB per 400 ms interval = 40 KiB/s, under a third of the 128 KiB/s threshold.
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            s.record_app_consumed(16 * 1024);
+        }
+
+        assert_eq!(
+            s.advertised_recv_window(),
+            INITIAL_STREAM_WINDOW,
+            "a reader slower than the window permits gains nothing from a wider window"
+        );
+    }
+
+    /// The positive direction: an application outrunning the window gets a wider one, by
+    /// doubling, and the ladder stops dead at the cap.
+    #[tokio::test]
+    async fn fast_consumption_doubles_the_window_up_to_the_cap() {
+        tokio::time::pause();
+        let s = Stream::new(1);
+        s.record_app_consumed(1);
+
+        // 128 KiB per 400 ms = 320 KiB/s, two and a half times the 128 KiB/s threshold at
+        // the initial window — one doubling per closed interval.
+        tokio::time::advance(Duration::from_millis(400)).await;
+        s.record_app_consumed(128 * 1024);
+        assert_eq!(s.advertised_recv_window(), 2 * INITIAL_STREAM_WINDOW);
+        assert_eq!(
+            s.recv_reorder_byte_limit(),
+            3 * INITIAL_STREAM_WINDOW as usize,
+            "the reorder budget tracks the window it has to hold out-of-order data for"
+        );
+
+        // Keep outrunning it: the window climbs to the cap and then stops for good.
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            s.record_app_consumed(MAX_RECV_WINDOW);
+        }
+        assert_eq!(s.advertised_recv_window(), MAX_RECV_WINDOW);
+        assert_eq!(
+            s.recv_reorder_byte_limit(),
+            MAX_RECV_REORDER_BYTES_CEILING,
+            "and the reorder budget stops with it"
+        );
+    }
+
+    /// The reason the trigger is a time interval and not a byte count. The delivery queue in
+    /// front of the application is bounded but not empty, so even a stalled reader absorbs
+    /// one queue's worth of bytes in a burst. A byte-triggered tuner would read that burst as
+    /// a sustained rate and climb the entire ladder on it; an interval no shorter than a
+    /// round trip lets it buy at most the one doubling the burst genuinely paid for.
+    #[tokio::test]
+    async fn a_burst_shorter_than_the_interval_does_not_climb_the_ladder() {
+        tokio::time::pause();
+        let s = Stream::new(1);
+        s.record_app_consumed(1);
+
+        // 256 KiB drains through in 50 ms — four windows' worth, at 5 MiB/s.
+        for _ in 0..256 {
+            s.record_app_consumed(1024);
+            tokio::time::advance(Duration::from_micros(195)).await;
+        }
+        assert_eq!(
+            s.advertised_recv_window(),
+            INITIAL_STREAM_WINDOW,
+            "no interval has closed yet, so there is nothing to conclude"
+        );
+
+        // The interval closes and the burst buys exactly one doubling …
+        tokio::time::advance(Duration::from_millis(400)).await;
+        s.record_app_consumed(1024);
+        assert_eq!(s.advertised_recv_window(), 2 * INITIAL_STREAM_WINDOW);
+
+        // … after which the real reader rate governs, and it is far below the threshold.
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            s.record_app_consumed(1024);
+        }
+        assert_eq!(
+            s.advertised_recv_window(),
+            2 * INITIAL_STREAM_WINDOW,
+            "a one-off burst must not be mistaken for a sustained rate"
+        );
+    }
+
+    /// A window increase reaches the peer as ordinary relative credit, and is emitted at once
+    /// rather than waiting for the consumption credit to reach its own threshold — the peer
+    /// is stalled on exactly this grant.
+    #[tokio::test]
+    async fn window_growth_is_emitted_as_relative_credit_immediately() {
+        tokio::time::pause();
+        let s = Stream::new(1);
+        s.record_app_consumed(1);
+
+        // Mid-interval, consumption crosses its own update threshold and is flushed …
+        tokio::time::advance(Duration::from_millis(200)).await;
+        assert_eq!(s.record_app_consumed(60 * 1024), Some(60 * 1024 + 1));
+
+        // … so when the interval closes, the growth is all that is left to advertise.
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let credit = s.record_app_consumed(8 * 1024).expect("growth is credited");
+        assert_eq!(
+            credit, INITIAL_STREAM_WINDOW,
+            "the credit is the 64 KiB the window grew by; the 8 KiB of consumption is still \
+             accumulating toward its own threshold"
+        );
+
+        // A peer applying it ends up with initial + growth, i.e. the new window.
+        let peer = Stream::new(1);
+        peer.apply_peer_window_update(credit);
+        assert_eq!(peer.peer_send_window(), 2 * INITIAL_STREAM_WINDOW);
     }
 
     #[test]
