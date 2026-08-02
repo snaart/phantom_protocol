@@ -1,0 +1,44 @@
+[package]
+name = "phantom-testbed"
+version = "0.2.2"
+edition = "2021"
+rust-version = "1.93"
+description = "Real-network (WAN) test harness for phantom-protocol: multi-leg daemon + scenario-driving probe"
+license = "Apache-2.0"
+publish = false
+
+# Sibling crate, out of the core/-only workspace — same convention as server/ and cli/.
+[workspace]
+
+[[bin]]
+name = "phantom-testd"
+path = "src/bin/testd.rs"
+
+[[bin]]
+name = "phantom-probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+# The testbed is a pure consumer of the published API. `mimicry` is on because
+# the harness measures that leg; `bindings` (UniFFI) is off because nothing here
+# crosses an FFI boundary.
+phantom-protocol = { path = "../core", default-features = false, features = [
+    "std",
+    "compression-zstd",
+    "classical-crypto",
+    "mimicry",
+] }
+
+tokio = { version = "1.36", features = ["full"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+
+[profile.release]
+# The probe records timestamps around tight send/recv loops; debug symbols cost
+# nothing at runtime and make a profiler or a crash dump readable.
+debug = 1

@@ -10,6 +10,38 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **`testbed/` — a real-network (WAN) test harness.** A new sibling crate with two
+  binaries: `phantom-testd`, a daemon that binds every network-testable leg
+  (PhantomUDP, Phantom-over-TCP, mimic-TLS) from a single persisted identity plus raw
+  TCP/UDP echo controls, and `phantom-probe`, which drives a scenario matrix and writes
+  raw per-operation samples. Scenarios: clock offset estimation, handshake latency,
+  RTT sweeps across payload sizes, message-boundary integrity, upload / download /
+  full-duplex goodput, concurrent streams, 0-RTT resumption, forced rekey, connection
+  migration, concurrency, and negative cases (wrong pin, closed port, junk flood).
+  Profiles `smoke` / `standard` / `deep`. Results are flushed after every scenario and
+  the client uploads its bundle to the daemon over the Phantom session itself.
+  Every automated test in this repository previously ran over loopback or an in-memory
+  transport, where RTT is microseconds, nothing reorders, no NAT exists, and the path
+  MTU is 65535 — a regime that cannot exercise the RTO timer, the bandwidth estimator,
+  real migration, or path-MTU behaviour. See `testbed/README.md`.
+
+### Documented
+
+- **`connect_pinned*` returns before the handshake completes.** The returned session is
+  in `Connecting` state with the handshake running on a background task, so callers must
+  `await_ready()` before treating the connection as established. Until they do, a
+  deliberately wrong pin looks like a successful connect (`ServerIdentityMismatch` has
+  not been raised yet), `resumption_hint()` returns `None`, and any timing around the
+  call measures socket setup rather than the post-quantum key exchange. This was
+  implied by the invariants but stated nowhere on the entry points themselves.
+- **`PhantomSession::send()` does not preserve application message boundaries.** The
+  data pump splits payloads above its internal `TRANSPORT_MTU` (1300 B) into chunks,
+  writes each as a separate reliable-stream write, and the peer's `recv()` yields them
+  one at a time — on every leg, since the split happens above the transport. The
+  failure mode is silent for structured payloads: the first chunk still parses, with
+  the tail gone. Embedders that need message semantics must frame and reassemble
+  themselves; `testbed/src/framing.rs` is a worked example.
+
 - **PhantomUDP is now reachable through the FFI surface.** New UniFFI exports make the
   production, migration-capable transport usable from every binding (Python / Swift /
   Kotlin / C), where previously only the TCP transport was reachable:
