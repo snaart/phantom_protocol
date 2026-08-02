@@ -5,10 +5,18 @@
 > materially rewritten — the loss-recovery rework (route `send()` through a
 > per-stream reliable buffer + BBR-paced drain) and the observability wiring (a
 > `session_opened` / `session_closed` gauge + `ObservedTransport`). The `run_data_pump` main-loop
-> section below is rewritten for the current 4-arm `select!`; the headline
+> section below is rewritten for the current 5-arm `select!`; the headline
 > concern raised for the re-run — a `pace_send` sleep stranding already-dequeued
 > data on cancel — was **resolved by the same loss-recovery rework that
 > introduced pacing** (see that section). Verdict stands: ✅ cancel-safe, no code change.
+>
+> **Amended when pacing was connected to the wire.** `pace_send` is gone. The
+> pacing wait is now a `sleep_until` *branch* of the main `select!` rather than
+> an await inside an arm body, which is stricter than what this document asked
+> for: the pump can no longer be parked by the rate limiter at all. The arm
+> count went 4 → 5 and the `Paced` outcome is inventoried below. Still no
+> cancel-safety code change — the change was made for scheduling reasons and
+> happens to close the concern outright.
 
 A `select!` arm that fires before its sibling completes effectively
 **cancels** the unfinished future. If that future was carrying
@@ -31,12 +39,14 @@ invocations: the 11 production sites inventoried below, plus two inside
 
 ## Inventory
 
-### `api/session.rs::run_data_pump` main loop (current, 4-arm)
+### `api/session.rs::run_data_pump` main loop (current, 5-arm)
 
 ```rust
 tokio::select! {
     _ = poll_interval.tick()       => { drain_streams_priority_ordered(..).await }
     _ = send_notify.notified()     => { drain_streams_priority_ordered(..).await }  // fast-wake
+    _ = sleep_until(paced_wake),
+        if paced_until.is_some()   => { drain_streams_priority_ordered(..).await }  // pacing wake
     cmd_opt = cmd_rx.recv()        => { match cmd { Send | SendStream{Reliable,Unreliable}
                                                    | SetStreamPriority | CloseStream
                                                    | Migrate | MigrateServer | Close } }
@@ -44,7 +54,13 @@ tokio::select! {
 }
 ```
 
-**Primitive cancel-safety (the four arms):**
+**Primitive cancel-safety (the five arms):**
+- `tokio::time::sleep_until()`: **cancel-safe** — it is a deadline, not an interval, so
+  dropping and recreating the future does not lose or extend the wait. Recreated each
+  iteration from `paced_until`, which is plain state the drain wrote; a lost poll costs
+  at most one extra pass through the loop, and the 10 ms `poll_interval.tick()` drains
+  regardless. Disabled entirely (`if paced_until.is_some()`) unless the last drain
+  stopped for want of pacing credit, so an unpaced session never registers this timer.
 - `tokio::time::Interval::tick()`: **cancel-safe** — dropping the future does not
   advance the timer.
 - `tokio::sync::Notify::notified()`: created fresh each iteration (not pinned).
@@ -81,19 +97,33 @@ pump task can be cancelled mid-body**, and **what is lost if it is**.
    resolves the re-run's headline concern. The concern was: `SessionCommand::Send →
    send_app_data → pace_send().await` consumes the payload from the mpsc channel and
    then sleeps, so an abort during the sleep silently drops a payload the channel had
-   already handed out. **The loss-recovery rework removed that path.** The `Send` arm now copies the
-   payload into the per-stream **reliable send buffer** (`raw_stream.send_reliable`)
-   and returns; `pace_send` no longer runs in the command arm at all. The actual paced
-   transmission happens later in `drain_streams_priority_ordered → Stream::poll_send →
-   send_app_data → pace_send`, and `poll_send` **retains** the segment (it iterates
-   `send_buffer` with `iter_mut`, sets `sent_at`, and returns a *clone* — it removes
-   nothing; only `Stream::on_sack()` retires a segment — the SACK-driven retire the pump
-   drives at `api/session.rs:2746`; `Stream::ack()` survives but is test-only). So a
-   cancel during `pace_send` leaves the reliable segment in the buffer; it is re-offered
-   on the next drain (after RTO).
-   The payload is decoupled from the channel before any sleep — pacing happens on
-   buffered, retained data, exactly the "restructure so pacing happens before the value
-   leaves the channel" the re-run asked for.
+   already handed out. **The loss-recovery rework removed that path**, and the pacing wiring removed the
+   sleep. The `Send` arm copies the payload into the per-stream **reliable send buffer**
+   (`raw_stream.send_reliable`) and returns; transmission happens later in
+   `drain_streams_priority_ordered → Stream::poll_send → send_app_data`, and `poll_send`
+   **retains** the segment (it iterates `send_buffer` with `iter_mut`, sets `sent_at`,
+   and returns a *clone* — it removes nothing; only `Stream::on_sack()` retires a
+   segment — the SACK-driven retire the pump drives; `Stream::ack()` survives but is
+   test-only). So a cancel anywhere in that chain leaves the reliable segment in the
+   buffer; it is re-offered on the next drain (after RTO).
+
+   `pace_send` itself no longer exists. Pacing is not a wait taken on the send path at
+   all: `drain_streams_priority_ordered` asks the pacer whether it may send, and when
+   the answer is no it **returns** `DrainStop::Paced(delay)`. The pump turns that into a
+   deadline for its own `sleep_until` *branch* (below), so the wait is a cancel-safe
+   timer in the `select!` rather than an await inside an arm body. That is a scheduling
+   fix as much as a cancel-safety one — a sleep inside the drain parks the whole pump,
+   which is how a saturating upload used to starve the download's flow-control credit —
+   but it also removes the last place a payload could be sitting mid-await for a pacing
+   reason. The one surviving inline pacing wait is in `drain_streams_fully`, which runs
+   during teardown after the loop has already broken; there is no other arm left to
+   starve, and the wait is capped at 2 ms per pass.
+
+   The remaining inline wait on the send path is `apply_send_jitter`, the opt-in
+   anti-fingerprint timing perturbation (default off, so zero-cost unless a session asks
+   for it). It sits in the same place `pace_send` did and inherits the same argument:
+   the reliable segment it delays is retained in the send buffer, so a teardown cancel
+   re-offers it rather than losing it.
    - *Unreliable* data (`poll_send`'s `unreliable_buffer.pop_front()`) **is** removed
      before `send_app_data`, so a teardown cancel drops it — which is the fire-and-
      forget contract, and only at teardown.

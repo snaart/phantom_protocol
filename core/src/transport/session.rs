@@ -345,13 +345,12 @@ pub struct Session {
     /// in the `Validated` state so legacy single-leg sessions keep
     /// working without any explicit setup.
     path_registry: Arc<PathRegistry>,
-    /// Outbound rate-limiter (Phase 2.6). Defaults to
-    /// [`Pacer::unlimited`] so the historical no-pacing behavior is
-    /// unchanged unless the caller explicitly sets a rate via
-    /// [`Session::pacer`]. The data pump consults this before every
-    /// outbound packet — the existing implementation just calls
-    /// `try_consume` and falls through if the pacer is disabled, so the
-    /// integration is zero-overhead in the default configuration.
+    /// Outbound rate-limiter. Starts as [`Pacer::unlimited`] — disabled, because
+    /// no acknowledgement has been processed and so no rate has been measured —
+    /// and [`Session::on_packet_acked`] switches it on with a real rate the
+    /// moment one has. The data pump's drain asks it before every segment and
+    /// stops the pass when it says wait, so this is what turns the congestion
+    /// window from a burst size into a rate.
     pacer: Arc<Pacer>,
     /// BBR-style bandwidth + RTT estimator (Phase 2.6 / Phase 4.4
     /// foundation). The data pump feeds it via [`Session::on_packet_sent`]
@@ -1142,15 +1141,53 @@ impl Session {
     /// returned `u64` is the updated bottleneck bandwidth estimate; we
     /// reflect it into the pacer so the outbound rate tracks the
     /// peer's actual receive throughput.
+    ///
+    /// This is also where pacing is switched on, and the condition is the
+    /// bootstrap answer: not before the estimator has measured a bottleneck
+    /// bandwidth. Until it has, every rate derived from it is invented, and a
+    /// sender metered against an invented rate is at best throttled and at
+    /// worst stopped. Until then the congestion window alone governs, exactly
+    /// as it always did — an initial window is a small enough burst that
+    /// pacing it buys nothing anyway.
     pub fn on_packet_acked(&self, sample: DeliverySample) -> u64 {
-        let bw = self.bandwidth_estimator.lock().on_ack(sample);
+        let mut est = self.bandwidth_estimator.lock();
+        let bw = est.on_ack(sample);
         // Mirror the estimator's pacing decision onto the pacer so the
         // two stay in lock-step.
-        let rate = self.bandwidth_estimator.lock().pacing_rate();
-        if rate > 0 {
-            self.pacer.set_rate(rate);
+        let rate = est.pacing_rate();
+        let measured = est.bottleneck_bandwidth() > 0;
+        drop(est);
+        self.pacer.set_rate(rate);
+        // Guarded, not unconditional: enabling restarts the bucket's refill
+        // clock, so calling it on every acknowledgement would discard the
+        // credit accruing between them and meter the sender at a fraction of
+        // the rate it was just told to use.
+        if measured && !self.pacer.is_enabled() {
+            self.pacer.set_enabled(true);
         }
         bw
+    }
+
+    /// Whether the pacer will admit another segment onto the wire right now.
+    ///
+    /// The send loop asks this *before* it pulls a segment out of a stream,
+    /// because that is the only order available: the stream chooses the
+    /// segment, so its size is not known until after the decision. The true
+    /// size is settled by [`Self::pacing_consume`], and the bucket carries any
+    /// overshoot as debt.
+    pub fn pacing_allows_send(&self) -> bool {
+        self.pacer.can_send()
+    }
+
+    /// Book `bytes` actually put on the wire against the pacer.
+    pub fn pacing_consume(&self, bytes: u64) {
+        self.pacer.consume(bytes);
+    }
+
+    /// How long until the pacer admits another segment. Zero when it already
+    /// does, or when pacing is off.
+    pub fn pacing_delay(&self) -> std::time::Duration {
+        self.pacer.time_until_credit()
     }
 
     /// Record that a packet of `bytes` length was lost (no ACK before
@@ -1177,6 +1214,10 @@ impl Session {
         let rate = est.pacing_rate();
         drop(est);
         // Drop the dead path's stale pacing rate; BBR re-paces on the first ACK.
+        // Pacing goes back off with it: the fresh estimator has measured nothing,
+        // and metering the new path against the old one's rate is precisely the
+        // carry-over this reset exists to prevent.
+        self.pacer.set_enabled(false);
         self.pacer.set_rate(rate);
     }
 

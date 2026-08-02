@@ -1422,18 +1422,90 @@ enum Deferred {
 /// before handing control back to the pump's `select!`.
 ///
 /// Without a bound, one stream with a full congestion window monopolises the
-/// pump for as long as the pacer takes to emit that window — on a long path,
-/// most of a round trip — during which no inbound flow-control credit is flushed
-/// and no command is serviced. The drain re-arms the outbound notify when it
-/// stops on this budget, so the only cost of the bound is one extra trip through
-/// `select!` per 32 packets; the gain is that every other arm gets a turn at that
-/// same cadence.
+/// pump for as long as it takes to encrypt and write that whole window, during
+/// which no inbound flow-control credit is flushed and no command is serviced.
+/// The drain re-arms the outbound notify when it stops on this budget, so the
+/// only cost of the bound is one extra trip through `select!` per 32 packets;
+/// the gain is that every other arm gets a turn at that same cadence.
 const DRAIN_MAX_SEGMENTS_PER_PASS: usize = 32;
 
 /// Safety valve on the flush-everything loops used at graceful close: bounds the
 /// number of `DRAIN_MAX_SEGMENTS_PER_PASS`-sized passes so a stream that keeps
 /// re-offering work can never wedge the teardown.
 const DRAIN_MAX_PASSES_ON_CLOSE: usize = 256;
+
+/// Floor on how long the pump waits after the pacer refuses a segment.
+///
+/// The wait is a timer, and a timer's resolution is about a millisecond, so
+/// asking for less than this buys nothing and a zero-length one would spin the
+/// pump against a bucket that still has no credit.
+const PACING_WAKE_MIN: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Ceiling on the same wait. The 10 ms heartbeat drains unconditionally, so a
+/// pacing deadline further out than that is already covered; capping here keeps
+/// a low rate estimate from being able to defer queued data by more than the
+/// pump's own worst-case latency.
+const PACING_WAKE_MAX: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Ceiling on a single pacing wait during the close-time flush. The flush obeys
+/// the rate — dumping a connection's tail at line rate is the same burst pacing
+/// exists to prevent — but a teardown must not be held hostage by a low
+/// estimate, and [`DRAIN_MAX_PASSES_ON_CLOSE`] bounds how many of these it can
+/// take.
+const CLOSE_FLUSH_PACING_WAIT_MAX: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Why a [`drain_streams_priority_ordered`] pass stopped.
+///
+/// The distinction matters because the two bounded cases want opposite things
+/// from the pump: a pass that spent its segment budget has work ready *now* and
+/// wants to be re-entered as soon as the other `select!` arms have had a turn,
+/// while a pass the pacer stopped must not be re-entered until credit exists,
+/// or the pump spins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainStop {
+    /// Every stream ran dry, or the congestion and flow-control windows are
+    /// full. Nothing to schedule — the next acknowledgement or application
+    /// write will wake the pump.
+    Drained,
+    /// Stopped on [`DRAIN_MAX_SEGMENTS_PER_PASS`] with data still offered.
+    SegmentBudget,
+    /// Stopped because the pacer has no credit. The delay is how long until it
+    /// does.
+    ///
+    /// Reported without first establishing that a stream had anything to
+    /// offer, because establishing that means polling a segment out and the
+    /// pacer's answer is a precondition of doing so. The cost is one wake-up
+    /// per pass that ends with an empty bucket and an empty stream, bounded by
+    /// [`PACING_WAKE_MAX`] — no more often than the pump's own heartbeat, and
+    /// it clears as soon as the bucket has credit again.
+    Paced(std::time::Duration),
+}
+
+/// Translate a drain pass's stopping reason into the pump's next move, and
+/// return the pacing deadline the pump's pacing branch should wait on (`None`
+/// when the pass did not stop on pacing).
+///
+/// The deadline is returned rather than awaited on purpose. The drain runs
+/// inside a `select!` arm body, and an arm body runs to completion — so a sleep
+/// taken here parks the entire pump: no flow-control credit for the reverse
+/// direction, no commands accepted, no liveness sweep. That is the shape that
+/// starved the download in the first place, and re-introducing it to implement
+/// pacing would trade one direction's collapse for the other's.
+fn apply_drain_outcome(
+    crypto_session: &Arc<Session>,
+    stop: DrainStop,
+) -> Option<tokio::time::Instant> {
+    match stop {
+        DrainStop::Drained => None,
+        DrainStop::SegmentBudget => {
+            crypto_session.notify_outbound_ready();
+            None
+        }
+        DrainStop::Paced(delay) => {
+            Some(tokio::time::Instant::now() + delay.clamp(PACING_WAKE_MIN, PACING_WAKE_MAX))
+        }
+    }
+}
 
 /// Shared client/server data pump.
 ///
@@ -1802,6 +1874,17 @@ async fn run_data_pump<T: SessionTransport>(
     // fills genuine gaps (idle-fill + a floor rate). Seeded at "now"/current PN.
     let mut last_outbound_pn = crypto_session.peek_send_pn();
     let mut last_outbound_at = std::time::Instant::now();
+    // Pacing bookkeeping: when the last drain stopped for want of pacing credit,
+    // the instant the pacer said credit would be back. `None` means the last
+    // drain did not stop on pacing, and the branch below stays disabled.
+    //
+    // The wait lives here, as a `select!` *branch*, and not inside the drain. An
+    // arm body runs to completion, so a sleep taken inside `drain_streams_*`
+    // parks the whole pump — no flow-control credit for the reverse direction,
+    // no commands accepted, no liveness sweep — which is the exact shape that
+    // collapsed the download under a saturating upload. Pacing must slow the
+    // sender, not stop the session.
+    let mut paced_until: Option<tokio::time::Instant> = None;
     // Outbound WINDOW_UPDATE control packets are emitted on the send loop — the
     // sole outbound writer — so the encrypted control frame is always sealed under
     // the epoch live when it stamps. The epoch has two writers (this loop's own
@@ -1814,6 +1897,11 @@ async fn run_data_pump<T: SessionTransport>(
     // can never collide with application data on the AEAD nonce).
 
     loop {
+        // tokio evaluates a disabled branch's expression and simply never polls
+        // the future, so this needs a real instant even when there is no pacing
+        // deadline. An hour out is "never" at this loop's timescale.
+        let paced_wake = paced_until
+            .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
         tokio::select! {
             _ = poll_interval.tick() => {
                 flush_deferred_sends(
@@ -1825,19 +1913,20 @@ async fn run_data_pump<T: SessionTransport>(
                     &transport, &crypto_session, session_id, &streams, &observability,
                 )
                 .await;
-                if drain_streams_priority_ordered(
-                    &transport,
+                // Stopped on the per-pass segment budget with work left? Come
+                // straight back after the other arms get a turn. Stopped for
+                // want of pacing credit? Come back when there is some.
+                paced_until = apply_drain_outcome(
                     &crypto_session,
-                    session_id,
-                    &streams,
-                    &observability,
-                )
-                .await
-                {
-                    // Stopped on the per-pass segment budget with work left —
-                    // come straight back after the other arms get a turn.
-                    crypto_session.notify_outbound_ready();
-                }
+                    drain_streams_priority_ordered(
+                        &transport,
+                        &crypto_session,
+                        session_id,
+                        &streams,
+                        &observability,
+                    )
+                    .await,
+                );
                 // Idle keep-alive (download-only liveness): on an
                 // otherwise-idle Connected path, emit one small ENCRYPTED PING so a
                 // download-only path (which sends only ACKs) has an outstanding probe
@@ -1891,17 +1980,36 @@ async fn run_data_pump<T: SessionTransport>(
                     &transport, &crypto_session, session_id, &streams, &observability,
                 )
                 .await;
-                if drain_streams_priority_ordered(
-                    &transport,
+                paced_until = apply_drain_outcome(
                     &crypto_session,
-                    session_id,
-                    &streams,
-                    &observability,
-                )
-                .await
-                {
-                    crypto_session.notify_outbound_ready();
-                }
+                    drain_streams_priority_ordered(
+                        &transport,
+                        &crypto_session,
+                        session_id,
+                        &streams,
+                        &observability,
+                    )
+                    .await,
+                );
+            }
+            // Pacing wake-up. Armed only while the previous drain stopped for
+            // want of credit, so an unpaced session never registers this timer
+            // at all. It exists because the 10 ms heartbeat above is too coarse
+            // to be a pacing clock: at a 16 KiB burst allowance, waking only
+            // every 10 ms caps the sender at 1.6 MB/s no matter what rate
+            // congestion control asked for.
+            _ = tokio::time::sleep_until(paced_wake), if paced_until.is_some() => {
+                paced_until = apply_drain_outcome(
+                    &crypto_session,
+                    drain_streams_priority_ordered(
+                        &transport,
+                        &crypto_session,
+                        session_id,
+                        &streams,
+                        &observability,
+                    )
+                    .await,
+                );
             }
             // Disabled while `deferred` holds work: the queue must clear in FIFO
             // order before another command is taken, which is what preserves
@@ -2460,21 +2568,40 @@ async fn flush_deferred_sends<T: SessionTransport>(
 /// weighted-fair scheduler can replace this without changing the
 /// caller surface. Phase 4.3.
 ///
-/// One pass emits at most [`DRAIN_MAX_SEGMENTS_PER_PASS`] segments. Returns
-/// `true` when it stopped on that budget rather than because every stream ran
-/// dry, which is the caller's signal to re-arm the outbound notify so the pump
-/// comes straight back here after giving the other `select!` arms — the
-/// flow-control flush, the receive-driven wake-ups, and the command channel — a
-/// turn. Unbounded, a single stream with a full congestion window held the pump
-/// for as long as the pacer needed to emit that window, which on a long path is
-/// most of a round trip with no inbound credit flushed.
+/// One pass emits at most [`DRAIN_MAX_SEGMENTS_PER_PASS`] segments, and stops
+/// earlier if the pacer runs out of credit. The [`DrainStop`] it returns tells
+/// the caller which of the three happened; [`apply_drain_outcome`] turns that
+/// into the pump's next move.
+///
+/// **Two budgets, and they answer different questions.** The congestion window
+/// bounds the *volume* outstanding — `min(cwnd, window) − inflight`, recomputed
+/// every iteration. The pacer bounds the *rate* it leaves at. A window released
+/// without the second bound is a burst: every byte the window allows goes out
+/// back to back and the sender then waits a round trip, which is not what BBR's
+/// gains describe and not what any queue on the path is sized for. Consulting
+/// only cwnd is how a window that grew from 5.6 KB to nearly a megabyte turned
+/// into a nearly-a-megabyte burst.
+///
+/// The pacer is asked *before* the segment is polled, because the stream picks
+/// the segment and its size is not known until it has. The bucket is settled
+/// with the true on-wire size inside `send_app_data`, carrying at most one
+/// segment of overshoot as debt.
+///
+/// **Only this path is paced.** Acknowledgements, `WINDOW_UPDATE` credit,
+/// keep-alives, path validation and cover frames are emitted elsewhere and are
+/// never gated on pacing credit. That asymmetry is deliberate and is what makes
+/// the reverse direction work: the flow-control credit the *other* direction
+/// depends on must not queue behind this direction's rate limiter, or pacing
+/// would re-create, one layer up, the standing queue it exists to remove. They
+/// are also small and infrequent enough that leaving them out of the rate
+/// accounting costs a fraction of a percent of it.
 async fn drain_streams_priority_ordered<T: SessionTransport>(
     transport: &Arc<T>,
     crypto_session: &Arc<Session>,
     session_id: SessionId,
     streams: &Arc<DashMap<u32, Arc<Stream>>>,
     observability: &Observability,
-) -> bool {
+) -> DrainStop {
     // Snapshot the stream set so we can sort without holding DashMap
     // shard locks across awaits. Each entry is (priority, stream_id,
     // stream-Arc) — Arc clones are cheap (refcount bump).
@@ -2493,7 +2620,13 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
                 // Budget spent. Congestion and flow control are unchanged — this
                 // only splits the same window across several passes — so the
                 // caller re-arms and we resume from the same priority order.
-                return true;
+                return DrainStop::SegmentBudget;
+            }
+            // Rate budget. Asked before the segment is polled out of the stream
+            // (see the function comment) and answered by *returning*: the wait
+            // belongs to the pump's `select!`, not to this loop.
+            if !crypto_session.pacing_allows_send() {
+                return DrainStop::Paced(crypto_session.pacing_delay());
             }
             // Bytes of new data the congestion window currently permits.
             // Recomputed each iteration: every send grows inflight, so the
@@ -2557,7 +2690,7 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
             sent += 1;
         }
     }
-    false
+    DrainStop::Drained
 }
 
 /// Run [`drain_streams_priority_ordered`] until every stream is drained or the
@@ -2574,7 +2707,7 @@ async fn drain_streams_fully<T: SessionTransport>(
     observability: &Observability,
 ) {
     for _ in 0..DRAIN_MAX_PASSES_ON_CLOSE {
-        if !drain_streams_priority_ordered(
+        match drain_streams_priority_ordered(
             transport,
             crypto_session,
             session_id,
@@ -2583,7 +2716,17 @@ async fn drain_streams_fully<T: SessionTransport>(
         )
         .await
         {
-            return;
+            DrainStop::Drained => return,
+            DrainStop::SegmentBudget => {}
+            // The tail of a connection is still data on a path, so the flush
+            // obeys the rate; the cap keeps a low estimate from turning a close
+            // into a hang. This is the one place a pacing wait is taken inline,
+            // and it is safe here for the reason it is not safe in the pump:
+            // the loop below is the teardown, not a `select!` arm — there is no
+            // other arm left to starve.
+            DrainStop::Paced(delay) => {
+                tokio::time::sleep(delay.min(CLOSE_FLUSH_PACING_WAIT_MAX)).await;
+            }
         }
     }
     log::warn!(
@@ -2670,41 +2813,24 @@ fn feed_bbr_on_ack(
     let _ = crypto_session.on_packet_acked(sample);
 }
 
-/// Wait until the pacer has tokens for `bytes` bytes. No-op when the
-/// pacer is unlimited (the default until BBR sets a finite rate).
-async fn pace_send(crypto_session: &Arc<Session>, bytes: u64) {
-    // Anti-fingerprint send-timing jitter (WIRE v6): when enabled,
-    // wait a uniform random [0, max] ms before this send so the inter-packet timing
-    // no longer tracks the application's writes. Applied independently of the pacer
-    // (a wire-rate limiter) and before it, so the total delay is jitter + pacing.
-    // Opt-in (default 0 → no-op, no latency cost).
+/// Anti-fingerprint send-timing jitter (WIRE v6): when enabled,
+/// wait a uniform random [0, max] ms before this send so the inter-packet timing
+/// no longer tracks the application's writes. Opt-in (default 0 → no-op, no
+/// latency cost).
+///
+/// Distinct from pacing, and deliberately still an inline wait. Jitter is a
+/// per-packet timing perturbation whose whole purpose is to sit between the
+/// decision to send and the send; a session that has switched it on has already
+/// accepted the latency. Pacing is a rate, it is answered by the pump's own
+/// scheduler ([`DrainStop::Paced`]), and it must never be waited on from here.
+async fn apply_send_jitter(crypto_session: &Arc<Session>) {
     let jitter_max = crypto_session.send_jitter();
-    if !jitter_max.is_zero() {
-        let delay = shaping::random_jitter(jitter_max.as_millis() as u32);
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-    }
-    let pacer = crypto_session.pacer();
-    if !pacer.is_enabled() {
+    if jitter_max.is_zero() {
         return;
     }
-    loop {
-        if pacer.try_consume(bytes) {
-            return;
-        }
-        let wait = pacer.time_until_available(bytes);
-        if wait.is_zero() {
-            // Tokens should be available; retry the consume to handle
-            // a concurrent race with another sender.
-            continue;
-        }
-        // Cap the wait to keep the loop responsive — a stale wait
-        // estimate from a long-idle pacer is corrected on the next
-        // iteration.
-        let cap = std::time::Duration::from_millis(50);
-        let wait = wait.min(cap);
-        tokio::time::sleep(wait).await;
+    let delay = shaping::random_jitter(jitter_max.as_millis() as u32);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -2835,12 +2961,17 @@ async fn send_app_data<T: SessionTransport>(
         }
     };
     let size = buf.len();
-    // Pacing is a wire-rate limiter, so it consumes the full on-wire size.
-    pace_send(crypto_session, size as u64).await;
+    apply_send_jitter(crypto_session).await;
     if let Err(e) = transport.send_bytes(&buf[..size]).await {
         log::error!("PhantomSession: transport send failed: {}", e);
         return false;
     }
+    // Pacing is a wire-rate limiter, so it settles the full on-wire size —
+    // header, ciphertext and tag, not just the payload. The drain authorised
+    // this segment against the bucket before it knew how large it would be, so
+    // this is where the true cost is booked; the difference is at most one
+    // segment and the bucket carries it as debt rather than forgiving it.
+    crypto_session.pacing_consume(size as u64);
     // Inflight/cwnd accounting MUST use the same unit the ACK and loss paths
     // settle in. `Stream::ack` returns and `on_packet_lost` subtracts the
     // segment's *payload* length (`seg.data.len()`), so the send side has to add
@@ -5860,6 +5991,172 @@ mod tests {
         );
     }
 
+    /// Feed the estimator a round trip's worth of delivery samples so it holds a
+    /// real bottleneck bandwidth and a real minimum RTT: `packets × bytes`
+    /// delivered over `rtt`. Returns with inflight back at zero.
+    fn seed_bandwidth_estimate(
+        session: &Arc<InnerSession>,
+        packets: u64,
+        bytes: u64,
+        rtt: std::time::Duration,
+    ) {
+        use crate::transport::bandwidth_estimator::DeliverySample;
+        let start = std::time::Instant::now();
+        for _ in 0..packets {
+            session.on_packet_sent(bytes);
+        }
+        for _ in 0..packets {
+            session.on_packet_acked(DeliverySample {
+                delivered_bytes: 0,
+                delivered_at: start,
+                sent_at: start,
+                acked_at: start + rtt,
+                packet_bytes: bytes,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: true,
+            });
+        }
+    }
+
+    /// **Pacing has to gate the wire, not just the window.** The congestion
+    /// window is a volume, and releasing a volume all at once is a burst: the
+    /// whole window leaves back to back and the sender then waits a round trip.
+    /// BBR's design assumes that window is spread across the round trip at the
+    /// pacing rate — without that, `cwnd` is a burst size and the estimator's
+    /// pacing rate is a number nothing reads.
+    ///
+    /// The window here is opened to 240 KB, far past what one drain pass could
+    /// want, so the only thing that can stop the pass short is the pacer.
+    #[tokio::test]
+    async fn the_drain_stops_on_the_pacer_instead_of_emptying_the_window() {
+        const SEGMENT: usize = 1_200;
+
+        let sid = fixed_session_id();
+        let (client, _server) = paired_sessions(sid);
+
+        // 100 × 1200 B delivered over a 200 ms round trip: 600 KB/s with a
+        // 120 KB bandwidth-delay product, so the window opens to 240 KB.
+        seed_bandwidth_estimate(&client, 100, 1_200, std::time::Duration::from_millis(200));
+        let snap = client.bandwidth_snapshot();
+        assert!(
+            snap.cwnd_bytes > 200_000,
+            "precondition: the window must be wide enough that only pacing can stop the \
+             drain short (cwnd {} B)",
+            snap.cwnd_bytes
+        );
+        assert_eq!(
+            snap.inflight_bytes, 0,
+            "precondition: every seeded packet was acknowledged"
+        );
+
+        // Offer twice the drain's own per-pass segment budget, so a pass that
+        // stops short stopped for a reason of its own.
+        let stream = Arc::new(TransportStream::new(1));
+        for _ in 0..64 {
+            stream
+                .send_reliable(Bytes::from(vec![0xA5u8; SEGMENT]))
+                .await
+                .unwrap();
+        }
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(1u32, stream);
+
+        let (client_t, _server_t) = ChannelTransport::pair();
+        let transport = Arc::new(client_t);
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        let began = std::time::Instant::now();
+        let stop = drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
+        let took = began.elapsed();
+
+        // Inflight counts payload bytes, so it is the segment count.
+        let emitted = client.bandwidth_snapshot().inflight_bytes / SEGMENT as u64;
+        assert!(
+            emitted > 0,
+            "the pass emitted nothing at all — pacing must meter the window out, not \
+             withhold it"
+        );
+        assert!(
+            emitted <= 20,
+            "the pass put {emitted} segments on the wire in one go with a {} B/s pacing \
+             rate — the window is being released as a burst",
+            snap.pacing_rate_bps,
+        );
+        assert!(
+            matches!(stop, DrainStop::Paced(_)),
+            "the pass stopped for a reason other than pacing ({stop:?}) — with a 240 KB \
+             window and 64 segments offered, nothing else should have been able to"
+        );
+        // And it must stop by *returning*, not by sleeping inside the pass: the
+        // drain runs in a `select!` arm body, so a wait taken here parks the
+        // whole pump — no flow-control credit, no commands, no heartbeat.
+        assert!(
+            took < std::time::Duration::from_millis(50),
+            "the drain pass took {} ms — it waited for pacing credit inside the pass \
+             instead of handing control back to the pump",
+            took.as_millis(),
+        );
+    }
+
+    /// **The bootstrap, at the drain.** A connection that has never had an
+    /// acknowledgement has no bandwidth estimate, and a pacer metering against
+    /// a rate derived from `btl_bw == 0` would admit two bytes a second — which
+    /// on the first segment is indistinguishable from a deadlock, because the
+    /// first segment is what produces the acknowledgement that would fix it.
+    ///
+    /// So a session with nothing measured must put its offered data on the
+    /// wire, promptly, under the congestion window alone.
+    #[tokio::test]
+    async fn a_session_with_no_bandwidth_estimate_still_sends() {
+        let sid = fixed_session_id();
+        let (client, _server) = paired_sessions(sid);
+
+        let snap = client.bandwidth_snapshot();
+        assert_eq!(
+            snap.bottleneck_bw_bps, 0,
+            "precondition: a fresh session has measured no bandwidth"
+        );
+        assert!(
+            !client.pacer().is_enabled(),
+            "pacing must stay off until something has been measured"
+        );
+
+        let stream = Arc::new(TransportStream::new(1));
+        for _ in 0..4 {
+            stream
+                .send_reliable(Bytes::from_static(b"first-flight"))
+                .await
+                .unwrap();
+        }
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(1u32, stream);
+
+        let (client_t, _server_t) = ChannelTransport::pair();
+        let transport = Arc::new(client_t);
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        let began = std::time::Instant::now();
+        let stop = drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
+        let took = began.elapsed();
+
+        assert!(
+            client.bandwidth_snapshot().inflight_bytes > 0,
+            "the first flight never left: a session with no bandwidth estimate paced \
+             itself to a stop"
+        );
+        assert_eq!(
+            stop,
+            DrainStop::Drained,
+            "the pass stopped on {stop:?} with no estimate to pace against"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(50),
+            "the first flight took {} ms to leave",
+            took.as_millis()
+        );
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // V2 wire-routing tests (Phase 4.2 / 2.5 follow-up — data-pump V2)
     // ────────────────────────────────────────────────────────────────────
@@ -8115,6 +8412,50 @@ mod tests {
         // The pacer's stored rate must match the estimator's view
         // (Session.on_packet_acked mirrors them).
         assert_eq!(client_session.pacer().rate(), snap.pacing_rate_bps);
+        // ...and the rate must now be governing something. A rate written into
+        // a disabled pacer is the defect this test was named for and did not
+        // catch: BBR computed a pacing rate for every session ever opened and
+        // nothing on the send path ever asked for it.
+        assert!(
+            client_session.pacer().is_enabled(),
+            "the estimator measured {} B/s and pacing is still switched off",
+            snap.bottleneck_bw_bps
+        );
+    }
+
+    /// A migration lands on a different network, so the old path's rate must not
+    /// meter the new one. `reset_congestion` drops the estimate; pacing has to
+    /// go with it, back to the same "nothing measured yet" state a fresh session
+    /// starts in — otherwise the first flight on the new path is metered against
+    /// a rate belonging to a path that is gone.
+    #[tokio::test]
+    async fn a_congestion_reset_puts_pacing_back_to_unmeasured() {
+        let session_id = fixed_session_id();
+        let (client_session, _server_session) = paired_sessions(session_id);
+
+        seed_bandwidth_estimate(
+            &client_session,
+            100,
+            1_200,
+            std::time::Duration::from_millis(200),
+        );
+        assert!(
+            client_session.pacer().is_enabled(),
+            "precondition: a measured path paces"
+        );
+
+        client_session.reset_congestion();
+
+        assert_eq!(
+            client_session.bandwidth_snapshot().bottleneck_bw_bps,
+            0,
+            "the reset must drop the old path's estimate"
+        );
+        assert!(
+            !client_session.pacer().is_enabled(),
+            "pacing survived a congestion reset — the new path would be metered at the \
+             dead path's rate"
+        );
     }
 
     /// Phase 4.3 — WINDOW_UPDATE round-trip under the relative-credit model.
