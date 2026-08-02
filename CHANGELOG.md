@@ -10,6 +10,43 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **A peer could set the local congestion window by reporting a false acknowledgement
+  delay.** `Sack::ack_delay_us` is the receiver's own claim about how long it held an
+  acknowledgement before sending it, and the sender subtracted it from the round trip it
+  had measured before feeding the result to its minimum-RTT filter. Nothing bounded the
+  claim. Because the consumer is a *minimum* filter — one that back-pops every entry at
+  or above a new value — a single report did not merely sit at the head of the window,
+  it discarded the accumulated honest history and restarted the expiry clock. A peer
+  reporting 199.9 ms of delay on a 200 ms path drove the sample to 100 µs, and since
+  `cwnd = 2 × btl_bw × min_rtt` the window then sat on its 5600-byte floor for as long
+  as the peer kept reporting. The same collapse signature was measured in the field: a
+  WAN transfer that peaked near a 128 KB window fell to exactly 5600 bytes and sustained
+  4.7-7.6% of a link whose raw-socket control measured 6.63 Mbit/s at 0.0% loss.
+  The `Sack` rides inside the AEAD plaintext, so this was never reachable by an on-path
+  attacker — it required the authenticated peer. That is a smaller mitigation than it
+  sounds: **a malicious or merely defective server could pin every client's congestion
+  window to its floor for the life of the connection, and a client could do the same to
+  a server.** A peer does not get to choose the other side's congestion window.
+  The order is now the one RFC 9002 specifies. §5.2: an endpoint "uses only locally
+  observed times in computing the min_rtt and does not adjust for acknowledgment delays
+  reported by the peer", and "min_rtt MUST be set to the latest_rtt on the first RTT
+  sample" — so the first round trip seeds the filter raw, rather than being measured
+  against the 100 ms opening guess the estimator starts with. §5.3: "MUST NOT subtract
+  the acknowledgment delay from the RTT sample if the resulting value is smaller than
+  the min_rtt", i.e. subtract only when `latest_rtt >= min_rtt + ack_delay`. Every value
+  entering the filter is therefore either a raw locally observed round trip or a value at
+  or above the filter's current minimum, so a reported delay can no longer lower
+  `min_rtt` below what the local clock saw; the worst a hostile report now achieves is
+  declining to lower it further, which is what reporting nothing would achieve. The
+  legitimate correction is retained — receivers really do batch acknowledgements, and a
+  reported hold that fits inside the round trip is still subtracted. The reported value
+  is additionally clamped to the observed round trip, since a peer cannot have held an
+  acknowledgement longer than the whole trip took; that also stops a nonsense report from
+  suppressing an honest measurement, which the previous saturating subtraction did by
+  collapsing the sample to zero.
+  **Sender-local accounting only: no wire-format, handshake or key-schedule change, the
+  `Sack` encoding is untouched, and old and new peers interoperate unchanged.**
+
 - **An acknowledgement for a retransmitted segment poisoned the minimum-RTT filter,
   pinning the congestion window on its floor for the life of the connection.** A sender
   restamps a segment's send time when it resends it, so an acknowledgement for the
