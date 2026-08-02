@@ -538,6 +538,9 @@ pub async fn upload(
     // Cross-check against what the server actually received and decrypted. A
     // gap between the two is the difference between "we handed bytes to the
     // API" and "bytes crossed the network" — the number that matters.
+    // The session's own byte counter, captured before the close, bounds how much
+    // was still unacknowledged when the burst ended.
+    let client_metrics = framed.session().metrics_snapshot();
     match sink_end_and_report(&framed, seq, win.cumulative).await {
         Ok((frames, bytes, first_ns, last_ns)) => {
             let server_span = last_ns.saturating_sub(first_ns);
@@ -554,7 +557,22 @@ pub async fn upload(
                 ));
             }
         }
-        Err(e) => out.error(leg, "upload", "sink report", &e),
+        Err((why, e)) => {
+            out.error(leg, "upload", why.context(), &e);
+            out.note(format!(
+                "upload could not be closed cleanly ({}); client enqueued {} B in {} frames, session counters report {} B / {} packets sent",
+                match why {
+                    SinkEndFailure::SendBlocked =>
+                        "the session never accepted the closing frame — its send buffer did not drain",
+                    SinkEndFailure::NoReport =>
+                        "the closing frame was handed to the session but no report came back — the tail of the transfer was not delivered",
+                },
+                win.cumulative,
+                seq,
+                client_metrics.bytes_sent,
+                client_metrics.packets_sent
+            ));
+        }
     }
 
     mark(&framed, "upload:end").await;
@@ -562,23 +580,53 @@ pub async fn upload(
     out
 }
 
+/// Why closing an upload burst failed, when it does.
+///
+/// The two cases have completely different causes and the distinction is not
+/// recoverable after the fact: either the session would not accept the closing
+/// frame (its send buffer never drained), or it accepted it and no answer ever
+/// came back (the frame was lost and nothing retransmitted it — the tail of a
+/// transfer has no following packet to trigger fast retransmit). Reporting a
+/// bare `Timeout` for both would throw that away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkEndFailure {
+    /// `send()` never accepted the closing frame.
+    SendBlocked,
+    /// The frame was handed off; no `SINK_REPORT` came back.
+    NoReport,
+}
+
+impl SinkEndFailure {
+    fn context(self) -> &'static str {
+        match self {
+            Self::SendBlocked => "sink_end send blocked",
+            Self::NoReport => "sink_end sent, no report",
+        }
+    }
+}
+
 async fn sink_end_and_report(
     framed: &Framed,
     frames: u64,
     bytes: u64,
-) -> Result<(u64, u64, u64, u64), CoreError> {
-    tokio::time::timeout(DRAIN_TIMEOUT, framed.send(&Msg::SinkEnd { frames, bytes }))
-        .await
-        .map_err(|_| CoreError::Timeout)??;
+) -> Result<(u64, u64, u64, u64), (SinkEndFailure, CoreError)> {
+    match tokio::time::timeout(DRAIN_TIMEOUT, framed.send(&Msg::SinkEnd { frames, bytes })).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err((SinkEndFailure::SendBlocked, e)),
+        Err(_) => return Err((SinkEndFailure::SendBlocked, CoreError::Timeout)),
+    }
     let deadline = Instant::now() + DRAIN_TIMEOUT;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(CoreError::Timeout);
+            return Err((SinkEndFailure::NoReport, CoreError::Timeout));
         }
-        let (msg, _) = tokio::time::timeout(remaining, framed.recv())
-            .await
-            .map_err(|_| CoreError::Timeout)??;
+        let got = tokio::time::timeout(remaining, framed.recv()).await;
+        let (msg, _) = match got {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err((SinkEndFailure::NoReport, e)),
+            Err(_) => return Err((SinkEndFailure::NoReport, CoreError::Timeout)),
+        };
         if let Msg::SinkReport {
             frames,
             bytes,
@@ -801,7 +849,7 @@ pub async fn bidir(
 
     match sink_end_and_report(&framed, up_frames, up_bytes).await {
         Ok((f, b, _, _)) => out.note(format!("server received {b} B in {f} upload frames")),
-        Err(e) => out.error(leg, "bidir", "sink report", &e),
+        Err((why, e)) => out.error(leg, "bidir", why.context(), &e),
     }
 
     mark(&framed, "bidir:end").await;
