@@ -84,6 +84,10 @@ Useful flags: `--legs udp,tcp,mimic,raw_tcp,raw_udp`, `--only rtt_sweep,upload`,
 `download`, `bidir`, `streams`, `zero_rtt`, `rekey`, `migration`,
 `concurrency`, `negative`, and the raw-leg baselines.
 
+`upload`, `download` and `bidir` additionally record the sender's congestion-control
+state throughout, and the daemon reports its own in `STATS` — during a download the
+server is the sender, so the client's window is not the one that governs it.
+
 ## Output
 
 Raw samples are the primary artifact; every percentile in `summary.json` is
@@ -93,6 +97,10 @@ Client, under `results/<run-id>/`:
 
 - `run.json` — run metadata, clock-offset estimate, and the caveat list
 - `samples/<leg>/<scenario>.jsonl` — one record per operation
+- `samples/<leg>/<scenario>.window.jsonl` — the congestion window sampled every 200 ms
+  through each bulk transfer: cwnd, bytes in flight, bandwidth estimate, BBR phase,
+  app-limited flag. This is what separates a sender-bound transfer from a slow link;
+  throughput alone cannot
 - `summary.json`, `errors.jsonl`
 
 Server, under `/var/lib/phantom-testd/`:
