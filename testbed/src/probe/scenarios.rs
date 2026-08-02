@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use phantom_protocol::api::session::PhantomSession;
 use phantom_protocol::CoreError;
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -31,6 +32,10 @@ use crate::stats::{Summary, Throughput};
 pub struct ScenarioOutput {
     pub file: String,
     pub sink: SampleSink,
+    /// Congestion-window time series, written alongside the scenario's own
+    /// samples as `<scenario>.window.jsonl`. Kept in its own file because it is
+    /// a different record shape sampled on a different clock.
+    pub window: SampleSink,
     pub summary: ScenarioSummary,
     pub errors: Vec<ErrorRecord>,
     /// Only `clock_sync` fills this.
@@ -42,6 +47,7 @@ impl ScenarioOutput {
         Self {
             file: format!("{scenario}.jsonl"),
             sink: SampleSink::new(),
+            window: SampleSink::new(),
             summary: ScenarioSummary {
                 leg,
                 scenario: scenario.to_string(),
@@ -70,6 +76,94 @@ impl ScenarioOutput {
             error: format!("{e:?}"),
             error_kind: error_kind(e),
         });
+    }
+}
+
+/// Samples the sender's congestion-control state on its own clock while a
+/// transfer runs.
+///
+/// A separate task rather than an inline sample per frame: the send loop is the
+/// thing being measured, and reading a mutex inside it would perturb exactly
+/// the timing under observation.
+struct WindowRecorder {
+    stop: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<Vec<crate::report::WindowSample>>,
+}
+
+impl WindowRecorder {
+    /// Sample every 200 ms — fine enough to see a window open over a handful of
+    /// round trips on a ~200 ms path, coarse enough to cost nothing.
+    const INTERVAL: Duration = Duration::from_millis(200);
+
+    fn start(session: Arc<PhantomSession>, leg: Leg, phase: &str) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let phase = phase.to_string();
+        let task = tokio::spawn(async move {
+            let started = Instant::now();
+            let mut out = Vec::new();
+            while !stop2.load(Ordering::Relaxed) {
+                if let Some(bw) = session.bandwidth_snapshot().await {
+                    out.push(crate::report::WindowSample {
+                        leg,
+                        phase: phase.clone(),
+                        t_unix_ns: unix_nanos(),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                        cwnd_bytes: bw.cwnd_bytes,
+                        inflight_bytes: bw.inflight_bytes,
+                        bottleneck_bw_bps: bw.bottleneck_bw_bps,
+                        pacing_rate_bps: bw.pacing_rate_bps,
+                        min_rtt_us: bw.min_rtt.as_micros() as u64,
+                        delivered_bytes: bw.delivered_bytes,
+                        state: bw.state.as_str().to_string(),
+                        app_limited: bw.app_limited,
+                    });
+                }
+                tokio::time::sleep(Self::INTERVAL).await;
+            }
+            out
+        });
+        Self { stop, task }
+    }
+
+    async fn finish(self) -> Vec<crate::report::WindowSample> {
+        self.stop.store(true, Ordering::Relaxed);
+        self.task.await.unwrap_or_default()
+    }
+}
+
+/// Summarise a window series into notes: where it started, where it got to, and
+/// which phase it ended in.
+fn note_window(out: &mut ScenarioOutput, samples: &[crate::report::WindowSample]) {
+    for w in samples {
+        out.window.push(w);
+    }
+    let Some(last) = samples.last() else {
+        out.note("no congestion-window samples (session never established)");
+        return;
+    };
+    let first = &samples[0];
+    let peak = samples.iter().map(|w| w.cwnd_bytes).max().unwrap_or(0);
+    let peak_bw = samples
+        .iter()
+        .map(|w| w.bottleneck_bw_bps)
+        .max()
+        .unwrap_or(0);
+    out.note(format!(
+        "congestion window {} B -> {} B (peak {} B); bottleneck estimate peaked at {:.2} Mbit/s; ended in {}{}",
+        first.cwnd_bytes,
+        last.cwnd_bytes,
+        peak,
+        peak_bw as f64 * 8.0 / 1e6,
+        last.state,
+        if last.app_limited { ", app-limited" } else { "" }
+    ));
+    // 5600 B is `PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE` — the floor a window
+    // sits on when the bandwidth estimate never rises.
+    if peak <= 5600 {
+        out.note(
+            "the window never left its 5600 B floor: throughput here is bounded by the sender, not the link",
+        );
     }
 }
 
@@ -494,6 +588,7 @@ pub async fn upload(
         }
     };
     mark(&framed, "upload:begin").await;
+    let recorder = WindowRecorder::start(framed.session().clone(), leg, "upload");
 
     let mut gen = PayloadGen::new(4);
     let payload = gen.fill(frame_size.saturating_sub(9));
@@ -589,6 +684,7 @@ pub async fn upload(
         }
     }
 
+    note_window(&mut out, &recorder.finish().await);
     mark(&framed, "upload:end").await;
     conn::close_session(framed.session()).await;
     out
@@ -672,6 +768,9 @@ pub async fn download(
         }
     };
     mark(&framed, "download:begin").await;
+    // The *server* is the sender here, so this series is the client's own
+    // window — near-idle by design. The server's side comes back in STATS.
+    let recorder = WindowRecorder::start(framed.session().clone(), leg, "download");
 
     if let Err(e) = conn::send_msg(
         &framed,
@@ -744,6 +843,7 @@ pub async fn download(
         ));
     }
     out.summary.throughput = Some(tp);
+    note_window(&mut out, &recorder.finish().await);
     mark(&framed, "download:end").await;
     conn::close_session(framed.session()).await;
     out
@@ -768,6 +868,7 @@ pub async fn bidir(
         }
     };
     mark(&framed, "bidir:begin").await;
+    let recorder = WindowRecorder::start(framed.session().clone(), leg, "bidir");
 
     if let Err(e) = conn::send_msg(
         &framed,
@@ -866,6 +967,7 @@ pub async fn bidir(
         Err((why, e)) => out.error(leg, "bidir", why.context(), &e),
     }
 
+    note_window(&mut out, &recorder.finish().await);
     mark(&framed, "bidir:end").await;
     conn::close_session(framed.session()).await;
     out

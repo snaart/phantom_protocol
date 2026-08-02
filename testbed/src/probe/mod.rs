@@ -225,6 +225,9 @@ impl RunState {
         if !out.sink.is_empty() {
             out.sink.write_to(&path)?;
         }
+        if !out.window.is_empty() {
+            out.window.write_to(&path.with_extension("window.jsonl"))?;
+        }
         for e in &out.errors {
             self.error_sink.push(e);
             self.total_errors += 1;

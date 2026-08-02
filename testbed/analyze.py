@@ -145,6 +145,39 @@ def analyze_client(run_dir):
             f"{pct(v, .50):>9.2f}M {max(v):>9.2f}M {min(v):>9.2f}M"
         )
 
+    # ── congestion window ────────────────────────────────────────────────
+    section("Congestion window over each transfer (the sender's own view)")
+    any_w = False
+    for f in sorted(run_dir.glob("samples/*/*.window.jsonl")):
+        rows = list(read_jsonl(f))
+        if not rows:
+            continue
+        any_w = True
+        leg, phase = rows[0]["leg"], rows[0]["phase"]
+        cw = [r["cwnd_bytes"] for r in rows]
+        infl = [r["inflight_bytes"] for r in rows]
+        bw = [r["bottleneck_bw_bps"] for r in rows]
+        states = []
+        for r in rows:
+            if not states or states[-1] != r["state"]:
+                states.append(r["state"])
+        limited = sum(1 for r in rows if r["app_limited"])
+        print(
+            f"  {leg:6} {phase:10} cwnd {cw[0]:>7} → {cw[-1]:>7} B (peak {max(cw):>7}), "
+            f"inflight peak {max(infl):>7} B, bw peak {max(bw) * 8 / 1e6:6.2f} Mbit/s"
+        )
+        print(f"         {'':17} phases: {' → '.join(states)}; app-limited in {limited}/{len(rows)} samples")
+        # 5600 B is PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE. A series that
+        # never leaves it means the sender, not the link, set the rate.
+        if max(cw) <= 5600:
+            print("         \033[33mwindow never left its 5600 B floor — sender-bound, not link-bound\033[0m")
+        # A window with room to spare that is never filled points at the
+        # application or the pacer rather than congestion control.
+        elif max(infl) < max(cw) * 0.5:
+            print("         window had room it never used — look at the pacer or the send loop, not cwnd")
+    if not any_w:
+        print("  (no window series — this run predates the cwnd instrumentation)")
+
     # ── message boundaries ───────────────────────────────────────────────
     section("Message-boundary integrity")
     any_mi = False
@@ -253,6 +286,18 @@ def analyze_server(server_dir):
             print(f"  load1      median {pct(load, .50):.2f}, peak {max(load):.2f}")
         if avail:
             print(f"  mem avail  low-water {min(avail) / 1024:.0f} MiB")
+
+    section("Server: sender window (from the last STATS reply seen)")
+    seen = [s["sender_window"] for s in snaps if s.get("sender_window")]
+    if seen:
+        w = seen[-1]
+        print(
+            f"  cwnd {w['cwnd_bytes']} B, inflight {w['inflight_bytes']} B, "
+            f"bw {w['bottleneck_bw_bps'] * 8 / 1e6:.2f} Mbit/s, min_rtt {w['min_rtt_us'] / 1000:.1f} ms, "
+            f"phase {w['state']}{', app-limited' if w['app_limited'] else ''}"
+        )
+    else:
+        print("  (none recorded — the probe never issued STATS_REQ during a transfer)")
 
     section("Server: per-leg counters (final snapshot)")
     last = {}

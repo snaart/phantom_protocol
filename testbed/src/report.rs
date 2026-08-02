@@ -244,6 +244,33 @@ pub struct MessageIntegritySample {
     pub error: Option<String>,
 }
 
+/// One observation of the sender's congestion-control state during a transfer.
+///
+/// Throughput alone cannot tell a window pinned at its floor from a slow link,
+/// and the two call for opposite responses. This series is what separates them:
+/// if `cwnd_bytes` never rises while `inflight_bytes` sits against it, the
+/// sender is the bottleneck, whatever the link can do.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowSample {
+    pub leg: Leg,
+    pub phase: String,
+    pub t_unix_ns: u64,
+    pub elapsed_ms: u64,
+    /// Congestion window, bytes. The floor is 5600 (4 × 1400).
+    pub cwnd_bytes: u64,
+    pub inflight_bytes: u64,
+    /// Estimated bottleneck bandwidth, bytes/sec.
+    pub bottleneck_bw_bps: u64,
+    pub pacing_rate_bps: u64,
+    pub min_rtt_us: u64,
+    pub delivered_bytes: u64,
+    /// BBR phase: startup / drain / probe_bw / probe_rtt / fast_recovery.
+    pub state: String,
+    /// True when the window had room and there was nothing to send — the
+    /// application was the limit, not the transport.
+    pub app_limited: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThroughputSample {
     pub leg: Leg,
@@ -428,6 +455,10 @@ pub struct ServerStats {
     pub metrics: ClientMetrics,
     pub per_leg: Vec<PerLegCounters>,
     pub process: ProcInfo,
+    /// The server's own congestion-control state for this session. During a
+    /// download the server is the sender, so this — not the client's series —
+    /// is the window that governs the transfer.
+    pub sender_window: Option<WindowSample>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

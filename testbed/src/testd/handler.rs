@@ -22,7 +22,9 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::framing::{encode_framed, Framed};
 use crate::proto::{checksum, Msg, PayloadGen};
-use crate::report::{unix_nanos, MarkRecord, PerLegCounters, ProcInfo, ServerStats, SessionRecord};
+use crate::report::{
+    unix_nanos, MarkRecord, PerLegCounters, ProcInfo, ServerStats, SessionRecord, WindowSample,
+};
 use crate::testd::collector::CollectorHandle;
 
 /// Depth of the handler's outbound queue.
@@ -268,7 +270,7 @@ async fn reader_loop(
             }
 
             Msg::StatsReq => {
-                let stats = collect_stats(&session, &ctx.listener);
+                let stats = collect_stats(&session, &ctx.listener).await;
                 let json = serde_json::to_vec(&stats).unwrap_or_else(|_| b"{}".to_vec());
                 if tx_out
                     .send(OutCmd::Frame(encode_framed(&Msg::Stats { json })))
@@ -474,7 +476,7 @@ async fn open_upload(
 /// `session.observability()` on an accepted session returns the **listener's**
 /// aggregate, which is what makes per-leg totals available for the UDP listener
 /// at all — it exposes no accessor of its own.
-fn collect_stats(session: &Arc<PhantomSession>, listener: &str) -> ServerStats {
+async fn collect_stats(session: &Arc<PhantomSession>, listener: &str) -> ServerStats {
     let snap = session.observability().snapshot();
 
     let mut per_leg = Vec::with_capacity(4);
@@ -490,12 +492,28 @@ fn collect_stats(session: &Arc<PhantomSession>, listener: &str) -> ServerStats {
         });
     }
 
+    let sender_window = session.bandwidth_snapshot().await.map(|bw| WindowSample {
+        leg: crate::report::Leg::Udp,
+        phase: format!("server:{listener}"),
+        t_unix_ns: unix_nanos(),
+        elapsed_ms: 0,
+        cwnd_bytes: bw.cwnd_bytes,
+        inflight_bytes: bw.inflight_bytes,
+        bottleneck_bw_bps: bw.bottleneck_bw_bps,
+        pacing_rate_bps: bw.pacing_rate_bps,
+        min_rtt_us: bw.min_rtt.as_micros() as u64,
+        delivered_bytes: bw.delivered_bytes,
+        state: bw.state.as_str().to_string(),
+        app_limited: bw.app_limited,
+    });
+
     ServerStats {
         listener: listener.to_string(),
         t_unix_ns: unix_nanos(),
         metrics: snap.to_ffi().into(),
         per_leg,
         process: proc_info_or_default(),
+        sender_window,
     }
 }
 

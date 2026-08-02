@@ -54,6 +54,28 @@ pub enum BbrState {
     FastRecovery,
 }
 
+impl BbrState {
+    /// Stable lowercase name, for logs and recorded artifacts.
+    ///
+    /// Deliberately not `Debug`: a recorded time series outlives the enum's
+    /// formatting, and a derive change should not silently rename a column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::ProbeBW => "probe_bw",
+            Self::Drain => "drain",
+            Self::ProbeRTT => "probe_rtt",
+            Self::FastRecovery => "fast_recovery",
+        }
+    }
+}
+
+impl core::fmt::Display for BbrState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A single delivery sample (attached to each ACKed packet)
 #[derive(Debug, Clone, Copy)]
 pub struct DeliverySample {

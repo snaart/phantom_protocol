@@ -443,6 +443,10 @@ async fn snapshot_loop(
                 metrics: snap.to_ffi().into(),
                 per_leg,
                 process: crate::sysinfo::proc_info(),
+                // The periodic sweep is listener-scoped and holds no session,
+                // so there is no single sender window to report here. The
+                // per-session view comes back through STATS.
+                sender_window: None,
             });
         }
         collector.event(

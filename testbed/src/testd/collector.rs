@@ -219,6 +219,7 @@ mod tests {
             },
             per_leg: vec![],
             process: Default::default(),
+            sender_window: None,
         });
 
         drop(h);

@@ -1190,6 +1190,8 @@ impl Session {
             cwnd_bytes: est.cwnd(),
             inflight_bytes: est.inflight_bytes(),
             delivered_bytes: est.delivered_bytes(),
+            state: est.state(),
+            app_limited: est.is_app_limited(),
         }
     }
 
@@ -1530,6 +1532,13 @@ pub struct BandwidthSnapshot {
     /// outgoing segment so its acknowledgement yields a delivery-rate sample
     /// over the interval the segment spanned.
     pub delivered_bytes: u64,
+    /// Which BBR phase the sender is in. Without it a window that stops growing
+    /// is indistinguishable from one that left Startup early on purpose.
+    pub state: crate::transport::bandwidth_estimator::BbrState,
+    /// Whether the sender is currently application-limited — i.e. the window
+    /// has room and there is simply nothing to send. Distinguishes "the
+    /// transport is the bottleneck" from "the application is".
+    pub app_limited: bool,
 }
 
 impl std::fmt::Debug for Session {

@@ -3696,6 +3696,23 @@ impl PhantomSession {
     pub fn observability(&self) -> Arc<Observability> {
         self.observability.clone()
     }
+
+    /// Snapshot of the live congestion-control state: window, bytes in flight,
+    /// estimated bottleneck bandwidth, minimum RTT, pacing rate, BBR phase.
+    /// `None` while still connecting.
+    ///
+    /// Rust-only. Exists because a window that fails to open is otherwise
+    /// invisible from outside the crate: throughput alone cannot distinguish a
+    /// congestion window pinned at its floor from a slow link, and the two call
+    /// for opposite responses. Sampling this over a transfer turns that question
+    /// into a measurement.
+    pub async fn bandwidth_snapshot(&self) -> Option<crate::transport::session::BandwidthSnapshot> {
+        self.inner_session
+            .lock()
+            .await
+            .as_ref()
+            .map(|s| s.bandwidth_snapshot())
+    }
 }
 
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
@@ -5264,6 +5281,23 @@ mod tests {
         server_session
             .protect_packet(&packet)
             .expect("header protection")
+    }
+
+    /// The congestion-control snapshot must be absent before a session exists
+    /// and present once it does. Without this the accessor could silently
+    /// return `None` forever and a recorded window series would just be empty —
+    /// indistinguishable from a window that never moved.
+    #[tokio::test]
+    async fn bandwidth_snapshot_is_none_until_the_session_is_established() {
+        let (client_transport, _server_transport) = ChannelTransport::pair();
+        let (_sk, vk) = crate::crypto::hybrid_sign::HybridSigningKey::generate();
+        let session =
+            PhantomSession::connect_with_transport("test-server:9000", client_transport, vk);
+
+        assert!(
+            session.bandwidth_snapshot().await.is_none(),
+            "no negotiated session yet, so there is no window to report"
+        );
     }
 
     /// Integration test: Client handshake via ChannelTransport with a
