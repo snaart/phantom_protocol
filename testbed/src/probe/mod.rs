@@ -24,11 +24,11 @@ use crate::report::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[clap(rename_all = "lowercase")]
 pub enum Profile {
-    /// ~6 minutes. Enough to answer "is it alive and roughly sane".
+    /// ~10 minutes on a ~230 ms path. Enough to answer "is it alive and sane".
     Smoke,
-    /// ~45 minutes. The full matrix at useful sample counts.
+    /// ~1 hour on a ~230 ms path. The full matrix at useful sample counts.
     Standard,
-    /// ~3.5 hours. Standard scaled up, plus a long soak.
+    /// ~4 hours on a ~230 ms path. Standard scaled up, plus a two-hour soak.
     Deep,
 }
 
@@ -55,6 +55,13 @@ pub struct Params {
     pub download_bytes: u64,
     pub transfer_frame: u32,
     pub bidir_bytes: u64,
+    /// Wall-clock ceiling on a single bulk transfer.
+    ///
+    /// The byte budgets above assume a link whose capacity is unknown before
+    /// the run. Throughput measured over a bounded window is meaningful whether
+    /// or not the full budget completed, so capping the window is strictly
+    /// better than discovering mid-run that 256 MiB does not fit in the day.
+    pub transfer_cap: Duration,
     pub streams: usize,
     pub stream_frames: usize,
     pub stream_frame_bytes: usize,
@@ -86,6 +93,7 @@ impl Params {
                 download_bytes: 8 * 1024 * 1024,
                 transfer_frame: 1024,
                 bidir_bytes: 4 * 1024 * 1024,
+                transfer_cap: Duration::from_secs(60),
                 streams: 4,
                 stream_frames: 10,
                 stream_frame_bytes: 512,
@@ -112,6 +120,7 @@ impl Params {
                 download_bytes: 64 * 1024 * 1024,
                 transfer_frame: 1024,
                 bidir_bytes: 32 * 1024 * 1024,
+                transfer_cap: Duration::from_secs(180),
                 streams: 8,
                 stream_frames: 30,
                 stream_frame_bytes: 1024,
@@ -135,9 +144,10 @@ impl Params {
                     512, 1200, 1280, 1290, 1300, 1310, 1400, 2600, 4096, 8192, 65536, 262_144,
                 ],
                 upload: Duration::from_secs(180),
-                download_bytes: 256 * 1024 * 1024,
+                download_bytes: 128 * 1024 * 1024,
                 transfer_frame: 1024,
-                bidir_bytes: 128 * 1024 * 1024,
+                bidir_bytes: 64 * 1024 * 1024,
+                transfer_cap: Duration::from_secs(420),
                 streams: 16,
                 stream_frames: 60,
                 stream_frame_bytes: 1024,
@@ -171,6 +181,20 @@ pub struct ProbeConfig {
 impl ProbeConfig {
     fn wants(&self, scenario: &str) -> bool {
         self.only.as_ref().is_none_or(|s| s.contains(scenario))
+    }
+
+    /// The one leg that carries the long soak.
+    ///
+    /// Soaking every leg would triple the longest scenario in the matrix for
+    /// almost no extra information — a `deep` run would spend six hours idling
+    /// instead of two. PhantomUDP is the production transport and the only
+    /// migration-capable one, so it gets the soak when it is in the run.
+    fn soak_leg(&self) -> Option<Leg> {
+        self.legs
+            .iter()
+            .copied()
+            .find(|l| *l == Leg::Udp)
+            .or_else(|| self.legs.iter().copied().find(|l| l.is_phantom()))
     }
 }
 
@@ -350,13 +374,29 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
         if cfg.wants("download") {
             st.absorb(
                 leg,
-                scenarios::download(ep, pin, leg, p.download_bytes, p.transfer_frame).await,
+                scenarios::download(
+                    ep,
+                    pin,
+                    leg,
+                    p.download_bytes,
+                    p.transfer_frame,
+                    p.transfer_cap,
+                )
+                .await,
             )?;
         }
         if cfg.wants("bidir") {
             st.absorb(
                 leg,
-                scenarios::bidir(ep, pin, leg, p.bidir_bytes, p.transfer_frame).await,
+                scenarios::bidir(
+                    ep,
+                    pin,
+                    leg,
+                    p.bidir_bytes,
+                    p.transfer_frame,
+                    p.transfer_cap,
+                )
+                .await,
             )?;
         }
         if cfg.wants("streams") {
@@ -400,7 +440,7 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
         if cfg.wants("negative") {
             st.absorb(leg, scenarios::negative(ep, pin, leg).await)?;
         }
-        if cfg.wants("liveness_soak") {
+        if cfg.wants("liveness_soak") && cfg.soak_leg() == Some(leg) {
             st.absorb(
                 leg,
                 scenarios::liveness_soak(ep, pin, leg, p.soak, p.soak_interval).await,
@@ -438,6 +478,11 @@ fn caveats(cfg: &ProbeConfig) -> Vec<String> {
         "Throughput is application-level goodput measured at the testbed protocol, so it excludes Phantom headers, AEAD tags, and any retransmission.".to_string(),
         "The raw TCP/UDP legs carry no Phantom at all; they are the control group, and protocol numbers are meaningful mainly as ratios against them.".to_string(),
     ];
+    if let Some(l) = cfg.soak_leg() {
+        v.push(format!(
+            "The long soak ran only on the {l} leg; liveness and keepalive behaviour on the other legs is not covered by this run."
+        ));
+    }
     if cfg.profile == Profile::Smoke {
         v.push("Smoke profile: sample counts are small, so tail percentiles (p99, p999) are not statistically meaningful.".to_string());
     }
@@ -573,6 +618,10 @@ mod tests {
             assert!(x.upload > Duration::ZERO);
             assert!(x.download_bytes > 0);
             assert!(
+                x.transfer_cap >= Duration::from_secs(30),
+                "{p:?}: a bulk-transfer window this short measures startup, not throughput"
+            );
+            assert!(
                 x.transfer_frame >= 64,
                 "frames must carry the header fields"
             );
@@ -600,6 +649,7 @@ mod tests {
         assert!(s.handshake_count < m.handshake_count);
         assert!(m.handshake_count < d.handshake_count);
         assert!(s.soak < m.soak && m.soak < d.soak);
+        assert!(s.transfer_cap < m.transfer_cap && m.transfer_cap < d.transfer_cap);
         assert!(s.concurrency < m.concurrency && m.concurrency < d.concurrency);
         assert!(s.rtt_sizes.len() <= m.rtt_sizes.len());
         assert!(m.rtt_sizes.len() <= d.rtt_sizes.len());
@@ -620,6 +670,32 @@ mod tests {
                 "{p:?} needs a size past the path MTU to force fragmentation"
             );
         }
+    }
+
+    /// The soak is the longest scenario in the matrix; running it per leg is
+    /// what turns a two-hour soak into a six-hour one.
+    #[test]
+    fn the_soak_runs_on_exactly_one_leg_and_prefers_udp() {
+        let cfg = demo_cfg(
+            vec![Leg::Tcp, Leg::Udp, Leg::Mimic, Leg::RawUdp],
+            Profile::Deep,
+        );
+        assert_eq!(cfg.soak_leg(), Some(Leg::Udp), "UDP wins when present");
+
+        let no_udp = demo_cfg(vec![Leg::Mimic, Leg::Tcp, Leg::RawTcp], Profile::Deep);
+        assert_eq!(
+            no_udp.soak_leg(),
+            Some(Leg::Mimic),
+            "otherwise the first Phantom leg carries it"
+        );
+
+        let raw_only = demo_cfg(vec![Leg::RawTcp, Leg::RawUdp], Profile::Deep);
+        assert_eq!(raw_only.soak_leg(), None, "raw controls hold no session");
+
+        // And the artifact must say which leg it was.
+        assert!(caveats(&cfg)
+            .iter()
+            .any(|c| c.contains("soak ran only on the udp leg")));
     }
 
     #[test]

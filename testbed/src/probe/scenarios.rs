@@ -599,6 +599,7 @@ pub async fn download(
     leg: Leg,
     total_bytes: u64,
     frame_size: u32,
+    cap: Duration,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "download");
     let framed = match connect_framed(leg, ep, pin).await {
@@ -626,12 +627,15 @@ pub async fn download(
     }
 
     let mut win = WindowTracker::new(leg, "download");
-    let overall_deadline = Instant::now() + Duration::from_secs(600);
+    let overall_deadline = Instant::now() + cap;
+    let mut capped = false;
 
     loop {
         if Instant::now() > overall_deadline {
-            out.note("download hit the 600 s ceiling before SOURCE_END");
-            out.error(leg, "download", "overall deadline", &CoreError::Timeout);
+            // Not a failure: the measurement window closed before the byte
+            // budget did. Throughput over that window is still exactly what was
+            // being measured; only the total is short.
+            capped = true;
             break;
         }
         let b = match tokio::time::timeout(OP_TIMEOUT, framed.recv()).await {
@@ -668,7 +672,16 @@ pub async fn download(
         }
     }
 
-    out.summary.throughput = Some(win.finish());
+    let tp = win.finish();
+    if capped {
+        out.note(format!(
+            "measurement window ({} s) closed before the {} B budget: {} B transferred, throughput is over the window",
+            cap.as_secs(),
+            total_bytes,
+            tp.bytes
+        ));
+    }
+    out.summary.throughput = Some(tp);
     mark(&framed, "download:end").await;
     conn::close_session(framed.session()).await;
     out
@@ -682,6 +695,7 @@ pub async fn bidir(
     leg: Leg,
     total_bytes: u64,
     frame_size: u32,
+    cap: Duration,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "bidir");
     let framed = match connect_framed(leg, ep, pin).await {
@@ -740,10 +754,11 @@ pub async fn bidir(
     });
 
     let mut down = WindowTracker::new(leg, "bidir_download");
-    let deadline = Instant::now() + Duration::from_secs(600);
+    let deadline = Instant::now() + cap;
+    let mut capped = false;
     loop {
         if Instant::now() > deadline {
-            out.error(leg, "bidir", "overall deadline", &CoreError::Timeout);
+            capped = true;
             break;
         }
         let b = match tokio::time::timeout(OP_TIMEOUT, framed.recv()).await {
@@ -772,6 +787,12 @@ pub async fn bidir(
     stop.store(true, Ordering::Relaxed);
     let (up_frames, up_bytes) = uploader.await.unwrap_or((0, 0));
     let down_tp = down.finish();
+    if capped {
+        out.note(format!(
+            "measurement window ({} s) closed before the byte budget",
+            cap.as_secs()
+        ));
+    }
     out.summary.throughput = Some(down_tp.clone());
     out.note(format!(
         "full duplex: down {:.2} Mbit/s ({} B), up {} B in {} frames over the same interval",

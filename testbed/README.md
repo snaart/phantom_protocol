@@ -61,11 +61,19 @@ Or through the wrapper, which fills in the flags and keeps a transcript:
 PHANTOM_HOST=<server> ./run-test.sh smoke        # pin read from ./pin.hex
 ```
 
+Wall-clock estimates assume a long-haul path (~230 ms RTT); on loopback they
+are far shorter.
+
 | Profile | Wall clock | Contents |
 |---|---|---|
-| `smoke` | ~6 min | enough to answer "is it alive and roughly sane" |
-| `standard` | ~45 min | the full matrix at useful sample counts, 10-minute soak |
-| `deep` | ~3.5 h | standard scaled up, 2-hour soak, 128 concurrent sessions |
+| `smoke` | ~10 min | enough to answer "is it alive and sane" |
+| `standard` | ~1 h | the full matrix at useful sample counts, 10-minute soak |
+| `deep` | ~4 h | standard scaled up, 2-hour soak, 128 concurrent sessions |
+
+Bulk transfers are bounded by a wall-clock window as well as a byte budget, so
+an unexpectedly slow link shortens the totals rather than the run. The long soak
+runs on one leg only (PhantomUDP when selected) — soaking all three would triple
+the longest scenario for almost no extra information.
 
 Useful flags: `--legs udp,tcp,mimic,raw_tcp,raw_udp`, `--only rtt_sweep,upload`,
 `--rtt-sizes 64,1024,8192`, `--soak-secs`, `--concurrency`, `--no-upload`.
