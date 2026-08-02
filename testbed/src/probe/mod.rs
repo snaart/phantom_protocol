@@ -62,6 +62,10 @@ pub struct Params {
     /// or not the full budget completed, so capping the window is strictly
     /// better than discovering mid-run that 256 MiB does not fit in the day.
     pub transfer_cap: Duration,
+    /// Window for the raw TCP capacity probe.
+    pub raw_throughput: Duration,
+    /// Time spent at each offered rate in the raw UDP capacity probe.
+    pub raw_rate_step: Duration,
     pub streams: usize,
     pub stream_frames: usize,
     pub stream_frame_bytes: usize,
@@ -94,6 +98,8 @@ impl Params {
                 transfer_frame: 1024,
                 bidir_bytes: 4 * 1024 * 1024,
                 transfer_cap: Duration::from_secs(60),
+                raw_throughput: Duration::from_secs(15),
+                raw_rate_step: Duration::from_secs(5),
                 streams: 4,
                 stream_frames: 10,
                 stream_frame_bytes: 512,
@@ -121,6 +127,8 @@ impl Params {
                 transfer_frame: 1024,
                 bidir_bytes: 32 * 1024 * 1024,
                 transfer_cap: Duration::from_secs(180),
+                raw_throughput: Duration::from_secs(30),
+                raw_rate_step: Duration::from_secs(10),
                 streams: 8,
                 stream_frames: 30,
                 stream_frame_bytes: 1024,
@@ -148,6 +156,8 @@ impl Params {
                 transfer_frame: 1024,
                 bidir_bytes: 64 * 1024 * 1024,
                 transfer_cap: Duration::from_secs(420),
+                raw_throughput: Duration::from_secs(60),
+                raw_rate_step: Duration::from_secs(15),
                 streams: 16,
                 stream_frames: 60,
                 stream_frame_bytes: 1024,
@@ -332,15 +342,31 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
         println!("\n  ── leg {leg} ──");
 
         if !leg.is_phantom() {
-            if !cfg.wants("rtt_sweep") {
-                continue;
+            if cfg.wants("rtt_sweep") {
+                let out = match leg {
+                    Leg::RawTcp => scenarios::raw_tcp_rtt(ep, &p.rtt_sizes, p.rtt_per_size).await,
+                    Leg::RawUdp => scenarios::raw_udp_rtt(ep, &p.rtt_sizes, p.rtt_per_size).await,
+                    _ => continue,
+                };
+                st.absorb(leg, out)?;
             }
-            let out = match leg {
-                Leg::RawTcp => scenarios::raw_tcp_rtt(ep, &p.rtt_sizes, p.rtt_per_size).await,
-                Leg::RawUdp => scenarios::raw_udp_rtt(ep, &p.rtt_sizes, p.rtt_per_size).await,
-                _ => continue,
-            };
-            st.absorb(leg, out)?;
+            // The capacity denominator. Without it a protocol throughput number
+            // cannot be attributed to the transport or to the link.
+            if cfg.wants("throughput") {
+                let out = match leg {
+                    Leg::RawTcp => {
+                        scenarios::raw_tcp_throughput(
+                            ep,
+                            p.raw_throughput,
+                            p.transfer_frame as usize,
+                        )
+                        .await
+                    }
+                    Leg::RawUdp => scenarios::raw_udp_throughput(ep, p.raw_rate_step).await,
+                    _ => continue,
+                };
+                st.absorb(leg, out)?;
+            }
             continue;
         }
 
@@ -617,6 +643,11 @@ mod tests {
             );
             assert!(x.upload > Duration::ZERO);
             assert!(x.download_bytes > 0);
+            assert!(
+                x.raw_throughput >= Duration::from_secs(10)
+                    && x.raw_rate_step >= Duration::from_secs(5),
+                "{p:?}: the capacity denominator needs a long enough window to mean anything"
+            );
             assert!(
                 x.transfer_cap >= Duration::from_secs(30),
                 "{p:?}: a bulk-transfer window this short measures startup, not throughput"

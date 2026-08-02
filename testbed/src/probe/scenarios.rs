@@ -1670,6 +1670,185 @@ pub async fn raw_tcp_rtt(ep: &Endpoints, sizes: &[usize], per_size: usize) -> Sc
     out
 }
 
+/// Raw TCP bulk throughput — the capacity denominator.
+///
+/// Saturates the length-prefixed echo control while draining it concurrently,
+/// so the number is the path's own bidirectional ceiling with no Phantom in the
+/// way. Without this, a protocol throughput figure cannot be attributed: a slow
+/// result might be the transport or might be the link, and the two are not
+/// distinguishable from the protocol leg alone.
+pub async fn raw_tcp_throughput(
+    ep: &Endpoints,
+    cap: Duration,
+    frame_size: usize,
+) -> ScenarioOutput {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let leg = Leg::RawTcp;
+    let mut out = ScenarioOutput::new(leg, "throughput");
+
+    let addr = ep.addr_for(leg);
+    let sock = match tokio::time::timeout(conn::CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
+        Ok(Ok(s)) => s,
+        _ => {
+            out.summary.error_count += 1;
+            out.note(format!("could not reach the raw TCP control at {addr}"));
+            return out;
+        }
+    };
+    let _ = sock.set_nodelay(true);
+    let (mut rd, mut wr) = sock.into_split();
+
+    let payload = PayloadGen::new(160).fill(frame_size);
+    let deadline = tokio::time::Instant::now() + cap;
+
+    // Writer and reader run concurrently: a send-then-receive loop would
+    // measure one round trip at a time and report the bandwidth-delay product
+    // rather than the link.
+    let writer = tokio::spawn(async move {
+        let mut sent = 0u64;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if wr
+                .write_all(&(payload.len() as u32).to_be_bytes())
+                .await
+                .is_err()
+                || wr.write_all(&payload).await.is_err()
+            {
+                break;
+            }
+            sent += payload.len() as u64;
+        }
+        let _ = wr.shutdown().await;
+        sent
+    });
+
+    let mut win = WindowTracker::new(leg, "raw_echo");
+    let mut lb = [0u8; 4];
+    loop {
+        if tokio::time::Instant::now() >= deadline + Duration::from_secs(5) {
+            break;
+        }
+        match tokio::time::timeout(Duration::from_secs(10), rd.read_exact(&mut lb)).await {
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+        let n = u32::from_be_bytes(lb) as usize;
+        if n == 0 || n > 4 * 1024 * 1024 {
+            break;
+        }
+        let mut body = vec![0u8; n];
+        match tokio::time::timeout(Duration::from_secs(10), rd.read_exact(&mut body)).await {
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+        out.summary.ok_count += 1;
+        if let Some(sample) = win.add(n) {
+            out.sink.push(&sample);
+        }
+    }
+
+    let sent = writer.await.unwrap_or(0);
+    let tp = win.finish();
+    out.note(format!(
+        "raw TCP, no Phantom: {} B offered, {} B echoed back in {:.1} s — {:.2} Mbit/s each way",
+        sent,
+        tp.bytes,
+        tp.duration_ns as f64 / 1e9,
+        tp.megabits_per_sec
+    ));
+    out.note("this is the path's own ceiling; every protocol throughput figure should be read against it");
+    out.summary.throughput = Some(tp);
+    out
+}
+
+/// Raw UDP one-way capacity and loss — the datagram denominator.
+///
+/// Sends at a series of offered rates and counts how much comes back. TCP's
+/// control cannot answer this: its congestion control hides where the datagram
+/// path actually starts losing, which is exactly what a UDP-based protocol runs
+/// into.
+pub async fn raw_udp_throughput(ep: &Endpoints, per_rate: Duration) -> ScenarioOutput {
+    let leg = Leg::RawUdp;
+    let mut out = ScenarioOutput::new(leg, "throughput");
+
+    let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await else {
+        out.summary.error_count += 1;
+        out.note("could not bind a local UDP socket");
+        return out;
+    };
+    let addr = ep.addr_for(leg);
+    if sock.connect(&addr).await.is_err() {
+        out.summary.error_count += 1;
+        out.note(format!("could not associate with {addr}"));
+        return out;
+    }
+    let sock = Arc::new(sock);
+
+    // Payload sized to the measured path MTU rather than the theoretical one.
+    let payload = PayloadGen::new(170).fill(1200);
+    let mut best = 0.0f64;
+
+    for &kbps in &[500u64, 2_000, 8_000, 32_000] {
+        let per_frame_ns = (payload.len() as u64 * 8 * 1_000_000) / kbps.max(1);
+        let deadline = tokio::time::Instant::now() + per_rate;
+
+        let rx = sock.clone();
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_536];
+            let mut got = 0u64;
+            let stop = deadline + Duration::from_secs(2);
+            while tokio::time::Instant::now() < stop {
+                match tokio::time::timeout(Duration::from_millis(500), rx.recv(&mut buf)).await {
+                    Ok(Ok(n)) => got += n as u64,
+                    Ok(Err(_)) => break,
+                    Err(_) => continue,
+                }
+            }
+            got
+        });
+
+        let mut sent = 0u64;
+        let started = Instant::now();
+        while tokio::time::Instant::now() < deadline {
+            if sock.send(&payload).await.is_ok() {
+                sent += payload.len() as u64;
+            }
+            tokio::time::sleep(Duration::from_nanos(per_frame_ns)).await;
+        }
+        let elapsed = started.elapsed().as_secs_f64().max(1e-9);
+        let got = reader.await.unwrap_or(0);
+
+        let offered = sent as f64 * 8.0 / elapsed / 1e6;
+        let returned = got as f64 * 8.0 / elapsed / 1e6;
+        let loss = if sent > 0 {
+            100.0 * (1.0 - (got as f64 / sent as f64)).max(0.0)
+        } else {
+            100.0
+        };
+        best = best.max(returned);
+        out.summary.ok_count += 1;
+        out.note(format!(
+            "offered {kbps} kbit/s → sent {offered:.2} Mbit/s, echoed {returned:.2} Mbit/s, round-trip loss {loss:.1}%"
+        ));
+        out.sink.push(&ThroughputSample {
+            leg,
+            direction: format!("raw_udp_offered_{kbps}kbps"),
+            t_unix_ns: unix_nanos(),
+            window_bytes: got,
+            window_frames: got / payload.len() as u64,
+            window_ns: (elapsed * 1e9) as u64,
+            cumulative_bytes: sent,
+        });
+    }
+
+    out.note(format!(
+        "best sustained datagram echo: {best:.2} Mbit/s — the ceiling PhantomUDP is working against"
+    ));
+    out
+}
+
 /// Raw UDP echo round trips. Also the direct path-MTU probe.
 pub async fn raw_udp_rtt(ep: &Endpoints, sizes: &[usize], per_size: usize) -> ScenarioOutput {
     let leg = Leg::RawUdp;
