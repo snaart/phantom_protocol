@@ -611,7 +611,13 @@ async fn upload_bundle(cfg: &ProbeConfig, dir: &Path) -> Result<(usize, usize)> 
         // into the session, and closing the session afterwards discards
         // everything still in flight — which is how a "45 files uploaded"
         // report came to mean two files actually written.
-        match wait_upload_ack(&framed).await {
+        // Scale the wait to the file: the acknowledgement sits behind the
+        // file's own bytes, and a deep run's largest samples are far bigger
+        // than a smoke run's. 8 KB/s is a deliberately pessimistic floor.
+        let budget = conn::DRAIN_TIMEOUT.max(Duration::from_secs(
+            (data.len() as u64 / 8_000).saturating_add(10),
+        ));
+        match wait_upload_ack(&framed, budget).await {
             Ok(true) => acked += 1,
             Ok(false) => println!("    · server rejected {name}"),
             Err(e) => {
@@ -630,10 +636,9 @@ async fn upload_bundle(cfg: &ProbeConfig, dir: &Path) -> Result<(usize, usize)> 
 /// Wait for the server's `UPLOAD_ACK`, ignoring anything else in flight.
 async fn wait_upload_ack(
     framed: &crate::framing::Framed,
+    budget: Duration,
 ) -> Result<bool, phantom_protocol::CoreError> {
-    // Generous: a bundle upload runs at whatever the link sustains, and the
-    // acknowledgement sits behind the file's own bytes.
-    let deadline = std::time::Instant::now() + conn::DRAIN_TIMEOUT;
+    let deadline = std::time::Instant::now() + budget;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
