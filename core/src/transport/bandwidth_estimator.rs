@@ -104,6 +104,19 @@ pub struct DeliverySample {
     /// The receiver measures time between packet receipt and ACK send;
     /// subtracting this from the observed RTT gives the propagation delay.
     pub ack_delay_us: u64,
+    /// Whether this sample's round trip is a usable RTT measurement — Karn's
+    /// algorithm. `false` for a segment that had been retransmitted before this
+    /// acknowledgement arrived.
+    ///
+    /// The sender restamps `sent_at` when it resends, so an acknowledgement for
+    /// the *original* transmission that lands just after the copy went out is
+    /// measured from the copy and reads as microseconds. Nothing in the
+    /// acknowledgement identifies which of the two it answers, so the figure is
+    /// not a round trip at all. [`BandwidthEstimator::on_ack`] keeps it out of
+    /// the min-RTT filter; the delivery-rate half of the sample is unaffected
+    /// (its numerator and denominator are restamped together, so it still
+    /// measures bytes delivered since the resend over the time since the resend).
+    pub rtt_sampled: bool,
 }
 
 /// Sliding window to track min/max of a value
@@ -307,9 +320,25 @@ impl BandwidthEstimator {
         let ack_delay = Duration::from_micros(sample.ack_delay_us);
         let rtt_propagation = send_elapsed.saturating_sub(ack_delay);
 
-        // Update min RTT using the propagation delay (RTprop)
+        // Update min RTT using the propagation delay (RTprop), but only from a
+        // sample whose round trip is unambiguous — Karn's algorithm.
+        //
+        // A retransmitted segment carries the send time of its *latest* copy,
+        // because that is what the sender restamped it with. An acknowledgement
+        // for the original then measures from the copy and reads as microseconds
+        // on a path that is orders of magnitude slower. Averaging estimators
+        // survive the odd bad sample; a minimum filter does not — the poisoned
+        // value evicts every honest measurement in the window and governs the
+        // BDP until it ages out, and on a lossy path the next retransmit renews
+        // it. `cwnd = 2 × btl_bw × min_rtt` then sits on its floor for the life
+        // of the connection.
+        //
+        // The delivery-rate half of the sample below is deliberately *not*
+        // gated: `sent_at`, `delivered_bytes` and `delivered_at` are restamped
+        // together, so the rate still measures bytes delivered since the resend
+        // over the time since the resend — a short interval, but an honest one.
         let rtt_us = rtt_propagation.as_micros() as u64;
-        if rtt_us > 0 {
+        if sample.rtt_sampled && rtt_us > 0 {
             let min_rtt_us = self.rtt_filter.update_min(now, rtt_us);
             self.min_rtt = Duration::from_micros(min_rtt_us);
         }
@@ -615,6 +644,7 @@ mod tests {
             packet_bytes,
             is_app_limited: false,
             ack_delay_us: 0, // No ACK delay in tests
+            rtt_sampled: true,
         }
     }
 
@@ -627,6 +657,7 @@ mod tests {
             packet_bytes,
             is_app_limited: true,
             ack_delay_us: 0,
+            rtt_sampled: true,
         }
     }
 
@@ -666,6 +697,7 @@ mod tests {
                 packet_bytes: PACKET,
                 is_app_limited: false,
                 ack_delay_us: 0,
+                rtt_sampled: true,
             });
         }
 
@@ -727,6 +759,7 @@ mod tests {
                 packet_bytes: PACKET,
                 is_app_limited: false,
                 ack_delay_us: 0,
+                rtt_sampled: true,
             });
         }
 
@@ -748,6 +781,117 @@ mod tests {
             "bandwidth estimate {} B/s undershoots the {} B/s actually delivered",
             est.bottleneck_bandwidth(),
             supported
+        );
+    }
+
+    /// Karn's algorithm, applied to the min-RTT filter.
+    ///
+    /// A sender restamps a segment's send time when it resends it, so an
+    /// acknowledgement for the *original* transmission — already in flight when
+    /// the copy went out — is measured from the copy and reads as microseconds
+    /// on a path whose real round trip is a fifth of a second. Nothing in the
+    /// acknowledgement says which of the two it answers; the figure is not a
+    /// round-trip measurement at all.
+    ///
+    /// Feeding it to a *minimum* filter is what makes it expensive. A minimum is
+    /// not averaged away: one sample evicts every honest measurement in the
+    /// window and governs until it ages out, and on a lossy path the next
+    /// retransmit re-poisons the filter and restarts its clock, so it never
+    /// does. `cwnd = 2 × btl_bw × min_rtt`, so a min RTT three orders of
+    /// magnitude too small drags the bandwidth-delay product down with it and
+    /// pins the window on its 5600-byte floor for the life of the connection.
+    /// A real 200 ms WAN run collapsed from a 128 KB peak to exactly that floor
+    /// and averaged 7.7 KB in flight where filling the pipe needed ~165 KB.
+    ///
+    /// `Stream`'s own SRTT estimator already skips these samples. This holds the
+    /// bandwidth estimator to the same rule.
+    #[test]
+    fn a_retransmits_ambiguous_ack_does_not_collapse_the_min_rtt() {
+        const PACKETS: u64 = 100;
+        const PACKET: u64 = 1200;
+        const RTT_MS: u64 = 200;
+
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+        let floor = PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE;
+
+        // A window's worth goes out and is acknowledged one round trip later —
+        // an ordinary bulk transfer on a 200 ms path.
+        for _ in 0..PACKETS {
+            est.on_send(PACKET);
+        }
+        for _ in 0..PACKETS {
+            est.on_ack(DeliverySample {
+                delivered_bytes: 0,
+                delivered_at: start,
+                sent_at: start,
+                acked_at: start + Duration::from_millis(RTT_MS),
+                packet_bytes: PACKET,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: true,
+            });
+        }
+
+        let healthy_rtt = est.min_rtt();
+        assert_eq!(healthy_rtt, Duration::from_millis(RTT_MS));
+        assert!(
+            est.cwnd() > 10 * floor,
+            "precondition: the window should be open before the retransmit ({} B)",
+            est.cwnd()
+        );
+
+        // Now a segment is declared lost and resent. `Stream::poll_send`
+        // restamps its send time (and its delivery mark, in lock-step) to the
+        // instant of the resend. The original's acknowledgement was already on
+        // the wire and lands 200 µs later, so the elapsed time reads 200 µs
+        // against a path that is a thousand times slower than that.
+        let resent_at = start + Duration::from_millis(RTT_MS);
+        est.on_send(PACKET);
+        est.on_ack(DeliverySample {
+            delivered_bytes: est.delivered_bytes(),
+            delivered_at: resent_at,
+            sent_at: resent_at,
+            acked_at: resent_at + Duration::from_micros(200),
+            packet_bytes: PACKET,
+            is_app_limited: false,
+            ack_delay_us: 0,
+            rtt_sampled: false,
+        });
+
+        assert_eq!(
+            est.min_rtt(),
+            healthy_rtt,
+            "an ack for a retransmitted segment is ambiguous (Karn) and must not \
+             enter the min-RTT filter; it dropped min_rtt to {:?}",
+            est.min_rtt()
+        );
+        assert!(
+            est.cwnd() > 10 * floor,
+            "cwnd collapsed to {} B (floor {} B) on one retransmit's ack",
+            est.cwnd(),
+            floor
+        );
+
+        // ...and the gate is Karn's condition, not a blanket refusal to measure:
+        // an unambiguous sample must still move the filter, or a controller that
+        // simply stopped tracking RTT would satisfy the assertions above.
+        let clean_at = start + Duration::from_millis(RTT_MS + 100);
+        est.on_send(PACKET);
+        est.on_ack(DeliverySample {
+            delivered_bytes: est.delivered_bytes(),
+            delivered_at: clean_at,
+            sent_at: clean_at,
+            acked_at: clean_at + Duration::from_millis(150),
+            packet_bytes: PACKET,
+            is_app_limited: false,
+            ack_delay_us: 0,
+            rtt_sampled: true,
+        });
+        assert_eq!(
+            est.min_rtt(),
+            Duration::from_millis(150),
+            "a never-retransmitted segment's round trip must still lower min_rtt"
         );
     }
 

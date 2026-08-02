@@ -2399,11 +2399,13 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
 ///
 /// This is also the RTT-sampling site: the same `acked_at − sent_at − ack_delay`
 /// propagation figure the estimator folds into its `min_rtt` filter is published
-/// to `Observability::record_rtt_us` for `path_id`. `sampled_rtt` gates that
-/// publication — pass `false` for a retransmitted segment so the per-path RTT
-/// gauge obeys Karn's algorithm exactly like `Stream`'s own srtt (an ACK for a
-/// retransmit is ambiguous about which copy it acknowledges). Only the single
-/// `Instant::now()` the `DeliverySample` already needed is read.
+/// to `Observability::record_rtt_us` for `path_id`. `sampled_rtt` is Karn's
+/// condition and gates **both** consumers — pass `false` for a retransmitted
+/// segment so the per-path RTT gauge and the estimator's min-RTT filter obey
+/// Karn's algorithm exactly like `Stream`'s own srtt (an ACK for a retransmit is
+/// ambiguous about which copy it acknowledges, and the sender restamped
+/// `sent_at` when it resent). Only the single `Instant::now()` the
+/// `DeliverySample` already needed is read.
 ///
 /// `path_id` is the **inbound** `header.path_id` (the id the ACK arrived under),
 /// which is the same id space `mark_path_seen` / `begin_path_validation` /
@@ -2454,6 +2456,10 @@ fn feed_bbr_on_ack(
         packet_bytes,
         is_app_limited: false,
         ack_delay_us,
+        // Karn's condition, carried through to the estimator's min-RTT filter.
+        // A retransmitted segment's `sent_at` was restamped when it was resent,
+        // so the elapsed time to this acknowledgement is not a round trip.
+        rtt_sampled: sampled_rtt,
     };
     let _ = crypto_session.on_packet_acked(sample);
 }
@@ -7869,6 +7875,7 @@ mod tests {
                 packet_bytes: 1500,
                 is_app_limited: false,
                 ack_delay_us: 100,
+                rtt_sampled: true,
             };
             client_session.on_packet_sent(1500);
             let _ = client_session.on_packet_acked(sample);

@@ -10,6 +10,31 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **An acknowledgement for a retransmitted segment poisoned the minimum-RTT filter,
+  pinning the congestion window on its floor for the life of the connection.** A sender
+  restamps a segment's send time when it resends it, so an acknowledgement for the
+  *original* transmission — already on the wire when the copy went out — was measured
+  from the copy and read as microseconds on a path whose real round trip is a fifth of a
+  second. Nothing in an acknowledgement says which of the two transmissions it answers,
+  which is why Karn's algorithm excludes these samples; the reliable stream's own SRTT
+  estimator already did, but the bandwidth estimator fed every sample into its minimum
+  filter unconditionally. A minimum is not averaged away like a mean: one bad sample
+  evicted every honest measurement in the 10-second window and governed the
+  bandwidth-delay product until it aged out — and on a lossy path the next retransmit
+  renewed it, so it never did. Since `cwnd = 2 × btl_bw × min_rtt`, the window then sat
+  on its 5600-byte floor. Measured over a ~200 ms WAN path: the window grew to a ~128 KB
+  peak and collapsed back to exactly 5600 bytes, averaging 7.7 KB in flight where
+  filling the pipe needs ~165 KB, and sustaining 4.7-7.6% of a link whose raw-socket
+  control measured 6.63 Mbit/s at 0.0% loss.
+  Karn's condition was already computed and already threaded to the call site, but only
+  the observability RTT gauge consulted it; it is now carried on the delivery sample and
+  gates the filter as well. The delivery-rate half of the sample is deliberately left
+  ungated — send time, delivered counter and delivery timestamp are restamped together,
+  so that rate still measures bytes delivered since the resend over the time since the
+  resend, a short interval but an honest one.
+  **Sender-local accounting only: no wire-format, handshake or key-schedule change, and
+  old and new peers interoperate unchanged.**
+
 - **BBR read a burst of acknowledgements as a whole window delivered inside one packet's
   round trip, overestimating the path by an order of magnitude.** The delivery-rate
   sample counted the bytes the connection delivered while a packet was in flight, but
