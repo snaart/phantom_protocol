@@ -20,9 +20,19 @@
 //!                      └─────────────┘
 //! ```
 //!
-//! - **Startup:** Double sending rate exponentially until bottleneck bandwidth is found
+//! - **Startup:** Double sending rate exponentially until bottleneck bandwidth is found —
+//!   i.e. until three consecutive *round trips* fail to grow the estimate by 25%
 //! - **Drain:** Reduce rate until inflight ≤ BDP (drain queues built during Startup)
-//! - **ProbeBW:** Cycle through pacing gains (1.25, 0.75, 1.0, 1.0) to probe bandwidth
+//! - **ProbeBW:** Cycle through pacing gains (1.25, 0.75, 1.0, 1.0) to probe bandwidth,
+//!   one gain per *round trip*
+//!
+//! Both of those are measured in round trips, and a round trip here is BBR's
+//! packet-timed one: it closes when an acknowledgement arrives for a packet that
+//! was sent at or beyond the delivered-bytes mark taken when the round opened
+//! (`BandwidthEstimator::update_round` carries the rule). Nothing in this file counts
+//! acknowledgements as a proxy for it — dozens land inside one round trip, and a
+//! controller scaled that way leaves Startup and spins its gain cycle before it
+//! has probed anything at all.
 //! - **ProbeRTT:** Every 10s, reduce CWND to 4 packets for 200ms to measure true min RTT
 //! - **FastRecovery:** Entered on explicit packet loss (BBRv3-style) — back off pacing to
 //!   0.5x and tighten CWND to 1x BDP until the pipe drains; not shown in the diagram above
@@ -247,13 +257,29 @@ pub struct BandwidthEstimator {
     pacing_gain: f64,
     /// CWND gain multiplier
     cwnd_gain: f64,
-    /// Round counter (ticks on each ACK in Startup, cycles in ProbeBW)
+    /// Packet-timed round trips elapsed. Advances in [`Self::update_round`] and
+    /// nowhere else, so every consumer of it — the Startup exit test, the
+    /// ProbeBW gain cycle — is measured in round trips.
     round_count: u32,
+    /// The delivered-bytes mark that closes the current round trip. An
+    /// acknowledgement for a packet that was *sent* at or beyond this mark is
+    /// answering data put on the wire after the round opened, which means a
+    /// full round trip has elapsed. See [`Self::update_round`].
+    next_round_delivered: u64,
+    /// Whether the acknowledgement currently being processed opened a new round
+    /// trip. Read by the state machine, which must judge the connection once per
+    /// round rather than once per packet.
+    round_start: bool,
     /// Whether we've found the bottleneck bandwidth
     filled_pipe: bool,
-    /// Previous bandwidth sample for startup exit decision
-    prev_bw: u64,
-    /// Number of rounds with insufficient BW increase (startup exit condition)
+    /// The bandwidth plateau Startup is trying to beat — BBR's `full_bw`. Raised
+    /// only when a round delivers at least [`STARTUP_GROWTH_THRESHOLD`] more
+    /// than it, so a path that keeps growing steadily but by less than a quarter
+    /// per round is not mistaken for one that has stopped growing.
+    full_bw: u64,
+    /// Consecutive round trips whose bandwidth failed to beat [`Self::full_bw`]
+    /// by the growth threshold — BBR's `full_bw_count`, the Startup exit
+    /// condition.
     rounds_without_growth: u32,
 
     // ── Inflight tracking ──
@@ -297,8 +323,10 @@ impl BandwidthEstimator {
             pacing_gain: 2.0, // Startup: double the rate
             cwnd_gain: 2.0,
             round_count: 0,
+            next_round_delivered: 0,
+            round_start: false,
             filled_pipe: false,
-            prev_bw: 0,
+            full_bw: 0,
             rounds_without_growth: 0,
             inflight_bytes: 0,
             last_probe_rtt_time: now,
@@ -330,6 +358,10 @@ impl BandwidthEstimator {
         // Update delivered bytes counter
         self.delivered_bytes += sample.packet_bytes;
         self.last_delivery = now;
+
+        // Has a round trip elapsed? Everything the state machine decides is
+        // scaled in round trips, so this has to be answered before it runs.
+        self.update_round(sample.delivered_bytes);
 
         // `send_elapsed` is the full round trip, timed entirely by this
         // endpoint's own clock: `sent_at` and `acked_at` are both its own
@@ -486,7 +518,7 @@ impl BandwidthEstimator {
         }
 
         // Run state machine
-        self.update_state(now);
+        self.update_state(now, sample.is_app_limited);
 
         // Return pacing rate
         self.pacing_rate()
@@ -580,16 +612,126 @@ impl BandwidthEstimator {
         self.last_delivery
     }
 
-    /// Get the round count.
+    /// Packet-timed round trips elapsed since the connection opened.
+    ///
+    /// Round trips, not acknowledgements: `update_round` carries the
+    /// delivered-counter rule that advances this.
     pub fn round_count(&self) -> u32 {
         self.round_count
     }
 
     // ── State Machine ───────────────────────────────────────────────────────
 
+    /// Detect the end of a packet-timed round trip — BBR's `BBRUpdateRound`:
+    ///
+    /// ```text
+    /// BBRUpdateRound():
+    ///   if (packet.delivered >= BBR.next_round_delivered)
+    ///     BBRStartRound()          # BBR.next_round_delivered = C.delivered
+    ///     BBR.round_count++
+    ///     BBR.round_start = true
+    ///   else
+    ///     BBR.round_start = false
+    /// ```
+    ///
+    /// `packet_delivered` is the connection's delivered counter *at the moment
+    /// this packet was sent* — `DeliverySample::delivered_bytes`, stamped in
+    /// `Stream::poll_send`. When an acknowledgement comes back for a packet that
+    /// left at or after the mark taken when the round opened, every packet that
+    /// was in flight at the start of the round has been answered: a round trip
+    /// has elapsed. The new mark is the counter as it stands now, which is the
+    /// last packet of *this* flight.
+    ///
+    /// The definition is deliberately in delivered bytes rather than in wall
+    /// clock. It costs nothing to compute, it needs no RTT estimate to be
+    /// correct first, and it stays right across an idle application or an RTT
+    /// that moves — "virtual time" in the draft's words. A timer would have to
+    /// be re-derived from `min_rtt`, which is itself a filtered guess this
+    /// endpoint is still refining.
+    ///
+    /// `wrapping_add` rather than `+=`: nothing downstream reads the absolute
+    /// count, only its parity against the four-entry gain cycle (and 2^32 is
+    /// divisible by four, so even the wrap keeps the cycle in phase).
+    fn update_round(&mut self, packet_delivered: u64) {
+        if packet_delivered >= self.next_round_delivered {
+            self.next_round_delivered = self.delivered_bytes;
+            self.round_count = self.round_count.wrapping_add(1);
+            self.round_start = true;
+        } else {
+            self.round_start = false;
+        }
+    }
+
+    /// BBR's `BBRCheckStartupFullBandwidth`: has the pipe stopped filling?
+    ///
+    /// ```text
+    /// if BBR.filled_pipe or !BBR.round_start or rs.is_app_limited
+    ///   return
+    /// if (BBR.max_bw >= BBR.full_bw * 1.25)
+    ///   BBR.full_bw = BBR.max_bw
+    ///   BBR.full_bw_count = 0
+    ///   return
+    /// BBR.full_bw_count++
+    /// if (BBR.full_bw_count >= 3)
+    ///   BBR.filled_pipe = true
+    /// ```
+    ///
+    /// Three points the previous version got wrong, all of which end Startup
+    /// early, and Startup is the connection's only exponential-growth phase:
+    ///
+    /// - **`round_start`.** The judgement is per round trip. Run per
+    ///   acknowledgement it is meaningless: between two acks microseconds apart
+    ///   a max-filtered estimate has not grown a quarter, and it never could,
+    ///   so the three-strike counter runs out inside the first flight.
+    /// - **`full_bw` is a plateau, not the previous round.** Comparing each
+    ///   round against only the one before it reads steady 20%-per-round growth
+    ///   as a plateau and quits while the path is still opening up. Held against
+    ///   a high-water mark, cumulative growth clears the 25% bar and resets the
+    ///   counter.
+    /// - **`is_app_limited`.** A round in which the application had nothing to
+    ///   send delivers less through no fault of the path, and its sample never
+    ///   reached the bandwidth filter in the first place — so its "growth" is
+    ///   flat by construction. Counting it as evidence the pipe is full lets an
+    ///   idle moment end Startup.
+    fn check_startup_full_bandwidth(&mut self, is_app_limited: bool) {
+        if self.filled_pipe || !self.round_start || is_app_limited {
+            return;
+        }
+
+        if self.btl_bw as f64 >= self.full_bw as f64 * (1.0 + STARTUP_GROWTH_THRESHOLD) {
+            self.full_bw = self.btl_bw;
+            self.rounds_without_growth = 0;
+            return;
+        }
+
+        self.rounds_without_growth = self.rounds_without_growth.saturating_add(1);
+        if self.rounds_without_growth >= STARTUP_ROUNDS_LIMIT {
+            self.filled_pipe = true;
+            self.transition_to(BbrState::Drain);
+        }
+    }
+
     /// Run BBR state machine transitions.
-    fn update_state(&mut self, now: Instant) {
+    fn update_state(&mut self, now: Instant, is_app_limited: bool) {
         // ── ProbeRTT check: global timer, any state can enter except Startup and FastRecovery ──
+        //
+        // Both ProbeRTT bounds below are wall clock — `Instant` differences
+        // against `sample.acked_at`, which is a real timestamp — and the draft
+        // is explicit that this is right: ProbeRTTInterval and ProbeRTTDuration
+        // "are explicitly wall-clock measurements", unlike the round counting
+        // above. They are not a second instance of the per-acknowledgement
+        // confusion and are deliberately left alone.
+        //
+        // Two honest divergences from the draft remain here, neither of which
+        // is that defect. Canonical BBR starts the 200 ms clock only once
+        // inflight has drained to the minimum window, and holds ProbeRTT for at
+        // least one round trip on top of the duration; this starts the clock on
+        // entry, which if anything leaves ProbeRTT sooner. And the trigger is
+        // "10 s since the last ProbeRTT" rather than the draft's "the min-RTT
+        // filter has gone stale", so a flow whose filter is being refreshed by
+        // every acknowledgement still pays a 200 ms window at the floor cwnd
+        // every 10 s. Both are behaviour changes rather than corrections, and
+        // are left for a change that measures them.
         if self.state != BbrState::ProbeRTT
             && self.state != BbrState::Startup
             && self.state != BbrState::FastRecovery
@@ -603,24 +745,7 @@ impl BandwidthEstimator {
 
         match self.state {
             BbrState::Startup => {
-                self.round_count += 1;
-
-                // Check if pipe is filled (BW growth < threshold)
-                if self.prev_bw > 0 {
-                    let growth = (self.btl_bw as f64 - self.prev_bw as f64) / self.prev_bw as f64;
-
-                    if growth < STARTUP_GROWTH_THRESHOLD {
-                        self.rounds_without_growth += 1;
-                    } else {
-                        self.rounds_without_growth = 0;
-                    }
-
-                    if self.rounds_without_growth >= STARTUP_ROUNDS_LIMIT {
-                        self.filled_pipe = true;
-                        self.transition_to(BbrState::Drain);
-                    }
-                }
-                self.prev_bw = self.btl_bw;
+                self.check_startup_full_bandwidth(is_app_limited);
             }
             BbrState::Drain => {
                 // Stay in Drain until inflight ≤ BDP
@@ -630,11 +755,20 @@ impl BandwidthEstimator {
                 }
             }
             BbrState::ProbeBW => {
-                // Cycle through pacing gains
+                // One gain phase per round trip, which is what the gains mean:
+                // 1.25 asks the path for a quarter more than the estimate and
+                // 0.75 gives back whatever queue that built. A phase has to
+                // outlast a round trip for its result to come back and be
+                // measured at all — advanced per acknowledgement, the probe
+                // covers one packet in four and the estimate can never climb
+                // above whatever Startup handed it.
+                //
+                // `round_count` only moves on a round boundary now, so the
+                // index below is constant for the whole round; no separate
+                // "advance" step is needed, and none may be added.
                 let cycle_idx = (self.round_count as usize) % PROBE_BW_GAINS.len();
                 self.pacing_gain = PROBE_BW_GAINS[cycle_idx];
                 self.cwnd_gain = 2.0;
-                self.round_count += 1;
             }
             BbrState::ProbeRTT => {
                 // Stay for PROBE_RTT_DURATION, then exit
@@ -710,6 +844,7 @@ impl std::fmt::Debug for BandwidthEstimator {
             .field("state", &self.state)
             .field("btl_bw_kbps", &(self.btl_bw / 1024))
             .field("min_rtt_ms", &self.min_rtt.as_millis())
+            .field("round_count", &self.round_count)
             .field("pacing_gain", &self.pacing_gain)
             .field("inflight_bytes", &self.inflight_bytes)
             .field("delivered_bytes", &self.delivered_bytes)
@@ -1152,6 +1287,216 @@ mod tests {
         );
     }
 
+    /// Acknowledge `packets` segments that all went out inside the same round
+    /// trip.
+    ///
+    /// Every one of them left before any acknowledgement came back, so they all
+    /// carry the same delivery mark: the connection's delivered counter, and the
+    /// instant it last advanced, as of the send. That shared mark is exactly what
+    /// a real sender stamps in `Stream::poll_send` from the estimator's own
+    /// snapshot, and it is what BBR's round detection keys on — a packet whose
+    /// mark is at or beyond the round's opening mark closes the round.
+    fn ack_one_round_trip(
+        est: &mut BandwidthEstimator,
+        packets: u64,
+        packet_bytes: u64,
+        sent_at: Instant,
+        rtt: Duration,
+    ) {
+        let mark = est.delivered_bytes();
+        let mark_time = est.delivered_time();
+        for _ in 0..packets {
+            est.on_send(packet_bytes);
+        }
+        for i in 0..packets {
+            est.on_ack(DeliverySample {
+                delivered_bytes: mark,
+                delivered_at: mark_time,
+                sent_at,
+                // Acknowledgements for one flight land close together — they do
+                // not arrive spread out the way the data was sent.
+                acked_at: sent_at + rtt + Duration::from_micros(i * 20),
+                packet_bytes,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: true,
+            });
+        }
+    }
+
+    /// Pacing gains are copies of the same `f64` constants, so an exact compare
+    /// would be sound — but a tolerance says what is meant and keeps the
+    /// assertion honest if a gain ever becomes computed rather than tabulated.
+    fn same_gain(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// A "round" in BBR is a round *trip*, not an acknowledgement.
+    ///
+    /// The Startup exit rule — three consecutive rounds whose bandwidth grew by
+    /// less than 25% — is canonical, and it is the only thing that ends the
+    /// connection's one exponential-growth phase. Counting each arriving
+    /// acknowledgement as a round makes it fire almost immediately: dozens of
+    /// acknowledgements land within a single round trip, and between two of them
+    /// microseconds apart a max-filtered bandwidth estimate essentially never
+    /// grows a quarter. Three of those in a row arrive long before the window
+    /// has doubled once, so the sender leaves Startup having never probed
+    /// anything, and the estimate it carries out is whatever the opening window
+    /// happened to deliver.
+    ///
+    /// Here a whole window's worth of segments goes out and is acknowledged one
+    /// round trip later — the shape of the first flight of any bulk transfer.
+    /// That is *one* round trip, and Startup must still be running at the end
+    /// of it.
+    #[test]
+    fn startup_survives_a_whole_window_of_acks_inside_one_round_trip() {
+        const PACKETS: u64 = 60;
+        const PACKET: u64 = 1200;
+        const RTT: Duration = Duration::from_millis(200);
+
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+        let opening_cwnd = est.cwnd();
+
+        ack_one_round_trip(&mut est, PACKETS, PACKET, start, RTT);
+
+        assert_eq!(
+            est.round_count(),
+            1,
+            "{PACKETS} acknowledgements for one flight are one round trip, not \
+             {} of them",
+            est.round_count()
+        );
+        assert_eq!(
+            est.state(),
+            BbrState::Startup,
+            "the connection left Startup inside its first round trip, before the \
+             window had doubled even once"
+        );
+        // ...and it must have used the round: a controller that stayed in
+        // Startup by refusing to estimate anything would satisfy the above.
+        assert!(
+            est.cwnd() > 10 * opening_cwnd,
+            "cwnd {} B has not grown past the {} B it opened at",
+            est.cwnd(),
+            opening_cwnd
+        );
+    }
+
+    /// The other direction, which is what stops the fix above from being
+    /// "never leave Startup".
+    ///
+    /// Startup is exponential growth; staying in it forever would keep the
+    /// window inflating against a bottleneck that has already been found and
+    /// standing queues in front of it. When the pipe genuinely fills — several
+    /// consecutive *round trips* delivering the same rate — the sender has to
+    /// notice and move on to Drain.
+    #[test]
+    fn startup_still_exits_once_the_pipe_stops_filling_over_several_round_trips() {
+        const PACKETS: u64 = 20;
+        const PACKET: u64 = 1200;
+        const RTT: Duration = Duration::from_millis(200);
+        const ROUNDS: u32 = 12;
+
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+
+        // A fixed window per round trip: the rate never grows, so from the
+        // second round on every round is a no-growth round.
+        let mut left_after: Option<u32> = None;
+        for round in 0..ROUNDS {
+            ack_one_round_trip(&mut est, PACKETS, PACKET, start + RTT * round, RTT);
+            if left_after.is_none() && est.state() != BbrState::Startup {
+                left_after = Some(round + 1);
+            }
+        }
+
+        assert_eq!(
+            est.round_count(),
+            ROUNDS,
+            "{ROUNDS} flights are {ROUNDS} round trips"
+        );
+        let window = STARTUP_ROUNDS_LIMIT..=STARTUP_ROUNDS_LIMIT + 5;
+        assert!(
+            matches!(left_after, Some(r) if window.contains(&r)),
+            "Startup should end within a few round trips of the rate flattening \
+             (expected somewhere in {window:?}); it ended after {left_after:?}"
+        );
+    }
+
+    /// The ProbeBW gain cycle is the only thing that lets the estimate climb
+    /// once Startup is over: three of its four phases pace at or below the
+    /// current estimate, and the 1.25 phase is the one that asks the path for
+    /// more. In BBR each phase lasts one `min_rtt`.
+    ///
+    /// Indexing the cycle with a counter that ticks per acknowledgement spins it
+    /// at ack rate, so the probe phase covers roughly one packet in four and
+    /// never lasts long enough to probe anything. The estimate then cannot climb
+    /// after Startup either — whatever it left Startup with is what it keeps.
+    #[test]
+    fn the_probe_bw_gain_cycle_advances_once_per_round_trip_not_once_per_ack() {
+        const PACKETS: u64 = 40;
+        const PACKET: u64 = 1200;
+        const RTT: Duration = Duration::from_millis(200);
+        const ROUNDS: u32 = 8;
+
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+        // Park it in ProbeBW directly. Startup's exit rule is the previous
+        // test's subject; reaching ProbeBW through it would only make this test
+        // fail for that test's reasons.
+        est.state = BbrState::ProbeBW;
+
+        let mut per_round: Vec<f64> = Vec::new();
+        for round in 0..ROUNDS {
+            let sent_at = start + RTT * round;
+            let mark = est.delivered_bytes();
+            let mark_time = est.delivered_time();
+            let mut within: Vec<f64> = Vec::new();
+            for i in 0..PACKETS {
+                est.on_send(PACKET);
+                est.on_ack(DeliverySample {
+                    delivered_bytes: mark,
+                    delivered_at: mark_time,
+                    sent_at,
+                    acked_at: sent_at + RTT + Duration::from_micros(i * 20),
+                    packet_bytes: PACKET,
+                    is_app_limited: false,
+                    ack_delay_us: 0,
+                    rtt_sampled: true,
+                });
+                within.push(est.pacing_gain);
+            }
+            let changes = within.windows(2).filter(|w| !same_gain(w[0], w[1])).count();
+            assert_eq!(
+                changes, 0,
+                "round {round}: the pacing gain changed {changes} times inside a \
+                 single round trip — a phase that turns over every \
+                 acknowledgement never probes anything: {within:?}"
+            );
+            per_round.push(within[0]);
+        }
+
+        // Four gains, one round trip each: the cycle's period is four *round
+        // trips*.
+        let period = PROBE_BW_GAINS.len();
+        for r in 0..(ROUNDS as usize - period) {
+            assert!(
+                same_gain(per_round[r], per_round[r + period]),
+                "the gain cycle is not periodic in round trips: {per_round:?}"
+            );
+        }
+        // ...and every phase must actually run, or a controller that pinned one
+        // gain forever would satisfy the assertions above.
+        for gain in PROBE_BW_GAINS {
+            assert!(
+                per_round.iter().any(|g| same_gain(*g, gain)),
+                "the {gain} phase never ran across {ROUNDS} round trips: \
+                 {per_round:?}"
+            );
+        }
+    }
+
     /// The estimator opens with a conservative 100 ms *guess* for `min_rtt`,
     /// which is not a measurement of anything. Anchoring RFC 9002 §5.3's guard
     /// on that guess would let a peer on a slower path subtract its way down to
@@ -1340,21 +1685,20 @@ mod tests {
     fn test_startup_to_drain_transition() {
         let mut est = BandwidthEstimator::new();
         let now = Instant::now();
+        let rtt = Duration::from_millis(10);
 
-        // Send many ACKs with constant bandwidth to trigger pipe-filled detection
-        for i in 0..20 {
-            let sent = now + Duration::from_millis(i * 10);
-            est.on_send(1400);
-            let sample = make_sample(sent, 10, 1400);
-            est.on_ack(sample);
+        // Constant bandwidth over many *round trips* triggers pipe-filled
+        // detection. Twenty acknowledgements would not, and must not: between
+        // them they are a single round trip.
+        for round in 0..20u32 {
+            ack_one_round_trip(&mut est, 10, 1400, now + rtt * round, rtt);
         }
 
-        // After enough rounds with no BW growth, should exit startup
-        assert!(
-            est.state() != BbrState::Startup || est.round_count < 20,
-            "expected startup exit, state = {:?}, rounds = {}",
+        assert_ne!(
             est.state(),
-            est.round_count
+            BbrState::Startup,
+            "expected startup exit after {} round trips at a flat rate",
+            est.round_count()
         );
     }
 
@@ -1426,33 +1770,64 @@ mod tests {
 
     #[test]
     fn test_drain_waits_for_bdp() {
+        const PACKET: u64 = 1400;
         let mut est = BandwidthEstimator::new();
         let now = Instant::now();
+        let rtt = Duration::from_millis(10);
 
-        // Drive into Drain state
-        for i in 0..20 {
-            let sent = now + Duration::from_millis(i * 10);
-            est.on_send(1400);
-            est.on_ack(make_sample(sent, 10, 1400));
+        // Four round trips at a steady rate, so the BDP below is a real number
+        // rather than the zero a fresh estimator carries (which would let Drain
+        // exit for the wrong reason).
+        for round in 0..4u32 {
+            ack_one_round_trip(&mut est, 10, PACKET, now + rtt * round, rtt);
         }
+        assert!(est.bdp() > 0, "precondition: the BDP must be known");
 
-        // Artificially set high inflight
-        if est.state() == BbrState::Drain {
-            // Add lots of inflight
-            est.inflight_bytes = est.bdp() * 3;
-            let sent = now + Duration::from_millis(300);
-            est.on_ack(make_sample(sent, 10, 1400));
-            // Should still be in Drain (inflight > BDP)
-            if est.inflight_bytes > est.bdp() {
-                assert_eq!(
-                    est.state(),
-                    BbrState::Drain,
-                    "should stay in Drain while inflight ({}) > BDP ({})",
-                    est.inflight_bytes,
-                    est.bdp()
-                );
-            }
-        }
+        // Drain holds while the queue Startup built is still in the pipe. The
+        // probe acknowledgement carries the current delivery mark, so it adds
+        // one packet over a long interval and cannot move the bandwidth
+        // estimate — the BDP under test stays put.
+        est.state = BbrState::Drain;
+        est.inflight_bytes = est.bdp() * 3;
+        let (mark, mark_time) = (est.delivered_bytes(), est.delivered_time());
+        est.on_ack(DeliverySample {
+            delivered_bytes: mark,
+            delivered_at: mark_time,
+            sent_at: now + Duration::from_millis(100),
+            acked_at: now + Duration::from_millis(110),
+            packet_bytes: PACKET,
+            is_app_limited: false,
+            ack_delay_us: 0,
+            rtt_sampled: true,
+        });
+        assert_eq!(
+            est.state(),
+            BbrState::Drain,
+            "should stay in Drain while inflight ({}) > BDP ({})",
+            est.inflight_bytes(),
+            est.bdp()
+        );
+
+        // ...and releases once it has drained back inside the BDP.
+        est.inflight_bytes = est.bdp() / 2;
+        let (mark, mark_time) = (est.delivered_bytes(), est.delivered_time());
+        est.on_ack(DeliverySample {
+            delivered_bytes: mark,
+            delivered_at: mark_time,
+            sent_at: now + Duration::from_millis(120),
+            acked_at: now + Duration::from_millis(130),
+            packet_bytes: PACKET,
+            is_app_limited: false,
+            ack_delay_us: 0,
+            rtt_sampled: true,
+        });
+        assert_eq!(
+            est.state(),
+            BbrState::ProbeBW,
+            "Drain must release once inflight ({}) is back inside the BDP ({})",
+            est.inflight_bytes(),
+            est.bdp()
+        );
     }
 
     #[test]
