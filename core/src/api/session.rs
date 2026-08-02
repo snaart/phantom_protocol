@@ -35,6 +35,7 @@ use crate::transport::types::{
 };
 use bytes::Bytes;
 use dashmap::DashMap;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -1393,6 +1394,47 @@ enum DeliverItem {
     Close(u32),
 }
 
+/// Outbound work the pump has taken off the command channel but that the target
+/// stream's send buffer has not yet accepted.
+///
+/// The pump used to hand application writes straight to `Stream::send_reliable`,
+/// which parks on the stream's backpressure semaphore until an acknowledgement
+/// frees a slot. Doing that from inside the pump's `select!` parks the *whole
+/// pump*: no heartbeat, no `WINDOW_UPDATE` flush, no drain, no command
+/// processing — so a saturating send in one direction stops the session issuing
+/// the other direction's flow-control credit and the download collapses to the
+/// single initial window. Deferring the refused chunk here instead keeps the loop
+/// turning; the pump simply stops reading commands until the backlog clears,
+/// which pushes the backpressure out to the application's own `send()` where it
+/// belongs.
+///
+/// FIFO order across the queue is what preserves stream ordering: the pump stops
+/// at the first chunk a buffer refuses rather than skipping ahead.
+#[derive(Clone)]
+enum Deferred {
+    /// Reliable application payload awaiting a send-buffer slot on `stream`.
+    Data { stream: Arc<Stream>, data: Bytes },
+    /// The reliable FIN sentinel for `stream_id` awaiting a slot.
+    Fin { stream_id: u32, stream: Arc<Stream> },
+}
+
+/// Maximum segments one [`drain_streams_priority_ordered`] pass puts on the wire
+/// before handing control back to the pump's `select!`.
+///
+/// Without a bound, one stream with a full congestion window monopolises the
+/// pump for as long as the pacer takes to emit that window — on a long path,
+/// most of a round trip — during which no inbound flow-control credit is flushed
+/// and no command is serviced. The drain re-arms the outbound notify when it
+/// stops on this budget, so the only cost of the bound is one extra trip through
+/// `select!` per 32 packets; the gain is that every other arm gets a turn at that
+/// same cadence.
+const DRAIN_MAX_SEGMENTS_PER_PASS: usize = 32;
+
+/// Safety valve on the flush-everything loops used at graceful close: bounds the
+/// number of `DRAIN_MAX_SEGMENTS_PER_PASS`-sized passes so a stream that keeps
+/// re-offering work can never wedge the teardown.
+const DRAIN_MAX_PASSES_ON_CLOSE: usize = 256;
+
 /// Shared client/server data pump.
 ///
 /// After the handshake completes (client side) or after the server `Session` is
@@ -1450,25 +1492,34 @@ async fn run_data_pump<T: SessionTransport>(
     let raw_stream = Arc::new(Stream::new(RAW_APP_STREAM_ID as TransportStreamId));
     streams.insert(RAW_APP_STREAM_ID, raw_stream.clone());
 
+    // Application writes the pump has accepted but that a stream's send buffer
+    // has not yet admitted (see `Deferred`). While this queue is non-empty the
+    // command arm below is disabled, so the pump keeps servicing the heartbeat,
+    // the receive-driven wake-ups and the flow-control flush, and the
+    // backpressure surfaces at the application's own `send()` instead of parking
+    // the pump.
+    let mut deferred: VecDeque<Deferred> = VecDeque::new();
+
     // ── Flush queued early-data onto the raw-app stream ──
     // Routed through the stream (not a one-shot direct send) so queued
     // pre-handshake data is buffered for retransmit just like post-handshake
     // sends — a dropped early-data frame is recovered, not lost.
+    //
+    // Queued rather than pushed directly: the pre-handshake queue has no size
+    // limit, so an application that writes more than the stream's 1024-segment
+    // buffer holds before the handshake completes would park here — before the
+    // loop that transmits, hence before any acknowledgement could ever free a
+    // slot. That is a permanent stall, not backpressure. The main loop admits
+    // this backlog as slots free.
     {
         let mut queue = send_queue.lock().await;
         let count = queue.len();
-        'flush: for msg in queue.drain(..) {
+        for msg in queue.drain(..) {
             for chunk in msg.chunks(TRANSPORT_MTU) {
-                if let Err(e) = raw_stream
-                    .send_reliable(Bytes::copy_from_slice(chunk))
-                    .await
-                {
-                    // T4.5 fail-closed: the reliable offset space is exhausted (~2^32
-                    // segments) — refuse rather than wrap. Astronomically unreachable;
-                    // the session stalls and the liveness sweep tears it down.
-                    log::error!("PhantomSession: early-data flush aborted — {e}");
-                    break 'flush;
-                }
+                deferred.push_back(Deferred::Data {
+                    stream: raw_stream.clone(),
+                    data: Bytes::copy_from_slice(chunk),
+                });
             }
         }
         if count > 0 {
@@ -1765,18 +1816,28 @@ async fn run_data_pump<T: SessionTransport>(
     loop {
         tokio::select! {
             _ = poll_interval.tick() => {
+                flush_deferred_sends(
+                    &mut deferred, &transport, &crypto_session, session_id, &streams,
+                    &demux, &stream_gauge, &observability,
+                )
+                .await;
                 flush_pending_window_updates(
                     &transport, &crypto_session, session_id, &streams, &observability,
                 )
                 .await;
-                drain_streams_priority_ordered(
+                if drain_streams_priority_ordered(
                     &transport,
                     &crypto_session,
                     session_id,
                     &streams,
                     &observability,
                 )
-                .await;
+                .await
+                {
+                    // Stopped on the per-pass segment budget with work left —
+                    // come straight back after the other arms get a turn.
+                    crypto_session.notify_outbound_ready();
+                }
                 // Idle keep-alive (download-only liveness): on an
                 // otherwise-idle Connected path, emit one small ENCRYPTED PING so a
                 // download-only path (which sends only ACKs) has an outstanding probe
@@ -1817,53 +1878,78 @@ async fn run_data_pump<T: SessionTransport>(
                 }
             }
             _ = send_notify.notified() => {
-                // Same drain logic as the tick arm — fast-wake path. Also flush
-                // any flow-control credit the delivery task staged.
+                // Same drain logic as the tick arm — fast-wake path. Also admit
+                // whatever the send buffers have room for now (an acknowledgement
+                // that freed a slot wakes us here) and flush any flow-control
+                // credit the delivery task staged.
+                flush_deferred_sends(
+                    &mut deferred, &transport, &crypto_session, session_id, &streams,
+                    &demux, &stream_gauge, &observability,
+                )
+                .await;
                 flush_pending_window_updates(
                     &transport, &crypto_session, session_id, &streams, &observability,
                 )
                 .await;
-                drain_streams_priority_ordered(
+                if drain_streams_priority_ordered(
                     &transport,
                     &crypto_session,
                     session_id,
                     &streams,
                     &observability,
                 )
-                .await;
+                .await
+                {
+                    crypto_session.notify_outbound_ready();
+                }
             }
-            cmd_opt = cmd_rx.recv() => {
+            // Disabled while `deferred` holds work: the queue must clear in FIFO
+            // order before another command is taken, which is what preserves
+            // per-stream byte ordering and lets the bounded command channel carry
+            // the backpressure back to the caller.
+            cmd_opt = cmd_rx.recv(), if deferred.is_empty() => {
                 match cmd_opt {
                     Some(SessionCommand::Send(data)) => {
                         // Route through the raw-app stream so the payload is
                         // buffered for retransmit until ACKed (drained by
                         // `drain_streams_priority_ordered`), instead of being
-                        // fired once and forgotten on the wire.
+                        // fired once and forgotten on the wire. Admission goes
+                        // through `deferred` so a full send buffer refuses the
+                        // chunk instead of parking this whole loop.
                         for chunk in data.chunks(TRANSPORT_MTU) {
-                            if let Err(e) = raw_stream
-                                .send_reliable(Bytes::copy_from_slice(chunk))
-                                .await
-                            {
-                                log::error!("PhantomSession: send aborted — {e}");
-                                break;
-                            }
+                            deferred.push_back(Deferred::Data {
+                                stream: raw_stream.clone(),
+                                data: Bytes::copy_from_slice(chunk),
+                            });
                         }
+                        flush_deferred_sends(
+                            &mut deferred, &transport, &crypto_session, session_id, &streams,
+                            &demux, &stream_gauge, &observability,
+                        )
+                        .await;
                         crypto_session.notify_outbound_ready();
                     }
                     Some(SessionCommand::SendStreamReliable { stream_id, data }) => {
-                        if let Some(stream) = streams.get(&stream_id) {
+                        // Clone the Arc out and drop the DashMap guard before any
+                        // await — the shard lock must never be held across one.
+                        let stream = streams.get(&stream_id).map(|s| s.clone());
+                        if let Some(stream) = stream {
                             for chunk in data.chunks(TRANSPORT_MTU) {
-                                if let Err(e) =
-                                    stream.send_reliable(Bytes::copy_from_slice(chunk)).await
-                                {
-                                    log::error!("PhantomSession: stream send aborted — {e}");
-                                    break;
-                                }
+                                deferred.push_back(Deferred::Data {
+                                    stream: stream.clone(),
+                                    data: Bytes::copy_from_slice(chunk),
+                                });
                             }
+                            flush_deferred_sends(
+                                &mut deferred, &transport, &crypto_session, session_id, &streams,
+                                &demux, &stream_gauge, &observability,
+                            )
+                            .await;
                         }
                     }
                     Some(SessionCommand::SendStreamUnreliable { stream_id, data }) => {
-                        if let Some(stream) = streams.get(&stream_id) {
+                        let stream = streams.get(&stream_id).map(|s| s.clone());
+                        if let Some(stream) = stream {
                             for chunk in data.chunks(TRANSPORT_MTU) {
                                 stream.send_unreliable(Bytes::copy_from_slice(chunk)).await;
                             }
@@ -1890,36 +1976,24 @@ async fn run_data_pump<T: SessionTransport>(
                         // "must have ENCRYPTED" gate in handle_packet). The security
                         // invariant test `forged_unencrypted_fin_does_not_close_a_stream`
                         // continues to pass because the drop happens before any FIN logic.
-                        if let Some(stream) = streams.get(&stream_id) {
-                            if let Err(e) = stream.queue_fin().await {
-                                // queue_fin can only fail on u32 offset exhaustion
-                                // (astronomically rare). Fall back to bare FIN.
-                                log::error!(
-                                    "PhantomSession: queue_fin failed for stream {stream_id}: {e}; \
-                                     sending bare FIN (best-effort)"
-                                );
-                                let _ = send_app_data(
-                                    &transport,
-                                    &crypto_session,
-                                    session_id,
-                                    stream_id as TransportStreamId,
-                                    &[],
-                                    PacketFlags::FIN,
-                                    None,
-                                    &observability,
-                                )
-                                .await;
-                                streams.remove(&stream_id);
-                                demux.close_stream(stream_id);
-                                // The stream leaves the routing tables here, so
-                                // retire it from the active-streams gauge (the
-                                // FIN-acked path below does the same for the
-                                // normal teardown).
-                                stream_gauge.closed(stream_id);
-                            }
-                            // Otherwise: stream stays until the FIN is SACKed.
-                            // Wake the send loop so the FIN is put on the wire
-                            // on the very next drain pass rather than after a 10 ms tick.
+                        //
+                        // Queued through `deferred` like any other reliable write,
+                        // so it lands strictly after the bytes queued before it and
+                        // a full send buffer refuses it rather than parking the
+                        // pump. `flush_deferred_sends` carries the offset-exhaustion
+                        // fallback (bare ENCRYPTED FIN + retire) that used to live
+                        // inline here.
+                        let stream = streams.get(&stream_id).map(|s| s.clone());
+                        if let Some(stream) = stream {
+                            deferred.push_back(Deferred::Fin { stream_id, stream });
+                            flush_deferred_sends(
+                                &mut deferred, &transport, &crypto_session, session_id, &streams,
+                                &demux, &stream_gauge, &observability,
+                            )
+                            .await;
+                            // The stream stays until the FIN is SACKed. Wake the
+                            // send loop so the FIN is put on the wire on the very
+                            // next drain pass rather than after a 10 ms tick.
                             crypto_session.notify_outbound_ready();
                         } else {
                             // Stream not in our table — maybe already removed.
@@ -2015,7 +2089,7 @@ async fn run_data_pump<T: SessionTransport>(
                             &transport, &crypto_session, session_id, &streams, &observability,
                         )
                         .await;
-                        drain_streams_priority_ordered(
+                        drain_streams_fully(
                             &transport, &crypto_session, session_id, &streams, &observability,
                         )
                         .await;
@@ -2035,7 +2109,7 @@ async fn run_data_pump<T: SessionTransport>(
                             &transport, &crypto_session, session_id, &streams, &observability,
                         )
                         .await;
-                        drain_streams_priority_ordered(
+                        drain_streams_fully(
                             &transport, &crypto_session, session_id, &streams, &observability,
                         )
                         .await;
@@ -2296,6 +2370,86 @@ async fn flush_pending_window_updates<T: SessionTransport>(
     }
 }
 
+/// Admit as much deferred outbound work into the stream send buffers as their
+/// backpressure currently allows, in strict FIFO order.
+///
+/// Stops at the first chunk a buffer refuses — the refused chunk stays at the
+/// head of the queue and is re-offered on the next pass — so a stream's byte
+/// order is preserved and a FIN can never overtake data queued before it. The
+/// only unbounded wait `Stream::send_reliable` had (the backpressure semaphore)
+/// is replaced by that refusal, which is what keeps the pump's `select!` loop
+/// turning while one direction saturates.
+///
+/// Wakes the send loop when anything was admitted so the newly-buffered bytes go
+/// out on the very next drain rather than after a heartbeat tick.
+#[allow(clippy::too_many_arguments)]
+async fn flush_deferred_sends<T: SessionTransport>(
+    deferred: &mut VecDeque<Deferred>,
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    streams: &Arc<DashMap<u32, Arc<Stream>>>,
+    demux: &Arc<StreamDemultiplexer>,
+    stream_gauge: &Arc<StreamGauge>,
+    observability: &Observability,
+) {
+    let mut admitted = false;
+    while let Some(item) = deferred.front().cloned() {
+        match item {
+            Deferred::Data { stream, data } => match stream.try_send_reliable(&data).await {
+                Ok(true) => {
+                    admitted = true;
+                    deferred.pop_front();
+                }
+                // Buffer full: leave it at the head and try again next pass.
+                Ok(false) => break,
+                Err(e) => {
+                    // T4.5 fail-closed: the reliable offset space is exhausted
+                    // (~2^32 segments). Astronomically unreachable; drop the
+                    // chunk so the queue cannot wedge, and let the liveness
+                    // sweep tear the stalled session down.
+                    log::error!("PhantomSession: send aborted — {e}");
+                    deferred.pop_front();
+                }
+            },
+            Deferred::Fin { stream_id, stream } => match stream.try_queue_fin().await {
+                Ok(true) => {
+                    admitted = true;
+                    deferred.pop_front();
+                }
+                Ok(false) => break,
+                Err(e) => {
+                    // Same offset exhaustion, on the FIN sentinel. Fall back to
+                    // a bare (still ENCRYPTED — Invariant 2) FIN and retire the
+                    // stream, exactly as the inline path used to.
+                    log::error!(
+                        "PhantomSession: queue_fin failed for stream {stream_id}: {e}; \
+                         sending bare FIN (best-effort)"
+                    );
+                    let _ = send_app_data(
+                        transport,
+                        crypto_session,
+                        session_id,
+                        stream_id as TransportStreamId,
+                        &[],
+                        PacketFlags::FIN,
+                        None,
+                        observability,
+                    )
+                    .await;
+                    streams.remove(&stream_id);
+                    demux.close_stream(stream_id);
+                    stream_gauge.closed(stream_id);
+                    deferred.pop_front();
+                }
+            },
+        }
+    }
+    if admitted {
+        crypto_session.notify_outbound_ready();
+    }
+}
+
 /// Drain every stream with pending data, scheduling them in strict
 /// priority order (higher `Stream::priority()` wins). Streams of equal
 /// priority are drained in stream-id order (deterministic so tests
@@ -2305,13 +2459,22 @@ async fn flush_pending_window_updates<T: SessionTransport>(
 /// to a stream with priority < N while it still has data. A future
 /// weighted-fair scheduler can replace this without changing the
 /// caller surface. Phase 4.3.
+///
+/// One pass emits at most [`DRAIN_MAX_SEGMENTS_PER_PASS`] segments. Returns
+/// `true` when it stopped on that budget rather than because every stream ran
+/// dry, which is the caller's signal to re-arm the outbound notify so the pump
+/// comes straight back here after giving the other `select!` arms — the
+/// flow-control flush, the receive-driven wake-ups, and the command channel — a
+/// turn. Unbounded, a single stream with a full congestion window held the pump
+/// for as long as the pacer needed to emit that window, which on a long path is
+/// most of a round trip with no inbound credit flushed.
 async fn drain_streams_priority_ordered<T: SessionTransport>(
     transport: &Arc<T>,
     crypto_session: &Arc<Session>,
     session_id: SessionId,
     streams: &Arc<DashMap<u32, Arc<Stream>>>,
     observability: &Observability,
-) {
+) -> bool {
     // Snapshot the stream set so we can sort without holding DashMap
     // shard locks across awaits. Each entry is (priority, stream_id,
     // stream-Arc) — Arc clones are cheap (refcount bump).
@@ -2323,8 +2486,15 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
     // order is stable across iterations.
     snapshot.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
+    let mut sent = 0usize;
     for (_priority, stream_id, stream) in snapshot {
         loop {
+            if sent >= DRAIN_MAX_SEGMENTS_PER_PASS {
+                // Budget spent. Congestion and flow control are unchanged — this
+                // only splits the same window across several passes — so the
+                // caller re-arms and we resume from the same priority order.
+                return true;
+            }
             // Bytes of new data the congestion window currently permits.
             // Recomputed each iteration: every send grows inflight, so the
             // budget shrinks and the drain stops once the window is full.
@@ -2382,8 +2552,42 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
                 }
                 break;
             }
+            sent += 1;
         }
     }
+    false
+}
+
+/// Run [`drain_streams_priority_ordered`] until every stream is drained or the
+/// pass budget runs out. Used on the teardown paths (graceful close and handle
+/// drop), which must put everything the congestion and flow-control windows
+/// currently allow on the wire before the pump exits — the per-pass segment
+/// budget is a scheduling bound, not a send budget, so it must not silently
+/// truncate a close.
+async fn drain_streams_fully<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    streams: &Arc<DashMap<u32, Arc<Stream>>>,
+    observability: &Observability,
+) {
+    for _ in 0..DRAIN_MAX_PASSES_ON_CLOSE {
+        if !drain_streams_priority_ordered(
+            transport,
+            crypto_session,
+            session_id,
+            streams,
+            observability,
+        )
+        .await
+        {
+            return;
+        }
+    }
+    log::warn!(
+        "PhantomSession: close-time flush hit the {DRAIN_MAX_PASSES_ON_CLOSE}-pass bound with \
+         data still buffered"
+    );
 }
 
 /// Build a `DeliverySample` from a successful Stream ack callback and
@@ -3222,7 +3426,7 @@ async fn handle_packet<T: SessionTransport>(
             // inside `on_sack` per Karn (only for never-retransmitted segments);
             // feed BBR per retired segment using the real `ack_delay_us`.
             let result = stream.on_sack(&sack).await;
-            for retired in result.retired {
+            for retired in &result.retired {
                 if let Some(sent_at) = retired.sent_at {
                     // `!was_retransmit` is Karn's condition — the same gate
                     // `Stream::on_sack` uses for its own srtt sample — so the
@@ -3255,7 +3459,13 @@ async fn handle_packet<T: SessionTransport>(
             // cwnd gate, so a lost segment is always retransmitted → the single feed at
             // the retransmission point reliably fires (and a spurious gap that gets ACKed
             // before retransmit correctly feeds no loss at all).
-            if !result.lost.is_empty() {
+            //
+            // A retirement wakes the loop for two more reasons: it frees
+            // congestion-window room for new data, and it returns a send-buffer
+            // slot that a deferred application write may be waiting on. Without
+            // this the pump would only notice on the next 10 ms heartbeat, which
+            // on an ack-clocked path is a self-inflicted rate limit.
+            if !result.lost.is_empty() || !result.retired.is_empty() {
                 crypto_recv.notify_outbound_ready();
             }
             // Reliable FIN teardown: if the stream was locally closed (via
