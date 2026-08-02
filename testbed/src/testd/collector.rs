@@ -14,6 +14,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -32,6 +33,15 @@ pub enum Record {
     Event(EventRecord),
     Snapshot(Box<ServerStats>),
 }
+
+/// How often the writers are flushed regardless of volume.
+///
+/// A count-only trigger is not durability: during a quiet stretch the last
+/// records sit in a `BufWriter` indefinitely, so a box that dies — or an
+/// operator who looks at the file — sees a journal missing its most recent
+/// entries. That is exactly how a successful upload came to leave no trace in
+/// `events.jsonl` while its bytes were already on disk.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct CollectorHandle {
@@ -88,11 +98,31 @@ pub fn spawn(dir: &Path) -> std::io::Result<(CollectorHandle, tokio::task::JoinH
     let (tx, mut rx) = mpsc::channel::<Record>(QUEUE_DEPTH);
     let dropped = Arc::new(AtomicU64::new(0));
 
+    let handle = tokio::runtime::Handle::current();
     let task = tokio::task::spawn_blocking(move || {
         // Blocking task: the writers are synchronous, and isolating them here
         // keeps every `write(2)` off the async runtime's worker threads.
         let mut since_flush = 0u32;
-        while let Some(rec) = rx.blocking_recv() {
+        loop {
+            // A bounded wait rather than a plain recv: the timeout arm is what
+            // makes the flush time-bounded during a quiet stretch. An extra
+            // sender feeding tick messages would have worked too, but it would
+            // also have held the channel open forever and stopped the collector
+            // from ever draining on shutdown.
+            let next = handle.block_on(tokio::time::timeout(FLUSH_INTERVAL, rx.recv()));
+            let rec = match next {
+                Ok(Some(rec)) => rec,
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    if since_flush > 0 {
+                        since_flush = 0;
+                        let _ = sessions.flush();
+                        let _ = events.flush();
+                        let _ = snapshots.flush();
+                    }
+                    continue;
+                }
+            };
             let res = match &rec {
                 Record::Session(r) => sessions.write(r.as_ref()),
                 Record::Event(r) => events.write(r),
@@ -102,9 +132,6 @@ pub fn spawn(dir: &Path) -> std::io::Result<(CollectorHandle, tokio::task::JoinH
                 tracing::error!(error = %e, "collector write failed");
             }
             since_flush += 1;
-            // Flush regularly: if the box is killed mid-run, the data written
-            // so far must already be on disk. A test artifact that only
-            // materialises on a clean shutdown is not much of an artifact.
             if since_flush >= 32 {
                 since_flush = 0;
                 let _ = sessions.flush();
@@ -246,6 +273,25 @@ mod tests {
         assert!(
             uids.windows(2).all(|w| w[0] < w[1]),
             "records preserve submission order"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record written during a quiet stretch must reach the disk on its own,
+    /// without 31 more records arriving to trigger a count-based flush.
+    #[tokio::test]
+    async fn a_single_record_reaches_disk_without_further_traffic() {
+        let dir = tmpdir("flush");
+        let (h, _task) = spawn(&dir).expect("spawn");
+        h.event("udp", "upload_ok", None, Some(1), "one quiet record");
+
+        // Well past FLUSH_INTERVAL, but far short of the 32-record threshold.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        let body = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
+        assert!(
+            body.contains("upload_ok"),
+            "a lone record must not sit in the buffer: {body:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
