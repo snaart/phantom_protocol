@@ -1909,9 +1909,15 @@ pub async fn raw_tcp_throughput(
     // probe measures `buffer / rtt` — on a 200 ms path a 128 KB default caps it
     // near 5 Mbit/s regardless of the link. An earlier version of this control
     // reported 4.65 Mbit/s as "the path", which was the kernel's default.
-    let (snd, rcv) = set_socket_buffers(&sock, 8 * 1024 * 1024);
+    // A few bandwidth-delay products, not "as much as the kernel will give".
+    // At 8 MiB on a path that loses 6% at 19 Mbit/s, TCP fills the buffer, the
+    // queue becomes the round trip, and the control collapses — it measured
+    // 1.34 Mbit/s on a link carrying 9.5. That is bufferbloat, and a control
+    // measuring its own queue is no better than one measuring its own timer.
+    // 1 MiB is ~3x the product at 9.5 Mbit/s and 250 ms.
+    let (snd, rcv) = set_socket_buffers(&sock, 1024 * 1024);
     out.note(format!(
-        "socket buffers: send {} KiB, receive {} KiB (asked for 8192 KiB) — this bounds TCP at buffer/RTT, so it must exceed the path's bandwidth-delay product for the number below to mean anything",
+        "socket buffers: send {} KiB, receive {} KiB (asked for 1024 KiB) — this bounds TCP at buffer/RTT, so it must exceed the path's bandwidth-delay product for the number below to mean anything",
         snd / 1024,
         rcv / 1024
     ));

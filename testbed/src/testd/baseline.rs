@@ -67,7 +67,7 @@ pub async fn serve_tcp(listener: TcpListener, stats: Arc<BaselineStats>) -> std:
         // leaves them at the OS default measures `default / rtt` and reports it
         // as the link — which is how this probe once produced a "path ceiling"
         // that was really the kernel's.
-        size_socket_buffers(&sock, 8 * 1024 * 1024);
+        size_socket_buffers(&sock, 1024 * 1024);
         stats.tcp_conns.fetch_add(1, Ordering::Relaxed);
         let stats = stats.clone();
 
