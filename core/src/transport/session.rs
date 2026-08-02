@@ -1189,6 +1189,7 @@ impl Session {
             pacing_rate_bps: est.pacing_rate(),
             cwnd_bytes: est.cwnd(),
             inflight_bytes: est.inflight_bytes(),
+            delivered_bytes: est.delivered_bytes(),
         }
     }
 
@@ -1525,6 +1526,10 @@ pub struct BandwidthSnapshot {
     pub pacing_rate_bps: u64,
     pub cwnd_bytes: u64,
     pub inflight_bytes: u64,
+    /// Total bytes the connection has had acknowledged. Stamped onto each
+    /// outgoing segment so its acknowledgement yields a delivery-rate sample
+    /// over the interval the segment spanned.
+    pub delivered_bytes: u64,
 }
 
 impl std::fmt::Debug for Session {

@@ -2330,7 +2330,7 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
             // budget shrinks and the drain stops once the window is full.
             let snap = crypto_session.bandwidth_snapshot();
             let budget = snap.cwnd_bytes.saturating_sub(snap.inflight_bytes);
-            let Some(seg) = stream.poll_send(budget).await else {
+            let Some(seg) = stream.poll_send(budget, snap.delivered_bytes).await else {
                 break;
             };
             // A retransmission means the prior send was lost — tell congestion
@@ -2407,10 +2407,12 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
 /// `record_path_validation` key on. It stays 0 until the *peer* migrates, which
 /// is what keeps `MetricsSnapshotFfi::rtt_us_path_0` — the only per-path RTT
 /// slot the FFI snapshot exposes — populated across a local `migrate()`.
+#[allow(clippy::too_many_arguments)]
 fn feed_bbr_on_ack(
     crypto_session: &Arc<Session>,
     sent_at: tokio::time::Instant,
     packet_bytes: u64,
+    delivered_at_send: u64,
     ack_delay_us: u64,
     observability: &Observability,
     path_id: u8,
@@ -2432,7 +2434,11 @@ fn feed_bbr_on_ack(
         }
     }
     let sample = crate::transport::bandwidth_estimator::DeliverySample {
-        delivered_bytes: 0, // BandwidthEstimator tracks its own counter
+        // The connection's delivered counter when this segment went out. The
+        // estimator subtracts it from the current total to get the bytes
+        // delivered over the interval — the quantity BBR's rate sample is
+        // defined as. Passing 0 here made every sample "one packet per RTT".
+        delivered_bytes: delivered_at_send,
         sent_at: sent_at_std,
         acked_at,
         packet_bytes,
@@ -3209,6 +3215,7 @@ async fn handle_packet<T: SessionTransport>(
                         crypto_recv,
                         sent_at,
                         retired.size,
+                        retired.delivered_at_send,
                         sack.ack_delay_us as u64,
                         observability,
                         path_id,
@@ -6891,7 +6898,10 @@ mod tests {
             .send_reliable(Bytes::from_static(b"reliable-payload"))
             .await
             .unwrap();
-        let _ = stream.poll_send(u64::MAX).await.expect("segment in-flight");
+        let _ = stream
+            .poll_send(u64::MAX, 0)
+            .await
+            .expect("segment in-flight");
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         streams.insert(stream_id as u32, stream.clone());
         (stream, streams, seq)
@@ -6967,7 +6977,7 @@ mod tests {
                 .send_reliable(Bytes::from_static(b"x"))
                 .await
                 .unwrap();
-            let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
+            let _ = stream.poll_send(u64::MAX, 0).await.expect("in-flight");
         }
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         streams.insert(stream_id as u32, stream.clone());
@@ -7003,7 +7013,7 @@ mod tests {
         // No fast-retransmit: nothing was flagged lost, so poll_send (all sent, no
         // new data) returns None rather than a Pass-0 retransmit.
         assert!(
-            stream.poll_send(u64::MAX).await.is_none(),
+            stream.poll_send(u64::MAX, 0).await.is_none(),
             "a forged SACK must not trigger a fast-retransmit (no segment flagged lost)"
         );
     }
@@ -7034,7 +7044,7 @@ mod tests {
                 .send_reliable(Bytes::from_static(b"x"))
                 .await
                 .unwrap();
-            let seg = stream.poll_send(u64::MAX).await.expect("in-flight");
+            let seg = stream.poll_send(u64::MAX, 0).await.expect("in-flight");
             seg_size = seg.data.len() as u64;
             server_session.on_packet_sent(seg_size);
         }
@@ -7126,7 +7136,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(seq, i);
-            let _ = stream.poll_send(u64::MAX).await.expect("in-flight");
+            let _ = stream.poll_send(u64::MAX, 0).await.expect("in-flight");
         }
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         streams.insert(stream_id as u32, stream.clone());

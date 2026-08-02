@@ -1598,7 +1598,7 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     s.send_reliable(Bytes::from(vec![0u8; 60])).await.unwrap(); // seq 1
 
     let first = s
-        .poll_send(u64::MAX)
+        .poll_send(u64::MAX, 0)
         .await
         .expect("first segment fits the window");
     assert!(!first.retransmit);
@@ -1607,7 +1607,7 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
 
     // The second 60-byte segment exceeds the remaining 40-byte window → withheld.
     assert!(
-        s.poll_send(u64::MAX).await.is_none(),
+        s.poll_send(u64::MAX, 0).await.is_none(),
         "new data exceeding the flow-control window must be withheld"
     );
     assert_eq!(
@@ -1622,7 +1622,7 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     // cwnd budget smaller than the segment → withheld by congestion control,
     // BEFORE the flow-control window is even consulted.
     assert!(
-        s2.poll_send(50).await.is_none(),
+        s2.poll_send(50, 0).await.is_none(),
         "new data exceeding the congestion window must be withheld"
     );
     assert_eq!(
@@ -1643,7 +1643,7 @@ async fn retransmissions_bypass_congestion_and_flow_control_windows() {
     s.send_reliable(Bytes::from(vec![0u8; 200])).await.unwrap(); // seq 0
 
     // First transmission debits the window (200 bytes) under an unbounded cwnd.
-    let first = s.poll_send(u64::MAX).await.expect("first transmission");
+    let first = s.poll_send(u64::MAX, 0).await.expect("first transmission");
     assert!(!first.retransmit);
     assert_eq!(first.data.len(), 200);
     assert_eq!(s.peer_send_window(), INITIAL_STREAM_WINDOW - 200);
@@ -1653,7 +1653,7 @@ async fn retransmissions_bypass_congestion_and_flow_control_windows() {
     assert_eq!(s.peer_send_window(), 0);
     // … and an immediate re-poll (cwnd 0, window 0) yields nothing — the
     // segment is in-flight, not yet timed out.
-    assert!(s.poll_send(0).await.is_none());
+    assert!(s.poll_send(0, 0).await.is_none());
 
     // Advance past the initial 1s RTO so the unacked segment is due to retransmit.
     tokio::time::advance(Duration::from_millis(1100)).await;
@@ -1661,7 +1661,7 @@ async fn retransmissions_bypass_congestion_and_flow_control_windows() {
     // The retransmit is produced despite cwnd == 0 AND window == 0 (Karn: the
     // bytes were accounted on first send; loss recovery must always proceed).
     let rtx = s
-        .poll_send(0)
+        .poll_send(0, 0)
         .await
         .expect("retransmission must bypass both the congestion and flow-control windows");
     assert!(rtx.retransmit, "must be flagged as a retransmission");

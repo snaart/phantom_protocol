@@ -278,9 +278,20 @@ impl BandwidthEstimator {
             self.min_rtt = Duration::from_micros(min_rtt_us);
         }
 
-        // Calculate bandwidth: delivered_bytes / time
-        let delivery_rate = if !send_elapsed.is_zero() {
-            (sample.packet_bytes as f64 / send_elapsed.as_secs_f64()) as u64
+        // Delivery rate over the interval this packet spanned, per BBR: the
+        // bytes the connection delivered between the packet leaving and its
+        // acknowledgement arriving, divided by that elapsed time.
+        //
+        // Dividing this packet's own size by its own RTT instead would make
+        // every sample "one packet per round trip" by construction, whatever is
+        // actually in flight. The BDP would then collapse to a single packet
+        // (`bytes/rtt × rtt ≡ bytes`), the window would sit on its floor, and a
+        // session would be capped near `cwnd_floor / rtt` on any real path —
+        // invisible on loopback, where an RTT near zero makes even that floor
+        // look fast.
+        let delivered_during = self.delivered_bytes.saturating_sub(sample.delivered_bytes);
+        let delivery_rate = if !send_elapsed.is_zero() && delivered_during > 0 {
+            (delivered_during as f64 / send_elapsed.as_secs_f64()) as u64
         } else {
             0
         };
@@ -543,6 +554,73 @@ mod tests {
             is_app_limited: true,
             ack_delay_us: 0,
         }
+    }
+
+    /// Send a whole window of packets, then acknowledge them one round trip
+    /// later — the shape of any bulk transfer.
+    ///
+    /// The bandwidth estimate must reflect the aggregate delivered over the
+    /// interval. Deriving it from a single packet's size over that packet's own
+    /// RTT is structurally "one packet per round trip": the BDP then collapses
+    /// to one packet's worth no matter how many are in flight, and the window
+    /// pins to its floor. On a 200 ms path that caps a session at roughly
+    /// `cwnd_floor / rtt` regardless of the link — which is exactly what a real
+    /// WAN run measured (0.19 Mbit/s against a 6.7 Mbit/s path).
+    #[test]
+    fn bandwidth_reflects_a_full_window_not_a_single_packet() {
+        const PACKETS: u64 = 100;
+        const PACKET: u64 = 1200;
+        const RTT_MS: u64 = 200;
+
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+
+        // A window's worth goes out back-to-back...
+        for _ in 0..PACKETS {
+            est.on_send(PACKET);
+        }
+        // ...and is acknowledged one RTT later. Every one of them left before
+        // anything came back, so the connection had delivered nothing when each
+        // was sent — that zero is what makes the interval span the whole window
+        // rather than a single packet.
+        for _ in 0..PACKETS {
+            est.on_ack(DeliverySample {
+                delivered_bytes: 0,
+                sent_at: start,
+                acked_at: start + Duration::from_millis(RTT_MS),
+                packet_bytes: PACKET,
+                is_app_limited: false,
+                ack_delay_us: 0,
+            });
+        }
+
+        // The delivered-over-interval rate is ~600 KB/s here; a per-packet rate
+        // would be 6 KB/s, a hundred times lower.
+        assert!(
+            est.bottleneck_bandwidth() > 10 * (PACKET * 1000 / RTT_MS),
+            "bandwidth estimate {} B/s is still near one packet per RTT ({} B/s)",
+            est.bottleneck_bandwidth(),
+            PACKET * 1000 / RTT_MS
+        );
+
+        // And the window must open well past its floor, or the estimate is moot.
+        let floor = PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE;
+        assert!(
+            est.cwnd() > 10 * floor,
+            "cwnd {} B is still pinned near the {} B floor",
+            est.cwnd(),
+            floor
+        );
+    }
+
+    /// The floor is what a session falls back to when nothing has been
+    /// estimated yet; on a long path it is also the throughput ceiling, so its
+    /// value is worth pinning explicitly.
+    #[test]
+    fn a_fresh_estimator_starts_at_the_cwnd_floor() {
+        let est = BandwidthEstimator::new();
+        assert_eq!(est.cwnd(), PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE);
+        assert_eq!(est.cwnd(), 5600);
     }
 
     #[test]

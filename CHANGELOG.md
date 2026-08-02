@@ -8,6 +8,26 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+### Fixed
+
+- **Congestion control could not open its window past the floor, capping a session at
+  roughly `cwnd_floor / rtt` on any real path.** BBR's delivery-rate sample divided a
+  single packet's size by that same packet's round-trip time, making every sample "one
+  packet per round trip" by construction however much was actually in flight. The BDP
+  then collapsed to one packet (`bytes/rtt × rtt ≡ bytes`), so the window sat on its
+  5600-byte floor permanently. Measured over a 210 ms path: 0.19 Mbit/s sustained
+  against a link demonstrating 6.7 Mbit/s of UDP echo at 0.3% loss — about 3% of
+  capacity, identical across the UDP, TCP and mimic legs. The same window also made an
+  8 KiB round trip cost ~3 RTT where the raw path needed one.
+  The rate is now the bytes the connection delivered over the interval the packet
+  spanned, per BBR: each outgoing segment is stamped with the connection's delivered
+  counter and reports it back when acknowledged (`DeliverySample::delivered_bytes`,
+  previously present but hardcoded to `0`).
+  Loopback could not surface this — with an RTT near zero the same floor still yields
+  >100 Mbit/s, which is why every existing test passed.
+  **Sender-local accounting only: no wire-format, handshake or key-schedule change, and
+  old and new peers interoperate unchanged.**
+
 ### Added
 
 - **`testbed/` — a real-network (WAN) test harness.** A new sibling crate with two
