@@ -3132,7 +3132,9 @@ async fn send_path_validation<T: SessionTransport>(
 /// Hard cap on concurrent receive streams a peer can open on one session (H-3). The recv
 /// path auto-creates a `Stream` for any of the 2^32 `stream_id`s; without a cap a peer can
 /// spray distinct ids to explode the stream table. With the per-stream reorder budget,
-/// `MAX_STREAMS` times `MAX_RECV_REORDER_BYTES` bounds the session's total reorder memory.
+/// `MAX_STREAMS` times `MAX_RECV_REORDER_BYTES_CEILING` bounds the session's total reorder
+/// memory (the ceiling being reachable only on a stream whose own application demonstrably
+/// consumed its way there — see `Stream::tune_recv_window`).
 /// Sized well above QUIC's ~100-stream default so real multiplexing is unaffected.
 const MAX_STREAMS: usize = 256;
 

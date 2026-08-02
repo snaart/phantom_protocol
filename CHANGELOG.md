@@ -10,6 +10,44 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **A fixed 64 KiB per-stream receive window was a hard rate ceiling that congestion
+  control could never lift.** Flow control returns credit to the sender one round trip
+  after the receiving application consumed the data, so a window of `W` bytes admits at
+  most `W` bytes per round trip: 2.62 Mbit/s per stream on a 200 ms path, and in practice
+  about half of that, because the credit for the second half of a window arrives only after
+  the first half has already been acknowledged. The measured sustained rate on such a path
+  was 1.2 Mbit/s — 46% of the nominal ceiling — on a link a raw socket carries 9.34 Mbit/s
+  over. None of that was congestion control's doing: its window reached 300–350 KB, which
+  at that round trip would have permitted around 13 Mbit/s. The window simply refused to
+  let it.
+  The receiver now auto-tunes the window it advertises, the same mechanism TCP receive-window
+  auto-tuning and QUIC flow-control auto-tuning implement. Over a measurement interval of
+  two round trips, if the application consumed more than four fifths of a window, the window
+  is close enough to being the binding constraint to double it, up to the existing 512 KiB
+  `MAX_SEND_WINDOW` — so the advertised window converges on two and a half bandwidth-delay
+  products and stops. The threshold sits deliberately below the round half, because a flow
+  that really is window-limited achieves about half its nominal ceiling and a test placed on
+  that figure would never fire on the flow it exists for.
+  What the growth is tied to is the whole of its safety argument: **demonstrated application
+  consumption, never arrival**. The counter is fed only by the delivery task, as it hands
+  bytes onward to the application, so a peer that floods a reader that never reads moves the
+  window by exactly nothing, however long it keeps it up. Measuring over a time interval
+  rather than a byte count matters for the same reason — the bounded delivery queue in front
+  of the application absorbs one queue's worth of bytes even when the reader has stopped, and
+  a byte-triggered rule would read that transient as a sustained rate and climb the whole
+  ladder on it. The round trip the interval is measured against is the *minimum* RTT sampled
+  on the stream rather than the smoothed one: a saturated path inflates the smoothed estimate,
+  a longer estimate makes growth easier, and a larger window queues more, which is a loop that
+  ends at the cap no matter what the application does.
+  The per-stream reorder budget now tracks the tuned window (`Stream::recv_reorder_byte_limit`,
+  128 KiB at the initial window as before, 576 KiB at the cap) rather than staying pinned to
+  twice the initial one. A window larger than the reorder budget would have had legitimate
+  out-of-order segments refused and retransmitted on exactly the lossy long paths a large
+  window is for. Session-wide, the number that bounds buffered-but-undelivered bytes is
+  unchanged: the pump still tears a session down at 4 MiB of delivery backlog.
+  **Receiver-local: `WINDOW_UPDATE` already carries relative credit, so a wider window is
+  expressed as more of the credit the frame already encodes. No wire-format change, and the
+  byte-exact wire vectors are untouched.**
 - **BBR had no concept of a round trip, so the sender left its only growth phase within
   the first one and then stopped probing for bandwidth entirely.** Both of the estimator's
   round-scaled rules — the Startup exit test and the ProbeBW gain cycle — were driven off

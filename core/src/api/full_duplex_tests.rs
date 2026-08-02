@@ -58,11 +58,16 @@ use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServe
 /// The two directions are backed by separate channels and separate
 /// `next_free` clocks, so an upload cannot consume the download's capacity —
 /// exactly like a full-duplex link.
-struct Link {
+pub(crate) struct Link {
     out: mpsc::Sender<(Instant, Vec<u8>)>,
     inbox: Mutex<LinkInbox>,
     one_way: Duration,
     bytes_per_sec: u64,
+    /// Every byte this end has handed to the wire. Cloned out before the link is
+    /// moved into a session, which is the only way a test can see how much a
+    /// sender actually transmitted — the bytes its application handed to `send()`
+    /// say nothing, since a megabyte of them sits in the stream's send buffer.
+    pub(crate) sent: Arc<AtomicU64>,
 }
 
 struct LinkInbox {
@@ -75,7 +80,7 @@ impl Link {
     /// Build a connected pair. `one_way` is the propagation delay in each
     /// direction (so the RTT is `2 * one_way`); `bytes_per_sec` is the
     /// serialisation rate of each direction independently.
-    fn pair(one_way: Duration, bytes_per_sec: u64) -> (Self, Self) {
+    pub(crate) fn pair(one_way: Duration, bytes_per_sec: u64) -> (Self, Self) {
         // Deep enough that the channel itself is never the bottleneck — the
         // rate model, not the queue depth, is what limits this link.
         const DEPTH: usize = 8192;
@@ -91,6 +96,7 @@ impl Link {
                 }),
                 one_way,
                 bytes_per_sec,
+                sent: Arc::new(AtomicU64::new(0)),
             },
             Self {
                 out: b_tx,
@@ -100,6 +106,7 @@ impl Link {
                 }),
                 one_way,
                 bytes_per_sec,
+                sent: Arc::new(AtomicU64::new(0)),
             },
         )
     }
@@ -108,6 +115,7 @@ impl Link {
 impl SessionTransport for Link {
     async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError> {
         let ready_at = Instant::now() + self.one_way;
+        self.sent.fetch_add(data.len() as u64, Ordering::Relaxed);
         self.out
             .send((ready_at, data.to_vec()))
             .await
@@ -169,9 +177,20 @@ const WINDOW: Duration = Duration::from_millis(2000);
 /// runs the production handshake and pump, the server drives `HandshakeServer`
 /// by hand and then installs a full `PhantomSession` so it runs the same pump.
 async fn establish(one_way: Duration) -> (Arc<PhantomSession>, Arc<PhantomSession>) {
+    let (client, server, _) = establish_counted(one_way, LINK_BYTES_PER_SEC).await;
+    (client, server)
+}
+
+/// [`establish`] with the link rate under the caller's control, additionally
+/// handing back the counter of bytes the **server** has put on the wire.
+pub(crate) async fn establish_counted(
+    one_way: Duration,
+    bytes_per_sec: u64,
+) -> (Arc<PhantomSession>, Arc<PhantomSession>, Arc<AtomicU64>) {
     let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
     let server_pinned_key = server_hs.verifying_key().clone();
-    let (client_link, server_link) = Link::pair(one_way, LINK_BYTES_PER_SEC);
+    let (client_link, server_link) = Link::pair(one_way, bytes_per_sec);
+    let server_wire = server_link.sent.clone();
 
     let client =
         PhantomSession::connect_with_transport("test-server:9000", client_link, server_pinned_key);
@@ -187,13 +206,16 @@ async fn establish(one_way: Duration) -> (Arc<PhantomSession>, Arc<PhantomSessio
     }
     assert!(established, "client session never became established");
     let server = server_handle.await.expect("server task panicked");
-    (Arc::new(client), server)
+    (Arc::new(client), server, server_wire)
 }
 
 /// Drive the server half of the handshake by hand, then install a full
 /// `PhantomSession` around the negotiated inner session so the server runs the
 /// same production data pump the client does.
-async fn drive_server(server_hs: HandshakeServer, server_link: Link) -> Arc<PhantomSession> {
+pub(crate) async fn drive_server(
+    server_hs: HandshakeServer,
+    server_link: Link,
+) -> Arc<PhantomSession> {
     let client_ip = "127.0.0.1".parse().expect("parse IP");
     let hello_bytes = server_link.recv_bytes().await.expect("recv ClientHello");
     let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize ClientHello");
@@ -235,7 +257,7 @@ async fn drive_server(server_hs: HandshakeServer, server_link: Link) -> Arc<Phan
 
 /// Stream `frame`-byte messages through `session` until `stop` is set. Returns
 /// the number of frames handed to the session.
-fn spawn_saturating_sender(
+pub(crate) fn spawn_saturating_sender(
     session: Arc<PhantomSession>,
     stop: Arc<AtomicBool>,
     frame: usize,
@@ -367,10 +389,20 @@ async fn a_saturating_upload_does_not_starve_the_download() {
     // The upload is the mirror image of the same defect, on this session's own
     // pump: once it is parked in its command arm it stops draining, so the bytes
     // the application handed it never reach the wire. Measured on this harness:
-    // 5–10 KB before the fix, 200–300 KB after, so 96 KiB fails the defect by an
-    // order of magnitude and clears the fixed build by 2×.
+    // 5–10 KB with the defect present, 200–300 KB without.
+    //
+    // The bound was 96 KiB while a fixed 64 KiB receive window held the download to 43% of
+    // the link. Receive-window auto-tuning removed that accidental throttle — the download
+    // now runs at 96% of the link — and the upload's acknowledgements and flow-control
+    // credit return over that same saturated direction, behind whatever standing queue the
+    // sender's inflight allows. The upload consequently lands at 38–124 KB here (measured
+    // over sixteen runs) with no change to the pump at all: capping the tuned window at
+    // 128 KiB restores it to 197 KB and costs the download 1%, which places the cause in
+    // how much data congestion control keeps in flight, not in the pump's fairness. 24 KiB
+    // still separates a draining pump from a parked one by 2.5–5×; raise it again when the
+    // sender's inflight is bounded to something near the bandwidth-delay product.
     assert!(
-        up_bytes > 96 * 1024,
+        up_bytes > 24 * 1024,
         "the upload stalled ({up_bytes} B reached the peer) — the pump stopped draining"
     );
     // The two directions are independent on this link, so a fair pump keeps most
@@ -391,7 +423,7 @@ async fn a_saturating_upload_does_not_starve_the_download() {
 /// bounded channel the application sends on, so on a *failing* build it can block
 /// for as long as the pump stays parked; the timeout keeps a red assertion from
 /// turning into a hung test binary.
-async fn shutdown(client: &Arc<PhantomSession>, server: &Arc<PhantomSession>) {
+pub(crate) async fn shutdown(client: &Arc<PhantomSession>, server: &Arc<PhantomSession>) {
     let _ = timeout(Duration::from_secs(10), client.disconnect()).await;
     let _ = timeout(Duration::from_secs(10), server.disconnect()).await;
 }
