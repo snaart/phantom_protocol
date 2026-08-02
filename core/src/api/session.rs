@@ -2506,8 +2506,10 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
             else {
                 break;
             };
-            // A retransmission means the prior send was lost — tell congestion
-            // control so BBR enters FastRecovery and the pacing rate backs off.
+            // A retransmission means the prior send was lost — book it against
+            // the round trip in progress so congestion control can judge the
+            // round's loss rate. It is a rate, not an event: this fires several
+            // times per round trip on any path that loses a few percent.
             if seg.retransmit {
                 crypto_session.on_packet_lost(seg.data.len() as u64);
             }
@@ -5784,12 +5786,15 @@ mod tests {
     }
 
     /// A retransmission (RTO expiry) must be reported to congestion control as
-    /// a loss, driving BBR into FastRecovery — proves the drain → on_packet_lost
-    /// wiring, not just that the retransmit happens.
+    /// a loss — proves the drain → `on_packet_lost` wiring, not just that the
+    /// retransmit happens.
+    ///
+    /// The observable is the byte counter rather than the BBR phase. Loss no
+    /// longer moves the state machine (it bounds inflight instead), and a test
+    /// that asserted on a phase would in any case have been asserting that a
+    /// particular response was chosen, not that the loss was reported at all.
     #[tokio::test]
     async fn drain_reports_a_retransmit_as_loss_to_bbr() {
-        use crate::transport::bandwidth_estimator::BbrState;
-
         tokio::time::pause();
         let sid = fixed_session_id();
         let (client, _server) = paired_sessions(sid);
@@ -5805,14 +5810,18 @@ mod tests {
 
         // First drain: the initial transmission — not a loss.
         drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
-        assert_ne!(client.bbr_state(), BbrState::FastRecovery);
+        assert_eq!(
+            client.bbr_bytes_lost(),
+            0,
+            "an initial transmission is not a loss"
+        );
 
         // The RTO expires; the next drain retransmits and must report the loss.
         tokio::time::advance(std::time::Duration::from_millis(1100)).await;
         drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
         assert_eq!(
-            client.bbr_state(),
-            BbrState::FastRecovery,
+            client.bbr_bytes_lost(),
+            b"payload".len() as u64,
             "a retransmit must be reported to BBR as a loss"
         );
     }

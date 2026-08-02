@@ -1159,6 +1159,13 @@ impl Session {
         self.bandwidth_estimator.lock().on_loss(bytes);
     }
 
+    /// Bytes this session has reported to congestion control as lost.
+    /// Observability / test hook — the observable that a retransmission on the
+    /// send path actually reached the estimator.
+    pub fn bbr_bytes_lost(&self) -> u64 {
+        self.bandwidth_estimator.lock().bytes_lost()
+    }
+
     /// Reset the congestion controller + pacer to startup (Phase 4 / QUIC §9.4):
     /// a migration path switch lands on a different network, so the old
     /// bottleneck-bandwidth / cwnd estimate must not carry over — inheriting a low
@@ -1173,8 +1180,10 @@ impl Session {
         self.pacer.set_rate(rate);
     }
 
-    /// Current BBR congestion-control state. Observability / test hook — lets
-    /// callers confirm a loss drove the estimator into `FastRecovery`.
+    /// Current BBR congestion-control phase. Observability / test hook.
+    ///
+    /// Loss does not appear here: it is answered by a bound on inflight, not by
+    /// a phase change. Use [`Self::bbr_bytes_lost`] for that.
     pub fn bbr_state(&self) -> crate::transport::bandwidth_estimator::BbrState {
         self.bandwidth_estimator.lock().state()
     }

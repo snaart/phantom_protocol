@@ -10,6 +10,65 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **BBR's loss response removed the mechanism by which the sender could recover from
+  loss, so a lossy path pinned the bandwidth estimate at whatever it happened to hold.**
+  Every retransmitted segment reported a loss, which put the estimator into a
+  `FastRecovery` state whose only substantive effect was to set `cwnd_gain = 1.0`; every
+  other state uses 2.0. That single line is an absorbing state rather than a back-off.
+  A sender's measurable delivery rate is bounded by what it has in flight —
+  `rate ≤ inflight / rtt` — so holding inflight at exactly one bandwidth-delay product,
+  which is what a gain of 1.0 means, makes the best sample it can possibly take equal to
+  `btl_bw`, the value it already holds. `btl_bw` is a *maximum* filter, so a sample that
+  merely equals it is no news and the estimate does not move. Growth needs headroom above
+  the BDP, and the back-off consumed exactly that headroom: after entering, the connection
+  could no longer discover that the path was faster than it believed, and no amount of
+  time on the path gave that back. On a link losing a few percent, retransmissions are
+  continuous and the state was re-entered on every one of them. A path measured with raw
+  sockets at 9.34 Mbit/s and 2.7% loss carried 1.2 Mbit/s of protocol traffic, with a
+  congestion window peaking at 300–350 KB — room for roughly 13 Mbit/s at the path's
+  200 ms round trip. The window was never the limit. The estimate was, and it was pinned
+  by its own output.
+  The granularity was wrong in the other direction at the same time. Loss on a real path
+  is a rate, not an event: a sender with a few hundred segments in flight at 2.7%
+  retransmits several times per round trip, so a response scaled per lost segment fires
+  permanently and conveys nothing. One lost segment out of 194 halved the window in the
+  regression test that now pins it — and by the end of that same round trip the response
+  had evaporated entirely, because `FastRecovery` exited as soon as inflight fell back
+  inside the BDP, which a window capped at the BDP satisfies almost immediately. The
+  sender was simultaneously over-reacting to a single packet and running with no
+  steady-state reduction at all.
+  Loss is now answered the way BBRv2 and BBRv3 answer it: with a bound on the volume
+  rather than a change to a gain, judged once per round trip against the round's loss
+  rate. `BBRHandleLostPacket` books the bytes and does nothing else — it does not move
+  the state machine's phase, and `BbrState::FastRecovery` is gone because loss is not a
+  phase. Once per round, a loss rate past the draft's `BBRLossThresh` (2%) reduces an
+  `inflight_hi` bound by `BBRBeta` (0.7); the congestion window becomes
+  `min(cwnd_gain × BDP, inflight_hi)`. The separation is the whole point: the gain governs
+  *growth*, the bound governs the *level*, and only one of them can be taken away without
+  blinding the sender. The bound is floored at 1.25 × BDP — strictly above one BDP, so the
+  fixed point cannot be reached through it either, and 1.25 specifically because that is
+  the ProbeBW probe gain, whose job is to ask the path for a quarter more than the current
+  estimate. Rounds that stay under the threshold lift the bound back by the same factor
+  until it no longer binds and is dropped, so it is a response and not a ratchet.
+  Rounds that say nothing about the path are skipped: an application-limited round has a
+  denominator it did not earn, and ProbeRTT pins the window to four packets by fiat, so
+  both halves of its ratio are the controller's own doing.
+  In a closed-loop regression over the measured path — 9.34 Mbit/s, 2.7% loss, 200 ms —
+  the estimate now climbs from 1.34 Mbit/s to 9.10 Mbit/s across eighteen round trips;
+  before, it moved from 1.34 to 2.59 Mbit/s and stopped. Sustained loss still costs the
+  sender a 37.5% window reduction, and a clean path returns it in full.
+  What is deliberately not implemented: `bw_lo` / `bw_hi`, the draft's short-term
+  *bandwidth* bounds. They exist to bound the pacing rate, and this crate's pacer is inert
+  on the live path (`Pacer::unlimited()` at every `Session` construction, `set_enabled`
+  never called), so a second bound there would be a knob wired to nothing — the congestion
+  window is the only limiter the drain loop consults. `BBRCheckStartupHighLoss` is also
+  omitted: the inflight bound already caps Startup's overshoot, and a second Startup exit
+  keyed on loss would end the connection's only exponential-growth phase on exactly the
+  class of path this change is about.
+  `Session::bbr_bytes_lost()` replaces the BBR phase as the observable for "the send path
+  reported a retransmission to congestion control".
+  **Sender-local congestion control only: no wire-format, handshake or key-schedule change,
+  and old and new peers interoperate unchanged.**
 - **BBR had no concept of a round trip, so the sender left its only growth phase within
   the first one and then stopped probing for bandwidth entirely.** Both of the estimator's
   round-scaled rules — the Startup exit test and the ProbeBW gain cycle — were driven off

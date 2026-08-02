@@ -264,7 +264,8 @@ pub struct WindowSample {
     pub pacing_rate_bps: u64,
     pub min_rtt_us: u64,
     pub delivered_bytes: u64,
-    /// BBR phase: startup / drain / probe_bw / probe_rtt / fast_recovery.
+    /// BBR phase: startup / drain / probe_bw / probe_rtt. Loss does not appear
+    /// here — it is answered by a bound on inflight, not by a phase change.
     pub state: String,
     /// True when the window had room and there was nothing to send — the
     /// application was the limit, not the transport.
