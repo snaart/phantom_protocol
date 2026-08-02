@@ -809,11 +809,6 @@ pub async fn download(
     let mut win = WindowTracker::new(leg, "download");
     let overall_deadline = Instant::now() + cap;
     let mut capped = false;
-    let mut server_windows: Vec<crate::report::WindowSample> = Vec::new();
-    // One STATS request per second, interleaved with the inbound stream. Cheap
-    // (a few hundred bytes) against a transfer, and it is the only way to see
-    // the window on the side that is actually sending.
-    let mut next_stats = Instant::now();
 
     loop {
         if Instant::now() > overall_deadline {
@@ -822,11 +817,6 @@ pub async fn download(
             // being measured; only the total is short.
             capped = true;
             break;
-        }
-        if Instant::now() >= next_stats {
-            next_stats = Instant::now() + Duration::from_secs(1);
-            // Best-effort: a dropped request just means one missing sample.
-            let _ = conn::send_msg(&framed, Msg::StatsReq).await;
         }
         let b = match tokio::time::timeout(OP_TIMEOUT, framed.recv()).await {
             Ok(Ok((m, _))) => m,
@@ -840,19 +830,6 @@ pub async fn download(
             }
         };
         match b {
-            Msg::Stats { json } => {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&json) {
-                    if let Some(w) = v.get("sender_window") {
-                        if let Ok(mut w) =
-                            serde_json::from_value::<crate::report::WindowSample>(w.clone())
-                        {
-                            w.phase = "download:server".to_string();
-                            w.elapsed_ms = win.started.elapsed().as_millis() as u64;
-                            server_windows.push(w);
-                        }
-                    }
-                }
-            }
             Msg::SourceData { payload, .. } => {
                 out.summary.ok_count += 1;
                 if let Some(s) = win.add(payload.len()) {
@@ -886,40 +863,13 @@ pub async fn download(
     }
     out.summary.throughput = Some(tp);
     note_window_as(&mut out, &recorder.finish().await, false);
-    // The server's window is the one that governs a download. Summarise what
-    // its STATS replies reported over the transfer.
-    if server_windows.is_empty() {
-        out.note(
-            "no server-side window samples — STATS replies did not arrive during the transfer",
-        );
-    } else {
-        let peak = server_windows
-            .iter()
-            .map(|w| w.cwnd_bytes)
-            .max()
-            .unwrap_or(0);
-        let peak_bw = server_windows
-            .iter()
-            .map(|w| w.bottleneck_bw_bps)
-            .max()
-            .unwrap_or(0);
-        let last = &server_windows[server_windows.len() - 1];
-        out.note(format!(
-            "SERVER window (the sender here): peak {} B, bottleneck estimate peaked at {:.2} Mbit/s, ended in {} over {} samples",
-            peak,
-            peak_bw as f64 * 8.0 / 1e6,
-            last.state,
-            server_windows.len()
-        ));
-        if peak <= 5600 {
-            out.note(
-                "the server's window never left its 5600 B floor: this download is sender-bound",
-            );
-        }
-        for w in &server_windows {
-            out.window.push(w);
-        }
-    }
+    // The window that governs a download is the server's, and the daemon records
+    // its own into `windows.jsonl` — sampled there rather than polled from here,
+    // so nothing this scenario does can perturb the transfer it is measuring.
+    // Join on the `download:*` marks in the server journal.
+    out.note(
+        "the sending side here is the server: its window is in the daemon's windows.jsonl, joinable via the download:begin/end marks",
+    );
     mark(&framed, "download:end").await;
     conn::close_session(framed.session()).await;
     out

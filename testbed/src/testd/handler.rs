@@ -82,6 +82,7 @@ pub async fn run(session: Arc<PhantomSession>, ctx: Arc<SessionCtx>, collector: 
     let (tx_out, rx_out) = mpsc::channel::<OutCmd>(OUT_QUEUE);
 
     let writer = tokio::spawn(writer_loop(session.clone(), ctx.clone(), rx_out));
+    let window_sampler = tokio::spawn(window_loop(session.clone(), ctx.clone(), collector.clone()));
     let streams = tokio::spawn(stream_loop(session.clone(), ctx.clone(), collector.clone()));
 
     let framed = Framed::new(session.clone());
@@ -91,6 +92,7 @@ pub async fn run(session: Arc<PhantomSession>, ctx: Arc<SessionCtx>, collector: 
     // when the session tears down.
     writer.abort();
     streams.abort();
+    window_sampler.abort();
     let _ = session.disconnect().await;
 
     let t_close = unix_nanos();
@@ -614,6 +616,51 @@ async fn source_stream(
     ctx.counters.frames_sent.fetch_add(1, Ordering::Relaxed);
     ctx.counters.bytes_sent.fetch_add(n, Ordering::Relaxed);
     Ok(())
+}
+
+/// Record this session's congestion-control state for as long as it lives.
+///
+/// On a download the server is the sender, so this is the window that governs
+/// the transfer — and sampling it here rather than answering a client poll
+/// keeps the measurement off the path being measured.
+async fn window_loop(
+    session: Arc<PhantomSession>,
+    ctx: Arc<SessionCtx>,
+    collector: CollectorHandle,
+) {
+    // 500 ms: fine enough to watch a window open over a few round trips on a
+    // ~200 ms path, coarse enough to be free.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let started = Instant::now();
+    loop {
+        tick.tick().await;
+        let Some(bw) = session.bandwidth_snapshot().await else {
+            continue;
+        };
+        collector.window(WindowSample {
+            leg: leg_of(&ctx.listener),
+            phase: format!("server:session:{}", ctx.uid),
+            t_unix_ns: unix_nanos(),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            cwnd_bytes: bw.cwnd_bytes,
+            inflight_bytes: bw.inflight_bytes,
+            bottleneck_bw_bps: bw.bottleneck_bw_bps,
+            pacing_rate_bps: bw.pacing_rate_bps,
+            min_rtt_us: bw.min_rtt.as_micros() as u64,
+            delivered_bytes: bw.delivered_bytes,
+            state: bw.state.as_str().to_string(),
+            app_limited: bw.app_limited,
+        });
+    }
+}
+
+fn leg_of(listener: &str) -> crate::report::Leg {
+    match listener {
+        "tcp" => crate::report::Leg::Tcp,
+        "mimic" => crate::report::Leg::Mimic,
+        _ => crate::report::Leg::Udp,
+    }
 }
 
 // ── Peer-initiated streams ──────────────────────────────────────────────────

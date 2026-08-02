@@ -299,6 +299,32 @@ def analyze_server(server_dir):
     else:
         print("  (none recorded — the probe never issued STATS_REQ during a transfer)")
 
+    section("Server: congestion window per session (the sender on any download)")
+    wins = list(read_jsonl(server_dir / "windows.jsonl"))
+    if not wins:
+        print("  (no windows.jsonl — daemon predates the server-side sampler)")
+    else:
+        by_session = defaultdict(list)
+        for w in wins:
+            by_session[w["phase"]].append(w)
+        # Busiest sessions first: an idle one's flat window says nothing.
+        ranked = sorted(by_session.items(), key=lambda kv: -max(x["cwnd_bytes"] for x in kv[1]))
+        for phase, rows in ranked[:8]:
+            cw = [r["cwnd_bytes"] for r in rows]
+            infl = [r["inflight_bytes"] for r in rows]
+            bw = [r["bottleneck_bw_bps"] for r in rows]
+            states = []
+            for r in rows:
+                if not states or states[-1] != r["state"]:
+                    states.append(r["state"])
+            print(
+                f"  {phase:26} cwnd peak {max(cw):>8} B, inflight peak {max(infl):>8} B, "
+                f"bw peak {max(bw) * 8 / 1e6:6.2f} Mbit/s"
+            )
+            print(f"  {'':26} phases: {' → '.join(states)}")
+            if max(cw) <= 5600:
+                print("  \033[33m" + " " * 26 + "never left the 5600 B floor — sender-bound\033[0m")
+
     section("Server: per-leg counters (final snapshot)")
     last = {}
     for s in snaps:

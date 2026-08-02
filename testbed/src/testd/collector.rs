@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::report::{unix_nanos, EventRecord, JsonlWriter, ServerStats, SessionRecord};
+use crate::report::{
+    unix_nanos, EventRecord, JsonlWriter, ServerStats, SessionRecord, WindowSample,
+};
 
 /// Per-stream rotation cap: 256 MiB. Three streams, one retained generation
 /// each, bounds the worst case at ~1.5 GiB against a 36 GiB volume.
@@ -32,6 +34,7 @@ pub enum Record {
     Session(Box<SessionRecord>),
     Event(EventRecord),
     Snapshot(Box<ServerStats>),
+    Window(Box<WindowSample>),
 }
 
 /// How often the writers are flushed regardless of volume.
@@ -64,6 +67,16 @@ impl CollectorHandle {
         self.offer(Record::Snapshot(Box::new(s)));
     }
 
+    /// One observation of a session's own congestion-control state.
+    ///
+    /// Sampled here rather than requested by the client: during a download the
+    /// server is the sender, so this is the window that governs the transfer,
+    /// and polling for it over the same session would perturb exactly what is
+    /// being measured.
+    pub fn window(&self, w: WindowSample) {
+        self.offer(Record::Window(Box::new(w)));
+    }
+
     pub fn event(
         &self,
         listener: &str,
@@ -94,6 +107,7 @@ pub fn spawn(dir: &Path) -> std::io::Result<(CollectorHandle, tokio::task::JoinH
     let sessions = JsonlWriter::open(dir.join("sessions.jsonl"), ROTATE_BYTES)?;
     let events = JsonlWriter::open(dir.join("events.jsonl"), ROTATE_BYTES)?;
     let snapshots = JsonlWriter::open(dir.join("snapshots.jsonl"), ROTATE_BYTES)?;
+    let windows = JsonlWriter::open(dir.join("windows.jsonl"), ROTATE_BYTES)?;
 
     let (tx, mut rx) = mpsc::channel::<Record>(QUEUE_DEPTH);
     let dropped = Arc::new(AtomicU64::new(0));
@@ -119,6 +133,7 @@ pub fn spawn(dir: &Path) -> std::io::Result<(CollectorHandle, tokio::task::JoinH
                         let _ = sessions.flush();
                         let _ = events.flush();
                         let _ = snapshots.flush();
+                        let _ = windows.flush();
                     }
                     continue;
                 }
@@ -127,6 +142,7 @@ pub fn spawn(dir: &Path) -> std::io::Result<(CollectorHandle, tokio::task::JoinH
                 Record::Session(r) => sessions.write(r.as_ref()),
                 Record::Event(r) => events.write(r),
                 Record::Snapshot(r) => snapshots.write(r.as_ref()),
+                Record::Window(r) => windows.write(r.as_ref()),
             };
             if let Err(e) = res {
                 tracing::error!(error = %e, "collector write failed");
@@ -137,11 +153,13 @@ pub fn spawn(dir: &Path) -> std::io::Result<(CollectorHandle, tokio::task::JoinH
                 let _ = sessions.flush();
                 let _ = events.flush();
                 let _ = snapshots.flush();
+                let _ = windows.flush();
             }
         }
         let _ = sessions.flush();
         let _ = events.flush();
         let _ = snapshots.flush();
+        let _ = windows.flush();
         tracing::info!("collector drained and flushed");
     });
 
