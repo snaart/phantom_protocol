@@ -1190,6 +1190,7 @@ impl Session {
             cwnd_bytes: est.cwnd(),
             inflight_bytes: est.inflight_bytes(),
             delivered_bytes: est.delivered_bytes(),
+            delivered_time: est.delivered_time(),
             state: est.state(),
             app_limited: est.is_app_limited(),
         }
@@ -1532,6 +1533,12 @@ pub struct BandwidthSnapshot {
     /// outgoing segment so its acknowledgement yields a delivery-rate sample
     /// over the interval the segment spanned.
     pub delivered_bytes: u64,
+    /// When `delivered_bytes` last advanced. Stamped alongside it, and it is the
+    /// pair that makes the sample an interval: the acknowledgement supplies the
+    /// far end, this supplies the near one. Without it the near end defaults to
+    /// the segment's own send time, which is later — and a numerator measured
+    /// over a longer span than its denominator reads high.
+    pub delivered_time: std::time::Instant,
     /// Which BBR phase the sender is in. Without it a window that stops growing
     /// is indistinguishable from one that left Startup early on purpose.
     pub state: crate::transport::bandwidth_estimator::BbrState,

@@ -2330,7 +2330,10 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
             // budget shrinks and the drain stops once the window is full.
             let snap = crypto_session.bandwidth_snapshot();
             let budget = snap.cwnd_bytes.saturating_sub(snap.inflight_bytes);
-            let Some(seg) = stream.poll_send(budget, snap.delivered_bytes).await else {
+            let Some(seg) = stream
+                .poll_send(budget, snap.delivered_bytes, snap.delivered_time)
+                .await
+            else {
                 break;
             };
             // A retransmission means the prior send was lost — tell congestion
@@ -2413,6 +2416,7 @@ fn feed_bbr_on_ack(
     sent_at: tokio::time::Instant,
     packet_bytes: u64,
     delivered_at_send: u64,
+    delivered_time_at_send: Option<std::time::Instant>,
     ack_delay_us: u64,
     observability: &Observability,
     path_id: u8,
@@ -2439,6 +2443,12 @@ fn feed_bbr_on_ack(
         // delivered over the interval — the quantity BBR's rate sample is
         // defined as. Passing 0 here made every sample "one packet per RTT".
         delivered_bytes: delivered_at_send,
+        // ...and when the counter stood at that value, which is the other end
+        // of the same interval. `poll_send` stamps it in lock-step with
+        // `sent_at`, so the fallback below is unreachable for any segment that
+        // reached the wire; it degrades to the segment's own round trip, which
+        // is the interval the estimator would have assumed anyway.
+        delivered_at: delivered_time_at_send.unwrap_or(sent_at_std),
         sent_at: sent_at_std,
         acked_at,
         packet_bytes,
@@ -3216,6 +3226,7 @@ async fn handle_packet<T: SessionTransport>(
                         sent_at,
                         retired.size,
                         retired.delivered_at_send,
+                        retired.delivered_time_at_send,
                         sack.ack_delay_us as u64,
                         observability,
                         path_id,
@@ -6933,7 +6944,7 @@ mod tests {
             .await
             .unwrap();
         let _ = stream
-            .poll_send(u64::MAX, 0)
+            .poll_send(u64::MAX, 0, std::time::Instant::now())
             .await
             .expect("segment in-flight");
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
@@ -7011,7 +7022,10 @@ mod tests {
                 .send_reliable(Bytes::from_static(b"x"))
                 .await
                 .unwrap();
-            let _ = stream.poll_send(u64::MAX, 0).await.expect("in-flight");
+            let _ = stream
+                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .await
+                .expect("in-flight");
         }
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         streams.insert(stream_id as u32, stream.clone());
@@ -7047,7 +7061,10 @@ mod tests {
         // No fast-retransmit: nothing was flagged lost, so poll_send (all sent, no
         // new data) returns None rather than a Pass-0 retransmit.
         assert!(
-            stream.poll_send(u64::MAX, 0).await.is_none(),
+            stream
+                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .await
+                .is_none(),
             "a forged SACK must not trigger a fast-retransmit (no segment flagged lost)"
         );
     }
@@ -7078,7 +7095,10 @@ mod tests {
                 .send_reliable(Bytes::from_static(b"x"))
                 .await
                 .unwrap();
-            let seg = stream.poll_send(u64::MAX, 0).await.expect("in-flight");
+            let seg = stream
+                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .await
+                .expect("in-flight");
             seg_size = seg.data.len() as u64;
             server_session.on_packet_sent(seg_size);
         }
@@ -7170,7 +7190,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(seq, i);
-            let _ = stream.poll_send(u64::MAX, 0).await.expect("in-flight");
+            let _ = stream
+                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .await
+                .expect("in-flight");
         }
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
         streams.insert(stream_id as u32, stream.clone());
@@ -7840,6 +7863,7 @@ mod tests {
             let acked_at = now - Duration::from_millis(i * 5);
             let sample = DeliverySample {
                 delivered_bytes: 0,
+                delivered_at: sent_at,
                 sent_at,
                 acked_at,
                 packet_bytes: 1500,

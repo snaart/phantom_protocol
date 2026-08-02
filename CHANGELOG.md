@@ -10,6 +10,26 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **BBR read a burst of acknowledgements as a whole window delivered inside one packet's
+  round trip, overestimating the path by an order of magnitude.** The delivery-rate
+  sample counted the bytes the connection delivered while a packet was in flight, but
+  divided them only by that packet's own send-to-ack time. Acknowledgements do not
+  arrive spread out the way data was sent — receivers batch them and one cumulative SACK
+  retires everything it covers at once — so the last packet of a burst contributed the
+  entire window's bytes against its own short flight time. Measured over a 200 ms WAN
+  path: a peak estimate of 63.51 Mbit/s against a link demonstrating 6.63 Mbit/s of UDP
+  echo at 0.0% loss, 9.6x the real ceiling; over TCP, 25.71 Mbit/s against 4.22. The
+  window grew to ~128 KB on that estimate, overshot, took loss and collapsed, ending one
+  upload in `fast_recovery` and sustaining 4.7-7.6% of the path.
+  The sample interval is now bounded by the acknowledgement interval as well as the send
+  interval (`max(send_elapsed, ack_elapsed)`, canonical BBR). Each outgoing segment is
+  stamped with *when* the connection's delivered counter last advanced alongside the
+  counter value it was already carrying, so both ends of the interval the sample
+  measures are known and the numerator is no longer divided by a shorter span than it
+  was accumulated over.
+  **Sender-local accounting only: no wire-format, handshake or key-schedule change, and
+  old and new peers interoperate unchanged.**
+
 - **Congestion control could not open its window past the floor, capping a session at
   roughly `cwnd_floor / rtt` on any real path.** BBR's delivery-rate sample divided a
   single packet's size by that same packet's round-trip time, making every sample "one
