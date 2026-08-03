@@ -1,8 +1,8 @@
 //! `phantom-testd` — the WAN testbed daemon.
 //!
 //! Binds every network-testable Phantom leg from a single persisted identity,
-//! plus raw TCP/UDP echo controls, and records server-side statistics for the
-//! duration of the run.
+//! a QUIC reference leg, and raw TCP/UDP echo controls, and records server-side
+//! statistics for the duration of the run.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -32,6 +32,11 @@ struct Args {
     #[arg(long, env = "TESTD_MIMIC_BIND", default_value = "0.0.0.0:4244")]
     mimic_bind: SocketAddr,
 
+    /// QUIC reference listener (quinn). Not the protocol under test — the
+    /// yardstick it is measured against, on the same path in the same run.
+    #[arg(long, env = "TESTD_QUIC_BIND", default_value = "0.0.0.0:4245")]
+    quic_bind: SocketAddr,
+
     /// Raw TCP echo control (no Phantom).
     #[arg(long, env = "TESTD_RAW_TCP_BIND", default_value = "0.0.0.0:4342")]
     raw_tcp_bind: SocketAddr,
@@ -43,6 +48,10 @@ struct Args {
     /// Disable the mimic-TLS leg.
     #[arg(long, env = "TESTD_NO_MIMIC")]
     no_mimic: bool,
+
+    /// Disable the QUIC reference leg.
+    #[arg(long, env = "TESTD_NO_QUIC")]
+    no_quic: bool,
 
     /// SNI the mimic-TLS leg presents.
     #[arg(long, env = "TESTD_MIMIC_SNI", default_value = "www.cloudflare.com")]
@@ -110,9 +119,11 @@ async fn main() -> Result<()> {
         tcp_bind: args.tcp_bind,
         udp_bind: args.udp_bind,
         mimic_bind: args.mimic_bind,
+        quic_bind: args.quic_bind,
         raw_tcp_bind: args.raw_tcp_bind,
         raw_udp_bind: args.raw_udp_bind,
         enable_mimic: !args.no_mimic,
+        enable_quic: !args.no_quic,
         mimic_sni: args.mimic_sni,
         data_dir: args.data_dir,
         signing_key_file: args.signing_key_file,

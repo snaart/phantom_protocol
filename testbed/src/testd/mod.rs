@@ -18,6 +18,8 @@ use phantom_protocol::observability::Observability;
 use phantom_protocol::PhantomConfig;
 use tokio::sync::Semaphore;
 
+use crate::framing::{Framed, MsgLink};
+use crate::quic::QuicLink;
 use crate::report::{unix_nanos, PerLegCounters, ServerStats};
 use crate::testd::collector::CollectorHandle;
 use crate::testd::handler::{Counters, SessionCtx};
@@ -27,14 +29,22 @@ use crate::testd::handler::{Counters, SessionCtx};
 /// Shutdown must not be able to block on a session that never ends.
 const COLLECTOR_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
+/// How long an accepted QUIC connection may go without opening its stream.
+///
+/// The probe opens one immediately. A connection that does not is holding a
+/// session slot for nothing, and on a 2 GB host those are worth reclaiming.
+const QUIC_STREAM_GRACE: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 pub struct TestdConfig {
     pub tcp_bind: SocketAddr,
     pub udp_bind: SocketAddr,
     pub mimic_bind: SocketAddr,
+    pub quic_bind: SocketAddr,
     pub raw_tcp_bind: SocketAddr,
     pub raw_udp_bind: SocketAddr,
     pub enable_mimic: bool,
+    pub enable_quic: bool,
     pub mimic_sni: String,
     pub data_dir: PathBuf,
     pub signing_key_file: PathBuf,
@@ -216,6 +226,34 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
         None
     };
 
+    // ── QUIC reference ─────────────────────────────────────────────────────
+    //
+    // Its certificate is persisted next to the signing seed and for the same
+    // reason: a restart must not invalidate every probe's pin. The hex form is
+    // written out and logged exactly as the Phantom pin is, because an operator
+    // needs to copy it to the client the same way.
+    let quic = if cfg.enable_quic {
+        let id = crate::quic::load_or_create_identity(
+            &cfg.data_dir.join("quic-cert.der"),
+            &cfg.data_dir.join("quic-key.der"),
+        )
+        .context("QUIC identity")?;
+        let cert_hex = hex::encode(&id.cert_der);
+        std::fs::write(cfg.data_dir.join("quic-cert.hex"), format!("{cert_hex}\n"))?;
+        let endpoint = quinn::Endpoint::server(
+            crate::quic::server_config(&id).context("QUIC server config")?,
+            cfg.quic_bind,
+        )
+        .with_context(|| format!("bind QUIC listener on {}", cfg.quic_bind))?;
+        tracing::info!(addr = %cfg.quic_bind, "quic reference listener bound");
+        tracing::warn!(
+            "quic certificate (pin this on clients, also at <data-dir>/quic-cert.hex): {cert_hex}"
+        );
+        Some(endpoint)
+    } else {
+        None
+    };
+
     // ── raw baselines ──────────────────────────────────────────────────────
     let base_stats = Arc::new(baseline::BaselineStats::default());
     {
@@ -267,6 +305,15 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
         slots.clone(),
         upload_root.clone(),
     )));
+    if let Some(q) = quic.clone() {
+        accepts.push(tokio::spawn(accept_quic(
+            q,
+            collector.clone(),
+            uid.clone(),
+            slots.clone(),
+            upload_root.clone(),
+        )));
+    }
 
     // ── periodic snapshots ─────────────────────────────────────────────────
     let snap_task = tokio::spawn(snapshot_loop(
@@ -282,11 +329,16 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
         None,
         None,
         format!(
-            "tcp={} udp={} mimic={} raw_tcp={} raw_udp={} pin={}",
+            "tcp={} udp={} mimic={} quic={} raw_tcp={} raw_udp={} pin={}",
             cfg.tcp_bind,
             cfg.udp_bind,
             if cfg.enable_mimic {
                 cfg.mimic_bind.to_string()
+            } else {
+                "disabled".to_string()
+            },
+            if cfg.enable_quic {
+                cfg.quic_bind.to_string()
             } else {
                 "disabled".to_string()
             },
@@ -308,6 +360,12 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
     udp.shutdown();
     if let Some(m) = mimic {
         m.shutdown();
+    }
+    if let Some(q) = quic {
+        // Tell live peers rather than letting them time out: an abrupt exit
+        // would show up in a probe's samples as a stall it has no way to
+        // attribute to a restart.
+        q.close(0u32.into(), b"shutdown");
     }
 
     // Give in-flight handlers a moment to emit their final session records
@@ -385,7 +443,7 @@ async fn accept_tcp(
         let collector2 = collector.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            handler::run(session, ctx, collector2).await;
+            handler::run(Arc::new(Framed::new(session)), ctx, collector2).await;
         });
     }
 }
@@ -429,7 +487,80 @@ async fn accept_udp(
         let collector2 = collector.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            handler::run(session, ctx, collector2).await;
+            handler::run(Arc::new(Framed::new(session)), ctx, collector2).await;
+        });
+    }
+}
+
+/// Accept QUIC connections and run the same session handler behind them.
+///
+/// The handshake is awaited inside the spawned task rather than here, so one
+/// slow client cannot hold up the accept loop; the session slot is taken first,
+/// exactly as on the other legs, so the daemon's concurrency ceiling means the
+/// same thing on all of them.
+async fn accept_quic(
+    endpoint: quinn::Endpoint,
+    collector: CollectorHandle,
+    uid: Arc<AtomicU64>,
+    slots: Arc<Semaphore>,
+    upload_root: PathBuf,
+) {
+    loop {
+        let permit = match slots.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let Some(incoming) = endpoint.accept().await else {
+            return;
+        };
+        let collector2 = collector.clone();
+        let uid2 = uid.clone();
+        let upload_root2 = upload_root.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let peer = incoming.remote_address().to_string();
+            let conn = match incoming.await {
+                Ok(c) => c,
+                Err(e) => {
+                    collector2.event("quic", "accept_error", Some(peer), None, format!("{e}"));
+                    return;
+                }
+            };
+            // The conversation's single bidirectional stream. It does not exist
+            // on the wire until the client writes to it, so this is where an
+            // idle connection is dropped instead of holding a slot.
+            let (send, recv) = match tokio::time::timeout(QUIC_STREAM_GRACE, conn.accept_bi()).await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    collector2.event("quic", "stream_error", Some(peer), None, format!("{e}"));
+                    return;
+                }
+                Err(_) => {
+                    collector2.event(
+                        "quic",
+                        "stream_timeout",
+                        Some(peer),
+                        None,
+                        format!("no stream within {}s", QUIC_STREAM_GRACE.as_secs()),
+                    );
+                    conn.close(0u32.into(), b"no stream");
+                    return;
+                }
+            };
+            let ctx = Arc::new(SessionCtx {
+                uid: uid2.fetch_add(1, Ordering::Relaxed),
+                listener: "quic".to_string(),
+                peer,
+                // 0-RTT early data is not offered on this leg — see the probe's
+                // skipped-scenario notes.
+                early_data_bytes: 0,
+                upload_root: upload_root2,
+                counters: Counters::default(),
+                marks: Default::default(),
+            });
+            let link: Arc<dyn MsgLink> = Arc::new(QuicLink::accepted(conn, send, recv));
+            handler::run(link, ctx, collector2).await;
         });
     }
 }

@@ -1,14 +1,19 @@
 //! Per-session testbed protocol handler.
 //!
-//! Full duplex by construction: a reader task drains `session.recv()` while a
-//! writer task owns every `session.send()`. Both hold the same `Arc<PhantomSession>`,
-//! which is safe because the session multiplexes through the data pump's
-//! channels rather than a lock.
+//! Full duplex by construction: a reader task drains the link while a writer
+//! task owns every send. Both hold the same link, which is safe because a
+//! Phantom session multiplexes through the data pump's channels and a QUIC
+//! stream is guarded per direction.
 //!
 //! The split is not incidental — a single-task handler would block its receive
 //! loop for the entire duration of a `SOURCE` download, so the `bidir` scenario
 //! would silently degrade into two sequential half-duplex transfers and report
 //! a number that looks like a full-duplex result but is not one.
+//!
+//! One handler serves every leg, including the QUIC reference. That is the
+//! point: `download` measures the same server-side send loop whichever
+//! transport carries it, so a difference in the result is a difference in the
+//! transport rather than in what the two servers were asked to do.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,10 +25,10 @@ use phantom_protocol::CoreError;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::framing::{encode_framed, Framed};
+use crate::framing::{encode_framed, MsgLink};
 use crate::proto::{checksum, Msg, PayloadGen};
 use crate::report::{
-    unix_nanos, MarkRecord, PerLegCounters, ProcInfo, ServerStats, SessionRecord, WindowSample,
+    unix_nanos, ClientMetrics, MarkRecord, PerLegCounters, ProcInfo, ServerStats, SessionRecord,
 };
 use crate::testd::collector::CollectorHandle;
 
@@ -68,7 +73,7 @@ enum OutCmd {
 }
 
 /// Drive one accepted session to completion, then emit its `SessionRecord`.
-pub async fn run(session: Arc<PhantomSession>, ctx: Arc<SessionCtx>, collector: CollectorHandle) {
+pub async fn run(link: Arc<dyn MsgLink>, ctx: Arc<SessionCtx>, collector: CollectorHandle) {
     let t_open = unix_nanos();
     let started = Instant::now();
     collector.event(
@@ -81,19 +86,26 @@ pub async fn run(session: Arc<PhantomSession>, ctx: Arc<SessionCtx>, collector: 
 
     let (tx_out, rx_out) = mpsc::channel::<OutCmd>(OUT_QUEUE);
 
-    let writer = tokio::spawn(writer_loop(session.clone(), ctx.clone(), rx_out));
-    let window_sampler = tokio::spawn(window_loop(session.clone(), ctx.clone(), collector.clone()));
-    let streams = tokio::spawn(stream_loop(session.clone(), ctx.clone(), collector.clone()));
+    let writer = tokio::spawn(writer_loop(link.clone(), ctx.clone(), rx_out));
+    let window_sampler = tokio::spawn(window_loop(link.clone(), ctx.clone(), collector.clone()));
+    // Peer-initiated streams are a Phantom feature; the reference leg runs the
+    // whole conversation over its one bidirectional stream by design, so there
+    // is no acceptor to spawn there.
+    let streams = link
+        .phantom()
+        .cloned()
+        .map(|session| tokio::spawn(stream_loop(session, ctx.clone(), collector.clone())));
 
-    let framed = Framed::new(session.clone());
-    let close_reason = reader_loop(&framed, ctx.clone(), tx_out, collector.clone()).await;
+    let close_reason = reader_loop(link.as_ref(), ctx.clone(), tx_out, collector.clone()).await;
 
     // Dropping the outbound sender ends the writer; the stream acceptor exits
     // when the session tears down.
     writer.abort();
-    streams.abort();
+    if let Some(s) = streams {
+        s.abort();
+    }
     window_sampler.abort();
-    let _ = session.disconnect().await;
+    link.close().await;
 
     let t_close = unix_nanos();
     let c = &ctx.counters;
@@ -148,12 +160,11 @@ struct UploadState {
 }
 
 async fn reader_loop(
-    framed: &Framed,
+    framed: &dyn MsgLink,
     ctx: Arc<SessionCtx>,
     tx_out: mpsc::Sender<OutCmd>,
     collector: CollectorHandle,
 ) -> String {
-    let session = framed.session().clone();
     let mut sink = SinkState::default();
     let mut upload: Option<UploadState> = None;
 
@@ -272,7 +283,7 @@ async fn reader_loop(
             }
 
             Msg::StatsReq => {
-                let stats = collect_stats(&session, &ctx.listener).await;
+                let stats = collect_stats(framed, &ctx.listener).await;
                 let json = serde_json::to_vec(&stats).unwrap_or_else(|_| b"{}".to_vec());
                 if tx_out
                     .send(OutCmd::Frame(encode_framed(&Msg::Stats { json })))
@@ -478,41 +489,40 @@ async fn open_upload(
 /// `session.observability()` on an accepted session returns the **listener's**
 /// aggregate, which is what makes per-leg totals available for the UDP listener
 /// at all — it exposes no accessor of its own.
-async fn collect_stats(session: &Arc<PhantomSession>, listener: &str) -> ServerStats {
-    let snap = session.observability().snapshot();
+///
+/// On the QUIC reference leg there is no Phantom instrumentation to snapshot,
+/// so `metrics` and `per_leg` come back empty and zeroed. That is "not
+/// instrumented", not "nothing happened"; the sender window is still real, and
+/// the process figures still describe the same daemon.
+async fn collect_stats(link: &dyn MsgLink, listener: &str) -> ServerStats {
+    let (metrics, per_leg) = match link.phantom() {
+        Some(session) => {
+            let snap = session.observability().snapshot();
+            let mut per_leg = Vec::with_capacity(4);
+            for i in 0..snap.per_leg_packets.len() {
+                let (leg, ps, pr) = snap.per_leg_packets[i];
+                let (_, bs, br) = snap.per_leg_bytes[i];
+                per_leg.push(PerLegCounters {
+                    leg: format!("{leg:?}").to_lowercase(),
+                    packets_sent: ps,
+                    packets_recv: pr,
+                    bytes_sent: bs,
+                    bytes_recv: br,
+                });
+            }
+            (ClientMetrics::from(snap.to_ffi()), per_leg)
+        }
+        None => (ClientMetrics::default(), Vec::new()),
+    };
 
-    let mut per_leg = Vec::with_capacity(4);
-    for i in 0..snap.per_leg_packets.len() {
-        let (leg, ps, pr) = snap.per_leg_packets[i];
-        let (_, bs, br) = snap.per_leg_bytes[i];
-        per_leg.push(PerLegCounters {
-            leg: format!("{leg:?}").to_lowercase(),
-            packets_sent: ps,
-            packets_recv: pr,
-            bytes_sent: bs,
-            bytes_recv: br,
-        });
-    }
-
-    let sender_window = session.bandwidth_snapshot().await.map(|bw| WindowSample {
-        leg: crate::report::Leg::Udp,
-        phase: format!("server:{listener}"),
-        t_unix_ns: unix_nanos(),
-        elapsed_ms: 0,
-        cwnd_bytes: bw.cwnd_bytes,
-        inflight_bytes: bw.inflight_bytes,
-        bottleneck_bw_bps: bw.bottleneck_bw_bps,
-        pacing_rate_bps: bw.pacing_rate_bps,
-        min_rtt_us: bw.min_rtt.as_micros() as u64,
-        delivered_bytes: bw.delivered_bytes,
-        state: bw.state.as_str().to_string(),
-        app_limited: bw.app_limited,
-    });
+    let sender_window = link
+        .window_sample(leg_of(listener), format!("server:{listener}"), 0)
+        .await;
 
     ServerStats {
         listener: listener.to_string(),
         t_unix_ns: unix_nanos(),
-        metrics: snap.to_ffi().into(),
+        metrics,
         per_leg,
         process: proc_info_or_default(),
         sender_window,
@@ -525,16 +535,12 @@ fn proc_info_or_default() -> ProcInfo {
 
 // ── Send side ───────────────────────────────────────────────────────────────
 
-async fn writer_loop(
-    session: Arc<PhantomSession>,
-    ctx: Arc<SessionCtx>,
-    mut rx: mpsc::Receiver<OutCmd>,
-) {
+async fn writer_loop(link: Arc<dyn MsgLink>, ctx: Arc<SessionCtx>, mut rx: mpsc::Receiver<OutCmd>) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
             OutCmd::Frame(bytes) => {
                 let n = bytes.len() as u64;
-                if session.send(bytes).await.is_err() {
+                if link.send_encoded(bytes).await.is_err() {
                     return;
                 }
                 ctx.counters.frames_sent.fetch_add(1, Ordering::Relaxed);
@@ -545,7 +551,7 @@ async fn writer_loop(
                 frame_size,
                 pace_kbps,
             } => {
-                if source_stream(&session, &ctx, total_bytes, frame_size, pace_kbps)
+                if source_stream(link.as_ref(), &ctx, total_bytes, frame_size, pace_kbps)
                     .await
                     .is_err()
                 {
@@ -557,7 +563,7 @@ async fn writer_loop(
 }
 
 async fn source_stream(
-    session: &Arc<PhantomSession>,
+    link: &dyn MsgLink,
     ctx: &Arc<SessionCtx>,
     total_bytes: u64,
     frame_size: u32,
@@ -594,7 +600,7 @@ async fn source_stream(
         };
         let encoded = encode_framed(&msg);
         let n = encoded.len() as u64;
-        session.send(encoded).await?;
+        link.send_encoded(encoded).await?;
         ctx.counters.frames_sent.fetch_add(1, Ordering::Relaxed);
         ctx.counters.source_frames.fetch_add(1, Ordering::Relaxed);
         ctx.counters.bytes_sent.fetch_add(n, Ordering::Relaxed);
@@ -612,7 +618,7 @@ async fn source_stream(
         bytes: sent_bytes,
     });
     let n = end.len() as u64;
-    session.send(end).await?;
+    link.send_encoded(end).await?;
     ctx.counters.frames_sent.fetch_add(1, Ordering::Relaxed);
     ctx.counters.bytes_sent.fetch_add(n, Ordering::Relaxed);
     Ok(())
@@ -623,35 +629,21 @@ async fn source_stream(
 /// On a download the server is the sender, so this is the window that governs
 /// the transfer — and sampling it here rather than answering a client poll
 /// keeps the measurement off the path being measured.
-async fn window_loop(
-    session: Arc<PhantomSession>,
-    ctx: Arc<SessionCtx>,
-    collector: CollectorHandle,
-) {
+async fn window_loop(link: Arc<dyn MsgLink>, ctx: Arc<SessionCtx>, collector: CollectorHandle) {
     // 500 ms: fine enough to watch a window open over a few round trips on a
     // ~200 ms path, coarse enough to be free.
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let started = Instant::now();
+    let leg = leg_of(&ctx.listener);
+    let phase = format!("server:session:{}", ctx.uid);
     loop {
         tick.tick().await;
-        let Some(bw) = session.bandwidth_snapshot().await else {
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let Some(w) = link.window_sample(leg, phase.clone(), elapsed_ms).await else {
             continue;
         };
-        collector.window(WindowSample {
-            leg: leg_of(&ctx.listener),
-            phase: format!("server:session:{}", ctx.uid),
-            t_unix_ns: unix_nanos(),
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            cwnd_bytes: bw.cwnd_bytes,
-            inflight_bytes: bw.inflight_bytes,
-            bottleneck_bw_bps: bw.bottleneck_bw_bps,
-            pacing_rate_bps: bw.pacing_rate_bps,
-            min_rtt_us: bw.min_rtt.as_micros() as u64,
-            delivered_bytes: bw.delivered_bytes,
-            state: bw.state.as_str().to_string(),
-            app_limited: bw.app_limited,
-        });
+        collector.window(w);
     }
 }
 
@@ -659,6 +651,7 @@ fn leg_of(listener: &str) -> crate::report::Leg {
     match listener {
         "tcp" => crate::report::Leg::Tcp,
         "mimic" => crate::report::Leg::Mimic,
+        "quic" => crate::report::Leg::Quic,
         _ => crate::report::Leg::Udp,
     }
 }

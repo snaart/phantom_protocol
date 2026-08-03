@@ -42,6 +42,33 @@ hex = "0.4"
 # reports is really the kernel's default and not the link.
 socket2 = { version = "0.5", features = ["all"] }
 
+# The QUIC reference leg. quinn is the mature implementation the protocol under
+# test is measured against, so it is deliberately taken as shipped rather than
+# tuned to flatter or to handicap it.
+#
+# `default-features = false` drops `platform-verifier` (a system trust store is
+# meaningless for a self-signed testbed certificate, and it pulls a large
+# platform-specific tree) and selects the **ring** rustls provider rather than
+# the default aws-lc-rs: `core` already links ring through `classical-crypto`,
+# so ring is free here, whereas aws-lc-rs would drag cmake and a C toolchain
+# onto a 2-core VPS for no benefit.
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+] }
+rustls-pki-types = "1"
+# Mints the daemon's self-signed certificate. `pem` is off — the certificate is
+# persisted and pinned as raw DER, so there is nothing to base64-armour.
+rcgen = { version = "0.13", default-features = false, features = [
+    "crypto",
+    "ring",
+] }
+
 [profile.release]
 # The probe records timestamps around tight send/recv loops; debug symbols cost
 # nothing at runtime and make a profiler or a crash dump readable.

@@ -5,6 +5,7 @@
 //! stopped delivering would hang the entire run and produce no data at all —
 //! which is strictly worse than recording the failure and moving on.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,8 +14,9 @@ use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
 use phantom_protocol::transport::legs::mimic_tls::{MimicConfig, MimicTlsLeg};
 use phantom_protocol::CoreError;
 
-use crate::framing::{Arrival, Framed};
+use crate::framing::{Arrival, Framed, MsgLink};
 use crate::proto::Msg;
+use crate::quic::QuicLink;
 use crate::report::Leg;
 
 /// Ceiling on a handshake. Generous against a ~230 ms path plus post-quantum
@@ -52,9 +54,16 @@ pub struct Endpoints {
     pub tcp_port: u16,
     pub udp_port: u16,
     pub mimic_port: u16,
+    pub quic_port: u16,
     pub raw_tcp_port: u16,
     pub raw_udp_port: u16,
     pub sni: String,
+    /// The daemon's QUIC certificate, DER, as pinned by the operator.
+    ///
+    /// `None` means no pin was supplied, and the QUIC reference leg is skipped
+    /// with a recorded note rather than connecting without verification — an
+    /// unverified handshake would measure something other than a handshake.
+    pub quic_cert: Option<Vec<u8>>,
 }
 
 impl Endpoints {
@@ -63,6 +72,7 @@ impl Endpoints {
             Leg::Udp => self.udp_port,
             Leg::Tcp => self.tcp_port,
             Leg::Mimic => self.mimic_port,
+            Leg::Quic => self.quic_port,
             Leg::RawTcp => self.raw_tcp_port,
             Leg::RawUdp => self.raw_udp_port,
         }
@@ -153,14 +163,87 @@ pub async fn connect_leg_unready(
                 )
                 .await
             }
-            Leg::RawTcp | Leg::RawUdp => Err(CoreError::Unsupported(
-                "raw baseline legs carry no Phantom session".to_string(),
-            )),
+            Leg::Quic | Leg::RawTcp | Leg::RawUdp => Err(CoreError::Unsupported(format!(
+                "{leg} carries no Phantom session"
+            ))),
         }
     };
     tokio::time::timeout(CONNECT_TIMEOUT, fut)
         .await
         .map_err(|_| CoreError::Timeout)?
+}
+
+/// Resolve a leg's host:port to a socket address.
+///
+/// Only the first result is used, matching what `connect_pinned_udp` does on
+/// the Phantom side — a leg that silently tried a second address would not be
+/// measuring the same path as its neighbours.
+async fn resolve(ep: &Endpoints, leg: Leg) -> Result<SocketAddr, CoreError> {
+    let addr = ep.addr_for(leg);
+    let mut it = tokio::net::lookup_host(addr.clone())
+        .await
+        .map_err(|e| CoreError::NetworkError(format!("resolve {addr}: {e}")))?;
+    it.next()
+        .ok_or_else(|| CoreError::NetworkError(format!("{addr} resolved to nothing")))
+}
+
+/// Open a link on `leg`, whichever protocol carries it, and wait until it is
+/// usable.
+///
+/// This is the entry point for every scenario that compares the protocol under
+/// test against the QUIC reference: both legs come back as an
+/// [`MsgLink`], so a comparison cannot accidentally be run over two different
+/// code paths measuring two different things.
+pub async fn connect_link(
+    leg: Leg,
+    ep: &Endpoints,
+    pin: &[u8],
+) -> Result<Arc<dyn MsgLink>, CoreError> {
+    Ok(connect_link_staged(leg, ep, pin).await?.0)
+}
+
+/// As [`connect_link`], additionally reporting how much of the elapsed time was
+/// spent before the handshake began.
+///
+/// The split exists because the two legs reach a usable connection differently:
+/// `connect_pinned*` returns a session in `Connecting` state and runs the
+/// handshake on a background task, while quinn's `connect(..).await` resolves
+/// only once the TLS handshake is done. Measuring both as one number would
+/// quietly compare a socket setup on one leg against a full key exchange on the
+/// other. `setup_ns` is the synchronous construction prefix on both.
+pub async fn connect_link_staged(
+    leg: Leg,
+    ep: &Endpoints,
+    pin: &[u8],
+) -> Result<(Arc<dyn MsgLink>, u64), CoreError> {
+    let t0 = Instant::now();
+    match leg {
+        Leg::Quic => {
+            let cert = ep.quic_cert.clone().ok_or_else(|| {
+                CoreError::ConfigError(
+                    "no QUIC certificate pinned: pass --quic-cert-file or --quic-cert-hex"
+                        .to_string(),
+                )
+            })?;
+            let addr = resolve(ep, leg).await?;
+            let setup_ns = t0.elapsed().as_nanos() as u64;
+            let link = tokio::time::timeout(CONNECT_TIMEOUT, QuicLink::connect(addr, &cert))
+                .await
+                .map_err(|_| CoreError::Timeout)??;
+            Ok((Arc::new(link), setup_ns))
+        }
+        Leg::Udp | Leg::Tcp | Leg::Mimic => {
+            let session = connect_leg_unready(leg, ep, pin).await?;
+            let setup_ns = t0.elapsed().as_nanos() as u64;
+            tokio::time::timeout(CONNECT_TIMEOUT, session.await_ready())
+                .await
+                .map_err(|_| CoreError::Timeout)??;
+            Ok((Arc::new(Framed::new(session)), setup_ns))
+        }
+        Leg::RawTcp | Leg::RawUdp => Err(CoreError::Unsupported(format!(
+            "{leg} is a raw socket control and carries no protocol"
+        ))),
+    }
 }
 
 /// Open a session on `leg`, offering a resumption ticket and 0-RTT early data.
@@ -228,9 +311,9 @@ async fn connect_leg_resumed_unready(
                     .connect()
                     .await
             }
-            Leg::RawTcp | Leg::RawUdp => Err(CoreError::Unsupported(
-                "raw baseline legs carry no Phantom session".to_string(),
-            )),
+            Leg::Quic | Leg::RawTcp | Leg::RawUdp => Err(CoreError::Unsupported(format!(
+                "{leg} carries no Phantom session"
+            ))),
         }
     };
     tokio::time::timeout(CONNECT_TIMEOUT, fut)
@@ -238,7 +321,12 @@ async fn connect_leg_resumed_unready(
         .map_err(|_| CoreError::Timeout)?
 }
 
-/// Open a session on `leg` and wrap it in testbed framing.
+/// Open a Phantom session on `leg` and wrap it in testbed framing.
+///
+/// Phantom-only by construction: the scenarios that call this reach for
+/// resumption, rekey, migration or per-stream multiplexing, none of which the
+/// reference leg is being asked to imitate. Anything that compares the two goes
+/// through [`connect_link`] instead.
 pub async fn connect_framed(leg: Leg, ep: &Endpoints, pin: &[u8]) -> Result<Framed, CoreError> {
     Ok(Framed::new(connect_leg(leg, ep, pin).await?))
 }
@@ -264,7 +352,7 @@ pub struct EchoOutcome {
 /// silently-cut payload registers as a clean round trip. It did, until this
 /// check was added.
 pub async fn echo_once(
-    framed: &Framed,
+    framed: &dyn MsgLink,
     seq: u64,
     payload: Vec<u8>,
 ) -> Result<EchoOutcome, CoreError> {
@@ -321,7 +409,7 @@ pub async fn echo_once(
 }
 
 /// Send a frame that expects no reply.
-pub async fn send_msg(framed: &Framed, msg: Msg) -> Result<(), CoreError> {
+pub async fn send_msg(framed: &dyn MsgLink, msg: Msg) -> Result<(), CoreError> {
     tokio::time::timeout(OP_TIMEOUT, framed.send(&msg))
         .await
         .map_err(|_| CoreError::Timeout)?
@@ -331,7 +419,7 @@ pub async fn send_msg(framed: &Framed, msg: Msg) -> Result<(), CoreError> {
 ///
 /// Best-effort by design: a failed marker must never abort a scenario, because
 /// the marker exists to annotate the data, not to be part of the measurement.
-pub async fn mark(framed: &Framed, label: impl Into<String>) {
+pub async fn mark(framed: &dyn MsgLink, label: impl Into<String>) {
     let _ = send_msg(
         framed,
         Msg::Mark {
@@ -342,7 +430,7 @@ pub async fn mark(framed: &Framed, label: impl Into<String>) {
 }
 
 /// Ask for the server's metric snapshot.
-pub async fn fetch_server_stats(framed: &Framed) -> Result<serde_json::Value, CoreError> {
+pub async fn fetch_server_stats(framed: &dyn MsgLink) -> Result<serde_json::Value, CoreError> {
     send_msg(framed, Msg::StatsReq).await?;
     let deadline = Instant::now() + OP_TIMEOUT;
     loop {
@@ -370,9 +458,11 @@ mod tests {
             tcp_port: 4242,
             udp_port: 4243,
             mimic_port: 4244,
+            quic_port: 4245,
             raw_tcp_port: 4342,
             raw_udp_port: 4343,
             sni: "www.example.com".into(),
+            quic_cert: None,
         }
     }
 
@@ -382,16 +472,24 @@ mod tests {
         assert_eq!(e.port_for(Leg::Tcp), 4242);
         assert_eq!(e.port_for(Leg::Udp), 4243);
         assert_eq!(e.port_for(Leg::Mimic), 4244);
+        assert_eq!(e.port_for(Leg::Quic), 4245);
         assert_eq!(e.port_for(Leg::RawTcp), 4342);
         assert_eq!(e.port_for(Leg::RawUdp), 4343);
         assert_eq!(e.addr_for(Leg::Udp), "example.test:4243");
 
         // No two legs may share a port, or a run would silently measure the
         // wrong listener.
-        let ports: Vec<u16> = [Leg::Udp, Leg::Tcp, Leg::Mimic, Leg::RawTcp, Leg::RawUdp]
-            .iter()
-            .map(|l| e.port_for(*l))
-            .collect();
+        let ports: Vec<u16> = [
+            Leg::Udp,
+            Leg::Tcp,
+            Leg::Mimic,
+            Leg::Quic,
+            Leg::RawTcp,
+            Leg::RawUdp,
+        ]
+        .iter()
+        .map(|l| e.port_for(*l))
+        .collect();
         let mut uniq = ports.clone();
         uniq.sort_unstable();
         uniq.dedup();
@@ -425,12 +523,38 @@ mod tests {
     #[tokio::test]
     async fn raw_legs_are_not_phantom_connectable() {
         let e = ep();
-        for leg in [Leg::RawTcp, Leg::RawUdp] {
+        for leg in [Leg::RawTcp, Leg::RawUdp, Leg::Quic] {
             let r = connect_leg(leg, &e, &[0u8; 64]).await;
             assert!(
                 matches!(r, Err(CoreError::Unsupported(_))),
                 "{leg} must not be reachable through the Phantom connect path"
             );
+        }
+    }
+
+    /// The raw controls are sockets, not protocols: asking for a message link
+    /// over one is a harness bug and must be reported as such rather than
+    /// producing an empty data set that looks like a failed server.
+    #[tokio::test]
+    async fn raw_legs_have_no_message_link() {
+        let e = ep();
+        for leg in [Leg::RawTcp, Leg::RawUdp] {
+            let r = connect_link(leg, &e, &[0u8; 64]).await;
+            assert!(matches!(r, Err(CoreError::Unsupported(_))), "{leg}");
+        }
+    }
+
+    /// Without a pinned certificate the QUIC leg must refuse before it touches
+    /// the network. Connecting anyway — with verification off — would turn its
+    /// handshake number into a measurement of something else entirely.
+    #[tokio::test]
+    async fn the_quic_leg_refuses_to_run_unpinned() {
+        let e = ep();
+        assert!(e.quic_cert.is_none());
+        match connect_link(Leg::Quic, &e, &[0u8; 64]).await {
+            Err(CoreError::ConfigError(msg)) => assert!(msg.contains("certificate"), "{msg}"),
+            Err(other) => panic!("an unpinned QUIC leg must be a config error, got {other:?}"),
+            Ok(_) => panic!("an unpinned QUIC leg must not connect at all"),
         }
     }
 }

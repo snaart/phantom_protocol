@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+use crate::framing::MsgLink;
 use crate::probe::conn::Endpoints;
 use crate::probe::scenarios::ScenarioOutput;
 use crate::proto::{Msg, UPLOAD_CHUNK_SIZE};
@@ -193,6 +194,26 @@ impl ProbeConfig {
         self.only.as_ref().is_none_or(|s| s.contains(scenario))
     }
 
+    /// Names in `--only` that no scenario answers to.
+    ///
+    /// The filter is exact, so a typo does not run a near-match — it runs
+    /// nothing, and an hour later the operator has an empty directory and no
+    /// idea why. Reported up front instead.
+    fn unknown_filters(&self) -> Vec<String> {
+        let Some(only) = &self.only else {
+            return Vec::new();
+        };
+        let mut unknown: Vec<String> = only
+            .iter()
+            .filter(|s| {
+                !PHANTOM_SCENARIOS.contains(&s.as_str()) && !RAW_SCENARIOS.contains(&s.as_str())
+            })
+            .cloned()
+            .collect();
+        unknown.sort();
+        unknown
+    }
+
     /// The one leg that carries the long soak.
     ///
     /// Soaking every leg would triple the longest scenario in the matrix for
@@ -321,6 +342,13 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
 
     println!("run {run_id} — profile {}", cfg.profile.as_str());
     println!("results: {}", dir.display());
+    let unknown = cfg.unknown_filters();
+    if !unknown.is_empty() {
+        println!(
+            "  warning: --only names no scenario answers to: {} (nothing will run for those)",
+            unknown.join(", ")
+        );
+    }
     println!();
 
     let ep = &cfg.endpoints;
@@ -343,6 +371,11 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
 
     for &leg in &cfg.legs {
         println!("\n  ── leg {leg} ──");
+
+        if leg.is_reference() {
+            run_reference_leg(&cfg, &mut st, leg).await?;
+            continue;
+        }
 
         if !leg.is_phantom() {
             if cfg.wants("rtt_sweep") {
@@ -505,6 +538,175 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Scenario names the raw controls answer to. They carry no protocol, so they
+/// run only the two probes that describe the path itself.
+const RAW_SCENARIOS: &[&str] = &["rtt_sweep", "throughput"];
+
+/// Every scenario the matrix runs against the protocol under test.
+///
+/// The reference leg must account for each of these — either by running it
+/// ([`QUIC_COVERED`]) or by saying why it does not ([`QUIC_SKIPPED`]). A test
+/// pins that, so a scenario added later cannot silently go unaccounted-for on
+/// the leg the whole comparison rests on.
+const PHANTOM_SCENARIOS: &[&str] = &[
+    "clock_sync",
+    "handshake",
+    "rtt_sweep",
+    "message_integrity",
+    "upload",
+    "download",
+    "bidir",
+    "streams",
+    "zero_rtt",
+    "rekey",
+    "migration",
+    "concurrency",
+    "negative",
+    "liveness_soak",
+];
+
+/// Scenarios the QUIC reference leg runs.
+///
+/// The five the comparison turns on — handshake, latency, and the three bulk
+/// transfers — plus `concurrency`, which measures connection setup under load
+/// and costs nothing extra because both legs reach it through the same code.
+const QUIC_COVERED: &[&str] = &[
+    "handshake",
+    "rtt_sweep",
+    "upload",
+    "download",
+    "bidir",
+    "concurrency",
+];
+
+/// Scenarios the QUIC reference leg does not run, and why.
+///
+/// Each is recorded as a skipped entry in `summary.json` rather than quietly
+/// omitted: a reader comparing the two legs must be able to see that the gap in
+/// coverage was a decision, and read the reason without leaving the artifact.
+const QUIC_SKIPPED: &[(&str, &str)] = &[
+    (
+        "clock_sync",
+        "the run's clock offset is estimated once, on a Phantom leg; a second estimate over a different transport would not be a second measurement of anything",
+    ),
+    (
+        "message_integrity",
+        "this measures a property of PhantomSession::send() — that it splits payloads above 1300 B and delivers the pieces separately. QUIC streams have no message boundaries at all, by specification, so the same probe would report an expected non-property as though it were a defect",
+    ),
+    (
+        "streams",
+        "the reference leg deliberately uses a single bidirectional stream so that the byte-pipe comparison is like-for-like; measuring QUIC's multiplexing would need a different server shape and would not be comparing anything the Phantom legs do here",
+    ),
+    (
+        "zero_rtt",
+        "quinn's 0-RTT needs a session-ticket cache carried across connections and a separate accept path on the daemon; not wired, so the comparison is not offered rather than offered wrongly",
+    ),
+    (
+        "rekey",
+        "key update is driven through PhantomSession::set_rekey_threshold, which has no counterpart in the quinn API surface used here",
+    ),
+    (
+        "migration",
+        "connection migration is exercised through PhantomSession::migrate(); quinn's is not driven by this harness",
+    ),
+    (
+        "negative",
+        "the negative cases assert Phantom's typed errors on a wrong pin, a closed port, and a junk flood; asserting quinn's behaviour would be testing quinn, which is not what this leg is for",
+    ),
+    (
+        "liveness_soak",
+        "the soak runs on exactly one leg by design — see the run's caveats for which",
+    ),
+];
+
+/// Drive the scenarios the reference leg does cover, and record the rest as
+/// skipped.
+async fn run_reference_leg(cfg: &ProbeConfig, st: &mut RunState, leg: Leg) -> Result<()> {
+    /// Both the operator's `--only` filter and the leg's own coverage list have
+    /// to agree. Routing through [`QUIC_COVERED`] rather than hard-coding the
+    /// names here is what makes that list load-bearing instead of decorative.
+    fn runs(cfg: &ProbeConfig, scenario: &str) -> bool {
+        cfg.wants(scenario) && QUIC_COVERED.contains(&scenario)
+    }
+
+    let ep = &cfg.endpoints;
+    let pin = &cfg.pin;
+    let p = &cfg.params;
+
+    if ep.quic_cert.is_none() {
+        st.absorb(
+            leg,
+            scenarios::skipped(
+                leg,
+                "handshake",
+                "no certificate was pinned for this leg (pass --quic-cert-file or --quic-cert-hex); \
+                 connecting without verification would measure something other than a handshake",
+            ),
+        )?;
+        return Ok(());
+    }
+
+    if runs(cfg, "handshake") {
+        st.absorb(
+            leg,
+            scenarios::handshake(ep, pin, leg, p.handshake_count).await,
+        )?;
+    }
+    if runs(cfg, "rtt_sweep") {
+        st.absorb(
+            leg,
+            scenarios::rtt_sweep(ep, pin, leg, &p.rtt_sizes, p.rtt_per_size).await,
+        )?;
+    }
+    if runs(cfg, "upload") {
+        st.absorb(
+            leg,
+            scenarios::upload(ep, pin, leg, p.upload, p.transfer_frame as usize).await,
+        )?;
+    }
+    if runs(cfg, "download") {
+        st.absorb(
+            leg,
+            scenarios::download(
+                ep,
+                pin,
+                leg,
+                p.download_bytes,
+                p.transfer_frame,
+                p.transfer_cap,
+            )
+            .await,
+        )?;
+    }
+    if runs(cfg, "bidir") {
+        st.absorb(
+            leg,
+            scenarios::bidir(
+                ep,
+                pin,
+                leg,
+                p.bidir_bytes,
+                p.transfer_frame,
+                p.transfer_cap,
+            )
+            .await,
+        )?;
+    }
+    if runs(cfg, "concurrency") {
+        st.absorb(
+            leg,
+            scenarios::concurrency(ep, pin, leg, p.concurrency, p.concurrency_ops).await,
+        )?;
+    }
+
+    for (scenario, why) in QUIC_SKIPPED {
+        if cfg.wants(scenario) {
+            st.absorb(leg, scenarios::skipped(leg, scenario, why))?;
+        }
+    }
+    Ok(())
+}
+
 /// Everything a reader must know before over-interpreting the numbers.
 fn caveats(cfg: &ProbeConfig) -> Vec<String> {
     let mut v = vec![
@@ -513,6 +715,26 @@ fn caveats(cfg: &ProbeConfig) -> Vec<String> {
         "Throughput is application-level goodput measured at the testbed protocol, so it excludes Phantom headers, AEAD tags, and any retransmission.".to_string(),
         "The raw TCP/UDP legs carry no Phantom at all; they are the control group, and protocol numbers are meaningful mainly as ratios against them.".to_string(),
     ];
+    if cfg.legs.iter().any(|l| l.is_reference()) {
+        v.push(
+            "The quic leg is a reference implementation, not the protocol under test and not a control: quinn over the same path, driving the same testbed application protocol over one bidirectional stream.".to_string(),
+        );
+        v.push(
+            "quinn is TLS 1.3 with classical cryptography, while the protocol under test does a hybrid post-quantum key exchange, so handshake latencies are not comparable like-for-like and the difference is expected. Throughput and loss behaviour are comparable.".to_string(),
+        );
+        v.push(
+            "quinn's default congestion controller is Cubic (loss-based) and is deliberately left at its default; the protocol under test uses a BBR-style estimator. The two congestion-window series are not the same statistic — compare outcomes, not the shape of the curve.".to_string(),
+        );
+        v.push(
+            "The quic leg's flow-control windows are raised to 8 MiB, matching the socket buffers the raw TCP control asks for, so that neither is bounded by a default buffer instead of by the path. quinn's own default stream window (1.25 MB) would cap a 250 ms path near 40 Mbit/s.".to_string(),
+        );
+        v.push(
+            "In the quic leg's window samples only cwnd_bytes and min_rtt_us carry values, and min_rtt_us holds quinn's smoothed RTT rather than a windowed minimum; quinn exposes no bytes-in-flight, bandwidth estimate, pacing rate, delivered total or app-limited flag, so those fields are zero rather than approximated. Its loss counters appear in the scenario notes.".to_string(),
+        );
+        v.push(
+            "The quic leg pins the daemon's self-signed certificate as its only trust anchor and performs ordinary rustls path and name validation against it; certificate verification is not disabled anywhere.".to_string(),
+        );
+    }
     if let Some(l) = cfg.soak_leg() {
         v.push(format!(
             "The long soak ran only on the {l} leg; liveness and keepalive behaviour on the other legs is not covered by this run."
@@ -795,9 +1017,11 @@ mod tests {
                 tcp_port: 1,
                 udp_port: 2,
                 mimic_port: 3,
+                quic_port: 6,
                 raw_tcp_port: 4,
                 raw_udp_port: 5,
                 sni: "s".into(),
+                quic_cert: None,
             },
             pin: vec![0; 64],
             profile,
@@ -845,28 +1069,103 @@ mod tests {
         }
     }
 
+    /// Every scenario the protocol under test runs must be accounted for on the
+    /// reference leg — either run, or skipped with a reason recorded in the
+    /// artifact. A scenario added later and forgotten here would leave a hole in
+    /// the comparison that nothing in the output would reveal.
+    #[test]
+    fn the_reference_leg_accounts_for_every_scenario() {
+        let skipped: Vec<&str> = QUIC_SKIPPED.iter().map(|(s, _)| *s).collect();
+        for s in PHANTOM_SCENARIOS {
+            let covered = QUIC_COVERED.contains(s);
+            let explained = skipped.contains(s);
+            assert!(
+                covered ^ explained,
+                "{s}: must be either run on the reference leg or skipped with a reason, not {}",
+                if covered { "both" } else { "neither" }
+            );
+        }
+        for s in QUIC_COVERED.iter().chain(skipped.iter()) {
+            assert!(
+                PHANTOM_SCENARIOS.contains(s),
+                "{s} is not a scenario the matrix runs"
+            );
+        }
+        // The five the measurement turns on must genuinely be in the covered set: they
+        // are what makes this a comparison rather than a demonstration.
+        for s in ["handshake", "rtt_sweep", "upload", "download", "bidir"] {
+            assert!(
+                QUIC_COVERED.contains(&s),
+                "{s} must run on the reference leg"
+            );
+        }
+    }
+
+    /// Every skipped scenario must carry a reason a reader can act on, not a
+    /// shrug.
+    #[test]
+    fn every_skip_states_a_reason() {
+        for (scenario, why) in QUIC_SKIPPED {
+            assert!(
+                why.len() > 40,
+                "{scenario}: a one-word reason is not a reason ({why})"
+            );
+            let out = scenarios::skipped(Leg::Quic, scenario, why);
+            assert_eq!(out.summary.error_count, 0, "a skip is not a failure");
+            assert_eq!(out.summary.ok_count, 0);
+            assert!(out.sink.is_empty(), "a skip records no samples");
+            assert!(
+                out.summary.notes.iter().any(|n| n.contains(why)),
+                "the reason must reach the artifact"
+            );
+        }
+    }
+
+    /// The caveat that keeps the comparison honest. If it ever stops travelling
+    /// with the data, someone will read a 40 ms TLS handshake against a
+    /// post-quantum one and conclude something false.
+    #[test]
+    fn the_reference_leg_states_what_it_does_not_control_for() {
+        let with = caveats(&demo_cfg(vec![Leg::Udp, Leg::Quic], Profile::Standard));
+        let joined = with.join("\n");
+        assert!(
+            joined.contains(
+                "quinn is TLS 1.3 with classical cryptography, while the protocol under test does a hybrid post-quantum key exchange, so handshake latencies are not comparable like-for-like and the difference is expected. Throughput and loss behaviour are comparable."
+            ),
+            "the handshake caveat must travel with the numbers verbatim: {joined}"
+        );
+        assert!(
+            joined.contains("Cubic") && joined.contains("BBR"),
+            "the congestion-control difference must be stated"
+        );
+        assert!(
+            joined.contains("8 MiB"),
+            "the one tuning knob touched must be disclosed"
+        );
+        assert!(
+            joined.contains("verification is not disabled"),
+            "what the handshake number means depends on this being said"
+        );
+        assert!(
+            joined.contains("min_rtt_us holds quinn's smoothed RTT"),
+            "the field whose meaning differs between legs must be called out"
+        );
+
+        // And none of it appears when the leg is not in the run, so a Phantom-only
+        // artifact does not carry caveats about a leg it never touched.
+        let without = caveats(&demo_cfg(vec![Leg::Udp, Leg::RawUdp], Profile::Standard)).join("\n");
+        assert!(!without.contains("quinn"), "{without}");
+    }
+
     /// `--only` must be an exact filter: naming one scenario must not silently
     /// enable a similarly-named neighbour, and omitting it must run everything.
     #[test]
     fn only_filter_is_exact_and_defaults_to_everything() {
         let all = demo_cfg(vec![Leg::Udp], Profile::Smoke);
-        for s in [
-            "clock_sync",
-            "handshake",
-            "rtt_sweep",
-            "upload",
-            "download",
-            "bidir",
-            "streams",
-            "zero_rtt",
-            "rekey",
-            "migration",
-            "concurrency",
-            "negative",
-            "liveness_soak",
-        ] {
+        for s in PHANTOM_SCENARIOS {
             assert!(all.wants(s), "no filter must run {s}");
         }
+        assert!(all.wants("throughput"), "the raw legs' capacity probe too");
 
         let mut filtered = demo_cfg(vec![Leg::Udp], Profile::Smoke);
         filtered.only = Some(["rtt_sweep".to_string()].into_iter().collect());
@@ -874,6 +1173,32 @@ mod tests {
         assert!(!filtered.wants("upload"));
         assert!(!filtered.wants("rtt"), "prefixes must not match");
         assert!(!filtered.wants("rtt_sweep_extra"));
+    }
+
+    /// Because the filter is exact, a typo runs nothing at all. Saying so up
+    /// front is the difference between a wasted minute and a wasted hour.
+    #[test]
+    fn a_misspelled_only_filter_is_reported_rather_than_running_nothing() {
+        let mut cfg = demo_cfg(vec![Leg::Udp], Profile::Smoke);
+        cfg.only = Some(
+            ["rtt-sweep".to_string(), "upload".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(cfg.unknown_filters(), vec!["rtt-sweep".to_string()]);
+
+        cfg.only = Some(
+            ["rtt_sweep".to_string(), "throughput".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        assert!(
+            cfg.unknown_filters().is_empty(),
+            "the raw legs' own scenario names are not typos"
+        );
+
+        let unfiltered = demo_cfg(vec![Leg::Udp], Profile::Smoke);
+        assert!(unfiltered.unknown_filters().is_empty());
     }
 
     #[test]

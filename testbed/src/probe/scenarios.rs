@@ -5,20 +5,27 @@
 //! recorded as data and the matrix continues, because a run that stops at the
 //! first error over a real WAN produces almost no information about the rest of
 //! the surface.
+//!
+//! Scenarios come in two shapes. Those that compare the protocol under test
+//! against the QUIC reference (`handshake`, `rtt_sweep`, `upload`, `download`,
+//! `bidir`, `concurrency`) are written against [`MsgLink`], so both legs run
+//! the *same* measurement code over the same application protocol. Those that
+//! probe something only Phantom has (`message_integrity`, `zero_rtt`, `rekey`,
+//! `migration`, `streams`, `negative`, `liveness_soak`) hold the concrete
+//! session, and the reference leg records a [`skipped`] note saying why.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use phantom_protocol::api::session::PhantomSession;
 use phantom_protocol::CoreError;
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::clock::{self, ClockSample};
-use crate::framing::Framed;
+use crate::framing::{Framed, MsgLink};
 use crate::probe::conn::{
-    self, connect_framed, connect_leg, connect_leg_resumed, echo_once, error_kind, mark, Endpoints,
-    DRAIN_TIMEOUT, OP_TIMEOUT,
+    self, connect_framed, connect_leg, connect_leg_resumed, connect_link, connect_link_staged,
+    echo_once, error_kind, mark, Endpoints, DRAIN_TIMEOUT, OP_TIMEOUT,
 };
 use crate::proto::{Msg, PayloadGen};
 use crate::report::{
@@ -79,6 +86,18 @@ impl ScenarioOutput {
     }
 }
 
+/// A scenario that does not apply to this leg.
+///
+/// Recorded rather than omitted: an empty row in `summary.json` carrying the
+/// reason is a statement about coverage, while a missing row is indistinguishable
+/// from a scenario that ran and produced nothing. It is deliberately not an
+/// error — nothing failed.
+pub fn skipped(leg: Leg, scenario: &str, why: &str) -> ScenarioOutput {
+    let mut out = ScenarioOutput::new(leg, scenario);
+    out.note(format!("skipped on this leg: {why}"));
+    out
+}
+
 /// Samples the sender's congestion-control state on its own clock while a
 /// transfer runs.
 ///
@@ -95,7 +114,9 @@ impl WindowRecorder {
     /// round trips on a ~200 ms path, coarse enough to cost nothing.
     const INTERVAL: Duration = Duration::from_millis(200);
 
-    fn start(session: Arc<PhantomSession>, leg: Leg, phase: &str) -> Self {
+    /// Records whatever the link's own stack exposes. On the QUIC leg most of
+    /// the record is zero by design — see [`crate::quic`].
+    fn start(link: Arc<dyn MsgLink>, leg: Leg, phase: &str) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let phase = phase.to_string();
@@ -103,21 +124,9 @@ impl WindowRecorder {
             let started = Instant::now();
             let mut out = Vec::new();
             while !stop2.load(Ordering::Relaxed) {
-                if let Some(bw) = session.bandwidth_snapshot().await {
-                    out.push(crate::report::WindowSample {
-                        leg,
-                        phase: phase.clone(),
-                        t_unix_ns: unix_nanos(),
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                        cwnd_bytes: bw.cwnd_bytes,
-                        inflight_bytes: bw.inflight_bytes,
-                        bottleneck_bw_bps: bw.bottleneck_bw_bps,
-                        pacing_rate_bps: bw.pacing_rate_bps,
-                        min_rtt_us: bw.min_rtt.as_micros() as u64,
-                        delivered_bytes: bw.delivered_bytes,
-                        state: bw.state.as_str().to_string(),
-                        app_limited: bw.app_limited,
-                    });
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if let Some(w) = link.window_sample(leg, phase.clone(), elapsed_ms).await {
+                    out.push(w);
                 }
                 tokio::time::sleep(Self::INTERVAL).await;
             }
@@ -162,24 +171,35 @@ fn note_window_as(
         .map(|w| w.bottleneck_bw_bps)
         .max()
         .unwrap_or(0);
-    out.note(format!(
-        "congestion window {} B -> {} B (peak {} B); bottleneck estimate peaked at {:.2} Mbit/s; ended in {}{}",
-        first.cwnd_bytes,
-        last.cwnd_bytes,
-        peak,
-        peak_bw as f64 * 8.0 / 1e6,
-        last.state,
-        if last.app_limited { ", app-limited" } else { "" }
-    ));
+    if out.summary.leg.is_phantom() {
+        out.note(format!(
+            "congestion window {} B -> {} B (peak {} B); bottleneck estimate peaked at {:.2} Mbit/s; ended in {}{}",
+            first.cwnd_bytes,
+            last.cwnd_bytes,
+            peak,
+            peak_bw as f64 * 8.0 / 1e6,
+            last.state,
+            if last.app_limited { ", app-limited" } else { "" }
+        ));
+    } else {
+        // Reporting a zeroed field as "peaked at 0.00 Mbit/s" would read as a
+        // measurement of a stalled link rather than as an absent instrument.
+        out.note(format!(
+            "congestion window {} B -> {} B (peak {} B), controller {}; this stack reports no bandwidth estimate, pacing rate, bytes in flight or app-limited flag, so those are absent rather than zero",
+            first.cwnd_bytes, last.cwnd_bytes, peak, last.state,
+        ));
+    }
     if !is_sender {
         out.note(
             "this is the receiving side's own window — near-idle by design; the window that governs this transfer is the server's, reported separately",
         );
         return;
     }
-    // 5600 B is `PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE` — the floor a window
-    // sits on when the bandwidth estimate never rises.
-    if peak <= 5600 {
+    // 5600 B is `PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE` — the floor a
+    // Phantom window sits on when the bandwidth estimate never rises. It is a
+    // constant of the protocol under test, so the conclusion it supports is
+    // only drawn on a leg that actually has it.
+    if out.summary.leg.is_phantom() && peak <= 5600 {
         out.note(
             "the window never left its 5600 B floor: throughput here is bounded by the sender, not the link",
         );
@@ -325,20 +345,12 @@ pub async fn handshake(ep: &Endpoints, pin: &[u8], leg: Leg, count: usize) -> Sc
         // Measure the two phases separately: `connect_pinned*` returns before
         // the handshake runs, so a single number would conflate a socket setup
         // with a post-quantum key exchange.
-        let staged = async {
-            let session = conn::connect_leg_unready(leg, ep, pin).await?;
-            let setup_ns = t0.elapsed().as_nanos() as u64;
-            tokio::time::timeout(conn::CONNECT_TIMEOUT, session.await_ready())
-                .await
-                .map_err(|_| CoreError::Timeout)??;
-            Ok::<_, CoreError>((session, setup_ns))
-        }
-        .await;
+        let staged = connect_link_staged(leg, ep, pin).await;
 
-        match staged.map(|(s, setup)| (Framed::new(s), setup)) {
+        match staged {
             Ok((framed, setup_ns)) => {
                 let c_ns = t0.elapsed().as_nanos() as u64;
-                let first = echo_once(&framed, 0, gen.fill(32)).await;
+                let first = echo_once(framed.as_ref(), 0, gen.fill(32)).await;
                 let (first_rtt, ok, err, kind) = match first {
                     Ok(o) => (Some(o.rtt_ns), true, None, None),
                     Err(e) => {
@@ -361,7 +373,7 @@ pub async fn handshake(ep: &Endpoints, pin: &[u8], leg: Leg, count: usize) -> Sc
                     error: err,
                     error_kind: kind,
                 });
-                conn::close_session(framed.session()).await;
+                framed.close().await;
             }
             Err(e) => {
                 out.error(leg, "handshake", "connect", &e);
@@ -381,7 +393,12 @@ pub async fn handshake(ep: &Endpoints, pin: &[u8], leg: Leg, count: usize) -> Sc
     }
 
     out.summary.latency_ns = Some(Summary::of_u64(&connect_ns));
-    out.note("connect_ns spans the full hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65 handshake including one network round trip; setup_ns is the socket-and-allocation prefix before the handshake starts");
+    if leg.is_reference() {
+        out.note("connect_ns spans quinn's TLS 1.3 handshake with classical primitives, including one network round trip; setup_ns is the endpoint-and-socket prefix before it starts");
+        out.note("this number is NOT comparable like-for-like with the Phantom legs': they exchange a hybrid post-quantum key and carry a ~4 KB hybrid signature, and the difference between the two is expected rather than a finding");
+    } else {
+        out.note("connect_ns spans the full hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65 handshake including one network round trip; setup_ns is the socket-and-allocation prefix before the handshake starts");
+    }
     out
 }
 
@@ -395,14 +412,14 @@ pub async fn rtt_sweep(
     per_size: usize,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "rtt_sweep");
-    let framed = match connect_framed(leg, ep, pin).await {
+    let framed = match connect_link(leg, ep, pin).await {
         Ok(s) => s,
         Err(e) => {
             out.error(leg, "rtt_sweep", "connect", &e);
             return out;
         }
     };
-    mark(&framed, "rtt_sweep:begin").await;
+    mark(framed.as_ref(), "rtt_sweep:begin").await;
 
     let mut gen = PayloadGen::new(3);
     let mut all = Vec::new();
@@ -424,7 +441,7 @@ pub async fn rtt_sweep(
             attempted += 1;
             let payload = gen.fill(size);
             let t_send = unix_nanos();
-            match echo_once(&framed, seq, payload).await {
+            match echo_once(framed.as_ref(), seq, payload).await {
                 Ok(o) => {
                     consecutive_failures = 0;
                     per.push(o.rtt_ns);
@@ -485,8 +502,11 @@ pub async fn rtt_sweep(
     }
 
     out.summary.latency_ns = Some(Summary::of_u64(&all));
-    mark(&framed, "rtt_sweep:end").await;
-    conn::close_session(framed.session()).await;
+    if let Some(n) = framed.transport_note() {
+        out.note(n);
+    }
+    mark(framed.as_ref(), "rtt_sweep:end").await;
+    framed.close().await;
     out
 }
 
@@ -599,15 +619,15 @@ pub async fn upload(
     frame_size: usize,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "upload");
-    let framed = match connect_framed(leg, ep, pin).await {
+    let framed = match connect_link(leg, ep, pin).await {
         Ok(s) => s,
         Err(e) => {
             out.error(leg, "upload", "connect", &e);
             return out;
         }
     };
-    mark(&framed, "upload:begin").await;
-    let recorder = WindowRecorder::start(framed.session().clone(), leg, "upload");
+    mark(framed.as_ref(), "upload:begin").await;
+    let recorder = WindowRecorder::start(framed.clone(), leg, "upload");
 
     let mut gen = PayloadGen::new(4);
     let payload = gen.fill(frame_size.saturating_sub(9));
@@ -657,9 +677,15 @@ pub async fn upload(
     // gap between the two is the difference between "we handed bytes to the
     // API" and "bytes crossed the network" — the number that matters.
     // The session's own byte counter, captured before the close, bounds how much
-    // was still unacknowledged when the burst ended.
-    let client_metrics = framed.session().metrics_snapshot();
-    match sink_end_and_report(&framed, seq, win.cumulative).await {
+    // was still unacknowledged when the burst ended. The reference leg has no
+    // such counter; `(0, 0)` there means "not instrumented", not "nothing sent",
+    // and the note below says which leg it came from.
+    let client_metrics = framed
+        .phantom()
+        .map(|s| s.metrics_snapshot())
+        .map(|m| (m.bytes_sent, m.packets_sent))
+        .unwrap_or((0, 0));
+    match sink_end_and_report(framed.as_ref(), seq, win.cumulative).await {
         Ok((frames, bytes, first_ns, last_ns)) => {
             let server_span = last_ns.saturating_sub(first_ns);
             let server_tp = Throughput::new(bytes, frames, server_span);
@@ -697,15 +723,18 @@ pub async fn upload(
                 },
                 win.cumulative,
                 seq,
-                client_metrics.bytes_sent,
-                client_metrics.packets_sent
+                client_metrics.0,
+                client_metrics.1
             ));
         }
     }
 
     note_window(&mut out, &recorder.finish().await);
-    mark(&framed, "upload:end").await;
-    conn::close_session(framed.session()).await;
+    if let Some(n) = framed.transport_note() {
+        out.note(n);
+    }
+    mark(framed.as_ref(), "upload:end").await;
+    framed.close().await;
     out
 }
 
@@ -735,7 +764,7 @@ impl SinkEndFailure {
 }
 
 async fn sink_end_and_report(
-    framed: &Framed,
+    framed: &dyn MsgLink,
     frames: u64,
     bytes: u64,
 ) -> Result<(u64, u64, u64, u64), (SinkEndFailure, CoreError)> {
@@ -779,20 +808,20 @@ pub async fn download(
     cap: Duration,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "download");
-    let framed = match connect_framed(leg, ep, pin).await {
+    let framed = match connect_link(leg, ep, pin).await {
         Ok(s) => s,
         Err(e) => {
             out.error(leg, "download", "connect", &e);
             return out;
         }
     };
-    mark(&framed, "download:begin").await;
+    mark(framed.as_ref(), "download:begin").await;
     // The *server* is the sender here, so this series is the client's own
     // window — near-idle by design. The server's side comes back in STATS.
-    let recorder = WindowRecorder::start(framed.session().clone(), leg, "download");
+    let recorder = WindowRecorder::start(framed.clone(), leg, "download");
 
     if let Err(e) = conn::send_msg(
-        &framed,
+        framed.as_ref(),
         Msg::SourceReq {
             total_bytes,
             frame_size,
@@ -802,7 +831,7 @@ pub async fn download(
     .await
     {
         out.error(leg, "download", "source request", &e);
-        conn::close_session(framed.session()).await;
+        framed.close().await;
         return out;
     }
 
@@ -870,8 +899,11 @@ pub async fn download(
     out.note(
         "the sending side here is the server: its window is in the daemon's windows.jsonl, joinable via the download:begin/end marks",
     );
-    mark(&framed, "download:end").await;
-    conn::close_session(framed.session()).await;
+    if let Some(n) = framed.transport_note() {
+        out.note(n);
+    }
+    mark(framed.as_ref(), "download:end").await;
+    framed.close().await;
     out
 }
 
@@ -886,18 +918,18 @@ pub async fn bidir(
     cap: Duration,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "bidir");
-    let framed = match connect_framed(leg, ep, pin).await {
-        Ok(s) => Arc::new(s),
+    let framed = match connect_link(leg, ep, pin).await {
+        Ok(s) => s,
         Err(e) => {
             out.error(leg, "bidir", "connect", &e);
             return out;
         }
     };
-    mark(&framed, "bidir:begin").await;
-    let recorder = WindowRecorder::start(framed.session().clone(), leg, "bidir");
+    mark(framed.as_ref(), "bidir:begin").await;
+    let recorder = WindowRecorder::start(framed.clone(), leg, "bidir");
 
     if let Err(e) = conn::send_msg(
-        &framed,
+        framed.as_ref(),
         Msg::SourceReq {
             total_bytes,
             frame_size,
@@ -907,7 +939,7 @@ pub async fn bidir(
     .await
     {
         out.error(leg, "bidir", "source request", &e);
-        conn::close_session(framed.session()).await;
+        framed.close().await;
         return out;
     }
 
@@ -988,14 +1020,17 @@ pub async fn bidir(
         down_tp.megabits_per_sec, down_tp.bytes, up_bytes, up_frames
     ));
 
-    match sink_end_and_report(&framed, up_frames, up_bytes).await {
+    match sink_end_and_report(framed.as_ref(), up_frames, up_bytes).await {
         Ok((f, b, _, _)) => out.note(format!("server received {b} B in {f} upload frames")),
         Err((why, e)) => out.error(leg, "bidir", why.context(), &e),
     }
 
     note_window(&mut out, &recorder.finish().await);
-    mark(&framed, "bidir:end").await;
-    conn::close_session(framed.session()).await;
+    if let Some(n) = framed.transport_note() {
+        out.note(n);
+    }
+    mark(framed.as_ref(), "bidir:end").await;
+    framed.close().await;
     out
 }
 
@@ -1564,7 +1599,7 @@ pub async fn concurrency(
         let pin = pin.to_vec();
         handles.push(tokio::spawn(async move {
             let t0 = Instant::now();
-            let framed = match connect_framed(leg, &ep, &pin).await {
+            let framed = match connect_link(leg, &ep, &pin).await {
                 Ok(s) => s,
                 Err(e) => return (idx, None, Vec::new(), 0u64, Some(format!("{e:?}"))),
             };
@@ -1573,7 +1608,7 @@ pub async fn concurrency(
             let mut rtts = Vec::with_capacity(ops_each);
             let mut err = None;
             for seq in 0..ops_each as u64 {
-                match echo_once(&framed, seq, gen.fill(128)).await {
+                match echo_once(framed.as_ref(), seq, gen.fill(128)).await {
                     Ok(o) => rtts.push(o.rtt_ns),
                     Err(e) => {
                         err = Some(format!("{e:?}"));
@@ -1582,7 +1617,7 @@ pub async fn concurrency(
                 }
             }
             let ops = rtts.len() as u64;
-            conn::close_session(framed.session()).await;
+            framed.close().await;
             (idx, Some(connect_ns), rtts, ops, err)
         }));
     }
@@ -1784,7 +1819,9 @@ async fn flood_junk(ep: &Endpoints, leg: Leg) -> usize {
                 sent += 1;
             }
         }
-        Leg::RawTcp | Leg::RawUdp => {}
+        // The QUIC reference leg is not asked to defend itself: `negative` is a
+        // Phantom scenario and the probe skips it there with a note.
+        Leg::Quic | Leg::RawTcp | Leg::RawUdp => {}
     }
     sent
 }

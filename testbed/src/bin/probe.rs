@@ -39,11 +39,15 @@ struct Args {
     profile: Profile,
 
     /// Legs to exercise, in order.
+    ///
+    /// `quic` is the reference leg and needs `--quic-cert-file` (or
+    /// `--quic-cert-hex`); without one it is skipped with a recorded note
+    /// rather than connecting unverified.
     #[arg(
         long,
         value_enum,
         value_delimiter = ',',
-        default_value = "udp,tcp,mimic,raw_tcp,raw_udp"
+        default_value = "udp,tcp,mimic,quic,raw_tcp,raw_udp"
     )]
     legs: Vec<Leg>,
 
@@ -57,6 +61,8 @@ struct Args {
     udp_port: u16,
     #[arg(long, default_value_t = 4244)]
     mimic_port: u16,
+    #[arg(long, default_value_t = 4245)]
+    quic_port: u16,
     #[arg(long, default_value_t = 4342)]
     raw_tcp_port: u16,
     #[arg(long, default_value_t = 4343)]
@@ -65,6 +71,19 @@ struct Args {
     /// SNI presented to the mimic-TLS leg. Must match the daemon's.
     #[arg(long, default_value = "www.cloudflare.com")]
     sni: String,
+
+    /// The daemon's QUIC certificate, hex-encoded DER. Logged by the daemon at
+    /// boot and written to its data directory as `quic-cert.hex`.
+    ///
+    /// The probe pins this certificate as its only trust anchor. There is no
+    /// flag to skip verification: an unverified handshake would not be
+    /// measuring a handshake.
+    #[arg(long, env = "PROBE_QUIC_CERT_HEX", conflicts_with = "quic_cert_file")]
+    quic_cert_hex: Option<String>,
+
+    /// File containing the daemon's QUIC certificate, hex or raw DER.
+    #[arg(long, env = "PROBE_QUIC_CERT_FILE")]
+    quic_cert_file: Option<PathBuf>,
 
     /// Override the profile's soak duration, seconds.
     #[arg(long)]
@@ -108,6 +127,8 @@ async fn main() -> Result<()> {
     let pin = hex::decode(&pin_hex).context("pin is not valid hex")?;
     anyhow::ensure!(!pin.is_empty(), "pin is empty");
 
+    let quic_cert = load_quic_cert(&args)?;
+
     // Deduplicate while preserving the order the operator asked for — running a
     // leg twice would double its wall clock for no extra information.
     let mut legs: Vec<Leg> = Vec::new();
@@ -139,9 +160,11 @@ async fn main() -> Result<()> {
             tcp_port: args.tcp_port,
             udp_port: args.udp_port,
             mimic_port: args.mimic_port,
+            quic_port: args.quic_port,
             raw_tcp_port: args.raw_tcp_port,
             raw_udp_port: args.raw_udp_port,
             sni: args.sni,
+            quic_cert,
         },
         pin,
         profile: args.profile,
@@ -154,4 +177,32 @@ async fn main() -> Result<()> {
 
     probe::run(cfg).await?;
     Ok(())
+}
+
+/// Resolve the QUIC certificate pin, if one was supplied.
+///
+/// Accepts hex or raw DER from a file, because the daemon writes both
+/// (`quic-cert.hex` and `quic-cert.der`) and an operator copying one of them
+/// should not have to know which the probe wanted. `None` — no pin — is not an
+/// error: the run proceeds and the reference leg records why it was skipped.
+fn load_quic_cert(args: &Args) -> Result<Option<Vec<u8>>> {
+    let raw = match (&args.quic_cert_hex, &args.quic_cert_file) {
+        (Some(h), _) => h.trim().as_bytes().to_vec(),
+        (None, Some(f)) => {
+            std::fs::read(f).with_context(|| format!("read QUIC cert file {}", f.display()))?
+        }
+        (None, None) => return Ok(None),
+    };
+
+    // A DER certificate always starts with a SEQUENCE tag (0x30); hex text
+    // never does. That is a cheaper and more reliable discriminator than
+    // guessing from the file extension.
+    if raw.first() == Some(&0x30) {
+        anyhow::ensure!(!raw.is_empty(), "QUIC certificate is empty");
+        return Ok(Some(raw));
+    }
+    let text = String::from_utf8(raw).context("QUIC certificate is neither DER nor text")?;
+    let der = hex::decode(text.trim()).context("QUIC certificate is not valid hex")?;
+    anyhow::ensure!(!der.is_empty(), "QUIC certificate is empty");
+    Ok(Some(der))
 }
