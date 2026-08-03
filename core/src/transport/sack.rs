@@ -206,11 +206,11 @@ impl Sack {
     ///
     /// The two ranges the sender cannot reconstruct from anything else are the **highest**
     /// and the **lowest**. The highest carries `largest_acked`, which drives loss detection
-    /// — every packet-threshold and time-threshold decision is measured against it. The
+    /// — a segment is only a candidate for it once newer data has been acknowledged. The
     /// lowest is the receiver's contiguous delivered run, and it is the only thing that
     /// retires the bulk of the send buffer: the sender's `on_sack` retires exactly what
     /// `acks()` covers, so a SACK missing that run retires none of it, and every segment in
-    /// it then sits `PACKET_THRESHOLD` or more behind `largest_acked` and is declared lost.
+    /// it then sits behind `largest_acked` and ages past the loss delay, and is declared lost.
     /// That is a whole window of already-delivered data retransmitted and a whole window of
     /// fabricated loss handed to congestion control, from one over-full reorder buffer.
     ///

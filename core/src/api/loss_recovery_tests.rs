@@ -188,26 +188,82 @@ impl SessionTransport for ChannelTransport {
 /// between a retransmission and its answer — the interval where SACK-driven loss
 /// detection actually lives. A real bottleneck serialises frames; this is that,
 /// with the link rate expressed as time per frame.
+///
+/// The line can also *reorder*, and it does it the way a path does: one frame in
+/// every `reorder_every` has its release deadline pushed back by a fixed
+/// `reorder_displacement`, so it arrives after whatever was emitted during that
+/// interval and the frames that overtook it are decided by the link rate rather
+/// than by the sender's burst pattern. This is why the frame-counting reorder in
+/// [`LossyTransport`] cannot express the case these tests need: it releases a held
+/// frame only once N further frames have been *sent*, so a frame held at the end
+/// of a congestion-window-limited burst stays held until the next burst — a whole
+/// round trip later. A datagram a round trip late is not reordered, it is lost,
+/// and a loss detector is right to say so. Displacement in time is bounded by
+/// construction and stays well inside the RACK threshold.
+///
+/// Releasing by deadline rather than in arrival order is what makes that work, so
+/// the forwarding task is a small deadline queue rather than a `sleep_until` in a
+/// loop.
 struct DelayLine {
-    line: mpsc::Sender<(tokio::time::Instant, Vec<u8>)>,
+    line: mpsc::Sender<(tokio::time::Instant, u64, Vec<u8>)>,
     delay: Duration,
     spacing: Duration,
-    /// Release deadline of the previously accepted frame, so the next is placed
-    /// at least `spacing` after it. Deadlines stay monotonic, which is what lets
-    /// the single forwarding task preserve order with a plain `sleep_until`.
+    /// Displace one frame in every this many. `0` never displaces.
+    reorder_every: u64,
+    /// How much later a displaced frame is released.
+    reorder_displacement: Duration,
+    /// Frames accepted so far — picks out the displaced ones and breaks deadline
+    /// ties in the release queue so equal deadlines keep send order.
+    accepted: std::sync::atomic::AtomicU64,
+    /// Release deadline of the previously accepted *undisplaced* frame, so the
+    /// next is placed at least `spacing` after it. A displaced frame does not
+    /// move this: the path did not slow down, one datagram took a longer route.
     last_release: std::sync::Mutex<Option<tokio::time::Instant>>,
     rx: Mutex<mpsc::Receiver<Vec<u8>>>,
 }
 
 impl DelayLine {
     fn new(inner: ChannelTransport, delay: Duration, spacing: Duration) -> Self {
-        let (line_tx, mut line_rx) = mpsc::channel::<(tokio::time::Instant, Vec<u8>)>(256);
+        Self::reordering(inner, delay, spacing, 0, Duration::ZERO)
+    }
+
+    fn reordering(
+        inner: ChannelTransport,
+        delay: Duration,
+        spacing: Duration,
+        reorder_every: u64,
+        reorder_displacement: Duration,
+    ) -> Self {
+        let (line_tx, mut line_rx) = mpsc::channel::<(tokio::time::Instant, u64, Vec<u8>)>(256);
         let out = inner.tx;
         tokio::spawn(async move {
-            while let Some((release_at, frame)) = line_rx.recv().await {
-                tokio::time::sleep_until(release_at).await;
-                if out.send(frame).await.is_err() {
+            let mut queued: std::collections::BinaryHeap<
+                std::cmp::Reverse<(tokio::time::Instant, u64, Vec<u8>)>,
+            > = std::collections::BinaryHeap::new();
+            let mut closed = false;
+            loop {
+                if closed && queued.is_empty() {
                     break;
+                }
+                let next = queued.peek().map(|std::cmp::Reverse((at, _, _))| *at);
+                tokio::select! {
+                    biased;
+                    item = line_rx.recv(), if !closed => match item {
+                        Some(entry) => queued.push(std::cmp::Reverse(entry)),
+                        None => closed = true,
+                    },
+                    () = async {
+                        match next {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if let Some(std::cmp::Reverse((_, _, frame))) = queued.pop() {
+                            if out.send(frame).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -215,12 +271,18 @@ impl DelayLine {
             line: line_tx,
             delay,
             spacing,
+            reorder_every,
+            reorder_displacement,
+            accepted: std::sync::atomic::AtomicU64::new(0),
             last_release: std::sync::Mutex::new(None),
             rx: inner.rx,
         }
     }
 
-    fn schedule(&self) -> tokio::time::Instant {
+    fn schedule(&self) -> (tokio::time::Instant, u64) {
+        let n = self
+            .accepted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut last = self
             .last_release
             .lock()
@@ -231,15 +293,20 @@ impl DelayLine {
             None => earliest,
         };
         *last = Some(release_at);
-        release_at
+        let displaced = self.reorder_every > 0 && n > 0 && n.is_multiple_of(self.reorder_every);
+        if displaced {
+            (release_at + self.reorder_displacement, n)
+        } else {
+            (release_at, n)
+        }
     }
 }
 
 impl SessionTransport for DelayLine {
     async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError> {
-        let release_at = self.schedule();
+        let (release_at, seq) = self.schedule();
         self.line
-            .send((release_at, data.to_vec()))
+            .send((release_at, seq, data.to_vec()))
             .await
             .map_err(|_| CoreError::NetworkError("delay line closed".into()))
     }
@@ -546,9 +613,9 @@ async fn run_pipelined_echo(
 /// `transport::stream`: a real session, a real data pump, a real SACK-driven
 /// loss detector, and exactly one segment removed from the wire.
 ///
-/// The detector's packet threshold compares `largest_acked` against the hole's
-/// offset, and `largest_acked` only grows — so once it has fired for an offset
-/// it would fire for that offset on every acknowledgement thereafter, and this
+/// The detector must stop applying once the hole has been answered. A rule that
+/// does not — the offset count this replaced, where `largest_acked` only grows —
+/// fires for that offset on every acknowledgement thereafter, and this
 /// implementation acknowledges every packet it receives. Each firing is a fresh
 /// `Session::on_packet_lost`, and each is also a fresh Pass-0 copy on the wire.
 /// `bbr_bytes_lost()` is the counter that makes that visible from outside: on a
@@ -574,10 +641,9 @@ async fn a_single_dropped_segment_is_reported_to_congestion_control_once() {
     /// from the PhantomUDP datagram budget, and a literal here would silently
     /// stop describing whole segments the next time that budget moves.
     const CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
-    /// Enough segments that the packet threshold (three offsets past the hole)
-    /// is reached from the acknowledgements of the surviving chunks alone, with
-    /// a long tail of further acknowledgements behind it — the tail is what a
-    /// re-declaring detector turns into a storm.
+    /// Enough segments that the hole is revealed by the acknowledgements of the
+    /// surviving chunks alone, with a long tail of further acknowledgements
+    /// behind it — the tail is what a re-declaring detector turns into a storm.
     const CHUNKS: usize = 40;
     /// One-way delay on the acknowledgement path, and so the round trip the
     /// server measures. It has to be large against the pumps' scheduling jitter:
@@ -698,6 +764,196 @@ async fn a_single_dropped_segment_is_reported_to_congestion_control_once() {
         "one dropped segment of {CHUNK} B must reach congestion control as exactly \
          {CHUNK} B of loss; a larger figure is the same segment re-reported once \
          per acknowledgement"
+    );
+
+    server.disconnect().await.expect("server clean disconnect");
+    client.disconnect().await.expect("client clean disconnect");
+}
+
+/// **A reordering path is not a losing path, end to end.**
+///
+/// The unit tests in `transport::stream` drive the loss detector directly. This
+/// one drives a real session: a real pump on each side, real acknowledgements, a
+/// real congestion controller, and a path that delivers every single byte but
+/// hands one frame in eight to the receiver five frames late.
+///
+/// The observable is `bbr_bytes_lost`: what the controller was told the path
+/// dropped. On a path that dropped nothing it must be nothing. Everything the
+/// defect did downstream follows from that number — a round loss rate over
+/// `LOSS_THRESH` beats `inflight_hi` down by `INFLIGHT_HI_BETA` until it rests on
+/// `1.25 × BDP`, and the sender is then pinned at the smallest window this
+/// controller will use on a path that is dropping nothing — so pinning the
+/// reports pins the consequence, and it does so without depending on which round
+/// a stray report happened to land in.
+///
+/// The reorder distance is five frames, above RFC 9002's three-offset packet
+/// threshold, because at or below it a detector counting offsets cannot see the
+/// reordering at all — which is exactly why the fault transport's adjacent swap
+/// could not express this case.
+///
+/// **On the timing.** This test runs on the real clock, so its constants are
+/// chosen to keep the clock out of the outcome, and both walls are asserted
+/// below rather than left as prose:
+///
+///   - The loss delay is `9/8 · max(srtt, latest_rtt)`, so a hole is condemned an
+///     eighth of a round trip after the acknowledgements that reveal it —
+///     [`REORDER_MARGIN`]. [`REORDER_DISPLACEMENT`] is a tenth of that, and the
+///     difference is what scheduler jitter must eat through to change an outcome.
+///     An earlier version of this test left three milliseconds of it and failed
+///     one run in four.
+///   - The modelled round trip stays under [`RtoEstimator::MIN_RTO`]. Above that
+///     floor the RFC-6298 timer sits at `srtt + 4·rttvar`, which on a path with
+///     little jitter is barely above the round trip itself, and it then fires on
+///     frames that are merely queued behind the modelled bottleneck. That is a
+///     property of the timer, not of the detector under test, and a test that
+///     trips it is measuring the wrong thing — it is what the residual failures
+///     of the previous version turned out to be.
+#[tokio::test]
+async fn a_reordering_path_is_not_reported_to_congestion_control_as_a_losing_one() {
+    use crate::transport::stream::RtoEstimator;
+
+    const CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
+    /// Enough frames for [`CHUNKS`] / [`REORDER_EVERY`] = 37 reordering events
+    /// across many rounds, so the controller judges a great many of them and one
+    /// unlucky event cannot decide the result either way. Measured on this
+    /// harness, a detector counting three offsets reports 5-11 of those events as
+    /// loss and the rule that ships reports none.
+    const CHUNKS: usize = 300;
+    /// One-way propagation each way, and the link rate as time per frame.
+    const PATH_DELAY: Duration = Duration::from_millis(50);
+    const SPACING: Duration = Duration::from_micros(100);
+    /// One frame in eight is displaced — 12.5%, against the 13.4% the production
+    /// path was measured at.
+    const REORDER_EVERY: u64 = 8;
+    /// How much later a displaced frame arrives. At [`SPACING`] per frame this is
+    /// twenty frames of displacement: well above the three offsets RFC 9002
+    /// offers as a packet threshold, so a detector counting offsets has to decide
+    /// about it and has a wide window in which to decide wrongly.
+    const REORDER_DISPLACEMENT: Duration = Duration::from_micros(2_000);
+    /// The modelled round trip.
+    const PATH_RTT: Duration = Duration::from_millis(PATH_DELAY.as_millis() as u64 * 2);
+    /// How late a frame may be before the loss delay condemns it: an eighth of the
+    /// round trip. [`REORDER_DISPLACEMENT`] has to stay well under this, and the
+    /// gap between them is this test's tolerance for scheduler jitter.
+    const REORDER_MARGIN: Duration = Duration::from_micros(PATH_RTT.as_micros() as u64 / 8);
+    /// What jitter may cost. The expected figure is zero — there is nothing to
+    /// adapt and no learning period — so this is purely the allowance for a
+    /// displaced frame that the scheduler happens to hold past the margin above.
+    /// Against it, a detector counting three offsets was measured on this harness
+    /// reporting 5-11 of the reordering events as loss over ten runs, so the
+    /// budget separates the two by more than a factor of two at the worst
+    /// observed case and by five at the median.
+    const JITTER_BUDGET: u64 = 2;
+
+    assert!(
+        REORDER_DISPLACEMENT * 4 < REORDER_MARGIN,
+        "the modelled displacement ({REORDER_DISPLACEMENT:?}) has to sit well \
+         inside the margin the loss delay allows ({REORDER_MARGIN:?}), or this \
+         test's outcome is decided by the scheduler rather than by the detector"
+    );
+    assert!(
+        PATH_RTT * 2 <= RtoEstimator::MIN_RTO,
+        "the modelled round trip ({PATH_RTT:?}) has to be at most half the \
+         retransmission timer's floor ({:?}), or the timer fires on frames merely \
+         queued behind the modelled bottleneck and this test measures it instead \
+         of the detector",
+        RtoEstimator::MIN_RTO
+    );
+
+    let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
+    let server_pinned_key = server_hs.verifying_key().clone();
+    let (client_channel, server_channel) = ChannelTransport::pair();
+
+    let client = PhantomSession::connect_with_transport(
+        "test-server:9000",
+        DelayLine::new(client_channel, PATH_DELAY, SPACING),
+        server_pinned_key,
+    );
+
+    let client_ip = "127.0.0.1".parse().expect("parse IP");
+    let mut inner_session = None;
+    for _ in 0..2 {
+        let hello_bytes = server_channel
+            .recv_bytes()
+            .await
+            .expect("server recv ClientHello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let bytes = ServerReply::Retry(retry)
+                    .to_wire()
+                    .expect("serialize retry");
+                server_channel
+                    .send_bytes(&bytes)
+                    .await
+                    .expect("server send retry");
+            }
+            HandshakeResponse::Success(server_hello, session, _) => {
+                let bytes = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("serialize ServerHello");
+                server_channel
+                    .send_bytes(&bytes)
+                    .await
+                    .expect("server send ServerHello");
+                inner_session = Some(session);
+                break;
+            }
+            HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    }
+    let inner = Arc::new(inner_session.expect("handshake never succeeded"));
+    let congestion = inner.clone();
+
+    // The data path reorders and does nothing else: every frame is delivered, one
+    // in eight of them late. The handshake has already run over the bare channel
+    // above, so nothing here can displace a `ServerHello`.
+    let server = PhantomSession::from_accepted_server_session(
+        "test-client".into(),
+        DelayLine::reordering(
+            server_channel,
+            PATH_DELAY,
+            SPACING,
+            REORDER_EVERY,
+            REORDER_DISPLACEMENT,
+        ),
+        inner,
+    );
+
+    let mut established = false;
+    for _ in 0..200 {
+        if client.connection_state() == ConnectionState::Connected {
+            established = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(established, "client session never became established");
+
+    let payload: Vec<u8> = (0..CHUNK * CHUNKS).map(|i| (i % 251) as u8).collect();
+    server.send(payload.clone()).await.expect("server send");
+
+    let mut received = Vec::with_capacity(payload.len());
+    for i in 0..CHUNKS {
+        let chunk = timeout(Duration::from_secs(30), client.recv())
+            .await
+            .unwrap_or_else(|_| panic!("client recv timed out on chunk {i}"))
+            .expect("client recv error");
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        received, payload,
+        "a reordering path still delivers every byte, in order"
+    );
+
+    let reported = congestion.bbr_bytes_lost();
+    assert!(
+        reported <= JITTER_BUDGET * CHUNK as u64,
+        "a path that dropped nothing reported {reported} B of loss to congestion \
+         control; at most {} B is this test's allowance for scheduler jitter, and \
+         anything above it is reordering being read as loss",
+        JITTER_BUDGET * CHUNK as u64
     );
 
     server.disconnect().await.expect("server clean disconnect");
