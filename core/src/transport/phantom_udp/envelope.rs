@@ -9,16 +9,18 @@ pub const CID_LEN: usize = 8;
 /// security rests on the inner Phantom AEAD (Invariant 2/4). NEVER transcript-bound.
 pub type ConnId = [u8; CID_LEN];
 
-/// Outer header length: flags byte + cid.
-pub const HDR_LEN: usize = 1 + CID_LEN;
-/// Conservative fixed path-MTU budget: 1200 bytes is the QUIC-style floor that
-/// survives almost every Internet path without IP fragmentation. Static today —
-/// dynamic DPLPMTUD to raise it is future work.
-pub const PATH_MTU: usize = 1200;
+/// The datagram budget lives in [`crate::transport::mtu`], not here: the data pump
+/// sizes its application chunks against the same numbers, and it compiles for
+/// targets that never build this module (browser wasm, WASI, embedded). Re-exported
+/// under the historical names so the framing code reads as before.
+pub use crate::transport::mtu::{DATAGRAM_HDR_LEN as HDR_LEN, MAX_INNER_UNFRAGMENTED, PATH_MTU};
+
+// The shared `DATAGRAM_HDR_LEN` is stated as a literal so it needs no knowledge of
+// this module; this is what keeps the two in step if `CID_LEN` ever changes.
+const _: () = assert!(HDR_LEN == 1 + CID_LEN);
+
 /// Fragment subheader: packet_id u32be + chunk_index u16be + total_chunks u16be.
 pub const FRAG_SUBHDR_LEN: usize = 8;
-/// Largest inner frame that fits one unfragmented datagram.
-pub const MAX_INNER_UNFRAGMENTED: usize = PATH_MTU - HDR_LEN;
 /// Largest chunk payload per fragmented datagram.
 pub const MAX_INNER_FRAG_CHUNK: usize = PATH_MTU - HDR_LEN - FRAG_SUBHDR_LEN;
 

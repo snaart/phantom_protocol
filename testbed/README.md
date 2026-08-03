@@ -207,7 +207,7 @@ a deliberately wrong pin looks like a *successful* connect, and
 `probe::conn::connect_leg`.
 
 **`PhantomSession::send()` does not preserve message boundaries.** The data pump
-splits payloads above its internal `TRANSPORT_MTU` (1300 B) into chunks, each
+splits payloads above its internal chunk size (`MAX_APP_CHUNK`, 1156 B) into chunks, each
 written separately, and the peer's `recv()` yields them one at a time. A
 structured message's first chunk still parses, with the tail quietly gone — so a
 truncated payload registers as a clean round trip. Every testbed message

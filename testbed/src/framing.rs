@@ -3,10 +3,11 @@
 //! ## Why this exists
 //!
 //! `PhantomSession::send()` is **not message-preserving**. The data pump splits
-//! any payload larger than its internal `TRANSPORT_MTU` (1300 B) into
-//! 1300-byte chunks and writes each as a separate reliable-stream write; the
-//! peer's `recv()` then yields each chunk as its own result. A caller that
-//! sends 8 KiB and expects one `recv()` of 8 KiB instead gets seven.
+//! any payload larger than its internal chunk size (`MAX_APP_CHUNK`, 1156 B —
+//! one chunk plus its packet overhead is exactly one PhantomUDP datagram) into
+//! chunks and writes each as a separate reliable-stream write; the peer's
+//! `recv()` then yields each chunk as its own result. A caller that sends 8 KiB
+//! and expects one `recv()` of 8 KiB instead gets eight.
 //!
 //! That behaviour is undocumented on `send`/`recv`, and it is silent: the first
 //! chunk of a structured message still parses as a valid — but truncated —
@@ -305,11 +306,11 @@ mod tests {
         assert_eq!(got[0].1.chunks, 1, "an unsplit message must report 1 chunk");
     }
 
-    /// The case this module exists for: an 8 KiB message split into 1300-byte
+    /// The case this module exists for: an 8 KiB message split into chunk-sized
     /// transport reads must come back byte-identical, and must *report* that it
     /// was split.
     #[test]
-    fn a_message_split_at_1300_bytes_is_reassembled_and_reported() {
+    fn a_message_split_at_the_chunk_size_is_reassembled_and_reported() {
         let payload = PayloadGen::new(5).fill(8192);
         let msg = Msg::Echo {
             seq: 42,
@@ -317,7 +318,10 @@ mod tests {
             payload: payload.clone(),
         };
         let wire = encode_framed(&msg);
-        let chunks: Vec<Vec<u8>> = wire.chunks(1300).map(|c| c.to_vec()).collect();
+        let chunks: Vec<Vec<u8>> = wire
+            .chunks(phantom_protocol::transport::mtu::MAX_APP_CHUNK)
+            .map(|c| c.to_vec())
+            .collect();
         assert!(chunks.len() > 1, "the test must actually split something");
 
         let got = drain(&chunks);
@@ -331,7 +335,7 @@ mod tests {
                 .chunk_sizes
                 .iter()
                 .take(chunks.len() - 1)
-                .all(|&n| n == 1300),
+                .all(|&n| n == phantom_protocol::transport::mtu::MAX_APP_CHUNK),
             "chunk sizes are recorded verbatim: {:?}",
             got[0].1.chunk_sizes
         );

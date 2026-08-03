@@ -43,6 +43,8 @@ pub mod handshake;
 #[cfg(feature = "std")]
 pub mod liveness;
 #[cfg(feature = "std")]
+pub mod mtu;
+#[cfg(feature = "std")]
 pub mod multiplexer;
 #[cfg(feature = "std")]
 pub mod pacer;

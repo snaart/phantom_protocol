@@ -1961,3 +1961,138 @@ async fn udp_ffi_with_config_roundtrip() {
     assert_eq!(reply, b"cfg-reply");
     server.await.unwrap();
 }
+
+/// A pass-through UDP relay that classifies every datagram it forwards by the
+/// PhantomUDP outer flags byte (`[type:2][frag:1][reserved:5]`), counting the
+/// short-header (1-RTT) datagrams and how many of those carry the fragment bit.
+///
+/// Handshake `Initial` datagrams are deliberately excluded from the count: a
+/// `ClientHello` / `ServerHello` carries a 1184-byte ML-KEM key and a 3309-byte
+/// ML-DSA signature, so it legitimately exceeds the path MTU and must fragment.
+/// Application data must not — it is the sender that chooses the chunk size.
+async fn spawn_counting_relay(
+    server_addr: std::net::SocketAddr,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    /// Outer flags: bits 7..6 are the packet type; `0b01` is `OneRtt`.
+    const TYPE_ONE_RTT: u8 = 0b01;
+    /// Outer flags: bit 5 marks a fragment of a larger logical frame.
+    const FRAG_BIT: u8 = 0b0010_0000;
+
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    upstream.connect(server_addr).await.unwrap();
+    let one_rtt = Arc::new(AtomicU64::new(0));
+    let fragmented = Arc::new(AtomicU64::new(0));
+    let (o, f) = (one_rtt.clone(), fragmented.clone());
+    tokio::spawn(async move {
+        let mut c2s = vec![0u8; 4096];
+        let mut s2c = vec![0u8; 4096];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        let classify = |d: &[u8]| {
+            if let Some(&flags) = d.first() {
+                if flags >> 6 == TYPE_ONE_RTT {
+                    o.fetch_add(1, Ordering::Relaxed);
+                    if flags & FRAG_BIT != 0 {
+                        f.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        };
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s) => {
+                    let (n, from) = match r { Ok(x) => x, Err(_) => continue };
+                    client_addr = Some(from);
+                    classify(&c2s[..n]);
+                    let _ = upstream.send(&c2s[..n]).await;
+                }
+                r = upstream.recv(&mut s2c) => {
+                    let n = match r { Ok(x) => x, Err(_) => continue };
+                    classify(&s2c[..n]);
+                    if let Some(ca) = client_addr {
+                        let _ = relay.send_to(&s2c[..n], ca).await;
+                    }
+                }
+            }
+        }
+    });
+    (relay_addr, one_rtt, fragmented)
+}
+
+/// A bulk transfer must arrive byte-exact AND must never put a fragmented 1-RTT
+/// datagram on the wire.
+///
+/// The sender chooses how much application data goes into one packet; the
+/// PhantomUDP transport then fragments whatever does not fit `PATH_MTU`. If the
+/// chunk is sized without accounting for the packet header, the in-plaintext
+/// reliable stream offset and the AEAD tag, every full-size segment is split into
+/// a full datagram plus a small tail — double the datagram rate for the same
+/// goodput, and a segment that now needs both datagrams to survive, so an
+/// independent per-datagram loss rate `p` becomes ~`2p` per segment. This test
+/// pins the property that the pump's chunk fits one datagram.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn udp_integration_bulk_transfer_never_fragments_application_datagrams() {
+    use std::sync::atomic::Ordering;
+
+    const BULK: usize = 64 * 1024;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        // `send()` does not preserve message boundaries above the chunk size, so
+        // drain until the full byte count has arrived, then echo it back in one
+        // write (which the pump re-chunks the same way).
+        let mut got = Vec::with_capacity(BULK);
+        while got.len() < BULK {
+            let part = session.recv().await.expect("server recv");
+            got.extend_from_slice(&part);
+        }
+        session.send(got).await.expect("server echo");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    });
+
+    let (relay_addr, one_rtt, fragmented) = spawn_counting_relay(server_addr).await;
+    let transport = UdpClientTransport::connect(relay_addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+
+    let payload: Vec<u8> = (0..BULK).map(|i| (i % 251) as u8).collect();
+    client.send(payload.clone()).await.expect("client send");
+
+    let mut echoed = Vec::with_capacity(BULK);
+    while echoed.len() < BULK {
+        let part = timeout(Duration::from_secs(30), client.recv())
+            .await
+            .expect("no timeout")
+            .expect("client recv");
+        echoed.extend_from_slice(&part);
+    }
+    assert_eq!(echoed, payload, "bulk transfer must be byte-exact");
+
+    let seen = one_rtt.load(Ordering::Relaxed);
+    let frag = fragmented.load(Ordering::Relaxed);
+    assert!(seen > 0, "the relay must have observed 1-RTT datagrams");
+    assert_eq!(
+        frag, 0,
+        "{frag} of {seen} application datagrams were fragmented; one application \
+         chunk must fit one PhantomUDP datagram"
+    );
+
+    server.await.unwrap();
+}

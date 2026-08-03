@@ -239,8 +239,8 @@ pub struct RttSample {
 
 /// One probe of the session's message-boundary behaviour.
 ///
-/// `PhantomSession::send()` splits payloads above its internal 1300-byte
-/// `TRANSPORT_MTU`, and the peer's `recv()` yields each piece separately. This
+/// `PhantomSession::send()` splits payloads above its internal 1156-byte chunk
+/// size, and the peer's `recv()` yields each piece separately. This
 /// record measures where that starts and how far it goes, per leg.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageIntegritySample {

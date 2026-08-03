@@ -1587,7 +1587,7 @@ async fn run_data_pump<T: SessionTransport>(
         let mut queue = send_queue.lock().await;
         let count = queue.len();
         for msg in queue.drain(..) {
-            for chunk in msg.chunks(TRANSPORT_MTU) {
+            for chunk in msg.chunks(APP_CHUNK) {
                 deferred.push_back(Deferred::Data {
                     stream: raw_stream.clone(),
                     data: Bytes::copy_from_slice(chunk),
@@ -1846,8 +1846,14 @@ async fn run_data_pump<T: SessionTransport>(
         let _ = recv_done_tx.send(());
     }));
 
-    // MTU for transport packets
-    const TRANSPORT_MTU: usize = 1300;
+    // How much application data goes into one packet. Derived from the PhantomUDP
+    // datagram budget (`transport::mtu`) so that a full chunk plus its header, its
+    // in-plaintext stream offset and its AEAD tag is exactly one unfragmented
+    // datagram: a chunk one byte over the budget would be split into a full
+    // datagram plus a short tail, which doubles the datagram rate and makes the
+    // segment need both halves to survive. On the byte-pipe legs the same constant
+    // just sets the framing granularity.
+    const APP_CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
     // Phase 2.4: the 10 ms `poll_interval` stays as a retransmit-timer
     // fallback (streams without an explicit notifier reference still
     // get swept), but `send_notify.notified()` joins the select! so the
@@ -2024,7 +2030,7 @@ async fn run_data_pump<T: SessionTransport>(
                         // fired once and forgotten on the wire. Admission goes
                         // through `deferred` so a full send buffer refuses the
                         // chunk instead of parking this whole loop.
-                        for chunk in data.chunks(TRANSPORT_MTU) {
+                        for chunk in data.chunks(APP_CHUNK) {
                             deferred.push_back(Deferred::Data {
                                 stream: raw_stream.clone(),
                                 data: Bytes::copy_from_slice(chunk),
@@ -2042,7 +2048,7 @@ async fn run_data_pump<T: SessionTransport>(
                         // await — the shard lock must never be held across one.
                         let stream = streams.get(&stream_id).map(|s| s.clone());
                         if let Some(stream) = stream {
-                            for chunk in data.chunks(TRANSPORT_MTU) {
+                            for chunk in data.chunks(APP_CHUNK) {
                                 deferred.push_back(Deferred::Data {
                                     stream: stream.clone(),
                                     data: Bytes::copy_from_slice(chunk),
@@ -2058,7 +2064,7 @@ async fn run_data_pump<T: SessionTransport>(
                     Some(SessionCommand::SendStreamUnreliable { stream_id, data }) => {
                         let stream = streams.get(&stream_id).map(|s| s.clone());
                         if let Some(stream) = stream {
-                            for chunk in data.chunks(TRANSPORT_MTU) {
+                            for chunk in data.chunks(APP_CHUNK) {
                                 stream.send_unreliable(Bytes::copy_from_slice(chunk)).await;
                             }
                         }
@@ -9959,5 +9965,187 @@ mod tests {
             matches!(err, CoreError::Unsupported(_)),
             "PhantomSession::migrate on a non-UDP session must return Unsupported; got {err:?}"
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Datagram budget — one full application chunk is one PhantomUDP datagram
+    // ────────────────────────────────────────────────────────────────────
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod datagram_budget {
+        use super::*;
+        use crate::api::udp_transport::UdpClientTransport;
+        use crate::transport::mtu::{
+            MAX_APP_CHUNK, MAX_INNER_UNFRAGMENTED, PATH_MTU, PER_PACKET_OVERHEAD,
+        };
+        use crate::transport::phantom_udp::datagram::{push_datagram, FragmentAssembler};
+
+        /// Outer flags: bit 5 marks a fragment of a larger logical frame.
+        const FRAG_BIT: u8 = 0b0010_0000;
+
+        /// Put `payload` on a real socket through the real send path — the pump's
+        /// own `send_app_data` (rekey stamp, in-plaintext stream offset, AEAD seal,
+        /// header protection) into a real `UdpClientTransport`, which is what
+        /// decides how many datagrams it becomes. Returns the datagrams as the peer
+        /// saw them, plus the receiving session that can open them.
+        async fn datagrams_for(payload: &[u8]) -> (Vec<Vec<u8>>, Arc<InnerSession>, SessionId) {
+            let session_id = fixed_session_id();
+            let (client, server) = paired_sessions(session_id);
+            let peer = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind peer socket");
+            let peer_addr = peer.local_addr().expect("peer addr");
+            let transport = Arc::new(
+                UdpClientTransport::connect(peer_addr)
+                    .await
+                    .expect("udp connect"),
+            );
+            // Post-handshake framing: short header, exactly as the pump leaves it.
+            transport.set_frame_phase(FramePhase::Established);
+
+            let obs = Observability::new(ObservabilityConfig::default());
+            assert!(
+                send_app_data(
+                    &transport,
+                    &client,
+                    session_id,
+                    1,
+                    payload,
+                    PacketFlags::RELIABLE,
+                    Some(0),
+                    &obs,
+                )
+                .await,
+                "the real send path must accept a {}-byte chunk",
+                payload.len()
+            );
+
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; 4096];
+            while let Ok(Ok((n, _))) = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                peer.recv_from(&mut buf),
+            )
+            .await
+            {
+                out.push(buf[..n].to_vec());
+            }
+            (out, server, session_id)
+        }
+
+        /// The property the chunk size exists to hold: a maximum-size application
+        /// chunk leaves as exactly one datagram, with the fragment bit clear.
+        ///
+        /// Asserted on the datagrams the peer socket actually received, not on a
+        /// recomputed constant — the split happens inside the transport, below the
+        /// layer that chose the chunk size.
+        #[tokio::test]
+        async fn a_full_chunk_is_one_unfragmented_datagram() {
+            let payload = vec![0x5Au8; MAX_APP_CHUNK];
+            let (dgrams, _server, _id) = datagrams_for(&payload).await;
+            assert_eq!(
+                dgrams.len(),
+                1,
+                "a {MAX_APP_CHUNK}-byte chunk must not be split; got {} datagrams of sizes {:?}",
+                dgrams.len(),
+                dgrams.iter().map(|d| d.len()).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                dgrams[0][0] & FRAG_BIT,
+                0,
+                "the single datagram must not carry the fragment bit"
+            );
+            assert_eq!(
+                dgrams[0].len(),
+                PATH_MTU,
+                "a full chunk should fill the path MTU exactly — anything less is \
+                 headroom paid for on every packet"
+            );
+        }
+
+        /// Two-sided: one byte past the budget genuinely does fragment, and the two
+        /// datagrams reassemble into the original packet, which still decrypts to
+        /// the exact payload.
+        ///
+        /// This rejects a "fix" that suppresses fragmentation (raising
+        /// `MAX_INNER_UNFRAGMENTED`, or dropping the oversized-frame split): with
+        /// fragmentation gone the datagram count would be 1 and the reassembly
+        /// assertion would never run.
+        #[tokio::test]
+        async fn one_byte_over_the_budget_fragments_and_reassembles() {
+            let payload = vec![0xA5u8; MAX_APP_CHUNK + 1];
+            let (dgrams, server, session_id) = datagrams_for(&payload).await;
+            assert_eq!(
+                dgrams.len(),
+                2,
+                "one byte over the budget costs a second datagram; got sizes {:?}",
+                dgrams.iter().map(|d| d.len()).collect::<Vec<_>>()
+            );
+            for d in &dgrams {
+                assert_ne!(d[0] & FRAG_BIT, 0, "both datagrams are fragments");
+            }
+
+            let mut asm = FragmentAssembler::new();
+            let mut frame = None;
+            for d in &dgrams {
+                if let (_, Some(done)) = push_datagram(&mut asm, d).expect("decode datagram") {
+                    frame = Some(done);
+                }
+            }
+            let frame = frame.expect("the two fragments must reassemble");
+            let mut packet = server
+                .parse_protected(&frame)
+                .expect("strip header protection");
+            // The 32-byte session id is authenticated in the AAD but never sent;
+            // the receiver fills it from session context, as `handle_packet` does.
+            packet.header.session_id = session_id;
+            let plaintext = server
+                .decrypt_packet(&packet.header, &packet.payload, &[])
+                .expect("decrypt reassembled packet");
+            assert_eq!(
+                &plaintext[4..],
+                &payload[..],
+                "the reassembled packet must carry the original payload byte-exactly \
+                 (the first four plaintext bytes are the reliable stream offset)"
+            );
+        }
+
+        /// Ties the chunk size to the datagram budget through the real crypto path:
+        /// the sealed, header-protected inner frame for a full chunk must measure
+        /// exactly `MAX_INNER_UNFRAGMENTED`.
+        ///
+        /// This rejects a "fix" that merely picks some smaller round number — 1024,
+        /// say — which would still pass the no-fragmentation test while quietly
+        /// spending an extra datagram every 1156 bytes. It equally rejects raising
+        /// the chunk without raising `PATH_MTU`, and catches an overhead change
+        /// (header size, tag size, the in-plaintext offset) that the derivation
+        /// failed to track.
+        #[tokio::test]
+        async fn a_full_chunk_measures_exactly_the_unfragmented_budget() {
+            let session_id = fixed_session_id();
+            let (client, _server) = paired_sessions(session_id);
+            let header = PacketHeader::new(
+                session_id,
+                1,
+                0,
+                PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::ENCRYPTED),
+            );
+            let mut plaintext = Vec::with_capacity(4 + MAX_APP_CHUNK);
+            plaintext.extend_from_slice(&0u32.to_be_bytes());
+            plaintext.extend_from_slice(&vec![0x11u8; MAX_APP_CHUNK]);
+            let ciphertext = client
+                .encrypt_packet(&header, &plaintext, &[])
+                .expect("encrypt");
+            let wire = client
+                .protect_packet(&PhantomPacket::new(header, ciphertext))
+                .expect("header protection");
+            assert_eq!(
+                wire.len(),
+                MAX_INNER_UNFRAGMENTED,
+                "measured per-packet overhead is {} bytes, the derivation assumes {}",
+                wire.len() - MAX_APP_CHUNK,
+                PER_PACKET_OVERHEAD
+            );
+        }
     }
 }

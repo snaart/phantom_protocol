@@ -50,7 +50,8 @@ pub struct Params {
     pub handshake_count: usize,
     pub rtt_sizes: Vec<usize>,
     pub rtt_per_size: usize,
-    /// Sizes walked by `message_integrity`, bracketing the 1300 B split point.
+    /// Sizes walked by `message_integrity`, bracketing the chunk split point
+    /// (`phantom_protocol::transport::mtu::MAX_APP_CHUNK`).
     pub integrity_sizes: Vec<usize>,
     pub upload: Duration,
     pub download_bytes: u64,
@@ -93,7 +94,7 @@ impl Params {
                 handshake_count: 10,
                 rtt_sizes: vec![64, 1024, 8192],
                 rtt_per_size: 20,
-                integrity_sizes: vec![512, 1200, 1290, 1300, 1310, 2600, 8192],
+                integrity_sizes: vec![512, 1024, 1146, 1156, 1166, 2600, 8192],
                 upload: Duration::from_secs(10),
                 download_bytes: 8 * 1024 * 1024,
                 transfer_frame: 1024,
@@ -121,7 +122,7 @@ impl Params {
                 rtt_sizes: vec![16, 128, 512, 1024, 4096, 16384, 65536],
                 rtt_per_size: 50,
                 integrity_sizes: vec![
-                    512, 1200, 1280, 1290, 1300, 1310, 1400, 2600, 4096, 8192, 65536,
+                    512, 1024, 1140, 1146, 1156, 1166, 1200, 1400, 2600, 4096, 8192, 65536,
                 ],
                 upload: Duration::from_secs(60),
                 download_bytes: 64 * 1024 * 1024,
@@ -150,7 +151,8 @@ impl Params {
                 rtt_sizes: vec![16, 128, 512, 1024, 1400, 4096, 16384, 65536],
                 rtt_per_size: 100,
                 integrity_sizes: vec![
-                    512, 1200, 1280, 1290, 1300, 1310, 1400, 2600, 4096, 8192, 65536, 262_144,
+                    512, 1024, 1140, 1146, 1156, 1166, 1200, 1400, 2600, 4096, 8192, 65536,
+                    262_144,
                 ],
                 upload: Duration::from_secs(180),
                 download_bytes: 128 * 1024 * 1024,
@@ -591,7 +593,7 @@ const QUIC_SKIPPED: &[(&str, &str)] = &[
     ),
     (
         "message_integrity",
-        "this measures a property of PhantomSession::send() — that it splits payloads above 1300 B and delivers the pieces separately. QUIC streams have no message boundaries at all, by specification, so the same probe would report an expected non-property as though it were a defect",
+        "this measures a property of PhantomSession::send() — that it splits payloads above its internal chunk size and delivers the pieces separately. QUIC streams have no message boundaries at all, by specification, so the same probe would report an expected non-property as though it were a defect",
     ),
     (
         "streams",
@@ -901,6 +903,11 @@ fn collect_files(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The size at which `PhantomSession::send()` stops preserving message
+    // boundaries, taken from the library rather than restated — so the sizes the
+    // integrity probe walks keep bracketing the real split point if the path-MTU
+    // budget ever moves.
+    use phantom_protocol::transport::mtu::MAX_APP_CHUNK;
 
     #[test]
     fn every_profile_is_internally_consistent() {
@@ -911,9 +918,9 @@ mod tests {
             assert!(!x.rtt_sizes.is_empty());
             assert!(x.rtt_per_size > 0);
             assert!(
-                x.integrity_sizes.iter().any(|&s| s < 1300)
-                    && x.integrity_sizes.iter().any(|&s| s > 1300),
-                "{p:?}: message_integrity must bracket the 1300 B split point"
+                x.integrity_sizes.iter().any(|&s| s < MAX_APP_CHUNK)
+                    && x.integrity_sizes.iter().any(|&s| s > MAX_APP_CHUNK),
+                "{p:?}: message_integrity must bracket the {MAX_APP_CHUNK} B split point"
             );
             assert!(x.upload > Duration::ZERO);
             assert!(x.download_bytes > 0);

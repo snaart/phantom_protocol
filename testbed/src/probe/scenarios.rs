@@ -514,8 +514,8 @@ pub async fn rtt_sweep(
 
 /// Measure whether `PhantomSession` preserves application message boundaries.
 ///
-/// The data pump splits any payload above its internal `TRANSPORT_MTU`
-/// (1300 B) into chunks and writes each as a separate reliable-stream write, so
+/// The data pump splits any payload above its internal chunk size
+/// (`MAX_APP_CHUNK`, 1156 B) into chunks and writes each as a separate reliable-stream write, so
 /// the peer's `recv()` returns them one at a time. Nothing on `send`/`recv`
 /// documents this, and the failure is silent: a structured message's first
 /// chunk still parses, with the tail quietly gone.
