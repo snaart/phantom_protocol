@@ -49,12 +49,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   before (40 MiB of reorder budget against 144 MiB) even though the per-stream ceiling
   doubled. Every stream of a connection — API-opened, pump-created or peer-initiated —
   draws on one handle, so the bound holds rather than merely being intended. Growth remains
-  driven by what the application consumed, never by what arrived, and the round-trip
-  reference it is measured against stays a constant: the interval is `2 × rtt`, so the
-  consumption rate a peer must be outrun by is inversely proportional to it, and every
-  round trip observable before application data moves is one the far end sets by choosing
-  when to answer. `MAX_SEND_WINDOW` moves with the ceiling — the two ends of one credit
-  ledger must agree.
+  driven by what the application consumed, never by what arrived. The round-trip reference
+  the interval is derived from is a constant on a receive-only stream, which is the flow
+  auto-tuning exists for, because such a stream never measures a round trip of its own. On a
+  stream that also sends, it is that stream's own `min_rtt`, and a peer that delays every
+  acknowledgement can stretch it — the interval is `2 × rtt`, so a longer one lowers the
+  consumption rate a doubling has to beat. What that buys the peer is bounded and is not the
+  dangerous direction: it can reach the ceiling sooner, never pass it, and every doubling is
+  still paid for in bytes the local application actually consumed. `MAX_SEND_WINDOW` moves
+  with the ceiling — the two ends of one credit ledger must agree.
 
 - **Every full-size PhantomUDP segment was sent as two datagrams.** The data pump chunked
   application data at 1300 bytes, a number chosen independently of the datagram budget it
@@ -445,6 +448,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   acknowledgement arrived. A peer's advertised window is deliberately not routed into the
   flag: it gates the loss response, the Startup judgement and the bandwidth filter, and no
   remote party may hold that switch.
+
+- **`phantom_protocol::transport::stream` gained the session-wide receive-window ledger.**
+  `SharedRecvTuning` (new public struct) is the handle every stream of one connection draws
+  its window growth from; `Stream::with_recv_tuning` constructs a stream against one and
+  `Stream::recv_tuning` hands the handle on, so a stream created by the pump or by a peer
+  joins the same ledger as one opened through the API. `SESSION_RECV_WINDOW_GROWTH_BUDGET`
+  (8 MiB) is what the ledger holds and `SharedRecvTuning::remaining_growth_budget` reports
+  what is left of it. `MAX_SEND_WINDOW` and `MAX_RECV_WINDOW` doubled from 512 KiB to 1 MiB
+  with the ceiling above.
 
 ### Added
 

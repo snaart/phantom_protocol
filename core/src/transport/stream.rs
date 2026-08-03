@@ -916,10 +916,19 @@ impl Stream {
     /// 1 MiB cap costs it four doublings, and each one requires the local application to
     /// consume four fifths of the *current* window inside one round-trip-length interval —
     /// ~790 KiB of genuinely consumed data in total, at a rate the peer cannot supply on its
-    /// own because the application has to keep up with it. The interval is measured against
-    /// a constant, not against anything the peer can stretch (see `AUTOTUNE_RTT_FALLBACK`),
-    /// so that rate is not a quantity the far end gets to set. If the application stops, the
+    /// own because the application has to keep up with it. If the application stops, the
     /// window stops where it is.
+    ///
+    /// The interval itself is not entirely outside the peer's reach, and claiming otherwise
+    /// would be the more comfortable statement rather than the true one. On a stream that
+    /// also *sends*, `min_rtt` is a real measurement and a peer that delays every one of its
+    /// acknowledgements can raise it, which lengthens the interval and so lowers the
+    /// consumption rate a doubling has to beat. What that buys is bounded and is not the
+    /// dangerous direction: it can only bring the window to the [`MAX_RECV_WINDOW`] ceiling
+    /// **sooner**, never past it, and the peer pays for it in its own throughput because
+    /// every doubling still has to be earned in bytes the local application actually took.
+    /// A receive-only stream — the flow auto-tuning exists for — never feeds its estimator
+    /// at all and uses the constant.
     ///
     /// Having paid, the peer may hold one window of unconsumed data on this stream and one
     /// window plus 64 KiB of reorder buffer ([`Self::recv_reorder_byte_limit`]). What bounds
@@ -1882,6 +1891,42 @@ impl std::fmt::Debug for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reorder-buffer entry cap has to sit in a window, and both walls are real.
+    ///
+    /// **Above** the number of segments one maximum flow-control window can hold: below
+    /// that the entry cap, not the byte budget, becomes the binding constraint, and the
+    /// receiver starts refusing legitimate out-of-order data on exactly the long lossy
+    /// paths a large window exists for. The segment count is `MAX_RECV_WINDOW` divided by
+    /// the application chunk size, so it moves whenever either does — which is why this is
+    /// computed here rather than restated as a number.
+    ///
+    /// **Below** the point where the entries' own unaccounted cost dominates. The byte
+    /// budget counts payload only; an entry also costs a deque slot, a `Vec<Bytes>` and the
+    /// retained allocation, and none of that is budgeted. A peer sending one-byte segments
+    /// above a hole it never fills pays the entry cap, not the byte budget. That wall is
+    /// already a compile-time assertion next to the constant; this test states the pair
+    /// together so the margin between them is visible when either side moves.
+    #[test]
+    fn the_reorder_entry_cap_sits_between_one_window_and_its_own_unaccounted_cost() {
+        let segments_in_one_window =
+            MAX_RECV_WINDOW as usize / crate::transport::mtu::MAX_APP_CHUNK;
+        assert!(
+            MAX_RECV_REORDER >= 2 * segments_in_one_window,
+            "the entry cap ({MAX_RECV_REORDER}) must clear the {segments_in_one_window} \
+             segments a full {MAX_RECV_WINDOW}-byte window holds with margin, or it — not \
+             the byte budget — is what refuses out-of-order data"
+        );
+        // The upper wall, restated from the const assertion beside the constant so a change
+        // to either bound is caught by the same test that names the trade.
+        const PER_ENTRY_OVERHEAD_ESTIMATE: usize = 128;
+        assert!(
+            MAX_RECV_REORDER * PER_ENTRY_OVERHEAD_ESTIMATE <= 256 * 1024,
+            "at {MAX_RECV_REORDER} entries the unbudgeted per-entry cost is \
+             {} B per stream, and MAX_STREAMS of them share a session",
+            MAX_RECV_REORDER * PER_ENTRY_OVERHEAD_ESTIMATE
+        );
+    }
 
     #[tokio::test]
     async fn test_stream_send_recv() {
