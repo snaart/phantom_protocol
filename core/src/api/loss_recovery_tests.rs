@@ -563,13 +563,16 @@ async fn run_pipelined_echo(
 /// inbound queue before it looks at its send path, so no acknowledgement ever
 /// lands in the window between a retransmission and its answer, which is the
 /// only window in which the re-declaration can happen. With a round trip and a
-/// per-frame spacing the storm reproduces: one 1300-byte drop was reported as
-/// 3900 bytes of loss, on every run.
+/// per-frame spacing the storm reproduces: one dropped segment was reported as
+/// three segments' worth of loss, on every run.
 #[tokio::test]
 async fn a_single_dropped_segment_is_reported_to_congestion_control_once() {
     /// `PhantomSession::send` splits at this boundary, so the payload below is
     /// exactly `CHUNKS` reliable segments and the assertion can name a size.
-    const CHUNK: usize = 1300;
+    /// Taken from the library rather than restated: the split point is derived
+    /// from the PhantomUDP datagram budget, and a literal here would silently
+    /// stop describing whole segments the next time that budget moves.
+    const CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
     /// Enough segments that the packet threshold (three offsets past the hole)
     /// is reached from the acknowledgements of the surviving chunks alone, with
     /// a long tail of further acknowledgements behind it — the tail is what a
