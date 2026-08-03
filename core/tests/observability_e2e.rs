@@ -205,7 +205,7 @@ async fn observability_e2e_encrypt_decrypt_and_rtt_reach_the_ffi_snapshot() {
     const ROUNDS: usize = 16;
     // Big enough that the AEAD call itself is far above any platform's
     // `Instant` granularity (`avg_*_ns > 0` must not be a clock race), yet
-    // under the pump's 1300-byte app-data chunking so one `send()` is exactly
+    // under the pump's 1156-byte app-data chunking so one `send()` is exactly
     // one `recv()` and the echo comparison stays a simple equality.
     const PAYLOAD: usize = 1024;
 

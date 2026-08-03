@@ -10,6 +10,25 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **Every full-size PhantomUDP segment was sent as two datagrams.** The data pump chunked
+  application data at 1300 bytes, a number chosen independently of the datagram budget it
+  had to fit. One reliable chunk becomes `header(15) ‖ AEAD(stream_offset(4) ‖ chunk)`,
+  and the AEAD adds a 16-byte tag, so a 1300-byte chunk is a 1335-byte inner frame — 144
+  bytes past the 1191 that fit one 1200-byte datagram after the 9-byte outer envelope.
+  The transport dutifully fragmented it into a full datagram plus a 169-byte tail.
+  That doubled the datagram rate for the same goodput, spent an 8-byte fragment
+  subheader plus a fresh 28-byte IP/UDP header on the tail, and — because a segment is
+  delivered only when every one of its fragments arrives — turned an independent
+  per-datagram loss rate `p` into `1 − (1 − p)² ≈ 2p` per segment. Loss recovery, the
+  SACK loss detector and BBR's 2% loss threshold all count segments, so the protocol was
+  reacting to roughly twice the loss the path was applying. The chunk size is now derived
+  from `PATH_MTU` in `transport::mtu` (1200 − 9 − 15 − 4 − 16 = 1156 B), so a full segment
+  is exactly one full datagram, and a future `PATH_MTU` rise widens it automatically.
+  The byte-pipe legs (TCP, mimicry, WebSocket, WASI, embedded) never fragmented and are
+  unaffected beyond a 0.4-point rise in per-packet framing overhead.
+  `PhantomSession::send()` still does not preserve message boundaries above the chunk;
+  only the threshold moved, from 1300 to 1156 bytes.
+
 - **The congestion window was released as a burst, because nothing on the send path read
   the pacing rate.** BBR computed one for every session ever opened, and every `Session`
   was constructed with `Pacer::unlimited()`, which sets `enabled = false`. `set_rate`
@@ -357,7 +376,7 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   call measures socket setup rather than the post-quantum key exchange. This was
   implied by the invariants but stated nowhere on the entry points themselves.
 - **`PhantomSession::send()` does not preserve application message boundaries.** The
-  data pump splits payloads above its internal `TRANSPORT_MTU` (1300 B) into chunks,
+  data pump splits payloads above its internal chunk size (1156 B) into chunks,
   writes each as a separate reliable-stream write, and the peer's `recv()` yields them
   one at a time — on every leg, since the split happens above the transport. The
   failure mode is silent for structured payloads: the first chunk still parses, with

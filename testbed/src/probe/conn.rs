@@ -347,7 +347,7 @@ pub struct EchoOutcome {
 /// is complete, so the measured interval covers exactly the protocol path.
 ///
 /// The echoed payload is compared byte-for-byte against what was sent. That
-/// check is not ceremony: `PhantomSession` splits payloads above 1300 B, and a
+/// check is not ceremony: `PhantomSession` splits payloads above its chunk size, and a
 /// truncated reply still carries a matching `seq`, so without this comparison a
 /// silently-cut payload registers as a clean round trip. It did, until this
 /// check was added.

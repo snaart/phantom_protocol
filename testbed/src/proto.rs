@@ -9,7 +9,7 @@
 //! *here* must never be mistakable for a bug in the protocol under test.
 //!
 //! Message *delimitation* is not this module's job — see [`crate::framing`].
-//! `PhantomSession::send()` splits payloads above 1300 B and the peer's
+//! `PhantomSession::send()` splits payloads above its chunk size and the peer's
 //! `recv()` yields the pieces separately, so a length prefix and explicit
 //! reassembly sit between this codec and the session.
 //!
