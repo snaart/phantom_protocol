@@ -113,18 +113,8 @@ struct FaultState {
     /// Fixed 0-based send indices to hold and release after the next send
     /// (adjacent reorder).
     reorder_indices: HashSet<u64>,
-    /// A frame held back by a reorder, and how many further forwarded sends must
-    /// pass it before it is released.
-    pending_reorder: Mutex<Option<(u64, Vec<u8>)>>,
-    /// How many forwarded sends overtake a reordered frame before it is released
-    /// — the reorder *distance*, in frames.
-    ///
-    /// One (the default, and what every existing caller gets) is an adjacent
-    /// swap, which no loss detector using RFC 9002's three-packet threshold can
-    /// see. Distances at or above that threshold are the interesting ones and are
-    /// what real paths produce: the path this transport was last measured over
-    /// reordered 13-14% of its datagrams.
-    reorder_distance: AtomicU64,
+    /// A frame held back by a reorder, awaiting the next forwarded send.
+    pending_reorder: Mutex<Option<Vec<u8>>>,
     /// Per-send forwarding delay in milliseconds (0 = none).
     delay_ms: AtomicU64,
     /// Seeded stochastic config (None = stochastic mode disabled — the default).
@@ -187,7 +177,6 @@ impl FaultControl {
                 dup_indices,
                 reorder_indices,
                 pending_reorder: Mutex::new(None),
-                reorder_distance: AtomicU64::new(1),
                 delay_ms: AtomicU64::new(delay_ms),
                 // A stochastic config is armed at construction; a control with
                 // no config is trivially disarmed.
@@ -292,19 +281,6 @@ impl FaultControl {
         self.state.arm_drop.store(n, Ordering::Relaxed);
     }
 
-    /// How many forwarded sends overtake a reordered frame before it is released.
-    ///
-    /// One — the default — is an adjacent swap, and a loss detector with a
-    /// three-offset packet threshold cannot see one at all. Set it above that
-    /// threshold to model a path that genuinely reorders. Zero is treated as one;
-    /// a "reorder" that releases the held frame before anything overtakes it is
-    /// not a reorder.
-    pub fn set_reorder_distance(&self, frames: u64) {
-        self.state
-            .reorder_distance
-            .store(frames.max(1), Ordering::Relaxed);
-    }
-
     /// Set the per-send forwarding delay (latency injection). `Duration::ZERO`
     /// disables it.
     pub fn set_delay(&self, delay: Duration) {
@@ -385,33 +361,15 @@ impl FaultControl {
         }
     }
 
-    /// Count one forwarded send against a held frame, and hand the frame back
-    /// once the configured number of sends have overtaken it.
+    /// Take any frame held back by a reorder (to release after the current send).
     fn take_pending_reorder(&self) -> Option<Vec<u8>> {
-        let mut held = lock_recover(&self.state.pending_reorder);
-        let (remaining, _) = held.as_mut()?;
-        *remaining = remaining.saturating_sub(1);
-        if *remaining > 0 {
-            return None;
-        }
-        held.take().map(|(_, data)| data)
-    }
-
-    /// Unconditionally take any held frame, whatever distance it still had to
-    /// travel — the flush path, for a reordered frame with no following sends.
-    fn drain_pending_reorder(&self) -> Option<Vec<u8>> {
-        lock_recover(&self.state.pending_reorder)
-            .take()
-            .map(|(_, data)| data)
+        lock_recover(&self.state.pending_reorder).take()
     }
 
     /// Hold a frame for reorder; returns any previously-held frame so the caller
     /// can flush it (a second reorder before the first is released).
     fn hold_for_reorder(&self, data: Vec<u8>) -> Option<Vec<u8>> {
-        let distance = self.state.reorder_distance.load(Ordering::Relaxed).max(1);
-        lock_recover(&self.state.pending_reorder)
-            .replace((distance, data))
-            .map(|(_, prev)| prev)
+        lock_recover(&self.state.pending_reorder).replace(data)
     }
 
     fn consume_armed_drop(&self) -> bool {
@@ -472,7 +430,7 @@ impl<T: SessionTransport> LossyTransport<T> {
     /// Flush any frame currently held back by a reorder (e.g. when the reordered
     /// frame was the last send and has no following frame to release it).
     pub async fn flush(&self) -> Result<(), CoreError> {
-        if let Some(held) = self.control.drain_pending_reorder() {
+        if let Some(held) = self.control.take_pending_reorder() {
             self.inner.send_bytes(&held).await?;
         }
         Ok(())
@@ -671,42 +629,6 @@ mod tests {
             &*got,
             &[b"r0".to_vec(), b"r2".to_vec(), b"r1".to_vec()],
             "the reordered frame must land after the following frame"
-        );
-    }
-
-    /// The adjacent swap above is invisible to a loss detector whose packet
-    /// threshold is three offsets, so it cannot express the case that matters: a
-    /// path where reordering is deep enough to be *mistaken* for loss. With a
-    /// distance set, the held frame stays held until that many frames have
-    /// overtaken it.
-    #[tokio::test]
-    async fn a_reorder_distance_holds_the_frame_for_that_many_forwarded_sends() {
-        let forwarded = Arc::new(Mutex::new(Vec::new()));
-        let inner = RecordingTransport {
-            forwarded: forwarded.clone(),
-        };
-        let control = FaultControl::with_reorder_indices(&[1]);
-        control.set_reorder_distance(4);
-        let lossy = LossyTransport::new(inner, control);
-
-        lossy.send_bytes(b"r0").await.expect("send r0");
-        lossy.send_bytes(b"r1").await.expect("send r1"); // held
-        for frame in [b"r2", b"r3", b"r4", b"r5"] {
-            lossy.send_bytes(frame).await.expect("send");
-        }
-
-        let got = forwarded.lock().expect("poisoned");
-        assert_eq!(
-            &*got,
-            &[
-                b"r0".to_vec(),
-                b"r2".to_vec(),
-                b"r3".to_vec(),
-                b"r4".to_vec(),
-                b"r5".to_vec(),
-                b"r1".to_vec(),
-            ],
-            "four frames must overtake the held one before it is released"
         );
     }
 

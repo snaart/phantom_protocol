@@ -10,55 +10,6 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
-- **The loss detector read a reordering path as a losing one.** `Stream::on_sack` declared a
-  hole lost once `largest_acked` was three offsets past it — RFC 9002's `kPacketThreshold`,
-  which the RFC is explicit is a default for a path with *little* reordering. The path this
-  transport was last measured over is not one: it delivers 60 Mbit/s at 1.1% loss while
-  reordering 13-14% of its datagrams, and at 20 Mbit/s the split is starker still — 0.12%
-  loss against 13.4% reordering. A fixed three declares a delivered-but-late segment lost on
-  the first acknowledgement that reaches three offsets past it, which costs twice: the
-  segment is retransmitted, spending forward capacity on data the peer already has, and the
-  retransmission reports a loss to congestion control. `adapt_inflight_bound` judges the
-  round's loss *rate* against `LOSS_THRESH` (2%), so a reordering path sits over the
-  threshold every round and `inflight_hi` is beaten down by `INFLIGHT_HI_BETA` to its
-  `1.25 × BDP` floor and pinned there — the sender held at the smallest window the
-  controller will use, on a path that is dropping almost nothing.
-
-  **The offset-counting rule is gone.** Counting cannot answer the question: a hole with
-  newer offsets acknowledged past it is what a dropped segment looks like from the sending
-  side, and it is equally what a delivered-but-late one looks like. Loss detection is now
-  RFC 9002 §6.1.2's time threshold alone — a segment with newer acknowledged data past it is
-  declared lost once it has been on the wire for `max(kGranularity, 9/8 · max(smoothed_rtt,
-  latest_rtt))`. That is the rule the RFC leads with, and the move Linux TCP made when
-  RACK-TLP replaced counting duplicate acknowledgements. The `max(smoothed_rtt, latest_rtt)`
-  input is new and is the RFC's: scaling by the smoothed estimate alone reads a sustained
-  rise in the path's round trip as a burst of loss for as long as the estimate takes to
-  catch up.
-
-  Two supporting changes make that safe to rely on. The time threshold is now evaluated in
-  the send path as well as on acknowledgement — RFC 9002's loss detection timer, folded into
-  the pass that already existed for the RTO — because the case that needed it most was a
-  hole in an application's last flight, revealed by the acknowledgements behind it and then
-  never re-examined, which used to fall through to the RTO's 200 ms floor. And the largest
-  acknowledged offset is remembered across a migration path switch, while the RTT estimate
-  is deliberately not: which of this side's offsets the peer has acknowledged stays true
-  whichever path carries the next packet, but a loss delay scaled by the old path's round
-  trip is a statement about a network the connection has left.
-
-  **Cost and residual exposure, stated plainly.** Dropping the offset count costs an eighth
-  of a round trip of recovery latency — a hole is declared at `1.125 × rtt` after its
-  transmission rather than on the acknowledgement that reaches three offsets past it — which
-  on the measured path is 28 ms against a 228 ms round trip, and it buys tolerance of every
-  reordering event displaced by less than that same 28 ms. A peer retains exactly one lever
-  on the threshold: it can delay its own acknowledgements, which raises the samples this
-  side measures and lengthens the loss delay, slowing this side's recovery. That cannot be
-  removed — an RTT estimate is measured from acknowledgements and there is nothing else to
-  measure it from — and it is bounded by what it costs the peer: the same samples raise the
-  RTO underneath, the added delay is delay on the peer's own connection, and the direction
-  that would actually hurt is unavailable, since no peer can make an acknowledgement arrive
-  sooner than the path allows. What a peer can no longer do is decide the threshold by
-  choosing *which* offsets to acknowledge. No wire change.
-
 - **A SACK carrying more than 32 islands threw away the one range that retires data.**
   `Stream::received_sack` builds its range list with the contiguous delivered run first —
   lowest — and `Sack::from_ascending_coalesced` reversed the list to descending and then
@@ -67,7 +18,7 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   on the books was that a dropped range is "recovered by cumulative re-ACK"; that does not
   hold when the range dropped *is* the cumulative one. Downstream, `on_sack` retires only
   what `Sack::acks` covers, so every segment of a delivered window stayed in the send
-  buffer, sat behind `largest_acked` until it aged past the loss delay, was declared lost and
+  buffer, fell at least `PACKET_THRESHOLD` behind `largest_acked`, was declared lost and
   was retransmitted — a whole window of already-delivered data resent and a whole window of
   fabricated loss fed to congestion control. It needed no malice: the reorder buffer holds
   thousands of islands, so more than 32 holes in one flight is a function of loss rate and
