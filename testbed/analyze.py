@@ -145,6 +145,73 @@ def analyze_client(run_dir):
             f"{pct(v, .50):>9.2f}M {max(v):>9.2f}M {min(v):>9.2f}M"
         )
 
+    # ── raw-path reordering ──────────────────────────────────────────────
+    #
+    # The distance columns are what size a transport's reordering tolerance.
+    # The count alone cannot: at 20 Mbit/s this path has been seen to reorder
+    # 13% of datagrams while losing 0.12% of them, and a tolerance sized on the
+    # median distance declares the tail lost and retransmits a window that was
+    # never missing.
+    section("Raw UDP reordering and the loss it is not (controls, no protocol)")
+    rows = []
+    for f in sorted(run_dir.glob("samples/*/*.jsonl")):
+        for r in read_jsonl(f):
+            if "reorder" in r and "offered_bps" in r:
+                rows.append(r)
+    if not rows:
+        print("  (no raw reorder records — this run predates the distance instrumentation)")
+    else:
+        print(
+            f"  {'direction':22} {'offered':>9} {'late':>7} "
+            f"{'dist p50/p90/p99/max':>22} {'behind ms p50/p99/max':>23} "
+            f"{'filled':>8} {'lost':>8} {'open':>6}"
+        )
+        for r in sorted(rows, key=lambda r: (r["direction"], r["rung"])):
+            ro = r["reorder"]
+            d, t = ro["distance"], ro["displacement_ns"]
+            mark = "" if r.get("admissible") else "  (inadmissible)"
+            # An empty distribution means every late arrival fell outside the
+            # receiver's window. Its zeroed percentiles would read as "reordered
+            # by nothing", which is the opposite of what happened.
+            if d["count"]:
+                dist = f"{d['p50']:>5.0f}/{d['p90']:>5.0f}/{d['p99']:>5.0f}/{d['max']:>5.0f}"
+            else:
+                dist = f"{'—':>22}"
+            if t["count"]:
+                disp = f"{t['p50'] / 1e6:>6.1f}/{t['p99'] / 1e6:>7.1f}/{t['max'] / 1e6:>7.1f}"
+            else:
+                disp = f"{'—':>23}"
+            print(
+                f"  {r['direction']:22} {r['offered_bps'] / 1e6:>7.0f}M "
+                f"{ro['late_datagrams']:>7} {dist} {disp} "
+                f"{ro['gaps_filled']:>8} {ro['gaps_lost']:>8} {ro['gaps_open_at_end']:>6}{mark}"
+            )
+        # Sizing a threshold means clearing the worst tail that was measured,
+        # not the typical one — so the headline is a maximum over the rungs.
+        adm = [r for r in rows if r.get("admissible")]
+        pool = adm or rows
+        worst_d = max(r["reorder"]["distance"]["max"] for r in pool)
+        worst_t = max(r["reorder"]["displacement_ns"]["max"] for r in pool)
+        horizon = max(r["reorder"]["horizon"] for r in pool)
+        print(
+            f"\n  worst reorder seen{'' if adm else ' (no admissible rung — read with care)'}: "
+            f"{worst_d:.0f} datagrams and {worst_t / 1e6:.1f} ms behind. A packet-threshold "
+            f"or time-threshold below either declares reordering as loss."
+        )
+        if worst_d >= horizon:
+            print(
+                "  \033[33mthe worst distance reached the receiver's own window "
+                f"({horizon}) — the tail is clipped by the instrument, not measured\033[0m"
+            )
+        unattributed = sum(
+            r["reorder"]["late_beyond_horizon"] + r["reorder"]["gaps_beyond_horizon"] for r in rows
+        )
+        still_open = sum(r["reorder"]["gaps_open_at_end"] for r in rows)
+        if unattributed:
+            print(f"  {unattributed} datagram(s)/gap(s) fell outside the window and are unclassified")
+        if still_open:
+            print(f"  {still_open} gap(s) were still open when their rung ended — neither loss nor reordering")
+
     # ── congestion window ────────────────────────────────────────────────
     section("Congestion window over each transfer (the sender's own view)")
     any_w = False

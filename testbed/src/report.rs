@@ -399,6 +399,15 @@ pub struct DownstreamSample {
     /// Arrived after a higher-numbered datagram already had.
     pub reordered_datagrams: u64,
     pub duplicate_datagrams: u64,
+    /// How far back, and how long after, those late datagrams came — plus the
+    /// gap-by-gap split of reordering from loss.
+    ///
+    /// The count above says the path reorders; it sizes nothing, because a
+    /// transport's reordering tolerance is a distance and a duration. This is
+    /// the distribution of both. Defaulted on deserialize so runs recorded
+    /// before it existed still load.
+    #[serde(default)]
+    pub reorder: crate::downlink::ReorderProfile,
 
     /// First arrival to last arrival — the receiver's own observation interval,
     /// which excludes the request's round trip and the sender's start-up.
@@ -1042,6 +1051,18 @@ mod tests {
             received_bytes: 36_000_000,
             reordered_datagrams: 12,
             duplicate_datagrams: 0,
+            reorder: crate::downlink::ReorderProfile {
+                horizon: 4096,
+                late_datagrams: 12,
+                distance: Summary::of_u64(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+                displacement_ns: Summary::of_u64(&[1_000_000; 12]),
+                transit_excess_ns: Summary::of_u64(&[2_000_000; 12]),
+                gaps_filled: 12,
+                gaps_lost: 340,
+                gaps_open_at_end: 3,
+                gaps_beyond_horizon: 0,
+                late_beyond_horizon: 0,
+            },
             observed_window_ns: 5_000_000_000,
             receiver_bps: 57.6e6,
             loss_fraction: Some(0.04),
@@ -1063,6 +1084,18 @@ mod tests {
         assert_eq!(v["observed_window_ns"], 5_000_000_000u64);
         assert_eq!(v["loss_fraction"], 0.04);
         assert_eq!(v["admissible"], true);
+        // The distribution, not just the count: an analysis that reads only
+        // `reordered_datagrams` cannot size a reordering tolerance.
+        assert_eq!(v["reorder"]["horizon"], 4096);
+        assert_eq!(v["reorder"]["distance"]["p50"], 6.0);
+        assert_eq!(v["reorder"]["distance"]["p90"], 11.0);
+        assert_eq!(v["reorder"]["distance"]["p99"], 12.0);
+        assert_eq!(v["reorder"]["distance"]["max"], 12.0);
+        assert_eq!(v["reorder"]["displacement_ns"]["p99"], 1_000_000.0);
+        assert_eq!(v["reorder"]["transit_excess_ns"]["p99"], 2_000_000.0);
+        assert_eq!(v["reorder"]["gaps_filled"], 12);
+        assert_eq!(v["reorder"]["gaps_lost"], 340);
+        assert_eq!(v["reorder"]["gaps_open_at_end"], 3);
 
         // A rung with no sender report must serialise its unknowns as null, not
         // as zero: zero would read as "the sender sent nothing", which is a
@@ -1086,6 +1119,29 @@ mod tests {
         assert!(v["loss_fraction"].is_null());
         assert_eq!(v["admissible"], false);
         assert!(!v["note"].as_str().unwrap_or_default().is_empty());
+    }
+
+    /// Runs already on disk predate the reorder profile, and re-reading them is
+    /// how a "did this change help" question gets answered. A record without
+    /// the field must load rather than fail the whole file.
+    #[test]
+    fn a_rung_recorded_before_the_reorder_profile_still_loads() {
+        let old = r#"{"leg":"raw_udp","direction":"raw_udp_downstream","t_unix_ns":1,
+            "rung":3,"offered_bps":60000000.0,"payload_bytes":1200,
+            "requested_ns":5000000000,"sender_datagrams":31250,"sender_bytes":37500000,
+            "sender_elapsed_ns":5000000000,"sender_bps":60000000.0,
+            "sender_reached_offer":true,"received_datagrams":30000,
+            "received_bytes":36000000,"reordered_datagrams":12,"duplicate_datagrams":0,
+            "observed_window_ns":5000000000,"receiver_bps":57600000.0,
+            "loss_fraction":0.04,"admissible":true,"note":""}"#;
+        let s: DownstreamSample = serde_json::from_str(old).expect("an older rung must load");
+        assert_eq!(s.reordered_datagrams, 12);
+        assert_eq!(
+            s.reorder,
+            crate::downlink::ReorderProfile::default(),
+            "and its unmeasured profile must read as empty, not as zero reordering"
+        );
+        assert_eq!(s.reorder.horizon, 0, "a zero horizon marks it unmeasured");
     }
 
     #[test]

@@ -2068,6 +2068,12 @@ pub async fn raw_tcp_throughput(
 /// counted here has crossed the path twice, so a shortfall could be either way
 /// and the two have different consequences for a protocol. That is
 /// [`raw_udp_downstream`]'s job.
+///
+/// Each datagram carries a sequence number and a send stamp — the daemon echoes
+/// bytes and knows nothing about either — so this direction reports the same
+/// reorder-distance distribution the downstream control does, in the same
+/// record shape. Read as a round trip: a distance measured here bounds the two
+/// directions together and neither of them alone.
 pub async fn raw_udp_throughput(
     ep: &Endpoints,
     rungs: &[u64],
@@ -2089,11 +2095,19 @@ pub async fn raw_udp_throughput(
     }
     let sock = Arc::new(sock);
 
-    let payload = PayloadGen::new(170).fill(downlink::DEFAULT_PAYLOAD);
+    // The datagram this control sends is unchanged in size and still filler as
+    // far as the daemon is concerned — it echoes bytes and keeps no state — but
+    // the first 34 of them now carry a sequence number and a send stamp. That
+    // is what lets this direction be counted by the same code as the downstream
+    // one, and reordering measured only one way sizes nothing for a protocol
+    // that has to tolerate it in both.
+    let mut payload = PayloadGen::new(170).fill(downlink::DEFAULT_PAYLOAD);
+    let run_nonce = unix_nanos() ^ ((std::process::id() as u64) << 40);
     let mut best = 0.0f64;
     let mut ceiling_suspected = false;
 
-    for &kbps in rungs {
+    for (i, &kbps) in rungs.iter().enumerate() {
+        let rung = i as u16;
         // The shared credit-bucket pacer, driven from a 1 ms tick — the same
         // one the downstream control uses, so the two directions are offering
         // identically shaped traffic and their rungs line up.
@@ -2101,34 +2115,65 @@ pub async fn raw_udp_throughput(
 
         let deadline = tokio::time::Instant::now() + per_rate;
         let rx = sock.clone();
+        let clock_base = Instant::now();
         let reader = tokio::spawn(async move {
             let mut buf = vec![0u8; 65_536];
             let mut got = 0u64;
+            let mut matched_bytes = 0u64;
+            let mut tracker = downlink::SeqTracker::new();
             let stop = deadline + Duration::from_secs(2);
             while tokio::time::Instant::now() < stop {
                 match tokio::time::timeout(Duration::from_millis(500), rx.recv(&mut buf)).await {
-                    Ok(Ok(n)) => got += n as u64,
+                    Ok(Ok(n)) => {
+                        // The byte count stays deliberately unfiltered, because
+                        // it is the figure the ladder's own prose and its
+                        // throughput sample have always reported and changing
+                        // it would break comparison with runs already taken.
+                        got += n as u64;
+                        let now = Instant::now();
+                        if let Some(h) = downlink::EchoHeader::decode(&buf[..n]) {
+                            if h.run_nonce == run_nonce
+                                && h.rung == rung
+                                && tracker
+                                    .observe_stamped(h.seq, stamps_at(clock_base, now, h.send_ns))
+                            {
+                                matched_bytes += n as u64;
+                            }
+                        }
+                    }
                     Ok(Err(_)) => break,
                     Err(_) => continue,
                 }
             }
-            got
+            (got, matched_bytes, tracker)
         });
 
         let mut sent = 0u64;
+        let mut sent_datagrams = 0u64;
         let started = Instant::now();
         let mut tick = tokio::time::interval(pacing::TICK);
         tick.set_missed_tick_behavior(pacing::MISSED_TICK);
         while tokio::time::Instant::now() < deadline {
             tick.tick().await;
             for _ in 0..pacer.on_tick() {
+                downlink::EchoHeader {
+                    run_nonce,
+                    rung,
+                    seq: sent_datagrams,
+                    // The same zero the reader dates arrivals from, so a
+                    // datagram's own two stamps subtract into its round trip.
+                    send_ns: clock_base.elapsed().as_nanos() as u64,
+                }
+                .write_into(&mut payload);
                 if sock.send(&payload).await.is_ok() {
                     sent += payload.len() as u64;
+                    sent_datagrams += 1;
                 }
             }
         }
         let elapsed_ns = started.elapsed().as_nanos() as u64;
-        let got = reader.await.unwrap_or(0);
+        let (got, matched_bytes, tracker) =
+            reader.await.unwrap_or((0, 0, downlink::SeqTracker::new()));
 
         let achieved = pacing::bits_per_sec(sent, elapsed_ns);
         let returned = pacing::bits_per_sec(got, elapsed_ns);
@@ -2140,11 +2185,13 @@ pub async fn raw_udp_throughput(
         };
         best = best.max(returned);
         out.summary.ok_count += 1;
+        let profile = tracker.profile();
         out.note(format!(
-            "asked {kbps} kbit/s -> sender achieved {:.2} Mbit/s{}, echoed back {:.2} Mbit/s, round-trip loss {loss:.1}%",
+            "asked {kbps} kbit/s -> sender achieved {:.2} Mbit/s{}, echoed back {:.2} Mbit/s, round-trip loss {loss:.1}%{}",
             achieved / 1e6,
             if reached { "" } else { " (SHORT OF ITS OWN OFFER — this rung says nothing about the path)" },
             returned / 1e6,
+            reorder_note(&profile),
         ));
         out.sink.push(&ThroughputSample {
             leg,
@@ -2154,6 +2201,39 @@ pub async fn raw_udp_throughput(
             window_frames: got / payload.len() as u64,
             window_ns: elapsed_ns,
             cumulative_bytes: sent,
+        });
+        // The same record shape the downstream control writes, so the two
+        // directions' reordering can be read side by side rather than by eye
+        // across two formats. Everything in it is round-trip: a datagram
+        // counted here crossed the path twice, so a distance measured here
+        // bounds the sum of the two directions, never either alone.
+        out.sink.push(&crate::report::DownstreamSample {
+            leg,
+            direction: "raw_udp_echo_roundtrip".to_string(),
+            t_unix_ns: unix_nanos(),
+            rung,
+            offered_bps: pacer.offered_bps(),
+            payload_bytes: payload.len(),
+            requested_ns: per_rate.as_nanos() as u64,
+            sender_datagrams: Some(sent_datagrams),
+            sender_bytes: Some(sent),
+            sender_elapsed_ns: Some(elapsed_ns),
+            sender_bps: Some(achieved),
+            sender_reached_offer: Some(reached),
+            received_datagrams: tracker.received(),
+            received_bytes: matched_bytes,
+            reordered_datagrams: tracker.reordered(),
+            duplicate_datagrams: tracker.duplicates(),
+            reorder: profile,
+            observed_window_ns: elapsed_ns,
+            receiver_bps: pacing::bits_per_sec(matched_bytes, elapsed_ns),
+            loss_fraction: tracker.loss_fraction(Some(sent_datagrams)),
+            admissible: reached && tracker.received() >= 2,
+            note: if reached {
+                String::new()
+            } else {
+                "the sender fell short of its own offer: this rung measures the client, not the path".to_string()
+            },
         });
 
         // Only a rate the sender genuinely reached, met by loss, indicates the
@@ -2174,6 +2254,7 @@ pub async fn raw_udp_throughput(
         }
     ));
     out.note("this is a round trip: a datagram counted here crossed the path twice, so it bounds neither direction on its own — see the downstream scenario for the server → client half");
+    out.note("the reorder distances and displacements recorded here are round-trip too: they bound the sum of the two directions, so a transport's reordering tolerance sized against them is sized generously");
     out
 }
 
@@ -2192,6 +2273,11 @@ pub async fn raw_udp_throughput(
 /// inadmissible, because it measures the sender rather than the link — the same
 /// mistake, in the other direction, once had this harness reporting its own
 /// timer as a path ceiling.
+///
+/// Each rung also records how far back and how long after the path brings a
+/// late datagram, and splits gap by gap what was reordering from what was loss.
+/// A count of reorderings says the path reorders; it does not size a
+/// transport's tolerance for it, which is a distance and a duration.
 pub async fn raw_udp_downstream(
     ep: &Endpoints,
     rungs: &[u64],
@@ -2298,6 +2384,18 @@ pub async fn raw_udp_downstream(
     out
 }
 
+/// Pair the receiver's own clock with the stamp the datagram carried.
+///
+/// The two are on unrelated clocks and the tracker never subtracts one from the
+/// other; `base` exists only so the receiver's side is a small monotonic number
+/// rather than an [`Instant`], which does not subtract into a `u64` on its own.
+fn stamps_at(base: Instant, now: Instant, sender_stamp_ns: u64) -> downlink::Stamps {
+    downlink::Stamps {
+        recv_ns: now.saturating_duration_since(base).as_nanos() as u64,
+        send_ns: sender_stamp_ns,
+    }
+}
+
 /// Prose for one rung, written so the console transcript alone is readable.
 fn rung_note(s: &crate::report::DownstreamSample) -> String {
     let offered = s.offered_bps / 1e6;
@@ -2312,17 +2410,55 @@ fn rung_note(s: &crate::report::DownstreamSample) -> String {
         .map(|l| format!("{:.1}%", l * 100.0))
         .unwrap_or_else(|| "unknown".to_string());
     format!(
-        "asked {offered:.0} Mbit/s -> sender achieved {:.2}, receiver saw {:.2} Mbit/s, loss {loss}, reordered {}, duplicated {}{}",
+        "asked {offered:.0} Mbit/s -> sender achieved {:.2}, receiver saw {:.2} Mbit/s, loss {loss}, reordered {}, duplicated {}{}{}",
         sender / 1e6,
         s.receiver_bps / 1e6,
         s.reordered_datagrams,
         s.duplicate_datagrams,
+        reorder_note(&s.reorder),
         if s.admissible {
             ""
         } else {
             " — NOT ADMISSIBLE, the sender never reached its own offer"
         }
     )
+}
+
+/// The part of a rung's prose that sizes the reordering rather than announcing
+/// it. Empty when nothing arrived late, so a clean rung stays one line.
+fn reorder_note(r: &crate::downlink::ReorderProfile) -> String {
+    if r.late_datagrams == 0 {
+        return String::new();
+    }
+    // An empty distribution means every late arrival fell outside the window,
+    // and printing its zeroed percentiles would read as "reordered by nothing"
+    // — the opposite of what happened.
+    let mut s = if r.distance.count == 0 {
+        "; none of them close enough to the highest seen to measure a distance".to_string()
+    } else {
+        format!(
+            "; late by p50 {:.0} / p90 {:.0} / p99 {:.0} / max {:.0} datagrams and p50 {:.1} / p99 {:.1} / max {:.1} ms",
+            r.distance.p50,
+            r.distance.p90,
+            r.distance.p99,
+            r.distance.max,
+            r.displacement_ns.p50 / 1e6,
+            r.displacement_ns.p99 / 1e6,
+            r.displacement_ns.max / 1e6,
+        )
+    };
+    // The classification, and — deliberately — what it could not classify.
+    s.push_str(&format!(
+        "; gaps {} filled / {} lost / {} still open at the end",
+        r.gaps_filled, r.gaps_lost, r.gaps_open_at_end
+    ));
+    if r.late_beyond_horizon > 0 || r.gaps_beyond_horizon > 0 {
+        s.push_str(&format!(
+            "; {} arrival(s) and {} gap(s) fell outside the {}-datagram window and are unattributed",
+            r.late_beyond_horizon, r.gaps_beyond_horizon, r.horizon
+        ));
+    }
+    s
 }
 
 /// Drive one rung: ask, collect, and fold both accounts into a record.
@@ -2361,6 +2497,10 @@ async fn measure_rung(
     let mut first_at: Option<Instant> = None;
     let mut last_at: Option<Instant> = None;
     let mut report: Option<downlink::Report> = None;
+    // Zero of the receiver's clock for this rung. The reorder displacements are
+    // differences within it, so where it starts does not matter — only that it
+    // is monotonic and that the sender's stamps are never subtracted from it.
+    let clock_base = Instant::now();
 
     let request = |cookie: [u8; downlink::COOKIE_LEN]| downlink::Request {
         run_nonce,
@@ -2412,7 +2552,7 @@ async fn measure_rung(
                 }
                 reached_the_daemon = true;
                 let now = Instant::now();
-                if tracker.observe(h.seq) {
+                if tracker.observe_stamped(h.seq, stamps_at(clock_base, now, h.send_unix_ns)) {
                     received_bytes += n as u64;
                     if first_at.is_none() {
                         first_at = Some(now);
@@ -2437,9 +2577,14 @@ async fn measure_rung(
                         break;
                     };
                     if let Some(h) = downlink::DataHeader::decode(&buf[..n]) {
-                        if h.run_nonce == run_nonce && h.rung == rung && tracker.observe(h.seq) {
+                        let now = Instant::now();
+                        if h.run_nonce == run_nonce
+                            && h.rung == rung
+                            && tracker
+                                .observe_stamped(h.seq, stamps_at(clock_base, now, h.send_unix_ns))
+                        {
                             received_bytes += n as u64;
-                            last_at = Some(Instant::now());
+                            last_at = Some(now);
                         }
                     }
                 }
@@ -2498,6 +2643,10 @@ async fn measure_rung(
         received_bytes,
         reordered_datagrams: tracker.reordered(),
         duplicate_datagrams: tracker.duplicates(),
+        // Taken here, after the rung's tail has drained: it is this call that
+        // draws the line between a gap that was still open and one a late
+        // arrival filled.
+        reorder: tracker.profile(),
         observed_window_ns,
         receiver_bps,
         loss_fraction: tracker.loss_fraction(report.map(|r| r.datagrams)),
@@ -2611,6 +2760,77 @@ mod tests {
         assert_eq!(t.frames, 10);
         assert!(t.duration_ns > 0);
         assert!(t.megabits_per_sec >= 0.0);
+    }
+
+    /// The console transcript is what an operator reads first, and "reordered
+    /// 4271" was exactly the number that could not size anything. The prose has
+    /// to carry the distribution and has to say what it could not classify.
+    #[test]
+    fn a_rungs_prose_sizes_the_reordering_rather_than_announcing_it() {
+        let mut t = downlink::SeqTracker::new();
+        for seq in 0..200u64 {
+            if seq == 100 {
+                continue;
+            }
+            t.observe_stamped(
+                seq,
+                downlink::Stamps {
+                    recv_ns: seq * 1_000_000,
+                    send_ns: seq * 1_000,
+                },
+            );
+        }
+        t.observe_stamped(
+            100,
+            downlink::Stamps {
+                recv_ns: 250_000_000,
+                send_ns: 100_000,
+            },
+        );
+        let note = reorder_note(&t.profile());
+        assert!(note.contains("p99"), "the tail has to be in it: {note}");
+        assert!(note.contains("ms"), "and the time as well as the count");
+        assert!(
+            note.contains("filled") && note.contains("lost") && note.contains("still open"),
+            "the classification is the point: {note}"
+        );
+
+        // A clean rung stays one line.
+        let mut clean = downlink::SeqTracker::new();
+        for seq in 0..10u64 {
+            clean.observe(seq);
+        }
+        assert_eq!(reorder_note(&clean.profile()), "");
+
+        // A rung whose only late arrivals fell outside the window has no
+        // distribution, and a zeroed one would read as "reordered by nothing".
+        let mut wild = downlink::SeqTracker::new();
+        wild.observe(0);
+        wild.observe(1_000_000);
+        wild.observe(1);
+        let note = reorder_note(&wild.profile());
+        assert!(
+            !note.contains("p50 0"),
+            "an unmeasured distance must not print as zero: {note}"
+        );
+        assert!(note.contains("fell outside"), "{note}");
+    }
+
+    /// The receiver's clock and the sender's stamp are paired but never
+    /// subtracted from each other. A `stamps_at` that mixed them would make
+    /// every displacement a clock-offset estimate instead of a measurement.
+    #[test]
+    fn the_two_clocks_are_carried_side_by_side_not_reconciled() {
+        let base = Instant::now();
+        let later = base + Duration::from_millis(250);
+        let s = stamps_at(base, later, 1_700_000_000_000_000_000);
+        assert_eq!(s.recv_ns, 250_000_000);
+        assert_eq!(
+            s.send_ns, 1_700_000_000_000_000_000,
+            "the sender's stamp is carried through untouched"
+        );
+        // An arrival dated before the base cannot produce a negative interval.
+        assert_eq!(stamps_at(later, base, 7).recv_ns, 0);
     }
 
     #[test]

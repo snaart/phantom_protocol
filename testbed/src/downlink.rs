@@ -1,4 +1,11 @@
-//! The raw server → client UDP capacity control: wire format and bookkeeping.
+//! The raw UDP capacity controls: wire formats and receiver bookkeeping.
+//!
+//! Most of this file is the server → client control, described below. The
+//! sequence-number bookkeeping ([`SeqTracker`], [`ReorderProfile`]) and the
+//! echo control's own datagram header ([`EchoHeader`]) live here too, so that
+//! both directions are counted by exactly the same code — a reorder distance
+//! measured one way and a differently-derived one measured the other way would
+//! not be comparable, which is the whole point of having both.
 //!
 //! ## Why it exists
 //!
@@ -38,6 +45,9 @@
 use std::net::{IpAddr, SocketAddr};
 
 use phantom_protocol::crypto::kdf::derive_key_32;
+use serde::{Deserialize, Serialize};
+
+use crate::stats::Summary;
 
 // ── Message kinds ───────────────────────────────────────────────────────────
 //
@@ -247,6 +257,66 @@ impl Report {
     }
 }
 
+// ── Echo control ────────────────────────────────────────────────────────────
+
+/// Marks a datagram of the client → server echo control.
+///
+/// A distinct magic from [`MAGIC_DATA`] because the two controls answer
+/// different questions and a datagram of one must never be counted into the
+/// other's ledger, whatever lands on a socket.
+pub const MAGIC_ECHO: [u8; 8] = *b"PHRAWEC1";
+pub const ECHO_HEADER_LEN: usize = 34;
+
+/// The prefix the echo control writes into each datagram it sends.
+///
+/// The echo daemon returns datagrams byte for byte and keeps no state, so this
+/// header comes back untouched — which is what lets the client number its own
+/// traffic without the daemon knowing anything about it, and without changing
+/// what is on the wire in either direction: the datagram is the same size and
+/// still unauthenticated filler as far as the daemon is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EchoHeader {
+    pub run_nonce: u64,
+    pub rung: u16,
+    /// Zero-based within the rung.
+    pub seq: u64,
+    /// The client's own monotonic clock when the datagram went out. Unlike
+    /// [`DataHeader::send_unix_ns`] this never crosses a clock boundary — the
+    /// same host stamps it and reads it back — so a difference of two of these
+    /// is exact.
+    pub send_ns: u64,
+}
+
+impl EchoHeader {
+    /// Write the header into the front of an already-sized datagram buffer.
+    ///
+    /// In place, for the same reason [`DataHeader::write_into`] is: at the top
+    /// of the ladder this runs twenty thousand times a second and an allocation
+    /// there would be the sender's own ceiling.
+    pub fn write_into(&self, buf: &mut [u8]) {
+        if buf.len() < ECHO_HEADER_LEN {
+            return;
+        }
+        buf[0..8].copy_from_slice(&MAGIC_ECHO);
+        buf[8..16].copy_from_slice(&self.run_nonce.to_be_bytes());
+        buf[16..18].copy_from_slice(&self.rung.to_be_bytes());
+        buf[18..26].copy_from_slice(&self.seq.to_be_bytes());
+        buf[26..34].copy_from_slice(&self.send_ns.to_be_bytes());
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < ECHO_HEADER_LEN || b[0..8] != MAGIC_ECHO {
+            return None;
+        }
+        Some(Self {
+            run_nonce: be64(&b[8..16]),
+            rung: be16(&b[16..18]),
+            seq: be64(&b[18..26]),
+            send_ns: be64(&b[26..34]),
+        })
+    }
+}
+
 // ── Return-routability cookie ───────────────────────────────────────────────
 
 /// Seconds a cookie epoch covers. A cookie is accepted in its own epoch and the
@@ -326,29 +396,140 @@ impl CookieMinter {
 
 // ── Receiver bookkeeping ────────────────────────────────────────────────────
 
-/// Sequence numbers the duplicate bitmap can look back over.
+/// Sequence numbers the receiver keeps per-datagram state for.
+///
+/// This is the cap on the receiver's bookkeeping, and it is a hard one: the
+/// state is a fixed array of this many slots, allocated once, whatever the
+/// rung's length and whatever sequence numbers turn up in it. A rung at the top
+/// of the ladder carries a hundred thousand datagrams and a broken or hostile
+/// sender can name any of 2^64, so a structure that grew with either would make
+/// the receive loop the thing that limits the measurement — or the thing that
+/// falls over.
+///
+/// What happens at the cap is stated in the record rather than hidden. A gap
+/// the window slides past unfilled is booked as loss; a jump that skips further
+/// ahead than the whole window leaves sequence numbers that can never be
+/// attributed either way, and those are counted separately as
+/// [`ReorderProfile::gaps_beyond_horizon`]; an arrival further behind than the
+/// window reaches cannot be matched to a gap or dup-checked, and lands in
+/// [`ReorderProfile::late_beyond_horizon`].
 ///
 /// Four thousand datagrams is roughly a fifth of a second at the top of the
-/// ladder — far beyond any reordering a path plausibly produces, and a fixed
-/// cost of 512 bytes whatever the rung's length. A bounded window rather than a
-/// set of every sequence number seen, because the receive loop must not become
-/// the thing that limits the measurement.
-const WINDOW_BITS: usize = 4096;
-const WINDOW_WORDS: usize = WINDOW_BITS / 64;
+/// ladder and the whole rung at the bottom of it — well past any reordering a
+/// path plausibly produces, which is what makes "slid past unfilled" a
+/// defensible reading of "lost".
+const REORDER_HORIZON: usize = 4096;
+
+/// Ceiling on the individual reorder measurements kept for the distribution.
+///
+/// The percentiles are wanted exactly, so the samples are kept rather than
+/// bucketed — but a rung's arrival count is not under this side's control, so
+/// the vector needs an end. Past it the counters keep counting and the
+/// distribution stops growing, which is visible because
+/// [`ReorderProfile::distance`]'s own `count` no longer matches
+/// [`ReorderProfile::late_datagrams`].
+const MAX_REORDER_SAMPLES: usize = 1 << 17;
+
+/// The two clocks that make a reordering measurable in time as well as in
+/// sequence numbers.
+///
+/// They are unrelated clocks and are never subtracted from each other: only
+/// differences *within* one of them are used, which is what keeps the result
+/// free of any assumption about the hosts being synchronised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamps {
+    /// The receiver's own monotonic clock, nanoseconds from an arbitrary zero.
+    pub recv_ns: u64,
+    /// The stamp the sender wrote into the datagram, on the sender's clock.
+    pub send_ns: u64,
+}
+
+/// What one in-window sequence number is known to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// The window has not reached this sequence number.
+    Vacant,
+    Arrived,
+    /// Expected and not yet seen. Carries the stamps of the arrival that
+    /// revealed the gap — the datagram that overtook this one — because the
+    /// displacement is measured from there and nowhere else.
+    Open(Option<Stamps>),
+}
+
+/// How far back the path brings a late datagram from, and how long after.
+///
+/// A count of reorderings says a path reorders; it does not size anything. A
+/// transport's reordering tolerance is a distance and a duration, and both have
+/// to clear the tail rather than the middle — hence percentiles rather than a
+/// mean. The three distributions answer three different questions:
+///
+/// - `distance` sizes a packet-threshold rule (how many sequence numbers may
+///   pass a datagram before it is declared lost).
+/// - `displacement_ns` sizes a receiver-side time threshold: how long after the
+///   arrival that revealed a gap the fill actually came. This is the RACK-style
+///   quantity, measured entirely on the receiver's clock.
+/// - `transit_excess_ns` is that plus the head start the late datagram had over
+///   its overtaker, taken from the two send stamps — how much longer it took to
+///   cross the path. The two send stamps and the two arrival stamps are each
+///   subtracted within their own clock, so no offset estimate enters.
+///
+/// The gap counters split what a bare reordering count conflates. A gap a later
+/// arrival filled is reordering; one the window slid past is loss; one still
+/// open when the rung ended is neither, and is reported as its own quantity
+/// because the datagram may well have arrived a millisecond after the rung
+/// stopped listening.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReorderProfile {
+    /// Sequence numbers the receiver kept state for. Stated in the record so a
+    /// reader can tell a measured tail from one clipped by the instrument.
+    pub horizon: u64,
+    /// Datagrams that arrived after a higher-numbered one already had.
+    pub late_datagrams: u64,
+    /// Sequence numbers behind the highest seen, over late datagrams.
+    pub distance: Summary,
+    /// Nanoseconds between the arrival that revealed the gap and the fill.
+    pub displacement_ns: Summary,
+    /// Nanoseconds of extra transit relative to the overtaking datagram.
+    pub transit_excess_ns: Summary,
+    /// Gaps a later arrival filled — reordering.
+    pub gaps_filled: u64,
+    /// Gaps the horizon slid past unfilled — loss.
+    pub gaps_lost: u64,
+    /// Gaps still open when the rung ended — neither, and deliberately not
+    /// folded into either.
+    pub gaps_open_at_end: u64,
+    /// Sequence numbers a forward jump skipped by more than the whole window,
+    /// which can never be filled and were never observed to be lost.
+    pub gaps_beyond_horizon: u64,
+    /// Arrivals too far behind the highest seen to match to a gap. Counted as
+    /// reordering and as arrivals, but they contribute no distance sample.
+    pub late_beyond_horizon: u64,
+}
 
 /// Counts arrivals, reordering and duplication from a stream of sequence
-/// numbers.
+/// numbers, and keeps the ledger that separates reordering from loss.
 ///
-/// Loss is deliberately *not* derived here from gaps: a gap at the receiver is
-/// indistinguishable from a datagram the sender never sent, and the sender's
-/// own count is the only honest denominator. See [`SeqTracker::loss_fraction`].
+/// Aggregate loss is deliberately *not* derived here from gaps: a gap at the
+/// receiver is indistinguishable from a datagram the sender never sent, and the
+/// sender's own count is the only honest denominator. See
+/// [`SeqTracker::loss_fraction`]. The per-gap classification in
+/// [`ReorderProfile`] is a different statement — it says which of the arrivals
+/// that *did* happen came late — and the two are reported side by side rather
+/// than reconciled into one number.
 #[derive(Debug)]
 pub struct SeqTracker {
     highest: Option<u64>,
     received: u64,
     duplicates: u64,
     reordered: u64,
-    window: [u64; WINDOW_WORDS],
+    slots: Box<[Slot]>,
+    gaps_filled: u64,
+    gaps_lost: u64,
+    gaps_beyond_horizon: u64,
+    late_beyond_horizon: u64,
+    distance: Vec<f64>,
+    displacement_ns: Vec<f64>,
+    transit_excess_ns: Vec<f64>,
 }
 
 impl Default for SeqTracker {
@@ -364,44 +545,94 @@ impl SeqTracker {
             received: 0,
             duplicates: 0,
             reordered: 0,
-            window: [0; WINDOW_WORDS],
+            slots: vec![Slot::Vacant; REORDER_HORIZON].into_boxed_slice(),
+            gaps_filled: 0,
+            gaps_lost: 0,
+            gaps_beyond_horizon: 0,
+            late_beyond_horizon: 0,
+            distance: Vec::new(),
+            displacement_ns: Vec::new(),
+            transit_excess_ns: Vec::new(),
         }
     }
 
-    /// Record one arrival. Returns false when the datagram was a duplicate, so
-    /// the caller can keep its byte count to distinct datagrams.
+    /// Record one arrival whose timing is unknown. The sequence-distance
+    /// distribution is still filled; the two time distributions are not.
     pub fn observe(&mut self, seq: u64) -> bool {
+        self.observe_at(seq, None)
+    }
+
+    /// Record one arrival together with the clocks that date it.
+    ///
+    /// Returns false when the datagram was a duplicate, so the caller can keep
+    /// its byte count to distinct datagrams.
+    pub fn observe_stamped(&mut self, seq: u64, stamps: Stamps) -> bool {
+        self.observe_at(seq, Some(stamps))
+    }
+
+    fn observe_at(&mut self, seq: u64, stamps: Option<Stamps>) -> bool {
         let Some(highest) = self.highest else {
+            // The first arrival sets the baseline. Sequence numbers below it
+            // were sent and did not turn up, so as much of that range as the
+            // window reaches is opened as gaps rather than assumed away — a
+            // rung whose opening datagrams are lost would otherwise account for
+            // none of them.
+            let floor = seq.saturating_sub(REORDER_HORIZON as u64 - 1);
+            for below in floor..seq {
+                self.set(below, Slot::Open(stamps));
+            }
             self.highest = Some(seq);
-            self.mark(seq);
+            self.set(seq, Slot::Arrived);
             self.received = 1;
             return true;
         };
 
         if seq > highest {
-            self.slide_to(seq);
+            self.advance(highest, seq, stamps);
             self.highest = Some(seq);
-            self.mark(seq);
             self.received += 1;
             return true;
         }
 
-        // At or below the high-water mark: either a duplicate, or a datagram
-        // overtaken in flight.
+        // At or below the high-water mark: a duplicate, or a datagram overtaken
+        // in flight.
         let behind = highest - seq;
-        if behind < WINDOW_BITS as u64 {
-            if self.is_marked(seq) {
-                self.duplicates += 1;
-                return false;
-            }
-            self.mark(seq);
+        if behind >= REORDER_HORIZON as u64 {
+            // Further back than the window reaches: it cannot be matched to a
+            // gap and cannot be dup-checked. Counting it as an arrival is the
+            // conservative choice, since treating a real datagram as a
+            // duplicate would understate what the path delivered.
+            self.late_beyond_horizon += 1;
+            self.reordered += 1;
+            self.received += 1;
+            return true;
         }
-        // Beyond the window it cannot be dup-checked; counting it as an arrival
-        // is the conservative choice, since treating a real datagram as a
-        // duplicate would understate what the path delivered.
-        self.reordered += 1;
-        self.received += 1;
-        true
+
+        match self.slot_of(seq) {
+            Slot::Arrived => {
+                self.duplicates += 1;
+                false
+            }
+            Slot::Open(revealed) => {
+                self.set(seq, Slot::Arrived);
+                self.gaps_filled += 1;
+                self.reordered += 1;
+                self.received += 1;
+                self.record(behind, revealed, stamps);
+                true
+            }
+            // Every in-window sequence number at or below the high-water mark
+            // is opened as a gap the moment the window reaches it, so this arm
+            // is not reachable. Handled as an unattributed late arrival rather
+            // than assumed away, because the alternative is a silent miscount.
+            Slot::Vacant => {
+                self.set(seq, Slot::Arrived);
+                self.reordered += 1;
+                self.received += 1;
+                self.record(behind, None, stamps);
+                true
+            }
+        }
     }
 
     pub fn received(&self) -> u64 {
@@ -421,6 +652,30 @@ impl SeqTracker {
         self.highest
     }
 
+    /// The reorder distributions and the gap ledger as they stand.
+    ///
+    /// Non-consuming, and the gaps still open are counted at the moment it is
+    /// called — so calling it is what draws the line between "still open" and
+    /// anything that arrives afterwards.
+    pub fn profile(&self) -> ReorderProfile {
+        ReorderProfile {
+            horizon: REORDER_HORIZON as u64,
+            late_datagrams: self.reordered,
+            distance: Summary::of(&self.distance),
+            displacement_ns: Summary::of(&self.displacement_ns),
+            transit_excess_ns: Summary::of(&self.transit_excess_ns),
+            gaps_filled: self.gaps_filled,
+            gaps_lost: self.gaps_lost,
+            gaps_open_at_end: self
+                .slots
+                .iter()
+                .filter(|s| matches!(s, Slot::Open(_)))
+                .count() as u64,
+            gaps_beyond_horizon: self.gaps_beyond_horizon,
+            late_beyond_horizon: self.late_beyond_horizon,
+        }
+    }
+
     /// The fraction of the sender's datagrams that never arrived.
     ///
     /// `None` when the sender's count is unknown — without it there is no
@@ -435,38 +690,70 @@ impl SeqTracker {
         Some((1.0 - ratio).clamp(0.0, 1.0))
     }
 
-    fn slide_to(&mut self, seq: u64) {
-        let Some(highest) = self.highest else { return };
+    /// Move the high-water mark from `highest` to `seq`, opening the sequence
+    /// numbers stepped over and retiring whatever leaves the window.
+    fn advance(&mut self, highest: u64, seq: u64, stamps: Option<Stamps>) {
         let advance = seq - highest;
-        if advance >= WINDOW_BITS as u64 {
-            self.window = [0; WINDOW_WORDS];
+        if advance >= REORDER_HORIZON as u64 {
+            // The jump replaces the whole window. Everything still open in it
+            // left unfilled, and the sequence numbers beyond the window's reach
+            // can never be attributed at all — the one case where the ledger
+            // has to admit it does not know, rather than book a loss it never
+            // observed.
+            for i in 0..self.slots.len() {
+                if matches!(self.slots[i], Slot::Open(_)) {
+                    self.gaps_lost += 1;
+                }
+                self.slots[i] = Slot::Open(stamps);
+            }
+            self.gaps_beyond_horizon += advance - REORDER_HORIZON as u64;
+            self.set(seq, Slot::Arrived);
             return;
         }
-        // The bitmap is addressed by sequence number modulo the window, so
-        // advancing means clearing the slots newly swept into view.
-        for s in (highest + 1)..=seq {
-            self.clear(s);
+        // Each slot about to be reused holds the state of the sequence number
+        // one window back, which is exactly the one leaving.
+        for y in (highest + 1)..=seq {
+            if matches!(self.slot_of(y), Slot::Open(_)) {
+                self.gaps_lost += 1;
+            }
+            let state = if y == seq {
+                Slot::Arrived
+            } else {
+                Slot::Open(stamps)
+            };
+            self.set(y, state);
         }
     }
 
-    fn slot(seq: u64) -> (usize, u64) {
-        let bit = (seq % WINDOW_BITS as u64) as usize;
-        (bit / 64, 1u64 << (bit % 64))
+    fn record(&mut self, distance: u64, revealed: Option<Stamps>, arrival: Option<Stamps>) {
+        if self.distance.len() >= MAX_REORDER_SAMPLES {
+            return;
+        }
+        self.distance.push(distance as f64);
+        let (Some(r), Some(a)) = (revealed, arrival) else {
+            return;
+        };
+        let displacement = a.recv_ns.saturating_sub(r.recv_ns);
+        // The head start the late datagram had over the one that overtook it,
+        // on the sender's clock. Added to the displacement it gives the extra
+        // time the path took over it, with both clock offsets cancelling.
+        let head_start = r.send_ns.saturating_sub(a.send_ns);
+        self.displacement_ns.push(displacement as f64);
+        self.transit_excess_ns
+            .push(displacement.saturating_add(head_start) as f64);
     }
 
-    fn mark(&mut self, seq: u64) {
-        let (w, m) = Self::slot(seq);
-        self.window[w] |= m;
+    fn index(seq: u64) -> usize {
+        (seq % REORDER_HORIZON as u64) as usize
     }
 
-    fn clear(&mut self, seq: u64) {
-        let (w, m) = Self::slot(seq);
-        self.window[w] &= !m;
+    fn set(&mut self, seq: u64, state: Slot) {
+        let i = Self::index(seq);
+        self.slots[i] = state;
     }
 
-    fn is_marked(&self, seq: u64) -> bool {
-        let (w, m) = Self::slot(seq);
-        self.window[w] & m != 0
+    fn slot_of(&self, seq: u64) -> Slot {
+        self.slots[Self::index(seq)]
     }
 }
 
@@ -520,6 +807,16 @@ mod tests {
         dh.write_into(&mut buf);
         assert_eq!(DataHeader::decode(&buf), Some(dh));
 
+        let eh = EchoHeader {
+            run_nonce: 0x0102_0304_0506_0708,
+            rung: 1,
+            seq: u64::MAX,
+            send_ns: 987_654_321,
+        };
+        let mut ebuf = vec![0u8; DEFAULT_PAYLOAD];
+        eh.write_into(&mut ebuf);
+        assert_eq!(EchoHeader::decode(&ebuf), Some(eh));
+
         let rep = Report {
             run_nonce: 5,
             rung: 2,
@@ -529,6 +826,38 @@ mod tests {
             elapsed_ns: 5_000_000_000,
         };
         assert_eq!(Report::decode(&rep.encode()), Some(rep));
+    }
+
+    /// The two controls run on different ports but must not be able to read
+    /// each other's datagrams even if one did land on the other's socket: a
+    /// downstream burst counted as echo returns would report a round trip that
+    /// never happened.
+    #[test]
+    fn the_two_controls_cannot_read_each_others_datagrams() {
+        let mut buf = vec![0u8; DEFAULT_PAYLOAD];
+        DataHeader {
+            run_nonce: 1,
+            rung: 0,
+            seq: 7,
+            send_unix_ns: 5,
+        }
+        .write_into(&mut buf);
+        assert_eq!(EchoHeader::decode(&buf), None);
+
+        let mut buf = vec![0u8; DEFAULT_PAYLOAD];
+        EchoHeader {
+            run_nonce: 1,
+            rung: 0,
+            seq: 7,
+            send_ns: 5,
+        }
+        .write_into(&mut buf);
+        assert_eq!(DataHeader::decode(&buf), None);
+        assert_eq!(Report::decode(&buf), None);
+        assert_eq!(Challenge::decode(&buf), None);
+        assert_eq!(Request::decode(&buf), None);
+        assert_eq!(EchoHeader::decode(&buf[..ECHO_HEADER_LEN - 1]), None);
+        assert_eq!(EchoHeader::decode(&[]), None);
     }
 
     /// This listener sits on a public port. Anything it does not recognise must
@@ -700,7 +1029,7 @@ mod tests {
     fn an_arrival_older_than_the_window_is_still_counted() {
         let mut t = SeqTracker::new();
         t.observe(0);
-        t.observe(WINDOW_BITS as u64 * 2);
+        t.observe(REORDER_HORIZON as u64 * 2);
         assert!(t.observe(1));
         assert_eq!(t.received(), 3);
         assert_eq!(t.reordered(), 1);
@@ -710,17 +1039,283 @@ mod tests {
     #[test]
     fn the_window_slides_without_leaving_stale_marks() {
         let mut t = SeqTracker::new();
-        for seq in 0..(WINDOW_BITS as u64 * 5) {
+        for seq in 0..(REORDER_HORIZON as u64 * 5) {
             assert!(t.observe(seq), "seq {seq} was wrongly seen as a duplicate");
         }
         assert_eq!(t.duplicates(), 0);
-        assert_eq!(t.received(), WINDOW_BITS as u64 * 5);
+        assert_eq!(t.received(), REORDER_HORIZON as u64 * 5);
 
         // A jump past the window clears it wholesale; nothing behind the jump
         // may still read as marked.
-        let far = WINDOW_BITS as u64 * 20;
+        let far = REORDER_HORIZON as u64 * 20;
         t.observe(far);
         assert!(t.observe(far - 1), "the swept region must be clear");
+        assert_eq!(t.duplicates(), 0);
+    }
+
+    // ── Reorder distance and the loss/reordering split ──────────────────────
+    //
+    // "The path reorders" sizes nothing. A transport's reordering tolerance is
+    // a distance and a duration, so these pin both: how far back a late
+    // datagram came from, how long after the datagram that overtook it it
+    // arrived, and — separately — which gaps were filled and which never were.
+
+    /// Sequence `seq` sent at `seq` µs and arriving at `at` ns on the
+    /// receiver's clock. The two clocks are deliberately unrelated, as they are
+    /// on the wire.
+    fn at(seq: u64, recv_ns: u64) -> Stamps {
+        Stamps {
+            recv_ns,
+            send_ns: seq.saturating_mul(1_000),
+        }
+    }
+
+    #[test]
+    fn an_in_order_stream_leaves_no_gaps_at_all() {
+        let mut t = SeqTracker::new();
+        for seq in 0..10_000u64 {
+            assert!(t.observe_stamped(seq, at(seq, seq * 1_000_000)));
+        }
+        let p = t.profile();
+        assert_eq!(p.late_datagrams, 0);
+        assert_eq!(p.gaps_filled, 0);
+        assert_eq!(p.gaps_lost, 0);
+        assert_eq!(p.gaps_open_at_end, 0);
+        assert_eq!(p.gaps_beyond_horizon, 0);
+        assert_eq!(p.distance.count, 0, "nothing arrived late to measure");
+    }
+
+    /// The single-datagram case, computed by hand: 3 is overtaken by 4 and 5,
+    /// so it lands two sequence numbers behind the highest seen, five
+    /// microseconds after the arrival that revealed the gap — and, correcting
+    /// for the microsecond head start it had on its overtaker, six microseconds
+    /// of extra transit.
+    #[test]
+    fn one_late_datagram_carries_a_distance_a_displacement_and_an_excess() {
+        let mut t = SeqTracker::new();
+        for (seq, recv) in [
+            (0u64, 1_000u64),
+            (1, 2_000),
+            (2, 3_000),
+            (4, 4_000),
+            (5, 5_000),
+        ] {
+            assert!(t.observe_stamped(seq, at(seq, recv)));
+        }
+        assert!(t.observe_stamped(3, at(3, 9_000)));
+
+        let p = t.profile();
+        assert_eq!(p.late_datagrams, 1);
+        assert_eq!(p.gaps_filled, 1);
+        assert_eq!(p.gaps_lost, 0);
+        assert_eq!(p.gaps_open_at_end, 0);
+        assert_eq!(p.distance.count, 1);
+        assert_eq!(p.distance.max, 2.0, "highest seen was 5, this was 3");
+        assert_eq!(
+            p.displacement_ns.max, 5_000.0,
+            "seq 4 revealed the gap at 4000 ns; seq 3 filled it at 9000"
+        );
+        assert_eq!(
+            p.transit_excess_ns.max, 6_000.0,
+            "displacement plus the 1 µs head start seq 3 had over seq 4"
+        );
+    }
+
+    /// A run of late datagrams, with every percentile hand-computed. The point
+    /// of the distribution is that the mean would hide the tail: here the mean
+    /// distance is 54 and the p99 is 99, and a tolerance sized on the former
+    /// declares a fifth of these lost.
+    #[test]
+    fn a_run_of_late_datagrams_reports_a_distribution_not_a_mean() {
+        const LATE: [u64; 10] = [100, 110, 120, 130, 140, 150, 160, 170, 180, 190];
+        let mut t = SeqTracker::new();
+
+        let mut idx = 0u64;
+        for seq in 0..200u64 {
+            if LATE.contains(&seq) {
+                continue;
+            }
+            assert!(t.observe_stamped(seq, at(seq, idx * 1_000_000)));
+            idx += 1;
+        }
+        for (n, seq) in LATE.iter().enumerate() {
+            assert!(t.observe_stamped(*seq, at(*seq, (190 + n as u64) * 1_000_000)));
+        }
+
+        let p = t.profile();
+        assert_eq!(p.late_datagrams, 10);
+        assert_eq!(p.gaps_filled, 10);
+        assert_eq!(p.gaps_lost, 0);
+        assert_eq!(p.gaps_open_at_end, 0);
+
+        // Distances are 199 − seq: 99, 89, …, 9. Nearest rank over ten samples
+        // puts p50 at the 5th, p90 at the 9th and p99 at the 10th.
+        assert_eq!(p.distance.count, 10);
+        assert_eq!(p.distance.p50, 49.0);
+        assert_eq!(p.distance.p90, 89.0);
+        assert_eq!(p.distance.p99, 99.0);
+        assert_eq!(p.distance.max, 99.0);
+
+        // Displacements, in the same order: 90, 82, 74, …, 18 ms.
+        assert_eq!(p.displacement_ns.p50, 50e6);
+        assert_eq!(p.displacement_ns.p90, 82e6);
+        assert_eq!(p.displacement_ns.p99, 90e6);
+        assert_eq!(p.displacement_ns.max, 90e6);
+
+        // Each of these was overtaken by the datagram sent 1 µs after it, so
+        // the excess is uniformly one microsecond above the displacement.
+        assert_eq!(p.transit_excess_ns.p50, 50e6 + 1_000.0);
+        assert_eq!(p.transit_excess_ns.max, 90e6 + 1_000.0);
+    }
+
+    /// The distinction the old counter could not draw: a gap the horizon slid
+    /// past is loss, and nothing else in the record says so.
+    #[test]
+    fn a_gap_the_horizon_slides_past_is_loss_not_reordering() {
+        let mut t = SeqTracker::new();
+        let horizon = t.profile().horizon;
+        for seq in 0..=(horizon + 1000) {
+            if seq == 10 {
+                continue;
+            }
+            t.observe_stamped(seq, at(seq, seq * 1_000_000));
+        }
+        let p = t.profile();
+        assert_eq!(p.gaps_lost, 1, "seq 10 was never going to arrive");
+        assert_eq!(p.gaps_filled, 0);
+        assert_eq!(p.gaps_open_at_end, 0);
+        assert_eq!(p.late_datagrams, 0, "loss is not reordering");
+    }
+
+    /// The other half of the same distinction: a gap the rung ended on is
+    /// neither, and must be reported as its own quantity rather than folded
+    /// into loss (the datagram may well have arrived a millisecond later).
+    #[test]
+    fn a_gap_still_open_when_the_rung_ends_is_classified_as_neither() {
+        let mut t = SeqTracker::new();
+        for seq in 0..=100u64 {
+            if seq == 50 {
+                continue;
+            }
+            t.observe_stamped(seq, at(seq, seq * 1_000_000));
+        }
+        let p = t.profile();
+        assert_eq!(p.gaps_open_at_end, 1);
+        assert_eq!(p.gaps_lost, 0, "the horizon never reached it");
+        assert_eq!(p.gaps_filled, 0);
+    }
+
+    /// A rung whose first datagrams never arrive still accounts for them: the
+    /// baseline opens the sequence numbers below the first arrival rather than
+    /// pretending the stream started there.
+    #[test]
+    fn sequence_numbers_below_the_first_arrival_are_still_accounted() {
+        let mut t = SeqTracker::new();
+        for seq in 3..=100u64 {
+            t.observe_stamped(seq, at(seq, seq * 1_000_000));
+        }
+        assert_eq!(
+            t.profile().gaps_open_at_end,
+            3,
+            "0, 1 and 2 are unaccounted"
+        );
+
+        // And one of them turning up late is a fill like any other.
+        assert!(t.observe_stamped(1, at(1, 200_000_000)));
+        let p = t.profile();
+        assert_eq!(p.gaps_filled, 1);
+        assert_eq!(p.gaps_open_at_end, 2);
+        assert_eq!(p.distance.max, 99.0, "highest seen was 100");
+    }
+
+    #[test]
+    fn a_duplicate_is_neither_a_fill_nor_a_loss() {
+        let mut t = SeqTracker::new();
+        for seq in 0..100u64 {
+            t.observe_stamped(seq, at(seq, seq * 1_000_000));
+        }
+        assert!(!t.observe_stamped(50, at(50, 200_000_000)));
+        let p = t.profile();
+        assert_eq!(p.gaps_filled, 0);
+        assert_eq!(p.late_datagrams, 0);
+        assert_eq!(p.distance.count, 0);
+        assert_eq!(t.duplicates(), 1);
+
+        // A late datagram that then repeats fills its gap exactly once.
+        let mut u = SeqTracker::new();
+        for seq in [0u64, 1, 3] {
+            u.observe_stamped(seq, at(seq, seq * 1_000_000));
+        }
+        assert!(u.observe_stamped(2, at(2, 9_000_000)));
+        assert!(!u.observe_stamped(2, at(2, 10_000_000)));
+        let p = u.profile();
+        assert_eq!(p.gaps_filled, 1);
+        assert_eq!(p.distance.count, 1);
+        assert_eq!(u.duplicates(), 1);
+    }
+
+    /// The bound the receiver runs under, stated as a test: a sender — broken
+    /// or hostile — can name any sequence number in a 64-bit space, and the
+    /// bookkeeping must not follow it. Nothing here may allocate per skipped
+    /// sequence number, and the record must say how much it could not attribute
+    /// rather than quietly booking it as loss.
+    ///
+    /// If the forward-jump bound is taken out — the obvious "just track every
+    /// gap" version — this test does not fail, it never returns, because the
+    /// obvious version walks 2^64 sequence numbers. That is the failure mode
+    /// the bound exists for, and it is why the assertion is on the horizon
+    /// rather than on the count of gaps the ledger happens to hold.
+    #[test]
+    fn a_wild_sequence_number_is_bounded_not_allocated() {
+        let mut t = SeqTracker::new();
+        let horizon = t.profile().horizon;
+
+        t.observe_stamped(0, at(0, 0));
+        t.observe_stamped(u64::MAX, at(u64::MAX, 1_000_000));
+        let p = t.profile();
+        assert_eq!(
+            p.gaps_open_at_end,
+            horizon - 1,
+            "only the horizon's worth of the jump is tracked"
+        );
+        assert_eq!(
+            p.gaps_beyond_horizon,
+            u64::MAX - horizon,
+            "the rest is unattributable and says so"
+        );
+        assert_eq!(p.gaps_lost, 0, "an unreachable gap is not a measured loss");
+
+        // An arrival further behind than the horizon cannot be matched to a
+        // gap; it counts as an arrival and as reordering, and is called out.
+        assert!(t.observe_stamped(1, at(1, 2_000_000)));
+        let p = t.profile();
+        assert_eq!(p.late_beyond_horizon, 1);
+        assert_eq!(p.gaps_filled, 0);
+        assert_eq!(p.late_datagrams, 1);
+        assert_eq!(t.received(), 3);
+    }
+
+    /// Whatever the arrival order, the reordering counter and the ledger must
+    /// agree: every late datagram is either a gap it filled or one the horizon
+    /// had already let go.
+    #[test]
+    fn the_ledger_and_the_reordering_counter_never_disagree() {
+        let mut t = SeqTracker::new();
+        let mut order: Vec<u64> = (0..2_000).collect();
+        // A deterministic shuffle with a long-distance component.
+        for i in 0..order.len() {
+            let j = (i * 7 + 13) % order.len();
+            order.swap(i, j);
+        }
+        for (n, seq) in order.iter().enumerate() {
+            t.observe_stamped(*seq, at(*seq, n as u64 * 1_000));
+        }
+        let p = t.profile();
+        assert_eq!(p.late_datagrams, t.reordered());
+        assert_eq!(p.gaps_filled + p.late_beyond_horizon, p.late_datagrams);
+        assert_eq!(p.gaps_lost, 0, "everything did arrive");
+        assert_eq!(p.gaps_open_at_end, 0);
+        assert_eq!(t.received(), 2_000);
         assert_eq!(t.duplicates(), 0);
     }
 

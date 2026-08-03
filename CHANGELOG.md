@@ -460,6 +460,29 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **The testbed's raw UDP controls now report a reorder *distance* distribution, in both
+  directions.** They counted a datagram as reordered when it arrived below the highest
+  sequence seen, which says a path reorders and sizes nothing: a transport's reordering
+  tolerance is a distance and a duration. On the production test path the downstream
+  control has measured 60 Mbit/s carried at 1.1% loss while 13–14% of datagrams reordered,
+  and at 20 Mbit/s 13.4% reordering against 0.12% loss — separable quantities that a single
+  counter cannot separate. Each rung now records the distance behind the highest seen
+  (`p50`/`p90`/`p95`/`p99`/`max`), the receiver-side time displacement between the arrival
+  that revealed a gap and the arrival that filled it — the quantity a RACK-style threshold
+  is sized in — and, correcting for the head start the late datagram had on its overtaker
+  using the send stamps both directions now carry, the extra transit time the path added.
+  Loss and reordering are classified per gap rather than inferred: a gap a later arrival
+  filled is reordering, one the receiver's window slid past is loss, and one still open when
+  the rung ended is neither and is reported as its own number instead of being folded into
+  either. The receiver's bookkeeping is a fixed 4096-slot array allocated once, so a rung of
+  100 000 datagrams — or a sender naming arbitrary 64-bit sequence numbers — cannot grow it;
+  what falls outside that window is counted and named rather than silently booked as loss.
+  The client → server echo control gained the same instrumentation by numbering and stamping
+  its own datagrams in bytes that were already filler, so the daemon, the datagram size, the
+  rate ladder and the pacing are all unchanged and the numbers stay comparable with runs
+  already taken. `analyze.py` prints both directions side by side and flags a tail that
+  reached the instrument's window rather than the path's.
+
 - **`testbed/` — a real-network (WAN) test harness.** A new sibling crate with two
   binaries: `phantom-testd`, a daemon that binds every network-testable leg
   (PhantomUDP, Phantom-over-TCP, mimic-TLS) from a single persisted identity plus raw

@@ -139,6 +139,55 @@ Useful flags: `--legs udp,tcp,mimic,quic,raw_tcp,raw_udp`,
 state throughout, and the daemon reports its own in `STATS` — during a download the
 server is the sender, so the client's window is not the one that governs it.
 
+### Reordering: how far back, and how long after
+
+Both raw UDP controls — the client → server echo and the server → client
+downstream source — number every datagram and stamp it, so each rung reports a
+**reorder distance distribution** rather than a count. The count was not enough
+to size anything: this path has been measured delivering 60 Mbit/s at 1.1% loss
+while reordering 13–14% of datagrams, and a transport's tolerance for that is a
+distance and a duration, both of which have to clear the tail rather than the
+middle. Each rung's `reorder` object carries:
+
+| Field | What it sizes |
+|---|---|
+| `distance` | sequence numbers behind the highest seen, over late datagrams — a packet-threshold rule |
+| `displacement_ns` | nanoseconds between the arrival that revealed a gap and the arrival that filled it — a receiver-side (RACK-style) time threshold |
+| `transit_excess_ns` | that plus the head start the late datagram had on its overtaker, from the two send stamps — how much longer the path took over it |
+| `gaps_filled` / `gaps_lost` / `gaps_open_at_end` | reordering / loss / neither |
+| `horizon`, `gaps_beyond_horizon`, `late_beyond_horizon` | the receiver's own bound, and what fell outside it |
+
+Each of the three is a full percentile summary (`p50`, `p90`, `p95`, `p99`,
+`p999`, `min`, `max`, `mean`, `count`), computed with the same nearest-rank
+definition as everything else here.
+
+**Loss and reordering are separated per gap, not inferred from a count.** A gap
+a later arrival filled is reordering. A gap the receiver's window slid past
+unfilled is loss. A gap still open when the rung ended is *neither*, and is
+reported as its own number rather than folded into either — the datagram may
+well have arrived a millisecond after the rung stopped listening. The aggregate
+`loss_fraction` is a separate statement and stays what it was: what arrived
+against what the sender says it sent.
+
+**The receiver's bookkeeping is bounded.** It is a fixed array of 4096 slots,
+allocated once, whatever the rung's length and whatever sequence numbers turn up
+in it — a rung at the top of the ladder carries ~100 000 datagrams and a broken
+sender could name any of 2^64. Four thousand datagrams is about a fifth of a
+second at the top of the ladder and the whole rung at the bottom, which is what
+makes "slid past unfilled" a defensible reading of "lost". What happens at the
+cap is in the record, not hidden: a forward jump larger than the whole window
+leaves sequence numbers that can never be attributed (`gaps_beyond_horizon`), an
+arrival further behind than the window reaches cannot be matched to a gap
+(`late_beyond_horizon`), and `analyze.py` says so when the worst distance
+observed reaches the horizon, because then the tail is the instrument's rather
+than the path's.
+
+The echo control's figures are **round-trip**: a datagram counted there crossed
+the path twice, so its distances bound the two directions together and neither
+alone. The downstream control's are one-way. The daemon is unchanged by any of
+this — it echoes bytes and keeps no state, so the sequence number and stamp ride
+in what was already filler, at the same datagram size, on the same rate ladder.
+
 ### What the reference leg covers
 
 | Scenario | On `quic` |
@@ -175,6 +224,10 @@ Client, under `results/<run-id>/`:
   total or app-limited flag, so those stay zero rather than being approximated,
   and `state` reads `quic:cubic`. quinn's loss and MTU counters, which have no
   field in the record, appear in each transfer's summary notes instead
+- `samples/raw_udp/downstream.jsonl` and `samples/raw_udp/throughput.jsonl` — one
+  record per rate rung of each raw control, carrying both ends' accounts and the
+  reorder distributions described above. `analyze.py` prints them under
+  "Raw UDP reordering and the loss it is not"
 - `summary.json`, `errors.jsonl`
 
 Server, under `/var/lib/phantom-testd/`:
