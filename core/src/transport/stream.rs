@@ -138,6 +138,11 @@ struct PendingData {
     /// stamps the segment on its first transmission; from then on it is pinned
     /// alongside `delivered_at_send`.
     delivered_time_at_send: Option<std::time::Instant>,
+    /// Whether the connection was inside an application-limited phase when this
+    /// segment was **first** put on the wire. Pinned across retransmission for
+    /// the same reason the delivery marks are: the sample this segment will
+    /// produce describes the flight it left with.
+    app_limited_at_send: bool,
     #[allow(dead_code)]
     retries: u32,
     /// Flagged lost by the SACK-driven loss detector (RFC 9002 packet- or
@@ -174,6 +179,12 @@ pub struct RetiredSegment {
     /// is stamped by the same `poll_send` pass that first put the segment on
     /// the wire.
     pub delivered_time_at_send: Option<std::time::Instant>,
+    /// Whether the connection was application-limited when this segment was
+    /// first sent. Feeds `DeliverySample::is_app_limited`, which decides whether
+    /// the sample may set the bandwidth maximum and whether its round's loss
+    /// rate is judged at all — so it has to describe the flight the segment left
+    /// with, not the phase in force when its acknowledgement happened to arrive.
+    pub app_limited_at_send: bool,
 }
 
 /// One segment newly declared lost by [`Stream::on_sack`]'s RFC-9002 loss
@@ -232,13 +243,14 @@ pub struct OutboundSegment {
 ///
 /// The three answers are not interchangeable, and collapsing them into a bare
 /// `None` cost the congestion controller the one signal it cannot derive for
-/// itself. `Idle` and `FlowControl` both mean the sender was *not* held back by
-/// its own congestion window — in the first case because the application had
-/// nothing more to give, in the second because the peer's receive window is
-/// closed — so a round that ends either way says nothing about where the path's
-/// knee is. `CongestionWindow` is the opposite: it is the controller enforcing
-/// its own decision about how much may be outstanding, and a round that ends
-/// there is exactly the kind a loss response exists to judge.
+/// itself: `Idle` says the application ran out of data, which is the whole
+/// content of BBR's application-limited flag. The other two are statements that
+/// a stream *had* data and something refused to carry it — the local
+/// controller's own window in one case, the peer's advertised window in the
+/// other — and neither is a statement about the sender's supply. Keeping the
+/// peer's answer distinct matters beyond bookkeeping: it is the one of the three
+/// a remote party chooses, and it must not be able to reach a local
+/// congestion-control decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendBlocked {
     /// Nothing buffered: every segment has been sent and none is due for
@@ -927,6 +939,7 @@ impl Stream {
             sent_at: None,
             delivered_at_send: 0,
             delivered_time_at_send: None,
+            app_limited_at_send: false,
             retries: 0,
             lost: false,
             fin: false,
@@ -969,6 +982,7 @@ impl Stream {
             sent_at: None,
             delivered_at_send: 0,
             delivered_time_at_send: None,
+            app_limited_at_send: false,
             retries: 0,
             lost: false,
             fin: false,
@@ -994,6 +1008,7 @@ impl Stream {
             sent_at: None,
             delivered_at_send: 0,
             delivered_time_at_send: None,
+            app_limited_at_send: false,
             retries: 0,
             lost: false,
             fin: true,
@@ -1038,6 +1053,7 @@ impl Stream {
             sent_at: None,
             delivered_at_send: 0,
             delivered_time_at_send: None,
+            app_limited_at_send: false,
             retries: 0,
             lost: false,
             fin: true,
@@ -1109,6 +1125,13 @@ impl Stream {
     /// Pass 0); only `sent_at` moves, because only the timers care which copy
     /// went out last.
     ///
+    /// `app_limited_now` is the connection's application-limited phase as it
+    /// stands right now, and it is stamped alongside the pair above for the same
+    /// reason they are: it is a property of the flight this segment is joining,
+    /// not of the moment its acknowledgement happens to arrive. Read at
+    /// acknowledgement time instead, it retroactively labels bytes that went out
+    /// at full rate with a phase that opened after they left.
+    ///
     /// `cwnd_budget` is how many bytes of *new* data the congestion window
     /// currently permits. Retransmissions ignore it — loss recovery must always
     /// proceed — but a first transmission is withheld when it would exceed the
@@ -1119,6 +1142,7 @@ impl Stream {
         cwnd_budget: u64,
         delivered_now: u64,
         delivered_time_now: std::time::Instant,
+        app_limited_now: bool,
     ) -> Result<OutboundSegment, SendBlocked> {
         // Unreliable data is fire-and-forget and not congestion-controlled.
         if let Some(data) = self.unreliable_buffer.lock().await.pop_front() {
@@ -1213,6 +1237,7 @@ impl Stream {
                 pending.sent_at = Some(now);
                 pending.delivered_at_send = delivered_now;
                 pending.delivered_time_at_send = Some(delivered_time_now);
+                pending.app_limited_at_send = app_limited_now;
                 return Ok(OutboundSegment {
                     stream_offset: pending.stream_offset,
                     data: pending.data.clone(),
@@ -1378,6 +1403,7 @@ impl Stream {
                     was_retransmit,
                     delivered_at_send: pending.delivered_at_send,
                     delivered_time_at_send: pending.delivered_time_at_send,
+                    app_limited_at_send: pending.app_limited_at_send,
                 });
                 // Do NOT advance `i`: `remove` shifted the next element into `i`.
             } else {
@@ -1658,7 +1684,7 @@ mod tests {
 
         // Poll send twice, the second should be None because it's already sent and hasn't timed out
         let seg = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .unwrap();
         assert_eq!(seg.stream_offset, 0);
@@ -1667,7 +1693,7 @@ mod tests {
         assert!(!seg.retransmit);
 
         let seg2 = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .unwrap();
         assert_eq!(seg2.stream_offset, 1);
@@ -1676,7 +1702,7 @@ mod tests {
         assert!(!seg2.retransmit);
 
         assert!(stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .is_err());
     }
@@ -1727,7 +1753,7 @@ mod tests {
 
         // First send — not a retransmission.
         let seg = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .unwrap();
         assert_eq!(seg.stream_offset, 0);
@@ -1736,7 +1762,7 @@ mod tests {
 
         // Immediate poll should be None
         assert!(stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .is_err());
 
@@ -1744,7 +1770,7 @@ mod tests {
         // no RTT samples yet, so the timer sits at the 1-second default).
         tokio::time::advance(std::time::Duration::from_millis(400)).await;
         assert!(stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .is_err());
 
@@ -1753,7 +1779,7 @@ mod tests {
 
         // Now it should retransmit — flagged as a retransmission.
         let seg2 = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .unwrap();
         assert_eq!(seg2.stream_offset, 0);
@@ -1767,7 +1793,7 @@ mod tests {
 
         // Poll again - queue is empty
         assert!(stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .is_err());
     }
@@ -1783,13 +1809,13 @@ mod tests {
         // First poll stamps `sent_at`; an immediate re-poll yields nothing
         // (treated as in-flight, not yet timed out).
         let seg = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .unwrap();
         assert_eq!(seg.stream_offset, 0);
         assert!(!seg.retransmit);
         assert!(stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .is_err());
 
@@ -1800,7 +1826,7 @@ mod tests {
         // It is re-offered immediately — without advancing past the RTO — and as
         // a fresh send (Pass 2), not a retransmission.
         let seg2 = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .unwrap();
         assert_eq!(seg2.stream_offset, 0);
@@ -1812,7 +1838,7 @@ mod tests {
         assert!(stream.ack(0).await.is_some());
         stream.mark_unsent(0).await; // no panic, no effect
         assert!(stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .is_err());
     }
@@ -1832,11 +1858,11 @@ mod tests {
         stream.send_reliable(Bytes::from("bbbb")).await.unwrap();
 
         let first = stream
-            .poll_send(u64::MAX, 10_000, std::time::Instant::now())
+            .poll_send(u64::MAX, 10_000, std::time::Instant::now(), false)
             .await
             .unwrap();
         let second = stream
-            .poll_send(u64::MAX, 25_000, std::time::Instant::now())
+            .poll_send(u64::MAX, 25_000, std::time::Instant::now(), false)
             .await
             .unwrap();
         assert_ne!(first.stream_offset, second.stream_offset);
@@ -1852,6 +1878,58 @@ mod tests {
             stamps,
             vec![10_000, 25_000],
             "each segment reports the counter as of its own transmission"
+        );
+    }
+
+    /// The application-limited phase belongs to the segment, stamped when it
+    /// went out — not to the moment its acknowledgement arrives.
+    ///
+    /// This is the difference between "these bytes left while the sender had
+    /// nothing more to give" and "these bytes are being acknowledged now, and
+    /// the sender happens to have nothing more to give *now*". The second is
+    /// true of the tail of every flight ever sent, so reading the flag at
+    /// acknowledgement time labels the whole flight — including the part that
+    /// went out at full rate — with a phase that opened after it left. Those are
+    /// exactly the samples the bandwidth filter needs.
+    #[tokio::test]
+    async fn a_retired_segment_reports_the_app_limited_phase_of_its_own_send() {
+        let stream = Stream::new(1);
+        stream
+            .send_reliable(Bytes::from("full-rate"))
+            .await
+            .unwrap();
+        stream
+            .send_reliable(Bytes::from("ran-dry!!"))
+            .await
+            .unwrap();
+
+        // The first segment leaves while the connection is sending at full
+        // rate; the second leaves after the sender has been marked.
+        let saturated = stream
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+            .await
+            .unwrap();
+        let starved = stream
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), true)
+            .await
+            .unwrap();
+
+        // Both are acknowledged by one SACK, arriving at a single instant with a
+        // single connection-level phase in force. Only a per-segment stamp can
+        // tell them apart.
+        let sack = Sack::from_received(&[saturated.stream_offset, starved.stream_offset], 0)
+            .expect("sack covering both");
+        let retired = stream.on_sack(&sack).await.retired;
+        assert_eq!(retired.len(), 2, "both segments are covered");
+
+        let mut flags: Vec<bool> = retired.iter().map(|r| r.app_limited_at_send).collect();
+        flags.sort_unstable();
+        assert_eq!(
+            flags,
+            vec![false, true],
+            "the two segments came back with the same phase; the flag was read from \
+             the connection when the acknowledgement landed rather than stamped on \
+             each segment when it went out"
         );
     }
 
@@ -1874,14 +1952,14 @@ mod tests {
                 .unwrap();
         }
         let head = stream
-            .poll_send(u64::MAX, 1_000, std::time::Instant::now())
+            .poll_send(u64::MAX, 1_000, std::time::Instant::now(), false)
             .await
             .unwrap();
         assert!(!head.retransmit);
         let mut acked = Vec::new();
         for _ in 0..5u32 {
             let seg = stream
-                .poll_send(u64::MAX, 1_000, std::time::Instant::now())
+                .poll_send(u64::MAX, 1_000, std::time::Instant::now(), false)
                 .await
                 .expect("in flight");
             acked.push(seg.stream_offset);
@@ -1897,7 +1975,7 @@ mod tests {
         );
 
         let again = stream
-            .poll_send(u64::MAX, 7_000, std::time::Instant::now())
+            .poll_send(u64::MAX, 7_000, std::time::Instant::now(), false)
             .await
             .unwrap();
         assert!(again.retransmit, "expected the fast-retransmit pass");
@@ -1929,7 +2007,7 @@ mod tests {
 
         // Budget of 10 admits the 10-byte head segment.
         let seg = stream
-            .poll_send(10, 0, std::time::Instant::now())
+            .poll_send(10, 0, std::time::Instant::now(), false)
             .await
             .unwrap();
         assert_eq!(seg.data.len(), 10);
@@ -1937,13 +2015,13 @@ mod tests {
 
         // Budget of 4 is too small for the next (5-byte) segment → withheld.
         assert!(stream
-            .poll_send(4, 0, std::time::Instant::now())
+            .poll_send(4, 0, std::time::Instant::now(), false)
             .await
             .is_err());
 
         // A budget of 5 now admits it.
         let seg2 = stream
-            .poll_send(5, 0, std::time::Instant::now())
+            .poll_send(5, 0, std::time::Instant::now(), false)
             .await
             .unwrap();
         assert_eq!(seg2.data, Bytes::from("abcde"));
@@ -2032,7 +2110,7 @@ mod tests {
             assert_eq!(seq, i);
             // Stamp it as in-flight so RTT sampling has a `sent_at`.
             let seg = stream
-                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
                 .await
                 .expect("poll");
             assert_eq!(seg.stream_offset, i);
@@ -2079,7 +2157,7 @@ mod tests {
                 .unwrap();
             assert_eq!(seq, i);
             let seg = stream
-                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
                 .await
                 .expect("poll"); // stamps sent_at
             assert_eq!(seg.stream_offset, i);
@@ -2104,7 +2182,7 @@ mod tests {
         let stream = Stream::new(1);
         stream.send_reliable(Bytes::from("zero")).await.unwrap(); // seq 0
         let _ = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .expect("poll");
 
@@ -2123,14 +2201,14 @@ mod tests {
         let stream = Stream::new(1);
         stream.send_reliable(Bytes::from("payload")).await.unwrap(); // seq 0
         let _ = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .expect("first send");
 
         // Force a retransmit by crossing the RTO, so retries > 0.
         tokio::time::advance(Duration::from_millis(1100)).await;
         let retx = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .expect("retransmit");
         assert!(retx.retransmit);
@@ -2163,7 +2241,7 @@ mod tests {
                 .await
                 .unwrap();
             let _ = stream
-                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
                 .await
                 .expect("in-flight");
         }
@@ -2177,7 +2255,7 @@ mod tests {
         );
         // Pass-0 re-sends a flagged segment even with a closed congestion window.
         let seg = stream
-            .poll_send(0, 0, std::time::Instant::now())
+            .poll_send(0, 0, std::time::Instant::now(), false)
             .await
             .expect("Pass-0 fast-retransmit must ignore the congestion window");
         assert!(seg.retransmit, "Pass-0 segment is a retransmit");
@@ -2204,7 +2282,7 @@ mod tests {
             .await
             .unwrap(); // offset 0
         let _ = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .expect("send 0");
         tokio::time::advance(Duration::from_millis(10)).await;
@@ -2222,11 +2300,11 @@ mod tests {
             .await
             .unwrap(); // offset 2
         let _ = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .expect("send 1");
         let _ = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .expect("send 2");
         tokio::time::advance(Duration::from_millis(50)).await;
@@ -2260,7 +2338,7 @@ mod tests {
                 .await
                 .unwrap();
             let _ = stream
-                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
                 .await
                 .expect("in flight");
         }
@@ -2290,7 +2368,7 @@ mod tests {
             // Stand in for the pump: Pass-0 answers the flag and clears it,
             // which is what re-armed the packet threshold on the next ack.
             if let Ok(seg) = stream
-                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
                 .await
             {
                 assert!(seg.retransmit, "Pass-0 hands back a retransmission");
@@ -2348,7 +2426,7 @@ mod tests {
             .await
             .unwrap();
         let _ = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .expect("send offset 0");
         tokio::time::advance(Duration::from_millis(10)).await;
@@ -2363,7 +2441,7 @@ mod tests {
                 .await
                 .unwrap();
             let _ = stream
-                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
                 .await
                 .expect("in flight");
         }
@@ -2375,7 +2453,7 @@ mod tests {
             "first detection"
         );
         let resend = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .expect("Pass-0 fast-retransmit");
         assert_eq!(resend.stream_offset, 1);
@@ -2412,7 +2490,7 @@ mod tests {
             // regression fails the assertion below instead of hanging.
             for _ in 0..4 {
                 match stream
-                    .poll_send(u64::MAX, 0, std::time::Instant::now())
+                    .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
                     .await
                 {
                     Ok(seg) => {
@@ -2476,7 +2554,7 @@ mod tests {
         for _ in 0..SEGMENTS {
             stream.send_reliable(payload.clone()).await.unwrap();
             let sent = stream
-                .poll_send(u64::MAX, est.delivered_bytes(), est.delivered_time())
+                .poll_send(u64::MAX, est.delivered_bytes(), est.delivered_time(), false)
                 .await
                 .expect("in flight");
             est.on_send(sent.data.len() as u64);
@@ -2494,7 +2572,7 @@ mod tests {
             // 3; the pump answers by resending it, which is where the mark used
             // to move.
             if let Ok(seg) = stream
-                .poll_send(u64::MAX, est.delivered_bytes(), est.delivered_time())
+                .poll_send(u64::MAX, est.delivered_bytes(), est.delivered_time(), false)
                 .await
             {
                 assert!(seg.retransmit);
@@ -2978,7 +3056,7 @@ mod tests {
         stream.queue_fin().await.expect("queue_fin");
 
         let seg = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .expect("must yield FIN segment");
         assert!(
@@ -3004,7 +3082,7 @@ mod tests {
 
         // Poll the FIN out (stamps sent_at, keeps it in buffer until ACKed).
         let seg = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .expect("FIN segment");
         assert_eq!(stream.pending_send_count().await, 1, "still buffered");
@@ -3032,7 +3110,9 @@ mod tests {
         stream.queue_fin().await.expect("queue_fin");
 
         // Pass budget = 0 — a normal data segment would be withheld.
-        let seg = stream.poll_send(0, 0, std::time::Instant::now()).await;
+        let seg = stream
+            .poll_send(0, 0, std::time::Instant::now(), false)
+            .await;
         assert!(seg.is_ok(), "FIN must be emitted even when cwnd_budget = 0");
         let seg = seg.unwrap();
         assert!(seg.fin, "segment must be the FIN sentinel");
@@ -3049,7 +3129,7 @@ mod tests {
 
         // First send.
         let seg = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .expect("first FIN");
         assert!(seg.fin);
@@ -3057,7 +3137,7 @@ mod tests {
 
         // Immediate re-poll: nothing (in-flight, RTO not elapsed).
         assert!(stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .is_err());
 
@@ -3065,7 +3145,7 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_millis(1100)).await;
 
         let retx = stream
-            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .expect("FIN retransmit");
         assert!(retx.fin, "retransmit must still carry fin = true");

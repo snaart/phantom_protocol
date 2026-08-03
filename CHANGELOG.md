@@ -349,6 +349,57 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   **Sender-local accounting only: no wire-format, handshake or key-schedule change, and
   old and new peers interoperate unchanged.**
 
+- **ProbeRTT timed a path it had not emptied, so the min-RTT filter could only ever
+  ratchet upward.** Entering ProbeRTT cuts the congestion window to four packets; it does
+  not retire the bytes already sitting in the bottleneck's queue, and until those have
+  been served every round trip the sender times still includes them. The window was
+  clocked from entry for a flat 200 ms, which on a converged flow is not enough time for
+  the queue to drain — at 600 KB/s a 240 KB backlog needs 400 ms of bottleneck service
+  before a single packet crosses an empty path. Because the filter is a ten-second
+  *minimum*, an unrefreshed one takes the smallest inflated sample available, so `min_rtt`
+  climbs to `prop + 2 × min_rtt_old`, `bdp = btl_bw × min_rtt` climbs with it, `cwnd`
+  with that, and the queue grows again. ProbeRTT now waits for `inflight` to fall to the
+  ProbeRTT window and holds `max(200 ms, one round trip)` from *that* instant, bounded by
+  a ceiling of two round trips of drain allowance plus the hold — retransmissions bypass
+  the congestion window, so a path losing enough to keep the sender resending must not be
+  able to pin it at the 5600-byte floor. Both the hold and the ceiling are derived from
+  the round trip as it stood at entry, so a successful probe lowering `min_rtt` cannot
+  shrink the ceiling out from under the hold it bounds.
+
+- **Unreliable datagrams were counted as congestion-controlled inflight.** `send_unreliable`
+  data went out through the same accounting as reliable data, but nothing acknowledges an
+  unreliable datagram, so no arrival ever subtracted it. The debt was permanent: it shrank
+  `cwnd − inflight` for the reliable data behind it for the rest of the session, and past
+  5600 bytes it also put ProbeRTT's drain condition permanently out of reach. Only
+  segments the ARQ tracks are booked now.
+
+- **The bandwidth filter never learned anything from a sender whose writes are smaller
+  than a congestion window.** Request/response is the shape of most traffic and of the
+  reference server's own handler, and every such write empties the send buffer, so every
+  round is application-limited. Such a round's delivery rate may not *set* the filter's
+  maximum — it measures the application, not the path — but a sample at or above the
+  current maximum is still a valid lower bound on capacity, and admitting it is the only
+  way such a flow measures anything at all. Without that escape (canonical BBR's
+  `!rs->is_app_limited || bw >= bbr_max_bw(sk)`) `btl_bw` stayed at zero, `bdp` with it,
+  and the window sat on its `4 × MIN_PACKET_SIZE` floor — about 25 KB/s on a 226 ms path,
+  for a flow whose problem was never congestion.
+
+### Changed
+
+- **`Stream::poll_send` (public, `phantom_protocol::transport::stream`) returns
+  `Result<OutboundSegment, SendBlocked>` instead of `Option<OutboundSegment>`, and takes a
+  fourth argument.** A pass that comes up empty because the application ran dry, because
+  the local congestion window is full, and because the *peer's* advertised receive window
+  is full are three different statements about the connection, and only the first is BBR's
+  application-limited signal — which the send loop is the only place that can observe. The
+  new `SendBlocked` enum carries that distinction; the new `app_limited_now: bool` argument
+  is stamped onto each segment's first transmission and reported back on
+  `RetiredSegment::app_limited_at_send`, so the phase a `DeliverySample` carries is the one
+  the segment was *sent* in rather than whichever phase happened to be in force when its
+  acknowledgement arrived. A peer's advertised window is deliberately not routed into the
+  flag: it gates the loss response, the Startup judgement and the bandwidth filter, and no
+  remote party may hold that switch.
+
 ### Added
 
 - **`testbed/` — a real-network (WAN) test harness.** A new sibling crate with two

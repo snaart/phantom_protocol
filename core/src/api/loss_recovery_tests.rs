@@ -121,6 +121,7 @@ use tokio::time::timeout;
 use crate::api::session::{ConnectionState, PhantomSession, SessionTransport};
 use crate::errors::CoreError;
 use crate::test_harness::fault_transport::{FaultControl, LossyTransport};
+use crate::transport::bandwidth_estimator::BbrState;
 use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer, ServerReply};
 
 // ── Local in-memory transport (mirrors the one in session::tests) ────────────
@@ -928,24 +929,26 @@ async fn handshaken_pair() -> (
 
 /// **The app-limited signal, through the real pump.**
 ///
-/// The plumbing under test spans three places: the drain classifies why it
-/// stopped, the pump turns that into `Session::set_app_limited`, and the
-/// acknowledgement path stamps the connection's app-limited phase onto every
-/// `DeliverySample` it builds. Each hop has a unit test; none of them proves the
-/// three are wired to one another, and the defect they fix was precisely that
-/// the last hop was a literal `false`.
+/// The plumbing under test spans four places: the drain classifies why it
+/// stopped, the pump turns that into `Session::note_app_limited_drain`,
+/// `Stream::poll_send` stamps the resulting phase onto each segment it puts on
+/// the wire, and the acknowledgement path carries that stamp back into the
+/// `DeliverySample`. Each hop has a unit test; none of them proves the four are
+/// wired to one another, and the defect they fix was precisely that the last hop
+/// was a literal `false`.
 ///
-/// The observable chosen is `bottleneck_bandwidth()`, because it is the one the
-/// flag is supposed to gate: an app-limited sample must not reach the delivery-
-/// rate maximum filter, since the rate it reports is the application's and not
-/// the path's. A single small message is entirely app-limited — the drain runs
-/// dry with the whole window free — so no estimate may come out of it. A bulk
-/// transfer that fills the window is not, and must produce one.
+/// A single small message is entirely application-limited — the drain runs dry
+/// with the whole window free — and the connection must say so. A bulk transfer
+/// that fills the window many times over is not, and both of the things the flag
+/// gates must be visible afterwards: the bandwidth filter must have taken the
+/// transfer's far higher delivery rate, and Startup must have been judged and
+/// left. `check_startup_full_bandwidth` returns early on an app-limited round,
+/// so a sender that marks every round can never conclude the pipe is full, never
+/// leaves Startup, and (`update_state` excludes Startup) never runs ProbeRTT for
+/// the life of the connection.
 ///
-/// That second half is what makes this two-sided: "mark every round
-/// app-limited" satisfies the first assertion while starving the bandwidth
-/// filter for the life of every connection, pinning `cwnd = 2 × btl_bw ×
-/// min_rtt` on its 5600-byte floor.
+/// That second half is what makes this two-sided against the trivial "mark
+/// everything" implementation.
 #[tokio::test]
 async fn the_app_limited_flag_reaches_the_estimator_through_the_pump() {
     const CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
@@ -979,10 +982,11 @@ async fn the_app_limited_flag_reaches_the_estimator_through_the_pump() {
         "after a single small message the sender is plainly application-limited, and \
          the connection is not marked"
     );
+    let application_rate = snap.bottleneck_bw_bps;
     assert_eq!(
-        snap.bottleneck_bw_bps, 0,
-        "an application-limited round's delivery rate reached the bandwidth filter — it \
-         measures how fast the application wrote, not how fast the path carries"
+        snap.state,
+        BbrState::Startup,
+        "precondition: nothing has told the controller the pipe is full yet"
     );
 
     // ── A bulk transfer that fills the window ───────────────────────────
@@ -998,11 +1002,84 @@ async fn the_app_limited_flag_reaches_the_estimator_through_the_pump() {
     }
     assert_eq!(received, bulk, "the bulk transfer must arrive byte-exact");
 
+    let snap = congestion.bandwidth_snapshot();
     assert!(
-        congestion.bandwidth_snapshot().bottleneck_bw_bps > 0,
-        "a transfer that filled the congestion window produced no bandwidth estimate — \
-         every round was marked app-limited, which starves the filter and pins the \
-         window on its floor"
+        snap.bottleneck_bw_bps > application_rate * 10,
+        "the bulk transfer moved the bandwidth estimate from {application_rate} B/s only \
+         to {} B/s — the flight that filled the window was labelled with a phase that \
+         opened after it left, and its samples were excluded from the filter",
+        snap.bottleneck_bw_bps
+    );
+    assert_ne!(
+        snap.state,
+        BbrState::Startup,
+        "the connection is still in Startup after a transfer that filled the window \
+         several times over — `check_startup_full_bandwidth` returns early on an \
+         app-limited round, so a sender marked in every round can never judge that \
+         the pipe is full, and never runs ProbeRTT either"
+    );
+
+    server.disconnect().await.expect("server clean disconnect");
+    client.disconnect().await.expect("client clean disconnect");
+}
+
+/// **A sender whose every write is smaller than a congestion window must still
+/// be able to measure the path.**
+///
+/// Request/response is the shape of most of what runs over a transport, and it
+/// is the shape of the reference server's own echo handler: a few kilobytes go
+/// out, the peer answers, a few more go out. Each of those writes empties the
+/// send buffer, so every drain pass ends because the application ran dry — which
+/// is exactly what the app-limited signal is for.
+///
+/// It must not follow from that that the connection never measures anything.
+/// `cwnd = 2 × btl_bw × min_rtt`, so a `btl_bw` that stays at zero leaves the
+/// window on its `4 × MIN_PACKET_SIZE` floor, which on a long path is a hard cap
+/// of a few tens of kilobytes per second — for a flow whose problem was never
+/// congestion.
+///
+/// The observable is the estimate itself rather than the window it sizes. The
+/// window cannot be observed here: this harness is an in-memory channel, so
+/// `min_rtt` is microseconds, `bdp = btl_bw × min_rtt` rounds to nothing, and
+/// the floor governs whatever the estimate says. On a real path the two are the
+/// same statement.
+#[tokio::test]
+async fn repeated_small_exchanges_still_measure_the_path() {
+    /// Comfortably under the 5600-byte opening window, so no exchange can fill
+    /// it and every drain ends on an empty send buffer.
+    const REQUEST: usize = 4_000;
+    const EXCHANGES: usize = 40;
+
+    let (client, congestion, server) = handshaken_pair().await;
+
+    for i in 0..EXCHANGES {
+        let msg = vec![(i % 251) as u8; REQUEST];
+        server.send(msg.clone()).await.expect("server send");
+        let mut got = Vec::with_capacity(REQUEST);
+        while got.len() < REQUEST {
+            let chunk = timeout(Duration::from_secs(5), client.recv())
+                .await
+                .expect("client recv timed out")
+                .expect("client recv error");
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, msg, "exchange {i} must arrive byte-exact");
+        // The answer travelling the other way is what carries the
+        // acknowledgement the estimator learns from.
+        client.send(b"ack".to_vec()).await.expect("client reply");
+        let _ = timeout(Duration::from_secs(5), server.recv())
+            .await
+            .expect("server recv timed out")
+            .expect("server recv error");
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let snap = congestion.bandwidth_snapshot();
+    assert!(
+        snap.bottleneck_bw_bps > 0,
+        "{EXCHANGES} exchanges of {REQUEST} B produced no bandwidth estimate at all — \
+         every sample was discarded, so the window can only ever be its floor"
     );
 
     server.disconnect().await.expect("server clean disconnect");

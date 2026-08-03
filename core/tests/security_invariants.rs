@@ -1598,7 +1598,7 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     s.send_reliable(Bytes::from(vec![0u8; 60])).await.unwrap(); // seq 1
 
     let first = s
-        .poll_send(u64::MAX, 0, std::time::Instant::now())
+        .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
         .await
         .expect("first segment fits the window");
     assert!(!first.retransmit);
@@ -1609,7 +1609,7 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     // and withheld for that reason: the congestion budget is unbounded here, so a
     // stream reporting anything else has consulted the wrong budget.
     assert_eq!(
-        s.poll_send(u64::MAX, 0, std::time::Instant::now())
+        s.poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
             .err(),
         Some(SendBlocked::FlowControl),
@@ -1627,7 +1627,9 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     // cwnd budget smaller than the segment → withheld by congestion control,
     // BEFORE the flow-control window is even consulted.
     assert_eq!(
-        s2.poll_send(50, 0, std::time::Instant::now()).await.err(),
+        s2.poll_send(50, 0, std::time::Instant::now(), false)
+            .await
+            .err(),
         Some(SendBlocked::CongestionWindow),
         "new data exceeding the congestion window must be withheld"
     );
@@ -1650,7 +1652,7 @@ async fn retransmissions_bypass_congestion_and_flow_control_windows() {
 
     // First transmission debits the window (200 bytes) under an unbounded cwnd.
     let first = s
-        .poll_send(u64::MAX, 0, std::time::Instant::now())
+        .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
         .await
         .expect("first transmission");
     assert!(!first.retransmit);
@@ -1663,7 +1665,9 @@ async fn retransmissions_bypass_congestion_and_flow_control_windows() {
     // … and an immediate re-poll (cwnd 0, window 0) yields nothing — the
     // segment is in-flight, not yet timed out.
     assert_eq!(
-        s.poll_send(0, 0, std::time::Instant::now()).await.err(),
+        s.poll_send(0, 0, std::time::Instant::now(), false)
+            .await
+            .err(),
         Some(SendBlocked::Idle),
         "an in-flight segment that has not timed out is nothing to send, not a \
          budget the sender is up against"
@@ -1675,7 +1679,7 @@ async fn retransmissions_bypass_congestion_and_flow_control_windows() {
     // The retransmit is produced despite cwnd == 0 AND window == 0 (Karn: the
     // bytes were accounted on first send; loss recovery must always proceed).
     let rtx = s
-        .poll_send(0, 0, std::time::Instant::now())
+        .poll_send(0, 0, std::time::Instant::now(), false)
         .await
         .expect("retransmission must bypass both the congestion and flow-control windows");
     assert!(rtx.retransmit, "must be flagged as a retransmission");
