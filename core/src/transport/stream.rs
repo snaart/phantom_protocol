@@ -21,12 +21,41 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 
 const MAX_PENDING_PACKETS: usize = 1024;
 
-/// Upper bound on out-of-order segments held for reassembly per stream. In
-/// practice the flow-control window bounds in-flight (hence reorderable) data far
-/// below this; a peer that floods past its window with huge gaps is refused here
-/// (the refused segment is NOT recorded as received, so it is not SACKed and the
-/// sender retransmits it — no SACK-without-data hazard, bounded memory).
+/// Upper bound on out-of-order segments held for reassembly per stream. A peer that floods
+/// past its window with huge gaps is refused here (the refused segment is NOT recorded as
+/// received, so it is not SACKed and the sender retransmits it — no SACK-without-data
+/// hazard, bounded memory).
+///
+/// It stays above the number of *segments* one maximum window holds — at
+/// [`MAX_RECV_WINDOW`] and the 1156-byte UDP application chunk
+/// ([`crate::transport::mtu::MAX_APP_CHUNK`]) that is ~908, so 2048 clears it with better
+/// than 2× margin (pinned by
+/// `the_reorder_entry_cap_sits_between_one_window_and_its_own_unaccounted_cost`).
+/// Below that it would become the binding constraint before the byte budget does and start
+/// refusing legitimate out-of-order data on exactly the long, lossy paths a large window
+/// exists for. It is not raised further, because the byte budget accounts only for payload
+/// while an entry also costs a deque slot, a `Vec<Bytes>` and the retained plaintext
+/// allocation — so the entry cap, not the byte budget, is what bounds a peer sending
+/// one-byte segments above a hole it never fills. It is also the bound on the linear scan
+/// `accept_in_order` does per out-of-order arrival.
 const MAX_RECV_REORDER: usize = 2048;
+
+// The entry cap is squeezed from both sides, and moving the window ceiling moves one of
+// them — so both bounds are checked at compile time rather than left to a reader.
+//
+// Below one window of MTU-sized segments the cap becomes the binding constraint before the
+// byte budget does, and starts refusing legitimate out-of-order data on the long, lossy
+// paths a large window exists for.
+const _: () =
+    assert!(MAX_RECV_REORDER > MAX_RECV_WINDOW as usize / crate::transport::mtu::MAX_APP_CHUNK);
+// Above that it is pure cost. The byte budget counts only payload, so a peer sending
+// one-byte segments above a hole it never fills is bounded by the entry cap alone, and each
+// held entry carries a deque slot, the `Vec<Bytes>` allocation behind it and a retained
+// plaintext allocation that the budget never sees. 128 B per entry is a deliberate
+// over-estimate of that structure; 2048 entries is then 256 KiB per stream, and `MAX_STREAMS`
+// is 256, so 64 MiB per session held for 2 KiB of budgeted payload. That is what raising this
+// cap costs, and it is why the cap did not move when the window ceiling did.
+const _: () = assert!(MAX_RECV_REORDER * 128 <= 256 * 1024);
 
 /// Per-stream byte budget for the out-of-order reorder buffer (H-3) **at the initial
 /// window**, tied to the flow-control window. A compliant peer keeps in-flight (hence
@@ -62,22 +91,154 @@ pub const INITIAL_STREAM_WINDOW: u32 = 64 * 1024;
 /// more outstanding credit than its own advertised window, itself capped at
 /// [`MAX_RECV_WINDOW`] — the same value — so the cap is only a misbehaving-peer
 /// guard (the receiver's own delivery HARD_CAP is the real bound on buffering).
-pub const MAX_SEND_WINDOW: u32 = 8 * INITIAL_STREAM_WINDOW;
+pub const MAX_SEND_WINDOW: u32 = 16 * INITIAL_STREAM_WINDOW;
 
 /// Ceiling on the **receiver's** auto-tuned advertised window (see
 /// [`Stream::advertised_recv_window`]). Deliberately equal to [`MAX_SEND_WINDOW`]: the two
 /// ends of the same credit ledger must agree, or a receiver would grant credit its peer
-/// silently discards. 512 KiB carries ~21 Mbit/s on a 200 ms path, which is above the
-/// measured capacity of the paths this transport targets.
+/// silently discards.
+///
+/// A window of `W` bytes admits `W / RTT` bytes per second, so this constant is a hard rate
+/// ceiling on every stream. The path this transport was last measured on has a 235 ms RTT
+/// and carried 41.8 Mbit/s of raw one-way UDP; its bandwidth-delay product is 1228 KB. At
+/// the previous 512 KiB the window could not hold even one BDP of that path — it admitted
+/// 17.85 Mbit/s, and server-side samples showed inflight pinned flat against the cap at
+/// 492–520 KB run after run. 1 MiB doubles that to 35.7 Mbit/s and removes the wall those
+/// samples were sitting against.
+///
+/// It is not raised further because nothing above it is reachable: a stream's ARQ send
+/// buffer holds at most [`MAX_PENDING_PACKETS`] unacked segments of at most
+/// [`crate::transport::mtu::MAX_APP_CHUNK`] bytes, so 1 183 744 B is all one stream can ever
+/// have outstanding whatever credit it is granted. Above roughly that figure the send
+/// buffer, not the window, is the binding constraint, and window granted past it is memory
+/// the receiver commits to hold for data that cannot arrive. Moving both together is a
+/// separate change with a memory case of its own to make; this constant sits just under the
+/// structural cap, pinned by
+/// `the_recv_window_ceiling_stays_within_what_the_send_buffer_can_put_in_flight`.
+///
+/// The ceiling is not a memory commitment on its own — see
+/// [`SESSION_RECV_WINDOW_GROWTH_BUDGET`] for the number that actually bounds a session.
 pub const MAX_RECV_WINDOW: u32 = MAX_SEND_WINDOW;
+
+// The ceiling must stay above the 512 KiB the measured path was pinned flat against, and at
+// or below what one stream's ARQ send buffer can ever have outstanding — window granted past
+// that point is memory held for data that cannot arrive. The upper bound is also measured
+// behaviourally by
+// `the_recv_window_ceiling_stays_within_what_the_send_buffer_can_put_in_flight`; this is the
+// same statement made where the constant is, so that moving it fails the build rather than a
+// test somebody might not run.
+const _: () = assert!(MAX_RECV_WINDOW > 512 * 1024);
+const _: () =
+    assert!(MAX_RECV_WINDOW as usize <= MAX_PENDING_PACKETS * crate::transport::mtu::MAX_APP_CHUNK);
+
+/// Total receive-window *growth* one session may hand out across all of its streams, over
+/// and above the [`INITIAL_STREAM_WINDOW`] every stream starts with.
+///
+/// This is the number that bounds a session's receive-side memory, and it exists because
+/// the per-stream ceiling does not: a session may hold up to `MAX_STREAMS` (256) streams,
+/// so a per-stream ceiling alone multiplies by 256 and by however many sessions the process
+/// is carrying. With the budget, one session's worst case is
+///
+/// ```text
+///   advertised windows   256 × 64 KiB + 8 MiB          = 24 MiB
+///   reorder budgets      Σ (window_i + 64 KiB)         = 40 MiB
+/// ```
+///
+/// — bounded regardless of how the streams divide it up, and *below* what the same
+/// arithmetic gave before this budget existed (256 × 512 KiB advertised = 128 MiB, 256 ×
+/// 576 KiB of reorder = 144 MiB), even though the per-stream ceiling is now twice as large.
+/// A single stream can still take the whole 1 MiB ceiling; what it cannot do is let 256 of
+/// them do so at once.
+///
+/// Budget is drawn on growth and returned when the stream is dropped, so a long-lived
+/// session that opens and closes many streams is not starved by streams that have gone.
+pub const SESSION_RECV_WINDOW_GROWTH_BUDGET: u32 = 8 * 1024 * 1024;
 
 /// RTT reference used by receive-window auto-tuning when the stream has no RTT sample of
 /// its own. A stream that only *receives* never puts a reliable segment on the wire, so its
 /// RFC-6298 estimator is never fed — and a pure download is precisely the case auto-tuning
 /// exists for. [`RtoEstimator::MIN_RTO`] is the transport's own "no measurement yet" floor,
 /// so reusing it keeps one answer to "how long is a round trip when we have not measured
-/// one". Erring high here would make growth *easier*, so the floor is the safe direction.
+/// one".
+///
+/// The reference has to be a constant rather than something observed during the connection,
+/// because it is the denominator of the consumption rate a window must beat to grow: raising
+/// it lowers that bar in proportion. Every round trip this side could observe before
+/// application data moves — the handshake exchange, the gap to the peer's first packet — is
+/// a quantity the peer chooses by delaying, so an observed reference would hand the peer a
+/// dial on how much memory this side is willing to commit to it. Erring low costs growth on
+/// paths longer than about 250 ms, which is the safe direction to err.
 const AUTOTUNE_RTT_FALLBACK: Duration = RtoEstimator::MIN_RTO;
+
+/// Receive-tuning state shared by every [`Stream`] of one session: the session-wide growth
+/// budget. It belongs here rather than on the stream because a per-stream ceiling cannot
+/// bound a session — see [`SESSION_RECV_WINDOW_GROWTH_BUDGET`].
+#[derive(Debug)]
+pub struct SharedRecvTuning {
+    /// Remaining session-wide receive-window growth, in bytes. Drawn on by
+    /// [`Stream::tune_recv_window`] and returned by [`Stream`]'s `Drop`.
+    growth_budget: AtomicU32,
+}
+
+impl Default for SharedRecvTuning {
+    fn default() -> Self {
+        Self {
+            growth_budget: AtomicU32::new(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+        }
+    }
+}
+
+impl SharedRecvTuning {
+    /// Remaining session-wide growth budget in bytes. Observability / test hook.
+    pub fn remaining_growth_budget(&self) -> u32 {
+        self.growth_budget.load(Ordering::Acquire)
+    }
+
+    /// Draw `bytes` from the budget, all or nothing. `false` means the session has already
+    /// committed its growth allowance to other streams and this one keeps the window it has.
+    fn try_take_growth(&self, bytes: u32) -> bool {
+        let mut cur = self.growth_budget.load(Ordering::Acquire);
+        loop {
+            if cur < bytes {
+                return false;
+            }
+            match self.growth_budget.compare_exchange_weak(
+                cur,
+                cur - bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Return `bytes` to the budget (a lost growth race, or a stream going away).
+    fn return_growth(&self, bytes: u32) {
+        if bytes == 0 {
+            return;
+        }
+        let mut cur = self.growth_budget.load(Ordering::Acquire);
+        loop {
+            // Saturate rather than wrap: the accounting is symmetric by construction, and a
+            // budget that overflowed would be a far worse failure than one that is briefly
+            // short.
+            let next = cur
+                .saturating_add(bytes)
+                .min(SESSION_RECV_WINDOW_GROWTH_BUDGET);
+            match self.growth_budget.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
 
 /// Shortest measurement interval auto-tuning will draw a conclusion from. Below this the
 /// interval is dominated by scheduler jitter rather than by the application, and a rate
@@ -457,11 +618,25 @@ pub struct Stream {
     /// the SACK's `ack_delay_us` (`now − recv_at`). A plain sync mutex; the guard
     /// is never held across an `.await`.
     last_data_recv_at: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// Receive-window growth budget shared with every other stream of the same session.
+    recv_tuning: Arc<SharedRecvTuning>,
 }
 
 impl Stream {
-    /// Create a new stream
+    /// Create a new stream with a growth budget of its own.
+    ///
+    /// Every stream of a live session shares one [`SharedRecvTuning`] — see
+    /// [`Self::with_recv_tuning`], which is what the session pump uses. This constructor
+    /// exists for standalone streams (tests, and the pull-style read API) where there is no
+    /// session to share with; such a stream gets the full budget to itself, which is the
+    /// same thing as being the session's only stream.
     pub fn new(id: StreamId) -> Self {
+        Self::with_recv_tuning(id, Arc::new(SharedRecvTuning::default()))
+    }
+
+    /// Create a stream that draws its receive-window growth from `recv_tuning`, the state
+    /// its session shares across all of its streams.
+    pub fn with_recv_tuning(id: StreamId, recv_tuning: Arc<SharedRecvTuning>) -> Self {
         Self {
             id,
             state: Mutex::new(StreamState::Open),
@@ -486,7 +661,14 @@ impl Stream {
             pending_window_update: AtomicU32::new(0),
             rto: std::sync::Mutex::new(RtoEstimator::new()),
             last_data_recv_at: std::sync::Mutex::new(None),
+            recv_tuning,
         }
+    }
+
+    /// The receive-tuning state this stream draws on. The session pump hands the same handle
+    /// to every stream it creates.
+    pub fn recv_tuning(&self) -> &Arc<SharedRecvTuning> {
+        &self.recv_tuning
     }
 
     // ── RFC 6298 retransmission timeout ──
@@ -696,21 +878,21 @@ impl Stream {
     /// ## What a hostile but authenticated peer gets
     ///
     /// Nothing it does not have to buy. Moving this stream's window from 64 KiB to the
-    /// 512 KiB cap costs it three doublings, and each one requires the local application to
+    /// 1 MiB cap costs it four doublings, and each one requires the local application to
     /// consume four fifths of the *current* window inside one round-trip-length interval —
-    /// ~360 KiB of genuinely consumed data in total, at a rate the peer cannot supply on its
-    /// own because the application has to keep up with it. If the application stops, the
+    /// ~790 KiB of genuinely consumed data in total, at a rate the peer cannot supply on its
+    /// own because the application has to keep up with it. The interval is measured against
+    /// a constant, not against anything the peer can stretch (see `AUTOTUNE_RTT_FALLBACK`),
+    /// so that rate is not a quantity the far end gets to set. If the application stops, the
     /// window stops where it is.
     ///
-    /// Having paid, the peer may hold 512 KiB of unconsumed data on this stream and up to
-    /// 576 KiB of reorder buffer ([`Self::recv_reorder_byte_limit`]), against 64 KiB and
-    /// 128 KiB before. Session-wide, the number that bounds buffered-but-undelivered bytes
-    /// is unchanged: the pump's `RECV_DELIVERY_HARD_CAP` still tears the session down at
-    /// 4 MiB of backlog. What auto-tuning changes is how few streams it takes to reach that
-    /// cap when an application stalls after running fast — eight rather than sixty-four —
-    /// and the per-stream reorder ceiling, whose `MAX_STREAMS`-wide worst case rises from
-    /// 32 MiB to 144 MiB, reachable only by an attacker who has already induced 256 separate
-    /// applications' worth of sustained consumption.
+    /// Having paid, the peer may hold one window of unconsumed data on this stream and one
+    /// window plus 64 KiB of reorder buffer ([`Self::recv_reorder_byte_limit`]). What bounds
+    /// the *session* is not that per-stream number but
+    /// [`SESSION_RECV_WINDOW_GROWTH_BUDGET`], which every doubling draws on: 256 streams
+    /// cannot each reach the ceiling, because between them they have 8 MiB of growth to
+    /// spend. The session-wide worst case works out lower than it was before the ceiling
+    /// moved — see that constant for the arithmetic.
     fn tune_recv_window(&self, n: u32) -> u32 {
         let window = self.advertised_recv_window.load(Ordering::Acquire);
         if window >= MAX_RECV_WINDOW {
@@ -721,7 +903,8 @@ impl Stream {
         // grow, and a bigger window queues more — a loop that ends at the cap regardless of
         // what the application is doing. `min_rtt` is what the queue cannot move. A stream
         // that only receives never feeds its own estimator at all, so the fallback is the
-        // common case on exactly the flows auto-tuning exists for.
+        // common case on exactly the flows auto-tuning exists for — see
+        // `AUTOTUNE_RTT_FALLBACK` for why that reference stays a constant.
         let rtt = self.min_rtt().unwrap_or(AUTOTUNE_RTT_FALLBACK);
         let interval = rtt.saturating_mul(2).max(AUTOTUNE_MIN_INTERVAL);
 
@@ -761,16 +944,28 @@ impl Stream {
         }
 
         let next = window.saturating_mul(2).min(MAX_RECV_WINDOW);
+        let growth = next - window;
+        // The session, not the stream, is what has to fit in memory. Take the growth from
+        // the shared budget first: if the session has already committed its allowance to
+        // other streams, this one keeps the window it has rather than adding to a total
+        // nobody bounded.
+        if !self.recv_tuning.try_take_growth(growth) {
+            return 0;
+        }
         match self.advertised_recv_window.compare_exchange(
             window,
             next,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => next - window,
+            Ok(_) => growth,
             // Lost a race with a concurrent grower: its increase stands, ours is dropped
-            // rather than compounded.
-            Err(_) => 0,
+            // rather than compounded — and the budget it drew must go back, or a contended
+            // stream would leak the session's allowance one lost race at a time.
+            Err(_) => {
+                self.recv_tuning.return_growth(growth);
+                0
+            }
         }
     }
 
@@ -1596,6 +1791,23 @@ impl Stream {
     /// Check if stream is closed
     pub fn is_closed(&self) -> bool {
         self.local_finished.load(Ordering::SeqCst) && self.remote_finished.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Stream {
+    /// Hand this stream's share of the session's receive-window growth back.
+    ///
+    /// Without this a session that opens and closes streams over its lifetime would spend
+    /// its allowance once and leave every later stream pinned at the initial window, which
+    /// is the same failure the budget exists to prevent, only slower. The buffers the growth
+    /// paid for are being released with the stream, so returning the credit is exactly
+    /// accurate rather than optimistic.
+    fn drop(&mut self) {
+        let grown = self
+            .advertised_recv_window
+            .load(Ordering::Acquire)
+            .saturating_sub(INITIAL_STREAM_WINDOW);
+        self.recv_tuning.return_growth(grown);
     }
 }
 
@@ -2568,6 +2780,131 @@ mod tests {
         assert!(stream.received_sack(0).await.is_none());
     }
 
+    /// Deliver `delivered` offsets in order, then plant `islands` single-offset holes above
+    /// the resulting hole so the SACK range set is `1 + islands` entries wide.
+    async fn stream_with_islands(delivered: u32, islands: u32) -> Stream {
+        let stream = Stream::new(1);
+        for seq in 0..delivered {
+            let _ = stream
+                .accept_in_order(seq, vec![Bytes::from_static(b"x")])
+                .await;
+        }
+        // The offset `delivered` itself stays missing, so every island below is a
+        // separate range; the extra `2 * i` keeps them non-adjacent.
+        for i in 0..islands {
+            let _ = stream
+                .accept_in_order(delivered + 1 + 2 * i, vec![Bytes::from_static(b"x")])
+                .await;
+        }
+        stream
+    }
+
+    /// **The truncation defect.** A receiver holding more islands than the wire form can
+    /// carry must still acknowledge the contiguous run it has already delivered. That run
+    /// is the one range the sender cannot reconstruct from anything else: without it every
+    /// segment in it stays in the send buffer, falls `PACKET_THRESHOLD` behind
+    /// `largest_acked`, and is retransmitted as a whole window of bogus loss.
+    #[tokio::test]
+    async fn received_sack_over_the_range_cap_still_acks_the_cumulative_run() {
+        const DELIVERED: u32 = 100;
+        let stream = stream_with_islands(DELIVERED, 40).await;
+
+        let sack = stream.received_sack(0).await.expect("non-empty");
+        assert!(
+            sack.ranges().len() <= crate::transport::sack::MAX_SACK_RANGES,
+            "the emitted SACK must fit the wire form: {} ranges",
+            sack.ranges().len()
+        );
+        assert!(
+            sack.acks(0),
+            "the cumulative run was dropped: SACK {:?} does not ack offset 0",
+            sack.ranges()
+        );
+        assert!(
+            sack.acks(DELIVERED - 1),
+            "the cumulative run was dropped: SACK {:?} does not ack offset {}",
+            sack.ranges(),
+            DELIVERED - 1
+        );
+    }
+
+    /// The common case must not move. With the island count inside the cap the emitted
+    /// range set is exactly the ascending set reversed — no reordering, no reshuffling —
+    /// so the bytes on the wire are what they always were. This is what rejects a fix that
+    /// changes the range order for every SACK rather than only for the ones that overflow.
+    #[tokio::test]
+    async fn received_sack_under_the_range_cap_is_unchanged() {
+        const DELIVERED: u32 = 50;
+        const ISLANDS: u32 = 31; // 1 cumulative + 31 islands == the 32-range cap exactly
+        let stream = stream_with_islands(DELIVERED, ISLANDS).await;
+
+        let sack = stream.received_sack(0).await.expect("non-empty");
+
+        // What the ascending build produces, reversed: cumulative run last, islands
+        // descending above it.
+        let mut expected: Vec<(u32, u32)> = vec![(0, DELIVERED - 1)];
+        for i in 0..ISLANDS {
+            let s = DELIVERED + 1 + 2 * i;
+            expected.push((s, s));
+        }
+        expected.reverse();
+        assert_eq!(sack.ranges(), expected.as_slice());
+
+        // And the wire bytes follow from the range set, so pinning the set pins the bytes.
+        let round_tripped = Sack::from_wire(&sack.to_wire()).expect("decodes");
+        assert_eq!(round_tripped.ranges(), expected.as_slice());
+    }
+
+    /// The sender side of the same defect. Given the SACK a receiver with 40 islands
+    /// emits, `on_sack` must retire the whole cumulative run and declare none of it lost.
+    /// Before the fix the run was not in the SACK at all, so every one of its segments
+    /// stayed buffered and was flagged lost by the packet threshold.
+    #[tokio::test]
+    async fn on_sack_over_the_range_cap_retires_the_cumulative_run() {
+        const DELIVERED: u32 = 60;
+        const ISLANDS: u32 = 40;
+
+        // A sender that has put offsets 0..DELIVERED+2*ISLANDS on the wire.
+        let sender = Stream::new(1);
+        let total = DELIVERED + 1 + 2 * ISLANDS;
+        for i in 0..total {
+            let off = sender
+                .send_reliable(Bytes::from(format!("seg-{i}")))
+                .await
+                .unwrap();
+            assert_eq!(off, i);
+            let seg = sender
+                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .await
+                .expect("poll");
+            assert_eq!(seg.stream_offset, i);
+        }
+
+        // The SACK its peer would build having delivered 0..DELIVERED-1 and buffered the
+        // islands above the hole at DELIVERED.
+        let receiver = stream_with_islands(DELIVERED, ISLANDS).await;
+        let sack = receiver.received_sack(0).await.expect("non-empty");
+
+        let result = sender.on_sack(&sack).await;
+
+        assert!(
+            result.retired.len() as u32 >= DELIVERED,
+            "one SACK must retire at least the whole cumulative run 0..{}; retired {}",
+            DELIVERED - 1,
+            result.retired.len()
+        );
+        for off in 0..DELIVERED {
+            assert!(
+                !result.lost.iter().any(|l| l.stream_offset == off),
+                "offset {off} is delivered data the SACK covers — it must not be declared lost"
+            );
+            assert!(
+                sender.ack(off).await.is_none(),
+                "offset {off} is still in the send buffer — the SACK did not retire it"
+            );
+        }
+    }
+
     /// `accept_in_order` delivers the contiguous run and buffers holes: feeding
     /// 0, then 2, then 1 yields `[0]`, `[]` (2 buffered), `[1, 2]` (1 fills the
     /// gap and drains the buffered 2) — strict in-order delivery.
@@ -2764,6 +3101,203 @@ mod tests {
             MAX_RECV_REORDER_BYTES_CEILING,
             "and the reorder budget stops with it"
         );
+    }
+
+    /// **The ceiling defect, and the constraint that bounds the fix.** A credit window of
+    /// `W` bytes admits `W / RTT` bytes per second whatever else is true, so the ceiling on
+    /// `W` is a hard rate ceiling on every stream. On the path this was measured on — 235 ms
+    /// RTT — the old 512 KiB ceiling admitted 2 230 828 B/s, i.e. 17.85 Mbit/s, while raw
+    /// one-way UDP over that same path carried 41.8 and 42.9 Mbit/s in two runs, and
+    /// server-side samples showed inflight pinned flat against the cap at 492–520 KB run
+    /// after run.
+    ///
+    /// What stops the answer being "make it enormous" is measured here rather than asserted
+    /// in prose: a stream's ARQ send buffer holds a fixed number of segments, so there is a
+    /// hard limit on what one stream can have outstanding no matter how much credit it is
+    /// granted, and receive window above that limit is memory committed for data that cannot
+    /// arrive. The ceiling must sit under it.
+    #[tokio::test]
+    async fn the_recv_window_ceiling_stays_within_what_the_send_buffer_can_put_in_flight() {
+        tokio::time::pause();
+
+        // Fill one stream's ARQ send buffer with full-size segments until it refuses more.
+        // That total is the most this stream can ever have unacknowledged.
+        let s = Stream::new(1);
+        let chunk = Bytes::from(vec![0u8; crate::transport::mtu::MAX_APP_CHUNK]);
+        let mut buffered = 0usize;
+        while tokio::time::timeout(Duration::from_secs(1), s.send_reliable(chunk.clone()))
+            .await
+            .is_ok()
+        {
+            buffered += chunk.len();
+            assert!(
+                buffered < 8 * 1024 * 1024,
+                "the send buffer accepted {buffered} B without ever blocking — this test no \
+                 longer measures what it thinks it does"
+            );
+        }
+
+        assert!(
+            MAX_RECV_WINDOW as usize <= buffered,
+            "the window ceiling ({MAX_RECV_WINDOW} B) grants more credit than one stream can \
+             ever have in flight ({buffered} B): the send buffer, not the window, is what \
+             decides the rate above that point, and the excess is memory held for data that \
+             cannot arrive"
+        );
+        // What that admits on the measured path, in the units the defect was reported in:
+        // 1 MiB / 0.235 s = 4 461 655 B/s = 35.7 Mbit/s, against 17.85 Mbit/s before.
+        const PATH_RTT_MS: u64 = 235;
+        let ceiling_bits_per_sec = u64::from(MAX_RECV_WINDOW) * 8 * 1000 / PATH_RTT_MS;
+        assert!(
+            ceiling_bits_per_sec > 30_000_000,
+            "the window ceiling admits only {ceiling_bits_per_sec} bit/s at a {PATH_RTT_MS} \
+             ms RTT"
+        );
+
+        // And the tuner reaches it. Four doublings from the 64 KiB initial window, one per
+        // closed measurement interval, so the ceiling is 1.6 s of sustained consumption away
+        // — not a ladder that outlives the transfer it is meant to accelerate.
+        let t = Stream::new(2);
+        t.record_app_consumed(1);
+        let mut intervals = 0u32;
+        while t.advertised_recv_window() < MAX_RECV_WINDOW {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            t.record_app_consumed(MAX_RECV_WINDOW);
+            intervals += 1;
+            assert!(
+                intervals <= 6,
+                "the tuner did not reach the ceiling within 6 measurement intervals; it \
+                 stalled at {} B",
+                t.advertised_recv_window()
+            );
+        }
+        assert_eq!(t.advertised_recv_window(), MAX_RECV_WINDOW);
+    }
+
+    /// The per-stream ceiling is not what bounds a session. Sixteen streams that each earn
+    /// the ceiling would commit 15 MiB of growth between them; the session-wide budget is
+    /// what says they may not, and it says so without denying any single stream the ceiling
+    /// (the test above shows a lone stream still reaching it).
+    #[tokio::test]
+    async fn the_session_growth_budget_bounds_every_stream_together() {
+        tokio::time::pause();
+        let tuning = Arc::new(SharedRecvTuning::default());
+        let streams: Vec<Stream> = (1..=16u16)
+            .map(|id| Stream::with_recv_tuning(id, tuning.clone()))
+            .collect();
+
+        for s in &streams {
+            s.record_app_consumed(1); // open each interval
+        }
+        // Far more sustained consumption than the whole budget is worth, on every stream at
+        // once — the growth has to stop because the session ran out, not because the
+        // applications did.
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            for s in &streams {
+                s.record_app_consumed(MAX_RECV_WINDOW);
+            }
+        }
+
+        let total_growth: u64 = streams
+            .iter()
+            .map(|s| u64::from(s.advertised_recv_window() - INITIAL_STREAM_WINDOW))
+            .sum();
+        assert!(
+            total_growth <= u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+            "sixteen streams grew by {total_growth} B against a \
+             {SESSION_RECV_WINDOW_GROWTH_BUDGET} B session budget"
+        );
+        // And the budget is what stopped them, not the per-stream ceiling: unconstrained,
+        // sixteen streams at this ceiling would have taken half again as much.
+        let unconstrained =
+            u64::from(MAX_RECV_WINDOW - INITIAL_STREAM_WINDOW) * streams.len() as u64;
+        assert!(
+            unconstrained > u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+            "this test no longer exercises the budget: sixteen streams at the ceiling want \
+             {unconstrained} B, which the {SESSION_RECV_WINDOW_GROWTH_BUDGET} B budget already \
+             covers"
+        );
+        assert_eq!(
+            u64::from(tuning.remaining_growth_budget()),
+            u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET) - total_growth,
+            "the budget accounting must match the windows actually handed out"
+        );
+        // And the reorder memory the session can be made to hold follows from it: one budget
+        // plus one initial window per stream, whatever the per-stream ceiling is.
+        let reorder: usize = streams.iter().map(|s| s.recv_reorder_byte_limit()).sum();
+        assert!(
+            reorder
+                <= SESSION_RECV_WINDOW_GROWTH_BUDGET as usize
+                    + 2 * streams.len() * INITIAL_STREAM_WINDOW as usize
+        );
+    }
+
+    /// A long-lived session opens and closes streams. If growth were spent for good, the
+    /// budget would drain away and every later stream would be pinned at the initial window —
+    /// the same failure the budget exists to prevent, only slower.
+    #[tokio::test]
+    async fn a_closed_stream_returns_its_growth_to_the_session() {
+        tokio::time::pause();
+        let tuning = Arc::new(SharedRecvTuning::default());
+        {
+            let s = Stream::with_recv_tuning(1, tuning.clone());
+            s.record_app_consumed(1);
+            for _ in 0..8 {
+                tokio::time::advance(Duration::from_millis(400)).await;
+                s.record_app_consumed(MAX_RECV_WINDOW);
+            }
+            assert_eq!(s.advertised_recv_window(), MAX_RECV_WINDOW);
+            assert!(tuning.remaining_growth_budget() < SESSION_RECV_WINDOW_GROWTH_BUDGET);
+        }
+        assert_eq!(
+            tuning.remaining_growth_budget(),
+            SESSION_RECV_WINDOW_GROWTH_BUDGET,
+            "the closed stream's buffers are gone; its share of the budget must be too"
+        );
+    }
+
+    /// **The RTT reference is a constant on purpose.** A stream that only receives never puts
+    /// a reliable segment on the wire, so `record_rtt_sample` — reached only from `ack` and
+    /// `on_sack`, both send-side — is never called and `min_rtt()` stays `None` for the life
+    /// of the transfer. That is the case auto-tuning exists for, and the obvious repair is to
+    /// feed it a round trip observed elsewhere in the connection.
+    ///
+    /// It must not be. The interval is `2 × rtt_used` and growth requires the application to
+    /// consume `0.8 × window` inside it, so the consumption rate a peer has to be outrun by
+    /// is inversely proportional to `rtt_used` — and every round trip this side could observe
+    /// before application data moves is one the far end sets by choosing when to answer. What
+    /// this pins is the direction: whatever the peer does, the bar this side holds it to is
+    /// the same one, and it comes from a constant.
+    #[tokio::test]
+    async fn the_growth_bar_does_not_move_with_anything_the_peer_controls() {
+        tokio::time::pause();
+
+        // A trickle: 30 KB/s, against the 131 KB/s that the 64 KiB window at the 200 ms
+        // reference demands (0.8 × 64 KiB / 0.4 s). Sustained for eight minutes of simulated
+        // time — far longer than any handshake gap a peer could introduce and then exploit.
+        let s = Stream::new(1);
+        s.record_app_consumed(1);
+        for _ in 0..480 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            s.record_app_consumed(30_000);
+        }
+        assert_eq!(
+            s.advertised_recv_window(),
+            INITIAL_STREAM_WINDOW,
+            "a trickle earned window growth — the consumption bar is being computed against \
+             something other than the fixed reference"
+        );
+
+        // And the bar is still met by an application that genuinely keeps up, so the test
+        // above is not passing merely because growth is broken.
+        let fast = Stream::new(2);
+        fast.record_app_consumed(1);
+        for _ in 0..8 {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            fast.record_app_consumed(MAX_RECV_WINDOW);
+        }
+        assert_eq!(fast.advertised_recv_window(), MAX_RECV_WINDOW);
     }
 
     /// The reason the trigger is a time interval and not a byte count. The delivery queue in

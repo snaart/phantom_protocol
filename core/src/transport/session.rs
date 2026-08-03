@@ -675,6 +675,10 @@ impl Session {
     /// Open a new stream
     pub fn open_stream(&self) -> Arc<Stream> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::SeqCst) as StreamId;
+        // A `Session` driven on its own — the raw transport API, without the `PhantomSession`
+        // that owns the connection-wide growth budget — gives each of its streams a budget of
+        // its own. The bounded path is the one the pump takes, where every stream is built
+        // from the single handle the `PhantomSession` holds.
         let stream = Arc::new(Stream::new(stream_id));
 
         self.streams.write().insert(stream_id, stream.clone());
