@@ -2984,7 +2984,7 @@ mod tests {
                 .unwrap();
             assert_eq!(off, i);
             let seg = sender
-                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
                 .await
                 .expect("poll");
             assert_eq!(seg.stream_offset, i);
