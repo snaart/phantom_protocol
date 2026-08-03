@@ -522,6 +522,10 @@ async fn collect_stats(link: &dyn MsgLink, listener: &str) -> ServerStats {
     ServerStats {
         listener: listener.to_string(),
         t_unix_ns: unix_nanos(),
+        // The probe reads this out of the first STATS reply of a run and files
+        // it in `run.json`, so one artifact names both builds in the
+        // comparison rather than only the half that wrote it.
+        build: crate::report::BuildId::current(),
         metrics,
         per_leg,
         process: proc_info_or_default(),

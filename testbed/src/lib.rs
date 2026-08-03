@@ -3,8 +3,9 @@
 //! Two binaries share this library:
 //!
 //! - `phantom-testd` — the daemon. Binds every network-testable leg (PhantomUDP,
-//!   Phantom-over-TCP, mimic-TLS), a QUIC reference leg, and raw TCP/UDP echo
-//!   controls, and records server-side statistics.
+//!   Phantom-over-TCP, mimic-TLS), a QUIC reference leg, and the raw TCP/UDP
+//!   controls — two echoes plus a one-way downstream source — and records
+//!   server-side statistics.
 //! - `phantom-probe` — the client. Drives a scenario matrix across those legs
 //!   and writes raw per-operation samples.
 //!
@@ -26,7 +27,9 @@
 //! the instrument for the regime that can.
 
 pub mod clock;
+pub mod downlink;
 pub mod framing;
+pub mod pacing;
 pub mod probe;
 pub mod proto;
 pub mod quic;
