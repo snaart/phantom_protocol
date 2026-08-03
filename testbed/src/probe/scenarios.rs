@@ -29,11 +29,12 @@ use crate::probe::conn::{
 };
 use crate::proto::{Msg, PayloadGen};
 use crate::report::{
-    unix_nanos, ConcurrencySample, ErrorRecord, HandshakeSample, Leg, MessageIntegritySample,
-    MigrationSample, NegativeSample, RekeySample, RttSample, SampleSink, ScenarioSummary,
-    SoakSample, StreamSample, ThroughputSample, ZeroRttSample,
+    unix_nanos, BuildId, ConcurrencySample, ErrorRecord, HandshakeSample, Leg,
+    MessageIntegritySample, MigrationSample, NegativeSample, RekeySample, RttSample, SampleSink,
+    ScenarioSummary, SoakSample, StreamSample, ThroughputSample, ZeroRttSample,
 };
 use crate::stats::{Summary, Throughput};
+use crate::{downlink, pacing};
 
 /// What one scenario produced.
 pub struct ScenarioOutput {
@@ -47,6 +48,12 @@ pub struct ScenarioOutput {
     pub errors: Vec<ErrorRecord>,
     /// Only `clock_sync` fills this.
     pub clock: Option<crate::report::ClockEstimate>,
+    /// The daemon's build, read out of its `STATS` reply.
+    ///
+    /// Filled by `clock_sync` because it already holds an established session
+    /// at the start of every run; opening a second one purely to ask would cost
+    /// a post-quantum handshake for one string.
+    pub daemon_build: Option<BuildId>,
 }
 
 impl ScenarioOutput {
@@ -66,6 +73,7 @@ impl ScenarioOutput {
             },
             errors: Vec::new(),
             clock: None,
+            daemon_build: None,
         }
     }
 
@@ -327,10 +335,34 @@ pub async fn clock_sync(ep: &Endpoints, pin: &[u8], leg: Leg, probes: usize) -> 
             c.offset_ns, c.dispersion_ns, c.samples
         ));
     }
+
+    // Ask the daemon which build it is while a session is already up. Without
+    // this the artifact names only the probe's code, and a comparison between
+    // two runs cannot show that the *server* changed — which, for every
+    // download figure in the set, is the half that matters.
+    out.daemon_build = read_daemon_build(&framed).await;
+    match &out.daemon_build {
+        Some(b) => out.note(format!("daemon build {} ({})", b.label(), b.version)),
+        None => out.note(
+            "the daemon did not report its build: this run cannot state which server code produced it",
+        ),
+    }
+
     out.summary.latency_ns = Some(Summary::of_u64(&rtts));
     mark(&framed, "clock_sync:end").await;
     conn::close_session(framed.session()).await;
     out
+}
+
+/// Pull the daemon's build stamp out of a `STATS` reply.
+///
+/// Best-effort: an older daemon has no such field and a failure here must not
+/// cost the run its clock estimate. `None` is recorded as an absence rather
+/// than papered over, so the artifact never implies it knows something it does
+/// not.
+async fn read_daemon_build(framed: &Framed) -> Option<BuildId> {
+    let stats = conn::fetch_server_stats(framed).await.ok()?;
+    serde_json::from_value(stats.get("build")?.clone()).ok()
 }
 
 // ── 2. handshake ────────────────────────────────────────────────────────────
@@ -2025,13 +2057,22 @@ pub async fn raw_tcp_throughput(
     out
 }
 
-/// Raw UDP one-way capacity and loss — the datagram denominator.
+/// Raw UDP echo capacity and loss — the datagram denominator, round trip.
 ///
 /// Sends at a series of offered rates and counts how much comes back. TCP's
 /// control cannot answer this: its congestion control hides where the datagram
 /// path actually starts losing, which is exactly what a UDP-based protocol runs
 /// into.
-pub async fn raw_udp_throughput(ep: &Endpoints, per_rate: Duration) -> ScenarioOutput {
+///
+/// What it cannot answer is *which direction* lost anything. Every datagram
+/// counted here has crossed the path twice, so a shortfall could be either way
+/// and the two have different consequences for a protocol. That is
+/// [`raw_udp_downstream`]'s job.
+pub async fn raw_udp_throughput(
+    ep: &Endpoints,
+    rungs: &[u64],
+    per_rate: Duration,
+) -> ScenarioOutput {
     let leg = Leg::RawUdp;
     let mut out = ScenarioOutput::new(leg, "throughput");
 
@@ -2048,19 +2089,15 @@ pub async fn raw_udp_throughput(ep: &Endpoints, per_rate: Duration) -> ScenarioO
     }
     let sock = Arc::new(sock);
 
-    let payload = PayloadGen::new(170).fill(1200);
+    let payload = PayloadGen::new(170).fill(downlink::DEFAULT_PAYLOAD);
     let mut best = 0.0f64;
     let mut ceiling_suspected = false;
 
-    for &kbps in &[1_000u64, 5_000, 20_000, 60_000, 200_000] {
-        // Pace in bursts on a 1 ms tick rather than sleeping between frames.
-        // A per-frame sleep cannot outrun the timer's granularity: at 1200 B
-        // per frame a ~1 ms floor caps the offered rate near 9.6 Mbit/s, so
-        // the "path ceiling" such a loop reports is really its own clock. That
-        // is exactly what an earlier version of this probe measured.
-        const TICK: Duration = Duration::from_millis(1);
-        let bytes_per_tick = (kbps * 1000 / 8) / 1000; // bytes per millisecond
-        let per_burst = ((bytes_per_tick as usize) / payload.len()).max(1);
+    for &kbps in rungs {
+        // The shared credit-bucket pacer, driven from a 1 ms tick — the same
+        // one the downstream control uses, so the two directions are offering
+        // identically shaped traffic and their rungs line up.
+        let mut pacer = pacing::Pacer::new(kbps, payload.len());
 
         let deadline = tokio::time::Instant::now() + per_rate;
         let rx = sock.clone();
@@ -2080,21 +2117,22 @@ pub async fn raw_udp_throughput(ep: &Endpoints, per_rate: Duration) -> ScenarioO
 
         let mut sent = 0u64;
         let started = Instant::now();
-        let mut tick = tokio::time::interval(TICK);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+        let mut tick = tokio::time::interval(pacing::TICK);
+        tick.set_missed_tick_behavior(pacing::MISSED_TICK);
         while tokio::time::Instant::now() < deadline {
             tick.tick().await;
-            for _ in 0..per_burst {
+            for _ in 0..pacer.on_tick() {
                 if sock.send(&payload).await.is_ok() {
                     sent += payload.len() as u64;
                 }
             }
         }
-        let elapsed = started.elapsed().as_secs_f64().max(1e-9);
+        let elapsed_ns = started.elapsed().as_nanos() as u64;
         let got = reader.await.unwrap_or(0);
 
-        let offered = sent as f64 * 8.0 / elapsed / 1e6;
-        let returned = got as f64 * 8.0 / elapsed / 1e6;
+        let achieved = pacing::bits_per_sec(sent, elapsed_ns);
+        let returned = pacing::bits_per_sec(got, elapsed_ns);
+        let reached = pacing::reached_offer(pacer.offered_bps(), achieved);
         let loss = if sent > 0 {
             100.0 * (1.0 - (got as f64 / sent as f64)).max(0.0)
         } else {
@@ -2103,8 +2141,10 @@ pub async fn raw_udp_throughput(ep: &Endpoints, per_rate: Duration) -> ScenarioO
         best = best.max(returned);
         out.summary.ok_count += 1;
         out.note(format!(
-            "asked {} kbit/s -> actually offered {offered:.2} Mbit/s, echoed back {returned:.2} Mbit/s, round-trip loss {loss:.1}%",
-            kbps
+            "asked {kbps} kbit/s -> sender achieved {:.2} Mbit/s{}, echoed back {:.2} Mbit/s, round-trip loss {loss:.1}%",
+            achieved / 1e6,
+            if reached { "" } else { " (SHORT OF ITS OWN OFFER — this rung says nothing about the path)" },
+            returned / 1e6,
         ));
         out.sink.push(&ThroughputSample {
             leg,
@@ -2112,27 +2152,359 @@ pub async fn raw_udp_throughput(ep: &Endpoints, per_rate: Duration) -> ScenarioO
             t_unix_ns: unix_nanos(),
             window_bytes: got,
             window_frames: got / payload.len() as u64,
-            window_ns: (elapsed * 1e9) as u64,
+            window_ns: elapsed_ns,
             cumulative_bytes: sent,
         });
 
         // Only a rate the sender genuinely reached, met by loss, indicates the
         // path's limit. Falling short of the ask means the *sender* ran out of
         // room, which says nothing about the link.
-        if offered >= kbps as f64 / 1000.0 * 0.8 && loss > 2.0 {
+        if reached && loss > 2.0 {
             ceiling_suspected = true;
         }
     }
 
     out.note(format!(
-        "best sustained datagram echo: {best:.2} Mbit/s{}",
+        "best sustained datagram echo: {:.2} Mbit/s{}",
+        best / 1e6,
         if ceiling_suspected {
             " — met loss at a rate the sender did reach, so this is the path"
         } else {
             " — NOT confirmed as the path's limit: no offered rate was both reached and met with loss, so this may still be the sender's own ceiling"
         }
     ));
+    out.note("this is a round trip: a datagram counted here crossed the path twice, so it bounds neither direction on its own — see the downstream scenario for the server → client half");
     out
+}
+
+/// Raw UDP one-way capacity, server → client — the download denominator.
+///
+/// Every leg reports a `download` figure, and until this scenario existed none
+/// of them could be attributed: a run where the protocol under test managed
+/// 3.7 Mbit/s downstream and the mature reference managed 2.1 was equally
+/// consistent with a slow receive path and with a server uplink of three
+/// megabits, and those call for opposite work. This measures the direction
+/// directly, with nothing in the way.
+///
+/// The daemon paces datagrams at each offered rate and afterwards states how
+/// many it actually managed; this side counts what arrived. A rung where the
+/// sender fell short of its own offer is recorded as such and marked
+/// inadmissible, because it measures the sender rather than the link — the same
+/// mistake, in the other direction, once had this harness reporting its own
+/// timer as a path ceiling.
+pub async fn raw_udp_downstream(
+    ep: &Endpoints,
+    rungs: &[u64],
+    per_rung: Duration,
+) -> ScenarioOutput {
+    let leg = Leg::RawUdp;
+    let mut out = ScenarioOutput::new(leg, "downstream");
+
+    let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await else {
+        out.summary.error_count += 1;
+        out.note("could not bind a local UDP socket");
+        return out;
+    };
+    let addr = ep.raw_downstream_addr();
+    if sock.connect(&addr).await.is_err() {
+        out.summary.error_count += 1;
+        out.note(format!("could not associate with {addr}"));
+        return out;
+    }
+
+    // Distinguishes this run's traffic from a previous probe's on the same
+    // port, so a burst that outlived its requester cannot be counted in here.
+    let run_nonce = unix_nanos() ^ ((std::process::id() as u64) << 40);
+    let mut cookie = [0u8; downlink::COOKIE_LEN];
+    let mut best: Option<Throughput> = None;
+    let mut buf = vec![0u8; 65_536];
+    // Whether anything on the path ever pushed back — the difference between a
+    // measured ceiling and a ladder that simply ran out of rungs. A rung counts
+    // as pushback if the sender fell short of its own offer (it was the sender
+    // that saturated, which is an instrument limit and is recorded as such) or
+    // if datagrams went missing (the path dropped them). Without pushback the
+    // best rate is a *lower bound* on the path and calling it a ceiling would
+    // be the same overclaim the uplink control was once guilty of.
+    let mut saw_pushback = false;
+
+    for (i, &kbps) in rungs.iter().enumerate() {
+        let rung = i as u16;
+        let (sample, reached) = measure_rung(
+            &sock,
+            &mut buf,
+            &mut cookie,
+            run_nonce,
+            rung,
+            kbps,
+            per_rung,
+            &mut out,
+        )
+        .await;
+
+        if sample.admissible
+            && best
+                .as_ref()
+                .is_none_or(|b| sample.receiver_bps > b.megabits_per_sec * 1e6)
+        {
+            // Built from the rung's own arrivals rather than from a rounded
+            // rate, so the headline in `summary.json` is recomputable from the
+            // JSONL like every other number here.
+            best = Some(Throughput::new(
+                sample.received_bytes,
+                sample.received_datagrams,
+                sample.observed_window_ns,
+            ));
+        }
+        // A rung that never reported (`None`) says nothing either way and must
+        // not be read as pushback — it is a missing measurement, not a full path.
+        if sample.sender_reached_offer == Some(false)
+            || sample.loss_fraction.is_some_and(|l| l > 0.001)
+        {
+            saw_pushback = true;
+        }
+        out.note(rung_note(&sample));
+        out.sink.push(&sample);
+
+        // A daemon that answered nothing at all will answer nothing on the next
+        // rung either, and each attempt costs its own timeouts. Say so once and
+        // stop rather than spending the ladder discovering it four more times.
+        if !reached {
+            out.note(format!(
+                "the downstream source at {addr} answered nothing — the remaining {} rung(s) were not attempted",
+                rungs.len() - i - 1
+            ));
+            break;
+        }
+    }
+
+    match &best {
+        Some(t) if saw_pushback => {
+            out.note(format!(
+                "downstream ceiling {:.2} Mbit/s — the path pushed back at or below this rate (loss appeared, or the sender could not reach its own offer), so it is a measured ceiling and every leg's download must be read against it",
+                t.megabits_per_sec
+            ));
+        }
+        Some(t) => {
+            out.note(format!(
+                "downstream carries AT LEAST {:.2} Mbit/s — the ladder ran out of rungs before the path did: nothing was lost and the sender reached every offer, so this is a lower bound, not a ceiling. A download below it is attributable to the transport; a download near it is not yet distinguishable from the path",
+                t.megabits_per_sec
+            ));
+        }
+        None => out.note(
+            "no rung was admissible: on every rate the daemon either fell short of its own offer or never reported, so this run has NO downstream denominator and its download figures cannot be attributed",
+        ),
+    }
+    out.summary.throughput = best;
+    out
+}
+
+/// Prose for one rung, written so the console transcript alone is readable.
+fn rung_note(s: &crate::report::DownstreamSample) -> String {
+    let offered = s.offered_bps / 1e6;
+    let Some(sender) = s.sender_bps else {
+        return format!(
+            "asked {offered:.0} Mbit/s -> the daemon never reported: {} datagrams arrived, but with no sender-side count there is no denominator and this rung is not evidence",
+            s.received_datagrams
+        );
+    };
+    let loss = s
+        .loss_fraction
+        .map(|l| format!("{:.1}%", l * 100.0))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "asked {offered:.0} Mbit/s -> sender achieved {:.2}, receiver saw {:.2} Mbit/s, loss {loss}, reordered {}, duplicated {}{}",
+        sender / 1e6,
+        s.receiver_bps / 1e6,
+        s.reordered_datagrams,
+        s.duplicate_datagrams,
+        if s.admissible {
+            ""
+        } else {
+            " — NOT ADMISSIBLE, the sender never reached its own offer"
+        }
+    )
+}
+
+/// Drive one rung: ask, collect, and fold both accounts into a record.
+///
+/// The second half of the return says whether the daemon answered *anything*,
+/// which is a different failure from a rung that ran badly and is what lets the
+/// ladder abandon an unreachable source instead of timing out five times.
+#[allow(clippy::too_many_arguments)]
+async fn measure_rung(
+    sock: &UdpSocket,
+    buf: &mut [u8],
+    cookie: &mut [u8; downlink::COOKIE_LEN],
+    run_nonce: u64,
+    rung: u16,
+    kbps: u64,
+    per_rung: Duration,
+    out: &mut ScenarioOutput,
+) -> (crate::report::DownstreamSample, bool) {
+    /// Attempts at getting past the return-routability challenge. Two is enough
+    /// for the expected case (no cookie yet, or one that just expired); a third
+    /// covers a lost request datagram.
+    const ATTEMPTS: usize = 3;
+    /// How long to wait for the daemon's first datagram before giving up on the
+    /// rung. Generous against a ~230 ms path plus the daemon's own scheduling.
+    const FIRST_REPLY: Duration = Duration::from_secs(5);
+    /// Quiet period after the last datagram that ends a rung early once the
+    /// sender's report is in hand.
+    const QUIET: Duration = Duration::from_millis(500);
+    /// Slack past the rung's own length, covering propagation plus the spaced
+    /// copies of the report.
+    const TAIL: Duration = Duration::from_secs(3);
+
+    let mut tracker = downlink::SeqTracker::new();
+    let mut received_bytes = 0u64;
+    let mut first_len = 0u64;
+    let mut first_at: Option<Instant> = None;
+    let mut last_at: Option<Instant> = None;
+    let mut report: Option<downlink::Report> = None;
+
+    let request = |cookie: [u8; downlink::COOKIE_LEN]| downlink::Request {
+        run_nonce,
+        cookie,
+        rung,
+        offered_kbps: kbps.min(u32::MAX as u64) as u32,
+        duration_ms: per_rung.as_millis().min(u32::MAX as u128) as u32,
+        payload_len: downlink::DEFAULT_PAYLOAD as u16,
+    };
+
+    let mut reached_the_daemon = false;
+
+    'attempt: for _ in 0..ATTEMPTS {
+        if sock.send(&request(*cookie).encode()).await.is_err() {
+            continue;
+        }
+        let hard_deadline = Instant::now() + per_rung + TAIL;
+
+        loop {
+            let budget = if first_at.is_none() {
+                FIRST_REPLY.min(hard_deadline.saturating_duration_since(Instant::now()))
+            } else {
+                hard_deadline.saturating_duration_since(Instant::now())
+            };
+            if budget.is_zero() {
+                break 'attempt;
+            }
+            let Ok(Ok(n)) = tokio::time::timeout(budget, sock.recv(buf)).await else {
+                // Nothing more is coming. If the rung already produced data
+                // this is simply its end; if not, retry the request.
+                if first_at.is_some() || report.is_some() {
+                    break 'attempt;
+                }
+                continue 'attempt;
+            };
+            let datagram = &buf[..n];
+
+            if let Some(ch) = downlink::Challenge::decode(datagram) {
+                if ch.run_nonce == run_nonce {
+                    *cookie = ch.cookie;
+                    reached_the_daemon = true;
+                    continue 'attempt;
+                }
+                continue;
+            }
+            if let Some(h) = downlink::DataHeader::decode(datagram) {
+                if h.run_nonce != run_nonce || h.rung != rung {
+                    continue;
+                }
+                reached_the_daemon = true;
+                let now = Instant::now();
+                if tracker.observe(h.seq) {
+                    received_bytes += n as u64;
+                    if first_at.is_none() {
+                        first_at = Some(now);
+                        first_len = n as u64;
+                    }
+                }
+                last_at = Some(now);
+                continue;
+            }
+            if let Some(r) = downlink::Report::decode(datagram) {
+                if r.run_nonce != run_nonce || r.rung != rung {
+                    continue;
+                }
+                reached_the_daemon = true;
+                report.get_or_insert(r);
+                // Copies of the report follow, and data may still be draining
+                // out of the receive queue behind it. Wait out a quiet period
+                // rather than cutting the rung short at the first copy.
+                let quiet_until = Instant::now() + QUIET;
+                while let Some(rest) = quiet_until.checked_duration_since(Instant::now()) {
+                    let Ok(Ok(n)) = tokio::time::timeout(rest, sock.recv(buf)).await else {
+                        break;
+                    };
+                    if let Some(h) = downlink::DataHeader::decode(&buf[..n]) {
+                        if h.run_nonce == run_nonce && h.rung == rung && tracker.observe(h.seq) {
+                            received_bytes += n as u64;
+                            last_at = Some(Instant::now());
+                        }
+                    }
+                }
+                break 'attempt;
+            }
+        }
+    }
+
+    if !reached_the_daemon {
+        out.summary.error_count += 1;
+    } else {
+        out.summary.ok_count += 1;
+    }
+
+    // First-to-last arrival, not the whole exchange: the request's round trip
+    // and the daemon's start-up are not part of the path's send rate.
+    let observed_window_ns = match (first_at, last_at) {
+        (Some(a), Some(b)) if b > a => b.duration_since(a).as_nanos() as u64,
+        _ => 0,
+    };
+    // The first datagram's bytes are excluded because they arrived at the start
+    // of the window, not during it: `n` datagrams span `n - 1` gaps, and
+    // counting all `n` over that span overstates the rate at low counts.
+    let receiver_bps =
+        pacing::bits_per_sec(received_bytes.saturating_sub(first_len), observed_window_ns);
+
+    let offered_bps = kbps as f64 * 1000.0;
+    let sender_bps = report.map(|r| pacing::bits_per_sec(r.bytes, r.elapsed_ns));
+    let sender_reached_offer = sender_bps.map(|b| pacing::reached_offer(offered_bps, b));
+    let admissible = sender_reached_offer == Some(true) && tracker.received() >= 2;
+
+    let note = if report.is_none() {
+        "the sender never reported what it managed, so there is no denominator for this rung"
+    } else if sender_reached_offer != Some(true) {
+        "the sender fell short of its own offer: this rung measures the daemon, not the path"
+    } else if tracker.received() < 2 {
+        "too few datagrams arrived to measure an interval"
+    } else {
+        ""
+    };
+
+    let sample = crate::report::DownstreamSample {
+        leg: Leg::RawUdp,
+        direction: "raw_udp_downstream".to_string(),
+        t_unix_ns: unix_nanos(),
+        rung,
+        offered_bps,
+        payload_bytes: downlink::DEFAULT_PAYLOAD,
+        requested_ns: per_rung.as_nanos() as u64,
+        sender_datagrams: report.map(|r| r.datagrams),
+        sender_bytes: report.map(|r| r.bytes),
+        sender_elapsed_ns: report.map(|r| r.elapsed_ns),
+        sender_bps,
+        sender_reached_offer,
+        received_datagrams: tracker.received(),
+        received_bytes,
+        reordered_datagrams: tracker.reordered(),
+        duplicate_datagrams: tracker.duplicates(),
+        observed_window_ns,
+        receiver_bps,
+        loss_fraction: tracker.loss_fraction(report.map(|r| r.datagrams)),
+        admissible,
+        note: note.to_string(),
+    };
+    (sample, reached_the_daemon)
 }
 
 /// Raw UDP echo round trips. Also the direct path-MTU probe.

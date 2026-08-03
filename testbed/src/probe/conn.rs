@@ -57,6 +57,11 @@ pub struct Endpoints {
     pub quic_port: u16,
     pub raw_tcp_port: u16,
     pub raw_udp_port: u16,
+    /// The one-way server → client control. Not reachable through
+    /// [`Endpoints::port_for`] because it is not a leg of its own: it is a
+    /// second probe against the same `raw_udp` control group, measuring the
+    /// direction the echo cannot isolate.
+    pub raw_udp_down_port: u16,
     pub sni: String,
     /// The daemon's QUIC certificate, DER, as pinned by the operator.
     ///
@@ -80,6 +85,11 @@ impl Endpoints {
 
     pub fn addr_for(&self, leg: Leg) -> String {
         format!("{}:{}", self.host, self.port_for(leg))
+    }
+
+    /// The raw downstream source's address.
+    pub fn raw_downstream_addr(&self) -> String {
+        format!("{}:{}", self.host, self.raw_udp_down_port)
     }
 }
 
@@ -461,6 +471,7 @@ mod tests {
             quic_port: 4245,
             raw_tcp_port: 4342,
             raw_udp_port: 4343,
+            raw_udp_down_port: 4344,
             sni: "www.example.com".into(),
             quic_cert: None,
         }
@@ -476,10 +487,12 @@ mod tests {
         assert_eq!(e.port_for(Leg::RawTcp), 4342);
         assert_eq!(e.port_for(Leg::RawUdp), 4343);
         assert_eq!(e.addr_for(Leg::Udp), "example.test:4243");
+        assert_eq!(e.raw_downstream_addr(), "example.test:4344");
 
-        // No two legs may share a port, or a run would silently measure the
-        // wrong listener.
-        let ports: Vec<u16> = [
+        // No two listeners may share a port, or a run would silently measure
+        // the wrong one. The downstream source is in the list even though it is
+        // not a leg: it is a distinct listener on the daemon.
+        let mut ports: Vec<u16> = [
             Leg::Udp,
             Leg::Tcp,
             Leg::Mimic,
@@ -490,10 +503,11 @@ mod tests {
         .iter()
         .map(|l| e.port_for(*l))
         .collect();
+        ports.push(e.raw_udp_down_port);
         let mut uniq = ports.clone();
         uniq.sort_unstable();
         uniq.dedup();
-        assert_eq!(uniq.len(), ports.len(), "leg ports must be distinct");
+        assert_eq!(uniq.len(), ports.len(), "listener ports must be distinct");
     }
 
     #[test]

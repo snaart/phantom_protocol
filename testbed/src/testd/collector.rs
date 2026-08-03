@@ -215,6 +215,7 @@ mod tests {
         h.snapshot(ServerStats {
             listener: "tcp".into(),
             t_unix_ns: 7,
+            build: crate::report::BuildId::current(),
             metrics: crate::report::ClientMetrics {
                 packets_sent: 5,
                 packets_recv: 6,

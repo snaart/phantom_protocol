@@ -143,6 +143,49 @@ impl std::fmt::Display for Leg {
     }
 }
 
+// ── Build identity ──────────────────────────────────────────────────────────
+
+/// Which code produced a binary.
+///
+/// Resolved at compile time by `build.rs`, not at run time. Asking git when the
+/// process starts answers a question about the *current directory* — normally a
+/// results folder on the operator's laptop, or a VPS with no checkout at all —
+/// rather than about the binary, so two runs of visibly different code could
+/// carry the same stamp or none. Baking it in is what lets an analysis comparing
+/// two runs prove they were not the same build.
+///
+/// `git_sha` reads `unknown` when the source was built outside a repository (a
+/// tarball, a vendored copy). That is a normal case and says so, which is better
+/// than a plausible-looking wrong answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildId {
+    pub git_sha: String,
+    /// True when tracked files differed from the commit at build time. A dirty
+    /// build is not reproducible from its SHA, and a comparison that treats it
+    /// as though it were is drawing a conclusion about code nobody has.
+    pub git_dirty: bool,
+    pub version: String,
+}
+
+impl BuildId {
+    pub fn current() -> Self {
+        Self {
+            git_sha: env!("TESTBED_GIT_SHA").to_string(),
+            git_dirty: env!("TESTBED_GIT_DIRTY") == "true",
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    /// Compact `<sha>` or `<sha>-dirty`, for a log line or an event detail.
+    pub fn label(&self) -> String {
+        if self.git_dirty {
+            format!("{}-dirty", self.git_sha)
+        } else {
+            self.git_sha.clone()
+        }
+    }
+}
+
 // ── Run metadata ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,7 +205,14 @@ pub struct RunMeta {
     pub client: HostInfo,
     pub testbed_version: String,
     pub phantom_version: String,
-    pub git_sha: Option<String>,
+    /// The probe's own build.
+    pub build: BuildId,
+    /// The daemon's build, read from its `STATS` reply during `clock_sync`.
+    ///
+    /// `None` when no Phantom leg was reachable to ask over. Recorded here
+    /// rather than only on the server so one artifact answers "which two builds
+    /// produced this comparison" without needing the daemon's directory too.
+    pub daemon_build: Option<BuildId>,
 
     pub clock: Option<ClockEstimate>,
 
@@ -310,6 +360,60 @@ pub struct ThroughputSample {
     pub window_frames: u64,
     pub window_ns: u64,
     pub cumulative_bytes: u64,
+}
+
+/// One rung of a raw UDP capacity ladder, recorded from both ends.
+///
+/// The fields exist in pairs on purpose. A rung has an *offered* rate, a rate
+/// the sender actually achieved on its own socket, and a rate the receiver
+/// observed; collapsing those into one number is how a control comes to report
+/// its own scheduler as the path's ceiling. So the sender's account travels
+/// with the receiver's, and [`Self::sender_reached_offer`] states in a field —
+/// not in prose — whether the rung is admissible as evidence at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownstreamSample {
+    pub leg: Leg,
+    /// `raw_udp_downstream` — server → client, no protocol in the way.
+    pub direction: String,
+    pub t_unix_ns: u64,
+    /// Index into the ladder, so rungs stay ordered after any sort.
+    pub rung: u16,
+    pub offered_bps: f64,
+    pub payload_bytes: usize,
+    /// Interval the rung was asked to run for.
+    pub requested_ns: u64,
+
+    /// Datagrams the sender says it put on its own socket. `None` when its
+    /// report never arrived, which makes every derived figure below unanchored
+    /// and is why they are optional too.
+    pub sender_datagrams: Option<u64>,
+    pub sender_bytes: Option<u64>,
+    pub sender_elapsed_ns: Option<u64>,
+    pub sender_bps: Option<f64>,
+    /// False when the sender fell short of its own offer. Such a rung measures
+    /// the sender, not the path, and the analysis filters on this field.
+    pub sender_reached_offer: Option<bool>,
+
+    pub received_datagrams: u64,
+    pub received_bytes: u64,
+    /// Arrived after a higher-numbered datagram already had.
+    pub reordered_datagrams: u64,
+    pub duplicate_datagrams: u64,
+
+    /// First arrival to last arrival — the receiver's own observation interval,
+    /// which excludes the request's round trip and the sender's start-up.
+    pub observed_window_ns: u64,
+    pub receiver_bps: f64,
+    /// `None` without the sender's count: a gap at the receiver is
+    /// indistinguishable from a datagram never sent.
+    pub loss_fraction: Option<f64>,
+
+    /// True only when the sender reached its offer and enough arrived to
+    /// measure an interval. The one field to filter on before quoting a rung as
+    /// the path's capacity.
+    pub admissible: bool,
+    /// Why not, when `admissible` is false.
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,6 +588,10 @@ pub struct PerLegCounters {
 pub struct ServerStats {
     pub listener: String,
     pub t_unix_ns: u64,
+    /// The daemon's own build. Carried on every snapshot and every `STATS`
+    /// reply because this is the only channel by which the probe can learn
+    /// which code was on the other end of its measurements.
+    pub build: BuildId,
     pub metrics: ClientMetrics,
     pub per_leg: Vec<PerLegCounters>,
     pub process: ProcInfo,
@@ -881,6 +989,103 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(l).expect("rotation never splits a record");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The build stamp is what lets an analysis prove two runs used different
+    /// code, so it must be present and well-formed in every binary this crate
+    /// produces — including one built outside a repository.
+    #[test]
+    fn the_build_identity_is_always_populated() {
+        let b = BuildId::current();
+        assert!(
+            !b.git_sha.is_empty(),
+            "an empty SHA is worse than 'unknown'"
+        );
+        assert_eq!(b.version, env!("CARGO_PKG_VERSION"));
+        if b.git_sha == "unknown" {
+            assert!(
+                !b.git_dirty,
+                "a build with no repository cannot know it is dirty"
+            );
+        } else {
+            assert_eq!(b.git_sha.len(), 40, "full object id: {}", b.git_sha);
+            assert!(b.git_sha.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        assert!(b.label().starts_with(&b.git_sha));
+        let dirty = BuildId {
+            git_sha: "abc".into(),
+            git_dirty: true,
+            version: "0".into(),
+        };
+        assert_eq!(dirty.label(), "abc-dirty");
+    }
+
+    /// The record the downstream control emits, in full, so a change to the
+    /// schema shows up here rather than in a Python traceback an hour into a
+    /// run's analysis.
+    #[test]
+    fn a_downstream_rung_serialises_with_every_field_the_analysis_reads() {
+        let s = DownstreamSample {
+            leg: Leg::RawUdp,
+            direction: "raw_udp_downstream".into(),
+            t_unix_ns: 1,
+            rung: 3,
+            offered_bps: 60e6,
+            payload_bytes: 1200,
+            requested_ns: 5_000_000_000,
+            sender_datagrams: Some(31_250),
+            sender_bytes: Some(37_500_000),
+            sender_elapsed_ns: Some(5_000_000_000),
+            sender_bps: Some(60e6),
+            sender_reached_offer: Some(true),
+            received_datagrams: 30_000,
+            received_bytes: 36_000_000,
+            reordered_datagrams: 12,
+            duplicate_datagrams: 0,
+            observed_window_ns: 5_000_000_000,
+            receiver_bps: 57.6e6,
+            loss_fraction: Some(0.04),
+            admissible: true,
+            note: String::new(),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&s).expect("encode")).expect("decode");
+        assert_eq!(v["leg"], "raw_udp");
+        assert_eq!(v["direction"], "raw_udp_downstream");
+        assert_eq!(v["rung"], 3);
+        assert_eq!(v["offered_bps"], 60e6);
+        assert_eq!(v["sender_bps"], 60e6);
+        assert_eq!(v["sender_reached_offer"], true);
+        assert_eq!(v["receiver_bps"], 57.6e6);
+        assert_eq!(v["received_datagrams"], 30_000);
+        assert_eq!(v["reordered_datagrams"], 12);
+        assert_eq!(v["duplicate_datagrams"], 0);
+        assert_eq!(v["observed_window_ns"], 5_000_000_000u64);
+        assert_eq!(v["loss_fraction"], 0.04);
+        assert_eq!(v["admissible"], true);
+
+        // A rung with no sender report must serialise its unknowns as null, not
+        // as zero: zero would read as "the sender sent nothing", which is a
+        // measurement, and the truth is that nothing is known.
+        let unknown = DownstreamSample {
+            sender_datagrams: None,
+            sender_bytes: None,
+            sender_elapsed_ns: None,
+            sender_bps: None,
+            sender_reached_offer: None,
+            loss_fraction: None,
+            admissible: false,
+            note: "no report from the sender".into(),
+            ..s
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&unknown).expect("encode"))
+                .expect("decode");
+        assert!(v["sender_bps"].is_null());
+        assert!(v["sender_reached_offer"].is_null());
+        assert!(v["loss_fraction"].is_null());
+        assert_eq!(v["admissible"], false);
+        assert!(!v["note"].as_str().unwrap_or_default().is_empty());
     }
 
     #[test]

@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 
 use crate::framing::{Framed, MsgLink};
 use crate::quic::QuicLink;
-use crate::report::{unix_nanos, PerLegCounters, ServerStats};
+use crate::report::{unix_nanos, BuildId, PerLegCounters, ServerStats};
 use crate::testd::collector::CollectorHandle;
 use crate::testd::handler::{Counters, SessionCtx};
 
@@ -43,6 +43,11 @@ pub struct TestdConfig {
     pub quic_bind: SocketAddr,
     pub raw_tcp_bind: SocketAddr,
     pub raw_udp_bind: SocketAddr,
+    /// The one-way server → client capacity control. Separate from the echo on
+    /// `raw_udp_bind` because that one must stay a pure echo: a listener that
+    /// both mirrors datagrams and bursts on request would be answering two
+    /// questions on one port, and neither cleanly.
+    pub raw_udp_down_bind: SocketAddr,
     pub enable_mimic: bool,
     pub enable_quic: bool,
     pub mimic_sni: String,
@@ -274,6 +279,15 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
             }
         });
     }
+    {
+        let s = base_stats.clone();
+        let addr = cfg.raw_udp_down_bind.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = baseline::run_udp_source(addr, s).await {
+                tracing::error!(error = %e, "raw udp downstream source exited");
+            }
+        });
+    }
 
     // ── accept loops ───────────────────────────────────────────────────────
     let mut accepts = Vec::new();
@@ -323,13 +337,20 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
         cfg.snapshot_interval,
     ));
 
+    // The build stamp goes in the startup event because that is the one record
+    // every run's journal is guaranteed to contain, whatever else failed. A
+    // comparison between two data sets can only claim they used different code
+    // if both halves say which code they were.
+    let build = BuildId::current();
     collector.event(
         "daemon",
         "start",
         None,
         None,
         format!(
-            "tcp={} udp={} mimic={} quic={} raw_tcp={} raw_udp={} pin={}",
+            "build={} version={} tcp={} udp={} mimic={} quic={} raw_tcp={} raw_udp={} raw_udp_down={} pin={}",
+            build.label(),
+            build.version,
             cfg.tcp_bind,
             cfg.udp_bind,
             if cfg.enable_mimic {
@@ -344,10 +365,11 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
             },
             cfg.raw_tcp_bind,
             cfg.raw_udp_bind,
+            cfg.raw_udp_down_bind,
             vk_hex
         ),
     );
-    tracing::info!("phantom-testd ready");
+    tracing::info!(build = %build.label(), "phantom-testd ready");
 
     shutdown_signal().await;
     tracing::info!("shutdown signal received");
@@ -593,6 +615,7 @@ async fn snapshot_loop(
             collector.snapshot(ServerStats {
                 listener: name.to_string(),
                 t_unix_ns: unix_nanos(),
+                build: BuildId::current(),
                 metrics: snap.to_ffi().into(),
                 per_leg,
                 process: crate::sysinfo::proc_info(),
@@ -608,12 +631,18 @@ async fn snapshot_loop(
             None,
             None,
             format!(
-                "tcp_conns={} tcp_frames={} tcp_bytes={} udp_datagrams={} udp_bytes={}",
+                "tcp_conns={} tcp_frames={} tcp_bytes={} udp_datagrams={} udp_bytes={} \
+                 down_rungs={} down_datagrams={} down_bytes={} down_challenges={} down_refused={}",
                 base.tcp_conns.load(Ordering::Relaxed),
                 base.tcp_frames.load(Ordering::Relaxed),
                 base.tcp_bytes.load(Ordering::Relaxed),
                 base.udp_datagrams.load(Ordering::Relaxed),
                 base.udp_bytes.load(Ordering::Relaxed),
+                base.down_rungs.load(Ordering::Relaxed),
+                base.down_datagrams.load(Ordering::Relaxed),
+                base.down_bytes.load(Ordering::Relaxed),
+                base.down_challenges.load(Ordering::Relaxed),
+                base.down_refused.load(Ordering::Relaxed),
             ),
         );
     }

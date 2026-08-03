@@ -45,6 +45,12 @@ struct Args {
     #[arg(long, env = "TESTD_RAW_UDP_BIND", default_value = "0.0.0.0:4343")]
     raw_udp_bind: SocketAddr,
 
+    /// Raw UDP downstream source (no Phantom): the server → client capacity
+    /// control. The echo above is a round trip and so isolates neither
+    /// direction; this is what puts a denominator under a `download` figure.
+    #[arg(long, env = "TESTD_RAW_UDP_DOWN_BIND", default_value = "0.0.0.0:4344")]
+    raw_udp_down_bind: SocketAddr,
+
     /// Disable the mimic-TLS leg.
     #[arg(long, env = "TESTD_NO_MIMIC")]
     no_mimic: bool,
@@ -111,6 +117,7 @@ async fn main() -> Result<()> {
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        build = %phantom_testbed::report::BuildId::current().label(),
         data_dir = %args.data_dir.display(),
         "phantom-testd starting"
     );
@@ -122,6 +129,7 @@ async fn main() -> Result<()> {
         quic_bind: args.quic_bind,
         raw_tcp_bind: args.raw_tcp_bind,
         raw_udp_bind: args.raw_udp_bind,
+        raw_udp_down_bind: args.raw_udp_down_bind,
         enable_mimic: !args.no_mimic,
         enable_quic: !args.no_quic,
         mimic_sni: args.mimic_sni,

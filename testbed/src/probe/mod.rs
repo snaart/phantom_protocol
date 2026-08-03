@@ -18,7 +18,7 @@ use crate::probe::conn::Endpoints;
 use crate::probe::scenarios::ScenarioOutput;
 use crate::proto::{Msg, UPLOAD_CHUNK_SIZE};
 use crate::report::{
-    self, run_id_stamp, unix_nanos, utc_stamp, Leg, RunMeta, RunSummary, SampleSink,
+    self, run_id_stamp, unix_nanos, utc_stamp, BuildId, Leg, RunMeta, RunSummary, SampleSink,
     ScenarioSummary,
 };
 
@@ -65,8 +65,14 @@ pub struct Params {
     pub transfer_cap: Duration,
     /// Window for the raw TCP capacity probe.
     pub raw_throughput: Duration,
-    /// Time spent at each offered rate in the raw UDP capacity probe.
+    /// Time spent at each offered rate in the raw UDP capacity probes.
+    ///
+    /// Shared by both directions so a downstream rung and its uplink twin are
+    /// measured over the same window — comparing a five-second reading against
+    /// a fifteen-second one would fold the difference into the answer.
     pub raw_rate_step: Duration,
+    /// The offered-rate ladder both raw UDP controls walk, kbit/s.
+    pub raw_rungs_kbps: Vec<u64>,
     pub streams: usize,
     pub stream_frames: usize,
     pub stream_frame_bytes: usize,
@@ -101,6 +107,7 @@ impl Params {
                 transfer_cap: Duration::from_secs(60),
                 raw_throughput: Duration::from_secs(15),
                 raw_rate_step: Duration::from_secs(5),
+                raw_rungs_kbps: crate::pacing::DEFAULT_RUNGS_KBPS.to_vec(),
                 streams: 4,
                 stream_frames: 10,
                 stream_frame_bytes: 512,
@@ -130,6 +137,7 @@ impl Params {
                 transfer_cap: Duration::from_secs(180),
                 raw_throughput: Duration::from_secs(30),
                 raw_rate_step: Duration::from_secs(10),
+                raw_rungs_kbps: crate::pacing::DEFAULT_RUNGS_KBPS.to_vec(),
                 streams: 8,
                 stream_frames: 30,
                 stream_frame_bytes: 1024,
@@ -159,6 +167,7 @@ impl Params {
                 transfer_cap: Duration::from_secs(420),
                 raw_throughput: Duration::from_secs(60),
                 raw_rate_step: Duration::from_secs(15),
+                raw_rungs_kbps: crate::pacing::DEFAULT_RUNGS_KBPS.to_vec(),
                 streams: 16,
                 stream_frames: 60,
                 stream_frame_bytes: 1024,
@@ -283,6 +292,9 @@ impl RunState {
         if let Some(c) = out.clock {
             self.meta.clock = Some(c);
         }
+        if let Some(b) = out.daemon_build {
+            self.meta.daemon_build = Some(b);
+        }
         self.summaries.push(out.summary);
         self.flush_summary()
     }
@@ -326,7 +338,9 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
         client: crate::sysinfo::host_info(Some(&cfg.endpoints.addr_for(Leg::Udp))),
         testbed_version: env!("CARGO_PKG_VERSION").to_string(),
         phantom_version: "0.2.2".to_string(),
-        git_sha: git_sha(),
+        build: BuildId::current(),
+        // Filled from the daemon's STATS reply during clock_sync; see there.
+        daemon_build: None,
         clock: None,
         caveats: caveats(&cfg),
     };
@@ -398,10 +412,21 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
                         )
                         .await
                     }
-                    Leg::RawUdp => scenarios::raw_udp_throughput(ep, p.raw_rate_step).await,
+                    Leg::RawUdp => {
+                        scenarios::raw_udp_throughput(ep, &p.raw_rungs_kbps, p.raw_rate_step).await
+                    }
                     _ => continue,
                 };
                 st.absorb(leg, out)?;
+            }
+            // The same ladder, one way, server → client. Both echoes above are
+            // round trips and so bound neither direction on its own; this is
+            // the only figure a `download` can honestly be divided by.
+            if leg == Leg::RawUdp && cfg.wants("downstream") {
+                st.absorb(
+                    leg,
+                    scenarios::raw_udp_downstream(ep, &p.raw_rungs_kbps, p.raw_rate_step).await,
+                )?;
             }
             continue;
         }
@@ -539,8 +564,13 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
 }
 
 /// Scenario names the raw controls answer to. They carry no protocol, so they
-/// run only the two probes that describe the path itself.
-const RAW_SCENARIOS: &[&str] = &["rtt_sweep", "throughput"];
+/// run only the probes that describe the path itself.
+///
+/// `throughput` is a round trip and `downstream` is one way, server → client.
+/// Both are here because they answer different questions: the first bounds what
+/// the path can carry at all, the second bounds the direction every `download`
+/// figure in the run is measured in.
+const RAW_SCENARIOS: &[&str] = &["rtt_sweep", "throughput", "downstream"];
 
 /// Every scenario the matrix runs against the protocol under test.
 ///
@@ -714,7 +744,11 @@ fn caveats(cfg: &ProbeConfig) -> Vec<String> {
         "Migration is a local UDP port rebind, not an interface change: it exercises the migration path and the server's path validation, but the external NAT mapping may not change and the client cannot observe whether it did.".to_string(),
         "Throughput is application-level goodput measured at the testbed protocol, so it excludes Phantom headers, AEAD tags, and any retransmission.".to_string(),
         "The raw TCP/UDP legs carry no Phantom at all; they are the control group, and protocol numbers are meaningful mainly as ratios against them.".to_string(),
+        "The raw TCP and raw UDP throughput controls are round trips: every byte they count crossed the path twice, so neither bounds a single direction. The raw_udp downstream scenario is the only one-way control, and it covers server -> client.".to_string(),
     ];
+    if !cfg.wants("downstream") || !cfg.legs.contains(&Leg::RawUdp) {
+        v.push("No one-way downstream control ran, so this run cannot say whether a low download figure is the transport or the server's uplink.".to_string());
+    }
     if cfg.legs.iter().any(|l| l.is_reference()) {
         v.push(
             "The quic leg is a reference implementation, not the protocol under test and not a control: quinn over the same path, driving the same testbed application protocol over one bidirectional stream.".to_string(),
@@ -751,17 +785,6 @@ fn caveats(cfg: &ProbeConfig) -> Vec<String> {
         v.push("No raw baseline leg was selected, so protocol overhead cannot be separated from path cost in this run.".to_string());
     }
     v
-}
-
-fn git_sha() -> Option<String> {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 /// Ship the result bundle to the daemon over a Phantom session.
@@ -1020,6 +1043,7 @@ mod tests {
                 quic_port: 6,
                 raw_tcp_port: 4,
                 raw_udp_port: 5,
+                raw_udp_down_port: 7,
                 sni: "s".into(),
                 quic_cert: None,
             },

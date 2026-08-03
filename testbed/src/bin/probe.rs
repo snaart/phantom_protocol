@@ -67,6 +67,9 @@ struct Args {
     raw_tcp_port: u16,
     #[arg(long, default_value_t = 4343)]
     raw_udp_port: u16,
+    /// The daemon's one-way downstream source (the `downstream` scenario).
+    #[arg(long, default_value_t = 4344)]
+    raw_udp_down_port: u16,
 
     /// SNI presented to the mimic-TLS leg. Must match the daemon's.
     #[arg(long, default_value = "www.cloudflare.com")]
@@ -101,6 +104,19 @@ struct Args {
     /// Override the number of probes per payload size.
     #[arg(long)]
     rtt_per_size: Option<usize>,
+
+    /// Override the raw UDP controls' offered-rate ladder, kbit/s.
+    ///
+    /// Applies to both directions, so the uplink and downlink rungs stay
+    /// comparable. Raise the top of it when the default ladder saturates
+    /// nothing — a run where the highest rung was still reached without loss
+    /// has not found the ceiling, only a lower bound on it.
+    #[arg(long, value_delimiter = ',')]
+    raw_rungs_kbps: Option<Vec<u64>>,
+
+    /// Override the seconds spent at each rung of that ladder.
+    #[arg(long)]
+    raw_rung_secs: Option<u64>,
 
     /// Run only these scenarios (comma-separated names, e.g. rtt_sweep,upload).
     /// Default: the whole matrix for the chosen profile.
@@ -153,6 +169,18 @@ async fn main() -> Result<()> {
     if let Some(n) = args.rtt_per_size {
         params.rtt_per_size = n.max(1);
     }
+    if let Some(rungs) = args.raw_rungs_kbps {
+        anyhow::ensure!(!rungs.is_empty(), "--raw-rungs-kbps cannot be empty");
+        anyhow::ensure!(
+            rungs.iter().all(|&r| r > 0),
+            "--raw-rungs-kbps must be positive rates"
+        );
+        params.raw_rungs_kbps = rungs;
+    }
+    if let Some(s) = args.raw_rung_secs {
+        anyhow::ensure!(s > 0, "--raw-rung-secs must be at least 1");
+        params.raw_rate_step = Duration::from_secs(s);
+    }
 
     let cfg = ProbeConfig {
         endpoints: Endpoints {
@@ -163,6 +191,7 @@ async fn main() -> Result<()> {
             quic_port: args.quic_port,
             raw_tcp_port: args.raw_tcp_port,
             raw_udp_port: args.raw_udp_port,
+            raw_udp_down_port: args.raw_udp_down_port,
             sni: args.sni,
             quic_cert,
         },
