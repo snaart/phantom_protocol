@@ -30,7 +30,7 @@ const MAX_PENDING_PACKETS: usize = 1024;
 /// [`MAX_RECV_WINDOW`] and the 1156-byte UDP application chunk
 /// ([`crate::transport::mtu::MAX_APP_CHUNK`]) that is ~908, so 2048 clears it with better
 /// than 2× margin (pinned by
-/// `the_reorder_entry_cap_sits_between_one_window_and_its_own_unaccounted_cost`).
+/// `the_reorder_entry_cap_clears_the_segments_one_window_holds`).
 /// Below that it would become the binding constraint before the byte budget does and start
 /// refusing legitimate out-of-order data on exactly the long, lossy paths a large window
 /// exists for. It is not raised further, because the byte budget accounts only for payload
@@ -1904,11 +1904,15 @@ mod tests {
     /// **Below** the point where the entries' own unaccounted cost dominates. The byte
     /// budget counts payload only; an entry also costs a deque slot, a `Vec<Bytes>` and the
     /// retained allocation, and none of that is budgeted. A peer sending one-byte segments
-    /// above a hole it never fills pays the entry cap, not the byte budget. That wall is
-    /// already a compile-time assertion next to the constant; this test states the pair
-    /// together so the margin between them is visible when either side moves.
+    /// above a hole it never fills pays the entry cap, not the byte budget. That wall is a
+    /// compile-time assertion next to the constant and is deliberately not restated here:
+    /// both of its sides are constants, so a runtime copy would assert at test time what
+    /// the build has already proved, and report it later.
+    ///
+    /// What the compiler cannot prove is the lower wall, because the segment count depends
+    /// on the chunk size the datagram budget derives — so that is what this states.
     #[test]
-    fn the_reorder_entry_cap_sits_between_one_window_and_its_own_unaccounted_cost() {
+    fn the_reorder_entry_cap_clears_the_segments_one_window_holds() {
         let segments_in_one_window =
             MAX_RECV_WINDOW as usize / crate::transport::mtu::MAX_APP_CHUNK;
         assert!(
@@ -1916,15 +1920,6 @@ mod tests {
             "the entry cap ({MAX_RECV_REORDER}) must clear the {segments_in_one_window} \
              segments a full {MAX_RECV_WINDOW}-byte window holds with margin, or it — not \
              the byte budget — is what refuses out-of-order data"
-        );
-        // The upper wall, restated from the const assertion beside the constant so a change
-        // to either bound is caught by the same test that names the trade.
-        const PER_ENTRY_OVERHEAD_ESTIMATE: usize = 128;
-        assert!(
-            MAX_RECV_REORDER * PER_ENTRY_OVERHEAD_ESTIMATE <= 256 * 1024,
-            "at {MAX_RECV_REORDER} entries the unbudgeted per-entry cost is \
-             {} B per stream, and MAX_STREAMS of them share a session",
-            MAX_RECV_REORDER * PER_ENTRY_OVERHEAD_ESTIMATE
         );
     }
 
