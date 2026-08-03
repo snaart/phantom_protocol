@@ -28,7 +28,7 @@ use crate::transport::packet_coalescer_codec::unwrap_coalesced_packet;
 use crate::transport::path_validation_codec::build_path_validation_packet;
 use crate::transport::session::{Session, SessionState};
 use crate::transport::shaping::{self, PaddingPolicy};
-use crate::transport::stream::{SendBlocked, Stream};
+use crate::transport::stream::{SendBlocked, SharedRecvTuning, Stream};
 use crate::transport::types::{
     LegType, PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
     WIRE_VERSION,
@@ -474,6 +474,15 @@ pub struct PhantomSession {
     /// receive path counts peer-initiated streams, and both the pump exit and
     /// `Drop for PhantomSession` drain whatever is still open.
     stream_gauge: Arc<StreamGauge>,
+    /// The connection's single receive-window growth budget (see
+    /// [`crate::transport::stream::SharedRecvTuning`]), shared with the data pump.
+    ///
+    /// Every stream of the connection — API-opened, pump-created, or peer-initiated — is
+    /// built from this one handle, which is what makes
+    /// [`crate::transport::stream::SESSION_RECV_WINDOW_GROWTH_BUDGET`] an actual bound
+    /// rather than an intention. It lives here rather than on the negotiated [`Session`]
+    /// because `open_stream()` is reachable before the handshake completes.
+    recv_tuning: Arc<SharedRecvTuning>,
 }
 
 /// Commands for the background session task
@@ -608,6 +617,11 @@ impl PhantomSession {
         let observability = Observability::new(ObservabilityConfig::default());
         // Balanced active-streams gauge, shared with the pump (see StreamGauge).
         let stream_gauge = StreamGauge::new(observability.clone());
+        // One receive-window growth budget for the whole connection. It is created here
+        // rather than on the negotiated `Session`, which does not exist yet: `open_stream()`
+        // is reachable before the handshake completes, and a stream built with a budget of
+        // its own would sit outside the session-wide bound for as long as it lived.
+        let recv_tuning = Arc::new(SharedRecvTuning::default());
 
         // Terminal-error capture + readiness signal.
         let terminal_error: Arc<parking_lot::Mutex<Option<CoreError>>> =
@@ -621,6 +635,7 @@ impl PhantomSession {
         // Query before moving `transport` into the background task.
         let migration_capable = transport.supports_migration();
 
+        let recv_tuning_for_pump = recv_tuning.clone();
         let session = Self {
             id: new_session_id(),
             peer_addr: peer.clone(),
@@ -641,6 +656,7 @@ impl PhantomSession {
             ready_rx,
             migration_capable,
             stream_gauge: stream_gauge.clone(),
+            recv_tuning: recv_tuning.clone(),
         };
 
         // Spawn the background handshake + data pump task on the supplied
@@ -672,6 +688,7 @@ impl PhantomSession {
             ready_tx,
             migration_capable,
             stream_gauge,
+            recv_tuning_for_pump,
         )));
 
         session
@@ -727,6 +744,10 @@ impl PhantomSession {
         // the gauge it feeds is "streams open across every accepted session" —
         // which is why the per-session drain below has to be exact.
         let stream_gauge = StreamGauge::new(observability.clone());
+        // One receive-window growth budget for the whole connection: this handle, and only
+        // this handle, is what every stream of the session is built from.
+        let recv_tuning = Arc::new(SharedRecvTuning::default());
+        let recv_tuning_for_pump = recv_tuning.clone();
 
         let inner_session: Arc<Mutex<Option<Arc<Session>>>> =
             Arc::new(Mutex::new(Some(server_session.clone())));
@@ -766,6 +787,7 @@ impl PhantomSession {
             ready_rx,
             migration_capable,
             stream_gauge: stream_gauge.clone(),
+            recv_tuning,
         });
 
         let session_id = *server_session.id();
@@ -800,6 +822,7 @@ impl PhantomSession {
             cmd_tx,
             incoming_stream_tx,
             stream_gauge,
+            recv_tuning_for_pump,
         )));
 
         session
@@ -835,6 +858,9 @@ impl PhantomSession {
         migration_capable: bool,
         // Balanced active-streams gauge shared with the outer `PhantomSession`.
         stream_gauge: Arc<StreamGauge>,
+        // The connection's single receive-window growth budget, created by the
+        // `PhantomSession` (which outlives the handshake) and handed to the pump below.
+        recv_tuning: Arc<SharedRecvTuning>,
     ) {
         // Derive the leg label once from migration_capable so every metric
         // and ObservedTransport inside this task uses the right leg type.
@@ -1002,6 +1028,7 @@ impl PhantomSession {
             cmd_tx_for_stream,
             incoming_stream_tx,
             stream_gauge,
+            recv_tuning,
         )
         .await;
     }
@@ -1330,6 +1357,11 @@ struct RecvScratch {
     last_peer_path: u8,
     /// Shared user-visible-stream gauge (see [`StreamGauge`]).
     stream_gauge: Arc<StreamGauge>,
+    /// The connection's single receive-window growth budget. The receive path needs it for
+    /// the same reason it needs the gauge above: it is where peer-initiated streams are
+    /// materialised, and a stream built with a budget of its own would sit outside the
+    /// session-wide bound.
+    recv_tuning: Arc<SharedRecvTuning>,
 }
 
 impl RecvScratch {
@@ -1337,12 +1369,14 @@ impl RecvScratch {
         ack_buf_capacity: usize,
         stream_gauge: Arc<StreamGauge>,
         challenges: Arc<PathChallenges>,
+        recv_tuning: Arc<SharedRecvTuning>,
     ) -> Self {
         Self {
             ack_buf: Vec::with_capacity(ack_buf_capacity),
             challenges,
             last_peer_path: 0,
             stream_gauge,
+            recv_tuning,
         }
     }
 }
@@ -1608,6 +1642,11 @@ async fn run_data_pump<T: SessionTransport>(
     // (see `StreamGauge`): the receive path counts peer-initiated streams, the
     // close paths retire them, and the teardown below drains the remainder.
     stream_gauge: Arc<StreamGauge>,
+    // The connection's single receive-window growth budget, created by the
+    // `PhantomSession` that outlives this pump. Every stream the pump builds — its own
+    // raw stream and each peer-initiated one — draws on this handle, which is what makes
+    // the session-wide bound hold rather than merely be intended.
+    recv_tuning: Arc<SharedRecvTuning>,
 ) {
     // Session is now established and active — bump the active-session gauge.
     // The matching `session_closed` at teardown (below) lets the gauge fall,
@@ -1626,7 +1665,10 @@ async fn run_data_pump<T: SessionTransport>(
     // its buffered segments on the poll tick / outbound-ready notify, and
     // inbound ACKs for id 1 clear them via `Stream::ack`. The demultiplexer
     // hands out ids 2+, so this never collides with a user-opened stream.
-    let raw_stream = Arc::new(Stream::new(RAW_APP_STREAM_ID as TransportStreamId));
+    let raw_stream = Arc::new(Stream::with_recv_tuning(
+        RAW_APP_STREAM_ID as TransportStreamId,
+        recv_tuning.clone(),
+    ));
     streams.insert(RAW_APP_STREAM_ID, raw_stream.clone());
 
     // Application writes the pump has accepted but that a stream's send buffer
@@ -1841,13 +1883,18 @@ async fn run_data_pump<T: SessionTransport>(
         // `PhantomPacket`, the 15-byte header plus the AEAD tag, so the
         // underlying buffer is never reallocated after the first frame) plus
         // the observability bookkeeping the receive path needs.
-        let mut scratch = RecvScratch::new(256, stream_gauge_recv, path_challenges_recv);
+        let mut scratch =
+            RecvScratch::new(256, stream_gauge_recv, path_challenges_recv, recv_tuning);
         // Buffering ceiling: the delivery queue is unbounded so the reader
         // never blocks, but a peer that ignores flow control could flood it.
-        // Compliant senders are bounded by ~one window per stream (enforced
-        // `poll_send`), far below this cap; crossing it means the peer is
+        // Compliant senders are bounded by one advertised window per stream
+        // (enforced in `poll_send`); crossing this cap means the peer is
         // misbehaving, so we tear the session down rather than buffer without
-        // limit. 4 MiB tolerates many streams × the 64 KiB window with margin.
+        // limit. Every byte counted here is resident, so the number is a memory
+        // commitment and stays a fixed literal: it is deliberately NOT derived from
+        // the window ceiling, or raising that ceiling would silently raise how much a
+        // peer can make this side hold. 4 MiB is four times what one auto-tuned stream
+        // can legitimately have outstanding, so honest traffic does not approach it.
         const RECV_DELIVERY_HARD_CAP: u64 = 4 * 1024 * 1024;
         loop {
             // Flow-control / anti-flood gate: if the app-delivery backlog
@@ -3404,10 +3451,11 @@ async fn send_path_validation<T: SessionTransport>(
 
 /// Hard cap on concurrent receive streams a peer can open on one session (H-3). The recv
 /// path auto-creates a `Stream` for any of the 2^32 `stream_id`s; without a cap a peer can
-/// spray distinct ids to explode the stream table. With the per-stream reorder budget,
-/// `MAX_STREAMS` times `MAX_RECV_REORDER_BYTES_CEILING` bounds the session's total reorder
-/// memory (the ceiling being reachable only on a stream whose own application demonstrably
-/// consumed its way there — see `Stream::tune_recv_window`).
+/// spray distinct ids to explode the stream table. It bounds the session's reorder memory
+/// together with — not by multiplying — the per-stream ceiling: what a session may hold is
+/// `MAX_STREAMS × MAX_RECV_REORDER_BYTES` plus one
+/// `SESSION_RECV_WINDOW_GROWTH_BUDGET`, because every byte of window above the initial one
+/// is drawn from that single session-wide allowance rather than granted per stream.
 /// Sized well above QUIC's ~100-stream default so real multiplexing is unaffected.
 const MAX_STREAMS: usize = 256;
 
@@ -4037,7 +4085,10 @@ async fn handle_packet<T: SessionTransport>(
                     );
                     return;
                 }
-                let new_stream = Arc::new(Stream::new(stream_id as TransportStreamId));
+                let new_stream = Arc::new(Stream::with_recv_tuning(
+                    stream_id as TransportStreamId,
+                    scratch.recv_tuning.clone(),
+                ));
                 streams_recv.insert(stream_id, new_stream.clone());
 
                 // For peer-initiated user streams (id ≥ 2), register in
@@ -4299,6 +4350,7 @@ impl PhantomSession {
             // Inert constructor: no pump, so only `Drop` ever drains this.
             stream_gauge: StreamGauge::new(observability.clone()),
             observability,
+            recv_tuning: Arc::new(SharedRecvTuning::default()),
         })
     }
 
@@ -4307,7 +4359,10 @@ impl PhantomSession {
         let handle = self.demux.open_stream(1024);
         let stream_id = handle.stream_id;
 
-        let transport_stream = Arc::new(Stream::new(stream_id as TransportStreamId));
+        let transport_stream = Arc::new(Stream::with_recv_tuning(
+            stream_id as TransportStreamId,
+            self.recv_tuning.clone(),
+        ));
         self.streams.insert(stream_id, transport_stream);
         // Count the stream on the active-streams gauge. The matching retire is
         // the pump's FIN-acked teardown, or — for a stream still open when the
@@ -5331,6 +5386,7 @@ mod tests {
             ack_capacity,
             StreamGauge::new(obs.clone()),
             Arc::new(PathChallenges::default()),
+            Arc::new(SharedRecvTuning::default()),
         )
     }
 
@@ -6794,6 +6850,140 @@ mod tests {
         let mut packet = PhantomPacket::from_wire(frame).expect("decode test recv frame");
         packet.header.session_id = session_id;
         packet
+    }
+
+    /// One connection, one receive-window growth budget.
+    ///
+    /// `SESSION_RECV_WINDOW_GROWTH_BUDGET` bounds a session's receive-side memory only if
+    /// every stream of that session actually draws on the same handle; a stream built with
+    /// a budget of its own is a second, unbounded allowance for as long as it lives, and
+    /// nothing about the arithmetic would show it. Two paths create streams outside
+    /// `open_stream()` — the pump's own raw stream and the peer-initiated branch of
+    /// `handle_packet` — and this pins both of them to the handle the `PhantomSession`
+    /// holds, including for a stream opened before the handshake had a chance to finish.
+    #[tokio::test]
+    async fn every_stream_of_one_connection_draws_on_one_growth_budget() {
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        let server_hs = HandshakeServer::new().unwrap();
+        let server_pinned_key = server_hs.verifying_key().clone();
+
+        let session = PhantomSession::connect_with_transport(
+            "test-server:9007",
+            client_transport,
+            server_pinned_key,
+        );
+
+        // Before the handshake has any chance to complete: the ordering that makes the
+        // budget's owner the API layer rather than the negotiated session.
+        let _early = session.open_stream();
+
+        let server_handle = tokio::spawn(async move {
+            let client_ip = "127.0.0.1".parse().unwrap();
+            let hello_bytes = server_transport.recv_bytes().await.unwrap();
+            let hello = borsh::from_slice::<ClientHello>(&hello_bytes).unwrap();
+            let mut response = server_hs.process_client_hello(&hello, 0, client_ip);
+            if let HandshakeResponse::Retry(retry) = response {
+                let retry_bytes = ServerReply::Retry(retry).to_wire().unwrap();
+                server_transport.send_bytes(&retry_bytes).await.unwrap();
+                let next_bytes = server_transport.recv_bytes().await.unwrap();
+                let next_hello = borsh::from_slice::<ClientHello>(&next_bytes).unwrap();
+                response = server_hs.process_client_hello(&next_hello, 0, client_ip);
+            }
+            match response {
+                HandshakeResponse::Success(server_hello, _s, _) => {
+                    let bytes = ServerReply::Hello(server_hello).to_wire().unwrap();
+                    server_transport.send_bytes(&bytes).await.unwrap();
+                    // Hold the pipe open past the assertions below: an EOF here would
+                    // close the session and the stream table with it.
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
+                other => panic!("handshake did not succeed: {other:?}"),
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(session.connection_state(), ConnectionState::Connected);
+        let _late = session.open_stream();
+
+        // The pump inserted its own raw stream (id 1) alongside the two opened here, so
+        // this covers all three creation sites the API layer owns.
+        assert!(
+            session.streams.len() >= 3,
+            "expected the pump's raw stream plus both opened streams, found {}",
+            session.streams.len()
+        );
+        for entry in session.streams.iter() {
+            assert!(
+                Arc::ptr_eq(entry.value().recv_tuning(), &session.recv_tuning),
+                "stream {} draws on a growth budget of its own — the session-wide bound \
+                 does not hold for it",
+                entry.key()
+            );
+        }
+
+        server_handle.await.unwrap();
+        session.disconnect().await.unwrap();
+    }
+
+    /// The peer-initiated branch of the same invariant: a stream this side never asked for
+    /// must land on the connection's budget too, or a peer could open `MAX_STREAMS` of them
+    /// and each would arrive with a fresh allowance.
+    #[tokio::test]
+    async fn a_peer_initiated_stream_draws_on_the_connection_growth_budget() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+
+        // Stream 2 is a user stream this side has never seen, so `handle_packet` takes the
+        // create-on-receive branch.
+        let frame = build_app_frame(&client_session, session_id, 2, 0, b"peer-opened");
+        let v2 = decode_recv_frame(&frame, session_id);
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
+        let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        let connection_budget = Arc::new(SharedRecvTuning::default());
+        let mut scratch = RecvScratch::new(
+            256,
+            StreamGauge::new(obs.clone()),
+            Arc::new(PathChallenges::default()),
+            connection_budget.clone(),
+        );
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (inc_tx, _inc_rx) = mpsc::channel(4);
+        handle_packet(
+            v2,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &transport_send,
+            &transport_send,
+            &deliver_tx,
+            &undelivered,
+            &mut scratch,
+            &obs,
+            LegType::Tcp,
+            &cmd_tx,
+            &inc_tx,
+        )
+        .await;
+
+        let created = streams
+            .get(&2)
+            .expect("the packet must have opened stream 2");
+        assert!(
+            Arc::ptr_eq(created.value().recv_tuning(), &connection_budget),
+            "a peer-initiated stream was built with a growth budget of its own"
+        );
     }
 
     #[tokio::test]

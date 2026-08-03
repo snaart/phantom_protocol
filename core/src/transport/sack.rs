@@ -71,6 +71,13 @@ use std::fmt;
 /// A 32-range SACK fits in 262 bytes, well within any AEAD budget.
 pub const MAX_SACK_RANGES: usize = 32;
 
+// The overflow reduction in `from_ascending_coalesced` keeps the top `MAX_SACK_RANGES - 1`
+// ranges plus the lowest one, so it needs room for both ends to be distinct. At a cap of 1
+// it would keep only the lowest range and then report that range's high as `largest_acked`
+// — the one field the peer's whole loss detection is measured against. Nothing today would
+// set the cap that low; this is what stops it being discovered on the wire.
+const _: () = assert!(MAX_SACK_RANGES >= 2);
+
 /// Minimum wire size for a 1-range SACK (10 fixed + 4 first_len).
 const MIN_WIRE_LEN: usize = 14;
 
@@ -166,11 +173,11 @@ impl Sack {
 
     /// Build a [`Sack`] from explicit inclusive `(low, high)` ranges in any order
     /// (each must have `low <= high`). Ranges are sorted ascending, coalesced
-    /// (adjacent/overlapping merged), reversed to descending, and **capped to the
-    /// highest [`MAX_SACK_RANGES`]** so the encoded SACK always decodes at the peer
-    /// (`from_wire` rejects `range_count > MAX_SACK_RANGES`). Dropping the lowest
-    /// ranges is safe: those sequences are recovered by cumulative re-ACK as holes
-    /// fill, or by RTO. Returns `None` if `ranges` is empty.
+    /// (adjacent/overlapping merged), reversed to descending, and — if the set overflows
+    /// [`MAX_SACK_RANGES`] — reduced from the middle so the encoded SACK always decodes at
+    /// the peer (`from_wire` rejects `range_count > MAX_SACK_RANGES`). See the private
+    /// `from_ascending_coalesced` for why the middle and not the bottom.
+    /// Returns `None` if `ranges` is empty.
     pub fn from_inclusive_ranges(mut ranges: Vec<(u32, u32)>, ack_delay_us: u32) -> Option<Sack> {
         if ranges.is_empty() {
             return None;
@@ -192,9 +199,35 @@ impl Sack {
     }
 
     /// Shared tail for [`from_received`] / [`from_inclusive_ranges`]: take ascending,
-    /// already-coalesced ranges, reverse to descending, **cap to the highest
-    /// [`MAX_SACK_RANGES`]** (drop the lowest, oldest ranges so the wire form always
-    /// decodes at the peer), set `largest_acked`, and construct. `None` if empty.
+    /// already-coalesced ranges, reverse to descending, reduce to [`MAX_SACK_RANGES`] if
+    /// the set overflows the wire form, set `largest_acked`, and construct. `None` if empty.
+    ///
+    /// ## Which ranges an overflowing set gives up
+    ///
+    /// The two ranges the sender cannot reconstruct from anything else are the **highest**
+    /// and the **lowest**. The highest carries `largest_acked`, which drives loss detection
+    /// — every packet-threshold and time-threshold decision is measured against it. The
+    /// lowest is the receiver's contiguous delivered run, and it is the only thing that
+    /// retires the bulk of the send buffer: the sender's `on_sack` retires exactly what
+    /// `acks()` covers, so a SACK missing that run retires none of it, and every segment in
+    /// it then sits `PACKET_THRESHOLD` or more behind `largest_acked` and is declared lost.
+    /// That is a whole window of already-delivered data retransmitted and a whole window of
+    /// fabricated loss handed to congestion control, from one over-full reorder buffer.
+    ///
+    /// So an overflowing set is reduced **from the middle**, keeping the top
+    /// `MAX_SACK_RANGES - 1` ranges and the bottom one. The islands dropped from the middle
+    /// really are the recoverable ones: the sender may retransmit them, but the receiver
+    /// still holds them and will report them again as the buffer drains and the set shrinks
+    /// back under the cap. That last property is specific to this design, and it is what
+    /// makes dropping the middle safe: `Stream::received_sack` rebuilds the whole range set
+    /// from live reorder state on every ACK, so a range omitted once is not lost, only
+    /// deferred. (No borrowing from QUIC here — a QUIC sender discards a packet on its first
+    /// acknowledgement and never needs a range repeated, so RFC 9000 has nothing to say
+    /// about which ranges an overflowing set should keep.)
+    ///
+    /// Raising [`MAX_SACK_RANGES`] is not an alternative: the cap exists so the encoded form
+    /// always decodes at a peer, and a larger cap only moves the point at which the set
+    /// overflows.
     fn from_ascending_coalesced(
         mut asc_ranges: Vec<(u32, u32)>,
         ack_delay_us: u32,
@@ -202,9 +235,19 @@ impl Sack {
         if asc_ranges.is_empty() {
             return None;
         }
-        // Reverse to descending order (highest first), then keep the highest ranges.
+        // Reverse to descending order (highest first). Below the cap this is the whole
+        // operation, so the common case emits exactly the bytes it always did.
         asc_ranges.reverse();
-        asc_ranges.truncate(MAX_SACK_RANGES);
+        if asc_ranges.len() > MAX_SACK_RANGES {
+            // PANIC-SAFETY: the length is strictly greater than `MAX_SACK_RANGES`, which is
+            // 32, so the vector is non-empty and `last()` cannot return `None`.
+            #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+            let lowest = *asc_ranges.last().unwrap();
+            asc_ranges.truncate(MAX_SACK_RANGES - 1);
+            // Still strictly descending and non-adjacent: `lowest` sits below every range
+            // kept above it, separated by at least the gap that made it a separate range.
+            asc_ranges.push(lowest);
+        }
         let largest_acked = asc_ranges[0].1;
 
         Some(Sack {
@@ -422,8 +465,8 @@ mod tests {
     #[test]
     fn from_received_caps_ranges_to_max_and_stays_decodable() {
         // 40 disjoint singleton islands (even sequences 0,2,..,78) → 40 ranges,
-        // which a peer would reject as TooManyRanges. Generation must cap to 32,
-        // keep the HIGHEST ranges (nearest largest_acked), and remain decodable.
+        // which a peer would reject as TooManyRanges. Generation must reduce to 32,
+        // keep the highest range and the lowest one, and remain decodable.
         let seqs: Vec<u32> = (0u32..40).map(|i| i * 2).collect();
         let sack = Sack::from_received(&seqs, 0).expect("non-empty");
         assert!(
@@ -431,27 +474,59 @@ mod tests {
             "generated SACK must be capped to MAX_SACK_RANGES, got {}",
             sack.ranges().len()
         );
-        // Kept the highest 32 ranges: (78,78) down to (16,16); largest unchanged.
+        // Kept the highest 31 ranges — (78,78) down to (18,18) — plus the lowest, (0,0).
         assert_eq!(sack.largest_acked, 78);
         assert_eq!(sack.ranges().len(), MAX_SACK_RANGES);
         assert_eq!(sack.ranges()[0], (78, 78));
-        assert_eq!(sack.ranges()[MAX_SACK_RANGES - 1], (16, 16));
+        assert_eq!(sack.ranges()[MAX_SACK_RANGES - 2], (18, 18));
+        assert_eq!(sack.ranges()[MAX_SACK_RANGES - 1], (0, 0));
         let wire = sack.to_wire();
         let decoded = Sack::from_wire(&wire).expect("a capped SACK must decode at the peer");
         assert_eq!(decoded, sack);
     }
 
     #[test]
-    fn from_inclusive_ranges_caps_and_keeps_highest() {
-        // Ascending (low,high) input with 40 islands; keep the highest 32.
+    fn from_inclusive_ranges_caps_and_keeps_the_ends() {
+        // Ascending (low,high) input with 40 islands; keep the highest 31 and the lowest.
         let asc: Vec<(u32, u32)> = (0u32..40).map(|i| (i * 2, i * 2)).collect();
         let sack = Sack::from_inclusive_ranges(asc, 7).expect("non-empty");
         assert_eq!(sack.ack_delay_us, 7);
         assert_eq!(sack.ranges().len(), MAX_SACK_RANGES);
         assert_eq!(sack.largest_acked, 78);
         assert_eq!(sack.ranges()[0], (78, 78));
+        assert_eq!(sack.ranges()[MAX_SACK_RANGES - 1], (0, 0));
         // Decodes at the peer.
         assert_eq!(Sack::from_wire(&sack.to_wire()).expect("decode"), sack);
+    }
+
+    /// The cap is a wire constraint, so the overflow policy has to keep the result inside
+    /// it AND keep it decodable. This is what rejects "raise `MAX_SACK_RANGES`" as the fix
+    /// for the dropped cumulative run: raising the cap moves the cliff, it does not remove
+    /// it, and the emitted form must still decode at a peer that enforces the old bound.
+    #[test]
+    fn overflowing_range_set_stays_within_the_cap_and_round_trips() {
+        // 41 islands: one wide cumulative run at the bottom plus 40 singletons above it,
+        // the shape a receiver with a deep reorder buffer actually produces.
+        let mut asc: Vec<(u32, u32)> = vec![(0, 99)];
+        asc.extend((0u32..40).map(|i| {
+            let s = 101 + 2 * i;
+            (s, s)
+        }));
+        let sack = Sack::from_inclusive_ranges(asc, 0).expect("non-empty");
+
+        assert_eq!(
+            sack.ranges().len(),
+            MAX_SACK_RANGES,
+            "an overflowing set must be reduced to exactly the cap"
+        );
+        assert!(sack.acks(0) && sack.acks(99), "the cumulative run survives");
+        assert_eq!(sack.largest_acked, 179, "the largest range survives");
+
+        let wire = sack.to_wire();
+        assert_eq!(
+            Sack::from_wire(&wire).expect("a reduced SACK must decode at the peer"),
+            sack
+        );
     }
 
     #[test]

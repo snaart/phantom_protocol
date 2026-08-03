@@ -43,8 +43,8 @@ const FIXED_WINDOW_CEILING_BPS: u64 =
     INITIAL_STREAM_WINDOW as u64 * 1000 / (2 * ONE_WAY.as_millis() as u64);
 
 /// Long enough for both ladders to climb: congestion control has to find the link rate, and
-/// the receive window has to walk 64 KiB → 512 KiB one doubling per round-trip-length
-/// measurement interval.
+/// the receive window has to walk up from 64 KiB, one doubling per round-trip-length
+/// measurement interval, until it stops being the binding constraint on this 2 MiB/s link.
 const WARMUP: Duration = Duration::from_millis(3000);
 /// Measurement window. Long enough that the ramp inside it is not what is being measured.
 const WINDOW: Duration = Duration::from_millis(3000);
@@ -120,12 +120,19 @@ async fn a_promptly_drained_download_beats_the_fixed_window_rate_ceiling() {
 /// receiver whose application never reads must stall its peer, and must stall it at
 /// substantially the same point as before auto-tuning existed.
 ///
-/// What bounds the number below: the initial 64 KiB window, plus the one doubling the
-/// bounded delivery queue in front of `recv()` can pay for as it fills (the queue absorbs a
-/// few hundred KiB whether or not the application ever reads it — that is true of this
+/// What bounds the number below: the initial 64 KiB window, plus the doublings the bounded
+/// delivery queue in front of `recv()` can pay for as it fills (the queue absorbs a few
+/// hundred KiB whether or not the application ever reads it — that is true of this
 /// implementation with or without auto-tuning), plus handshake and framing. It is emphatically
 /// *not* the megabyte the application handed to `send()`: most of that is still sitting in the
 /// stream's send buffer, which is why this measures the wire and not the sender's API.
+///
+/// Note what does **not** appear in that list:
+/// [`crate::transport::stream::MAX_RECV_WINDOW`]. The queue transient is a fixed number of
+/// bytes — the 256-slot `recv()` channel — so it pays for a fixed number of doublings no
+/// matter how many rungs the ceiling above it offers. That is the property worth pinning: a
+/// ceiling is not an allowance, and this test's bound is therefore allowed to stay where it
+/// was when the ceiling was half its present size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_receiver_that_never_reads_stalls_the_sender() {
     let (client, server, server_wire) = establish_counted(ONE_WAY, LINK_BYTES_PER_SEC).await;
@@ -152,10 +159,15 @@ async fn a_receiver_that_never_reads_stalls_the_sender() {
         "the sender transmitted almost nothing ({on_wire} B) — the harness, not flow \
          control, is what stopped it"
     );
-    // Measured on this harness: 345 KB with auto-tuning compiled out, 413 KB with it — the
-    // 68 KB difference is the single doubling the queue transient pays for. A tuner that
-    // grew on arrival instead would run the window to its 512 KiB cap and put ~800 KB on the
-    // wire, so 640 KiB separates the two by better than 1.2× either way.
+    // Both sides of this bound are measured on this harness rather than reasoned about.
+    // Honest, over sixteen runs: 413–552 KB, quantised — fifteen runs land at 413–419 KB
+    // (two doublings bought by the queue transient) and one at 552 KB, the third doubling
+    // the transient can occasionally afford. Failing, with the consumption test removed so
+    // the tuner grows on arrival: 821–823 KB over three runs, the next rung up; and with the
+    // window removed entirely the link would carry 12 MiB. 640 KiB sits between the two
+    // measured populations — 1.19× above the worst honest run, 1.25× below the cheapest way
+    // to fail — and is unchanged from before the ceiling moved, which is the point: raising
+    // the ceiling added rungs the queue transient still cannot pay for.
     assert!(
         on_wire < 640 * 1024,
         "a receiver whose application never read a byte let its peer transmit {on_wire} B — \

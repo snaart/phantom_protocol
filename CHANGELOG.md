@@ -10,6 +10,52 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **A SACK carrying more than 32 islands threw away the one range that retires data.**
+  `Stream::received_sack` builds its range list with the contiguous delivered run first —
+  lowest — and `Sack::from_ascending_coalesced` reversed the list to descending and then
+  truncated it to `MAX_SACK_RANGES`. The reverse put the highest ranges at the front, so
+  the truncation dropped the lowest, which is exactly the cumulative run. The justification
+  on the books was that a dropped range is "recovered by cumulative re-ACK"; that does not
+  hold when the range dropped *is* the cumulative one. Downstream, `on_sack` retires only
+  what `Sack::acks` covers, so every segment of a delivered window stayed in the send
+  buffer, fell at least `PACKET_THRESHOLD` behind `largest_acked`, was declared lost and
+  was retransmitted — a whole window of already-delivered data resent and a whole window of
+  fabricated loss fed to congestion control. It needed no malice: the reorder buffer holds
+  thousands of islands, so more than 32 holes in one flight is a function of loss rate and
+  window size. An overflowing range set is now reduced **from the middle**, keeping the
+  largest range (which drives loss detection) and the cumulative run (which drives
+  retirement); the middle islands are the recoverable ones, because `received_sack` rebuilds
+  the whole set from live reorder state on every ACK and reports them again as the buffer
+  drains. `MAX_SACK_RANGES` is unchanged: the cap exists so the encoded form always decodes
+  at the peer, and raising it moves the cliff rather than removing it. Below the cap the
+  emitted bytes are exactly what they were.
+
+- **The receive window's ceiling sat below the path.** `MAX_RECV_WINDOW` was 512 KiB, and a
+  window of `W` bytes admits `W / RTT` bytes per second whatever congestion control decides.
+  On the 235 ms path this transport was last measured on that is 17.85 Mbit/s, against
+  41.8 and 42.9 Mbit/s of raw one-way UDP over the same path in two runs; server-side
+  samples showed inflight pinned flat against the cap at 492–520 KB run after run. The
+  ceiling is now 1 MiB, which doubles that to 35.7 Mbit/s. It is not raised further because
+  nothing above it is reachable: a stream's ARQ send buffer holds at most 1024 unacked
+  segments of at most 1156 bytes, so 1 183 744 B is all one stream can ever have
+  outstanding whatever credit it is granted, and window granted past that is memory
+  committed for data that cannot arrive. Moving both together is a separate change with its
+  own memory case to make.
+
+  The receive-side memory a session can be made to commit is now bounded by a session-wide
+  growth budget (`SESSION_RECV_WINDOW_GROWTH_BUDGET`, 8 MiB) that every doubling draws on
+  and every dropped stream returns to. A per-stream ceiling never bounded a session, which
+  may hold 256 streams: with the budget the session-wide worst case works out *lower* than
+  before (40 MiB of reorder budget against 144 MiB) even though the per-stream ceiling
+  doubled. Every stream of a connection — API-opened, pump-created or peer-initiated —
+  draws on one handle, so the bound holds rather than merely being intended. Growth remains
+  driven by what the application consumed, never by what arrived, and the round-trip
+  reference it is measured against stays a constant: the interval is `2 × rtt`, so the
+  consumption rate a peer must be outrun by is inversely proportional to it, and every
+  round trip observable before application data moves is one the far end sets by choosing
+  when to answer. `MAX_SEND_WINDOW` moves with the ceiling — the two ends of one credit
+  ledger must agree.
+
 - **Every full-size PhantomUDP segment was sent as two datagrams.** The data pump chunked
   application data at 1300 bytes, a number chosen independently of the datagram budget it
   had to fit. One reliable chunk becomes `header(15) ‖ AEAD(stream_offset(4) ‖ chunk)`,
