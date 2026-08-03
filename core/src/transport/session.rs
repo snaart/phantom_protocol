@@ -1196,6 +1196,29 @@ impl Session {
         self.bandwidth_estimator.lock().on_loss(bytes);
     }
 
+    /// Declare the sender application-limited: it stopped for want of data to
+    /// send, or because the peer's receive window is closed, rather than because
+    /// congestion control held it back.
+    ///
+    /// The send loop is the only place that knows this. From the acknowledgement
+    /// stream alone a round in which the application had nothing to give looks
+    /// exactly like one in which the path refused to carry more, and the two ask
+    /// for opposite responses: the first must not admit its delivery rate to the
+    /// bandwidth filter and must not have its loss rate judged, because both of
+    /// those figures are measurements of the application.
+    ///
+    /// The phase this opens closes by itself, in the estimator, once everything
+    /// that was outstanding when it opened has been acknowledged.
+    pub fn set_app_limited(&self) {
+        self.bandwidth_estimator.lock().set_app_limited();
+    }
+
+    /// Whether the connection is currently inside an application-limited phase.
+    /// Stamped onto every `DeliverySample` the acknowledgement path builds.
+    pub fn is_app_limited(&self) -> bool {
+        self.bandwidth_estimator.lock().is_app_limited()
+    }
+
     /// Bytes this session has reported to congestion control as lost.
     /// Observability / test hook — the observable that a retransmission on the
     /// send path actually reached the estimator.

@@ -228,6 +228,29 @@ pub struct OutboundSegment {
     pub fin: bool,
 }
 
+/// Why [`Stream::poll_send`] handed nothing back.
+///
+/// The three answers are not interchangeable, and collapsing them into a bare
+/// `None` cost the congestion controller the one signal it cannot derive for
+/// itself. `Idle` and `FlowControl` both mean the sender was *not* held back by
+/// its own congestion window — in the first case because the application had
+/// nothing more to give, in the second because the peer's receive window is
+/// closed — so a round that ends either way says nothing about where the path's
+/// knee is. `CongestionWindow` is the opposite: it is the controller enforcing
+/// its own decision about how much may be outstanding, and a round that ends
+/// there is exactly the kind a loss response exists to judge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendBlocked {
+    /// Nothing buffered: every segment has been sent and none is due for
+    /// retransmission.
+    Idle,
+    /// The head unsent segment is larger than the congestion budget offered.
+    CongestionWindow,
+    /// The peer's advertised flow-control window has no room for the head
+    /// unsent segment. Clears on a `WINDOW_UPDATE`, not on an acknowledgement.
+    FlowControl,
+}
+
 /// RFC 6298 retransmission-timeout estimator (per stream). Replaces a fixed
 /// retransmit timer with one that tracks measured RTT (SRTT / RTTVAR) and backs
 /// off exponentially on consecutive timeouts.
@@ -1069,7 +1092,12 @@ impl Stream {
         self.unreliable_buffer.lock().await.push_back(data);
     }
 
-    /// Get the next segment to (re)transmit, or `None` if nothing is due.
+    /// Get the next segment to (re)transmit, or the reason nothing is due.
+    ///
+    /// The failure side is a [`SendBlocked`] rather than a bare `None` because
+    /// the three ways a pass can come up empty are three different statements
+    /// about the connection, and only one of them is about congestion. See the
+    /// enum.
     ///
     /// `delivered_now` is the connection's current delivered-bytes counter and
     /// `delivered_time_now` is when it last advanced; the pair is stamped onto a
@@ -1083,18 +1111,18 @@ impl Stream {
     ///
     /// `cwnd_budget` is how many bytes of *new* data the congestion window
     /// currently permits. Retransmissions ignore it — loss recovery must always
-    /// proceed — but a first transmission is withheld (`None`) when it would
-    /// exceed the budget, so the next drain resumes once ACKs free the window.
-    /// Pass `u64::MAX` to disable the limit.
+    /// proceed — but a first transmission is withheld when it would exceed the
+    /// budget, so the next drain resumes once ACKs free the window. Pass
+    /// `u64::MAX` to disable the limit.
     pub async fn poll_send(
         &self,
         cwnd_budget: u64,
         delivered_now: u64,
         delivered_time_now: std::time::Instant,
-    ) -> Option<OutboundSegment> {
+    ) -> Result<OutboundSegment, SendBlocked> {
         // Unreliable data is fire-and-forget and not congestion-controlled.
         if let Some(data) = self.unreliable_buffer.lock().await.pop_front() {
-            return Some(OutboundSegment {
+            return Ok(OutboundSegment {
                 // Unreliable segments are not reassembled; offset is unused (the
                 // send path does not prefix it).
                 stream_offset: 0,
@@ -1129,7 +1157,7 @@ impl Stream {
                 pending.lost = false;
                 pending.sent_at = Some(now);
                 pending.retries += 1;
-                return Some(OutboundSegment {
+                return Ok(OutboundSegment {
                     stream_offset: pending.stream_offset,
                     data: pending.data.clone(),
                     reliable: true,
@@ -1149,7 +1177,7 @@ impl Stream {
                     pending.retries += 1;
                     // Back the RTO off exponentially for the next attempt.
                     self.note_rto_timeout();
-                    return Some(OutboundSegment {
+                    return Ok(OutboundSegment {
                         stream_offset: pending.stream_offset,
                         data: pending.data.clone(),
                         reliable: true,
@@ -1169,19 +1197,23 @@ impl Stream {
             if pending.sent_at.is_none() {
                 let len = pending.data.len() as u64;
                 if len > cwnd_budget {
-                    return None; // congestion window full — wait for ACKs to free it
+                    // The controller's own window is the binding constraint —
+                    // wait for ACKs to free it.
+                    return Err(SendBlocked::CongestionWindow);
                 }
                 // The reliable FIN sentinel (len == 0) bypasses the
                 // flow-control window check — it consumes no peer window.
                 // For non-FIN segments, enforce the peer's flow-control window.
                 if !pending.fin && !self.try_consume_send_window(len as u32) {
-                    return None; // peer flow-control window closed — wait for WINDOW_UPDATE
+                    // The peer's receive window is the binding constraint —
+                    // wait for a WINDOW_UPDATE, not for an acknowledgement.
+                    return Err(SendBlocked::FlowControl);
                 }
                 let is_fin = pending.fin;
                 pending.sent_at = Some(now);
                 pending.delivered_at_send = delivered_now;
                 pending.delivered_time_at_send = Some(delivered_time_now);
-                return Some(OutboundSegment {
+                return Ok(OutboundSegment {
                     stream_offset: pending.stream_offset,
                     data: pending.data.clone(),
                     reliable: true,
@@ -1191,7 +1223,7 @@ impl Stream {
             }
         }
 
-        None
+        Err(SendBlocked::Idle)
     }
 
     /// Mark a sequence number as acknowledged.
@@ -1646,7 +1678,7 @@ mod tests {
         assert!(stream
             .poll_send(u64::MAX, 0, std::time::Instant::now())
             .await
-            .is_none());
+            .is_err());
     }
 
     /// T4.5 (`stream_offset`): the gap-free reliable offset is a `u32`
@@ -1706,7 +1738,7 @@ mod tests {
         assert!(stream
             .poll_send(u64::MAX, 0, std::time::Instant::now())
             .await
-            .is_none());
+            .is_err());
 
         // Advance 400ms — still under the initial 1s RTO (RFC 6298 (2.1):
         // no RTT samples yet, so the timer sits at the 1-second default).
@@ -1714,7 +1746,7 @@ mod tests {
         assert!(stream
             .poll_send(u64::MAX, 0, std::time::Instant::now())
             .await
-            .is_none());
+            .is_err());
 
         // Advance past the 1s initial RTO (total ~1.1s).
         tokio::time::advance(std::time::Duration::from_millis(700)).await;
@@ -1737,7 +1769,7 @@ mod tests {
         assert!(stream
             .poll_send(u64::MAX, 0, std::time::Instant::now())
             .await
-            .is_none());
+            .is_err());
     }
 
     #[tokio::test]
@@ -1759,7 +1791,7 @@ mod tests {
         assert!(stream
             .poll_send(u64::MAX, 0, std::time::Instant::now())
             .await
-            .is_none());
+            .is_err());
 
         // Simulate a send that failed *after* `poll_send` stamped the segment:
         // clear `sent_at` so it is no longer considered in-flight.
@@ -1782,7 +1814,7 @@ mod tests {
         assert!(stream
             .poll_send(u64::MAX, 0, std::time::Instant::now())
             .await
-            .is_none());
+            .is_err());
     }
 
     /// A segment must carry back the delivered counter it was stamped with when
@@ -1907,7 +1939,7 @@ mod tests {
         assert!(stream
             .poll_send(4, 0, std::time::Instant::now())
             .await
-            .is_none());
+            .is_err());
 
         // A budget of 5 now admits it.
         let seg2 = stream
@@ -2257,7 +2289,7 @@ mod tests {
             reports += stream.on_sack(&sack).await.lost.len();
             // Stand in for the pump: Pass-0 answers the flag and clears it,
             // which is what re-armed the packet threshold on the next ack.
-            if let Some(seg) = stream
+            if let Ok(seg) = stream
                 .poll_send(u64::MAX, 0, std::time::Instant::now())
                 .await
             {
@@ -2383,11 +2415,11 @@ mod tests {
                     .poll_send(u64::MAX, 0, std::time::Instant::now())
                     .await
                 {
-                    Some(seg) => {
+                    Ok(seg) => {
                         assert!(seg.retransmit, "nothing new is queued");
                         copies += 1;
                     }
-                    None => break,
+                    Err(_) => break,
                 }
             }
         }
@@ -2461,7 +2493,7 @@ mod tests {
             // The packet threshold qualifies the hole once largest_acked reaches
             // 3; the pump answers by resending it, which is where the mark used
             // to move.
-            if let Some(seg) = stream
+            if let Ok(seg) = stream
                 .poll_send(u64::MAX, est.delivered_bytes(), est.delivered_time())
                 .await
             {
@@ -3001,10 +3033,7 @@ mod tests {
 
         // Pass budget = 0 — a normal data segment would be withheld.
         let seg = stream.poll_send(0, 0, std::time::Instant::now()).await;
-        assert!(
-            seg.is_some(),
-            "FIN must be emitted even when cwnd_budget = 0"
-        );
+        assert!(seg.is_ok(), "FIN must be emitted even when cwnd_budget = 0");
         let seg = seg.unwrap();
         assert!(seg.fin, "segment must be the FIN sentinel");
     }
@@ -3030,7 +3059,7 @@ mod tests {
         assert!(stream
             .poll_send(u64::MAX, 0, std::time::Instant::now())
             .await
-            .is_none());
+            .is_err());
 
         // Advance past the initial 1-second RTO.
         tokio::time::advance(std::time::Duration::from_millis(1100)).await;

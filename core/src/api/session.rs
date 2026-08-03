@@ -28,7 +28,7 @@ use crate::transport::packet_coalescer_codec::unwrap_coalesced_packet;
 use crate::transport::path_validation_codec::build_path_validation_packet;
 use crate::transport::session::{Session, SessionState};
 use crate::transport::shaping::{self, PaddingPolicy};
-use crate::transport::stream::Stream;
+use crate::transport::stream::{SendBlocked, Stream};
 use crate::transport::types::{
     LegType, PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
     WIRE_VERSION,
@@ -1463,10 +1463,17 @@ const CLOSE_FLUSH_PACING_WAIT_MAX: std::time::Duration = std::time::Duration::fr
 /// or the pump spins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainStop {
-    /// Every stream ran dry, or the congestion and flow-control windows are
-    /// full. Nothing to schedule — the next acknowledgement or application
-    /// write will wake the pump.
+    /// Every stream ran dry: the application had nothing more to give. Nothing
+    /// to schedule — the next application write will wake the pump.
     Drained,
+    /// At least one stream still had data, and the congestion window had no
+    /// room for it. Nothing to schedule — an acknowledgement frees the window
+    /// and wakes the pump.
+    CongestionLimited,
+    /// At least one stream still had data, and the *peer's* advertised
+    /// flow-control window had no room for it. Nothing to schedule — a
+    /// `WINDOW_UPDATE` wakes the pump.
+    FlowControlled,
     /// Stopped on [`DRAIN_MAX_SEGMENTS_PER_PASS`] with data still offered.
     SegmentBudget,
     /// Stopped because the pacer has no credit. The delay is how long until it
@@ -1481,6 +1488,41 @@ enum DrainStop {
     Paced(std::time::Duration),
 }
 
+/// Whether a pass that stopped for `stop` leaves the round it belongs to
+/// application-limited — i.e. whether the sender's own supply of data, rather
+/// than the path, is what bounded it.
+///
+/// The classification, variant by variant:
+///
+/// - [`DrainStop::Drained`] — the application had nothing more to give. That is
+///   the definition of app-limited, subject to the window check below.
+/// - [`DrainStop::FlowControlled`] — the *peer's* receive window is closed. The
+///   sender is not permitted to fill the pipe, so the round measures the
+///   receiver's buffer, not the path's capacity. Also app-limited.
+/// - [`DrainStop::CongestionLimited`] — the controller's own window is what held
+///   the data back. That is a saturated round by construction and is exactly the
+///   kind a loss response exists to judge. **Not** app-limited.
+/// - [`DrainStop::Paced`] — the pacer is the controller metering itself, on
+///   purpose, and in steady state it is what stops nearly every pass. Marking it
+///   app-limited would mark almost every round app-limited and switch the loss
+///   response off entirely. **Not** app-limited.
+/// - [`DrainStop::SegmentBudget`] — there is data ready right now and the pump
+///   is coming straight back for it. The sender is short of nothing. **Not**
+///   app-limited.
+///
+/// The window check is the other half, and it is canonical (Linux's
+/// `tcp_rate_check_app_limited` carries the same `packets_in_flight < cwnd`
+/// term). A stream can run dry with the congestion window *already* full — the
+/// last segment it had fitted exactly — and that round was bounded by the
+/// window, not by the application. Requiring room left over is what keeps
+/// "ran out of data" from quietly covering "ran out of window".
+fn drain_stop_is_app_limited(stop: DrainStop, inflight_bytes: u64, cwnd_bytes: u64) -> bool {
+    match stop {
+        DrainStop::Drained | DrainStop::FlowControlled => inflight_bytes < cwnd_bytes,
+        DrainStop::CongestionLimited | DrainStop::Paced(_) | DrainStop::SegmentBudget => false,
+    }
+}
+
 /// Translate a drain pass's stopping reason into the pump's next move, and
 /// return the pacing deadline the pump's pacing branch should wait on (`None`
 /// when the pass did not stop on pacing).
@@ -1491,12 +1533,22 @@ enum DrainStop {
 /// direction, no commands accepted, no liveness sweep. That is the shape that
 /// starved the download in the first place, and re-introducing it to implement
 /// pacing would trade one direction's collapse for the other's.
+///
+/// This is also where the app-limited signal is raised, because this is the only
+/// place that knows *why* the pass ended. Congestion control cannot derive it:
+/// from the acknowledgement stream alone, a round in which the sender had
+/// nothing to send is indistinguishable from one in which the path refused to
+/// carry more.
 fn apply_drain_outcome(
     crypto_session: &Arc<Session>,
     stop: DrainStop,
 ) -> Option<tokio::time::Instant> {
+    let snap = crypto_session.bandwidth_snapshot();
+    if drain_stop_is_app_limited(stop, snap.inflight_bytes, snap.cwnd_bytes) {
+        crypto_session.set_app_limited();
+    }
     match stop {
-        DrainStop::Drained => None,
+        DrainStop::Drained | DrainStop::CongestionLimited | DrainStop::FlowControlled => None,
         DrainStop::SegmentBudget => {
             crypto_session.notify_outbound_ready();
             None
@@ -2620,6 +2672,11 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
     snapshot.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
     let mut sent = 0usize;
+    // The most binding reason any stream was withheld this pass. The congestion
+    // window is a session-wide budget, so a stream it blocked means the pass was
+    // congestion-limited whatever the other streams did; a closed peer window is
+    // per-stream and only speaks for the pass if nothing else bound it.
+    let mut blocked: Option<SendBlocked> = None;
     for (_priority, stream_id, stream) in snapshot {
         loop {
             if sent >= DRAIN_MAX_SEGMENTS_PER_PASS {
@@ -2639,11 +2696,17 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
             // budget shrinks and the drain stops once the window is full.
             let snap = crypto_session.bandwidth_snapshot();
             let budget = snap.cwnd_bytes.saturating_sub(snap.inflight_bytes);
-            let Some(seg) = stream
+            let seg = match stream
                 .poll_send(budget, snap.delivered_bytes, snap.delivered_time)
                 .await
-            else {
-                break;
+            {
+                Ok(seg) => seg,
+                Err(why) => {
+                    if blocked.is_none_or(|held| drain_block_rank(why) > drain_block_rank(held)) {
+                        blocked = Some(why);
+                    }
+                    break;
+                }
             };
             // A retransmission means the prior send was lost — book it against
             // the round trip in progress so congestion control can judge the
@@ -2696,7 +2759,26 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
             sent += 1;
         }
     }
-    DrainStop::Drained
+    match blocked {
+        None | Some(SendBlocked::Idle) => DrainStop::Drained,
+        Some(SendBlocked::FlowControl) => DrainStop::FlowControlled,
+        Some(SendBlocked::CongestionWindow) => DrainStop::CongestionLimited,
+    }
+}
+
+/// How strongly a per-stream [`SendBlocked`] speaks for the whole pass.
+///
+/// A closed congestion window outranks everything because it is a session-wide
+/// budget: if it withheld one stream it would have withheld any other with data
+/// to offer. A closed *peer* window outranks an idle stream for the mirror-image
+/// reason — it is a statement that a stream had data and could not send it,
+/// where an idle stream is a statement that it had none.
+fn drain_block_rank(why: SendBlocked) -> u8 {
+    match why {
+        SendBlocked::Idle => 0,
+        SendBlocked::FlowControl => 1,
+        SendBlocked::CongestionWindow => 2,
+    }
 }
 
 /// Run [`drain_streams_priority_ordered`] until every stream is drained or the
@@ -2722,7 +2804,10 @@ async fn drain_streams_fully<T: SessionTransport>(
         )
         .await
         {
-            DrainStop::Drained => return,
+            // Nothing further can leave until the peer acts — an
+            // acknowledgement frees the congestion window, a `WINDOW_UPDATE`
+            // frees the peer's. A teardown does not wait for either.
+            DrainStop::Drained | DrainStop::CongestionLimited | DrainStop::FlowControlled => return,
             DrainStop::SegmentBudget => {}
             // The tail of a connection is still data on a path, so the flush
             // obeys the rate; the cap keeps a low estimate from turning a close
@@ -2778,6 +2863,7 @@ fn feed_bbr_on_ack(
     observability: &Observability,
     path_id: u8,
     sampled_rtt: bool,
+    app_limited: bool,
 ) {
     let acked_at = std::time::Instant::now();
     let sent_at_std = sent_at.into_std();
@@ -2809,7 +2895,14 @@ fn feed_bbr_on_ack(
         sent_at: sent_at_std,
         acked_at,
         packet_bytes,
-        is_app_limited: false,
+        // The connection's application-limited phase as of this
+        // acknowledgement, raised by the send loop (`apply_drain_outcome`) and
+        // cleared by the estimator once everything outstanding when it was
+        // raised has been retired. The phase covers exactly the packets that
+        // were on the wire while the sender had nothing more to give, which is
+        // the set whose delivery rate and loss rate describe the application
+        // rather than the path.
+        is_app_limited: app_limited,
         ack_delay_us,
         // Karn's condition, carried through to the estimator's min-RTT filter.
         // A retransmitted segment's `sent_at` was restamped when it was resent,
@@ -3567,6 +3660,11 @@ async fn handle_packet<T: SessionTransport>(
             // inside `on_sack` per Karn (only for never-retransmitted segments);
             // feed BBR per retired segment using the real `ack_delay_us`.
             let result = stream.on_sack(&sack).await;
+            // Read once for the whole SACK rather than per retired segment: a
+            // cumulative acknowledgement can retire a window's worth, the flag
+            // is a property of the connection and not of any one of them, and
+            // the read takes the estimator's lock.
+            let app_limited = crypto_recv.is_app_limited();
             for retired in &result.retired {
                 if let Some(sent_at) = retired.sent_at {
                     // `!was_retransmit` is Karn's condition — the same gate
@@ -3582,6 +3680,7 @@ async fn handle_packet<T: SessionTransport>(
                         observability,
                         path_id,
                         !retired.was_retransmit,
+                        app_limited,
                     );
                 }
             }
@@ -6163,6 +6262,230 @@ mod tests {
         );
     }
 
+    // ── The app-limited signal ──────────────────────────────────────────
+
+    /// Segment size for the estimator rounds driven below.
+    const APP_LIMITED_SEG: u64 = 1_200;
+
+    /// One round trip of a bulk flight through a bandwidth estimator.
+    ///
+    /// The loss the previous round suffered is reported at the top, which is
+    /// where the live drain reports it — at the retransmission — and that one
+    /// round of lag is what puts the judgement on the round the loss belongs to.
+    /// `app_limited` is whatever the drain's stopping reason produced for this
+    /// round.
+    fn bbr_round(
+        est: &mut crate::transport::bandwidth_estimator::BandwidthEstimator,
+        t0: std::time::Instant,
+        rtt: std::time::Duration,
+        packets: u64,
+        carry_lost: u64,
+        app_limited: bool,
+    ) {
+        use crate::transport::bandwidth_estimator::DeliverySample;
+        if carry_lost > 0 {
+            est.on_loss(carry_lost * APP_LIMITED_SEG);
+        }
+        for _ in 0..packets {
+            est.on_send(APP_LIMITED_SEG);
+        }
+        let mark = est.delivered_bytes();
+        let mark_time = est.delivered_time();
+        for _ in 0..packets {
+            est.on_ack(DeliverySample {
+                delivered_bytes: mark,
+                delivered_at: mark_time,
+                sent_at: t0,
+                acked_at: t0 + rtt,
+                packet_bytes: APP_LIMITED_SEG,
+                is_app_limited: app_limited,
+                ack_delay_us: 0,
+                rtt_sampled: true,
+            });
+        }
+    }
+
+    /// **A round the application starved is not evidence about the path.**
+    ///
+    /// `adapt_inflight_bound` skips app-limited rounds precisely because such a
+    /// round's loss *rate* has a denominator it did not earn: one retransmit
+    /// against a nearly idle round reads as heavy congestion and clamps
+    /// `inflight_hi` for a path that was never asked to carry anything. The
+    /// guard is only worth having if something ever sets the flag, and nothing
+    /// did — every `DeliverySample` the pump built said `is_app_limited: false`.
+    ///
+    /// The flag is taken here from the real drain rather than asserted into
+    /// existence: a pass over a stream with nothing buffered, with the
+    /// congestion window wide open, is the definition of application-limited,
+    /// and the boolean that pass produces is the one fed to the estimator below.
+    #[tokio::test]
+    async fn a_drain_that_ran_dry_marks_the_round_app_limited_and_spares_the_bound() {
+        const RTT: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let sid = fixed_session_id();
+        let (client, _server) = paired_sessions(sid);
+
+        // A wide window, and a registered stream with nothing in it.
+        seed_bandwidth_estimate(&client, 100, 1_200, RTT);
+        let stream = Arc::new(TransportStream::new(1));
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(1u32, stream);
+
+        let snap = client.bandwidth_snapshot();
+        assert!(
+            snap.inflight_bytes < snap.cwnd_bytes,
+            "precondition: the congestion window must have room ({} B in flight against \
+             a {} B window), or the round is congestion-limited and not app-limited",
+            snap.inflight_bytes,
+            snap.cwnd_bytes
+        );
+
+        let (client_t, _server_t) = ChannelTransport::pair();
+        let transport = Arc::new(client_t);
+        let obs = Observability::new(ObservabilityConfig::default());
+        let stop = drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
+        apply_drain_outcome(&client, stop);
+
+        assert!(
+            client.bandwidth_snapshot().app_limited,
+            "a drain pass that ran dry with the window open ({stop:?}) left the \
+             connection un-marked — the controller cannot tell an idle sender from a \
+             saturated one"
+        );
+
+        // ...and the flag has to reach the loss response. A round that lost 5%
+        // of a small flight is over the 2% threshold on paper; app-limited, it
+        // is not a measurement of the path and must not clamp the bound.
+        let mut est = crate::transport::bandwidth_estimator::BandwidthEstimator::new();
+        let mut t = std::time::Instant::now();
+        for _ in 0..6 {
+            bbr_round(&mut est, t, RTT, 200, 0, false);
+            t += RTT;
+        }
+        assert_eq!(
+            est.inflight_hi(),
+            None,
+            "precondition: a clean warm-up must leave no bound in place"
+        );
+
+        let app_limited = client.bandwidth_snapshot().app_limited;
+        for _ in 0..4 {
+            bbr_round(&mut est, t, RTT, 200, 10, app_limited);
+            t += RTT;
+        }
+        assert_eq!(
+            est.inflight_hi(),
+            None,
+            "a 5% loss rate over rounds the application starved clamped inflight_hi to \
+             {:?} — the round's denominator is the sender's own idleness, not the path's \
+             capacity",
+            est.inflight_hi()
+        );
+    }
+
+    /// **The other side, and the one that stops the fix above from being "mark
+    /// everything app-limited".**
+    ///
+    /// A pass stopped by the congestion window or by the pacer is the controller
+    /// throttling *itself* — on purpose, because it decided that is how much may
+    /// be outstanding and how fast it may leave. Those are exactly the rounds a
+    /// loss response is meant to judge, and marking them app-limited would
+    /// disable it in the only regime where it matters.
+    #[tokio::test]
+    async fn a_drain_stopped_by_the_congestion_window_or_the_pacer_is_not_app_limited() {
+        const SEGMENT: usize = 1_200;
+        const RTT: std::time::Duration = std::time::Duration::from_millis(100);
+
+        // ── Stopped by the congestion window ────────────────────────────
+        let sid = fixed_session_id();
+        let (client, _server) = paired_sessions(sid);
+        // No estimate at all, so the window is its 5600 B floor and four
+        // segments fill it. Pacing stays off until something is measured.
+        let stream = Arc::new(TransportStream::new(1));
+        for _ in 0..32 {
+            stream
+                .send_reliable(Bytes::from(vec![0x5Au8; SEGMENT]))
+                .await
+                .unwrap();
+        }
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(1u32, stream);
+
+        let (client_t, _server_t) = ChannelTransport::pair();
+        let transport = Arc::new(client_t);
+        let obs = Observability::new(ObservabilityConfig::default());
+        let stop = drain_streams_priority_ordered(&transport, &client, sid, &streams, &obs).await;
+        apply_drain_outcome(&client, stop);
+
+        let snap = client.bandwidth_snapshot();
+        assert!(
+            snap.inflight_bytes + SEGMENT as u64 > snap.cwnd_bytes,
+            "precondition: the pass should have filled the {} B window ({} B in flight)",
+            snap.cwnd_bytes,
+            snap.inflight_bytes
+        );
+        assert!(
+            !snap.app_limited,
+            "a pass stopped by the congestion window ({stop:?}) was marked app-limited — \
+             the sender had 32 segments queued and the controller's own window is what \
+             held them back"
+        );
+
+        // ── Stopped by the pacer ────────────────────────────────────────
+        let (paced, _server2) = paired_sessions(sid);
+        seed_bandwidth_estimate(&paced, 100, 1_200, std::time::Duration::from_millis(200));
+        let stream2 = Arc::new(TransportStream::new(1));
+        for _ in 0..64 {
+            stream2
+                .send_reliable(Bytes::from(vec![0xA5u8; SEGMENT]))
+                .await
+                .unwrap();
+        }
+        let streams2: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams2.insert(1u32, stream2);
+        let (client_t2, _server_t2) = ChannelTransport::pair();
+        let transport2 = Arc::new(client_t2);
+        let stop2 = drain_streams_priority_ordered(&transport2, &paced, sid, &streams2, &obs).await;
+        apply_drain_outcome(&paced, stop2);
+        assert!(
+            matches!(stop2, DrainStop::Paced(_)),
+            "precondition: a 240 KB window and 64 segments offered should leave pacing \
+             as the only thing able to stop the pass ({stop2:?})"
+        );
+        assert!(
+            !paced.bandwidth_snapshot().app_limited,
+            "a pass stopped for want of pacing credit was marked app-limited — the rate \
+             limiter is the controller metering itself, and in steady state it is what \
+             stops nearly every pass"
+        );
+
+        // ...and a genuinely congested round must still cost the sender its
+        // bound. A response that never fires is not a conservative response.
+        let mut est = crate::transport::bandwidth_estimator::BandwidthEstimator::new();
+        let mut t = std::time::Instant::now();
+        for _ in 0..6 {
+            bbr_round(&mut est, t, RTT, 200, 0, false);
+            t += RTT;
+        }
+        let target = est.cwnd();
+        assert_eq!(
+            est.inflight_hi(),
+            None,
+            "precondition: a clean warm-up must leave no bound in place"
+        );
+
+        let congested = client.bandwidth_snapshot().app_limited;
+        bbr_round(&mut est, t, RTT, 200, 10, congested);
+        let bound = est
+            .inflight_hi()
+            .expect("a 5% loss rate over a saturated round must set a bound");
+        assert!(
+            bound < target,
+            "the bound came out at {bound} B against a {target} B window — a 5% loss \
+             rate did not cost the sender anything"
+        );
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // V2 wire-routing tests (Phase 4.2 / 2.5 follow-up — data-pump V2)
     // ────────────────────────────────────────────────────────────────────
@@ -7589,12 +7912,13 @@ mod tests {
             "a forged unauthenticated SACK must not retire any segment (H1)"
         );
         // No fast-retransmit: nothing was flagged lost, so poll_send (all sent, no
-        // new data) returns None rather than a Pass-0 retransmit.
-        assert!(
+        // new data) reports an idle stream rather than a Pass-0 retransmit.
+        assert_eq!(
             stream
                 .poll_send(u64::MAX, 0, std::time::Instant::now())
                 .await
-                .is_none(),
+                .err(),
+            Some(SendBlocked::Idle),
             "a forged SACK must not trigger a fast-retransmit (no segment flagged lost)"
         );
     }

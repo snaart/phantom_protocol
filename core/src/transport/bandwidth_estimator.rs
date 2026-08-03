@@ -16,7 +16,7 @@
 //!                         │    └──────────────┘
 //!                         │       ▲
 //!                      ┌──┴───────┴──┐
-//!                      │  ProbeRTT   │  (every 10s for 200ms)
+//!                      │  ProbeRTT   │  (every 10s: drain, then hold)
 //!                      └─────────────┘
 //! ```
 //!
@@ -33,7 +33,10 @@
 //! acknowledgements as a proxy for it — dozens land inside one round trip, and a
 //! controller scaled that way leaves Startup and spins its gain cycle before it
 //! has probed anything at all.
-//! - **ProbeRTT:** Every 10s, reduce CWND to 4 packets for 200ms to measure true min RTT
+//! - **ProbeRTT:** Every 10s, reduce CWND to 4 packets, wait for the pipe to actually
+//!   drain, and only then hold long enough for a packet to cross the emptied path and
+//!   be acknowledged. Timing the window from entry instead measures the standing queue
+//!   the sender built, which is the one thing the measurement must exclude.
 //!
 //! Loss is deliberately *not* a state. BBRv2 and BBRv3 respond to it with a
 //! volume bound — `inflight_hi` — that the congestion window is capped by
@@ -242,8 +245,43 @@ const STARTUP_ROUNDS_LIMIT: u32 = 3;
 /// ProbeRTT interval — enter ProbeRTT every 10 seconds
 const PROBE_RTT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// ProbeRTT duration — stay in ProbeRTT for 200ms
+/// How long ProbeRTT holds the floored window **after the pipe has drained**,
+/// or one round trip if that is longer.
+///
+/// Not measured from entry. Entry cuts the congestion window; it does not
+/// retire the bytes already sitting in the bottleneck's queue, and until those
+/// have been served every round trip the sender times still includes them. A
+/// clock started on entry therefore times exactly the inflated path ProbeRTT
+/// exists to escape, and — because the min-RTT filter is a ten-second
+/// *minimum* — an unrefreshed filter can only ratchet upward, taking
+/// `bdp = btl_bw × min_rtt` and `cwnd = 2 × bdp` with it, which grows the queue
+/// that caused the problem.
 const PROBE_RTT_DURATION: Duration = Duration::from_millis(200);
+
+/// How long the *drain* half of ProbeRTT is allowed to take, in round trips,
+/// before the sender leaves anyway.
+///
+/// ProbeRTT cuts the congestion window to the floor and then waits for the pipe
+/// to empty, which is the only condition under which the round trip it times is
+/// the path's own. Waiting for that unconditionally is a way to be pinned at the
+/// floor forever: retransmissions bypass the congestion window entirely
+/// (`Stream::poll_send`'s Pass 0 and Pass 1), so a path losing enough to keep the
+/// sender resending keeps `inflight_bytes` above the floor no matter what the
+/// window says.
+///
+/// Two round trips, and the figure is derived rather than chosen. Inflight at
+/// entry is at most the window the previous phase allowed, `cwnd_gain × BDP`
+/// with `cwnd_gain` = 2: one bandwidth-delay product in the path itself and at
+/// most one more queued in front of it. A queue of one BDP costs one round trip
+/// of bottleneck service to clear, and the last packet's acknowledgement needs
+/// one propagation delay on top of that. Anything still outstanding after those
+/// two is not a queue this sender can drain by waiting.
+///
+/// Being expressed in `min_rtt` rather than in milliseconds is what makes it
+/// self-scaling in the right direction: the flows that need the longest drain
+/// are exactly the ones whose `min_rtt` has been inflated by the standing queue,
+/// so they are granted proportionally more time to clear it.
+const PROBE_RTT_MAX_DRAIN_ROUND_TRIPS: u32 = 2;
 
 /// Minimum CWND in ProbeRTT mode (4 packets)
 const PROBE_RTT_CWND_PACKETS: u64 = 4;
@@ -364,8 +402,19 @@ pub struct BandwidthEstimator {
     // ── ProbeRTT timer ──
     /// Timestamp of last ProbeRTT exit (or Startup start)
     last_probe_rtt_time: Instant,
-    /// When we entered ProbeRTT (for duration tracking)
+    /// When we entered ProbeRTT — the origin of the ceiling in
+    /// [`Self::probe_rtt_ceiling`], and nothing else.
     probe_rtt_entered: Option<Instant>,
+    /// When [`Self::inflight_bytes`] first fell to the ProbeRTT window, and so
+    /// the first instant at which a packet this sender puts on the wire crosses
+    /// a path it is no longer queueing behind itself.
+    ///
+    /// `None` while the pipe is still full. The hold that produces the actual
+    /// measurement is timed from here, not from entry: cutting the window to
+    /// the floor stops new data but leaves everything already in the
+    /// bottleneck's queue exactly where it was, and a round trip measured
+    /// through that queue is the inflated one ProbeRTT is trying to escape.
+    probe_rtt_drained_at: Option<Instant>,
     /// State to return to after ProbeRTT
     prior_state: BbrState,
 
@@ -412,6 +461,7 @@ impl BandwidthEstimator {
             inflight_hi: None,
             last_probe_rtt_time: now,
             probe_rtt_entered: None,
+            probe_rtt_drained_at: None,
             prior_state: BbrState::ProbeBW,
             app_limited: false,
             app_limited_at_delivered: 0,
@@ -606,7 +656,9 @@ impl BandwidthEstimator {
             self.btl_bw = self.bw_filter.update_max(now, delivery_rate);
         }
 
-        // Check if we've exited app-limited phase
+        // The app-limited phase ends once everything that was outstanding when
+        // it opened has been retired — see `set_app_limited` for why the
+        // watermark includes inflight.
         if self.app_limited && self.delivered_bytes > self.app_limited_at_delivered {
             self.app_limited = false;
         }
@@ -648,12 +700,23 @@ impl BandwidthEstimator {
 
     /// Mark the sender as application-limited (not sending at line rate).
     ///
-    /// Call this when there is no data to send but the CWND has room.
-    /// Samples produced during app-limited periods won't update the BW filter,
-    /// preventing bandwidth underestimation.
+    /// Call this when there is no data to send but the congestion window has
+    /// room, or when the peer's flow-control window is what held the data back.
+    /// Samples produced during an app-limited phase do not update the bandwidth
+    /// filter — they measure how fast the application wrote, not how fast the
+    /// path carries — and their loss rate is not judged, because its denominator
+    /// is the sender's own idleness.
+    ///
+    /// The phase ends when everything that was **outstanding at this moment**
+    /// has been acknowledged, which is why the watermark is `delivered +
+    /// inflight` and not `delivered` alone. Those in-flight bytes are precisely
+    /// the ones that were on the wire while the sender had nothing more to give;
+    /// marking at `delivered` would end the phase on the very next
+    /// acknowledgement and leave the guard covering one sample instead of a
+    /// flight. This is BBR's `BBRMarkConnectionAppLimited`.
     pub fn set_app_limited(&mut self) {
         self.app_limited = true;
-        self.app_limited_at_delivered = self.delivered_bytes;
+        self.app_limited_at_delivered = self.delivered_bytes.saturating_add(self.inflight_bytes);
     }
 
     /// Whether the sender is currently considered application-limited.
@@ -975,6 +1038,30 @@ impl BandwidthEstimator {
         }
     }
 
+    /// `Some(now)` if the pipe is empty enough that the next packet out crosses
+    /// a path this sender is no longer queueing behind itself, `None` otherwise.
+    ///
+    /// The comparison is against the ProbeRTT window rather than against zero
+    /// because the window *is* the definition of empty here: the sender is
+    /// allowed that much outstanding throughout, so requiring less would be
+    /// requiring a condition ProbeRTT itself prevents.
+    fn probe_rtt_drain_mark(&self, now: Instant) -> Option<Instant> {
+        (self.inflight_bytes <= PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE).then_some(now)
+    }
+
+    /// Longest ProbeRTT may run, measured from entry.
+    ///
+    /// The drain allowance ([`PROBE_RTT_MAX_DRAIN_ROUND_TRIPS`] round trips)
+    /// plus the hold that would follow a successful drain, so the ceiling can
+    /// never pre-empt an ordinary completion — it only ever ends a ProbeRTT
+    /// whose pipe is not emptying, which is a pipe no amount of further waiting
+    /// will empty.
+    fn probe_rtt_ceiling(&self) -> Duration {
+        self.min_rtt
+            .saturating_mul(PROBE_RTT_MAX_DRAIN_ROUND_TRIPS)
+            .saturating_add(PROBE_RTT_DURATION.max(self.min_rtt))
+    }
+
     /// Run BBR state machine transitions.
     fn update_state(&mut self, now: Instant, is_app_limited: bool) {
         // ── ProbeRTT check: global timer, any state can enter except Startup ──
@@ -986,16 +1073,17 @@ impl BandwidthEstimator {
         // above. They are not a second instance of the per-acknowledgement
         // confusion and are deliberately left alone.
         //
-        // Two honest divergences from the draft remain here, neither of which
-        // is that defect. Canonical BBR starts the 200 ms clock only once
-        // inflight has drained to the minimum window, and holds ProbeRTT for at
-        // least one round trip on top of the duration; this starts the clock on
-        // entry, which if anything leaves ProbeRTT sooner. And the trigger is
+        // One divergence from the draft remains, deliberately. The trigger is
         // "10 s since the last ProbeRTT" rather than the draft's "the min-RTT
-        // filter has gone stale", so a flow whose filter is being refreshed by
-        // every acknowledgement still pays a 200 ms window at the floor cwnd
-        // every 10 s. Both are behaviour changes rather than corrections, and
-        // are left for a change that measures them.
+        // filter has gone stale", so a flow whose filter is fresh still pays a
+        // window at the floor cwnd every 10 s. Under a *windowed* minimum filter
+        // that trade is much smaller than it looks: the filter's minimum is
+        // re-confirmed only by a sample at or below it, so on a path with a
+        // steady round trip the stamp goes stale on almost every cycle anyway
+        // and the staleness trigger degenerates to this timer while adding a
+        // second way for a flow to talk itself out of measuring. The cost of
+        // paying it unnecessarily is bounded below; the cost of skipping it
+        // wrongly is the ratchet this function exists to break.
         if self.state != BbrState::ProbeRTT
             && self.state != BbrState::Startup
             && now.duration_since(self.last_probe_rtt_time) >= PROBE_RTT_INTERVAL
@@ -1003,6 +1091,9 @@ impl BandwidthEstimator {
             self.prior_state = self.state;
             self.transition_to(BbrState::ProbeRTT);
             self.probe_rtt_entered = Some(now);
+            // A flow that was already running an empty pipe has nothing to
+            // wait for, and must not be charged the drain allowance for it.
+            self.probe_rtt_drained_at = self.probe_rtt_drain_mark(now);
             return;
         }
 
@@ -1034,16 +1125,38 @@ impl BandwidthEstimator {
                 self.cwnd_gain = 2.0;
             }
             BbrState::ProbeRTT => {
-                // Stay for PROBE_RTT_DURATION, then exit
-                if let Some(entered) = self.probe_rtt_entered {
-                    if now.duration_since(entered) >= PROBE_RTT_DURATION {
-                        self.last_probe_rtt_time = now;
-                        self.probe_rtt_entered = None;
-                        self.transition_to(self.prior_state);
-                    }
-                } else {
-                    // Safety: shouldn't happen, but exit gracefully
+                let Some(entered) = self.probe_rtt_entered else {
+                    // No entry stamp means no clock to run, and a state with no
+                    // way out is worse than an early exit.
+                    self.probe_rtt_drained_at = None;
                     self.transition_to(BbrState::ProbeBW);
+                    return;
+                };
+                if self.probe_rtt_drained_at.is_none() {
+                    self.probe_rtt_drained_at = self.probe_rtt_drain_mark(now);
+                }
+
+                // The measurement is complete once the pipe has emptied *and*
+                // the hold has elapsed since it did. Canonical BBR holds for
+                // `max(ProbeRTTDuration, one round trip)`; the round trip is
+                // what gives a packet sent over the drained path time to be
+                // acknowledged, and without it the window ends before the
+                // sample it exists to take can possibly have arrived.
+                //
+                // `min_rtt` is the inflated figure at this point, which is the
+                // right way round: it is an upper bound on the true round trip,
+                // so holding for it guarantees the trip completes.
+                let measured = self.probe_rtt_drained_at.is_some_and(|drained| {
+                    now.duration_since(drained) >= PROBE_RTT_DURATION.max(self.min_rtt)
+                });
+                // ...and the ceiling, for the pipe that never empties.
+                let expired = now.duration_since(entered) >= self.probe_rtt_ceiling();
+
+                if measured || expired {
+                    self.last_probe_rtt_time = now;
+                    self.probe_rtt_entered = None;
+                    self.probe_rtt_drained_at = None;
+                    self.transition_to(self.prior_state);
                 }
             }
         }
@@ -2203,6 +2316,368 @@ mod tests {
             "ProbeRTT CWND should be {} (4 packets), got {}",
             PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE,
             cwnd
+        );
+    }
+
+    // ── ProbeRTT ────────────────────────────────────────────────────────────
+
+    /// One flight in the closed-loop path model below.
+    struct PathFlight {
+        bytes: u64,
+        sent_at: Instant,
+        acked_at: Instant,
+        delivered_mark: u64,
+        delivered_time: Instant,
+    }
+
+    /// A closed loop just detailed enough to make ProbeRTT's premise real.
+    ///
+    /// The round trip a packet measures is the path's propagation delay plus
+    /// the time the bottleneck needs to clear whatever was already queued when
+    /// that packet was sent — `prop + inflight/bw`. The only way that queue
+    /// shrinks is by being served at `bw`. That is the whole mechanism ProbeRTT
+    /// exists to exploit, and a test that simply hands the estimator a low RTT
+    /// sample it could never have taken proves nothing about it.
+    ///
+    /// The sender offers whatever the congestion window has room for, metered
+    /// at the bottleneck rate, so a window cut to the ProbeRTT floor stops new
+    /// data going out but does not retire the bytes already in the queue.
+    ///
+    /// `trace` collects `(state, inflight)` after every acknowledgement, which
+    /// is what lets a test ask the question that matters: what was still in
+    /// flight at the moment ProbeRTT decided it was done.
+    fn run_bottlenecked_path(
+        est: &mut BandwidthEstimator,
+        start: Instant,
+        prop: Duration,
+        bw: u64,
+        span: Duration,
+        step: Duration,
+        trace: &mut Vec<(BbrState, u64)>,
+    ) {
+        let mut queue: VecDeque<PathFlight> = VecDeque::new();
+        let mut now = start;
+        let deadline = start + span;
+        let per_step = (bw as f64 * step.as_secs_f64()) as u64;
+
+        while now < deadline {
+            while queue.front().is_some_and(|f| f.acked_at <= now) {
+                let Some(flight) = queue.pop_front() else {
+                    break;
+                };
+                est.on_ack(DeliverySample {
+                    delivered_bytes: flight.delivered_mark,
+                    delivered_at: flight.delivered_time,
+                    sent_at: flight.sent_at,
+                    acked_at: flight.acked_at,
+                    packet_bytes: flight.bytes,
+                    is_app_limited: false,
+                    ack_delay_us: 0,
+                    rtt_sampled: true,
+                });
+                trace.push((est.state(), est.inflight_bytes()));
+            }
+
+            let room = est.cwnd().saturating_sub(est.inflight_bytes());
+            let bytes = room.min(per_step);
+            if bytes > 0 {
+                // Queueing delay is what is already in the pipe, served at the
+                // bottleneck rate; the propagation delay is on top of it.
+                let rtt = prop + Duration::from_secs_f64(est.inflight_bytes() as f64 / bw as f64);
+                let delivered_mark = est.delivered_bytes();
+                let delivered_time = est.delivered_time();
+                est.on_send(bytes);
+                queue.push_back(PathFlight {
+                    bytes,
+                    sent_at: now,
+                    acked_at: now + rtt,
+                    delivered_mark,
+                    delivered_time,
+                });
+            }
+            now += step;
+        }
+    }
+
+    /// **ProbeRTT must empty the pipe before it times it.**
+    ///
+    /// Cutting the congestion window to `PROBE_RTT_CWND_PACKETS × MIN_PACKET_SIZE`
+    /// (5600 B) stops *new* data going out. It does not remove the bytes already
+    /// sitting in the bottleneck's queue, and those bytes are exactly what makes
+    /// every round trip long. So a ProbeRTT window whose clock starts on entry
+    /// measures the same inflated path it was trying to escape.
+    ///
+    /// The arithmetic, for the path simulated here — 600 KB/s, 200 ms
+    /// propagation. A converged flow runs at `cwnd = 2 × btl_bw × min_rtt`, so
+    /// inflight is two bandwidth-delay products and the queue in front of the
+    /// path holds one of them: `queue = inflight/bw = 2 × min_rtt`, and the
+    /// round trip a packet measures is `prop + 2 × min_rtt`. The min-RTT filter
+    /// is a *ten-second minimum*, so once the last drained-path sample ages out
+    /// it can only take the smallest inflated sample available and `min_rtt`
+    /// becomes `prop + 2 × min_rtt_old` — 200 ms → 600 ms on the first ratchet.
+    /// `bdp = btl_bw × min_rtt` grows with it, `cwnd = 2 × bdp` grows with that,
+    /// and the queue grows again. The loop is closed and self-reinforcing, and a
+    /// 200 ms window at the floor never breaks it: at 600 KB/s a 240 KB backlog
+    /// needs 400 ms of bottleneck service before a single packet crosses an
+    /// empty path.
+    ///
+    /// Two assertions, both of which the entry-clocked version fails: ProbeRTT
+    /// must not report itself done while the pipe is still full, and the low
+    /// sample it exists to collect must actually reach the filter.
+    #[test]
+    fn probe_rtt_holds_until_the_pipe_has_actually_drained() {
+        const PROP: Duration = Duration::from_millis(200);
+        const BW: u64 = 600_000;
+        const STEP: Duration = Duration::from_millis(10);
+        // Long enough for the first two ProbeRTT windows (due 10 s apart) and
+        // for the ten-second RTT filter to have turned over once behind them.
+        const SPAN: Duration = Duration::from_millis(24_000);
+
+        let mut est = BandwidthEstimator::new();
+        let mut trace: Vec<(BbrState, u64)> = Vec::new();
+        run_bottlenecked_path(&mut est, Instant::now(), PROP, BW, SPAN, STEP, &mut trace);
+
+        let floor = PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE;
+
+        // The run has to have contained a ProbeRTT episode at all, or the rest
+        // asserts nothing.
+        assert!(
+            trace.iter().any(|(s, _)| *s == BbrState::ProbeRTT),
+            "the {} s run never entered ProbeRTT — the fixture, not the \
+             controller, is what this would be testing",
+            SPAN.as_secs()
+        );
+
+        // Find every ProbeRTT → not-ProbeRTT boundary and ask what was still
+        // outstanding when the controller decided it had timed a drained path.
+        for pair in trace.windows(2) {
+            let (before, _) = pair[0];
+            let (after, inflight_after) = pair[1];
+            if before == BbrState::ProbeRTT && after != BbrState::ProbeRTT {
+                assert!(
+                    inflight_after <= floor,
+                    "ProbeRTT ended with {inflight_after} B still in flight against a \
+                     {floor} B window — the queue was never served, so no packet \
+                     crossed an empty path and the sample it took is the inflated \
+                     one it already had"
+                );
+            }
+        }
+
+        // ...and the point of the exercise: the filter has to come out holding
+        // the propagation delay, not the queued round trip. A quarter of margin
+        // covers the fluid model's step quantisation.
+        assert!(
+            est.min_rtt() <= PROP + PROP / 4,
+            "min_rtt is {:?} on a path whose propagation delay is {:?} — the \
+             ten-second minimum filter only ever ratcheted upward",
+            est.min_rtt(),
+            PROP
+        );
+    }
+
+    /// One acknowledgement on a path whose backlog is held fixed.
+    ///
+    /// Pinning `inflight_bytes` models the one thing that genuinely keeps the
+    /// pipe from emptying under a floored window: retransmissions bypass the
+    /// congestion window entirely (`Stream::poll_send`'s Pass 0 and Pass 1), so
+    /// a path losing enough to keep the sender resending keeps putting bytes on
+    /// the wire no matter what `cwnd()` says.
+    fn ack_holding_backlog(
+        est: &mut BandwidthEstimator,
+        sent_at: Instant,
+        rtt: Duration,
+        inflight: u64,
+    ) {
+        const PACKET: u64 = 1200;
+        est.inflight_bytes = inflight;
+        let delivered_mark = est.delivered_bytes();
+        let delivered_time = est.delivered_time();
+        est.on_send(PACKET);
+        est.on_ack(DeliverySample {
+            delivered_bytes: delivered_mark,
+            delivered_at: delivered_time,
+            sent_at,
+            acked_at: sent_at + rtt,
+            packet_bytes: PACKET,
+            is_app_limited: false,
+            ack_delay_us: 0,
+            rtt_sampled: true,
+        });
+    }
+
+    /// Drive a flow to a converged estimate on a `rtt` path, then park it in
+    /// ProbeBW with its ProbeRTT timer due.
+    fn ready_for_probe_rtt(rtt: Duration) -> (BandwidthEstimator, Instant) {
+        const PACKETS: u64 = 100;
+        const PACKET: u64 = 1200;
+
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+        let mut t = start;
+        for _ in 0..4 {
+            ack_one_round_trip(&mut est, PACKETS, PACKET, t, rtt);
+            t += rtt;
+        }
+        est.state = BbrState::ProbeBW;
+        est.last_probe_rtt_time = t - PROBE_RTT_INTERVAL;
+        (est, t)
+    }
+
+    /// **The bound.** "Wait until the pipe has drained" without a ceiling is a
+    /// way for a peer to pin the connection at the 5600-byte floor for the rest
+    /// of its life: retransmissions bypass the congestion window, so a lossy or
+    /// unresponsive path can keep `inflight_bytes` above the floor indefinitely
+    /// while acknowledgements keep arriving to drive the state machine.
+    ///
+    /// The ceiling is expressed in the path's own units — the drain allowance is
+    /// [`PROBE_RTT_MAX_DRAIN_ROUND_TRIPS`] round trips, because inflight at entry
+    /// is at most `cwnd_gain × BDP` = two bandwidth-delay products, one of which
+    /// is queue that costs one round trip of bottleneck service to clear and one
+    /// of which is the path itself — plus the hold that follows a successful
+    /// drain. On this 200 ms path that is 2 × 200 ms + max(200 ms, 200 ms) =
+    /// 600 ms, and the sender must be out by then.
+    ///
+    /// This is the two-sided half of the test above: it rejects a fix that
+    /// simply waits for a drain that never comes.
+    #[test]
+    fn probe_rtt_is_bounded_when_the_backlog_never_clears() {
+        const RTT: Duration = Duration::from_millis(200);
+        const BACKLOG: u64 = 500_000;
+
+        let (mut est, mut t) = ready_for_probe_rtt(RTT);
+
+        ack_holding_backlog(&mut est, t, RTT, BACKLOG);
+        assert_eq!(
+            est.state(),
+            BbrState::ProbeRTT,
+            "precondition: the ProbeRTT timer was due and should have fired"
+        );
+        let entered = t;
+
+        // Two round trips of drain allowance plus the post-drain hold. Nothing
+        // ever drains here, so this is the ceiling and nothing else.
+        let bound = RTT * PROBE_RTT_MAX_DRAIN_ROUND_TRIPS + PROBE_RTT_DURATION.max(RTT);
+
+        // Acknowledgements keep arriving — the peer is answering, it is the
+        // backlog that will not clear — well past the ceiling.
+        let mut left_after: Option<Duration> = None;
+        for _ in 0..40 {
+            t += RTT / 4;
+            ack_holding_backlog(&mut est, t, RTT, BACKLOG);
+            if left_after.is_none() && est.state() != BbrState::ProbeRTT {
+                left_after = Some(t.duration_since(entered));
+            }
+        }
+
+        let left = left_after.unwrap_or_else(|| {
+            panic!(
+                "the sender is still in ProbeRTT {:?} after entry with a backlog that \
+                 never clears — its window is pinned at {} B for the life of the \
+                 connection",
+                t.duration_since(entered),
+                PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE
+            )
+        });
+        assert!(
+            left <= bound + RTT / 4,
+            "ProbeRTT ran {left:?} against a {bound:?} ceiling"
+        );
+    }
+
+    /// **The other side of the bound.** A flow whose pipe is already empty must
+    /// not be held for the ceiling — the ceiling is a safety valve, not the
+    /// duration. Canonical BBR holds for `max(ProbeRTTDuration, one round trip)`
+    /// measured from the drain, and a drained flow drains at entry.
+    ///
+    /// This rejects "always wait the maximum", which would turn a 200 ms
+    /// measurement into a 600 ms one on every cycle and cost three times the
+    /// throughput it needed to.
+    #[test]
+    fn probe_rtt_ends_promptly_on_a_path_with_no_queue() {
+        const RTT: Duration = Duration::from_millis(200);
+
+        let (mut est, mut t) = ready_for_probe_rtt(RTT);
+
+        // Nothing outstanding: this path carries no standing queue at all.
+        ack_holding_backlog(&mut est, t, RTT, 0);
+        assert_eq!(
+            est.state(),
+            BbrState::ProbeRTT,
+            "precondition: the ProbeRTT timer was due and should have fired"
+        );
+        let entered = t;
+
+        let hold = PROBE_RTT_DURATION.max(RTT);
+        let ceiling = RTT * PROBE_RTT_MAX_DRAIN_ROUND_TRIPS + hold;
+
+        let mut left_after: Option<Duration> = None;
+        for _ in 0..40 {
+            t += RTT / 8;
+            ack_holding_backlog(&mut est, t, RTT, 0);
+            if left_after.is_none() && est.state() != BbrState::ProbeRTT {
+                left_after = Some(t.duration_since(entered));
+            }
+        }
+
+        let left = left_after.expect("ProbeRTT never ended on an already-drained path");
+        assert!(
+            left < ceiling,
+            "an already-drained path was held in ProbeRTT for {left:?}, up against the \
+             {ceiling:?} ceiling that exists for paths that never drain"
+        );
+        assert!(
+            left >= hold,
+            "ProbeRTT ended after {left:?}, short of the {hold:?} a packet needs to \
+             cross the drained path and come back — the sample it exists to take \
+             cannot have arrived"
+        );
+    }
+
+    /// The filter must still be able to move *up*.
+    ///
+    /// A route change genuinely lengthens the path, and a min-RTT filter that
+    /// refused upward movement would size the bandwidth-delay product — and so
+    /// the congestion window — against a path that no longer exists, then
+    /// under-run the new one forever. The ten-second window is what allows the
+    /// rise; nothing about draining the pipe before timing it may interfere
+    /// with that.
+    #[test]
+    fn min_rtt_still_rises_when_the_path_genuinely_gets_longer() {
+        const PACKETS: u64 = 40;
+        const PACKET: u64 = 1200;
+        const SHORT: Duration = Duration::from_millis(100);
+        const LONG: Duration = Duration::from_millis(400);
+
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+
+        let mut t = start;
+        for _ in 0..4 {
+            ack_one_round_trip(&mut est, PACKETS, PACKET, t, SHORT);
+            t += SHORT;
+        }
+        assert_eq!(
+            est.min_rtt(),
+            SHORT,
+            "precondition: the short path should be measured"
+        );
+
+        // The route changes. Every subsequent round trip is four times as long,
+        // and after the filter window has turned over the old measurement is no
+        // longer evidence about this path.
+        t = start + Duration::from_millis(11_000);
+        for _ in 0..6 {
+            ack_one_round_trip(&mut est, PACKETS, PACKET, t, LONG);
+            t += LONG;
+        }
+
+        assert_eq!(
+            est.min_rtt(),
+            LONG,
+            "the path is {LONG:?} long now; a filter stuck at {:?} sizes the window \
+             for a path that no longer exists",
+            est.min_rtt()
         );
     }
 

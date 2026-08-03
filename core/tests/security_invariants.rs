@@ -34,7 +34,7 @@ use phantom_protocol::transport::session::{
     CryptoState, Session, MAX_REKEY_CATCHUP, REBIND_VALIDATION_PATH_ID,
 };
 use phantom_protocol::transport::shaping::{self, PaddingPolicy, MAX_SHAPED_WIRE};
-use phantom_protocol::transport::stream::{Stream, INITIAL_STREAM_WINDOW};
+use phantom_protocol::transport::stream::{SendBlocked, Stream, INITIAL_STREAM_WINDOW};
 use phantom_protocol::transport::types::{
     PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
 };
@@ -1605,11 +1605,14 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     assert_eq!(first.data.len(), 60);
     assert_eq!(s.peer_send_window(), 40, "window debited by the sent bytes");
 
-    // The second 60-byte segment exceeds the remaining 40-byte window → withheld.
-    assert!(
+    // The second 60-byte segment exceeds the remaining 40-byte window → withheld,
+    // and withheld for that reason: the congestion budget is unbounded here, so a
+    // stream reporting anything else has consulted the wrong budget.
+    assert_eq!(
         s.poll_send(u64::MAX, 0, std::time::Instant::now())
             .await
-            .is_none(),
+            .err(),
+        Some(SendBlocked::FlowControl),
         "new data exceeding the flow-control window must be withheld"
     );
     assert_eq!(
@@ -1623,10 +1626,9 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     s2.send_reliable(Bytes::from(vec![0u8; 100])).await.unwrap();
     // cwnd budget smaller than the segment → withheld by congestion control,
     // BEFORE the flow-control window is even consulted.
-    assert!(
-        s2.poll_send(50, 0, std::time::Instant::now())
-            .await
-            .is_none(),
+    assert_eq!(
+        s2.poll_send(50, 0, std::time::Instant::now()).await.err(),
+        Some(SendBlocked::CongestionWindow),
         "new data exceeding the congestion window must be withheld"
     );
     assert_eq!(
@@ -1660,7 +1662,12 @@ async fn retransmissions_bypass_congestion_and_flow_control_windows() {
     assert_eq!(s.peer_send_window(), 0);
     // … and an immediate re-poll (cwnd 0, window 0) yields nothing — the
     // segment is in-flight, not yet timed out.
-    assert!(s.poll_send(0, 0, std::time::Instant::now()).await.is_none());
+    assert_eq!(
+        s.poll_send(0, 0, std::time::Instant::now()).await.err(),
+        Some(SendBlocked::Idle),
+        "an in-flight segment that has not timed out is nothing to send, not a \
+         budget the sender is up against"
+    );
 
     // Advance past the initial 1s RTO so the unacked segment is due to retransmit.
     tokio::time::advance(Duration::from_millis(1100)).await;

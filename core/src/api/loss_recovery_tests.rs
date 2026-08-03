@@ -855,3 +855,156 @@ async fn pipelined_recovers_at_20pct_loss() {
     )
     .await;
 }
+
+/// Complete a handshake over an in-memory pair and hand back the client session,
+/// the server's negotiated `Session` — so a test can read the server's
+/// congestion controller directly while its own pump drives it — and the server
+/// session handle, which must be kept alive or the pump stops.
+async fn handshaken_pair() -> (
+    PhantomSession,
+    Arc<crate::transport::session::Session>,
+    Arc<PhantomSession>,
+) {
+    let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
+    let server_pinned_key = server_hs.verifying_key().clone();
+    let (client_channel, server_channel) = ChannelTransport::pair();
+
+    let client = PhantomSession::connect_with_transport(
+        "test-server:9000",
+        client_channel,
+        server_pinned_key,
+    );
+
+    let client_ip = "127.0.0.1".parse().expect("parse IP");
+    let mut inner_session = None;
+    // At most one HelloRetryRequest round, then the hello must succeed.
+    for _ in 0..2 {
+        let hello_bytes = server_channel
+            .recv_bytes()
+            .await
+            .expect("server recv ClientHello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let bytes = ServerReply::Retry(retry)
+                    .to_wire()
+                    .expect("serialize retry");
+                server_channel
+                    .send_bytes(&bytes)
+                    .await
+                    .expect("server send retry");
+            }
+            HandshakeResponse::Success(server_hello, session, _) => {
+                let bytes = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("serialize ServerHello");
+                server_channel
+                    .send_bytes(&bytes)
+                    .await
+                    .expect("server send ServerHello");
+                inner_session = Some(session);
+                break;
+            }
+            HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    }
+    let inner = Arc::new(inner_session.expect("handshake never succeeded"));
+    let congestion = inner.clone();
+    let server =
+        PhantomSession::from_accepted_server_session("test-client".into(), server_channel, inner);
+
+    let mut established = false;
+    for _ in 0..200 {
+        if client.connection_state() == ConnectionState::Connected {
+            established = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(established, "client session never became established");
+    (client, congestion, server)
+}
+
+/// **The app-limited signal, through the real pump.**
+///
+/// The plumbing under test spans three places: the drain classifies why it
+/// stopped, the pump turns that into `Session::set_app_limited`, and the
+/// acknowledgement path stamps the connection's app-limited phase onto every
+/// `DeliverySample` it builds. Each hop has a unit test; none of them proves the
+/// three are wired to one another, and the defect they fix was precisely that
+/// the last hop was a literal `false`.
+///
+/// The observable chosen is `bottleneck_bandwidth()`, because it is the one the
+/// flag is supposed to gate: an app-limited sample must not reach the delivery-
+/// rate maximum filter, since the rate it reports is the application's and not
+/// the path's. A single small message is entirely app-limited — the drain runs
+/// dry with the whole window free — so no estimate may come out of it. A bulk
+/// transfer that fills the window is not, and must produce one.
+///
+/// That second half is what makes this two-sided: "mark every round
+/// app-limited" satisfies the first assertion while starving the bandwidth
+/// filter for the life of every connection, pinning `cwnd = 2 × btl_bw ×
+/// min_rtt` on its 5600-byte floor.
+#[tokio::test]
+async fn the_app_limited_flag_reaches_the_estimator_through_the_pump() {
+    const CHUNK: usize = crate::transport::mtu::MAX_APP_CHUNK;
+    /// Far more than the 5600 B opening window, so the drain is repeatedly
+    /// stopped by the congestion window rather than by an empty send buffer.
+    const BULK_CHUNKS: usize = 60;
+
+    let (client, congestion, server) = handshaken_pair().await;
+
+    assert_eq!(
+        congestion.bandwidth_snapshot().bottleneck_bw_bps,
+        0,
+        "precondition: a fresh session has measured no bandwidth"
+    );
+
+    // ── One small message: the sender has nothing else to give ──────────
+    let hello = b"one-small-message".to_vec();
+    server.send(hello.clone()).await.expect("server send");
+    let got = timeout(Duration::from_secs(5), client.recv())
+        .await
+        .expect("client recv timed out")
+        .expect("client recv error");
+    assert_eq!(got, hello, "the message must arrive byte-exact");
+
+    // Let the acknowledgement for the server's echo land.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let snap = congestion.bandwidth_snapshot();
+    assert!(
+        snap.app_limited,
+        "after a single small message the sender is plainly application-limited, and \
+         the connection is not marked"
+    );
+    assert_eq!(
+        snap.bottleneck_bw_bps, 0,
+        "an application-limited round's delivery rate reached the bandwidth filter — it \
+         measures how fast the application wrote, not how fast the path carries"
+    );
+
+    // ── A bulk transfer that fills the window ───────────────────────────
+    let bulk: Vec<u8> = (0..CHUNK * BULK_CHUNKS).map(|i| (i % 251) as u8).collect();
+    server.send(bulk.clone()).await.expect("server bulk send");
+    let mut received = Vec::with_capacity(bulk.len());
+    while received.len() < bulk.len() {
+        let chunk = timeout(Duration::from_secs(30), client.recv())
+            .await
+            .expect("client recv timed out on the bulk transfer")
+            .expect("client recv error");
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received, bulk, "the bulk transfer must arrive byte-exact");
+
+    assert!(
+        congestion.bandwidth_snapshot().bottleneck_bw_bps > 0,
+        "a transfer that filled the congestion window produced no bandwidth estimate — \
+         every round was marked app-limited, which starves the filter and pins the \
+         window on its floor"
+    );
+
+    server.disconnect().await.expect("server clean disconnect");
+    client.disconnect().await.expect("client clean disconnect");
+}
