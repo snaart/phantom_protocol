@@ -119,13 +119,24 @@ struct PendingData {
     data: Bytes,
     sent_at: Option<tokio::time::Instant>,
     /// The connection's `delivered_bytes` counter at the moment this segment
-    /// was last put on the wire. BBR's delivery-rate sample is the bytes
+    /// was **first** put on the wire. BBR's delivery-rate sample is the bytes
     /// delivered *between* that instant and the acknowledgement, so without
     /// this the rate degenerates to one packet per round trip.
+    ///
+    /// Deliberately not moved by a retransmission, unlike `sent_at`. Nothing in
+    /// an acknowledgement says which copy of a resent segment it answers, and
+    /// the common case is that it answers the original: the ack was already on
+    /// the path when the copy went out. Restamping then divides everything the
+    /// connection delivered during that round trip by the time since the resend
+    /// — microseconds — and hands a maximum filter a rate no interval of the
+    /// connection ever sustained. Anchoring on the original send can only
+    /// under-state the instantaneous rate, and a maximum filter ignores a low
+    /// sample.
     delivered_at_send: u64,
     /// When the counter above was last at that value — the near end of the
     /// interval the acknowledgement will measure. `None` until `poll_send`
-    /// stamps the segment, in lock-step with `sent_at`.
+    /// stamps the segment on its first transmission; from then on it is pinned
+    /// alongside `delivered_at_send`.
     delivered_time_at_send: Option<std::time::Instant>,
     #[allow(dead_code)]
     retries: u32,
@@ -154,12 +165,14 @@ pub struct RetiredSegment {
     /// True if the segment had been retransmitted at least once (`retries > 0`).
     /// Per Karn's algorithm, the caller must NOT sample RTT from such a segment.
     pub was_retransmit: bool,
-    /// The connection's delivered-bytes counter when this segment was sent.
-    /// Feeds `DeliverySample::delivered_bytes`.
+    /// The connection's delivered-bytes counter when this segment was **first**
+    /// sent — retransmission does not move it. Feeds
+    /// `DeliverySample::delivered_bytes`.
     pub delivered_at_send: u64,
-    /// When that counter last advanced, as of this segment's send. Feeds
-    /// `DeliverySample::delivered_at`. `Some` whenever `sent_at` is — both are
-    /// stamped together by `poll_send`.
+    /// When that counter last advanced, as of this segment's first send. Feeds
+    /// `DeliverySample::delivered_at`. `Some` whenever `sent_at` is — the pair
+    /// is stamped by the same `poll_send` pass that first put the segment on
+    /// the wire.
     pub delivered_time_at_send: Option<std::time::Instant>,
 }
 
@@ -1059,12 +1072,14 @@ impl Stream {
     /// Get the next segment to (re)transmit, or `None` if nothing is due.
     ///
     /// `delivered_now` is the connection's current delivered-bytes counter and
-    /// `delivered_time_now` is when it last advanced; the pair is stamped onto
-    /// whatever segment goes out so the acknowledgement can be turned into a
-    /// delivery-rate sample over the right interval. The counter alone fixes
-    /// only how many bytes the sample covers — the timestamp is what fixes how
-    /// long they took, and a burst of acknowledgements is exactly the case
-    /// where those two answers diverge.
+    /// `delivered_time_now` is when it last advanced; the pair is stamped onto a
+    /// segment's **first** transmission so the acknowledgement can be turned
+    /// into a delivery-rate sample over the right interval. The counter alone
+    /// fixes only how many bytes the sample covers — the timestamp is what fixes
+    /// how long they took, and a burst of acknowledgements is exactly the case
+    /// where those two answers diverge. A retransmission leaves both alone (see
+    /// Pass 0); only `sent_at` moves, because only the timers care which copy
+    /// went out last.
     ///
     /// `cwnd_budget` is how many bytes of *new* data the congestion window
     /// currently permits. Retransmissions ignore it — loss recovery must always
@@ -1101,12 +1116,18 @@ impl Stream {
         // the flow-control invariant), but it does NOT back the RTO off (this was a
         // SACK-detected loss, not a timeout). Clears the flag and marks the segment
         // retransmitted (ambiguous for RTT — Karn).
+        //
+        // `sent_at` moves, the delivery marks do not — see the field docs on
+        // `PendingData::delivered_at_send`. The RTO and the RACK time threshold
+        // both ask "how long since this segment was last on the wire", so they
+        // need the new instant; the delivery-rate sample asks "how much has the
+        // connection delivered since these bytes were first entrusted to the
+        // path", and moving its origin forward is what let one acknowledgement
+        // report a whole window as having arrived in a millisecond.
         for pending in buffer.iter_mut() {
             if pending.lost && pending.sent_at.is_some() {
                 pending.lost = false;
                 pending.sent_at = Some(now);
-                pending.delivered_at_send = delivered_now;
-                pending.delivered_time_at_send = Some(delivered_time_now);
                 pending.retries += 1;
                 return Some(OutboundSegment {
                     stream_offset: pending.stream_offset,
@@ -1118,13 +1139,13 @@ impl Stream {
             }
         }
 
-        // Pass 1: a timed-out segment (retransmission) — always allowed.
+        // Pass 1: a timed-out segment (retransmission) — always allowed. Same
+        // restamping rule as Pass 0: the timer moves, the delivery marks stay
+        // with the original transmission.
         for pending in buffer.iter_mut() {
             if let Some(sent_at) = pending.sent_at {
                 if now.duration_since(sent_at) >= timeout {
                     pending.sent_at = Some(now);
-                    pending.delivered_at_send = delivered_now;
-                    pending.delivered_time_at_send = Some(delivered_time_now);
                     pending.retries += 1;
                     // Back the RTO off exponentially for the next attempt.
                     self.note_rto_timeout();
@@ -1334,11 +1355,12 @@ impl Stream {
 
         // Loss detection (RFC 9002 §6.1.1) over the still-buffered, in-flight
         // segments, keyed on the gap-free `stream_offset`: declare lost any offset
-        // at least `PACKET_THRESHOLD` behind `largest_acked` (packet-threshold), or
-        // — if an srtt is known — any offset below `largest_acked` aged past
-        // srtt·9/8 (RACK time-threshold). Flagged segments are fast-retransmitted
-        // by `poll_send`'s Pass-0; already-flagged ones are skipped (no double-count
-        // into congestion control).
+        // at least `PACKET_THRESHOLD` behind `largest_acked` (packet-threshold, and
+        // only while nothing has been resent for it — see the predicate), or — if
+        // an srtt is known — any offset below `largest_acked` aged past srtt·9/8
+        // since its latest transmission (RACK time-threshold). Flagged segments are
+        // fast-retransmitted by `poll_send`'s Pass-0; already-flagged ones are
+        // skipped (no double-count into congestion control).
         // T5.4: clamp `largest_acked` to the highest `stream_offset` we have actually assigned
         // (`reliable_offset` is the next-to-assign, so it bounds every offset on the wire). A
         // peer cannot legitimately ack an offset we never sent; without this an authenticated
@@ -1365,8 +1387,30 @@ impl Stream {
             if pending.stream_offset >= largest_acked {
                 continue; // not behind the largest ack — still legitimately in flight
             }
-            let packet_lost =
-                largest_acked >= pending.stream_offset.saturating_add(PACKET_THRESHOLD);
+            // The packet threshold is a one-shot test, and the predicate has to
+            // say so, because nothing else does. `largest_acked` only grows, so
+            // once it is three offsets past a segment it stays there for the
+            // rest of the connection; and the `lost` flag is not a record of the
+            // detection — `poll_send`'s Pass-0 clears it the instant it puts the
+            // copy on the wire. With the flag cleared and the comparison
+            // permanently true, every subsequent acknowledgement re-declared the
+            // same segment lost and Pass-0 emitted another copy of it. On a path
+            // that acknowledges each packet with a window of a few hundred
+            // segments, that is hundreds of bogus loss reports and hundreds of
+            // duplicates per round trip, all for one drop: the round's computed
+            // loss rate saturates, the inflight bound sits on its floor, and
+            // Pass-0 (which runs ahead of the new-data pass) starves the
+            // application for as long as it lasts.
+            //
+            // `retries` is the record that a copy is already out there. Once one
+            // is, the question is no longer "did this segment arrive" — it is
+            // "did the copy arrive", and the only evidence that bears on that is
+            // time since the copy left. That is the RACK time threshold below,
+            // measured from the restamped `sent_at`, and it re-declares the
+            // segment once per `srtt·9/8` rather than once per acknowledgement.
+            // The RTO pass remains the backstop underneath both.
+            let packet_lost = pending.retries == 0
+                && largest_acked >= pending.stream_offset.saturating_add(PACKET_THRESHOLD);
             let time_lost = time_threshold.is_some_and(|t| now.duration_since(sent_at) >= t);
             if packet_lost || time_lost {
                 pending.lost = true;
@@ -1779,10 +1823,13 @@ mod tests {
         );
     }
 
-    /// A retransmission is a fresh transmission: its interval starts when the
-    /// retry left the wire, not when the original did.
+    /// A retransmission is a fresh transmission for the *timers* only. The
+    /// delivery marks stay with the original send, because an acknowledgement
+    /// does not say which copy it answers and the usual answer is the original —
+    /// measuring from the retry would then divide a round trip's worth of
+    /// delivery by the moments since the resend.
     #[tokio::test]
-    async fn a_retransmit_restamps_the_delivered_counter() {
+    async fn a_retransmit_keeps_the_delivery_marks_of_the_original_send() {
         let stream = Stream::new(1);
         stream.send_reliable(Bytes::from("payload")).await.unwrap();
 
@@ -1828,8 +1875,14 @@ mod tests {
         let retired = stream.on_sack(&sack).await.retired;
         assert_eq!(retired.len(), 1);
         assert_eq!(
-            retired[0].delivered_at_send, 7_000,
-            "the retry's own send time is what bounds its delivery interval"
+            retired[0].delivered_at_send, 1_000,
+            "the interval the acknowledgement measures starts at the original \
+             transmission, not at the retry"
+        );
+        assert!(
+            retired[0].was_retransmit,
+            "the segment is still flagged retransmitted, so Karn's gate still \
+             keeps its round trip out of the RTT filter"
         );
     }
 
@@ -2156,6 +2209,321 @@ mod tests {
             vec![1],
             "an aged unacked segment must be flagged by the time-threshold"
         );
+    }
+
+    /// Build the five-segment "one open hole" shape every loss-storm test below
+    /// starts from: offsets 0..=4 are all on the wire, and a SACK covering
+    /// {1,2,3,4} leaves offset 0 as the only hole. `largest_acked` is then 4,
+    /// which is at or past `0 + PACKET_THRESHOLD`, so the packet threshold
+    /// qualifies offset 0 on the very first acknowledgement.
+    ///
+    /// Time must be paused by the caller: these tests separate the packet
+    /// threshold from the RACK time threshold, and the latter fires on any
+    /// segment aged past `max(1 ms, srtt·9/8)`.
+    async fn stream_with_one_open_hole() -> (Stream, Sack) {
+        let stream = Stream::new(1);
+        for _ in 0..5u32 {
+            stream
+                .send_reliable(Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+            let _ = stream
+                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .await
+                .expect("in flight");
+        }
+        let sack = Sack::from_received(&[1, 2, 3, 4], 0).expect("sack over the hole");
+        (stream, sack)
+    }
+
+    /// **A loss is reported once per loss, not once per acknowledgement.**
+    ///
+    /// `largest_acked` only grows, so once an offset has qualified under the
+    /// packet threshold it qualifies under it forever. The `lost` flag is not a
+    /// memory of that — `poll_send`'s Pass-0 clears it the moment it puts the
+    /// copy on the wire — so with the flag cleared and the threshold still
+    /// satisfied, every subsequent acknowledgement re-declared the same segment
+    /// lost. On a path that acknowledges every packet, that is one bogus loss
+    /// report per received packet for a whole round trip: a round with a single
+    /// genuine loss reads as a round that lost most of its window, and the
+    /// congestion controller's inflight bound sits on its floor.
+    #[tokio::test]
+    async fn a_retransmitted_segment_is_not_re_declared_lost_by_every_ack() {
+        tokio::time::pause();
+        let (stream, sack) = stream_with_one_open_hole().await;
+
+        let mut reports = 0usize;
+        for _ in 0..20 {
+            reports += stream.on_sack(&sack).await.lost.len();
+            // Stand in for the pump: Pass-0 answers the flag and clears it,
+            // which is what re-armed the packet threshold on the next ack.
+            if let Some(seg) = stream
+                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .await
+            {
+                assert!(seg.retransmit, "Pass-0 hands back a retransmission");
+                assert_eq!(seg.stream_offset, 0, "the hole is offset 0");
+            }
+        }
+
+        assert_eq!(
+            reports, 1,
+            "one hole must be reported lost exactly once while its retransmission \
+             is outstanding; got {reports} reports over 20 acknowledgements"
+        );
+    }
+
+    /// Two-sided companion to the test above: the suppression is scoped to a
+    /// segment that has *already* been resent. A hole that meets the packet
+    /// threshold for the first time — `retries == 0`, nothing on the wire to
+    /// wait for — is still declared lost immediately.
+    ///
+    /// This rejects the naive "fix" of deleting the packet-threshold test, which
+    /// would silence the storm by removing fast retransmit altogether and leave
+    /// every loss to the RTO.
+    #[tokio::test]
+    async fn a_never_retransmitted_hole_is_still_declared_lost_at_once() {
+        tokio::time::pause();
+        let (stream, sack) = stream_with_one_open_hole().await;
+
+        let result = stream.on_sack(&sack).await;
+        assert_eq!(
+            result.lost_offsets(),
+            vec![0],
+            "the first acknowledgement that puts largest_acked three offsets past \
+             the hole must declare it lost"
+        );
+    }
+
+    /// Two-sided companion: a retransmission that is *itself* lost must be
+    /// re-declared. The rule that replaces the packet threshold is RACK's time
+    /// threshold measured from the latest transmission — so the re-detection is
+    /// paced by `srtt·9/8`, once per round trip, instead of once per
+    /// acknowledgement.
+    ///
+    /// This rejects the naive "fix" of declaring a segment lost at most once
+    /// ever, which would leave a lost retransmission to the RTO backstop and
+    /// turn a second drop into a whole RTO of stall.
+    #[tokio::test]
+    async fn a_lost_retransmission_is_re_declared_by_the_time_threshold() {
+        tokio::time::pause();
+        let stream = Stream::new(1);
+
+        // Establish an srtt of ~10 ms so the time threshold is ~11.25 ms — well
+        // clear of the 1 ms kGranularity floor, and well under the RTO.
+        stream
+            .send_reliable(Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        let _ = stream
+            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .await
+            .expect("send offset 0");
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let _ = stream
+            .on_sack(&Sack::from_received(&[0], 0).expect("sack"))
+            .await;
+
+        // Offsets 1..=5 go out; a SACK covering {2,3,4,5} leaves 1 as the hole.
+        for _ in 0..5u32 {
+            stream
+                .send_reliable(Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+            let _ = stream
+                .poll_send(u64::MAX, 0, std::time::Instant::now())
+                .await
+                .expect("in flight");
+        }
+        let sack = Sack::from_received(&[2, 3, 4, 5], 0).expect("sack over the hole");
+
+        assert_eq!(
+            stream.on_sack(&sack).await.lost_offsets(),
+            vec![1],
+            "first detection"
+        );
+        let resend = stream
+            .poll_send(u64::MAX, 0, std::time::Instant::now())
+            .await
+            .expect("Pass-0 fast-retransmit");
+        assert_eq!(resend.stream_offset, 1);
+
+        // Immediately after the resend nothing has been learned, so nothing is
+        // reported: the copy has not had time to be acknowledged.
+        assert!(
+            stream.on_sack(&sack).await.lost.is_empty(),
+            "an ack landing in the same instant as the resend carries no news"
+        );
+
+        // A round trip later the copy is still unacknowledged. That IS news.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert_eq!(
+            stream.on_sack(&sack).await.lost_offsets(),
+            vec![1],
+            "a retransmission aged past srtt·9/8 must be re-declared lost"
+        );
+    }
+
+    /// The wire-facing half of the same defect: a re-declaration is also a
+    /// re-*transmission*, because Pass-0 bypasses the congestion window and runs
+    /// ahead of the pass that sends new data. Under a storm the sender spends a
+    /// whole round trip emitting copies of one segment while new data waits.
+    #[tokio::test]
+    async fn pass0_emits_one_copy_of_a_hole_per_detection_not_per_ack() {
+        tokio::time::pause();
+        let (stream, sack) = stream_with_one_open_hole().await;
+
+        let mut copies = 0usize;
+        for _ in 0..20 {
+            let _ = stream.on_sack(&sack).await;
+            // Drain whatever the pump would have drained this pass. Bounded so a
+            // regression fails the assertion below instead of hanging.
+            for _ in 0..4 {
+                match stream
+                    .poll_send(u64::MAX, 0, std::time::Instant::now())
+                    .await
+                {
+                    Some(seg) => {
+                        assert!(seg.retransmit, "nothing new is queued");
+                        copies += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        assert_eq!(
+            copies, 1,
+            "the hole must go on the wire once per detection; got {copies} copies \
+             over 20 acknowledgements"
+        );
+    }
+
+    /// **A retransmission must not fabricate a delivery-rate sample.**
+    ///
+    /// The estimator's rate is `bytes the connection delivered since the sample's
+    /// mark` over `time since that mark`. Moving the mark forward on a resend
+    /// keeps the two consistent only if the acknowledgement being measured
+    /// answers the *resend*. It frequently does not: an acknowledgement already
+    /// in flight for the original lands moments after the copy goes out, and
+    /// then a whole window of delivery is divided by the milliseconds since the
+    /// restamp.
+    ///
+    /// The arithmetic this test sets up, with 20 segments of 1200 B on a 250 ms
+    /// path whose acknowledgements arrive 100 µs apart:
+    ///
+    /// - the connection delivers 20 × 1200 = 24 000 B, all of it acknowledged by
+    ///   t ≈ 251.9 ms, so nothing above 24 000 B / 0.2519 s ≈ 95 KB/s (0.76
+    ///   Mbit/s) is supported by anything that happened;
+    /// - restamping put the hole's mark at 3 × 1200 = 3600 B delivered, at
+    ///   t ≈ 250.2 ms. Its acknowledgement lands at t ≈ 251.9 ms, so the sample
+    ///   reads (24 000 − 3600) B / 1.7 ms ≈ 12 MB/s — 126× the truth, from one
+    ///   sample, into a maximum filter that holds it for ten seconds;
+    /// - keeping the mark at the original send gives 24 000 B / 251.9 ms, i.e.
+    ///   exactly the supported figure. It can only ever under-report, and a
+    ///   maximum filter is indifferent to a low sample.
+    #[tokio::test]
+    async fn a_retransmits_ack_cannot_fabricate_a_delivery_rate() {
+        use crate::transport::bandwidth_estimator::BandwidthEstimator;
+
+        const SEGMENTS: u32 = 20;
+        const PAYLOAD: usize = 1200;
+        const RTT_MS: u64 = 250;
+        /// Spacing between the acknowledgements of the burst.
+        const ACK_GAP_US: u64 = 100;
+
+        tokio::time::pause();
+        // The tokio clock is frozen, so this origin and every `advance` below
+        // agree with the `std::time::Instant`s the estimator works in.
+        let t0 = tokio::time::Instant::now().into_std();
+        let stream = Stream::new(1);
+        let mut est = BandwidthEstimator::new();
+        let payload = Bytes::from(vec![0u8; PAYLOAD]);
+
+        // A window's worth leaves back-to-back at t = 0.
+        for _ in 0..SEGMENTS {
+            stream.send_reliable(payload.clone()).await.unwrap();
+            let sent = stream
+                .poll_send(u64::MAX, est.delivered_bytes(), est.delivered_time())
+                .await
+                .expect("in flight");
+            est.on_send(sent.data.len() as u64);
+        }
+
+        // One round trip later the acknowledgements arrive, one per received
+        // packet, with offset 0 missing.
+        tokio::time::advance(Duration::from_millis(RTT_MS)).await;
+        let mut acked: Vec<u32> = Vec::new();
+        for offset in 1..SEGMENTS {
+            acked.push(offset);
+            let sack = Sack::from_received(&acked, 0).expect("sack");
+            feed_retirements(&stream, &sack, &mut est).await;
+            // The packet threshold qualifies the hole once largest_acked reaches
+            // 3; the pump answers by resending it, which is where the mark used
+            // to move.
+            if let Some(seg) = stream
+                .poll_send(u64::MAX, est.delivered_bytes(), est.delivered_time())
+                .await
+            {
+                assert!(seg.retransmit);
+                est.on_send(seg.data.len() as u64);
+            }
+            tokio::time::advance(Duration::from_micros(ACK_GAP_US)).await;
+        }
+
+        // Finally the hole's own acknowledgement lands — answering the original
+        // transmission, which had been in flight for the whole round trip.
+        acked.push(0);
+        let sack = Sack::from_received(&acked, 0).expect("sack");
+        feed_retirements(&stream, &sack, &mut est).await;
+
+        let total = u64::from(SEGMENTS) * PAYLOAD as u64;
+        let elapsed = tokio::time::Instant::now().into_std().duration_since(t0);
+        let supported = (total as f64 / elapsed.as_secs_f64()) as u64;
+        assert!(
+            est.bottleneck_bandwidth() <= supported + supported / 10,
+            "estimate {} B/s exceeds the {} B/s that {} B over {:?} supports",
+            est.bottleneck_bandwidth(),
+            supported,
+            total,
+            elapsed
+        );
+        // ...and it must still find the rate, or an estimator that refused to
+        // sample a retransmitted segment at all would satisfy the bound above.
+        assert!(
+            est.bottleneck_bandwidth() >= supported / 2,
+            "estimate {} B/s undershoots the {} B/s actually delivered",
+            est.bottleneck_bandwidth(),
+            supported
+        );
+    }
+
+    /// Mirror what the data pump does with a `SackResult`: turn every retired
+    /// segment into the `DeliverySample` the estimator is fed, using the marks
+    /// the segment carried and `now` as the acknowledgement instant.
+    async fn feed_retirements(
+        stream: &Stream,
+        sack: &Sack,
+        est: &mut crate::transport::bandwidth_estimator::BandwidthEstimator,
+    ) {
+        use crate::transport::bandwidth_estimator::DeliverySample;
+        let acked_at = tokio::time::Instant::now().into_std();
+        for retired in stream.on_sack(sack).await.retired {
+            let Some(sent_at) = retired.sent_at else {
+                continue;
+            };
+            let sent_at = sent_at.into_std();
+            est.on_ack(DeliverySample {
+                delivered_bytes: retired.delivered_at_send,
+                delivered_at: retired.delivered_time_at_send.unwrap_or(sent_at),
+                sent_at,
+                acked_at,
+                packet_bytes: retired.size,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: !retired.was_retransmit,
+            });
+        }
     }
 
     /// `received_sack` derives ranges from the reorder state with a gap, and

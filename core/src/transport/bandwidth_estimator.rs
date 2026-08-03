@@ -129,9 +129,14 @@ pub struct DeliverySample {
     /// measured from the copy and reads as microseconds. Nothing in the
     /// acknowledgement identifies which of the two it answers, so the figure is
     /// not a round trip at all. [`BandwidthEstimator::on_ack`] keeps it out of
-    /// the min-RTT filter; the delivery-rate half of the sample is unaffected
-    /// (its numerator and denominator are restamped together, so it still
-    /// measures bytes delivered since the resend over the time since the resend).
+    /// the min-RTT filter.
+    ///
+    /// It does **not** gate the delivery-rate half of the sample, which stays
+    /// honest for a different reason: [`Self::delivered_bytes`] and
+    /// [`Self::delivered_at`] are *not* restamped on a resend, so the rate is
+    /// measured over an interval that spans the original transmission whichever
+    /// copy is being acknowledged. That can only widen the denominator — an
+    /// under-estimate, which a maximum filter discards.
     pub rtt_sampled: bool,
 }
 
@@ -532,9 +537,21 @@ impl BandwidthEstimator {
         // of the connection.
         //
         // The delivery-rate half of the sample below is deliberately *not*
-        // gated: `sent_at`, `delivered_bytes` and `delivered_at` are restamped
-        // together, so the rate still measures bytes delivered since the resend
-        // over the time since the resend — a short interval, but an honest one.
+        // gated, and it does not need to be: `delivered_bytes` and
+        // `delivered_at` stay with the segment's *original* transmission across
+        // a resend (`Stream::poll_send` moves only `sent_at`), so the rate
+        // measures bytes delivered since those bytes were first entrusted to
+        // the path, over the time since then. Both ends of that interval are
+        // this endpoint's own readings and neither depends on which copy the
+        // acknowledgement answers. The interval is at least as wide as the
+        // truth, so the rate is at most as high — and a maximum filter is
+        // indifferent to a low sample, where a single high one governs the
+        // window for the whole ten-second window.
+        //
+        // Gating it on Karn's condition as well would be the stricter rule and
+        // the wrong one: a path losing enough that most segments get resent
+        // would stop feeding the filter entirely, `btl_bw` would decay to zero
+        // as the window emptied, and `cwnd` would pin to its floor.
         let rtt_us = u64::try_from(adjusted_rtt.as_micros()).unwrap_or(u64::MAX);
         if sample.rtt_sampled && rtt_us > 0 {
             let min_rtt_us = self.rtt_filter.update_min(now, rtt_us);
@@ -1356,6 +1373,92 @@ mod tests {
             est.min_rtt(),
             Duration::from_millis(150),
             "a never-retransmitted segment's round trip must still lower min_rtt"
+        );
+    }
+
+    /// Karn's gate stops at the RTT filter. The delivery-rate half of a sample
+    /// from a retransmitted segment is still a measurement and must still be
+    /// taken.
+    ///
+    /// The tempting stricter rule — drop the whole sample whenever the segment
+    /// had been resent — is safe only while retransmissions are rare. On a path
+    /// losing enough that most segments are resent at least once it starves the
+    /// filter: `btl_bw` decays to zero as the ten-second window empties, `cwnd
+    /// = 2 × btl_bw × min_rtt` collapses onto its 5600-byte floor, and the
+    /// sender is pinned there for the rest of the connection — precisely the
+    /// failure the floor and the inflight bound exist to avoid.
+    ///
+    /// So this feeds nothing but ambiguous samples (`rtt_sampled: false`) and
+    /// requires that the estimator both finds the rate and *raises* it when the
+    /// path genuinely speeds up. A rate sample stays honest under Fix 2 for a
+    /// different reason than Karn's: the interval and the bytes are both
+    /// measured from the original transmission, so the worst it can be is an
+    /// under-estimate, and a maximum filter is indifferent to those.
+    #[test]
+    fn a_resent_segments_delivery_rate_still_reaches_the_filter() {
+        const PACKET: u64 = 1200;
+        const ROUND: u64 = 100;
+        const SLOW_RTT_MS: u64 = 200;
+        // Four times the delivery in the same interval — a path that opened up.
+        const FAST_RTT_MS: u64 = 50;
+
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+
+        // Round one, every segment a retransmission: 100 × 1200 B delivered over
+        // 200 ms is 600 KB/s.
+        for _ in 0..ROUND {
+            est.on_send(PACKET);
+        }
+        for _ in 0..ROUND {
+            est.on_ack(DeliverySample {
+                delivered_bytes: 0,
+                delivered_at: start,
+                sent_at: start,
+                acked_at: start + Duration::from_millis(SLOW_RTT_MS),
+                packet_bytes: PACKET,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: false,
+            });
+        }
+
+        let slow = ROUND * PACKET * 1000 / SLOW_RTT_MS;
+        assert!(
+            est.bottleneck_bandwidth() >= slow - slow / 10,
+            "an ambiguous round trip is still a delivery-rate measurement; the \
+             estimate is {} B/s against {} B/s delivered",
+            est.bottleneck_bandwidth(),
+            slow
+        );
+
+        // Round two, also all retransmissions, on a path that now carries the
+        // same window in a quarter of the time.
+        let second = start + Duration::from_millis(SLOW_RTT_MS);
+        let mark = est.delivered_bytes();
+        for _ in 0..ROUND {
+            est.on_send(PACKET);
+        }
+        for _ in 0..ROUND {
+            est.on_ack(DeliverySample {
+                delivered_bytes: mark,
+                delivered_at: second,
+                sent_at: second,
+                acked_at: second + Duration::from_millis(FAST_RTT_MS),
+                packet_bytes: PACKET,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: false,
+            });
+        }
+
+        let fast = ROUND * PACKET * 1000 / FAST_RTT_MS;
+        assert!(
+            est.bottleneck_bandwidth() >= fast - fast / 10,
+            "the estimator must still discover a genuine speed-up from resent \
+             segments; the estimate is {} B/s against {} B/s delivered",
+            est.bottleneck_bandwidth(),
+            fast
         );
     }
 

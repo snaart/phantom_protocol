@@ -165,6 +165,94 @@ impl SessionTransport for ChannelTransport {
     }
 }
 
+/// A [`ChannelTransport`] whose *send* side behaves like a link rather than a
+/// function call: a fixed one-way propagation delay, and a minimum spacing
+/// between consecutive frames.
+///
+/// Both halves are load-bearing for anything that reasons about acknowledgement
+/// *timing*, and an in-memory channel has neither.
+///
+/// The delay must be a delay **line**, not a `sleep` inside `send_bytes`. An
+/// inline sleep blocks the pump that called it, which stalls acknowledgement
+/// processing as well as emission: the round trip a sender then measures swings
+/// by up to a whole delay depending on what else that pump had queued, and
+/// RACK's time threshold — `srtt·9/8`, an eighth of a round trip of margin —
+/// disappears into that noise. Here `send_bytes` stamps a release deadline and
+/// returns; one forwarding task releases frames at their deadlines.
+///
+/// The spacing is what makes a receiver's acknowledgements arrive *spread out*.
+/// Without it, everything a peer emits in one scheduling slice is released in
+/// one burst, the far pump drains its whole inbound queue before it next looks
+/// at its send path, and no acknowledgement can ever land in the interval
+/// between a retransmission and its answer — the interval where SACK-driven loss
+/// detection actually lives. A real bottleneck serialises frames; this is that,
+/// with the link rate expressed as time per frame.
+struct DelayLine {
+    line: mpsc::Sender<(tokio::time::Instant, Vec<u8>)>,
+    delay: Duration,
+    spacing: Duration,
+    /// Release deadline of the previously accepted frame, so the next is placed
+    /// at least `spacing` after it. Deadlines stay monotonic, which is what lets
+    /// the single forwarding task preserve order with a plain `sleep_until`.
+    last_release: std::sync::Mutex<Option<tokio::time::Instant>>,
+    rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+}
+
+impl DelayLine {
+    fn new(inner: ChannelTransport, delay: Duration, spacing: Duration) -> Self {
+        let (line_tx, mut line_rx) = mpsc::channel::<(tokio::time::Instant, Vec<u8>)>(256);
+        let out = inner.tx;
+        tokio::spawn(async move {
+            while let Some((release_at, frame)) = line_rx.recv().await {
+                tokio::time::sleep_until(release_at).await;
+                if out.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            line: line_tx,
+            delay,
+            spacing,
+            last_release: std::sync::Mutex::new(None),
+            rx: inner.rx,
+        }
+    }
+
+    fn schedule(&self) -> tokio::time::Instant {
+        let mut last = self
+            .last_release
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let earliest = tokio::time::Instant::now() + self.delay;
+        let release_at = match *last {
+            Some(prev) => earliest.max(prev + self.spacing),
+            None => earliest,
+        };
+        *last = Some(release_at);
+        release_at
+    }
+}
+
+impl SessionTransport for DelayLine {
+    async fn send_bytes(&self, data: &[u8]) -> Result<(), CoreError> {
+        let release_at = self.schedule();
+        self.line
+            .send((release_at, data.to_vec()))
+            .await
+            .map_err(|_| CoreError::NetworkError("delay line closed".into()))
+    }
+
+    async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
+        let mut rx = self.rx.lock().await;
+        let v = rx
+            .recv()
+            .await
+            .ok_or_else(|| CoreError::NetworkError("channel closed".into()))?;
+        Ok(Bytes::from(v))
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Drive one full session-survives-loss exchange and assert byte-exact, in-order
@@ -452,6 +540,165 @@ async fn run_pipelined_echo(
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// **One drop, one loss report.** The end-to-end form of the unit tests in
+/// `transport::stream`: a real session, a real data pump, a real SACK-driven
+/// loss detector, and exactly one segment removed from the wire.
+///
+/// The detector's packet threshold compares `largest_acked` against the hole's
+/// offset, and `largest_acked` only grows — so once it has fired for an offset
+/// it would fire for that offset on every acknowledgement thereafter, and this
+/// implementation acknowledges every packet it receives. Each firing is a fresh
+/// `Session::on_packet_lost`, and each is also a fresh Pass-0 copy on the wire.
+/// `bbr_bytes_lost()` is the counter that makes that visible from outside: on a
+/// path that dropped 1300 bytes it must read 1300 bytes, not a multiple of them.
+///
+/// The drop is armed immediately before the application write, so the frame
+/// removed is the payload's first chunk. If that ever stopped being true the
+/// assertion would read zero rather than silently passing.
+///
+/// The acknowledgement path runs through a [`DelayLine`] and not a bare channel,
+/// because the defect is a *timing* one and an in-memory channel has no timing:
+/// with everything released in one burst the receiving pump drains its whole
+/// inbound queue before it looks at its send path, so no acknowledgement ever
+/// lands in the window between a retransmission and its answer, which is the
+/// only window in which the re-declaration can happen. With a round trip and a
+/// per-frame spacing the storm reproduces: one 1300-byte drop was reported as
+/// 3900 bytes of loss, on every run.
+#[tokio::test]
+async fn a_single_dropped_segment_is_reported_to_congestion_control_once() {
+    /// `PhantomSession::send` splits at this boundary, so the payload below is
+    /// exactly `CHUNKS` reliable segments and the assertion can name a size.
+    const CHUNK: usize = 1300;
+    /// Enough segments that the packet threshold (three offsets past the hole)
+    /// is reached from the acknowledgements of the surviving chunks alone, with
+    /// a long tail of further acknowledgements behind it — the tail is what a
+    /// re-declaring detector turns into a storm.
+    const CHUNKS: usize = 40;
+    /// One-way delay on the acknowledgement path, and so the round trip the
+    /// server measures. It has to be large against the pumps' scheduling jitter:
+    /// the RACK time threshold sits at `srtt·9/8`, so the margin between "the
+    /// retransmission's acknowledgement came back" and "the retransmission looks
+    /// lost too" is an eighth of a round trip, and at single-digit milliseconds
+    /// that margin *is* the jitter.
+    const ACK_PATH_DELAY: Duration = Duration::from_millis(80);
+    /// Minimum spacing between acknowledgements on that path — the link rate,
+    /// expressed as time per frame.
+    const ACK_SPACING: Duration = Duration::from_millis(3);
+
+    let server_hs = HandshakeServer::new().expect("HandshakeServer::new");
+    let server_pinned_key = server_hs.verifying_key().clone();
+    let (client_channel, server_channel) = ChannelTransport::pair();
+
+    // The client's pump runs in the background from here; the server handshake
+    // is driven inline so the negotiated `Session` stays in reach.
+    let client = PhantomSession::connect_with_transport(
+        "test-server:9000",
+        DelayLine::new(client_channel, ACK_PATH_DELAY, ACK_SPACING),
+        server_pinned_key,
+    );
+
+    let client_ip = "127.0.0.1".parse().expect("parse IP");
+    let hello_bytes = server_channel
+        .recv_bytes()
+        .await
+        .expect("server recv ClientHello");
+    let client_hello =
+        borsh::from_slice::<ClientHello>(&hello_bytes).expect("deserialize ClientHello");
+    let inner_session = match server_hs.process_client_hello(&client_hello, 0, client_ip) {
+        HandshakeResponse::Retry(retry) => {
+            let retry_bytes = ServerReply::Retry(retry)
+                .to_wire()
+                .expect("serialize retry");
+            server_channel
+                .send_bytes(&retry_bytes)
+                .await
+                .expect("server send retry");
+            let next_bytes = server_channel
+                .recv_bytes()
+                .await
+                .expect("server recv retry ClientHello");
+            let next_hello =
+                borsh::from_slice::<ClientHello>(&next_bytes).expect("deserialize retry hello");
+            match server_hs.process_client_hello(&next_hello, 0, client_ip) {
+                HandshakeResponse::Success(server_hello, session, _) => {
+                    let b = ServerReply::Hello(server_hello)
+                        .to_wire()
+                        .expect("serialize ServerHello");
+                    server_channel
+                        .send_bytes(&b)
+                        .await
+                        .expect("server send ServerHello");
+                    session
+                }
+                other => panic!("expected Success after retry, got {other:?}"),
+            }
+        }
+        HandshakeResponse::Success(server_hello, session, _) => {
+            let b = ServerReply::Hello(server_hello)
+                .to_wire()
+                .expect("serialize ServerHello");
+            server_channel
+                .send_bytes(&b)
+                .await
+                .expect("server send ServerHello");
+            session
+        }
+        HandshakeResponse::Reject(r) => panic!("unexpected Reject: {r:?}"),
+        HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+    };
+
+    let inner = Arc::new(inner_session);
+    let congestion = inner.clone();
+    let faults = FaultControl::new();
+    let server = PhantomSession::from_accepted_server_session(
+        "test-client".into(),
+        LossyTransport::new(server_channel, faults.clone()),
+        inner,
+    );
+
+    let mut established = false;
+    for _ in 0..200 {
+        if client.connection_state() == ConnectionState::Connected {
+            established = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(established, "client session never became established");
+
+    // Distinct bytes throughout, so a truncation or a reordering shows up as a
+    // mismatch rather than as a length that happens to agree.
+    let payload: Vec<u8> = (0..CHUNK * CHUNKS).map(|i| (i % 251) as u8).collect();
+    // Take exactly one frame off the wire — the first chunk, since the write
+    // below is the next thing this pump sends.
+    faults.arm_drop_next(1);
+    server.send(payload.clone()).await.expect("server send");
+
+    let mut received = Vec::with_capacity(payload.len());
+    for i in 0..CHUNKS {
+        let chunk = timeout(Duration::from_secs(30), client.recv())
+            .await
+            .unwrap_or_else(|_| panic!("client recv timed out on chunk {i} — loss not recovered"))
+            .expect("client recv error");
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        received, payload,
+        "the dropped segment must be recovered byte-exact and in order"
+    );
+
+    assert_eq!(
+        congestion.bbr_bytes_lost(),
+        CHUNK as u64,
+        "one dropped segment of {CHUNK} B must reach congestion control as exactly \
+         {CHUNK} B of loss; a larger figure is the same segment re-reported once \
+         per acknowledgement"
+    );
+
+    server.disconnect().await.expect("server clean disconnect");
+    client.disconnect().await.expect("client clean disconnect");
+}
 
 /// **Seeded-loss survival.** A real session survives seeded packet loss + light
 /// reorder on every application send, recovering every message byte-exact and in
