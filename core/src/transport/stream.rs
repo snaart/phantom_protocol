@@ -107,7 +107,7 @@ pub const MAX_SEND_WINDOW: u32 = 16 * INITIAL_STREAM_WINDOW;
 /// samples were sitting against.
 ///
 /// It is not raised further because nothing above it is reachable: a stream's ARQ send
-/// buffer holds at most [`MAX_PENDING_PACKETS`] unacked segments of at most
+/// buffer holds at most `MAX_PENDING_PACKETS` unacked segments of at most
 /// [`crate::transport::mtu::MAX_APP_CHUNK`] bytes, so 1 183 744 B is all one stream can ever
 /// have outstanding whatever credit it is granted. Above roughly that figure the send
 /// buffer, not the window, is the binding constraint, and window granted past it is memory
@@ -738,7 +738,7 @@ impl Stream {
 
     /// Smallest RTT sampled on this stream, or `None` before the first measurement — the
     /// path's propagation delay rather than the queue-inflated smoothed estimate. Feeds
-    /// receive-window auto-tuning; see [`Self::tune_recv_window`].
+    /// receive-window auto-tuning; see `tune_recv_window`.
     fn min_rtt(&self) -> Option<Duration> {
         match self.rto.lock() {
             Ok(g) => g.min_rtt,
@@ -851,7 +851,7 @@ impl Stream {
 
     /// The window this side currently advertises: the most bytes the peer may hold in our
     /// buffers before it must stop and wait for the application to consume. Starts at
-    /// [`INITIAL_STREAM_WINDOW`] and is auto-tuned upward by [`Self::tune_recv_window`],
+    /// [`INITIAL_STREAM_WINDOW`] and is auto-tuned upward by `tune_recv_window`,
     /// never past [`MAX_RECV_WINDOW`].
     pub fn advertised_recv_window(&self) -> u32 {
         self.advertised_recv_window.load(Ordering::Acquire)
@@ -1021,7 +1021,7 @@ impl Stream {
     /// it to its send window). The half-window threshold trades update frequency
     /// against peer stalls.
     ///
-    /// The credit also carries any growth [`Self::tune_recv_window`] just decided. Because
+    /// The credit also carries any growth `tune_recv_window` just decided. Because
     /// `WINDOW_UPDATE` is relative, opening the window wider is simply extra credit — the
     /// wire format expresses it as it stands, and a window increase needs no new frame.
     /// Growth is emitted immediately even when the consumption credit is still below the

@@ -40,7 +40,7 @@
 //!
 //! Loss is deliberately *not* a state. BBRv2 and BBRv3 respond to it with a
 //! volume bound — `inflight_hi` — that the congestion window is capped by
-//! ([`BandwidthEstimator::adapt_inflight_bound`] carries the reasoning); the
+//! (`BandwidthEstimator::adapt_inflight_bound` carries the reasoning); the
 //! phase the connection is in never changes because a packet went missing.
 //!
 //! # Integration
@@ -306,7 +306,7 @@ const MIN_PACKET_SIZE: u64 = 1400;
 const LOSS_THRESH: f64 = 0.02;
 
 /// Multiplicative decrease applied to [`BandwidthEstimator::inflight_hi`] on a
-/// round that lost more than [`LOSS_THRESH`] — BBRv2/v3's `BBRBeta`, and the
+/// round that lost more than `LOSS_THRESH` — BBRv2/v3's `BBRBeta`, and the
 /// same 0.7.
 const INFLIGHT_HI_BETA: f64 = 0.7;
 
@@ -327,7 +327,7 @@ const INFLIGHT_HI_BETA: f64 = 0.7;
 const INFLIGHT_HI_FLOOR_GAIN: f64 = 1.25;
 
 /// Multiplicative increase applied to [`BandwidthEstimator::inflight_hi`] on a
-/// round that stayed under [`LOSS_THRESH`], until it clears the window the
+/// round that stayed under `LOSS_THRESH`, until it clears the window the
 /// gains alone would allow and is dropped entirely.
 ///
 /// Without it the bound is a one-way ratchet and a connection that saw one bad
@@ -399,10 +399,10 @@ pub struct BandwidthEstimator {
     inflight_bytes: u64,
     /// Upper bound on inflight imposed by observed loss — BBRv2/v3's
     /// `inflight_hi`. `None` means the path has given no reason for one and the
-    /// window is whatever [`Self::cwnd_gain`] asks for.
+    /// window is whatever `cwnd_gain` asks for.
     ///
     /// This, not the gain, is where the loss response belongs. See
-    /// [`Self::adapt_inflight_bound`].
+    /// `adapt_inflight_bound`.
     inflight_hi: Option<u64>,
 
     // ── ProbeRTT timer ──
@@ -443,7 +443,7 @@ pub struct BandwidthEstimator {
 
     // ── Loss accounting ──
     /// Bytes reported lost since the current round trip opened. Reset by
-    /// [`Self::adapt_inflight_bound`] once the round has been judged.
+    /// `adapt_inflight_bound` once the round has been judged.
     round_bytes_lost: u64,
     /// [`Self::delivered_bytes`] as it stood when the current round opened —
     /// the denominator half of the round's loss rate.
@@ -710,7 +710,7 @@ impl BandwidthEstimator {
     /// else. In particular it does not change the state machine's phase, does
     /// not touch a gain, and does not move the congestion window: the response
     /// is decided once per round trip, over the round's *loss rate*, in
-    /// [`Self::adapt_inflight_bound`].
+    /// `adapt_inflight_bound`.
     ///
     /// The granularity matters more than it looks. `drain_streams_priority_ordered`
     /// calls this once per retransmitted segment, and on a path losing a few
@@ -766,7 +766,7 @@ impl BandwidthEstimator {
     /// exactly 1.0, so a converged flow paces at the bottleneck rate and the
     /// 1.25 phase is the mechanism by which it finds out the path got faster.
     ///
-    /// Floored at [`Self::pacing_rate_floor`], which is what makes it safe to
+    /// Floored at `pacing_rate_floor`, which is what makes it safe to
     /// hand this to a live rate limiter. Two ways the unfloored figure is not a
     /// rate anyone should be metered against: before the first acknowledgement
     /// `btl_bw` is zero, and the old `btl_bw.max(1)` turned that into two bytes
@@ -804,7 +804,7 @@ impl BandwidthEstimator {
     ///
     /// Two separate things decide it, and keeping them separate is the point:
     ///
-    /// - [`Self::cwnd_gain`] governs *growth*. It is the headroom above the
+    /// - `cwnd_gain` governs *growth*. It is the headroom above the
     ///   bandwidth-delay product that lets a delivery-rate sample come back
     ///   larger than the current estimate, which is the only way the estimate
     ///   ever rises. Loss must not touch it.
@@ -835,7 +835,7 @@ impl BandwidthEstimator {
     }
 
     /// The loss-imposed upper bound on inflight, if the path has earned one.
-    /// `None` means no round trip has yet lost more than [`LOSS_THRESH`] (or the
+    /// `None` means no round trip has yet lost more than `LOSS_THRESH` (or the
     /// bound has since been relaxed away).
     pub fn inflight_hi(&self) -> Option<u64> {
         self.inflight_hi

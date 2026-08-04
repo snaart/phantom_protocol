@@ -30,13 +30,13 @@
 //! figure is not hypothetical; it is what a per-packet `sleep` measured.
 //!
 //! So the allowance here is a fixed *duration* of the current rate,
-//! [`BURST_INTERVAL`], clamped into [`MIN_BURST_BYTES`]..=[`MAX_BURST_BYTES`].
+//! `BURST_INTERVAL`, clamped into `MIN_BURST_BYTES`..=`MAX_BURST_BYTES`.
 //! Four milliseconds is comfortably longer than the timer granularity, so an
 //! ordinary wake never finds the bucket clipped, and it bounds what a sender
 //! that has been idle may dump to four milliseconds of the path — not a window.
 //! The clamps state the range where that reasoning holds: below about 4 MB/s
 //! the floor is a slightly longer burst than four milliseconds, and the ceiling
-//! this pacer can sustain is [`MAX_BURST_BYTES`] per [`BURST_INTERVAL`], which
+//! this pacer can sustain is `MAX_BURST_BYTES` per `BURST_INTERVAL`, which
 //! is 128 MiB/s — about 1.07 Gbit/s.
 //!
 //! # Debt
@@ -68,7 +68,7 @@ const BURST_INTERVAL: Duration = Duration::from_millis(4);
 /// one packet per timer tick.
 const MIN_BURST_BYTES: i64 = 16 * 1_024;
 
-/// Ceiling on the burst allowance, and with [`BURST_INTERVAL`] the ceiling on
+/// Ceiling on the burst allowance, and with `BURST_INTERVAL` the ceiling on
 /// the rate this pacer can sustain: 512 KiB per 4 ms is 128 MiB/s ≈ 1.07 Gbit/s.
 /// Above that the bucket, not the rate, is the limiter.
 const MAX_BURST_BYTES: i64 = 512 * 1_024;
@@ -120,7 +120,7 @@ impl Pacer {
         pacer
     }
 
-    /// The burst allowance for `rate`: [`BURST_INTERVAL`] of it, clamped.
+    /// The burst allowance for `rate`: `BURST_INTERVAL` of it, clamped.
     fn burst_for(rate: u64) -> i64 {
         let per_interval =
             (rate as u128).saturating_mul(BURST_INTERVAL.as_nanos()) / 1_000_000_000u128;
