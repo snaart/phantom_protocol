@@ -719,6 +719,19 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   and omitted `transport/udp_transport.rs` and `transport/legs/mimic_tls/`, which therefore
   never requested codeowner review.
 
+### Added
+
+- **`PhantomUdpListener::metrics_snapshot()`**, exported over UniFFI and identical in shape to
+  the TCP `PhantomListener`'s, so the two listeners are interchangeable in an embedder's
+  monitoring code. The UDP listener owns the `Arc<Observability>` that its handshake path and
+  every accepted session write through, but published no accessor for it: the aggregate was
+  reachable only through an *accepted session's* `metrics_snapshot()`. An operator running the
+  production, migration-capable transport from a foreign language therefore had no listener-level
+  metrics at all, and — precisely when it matters — a server that is being probed but has no live
+  session could report neither its handshake counters nor `replay_rejected_total` nor
+  `aead_failure_total`. Nothing about what is counted changes; the counters were always there,
+  only unreadable.
+
 ## [0.2.2] - 2026-06-22
 
 Documentation release. **No code, wire-format, public-API, or dependency changes** —
