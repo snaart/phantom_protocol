@@ -459,9 +459,9 @@ Full threat model, mitigations, and disclosure policy are in
 - **AEAD nonce-exhaustion guard** — `CryptoError::NonceExhausted` at
   `AEAD_MAX_INVOCATIONS = 2^48`.
 - **`ZeroizeOnDrop` on all key-bearing structs**; `#![deny(unsafe_code)]`
-  crate-wide with three audited opt-ins (`transport/udp_transport.rs` libc
-  `setsockopt` pacing, `transport/legs/websocket.rs` wasm-bindgen glue,
-  `transport/legs/wasi.rs` WIT-bindgen `Send`/`Sync`).
+  crate-wide with two audited opt-ins (`transport/legs/websocket.rs`
+  wasm-bindgen glue, `transport/legs/wasi.rs` WIT-bindgen `Send`/`Sync`) — both
+  cross-language-boundary glue, so a native build compiles no `unsafe` at all.
 - Cancel-safety audit: zero bugs found across all `tokio::select!` sites.
 - Documented production panic sites with `PANIC-SAFETY:` invariants — see
   [`docs/security/panic-sites.md`](docs/security/panic-sites.md).

@@ -273,11 +273,11 @@ server detects a vanished client symmetrically.
 | `aes_session` | `AesSession` | Reference per-direction AEAD pattern. |
 | `pow` | `PoWChallenge`, `PoWSolution` | blake3 PoW + stateless cookie DoS gate (constant-time MAC compare). |
 
-`#![deny(unsafe_code)]` at the crate root; three audited, sound opt-ins:
-`transport/udp_transport.rs` (a single `libc::setsockopt(SO_MAX_PACING_RATE)` call —
-the former GSO / `sendmmsg` / `recvmmsg` batch path was removed),
-`transport/legs/wasi.rs` (`unsafe impl Send/Sync` over WIT-bindgen handles),
-`transport/legs/websocket.rs` (wasm-bindgen JS glue). No `unsafe` in `crypto/`.
+`#![deny(unsafe_code)]` at the crate root; two audited, sound opt-ins:
+`transport/legs/wasi.rs` (`unsafe impl Send/Sync` over WIT-bindgen handles) and
+`transport/legs/websocket.rs` (wasm-bindgen JS glue). Both are confined to a
+non-native target, so a native build compiles no `unsafe` at all. No `unsafe`
+in `crypto/`.
 
 ---
 

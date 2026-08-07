@@ -50,13 +50,13 @@ multiple sites (row 10 = 2 calls, row 11 = 2 calls, row 12 = 3 calls).
 
 ## Unsafe Blocks
 
-The crate is `#![deny(unsafe_code)]` at the root (`core/src/lib.rs`). Three
+The crate is `#![deny(unsafe_code)]` at the root (`core/src/lib.rs`). Two
 modules opt in with module-level `#![allow(unsafe_code)]` plus per-block
-`// SAFETY:` comments:
+`// SAFETY:` comments. Both are cross-language-boundary glue confined to a
+non-native target, so a native build compiles no `unsafe` at all:
 
 | Module | Why `unsafe` |
 | --- | --- |
-| `core/src/transport/udp_transport.rs` | A single `libc::setsockopt` call in `set_pacing_rate` (Linux `SO_MAX_PACING_RATE`, with the `fq` qdisc). The block has a SAFETY line explaining the fd, option-value pointer, and length-argument invariants. The earlier dead `sendmmsg(2)` GSO-batch path (the only user of `libc::sendmmsg` / `libc::mmsghdr` / `MaybeUninit::zeroed`) was removed in the unsafe-surface reduction. Native (`cfg(not(target_arch = "wasm32"))`) only. |
 | `core/src/transport/legs/websocket.rs` | wasm-bindgen-generated JS-boundary glue (`#[wasm_bindgen]` extern blocks). `wasm32-*` browser target only (`cfg(all(target_arch = "wasm32", target_os = "unknown"))`). |
 | `core/src/transport/legs/wasi.rs` | `unsafe impl Send` + `unsafe impl Sync` for `WasiLeg`. The WIT-bindgen `Resource<TcpSocket>` / `Resource<InputStream>` / `Resource<OutputStream>` types hide an opaque numeric host handle and are `!Send + !Sync` by default. The internal `std::sync::Mutex` wrappers enforce single-accessor discipline; the unsafe impl is the contract that any cross-thread access goes through that mutex. WASI Preview 2 today provides no thread primitive, so the contract is vacuously satisfied — the explicit `unsafe impl` (plus the SAFETY block in the file) keeps the argument auditable if a future WASI threading proposal stabilizes. `cfg(all(feature = "wasi-leg", target_os = "wasi"))` only. |
 

@@ -68,16 +68,15 @@
         clippy::disallowed_methods
     )
 )]
-// Deny `unsafe` by default at the crate root. The three modules that genuinely
-// require `unsafe` (a single `libc::setsockopt(SO_MAX_PACING_RATE)` call in
-// `transport::udp_transport`, native-only — the dead `sendmmsg` GSO path was
-// removed; wasm-bindgen-generated JS-boundary glue in
+// Deny `unsafe` by default at the crate root. The two modules that genuinely
+// require `unsafe` (wasm-bindgen-generated JS-boundary glue in
 // `transport::legs::websocket`, wasm32-only; `unsafe impl Send/Sync for
 // WasiLeg` over WIT-bindgen `Resource<T>` socket handles in
 // `transport::legs::wasi`, WASI-only) opt back in with a module-level
-// `#![allow(unsafe_code)]` and per-block `// SAFETY:` comments. Audit note:
-// any future PR touching `unsafe` outside those three modules will fail this
-// lint and must justify itself explicitly.
+// `#![allow(unsafe_code)]` and per-block `// SAFETY:` comments. Both are
+// cross-language-boundary glue; no native build compiles any `unsafe` at all.
+// Audit note: any future PR touching `unsafe` outside those two modules will
+// fail this lint and must justify itself explicitly.
 #![deny(unsafe_code)]
 // Phase 3.6: when neither `std` nor any std-implying feature is on, drop std
 // from the crate root so a bare-metal `--no-default-features --features

@@ -85,7 +85,7 @@ CVSS arithmetic.
 | --- | --- |
 | Triage Lead | Acknowledges report, runs initial reproduction, assigns severity. |
 | Fix Author | Writes the patch + tests; usually the same person as Triage Lead unless deep expertise is needed. |
-| Reviewer | Independent code review by another maintainer. Required for any fix that touches one of the six codeowner paths (`CONTRIBUTING.md` "Security-sensitive changes" / `.github/CODEOWNERS`): `core/src/crypto/`, `core/src/transport/handshake.rs`, `core/src/transport/session.rs`, `core/src/transport/udp_transport.rs`, `core/src/transport/legs/mimic_tls/`, `core/src/security/`. |
+| Reviewer | Independent code review by another maintainer. Required for any fix that touches one of the six codeowner paths (`CONTRIBUTING.md` "Security-sensitive changes" / `.github/CODEOWNERS`): `core/src/crypto/`, `core/src/transport/handshake.rs`, `core/src/transport/session.rs`, `core/src/api/udp_transport.rs`, `core/src/transport/legs/mimic_tls/`, `core/src/security/`. |
 | Release Captain | Cuts the release, drafts CHANGELOG entry, files the GHSA / CVE. |
 
 For solo-maintainer operation, all four roles collapse into one person —

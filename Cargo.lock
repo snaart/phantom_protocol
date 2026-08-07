@@ -1589,7 +1589,6 @@ dependencies = [
  "hkdf",
  "hmac",
  "js-sys",
- "libc",
  "log",
  "lz4_flex",
  "ml-dsa",
