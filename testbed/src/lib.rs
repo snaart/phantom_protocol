@@ -26,6 +26,17 @@
 //! bandwidth estimator, real migration, or path-MTU behaviour. This crate is
 //! the instrument for the regime that can.
 
+/// The build script's rule for choosing between the commit a deployment names
+/// and the one git reports, compiled here so `cargo test` can execute it.
+///
+/// Build scripts are not test targets: nothing in `cargo test` runs `build.rs`,
+/// which is how the daemon shipped a run artifact reading `unknown` without a
+/// red test anywhere. `build.rs` includes the same file textually, so the rule
+/// under test is the rule that runs.
+#[cfg(test)]
+#[path = "../build_identity.rs"]
+mod build_identity;
+
 pub mod clock;
 pub mod downlink;
 pub mod framing;

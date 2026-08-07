@@ -48,6 +48,12 @@ jobs:
             echo "$MISSING"
             exit 1
           fi
+      # The drift check is itself a gate, so it gets a gate: each case builds a
+      # throwaway tree and asserts the script accepts an aligned one and
+      # rejects a drifted one, per manifest. Dropping an entry from the
+      # enforced set otherwise leaves every run green.
+      - name: Test the version drift check
+        run: tests/bindings/check_versions_test.sh
       - name: Check binding manifest versions match core/Cargo.toml
         run: tests/bindings/check_versions.sh
       - name: Fail if committed bindings drifted
