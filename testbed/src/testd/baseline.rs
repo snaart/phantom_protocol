@@ -510,6 +510,14 @@ mod tests {
             .ok()
     }
 
+    /// The datagram size every test request asks for. Named because the rung
+    /// ceiling below is arithmetic over it, and a silent change to one without
+    /// the other would leave the bound wrong rather than failing.
+    const PAYLOAD_LEN: u32 = 1200;
+
+    /// The offer the full-round test places, kbit/s.
+    const OFFER_KBPS: u32 = 8_000;
+
     fn request(
         nonce: u64,
         cookie: [u8; crate::downlink::COOKIE_LEN],
@@ -522,7 +530,7 @@ mod tests {
             rung: 0,
             offered_kbps: kbps,
             duration_ms: ms,
-            payload_len: 1200,
+            payload_len: PAYLOAD_LEN as u16,
         }
     }
 
@@ -535,7 +543,7 @@ mod tests {
 
         // No cookie: a challenge, and not a single byte of data.
         client
-            .send(&request(0xA1, [0; crate::downlink::COOKIE_LEN], 8_000, 500).encode())
+            .send(&request(0xA1, [0; crate::downlink::COOKIE_LEN], OFFER_KBPS, 500).encode())
             .await
             .expect("send");
         let n = recv_within(&client, &mut buf, Duration::from_secs(3)).await;
@@ -550,7 +558,7 @@ mod tests {
 
         // With the cookie: the burst runs.
         client
-            .send(&request(0xA1, ch.cookie, 8_000, 500).encode())
+            .send(&request(0xA1, ch.cookie, OFFER_KBPS, 500).encode())
             .await
             .expect("send");
 
@@ -579,7 +587,7 @@ mod tests {
 
         let r = report.expect("the sender must state its own account");
         assert_eq!(r.run_nonce, 0xA1);
-        assert_eq!(r.offered_kbps, 8_000);
+        assert_eq!(r.offered_kbps, OFFER_KBPS);
         assert!(
             data <= r.datagrams && bytes <= r.bytes,
             "more arrived ({data} datagrams, {bytes} B) than the sender says it sent \
@@ -594,15 +602,42 @@ mod tests {
         );
         assert!(r.elapsed_ns > 0);
 
-        // 8 Mbit/s for half a second is ~500 KB. Loopback should reach the
-        // offer comfortably; the point of the assertion is that the pacer aims
-        // at the ask rather than at its own timer.
+        // A rung may not exceed the rate it asked for. This is the direction
+        // that is the sender's own doing: the credit bucket earns one tick's
+        // worth per tick and nothing else can release a datagram, so a loop
+        // that ignored the pacer — or one that repaid a scheduling gap at line
+        // speed — shows up here and nowhere else. It is also the direction that
+        // matters operationally: a control that overshoots its offer queues the
+        // path at a rate nobody asked for and the loss it provokes gets read as
+        // the link's.
+        //
+        // The ceiling is computed from the offer and the sender's own elapsed
+        // interval rather than from `Pacer`, so a fault in the pacer's
+        // arithmetic cannot move both sides of the comparison together. One
+        // datagram of slack covers the tick that `interval` fires immediately
+        // on entry, whose credit (1000 B at this offer) is earned before any
+        // measurable time has passed.
+        let ceiling =
+            OFFER_KBPS as u128 * 125 * r.elapsed_ns as u128 / 1_000_000_000 + PAYLOAD_LEN as u128;
         let bps = crate::pacing::bits_per_sec(r.bytes, r.elapsed_ns);
         assert!(
-            crate::pacing::reached_offer(8_000_000.0, bps),
-            "offered 8 Mbit/s, sender achieved {:.2} Mbit/s",
+            r.bytes as u128 <= ceiling,
+            "offered {OFFER_KBPS} kbit/s for {} ms and sent {} B — above the {ceiling} B \
+             that offer allows ({:.2} Mbit/s achieved)",
+            r.elapsed_ns / 1_000_000,
+            r.bytes,
             bps / 1e6
         );
+
+        // The other direction — that the sender got *close* to its offer — is
+        // deliberately not asserted here. At 8 Mbit/s in 1200 B datagrams the
+        // pacer needs 0.83 datagrams per tick, so what reaches the wire is the
+        // offer scaled by 1 ms over the host's real tick period, and on a
+        // loaded or coarse-timer machine that lands anywhere from 40% to 90% of
+        // the ask. Such an assertion measures the host, which is the mistake
+        // this whole control group exists to avoid making about a link. That
+        // the pacer aims at the ask rather than at its own timer is pinned
+        // without a clock or a socket in `pacing::tests`.
 
         assert_eq!(stats.down_rungs.load(Ordering::Relaxed), 1);
         assert_eq!(stats.down_challenges.load(Ordering::Relaxed), 1);

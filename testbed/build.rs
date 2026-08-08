@@ -10,14 +10,34 @@
 //! A source tarball with no git available is a normal case, not a failure: the
 //! build proceeds and the identity reads `unknown`, which is honest and lets the
 //! analysis say so rather than silently comparing two unlabelled runs.
+//!
+//! Asking git is not the only way to know, though, and on the host that matters
+//! most it is the wrong one: the daemon is built on a VPS from `/opt/phantom/src`,
+//! a copy of the tree carrying no repository, so git there has never had an
+//! answer and the daemon's half of every run artifact read `unknown`. The
+//! machine doing the copying does know, so the environment is consulted first
+//! and git is the fallback — see `build_identity.rs`, which holds that
+//! precedence rule where `cargo test` can reach it.
 
 use std::path::PathBuf;
 use std::process::Command;
 
+include!("build_identity.rs");
+
 fn main() {
-    let (sha, dirty) = git_identity().unwrap_or_else(|| ("unknown".to_string(), false));
-    println!("cargo:rustc-env=TESTBED_GIT_SHA={sha}");
-    println!("cargo:rustc-env=TESTBED_GIT_DIRTY={dirty}");
+    // Build-script output is cached, so without these the identity would
+    // survive a change to the very variables that produced it — a redeploy
+    // naming a new commit would restamp the old one.
+    println!("cargo:rerun-if-env-changed={ENV_SHA}");
+    println!("cargo:rerun-if-env-changed={ENV_DIRTY}");
+
+    let (sha, dirty) = resolve_identity(
+        std::env::var(ENV_SHA).ok(),
+        std::env::var(ENV_DIRTY).ok(),
+        git_identity,
+    );
+    println!("cargo:rustc-env={ENV_SHA}={sha}");
+    println!("cargo:rustc-env={ENV_DIRTY}={dirty}");
     watch_git_state();
 }
 
