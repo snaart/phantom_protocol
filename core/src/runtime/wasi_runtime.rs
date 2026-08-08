@@ -134,6 +134,9 @@ impl WasiRuntime {
     /// Number of tasks currently in the queue (neither completed nor
     /// aborted). Useful as a loop-termination signal.
     pub fn tasks_pending(&self) -> usize {
+        // PANIC-SAFETY: the same private `tasks` mutex as `drive` above, on
+        // the query-only path; a poison means a panic already happened
+        // inside `drive` or `spawn` and the queue is unrecoverable.
         #[allow(clippy::expect_used)]
         self.inner
             .tasks
@@ -147,6 +150,9 @@ impl Runtime for WasiRuntime {
     fn spawn(&self, fut: BoxFuture<()>) -> SpawnHandle {
         let aborted = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
+        // PANIC-SAFETY: the same private `tasks` mutex as `drive` above, on
+        // the write path; a poison means a panic already happened inside
+        // `drive` or `spawn` and the queue is unrecoverable.
         #[allow(clippy::expect_used)]
         let mut tasks = self
             .inner

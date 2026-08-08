@@ -156,6 +156,18 @@ jobs:
             exit 1
           fi
 
+  panic-sites:
+    # The inventory in docs/security/panic-sites.md is the entry point for an
+    # adversarial review, and it had drifted a whole row out of step with the
+    # code while every one of its stream.rs addresses pointed somewhere else.
+    # A document nobody can trust is worse than no document, so the agreement
+    # is now machine-checked. No toolchain needed — it is a text scan.
+    name: panic-site inventory
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - run: scripts/check_panic_sites.py
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest

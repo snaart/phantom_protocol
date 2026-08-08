@@ -56,6 +56,16 @@ repos:
         # can break a lint two files over, so we don't pass filenames.
         pass_filenames: false
 
+      # ── Panic-site inventory ──────────────────────────────────────────
+      - id: check-panic-sites
+        name: panic-site inventory matches core/src
+        entry: scripts/check_panic_sites.py
+        language: system
+        # Fires on any Rust change (a new panic site can appear anywhere)
+        # and on the document itself. Pure text scan, a few tens of ms.
+        files: ^(core/src/.*\.rs|docs/security/panic-sites\.md)$
+        pass_filenames: false
+
       # ── Binding manifest version sync ─────────────────────────────────
       - id: check-binding-versions
         name: bindings — manifest version sync
