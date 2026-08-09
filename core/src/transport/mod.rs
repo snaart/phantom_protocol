@@ -74,7 +74,7 @@ pub mod stream;
 pub mod types;
 
 // ── Native-only sub-modules (Phase 3.5) ────────────────────────────────
-// These pull in `tokio::net::*` / raw sockets / libc and have no wasm
+// These pull in `tokio::net::*` / raw sockets and have no wasm
 // equivalent. On wasm32 the corresponding functionality is provided
 // either by `legs::WebSocketLeg` (transport) or by simply not being
 // available (listening for incoming TCP — browsers cannot listen).
@@ -83,8 +83,6 @@ pub mod types;
 pub mod framing;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod phantom_udp;
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-pub mod udp_transport;
 
 // Re-exports for convenience
 #[cfg(feature = "std")]

@@ -15,7 +15,7 @@
 /core/src/crypto/                       @snaart
 /core/src/transport/handshake.rs        @snaart
 /core/src/transport/session.rs          @snaart
-/core/src/transport/udp_transport.rs    @snaart
+/core/src/api/udp_transport.rs          @snaart
 /core/src/transport/legs/mimic_tls/     @snaart
 /core/src/security/                     @snaart
 

@@ -8,6 +8,32 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ## [Unreleased]
 
+### Removed
+
+- **`transport::udp_transport` — a public module nothing could reach, carrying the crate's
+  only native `unsafe`.** `UdpTransport`, `UdpHandshakeListener`, `PacedSender` and
+  `FastSender` were exported from `phantom_protocol::transport::udp_transport` and had no
+  caller anywhere: not in the library, not in the benches, examples, integration tests or
+  fuzz targets, and not in the `server` / `cli` / `testbed` siblings. Restricting the module
+  to `pub(crate)` made the compiler report every item in it as never constructed; the same
+  restriction applied to a live module reports nothing, which is what makes that a proof and
+  not an absence of evidence. What hid it for so long is a name collision:
+  `core/src/api/udp_transport.rs` is the live PhantomUDP transport and is the file everyone
+  meant when they read the path. This is a public API removal, but no code could have been
+  depending on it — the types were unreachable in the sense that constructing one gave a
+  socket helper wired to nothing.
+
+  It mattered beyond the dead bytes. The module held one of three `#![allow(unsafe_code)]`
+  opt-ins and the crate's only `libc::setsockopt(SO_MAX_PACING_RATE)` call, and the `unsafe`
+  inventory at the crate root — the comment an auditor reads first to learn where `unsafe` lives —
+  described it as a live low-level socket and pacing helper. An inventory of `unsafe` that
+  points at code no build can execute overstates the surface under review and, worse,
+  understates the reviewer's ability to trust the rest of the list. Two opt-ins remain
+  (`transport/legs/websocket.rs`, `transport/legs/wasi.rs`), both cross-language-boundary
+  glue confined to a non-native target, so a native build now compiles no `unsafe` at all.
+  The Linux-only `libc` dependency went with it, since nothing in `core/src` names `libc::`
+  any more.
+
 ### Fixed
 
 - **A SACK carrying more than 32 islands threw away the one range that retires data.**
