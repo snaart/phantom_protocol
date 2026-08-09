@@ -34,6 +34,201 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   The Linux-only `libc` dependency went with it, since nothing in `core/src` names `libc::`
   any more.
 
+### Changed
+
+- **`Stream::poll_send` (public, `phantom_protocol::transport::stream`) returns
+  `Result<OutboundSegment, SendBlocked>` instead of `Option<OutboundSegment>`, and takes a
+  fourth argument.** A pass that comes up empty because the application ran dry, because
+  the local congestion window is full, and because the *peer's* advertised receive window
+  is full are three different statements about the connection, and only the first is BBR's
+  application-limited signal — which the send loop is the only place that can observe. The
+  new `SendBlocked` enum carries that distinction; the new `app_limited_now: bool` argument
+  is stamped onto each segment's first transmission and reported back on
+  `RetiredSegment::app_limited_at_send`, so the phase a `DeliverySample` carries is the one
+  the segment was *sent* in rather than whichever phase happened to be in force when its
+  acknowledgement arrived. A peer's advertised window is deliberately not routed into the
+  flag: it gates the loss response, the Startup judgement and the bandwidth filter, and no
+  remote party may hold that switch.
+
+- **`phantom_protocol::transport::stream` gained the session-wide receive-window ledger.**
+  `SharedRecvTuning` (new public struct) is the handle every stream of one connection draws
+  its window growth from; `Stream::with_recv_tuning` constructs a stream against one and
+  `Stream::recv_tuning` hands the handle on, so a stream created by the pump or by a peer
+  joins the same ledger as one opened through the API. `SESSION_RECV_WINDOW_GROWTH_BUDGET`
+  (8 MiB) is what the ledger holds and `SharedRecvTuning::remaining_growth_budget` reports
+  what is left of it. `MAX_SEND_WINDOW` and `MAX_RECV_WINDOW` doubled from 512 KiB to 1 MiB
+  with the ceiling above.
+- **`migrate()` on a non-migration transport now returns `Err(CoreError::Unsupported)`**
+  instead of a silent `Ok(())` no-op. Real migration requires a UDP-backed session
+  (`connect_pinned_udp*`); on TCP / WebSocket / WASI / Embedded it now errors honestly.
+- **Combinatorial Rust constructors were removed** in favour of the builder:
+  `PhantomSession::connect_with_resumption`,
+  `PhantomListener::bind_with_signing_key_with_runtime`, and
+  `PhantomListener::bind_with_signing_key_mimic`. The runtime-injection shims
+  `PhantomSession::connect_with_transport_with_runtime` and
+  `PhantomListener::bind_with_runtime` survive, as do `connect_with_transport` and the
+  UniFFI-exported free functions and constructors. `PhantomStream::recv()` returns
+  `Option<Vec<u8>>` (`None` = clean EOF). All breaking, within the pre-1.0 0.2.x window.
+- **`PhantomUdpListener::accept()` now takes an owned receiver** (`self: Arc<Self>`
+  instead of `self: &Arc<Self>`) — required by its new UniFFI export. Rust callers
+  write `listener.clone().accept().await`. Breaking, within the pre-1.0 0.2.x window.
+
+### Added
+
+- **The testbed's raw UDP controls now report a reorder *distance* distribution, in both
+  directions.** They counted a datagram as reordered when it arrived below the highest
+  sequence seen, which says a path reorders and sizes nothing: a transport's reordering
+  tolerance is a distance and a duration. On the production test path the downstream
+  control has measured 60 Mbit/s carried at 1.1% loss while 13–14% of datagrams reordered,
+  and at 20 Mbit/s 13.4% reordering against 0.12% loss — separable quantities that a single
+  counter cannot separate. Each rung now records the distance behind the highest seen
+  (`p50`/`p90`/`p95`/`p99`/`max`), the receiver-side time displacement between the arrival
+  that revealed a gap and the arrival that filled it — the quantity a RACK-style threshold
+  is sized in — and, correcting for the head start the late datagram had on its overtaker
+  using the send stamps both directions now carry, the extra transit time the path added.
+  Loss and reordering are classified per gap rather than inferred: a gap a later arrival
+  filled is reordering, one the receiver's window slid past is loss, and one still open when
+  the rung ended is neither and is reported as its own number instead of being folded into
+  either. The receiver's bookkeeping is a fixed 4096-slot array allocated once, so a rung of
+  100 000 datagrams — or a sender naming arbitrary 64-bit sequence numbers — cannot grow it;
+  what falls outside that window is counted and named rather than silently booked as loss.
+  The client → server echo control gained the same instrumentation by numbering and stamping
+  its own datagrams in bytes that were already filler, so the daemon, the datagram size, the
+  rate ladder and the pacing are all unchanged and the numbers stay comparable with runs
+  already taken. `analyze.py` prints both directions side by side and flags a tail that
+  reached the instrument's window rather than the path's.
+
+- **`testbed/` — a real-network (WAN) test harness.** A new sibling crate with two
+  binaries: `phantom-testd`, a daemon that binds every network-testable leg
+  (PhantomUDP, Phantom-over-TCP, mimic-TLS) from a single persisted identity plus raw
+  TCP/UDP echo controls, and `phantom-probe`, which drives a scenario matrix and writes
+  raw per-operation samples. Scenarios: clock offset estimation, handshake latency,
+  RTT sweeps across payload sizes, message-boundary integrity, upload / download /
+  full-duplex goodput, concurrent streams, 0-RTT resumption, forced rekey, connection
+  migration, concurrency, and negative cases (wrong pin, closed port, junk flood).
+  Profiles `smoke` / `standard` / `deep`. Results are flushed after every scenario and
+  the client uploads its bundle to the daemon over the Phantom session itself.
+  Every automated test in this repository previously ran over loopback or an in-memory
+  transport, where RTT is microseconds, nothing reorders, no NAT exists, and the path
+  MTU is 65535 — a regime that cannot exercise the RTO timer, the bandwidth estimator,
+  real migration, or path-MTU behaviour. See `testbed/README.md`.
+- **PhantomUDP is now reachable through the FFI surface.** New UniFFI exports make the
+  production, migration-capable transport usable from every binding (Python / Swift /
+  Kotlin / C), where previously only the TCP transport was reachable:
+  - free functions `connect_pinned_udp(host, port, pinned_key)` and
+    `connect_pinned_udp_with_resumption(host, port, pinned_key, hint, early_data)` (the
+    0-RTT analogue);
+  - the `PhantomUdpListener` object — constructor `bind_udp` plus `accept`,
+    `verifying_key_bytes`, `local_addr`, `shutdown`, and `is_shutting_down`.
+  Over a `connect_pinned_udp` session the exported `migrate()` now performs a real
+  single-path connection migration (e.g. Wi-Fi ↔ LTE handover); over a TCP session
+  (`connect_pinned`) it now returns `Err(Unsupported)` rather than silently succeeding.
+  Liveness / `Migrating` / `Dead` transitions, path validation, and passive NAT-rebind
+  recovery are all live for FFI consumers on the UDP path.
+- **FFI server identity.** `generate_signing_key()` and `verifying_key_from_signing_key(seed)`
+  (free functions) plus the `PhantomListener::bind_with_signing_key_bytes` and
+  `PhantomUdpListener::bind_udp_with_signing_key_bytes` constructors let a pure-FFI
+  (mobile / C) embedder generate, persist, load, and pin a server's hybrid signing
+  identity, so a server keeps a stable pinned identity across restarts — previously key
+  generation and `bind_with_signing_key` were Rust/CLI-only. The 64-byte seed
+  (`ed25519_seed[32] || ml_dsa_seed[32]`, the same form `phantom-cli keygen` writes) is
+  secret key material and is **not** zeroized across the FFI boundary — persist it `0600`
+  and wipe the buffer after use.
+- **In-app metrics over FFI.** `metrics_snapshot()` on `PhantomSession` and
+  `PhantomListener` returns a flat `MetricsSnapshotFfi` record (packets/bytes,
+  encrypt/decrypt timing, RTT, handshakes, active sessions/streams, uptime, and — newly
+  promoted into the lock-free atomics so they're available without an OpenTelemetry
+  collector — `replay_rejected_total` / `aead_failure_total`). A server-accepted session
+  reports the owning listener's aggregate (shared handle).
+- **Working tunables via `PhantomConfig`.** `PhantomConfig` was an FFI-exported struct
+  whose fields nothing read; it is now an honest 4-field record
+  (`keepalive_interval`, `session_timeout`, `session_cache_capacity`,
+  `session_ticket_lifetime`) consumed through new `connect_pinned_with_config` /
+  `connect_pinned_udp_with_config` and `bind_with_config_bytes` /
+  `bind_udp_with_config_bytes`. Keepalive/timeout map to the live `LivenessConfig`;
+  cache fields size the server resumption cache. (`session_timeout` is the
+  Migrating→Dead reap window, not a general idle-disconnect.) The 8 inert legacy fields
+  (fallback/buffer/MTU/connect_timeout) were removed.
+- **Multi-stream is usable.** `PhantomSession::accept_stream()` surfaces peer-initiated
+  streams; `PhantomStream::set_priority()` sets scheduler priority; `PhantomStream::recv()`
+  now returns `Option<Vec<u8>>` (`None` = clean peer EOF) instead of a stringly-typed
+  error. Stream ids are allocated client-odd / server-even so concurrent opens never
+  collide.
+- **FFI ergonomics.** `AcceptOutcome::peer_addr_string()` (per-peer admission control),
+  and `set_early_data_enabled(bool)` is now exported on both listeners.
+- **Builder API (Rust).** `PhantomSession::builder(addr)` / `PhantomListener::builder(addr)` /
+  `PhantomUdpListener::builder(addr)` with orthogonal chained setters
+  (`.transport()` / `.pinned_key()` / `.resumption()` / `.config()` / `.runtime()` →
+  `.connect()`; `.signing_key()` / `.config()` / `.runtime()` → `.bind()`, plus
+  `.mimic_sni()` on `ListenerBuilder`) replace the combinatorial
+  `connect_with_resumption` / `bind_with_signing_key_with_runtime` /
+  `bind_with_signing_key_mimic` variant explosion (the
+  `connect_with_transport_with_runtime` and `bind_with_runtime` runtime-injection
+  shims survive). A builder cannot produce an unpinned session (Security Invariant 1).
+- **Typed client failure.** `PhantomSession::last_error()` and `await_ready()` (both
+  FFI-exported) let an embedder learn *why* a connect failed (the background handshake
+  task now captures the terminal `CoreError`) and wait for readiness; `send()`/`recv()`
+  surface the captured cause instead of a generic "session closed". New structured
+  `CoreError` variants — `ServerIdentityMismatch` (fatal pinning failure),
+  `ProtocolRejected`, `Unsupported` — with a retryable-vs-fatal classification in the
+  rustdoc, so callers can build correct retry/backoff logic without string-matching.
+  Handshake failures also stop collapsing into `CoreError::InternalError`: the
+  `From<HandshakeError>` conversion now yields `ServerIdentityMismatch` /
+  `ProtocolRejected` for those two cases and `CoreError::HandshakeError(..)` for the
+  rest, so `match`es on `InternalError` for handshake errors must be updated.
+- **Migration discoverability.** `PhantomSession::supports_migration()` reports whether a
+  session can migrate (true only for UDP-backed sessions); client-side handshake outcome
+  metrics are now recorded (a client `metrics_snapshot()` no longer always shows 0
+  handshakes).
+- **Secure seed default for Rust.** `generate_signing_key_secure()` returns the 64-byte
+  seed wrapped in `Zeroizing` (wiped on drop); the FFI `generate_signing_key()` (which
+  cannot carry `Zeroizing` across UniFFI) now documents the secure variant.
+- **Documentation.** README is now the docs.rs landing page with a UDP-first runnable
+  quickstart, a "Getting started" / "Choosing a transport" / "Two ways to send" guide,
+  and runnable rustdoc examples on the session/listener types; a PyPI-wheel packaging
+  path (maturin) + a manual CI smoke job were added.
+- **Observability instruments that were registered but never recorded are now live.**
+  Twelve instruments existed in the registry with no call site anywhere in the library, so
+  the corresponding Grafana panels and the `PhantomPoWRejectionStorm` alert were silently
+  empty and `MetricsSnapshotFfi`'s encrypt/decrypt-timing and RTT fields were always zero.
+  Now recorded: AEAD encrypt/decrypt durations, RTT samples (per `path_id`, Karn-gated),
+  rekey events per direction, path migrations (active, server-initiated, peer-detected and
+  passive NAT-rebind), path-validation outcomes, a balanced active-stream gauge, and the
+  handshake-side cookie / proof-of-work / early-data / resumption outcomes. The handshake
+  recorders required plumbing an optional `Arc<Observability>` into `HandshakeServer` via a
+  purely additive `with_observability(...)` builder — every existing constructor keeps its
+  signature and gets a no-op sink. `record_fallback` remains unrecorded: the
+  `FallbackStateMachine` it would observe is itself inert.
+  Two attribute values are new: `EarlyDataOutcome::RejectedDisabled` (`rejected_disabled`)
+  so a server running the 0-RTT kill switch is distinguishable from one simply seeing no
+  0-RTT traffic, and `PathValidationOutcome::Timeout` (`timeout`) so an abandoned path
+  challenge is distinguishable from one answered wrongly. The latter is backed by an
+  expiry sweep on the pump's existing 10 ms heartbeat, budgeted from the session's own
+  `LivenessConfig` and BBR `min_rtt` — the same threshold at which that heartbeat already
+  declares a path down — so a challenge yields exactly one `success`, `failure` or
+  `timeout` sample and never leaks its bookkeeping. The sweep is metrics-only; it does not
+  change `PathRegistry` state.
+- **Two API properties that were recorded only here are now stated where they are read.**
+  Every `connect_pinned*` function's rustdoc now opens with the fact that it returns
+  **before** the handshake — so `Ok` means a socket was opened, not that the server holds
+  the pinned key — and carries an example that calls `await_ready()` immediately. Likewise
+  `PhantomSession::send`, `PhantomStream::send_reliable` and `PhantomStream::send_unreliable`
+  now state that they do not preserve message boundaries, name
+  `transport::mtu::MAX_APP_CHUNK` as the split size, and point at the length-prefix pattern
+  in `testbed/src/framing.rs`. No behaviour change.
+
+
+- **`PhantomUdpListener::metrics_snapshot()`**, exported over UniFFI and identical in shape to
+  the TCP `PhantomListener`'s, so the two listeners are interchangeable in an embedder's
+  monitoring code. The UDP listener owns the `Arc<Observability>` that its handshake path and
+  every accepted session write through, but published no accessor for it: the aggregate was
+  reachable only through an *accepted session's* `metrics_snapshot()`. An operator running the
+  production, migration-capable transport from a foreign language therefore had no listener-level
+  metrics at all, and — precisely when it matters — a server that is being probed but has no live
+  session could report neither its handshake counters nor `replay_rejected_total` nor
+  `aead_failure_total`. Nothing about what is counted changes; the counters were always there,
+  only unreadable.
+
 ### Fixed
 
 - **A SACK carrying more than 32 islands threw away the one range that retires data.**
@@ -458,231 +653,105 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `!rs->is_app_limited || bw >= bbr_max_bw(sk)`) `btl_bw` stayed at zero, `bdp` with it,
   and the window sat on its `4 × MIN_PACKET_SIZE` floor — about 25 KB/s on a 226 ms path,
   for a flow whose problem was never congestion.
+- **Connection migration could hang the client receive loop.** `UdpClientTransport::recv_bytes`
+  did not wake when `migrate_to()` rebound the local socket: a receive parked on the old
+  socket (which goes silent once the server follows the client) would block forever. Both
+  the single-socket and the dual-socket migration-overlap receive paths now wake on a
+  migration and re-snapshot the active/previous sockets, also closing a loop-top torn-read
+  race (a migration interleaved between the two socket loads) and a hang on a second
+  migration during an overlap. Regression-tested (each guard verified to fail without the
+  fix).
+- **C ABI declaration for `PhantomListener::shutdown` was wrong.** The hand-curated C
+  header declared the synchronous `shutdown()` as an async future handle
+  (`uint64_t ...(void *ptr)`); it is now correctly `void ...(void *ptr, RustCallStatus *)`,
+  matching the actual ABI and the other bindings.
+- **Per-stream receive was lossy and could deliver EOF before data.** Inbound data on
+  an opened stream (id ≥ 2) was double-delivered — once losslessly to `session.recv()`
+  and once via a best-effort `try_send` that **dropped** on a full/unknown channel — so
+  `PhantomStream::recv()` lost bytes under load. Opened-stream delivery is now lossless
+  and backpressured via a dedicated delivery task that never blocks the raw-app path, and
+  a reliable in-order FIN (carried over the ARQ path, retransmitted until SACKed) now
+  surfaces clean EOF strictly **after** all data — so a FIN arriving over a gap on a
+  lossy/reordering path no longer truncates the stream. (Two bugs in this area were caught
+  in review: a DashMap shard guard held across an `await` that could stall
+  `open_stream()` / the pump, and the premature-EOF ordering — both fixed and
+  regression-tested.)
+- **Inert legacy `connect()` now reports `Failed`** instead of an eternal `Connecting`
+  shell, so misuse is observable via `connection_state()` (use `connect_pinned` /
+  `connect_pinned_udp`).
+- **Dropping the last `PhantomSession` handle now closes the session** (sends an in-order
+  `Close` so the peer sees EOF), fixing a regression where extra internal command
+  senders kept the pump alive after the handle was dropped.
+- **Release tarballs contained no library.** The packaging step copied from
+  `core/target/<triple>/release/` — a path that does not exist, since `core` is the only
+  workspace member and cargo's target directory is the repository root — and the copy was
+  guarded by `2>/dev/null || true`, so every published `0.1.0`–`0.2.2` artifact silently
+  shipped `LICENSE` + `README.md` only. The path is corrected, the `cdylib` (the actual
+  FFI delivery vehicle) is shipped alongside the `rlib`, and a missing library now fails
+  the job loudly instead of producing an empty tarball.
+- **The Helm chart ignored the mounted signing-key Secret**, so every pod minted a fresh
+  identity on restart and broke client key pinning. The chart published `PHANTOM_BIND_PORT`
+  and `PHANTOM_SIGNING_KEY_PATH`, neither of which `phantom-server` reads, and the
+  Deployment never set `PHANTOM_SIGNING_KEY_FILE` at all. It now emits `PHANTOM_BIND`
+  (a full `SocketAddr`) and `PHANTOM_SIGNING_KEY_FILE` pointing at the mounted key. The
+  sample manifest in `docs/operations/kubernetes.md` had the same defect.
+- **`--otel-trace-sample-ratio` was parsed and then discarded** (`let _ = cfg.trace_sample_ratio;`),
+  so no sampler was ever installed and the effective trace rate was 100% regardless of the
+  flag. The ratio is now applied as `Sampler::ParentBased(TraceIdRatioBased(ratio))`, which
+  also makes it effective from the `OTEL_TRACES_SAMPLER_ARG` env form without additionally
+  setting `OTEL_TRACES_SAMPLER`. The default changed `0.01` → `1.0` so shipped behaviour is
+  unchanged — lower it deliberately.
+- **`core/examples/embedded_demo.rs` did not compile** under `--features embedded`: the
+  `embedded-io-async` 0.6 → 0.7 bump made `Write::flush` a required method and the example's
+  `MockWriter` never gained one (`E0046`). It went unnoticed because the `embedded-feature`
+  CI job runs `cargo test --lib`, and `--lib` never builds examples; the job now checks them.
+- **The iOS static-library flow could not work.** `build-xcframework.sh` and the by-hand
+  `lipo` recipes feed `libphantom_protocol.a` to `xcodebuild -create-xcframework`, but
+  `[lib] crate-type = ["lib", "cdylib"]` never emits a static archive. The slices are now
+  built with `cargo rustc --crate-type staticlib`. (Adding `staticlib` to the manifest is
+  *not* a valid fix: a staticlib is a final artifact, so it makes cargo demand a
+  `#[panic_handler]` and a `#[global_allocator]` from the library and breaks the
+  `thumbv7em-none-eabihf` bare-metal build.)
+- **Several hand-curated C ABI declarations were wrong**, so a C consumer following the
+  header got undefined behaviour rather than a compile error: `open_stream` was declared
+  async although it is synchronous, `flush_queue` was declared to complete to `void`
+  although it yields `u32`, a `_pointer` future poll/complete family was documented that
+  does not exist in the cdylib (objects complete through `_u64`), and the `ConnectionState`
+  discriminant comment named five states that do not exist. The maximum-datagram macro
+  advertised 65507 bytes where PhantomUDP's path MTU is 1200, and a comment still described
+  the replay window as per-stream.
+- **`phantom_helpers.h`'s blocking wrappers could not work.** `Vec<u8>` arguments were
+  passed as raw bytes although UniFFI lowers them as a RustBuffer of
+  `[i32 big-endian length][payload]` (only a top-level `String` is raw UTF-8), so
+  `phantom_blocking_connect_pinned` failed unconditionally with `RustCallStatus.code == 2`;
+  and the helpers passed the caller's handle straight to the scaffolding, but a UniFFI
+  method **consumes** its receiver — every generated binding clones per call — so the second
+  call on a session was a use-after-free. Both are fixed with explicit lowering and
+  clone-per-call helpers.
+- **`phantom_protocol.h` was unusable from C++** even though it guards its declarations
+  with `extern "C"`: `PhantomRustBuffer` was defined *inside* `PhantomRustCallStatus`, which
+  C gives file scope but C++ scopes to the enclosing class, leaving the type incomplete for
+  every C++ translation unit. Hoisted; layout and ABI unchanged.
+- **`check_versions.sh` did not cover `python/pyproject.toml`**, the maturin manifest that
+  `PACKAGING.md` designates as the recommended PyPI path and which carries its own hardcoded
+  version — so it could drift from `core/Cargo.toml` undetected. Six manifests are now
+  drift-checked, not five.
+- **`.github/CODEOWNERS` had drifted from `CONTRIBUTING.md`'s touch-with-care set**: it still
+  routed the deleted `transport/legs/faketls.rs` (matching nothing, so the rule was inert)
+  and omitted `transport/udp_transport.rs` and `transport/legs/mimic_tls/`, which therefore
+  never requested codeowner review.
+- **The panic-site inventory had drifted from the code it inventories.**
+  `docs/security/panic-sites.md` claimed nineteen rows against twenty marked sites, and not
+  one of its `stream.rs` line numbers still pointed at the code it described — a document
+  whose addresses do not resolve turns the security review it exists to support into a
+  formality. Four production panics carried no `// PANIC-SAFETY:` comment at all
+  (`WasiLeg::recv_bytes`, `WasiRuntime::{spawn, tasks_pending}` and the three `setTimeout`
+  calls in `WasmRuntime::sleep`, the last in a module the native clippy job never compiles,
+  so nothing had ever required one). The table is rebuilt from the source, rows are keyed on
+  file and enclosing function instead of a line number, and `scripts/check_panic_sites.py`
+  now re-derives the inventory and fails when the two disagree — as a `pre-commit` hook and
+  as the `panic-sites` CI job. No behaviour changed; the four new comments are comments.
 
-### Changed
-
-- **`Stream::poll_send` (public, `phantom_protocol::transport::stream`) returns
-  `Result<OutboundSegment, SendBlocked>` instead of `Option<OutboundSegment>`, and takes a
-  fourth argument.** A pass that comes up empty because the application ran dry, because
-  the local congestion window is full, and because the *peer's* advertised receive window
-  is full are three different statements about the connection, and only the first is BBR's
-  application-limited signal — which the send loop is the only place that can observe. The
-  new `SendBlocked` enum carries that distinction; the new `app_limited_now: bool` argument
-  is stamped onto each segment's first transmission and reported back on
-  `RetiredSegment::app_limited_at_send`, so the phase a `DeliverySample` carries is the one
-  the segment was *sent* in rather than whichever phase happened to be in force when its
-  acknowledgement arrived. A peer's advertised window is deliberately not routed into the
-  flag: it gates the loss response, the Startup judgement and the bandwidth filter, and no
-  remote party may hold that switch.
-
-- **`phantom_protocol::transport::stream` gained the session-wide receive-window ledger.**
-  `SharedRecvTuning` (new public struct) is the handle every stream of one connection draws
-  its window growth from; `Stream::with_recv_tuning` constructs a stream against one and
-  `Stream::recv_tuning` hands the handle on, so a stream created by the pump or by a peer
-  joins the same ledger as one opened through the API. `SESSION_RECV_WINDOW_GROWTH_BUDGET`
-  (8 MiB) is what the ledger holds and `SharedRecvTuning::remaining_growth_budget` reports
-  what is left of it. `MAX_SEND_WINDOW` and `MAX_RECV_WINDOW` doubled from 512 KiB to 1 MiB
-  with the ceiling above.
-
-### Added
-
-- **The testbed's raw UDP controls now report a reorder *distance* distribution, in both
-  directions.** They counted a datagram as reordered when it arrived below the highest
-  sequence seen, which says a path reorders and sizes nothing: a transport's reordering
-  tolerance is a distance and a duration. On the production test path the downstream
-  control has measured 60 Mbit/s carried at 1.1% loss while 13–14% of datagrams reordered,
-  and at 20 Mbit/s 13.4% reordering against 0.12% loss — separable quantities that a single
-  counter cannot separate. Each rung now records the distance behind the highest seen
-  (`p50`/`p90`/`p95`/`p99`/`max`), the receiver-side time displacement between the arrival
-  that revealed a gap and the arrival that filled it — the quantity a RACK-style threshold
-  is sized in — and, correcting for the head start the late datagram had on its overtaker
-  using the send stamps both directions now carry, the extra transit time the path added.
-  Loss and reordering are classified per gap rather than inferred: a gap a later arrival
-  filled is reordering, one the receiver's window slid past is loss, and one still open when
-  the rung ended is neither and is reported as its own number instead of being folded into
-  either. The receiver's bookkeeping is a fixed 4096-slot array allocated once, so a rung of
-  100 000 datagrams — or a sender naming arbitrary 64-bit sequence numbers — cannot grow it;
-  what falls outside that window is counted and named rather than silently booked as loss.
-  The client → server echo control gained the same instrumentation by numbering and stamping
-  its own datagrams in bytes that were already filler, so the daemon, the datagram size, the
-  rate ladder and the pacing are all unchanged and the numbers stay comparable with runs
-  already taken. `analyze.py` prints both directions side by side and flags a tail that
-  reached the instrument's window rather than the path's.
-
-- **`testbed/` — a real-network (WAN) test harness.** A new sibling crate with two
-  binaries: `phantom-testd`, a daemon that binds every network-testable leg
-  (PhantomUDP, Phantom-over-TCP, mimic-TLS) from a single persisted identity plus raw
-  TCP/UDP echo controls, and `phantom-probe`, which drives a scenario matrix and writes
-  raw per-operation samples. Scenarios: clock offset estimation, handshake latency,
-  RTT sweeps across payload sizes, message-boundary integrity, upload / download /
-  full-duplex goodput, concurrent streams, 0-RTT resumption, forced rekey, connection
-  migration, concurrency, and negative cases (wrong pin, closed port, junk flood).
-  Profiles `smoke` / `standard` / `deep`. Results are flushed after every scenario and
-  the client uploads its bundle to the daemon over the Phantom session itself.
-  Every automated test in this repository previously ran over loopback or an in-memory
-  transport, where RTT is microseconds, nothing reorders, no NAT exists, and the path
-  MTU is 65535 — a regime that cannot exercise the RTO timer, the bandwidth estimator,
-  real migration, or path-MTU behaviour. See `testbed/README.md`.
-
-### Documented
-
-- **`connect_pinned*` returns before the handshake completes.** The returned session is
-  in `Connecting` state with the handshake running on a background task, so callers must
-  `await_ready()` before treating the connection as established. Until they do, a
-  deliberately wrong pin looks like a successful connect (`ServerIdentityMismatch` has
-  not been raised yet), `resumption_hint()` returns `None`, and any timing around the
-  call measures socket setup rather than the post-quantum key exchange. This was
-  implied by the invariants but stated nowhere on the entry points themselves.
-- **`PhantomSession::send()` does not preserve application message boundaries.** The
-  data pump splits payloads above its internal chunk size (1156 B) into chunks,
-  writes each as a separate reliable-stream write, and the peer's `recv()` yields them
-  one at a time — on every leg, since the split happens above the transport. The
-  failure mode is silent for structured payloads: the first chunk still parses, with
-  the tail gone. Embedders that need message semantics must frame and reassemble
-  themselves; `testbed/src/framing.rs` is a worked example.
-
-- **PhantomUDP is now reachable through the FFI surface.** New UniFFI exports make the
-  production, migration-capable transport usable from every binding (Python / Swift /
-  Kotlin / C), where previously only the TCP transport was reachable:
-  - free functions `connect_pinned_udp(host, port, pinned_key)` and
-    `connect_pinned_udp_with_resumption(host, port, pinned_key, hint, early_data)` (the
-    0-RTT analogue);
-  - the `PhantomUdpListener` object — constructor `bind_udp` plus `accept`,
-    `verifying_key_bytes`, `local_addr`, `shutdown`, and `is_shutting_down`.
-  Over a `connect_pinned_udp` session the exported `migrate()` now performs a real
-  single-path connection migration (e.g. Wi-Fi ↔ LTE handover); over a TCP session
-  (`connect_pinned`) it now returns `Err(Unsupported)` rather than silently succeeding.
-  Liveness / `Migrating` / `Dead` transitions, path validation, and passive NAT-rebind
-  recovery are all live for FFI consumers on the UDP path.
-- **FFI server identity.** `generate_signing_key()` and `verifying_key_from_signing_key(seed)`
-  (free functions) plus the `PhantomListener::bind_with_signing_key_bytes` and
-  `PhantomUdpListener::bind_udp_with_signing_key_bytes` constructors let a pure-FFI
-  (mobile / C) embedder generate, persist, load, and pin a server's hybrid signing
-  identity, so a server keeps a stable pinned identity across restarts — previously key
-  generation and `bind_with_signing_key` were Rust/CLI-only. The 64-byte seed
-  (`ed25519_seed[32] || ml_dsa_seed[32]`, the same form `phantom-cli keygen` writes) is
-  secret key material and is **not** zeroized across the FFI boundary — persist it `0600`
-  and wipe the buffer after use.
-- **In-app metrics over FFI.** `metrics_snapshot()` on `PhantomSession` and
-  `PhantomListener` returns a flat `MetricsSnapshotFfi` record (packets/bytes,
-  encrypt/decrypt timing, RTT, handshakes, active sessions/streams, uptime, and — newly
-  promoted into the lock-free atomics so they're available without an OpenTelemetry
-  collector — `replay_rejected_total` / `aead_failure_total`). A server-accepted session
-  reports the owning listener's aggregate (shared handle).
-- **Working tunables via `PhantomConfig`.** `PhantomConfig` was an FFI-exported struct
-  whose fields nothing read; it is now an honest 4-field record
-  (`keepalive_interval`, `session_timeout`, `session_cache_capacity`,
-  `session_ticket_lifetime`) consumed through new `connect_pinned_with_config` /
-  `connect_pinned_udp_with_config` and `bind_with_config_bytes` /
-  `bind_udp_with_config_bytes`. Keepalive/timeout map to the live `LivenessConfig`;
-  cache fields size the server resumption cache. (`session_timeout` is the
-  Migrating→Dead reap window, not a general idle-disconnect.) The 8 inert legacy fields
-  (fallback/buffer/MTU/connect_timeout) were removed.
-- **Multi-stream is usable.** `PhantomSession::accept_stream()` surfaces peer-initiated
-  streams; `PhantomStream::set_priority()` sets scheduler priority; `PhantomStream::recv()`
-  now returns `Option<Vec<u8>>` (`None` = clean peer EOF) instead of a stringly-typed
-  error. Stream ids are allocated client-odd / server-even so concurrent opens never
-  collide.
-- **FFI ergonomics.** `AcceptOutcome::peer_addr_string()` (per-peer admission control),
-  and `set_early_data_enabled(bool)` is now exported on both listeners.
-- **Builder API (Rust).** `PhantomSession::builder(addr)` / `PhantomListener::builder(addr)` /
-  `PhantomUdpListener::builder(addr)` with orthogonal chained setters
-  (`.transport()` / `.pinned_key()` / `.resumption()` / `.config()` / `.runtime()` →
-  `.connect()`; `.signing_key()` / `.config()` / `.runtime()` → `.bind()`, plus
-  `.mimic_sni()` on `ListenerBuilder`) replace the combinatorial
-  `connect_with_resumption` / `bind_with_signing_key_with_runtime` /
-  `bind_with_signing_key_mimic` variant explosion (the
-  `connect_with_transport_with_runtime` and `bind_with_runtime` runtime-injection
-  shims survive). A builder cannot produce an unpinned session (Security Invariant 1).
-- **Typed client failure.** `PhantomSession::last_error()` and `await_ready()` (both
-  FFI-exported) let an embedder learn *why* a connect failed (the background handshake
-  task now captures the terminal `CoreError`) and wait for readiness; `send()`/`recv()`
-  surface the captured cause instead of a generic "session closed". New structured
-  `CoreError` variants — `ServerIdentityMismatch` (fatal pinning failure),
-  `ProtocolRejected`, `Unsupported` — with a retryable-vs-fatal classification in the
-  rustdoc, so callers can build correct retry/backoff logic without string-matching.
-  Handshake failures also stop collapsing into `CoreError::InternalError`: the
-  `From<HandshakeError>` conversion now yields `ServerIdentityMismatch` /
-  `ProtocolRejected` for those two cases and `CoreError::HandshakeError(..)` for the
-  rest, so `match`es on `InternalError` for handshake errors must be updated.
-- **Migration discoverability.** `PhantomSession::supports_migration()` reports whether a
-  session can migrate (true only for UDP-backed sessions); client-side handshake outcome
-  metrics are now recorded (a client `metrics_snapshot()` no longer always shows 0
-  handshakes).
-- **Secure seed default for Rust.** `generate_signing_key_secure()` returns the 64-byte
-  seed wrapped in `Zeroizing` (wiped on drop); the FFI `generate_signing_key()` (which
-  cannot carry `Zeroizing` across UniFFI) now documents the secure variant.
-- **Documentation.** README is now the docs.rs landing page with a UDP-first runnable
-  quickstart, a "Getting started" / "Choosing a transport" / "Two ways to send" guide,
-  and runnable rustdoc examples on the session/listener types; a PyPI-wheel packaging
-  path (maturin) + a manual CI smoke job were added.
-- **Observability instruments that were registered but never recorded are now live.**
-  Twelve instruments existed in the registry with no call site anywhere in the library, so
-  the corresponding Grafana panels and the `PhantomPoWRejectionStorm` alert were silently
-  empty and `MetricsSnapshotFfi`'s encrypt/decrypt-timing and RTT fields were always zero.
-  Now recorded: AEAD encrypt/decrypt durations, RTT samples (per `path_id`, Karn-gated),
-  rekey events per direction, path migrations (active, server-initiated, peer-detected and
-  passive NAT-rebind), path-validation outcomes, a balanced active-stream gauge, and the
-  handshake-side cookie / proof-of-work / early-data / resumption outcomes. The handshake
-  recorders required plumbing an optional `Arc<Observability>` into `HandshakeServer` via a
-  purely additive `with_observability(...)` builder — every existing constructor keeps its
-  signature and gets a no-op sink. `record_fallback` remains unrecorded: the
-  `FallbackStateMachine` it would observe is itself inert.
-  Two attribute values are new: `EarlyDataOutcome::RejectedDisabled` (`rejected_disabled`)
-  so a server running the 0-RTT kill switch is distinguishable from one simply seeing no
-  0-RTT traffic, and `PathValidationOutcome::Timeout` (`timeout`) so an abandoned path
-  challenge is distinguishable from one answered wrongly. The latter is backed by an
-  expiry sweep on the pump's existing 10 ms heartbeat, budgeted from the session's own
-  `LivenessConfig` and BBR `min_rtt` — the same threshold at which that heartbeat already
-  declares a path down — so a challenge yields exactly one `success`, `failure` or
-  `timeout` sample and never leaks its bookkeeping. The sweep is metrics-only; it does not
-  change `PathRegistry` state.
-- **Two API properties that were recorded only here are now stated where they are read.**
-  Every `connect_pinned*` function's rustdoc now opens with the fact that it returns
-  **before** the handshake — so `Ok` means a socket was opened, not that the server holds
-  the pinned key — and carries an example that calls `await_ready()` immediately. Likewise
-  `PhantomSession::send`, `PhantomStream::send_reliable` and `PhantomStream::send_unreliable`
-  now state that they do not preserve message boundaries, name
-  `transport::mtu::MAX_APP_CHUNK` as the split size, and point at the length-prefix pattern
-  in `testbed/src/framing.rs`. No behaviour change.
-
-### Changed
-
-- **`migrate()` on a non-migration transport now returns `Err(CoreError::Unsupported)`**
-  instead of a silent `Ok(())` no-op. Real migration requires a UDP-backed session
-  (`connect_pinned_udp*`); on TCP / WebSocket / WASI / Embedded it now errors honestly.
-- **Combinatorial Rust constructors were removed** in favour of the builder:
-  `PhantomSession::connect_with_resumption`,
-  `PhantomListener::bind_with_signing_key_with_runtime`, and
-  `PhantomListener::bind_with_signing_key_mimic`. The runtime-injection shims
-  `PhantomSession::connect_with_transport_with_runtime` and
-  `PhantomListener::bind_with_runtime` survive, as do `connect_with_transport` and the
-  UniFFI-exported free functions and constructors. `PhantomStream::recv()` returns
-  `Option<Vec<u8>>` (`None` = clean EOF). All breaking, within the pre-1.0 0.2.x window.
-- **`PhantomUdpListener::accept()` now takes an owned receiver** (`self: Arc<Self>`
-  instead of `self: &Arc<Self>`) — required by its new UniFFI export. Rust callers
-  write `listener.clone().accept().await`. Breaking, within the pre-1.0 0.2.x window.
-- **`ConnectionState::{ClassicalReady, PqcUpgrading, PqcReady}` and
-  `PhantomSession::is_pqc_ready()` were removed.** They belonged to a staged
-  classical-then-post-quantum upgrade the protocol never shipped: the hybrid handshake is a
-  single flight, so no production path ever wrote those three states and `is_pqc_ready()`
-  was permanently false. An embedder following the rustdoc would have waited for a state
-  that cannot arrive, or gated its send path on a readiness flag that never turns true.
-  The session rustdoc now describes the machine that exists —
-  `Connecting → Connected → Migrating → Dead`, plus `Failed` and `Closed`. Use
-  `is_data_ready()`: because the handshake is one flight, a data-ready session is
-  post-quantum protected by construction. Discriminants `1..=3` are left retired rather
-  than reused. Breaking for the FFI enum and for `is_pqc_ready()` callers, within the
-  pre-1.0 breaking window.
-- **`PhantomSession::current_epoch()` and `set_rekey_threshold()` are no longer exported
-  over FFI.** Both documented themselves as Rust-only while sitting inside the UniFFI
-  export block. `set_rekey_threshold` lowers the watermark that triggers key rotation on a
-  live session — a knob on the same axis as the `AEAD_MAX_INVOCATIONS` ceiling, which is
-  documented as not to be moved without an audit — so it should not have reached foreign
-  callers by accident. Both remain public Rust API for soak and integration harnesses.
-  Breaking for any binding consumer that called them.
-
-### Fixed
 
 - **Connection migration could hang the client receive loop.** `UdpClientTransport::recv_bytes`
   did not wake when `migrate_to()` rebound the local socket: a receive parked on the old
@@ -772,18 +841,56 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   and omitted `transport/udp_transport.rs` and `transport/legs/mimic_tls/`, which therefore
   never requested codeowner review.
 
-### Added
+### Documented
 
-- **`PhantomUdpListener::metrics_snapshot()`**, exported over UniFFI and identical in shape to
-  the TCP `PhantomListener`'s, so the two listeners are interchangeable in an embedder's
-  monitoring code. The UDP listener owns the `Arc<Observability>` that its handshake path and
-  every accepted session write through, but published no accessor for it: the aggregate was
-  reachable only through an *accepted session's* `metrics_snapshot()`. An operator running the
-  production, migration-capable transport from a foreign language therefore had no listener-level
-  metrics at all, and — precisely when it matters — a server that is being probed but has no live
-  session could report neither its handshake counters nor `replay_rejected_total` nor
-  `aead_failure_total`. Nothing about what is counted changes; the counters were always there,
-  only unreadable.
+- **`connect_pinned*` returns before the handshake completes.** The returned session is
+  in `Connecting` state with the handshake running on a background task, so callers must
+  `await_ready()` before treating the connection as established. Until they do, a
+  deliberately wrong pin looks like a successful connect (`ServerIdentityMismatch` has
+  not been raised yet), `resumption_hint()` returns `None`, and any timing around the
+  call measures socket setup rather than the post-quantum key exchange. This was
+  implied by the invariants but stated nowhere on the entry points themselves.
+- **`PhantomSession::send()` does not preserve application message boundaries.** The
+  data pump splits payloads above its internal chunk size (1156 B) into chunks,
+  writes each as a separate reliable-stream write, and the peer's `recv()` yields them
+  one at a time — on every leg, since the split happens above the transport. The
+  failure mode is silent for structured payloads: the first chunk still parses, with
+  the tail gone. Embedders that need message semantics must frame and reassemble
+  themselves; `testbed/src/framing.rs` is a worked example.
+- **`migrate()` on a non-migration transport now returns `Err(CoreError::Unsupported)`**
+  instead of a silent `Ok(())` no-op. Real migration requires a UDP-backed session
+  (`connect_pinned_udp*`); on TCP / WebSocket / WASI / Embedded it now errors honestly.
+- **Combinatorial Rust constructors were removed** in favour of the builder:
+  `PhantomSession::connect_with_resumption`,
+  `PhantomListener::bind_with_signing_key_with_runtime`, and
+  `PhantomListener::bind_with_signing_key_mimic`. The runtime-injection shims
+  `PhantomSession::connect_with_transport_with_runtime` and
+  `PhantomListener::bind_with_runtime` survive, as do `connect_with_transport` and the
+  UniFFI-exported free functions and constructors. `PhantomStream::recv()` returns
+  `Option<Vec<u8>>` (`None` = clean EOF). All breaking, within the pre-1.0 0.2.x window.
+- **`PhantomUdpListener::accept()` now takes an owned receiver** (`self: Arc<Self>`
+  instead of `self: &Arc<Self>`) — required by its new UniFFI export. Rust callers
+  write `listener.clone().accept().await`. Breaking, within the pre-1.0 0.2.x window.
+- **`ConnectionState::{ClassicalReady, PqcUpgrading, PqcReady}` and
+  `PhantomSession::is_pqc_ready()` were removed.** They belonged to a staged
+  classical-then-post-quantum upgrade the protocol never shipped: the hybrid handshake is a
+  single flight, so no production path ever wrote those three states and `is_pqc_ready()`
+  was permanently false. An embedder following the rustdoc would have waited for a state
+  that cannot arrive, or gated its send path on a readiness flag that never turns true.
+  The session rustdoc now describes the machine that exists —
+  `Connecting → Connected → Migrating → Dead`, plus `Failed` and `Closed`. Use
+  `is_data_ready()`: because the handshake is one flight, a data-ready session is
+  post-quantum protected by construction. Discriminants `1..=3` are left retired rather
+  than reused. Breaking for the FFI enum and for `is_pqc_ready()` callers, within the
+  pre-1.0 breaking window.
+- **`PhantomSession::current_epoch()` and `set_rekey_threshold()` are no longer exported
+  over FFI.** Both documented themselves as Rust-only while sitting inside the UniFFI
+  export block. `set_rekey_threshold` lowers the watermark that triggers key rotation on a
+  live session — a knob on the same axis as the `AEAD_MAX_INVOCATIONS` ceiling, which is
+  documented as not to be moved without an audit — so it should not have reached foreign
+  callers by accident. Both remain public Rust API for soak and integration harnesses.
+  Breaking for any binding consumer that called them.
+
 
 ## [0.2.2] - 2026-06-22
 

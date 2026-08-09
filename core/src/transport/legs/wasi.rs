@@ -188,6 +188,10 @@ impl SessionTransport for WasiLeg {
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, CoreError> {
+        // PANIC-SAFETY: same shape as `send_bytes` above — the mutex is a
+        // private field, held only here, and a poison could only follow a
+        // panic inside an earlier `recv_bytes`, after which the WASI input
+        // stream and the half-read accumulator are both indeterminate.
         #[allow(clippy::expect_used)]
         let mut guard = self.read.lock().expect("WasiLeg read mutex poisoned");
         let (input, accum) = &mut *guard;

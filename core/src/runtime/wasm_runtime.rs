@@ -86,6 +86,15 @@ impl Runtime for WasmRuntime {
         // Resolve `setTimeout` via the JS global object so we don't depend
         // on the `Window` web-sys feature (which isn't enabled in this
         // crate's `web-sys` feature set).
+        //
+        // PANIC-SAFETY: the three `.expect`s below only fire when the global
+        // has no callable `setTimeout` — that is, when the wasm artifact was
+        // loaded outside a browser or Web Worker. None of the values comes
+        // from the network, so no peer can reach them, and a runtime with no
+        // timer cannot drive a session at all; failing loudly at the first
+        // sleep is more useful than a session that silently never wakes.
+        // The native clippy job never compiles this module, so the audit
+        // lints do not require a statement-level `#[allow]` here.
         let global = js_sys::global();
         let set_timeout = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
             .expect("global.setTimeout missing — not a browser/worker context");
