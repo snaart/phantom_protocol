@@ -1,7 +1,7 @@
 //! PhantomUDP server listener: one bound `UdpSocket`, a central demux task routing datagrams by the
 //! 8-byte connection-ID into per-session channels, and a decoupled accept queue mirroring
 //! `PhantomListener`. Exposed through UniFFI via `bind_udp` / `accept` / `verifying_key_bytes` /
-//! `local_addr` / `shutdown` / `is_shutting_down`.
+//! `metrics_snapshot` / `local_addr` / `shutdown` / `is_shutting_down`.
 //!
 //! Phase 1 uses a single shared `FragmentAssembler` for reassembly across all CIDs (bounded by the
 //! assembler's own anti-DoS caps); per-CID isolation is a Phase-2 refinement — see `run_udp_demux`.
@@ -248,6 +248,21 @@ impl PhantomUdpListener {
     /// Clients MUST pin this before completing a handshake (security invariant 1).
     pub fn verifying_key_bytes(&self) -> Vec<u8> {
         self.handshake_server.verifying_key().to_bytes()
+    }
+
+    /// Flat snapshot of the listener's aggregated connection metrics (all
+    /// accepted sessions share this counter set). Lock-free read; available
+    /// with or without `telemetry-otel`.
+    ///
+    /// Identical in shape and meaning to
+    /// [`PhantomListener::metrics_snapshot`](crate::api::listener::PhantomListener::metrics_snapshot),
+    /// so an embedder can swap the TCP listener for this one without touching its
+    /// monitoring code. It is the only way to read handshake counters,
+    /// `replay_rejected_total` and `aead_failure_total` while no session is in
+    /// hand — reaching them through an accepted session's snapshot requires a
+    /// session, and a server that is being probed but not connected to has none.
+    pub fn metrics_snapshot(&self) -> crate::observability::MetricsSnapshotFfi {
+        self.observability.snapshot().into()
     }
 
     /// Local socket address the listener is actually bound to (resolved at bind

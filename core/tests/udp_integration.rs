@@ -1632,6 +1632,82 @@ async fn udp_integration_listener_shutdown_flag_is_observable() {
     ));
 }
 
+/// The PhantomUDP listener publishes its own counter set, and it is the same
+/// aggregate an accepted session reports — an operator running the production
+/// transport from a foreign language must be able to read handshake counters,
+/// `replay_rejected_total` and `aead_failure_total` while no session is in hand.
+///
+/// Two-sided by construction: the pre-accept assertion rejects an accessor that
+/// answers with a constant, and the session-versus-listener equality rejects one
+/// that hands back a freshly built `Observability` instead of the shared handle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_listener_metrics_snapshot_is_the_shared_aggregate() {
+    const SESSIONS: u64 = 3;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let before = listener.metrics_snapshot();
+    assert_eq!(
+        before.handshakes_success, 0,
+        "a listener that has accepted nothing must report no handshakes"
+    );
+    assert_eq!(before.handshakes_failure, 0);
+
+    // Keep every client and every accepted session alive for the whole test: a
+    // dropped session tears its pump down, and the point here is the aggregate.
+    let mut clients = Vec::new();
+    let mut accepted = Vec::new();
+    for i in 0..SESSIONS {
+        let transport = UdpClientTransport::connect(addr)
+            .await
+            .expect("udp connect");
+        let client =
+            PhantomSession::connect_with_transport(&addr.to_string(), transport, key.clone());
+        let outcome = timeout(Duration::from_secs(10), listener.clone().accept())
+            .await
+            .expect("no accept timeout")
+            .expect("accept");
+        let session = outcome.session();
+        // Exchange a datagram so the session is genuinely established, not merely
+        // handed over by the acceptor.
+        client
+            .send(format!("ping-{i}").into_bytes())
+            .await
+            .expect("client send");
+        let got = timeout(Duration::from_secs(10), session.recv())
+            .await
+            .expect("no recv timeout")
+            .expect("server recv");
+        assert_eq!(got, format!("ping-{i}").into_bytes());
+        clients.push(client);
+        accepted.push(session);
+    }
+
+    let after = listener.metrics_snapshot();
+    assert_eq!(
+        after.handshakes_success, SESSIONS,
+        "listener handshake successes must count every accepted session"
+    );
+    assert_eq!(after.handshake_latency_count, SESSIONS);
+
+    // The accessor is only worth anything if it reads the very counters the
+    // sessions write through: each accepted session shares the listener's handle,
+    // so its snapshot carries the same aggregate.
+    for session in &accepted {
+        let from_session = session.metrics_snapshot();
+        assert_eq!(
+            from_session.handshakes_success, after.handshakes_success,
+            "accepted session and listener must read one shared counter set"
+        );
+        assert_eq!(from_session.uptime_secs, after.uptime_secs);
+    }
+}
+
 /// Headline regression: a session built through the FFI shim `connect_pinned_udp`
 /// performs a REAL single-path connection migration mid-exchange. Over the TCP
 /// `connect_pinned` shim `migrate()` is a no-op; this proves the UDP FFI path wires
