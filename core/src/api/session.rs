@@ -67,6 +67,12 @@ fn new_session_id() -> String {
 ///
 /// The session is usable from the moment it's created — sends are queued
 /// until the handshake completes.
+///
+/// The discriminants are not contiguous: `1..=3` are retired numbers that once
+/// stood for a staged classical-then-PQC upgrade the protocol never shipped —
+/// the hybrid handshake is a single flight, so there is no intermediate
+/// classical-only state to be in. They are left as holes rather than reused so a
+/// number captured in an old log cannot come back meaning something else.
 #[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -74,12 +80,6 @@ fn new_session_id() -> String {
 pub enum ConnectionState {
     /// Connection initiated, handshake pending
     Connecting = 0,
-    /// Classical (X25519) channel established — data flows
-    ClassicalReady = 1,
-    /// PQC upgrade in progress
-    PqcUpgrading = 2,
-    /// Full hybrid PQC protection active
-    PqcReady = 3,
     /// Fully connected and operational
     Connected = 4,
     /// Connection failed
@@ -137,30 +137,24 @@ impl ConnectionState {
     fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::Connecting,
-            1 => Self::ClassicalReady,
-            2 => Self::PqcUpgrading,
-            3 => Self::PqcReady,
             4 => Self::Connected,
             5 => Self::Failed,
             6 => Self::Closed,
             7 => Self::Migrating,
             8 => Self::Dead,
+            // Includes the retired 1..=3: a value nothing writes any more is not
+            // a state, and `Failed` is the safe reading of a number we cannot
+            // interpret — it makes the session unusable rather than pretending
+            // data can flow.
             _ => Self::Failed,
         }
     }
 
-    /// Whether data can flow (classical or better). `Migrating` counts as ready:
-    /// the keep-alive window still accepts `send()` (buffered + retransmitted until
-    /// the path recovers), so the embedder's send path doesn't error mid-migration.
+    /// Whether data can flow. `Migrating` counts as ready: the keep-alive window
+    /// still accepts `send()` (buffered + retransmitted until the path recovers),
+    /// so the embedder's send path doesn't error mid-migration.
     pub fn is_data_ready(&self) -> bool {
-        matches!(
-            self,
-            Self::ClassicalReady
-                | Self::PqcUpgrading
-                | Self::PqcReady
-                | Self::Connected
-                | Self::Migrating
-        )
+        matches!(self, Self::Connected | Self::Migrating)
     }
 }
 
@@ -347,7 +341,12 @@ impl<T: SessionTransport> SessionTransport for ObservedTransport<T> {
 /// ```
 ///
 /// The session progresses through states:
-/// `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
+/// `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
+/// `Connecting` (handshake rejection, a wrong pin) and `Closed` from
+/// `disconnect()`. `Migrating` is entered when the path goes silent and left
+/// again for `Connected` if it recovers; sends keep buffering throughout. There
+/// is no intermediate classical-only state — the hybrid handshake is one flight,
+/// so the session is either unkeyed or fully post-quantum keyed.
 ///
 /// # Example
 ///
@@ -4408,6 +4407,26 @@ impl PhantomSession {
     ///   error (from the handshake or the data pump) so the caller gets the
     ///   *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
     ///   than the generic `"Cannot send in state Failed"` message.
+    ///
+    /// # ⚠ This is a byte stream, not a message channel
+    ///
+    /// **Message boundaries are not preserved.** The data pump splits `data`
+    /// into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
+    /// bytes — one chunk plus its packet overhead is exactly one PhantomUDP
+    /// datagram — and writes each chunk separately, so the peer's
+    /// [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
+    /// An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
+    /// nothing marks where one `send` ended and the next began.
+    ///
+    /// This is silent when it bites: the first chunk of a structured message
+    /// usually still parses, as a truncated one, so a caller that reads a single
+    /// `recv` and calls it a message records a successful round trip for a
+    /// payload that was quietly cut.
+    ///
+    /// A caller that needs messages must frame them itself — the usual shape is
+    /// a length prefix written ahead of each payload and a reassembler that
+    /// accumulates `recv` results until the declared length is complete.
+    /// `testbed/src/framing.rs` in this repository is a worked example.
     pub async fn send(&self, data: Vec<u8>) -> Result<(), CoreError> {
         let state = self.connection_state();
 
@@ -4500,8 +4519,8 @@ impl PhantomSession {
             .await
             .map_err(|_| CoreError::NetworkError("readiness channel closed".into()))?;
         // Now check the resolved state. Anything that is NOT a terminal failure
-        // (Connected, but also Migrating / the established sub-states) counts as
-        // ready; only a genuine failure surfaces the captured terminal error.
+        // (Connected, and also Migrating — the keys exist, the path is moving)
+        // counts as ready; only a genuine failure surfaces the captured error.
         match self.connection_state() {
             ConnectionState::Failed | ConnectionState::Dead | ConnectionState::Closed => {
                 // Surface the captured terminal error, or a generic fallback.
@@ -4529,16 +4548,13 @@ impl PhantomSession {
     }
 
     /// Whether the session is ready for data transmission.
+    ///
+    /// There is no separate "post-quantum ready" question to ask: the hybrid
+    /// KEM and the hybrid signature both belong to the one handshake flight, so
+    /// there is no window in which a session is up but only classically
+    /// protected. Data-ready implies post-quantum protected.
     pub fn is_data_ready(&self) -> bool {
         self.connection_state().is_data_ready()
-    }
-
-    /// Whether the session has full PQC protection.
-    pub fn is_pqc_ready(&self) -> bool {
-        matches!(
-            self.connection_state(),
-            ConnectionState::PqcReady | ConnectionState::Connected
-        )
     }
 
     /// Flush all queued messages (called when handshake completes).
@@ -4601,32 +4617,6 @@ impl PhantomSession {
                 session_id: session_id.to_vec(),
                 resumption_secret: resumption_secret.to_vec(),
             })
-    }
-
-    /// Current rekey epoch of the established session (`None` while still
-    /// connecting). Rust-only — used by soak / integration tests to confirm
-    /// that automatic mid-session rekey (C1) advanced the epoch.
-    pub async fn current_epoch(&self) -> Option<u8> {
-        self.inner_session
-            .lock()
-            .await
-            .as_ref()
-            .map(|s| s.current_epoch())
-    }
-
-    /// Override the automatic-rekey send-invocation high-watermark on the
-    /// established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
-    /// Returns `false` if the session is still connecting. Rust-only — primarily
-    /// for soak/load harnesses that need to exercise mid-session rekey without
-    /// sending `2^32` packets.
-    pub async fn set_rekey_threshold(&self, n: u64) -> bool {
-        match self.inner_session.lock().await.as_ref() {
-            Some(s) => {
-                s.set_rekey_threshold(n);
-                true
-            }
-            None => false,
-        }
     }
 
     /// Apply an anti-fingerprint traffic-shaping configuration to the established
@@ -4723,6 +4713,41 @@ impl PhantomSession {
     /// Get the stream demultiplexer (internal use, not exposed to UniFFI)
     pub fn demux(&self) -> Arc<StreamDemultiplexer> {
         self.demux.clone()
+    }
+
+    /// Current rekey epoch of the established session (`None` while still
+    /// connecting). Rust-only — used by soak / integration tests to confirm
+    /// that automatic mid-session rekey (C1) advanced the epoch.
+    pub async fn current_epoch(&self) -> Option<u8> {
+        self.inner_session
+            .lock()
+            .await
+            .as_ref()
+            .map(|s| s.current_epoch())
+    }
+
+    /// Override the automatic-rekey send-invocation high-watermark on the
+    /// established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
+    /// Returns `false` if the session is still connecting. Primarily for
+    /// soak / load harnesses that need to exercise mid-session rekey without
+    /// sending `2^32` packets.
+    ///
+    /// **Rust-only, and deliberately so.** This lowers the watermark that
+    /// triggers key rotation on a live session — a knob on the same axis as the
+    /// `AEAD_MAX_INVOCATIONS` ceiling, which is documented as not to be moved
+    /// without an audit. A harness that links the crate directly is inside that
+    /// audit boundary; an arbitrary foreign-language embedder reached through
+    /// the bindings is not, and none has asked for it. Keeping it off the FFI
+    /// surface is reversible in one line; recalling it from a shipped binding is
+    /// not.
+    pub async fn set_rekey_threshold(&self, n: u64) -> bool {
+        match self.inner_session.lock().await.as_ref() {
+            Some(s) => {
+                s.set_rekey_threshold(n);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Override the path-liveness thresholds on the established session (Phase 4 /
@@ -4827,6 +4852,38 @@ impl Drop for PhantomSession {
 
 /// Connect to a server over **TCP**, pinning its identity to `pinned_key`.
 ///
+/// # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+///
+/// This returns as soon as the TCP socket is open. The handshake, and with it
+/// the check that the server actually holds `pinned_key`, runs on the background
+/// task. Until it completes the session reports
+/// [`ConnectionState::Connecting`], and [`send`](PhantomSession::send) accepts
+/// bytes into the pending queue rather than refusing them. A connection to an
+/// impostor therefore looks exactly like a connection to the right server, right
+/// up to the moment the caller asks.
+///
+/// **Call [`await_ready`](PhantomSession::await_ready) before treating the
+/// session as authenticated.** It resolves the handshake outcome and surfaces
+/// [`CoreError::ServerIdentityMismatch`] on a wrong pin; the same error is also
+/// available later from [`last_error`](PhantomSession::last_error) and is what
+/// `send`/`recv` return once the state is terminal.
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() {
+/// # let pinned_key: Vec<u8> = vec![];
+/// let session = phantom_protocol::connect_pinned("host".into(), 4242, pinned_key)
+///     .await
+///     .expect("socket opened — says nothing about the peer's identity");
+///
+/// // The pin is verified here, not above.
+/// if let Err(e) = session.await_ready().await {
+///     eprintln!("not the pinned server: {e}");
+///     return;
+/// }
+/// # }
+/// ```
+///
 /// Opens a `TcpSessionTransport`, parses the pinned [`HybridVerifyingKey`]
 /// from raw bytes (Security Invariant 1 — mandatory), and starts the
 /// background handshake + data pump.
@@ -4893,6 +4950,27 @@ pub async fn connect_pinned(
 
 /// Like [`connect_pinned`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
 /// liveness settings to the session. FFI-exported.
+///
+/// # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+///
+/// Same contract as [`connect_pinned`]: the pinned-key check runs on the
+/// background task, so an impostor is indistinguishable from the real server
+/// until [`await_ready`](PhantomSession::await_ready) resolves it.
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() {
+/// # let pinned_key: Vec<u8> = vec![];
+/// let config = phantom_protocol::config::PhantomConfig::mobile();
+/// let session =
+///     phantom_protocol::connect_pinned_with_config("host".into(), 4242, pinned_key, config)
+///         .await
+///         .expect("socket opened — says nothing about the peer's identity");
+///
+/// // The pin is verified here, not above.
+/// session.await_ready().await.expect("not the pinned server");
+/// # }
+/// ```
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 pub async fn connect_pinned_with_config(
@@ -4927,6 +5005,32 @@ pub async fn connect_pinned_with_config(
 /// (`mimicry` feature) — the flow looks like an ordinary HTTPS handshake to an
 /// on-path observer, while the real authentication / confidentiality remains the
 /// inner Phantom post-quantum session.
+///
+/// # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+///
+/// The synthetic TLS prelude completes before this returns, but the *Phantom*
+/// handshake — the only thing that authenticates anyone — runs on the background
+/// task. Exactly as in [`connect_pinned`], call
+/// [`await_ready`](PhantomSession::await_ready) before treating the session as
+/// authenticated.
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() {
+/// # let pinned_key: Vec<u8> = vec![];
+/// let session = phantom_protocol::api::session::connect_pinned_mimic(
+///     "host".into(),
+///     443,
+///     pinned_key,
+///     "www.example.com".into(),
+/// )
+/// .await
+/// .expect("cover handshake completed — says nothing about the peer's identity");
+///
+/// // The pin is verified here, not above.
+/// session.await_ready().await.expect("not the pinned server");
+/// # }
+/// ```
 ///
 /// `sni` is the cover domain presented in the synthetic ClientHello. It is
 /// **required and should be rotated** per connection and kept plausible for the
@@ -4972,6 +5076,33 @@ pub async fn connect_pinned_mimic(
 
 /// Connect to a pinned server with a **0-RTT resumption attempt** — the
 /// resumption-aware analogue of [`connect_pinned`].
+///
+/// # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+///
+/// Same contract as [`connect_pinned`]. It matters more here: the early-data
+/// blob is already on the wire when this returns, so `Ok` is not even evidence
+/// that the ticket was usable. [`await_ready`](PhantomSession::await_ready)
+/// resolves the pin, and only then does
+/// [`early_data_accepted`](PhantomSession::early_data_accepted) mean anything.
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() {
+/// # let pinned_key: Vec<u8> = vec![];
+/// # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+/// let session = phantom_protocol::connect_pinned_with_resumption(
+///     "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
+/// )
+/// .await
+/// .expect("socket opened — says nothing about the peer's identity");
+///
+/// // The pin is verified here, not above.
+/// session.await_ready().await.expect("not the pinned server");
+/// if session.early_data_accepted().await != Some(true) {
+///     // The server declined 0-RTT; the payload was requeued for 1-RTT.
+/// }
+/// # }
+/// ```
 ///
 /// `hint` is a [`ResumptionHint`] from a prior session's
 /// [`PhantomSession::resumption_hint`]; both of its fields must be
@@ -5056,6 +5187,19 @@ pub async fn connect_pinned_with_resumption(
 /// Connect to a pinned server over the production **PhantomUDP** transport — the
 /// reliable-UDP, migration-capable analogue of [`connect_pinned`].
 ///
+/// # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+///
+/// This returns as soon as the UDP socket is bound — which, on an unconnected
+/// datagram socket, involves no exchange with the peer at all. The handshake and
+/// the check that the server holds `pinned_key` run on the background task,
+/// while the session reports [`ConnectionState::Connecting`] and
+/// [`send`](PhantomSession::send) queues bytes rather than refusing them.
+///
+/// **Call [`await_ready`](PhantomSession::await_ready) before treating the
+/// session as authenticated**; it surfaces
+/// [`CoreError::ServerIdentityMismatch`] on a wrong pin. The example below does
+/// it immediately.
+///
 /// Unlike the TCP [`connect_pinned`], a session built here runs over
 /// [`UdpClientTransport`](crate::api::udp_transport::UdpClientTransport), so
 /// [`PhantomSession::migrate`] performs a real single-path connection migration
@@ -5119,6 +5263,27 @@ pub async fn connect_pinned_udp(
 
 /// Like [`connect_pinned_udp`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
 /// liveness settings. FFI-exported.
+///
+/// # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+///
+/// Same contract as [`connect_pinned_udp`]: binding a datagram socket says
+/// nothing about who is on the other end, and the pinned-key check runs on the
+/// background task.
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() {
+/// # let pinned_key: Vec<u8> = vec![];
+/// let config = phantom_protocol::config::PhantomConfig::mobile();
+/// let session =
+///     phantom_protocol::connect_pinned_udp_with_config("host".into(), 4242, pinned_key, config)
+///         .await
+///         .expect("socket bound — says nothing about the peer's identity");
+///
+/// // The pin is verified here, not above.
+/// session.await_ready().await.expect("not the pinned server");
+/// # }
+/// ```
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(feature = "bindings", uniffi::export(async_runtime = "tokio"))]
 pub async fn connect_pinned_udp_with_config(
@@ -5153,6 +5318,34 @@ pub async fn connect_pinned_udp_with_config(
 
 /// 0-RTT resumption analogue of [`connect_pinned_udp`] — the UDP sibling of
 /// [`connect_pinned_with_resumption`].
+///
+/// # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+///
+/// Same contract as [`connect_pinned_udp`], and it matters more here: the
+/// early-data blob is already on the wire when this returns, so `Ok` is not even
+/// evidence that the ticket was usable.
+/// [`await_ready`](PhantomSession::await_ready) resolves the pin, and only then
+/// does [`early_data_accepted`](PhantomSession::early_data_accepted) mean
+/// anything.
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() {
+/// # let pinned_key: Vec<u8> = vec![];
+/// # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+/// let session = phantom_protocol::connect_pinned_udp_with_resumption(
+///     "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
+/// )
+/// .await
+/// .expect("socket bound — says nothing about the peer's identity");
+///
+/// // The pin is verified here, not above.
+/// session.await_ready().await.expect("not the pinned server");
+/// if session.early_data_accepted().await != Some(true) {
+///     // The server declined 0-RTT; the payload was requeued for 1-RTT.
+/// }
+/// # }
+/// ```
 ///
 /// `hint` is a [`ResumptionHint`] from a prior session's
 /// [`PhantomSession::resumption_hint`]; both of its fields must be exactly 32 bytes
@@ -5364,6 +5557,54 @@ impl<T: SessionTransport> SessionBuilder<T> {
 mod tests {
     use super::*;
     use crate::transport::handshake::{ClientHello, HandshakeResponse, HandshakeServer};
+
+    /// Every state the enum offers is a state some production path writes.
+    ///
+    /// `ConnectionState` is `#[non_exhaustive]` only for downstream crates, so
+    /// inside the crate the match below stays exhaustive and wildcard-free. That
+    /// is the whole point of the test: a variant nobody writes is worse than a
+    /// missing one, because an embedder reading the enum will wait for it. Adding
+    /// a variant therefore has to break this compile, and the arm that unbreaks it
+    /// has to name the code that reaches the state.
+    #[test]
+    fn every_connection_state_has_a_production_writer() {
+        for state in [
+            ConnectionState::Connecting,
+            ConnectionState::Connected,
+            ConnectionState::Failed,
+            ConnectionState::Closed,
+            ConnectionState::Migrating,
+            ConnectionState::Dead,
+        ] {
+            // The session keeps the state in an `AtomicU8`, so every reachable
+            // variant has to survive the round trip through it.
+            assert_eq!(
+                ConnectionState::from_u8(state as u8),
+                state,
+                "{state:?} does not round-trip through the atomic it is stored in"
+            );
+
+            let (writer, data_ready) = match state {
+                // `spawn_client` before the background handshake resolves.
+                ConnectionState::Connecting => ("spawn_client", false),
+                // The handshake completed, or `apply_liveness` saw the path recover.
+                ConnectionState::Connected => ("handshake completion", true),
+                // A terminal handshake or pump failure, plus the inert `connect()`.
+                ConnectionState::Failed => ("terminal_error capture", false),
+                // `disconnect()`.
+                ConnectionState::Closed => ("disconnect", false),
+                // `apply_liveness` on `PathDown`: sends still buffer for the move.
+                ConnectionState::Migrating => ("apply_liveness/PathDown", true),
+                // `apply_liveness` once the migration idle timeout expires.
+                ConnectionState::Dead => ("apply_liveness/Dead", false),
+            };
+            assert_eq!(
+                state.is_data_ready(),
+                data_ready,
+                "{state:?} (written by {writer}) disagrees with is_data_ready()"
+            );
+        }
+    }
 
     // ── No-op sinks for handle_packet calls in tests that don't exercise accept_stream ──
 
@@ -5690,7 +5931,6 @@ mod tests {
         // Inert constructor immediately reports Failed — not an eternal Connecting.
         assert_eq!(session.connection_state(), ConnectionState::Failed);
         assert!(!session.is_data_ready());
-        assert!(!session.is_pqc_ready());
 
         // send() returns an error in Failed state — no silent buffering.
         let send_err = session.send(b"first".to_vec()).await;
@@ -5742,7 +5982,7 @@ mod tests {
         assert_eq!(session.queued_count().await, 2);
 
         // Simulate handshake completion
-        session.set_state(ConnectionState::ClassicalReady);
+        session.set_state(ConnectionState::Connected);
         assert!(session.is_data_ready());
 
         // Flush queue
@@ -5751,6 +5991,10 @@ mod tests {
         assert_eq!(session.queued_count().await, 0);
     }
 
+    /// Walk the state machine the rustdoc advertises, in order, and check the
+    /// data-readiness answer at every step. `Migrating` is the interesting one:
+    /// it must stay data-ready, because a session whose path went silent still
+    /// accepts `send()` — the bytes buffer and go out after the move.
     #[tokio::test]
     async fn test_phantom_session_state_progression() {
         let session = PhantomSession::connect("example.com:443".to_string());
@@ -5760,21 +6004,17 @@ mod tests {
         assert_eq!(session.connection_state(), ConnectionState::Connecting);
         assert!(!session.is_data_ready());
 
-        session.set_state(ConnectionState::ClassicalReady);
+        session.set_state(ConnectionState::Connected);
         assert!(session.is_data_ready());
-        assert!(!session.is_pqc_ready());
 
-        session.set_state(ConnectionState::PqcUpgrading);
+        session.set_state(ConnectionState::Migrating);
         assert!(session.is_data_ready());
-        assert!(!session.is_pqc_ready());
-
-        session.set_state(ConnectionState::PqcReady);
-        assert!(session.is_data_ready());
-        assert!(session.is_pqc_ready());
 
         session.set_state(ConnectionState::Connected);
         assert!(session.is_data_ready());
-        assert!(session.is_pqc_ready());
+
+        session.set_state(ConnectionState::Dead);
+        assert!(!session.is_data_ready());
     }
 
     #[tokio::test]

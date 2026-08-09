@@ -611,6 +611,14 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   declares a path down — so a challenge yields exactly one `success`, `failure` or
   `timeout` sample and never leaks its bookkeeping. The sweep is metrics-only; it does not
   change `PathRegistry` state.
+- **Two API properties that were recorded only here are now stated where they are read.**
+  Every `connect_pinned*` function's rustdoc now opens with the fact that it returns
+  **before** the handshake — so `Ok` means a socket was opened, not that the server holds
+  the pinned key — and carries an example that calls `await_ready()` immediately. Likewise
+  `PhantomSession::send`, `PhantomStream::send_reliable` and `PhantomStream::send_unreliable`
+  now state that they do not preserve message boundaries, name
+  `transport::mtu::MAX_APP_CHUNK` as the split size, and point at the length-prefix pattern
+  in `testbed/src/framing.rs`. No behaviour change.
 
 ### Changed
 
@@ -628,6 +636,25 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 - **`PhantomUdpListener::accept()` now takes an owned receiver** (`self: Arc<Self>`
   instead of `self: &Arc<Self>`) — required by its new UniFFI export. Rust callers
   write `listener.clone().accept().await`. Breaking, within the pre-1.0 0.2.x window.
+- **`ConnectionState::{ClassicalReady, PqcUpgrading, PqcReady}` and
+  `PhantomSession::is_pqc_ready()` were removed.** They belonged to a staged
+  classical-then-post-quantum upgrade the protocol never shipped: the hybrid handshake is a
+  single flight, so no production path ever wrote those three states and `is_pqc_ready()`
+  was permanently false. An embedder following the rustdoc would have waited for a state
+  that cannot arrive, or gated its send path on a readiness flag that never turns true.
+  The session rustdoc now describes the machine that exists —
+  `Connecting → Connected → Migrating → Dead`, plus `Failed` and `Closed`. Use
+  `is_data_ready()`: because the handshake is one flight, a data-ready session is
+  post-quantum protected by construction. Discriminants `1..=3` are left retired rather
+  than reused. Breaking for the FFI enum and for `is_pqc_ready()` callers, within the
+  pre-1.0 breaking window.
+- **`PhantomSession::current_epoch()` and `set_rekey_threshold()` are no longer exported
+  over FFI.** Both documented themselves as Rust-only while sitting inside the UniFFI
+  export block. `set_rekey_threshold` lowers the watermark that triggers key rotation on a
+  live session — a knob on the same axis as the `AEAD_MAX_INVOCATIONS` ceiling, which is
+  documented as not to be moved without an audit — so it should not have reached foreign
+  callers by accident. Both remain public Rust API for soak and integration harnesses.
+  Breaking for any binding consumer that called them.
 
 ### Fixed
 
