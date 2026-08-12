@@ -419,22 +419,6 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
-    typealias FfiType = UInt8
-    typealias SwiftType = UInt8
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt8 {
-        return try lift(readInt(&buf))
-    }
-
-    public static func write(_ value: UInt8, into buf: inout [UInt8]) {
-        writeInt(&buf, lower(value))
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
     typealias FfiType = UInt16
     typealias SwiftType = UInt16
@@ -1239,7 +1223,12 @@ public func FfiConverterTypePhantomListener_lower(_ value: PhantomListener) -> U
  * ```
  *
  * The session progresses through states:
- * `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
+ * `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
+ * `Connecting` (handshake rejection, a wrong pin) and `Closed` from
+ * `disconnect()`. `Migrating` is entered when the path goes silent and left
+ * again for `Connected` if it recovers; sends keep buffering throughout. There
+ * is no intermediate classical-only state — the hybrid handshake is one flight,
+ * so the session is either unkeyed or fully post-quantum keyed.
  *
  * # Example
  *
@@ -1328,13 +1317,6 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
     func connectionState()  -> ConnectionState
     
     /**
-     * Current rekey epoch of the established session (`None` while still
-     * connecting). Rust-only — used by soak / integration tests to confirm
-     * that automatic mid-session rekey (C1) advanced the epoch.
-     */
-    func currentEpoch() async  -> UInt8?
-    
-    /**
      * Send the graceful close frame and shut the session down.
      *
      * Named `disconnect` rather than `close` because UniFFI's Kotlin
@@ -1367,13 +1349,13 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
     
     /**
      * Whether the session is ready for data transmission.
+     *
+     * There is no separate "post-quantum ready" question to ask: the hybrid
+     * KEM and the hybrid signature both belong to the one handshake flight, so
+     * there is no window in which a session is up but only classically
+     * protected. Data-ready implies post-quantum protected.
      */
     func isDataReady()  -> Bool
-    
-    /**
-     * Whether the session has full PQC protection.
-     */
-    func isPqcReady()  -> Bool
     
     /**
      * Returns the terminal error from a failed handshake or a dead session,
@@ -1482,17 +1464,28 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      * error (from the handshake or the data pump) so the caller gets the
      * *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
      * than the generic `"Cannot send in state Failed"` message.
+     *
+     * # ⚠ This is a byte stream, not a message channel
+     *
+     * **Message boundaries are not preserved.** The data pump splits `data`
+     * into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
+     * bytes — one chunk plus its packet overhead is exactly one PhantomUDP
+     * datagram — and writes each chunk separately, so the peer's
+     * [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
+     * An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
+     * nothing marks where one `send` ended and the next began.
+     *
+     * This is silent when it bites: the first chunk of a structured message
+     * usually still parses, as a truncated one, so a caller that reads a single
+     * `recv` and calls it a message records a successful round trip for a
+     * payload that was quietly cut.
+     *
+     * A caller that needs messages must frame them itself — the usual shape is
+     * a length prefix written ahead of each payload and a reassembler that
+     * accumulates `recv` results until the declared length is complete.
+     * `testbed/src/framing.rs` in this repository is a worked example.
      */
     func send(data: Data) async throws 
-    
-    /**
-     * Override the automatic-rekey send-invocation high-watermark on the
-     * established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
-     * Returns `false` if the session is still connecting. Rust-only — primarily
-     * for soak/load harnesses that need to exercise mid-session rekey without
-     * sending `2^32` packets.
-     */
-    func setRekeyThreshold(n: UInt64) async  -> Bool
     
     /**
      * Apply an anti-fingerprint traffic-shaping configuration to the established
@@ -1545,7 +1538,12 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
  * ```
  *
  * The session progresses through states:
- * `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
+ * `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
+ * `Connecting` (handshake rejection, a wrong pin) and `Closed` from
+ * `disconnect()`. `Migrating` is entered when the path goes silent and left
+ * again for `Connected` if it recovers; sends keep buffering throughout. There
+ * is no intermediate classical-only state — the hybrid handshake is one flight,
+ * so the session is either unkeyed or fully post-quantum keyed.
  *
  * # Example
  *
@@ -1770,29 +1768,6 @@ open func connectionState() -> ConnectionState  {
 }
     
     /**
-     * Current rekey epoch of the established session (`None` while still
-     * connecting). Rust-only — used by soak / integration tests to confirm
-     * that automatic mid-session rekey (C1) advanced the epoch.
-     */
-open func currentEpoch()async  -> UInt8?  {
-    return
-        try!  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_phantom_protocol_fn_method_phantomsession_current_epoch(
-                    self.uniffiCloneHandle()
-                    
-                )
-            },
-            pollFunc: ffi_phantom_protocol_rust_future_poll_rust_buffer,
-            completeFunc: ffi_phantom_protocol_rust_future_complete_rust_buffer,
-            freeFunc: ffi_phantom_protocol_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterOptionUInt8.lift,
-            errorHandler: nil
-            
-        )
-}
-    
-    /**
      * Send the graceful close frame and shut the session down.
      *
      * Named `disconnect` rather than `close` because UniFFI's Kotlin
@@ -1877,21 +1852,15 @@ open func id() -> String  {
     
     /**
      * Whether the session is ready for data transmission.
+     *
+     * There is no separate "post-quantum ready" question to ask: the hybrid
+     * KEM and the hybrid signature both belong to the one handshake flight, so
+     * there is no window in which a session is up but only classically
+     * protected. Data-ready implies post-quantum protected.
      */
 open func isDataReady() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
-    /**
-     * Whether the session has full PQC protection.
-     */
-open func isPqcReady() -> Bool  {
-    return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -2100,6 +2069,26 @@ open func resumptionHint()async  -> ResumptionHint?  {
      * error (from the handshake or the data pump) so the caller gets the
      * *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
      * than the generic `"Cannot send in state Failed"` message.
+     *
+     * # ⚠ This is a byte stream, not a message channel
+     *
+     * **Message boundaries are not preserved.** The data pump splits `data`
+     * into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
+     * bytes — one chunk plus its packet overhead is exactly one PhantomUDP
+     * datagram — and writes each chunk separately, so the peer's
+     * [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
+     * An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
+     * nothing marks where one `send` ended and the next began.
+     *
+     * This is silent when it bites: the first chunk of a structured message
+     * usually still parses, as a truncated one, so a caller that reads a single
+     * `recv` and calls it a message records a successful round trip for a
+     * payload that was quietly cut.
+     *
+     * A caller that needs messages must frame them itself — the usual shape is
+     * a length prefix written ahead of each payload and a reassembler that
+     * accumulates `recv` results until the declared length is complete.
+     * `testbed/src/framing.rs` in this repository is a worked example.
      */
 open func send(data: Data)async throws   {
     return
@@ -2115,31 +2104,6 @@ open func send(data: Data)async throws   {
             freeFunc: ffi_phantom_protocol_rust_future_free_void,
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeCoreError_lift
-        )
-}
-    
-    /**
-     * Override the automatic-rekey send-invocation high-watermark on the
-     * established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
-     * Returns `false` if the session is still connecting. Rust-only — primarily
-     * for soak/load harnesses that need to exercise mid-session rekey without
-     * sending `2^32` packets.
-     */
-open func setRekeyThreshold(n: UInt64)async  -> Bool  {
-    return
-        try!  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold(
-                    self.uniffiCloneHandle(),
-                    FfiConverterUInt64.lower(n)
-                )
-            },
-            pollFunc: ffi_phantom_protocol_rust_future_poll_i8,
-            completeFunc: ffi_phantom_protocol_rust_future_complete_i8,
-            freeFunc: ffi_phantom_protocol_rust_future_free_i8,
-            liftFunc: FfiConverterBool.lift,
-            errorHandler: nil
-            
         )
 }
     
@@ -2296,8 +2260,45 @@ public protocol PhantomStreamProtocol: AnyObject, Sendable {
      */
     func recv() async throws  -> Data?
     
+    /**
+     * Queue `data` for reliable, in-order delivery on this stream.
+     *
+     * # ⚠ This is a byte stream, not a message channel
+     *
+     * **Message boundaries are not preserved.** The session's data pump splits
+     * `data` into chunks of
+     * [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — one chunk
+     * plus its packet overhead is exactly one PhantomUDP datagram — and buffers
+     * each chunk as its own reliable write, so the peer's [`recv`](Self::recv)
+     * yields one result *per chunk*, not one per `send_reliable`. Order is
+     * guaranteed; grouping is not, and nothing marks where one call's payload
+     * ended.
+     *
+     * Frame the messages yourself if you need them: write a length prefix ahead
+     * of each payload and accumulate `recv` results until the declared length is
+     * complete. `testbed/src/framing.rs` in this repository is a worked example.
+     */
     func sendReliable(data: Data) async throws 
     
+    /**
+     * Queue `data` for best-effort delivery on this stream — no retransmit, no
+     * ordering guarantee, and no delivery guarantee.
+     *
+     * # ⚠ This is a byte stream, not a message channel
+     *
+     * **Message boundaries are not preserved**, exactly as in
+     * [`send_reliable`](Self::send_reliable): the pump splits `data` into
+     * chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes
+     * and sends each on its own. Here that is sharper than on the reliable
+     * path, because the chunks are independent datagrams: any subset of them
+     * can be lost or arrive out of order, so a payload larger than one chunk
+     * can reach the peer with a hole in the middle and no signal that it did.
+     *
+     * Keep unreliable payloads within one chunk, or carry your own length
+     * prefix and sequence number and drop incomplete messages —
+     * `testbed/src/framing.rs` in this repository is a worked example of the
+     * framing half.
+     */
     func sendUnreliable(data: Data) async throws 
     
     /**
@@ -2425,6 +2426,24 @@ open func recv()async throws  -> Data?  {
         )
 }
     
+    /**
+     * Queue `data` for reliable, in-order delivery on this stream.
+     *
+     * # ⚠ This is a byte stream, not a message channel
+     *
+     * **Message boundaries are not preserved.** The session's data pump splits
+     * `data` into chunks of
+     * [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — one chunk
+     * plus its packet overhead is exactly one PhantomUDP datagram — and buffers
+     * each chunk as its own reliable write, so the peer's [`recv`](Self::recv)
+     * yields one result *per chunk*, not one per `send_reliable`. Order is
+     * guaranteed; grouping is not, and nothing marks where one call's payload
+     * ended.
+     *
+     * Frame the messages yourself if you need them: write a length prefix ahead
+     * of each payload and accumulate `recv` results until the declared length is
+     * complete. `testbed/src/framing.rs` in this repository is a worked example.
+     */
 open func sendReliable(data: Data)async throws   {
     return
         try  await uniffiRustCallAsync(
@@ -2442,6 +2461,25 @@ open func sendReliable(data: Data)async throws   {
         )
 }
     
+    /**
+     * Queue `data` for best-effort delivery on this stream — no retransmit, no
+     * ordering guarantee, and no delivery guarantee.
+     *
+     * # ⚠ This is a byte stream, not a message channel
+     *
+     * **Message boundaries are not preserved**, exactly as in
+     * [`send_reliable`](Self::send_reliable): the pump splits `data` into
+     * chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes
+     * and sends each on its own. Here that is sharper than on the reliable
+     * path, because the chunks are independent datagrams: any subset of them
+     * can be lost or arrive out of order, so a payload larger than one chunk
+     * can reach the peer with a hole in the middle and no signal that it did.
+     *
+     * Keep unreliable payloads within one chunk, or carry your own length
+     * prefix and sequence number and drop incomplete messages —
+     * `testbed/src/framing.rs` in this repository is a worked example of the
+     * framing half.
+     */
 open func sendUnreliable(data: Data)async throws   {
     return
         try  await uniffiRustCallAsync(
@@ -2594,6 +2632,21 @@ public protocol PhantomUdpListenerProtocol: AnyObject, Sendable {
      * time) — useful when the caller passed `"host:0"`.
      */
     func localAddr()  -> String
+    
+    /**
+     * Flat snapshot of the listener's aggregated connection metrics (all
+     * accepted sessions share this counter set). Lock-free read; available
+     * with or without `telemetry-otel`.
+     *
+     * Identical in shape and meaning to
+     * [`PhantomListener::metrics_snapshot`](crate::api::listener::PhantomListener::metrics_snapshot),
+     * so an embedder can swap the TCP listener for this one without touching its
+     * monitoring code. It is the only way to read handshake counters,
+     * `replay_rejected_total` and `aead_failure_total` while no session is in
+     * hand — reaching them through an accepted session's snapshot requires a
+     * session, and a server that is being probed but not connected to has none.
+     */
+    func metricsSnapshot()  -> MetricsSnapshotFfi
     
     /**
      * Enable or disable 0-RTT early-data acceptance (default: enabled). When
@@ -2811,6 +2864,27 @@ open func isShuttingDown() -> Bool  {
 open func localAddr() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Flat snapshot of the listener's aggregated connection metrics (all
+     * accepted sessions share this counter set). Lock-free read; available
+     * with or without `telemetry-otel`.
+     *
+     * Identical in shape and meaning to
+     * [`PhantomListener::metrics_snapshot`](crate::api::listener::PhantomListener::metrics_snapshot),
+     * so an embedder can swap the TCP listener for this one without touching its
+     * monitoring code. It is the only way to read handshake counters,
+     * `replay_rejected_total` and `aead_failure_total` while no session is in
+     * hand — reaching them through an accepted session's snapshot requires a
+     * session, and a server that is being probed but not connected to has none.
+     */
+open func metricsSnapshot() -> MetricsSnapshotFfi  {
+    return try!  FfiConverterTypeMetricsSnapshotFfi_lift(try! rustCall() {
+    uniffi_phantom_protocol_fn_method_phantomudplistener_metrics_snapshot(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -3385,6 +3459,12 @@ public func FfiConverterTypeTrafficShapingConfig_lower(_ value: TrafficShapingCo
  *
  * The session is usable from the moment it's created — sends are queued
  * until the handshake completes.
+ *
+ * The discriminants are not contiguous: `1..=3` are retired numbers that once
+ * stood for a staged classical-then-PQC upgrade the protocol never shipped —
+ * the hybrid handshake is a single flight, so there is no intermediate
+ * classical-only state to be in. They are left as holes rather than reused so a
+ * number captured in an old log cannot come back meaning something else.
  */
 
 public enum ConnectionState: UInt8, Equatable, Hashable {
@@ -3393,18 +3473,6 @@ public enum ConnectionState: UInt8, Equatable, Hashable {
      * Connection initiated, handshake pending
      */
     case connecting = 0
-    /**
-     * Classical (X25519) channel established — data flows
-     */
-    case classicalReady = 1
-    /**
-     * PQC upgrade in progress
-     */
-    case pqcUpgrading = 2
-    /**
-     * Full hybrid PQC protection active
-     */
-    case pqcReady = 3
     /**
      * Fully connected and operational
      */
@@ -3451,21 +3519,15 @@ public struct FfiConverterTypeConnectionState: FfiConverterRustBuffer {
         
         case 1: return .connecting
         
-        case 2: return .classicalReady
+        case 2: return .connected
         
-        case 3: return .pqcUpgrading
+        case 3: return .failed
         
-        case 4: return .pqcReady
+        case 4: return .closed
         
-        case 5: return .connected
+        case 5: return .migrating
         
-        case 6: return .failed
-        
-        case 7: return .closed
-        
-        case 8: return .migrating
-        
-        case 9: return .dead
+        case 6: return .dead
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -3479,36 +3541,24 @@ public struct FfiConverterTypeConnectionState: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case .classicalReady:
+        case .connected:
             writeInt(&buf, Int32(2))
         
         
-        case .pqcUpgrading:
+        case .failed:
             writeInt(&buf, Int32(3))
         
         
-        case .pqcReady:
+        case .closed:
             writeInt(&buf, Int32(4))
         
         
-        case .connected:
+        case .migrating:
             writeInt(&buf, Int32(5))
         
         
-        case .failed:
-            writeInt(&buf, Int32(6))
-        
-        
-        case .closed:
-            writeInt(&buf, Int32(7))
-        
-        
-        case .migrating:
-            writeInt(&buf, Int32(8))
-        
-        
         case .dead:
-            writeInt(&buf, Int32(9))
+            writeInt(&buf, Int32(6))
         
         }
     }
@@ -3916,30 +3966,6 @@ public func FfiConverterTypePaddingPolicy_lower(_ value: PaddingPolicy) -> RustB
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionUInt8: FfiConverterRustBuffer {
-    typealias SwiftType = UInt8?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterUInt8.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterUInt8.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionBool: FfiConverterRustBuffer {
     typealias SwiftType = Bool?
 
@@ -4139,6 +4165,38 @@ public func verifyingKeyFromSigningKey(seed: Data)throws  -> Data  {
 /**
  * Connect to a server over **TCP**, pinning its identity to `pinned_key`.
  *
+ * # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+ *
+ * This returns as soon as the TCP socket is open. The handshake, and with it
+ * the check that the server actually holds `pinned_key`, runs on the background
+ * task. Until it completes the session reports
+ * [`ConnectionState::Connecting`], and [`send`](PhantomSession::send) accepts
+ * bytes into the pending queue rather than refusing them. A connection to an
+ * impostor therefore looks exactly like a connection to the right server, right
+ * up to the moment the caller asks.
+ *
+ * **Call [`await_ready`](PhantomSession::await_ready) before treating the
+ * session as authenticated.** It resolves the handshake outcome and surfaces
+ * [`CoreError::ServerIdentityMismatch`] on a wrong pin; the same error is also
+ * available later from [`last_error`](PhantomSession::last_error) and is what
+ * `send`/`recv` return once the state is terminal.
+ *
+ * ```rust,no_run
+ * # #[tokio::main]
+ * # async fn main() {
+ * # let pinned_key: Vec<u8> = vec![];
+ * let session = phantom_protocol::connect_pinned("host".into(), 4242, pinned_key)
+ * .await
+ * .expect("socket opened — says nothing about the peer's identity");
+ *
+ * // The pin is verified here, not above.
+ * if let Err(e) = session.await_ready().await {
+ * eprintln!("not the pinned server: {e}");
+ * return;
+ * }
+ * # }
+ * ```
+ *
  * Opens a `TcpSessionTransport`, parses the pinned [`HybridVerifyingKey`]
  * from raw bytes (Security Invariant 1 — mandatory), and starts the
  * background handshake + data pump.
@@ -4184,6 +4242,19 @@ public func connectPinned(host: String, port: UInt16, pinnedKey: Data)async thro
 /**
  * Connect to a pinned server over the production **PhantomUDP** transport — the
  * reliable-UDP, migration-capable analogue of [`connect_pinned`].
+ *
+ * # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+ *
+ * This returns as soon as the UDP socket is bound — which, on an unconnected
+ * datagram socket, involves no exchange with the peer at all. The handshake and
+ * the check that the server holds `pinned_key` run on the background task,
+ * while the session reports [`ConnectionState::Connecting`] and
+ * [`send`](PhantomSession::send) queues bytes rather than refusing them.
+ *
+ * **Call [`await_ready`](PhantomSession::await_ready) before treating the
+ * session as authenticated**; it surfaces
+ * [`CoreError::ServerIdentityMismatch`] on a wrong pin. The example below does
+ * it immediately.
  *
  * Unlike the TCP [`connect_pinned`], a session built here runs over
  * [`UdpClientTransport`](crate::api::udp_transport::UdpClientTransport), so
@@ -4238,6 +4309,27 @@ public func connectPinnedUdp(host: String, port: UInt16, pinnedKey: Data)async t
 /**
  * Like [`connect_pinned_udp`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
  * liveness settings. FFI-exported.
+ *
+ * # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+ *
+ * Same contract as [`connect_pinned_udp`]: binding a datagram socket says
+ * nothing about who is on the other end, and the pinned-key check runs on the
+ * background task.
+ *
+ * ```rust,no_run
+ * # #[tokio::main]
+ * # async fn main() {
+ * # let pinned_key: Vec<u8> = vec![];
+ * let config = phantom_protocol::config::PhantomConfig::mobile();
+ * let session =
+ * phantom_protocol::connect_pinned_udp_with_config("host".into(), 4242, pinned_key, config)
+ * .await
+ * .expect("socket bound — says nothing about the peer's identity");
+ *
+ * // The pin is verified here, not above.
+ * session.await_ready().await.expect("not the pinned server");
+ * # }
+ * ```
  */
 public func connectPinnedUdpWithConfig(host: String, port: UInt16, pinnedKey: Data, config: PhantomConfig)async throws  -> PhantomSession  {
     return
@@ -4256,6 +4348,34 @@ public func connectPinnedUdpWithConfig(host: String, port: UInt16, pinnedKey: Da
 /**
  * 0-RTT resumption analogue of [`connect_pinned_udp`] — the UDP sibling of
  * [`connect_pinned_with_resumption`].
+ *
+ * # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+ *
+ * Same contract as [`connect_pinned_udp`], and it matters more here: the
+ * early-data blob is already on the wire when this returns, so `Ok` is not even
+ * evidence that the ticket was usable.
+ * [`await_ready`](PhantomSession::await_ready) resolves the pin, and only then
+ * does [`early_data_accepted`](PhantomSession::early_data_accepted) mean
+ * anything.
+ *
+ * ```rust,no_run
+ * # #[tokio::main]
+ * # async fn main() {
+ * # let pinned_key: Vec<u8> = vec![];
+ * # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+ * let session = phantom_protocol::connect_pinned_udp_with_resumption(
+ * "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
+ * )
+ * .await
+ * .expect("socket bound — says nothing about the peer's identity");
+ *
+ * // The pin is verified here, not above.
+ * session.await_ready().await.expect("not the pinned server");
+ * if session.early_data_accepted().await != Some(true) {
+ * // The server declined 0-RTT; the payload was requeued for 1-RTT.
+ * }
+ * # }
+ * ```
  *
  * `hint` is a [`ResumptionHint`] from a prior session's
  * [`PhantomSession::resumption_hint`]; both of its fields must be exactly 32 bytes
@@ -4284,6 +4404,27 @@ public func connectPinnedUdpWithResumption(host: String, port: UInt16, pinnedKey
 /**
  * Like [`connect_pinned`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
  * liveness settings to the session. FFI-exported.
+ *
+ * # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+ *
+ * Same contract as [`connect_pinned`]: the pinned-key check runs on the
+ * background task, so an impostor is indistinguishable from the real server
+ * until [`await_ready`](PhantomSession::await_ready) resolves it.
+ *
+ * ```rust,no_run
+ * # #[tokio::main]
+ * # async fn main() {
+ * # let pinned_key: Vec<u8> = vec![];
+ * let config = phantom_protocol::config::PhantomConfig::mobile();
+ * let session =
+ * phantom_protocol::connect_pinned_with_config("host".into(), 4242, pinned_key, config)
+ * .await
+ * .expect("socket opened — says nothing about the peer's identity");
+ *
+ * // The pin is verified here, not above.
+ * session.await_ready().await.expect("not the pinned server");
+ * # }
+ * ```
  */
 public func connectPinnedWithConfig(host: String, port: UInt16, pinnedKey: Data, config: PhantomConfig)async throws  -> PhantomSession  {
     return
@@ -4302,6 +4443,33 @@ public func connectPinnedWithConfig(host: String, port: UInt16, pinnedKey: Data,
 /**
  * Connect to a pinned server with a **0-RTT resumption attempt** — the
  * resumption-aware analogue of [`connect_pinned`].
+ *
+ * # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+ *
+ * Same contract as [`connect_pinned`]. It matters more here: the early-data
+ * blob is already on the wire when this returns, so `Ok` is not even evidence
+ * that the ticket was usable. [`await_ready`](PhantomSession::await_ready)
+ * resolves the pin, and only then does
+ * [`early_data_accepted`](PhantomSession::early_data_accepted) mean anything.
+ *
+ * ```rust,no_run
+ * # #[tokio::main]
+ * # async fn main() {
+ * # let pinned_key: Vec<u8> = vec![];
+ * # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+ * let session = phantom_protocol::connect_pinned_with_resumption(
+ * "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
+ * )
+ * .await
+ * .expect("socket opened — says nothing about the peer's identity");
+ *
+ * // The pin is verified here, not above.
+ * session.await_ready().await.expect("not the pinned server");
+ * if session.early_data_accepted().await != Some(true) {
+ * // The server declined 0-RTT; the payload was requeued for 1-RTT.
+ * }
+ * # }
+ * ```
  *
  * `hint` is a [`ResumptionHint`] from a prior session's
  * [`PhantomSession::resumption_hint`]; both of its fields must be
@@ -4353,22 +4521,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_func_verifying_key_from_signing_key() != 48109) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned() != 16773) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned() != 34076) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 51918) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 35741) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 19062) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 7565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 47926) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 59191) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 17324) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 48093) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 60625) {
+    if (uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 23673) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_acceptoutcome_has_early_data() != 13201) {
@@ -4413,9 +4581,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 25030) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_current_epoch() != 39888) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 34217) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4428,10 +4593,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomsession_id() != 42609) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 63798) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready() != 47934) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 25961) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_last_error() != 3339) {
@@ -4458,10 +4620,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_send() != 53770) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 44795) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_send() != 31785) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675) {
@@ -4479,10 +4638,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 18540) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 50030) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 49288) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 38734) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 21344) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 56290) {
@@ -4498,6 +4657,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr() != 6213) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_phantom_protocol_checksum_method_phantomudplistener_metrics_snapshot() != 18131) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomudplistener_set_early_data_enabled() != 49550) {

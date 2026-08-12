@@ -479,17 +479,17 @@ def _uniffi_check_contract_api_version(lib):
         raise InternalError("UniFFI contract version mismatch: try cleaning and rebuilding your project")
 
 def _uniffi_check_api_checksums(lib):
-    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 16773:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned() != 34076:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 51918:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp() != 35741:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 19062:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_config() != 7565:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 47926:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_udp_with_resumption() != 59191:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 17324:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_config() != 48093:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 60625:
+    if lib.uniffi_phantom_protocol_checksum_func_connect_pinned_with_resumption() != 23673:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_func_generate_signing_key() != 61598:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -531,8 +531,6 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 25030:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_current_epoch() != 39888:
-        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 34217:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted() != 8121:
@@ -541,9 +539,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_id() != 42609:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 63798:
-        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready() != 47934:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 25961:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_last_error() != 3339:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -561,9 +557,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 53770:
-        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold() != 44795:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 31785:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -575,9 +569,9 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 18540:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 50030:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 49288:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 38734:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 21344:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 56290:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -594,6 +588,8 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_is_shutting_down() != 49450:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr() != 6213:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_metrics_snapshot() != 18131:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomudplistener_set_early_data_enabled() != 49550:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1053,10 +1049,6 @@ _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_connection_state.arg
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_connection_state.restype = _UniffiRustBuffer
-_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_current_epoch.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_current_epoch.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_disconnect.argtypes = (
     ctypes.c_uint64,
 )
@@ -1079,11 +1071,6 @@ _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready.argtyp
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready.restype = ctypes.c_int8
-_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready.restype = ctypes.c_int8
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_last_error.argtypes = (
     ctypes.c_uint64,
 )
@@ -1125,11 +1112,6 @@ _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_send.argtypes = (
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_send.restype = ctypes.c_uint64
-_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold.argtypes = (
-    ctypes.c_uint64,
-    ctypes.c_uint64,
-)
-_UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold.restype = ctypes.c_uint64
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_traffic_shaping.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1201,6 +1183,11 @@ _UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr.argty
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_metrics_snapshot.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_metrics_snapshot.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_set_early_data_enabled.argtypes = (
     ctypes.c_uint64,
     ctypes.c_int8,
@@ -1298,9 +1285,6 @@ _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_await_ready.re
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_current_epoch.argtypes = (
-)
-_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_current_epoch.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect.restype = ctypes.c_uint16
@@ -1316,9 +1300,6 @@ _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_id.restype = c
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready.argtypes = (
-)
-_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_is_pqc_ready.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_last_error.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_last_error.restype = ctypes.c_uint16
@@ -1346,9 +1327,6 @@ _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hin
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_send.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_send.restype = ctypes.c_uint16
-_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold.argtypes = (
-)
-_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_rekey_threshold.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping.restype = ctypes.c_uint16
@@ -1394,6 +1372,9 @@ _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_is_shuttin
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_local_addr.restype = ctypes.c_uint16
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_metrics_snapshot.argtypes = (
+)
+_UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_metrics_snapshot.restype = ctypes.c_uint16
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_set_early_data_enabled.argtypes = (
 )
 _UniffiLib.uniffi_phantom_protocol_checksum_method_phantomudplistener_set_early_data_enabled.restype = ctypes.c_uint16
@@ -1936,26 +1917,17 @@ class ConnectionState(enum.Enum):
 
     The session is usable from the moment it's created — sends are queued
     until the handshake completes.
+
+    The discriminants are not contiguous: `1..=3` are retired numbers that once
+    stood for a staged classical-then-PQC upgrade the protocol never shipped —
+    the hybrid handshake is a single flight, so there is no intermediate
+    classical-only state to be in. They are left as holes rather than reused so a
+    number captured in an old log cannot come back meaning something else.
 """
     
     CONNECTING = 0
     """
     Connection initiated, handshake pending
-"""
-    
-    CLASSICAL_READY = 1
-    """
-    Classical (X25519) channel established — data flows
-"""
-    
-    PQC_UPGRADING = 2
-    """
-    PQC upgrade in progress
-"""
-    
-    PQC_READY = 3
-    """
-    Full hybrid PQC protection active
 """
     
     CONNECTED = 4
@@ -1995,32 +1967,20 @@ class _UniffiFfiConverterTypeConnectionState(_UniffiConverterRustBuffer):
         if variant == 1:
             return ConnectionState.CONNECTING
         if variant == 2:
-            return ConnectionState.CLASSICAL_READY
-        if variant == 3:
-            return ConnectionState.PQC_UPGRADING
-        if variant == 4:
-            return ConnectionState.PQC_READY
-        if variant == 5:
             return ConnectionState.CONNECTED
-        if variant == 6:
+        if variant == 3:
             return ConnectionState.FAILED
-        if variant == 7:
+        if variant == 4:
             return ConnectionState.CLOSED
-        if variant == 8:
+        if variant == 5:
             return ConnectionState.MIGRATING
-        if variant == 9:
+        if variant == 6:
             return ConnectionState.DEAD
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
     def check_lower(value):
         if value == ConnectionState.CONNECTING:
-            return
-        if value == ConnectionState.CLASSICAL_READY:
-            return
-        if value == ConnectionState.PQC_UPGRADING:
-            return
-        if value == ConnectionState.PQC_READY:
             return
         if value == ConnectionState.CONNECTED:
             return
@@ -2038,22 +1998,16 @@ class _UniffiFfiConverterTypeConnectionState(_UniffiConverterRustBuffer):
     def write(value, buf):
         if value == ConnectionState.CONNECTING:
             buf.write_i32(1)
-        if value == ConnectionState.CLASSICAL_READY:
-            buf.write_i32(2)
-        if value == ConnectionState.PQC_UPGRADING:
-            buf.write_i32(3)
-        if value == ConnectionState.PQC_READY:
-            buf.write_i32(4)
         if value == ConnectionState.CONNECTED:
-            buf.write_i32(5)
+            buf.write_i32(2)
         if value == ConnectionState.FAILED:
-            buf.write_i32(6)
+            buf.write_i32(3)
         if value == ConnectionState.CLOSED:
-            buf.write_i32(7)
+            buf.write_i32(4)
         if value == ConnectionState.MIGRATING:
-            buf.write_i32(8)
+            buf.write_i32(5)
         if value == ConnectionState.DEAD:
-            buf.write_i32(9)
+            buf.write_i32(6)
 
 
 
@@ -2751,8 +2705,45 @@ class PhantomStreamProtocol(typing.Protocol):
 """
         raise NotImplementedError
     async def send_reliable(self, data: bytes) -> None:
+        """
+        Queue `data` for reliable, in-order delivery on this stream.
+
+        # ⚠ This is a byte stream, not a message channel
+
+        **Message boundaries are not preserved.** The session's data pump splits
+        `data` into chunks of
+        [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — one chunk
+        plus its packet overhead is exactly one PhantomUDP datagram — and buffers
+        each chunk as its own reliable write, so the peer's [`recv`](Self::recv)
+        yields one result *per chunk*, not one per `send_reliable`. Order is
+        guaranteed; grouping is not, and nothing marks where one call's payload
+        ended.
+
+        Frame the messages yourself if you need them: write a length prefix ahead
+        of each payload and accumulate `recv` results until the declared length is
+        complete. `testbed/src/framing.rs` in this repository is a worked example.
+"""
         raise NotImplementedError
     async def send_unreliable(self, data: bytes) -> None:
+        """
+        Queue `data` for best-effort delivery on this stream — no retransmit, no
+        ordering guarantee, and no delivery guarantee.
+
+        # ⚠ This is a byte stream, not a message channel
+
+        **Message boundaries are not preserved**, exactly as in
+        [`send_reliable`](Self::send_reliable): the pump splits `data` into
+        chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes
+        and sends each on its own. Here that is sharper than on the reliable
+        path, because the chunks are independent datagrams: any subset of them
+        can be lost or arrive out of order, so a payload larger than one chunk
+        can reach the peer with a hole in the middle and no signal that it did.
+
+        Keep unreliable payloads within one chunk, or carry your own length
+        prefix and sequence number and drop incomplete messages —
+        `testbed/src/framing.rs` in this repository is a worked example of the
+        framing half.
+"""
         raise NotImplementedError
     async def set_priority(self, priority: int) -> None:
         """
@@ -2845,6 +2836,24 @@ class PhantomStream(PhantomStreamProtocol):
             _uniffi_error_converter,
         )
     async def send_reliable(self, data: bytes) -> None:
+        """
+        Queue `data` for reliable, in-order delivery on this stream.
+
+        # ⚠ This is a byte stream, not a message channel
+
+        **Message boundaries are not preserved.** The session's data pump splits
+        `data` into chunks of
+        [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — one chunk
+        plus its packet overhead is exactly one PhantomUDP datagram — and buffers
+        each chunk as its own reliable write, so the peer's [`recv`](Self::recv)
+        yields one result *per chunk*, not one per `send_reliable`. Order is
+        guaranteed; grouping is not, and nothing marks where one call's payload
+        ended.
+
+        Frame the messages yourself if you need them: write a length prefix ahead
+        of each payload and accumulate `recv` results until the declared length is
+        complete. `testbed/src/framing.rs` in this repository is a worked example.
+"""
         
         _UniffiFfiConverterBytes.check_lower(data)
         _uniffi_lowered_args = (
@@ -2862,6 +2871,25 @@ class PhantomStream(PhantomStreamProtocol):
             _uniffi_error_converter,
         )
     async def send_unreliable(self, data: bytes) -> None:
+        """
+        Queue `data` for best-effort delivery on this stream — no retransmit, no
+        ordering guarantee, and no delivery guarantee.
+
+        # ⚠ This is a byte stream, not a message channel
+
+        **Message boundaries are not preserved**, exactly as in
+        [`send_reliable`](Self::send_reliable): the pump splits `data` into
+        chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes
+        and sends each on its own. Here that is sharper than on the reliable
+        path, because the chunks are independent datagrams: any subset of them
+        can be lost or arrive out of order, so a payload larger than one chunk
+        can reach the peer with a hole in the middle and no signal that it did.
+
+        Keep unreliable payloads within one chunk, or carry your own length
+        prefix and sequence number and drop incomplete messages —
+        `testbed/src/framing.rs` in this repository is a worked example of the
+        framing half.
+"""
         
         _UniffiFfiConverterBytes.check_lower(data)
         _uniffi_lowered_args = (
@@ -2940,44 +2968,6 @@ class _UniffiFfiConverterTypePhantomStream:
     @classmethod
     def write(cls, value: PhantomStream, buf: _UniffiRustBuffer):
         buf.write_u64(cls.lower(value))
-
-class _UniffiFfiConverterUInt8(_UniffiConverterPrimitiveInt):
-    CLASS_NAME = "u8"
-    VALUE_MIN = 0
-    VALUE_MAX = 2**8
-
-    @staticmethod
-    def read(buf):
-        return buf.read_u8()
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_u8(value)
-
-class _UniffiFfiConverterOptionalUInt8(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterUInt8.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterUInt8.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterUInt8.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
 
 class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
     @classmethod
@@ -3101,7 +3091,12 @@ class PhantomSessionProtocol(typing.Protocol):
     ```
 
     The session progresses through states:
-    `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
+    `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
+    `Connecting` (handshake rejection, a wrong pin) and `Closed` from
+    `disconnect()`. `Migrating` is entered when the path goes silent and left
+    again for `Connected` if it recovers; sends keep buffering throughout. There
+    is no intermediate classical-only state — the hybrid handshake is one flight,
+    so the session is either unkeyed or fully post-quantum keyed.
 
     # Example
 
@@ -3188,13 +3183,6 @@ class PhantomSessionProtocol(typing.Protocol):
         Get the current connection state (lock-free).
 """
         raise NotImplementedError
-    async def current_epoch(self, ) -> typing.Optional[int]:
-        """
-        Current rekey epoch of the established session (`None` while still
-        connecting). Rust-only — used by soak / integration tests to confirm
-        that automatic mid-session rekey (C1) advanced the epoch.
-"""
-        raise NotImplementedError
     async def disconnect(self, ) -> None:
         """
         Send the graceful close frame and shut the session down.
@@ -3229,11 +3217,11 @@ class PhantomSessionProtocol(typing.Protocol):
     def is_data_ready(self, ) -> bool:
         """
         Whether the session is ready for data transmission.
-"""
-        raise NotImplementedError
-    def is_pqc_ready(self, ) -> bool:
-        """
-        Whether the session has full PQC protection.
+
+        There is no separate "post-quantum ready" question to ask: the hybrid
+        KEM and the hybrid signature both belong to the one handshake flight, so
+        there is no window in which a session is up but only classically
+        protected. Data-ready implies post-quantum protected.
 """
         raise NotImplementedError
     async def last_error(self, ) -> typing.Optional[CoreError]:
@@ -3344,15 +3332,26 @@ class PhantomSessionProtocol(typing.Protocol):
         error (from the handshake or the data pump) so the caller gets the
         *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
         than the generic `"Cannot send in state Failed"` message.
-"""
-        raise NotImplementedError
-    async def set_rekey_threshold(self, n: int) -> bool:
-        """
-        Override the automatic-rekey send-invocation high-watermark on the
-        established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
-        Returns `false` if the session is still connecting. Rust-only — primarily
-        for soak/load harnesses that need to exercise mid-session rekey without
-        sending `2^32` packets.
+
+        # ⚠ This is a byte stream, not a message channel
+
+        **Message boundaries are not preserved.** The data pump splits `data`
+        into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
+        bytes — one chunk plus its packet overhead is exactly one PhantomUDP
+        datagram — and writes each chunk separately, so the peer's
+        [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
+        An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
+        nothing marks where one `send` ended and the next began.
+
+        This is silent when it bites: the first chunk of a structured message
+        usually still parses, as a truncated one, so a caller that reads a single
+        `recv` and calls it a message records a successful round trip for a
+        payload that was quietly cut.
+
+        A caller that needs messages must frame them itself — the usual shape is
+        a length prefix written ahead of each payload and a reassembler that
+        accumulates `recv` results until the declared length is complete.
+        `testbed/src/framing.rs` in this repository is a worked example.
 """
         raise NotImplementedError
     async def set_traffic_shaping(self, config: TrafficShapingConfig) -> bool:
@@ -3407,7 +3406,12 @@ class PhantomSession(PhantomSessionProtocol):
     ```
 
     The session progresses through states:
-    `Connecting → ClassicalReady → PqcUpgrading → PqcReady → Connected`
+    `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
+    `Connecting` (handshake rejection, a wrong pin) and `Closed` from
+    `disconnect()`. `Migrating` is entered when the path goes silent and left
+    again for `Connected` if it recovers; sends keep buffering throughout. There
+    is no intermediate classical-only state — the hybrid handshake is one flight,
+    so the session is either unkeyed or fully post-quantum keyed.
 
     # Example
 
@@ -3606,25 +3610,6 @@ class PhantomSession(PhantomSessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
-    async def current_epoch(self, ) -> typing.Optional[int]:
-        """
-        Current rekey epoch of the established session (`None` while still
-        connecting). Rust-only — used by soak / integration tests to confirm
-        that automatic mid-session rekey (C1) advanced the epoch.
-"""
-        _uniffi_lowered_args = (
-            self._uniffi_clone_handle(),
-        )
-        _uniffi_lift_return = _UniffiFfiConverterOptionalUInt8.lift
-        _uniffi_error_converter = None
-        return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_current_epoch(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_protocol_rust_future_poll_rust_buffer,
-            _UniffiLib.ffi_phantom_protocol_rust_future_complete_rust_buffer,
-            _UniffiLib.ffi_phantom_protocol_rust_future_free_rust_buffer,
-            _uniffi_lift_return,
-            _uniffi_error_converter,
-        )
     async def disconnect(self, ) -> None:
         """
         Send the graceful close frame and shut the session down.
@@ -3705,6 +3690,11 @@ class PhantomSession(PhantomSessionProtocol):
     def is_data_ready(self, ) -> bool:
         """
         Whether the session is ready for data transmission.
+
+        There is no separate "post-quantum ready" question to ask: the hybrid
+        KEM and the hybrid signature both belong to the one handshake flight, so
+        there is no window in which a session is up but only classically
+        protected. Data-ready implies post-quantum protected.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
@@ -3714,21 +3704,6 @@ class PhantomSession(PhantomSessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready,
-            *_uniffi_lowered_args,
-        )
-        return _uniffi_lift_return(_uniffi_ffi_result)
-    def is_pqc_ready(self, ) -> bool:
-        """
-        Whether the session has full PQC protection.
-"""
-        _uniffi_lowered_args = (
-            self._uniffi_clone_handle(),
-        )
-        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
-        _uniffi_error_converter = None
-        _uniffi_ffi_result = _uniffi_rust_call_with_error(
-            _uniffi_error_converter,
-            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -3933,6 +3908,26 @@ class PhantomSession(PhantomSessionProtocol):
         error (from the handshake or the data pump) so the caller gets the
         *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
         than the generic `"Cannot send in state Failed"` message.
+
+        # ⚠ This is a byte stream, not a message channel
+
+        **Message boundaries are not preserved.** The data pump splits `data`
+        into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
+        bytes — one chunk plus its packet overhead is exactly one PhantomUDP
+        datagram — and writes each chunk separately, so the peer's
+        [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
+        An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
+        nothing marks where one `send` ended and the next began.
+
+        This is silent when it bites: the first chunk of a structured message
+        usually still parses, as a truncated one, so a caller that reads a single
+        `recv` and calls it a message records a successful round trip for a
+        payload that was quietly cut.
+
+        A caller that needs messages must frame them itself — the usual shape is
+        a length prefix written ahead of each payload and a reassembler that
+        accumulates `recv` results until the declared length is complete.
+        `testbed/src/framing.rs` in this repository is a worked example.
 """
         
         _UniffiFfiConverterBytes.check_lower(data)
@@ -3947,30 +3942,6 @@ class PhantomSession(PhantomSessionProtocol):
             _UniffiLib.ffi_phantom_protocol_rust_future_poll_void,
             _UniffiLib.ffi_phantom_protocol_rust_future_complete_void,
             _UniffiLib.ffi_phantom_protocol_rust_future_free_void,
-            _uniffi_lift_return,
-            _uniffi_error_converter,
-        )
-    async def set_rekey_threshold(self, n: int) -> bool:
-        """
-        Override the automatic-rekey send-invocation high-watermark on the
-        established session (default `REKEY_SOFT_LIMIT`, currently `2^32`).
-        Returns `false` if the session is still connecting. Rust-only — primarily
-        for soak/load harnesses that need to exercise mid-session rekey without
-        sending `2^32` packets.
-"""
-        
-        _UniffiFfiConverterUInt64.check_lower(n)
-        _uniffi_lowered_args = (
-            self._uniffi_clone_handle(),
-            _UniffiFfiConverterUInt64.lower(n),
-        )
-        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
-        _uniffi_error_converter = None
-        return await _uniffi_rust_call_async(
-            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold(*_uniffi_lowered_args),
-            _UniffiLib.ffi_phantom_protocol_rust_future_poll_i8,
-            _UniffiLib.ffi_phantom_protocol_rust_future_complete_i8,
-            _UniffiLib.ffi_phantom_protocol_rust_future_free_i8,
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
@@ -4693,6 +4664,21 @@ class PhantomUdpListenerProtocol(typing.Protocol):
         time) — useful when the caller passed `"host:0"`.
 """
         raise NotImplementedError
+    def metrics_snapshot(self, ) -> MetricsSnapshotFfi:
+        """
+        Flat snapshot of the listener's aggregated connection metrics (all
+        accepted sessions share this counter set). Lock-free read; available
+        with or without `telemetry-otel`.
+
+        Identical in shape and meaning to
+        [`PhantomListener::metrics_snapshot`](crate::api::listener::PhantomListener::metrics_snapshot),
+        so an embedder can swap the TCP listener for this one without touching its
+        monitoring code. It is the only way to read handshake counters,
+        `replay_rejected_total` and `aead_failure_total` while no session is in
+        hand — reaching them through an accepted session's snapshot requires a
+        session, and a server that is being probed but not connected to has none.
+"""
+        raise NotImplementedError
     def set_early_data_enabled(self, enabled: bool) -> None:
         """
         Enable or disable 0-RTT early-data acceptance (default: enabled). When
@@ -4905,6 +4891,31 @@ class PhantomUdpListener(PhantomUdpListenerProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def metrics_snapshot(self, ) -> MetricsSnapshotFfi:
+        """
+        Flat snapshot of the listener's aggregated connection metrics (all
+        accepted sessions share this counter set). Lock-free read; available
+        with or without `telemetry-otel`.
+
+        Identical in shape and meaning to
+        [`PhantomListener::metrics_snapshot`](crate::api::listener::PhantomListener::metrics_snapshot),
+        so an embedder can swap the TCP listener for this one without touching its
+        monitoring code. It is the only way to read handshake counters,
+        `replay_rejected_total` and `aead_failure_total` while no session is in
+        hand — reaching them through an accepted session's snapshot requires a
+        session, and a server that is being probed but not connected to has none.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeMetricsSnapshotFfi.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_phantom_protocol_fn_method_phantomudplistener_metrics_snapshot,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def set_early_data_enabled(self, enabled: bool) -> None:
         """
         Enable or disable 0-RTT early-data acceptance (default: enabled). When
@@ -5001,9 +5012,54 @@ class _UniffiFfiConverterUInt16(_UniffiConverterPrimitiveInt):
     @staticmethod
     def write(value, buf):
         buf.write_u16(value)
+
+class _UniffiFfiConverterUInt8(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u8"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**8
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u8()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u8(value)
 async def connect_pinned(host: str,port: int,pinned_key: bytes) -> PhantomSession:
     """
     Connect to a server over **TCP**, pinning its identity to `pinned_key`.
+
+    # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+
+    This returns as soon as the TCP socket is open. The handshake, and with it
+    the check that the server actually holds `pinned_key`, runs on the background
+    task. Until it completes the session reports
+    [`ConnectionState::Connecting`], and [`send`](PhantomSession::send) accepts
+    bytes into the pending queue rather than refusing them. A connection to an
+    impostor therefore looks exactly like a connection to the right server, right
+    up to the moment the caller asks.
+
+    **Call [`await_ready`](PhantomSession::await_ready) before treating the
+    session as authenticated.** It resolves the handshake outcome and surfaces
+    [`CoreError::ServerIdentityMismatch`] on a wrong pin; the same error is also
+    available later from [`last_error`](PhantomSession::last_error) and is what
+    `send`/`recv` return once the state is terminal.
+
+    ```rust,no_run
+    # #[tokio::main]
+    # async fn main() {
+    # let pinned_key: Vec<u8> = vec![];
+    let session = phantom_protocol::connect_pinned("host".into(), 4242, pinned_key)
+    .await
+    .expect("socket opened — says nothing about the peer's identity");
+
+    // The pin is verified here, not above.
+    if let Err(e) = session.await_ready().await {
+    eprintln!("not the pinned server: {e}");
+    return;
+    }
+    # }
+    ```
 
     Opens a `TcpSessionTransport`, parses the pinned [`HybridVerifyingKey`]
     from raw bytes (Security Invariant 1 — mandatory), and starts the
@@ -5058,6 +5114,19 @@ async def connect_pinned_udp(host: str,port: int,pinned_key: bytes) -> PhantomSe
     """
     Connect to a pinned server over the production **PhantomUDP** transport — the
     reliable-UDP, migration-capable analogue of [`connect_pinned`].
+
+    # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+
+    This returns as soon as the UDP socket is bound — which, on an unconnected
+    datagram socket, involves no exchange with the peer at all. The handshake and
+    the check that the server holds `pinned_key` run on the background task,
+    while the session reports [`ConnectionState::Connecting`] and
+    [`send`](PhantomSession::send) queues bytes rather than refusing them.
+
+    **Call [`await_ready`](PhantomSession::await_ready) before treating the
+    session as authenticated**; it surfaces
+    [`CoreError::ServerIdentityMismatch`] on a wrong pin. The example below does
+    it immediately.
 
     Unlike the TCP [`connect_pinned`], a session built here runs over
     [`UdpClientTransport`](crate::api::udp_transport::UdpClientTransport), so
@@ -5120,6 +5189,27 @@ async def connect_pinned_udp_with_config(host: str,port: int,pinned_key: bytes,c
     """
     Like [`connect_pinned_udp`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
     liveness settings. FFI-exported.
+
+    # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+
+    Same contract as [`connect_pinned_udp`]: binding a datagram socket says
+    nothing about who is on the other end, and the pinned-key check runs on the
+    background task.
+
+    ```rust,no_run
+    # #[tokio::main]
+    # async fn main() {
+    # let pinned_key: Vec<u8> = vec![];
+    let config = phantom_protocol::config::PhantomConfig::mobile();
+    let session =
+    phantom_protocol::connect_pinned_udp_with_config("host".into(), 4242, pinned_key, config)
+    .await
+    .expect("socket bound — says nothing about the peer's identity");
+
+    // The pin is verified here, not above.
+    session.await_ready().await.expect("not the pinned server");
+    # }
+    ```
 """
     
     _UniffiFfiConverterString.check_lower(host)
@@ -5149,6 +5239,34 @@ async def connect_pinned_udp_with_resumption(host: str,port: int,pinned_key: byt
     """
     0-RTT resumption analogue of [`connect_pinned_udp`] — the UDP sibling of
     [`connect_pinned_with_resumption`].
+
+    # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+
+    Same contract as [`connect_pinned_udp`], and it matters more here: the
+    early-data blob is already on the wire when this returns, so `Ok` is not even
+    evidence that the ticket was usable.
+    [`await_ready`](PhantomSession::await_ready) resolves the pin, and only then
+    does [`early_data_accepted`](PhantomSession::early_data_accepted) mean
+    anything.
+
+    ```rust,no_run
+    # #[tokio::main]
+    # async fn main() {
+    # let pinned_key: Vec<u8> = vec![];
+    # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+    let session = phantom_protocol::connect_pinned_udp_with_resumption(
+    "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
+    )
+    .await
+    .expect("socket bound — says nothing about the peer's identity");
+
+    // The pin is verified here, not above.
+    session.await_ready().await.expect("not the pinned server");
+    if session.early_data_accepted().await != Some(true) {
+    // The server declined 0-RTT; the payload was requeued for 1-RTT.
+    }
+    # }
+    ```
 
     `hint` is a [`ResumptionHint`] from a prior session's
     [`PhantomSession::resumption_hint`]; both of its fields must be exactly 32 bytes
@@ -5191,6 +5309,27 @@ async def connect_pinned_with_config(host: str,port: int,pinned_key: bytes,confi
     """
     Like [`connect_pinned`] but also applies [`PhantomConfig`](crate::config::PhantomConfig)
     liveness settings to the session. FFI-exported.
+
+    # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+
+    Same contract as [`connect_pinned`]: the pinned-key check runs on the
+    background task, so an impostor is indistinguishable from the real server
+    until [`await_ready`](PhantomSession::await_ready) resolves it.
+
+    ```rust,no_run
+    # #[tokio::main]
+    # async fn main() {
+    # let pinned_key: Vec<u8> = vec![];
+    let config = phantom_protocol::config::PhantomConfig::mobile();
+    let session =
+    phantom_protocol::connect_pinned_with_config("host".into(), 4242, pinned_key, config)
+    .await
+    .expect("socket opened — says nothing about the peer's identity");
+
+    // The pin is verified here, not above.
+    session.await_ready().await.expect("not the pinned server");
+    # }
+    ```
 """
     
     _UniffiFfiConverterString.check_lower(host)
@@ -5220,6 +5359,33 @@ async def connect_pinned_with_resumption(host: str,port: int,pinned_key: bytes,h
     """
     Connect to a pinned server with a **0-RTT resumption attempt** — the
     resumption-aware analogue of [`connect_pinned`].
+
+    # ⚠ Returns before the handshake — `Ok` here does not mean the pin matched
+
+    Same contract as [`connect_pinned`]. It matters more here: the early-data
+    blob is already on the wire when this returns, so `Ok` is not even evidence
+    that the ticket was usable. [`await_ready`](PhantomSession::await_ready)
+    resolves the pin, and only then does
+    [`early_data_accepted`](PhantomSession::early_data_accepted) mean anything.
+
+    ```rust,no_run
+    # #[tokio::main]
+    # async fn main() {
+    # let pinned_key: Vec<u8> = vec![];
+    # let hint: phantom_protocol::api::session::ResumptionHint = unimplemented!();
+    let session = phantom_protocol::connect_pinned_with_resumption(
+    "host".into(), 4242, pinned_key, hint, b"GET /".to_vec(),
+    )
+    .await
+    .expect("socket opened — says nothing about the peer's identity");
+
+    // The pin is verified here, not above.
+    session.await_ready().await.expect("not the pinned server");
+    if session.early_data_accepted().await != Some(true) {
+    // The server declined 0-RTT; the payload was requeued for 1-RTT.
+    }
+    # }
+    ```
 
     `hint` is a [`ResumptionHint`] from a prior session's
     [`PhantomSession::resumption_hint`]; both of its fields must be

@@ -489,6 +489,14 @@ int8_t uniffi_phantom_protocol_fn_method_phantomudplistener_is_shutting_down(
     PhantomRustCallStatus   *call_status);
 
 /* local_addr() -> string (sync; RustBuffer carries UTF-8). Resolved bind address. */
+/* metrics_snapshot() -> MetricsSnapshotFfi (sync). The same aggregate the
+ * TCP listener reports, for the production UDP transport: this listener owns
+ * the Observability instance its accepted sessions share, so the figure is
+ * readable with no session currently accepted. */
+PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomudplistener_metrics_snapshot(
+    void                    *ptr,
+    PhantomRustCallStatus   *call_status);
+
 PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomudplistener_local_addr(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
@@ -547,11 +555,6 @@ PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomsession_connection_st
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
-/* current_epoch() -> async Option<u8>. Some(epoch) once established;
- * advances when automatic mid-session rekey bumps the epoch. */
-uint64_t uniffi_phantom_protocol_fn_method_phantomsession_current_epoch(
-    void                    *ptr);
-
 /* early_data_accepted() -> async Option<bool> (rust_buffer result).
  * `None` — still handshaking, the handshake failed, or no early-data was
  * sent on this connect. `Some(true)` — the server consumed the 0-RTT blob;
@@ -573,12 +576,6 @@ PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomsession_id(
 
 /* is_data_ready() -> bool (sync). */
 int8_t uniffi_phantom_protocol_fn_method_phantomsession_is_data_ready(
-    void                    *ptr,
-    PhantomRustCallStatus   *call_status);
-
-/* is_pqc_ready() -> bool (sync). True once ML-KEM-768 +
- * ML-DSA-65 sides of the hybrid handshake have completed. */
-int8_t uniffi_phantom_protocol_fn_method_phantomsession_is_pqc_ready(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
 
@@ -641,13 +638,6 @@ uint64_t uniffi_phantom_protocol_fn_method_phantomsession_send(
 PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomsession_metrics_snapshot(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);
-
-/* set_rekey_threshold(threshold: u64) -> async bool. Lowers the
- * per-direction AEAD-invocation count that triggers automatic rekey;
- * returns false if the session is not yet established. */
-uint64_t uniffi_phantom_protocol_fn_method_phantomsession_set_rekey_threshold(
-    void                    *ptr,
-    uint64_t                 threshold);
 
 /* set_traffic_shaping(config: TrafficShapingConfig) -> async bool. Applies an
  * anti-fingerprint traffic-shaping config (WIRE v6): size padding + timing jitter
