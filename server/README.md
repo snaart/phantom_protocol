@@ -45,6 +45,7 @@ both are set; the env var is the fallback (clap default).
 | `--otel-trace-sample-ratio`| `OTEL_TRACES_SAMPLER_ARG`      | `1.0` (sample everything)         | Head-sampling ratio for **root** spans, installed as `ParentBased(TraceIdRatioBased(ratio))`. Either form works on its own — no `OTEL_TRACES_SAMPLER` needed. Values outside `0.0..=1.0` are clamped. |
 | `--max-sessions`           | `PHANTOM_MAX_SESSIONS`         | `1024`                            | Global concurrent-session cap (backpressure, not drop); `0` = unbounded. |
 | `--max-sessions-per-ip`    | `PHANTOM_MAX_SESSIONS_PER_IP`  | `64`                              | Per-source-IP concurrent-session cap; `0` disables it.               |
+| `--max-recv-memory-mib`    | `PHANTOM_MAX_RECV_MEMORY_MIB`  | `0` (off)                         | Receive-memory budget in MiB. Lowers the session cap to what it holds (108 MiB/session); refuses to start below one session. |
 | `--log-json`               | `PHANTOM_LOG_JSON`             | `false` (pretty)                  | Emit structured JSON logs.                                           |
 | `--log-filter`             | `RUST_LOG`                     | `info,phantom_protocol=debug`         | `tracing-subscriber` `EnvFilter` directive.                          |
 

@@ -24,6 +24,9 @@
 #![allow(clippy::disallowed_methods)]
 
 use bytes::Bytes;
+use phantom_protocol::api::session::{
+    MAX_STREAMS, RECV_DELIVERY_HARD_CAP, SESSION_RECV_MEMORY_COMMITMENT,
+};
 use phantom_protocol::crypto::adaptive_crypto::{CipherSuite, CryptoSession, AEAD_OVERHEAD};
 use phantom_protocol::crypto::hybrid_sign::{HybridSigningKey, HybridVerifyingKey};
 use phantom_protocol::transport::handshake::{
@@ -34,10 +37,14 @@ use phantom_protocol::transport::session::{
     CryptoState, Session, MAX_REKEY_CATCHUP, REBIND_VALIDATION_PATH_ID,
 };
 use phantom_protocol::transport::shaping::{self, PaddingPolicy, MAX_SHAPED_WIRE};
-use phantom_protocol::transport::stream::{SendBlocked, Stream, INITIAL_STREAM_WINDOW};
+use phantom_protocol::transport::stream::{
+    SendBlocked, SharedRecvTuning, Stream, INITIAL_STREAM_WINDOW, MAX_RECV_REORDER,
+    MAX_RECV_WINDOW, REORDER_ENTRY_OVERHEAD_BYTES, SESSION_RECV_WINDOW_GROWTH_BUDGET,
+};
 use phantom_protocol::transport::types::{
     PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -2430,5 +2437,122 @@ async fn client_server_migration_candidate_is_anti_amp_capped_and_never_the_send
             .await
             .is_err(),
         "an unvalidated candidate must never receive app data — it is not the c2s send target"
+    );
+}
+
+/// Receive-side memory amplification by an authenticated peer (threat-model §5 §D).
+///
+/// A peer chooses how many streams to open, how much it sends and how long it leaves a
+/// reassembly hole open, so every receive-side buffer is a commitment this side makes on
+/// the peer's word. The advertised receive window is the head of that chain — it sizes
+/// both what one stream may hold unconsumed and the reorder budget that tracks it — which
+/// is why window growth is drawn from **one allowance per session** rather than granted
+/// per stream: a per-stream ceiling multiplies by `MAX_STREAMS`, a session-wide one does
+/// not.
+///
+/// The bound is per **session**, deliberately (a process-wide pool would let one peer's
+/// growth decide another peer's window). What this pins is that the per-session bound
+/// really is per-session — N sessions of M streams hold no more than N budgets between
+/// them — and that the arithmetic published in `SESSION_RECV_MEMORY_COMMITMENT` still
+/// covers what the constants allow.
+#[tokio::test]
+async fn recv_window_growth_is_bounded_per_session_not_per_stream() {
+    tokio::time::pause();
+    const SESSIONS: usize = 3;
+    const STREAMS_PER_SESSION: usize = 32;
+
+    // Every stream of every session consumes far more than the whole budget is worth, so
+    // growth stops because the session ran out of allowance, not because an application
+    // stopped reading.
+    let mut per_session_growth = Vec::new();
+    for i in 0..SESSIONS {
+        let (session, _peer) = make_session_pair([0x40 + i as u8; 32]);
+        let streams: Vec<_> = (0..STREAMS_PER_SESSION)
+            .map(|_| session.open_stream())
+            .collect();
+        for s in &streams {
+            s.record_app_consumed(1); // open each measurement interval
+        }
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            for s in &streams {
+                s.record_app_consumed(MAX_RECV_WINDOW);
+            }
+        }
+        per_session_growth.push(
+            streams
+                .iter()
+                .map(|s| u64::from(s.advertised_recv_window() - INITIAL_STREAM_WINDOW))
+                .sum::<u64>(),
+        );
+    }
+
+    for (i, growth) in per_session_growth.iter().enumerate() {
+        assert!(
+            *growth <= u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+            "session {i}'s {STREAMS_PER_SESSION} streams grew by {growth} B against a \
+             {SESSION_RECV_WINDOW_GROWTH_BUDGET} B session budget — the budget is being \
+             handed out per stream, so the commitment scales with stream count"
+        );
+    }
+    let total: u64 = per_session_growth.iter().sum();
+    assert!(
+        total <= SESSIONS as u64 * u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+        "{SESSIONS} sessions × {STREAMS_PER_SESSION} streams grew by {total} B; the \
+         documented bound is one budget per session"
+    );
+
+    // Positive control: the assertions above are not vacuous. The naive removal of the
+    // mechanism is one budget per stream — exactly what a stream built without a shared
+    // handle gets — and under it the same streams blow past the bound.
+    let mut unshared_total = 0u64;
+    for _ in 0..SESSIONS {
+        let streams: Vec<Stream> = (0..STREAMS_PER_SESSION)
+            .map(|id| Stream::with_recv_tuning(id as u16, Arc::new(SharedRecvTuning::default())))
+            .collect();
+        for s in &streams {
+            s.record_app_consumed(1);
+        }
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            for s in &streams {
+                s.record_app_consumed(MAX_RECV_WINDOW);
+            }
+        }
+        unshared_total += streams
+            .iter()
+            .map(|s| u64::from(s.advertised_recv_window() - INITIAL_STREAM_WINDOW))
+            .sum::<u64>();
+    }
+    assert!(
+        unshared_total > SESSIONS as u64 * u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+        "this test no longer exercises the budget: without it these streams took only \
+         {unshared_total} B, which one budget per session already covers"
+    );
+}
+
+/// The published per-session receive-memory commitment has to keep covering what the
+/// constants actually permit, or the number an operator sizes a host with is fiction.
+/// Recomputed here from the constants themselves so that raising any one of them — the
+/// window ceiling, the growth budget, the stream cap, the reorder entry cap — fails here
+/// rather than silently invalidating `docs/operations/deployment.md`.
+#[test]
+fn the_published_session_recv_commitment_covers_what_the_constants_permit() {
+    // Reorder payload: every stream's budget tracks its own window plus one initial
+    // window of headroom, and the windows themselves are one initial window each plus,
+    // between them, one growth budget.
+    let windows = MAX_STREAMS as u64 * u64::from(INITIAL_STREAM_WINDOW)
+        + u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET);
+    let reorder_payload = windows + MAX_STREAMS as u64 * u64::from(INITIAL_STREAM_WINDOW);
+    // Reorder structure: the byte budget counts payload only, so a peer sending tiny
+    // segments above a hole it never fills is bounded by the entry cap alone.
+    let reorder_structure =
+        MAX_STREAMS as u64 * MAX_RECV_REORDER as u64 * REORDER_ENTRY_OVERHEAD_BYTES as u64;
+    let worst_case = reorder_payload + reorder_structure + RECV_DELIVERY_HARD_CAP;
+
+    assert_eq!(
+        SESSION_RECV_MEMORY_COMMITMENT, worst_case,
+        "the published commitment ({SESSION_RECV_MEMORY_COMMITMENT} B) no longer matches \
+         what the constants permit ({worst_case} B)"
     );
 }

@@ -21,7 +21,7 @@ use crate::transport::{
     path::{PathRegistry, PathStateKind, PATH_CHALLENGE_LEN},
     scheduler::Scheduler,
     shaping::PaddingPolicy,
-    stream::Stream,
+    stream::{SharedRecvTuning, Stream},
     types::{
         PacketFlags, PacketHeader, PacketNumber, PhantomPacket, RawPacket, SchedulerMode,
         SessionId, StreamId,
@@ -299,6 +299,10 @@ pub struct Session {
     streams: RwLock<HashMap<StreamId, Arc<Stream>>>,
     /// Next stream ID counter
     next_stream_id: AtomicU32,
+    /// Receive-window growth allowance shared by every stream this session opens. One
+    /// handle per session is the whole point: a per-stream allowance multiplies the
+    /// commitment by the stream count, which is a number the peer picks.
+    recv_tuning: Arc<SharedRecvTuning>,
     /// Path scheduler — **vestigial** (single-path connection migration, not
     /// multipath aggregation): constructed and reachable via `scheduler()`, but
     /// `select_paths` is never called on the live data path. See `SchedulerMode`.
@@ -417,6 +421,7 @@ impl Session {
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
+            recv_tuning: Arc::new(SharedRecvTuning::default()),
             scheduler: Arc::new(Scheduler::new(SchedulerMode::LowLatency)),
             resumption_secret: RwLock::new(None),
             last_activity: RwLock::new(Instant::now()),
@@ -472,6 +477,7 @@ impl Session {
             is_server,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
+            recv_tuning: Arc::new(SharedRecvTuning::default()),
             scheduler: Arc::new(Scheduler::new(scheduler_mode)),
             resumption_secret: RwLock::new(None),
             last_activity: RwLock::new(Instant::now()),
@@ -522,6 +528,7 @@ impl Session {
             is_server: peer_side,
             streams: RwLock::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
+            recv_tuning: Arc::new(SharedRecvTuning::default()),
             scheduler: Arc::new(Scheduler::new(SchedulerMode::LowLatency)),
             resumption_secret: RwLock::new(Some(*resumption_secret)),
             last_activity: RwLock::new(Instant::now()),
@@ -675,11 +682,14 @@ impl Session {
     /// Open a new stream
     pub fn open_stream(&self) -> Arc<Stream> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::SeqCst) as StreamId;
-        // A `Session` driven on its own — the raw transport API, without the `PhantomSession`
-        // that owns the connection-wide growth budget — gives each of its streams a budget of
-        // its own. The bounded path is the one the pump takes, where every stream is built
-        // from the single handle the `PhantomSession` holds.
-        let stream = Arc::new(Stream::new(stream_id));
+        // Every stream of this session draws its receive-window growth from the session's
+        // one allowance, exactly as the streams the `PhantomSession` pump builds do. A
+        // `Session` driven on its own is still a session, and a budget handed out per stream
+        // would bound nothing: the multiplier on it is the peer's stream count.
+        let stream = Arc::new(Stream::with_recv_tuning(
+            stream_id,
+            self.recv_tuning.clone(),
+        ));
 
         self.streams.write().insert(stream_id, stream.clone());
         stream

@@ -81,6 +81,7 @@ env vars):
 | --- | --- | --- | --- |
 | `--max-sessions` | `PHANTOM_MAX_SESSIONS` | `1024` | Global concurrent-session ceiling. At the cap the accept loop stops accepting — new connections queue in the OS backlog (`somaxconn` / `tcp_max_syn_backlog`) until a session closes. Backpressure, not a hard drop. `0` = unbounded. |
 | `--max-sessions-per-ip` | `PHANTOM_MAX_SESSIONS_PER_IP` | `64` | Per-source-IP concurrent-session ceiling. A peer already at the cap has further connections rejected (closed right after the handshake), so one source cannot monopolise the global pool. `0` disables. |
+| `--max-recv-memory-mib` | `PHANTOM_MAX_RECV_MEMORY_MIB` | `0` (off) | Receive-side memory the process may commit to peers, in MiB. Lowers `--max-sessions` to the largest number of sessions that fits; refuses to start if the budget cannot hold one. See "Memory" below. |
 
 **Size `PHANTOM_MAX_SESSIONS` against two limits:**
 
@@ -88,10 +89,46 @@ env vars):
   `PHANTOM_MAX_SESSIONS` comfortably below `LimitNOFILE` (`systemd.md` sets
   `65535`) so the listen socket, OTLP exporter connection, and transient
   accept churn have headroom — e.g. `max_sessions ≈ LimitNOFILE − 1000`.
-- **Memory.** Budget ~512 KiB per session (send/recv buffers + crypto state).
-  The Kubernetes guide's `~1000 sessions → 512 MiB limit` line is exactly this:
-  `PHANTOM_MAX_SESSIONS × 512 KiB` should fit the pod/host memory limit with
-  headroom.
+- **Memory.** Two different numbers, and using the first one as if it were the
+  second is the mistake this section exists to prevent.
+
+  A session carrying ordinary traffic sits around **512 KiB** (send/recv
+  buffers plus crypto state), and that is what the Kubernetes guide's
+  `~1000 sessions → 512 MiB limit` line is sized from. It is a typical figure,
+  not a bound.
+
+  The bound is **108 MiB per session** — `SESSION_RECV_MEMORY_COMMITMENT` in
+  `core/src/api/session.rs`, which computes it from the transport's own
+  constants so the two cannot drift:
+
+  ```text
+    reorder payload    Σ (window_i + 64 KiB), windows ≤ 256 × 64 KiB + 8 MiB   =  40 MiB
+    reorder structure  256 streams × 2048 held entries × 128 B                 =  64 MiB
+    delivery backlog   the per-session hard cap that tears a flooding peer down =  4 MiB
+                                                                                ────────
+                                                                                 108 MiB
+  ```
+
+  Every term is something the peer picks — how many streams it opens, how much
+  it sends, how long it leaves a reassembly hole open — so this is what one
+  **authenticated but hostile** peer can make a session hold. It is bounded per
+  session; the transport does **not** divide it between concurrent sessions, so
+  a process admitting `N` sessions commits `N × 108 MiB` in the worst case
+  (`1024 × 108 MiB ≈ 108 GiB` at the default cap). Admission control is the only
+  thing that bounds it at process scale, which is why the session cap is a
+  memory setting whether or not it was set as one.
+
+  Pick a posture:
+
+  - **Trusted or authenticated-and-accountable clients** (the common case):
+    size from the typical figure, leave `--max-recv-memory-mib` off, and watch
+    RSS. The worst case needs a peer deliberately holding reassembly holes
+    open on hundreds of streams.
+  - **Open to the internet**: state the budget. `--max-recv-memory-mib 8192`
+    on an 8 GiB host lowers the cap to 75 sessions and logs that it did. That
+    is a small number because the guarantee is strong; if it is too small for
+    the deployment, the honest fix is more hosts or the first posture, not a
+    larger cap.
 
 The per-IP cap is a *session-count* cap, not a handshake-rate limit — an
 abusive IP can still trigger (cheap, PoW/cookie-gated) handshakes that are then

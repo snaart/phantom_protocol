@@ -176,17 +176,33 @@ async fn main() -> Result<()> {
     // Admission control: a global session cap (backpressure — stop accepting
     // when full rather than exhausting fds/memory) plus a per-IP cap so one
     // source can't monopolise the pool. `max_sessions == 0` → unbounded.
-    let session_slots = Arc::new(Semaphore::new(if cfg.max_sessions == 0 {
+    //
+    // The transport bounds its receive buffers per session and not per process, so the
+    // session cap is what bounds the process's memory whether or not it was set with that
+    // in mind. `--max-recv-memory-mib` lets an operator say the memory figure instead and
+    // have the cap follow from it.
+    let max_sessions = cfg.effective_max_sessions().map_err(anyhow::Error::msg)?;
+    let session_slots = Arc::new(Semaphore::new(if max_sessions == 0 {
         Semaphore::MAX_PERMITS
     } else {
-        cfg.max_sessions
+        max_sessions
     }));
     let per_ip = PerIpLimiter::new(cfg.max_sessions_per_ip);
     tracing::info!(
-        max_sessions = cfg.max_sessions,
+        max_sessions,
         max_sessions_per_ip = cfg.max_sessions_per_ip,
+        max_recv_memory_mib = cfg.max_recv_memory_mib,
+        session_recv_memory_commitment_mib =
+            phantom_protocol::api::session::SESSION_RECV_MEMORY_COMMITMENT / (1024 * 1024),
         "session admission control active"
     );
+    if max_sessions != cfg.max_sessions {
+        tracing::warn!(
+            requested = cfg.max_sessions,
+            enforced = max_sessions,
+            "session cap lowered to fit --max-recv-memory-mib"
+        );
+    }
 
     // JoinSet tracks every spawned handler so we can give them a
     // bounded drain window on shutdown.

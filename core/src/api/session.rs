@@ -28,7 +28,10 @@ use crate::transport::packet_coalescer_codec::unwrap_coalesced_packet;
 use crate::transport::path_validation_codec::build_path_validation_packet;
 use crate::transport::session::{Session, SessionState};
 use crate::transport::shaping::{self, PaddingPolicy};
-use crate::transport::stream::{SendBlocked, SharedRecvTuning, Stream};
+use crate::transport::stream::{
+    SendBlocked, SharedRecvTuning, Stream, INITIAL_STREAM_WINDOW, MAX_RECV_REORDER,
+    REORDER_ENTRY_OVERHEAD_BYTES, SESSION_RECV_WINDOW_GROWTH_BUDGET,
+};
 use crate::transport::types::{
     LegType, PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
     WIRE_VERSION,
@@ -1884,17 +1887,6 @@ async fn run_data_pump<T: SessionTransport>(
         // the observability bookkeeping the receive path needs.
         let mut scratch =
             RecvScratch::new(256, stream_gauge_recv, path_challenges_recv, recv_tuning);
-        // Buffering ceiling: the delivery queue is unbounded so the reader
-        // never blocks, but a peer that ignores flow control could flood it.
-        // Compliant senders are bounded by one advertised window per stream
-        // (enforced in `poll_send`); crossing this cap means the peer is
-        // misbehaving, so we tear the session down rather than buffer without
-        // limit. Every byte counted here is resident, so the number is a memory
-        // commitment and stays a fixed literal: it is deliberately NOT derived from
-        // the window ceiling, or raising that ceiling would silently raise how much a
-        // peer can make this side hold. 4 MiB is four times what one auto-tuned stream
-        // can legitimately have outstanding, so honest traffic does not approach it.
-        const RECV_DELIVERY_HARD_CAP: u64 = 4 * 1024 * 1024;
         loop {
             // Flow-control / anti-flood gate: if the app-delivery backlog
             // has blown past the cap, the peer is not honouring the window —
@@ -3456,7 +3448,59 @@ async fn send_path_validation<T: SessionTransport>(
 /// `SESSION_RECV_WINDOW_GROWTH_BUDGET`, because every byte of window above the initial one
 /// is drawn from that single session-wide allowance rather than granted per stream.
 /// Sized well above QUIC's ~100-stream default so real multiplexing is unaffected.
-const MAX_STREAMS: usize = 256;
+pub const MAX_STREAMS: usize = 256;
+
+/// Ceiling on the app-delivery backlog one session may hold, in bytes.
+///
+/// The delivery queue is unbounded so the reader never blocks, but a peer that ignores flow
+/// control could flood it. Compliant senders are bounded by one advertised window per stream
+/// (enforced in `poll_send`); crossing this cap means the peer is misbehaving, so the session
+/// is torn down rather than buffered without limit. Every byte counted here is resident, so
+/// the number is a memory commitment and stays a fixed literal: it is deliberately NOT
+/// derived from the window ceiling, or raising that ceiling would silently raise how much a
+/// peer can make this side hold. 4 MiB is four times what one auto-tuned stream can
+/// legitimately have outstanding, so honest traffic does not approach it.
+pub const RECV_DELIVERY_HARD_CAP: u64 = 4 * 1024 * 1024;
+
+/// Receive-side memory one session may commit, in bytes — the figure a host is sized from.
+///
+/// Every term is something an authenticated peer chooses (how many streams it opens, how
+/// much it sends, how long it leaves a reassembly hole open), so this is the amplification
+/// bound for the receive path and it is stated in full rather than by its largest term:
+///
+/// ```text
+///   advertised windows   MAX_STREAMS × 64 KiB + growth budget       = 24 MiB
+///   reorder payload      Σ (window_i + 64 KiB)                      = 40 MiB
+///   reorder structure    MAX_STREAMS × 2048 × 128 B                 = 64 MiB
+///   delivery backlog     RECV_DELIVERY_HARD_CAP                     =  4 MiB
+///                                                                   ─────────
+///                                                        resident    108 MiB
+/// ```
+///
+/// The advertised windows are a promise rather than an allocation — the bytes they admit
+/// come to rest in the reorder buffer or the delivery backlog, both counted above — so the
+/// resident total is the last three terms. `SESSION_RECV_WINDOW_GROWTH_BUDGET` bounds 8 MiB
+/// of it; the rest follows from `MAX_STREAMS`, the reorder entry cap and the delivery cap,
+/// which is why raising any of those is a memory decision and not a tuning one.
+///
+/// **This is per session, and nothing divides it between concurrent sessions.** A process
+/// admitting `N` sessions commits `N ×` this figure in the worst case, so the bound at
+/// process scale is admission control — the embedder's, not the library's. The reference
+/// server derives its session cap from this constant when
+/// `--max-recv-memory-mib` is set; see `docs/operations/deployment.md`.
+pub const SESSION_RECV_MEMORY_COMMITMENT: u64 = {
+    // Reorder payload: each stream's budget tracks its own window plus one initial window of
+    // headroom, and the windows are one initial window each plus, between them, one growth
+    // budget.
+    let windows = MAX_STREAMS as u64 * INITIAL_STREAM_WINDOW as u64
+        + SESSION_RECV_WINDOW_GROWTH_BUDGET as u64;
+    let reorder_payload = windows + MAX_STREAMS as u64 * INITIAL_STREAM_WINDOW as u64;
+    // Reorder structure: the byte budget counts payload only, so a peer sending tiny segments
+    // above a hole it never fills is bounded by the entry cap alone.
+    let reorder_structure =
+        MAX_STREAMS as u64 * MAX_RECV_REORDER as u64 * REORDER_ENTRY_OVERHEAD_BYTES as u64;
+    reorder_payload + reorder_structure + RECV_DELIVERY_HARD_CAP
+};
 
 /// EPS-02 symmetric-rotation step — extracted from [`handle_packet`] so the role
 /// branch is unit-tested always-on (not only by the `#[ignore]` `udp_integration`
