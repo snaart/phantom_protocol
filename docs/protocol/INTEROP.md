@@ -31,9 +31,9 @@ downgrade). Pin these first:
 
 | Constant | Value (default build) | Source of truth | Wire role |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `6` | `core/src/transport/types.rs:82` | `PacketHeader.version` (byte 0, HP-masked) |
-| `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs:67` | `ClientHello.version`, transcript-bound |
-| `PROTOCOL_VARIANT` | `b"phantom-default-1"` | `core/src/transport/handshake.rs:59` | leading field of the signed transcript |
+| `WIRE_VERSION` | `6` | `core/src/transport/types.rs` | `PacketHeader.version` (byte 0, HP-masked) |
+| `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs` | `ClientHello.version`, transcript-bound |
+| `PROTOCOL_VARIANT` | `b"phantom-default-1"` | `core/src/transport/handshake.rs` | leading field of the signed transcript |
 
 A receiver **drops** any data frame whose `header.version != WIRE_VERSION`
 (`api/session.rs`), and the server rejects a `ClientHello` whose
@@ -41,6 +41,21 @@ A receiver **drops** any data frame whose `header.version != WIRE_VERSION`
 any KEM/signature work. The `PROTOCOL_VARIANT` is the leading field of the signed
 handshake transcript (PROTOCOL.md § 6.5/§ 6.7), so a cross-variant peer fails the
 signature check even if it forged the cleartext tag. See PROTOCOL.md § 1.
+
+**A fourth constant is agreed off the wire: the AEAD suite.** There is no cipher
+field in any message; each peer independently resolves AES-256-GCM vs
+ChaCha20-Poly1305 from local CPU capability and derives its keys — and its
+header-protection mask primitive — accordingly (PROTOCOL.md § 2). Two peers that
+resolve it differently finish the handshake and then fail every packet. Pin one
+suite per deployment and pin it on both ends; do not build a probe for it.
+
+**And one asymmetry is not a constant at all: which side swaps.** Every
+per-direction key pair is derived once and assigned by role — the initiator
+takes the `…-send-…` label as its send key, the responder takes `…-recv-…`
+(PROTOCOL.md § 3). Getting this backwards is the single most common way a second
+implementation passes every vector in this guide and still cannot exchange a
+packet, because no fixture covers it: the vectors freeze the *cleartext* wire
+image, and the key-role assignment only shows up under a live AEAD.
 
 ---
 
@@ -85,6 +100,30 @@ Cross-check your encoder/decoder against
 **and** re-encodes each fixture with Python stdlib only — if your bytes and the
 Python encoder's bytes both equal the `.bin`, the grammar is genuinely shared, not
 self-referential.
+
+### Rung 1b — Transport framing (no fixture; still mandatory)
+
+A `PhantomPacket` is not self-delimiting, so something has to carry it. This rung
+has no `.bin` because the framing sits *outside* the frozen wire — but a peer
+that skips it cannot exchange a byte, and the framing differs per transport:
+
+| Transport | Framing | Spec |
+| --- | --- | --- |
+| PhantomUDP (the production transport) | 9-byte cleartext envelope `[flags: u8][ConnId: 8]` per datagram, plus an 8-byte fragment subheader when the `FRAG_BIT` is set | PROTOCOL.md § 4.9 |
+| TCP (and the mimicry leg's inner stream) | 4-byte big-endian `u32` message length, phase-capped at 64 KiB before the session establishes and 4 MiB after | PROTOCOL.md § 9 |
+| WebSocket / WASI / embedded | already message-framed by the substrate; no additional prefix | — |
+
+Two properties of the envelope are easy to get wrong and fail closed only later:
+the reserved low five flag bits **must be zero** (a datagram with any of them set
+is rejected outright), and the `Initial` packet type carries a *bare* borsh
+`ClientHello` from the client but a **discriminant-framed** `ServerReply`
+(`[kind: u8] ‖ borsh(body)`) from the server — the asymmetry is deliberate
+(PROTOCOL.md § 6).
+
+Because `recv_bytes` is message-framed on every transport, `payload` is simply
+the remainder after the 15-byte header (Rung 1) — which is exactly why v6 could
+drop the length prefixes. A stream transport that loses message boundaries turns
+that simplification into silent corruption.
 
 ### Rung 2 — Handshake messages (borsh, little-endian)
 
@@ -133,7 +172,31 @@ header — the exact sample offset, cipher, and apply step are in § 4.6). The H
 is keyed crypto and is **not** frozen as a `.bin` (it would require committing key
 material); it is verified in Rust separately. To interoperate you must reproduce
 the HP key-derivation labels exactly — see the KDF label inventory in
-PROTOCOL.md § 3.
+PROTOCOL.md § 3, and note that the negotiated-off-the-wire suite (§ 1 above)
+selects the mask primitive as well as the AEAD.
+
+### Rung 4b — The AEAD plaintext codecs
+
+Opening the AEAD gets you a plaintext, not a message. What is inside depends on
+the (authenticated) flags, and each shape has its own grammar in PROTOCOL.md
+§ 4.5 / § 4.8:
+
+| Flag | Plaintext |
+| --- | --- |
+| `RELIABLE` | `stream_offset: u32 be` then the application bytes — a frame shorter than the 4-byte prefix is malformed |
+| `ACK` | a `Sack`, scoped to the packet's `stream_id` |
+| `WINDOW_UPDATE` | exactly 4 bytes: a big-endian `u32` of *relative* credit |
+| `PATH_VALIDATION` | exactly 32 bytes: a challenge or its echo |
+| `KEEPALIVE` | empty (PING); `KEEPALIVE \| ACK` is the PONG |
+| `COALESCED` | `[count: u16][len: u16][payload]…` |
+| `PADDED` | strip the `‹zeros› ‖ pad_n: u16 be` trailer **first**, then interpret the rest by the other flags |
+
+A minimal peer needs `RELIABLE` and `ACK` to move data at all; `COALESCED` is
+receive-only in this implementation (nothing emits a bundle), and `PADDED` /
+`COVER` are opt-in shaping a peer may simply never enable. Every one of these is
+inside the AEAD, so none of them is frozen by a `.bin` and none of them is a
+`WIRE_VERSION` concern — but a mismatch here reads as data corruption, not as a
+parse error.
 
 ### Rung 5 — Migration & liveness (optional for a minimal peer)
 
@@ -185,11 +248,14 @@ Never hand-edit a `.bin`. See `core/tests/wire_vectors/README.md`.
 A peer is wire-conformant with the default build of this repository when:
 
 - [ ] It is built for `WIRE_VERSION = 6`, `PROTOCOL_VERSION = 3`, `PROTOCOL_VARIANT = phantom-default-1`, and treats a mismatch as a hard error (no downgrade).
+- [ ] It agrees with its peer on the AEAD suite (not negotiated — § 1) and assigns the per-direction keys by role, initiator un-swapped and responder swapped (§ 1).
 - [ ] Its AEAD / KDF / hash / ML-KEM / ML-DSA primitives reproduce every KAT in `cavp.rs` (Rung 0).
 - [ ] `encode(value)` equals each packet `.bin`, and `decode(.bin)` equals the value, for the four packet fixtures (Rung 1).
+- [ ] It frames packets for its transport — the 9-byte PhantomUDP envelope with zeroed reserved bits, or the 4-byte big-endian TCP prefix (Rung 1b).
 - [ ] The same holds for all borsh handshake / sub-struct fixtures (Rung 2).
 - [ ] Its transcript hash equals `transcript_hash.bin` (Rung 3).
 - [ ] Its AEAD nonce/AAD construction and HP masking reproduce PROTOCOL.md § 4.6 / § 5; a tampered AAD byte (version included) fails decryption with no oracle (Rung 4).
+- [ ] It reads the AEAD plaintext by flag — reliable offset prefix, SACK, window credit, path challenge, padding trailer (Rung 4b).
 - [ ] `tests/wire_vectors_decode.py` agrees with the peer's serializer in both directions (§ 3).
 - [ ] (If migrating) the CID chain and path-validation grammar match PROTOCOL.md § 4.7 / § 12 (Rung 5).
 
@@ -205,3 +271,12 @@ transcript, a FIPS peer and a default peer fail each other's signature check on 
 first message — they do not, and are not meant to, interoperate. A FIPS↔FIPS
 conformance set would need its own committed vectors (the wire-vector test compiles
 to nothing under `--features fips`). See `docs/compliance/fips-readiness.md`.
+
+---
+
+## 7. Last verified against the code
+
+Checked against the source on **2026-08-15**, commit `41183f49` — the same
+sync as PROTOCOL.md § 13, which carries the itemised list of what was
+re-derived. Every fixture byte count quoted above was read off
+the committed `.bin` files at that commit.
