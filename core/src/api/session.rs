@@ -954,7 +954,6 @@ impl PhantomSession {
         // silent or stalling server can't hang the connect indefinitely. The
         // TIMER is `runtime.sleep` (NOT raw tokio::time) so it stays correct
         // under WasmRuntime/EmbeddedRuntime; `select!` is just the combinator.
-        const CLIENT_HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
         let handshake_started = std::time::Instant::now();
         // Scoped so the handshake future's borrow of `transport` ends before
         // `transport` is moved into the data pump below.
@@ -1219,6 +1218,19 @@ async fn run_client_handshake<T: SessionTransport>(
         }
     }
 }
+
+/// Wall-clock ceiling on the whole client handshake (HS-02), from the first
+/// keypair generated to the established `Session`, so a silent or stalling server
+/// cannot hang a connect indefinitely.
+///
+/// This is the outer authority over every retransmission strategy underneath it: a
+/// transport that retransmits its handshake flight — `UdpClientTransport` is the one
+/// that does — must exhaust its own budget *inside* this window, or its last
+/// retransmit is sent after the session has already abandoned the connect and the
+/// work is wasted. That transport's `HANDSHAKE_RETRANSMIT_BUDGET` is sized against
+/// this constant.
+pub(crate) const CLIENT_HANDSHAKE_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(10);
 
 /// Reserved stream id for the connectionless `send()`/`recv()` surface. The
 /// demultiplexer hands out ids of two and above, so this never collides with a
