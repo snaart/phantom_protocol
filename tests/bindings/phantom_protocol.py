@@ -1496,7 +1496,7 @@ class MetricsSnapshotFfi:
     server-accepted session the counters are the owning listener's aggregate
     (shared `Arc<Observability>` handle), not per-connection.
 """
-    def __init__(self, *, packets_sent:int, packets_recv:int, bytes_sent:int, bytes_recv:int, avg_encrypt_ns:int, avg_decrypt_ns:int, encrypt_count:int, decrypt_count:int, rtt_us_path_0:int, active_sessions:int, active_streams:int, handshakes_success:int, handshakes_failure:int, handshake_latency_ns_sum:int, handshake_latency_count:int, replay_rejected_total:int, aead_failure_total:int, unencrypted_dropped_total:int, uptime_secs:int):
+    def __init__(self, *, packets_sent:int, packets_recv:int, bytes_sent:int, bytes_recv:int, avg_encrypt_ns:int, avg_decrypt_ns:int, encrypt_count:int, decrypt_count:int, rtt_us_path_0:int, active_sessions:int, active_streams:int, handshakes_success:int, handshakes_failure:int, handshake_latency_ns_sum:int, handshake_latency_count:int, replay_rejected_total:int, aead_failure_total:int, uptime_secs:int, unencrypted_dropped_total:int):
         self.packets_sent = packets_sent
         self.packets_recv = packets_recv
         self.bytes_sent = bytes_sent
@@ -1514,14 +1514,14 @@ class MetricsSnapshotFfi:
         self.handshake_latency_count = handshake_latency_count
         self.replay_rejected_total = replay_rejected_total
         self.aead_failure_total = aead_failure_total
-        self.unencrypted_dropped_total = unencrypted_dropped_total
         self.uptime_secs = uptime_secs
+        self.unencrypted_dropped_total = unencrypted_dropped_total
         
         
 
     
     def __str__(self):
-        return "MetricsSnapshotFfi(packets_sent={}, packets_recv={}, bytes_sent={}, bytes_recv={}, avg_encrypt_ns={}, avg_decrypt_ns={}, encrypt_count={}, decrypt_count={}, rtt_us_path_0={}, active_sessions={}, active_streams={}, handshakes_success={}, handshakes_failure={}, handshake_latency_ns_sum={}, handshake_latency_count={}, replay_rejected_total={}, aead_failure_total={}, unencrypted_dropped_total={}, uptime_secs={})".format(self.packets_sent, self.packets_recv, self.bytes_sent, self.bytes_recv, self.avg_encrypt_ns, self.avg_decrypt_ns, self.encrypt_count, self.decrypt_count, self.rtt_us_path_0, self.active_sessions, self.active_streams, self.handshakes_success, self.handshakes_failure, self.handshake_latency_ns_sum, self.handshake_latency_count, self.replay_rejected_total, self.aead_failure_total, self.unencrypted_dropped_total, self.uptime_secs)
+        return "MetricsSnapshotFfi(packets_sent={}, packets_recv={}, bytes_sent={}, bytes_recv={}, avg_encrypt_ns={}, avg_decrypt_ns={}, encrypt_count={}, decrypt_count={}, rtt_us_path_0={}, active_sessions={}, active_streams={}, handshakes_success={}, handshakes_failure={}, handshake_latency_ns_sum={}, handshake_latency_count={}, replay_rejected_total={}, aead_failure_total={}, uptime_secs={}, unencrypted_dropped_total={})".format(self.packets_sent, self.packets_recv, self.bytes_sent, self.bytes_recv, self.avg_encrypt_ns, self.avg_decrypt_ns, self.encrypt_count, self.decrypt_count, self.rtt_us_path_0, self.active_sessions, self.active_streams, self.handshakes_success, self.handshakes_failure, self.handshake_latency_ns_sum, self.handshake_latency_count, self.replay_rejected_total, self.aead_failure_total, self.uptime_secs, self.unencrypted_dropped_total)
     def __eq__(self, other):
         if self.packets_sent != other.packets_sent:
             return False
@@ -1557,9 +1557,9 @@ class MetricsSnapshotFfi:
             return False
         if self.aead_failure_total != other.aead_failure_total:
             return False
-        if self.unencrypted_dropped_total != other.unencrypted_dropped_total:
-            return False
         if self.uptime_secs != other.uptime_secs:
+            return False
+        if self.unencrypted_dropped_total != other.unencrypted_dropped_total:
             return False
         return True
 
@@ -1584,8 +1584,8 @@ class _UniffiFfiConverterTypeMetricsSnapshotFfi(_UniffiConverterRustBuffer):
             handshake_latency_count=_UniffiFfiConverterUInt64.read(buf),
             replay_rejected_total=_UniffiFfiConverterUInt64.read(buf),
             aead_failure_total=_UniffiFfiConverterUInt64.read(buf),
-            unencrypted_dropped_total=_UniffiFfiConverterUInt64.read(buf),
             uptime_secs=_UniffiFfiConverterUInt64.read(buf),
+            unencrypted_dropped_total=_UniffiFfiConverterUInt64.read(buf),
         )
 
     @staticmethod
@@ -1607,8 +1607,8 @@ class _UniffiFfiConverterTypeMetricsSnapshotFfi(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt64.check_lower(value.handshake_latency_count)
         _UniffiFfiConverterUInt64.check_lower(value.replay_rejected_total)
         _UniffiFfiConverterUInt64.check_lower(value.aead_failure_total)
-        _UniffiFfiConverterUInt64.check_lower(value.unencrypted_dropped_total)
         _UniffiFfiConverterUInt64.check_lower(value.uptime_secs)
+        _UniffiFfiConverterUInt64.check_lower(value.unencrypted_dropped_total)
 
     @staticmethod
     def write(value, buf):
@@ -1629,8 +1629,8 @@ class _UniffiFfiConverterTypeMetricsSnapshotFfi(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt64.write(value.handshake_latency_count, buf)
         _UniffiFfiConverterUInt64.write(value.replay_rejected_total, buf)
         _UniffiFfiConverterUInt64.write(value.aead_failure_total, buf)
-        _UniffiFfiConverterUInt64.write(value.unencrypted_dropped_total, buf)
         _UniffiFfiConverterUInt64.write(value.uptime_secs, buf)
+        _UniffiFfiConverterUInt64.write(value.unencrypted_dropped_total, buf)
 
 # The Duration type.
 Duration = datetime.timedelta

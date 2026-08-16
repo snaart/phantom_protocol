@@ -4917,9 +4917,22 @@ data class MetricsSnapshotFfi (
     , 
     var `aeadFailureTotal`: kotlin.ULong
     , 
-    var `unencryptedDroppedTotal`: kotlin.ULong
-    , 
     var `uptimeSecs`: kotlin.ULong
+    , 
+    /**
+     * Deliberately last in the record, and it must stay last.
+     *
+     * UniFFI lays a record out in declaration order and the generated bindings
+     * read it back the same way, so inserting a field anywhere but the end
+     * shifts every field after it. The four generated surfaces are regenerated
+     * together and stay consistent; the two hand-curated C headers are not
+     * generated and carry no length check, so a C consumer built against an
+     * older header would keep reading at the old offsets and silently return
+     * this counter where it asked for `uptime_secs`. Appending is the only
+     * placement where a stale reader is merely missing a field rather than
+     * misreading the ones it already knew.
+     */
+    var `unencryptedDroppedTotal`: kotlin.ULong
     
 ){
     
@@ -4976,8 +4989,8 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.allocationSize(value.`handshakeLatencyCount`) +
             FfiConverterULong.allocationSize(value.`replayRejectedTotal`) +
             FfiConverterULong.allocationSize(value.`aeadFailureTotal`) +
-            FfiConverterULong.allocationSize(value.`unencryptedDroppedTotal`) +
-            FfiConverterULong.allocationSize(value.`uptimeSecs`)
+            FfiConverterULong.allocationSize(value.`uptimeSecs`) +
+            FfiConverterULong.allocationSize(value.`unencryptedDroppedTotal`)
     )
 
     override fun write(value: MetricsSnapshotFfi, buf: ByteBuffer) {
@@ -4998,8 +5011,8 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.write(value.`handshakeLatencyCount`, buf)
             FfiConverterULong.write(value.`replayRejectedTotal`, buf)
             FfiConverterULong.write(value.`aeadFailureTotal`, buf)
-            FfiConverterULong.write(value.`unencryptedDroppedTotal`, buf)
             FfiConverterULong.write(value.`uptimeSecs`, buf)
+            FfiConverterULong.write(value.`unencryptedDroppedTotal`, buf)
     }
 }
 

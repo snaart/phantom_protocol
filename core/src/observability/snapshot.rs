@@ -208,8 +208,19 @@ pub struct MetricsSnapshotFfi {
     pub handshake_latency_count: u64,
     pub replay_rejected_total: u64,
     pub aead_failure_total: u64,
-    pub unencrypted_dropped_total: u64,
     pub uptime_secs: u64,
+    /// Deliberately last in the record, and it must stay last.
+    ///
+    /// UniFFI lays a record out in declaration order and the generated bindings
+    /// read it back the same way, so inserting a field anywhere but the end
+    /// shifts every field after it. The four generated surfaces are regenerated
+    /// together and stay consistent; the two hand-curated C headers are not
+    /// generated and carry no length check, so a C consumer built against an
+    /// older header would keep reading at the old offsets and silently return
+    /// this counter where it asked for `uptime_secs`. Appending is the only
+    /// placement where a stale reader is merely missing a field rather than
+    /// misreading the ones it already knew.
+    pub unencrypted_dropped_total: u64,
 }
 
 impl From<MetricsSnapshot> for MetricsSnapshotFfi {
@@ -232,8 +243,8 @@ impl From<MetricsSnapshot> for MetricsSnapshotFfi {
             handshake_latency_count: s.handshake_latency_count,
             replay_rejected_total: s.replay_rejected_total,
             aead_failure_total: s.aead_failure_total,
-            unencrypted_dropped_total: s.unencrypted_dropped_total,
             uptime_secs: s.uptime_secs,
+            unencrypted_dropped_total: s.unencrypted_dropped_total,
         }
     }
 }

@@ -324,8 +324,12 @@ typedef struct PhantomMetricsSnapshotFfi {
     /* Post-handshake packets refused for arriving without the ENCRYPTED
      * flag. Always populated; a non-zero value means the downgrade defence
      * fired, which is otherwise indistinguishable from nothing arriving. */
-    uint64_t unencrypted_dropped_total;
     uint64_t uptime_secs;
+    /* Appended last, and new fields must keep going last: this header carries no
+     * length, so a consumer built against an older copy reads at the offsets it
+     * knew. Appending leaves such a reader merely missing a field; inserting
+     * anywhere else makes it misread every field that followed. */
+    uint64_t unencrypted_dropped_total;
 } PhantomMetricsSnapshotFfi;
 
 /* ====================================================================
