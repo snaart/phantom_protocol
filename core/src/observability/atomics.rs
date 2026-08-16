@@ -92,6 +92,7 @@ pub(crate) struct HotPathAtomics {
     /// paths are driven together by the facade in `mod.rs`.
     replay_rejected_total: CachePadded<AtomicU64>,
     aead_failure_total: CachePadded<AtomicU64>,
+    unencrypted_dropped_total: CachePadded<AtomicU64>,
 
     /// Process-start timestamp for uptime calculation. Set once at
     /// construction; the snapshot reader computes `elapsed()` on read.
@@ -120,6 +121,7 @@ impl HotPathAtomics {
             handshake_latency_count: CachePadded::new(AtomicU64::new(0)),
             replay_rejected_total: CachePadded::new(AtomicU64::new(0)),
             aead_failure_total: CachePadded::new(AtomicU64::new(0)),
+            unencrypted_dropped_total: CachePadded::new(AtomicU64::new(0)),
             started_at: Instant::now(),
         }
     }
@@ -221,6 +223,19 @@ impl HotPathAtomics {
         self.aead_failure_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment the always-on unencrypted-drop total — the receive path's
+    /// stripped-flag downgrade defence firing (Invariant 2). Kept alongside the
+    /// other two security totals rather than in the OTel instruments alone: the
+    /// event it counts is an attack indicator, and an operator who has not opted
+    /// into `telemetry-otel` still needs to see that it happened. It is also the
+    /// only externally visible evidence that the gate ran at all — a dropped
+    /// packet is otherwise indistinguishable from one that never arrived.
+    #[inline]
+    pub(crate) fn record_unencrypted_dropped(&self) {
+        self.unencrypted_dropped_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     // --- Read accessors (cold path) ---
 
     pub(crate) fn packets_total(&self, dir: usize) -> u64 {
@@ -298,6 +313,10 @@ impl HotPathAtomics {
 
     pub(crate) fn aead_failure_total(&self) -> u64 {
         self.aead_failure_total.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn unencrypted_dropped_total(&self) -> u64 {
+        self.unencrypted_dropped_total.load(Ordering::Relaxed)
     }
 
     pub(crate) fn uptime_secs(&self) -> u64 {
@@ -400,13 +419,18 @@ mod tests {
         let h = HotPathAtomics::new();
         assert_eq!(h.replay_rejected_total(), 0);
         assert_eq!(h.aead_failure_total(), 0);
+        assert_eq!(h.unencrypted_dropped_total(), 0);
 
         h.record_replay_rejected();
         h.record_replay_rejected();
         h.record_aead_failure();
+        h.record_unencrypted_dropped();
+        h.record_unencrypted_dropped();
+        h.record_unencrypted_dropped();
 
         assert_eq!(h.replay_rejected_total(), 2);
         assert_eq!(h.aead_failure_total(), 1);
+        assert_eq!(h.unencrypted_dropped_total(), 3);
     }
 
     #[test]

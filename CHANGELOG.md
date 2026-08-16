@@ -154,6 +154,33 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **`unencrypted_dropped_total` in the metrics snapshot, and an always-on test that drives the
+  gate it counts.** The receive path drops every unencrypted post-handshake packet — the
+  stripped-flag downgrade defence, and the one thing standing between a forged standalone
+  `FIN` and a torn-down stream. Two things were wrong with how that was carried. The drop was
+  recorded only into an OpenTelemetry instrument, which is a no-op ZST unless the
+  `telemetry-otel` feature is on, so on a default build neither an operator nor a test could
+  see the gate fire; a dropped frame leaves no other trace, and "nothing arrived" and "we
+  refused what arrived" looked identical. It now increments a lock-free counter alongside
+  `replay_rejected_total` and `aead_failure_total` and surfaces through `MetricsSnapshot` /
+  `MetricsSnapshotFfi`, so it is readable from every language binding with no exporter
+  configured. The FFI record gains one `u64` field; the generated bindings need regenerating.
+
+  And `core/tests/security_invariants.rs` — the file this project points auditors at as the
+  place its numbered invariants are pinned — did not drive that receive path at all. What it
+  held was the neighbouring AEAD property, that the flag cannot be stripped from a *genuine*
+  packet without breaking the tag, which is a different statement from a freshly forged
+  unencrypted packet being refused. The gate was covered by two in-crate tests under
+  `cargo test --lib`, so it was gated; it just was not where a reviewer following the
+  documentation would look, and an inventory that does not contain what it claims turns a
+  security review into theatre. The suite now runs a live session against a hand-driven
+  server and puts three frames on the wire: an empty-payload forged `FIN`, which on the v6
+  wire cannot reach the flag gate at all because header protection samples sixteen ciphertext
+  bytes it does not have; the same forgery at the smallest size the wire admits, laid out so
+  that a receiver skipping the gate would hand its bytes to the application; and an authentic
+  frame, whose delivery is what keeps the test from passing on a receive path that drops
+  everything.
+
 - **The testbed's raw UDP controls now report a reorder *distance* distribution, in both
   directions.** They counted a datagram as reordered when it arrived below the highest
   sequence seen, which says a path reorders and sizes nothing: a transport's reordering

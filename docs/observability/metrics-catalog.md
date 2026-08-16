@@ -99,7 +99,8 @@ Fields: `packets_sent`, `packets_recv`, `bytes_sent`, `bytes_recv`,
 `avg_encrypt_ns`, `avg_decrypt_ns`, `encrypt_count`, `decrypt_count`,
 `rtt_us_path_0`, `active_sessions`, `active_streams`, `handshakes_success`,
 `handshakes_failure`, `handshake_latency_ns_sum`, `handshake_latency_count`,
-`replay_rejected_total`, `aead_failure_total`, `uptime_secs`.
+`replay_rejected_total`, `aead_failure_total`, `unencrypted_dropped_total`,
+`uptime_secs`.
 The Rust-only `MetricsSnapshot` adds `per_leg_packets` / `per_leg_bytes`
 (`[(LegType, sent, recv); 4]`).
 
@@ -114,6 +115,11 @@ that used to read zero:
   migrates, so it keeps reporting across a local `migrate()`.
 - `active_streams` — the balanced `StreamGauge`, user-visible streams only
   (reserved ids 0 and 1 excluded).
+- `unencrypted_dropped_total` — the Invariant-2 receive gate firing. It sits
+  in the snapshot rather than in the OTel instruments alone because it is the
+  only externally visible evidence that the gate ran: a dropped frame leaves
+  no other trace, and an operator on a default build has no OTLP pipeline to
+  read. On a healthy connection it stays at zero for the session's whole life.
 
 Caveat: on a server-accepted session the counters are the owning
 listener's aggregate, not per-connection. The labeled OTel-only counters

@@ -10,11 +10,15 @@
 //!   - AEAD authenticated decryption rejects bit-flipped ciphertext.
 //!   - AEAD AAD-binding: a tampered `PacketHeader` (used as AAD) is rejected
 //!     even if the ciphertext bytes are intact.
+//!   - The receive path drops a forged unencrypted post-handshake packet
+//!     (Invariant 2), driven through a live session's pump.
 //!   - Malformed wire bytes are rejected as a typed parse error, not a panic.
 //!   - The handshake cookie path uses constant-time equality (smoke check).
 //!   - Server identity mismatch fails the handshake at the client side.
-//!   - The AEAD `AEAD_MAX_INVOCATIONS` ceiling is reachable through a
-//!     synthetic counter-bump and yields `NonceExhausted`.
+//!   - The per-direction AEAD invocation counter — the input to the
+//!     `AEAD_MAX_INVOCATIONS` ceiling — advances once per successful operation
+//!     and not at all on a failed open. The ceiling itself (2^48) is not
+//!     reachable from a test; what is pinned here is the counter feeding it.
 //!   - Cookie tampering yields a `Retry` (not `Success`) on the server side.
 
 // Tests `.unwrap()` freely so failures surface as readable diagnostics; the
@@ -2314,8 +2318,11 @@ async fn reorder_buffer_is_byte_bounded_when_the_head_is_missing() {
 
 /// Idle keep-alive (`KEEPALIVE` PING/PONG) is invariant-safe: a keep-alive packet is
 /// `ENCRYPTED | KEEPALIVE` with an **empty** payload, so it
-///  (1) carries the post-handshake `ENCRYPTED` invariant flag (Inv-2 — the recv
-///      path drops every unencrypted post-handshake packet, including empty ones),
+///  (1) carries the post-handshake `ENCRYPTED` invariant flag, which is what the
+///      recv gate requires of it — the gate itself is driven by
+///      `forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path`;
+///      the header here is one this test built, so this is a statement about the
+///      keep-alive's shape, not about the receiver,
 ///  (2) is AEAD-authenticated (the empty plaintext seals to a bare tag and opens
 ///      back to empty — an off-path peer cannot forge one),
 ///  (3) draws a per-direction packet number like any other packet, so a replayed
@@ -2700,5 +2707,227 @@ async fn the_per_stream_receive_buffers_stay_inside_the_figures_published_for_th
         "one stream's delivery channel at its depth takes {channel_resident} B against a \
          published {channel_published} B ({STREAM_RECV_CHANNEL_DEPTH} slots of \
          {MAX_RECV_PAYLOAD} B plus {DELIVERY_ITEM_OVERHEAD_BYTES} B of structure each)"
+    );
+}
+
+// ── Invariant 2: the receive path rejects unencrypted post-handshake packets ──
+//
+// The neighbouring AAD tests above say a genuine packet cannot have its `ENCRYPTED`
+// flag stripped without breaking the tag. That is a different statement from the one
+// Invariant 2 makes, which is about a packet that was never sealed at all: the recv
+// loop drops it before it can be routed, empty payload included (the M-2 forged
+// standalone FIN). Reaching that gate means going through the real pump — header
+// protection, the version gate, the session-id bind — so this drives a live
+// `PhantomSession` against a hand-run server and puts the forgeries on the wire.
+
+/// The wire between the client under test and the server this test plays. Message
+/// oriented like every other `SessionTransport`, so a frame handed to `to_peer` is
+/// exactly one frame out of the client's `recv_bytes` — which is what lets the test
+/// forge a single packet rather than a byte stream.
+///
+/// A leaf transport, not a wrapper: it has no address and no migration, so the
+/// defaulted control surface of the trait is the right answer for every method it
+/// does not implement. The EPS-04 forwarding obligation is on types that wrap
+/// another `SessionTransport` and would otherwise silence its control calls.
+struct PipeTransport {
+    to_peer: tokio::sync::mpsc::Sender<Bytes>,
+    from_peer: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Bytes>>,
+}
+
+impl phantom_protocol::api::session::SessionTransport for PipeTransport {
+    async fn send_bytes(&self, data: &[u8]) -> Result<(), phantom_protocol::CoreError> {
+        self.to_peer
+            .send(Bytes::copy_from_slice(data))
+            .await
+            .map_err(|_| phantom_protocol::CoreError::NetworkError("pipe closed".into()))
+    }
+
+    async fn recv_bytes(&self) -> Result<Bytes, phantom_protocol::CoreError> {
+        self.from_peer
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| phantom_protocol::CoreError::NetworkError("pipe closed".into()))
+    }
+}
+
+/// Reserved stream id of the connectionless `send()` / `recv()` surface. Mirrors the
+/// crate-private `RAW_APP_STREAM_ID`; a frame stamped with it is what `recv()` returns.
+const RAW_APP_STREAM: u16 = 1;
+
+/// **Invariant 2.** A post-handshake packet that arrives without `ENCRYPTED` is
+/// dropped by the receive path — it is never decrypted, never routed to a stream,
+/// and its `FIN` never closes one. This is the stripped-flag downgrade defence, and
+/// the case it exists for is the smallest possible forgery: a standalone FIN
+/// carrying no application data, which under the pre-M-2 rule (drop only *non-empty*
+/// unencrypted payloads) would have torn a stream down without any AEAD verification.
+///
+/// Three frames go down the wire, in order, and the client's own `recv()` is the
+/// barrier that proves all three were processed:
+///
+///  1. a forged FIN with a literally empty payload. On the v6 wire this cannot even
+///     reach the flag gate: header protection samples the first 16 ciphertext bytes,
+///     so a frame with no payload fails to unmask and is dropped one layer earlier.
+///     Pinned here because it is the shape the audit named, and because it is what
+///     makes the counter below mean "the flag gate fired" rather than "something,
+///     somewhere, dropped a frame";
+///  2. a forged FIN at the smallest size header protection admits — 16 payload
+///     bytes, masked with the server's real send key so it unmasks into a valid
+///     header on the client. Its bytes are laid out as a reliable frame at stream
+///     offset 0, so a receiver that skipped the gate would hand `downgraded!!` to
+///     the application;
+///  3. a genuine `ENCRYPTED | RELIABLE` frame on the same stream and path.
+///
+/// The two-sidedness is (3): a receive path that dropped everything would pass an
+/// assertion about the forgeries and fail this one. And deleting the gate fails the
+/// test twice over — `recv()` yields the forged bytes instead of the authentic ones,
+/// and the drop counter reads zero.
+#[tokio::test]
+async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() {
+    use phantom_protocol::api::PhantomSession;
+    use phantom_protocol::transport::handshake::ServerReply;
+
+    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let (to_server_tx, mut to_server_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let client_transport = PipeTransport {
+        to_peer: to_server_tx,
+        from_peer: tokio::sync::Mutex::new(to_client_rx),
+    };
+
+    let server_hs = HandshakeServer::new().expect("server handshake state");
+    let pinned = server_hs.verifying_key().clone();
+    let session = PhantomSession::connect_with_transport("pipe-peer:0", client_transport, pinned);
+
+    // Run the server side by hand: the DoS gate answers the first hello with a
+    // cookie `Retry`, and the re-sent hello succeeds. Looping rather than
+    // straight-lining keeps the test correct if the gate ever adds a round.
+    let client_ip = "127.0.0.1".parse().expect("client ip");
+    let server_session = loop {
+        let hello_bytes = to_server_rx.recv().await.expect("client hello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("decode client hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let wire = ServerReply::Retry(retry).to_wire().expect("encode retry");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send retry");
+            }
+            HandshakeResponse::Success(server_hello, negotiated, _) => {
+                let wire = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("encode server hello");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send server hello");
+                break negotiated;
+            }
+            HandshakeResponse::Reject(r) => panic!("server rejected its own client: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    };
+
+    session
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+
+    assert_eq!(
+        session.metrics_snapshot().unencrypted_dropped_total,
+        0,
+        "nothing has been dropped yet — the handshake itself must not trip the gate"
+    );
+
+    let session_id = *server_session.id();
+
+    // (1) The empty-payload forged FIN. Unmasked on purpose: there is nothing to
+    // mask it against, since header protection derives its mask from a ciphertext
+    // sample this frame does not have.
+    let empty_fin = PhantomPacket::new(
+        PacketHeader::new(
+            session_id,
+            RAW_APP_STREAM,
+            1,
+            PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::FIN),
+        ),
+        Vec::new(),
+    );
+    to_client_tx
+        .send(Bytes::from(empty_fin.to_wire()))
+        .await
+        .expect("send empty forged FIN");
+
+    // (2) The same forgery at the smallest size the wire admits. The payload of an
+    // unencrypted packet IS its plaintext, so these bytes are laid out exactly as the
+    // reliable receive path expects — `[stream_offset: u32 BE][data]` at offset 0 —
+    // to make a missing gate deliver something recognisable rather than something
+    // that happens to be discarded further down.
+    let mut forged_payload = 0u32.to_be_bytes().to_vec();
+    forged_payload.extend_from_slice(b"downgraded!!");
+    assert_eq!(
+        forged_payload.len(),
+        16,
+        "the minimum header-protected size"
+    );
+    let forged_fin = PhantomPacket::new(
+        PacketHeader::new(
+            session_id,
+            RAW_APP_STREAM,
+            2,
+            PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::FIN),
+        ),
+        forged_payload,
+    );
+    let forged_wire = server_session
+        .protect_packet(&forged_fin)
+        .expect("mask the forgery with the real send key");
+    to_client_tx
+        .send(Bytes::from(forged_wire))
+        .await
+        .expect("send forged FIN");
+
+    // (3) The authentic frame — first reliable frame server→client on this stream, so
+    // its gap-free stream offset is 0.
+    let genuine_header = PacketHeader::new(
+        session_id,
+        RAW_APP_STREAM,
+        3,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
+    )
+    .with_epoch(server_session.current_epoch());
+    let mut genuine_plaintext = 0u32.to_be_bytes().to_vec();
+    genuine_plaintext.extend_from_slice(b"authentic");
+    let ciphertext = server_session
+        .encrypt_packet(&genuine_header, &genuine_plaintext, &[])
+        .expect("seal the authentic frame");
+    let genuine_wire = server_session
+        .protect_packet(&PhantomPacket::new(genuine_header, ciphertext))
+        .expect("protect the authentic frame");
+    to_client_tx
+        .send(Bytes::from(genuine_wire))
+        .await
+        .expect("send authentic frame");
+
+    // The pipe is FIFO and the reader task drains it in order, so a delivered
+    // authentic payload proves both forgeries were seen and disposed of first. The
+    // timeout is only there so that a gate-less build fails instead of hanging when
+    // the forged FIN closes the stream the authentic frame needs.
+    let delivered = tokio::time::timeout(Duration::from_secs(10), session.recv())
+        .await
+        .expect("the authentic frame is delivered")
+        .expect("recv");
+    assert_eq!(
+        delivered, b"authentic",
+        "the forged unencrypted frame must not reach the application"
+    );
+
+    assert_eq!(
+        session.metrics_snapshot().unencrypted_dropped_total,
+        1,
+        "exactly one frame reached the ENCRYPTED gate and was dropped by it: the \
+         empty-payload forgery never got past header protection, and the authentic \
+         frame carried the flag"
     );
 }
