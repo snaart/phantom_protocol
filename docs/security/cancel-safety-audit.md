@@ -322,7 +322,7 @@ the top of the loop — **no `ArcSwap` guard is ever held across an `.await`**
 tokio::select! {
     biased;
     r = active.recv_from(&mut buf)            => { /* got a datagram */ }
-    _ = tokio::time::sleep(wait)              => { /* retransmit last_sent, continue */ }
+    _ = tokio::time::sleep_until(deadline)    => { /* retransmit last_sent, continue */ }
 }
 
 // api/udp_transport.rs:332 — migration overlap: new socket vs retained old vs migrate wake
@@ -345,11 +345,14 @@ tokio::select! {
   wake correctness*, not for cancel-safety (an unbiased select starves the recv
   arm ~50 % of the time when both are ready, causing spurious handshake
   retransmits).
-- `tokio::time::sleep`: **cancel-safe** — a dropped sleep advances nothing. The
-  retransmission schedule (`attempt`, `spent`) lives outside the select and is
-  advanced only by an expiry that actually elapsed, so a cancelled sleep neither
-  consumes budget nor backs the timer off. The schedule is deliberately monotonic
-  across the loop's `continue` paths: nothing an inbound datagram does extends it.
+- `tokio::time::sleep_until`: **cancel-safe** — a dropped sleep advances nothing.
+  Cancel-safety alone is not enough here, though: the loop re-enters this select
+  on every datagram that does not complete a frame, and a timer built from a
+  *length* would restart its interval each time, so an off-path source could hold
+  the read open for as long as it kept sending. The deadline is an absolute
+  instant computed once and carried across the loop's `continue` paths; the
+  schedule (`attempt`, `spent`) is advanced only by an expiry that actually
+  elapsed. Nothing an inbound datagram does extends the read.
 - `Notify::notified()` (`migrate_notify`): created fresh per iteration and not
   pinned, which is safe here because `migrate_to()` calls `notify_one`, whose
   stored permit survives — a migration raised while this task is inside another
