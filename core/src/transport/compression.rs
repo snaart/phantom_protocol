@@ -1,13 +1,27 @@
-//! Production Adaptive Compression
+//! Adaptive compression — **not connected to the data path.**
 //!
-//! Real compression using LZ4 (lz4_flex) and Zstd:
-//! - Performance tier: LZ4 frame compression (~4 GB/s decompress, ~2 GB/s compress)
-//! - Standard tier: Zstd level 1 (~500 MB/s compress, ratio ~2.5x)
-//! - Constrained tier: off (CPU > bandwidth)
+//! No send or receive path in this crate calls [`AdaptiveCompressor`], and
+//! `PacketFlags::COMPRESSED` is set by no code anywhere in it, so every packet
+//! this library emits is uncompressed and every packet it accepts is treated as
+//! uncompressed. Wiring this up is a feature and not a cleanup, because the
+//! unfinished part is not the codec: the algorithm byte has to reach a receiver
+//! that does not yet hold a plaintext, which means it travels either in the header
+//! or inside the AEAD, and that is a wire decision; and compressing
+//! attacker-influenced bytes next to secret bytes under one key is the shape that
+//! made TLS drop compression, so a per-stream or opt-in-only answer has to exist
+//! before the first compressed byte ships.
 //!
-//! Auto-probe: if the compression ratio stays below `probe_threshold` after the
-//! first `probe_samples` packets, compression self-disables (CPU not worth it).
-//! Minimum payload worth compressing = 64 bytes (below that the overhead dominates).
+//! What survives here is a working, bounded codec, kept because that analysis is
+//! the expensive half and this code is the cheap one. LZ4 comes from `lz4_flex`
+//! (pure Rust, always available) and Zstd from `zstd` (C bindings, gated on the
+//! default-on `compression-zstd` feature); an auto-probe stops compressing when the
+//! ratio stays under `probe_threshold` across the first `probe_samples` payloads,
+//! payloads below 64 bytes are left alone because framing overhead dominates them,
+//! and [`MAX_DECOMPRESSED_LEN`] caps decompression output so the decode half is
+//! safe to expose before it has a caller. Because this module is the crate's only
+//! consumer of either compressor, a build that does not intend to wire it up can
+//! turn `compression-zstd` off and drop the C toolchain dependency with no effect
+//! on the wire.
 
 /// Compression algorithm
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

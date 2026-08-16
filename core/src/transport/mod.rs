@@ -7,11 +7,22 @@
 //! - Multi-streaming (independent streams, no head-of-line blocking)
 //! - 0-RTT connection establishment (resumption + early-data)
 //! - Seamless single-path connection migration (session survives IP changes)
-//! - Adaptive fallback tiers (`Turbo → Reliable → Stealth`, see `fallback`)
 //!
 //! NOTE: multipath bandwidth aggregation / multi-homing was deliberately rejected
-//! — migration moves one active path at a time, it does not bond paths. The
-//! `scheduler` module is consequently vestigial.
+//! — migration moves one active path at a time, it does not bond paths.
+//!
+//! # Modules that are published but not on the data path
+//!
+//! [`compression`], [`fallback`], [`scheduler`] and the encoding half of
+//! [`packet_coalescer`] are compiled, tested and exported, and no send or receive
+//! path calls any of them. They are named here rather than left to be discovered
+//! because the cost of mistaking one for a working mechanism falls on the reader
+//! and never on the compiler: someone who finds `AdaptiveCompressor` in the public
+//! API concludes that packets are compressed, and not one is. Each of those
+//! modules now opens its own documentation with the same statement, so the
+//! disclaimer survives arriving at a module directly rather than through this
+//! index. Connecting any of them to the pump is a feature with a wire-level design
+//! behind it, not a cleanup.
 
 // ── no_std-clean subset (Phase 3.6) ────────────────────────────────────
 // `session_transport` and `legs::embedded` compile on bare-metal and are the
@@ -32,8 +43,6 @@ pub mod bandwidth_estimator;
 pub mod buffer_pool;
 #[cfg(feature = "std")]
 pub mod compression;
-#[cfg(feature = "std")]
-pub mod device_profile;
 #[cfg(feature = "std")]
 pub mod fallback;
 #[cfg(feature = "std")]

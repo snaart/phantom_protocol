@@ -1,16 +1,22 @@
-//! Phantom Protocol - Multi-Path Scheduler (vestigial)
+//! Multi-path selection table — **not connected to the data path.**
 //!
-//! A round-robin / low-latency path-selection table over multiple transport legs.
+//! A [`Scheduler`] is constructed inside every `Session` and reachable through
+//! `Session::scheduler()`, but [`select_paths`] is called by nothing that steers
+//! production traffic, so no packet has ever left this crate on a path this table
+//! chose. The per-path RTT and loss figures it would rank are populated nowhere
+//! either; the live equivalents live in `transport::path::PathState` and the BBR
+//! `BandwidthEstimator`, and those are what the sender actually reads.
 //!
-//! **Vestigial — not on the live data path.** The project deliberately does
-//! single-path connection migration, not multipath aggregation (bandwidth bonding
-//! was evaluated and rejected). `Scheduler` is still constructed inside `Session`
-//! and reachable via `Session::scheduler()` for diagnostics, but `select_paths` is
-//! never called to steer production traffic; live per-path RTT / loss lives in
-//! `transport::path::PathState` plus the BBR `BandwidthEstimator`. The
-//! `HighThroughput` "multi-path bonding" branch below describes the rejected
-//! aggregation design and never runs against a real socket. Kept intact as the
-//! seam in case multi-path selection is ever rewired.
+//! Connecting it is not a cleanup and probably not wanted at all: the design it
+//! serves — bonding several paths at once — was evaluated and rejected in favour of
+//! single-path connection migration, which moves one active path and does not
+//! aggregate. The `HighThroughput` branch below spells out that rejected
+//! aggregation and has never run against a socket. The table is kept as the seam a
+//! future multi-path selector would occupy, and `SchedulerMode` outlives it for an
+//! unrelated reason: it is a required argument of `Session::from_derived` and so is
+//! genuinely live.
+//!
+//! [`select_paths`]: Scheduler::select_paths
 
 use crate::transport::types::{LegType, SchedulerMode};
 use parking_lot::RwLock;

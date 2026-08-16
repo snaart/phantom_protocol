@@ -1,13 +1,23 @@
-//! Packet Coalescer — UDP Datagram Batching
+//! UDP datagram batching — **the encoding half is not connected to the data
+//! path; the decoding half is.**
 //!
-//! Bundles many small packets into one larger UDP datagram: instead of N small
-//! packets (N syscalls) we send one big datagram (1 syscall), cutting per-send
-//! overhead and improving wire efficiency.
+//! The two directions of this module have opposite status, and reading it as one
+//! working mechanism gets both wrong. [`Decoalescer`] is live: the pump parses
+//! inbound `COALESCED` bundles through `transport::packet_coalescer_codec`, so a
+//! peer that bundles is understood. [`PacketCoalescer`] is not: outside this
+//! file's tests it is constructed nowhere, no send path bundles anything, and this
+//! implementation emits no datagram that any peer has received. The asymmetry is
+//! deliberate and is the safe direction to be asymmetric in — accepting a bundle
+//! costs a parser that already has to be hardened against a hostile peer, while
+//! emitting one changes what our traffic looks like on the wire.
 //!
 //! Bundle format: `[count: u16][len1: u16][payload1][len2: u16][payload2]...`
 //!
-//! Encrypting a single large block lets hardware AES run at full speed rather
-//! than paying per-message AEAD setup on each tiny packet.
+//! The saving that would justify turning the send half on is one `sendmsg` in
+//! place of N, plus one AEAD setup over a single large block instead of one per
+//! tiny packet. Claiming it needs a measurement against the pacer that now governs
+//! send timing, since batching and pacing compete for the same decision about when
+//! a packet leaves.
 
 use std::time::{Duration, Instant};
 
