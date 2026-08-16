@@ -68,8 +68,12 @@ pub type SequenceNumber = u32;
 pub type PacketNumber = u64;
 
 /// The sole on-wire packet-header version byte. Pinned — the wire format is not
-/// negotiated (pre-1.0, no users); a decoder rejects anything else. `6` is the
-/// anti-fingerprint diet: the version byte is now itself HP-masked (the WHOLE
+/// negotiated (pre-1.0, no users); a decoder rejects anything else. `7` changes the
+/// `WINDOW_UPDATE` plaintext from a 4-byte relative credit to an 8-byte cumulative limit
+/// (see [`PacketFlags::WINDOW_UPDATE`]); [`crate::transport::handshake::PROTOCOL_VERSION`]
+/// moved with it, so a peer speaking the older format is refused at the handshake with a
+/// typed `ServerReject` rather than having its packets dropped by the check on this byte.
+/// `6` was the anti-fingerprint diet: the version byte became itself HP-masked (the WHOLE
 /// 15-byte header `[0..15]` is masked — no constant cleartext byte), and the two
 /// cleartext `u32` length prefixes are dropped (`payload` is the message
 /// remainder — `recv_bytes` is message-framed — and `extensions` leave the wire),
@@ -79,7 +83,13 @@ pub type PacketNumber = u64;
 /// header to 15 bytes. `4` (T4.6) added QUIC-style header protection (RFC 9001
 /// §5.4) over a 47-byte header; `3` (Phase 4) widened the packet number to `u64`.
 /// See PROTOCOL.md § 4.2.
-pub const WIRE_VERSION: u8 = 6;
+pub const WIRE_VERSION: u8 = 7;
+
+/// Exact `WINDOW_UPDATE` AEAD-plaintext length: a big-endian `u64` cumulative limit. The
+/// receive path rejects any other length outright rather than reading a prefix, so a frame
+/// from a peer speaking a different flow-control encoding is dropped instead of being
+/// half-understood. See [`PacketFlags::WINDOW_UPDATE`].
+pub const WINDOW_UPDATE_PAYLOAD_LEN: usize = 8;
 
 /// Wire offset where the header-protected region begins. **WIRE v6
 /// (anti-fingerprint): `0`** — the masked region now covers the WHOLE 15-byte
@@ -150,13 +160,13 @@ impl PacketFlags {
     /// Payload is a coalesced bundle of inner packets in
     /// `[count: u16][len1: u16][payload1]...` format (Phase 2.5).
     pub const COALESCED: u16 = 0x0400;
-    /// Per-stream flow control update (Phase 4.3). Payload is a big-endian
-    /// `u32` of **relative** credit — the bytes the receiver's application has
-    /// just consumed, which the peer adds to its send window (saturating at
-    /// `MAX_SEND_WINDOW`). Relative rather than absolute is what keeps the
-    /// ledger correct past 4 GiB of transfer: the sender's window is
-    /// `initial + Σ granted − Σ sent`, so the receiver's unconsumed bytes stay
-    /// bounded by the initial window however long the session runs.
+    /// Per-stream flow control update (Phase 4.3). Payload is
+    /// [`WINDOW_UPDATE_PAYLOAD_LEN`] bytes: a big-endian `u64` **cumulative limit** — the
+    /// total the receiver is willing to have sent on that stream, counted from its first
+    /// byte. The sender takes the maximum of it and the limit it already held, so the frame
+    /// is idempotent, reorder-safe and loss-tolerant: nothing is destroyed by a duplicate, a
+    /// stale one is discarded, and one that never arrives is repaired by the next, which
+    /// states the whole truth rather than the difference since the last.
     pub const WINDOW_UPDATE: u16 = 0x0800;
     /// Idle keep-alive PING (download-only liveness). A small
     /// `ENCRYPTED | KEEPALIVE` packet with an **empty** payload that an idle
@@ -300,7 +310,7 @@ impl fmt::Debug for PacketFlags {
 /// ε CID collapse), reconstructed by the receiver from session context.
 ///
 /// ```text
-/// off  0  version        u8       (= WIRE_VERSION = 6)            HP-MASKED ┐
+/// off  0  version        u8       (= WIRE_VERSION = 7)            HP-MASKED ┐
 /// off  1  packet_number  u64 be   (per-direction monotonic)      HP-MASKED │
 /// off  9  flags          u16 be                                  HP-MASKED │ [0..15]
 /// off 11  stream_id      u16 be                                  HP-MASKED │
@@ -942,9 +952,12 @@ mod tests {
             PacketHeader::SIZE,
             "v6 masks the whole 15-byte header"
         );
+        // The layout below is the one the anti-fingerprint diet introduced at version 6 and
+        // is unchanged since; the constant has moved on to 7, which changed the
+        // `WINDOW_UPDATE` plaintext rather than anything in the header.
         assert_eq!(
-            WIRE_VERSION, 6,
-            "anti-fingerprint diet bumps the wire version"
+            WIRE_VERSION, 7,
+            "the wire version must move whenever anything on the wire does"
         );
 
         let header = PacketHeader::new(

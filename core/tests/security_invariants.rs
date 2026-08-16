@@ -35,6 +35,7 @@ use phantom_protocol::crypto::adaptive_crypto::{CipherSuite, CryptoSession, AEAD
 use phantom_protocol::crypto::hybrid_sign::{HybridSigningKey, HybridVerifyingKey};
 use phantom_protocol::transport::handshake::{
     ClientHello, HandshakeClient, HandshakeError, HandshakeResponse, HandshakeServer, ServerHello,
+    PROTOCOL_VERSION, REJECT_UNSUPPORTED_VERSION,
 };
 use phantom_protocol::transport::mtu::MAX_RECV_PAYLOAD;
 use phantom_protocol::transport::multiplexer::{StreamDemultiplexer, StreamMessage};
@@ -1653,6 +1654,67 @@ fn packet_roundtrip_preserves_fields() {
     assert_eq!(decoded.header.path_id, 2);
     assert!(decoded.header.flags.contains(PacketFlags::REKEY));
     assert_eq!(decoded.payload, vec![0xDE, 0xAD]);
+}
+
+/// **A peer speaking an older protocol is refused, not left to stall.**
+///
+/// The data-plane version check drops a mismatched frame *silently*: nothing is logged to
+/// the peer, no error is raised, the packet simply vanishes. That is the right behaviour for
+/// a frame — an attacker must not learn anything from spraying them — and it is exactly why
+/// a wire-format change cannot rely on `WIRE_VERSION` alone. An older peer would complete a
+/// handshake, believe itself connected, and then sit with its packets disappearing: a stall
+/// with no diagnosis, which is the failure mode a format change is normally made to remove.
+///
+/// So the handshake version moves with the wire version, and this pins both halves of that
+/// argument: the hello is refused with a typed reject naming the version this build speaks,
+/// **before** any KEM or signature work; and the packet-level check really is the silent
+/// drop that makes the refusal necessary.
+#[test]
+fn an_older_peer_is_refused_at_the_handshake_rather_than_dropped_on_the_wire() {
+    let server = HandshakeServer::new().unwrap();
+    let client = HandshakeClient::new().unwrap();
+    let client_ip = "127.0.0.1".parse().unwrap();
+
+    let mut hello = client.create_client_hello();
+    hello.version = PROTOCOL_VERSION - 1;
+
+    match server.process_client_hello(&hello, 0, client_ip) {
+        HandshakeResponse::Reject(reject) => {
+            assert!(reject.has_marker(), "reject must carry the marker");
+            assert_eq!(reject.code, REJECT_UNSUPPORTED_VERSION);
+            assert_eq!(
+                reject.supported_version, PROTOCOL_VERSION,
+                "the reject must name the version this build speaks, or an operator \
+                 reading it learns nothing actionable"
+            );
+        }
+        other => panic!(
+            "an older peer's hello was not refused with a typed reject: {other:?} — it \
+             would have established a session and then stalled"
+        ),
+    }
+
+    // The contrast that makes the bump load-bearing. The packet codec carries the version
+    // byte but does not judge it: a frame at the previous wire version parses cleanly here,
+    // and what refuses it is the receive loop's gate, whose only action is to skip the frame
+    // — no reply, no error, nothing the peer can observe. So the version byte can tell a
+    // receiver that a frame is foreign, and can tell the *sender* nothing at all; that is
+    // the whole argument for refusing an older peer one layer earlier, at the handshake.
+    let header = PacketHeader::new(
+        SessionId::from_bytes([7u8; 32]),
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED),
+    );
+    let mut wire = PhantomPacket::new(header, vec![0u8; 32]).to_wire();
+    wire[0] = WIRE_VERSION - 1;
+    let decoded = PhantomPacket::from_wire(&wire)
+        .expect("the codec parses the header before anything judges its version");
+    assert_eq!(
+        decoded.header.version,
+        WIRE_VERSION - 1,
+        "the version byte a receiver gates on must survive decoding"
+    );
 }
 
 // ── Flow-control enforcement invariants (receive-backpressure decoupling) ────

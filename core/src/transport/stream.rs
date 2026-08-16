@@ -3,7 +3,7 @@
 //! Independently-flow-controlled, reliability-segmented data channels multiplexed
 //! within one session. Each [`Stream`] owns its own send/receive buffers, gap-free
 //! reliable offset space (A.5), SACK-driven loss detection (RFC 9002), RFC-6298 RTO
-//! estimator, and credit-based flow-control windows. Per-stream sequencing means a
+//! estimator, and cumulative-limit flow control. Per-stream sequencing means a
 //! stall or loss on one stream does not head-of-line-block any other stream (HoL
 //! blocking still applies *within* a stream — reliable data is delivered strictly
 //! in send order via `accept_in_order`).
@@ -14,7 +14,7 @@ use crate::transport::types::{SequenceNumber, StreamId};
 
 use bytes::Bytes;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, Semaphore};
@@ -101,19 +101,28 @@ const PACKET_THRESHOLD: u32 = 3;
 /// Initial per-stream send window — caps how many bytes the local
 /// side will put on the wire before receiving a `WINDOW_UPDATE` from
 /// the peer. 64 KiB matches QUIC's stream initial-window default.
+///
+/// It is also the cumulative limit both ends assume for a stream before any
+/// `WINDOW_UPDATE` has been exchanged: the first `INITIAL_STREAM_WINDOW` bytes sent on a
+/// stream need no permission, and every later limit is an absolute total measured from the
+/// same origin.
 pub const INITIAL_STREAM_WINDOW: u32 = 64 * 1024;
 
-/// Hard ceiling on the credit-based send window. `WINDOW_UPDATE` frames add
-/// *relative* credit; this caps the accumulated window so a peer that floods
-/// inflated credits cannot overflow the counter. A compliant peer never grants
-/// more outstanding credit than its own advertised window, itself capped at
-/// [`MAX_RECV_WINDOW`] — the same value — so the cap is only a misbehaving-peer
-/// guard (the receiver's own delivery HARD_CAP is the real bound on buffering).
+/// Hard ceiling on how far the local side will run ahead of the peer's last advertisement.
+///
+/// A `WINDOW_UPDATE` states a cumulative total, so a peer is free to write any number it
+/// likes into one; [`Stream::apply_peer_window_limit`] therefore clamps what it will honour
+/// to `bytes already sent + MAX_SEND_WINDOW`. A compliant peer never advertises more than
+/// `consumed + its own advertised window`, and its window is capped at [`MAX_RECV_WINDOW`]
+/// — the same value — so the clamp never touches one; it exists so that a peer writing
+/// `u64::MAX` buys the same allowance as a peer writing the truth. (The real bound on what
+/// this side can hold outstanding is elsewhere: the ARQ send buffer's `MAX_PENDING_PACKETS`
+/// segments, and the congestion window.)
 pub const MAX_SEND_WINDOW: u32 = 16 * INITIAL_STREAM_WINDOW;
 
 /// Ceiling on the **receiver's** auto-tuned advertised window (see
 /// [`Stream::advertised_recv_window`]). Deliberately equal to [`MAX_SEND_WINDOW`]: the two
-/// ends of the same credit ledger must agree, or a receiver would grant credit its peer
+/// ends of the same ledger must agree, or a receiver would advertise room its peer's clamp
 /// silently discards.
 ///
 /// A window of `W` bytes admits `W / RTT` bytes per second, so this constant is a hard rate
@@ -652,16 +661,25 @@ pub struct Stream {
     priority: AtomicU32,
     /// Backpressure semaphore
     send_semaphore: Arc<Semaphore>,
-    /// Bytes the **peer** has granted us to send — decremented as we
-    /// emit payload bytes, replenished by inbound `WINDOW_UPDATE`
-    /// frames (Phase 4.3). When it hits zero, `poll_send` stalls
-    /// until the next `WINDOW_UPDATE` — sending, meanwhile, the empty persist probe
-    /// [`Stream::try_persist_probe`] issues when no such frame can be counted on.
-    peer_send_window: AtomicU32,
-    /// Bytes the local side has granted the peer — replenished as
-    /// the application drains `recv_ready`. We periodically emit a
-    /// `WINDOW_UPDATE` carrying the new absolute window.
-    local_recv_window: AtomicU32,
+    /// Total reliable application bytes this side has put on the wire for this stream,
+    /// counting each byte once: a first transmission adds, a retransmission does not (those
+    /// bytes were counted when they first left), and a write the transport refused subtracts
+    /// again ([`Stream::mark_unsent`]). It is one half of the flow-control ledger and the
+    /// peer counts the other half in the same units, which is what lets an absolute limit be
+    /// compared against it without either end inferring the other's state.
+    bytes_sent: AtomicU64,
+    /// The largest cumulative total the peer has said may be sent on this stream, as this
+    /// side honours it. Starts at [`INITIAL_STREAM_WINDOW`] — the allowance both ends assume
+    /// before any `WINDOW_UPDATE` — and only ever rises
+    /// ([`Stream::apply_peer_window_limit`]). When it stops exceeding `bytes_sent`,
+    /// `poll_send` stalls until a later `WINDOW_UPDATE` raises it — sending, meanwhile, the
+    /// empty persist probe [`Stream::try_persist_probe`] issues when no such frame can be
+    /// counted on.
+    peer_send_limit: AtomicU64,
+    /// Total bytes the local application has consumed on this stream. The limit this side
+    /// advertises is this counter plus [`Stream::advertised_recv_window`], so the number on
+    /// the wire moves only when the application really took bytes.
+    bytes_consumed: AtomicU64,
     /// The window this side is currently *advertising*: how many bytes the peer may hold
     /// unacknowledged-by-the-application at once. Auto-tuned upward by
     /// [`Stream::tune_recv_window`] and never above [`MAX_RECV_WINDOW`].
@@ -669,28 +687,25 @@ pub struct Stream {
     /// Measurement interval backing the auto-tuner. A plain sync mutex — taken only by the
     /// single delivery task that credits this stream, and never held across an `.await`.
     recv_window_probe: std::sync::Mutex<RecvWindowProbe>,
-    /// Total bytes the local side has consumed since the last
-    /// emitted `WINDOW_UPDATE`. Used to decide when to send the
-    /// next update (avoid flooding the wire with tiny updates).
-    ///
-    /// Two paths on two tasks mutate it — [`Stream::record_app_consumed`] on the delivery
-    /// task and [`Stream::take_owed_window_credit`] on the receive task — so each of its
-    /// operations has to be a single atomic transition rather than a read followed by a
-    /// write. Either function's justification for its compare-exchange or swap is the other
-    /// one existing.
+    /// Bytes the local application has consumed since the last emitted `WINDOW_UPDATE`.
+    /// Used to decide when to send the next one, so the wire is not flooded with tiny
+    /// updates. Accumulated and reset in one compare-exchange transition, which is what
+    /// keeps a reset from discarding bytes credited while it was being computed.
     bytes_since_last_update: AtomicU32,
-    /// Pending **relative** flow-control credit to advertise in a
-    /// `WINDOW_UPDATE`, staged by the receive **delivery** task (which credits
-    /// the window on *real* app consumption) and flushed by the **send loop** —
-    /// the sole *outbound* writer, so the encrypted control frame is sealed by the
-    /// same task that stamps every data packet, under the epoch live at flush
-    /// time. (The epoch itself has TWO writers — the send loop's own `rekey()` and
-    /// the receive task's authenticated forward catch-up in
+    /// Pending cumulative flow-control limit to advertise in a `WINDOW_UPDATE`, staged by
+    /// the receive **delivery** task (which moves the limit only on *real* app consumption)
+    /// and flushed by the **send loop** — the sole *outbound* writer, so the encrypted
+    /// control frame is sealed by the same task that stamps every data packet, under the
+    /// epoch live at flush time. (The epoch itself has TWO writers — the send loop's own
+    /// `rekey()` and the receive task's authenticated forward catch-up in
     /// `decrypt_packet_accepting_rekey` — but both serialise through the session's
     /// `rekey_lock`, so the send loop always seals under a consistent key.)
-    /// Credits accumulate additively, so several grants between two flushes are
-    /// never lost. `0` = nothing pending.
-    pending_window_update: AtomicU32,
+    ///
+    /// Stagings resolve by **maximum**, not by sum: the value is a total, so two stagings
+    /// between one pair of flushes are two statements about the same quantity and the later,
+    /// larger one subsumes the earlier. `0` = nothing pending, which is unambiguous because
+    /// a real limit is never below [`INITIAL_STREAM_WINDOW`].
+    pending_window_update: AtomicU64,
     /// RFC 6298 retransmission-timeout estimator. A plain (sync) mutex: it is
     /// updated only from the serial ACK path and read by `poll_send`, and the
     /// guard is never held across an `.await`.
@@ -745,12 +760,13 @@ impl Stream {
             remote_fin_offset: AtomicU32::new(u32::MAX),
             priority: AtomicU32::new(0),
             send_semaphore: Arc::new(Semaphore::new(MAX_PENDING_PACKETS)),
-            peer_send_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
-            local_recv_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
+            bytes_sent: AtomicU64::new(0),
+            peer_send_limit: AtomicU64::new(u64::from(INITIAL_STREAM_WINDOW)),
+            bytes_consumed: AtomicU64::new(0),
             advertised_recv_window: AtomicU32::new(INITIAL_STREAM_WINDOW),
             recv_window_probe: std::sync::Mutex::new(RecvWindowProbe::default()),
             bytes_since_last_update: AtomicU32::new(0),
-            pending_window_update: AtomicU32::new(0),
+            pending_window_update: AtomicU64::new(0),
             rto: std::sync::Mutex::new(RtoEstimator::new()),
             last_data_recv_at: std::sync::Mutex::new(None),
             persist_probe_at: std::sync::Mutex::new(None),
@@ -862,78 +878,78 @@ impl Stream {
         }
     }
 
-    /// Bytes the peer currently allows us to send.
+    /// Bytes the peer currently allows us to send: its cumulative limit less what has
+    /// already gone out. Zero means the stream is stopped until a later `WINDOW_UPDATE`
+    /// raises the limit. Reported as a `u32` because it is a difference between two totals
+    /// that [`Self::apply_peer_window_limit`] keeps within [`MAX_SEND_WINDOW`] of each
+    /// other, and clamped rather than truncated so it can never read as small when it is
+    /// large.
     pub fn peer_send_window(&self) -> u32 {
-        self.peer_send_window.load(Ordering::Acquire)
+        let limit = self.peer_send_limit.load(Ordering::Acquire);
+        let sent = self.bytes_sent.load(Ordering::Acquire);
+        limit.saturating_sub(sent).min(u64::from(u32::MAX)) as u32
     }
 
-    /// Atomically reserve `n` bytes from the peer's send window.
-    /// Returns `true` if the reservation succeeded (and the window
-    /// was decremented); `false` if the window doesn't have enough
-    /// capacity — caller must wait for a `WINDOW_UPDATE`.
+    /// Total bytes this side has put on the wire for this stream — the sender's half of the
+    /// flow-control ledger. Observability / test hook.
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent.load(Ordering::Acquire)
+    }
+
+    /// Atomically charge `n` bytes against the peer's cumulative limit.
+    /// Returns `true` if the bytes fit under the limit (and the sent-byte total was
+    /// advanced); `false` if they do not — the caller must wait for a `WINDOW_UPDATE`.
     pub fn try_consume_send_window(&self, n: u32) -> bool {
-        let mut cur = self.peer_send_window.load(Ordering::Acquire);
+        let n = u64::from(n);
+        let mut sent = self.bytes_sent.load(Ordering::Acquire);
         loop {
-            if cur < n {
+            // Re-read the limit on every attempt: a `WINDOW_UPDATE` applied on the receive
+            // task between two attempts of this loop is a raise this pass may as well use.
+            let limit = self.peer_send_limit.load(Ordering::Acquire);
+            if sent.saturating_add(n) > limit {
                 return false;
             }
-            match self.peer_send_window.compare_exchange_weak(
-                cur,
-                cur - n,
+            match self.bytes_sent.compare_exchange_weak(
+                sent,
+                sent + n,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => return true,
-                Err(actual) => cur = actual,
+                Err(actual) => sent = actual,
             }
         }
     }
 
-    /// Process an inbound `WINDOW_UPDATE` from the peer. The payload is a
-    /// **relative credit** — the number of bytes the peer's application just
-    /// consumed and is therefore newly willing to receive. We *add* it to the
-    /// send window (saturating at [`MAX_SEND_WINDOW`] so a misbehaving peer's
-    /// inflated credit cannot overflow the counter).
+    /// Process an inbound `WINDOW_UPDATE` from the peer. The payload is a **cumulative
+    /// limit** — the total number of bytes the peer is willing to have sent on this stream,
+    /// counted from the stream's first byte in the same units this side counts
+    /// `bytes_sent`.
     ///
-    /// Relative credit (vs. an absolute window) is what makes flow control
-    /// correct for a session of any length: the sender's window is
-    /// `initial + Σ credit_granted − Σ bytes_sent` = `initial + consumed −
-    /// sent`, so the receiver's outstanding (unconsumed) bytes `sent − consumed`
-    /// are bounded by `initial`. An absolute u32 window could not express this
-    /// for sessions exceeding 4 GiB and over-committed the receiver's buffer.
-    pub fn apply_peer_window_update(&self, credit: u32) {
-        self.credit_send_window(credit);
-    }
-
-    /// Add `credit` bytes to the peer's send window, saturating at
-    /// [`MAX_SEND_WINDOW`].
+    /// Three properties follow from the quantity being a monotone total rather than an
+    /// increment, and between them they are why the frame does not have to be reliable:
     ///
-    /// Two callers, and the distinction is worth keeping in the names rather than here:
-    /// [`Self::apply_peer_window_update`] adds credit the peer granted, and
-    /// [`Self::mark_unsent`] puts back credit this side debited for bytes that never
-    /// reached the wire. Only the first is a value a peer writes.
-    fn credit_send_window(&self, credit: u32) {
-        let mut cur = self.peer_send_window.load(Ordering::Acquire);
-        loop {
-            let next = cur.saturating_add(credit).min(MAX_SEND_WINDOW);
-            if next == cur {
-                return; // already at the cap; nothing to add
-            }
-            match self.peer_send_window.compare_exchange_weak(
-                cur,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(actual) => cur = actual,
-            }
-        }
-    }
-
-    /// Bytes the local side has granted the peer.
-    pub fn local_recv_window(&self) -> u32 {
-        self.local_recv_window.load(Ordering::Acquire)
+    /// * **idempotent** — applying the same limit twice is a no-op, so a duplicate carries
+    ///   no error;
+    /// * **reorder-safe** — a stale frame overtaken by a newer one states a smaller total
+    ///   and the maximum below discards it;
+    /// * **loss-tolerant** — a frame that never arrives costs nothing, because the next one
+    ///   states the whole truth rather than the difference since the last.
+    ///
+    /// The limit is a number the peer writes, so what this side honours is clamped to
+    /// `bytes_sent + MAX_SEND_WINDOW`. A compliant peer is never clamped: it advertises
+    /// `consumed + its advertised window`, its window is capped at [`MAX_RECV_WINDOW`] —
+    /// the same figure — and it cannot have consumed more than this side has sent. What the
+    /// clamp denies is the peer that writes an enormous number to buy itself unlimited
+    /// permission: it buys one [`MAX_SEND_WINDOW`] beyond what has already gone out, the
+    /// same as any other advertisement, and must send another frame for more.
+    pub fn apply_peer_window_limit(&self, limit: u64) {
+        let ceiling = self
+            .bytes_sent
+            .load(Ordering::Acquire)
+            .saturating_add(u64::from(MAX_SEND_WINDOW));
+        self.peer_send_limit
+            .fetch_max(limit.min(ceiling), Ordering::AcqRel);
     }
 
     /// The window this side currently advertises: the most bytes the peer may hold in our
@@ -954,13 +970,16 @@ impl Stream {
         self.advertised_recv_window() as usize + INITIAL_STREAM_WINDOW as usize
     }
 
-    /// Receive-window auto-tuning. Returns the **extra** relative credit to hand the peer
-    /// because the advertised window just grew (`0` when it did not).
+    /// Receive-window auto-tuning. Returns `true` when the advertised window just grew, so
+    /// the caller can advertise the new, larger limit at once instead of waiting for
+    /// consumption to reach its own emission threshold — a peer stalled on the old limit is
+    /// waiting for exactly this.
     ///
     /// ## Why the window has to move at all
     ///
-    /// A credit window of `W` bytes returned one round trip after the data was consumed is
-    /// a hard rate ceiling of `W / RTT`, whatever congestion control decides. A fixed 64 KiB
+    /// A window of `W` bytes whose room reopens one round trip after the data was consumed
+    /// is a hard rate ceiling of `W / RTT`, whatever congestion control decides. A fixed
+    /// 64 KiB
     /// window on a 200 ms path is 2.6 Mbit/s per stream — below the capacity of any path
     /// worth measuring — so on a long path flow control, not the network, is the limiter.
     /// TCP window auto-tuning and QUIC flow-control auto-tuning both exist for this reason,
@@ -985,7 +1004,7 @@ impl Stream {
     /// auto-tuning aims at too, and it is deliberately not far above it — the point is to
     /// stop being the binding constraint, not to hand out buffer nobody needs.
     ///
-    /// Why `0.4` and not the round `0.5`: credit is returned a round trip *after* the
+    /// Why `0.4` and not the round `0.5`: room reopens a round trip *after* the
     /// application consumed, so a flow that really is window-limited does not achieve
     /// `window / RTT` — it achieves about half of that, which is exactly what the measurement
     /// that prompted this work showed (1.2 Mbit/s against a 2.62 Mbit/s window ceiling, 46%).
@@ -1024,10 +1043,10 @@ impl Stream {
     /// cannot each reach the ceiling, because between them they have 8 MiB of growth to
     /// spend. The session-wide worst case works out lower than it was before the ceiling
     /// moved — see that constant for the arithmetic.
-    fn tune_recv_window(&self, n: u32) -> u32 {
+    fn tune_recv_window(&self, n: u32) -> bool {
         let window = self.advertised_recv_window.load(Ordering::Acquire);
         if window >= MAX_RECV_WINDOW {
-            return 0;
+            return false;
         }
         // The path's propagation delay, NOT the smoothed estimate: a saturated forward
         // path inflates smoothed RTT, a longer RTT lowers the rate a window has to beat to
@@ -1049,11 +1068,11 @@ impl Stream {
             // First consumption on this stream opens the interval; there is no elapsed
             // time yet to draw a rate from.
             probe.started_at = Some(now);
-            return 0;
+            return false;
         };
         let elapsed = now.duration_since(started_at);
         if elapsed < interval {
-            return 0; // interval still open — keep accumulating
+            return false; // interval still open — keep accumulating
         }
         let bytes = probe.bytes;
         probe.bytes = 0;
@@ -1071,7 +1090,7 @@ impl Stream {
             .saturating_mul(4)
             .saturating_mul(elapsed.as_nanos());
         if lhs <= rhs {
-            return 0; // the application is not keeping up with the window we already gave it
+            return false; // the application is not keeping up with the window we already gave it
         }
 
         let next = window.saturating_mul(2).min(MAX_RECV_WINDOW);
@@ -1081,7 +1100,7 @@ impl Stream {
         // other streams, this one keeps the window it has rather than adding to a total
         // nobody bounded.
         if !self.recv_tuning.try_take_growth(growth) {
-            return 0;
+            return false;
         }
         match self.advertised_recv_window.compare_exchange(
             window,
@@ -1089,58 +1108,58 @@ impl Stream {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => growth,
+            Ok(_) => true,
             // Lost a race with a concurrent grower: its increase stands, ours is dropped
             // rather than compounded — and the budget it drew must go back, or a contended
             // stream would leak the session's allowance one lost race at a time.
             Err(_) => {
                 self.recv_tuning.return_growth(growth);
-                0
+                false
             }
         }
     }
 
+    /// The cumulative flow-control limit this side currently grants the peer on this
+    /// stream: every byte the application has consumed, plus one advertised window of room
+    /// beyond it. Both terms move only on real application consumption — the second because
+    /// `tune_recv_window` is fed from the same place — so the number on the wire is a
+    /// statement about what this side has actually digested, never about what has arrived.
+    pub fn recv_limit(&self) -> u64 {
+        self.bytes_consumed
+            .load(Ordering::Acquire)
+            .saturating_add(u64::from(self.advertised_recv_window()))
+    }
+
     /// Record that the application has actually consumed `n` bytes from this
     /// stream (called by the receive *delivery* task on real drainage, not
-    /// on routing). Accumulates the consumed bytes and, once the unreported
-    /// total crosses half the initial window, returns `Some(credit)` — the
-    /// **relative credit** to advertise in a `WINDOW_UPDATE` (the peer *adds*
-    /// it to its send window). The half-window threshold trades update frequency
-    /// against peer stalls.
+    /// on routing). Advances the consumed total and returns `Some(limit)` — the cumulative
+    /// limit to advertise in a `WINDOW_UPDATE` — when it is worth spending a frame on:
+    /// either the unreported consumption has crossed half the initial window, or the
+    /// advertised window just grew. The half-window threshold trades update frequency
+    /// against peer stalls; growth is emitted regardless of it, because a window that just
+    /// doubled is precisely the case where the peer is stopped waiting for the room.
     ///
-    /// The credit also carries any growth `tune_recv_window` just decided. Because
-    /// `WINDOW_UPDATE` is relative, opening the window wider is simply extra credit — the
-    /// wire format expresses it as it stands, and a window increase needs no new frame.
-    /// Growth is emitted immediately even when the consumption credit is still below the
-    /// update threshold: it is precisely the case where the peer is stalled waiting.
-    pub fn record_app_consumed(&self, n: u32) -> Option<u32> {
-        let growth = self.tune_recv_window(n);
+    /// A limit needs no arithmetic on the wire and no separate frame for growth: whatever
+    /// moved, the answer is the same sentence, and the peer takes the larger of it and what
+    /// it already had.
+    pub fn record_app_consumed(&self, n: u32) -> Option<u64> {
+        self.bytes_consumed
+            .fetch_add(u64::from(n), Ordering::AcqRel);
+        let grew = self.tune_recv_window(n);
         let threshold = INITIAL_STREAM_WINDOW / 2;
-        // Accumulate and — on crossing the threshold — take the whole accumulator, in one
-        // transition. The counter has a second mutator: [`Self::take_owed_window_credit`]
-        // swaps it to zero on the receive task when the peer's persist probe arrives, while
-        // this runs on the delivery task. Adding `n` and then subtracting the total just read
-        // is two transitions, and the swap fits between them: the subtraction would run
-        // against a counter the other path had already emptied, so on a `u32` it lands at
-        // `2^32` minus the bytes taken. The next probe reads that as bytes owed and grants
-        // it, taking the peer's send window to `MAX_SEND_WINDOW` with nothing consumed to pay
-        // for it — and since the peer chooses when to probe, and the probe is what performs
-        // the swap, an accumulator that can be caught mid-update is a window the peer opens
-        // for itself. `pending_window_update` next door — staged by this task, flushed by
-        // another — is a compare-exchange against a swap already: the same two-task shape,
-        // resolved the same way. The cost here is an acquire load and one locked
-        // compare-exchange against the pair's one or two locked read-modify-writes, so the
-        // per-chunk path this sits on gets no slower.
+        // Accumulate and — on crossing the threshold — clear the accumulator, in one
+        // transition rather than a read followed by a write, so bytes credited in between
+        // are carried into the next interval instead of being dropped by the reset.
         let mut cur = self.bytes_since_last_update.load(Ordering::Acquire);
-        let consumed_credit = loop {
+        let crossed = loop {
             // Saturating rather than wrapping: what keeps this sum small is the reset in the
             // same transition, not the width of the type, and `n` is the length of something
             // a peer sent.
             let pending = cur.saturating_add(n);
-            let (next, credit) = if pending >= threshold {
-                (0, pending)
+            let (next, crossed) = if pending >= threshold {
+                (0, true)
             } else {
-                (pending, 0)
+                (pending, false)
             };
             match self.bytes_since_last_update.compare_exchange_weak(
                 cur,
@@ -1148,48 +1167,31 @@ impl Stream {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break credit,
+                Ok(_) => break crossed,
                 Err(actual) => cur = actual,
             }
         };
-        let credit = consumed_credit.saturating_add(growth);
-        if credit == 0 {
-            return None;
-        }
-        // Keep the (now informational) local_recv_window in step for stats.
-        self.local_recv_window.fetch_add(credit, Ordering::AcqRel);
-        Some(credit)
+        (crossed || grew).then(|| self.recv_limit())
     }
 
-    /// Stage relative flow-control credit to be flushed by the send loop.
-    /// Called by the receive delivery task after it credits real app
-    /// consumption. Credits **accumulate additively** (saturating at
-    /// `u32::MAX`) rather than overwriting, so several grants landing between
-    /// two send-loop flushes are summed instead of lost — the send loop is the
-    /// single emitter (epoch-safe), and it may run arbitrarily after a grant.
-    pub fn stage_window_update_credit(&self, credit: u32) {
-        let mut cur = self.pending_window_update.load(Ordering::Acquire);
-        loop {
-            let next = cur.saturating_add(credit);
-            if next == cur {
-                return; // nothing to add (zero credit, or already saturated)
-            }
-            match self.pending_window_update.compare_exchange_weak(
-                cur,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(actual) => cur = actual,
-            }
-        }
+    /// Stage a cumulative flow-control limit to be flushed by the send loop. Called by the
+    /// receive delivery task after real app consumption moved the limit, and by the receive
+    /// task when the peer's persist probe asks for it.
+    ///
+    /// Stagings resolve by **maximum**: the value is a total, so a second staging before the
+    /// send loop has flushed the first is a later statement about the same quantity, and
+    /// keeping the larger loses nothing. This is also what makes a failed send safe to
+    /// re-stage — see `flush_pending_window_updates`.
+    pub fn stage_window_update_limit(&self, limit: u64) {
+        self.pending_window_update
+            .fetch_max(limit, Ordering::AcqRel);
     }
 
-    /// Take all staged credit (swaps the slot back to `0`). The send loop calls
-    /// this each drain pass and emits one `WINDOW_UPDATE` carrying the summed
-    /// credit if `Some`.
-    pub fn take_pending_window_update(&self) -> Option<u32> {
+    /// Take the staged limit (swapping the slot back to `0`). The send loop calls this each
+    /// drain pass and emits one `WINDOW_UPDATE` carrying it if `Some`. `0` is the empty
+    /// sentinel and cannot collide with a real limit, which is never below
+    /// [`INITIAL_STREAM_WINDOW`].
+    pub fn take_pending_window_update(&self) -> Option<u64> {
         match self.pending_window_update.swap(0, Ordering::AcqRel) {
             0 => None,
             w => Some(w),
@@ -1276,7 +1278,7 @@ impl Stream {
     /// This exists because the data pump admits application writes from inside
     /// its `select!` loop. `send_reliable` parks on the backpressure semaphore
     /// until an acknowledgement frees a slot, and a parked pump is a pump that
-    /// has stopped emitting the *receive* side's flow-control credit and
+    /// has stopped emitting the *receive* side's flow-control limits and
     /// stopped draining its command channel — so a saturating send in one
     /// direction silently strangles the other. Refusing the write and letting
     /// the pump loop keep turning replaces that with real, visible
@@ -1427,24 +1429,29 @@ impl Stream {
     /// Hand back the flow-control persist probe, if a stream the peer's window has stopped
     /// is due one.
     ///
-    /// Flow-control credit is *relative*: a `WINDOW_UPDATE` says "add this much", never
-    /// "your window is this". The receiver clears the bytes off its own accumulator as it
-    /// composes the frame ([`Self::record_app_consumed`]), the frame is sent once,
-    /// unacknowledged, and nothing retransmits it — so a datagram that does not arrive
-    /// subtracts its credit from this side's window for the rest of the connection. Once the
-    /// accumulated deficit reaches the initial window the sender is left in a state no
-    /// message can leave: window below one segment, nothing outstanding, data still queued.
-    /// No acknowledgement can arrive because nothing is in flight, and the one frame that
-    /// could free it is the class of frame that went missing.
+    /// A `WINDOW_UPDATE` is sent once, unacknowledged, and nothing retransmits it. Because
+    /// it carries a cumulative limit, a lost one costs nothing *provided another follows* —
+    /// and the case this exists for is the one where none will: the peer's application has
+    /// consumed everything it is going to for now, so it has no reason to speak again, while
+    /// this side is stopped at a limit that a lost frame has left below the truth. Nothing
+    /// outstanding means no acknowledgement is due either, so the stream has no event left
+    /// that could free it.
     ///
-    /// What leaves that state is asking. The probe is a **zero-length** reliable segment —
-    /// the [`Self::queue_fin`] sentinel's shape without the `FIN` flag — so it carries no
-    /// application byte past a window that has no room for one. That is the whole of why it
-    /// is safe: the sender cannot tell a receiver whose grant was lost from one whose
-    /// application has simply stopped reading, and with an empty probe it does not have to.
-    /// A receiver holding a full window of unconsumed data is charged nothing at all and
-    /// stays entitled to keep this side stopped for as long as its application is not
-    /// reading — which is flow control working, not failing.
+    /// The signal has to come from here rather than from the receiver, because the fact that
+    /// matters — data queued and no room for it — is only visible on this side. A receiver
+    /// cannot tell a peer that is blocked from one that simply has nothing to send: both are
+    /// silent, and both leave its own counters unchanged. So it would have to re-advertise
+    /// on a timer forever, on every open stream, since no frame in that direction is ever
+    /// acknowledged and it could never learn that it may stop.
+    ///
+    /// The probe is a **zero-length** reliable segment — the [`Self::queue_fin`] sentinel's
+    /// shape without the `FIN` flag — so it carries no application byte past a window that
+    /// has no room for one. That is the whole of why it is safe: the sender cannot tell a
+    /// receiver whose grant was lost from one whose application has simply stopped reading,
+    /// and with an empty probe it does not have to. A receiver holding a full window of
+    /// unconsumed data is charged nothing at all and stays entitled to keep this side
+    /// stopped for as long as its application is not reading — which is flow control
+    /// working, not failing.
     ///
     /// It repeats the **highest offset the peer has already acknowledged**, and that choice
     /// is load-bearing rather than economical. A probe on a fresh offset would necessarily
@@ -1468,17 +1475,16 @@ impl Stream {
     /// does too. What bounds it is [`RtoEstimator::MIN_RTO`] under that interval, and the
     /// bound is meaningful because a probe is one small frame carrying nothing: there is no
     /// volume for a second bound to limit. Neither the trigger nor the interval is a value
-    /// the peer writes — withholding credit is what causes a probe, and withholding it
+    /// the peer writes — withholding room is what causes a probe, and withholding it
     /// faster does not make one come sooner.
     ///
-    /// The answer, when there is one, comes from the receiver: an empty reliable segment is
-    /// recognised there as a probe and flushes whatever credit that side already owes but
-    /// has held back below its emission threshold (see [`Self::take_owed_window_credit`]).
-    /// That is credit its application really did consume, so a stalled application produces
-    /// none of it and a probing peer can extract nothing it has not earned. Credit already
-    /// written off into a lost frame is *not* recoverable this way, by this side or any
-    /// other: nothing on either end remembers it. Closing that gap needs an absolute window
-    /// on the wire, which is a protocol change and not this.
+    /// The answer comes from the receiver: an empty reliable segment is recognised there as
+    /// a probe and re-states that stream's current limit ([`Self::recv_limit`]). That is a
+    /// total, not the crumbs held back below an emission threshold, so one answer repairs
+    /// however many earlier frames the path ate. It is still bounded by what the local
+    /// application took: a receiver whose application has consumed nothing re-states the
+    /// limit the peer is already stopped at, and a probing peer extracts nothing it has not
+    /// earned however often it asks.
     fn try_persist_probe(
         &self,
         now: tokio::time::Instant,
@@ -1509,33 +1515,6 @@ impl Stream {
             retransmit: false,
             fin: false,
         })
-    }
-
-    /// Take every byte of flow-control credit this side owes the peer and has not yet
-    /// advertised, whatever [`Self::record_app_consumed`]'s emission threshold says.
-    ///
-    /// That threshold — half the initial window — trades frames against peer stalls, and it
-    /// is right while data keeps arriving to push the accumulator over it. Once the peer has
-    /// stopped, nothing will: the last few kilobytes the application consumed sit
-    /// unadvertised for the rest of the connection, and if the peer stopped *because* its
-    /// window is empty, that withheld credit is precisely what it is waiting for. A persist
-    /// probe is the peer saying so, and this is the answer.
-    ///
-    /// It grants only bytes the local application actually took, so it cannot over-commit
-    /// this side's buffers however often it is asked: a receiver whose application has
-    /// stopped reading owes nothing and returns `None`, emitting no frame at all.
-    ///
-    /// A single swap, not a read and a store, because the peer decides when this runs and
-    /// [`Self::record_app_consumed`] is accumulating into the same counter on another task —
-    /// see the compare-exchange there for what a half-applied update to it is worth to a peer.
-    pub fn take_owed_window_credit(&self) -> Option<u32> {
-        let owed = self.bytes_since_last_update.swap(0, Ordering::AcqRel);
-        if owed == 0 {
-            return None;
-        }
-        // Keep the (informational) local_recv_window in step, as the threshold path does.
-        self.local_recv_window.fetch_add(owed, Ordering::AcqRel);
-        Some(owed)
     }
 
     /// Get the next segment to (re)transmit, or the reason nothing is due.
@@ -1750,27 +1729,27 @@ impl Stream {
     /// removed.
     ///
     /// `was_first_transmission` says whether the attempt that failed was the one that
-    /// debited the peer's flow-control window, and it has to, because only the caller
-    /// knows: a retransmission was paid for on its original send and must not be refunded,
-    /// while a first transmission that never reached the wire has taken credit off a
-    /// counter that no acknowledgement will ever put back. Left unrefunded, every refused
-    /// write shrank the window by a segment for the rest of the connection, which arrives
-    /// at the same dead end as a lost `WINDOW_UPDATE` — window below one segment, nothing
-    /// outstanding — by a route entirely inside this side.
+    /// charged the peer's flow-control limit, and it has to, because only the caller knows:
+    /// a retransmission was paid for on its original send and must not be uncharged, while a
+    /// first transmission that never reached the wire has advanced a total that counts bytes
+    /// on the wire. Left uncorrected, the sent total would drift permanently above the bytes
+    /// the peer will ever see, so the peer's limit — which it computes from what it received
+    /// — would stay a refusal's worth behind for the rest of the connection, one refusal at
+    /// a time.
     pub async fn mark_unsent(&self, stream_offset: SequenceNumber, was_first_transmission: bool) {
-        // Zero for the FIN sentinel and the persist probe, which never debited the window.
-        let mut refund = 0u32;
+        // Zero for the FIN sentinel and the persist probe, which never charged the limit.
+        let mut uncharge = 0u64;
         {
             let mut buffer = self.send_buffer.lock().await;
             if let Some(pending) = buffer.iter_mut().find(|p| p.stream_offset == stream_offset) {
                 pending.sent_at = None;
                 if was_first_transmission {
-                    refund = pending.data.len() as u32;
+                    uncharge = pending.data.len() as u64;
                 }
             }
         }
-        if refund > 0 {
-            self.credit_send_window(refund);
+        if uncharge > 0 {
+            self.bytes_sent.fetch_sub(uncharge, Ordering::AcqRel);
         }
     }
 
@@ -3412,32 +3391,73 @@ mod tests {
     }
 
     #[test]
-    fn try_consume_send_window_decrements_atomically() {
+    fn try_consume_send_window_charges_the_sent_total_atomically() {
         let s = Stream::new(1);
         assert!(s.try_consume_send_window(1000));
+        assert_eq!(s.bytes_sent(), 1000);
         assert_eq!(s.peer_send_window(), INITIAL_STREAM_WINDOW - 1000);
         assert!(s.try_consume_send_window(INITIAL_STREAM_WINDOW - 1000));
+        assert_eq!(s.bytes_sent(), u64::from(INITIAL_STREAM_WINDOW));
         assert_eq!(s.peer_send_window(), 0);
-        // Further consumption fails until refilled.
+        // Nothing more fits under the limit until a later WINDOW_UPDATE raises it.
         assert!(!s.try_consume_send_window(1));
     }
 
+    /// **The three properties of a cumulative limit**, each asserted by name, because they
+    /// are the whole reason the frame carrying it does not have to be reliable.
     #[test]
-    fn apply_peer_window_update_adds_relative_credit() {
+    fn a_cumulative_limit_is_idempotent_reorder_safe_and_loss_tolerant() {
         let s = Stream::new(1);
-        // Drain to 100 bytes.
         assert!(s.try_consume_send_window(INITIAL_STREAM_WINDOW - 100));
         assert_eq!(s.peer_send_window(), 100);
+        let sent = s.bytes_sent();
 
-        // A WINDOW_UPDATE is a relative credit: it ADDS to the window.
-        s.apply_peer_window_update(1000);
+        // Loss-tolerant: whatever was in the frames that never arrived, this one states the
+        // total outright, so the window it leaves behind does not depend on them.
+        s.apply_peer_window_limit(sent + 1100);
         assert_eq!(s.peer_send_window(), 1100);
-        s.apply_peer_window_update(50);
-        assert_eq!(s.peer_send_window(), 1150);
 
-        // Saturates at the hard cap (misbehaving-peer guard).
-        s.apply_peer_window_update(u32::MAX);
-        assert_eq!(s.peer_send_window(), MAX_SEND_WINDOW);
+        // Idempotent: the same limit again is not more credit.
+        s.apply_peer_window_limit(sent + 1100);
+        assert_eq!(s.peer_send_window(), 1100);
+
+        // Reorder-safe: a stale, smaller total arriving late does not shrink the window.
+        s.apply_peer_window_limit(sent + 200);
+        assert_eq!(s.peer_send_window(), 1100);
+
+        // And a genuinely larger one does raise it — the same test in the other direction,
+        // so "ignores the small one" cannot pass by ignoring everything.
+        s.apply_peer_window_limit(sent + 1150);
+        assert_eq!(s.peer_send_window(), 1150);
+    }
+
+    /// **What an absurd advertisement buys.** The limit is a number the peer writes, so the
+    /// bound on it has to be local: this side honours at most one [`MAX_SEND_WINDOW`] beyond
+    /// what it has already put on the wire, and the peer has to send another frame for more.
+    #[test]
+    fn an_absurd_limit_buys_one_max_send_window_and_no_more() {
+        let s = Stream::new(1);
+        assert!(s.try_consume_send_window(INITIAL_STREAM_WINDOW));
+        let sent = s.bytes_sent();
+
+        s.apply_peer_window_limit(u64::MAX);
+        assert_eq!(
+            s.peer_send_window(),
+            MAX_SEND_WINDOW,
+            "a peer advertising u64::MAX bought more than the local cap allows"
+        );
+
+        // Having spent it, the same absurd advertisement is worth nothing further until the
+        // sent total moves again — and it only moves by bytes that actually went out.
+        assert!(s.try_consume_send_window(MAX_SEND_WINDOW));
+        assert_eq!(s.bytes_sent(), sent + u64::from(MAX_SEND_WINDOW));
+        s.apply_peer_window_limit(u64::MAX);
+        assert_eq!(
+            s.peer_send_window(),
+            MAX_SEND_WINDOW,
+            "the clamp is re-evaluated against the bytes sent since, so it is a rate of \
+             permission per frame rather than a one-off ceiling"
+        );
     }
 
     // ── Receive-window auto-tuning ──
@@ -3765,60 +3785,72 @@ mod tests {
         );
     }
 
-    /// A window increase reaches the peer as ordinary relative credit, and is emitted at once
-    /// rather than waiting for the consumption credit to reach its own threshold — the peer
-    /// is stalled on exactly this grant.
+    /// A window increase reaches the peer as an ordinary raised limit — no separate frame,
+    /// no arithmetic — and is emitted at once rather than waiting for consumption to reach
+    /// its own threshold, because the peer is stopped on exactly this room.
     #[tokio::test]
-    async fn window_growth_is_emitted_as_relative_credit_immediately() {
+    async fn window_growth_is_advertised_immediately_as_a_raised_limit() {
         tokio::time::pause();
         let s = Stream::new(1);
         s.record_app_consumed(1);
 
         // Mid-interval, consumption crosses its own update threshold and is flushed …
         tokio::time::advance(Duration::from_millis(200)).await;
-        assert_eq!(s.record_app_consumed(60 * 1024), Some(60 * 1024 + 1));
-
-        // … so when the interval closes, the growth is all that is left to advertise.
-        tokio::time::advance(Duration::from_millis(200)).await;
-        let credit = s.record_app_consumed(8 * 1024).expect("growth is credited");
+        let consumed = 60u64 * 1024 + 1;
         assert_eq!(
-            credit, INITIAL_STREAM_WINDOW,
-            "the credit is the 64 KiB the window grew by; the 8 KiB of consumption is still \
-             accumulating toward its own threshold"
+            s.record_app_consumed(60 * 1024),
+            Some(consumed + u64::from(INITIAL_STREAM_WINDOW))
         );
 
-        // A peer applying it ends up with initial + growth, i.e. the new window.
+        // … so when the interval closes, the growth is what makes the next one worth
+        // emitting: the 8 KiB of consumption is nowhere near the threshold on its own.
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let limit = s
+            .record_app_consumed(8 * 1024)
+            .expect("growth is advertised");
+        assert_eq!(
+            limit,
+            consumed + 8 * 1024 + u64::from(2 * INITIAL_STREAM_WINDOW),
+            "the limit is everything consumed plus the window that just doubled"
+        );
+
+        // A peer applying it may send up to that total, having sent nothing yet.
         let peer = Stream::new(1);
-        peer.apply_peer_window_update(credit);
-        assert_eq!(peer.peer_send_window(), 2 * INITIAL_STREAM_WINDOW);
+        peer.apply_peer_window_limit(limit);
+        assert_eq!(peer.peer_send_window(), MAX_SEND_WINDOW.min(limit as u32));
     }
 
     #[test]
-    fn record_app_consumed_grants_relative_credit_after_threshold() {
+    fn record_app_consumed_advertises_the_limit_after_the_threshold() {
         let s = Stream::new(1);
         let threshold = INITIAL_STREAM_WINDOW / 2;
 
-        // Small drains return None.
+        // Small drains move the limit but are not worth a frame.
         assert!(s.record_app_consumed(100).is_none());
         assert!(s.record_app_consumed(200).is_none());
 
-        // Drain across the half-window threshold → emit a credit equal to the
-        // accumulated consumption (300 + threshold), NOT an absolute window.
-        let credit = s.record_app_consumed(threshold);
+        // Drain across the half-window threshold → advertise the cumulative limit:
+        // everything consumed so far plus one advertised window of room beyond it.
         assert_eq!(
-            credit,
-            Some(300 + threshold),
-            "WINDOW_UPDATE carries the relative credit (bytes consumed since last update)"
+            s.record_app_consumed(threshold),
+            Some(u64::from(300 + threshold + INITIAL_STREAM_WINDOW)),
+            "WINDOW_UPDATE carries the total the peer may send, not the increment"
         );
 
-        // Counter resets after emitting — small further drains do not re-emit.
+        // The emission accumulator resets — small further drains do not re-emit — but the
+        // limit itself keeps rising underneath, so the next frame states the truth including
+        // everything withheld in between.
         assert!(s.record_app_consumed(10).is_none());
+        assert_eq!(
+            s.recv_limit(),
+            u64::from(310 + threshold + INITIAL_STREAM_WINDOW)
+        );
     }
 
     #[test]
-    fn relative_credit_round_trip_bounds_outstanding_to_one_window() {
-        // Model: receiver grants credit == consumed; sender's window =
-        // initial + Σcredit − Σsent, so outstanding (sent − consumed) ≤ initial.
+    fn the_limit_round_trip_bounds_outstanding_to_one_window() {
+        // Model: the receiver advertises `consumed + window`, the sender may send up to it,
+        // so outstanding (sent − consumed) never exceeds the advertised window.
         let sender = Stream::new(1);
         let receiver = Stream::new(1);
         let threshold = INITIAL_STREAM_WINDOW / 2;
@@ -3827,41 +3859,45 @@ mod tests {
         assert!(sender.try_consume_send_window(INITIAL_STREAM_WINDOW));
         assert_eq!(sender.peer_send_window(), 0, "initial window exhausted");
 
-        // Receiver consumes one threshold's worth → grants that much credit.
-        let credit = receiver
+        // Receiver consumes one threshold's worth → advertises that much past the initial
+        // window it had already granted.
+        let limit = receiver
             .record_app_consumed(threshold)
             .expect("threshold crossed");
-        sender.apply_peer_window_update(credit);
+        sender.apply_peer_window_limit(limit);
         assert_eq!(
             sender.peer_send_window(),
             threshold,
             "sender may now send exactly the bytes the receiver consumed"
         );
+        // What the receiver is still holding unconsumed, plus the room it has left open, is
+        // exactly one advertised window — the property the whole scheme exists to maintain,
+        // stated on the two counters that maintain it.
+        let outstanding = sender.bytes_sent() - u64::from(threshold);
+        assert_eq!(
+            outstanding + u64::from(sender.peer_send_window()),
+            u64::from(INITIAL_STREAM_WINDOW),
+        );
     }
 
     #[test]
-    fn staged_window_update_credit_accumulates_until_taken() {
+    fn a_staged_limit_keeps_the_larger_of_two() {
         let s = Stream::new(1);
         assert_eq!(s.take_pending_window_update(), None);
 
-        // Two grants staged before a single flush must SUM, not overwrite: the
-        // send loop (sole emitter) may run arbitrarily late after a credit is
-        // staged, so back-to-back grants would otherwise lose all but the last
-        // — a permanent credit leak that shrinks the peer's window over time.
-        s.stage_window_update_credit(1000);
-        s.stage_window_update_credit(2500);
-        assert_eq!(s.take_pending_window_update(), Some(3500));
+        // Two stagings before a single flush are two statements about the same total, so the
+        // later, larger one subsumes the earlier: summing them would advertise a limit
+        // nobody's application paid for.
+        s.stage_window_update_limit(70_000);
+        s.stage_window_update_limit(72_500);
+        assert_eq!(s.take_pending_window_update(), Some(72_500));
+
+        // Order does not matter — a lower one staged second must not pull the limit down.
+        s.stage_window_update_limit(80_000);
+        s.stage_window_update_limit(70_000);
+        assert_eq!(s.take_pending_window_update(), Some(80_000));
 
         // The slot resets to empty once taken.
-        assert_eq!(s.take_pending_window_update(), None);
-
-        // Accumulation saturates instead of wrapping past u32::MAX.
-        s.stage_window_update_credit(u32::MAX);
-        s.stage_window_update_credit(10);
-        assert_eq!(s.take_pending_window_update(), Some(u32::MAX));
-
-        // Zero credit is a no-op (no spurious WINDOW_UPDATE).
-        s.stage_window_update_credit(0);
         assert_eq!(s.take_pending_window_update(), None);
     }
 
@@ -4046,7 +4082,7 @@ mod tests {
         assert!(!s.take_in_order_fin(), "EOF is one-shot");
     }
 
-    // ── Flow-control credit that never arrives ──
+    // ── Flow-control frames that never arrive ──
 
     /// What the data pump hands a stream: one application chunk, one segment, one datagram.
     const HARNESS_SEG: usize = crate::transport::mtu::MAX_APP_CHUNK;
@@ -4065,18 +4101,17 @@ mod tests {
     }
 
     /// Move `total` bytes from `sender` to `receiver` a round trip at a time, delivering
-    /// every segment and every acknowledgement, and dropping the flow-control grants `lose`
+    /// every segment and every acknowledgement, and dropping the flow-control frames `lose`
     /// selects — by ordinal, so a test names which `WINDOW_UPDATE` datagrams the path ate.
     ///
-    /// Dropping a grant is exactly what losing that datagram does to both ends: the receiver
-    /// has already taken the bytes off its own books as it composed the frame, and the
-    /// sender never hears about them. Nothing else is impaired — no data is dropped, no
-    /// acknowledgement is delayed — so anything the sender fails to move is attributable to
-    /// the credit alone.
+    /// Dropping one is exactly what losing that datagram does to both ends: the receiver
+    /// emitted it and moved on, and the sender never hears it. Nothing else is impaired — no
+    /// data is dropped, no acknowledgement is delayed — so anything the sender fails to move
+    /// is attributable to the flow-control frames alone.
     ///
     /// The receiver's answer to a probe is modelled the way the pump implements it: an empty
-    /// reliable segment flushes the credit this side owes, and that frame takes an ordinal
-    /// like any other and can be lost like any other.
+    /// reliable segment is answered with the stream's current limit, and that frame takes an
+    /// ordinal like any other and can be lost like any other.
     ///
     /// Returns the number of rounds it took, or `Err(bytes_delivered)` when `max_rounds` ran
     /// out. A stall must report as a bounded assertion, never as a test that hangs.
@@ -4099,11 +4134,11 @@ mod tests {
 
         let mut delivered = 0usize;
         let mut grant_ordinal = 0u64;
-        let mut grant = |sender: &Stream, credit: Option<u32>| {
-            if let Some(credit) = credit {
+        let mut grant = |sender: &Stream, limit: Option<u64>| {
+            if let Some(limit) = limit {
                 grant_ordinal += 1;
                 if !lose(grant_ordinal) {
-                    sender.apply_peer_window_update(credit);
+                    sender.apply_peer_window_limit(limit);
                 }
             }
         };
@@ -4129,7 +4164,7 @@ mod tests {
                     grant(sender, receiver.record_app_consumed(released.len() as u32));
                 }
                 if is_persist_probe(seg) {
-                    grant(sender, receiver.take_owed_window_credit());
+                    grant(sender, Some(receiver.recv_limit()));
                 }
             }
             for seg in &flight {
@@ -4145,18 +4180,15 @@ mod tests {
 
     /// **The upload that stops and never resumes.**
     ///
-    /// Flow-control credit is relative — a `WINDOW_UPDATE` says "add this much", not "your
-    /// window is this" — and it is emitted once, in a single unacknowledged frame, after the
-    /// receiver has already cleared it from its own accumulator. A datagram that does not
-    /// arrive therefore subtracts its credit from the sender's window permanently. Once the
-    /// deficit puts the window under one segment the sender is left in a state nothing can
-    /// leave: no acknowledgement can arrive, because nothing is outstanding, and the only
-    /// frame that could free it is the class of frame that just went missing.
+    /// A `WINDOW_UPDATE` is emitted once, in a single unacknowledged frame that nothing
+    /// retransmits. A sender left with no room, data queued and *nothing outstanding* is in
+    /// a state no event can leave on its own: no acknowledgement is due, because nothing is
+    /// in flight, and the frame that would open the window is the class of frame that just
+    /// went missing.
     ///
-    /// One lost grant is enough here. The transfer is eight times the initial window, so it
-    /// cannot finish on the initial credit; the first grant closes the gap and is lost; the
-    /// receiver is left holding the rest of what it owes below its emission threshold, where
-    /// nothing will ever push it over. What frees the sender is asking for it.
+    /// One lost frame is enough here. The transfer is eight times the initial window, so it
+    /// cannot finish on the opening allowance; the first advertisement closes the gap and is
+    /// lost. What frees the sender is asking for it.
     #[tokio::test(start_paused = true)]
     async fn a_transfer_completes_when_the_grant_that_would_continue_it_is_lost() {
         let sender = Stream::new(1);
@@ -4175,33 +4207,65 @@ mod tests {
         }
     }
 
-    /// **What the probe recovers, and what it cannot.**
+    /// **The stall the persist probe cannot reach.**
     ///
-    /// The probe asks; the receiver answers with the credit its application really did
-    /// consume and it had held back below its emission threshold. Credit that reached that
-    /// threshold, went out in a frame and was lost is not recoverable by asking: neither end
-    /// remembers it — the receiver cleared it as it composed the frame and the sender never
-    /// saw it. Closing *that* gap needs an absolute window on the wire.
+    /// A lossy path does not eat one flow-control frame, it eats a share of them, and the
+    /// deficit that leaves behind is monotone: at loss rate `p` it accrues as `p ×` the bytes
+    /// transferred, so on a long enough transfer it reaches the initial window and the sender
+    /// stops for good. Here two frames in every three are lost. The transfer is eight times
+    /// the initial window, so a third of the credit is nowhere near enough to carry it.
     ///
-    /// So this pins the boundary rather than pretending there is none: with every grant
-    /// lost, including the answers to the probes, the transfer does **not** complete. The
-    /// test above and this one differ in exactly one bit — whether the answer gets through —
-    /// which is what makes them evidence about the mechanism instead of about the harness.
+    /// The probe cannot close this, and the reason is structural rather than a matter of
+    /// tuning: it can only return credit still sitting in the receiver's accumulator, and the
+    /// bytes that went missing are exactly the ones the receiver had already cleared out of it
+    /// as it composed the frame the path ate. Neither end retains them. What completes this
+    /// transfer is a frame that states the sender's total allowance outright, so that the next
+    /// one to arrive repairs every one that did not.
     #[tokio::test(start_paused = true)]
-    async fn credit_already_lost_in_flight_is_not_recovered_by_asking() {
+    async fn a_transfer_survives_losing_two_flow_control_frames_in_every_three() {
+        let sender = Stream::new(1);
+        let receiver = Stream::new(1);
+        const TOTAL: usize = 8 * INITIAL_STREAM_WINDOW as usize;
+
+        match move_bytes_losing_grants(&sender, &receiver, TOTAL, 200, |n| n % 3 != 0).await {
+            Ok(rounds) => {
+                eprintln!("delivered {TOTAL} B in {rounds} rounds with 2 grants in 3 lost")
+            }
+            Err(delivered) => panic!(
+                "the sender stopped after {delivered} of {TOTAL} bytes: its peer window is \
+                 {} bytes with nothing in flight, so no acknowledgement can free it, and the \
+                 grants that were lost are gone from both ends — the surviving frames carry \
+                 an increment rather than a total, so they cannot make up for them",
+                sender.peer_send_window()
+            ),
+        }
+    }
+
+    /// **The limit only travels in the frames that carry it.**
+    ///
+    /// A cumulative limit repairs the frames that were lost *before* it, but it cannot
+    /// repair itself: with every flow-control frame lost, including every answer to a probe,
+    /// the sender never learns of any allowance beyond the opening one and the transfer does
+    /// **not** complete. That is the correct outcome and the one worth pinning — a sender
+    /// that finished this transfer would be one that had stopped obeying the limit
+    /// altogether. This test and the two above it differ in exactly which frames get
+    /// through, which is what makes them evidence about the mechanism instead of about the
+    /// harness.
+    #[tokio::test(start_paused = true)]
+    async fn a_sender_invents_no_allowance_when_every_flow_control_frame_is_lost() {
         let sender = Stream::new(1);
         let receiver = Stream::new(1);
         const TOTAL: usize = 8 * INITIAL_STREAM_WINDOW as usize;
 
         let outcome = move_bytes_losing_grants(&sender, &receiver, TOTAL, 40, |_| true).await;
         let delivered = outcome.expect_err(
-            "no local mechanism can recover credit both ends have forgotten — a transfer \
-             that completes with every grant lost is one whose sender stopped obeying the \
-             window",
+            "the limit travels only in the frames that carry it, so a transfer that \
+             completes with every one of them lost is one whose sender stopped obeying the \
+             limit",
         );
         assert!(
             delivered < TOTAL,
-            "delivered {delivered} of {TOTAL} bytes with no grant ever arriving"
+            "delivered {delivered} of {TOTAL} bytes with no limit ever arriving"
         );
     }
 
@@ -4385,7 +4449,7 @@ mod tests {
 
         // The window reopens and two segments genuinely go into flight — not yet delivered,
         // so the peer's next acknowledgement says nothing about them either way.
-        sender.apply_peer_window_update(10_000);
+        sender.apply_peer_window_limit(sender.bytes_sent() + 10_000);
         let a = poll_once(&sender).await.expect("the window admits it");
         let b = poll_once(&sender).await.expect("and the next");
         assert!(!is_persist_probe(&a) && !is_persist_probe(&b));
@@ -4404,134 +4468,123 @@ mod tests {
         );
     }
 
-    /// **A receiver that is not reading owes nothing, and says so by saying nothing.**
+    /// **A receiver that is not reading grants nothing, however often it is asked.**
     ///
-    /// The answer to a probe is the credit the local application has already consumed. An
-    /// application that has consumed nothing leaves that quantity at zero however much has
-    /// arrived, so the reply is `None` — no frame, no credit — and the peer stays stopped.
-    /// This is the discrimination the sender cannot make and does not have to: it is made
-    /// here, on the side that knows.
+    /// The answer to a probe is `consumed + advertised window`, and both terms move only on
+    /// application consumption. An application that has consumed nothing leaves the answer at
+    /// the number the peer is already stopped at, however much has arrived and however many
+    /// times it asks — so the peer stays stopped. This is the discrimination the sender
+    /// cannot make and does not have to: it is made here, on the side that knows.
     #[tokio::test]
-    async fn a_receiver_whose_application_has_not_read_owes_no_credit() {
+    async fn a_receiver_whose_application_has_not_read_grants_no_room() {
         let r = Stream::new(1);
+        let opening = r.recv_limit();
+        assert_eq!(opening, u64::from(INITIAL_STREAM_WINDOW));
+
         for offset in 0..16 {
             r.accept_in_order(offset, vec![Bytes::from(vec![0u8; HARNESS_SEG])])
                 .await;
         }
-        assert_eq!(
-            r.take_owed_window_credit(),
-            None,
-            "credit was granted for bytes that arrived rather than for bytes the \
-             application took"
-        );
+        for _ in 0..64 {
+            assert_eq!(
+                r.recv_limit(),
+                opening,
+                "the limit moved for bytes that arrived rather than for bytes the \
+                 application took"
+            );
+        }
 
         // One chunk consumed — below the emission threshold, so `record_app_consumed`
-        // withholds it and nothing would ever push it over once the peer has stopped.
+        // withholds the frame; the limit itself has still moved by exactly that chunk, and a
+        // probe would state it.
         assert_eq!(r.record_app_consumed(HARNESS_SEG as u32), None);
         assert_eq!(
-            r.take_owed_window_credit(),
-            Some(HARNESS_SEG as u32),
-            "the withheld credit is exactly the bytes the application consumed"
-        );
-        assert_eq!(
-            r.take_owed_window_credit(),
-            None,
-            "credit is owed once; a second ask must not grant it again"
+            r.recv_limit(),
+            opening + HARNESS_SEG as u64,
+            "the answer to a probe is the bytes the application consumed, and only those"
         );
     }
 
-    /// **The owed-credit accumulator has two mutators, and the peer picks when the second
-    /// one runs.**
+    /// **A probing peer cannot open a window for itself.**
     ///
-    /// `record_app_consumed` runs on the delivery task. `take_owed_window_credit` runs on the
-    /// receive task, and what calls it is a persist probe arriving — a frame the peer emits
-    /// whenever it chooses. Accumulating by adding `n` and then subtracting the total just
-    /// read is two transitions, and the swap fits between them: the subtraction then runs
-    /// against a counter the other path has already emptied, so on a `u32` it lands at `2^32`
-    /// minus the bytes taken. The next probe reads that as bytes owed and grants it, and the
-    /// peer's send window goes to [`MAX_SEND_WINDOW`] without one byte of it having been
-    /// consumed by anybody — a window the peer opens for itself, by asking.
-    ///
-    /// Two threads, because the defect lives strictly inside one function's body: no ordering
-    /// of the two public calls expresses it, since every sequential ordering leaves the
-    /// counter non-negative. What is asserted is the counter itself rather than anything
-    /// downstream of it. With a single recorder it can never hold more than the emission
-    /// threshold plus one call's worth, so a value above that is a wrap and nothing else;
-    /// the second assertion adds conservation — every byte recorded is either still in the
-    /// accumulator or was handed out exactly once. Replace the compare-exchange with an add
-    /// and a subtract and this fails.
+    /// The peer chooses when a probe arrives, so the answer is computed on the receive task
+    /// while the delivery task is crediting consumption — and the peer can ask as fast as it
+    /// likes. What bounds it is that the answer is derived, not consumed: it is a read of two
+    /// counters that only real consumption advances, so asking cannot move it and asking
+    /// twice cannot move it twice. Asserted against an independent count of the bytes the
+    /// application actually took, under concurrency, so an answer that ever ran ahead of that
+    /// figure fails here.
     #[test]
-    fn the_owed_credit_accumulator_survives_a_probe_landing_mid_update() {
+    fn a_probe_answer_never_exceeds_what_the_application_consumed() {
         const ROUNDS: u32 = 200_000;
-        let threshold = INITIAL_STREAM_WINDOW / 2;
-        // Each call carries the whole threshold, so each one takes the accumulator instead of
-        // one call in twenty-eight. The take is the half of the operation a swap has to land
-        // inside, and this makes every iteration a chance at it rather than every 28th.
-        let chunk = threshold;
+        let chunk = INITIAL_STREAM_WINDOW / 2;
 
         let s = Arc::new(Stream::new(1));
         // Pin the advertised window at its ceiling so `tune_recv_window` returns on its first
-        // load, before it reads a clock or takes a lock. This is a measurement of the
-        // accumulator alone; growth credit would be summed into the totals below and hide the
-        // arithmetic under it.
+        // load, before it reads a clock or takes a lock. This measures the consumed term
+        // alone; a window doubling underneath would be a second moving part in the bound.
         s.advertised_recv_window
             .store(MAX_RECV_WINDOW, Ordering::SeqCst);
+        let room = u64::from(MAX_RECV_WINDOW);
 
         let delivery = {
             let s = s.clone();
             std::thread::spawn(move || {
-                let mut granted = 0u64;
-                let mut high_water = 0u32;
                 for _ in 0..ROUNDS {
-                    granted += u64::from(s.record_app_consumed(chunk).unwrap_or(0));
-                    high_water = high_water.max(s.bytes_since_last_update.load(Ordering::Acquire));
+                    s.record_app_consumed(chunk);
                 }
-                (granted, high_water)
             })
         };
         let probing = {
             let s = s.clone();
             std::thread::spawn(move || {
-                let mut granted = 0u64;
+                let mut highest = 0u64;
                 for _ in 0..ROUNDS {
-                    granted += u64::from(s.take_owed_window_credit().unwrap_or(0));
+                    // Exactly what the receive path does when a probe lands, and the
+                    // strongest form of the claim: the answer is bounded by what had been
+                    // consumed when it was read, so it is compared against a fresh read of
+                    // that counter taken afterwards.
+                    let answer = s.recv_limit();
+                    let consumed = s.bytes_consumed.load(Ordering::Acquire);
+                    assert!(
+                        answer <= consumed + room,
+                        "a probe was answered with {answer} against {consumed} B consumed \
+                         and {room} B of window — the peer opened a window for itself by \
+                         asking"
+                    );
+                    highest = highest.max(answer);
                 }
-                granted
+                highest
             })
         };
 
-        let (granted_on_consumption, high_water) = delivery.join().expect(
-            "the delivery side panicked: the accumulator wrapped and the next call's \
-             `old + n` overflowed",
-        );
-        let granted_on_probe = probing.join().expect("the probing side panicked");
-        let still_owed = s.bytes_since_last_update.load(Ordering::SeqCst);
-
-        assert!(
-            high_water <= threshold + chunk,
-            "the accumulator reached {high_water} B against a {threshold} B threshold and \
-             {chunk} B per call: it was decremented past zero and wrapped, and the next probe \
-             hands that figure to the peer as relative credit"
-        );
+        delivery.join().expect("the delivery side panicked");
+        let highest = probing.join().expect("the probing side panicked");
         assert_eq!(
-            granted_on_consumption + granted_on_probe + u64::from(still_owed),
-            u64::from(ROUNDS) * u64::from(chunk),
-            "granted {granted_on_consumption} B on consumption and {granted_on_probe} B on \
-             probes with {still_owed} B still owed, against {ROUNDS} × {chunk} B consumed — \
-             credit was granted for bytes nobody consumed"
+            s.recv_limit(),
+            u64::from(ROUNDS) * u64::from(chunk) + room,
+            "the final limit is every consumed byte plus one window, exactly"
+        );
+        assert!(
+            highest <= s.recv_limit(),
+            "a probe was answered with {highest}, above the final limit {} — the answer is \
+             not a read of the consumed total",
+            s.recv_limit()
         );
     }
 
     /// **A write the transport refused must not cost the window.**
     ///
-    /// `poll_send` debits the peer's window as it hands a first transmission out, so a write
-    /// that then fails has taken credit off a counter no acknowledgement will put back — the
-    /// segment is re-offered and debited a second time for the same bytes. Every refusal
-    /// therefore shrank the window by a segment for the rest of the connection, arriving at
-    /// the same dead end as a lost grant by a route entirely inside this side. Drop the
-    /// refund from `mark_unsent` and the second assertion fails.
+    /// `poll_send` charges the sent total as it hands a first transmission out, so a write
+    /// that then fails has counted bytes that never reached the wire — and the segment is
+    /// re-offered and charged a second time for the same bytes. Left uncorrected the total
+    /// drifts above what the peer can ever receive, and since the peer computes its limit
+    /// from what it received, every refusal shrank this side's room by a segment for the rest
+    /// of the connection — arriving at the same dead end as a lost frame by a route entirely
+    /// inside this side. Drop the correction from `mark_unsent` and the second assertion
+    /// fails.
     #[tokio::test(start_paused = true)]
-    async fn a_refused_write_returns_the_flow_control_credit_it_debited() {
+    async fn a_refused_write_uncharges_the_bytes_that_never_left() {
         let s = Stream::new(1);
         s.send_reliable(Bytes::from(vec![0u8; HARNESS_SEG]))
             .await
@@ -4539,40 +4592,39 @@ mod tests {
 
         let seg = poll_once(&s).await.expect("first transmission");
         assert!(!seg.retransmit);
+        assert_eq!(s.bytes_sent(), HARNESS_SEG as u64);
         assert_eq!(
             s.peer_send_window(),
             INITIAL_STREAM_WINDOW - HARNESS_SEG as u32,
-            "a first transmission debits the window"
+            "a first transmission charges the sent total"
         );
 
         // The write failed after `poll_send` had stamped the segment: the bytes never
-        // reached the wire, so the debit was for nothing.
+        // reached the wire, so the charge was for nothing.
         s.mark_unsent(seg.stream_offset, !seg.retransmit).await;
+        assert_eq!(s.bytes_sent(), 0);
         assert_eq!(
             s.peer_send_window(),
             INITIAL_STREAM_WINDOW,
-            "the window kept credit for bytes that never left"
+            "the sent total counted bytes that never left"
         );
 
-        // The re-offer is a first transmission again and debits once, not twice.
+        // The re-offer is a first transmission again and charges once, not twice.
         let again = poll_once(&s).await.expect("re-offered immediately");
         assert!(!again.retransmit);
         assert_eq!(again.stream_offset, seg.stream_offset);
-        assert_eq!(
-            s.peer_send_window(),
-            INITIAL_STREAM_WINDOW - HARNESS_SEG as u32
-        );
+        assert_eq!(s.bytes_sent(), HARNESS_SEG as u64);
 
         // A retransmission was accounted on its original send (Karn), so its failure must
-        // refund nothing — that would credit the window for bytes it never held.
+        // uncharge nothing — that would put the sent total below the bytes the peer saw.
         tokio::time::advance(RtoEstimator::MAX_RTO).await;
         let rtx = poll_once(&s).await.expect("retransmission");
         assert!(rtx.retransmit);
         s.mark_unsent(rtx.stream_offset, !rtx.retransmit).await;
         assert_eq!(
-            s.peer_send_window(),
-            INITIAL_STREAM_WINDOW - HARNESS_SEG as u32,
-            "a failed retransmission credited the window for bytes it never debited"
+            s.bytes_sent(),
+            HARNESS_SEG as u64,
+            "a failed retransmission uncharged bytes it never charged"
         );
     }
 }

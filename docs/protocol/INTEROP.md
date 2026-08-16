@@ -31,8 +31,8 @@ downgrade). Pin these first:
 
 | Constant | Value (default build) | Source of truth | Wire role |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `6` | `core/src/transport/types.rs` | `PacketHeader.version` (byte 0, HP-masked) |
-| `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs` | `ClientHello.version`, transcript-bound |
+| `WIRE_VERSION` | `7` | `core/src/transport/types.rs` | `PacketHeader.version` (byte 0, HP-masked) |
+| `PROTOCOL_VERSION` | `4` | `core/src/transport/handshake.rs` | `ClientHello.version`, transcript-bound |
 | `PROTOCOL_VARIANT` | `b"phantom-default-1"` | `core/src/transport/handshake.rs` | leading field of the signed transcript |
 
 A receiver **drops** any data frame whose `header.version != WIRE_VERSION`
@@ -41,6 +41,13 @@ A receiver **drops** any data frame whose `header.version != WIRE_VERSION`
 any KEM/signature work. The `PROTOCOL_VARIANT` is the leading field of the signed
 handshake transcript (PROTOCOL.md § 6.5/§ 6.7), so a cross-variant peer fails the
 signature check even if it forged the cleartext tag. See PROTOCOL.md § 1.
+
+Note the asymmetry between those two refusals, because it decides which one you will
+actually observe while building: the data-frame drop is **silent** — no reply, nothing the
+sender can distinguish from a black hole — while the `ServerReject` names both versions.
+That is why the two constants move together even when only the data plane changed, as at
+`WIRE_VERSION 6 → 7` / `PROTOCOL_VERSION 3 → 4`. If your peer establishes a session and
+then moves no data, check the version pair before anything else.
 
 **A fourth constant is agreed off the wire: the AEAD suite.** There is no cipher
 field in any message; each peer independently resolves AES-256-GCM vs
@@ -196,7 +203,7 @@ the (authenticated) flags, and each shape has its own grammar in PROTOCOL.md
 | --- | --- |
 | `RELIABLE` | `stream_offset: u32 be` then the application bytes — a frame shorter than the 4-byte prefix is malformed |
 | `ACK` | a `Sack`, scoped to the packet's `stream_id` |
-| `WINDOW_UPDATE` | exactly 4 bytes: a big-endian `u32` of *relative* credit |
+| `WINDOW_UPDATE` | exactly 8 bytes: a big-endian `u64` **cumulative limit** — the total the receiver will let you send on that stream. Apply it as a maximum, never a sum |
 | `PATH_VALIDATION` | exactly 32 bytes: a challenge or its echo |
 | `KEEPALIVE` | empty (PING); `KEEPALIVE \| ACK` is the PONG |
 | `COALESCED` | `[count: u16][len: u16][payload]…` |
@@ -274,7 +281,7 @@ Never hand-edit a `.bin`. See `core/tests/wire_vectors/README.md`.
 
 A peer is wire-conformant with the default build of this repository when:
 
-- [ ] It is built for `WIRE_VERSION = 6`, `PROTOCOL_VERSION = 3`, `PROTOCOL_VARIANT = phantom-default-1`, and treats a mismatch as a hard error (no downgrade).
+- [ ] It is built for `WIRE_VERSION = 7`, `PROTOCOL_VERSION = 4`, `PROTOCOL_VARIANT = phantom-default-1`, and treats a mismatch as a hard error (no downgrade).
 - [ ] It agrees with its peer on the AEAD suite (not negotiated — § 1) and assigns the per-direction keys by role, initiator un-swapped and responder swapped (§ 1).
 - [ ] Its AEAD / KDF / hash / ML-KEM / ML-DSA primitives reproduce every KAT in `cavp.rs` (Rung 0).
 - [ ] `encode(value)` equals each packet `.bin`, and `decode(.bin)` equals the value, for the four packet fixtures (Rung 1).
@@ -283,7 +290,8 @@ A peer is wire-conformant with the default build of this repository when:
 - [ ] The same holds for all borsh handshake / sub-struct fixtures (Rung 2).
 - [ ] Its transcript hash equals `transcript_hash.bin` (Rung 3).
 - [ ] Its AEAD nonce/AAD construction and HP masking reproduce PROTOCOL.md § 4.6 / § 5; a tampered AAD byte (version included) fails decryption with no oracle (Rung 4).
-- [ ] It reads the AEAD plaintext by flag — reliable offset prefix, SACK, window credit, path challenge, padding trailer (Rung 4b).
+- [ ] It reads the AEAD plaintext by flag — reliable offset prefix, SACK, cumulative window limit, path challenge, padding trailer (Rung 4b).
+- [ ] It applies an inbound `WINDOW_UPDATE` as a maximum, counts its own sent bytes once per byte, and never sends past the highest limit received (§ 4.5 of PROTOCOL.md).
 - [ ] `tests/wire_vectors_decode.py` agrees with the peer's serializer in both directions (§ 3).
 - [ ] (If migrating) the CID chain and path-validation grammar match PROTOCOL.md § 4.7 / § 12 (Rung 5).
 

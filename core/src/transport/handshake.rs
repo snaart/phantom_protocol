@@ -64,9 +64,18 @@ pub const PROTOCOL_VARIANT: &[u8] = b"phantom-fips-1";
 
 /// The sole protocol version carried in `ClientHello.version` and bound into the
 /// handshake transcript. Pinned to one value — the protocol is not negotiated
-/// (pre-1.0, no users). It is a tamper-check anchor and a hook for a future,
-/// deliberate version increment.
-pub const PROTOCOL_VERSION: u8 = 3;
+/// (pre-1.0, no users). It is a tamper-check anchor and the field that makes a
+/// deliberate version increment *diagnosable*.
+///
+/// It moved `3 → 4` together with
+/// [`WIRE_VERSION`](crate::transport::types::WIRE_VERSION) `6 → 7`, which changed the
+/// `WINDOW_UPDATE` plaintext from a relative credit to a cumulative limit. Bumping the wire
+/// version alone would not have been enough and would have been the worse of the two
+/// failures: the data-plane check on `PacketHeader.version` **drops** a mismatched frame
+/// silently, so an old peer would have completed a handshake and then sat in a stall with
+/// no error to show for it — the exact shape of failure this change exists to remove.
+/// A mismatch here is answered with a typed [`ServerReject`] before any session exists.
+pub const PROTOCOL_VERSION: u8 = 4;
 
 /// Marker leading a [`ServerReject`] body. Reply *kind* dispatch is by the
 /// explicit [`ServerReply`] discriminant byte (`from_wire`), not by this marker

@@ -74,6 +74,57 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   have depended on it for behaviour, since constructing a `DeviceProfile` changed no bytes and
   no timing.
 
+### Changed (wire-breaking)
+
+- **`WINDOW_UPDATE` carries a cumulative limit instead of a relative credit —
+  `WIRE_VERSION` 6 → 7, `PROTOCOL_VERSION` 3 → 4.** The frame's AEAD plaintext is now eight
+  big-endian bytes stating the *total* the receiver will let its peer send on that stream,
+  counted from the stream's first byte, in place of four bytes saying "add this much". Both
+  ends count the same quantity — the sender counts every reliable application byte it puts
+  on the wire once, the receiver counts every byte it hands to its application — so the two
+  can be compared without either inferring the other's state, and a receiver applies an
+  inbound limit as `max(held, advertised)`.
+
+  The defect this removes is a permanent stall, not a slow path. A `WINDOW_UPDATE` rides in
+  one unacknowledged datagram that nothing retransmits, and the receiver destroyed the credit
+  as it composed the frame, so a lost one subtracted from the sender's window **for the rest
+  of the connection**. The deficit is monotone — at loss rate `p` it accrues as `p ×` the
+  bytes transferred — so on any lossy path it reaches the initial 64 KiB window in finite
+  time, and the sender is then blocked with *nothing in flight*, which means no
+  acknowledgement can arrive to free it. On the reference WAN path it reproduced in four of
+  seven uploads that established a session: 69.7 s, 69.9 s, 55.9 s and 48.7 s frozen, each
+  ending only at the harness cap, with `inflight/cwnd` at a median of 0.000 against 0.63–0.93
+  for a transfer that completes and the congestion window open the whole time. The TCP and
+  mimic legs, whose datagrams cannot be lost, never froze for more than 2.8 s in the same
+  runs. The persist probe that had already shipped could not close it, because it can only
+  return credit still sitting in the receiver's accumulator and the terminal case is the one
+  where the lost frame is what emptied that accumulator — neither end retains it, so no local
+  mechanism can reconstruct it.
+
+  A total has the three properties an increment lacks, and they are what make the frame safe
+  to lose: it is **idempotent** (a duplicate grants nothing extra), **reorder-safe** (a stale
+  frame states a smaller total and the maximum discards it) and **loss-tolerant** (the next
+  frame states the whole truth rather than the difference since the last). The persist probe
+  is kept — it is the only place the fact "data queued and no room" exists, since a receiver
+  cannot tell a blocked peer from an idle one — but its answer is now simply the current
+  limit, which repairs however many earlier frames were lost. `Stream::take_owed_window_credit`
+  and the two-task race on the emission accumulator it required are deleted with it.
+
+  `PROTOCOL_VERSION` moves with `WIRE_VERSION` even though no handshake byte changed, and
+  that pairing is the point: the data-plane version check **drops** a mismatched frame
+  silently, so a wire bump on its own would let an older peer complete a handshake and then
+  stall with no error — the exact failure this change exists to remove. With the handshake
+  version moved too, an older peer gets a typed `ServerReject` naming both versions before
+  any session exists. `docs/policy/versioning.md` records the rule.
+
+  Seven frozen fixtures moved: the four packet vectors by their `version` byte alone, the two
+  `ClientHello` vectors by theirs, and `transcript_hash.bin` because the hello it covers
+  changed. `tests/wire_vectors_decode.py` gained an independent statement of the new
+  plaintext codec and of the monotone-maximum rule. What a hostile peer gains is unchanged:
+  `MAX_SEND_WINDOW` (1 MiB) now clamps the honoured limit to `bytes_sent + 1 MiB`, so a peer
+  advertising `u64::MAX` buys one window of permission and must send another frame for more,
+  exactly as a peer flooding inflated credits did before.
+
 ### Changed
 
 - **`transport::{compression, fallback, scheduler, packet_coalescer}` stay public and now say

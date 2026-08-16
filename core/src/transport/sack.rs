@@ -8,9 +8,12 @@
 //! single ACK and detect gaps for fast-retransmit.
 //!
 //! This is the **AEAD plaintext** of that control frame — it is NOT the outer
-//! frozen `PhantomPacket` container. Changing this format does NOT require a
-//! `WIRE_VERSION` or `PROTOCOL_VERSION` bump and does NOT invalidate
-//! `core/tests/wire_vectors`.
+//! frozen `PhantomPacket` container, so changing it does NOT invalidate
+//! `core/tests/wire_vectors`, which pins only the container. It does still require a
+//! `WIRE_VERSION` / `PROTOCOL_VERSION` bump: two peers disagreeing here do not fail to
+//! parse, they decrypt each other's frames and then disagree about what was
+//! acknowledged, which surfaces as a stall rather than an error. See
+//! `docs/protocol/PROTOCOL.md` § 4.5.
 //!
 //! # Wire format
 //!

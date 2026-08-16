@@ -76,7 +76,7 @@ use crate::transport::shaping::{self, PaddingPolicy};
 use crate::transport::stream::{SendBlocked, SharedRecvTuning, Stream};
 use crate::transport::types::{
     LegType, PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
-    WIRE_VERSION,
+    WINDOW_UPDATE_PAYLOAD_LEN, WIRE_VERSION,
 };
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -1505,7 +1505,7 @@ fn delivery_charge(payload_len: usize) -> u64 {
 /// frees a slot. Doing that from inside the pump's `select!` parks the *whole
 /// pump*: no heartbeat, no `WINDOW_UPDATE` flush, no drain, no command
 /// processing — so a saturating send in one direction stops the session issuing
-/// the other direction's flow-control credit and the download collapses to the
+/// the other direction's flow-control limits and the download collapses to the
 /// single initial window. Deferring the refused chunk here instead keeps the loop
 /// turning; the pump simply stops reading commands until the backlog clears,
 /// which pushes the backpressure out to the application's own `send()` where it
@@ -1526,7 +1526,7 @@ enum Deferred {
 ///
 /// Without a bound, one stream with a full congestion window monopolises the
 /// pump for as long as it takes to encrypt and write that whole window, during
-/// which no inbound flow-control credit is flushed and no command is serviced.
+/// which no inbound flow-control limit is flushed and no command is serviced.
 /// The drain re-arms the outbound notify when it stops on this budget, so the
 /// only cost of the bound is one extra trip through `select!` per 32 packets;
 /// the gain is that every other arm gets a turn at that same cadence.
@@ -1649,7 +1649,7 @@ fn drain_stop_is_app_limited(stop: DrainStop) -> bool {
 ///
 /// The deadline is returned rather than awaited on purpose. The drain runs
 /// inside a `select!` arm body, and an arm body runs to completion — so a sleep
-/// taken here parks the entire pump: no flow-control credit for the reverse
+/// taken here parks the entire pump: no flow-control limit for the reverse
 /// direction, no commands accepted, no liveness sweep. That is the shape that
 /// starved the download in the first place, and re-introducing it to implement
 /// pacing would trade one direction's collapse for the other's.
@@ -1814,7 +1814,7 @@ async fn run_data_pump<T: SessionTransport>(
     // local application stopped reading, which is neither the peer's fault nor what
     // the hard cap is for.
     //
-    // Flow-control credit is issued in Task A / Task B immediately on dequeue
+    // The flow-control limit is advanced in Task A / Task B immediately on dequeue
     // (one item of look-ahead, cancel-safe: mpsc send drops the item on cancel
     // but cannot double-count because we already subtracted from undelivered_bytes
     // before the blocking send).
@@ -1846,8 +1846,8 @@ async fn run_data_pump<T: SessionTransport>(
                 undelivered_a.fetch_sub(delivery_charge(bytes.len()), Ordering::AcqRel);
                 // Credit the flow-control window for the raw-app stream (id 1).
                 if let Some(stream) = streams_a.get(&RAW_APP_STREAM_ID) {
-                    if let Some(credit) = stream.record_app_consumed(len as u32) {
-                        stream.stage_window_update_credit(credit);
+                    if let Some(limit) = stream.record_app_consumed(len as u32) {
+                        stream.stage_window_update_limit(limit);
                         crypto_a.notify_outbound_ready();
                     }
                 }
@@ -1874,8 +1874,8 @@ async fn run_data_pump<T: SessionTransport>(
                         undelivered_b.fetch_sub(delivery_charge(bytes.len()), Ordering::AcqRel);
                         // Credit flow-control for this opened stream.
                         if let Some(stream) = streams_b.get(&stream_id) {
-                            if let Some(credit) = stream.record_app_consumed(len as u32) {
-                                stream.stage_window_update_credit(credit);
+                            if let Some(limit) = stream.record_app_consumed(len as u32) {
+                                stream.stage_window_update_limit(limit);
                                 crypto_b.notify_outbound_ready();
                             }
                         }
@@ -2104,7 +2104,7 @@ async fn run_data_pump<T: SessionTransport>(
     //
     // The wait lives here, as a `select!` *branch*, and not inside the drain. An
     // arm body runs to completion, so a sleep taken inside `drain_streams_*`
-    // parks the whole pump — no flow-control credit for the reverse direction,
+    // parks the whole pump — no flow-control limit for the reverse direction,
     // no commands accepted, no liveness sweep — which is the exact shape that
     // collapsed the download under a saturating upload. Pacing must slow the
     // sender, not stop the session.
@@ -2115,7 +2115,7 @@ async fn run_data_pump<T: SessionTransport>(
     // `rekey()` and the receive task's authenticated forward catch-up in
     // `decrypt_packet_accepting_rekey`), but both serialise through the session's
     // `rekey_lock`, so the seal is always epoch-consistent. The delivery task only
-    // stages the relative credit (`Stream::stage_window_update_credit`) and
+    // stages the cumulative limit (`Stream::stage_window_update_limit`) and
     // wakes us; the wire sequence is drawn from the stream's own send-sequence
     // space inside `flush_pending_window_updates` (no private counter, so it
     // can never collide with application data on the AEAD nonce).
@@ -2194,7 +2194,7 @@ async fn run_data_pump<T: SessionTransport>(
                 // Same drain logic as the tick arm — fast-wake path. Also admit
                 // whatever the send buffers have room for now (an acknowledgement
                 // that freed a slot wakes us here) and flush any flow-control
-                // credit the delivery task staged.
+                // limit the delivery task staged.
                 flush_deferred_sends(
                     &mut deferred, &transport, &crypto_session, session_id, &streams,
                     &demux, &stream_gauge, &observability,
@@ -2653,18 +2653,16 @@ async fn maybe_send_keepalive<T: SessionTransport>(
     }
 }
 
-/// Emit any flow-control credit the receive **delivery** task staged.
+/// Emit any flow-control limit the receive **delivery** task staged.
 ///
-/// The delivery task credits the window on real app consumption and stages the
-/// relative credit via `Stream::stage_window_update_credit` + a send-loop wake;
-/// the send loop (this, the sole outbound writer) actually encrypts and sends the
-/// `WINDOW_UPDATE`, so the control frame is always sealed under the epoch live
-/// when it stamps. The epoch can be advanced by either this loop's own `rekey()`
-/// or the receive task's authenticated forward catch-up, but both serialise
-/// through `rekey_lock`, so the seal is always epoch-consistent. The staged
-/// credits are snapshotted out of the `DashMap` first so no
-/// shard lock is held across the `.await` (which would deadlock the delivery /
-/// reader tasks that also touch `streams`).
+/// The delivery task moves the limit on real app consumption and stages it via
+/// `Stream::stage_window_update_limit` + a send-loop wake; the send loop (this, the sole
+/// outbound writer) actually encrypts and sends the `WINDOW_UPDATE`, so the control frame is
+/// always sealed under the epoch live when it stamps. The epoch can be advanced by either
+/// this loop's own `rekey()` or the receive task's authenticated forward catch-up, but both
+/// serialise through `rekey_lock`, so the seal is always epoch-consistent. The staged limits
+/// are snapshotted out of the `DashMap` first so no shard lock is held across the `.await`
+/// (which would deadlock the delivery / reader tasks that also touch `streams`).
 async fn flush_pending_window_updates<T: SessionTransport>(
     transport: &Arc<T>,
     crypto_session: &Arc<Session>,
@@ -2672,7 +2670,7 @@ async fn flush_pending_window_updates<T: SessionTransport>(
     streams: &Arc<DashMap<u32, Arc<Stream>>>,
     observability: &Observability,
 ) {
-    let pending: Vec<(u32, u32, Arc<Stream>)> = streams
+    let pending: Vec<(u32, u64, Arc<Stream>)> = streams
         .iter()
         .filter_map(|e| {
             e.value()
@@ -2680,24 +2678,23 @@ async fn flush_pending_window_updates<T: SessionTransport>(
                 .map(|c| (*e.key(), c, e.value().clone()))
         })
         .collect();
-    for (stream_id, credit, stream) in pending {
+    for (stream_id, limit, stream) in pending {
         if !send_window_update(
             transport,
             crypto_session,
             session_id,
             stream_id as TransportStreamId,
-            credit,
+            limit,
             observability,
         )
         .await
         {
-            // The send failed (transient transport hiccup): re-stage the credit
-            // so the next send-loop pass — the 10 ms tick at the latest — retries
-            // it. Dropping it silently would under-credit the peer and could
-            // eventually stall the sender. Credits accumulate, so a retry simply
-            // folds back in; a permanently dead transport tears the session down
-            // via the reader, which ends this loop.
-            stream.stage_window_update_credit(credit);
+            // The send failed (transient transport hiccup): re-stage the limit so the next
+            // send-loop pass — the 10 ms tick at the latest — retries it. Staging resolves
+            // by maximum, so a limit the delivery task raised while this send was failing
+            // survives the retry rather than being pushed back down by it. A permanently
+            // dead transport tears the session down via the reader, which ends this loop.
+            stream.stage_window_update_limit(limit);
         }
     }
 }
@@ -2811,10 +2808,10 @@ async fn flush_deferred_sends<T: SessionTransport>(
 /// with the true on-wire size inside `send_app_data`, carrying at most one
 /// segment of overshoot as debt.
 ///
-/// **Only this path is paced.** Acknowledgements, `WINDOW_UPDATE` credit,
+/// **Only this path is paced.** Acknowledgements, `WINDOW_UPDATE` limits,
 /// keep-alives, path validation and cover frames are emitted elsewhere and are
 /// never gated on pacing credit. That asymmetry is deliberate and is what makes
-/// the reverse direction work: the flow-control credit the *other* direction
+/// the reverse direction work: the flow-control limit the *other* direction
 /// depends on must not queue behind this direction's rate limiter, or pacing
 /// would re-create, one layer up, the standing queue it exists to remove. They
 /// are also small and infrequent enough that leaving them out of the rate
@@ -2925,8 +2922,9 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
                 // segment, but the bytes never reached the wire. Clear it so the
                 // next drain re-offers it immediately instead of stalling a full
                 // RTO before the retransmit pass, and — on a first transmission —
-                // put back the flow-control credit that same pass debited, which
-                // otherwise leaves the window a segment smaller for good.
+                // uncharge the sent total that same pass advanced, which otherwise
+                // counts bytes the peer will never see and leaves this side a
+                // segment short of its limit for good.
                 // Unreliable segments were removed by `poll_send`
                 // (fire-and-forget) — nothing to reset.
                 if seg.reliable {
@@ -3280,15 +3278,15 @@ async fn send_app_data<T: SessionTransport>(
     true
 }
 
-/// Emit a V2 WINDOW_UPDATE packet announcing `new_window` bytes of
-/// receive capacity for `stream_id`. Encrypted under the current
-/// session epoch (Phase 4.3 flow control).
+/// Emit a WINDOW_UPDATE packet announcing `limit` — the cumulative total this side is
+/// willing to have sent on `stream_id`, counted from the stream's first byte. Encrypted
+/// under the current session epoch (Phase 4.3 flow control).
 async fn send_window_update<T: SessionTransport>(
     transport: &Arc<T>,
     crypto_session: &Arc<Session>,
     session_id: SessionId,
     stream_id: TransportStreamId,
-    new_window: u32,
+    limit: u64,
     observability: &Observability,
 ) -> bool {
     let mut flag_bits = PacketFlags::ENCRYPTED | PacketFlags::WINDOW_UPDATE;
@@ -3305,7 +3303,7 @@ async fn send_window_update<T: SessionTransport>(
         PacketFlags::new(flag_bits),
     )
     .with_epoch(crypto_session.current_epoch());
-    let payload = new_window.to_be_bytes();
+    let payload = limit.to_be_bytes();
     let ciphertext = match timed_encrypt(crypto_session, observability, &header, &payload, &[]) {
         Ok(c) => c,
         Err(e) => {
@@ -3681,7 +3679,8 @@ fn apply_eps02_peer_migration_rotation<T: SessionTransport>(crypto: &Session, tr
 /// - PATH_VALIDATION flag → drive the path registry: verify against an
 ///   outstanding challenge if one exists, otherwise echo the payload
 ///   back as a response.
-/// - WINDOW_UPDATE flag → apply the peer's announced flow-control window.
+/// - WINDOW_UPDATE flag → apply the peer's announced cumulative flow-control
+///   limit, taking the maximum of it and the one already held.
 /// - COALESCED flag → split the decrypted bundle into sub-payloads and
 ///   route each through the demux as an independent application chunk.
 #[allow(clippy::too_many_arguments)]
@@ -4014,23 +4013,24 @@ async fn handle_packet<T: SessionTransport>(
         return;
     }
 
-    // WINDOW_UPDATE dispatch (Phase 4.3 flow control). Payload is a
-    // big-endian u32 carrying relative flow-control credit — the bytes the
-    // peer's application just consumed, which we ADD to our send window.
+    // WINDOW_UPDATE dispatch (Phase 4.3 flow control). Payload is a big-endian u64 carrying
+    // the peer's cumulative limit for this stream — the total it is willing to have sent on
+    // it, counted from the stream's first byte.
     if packet.header.flags.contains(PacketFlags::WINDOW_UPDATE) {
-        if plaintext.len() != 4 {
+        let Ok(be) = <[u8; WINDOW_UPDATE_PAYLOAD_LEN]>::try_from(&plaintext[..]) else {
             log::warn!(
-                "PhantomSession: WINDOW_UPDATE payload length {} (expected 4)",
-                plaintext.len()
+                "PhantomSession: WINDOW_UPDATE payload length {} (expected {})",
+                plaintext.len(),
+                WINDOW_UPDATE_PAYLOAD_LEN
             );
             return;
-        }
-        let credit = u32::from_be_bytes([plaintext[0], plaintext[1], plaintext[2], plaintext[3]]);
+        };
+        let limit = u64::from_be_bytes(be);
         if let Some(stream) = streams_recv.get(&stream_id) {
-            // Relative-credit flow control — add the granted credit, then
-            // wake the send loop so a window-blocked sender resumes immediately
-            // instead of waiting a full poll tick.
-            stream.apply_peer_window_update(credit);
+            // The limit is monotone, so applying it takes the maximum — a duplicate or a
+            // reordered frame changes nothing. Then wake the send loop so a stream stopped
+            // at the old limit resumes immediately instead of waiting a full poll tick.
+            stream.apply_peer_window_limit(limit);
             crypto_recv.notify_outbound_ready();
         }
         return;
@@ -4373,18 +4373,15 @@ async fn handle_packet<T: SessionTransport>(
         deliver_in_order_run(delivered, stream_id, deliver_tx, undelivered_bytes);
 
         // A zero-length reliable segment that is not the FIN sentinel is the peer's
-        // flow-control persist probe: it is stopped on this side's window and has nothing
-        // outstanding to wait on, so it is asking whether anything is owed. Answer with
-        // whatever credit the local application has already consumed and this side has been
-        // holding below its emission threshold — that threshold assumes more data is coming
-        // to push the accumulator over it, and once the peer has stopped, none is. It is a
-        // grant of bytes really taken by the application, so a receiver that is not reading
-        // owes nothing, emits no frame, and leaves its peer stopped.
+        // flow-control persist probe: it is stopped on this side's limit and has nothing
+        // outstanding to wait on, so it is asking what that limit is. Re-state it. Because
+        // the limit is a total, one answer repairs however many earlier `WINDOW_UPDATE`
+        // frames the path ate — and because both of its terms move only on real application
+        // consumption, a receiver that is not reading re-states the number its peer is
+        // already stopped at and leaves it stopped.
         if is_persist_probe {
-            if let Some(credit) = local.take_owed_window_credit() {
-                local.stage_window_update_credit(credit);
-                crypto_recv.notify_outbound_ready();
-            }
+            local.stage_window_update_limit(local.recv_limit());
+            crypto_recv.notify_outbound_ready();
         }
 
         // Record a FIN's reliable offset; emit the per-stream Close (EOF) ONLY once
@@ -5965,7 +5962,7 @@ mod tests {
     /// generic failure — and crucially does NOT auto-downgrade.
     #[tokio::test]
     async fn client_surfaces_server_reject_as_version_error() {
-        use crate::transport::handshake::{ServerReject, ServerReply};
+        use crate::transport::handshake::{ServerReject, ServerReply, PROTOCOL_VERSION};
 
         let (client_transport, server_transport) = ChannelTransport::pair();
         // The reject path errors before any key verification, so any key works.
@@ -5984,10 +5981,20 @@ mod tests {
         server.await.unwrap();
 
         let err = result.expect_err("client must surface the reject as an error");
+        // The typed variant, not a string: this is what an application branches on to tell
+        // "update your client" apart from a generic handshake failure, and it is the whole
+        // reason `PROTOCOL_VERSION` moves whenever the wire does — a version mismatch left
+        // to the packet-level check would be a silent drop with no error at all.
+        assert!(
+            matches!(err, CoreError::ProtocolRejected(_)),
+            "expected a typed rejection, got: {err:?}"
+        );
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("unsupported protocol version"),
-            "expected a version-mismatch error, got: {msg}"
+            msg.contains("unsupported protocol version")
+                && msg.contains(&format!("v{PROTOCOL_VERSION}")),
+            "the error must name the versions involved so an operator can act on it, got: \
+             {msg}"
         );
     }
 
@@ -6830,7 +6837,7 @@ mod tests {
         );
         // And it must stop by *returning*, not by sleeping inside the pass: the
         // drain runs in a `select!` arm body, so a wait taken here parks the
-        // whole pump — no flow-control credit, no commands, no heartbeat.
+        // whole pump — no flow-control limit, no commands, no heartbeat.
         assert!(
             took < std::time::Duration::from_millis(50),
             "the drain pass took {} ms — it waited for pacing credit inside the pass \
@@ -9852,12 +9859,11 @@ mod tests {
         );
     }
 
-    /// Phase 4.3 — WINDOW_UPDATE round-trip under the relative-credit model.
-    /// The receive **delivery** task credits the flow-control window on real
-    /// app consumption and stages the credit; the **send loop** flushes it as a
-    /// single encrypted WINDOW_UPDATE via `flush_pending_window_updates`. The
-    /// sender then ADDS the relative credit to its `peer_send_window` — it does
-    /// not overwrite it with an absolute value.
+    /// Phase 4.3 — WINDOW_UPDATE round-trip under the cumulative-limit model.
+    /// The receive **delivery** task moves the limit on real app consumption and stages it;
+    /// the **send loop** flushes it as a single encrypted WINDOW_UPDATE via
+    /// `flush_pending_window_updates`, eight big-endian bytes of it. The sender then takes
+    /// the **maximum** of the announced total and the one it already held — it does not add.
     #[tokio::test]
     async fn flow_control_window_update_round_trip() {
         use crate::transport::stream::INITIAL_STREAM_WINDOW;
@@ -9870,25 +9876,25 @@ mod tests {
         let server_stream = Arc::new(TransportStream::new(stream_id));
         server_streams.insert(stream_id as u32, server_stream.clone());
 
-        // Client also has a Stream so we can apply the inbound credit.
+        // Client also has a Stream so we can apply the inbound limit.
         let client_stream = Arc::new(TransportStream::new(stream_id));
 
-        // Pre-drain the client's peer_send_window so the credit has a real
+        // Pre-drain the client's peer_send_window so the limit has a real
         // effect to assert against.
         let drain = INITIAL_STREAM_WINDOW - 1000;
         assert!(client_stream.try_consume_send_window(drain));
         assert_eq!(client_stream.peer_send_window(), 1000);
 
-        // The delivery task credits the window on real consumption: model one
-        // drain that crosses the half-window threshold and stage the credit
-        // exactly as `run_data_pump`'s delivery task does.
+        // The delivery task moves the limit on real consumption: model one drain that
+        // crosses the half-window threshold and stage the limit exactly as
+        // `run_data_pump`'s delivery task does.
         let consumed = INITIAL_STREAM_WINDOW / 2 + 1;
-        let credit = server_stream
+        let limit = server_stream
             .record_app_consumed(consumed)
-            .expect("threshold crossed → credit granted");
-        server_stream.stage_window_update_credit(credit);
+            .expect("threshold crossed → limit advertised");
+        server_stream.stage_window_update_limit(limit);
 
-        // The send loop flushes the staged credit as a single WINDOW_UPDATE.
+        // The send loop flushes the staged limit as a single WINDOW_UPDATE.
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(4);
         let (back_tx, back_rx) = mpsc::channel::<Vec<u8>>(4);
         let server_outbound: Arc<ChannelTransport> = Arc::new(ChannelTransport {
@@ -9906,7 +9912,7 @@ mod tests {
         )
         .await;
 
-        // Exactly one WINDOW_UPDATE was emitted; decrypt it and read the credit.
+        // Exactly one WINDOW_UPDATE was emitted; decrypt it and read the limit.
         let frame = tokio::time::timeout(std::time::Duration::from_millis(100), out_rx.recv())
             .await
             .expect("expected a WINDOW_UPDATE frame")
@@ -9918,11 +9924,13 @@ mod tests {
         let pt = client_session
             .decrypt_packet(&pv2.header, &pv2.payload, &[])
             .expect("decrypt WINDOW_UPDATE");
-        assert_eq!(pt.len(), 4);
-        let announced = u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]);
+        assert_eq!(pt.len(), WINDOW_UPDATE_PAYLOAD_LEN);
+        let announced = u64::from_be_bytes(
+            <[u8; WINDOW_UPDATE_PAYLOAD_LEN]>::try_from(&pt[..]).expect("length just asserted"),
+        );
         assert_eq!(
-            announced, credit,
-            "WINDOW_UPDATE carries the relative credit (bytes consumed since last update)"
+            announced, limit,
+            "WINDOW_UPDATE carries the cumulative limit (bytes consumed plus one window)"
         );
         // Exactly one frame was emitted — nothing else is queued on the wire.
         assert!(
@@ -9941,19 +9949,24 @@ mod tests {
         .await;
         assert!(
             out_rx.try_recv().is_err(),
-            "no spurious second WINDOW_UPDATE after the credit was already flushed"
+            "no spurious second WINDOW_UPDATE after the limit was already flushed"
         );
 
-        // Apply the relative credit on the client side: peer_send_window ADDS it
-        // to the current 1000 (it does not jump to an absolute value).
-        client_stream.apply_peer_window_update(announced);
-        assert_eq!(client_stream.peer_send_window(), 1000 + credit);
+        // Apply the limit on the client side. It has sent `drain` bytes, so the room it is
+        // left with is the announced total less what it has already spent — and a second
+        // application of the same frame adds nothing, which is what makes the frame safe to
+        // duplicate.
+        client_stream.apply_peer_window_limit(announced);
+        let room = announced - u64::from(drain);
+        assert_eq!(u64::from(client_stream.peer_send_window()), room);
+        client_stream.apply_peer_window_limit(announced);
+        assert_eq!(u64::from(client_stream.peer_send_window()), room);
     }
 
     /// The flow-control persist probe as it actually reaches the wire.
     ///
     /// A stream the peer's window has stopped, with nothing outstanding, has no event left
-    /// that could free it: no acknowledgement is coming, and the credit that would arrive
+    /// that could free it: no acknowledgement is coming, and the room that would arrive
     /// rides in a frame nothing retransmits. The drain therefore emits a probe — and what it
     /// emits has to be checked here rather than at the stream, because it is this path that
     /// decides what the peer actually receives. The frame is `RELIABLE | ENCRYPTED`, carries
@@ -10029,13 +10042,13 @@ mod tests {
 
     /// The other half of the same exchange: what the receiver does with a probe.
     ///
-    /// It answers with the credit it already owes — bytes its application consumed that sat
-    /// below `record_app_consumed`'s emission threshold, where nothing would ever push them
-    /// once the peer stopped sending. That is the whole of the answer: a receiver whose
-    /// application has consumed nothing owes nothing and says nothing, which is what leaves
-    /// it able to hold a peer still.
+    /// It re-states the stream's current limit — every byte its application has consumed
+    /// plus one advertised window — which is a total, so one answer makes up for however many
+    /// earlier `WINDOW_UPDATE` frames the path ate. It is still bounded by consumption: a
+    /// receiver whose application has read nothing answers with the number the peer is
+    /// already stopped at, which is what leaves it able to hold a peer still.
     #[tokio::test]
-    async fn a_probe_is_answered_with_the_credit_the_receiver_owes() {
+    async fn a_probe_is_answered_with_the_receivers_current_limit() {
         use crate::transport::stream::INITIAL_STREAM_WINDOW;
 
         let session_id = fixed_session_id();
@@ -10048,11 +10061,22 @@ mod tests {
         assert_eq!(
             reading.record_app_consumed(consumed),
             None,
-            "below the threshold the credit is withheld — that is the state a probe finds"
+            "below the threshold no frame is emitted — that is the state a probe finds"
         );
         let idle = Arc::new(TransportStream::new(stream_id));
+        let opening = u64::from(INITIAL_STREAM_WINDOW);
 
-        for (stream, expected) in [(reading, Some(consumed)), (idle, None)] {
+        // Distinct packet numbers per case: the two probes share one `server_session`, and
+        // a repeat of a packet number it has already opened is rejected by the replay window
+        // (Invariant 4) before it reaches the probe branch at all — which would leave the
+        // second case asserting nothing.
+        for (pn, (stream, expected)) in [
+            (reading, Some(opening + u64::from(consumed))),
+            (idle, Some(opening)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
             streams.insert(stream_id as u32, stream.clone());
 
@@ -10071,7 +10095,14 @@ mod tests {
 
             // A reliable frame with an empty payload: the probe, exactly as the drain above
             // puts it on the wire.
-            let frame = build_app_frame(&client_session, session_id, stream_id, 0, b"");
+            let frame = build_app_frame_with_offset(
+                &client_session,
+                session_id,
+                stream_id,
+                pn as u32,
+                0,
+                b"",
+            );
             handle_packet(
                 decode_recv_frame(&frame, session_id),
                 session_id,
@@ -10093,7 +10124,8 @@ mod tests {
             assert_eq!(
                 stream.take_pending_window_update(),
                 expected,
-                "the answer to a probe must be exactly the credit the application earned"
+                "the answer to a probe must be the limit the application earned, and the \
+                 non-reading receiver's must be the one its peer already has"
             );
             assert!(
                 deliver_rx.try_recv().is_err(),

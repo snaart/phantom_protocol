@@ -30,10 +30,20 @@ that sees any other value drops the frame (packets) or rejects the handshake
 
 | Constant | Value | Source | Where it lives on the wire |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `6` | `core/src/transport/types.rs` | `PacketHeader.version` byte (now HP-masked, inside the 15-byte header — § 4.2) |
-| `PROTOCOL_VERSION` | `3` | `core/src/transport/handshake.rs` | `ClientHello.version`, transcript-bound |
+| `WIRE_VERSION` | `7` | `core/src/transport/types.rs` | `PacketHeader.version` byte (HP-masked, inside the 15-byte header — § 4.2) |
+| `PROTOCOL_VERSION` | `4` | `core/src/transport/handshake.rs` | `ClientHello.version`, transcript-bound |
 
-`WIRE_VERSION` is `6`: it went `1 → 2` when the packet codec moved from
+**The two move together.** `WIRE_VERSION 7` changed the `WINDOW_UPDATE` plaintext (§ 4.5)
+and nothing else; `PROTOCOL_VERSION` was incremented in the same change even though no
+handshake message moved a byte. That is deliberate and is the rule for any future
+data-plane change: the packet-level check on `PacketHeader.version` **drops** a mismatched
+frame silently — no reply, nothing the sender can observe — so a wire bump on its own would
+let an older peer complete a handshake and then stall with no diagnosis. Incrementing
+`PROTOCOL_VERSION` alongside moves the refusal to the handshake, where it is a typed
+`ServerReject` naming both versions, delivered before any session exists. An implementation
+that bumps only one of the two is not interoperating; it is failing quietly.
+
+`WIRE_VERSION` is `7`: it went `1 → 2` when the packet codec moved from
 `alkahest` to the explicit big-endian layout in § 4.2, then `2 → 3` (Phase 4 /
 P4.0) when the AEAD packet identity became a single **per-direction monotonic
 `u64` packet number** — the header dropped the dead `ack_delay` field and widened
@@ -54,16 +64,21 @@ remainder (`recv_bytes` is message-framed on every transport, so they were pure
 redundancy) and `extensions` left the data-plane wire — saving 8 bytes/packet
 (§ 4.1 / § 4.2 / § 4.6). v6 also adds opt-in **encrypted size padding** (PADÉ
 bucketing, the `PADDED` flag) so the datagram size no longer tracks the payload
-size (§ 4.8). The sole routing identifier is the outer 8-byte UDP `ConnId`,
-which **rotates** on each migration (§ 4.7) — symmetrically for **both** a client- and
-a server-initiated migration (both directions, EPS-02 closed by A2a; § 12.5). The handshake (`PROTOCOL_VERSION`) is unchanged by T4.6, ε, or v6.
-`PROTOCOL_VERSION` is `3` (bumped
+size (§ 4.8). Then `6 → 7` (**cumulative flow control**) changed the `WINDOW_UPDATE`
+plaintext from a 4-byte *relative credit* to an 8-byte *cumulative limit* (§ 4.5) — the only
+byte that moved, and the reason it had to move is in that section. The sole routing
+identifier is the outer 8-byte UDP `ConnId`, which **rotates** on each migration (§ 4.7) —
+symmetrically for **both** a client- and a server-initiated migration (both directions,
+EPS-02 closed by A2a; § 12.5). The handshake byte grammar is unchanged by T4.6, ε, v6 or v7.
+`PROTOCOL_VERSION` is `4` (bumped
 `1 → 2` when the signed transcript began covering the 0-RTT verdict
 `early_data_accepted` (H2) and `ClientHello` gained the `resumption_binder`
 proof-of-possession field (HS-03); `2 → 3` (T4.3) when `ServerHello`'s
 `server_key_package` was replaced by a 32-byte `server_nonce`, changing the
-signed-transcript content; handshakes across these versions cannot interoperate
-because the signed transcript content differs). They exist so that:
+signed-transcript content; `3 → 4` alongside `WIRE_VERSION 6 → 7` — no handshake field
+changed, but a peer that speaks the older flow control must be refused here rather than
+left to stall, per the rule above; handshakes across these versions cannot interoperate).
+They exist so that:
 
 - a tampered frame / hello that flips the byte is rejected up front
   (`PacketHeader.version != WIRE_VERSION` → drop; `ClientHello.version !=
@@ -346,7 +361,7 @@ Source: `core/src/transport/types.rs`.
 | `0x0100` | `REKEY` | Sender rekeyed; receiver trial-decrypts at `header.epoch` and commits the ratchet on AEAD success (§ 5) |
 | `0x0200` | `PATH_VALIDATION` | AEAD plaintext is exactly a 32-byte challenge or its echo (connection migration — § 12; a plaintext of any other length is dropped) |
 | `0x0400` | `COALESCED` | Payload bundles inner packets as `[count: u16][len1: u16][p1]…` (full byte layout — § 4.5) |
-| `0x0800` | `WINDOW_UPDATE` | Payload is a big-endian `u32` relative flow-control credit (per-stream; the receiver grants the sender an additional `u32` bytes that is added to the sender's send window, saturating at `MAX_SEND_WINDOW`) |
+| `0x0800` | `WINDOW_UPDATE` | Payload is a big-endian `u64` **cumulative** flow-control limit (per-stream; the total the receiver is willing to have sent on that stream, counted from its first byte — see § 4.5) |
 | `0x1000` | `KEEPALIVE` | Idle keep-alive PING (empty payload); `KEEPALIVE \| ACK` is the PONG echo (download-only liveness — § 12.4) |
 | `0x2000` | `PADDED` | Anti-fingerprint size padding present: the AEAD plaintext ends with a `‹zeros› ‖ pad_n:u16be` trailer the receiver strips post-decrypt (§ 4.8) |
 | `0x4000` | `COVER` | Anti-fingerprint cover (dummy) traffic: empty inner plaintext (usually `PADDED`); authenticated then dropped by the peer, never reaches `recv()` (§ 4.8) |
@@ -391,7 +406,7 @@ detail. A receiver dispatches in this order, each step consuming the packet:
 6. `COVER` → drop after the liveness bookkeeping; it carries no application data.
 7. `ACK` → the plaintext is a `Sack` (§ 4.5); a `FIN` riding the same packet
    closes the stream behind the data already queued for delivery.
-8. `WINDOW_UPDATE` → exactly 4 bytes of relative credit.
+8. `WINDOW_UPDATE` → exactly 8 bytes of cumulative limit (§ 4.5).
 9. `PATH_VALIDATION` → exactly 32 bytes of challenge or echo (§ 12.1).
 10. `COALESCED` → split the bundle and deliver each sub-payload in order (§ 4.5).
 11. Otherwise it is application data. `RELIABLE` reassembles by the
@@ -459,9 +474,16 @@ retransmits and that stream stalls instead of the table growing without bound.
 
 These are the **AEAD plaintext** that lives *inside* `PhantomPacket.payload`
 once the AEAD opens — they are NOT the frozen outer `PhantomPacket` container
-(§ 4.1) and changing them does **not** require a `WIRE_VERSION` bump or invalidate
-`core/tests/wire_vectors`. They are authenticated (inside the AEAD) and invisible
-on the wire. All integers are big-endian, matching the rest of the codec.
+(§ 4.1), so changing one does not invalidate `core/tests/wire_vectors`, which pins
+only the container. They are authenticated (inside the AEAD) and invisible on the
+wire. All integers are big-endian, matching the rest of the codec.
+
+Not being frozen by a fixture is not the same as being free to change. Two peers
+disagreeing about one of these codecs do not fail to parse — the frames decrypt, and
+the peers then disagree about how much may be sent or what was acknowledged, which
+surfaces as a stall rather than as an error. So a change to the *meaning or width* of
+one of them is a version bump like any other: `WIRE_VERSION 6 → 7` was exactly that,
+and nothing outside this section moved.
 
 **SACK — the ACK control-frame plaintext** (`core/src/transport/sack.rs`).
 Carried as the plaintext of an `ENCRYPTED | ACK` packet (§ 4.3). The ranges are
@@ -571,33 +593,66 @@ flushed bundle at `DEFAULT_MAX_DATAGRAM = 1200` bytes (path-MTU-safe). The decod
 side is wired into the recv pump; the send-side wrap helper is a tested primitive
 not yet driven from the live send path.
 
-**`WINDOW_UPDATE` plaintext** (`transport/stream.rs`). Exactly four bytes: a u32
-big-endian *relative* credit, scoped like a SACK to the stream named by the
-enclosing header. The receiver adds it to that stream's send window; it is not an
-absolute window, so it cannot be reordered into a smaller one and it stays correct
-past 4 GiB of transfer (`send_window = initial + Σ credit − Σ sent`, which bounds
-the receiver's unconsumed bytes by `initial` for a session of any length). A
-plaintext of any other length is dropped.
+**`WINDOW_UPDATE` plaintext** (`transport/stream.rs`). Exactly eight bytes: a u64
+big-endian **cumulative limit**, scoped like a SACK to the stream named by the enclosing
+header. It states the *total* number of application bytes the receiver is willing to have
+sent on that stream, counted from the stream's first byte. A plaintext of any other length
+is dropped.
 
-The two ends of that ledger are numbers, not encodings, and a second
-implementation has to match them or the credit it grants is silently discarded:
-every stream starts with `INITIAL_STREAM_WINDOW = 64 KiB` of send credit before
-any `WINDOW_UPDATE` is seen — an implementation that treats the opening window as
-zero deadlocks, because the first credit is only emitted once the peer's
-application has consumed bytes it would never have been sent — and the
-accumulated window saturates at `MAX_SEND_WINDOW = 1 MiB`, which is equally the
-ceiling a conforming receiver's auto-tuning must not grant past. When to emit
-a credit is a local choice (this implementation emits on application consumption);
-how much is not.
+Both ends count the same quantity in the same units, which is what lets the number be
+compared without either end inferring the other's state: the sender counts every reliable
+application byte it puts on the wire, counting each byte **once** — a retransmission is not
+counted again, and a first transmission that the transport refused (so those bytes never
+left) is subtracted back — and the receiver counts every byte it has delivered to its
+application. A sender MUST NOT transmit a byte whose position in that count would exceed
+the highest limit it has received.
 
-**Persist probe.** Relative credit is emitted once, in a frame nothing
-acknowledges or retransmits, so a `WINDOW_UPDATE` that does not arrive subtracts
-its credit from the sender's window permanently. A sender left with a window under
-one segment, data queued and *nothing outstanding* has no event that can free it:
-no acknowledgement is due, and the frame that would open the window is the class of
-frame that went missing. In that state a sender MAY emit a **persist probe** — a
-`RELIABLE` frame carrying an empty payload after its 4-byte stream offset, i.e. the
-FIN sentinel's shape without the `FIN` flag.
+Three properties follow from the value being a monotone total rather than an increment, and
+between them they are why this frame is never acknowledged and never retransmitted. A
+conforming implementation MUST provide all three, which it does by applying an inbound limit
+as `limit = max(limit, advertised)`:
+
+  * **idempotent** — a duplicate frame grants nothing extra;
+  * **reorder-safe** — a stale frame overtaken by a newer one states a smaller total and is
+    discarded by the maximum;
+  * **loss-tolerant** — a frame that never arrives costs nothing, because the next one to
+    arrive states the whole truth rather than the difference since the last.
+
+The relative-credit encoding this replaced had none of them. Its deficit from a lost frame
+was permanent and monotone — at loss rate `p` it accrued as `p ×` the bytes transferred — so
+on a lossy path it reached the initial window in finite time and stopped the sender for
+good, with nothing outstanding and therefore no acknowledgement that could ever free it.
+
+The two ends of the ledger are numbers, not encodings, and a second implementation has to
+match them or the room it grants is silently discarded:
+
+  * every stream starts at `INITIAL_STREAM_WINDOW = 64 KiB` — that is the limit both ends
+    assume before any `WINDOW_UPDATE` is seen. An implementation that treats the opening
+    limit as zero deadlocks, because the first frame is only emitted once the peer's
+    application has consumed bytes it would never have been sent;
+  * a receiver MUST NOT advertise more than `consumed + MAX_RECV_WINDOW`, with
+    `MAX_RECV_WINDOW = 1 MiB` the ceiling its auto-tuning may not grant past;
+  * a sender honours at most `MAX_SEND_WINDOW = 1 MiB` — the same figure — beyond the bytes
+    it has already sent, whatever number arrives. A conforming peer is never clamped by
+    this; it exists so that a peer advertising `u64::MAX` buys exactly one window of
+    permission and must send another frame for more.
+
+When to emit is a local choice (this implementation emits when unreported consumption
+crosses half the initial window, when the advertised window grows, and in answer to a
+persist probe); what the number means is not.
+
+**Persist probe.** A `WINDOW_UPDATE` is emitted once, in a frame nothing acknowledges or
+retransmits. A lost one is repaired by the next — *provided there is a next*, and the case
+where there is not is this one: the receiver's application has consumed all it is going to
+for now, so it has no reason to speak again, while the sender is stopped at a limit a lost
+frame left below the truth, with data queued and *nothing outstanding*. No acknowledgement
+is due either, so no event can free it. The signal has to come from the sender, because
+"data queued and no room" is visible only there: a receiver cannot tell a blocked peer from
+an idle one, since both are silent and both leave its counters unchanged.
+
+In that state a sender MAY emit a **persist probe** — a `RELIABLE` frame carrying an empty
+payload after its 4-byte stream offset, i.e. the FIN sentinel's shape without the `FIN`
+flag.
 
 The offset a probe carries MUST be one the receiver has already acknowledged, never
 a fresh one; this implementation repeats the highest such offset. A probe on a fresh
@@ -616,15 +671,13 @@ is simply asked again. This implementation sends no more than one per retransmit
 timeout, and only while nothing is outstanding — and only on a stream the peer has
 acknowledged something on, since otherwise there is no offset to repeat.
 
-A receiver MUST deliver nothing to the application for an empty reliable segment.
-It SHOULD answer one by emitting whatever credit it owes but has held back below
-its own emission threshold; a receiver whose application has consumed nothing owes
-nothing, emits nothing, and correctly leaves the sender stopped. A receiver that
-does not implement the answer is interoperable — it acknowledges the probe and its
-peer stays blocked exactly as it would have without it. Credit that was already
-emitted into a lost frame is not recoverable by this or any other means at either
-end, since neither retains it; recovering *that* would require an absolute window
-on the wire, which this version does not have.
+A receiver MUST deliver nothing to the application for an empty reliable segment. It SHOULD
+answer one by emitting that stream's current limit. Because the limit is a total, one answer
+repairs however many earlier frames the path ate — and it is still bounded by consumption: a
+receiver whose application has consumed nothing re-states the number its peer is already
+stopped at, and correctly leaves it stopped. A receiver that does not implement the answer is
+interoperable — it acknowledges the probe and its peer stays blocked exactly as it would have
+without it.
 
 ### 4.6 Header protection (T4.6, QUIC RFC 9001 § 5.4)
 
@@ -1616,7 +1669,9 @@ than driving Rust types ↔ Rust types, so a layout / endianness / discriminant
 regression in the packet codec or in `borsh` fails CI instead of silently
 breaking interop. `tests/wire_vectors_decode.py` is an independent (non-Rust)
 decoder + encoder over the same fixtures — cross-implementation evidence that the
-grammar is real.
+grammar is real. It also carries the `WINDOW_UPDATE` plaintext codec and its
+monotone-maximum rule (§ 4.5), which has no fixture of its own because it is an AEAD
+plaintext rather than an outer container.
 
 | Fixture | Codec | Type |
 | --- | --- | --- |
@@ -1841,12 +1896,18 @@ that has moved in `core/src/transport/`,
 `core/src/crypto/` or `core/src/api/session.rs` since then has not been
 re-checked here.
 
+One change has landed since that pass and is reflected above: `WIRE_VERSION 6 → 7` and
+`PROTOCOL_VERSION 3 → 4`, which replaced the `WINDOW_UPDATE` relative credit with a
+cumulative limit (§ 1, § 4.3, § 4.5) and moved seven frozen fixtures — the four packet
+vectors by their version byte, the two `ClientHello` vectors by theirs, and
+`transcript_hash.bin` because the hello it covers changed.
+
 The same pass closed a set of silences, which are harder to notice than
 contradictions because nothing in the document points at them: the `stream_id`
 allocation rule (§ 4.4), the receiver's flag-dispatch order and what an
 unrecognised flag means (§ 4.3), when an acknowledgement is required and what is
 never acknowledged (§ 4.5), the `WINDOW_UPDATE` plaintext with the initial and
-maximum window that make its credit meaningful (§ 4.5), the reserved `path_id`
+maximum window that make its limit meaningful (§ 4.5), the reserved `path_id`
 values (§ 7), the bounded `ClientHello` decode a stranger's hello must satisfy
 and the absence of any forward-compatible trailer (§ 6.2), and the per-source
 term that puts the real PoW demand above the load-tier table (§ 6.9).

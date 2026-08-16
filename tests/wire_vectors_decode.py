@@ -23,7 +23,12 @@ What it covers:
     and `extensions` are off the wire; the 15-byte header has session_id off-wire).
     Fully decoded **and** re-encoded, same as the borsh structs.
 
-Run: ``python3 tests/wire_vectors_decode.py`` (stdlib only; exits non-zero on
+  * **the `WINDOW_UPDATE` plaintext** — an 8-byte big-endian cumulative limit, together
+    with the monotone-maximum rule a receiver of one must apply. It has no frozen fixture
+    (it is an AEAD plaintext, not an outer container), so what is stated here is the codec
+    and the rule, in a second language.
+
+Run:``python3 tests/wire_vectors_decode.py`` (stdlib only; exits non-zero on
 any mismatch). Regenerate the fixtures from Rust with
 ``PHANTOM_REGEN_WIRE_VECTORS=1 cargo test --manifest-path core/Cargo.toml``.
 """
@@ -44,8 +49,16 @@ ML_DSA_PK_LEN = 1952
 ML_DSA_SIG_LEN = 3309
 CLASSICAL_PK_LEN = 32
 PROTOCOL_VARIANT = b"phantom-default-1"
-PROTOCOL_VERSION = 3  # bumped 2->3 (T4.3): ServerHello server_key_package -> 32-byte server_nonce
-WIRE_VERSION = 6  # bumped 5->6 (v6 anti-fingerprint): masked version byte + dropped length prefixes
+PROTOCOL_VERSION = 4  # bumped 3->4: WINDOW_UPDATE carries a cumulative limit (see below)
+WIRE_VERSION = 7  # bumped 6->7 with it, so a peer speaking the older flow control is refused
+
+# WINDOW_UPDATE AEAD plaintext: 8 big-endian bytes, the cumulative total the receiver is
+# willing to have sent on that stream, counted from the stream's first byte. It replaced a
+# 4-byte relative credit at WIRE_VERSION 7. There is no frozen fixture for it — it is an
+# AEAD plaintext rather than an outer container — but a second implementation reading only
+# this file has to get the length and the meaning right, so both are stated here and the
+# length is asserted against the spec below.
+WINDOW_UPDATE_PAYLOAD_LEN = 8
 
 
 def pat(seed: int, n: int) -> bytes:
@@ -493,6 +506,50 @@ def phantom_packet_extensions():
     _packet_roundtrip("phantom_packet_extensions.bin", pat(0x11, 16), b"")
     check(len(load("phantom_packet_extensions.bin")) == HEADER_SIZE + 16,
           "v6 ext fixture is header || payload only (no extension bytes)")
+
+
+def enc_window_update(limit: int) -> bytes:
+    """WINDOW_UPDATE AEAD plaintext: the cumulative limit, big-endian u64."""
+    return struct.pack(">Q", limit)
+
+
+def dec_window_update(raw: bytes) -> int:
+    check(len(raw) == WINDOW_UPDATE_PAYLOAD_LEN,
+          f"WINDOW_UPDATE plaintext must be exactly {WINDOW_UPDATE_PAYLOAD_LEN} bytes")
+    return struct.unpack(">Q", raw)[0]
+
+
+@vector
+def window_update_plaintext():
+    """The flow-control plaintext, stated independently of the Rust.
+
+    There is no frozen fixture — this is an AEAD plaintext, not an outer container — so
+    what is checked is the codec and the rule a second implementation has to follow: an
+    8-byte big-endian total, and a receiver that takes the MAXIMUM of it and the limit it
+    already holds. That maximum is what makes the frame idempotent, reorder-safe and
+    loss-tolerant, and it is the whole reason the frame needs no acknowledgement.
+    """
+    initial = 64 * 1024
+    limit = initial + 100_000
+    raw = enc_window_update(limit)
+    check(raw == bytes([0, 0, 0, 0, 0, 0x02, 0x86, 0xA0]),
+          f"WINDOW_UPDATE big-endian encoding: got {raw.hex()}")
+    check(dec_window_update(raw) == limit, "WINDOW_UPDATE decode != encode input")
+
+    # Applying limits: monotone maximum, never a sum and never a decrease.
+    held = initial
+    for advertised, expected in [(limit, limit), (limit, limit), (initial, limit),
+                                 (limit + 1, limit + 1)]:
+        held = max(held, advertised)
+        check(held == expected,
+              f"applying {advertised} to {held} gave {held}, expected {expected}")
+
+    for bad in (b"", b"\x00\x00\x00\x01", b"\x00" * 9):
+        try:
+            dec_window_update(bad)
+        except Failure:
+            continue
+        raise Failure(f"a {len(bad)}-byte WINDOW_UPDATE plaintext was accepted")
 
 
 def main() -> int:

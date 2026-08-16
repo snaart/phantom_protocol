@@ -1,6 +1,6 @@
 //! Receive-window auto-tuning, measured end to end (test-only).
 //!
-//! A credit window of `W` bytes whose credit returns one round trip after the data was
+//! A window of `W` bytes whose room reopens one round trip after the data was
 //! consumed is a hard rate ceiling of `W / RTT`, whatever congestion control decides. With
 //! `W` fixed at 64 KiB that is 2.6 Mbit/s on a 200 ms path — under a third of what the paths
 //! this transport targets actually carry — so on a long path the limiter was flow control,
@@ -72,7 +72,7 @@ fn spawn_prompt_receiver(
 
 /// **The throughput regression.** A stream whose receiver consumes promptly must sustain a
 /// rate above what a fixed 64 KiB window permits on this path. Before receive-window
-/// auto-tuning it could not: the window returned 64 KiB of credit per round trip and the
+/// auto-tuning it could not: the window reopened 64 KiB of room per round trip and the
 /// download sat pinned at ~320 KiB/s on a link carrying six times that, with congestion
 /// control's window never becoming the binding constraint at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

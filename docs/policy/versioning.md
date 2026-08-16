@@ -17,8 +17,8 @@ And one pinned constant that is **not** an evolving axis (see §3):
 
 | Constant | Identifier | Lives in | Value |
 | --- | --- | --- | --- |
-| Wire-format version | `WIRE_VERSION` (packet-header byte) | `core/src/transport/types.rs` | `6` |
-| Protocol version | `PROTOCOL_VERSION` (`ClientHello.version`) | `core/src/transport/handshake.rs` | `3` |
+| Wire-format version | `WIRE_VERSION` (packet-header byte) | `core/src/transport/types.rs` | `7` |
+| Protocol version | `PROTOCOL_VERSION` (`ClientHello.version`) | `core/src/transport/handshake.rs` | `4` |
 
 A single commit can move zero, one, or both of the live axes. Each axis has its
 own changelog entry (see `CHANGELOG.md`).
@@ -66,10 +66,10 @@ with, so there is nothing to negotiate against.
 
 Two constants pin the format:
 
-- `WIRE_VERSION = 6` — the packet-header version byte (`transport/types.rs`). It
-  is bound into the AEAD AAD; as of v6 it is itself header-protection–masked on the
+- `WIRE_VERSION = 7` — the packet-header version byte (`transport/types.rs`). It
+  is bound into the AEAD AAD; since v6 it is itself header-protection–masked on the
   wire (no constant cleartext byte). See `docs/protocol/PROTOCOL.md` § 1 / § 4.2.
-- `PROTOCOL_VERSION = 3` — `ClientHello.version` (`transport/handshake.rs`),
+- `PROTOCOL_VERSION = 4` — `ClientHello.version` (`transport/handshake.rs`),
   bound into the signed handshake transcript.
 
 Both bumped several times pre-1.0, as a hard cut each time (no negotiation, no
@@ -89,11 +89,23 @@ deployed peers to keep compatible). The history, for the record:
   `version` byte included) and the two cleartext `u32` length prefixes
   (`payload_len` / `ext_len`) were dropped, with `extensions` moved off the
   data-plane wire.
+- **`6 → 7`** — cumulative flow control: the `WINDOW_UPDATE` AEAD plaintext went
+  from a 4-byte relative credit to an 8-byte cumulative limit. The header did not
+  move; what moved is a plaintext codec, which is normally not a version concern
+  (§ "Adding bytes without a version bump"). It is one here because a peer reading
+  the old encoding would compute a wrong window rather than fail to parse, and
+  because a relative credit in an unacknowledged frame is destroyed by loss —
+  see `PROTOCOL.md` § 4.5.
 
 `PROTOCOL_VERSION` bumped `1 → 2` (the signed transcript began covering the 0-RTT
 verdict `early_data_accepted` and `ClientHello` gained the `resumption_binder`
-proof-of-possession field) and `2 → 3` (`ServerHello`'s `server_key_package` was
-replaced by a 32-byte `server_nonce`, changing the signed-transcript content).
+proof-of-possession field), `2 → 3` (`ServerHello`'s `server_key_package` was
+replaced by a 32-byte `server_nonce`, changing the signed-transcript content), and
+`3 → 4` alongside `WIRE_VERSION 6 → 7` — no handshake field changed there; the
+bump exists so an older peer is refused with a typed `ServerReject` instead of
+completing a handshake and then having its packets dropped silently by the
+data-plane version check. **That pairing is the rule, not a one-off**: a data-plane
+change without a handshake bump converts a diagnosable refusal into a silent stall.
 Handshakes across any of these versions cannot interoperate. See PROTOCOL.md § 1
 for the authoritative narrative.
 
@@ -149,6 +161,11 @@ A change to any of the following requires bumping `WIRE_VERSION` /
 - A change to the borsh field order of `ClientHello` / `ServerHello` /
   `HelloRetryRequest`.
 - A change to the cookie or PoW inputs.
+- A change to the meaning or width of an AEAD-plaintext control codec that both
+  peers must agree on to make progress — the `WINDOW_UPDATE` limit, the `Sack`
+  encoding, the reliable-frame offset prefix. These are not frozen by any `.bin`,
+  so nothing else catches a divergence: the frames decrypt, and the peers then
+  disagree about how much may be sent or what was acknowledged.
 
 Because there is no negotiation, such a bump is a **coordinated, breaking
 change**: every peer must move to the new constant at once. Pre-1.0 there are no
