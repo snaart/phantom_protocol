@@ -112,6 +112,15 @@ impl Drop for PerIpGuard {
 async fn main() -> Result<()> {
     let cfg = Config::parse();
 
+    // Resolve admission control before anything is bound or generated. The transport bounds
+    // its receive buffers per session and not per process, so the session cap is what bounds
+    // this process's memory whether or not it was set with that in mind;
+    // `--max-recv-memory-mib` lets an operator state the memory figure instead and have the
+    // cap follow from it. A budget that cannot hold one session is a refusal, and it has to
+    // land here: past this point the listen socket opens, and a readiness probe that sees the
+    // port must never be looking at a process that is about to exit on its own configuration.
+    let max_sessions = cfg.effective_max_sessions().map_err(anyhow::Error::msg)?;
+
     // OTel must be installed BEFORE the tracing subscriber so the
     // `tracing-opentelemetry` layer has a tracer to bridge into. The
     // subscriber then composes the OTel layer alongside the fmt layer.
@@ -176,12 +185,7 @@ async fn main() -> Result<()> {
     // Admission control: a global session cap (backpressure — stop accepting
     // when full rather than exhausting fds/memory) plus a per-IP cap so one
     // source can't monopolise the pool. `max_sessions == 0` → unbounded.
-    //
-    // The transport bounds its receive buffers per session and not per process, so the
-    // session cap is what bounds the process's memory whether or not it was set with that
-    // in mind. `--max-recv-memory-mib` lets an operator say the memory figure instead and
-    // have the cap follow from it.
-    let max_sessions = cfg.effective_max_sessions().map_err(anyhow::Error::msg)?;
+    // `max_sessions` was resolved against `--max-recv-memory-mib` at startup.
     let session_slots = Arc::new(Semaphore::new(if max_sessions == 0 {
         Semaphore::MAX_PERMITS
     } else {

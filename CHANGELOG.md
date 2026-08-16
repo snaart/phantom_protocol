@@ -57,7 +57,11 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   joins the same ledger as one opened through the API. `SESSION_RECV_WINDOW_GROWTH_BUDGET`
   (8 MiB) is what the ledger holds and `SharedRecvTuning::remaining_growth_budget` reports
   what is left of it. `MAX_SEND_WINDOW` and `MAX_RECV_WINDOW` doubled from 512 KiB to 1 MiB
-  with the ceiling above.
+  with the ceiling above. `MAX_RECV_REORDER` and the new `REORDER_ENTRY_OVERHEAD_BYTES` are
+  public alongside them, and `api::session` exports `MAX_STREAMS`, `RECV_DELIVERY_HARD_CAP`
+  and `SESSION_RECV_MEMORY_COMMITMENT` — the five constants the per-session receive-memory
+  bound is computed from, so an embedder can size a host from the same arithmetic the
+  transport enforces rather than from a figure copied out of a document.
 - **`migrate()` on a non-migration transport now returns `Err(CoreError::Unsupported)`**
   instead of a silent `Ok(())` no-op. Real migration requires a UDP-backed session
   (`connect_pinned_udp*`); on TCP / WebSocket / WASI / Embedded it now errors honestly.
@@ -231,6 +235,42 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **The receive-window growth budget was handed out per stream on the raw session API, and
+  described as bounding more than it does.** `Session::open_stream` — the Rust-only
+  transport-level API, distinct from `PhantomSession::open_stream` — built each of its
+  streams with a `SharedRecvTuning` of its own. The allowance whose entire purpose is to stop
+  256 streams each reaching the per-stream ceiling was therefore multiplied by the stream
+  count, which is a number the peer picks: 32 streams of one session took 30 MiB of growth
+  against an 8 MiB budget, scaling linearly to 256. One handle per `Session` now, as the
+  streams the data pump builds already had. `security_invariants.rs` pins it two-sided —
+  N sessions × M streams hold no more than N budgets between them, with a positive control
+  showing the same streams blow past that when each gets its own handle.
+
+  The accompanying claim needed correcting too. `SESSION_RECV_WINDOW_GROWTH_BUDGET` bounds
+  *growth*, so it is worth 8 MiB of what one session can be made to hold; it does not touch
+  the 16 MiB of initial windows 256 streams start with, the 64 MiB of reorder structure a
+  peer can pin with tiny segments above a hole it never fills (the byte budget counts payload,
+  the entry cap counts entries), or the 4 MiB delivery backlog. The resident total is
+  **108 MiB per session**, now published as `api::session::SESSION_RECV_MEMORY_COMMITMENT`
+  and computed there from `MAX_STREAMS`, `INITIAL_STREAM_WINDOW`, the growth budget,
+  `MAX_RECV_REORDER` × `REORDER_ENTRY_OVERHEAD_BYTES` and `RECV_DELIVERY_HARD_CAP`, so
+  raising any of them moves the published figure instead of quietly invalidating it. All
+  five constants are now public, and a second test asserts the figure still equals what they
+  permit.
+
+  It is a bound **per session**, and nothing divides it between concurrent sessions: a
+  process admitting N sessions commits N × 108 MiB in the worst case, which at the reference
+  server's default `PHANTOM_MAX_SESSIONS=1024` is ~108 GiB. Admission control is what bounds
+  the process, so `phantom-server` gained `--max-recv-memory-mib` /
+  `PHANTOM_MAX_RECV_MEMORY_MIB`: state the receive-memory figure and the session cap follows
+  from it, refusing to start on a budget too small for one session. A process-wide second
+  tier over the growth budget was considered and rejected — it would bound 8 GiB of that
+  ~108 GiB by letting one peer's growth decisions pin another peer's window at the 64 KiB
+  initial size, which is a remote peer steering a local control loop. The reasoning is in
+  `docs/security/threat-model.md` §5 §D.1, which is also where this whole class of threat
+  now has a row; `docs/operations/deployment.md` carries the operator-facing arithmetic and
+  the distinction between the ~512 KiB a typical session occupies and the 108 MiB bound.
+
 - **A SACK carrying more than 32 islands threw away the one range that retires data.**
   `Stream::received_sack` builds its range list with the contiguous delivered run first —
   lowest — and `Sack::from_ascending_coalesced` reversed the list to descending and then
@@ -270,7 +310,10 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   before (40 MiB of reorder budget against 144 MiB) even though the per-stream ceiling
   doubled. Every stream of a connection — API-opened, pump-created or peer-initiated —
   draws on one handle, so the bound holds rather than merely being intended. Growth remains
-  driven by what the application consumed, never by what arrived. The round-trip reference
+  driven by what the application consumed, never by what arrived. What the budget bounds and
+  what it does not is set out in the entry below and in `docs/security/threat-model.md`
+  §5 §D.1; the short form is that it is 8 MiB of a 108 MiB per-session commitment, and that
+  the commitment is per session rather than per process. The round-trip reference
   the interval is derived from is a constant on a receive-only stream, which is the flow
   auto-tuning exists for, because such a stream never measures a round trip of its own. On a
   stream that also sends, it is that stream's own `min_rtt`, and a peer that delays every

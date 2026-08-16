@@ -1,7 +1,11 @@
 # Phantom Protocol Threat Model
 
 Methodology: STRIDE for security, LINDDUN for privacy. Audit-friendly format —
-each finding maps to a concrete mitigation with file:line traceability.
+each finding maps to a concrete mitigation, traceable to a file and the item
+inside it. Pointers name the enclosing function, type or constant rather than a
+line number: line numbers here had drifted far enough that five of them resolved
+into unrelated code, which turns an adversarial read of this document into a
+fiction. A name survives the edits a line number does not.
 
 Document status: **draft**. Living document; updates with each substantive
 change to the protocol or trust boundaries. Last reviewed against repo state
@@ -125,9 +129,9 @@ process is a weaker boundary (we trust the caller and the OS).
 
 | Threat | Mitigation | Code |
 | --- | --- | --- |
-| Adversary presents a fake server key in `ServerHello` | Client pins `expected_server_key`; mismatch → `HandshakeError::ServerIdentityMismatch` | `core/src/transport/handshake.rs::process_server_hello` (`:1334-1337`) |
-| Adversary forges a `ClientHello` to spoof an IP | Cookie + adaptive PoW; cookie is HMAC(rotating-secret, ip, bucket) so forgery requires the secret | `core/src/transport/handshake.rs::cookie_pow_gate` (`:1037-1121`) |
-| Replay of an old, captured `ServerHello` to a fresh client | Transcript signature binds `client_hello.nonce` and `session_id_bytes`; replay fails signature check | `core/src/transport/handshake.rs:441-453` (`HandshakeTranscript`) + `::process_server_hello` (`:1345-1360`, client-side verify) |
+| Adversary presents a fake server key in `ServerHello` | Client pins `expected_server_key`; mismatch → `HandshakeError::ServerIdentityMismatch` | `core/src/transport/handshake.rs::process_server_hello` (the pinned-key compare) |
+| Adversary forges a `ClientHello` to spoof an IP | Cookie + adaptive PoW; cookie is HMAC(rotating-secret, ip, bucket) so forgery requires the secret | `core/src/transport/handshake.rs::cookie_pow_gate` |
+| Replay of an old, captured `ServerHello` to a fresh client | Transcript signature binds `client_hello.nonce` and `session_id_bytes`; replay fails signature check | `core/src/transport/handshake.rs::HandshakeTranscript` + `::process_server_hello` (client-side verify) |
 | Connection-migration hijack: a known (plaintext) `session_id`/CID replayed from a spoofed source to steal the session | Path validation — a fresh unguessable 32-byte challenge must be echoed *from* the claimed address (only the session-key holder can), constant-time verified, before the server switches its peer; pinned-key AEAD blocks read/inject. Worst achievable is a **redirection-DoS**, **never** hijack/decrypt (the QUIC §9 boundary) | `core/src/transport/path.rs`, `core/src/api/session.rs`, `PROTOCOL.md` §12 |
 | 0-RTT early-data replay against a **single** server | The server `peek()`s the ticket (non-consuming), verifies the `ClientHello.resumption_binder` proof-of-possession in constant time, then **eagerly `remove()`s** it (race-free one-shot, Invariant 9), so a replayed `ClientHello` finds no ticket and the server falls back to a 1-RTT handshake that ignores the early-data. On any *later* handshake failure the ticket is re-inserted unchanged (`reinsert_with_expiry`), so a corrupted resuming hello cannot burn a victim's ticket | `core/src/transport/handshake.rs::process_client_hello` (peek/binder/remove), `core/src/transport/session_cache.rs::{peek, remove, reinsert_with_expiry}`, `PROTOCOL.md` §6.6 |
 | 0-RTT early-data replay against a **different node** (horizontal scale-out) | **Mitigable — the library provides the controls (A2b); the embedder picks a posture.** The built-in one-shot guarantee holds only under a *single coherent* `SessionCache` (an in-process LRU, not replicated), so a horizontally-scaled deployment with per-node caches would otherwise let an attacker replay a captured 0-RTT `ClientHello` against a node that still holds an unconsumed copy of the ticket (the classic TLS-1.3 0-RTT-across-a-server-farm replay). The library now offers two controls: **(1)** install a distributed `ZeroRttAntiReplay` store (`set_zero_rtt_anti_replay`) whose atomic `check_and_set` makes the consume first-use **globally** across the fleet — replay-safe 0-RTT at scale (the *store* is the embedder's infra, e.g. Redis `SET NX`; the transport ships only the seam, failing closed on store errors); or **(2)** disable 0-RTT early-data entirely (`set_early_data_enabled(false)`) so the payload is only ever delivered 1-RTT — the zero-infrastructure default. Sticky/hashed routing or idempotent early-data also suffice. The post-handshake session's PFS + auth are unaffected regardless. See `docs/operations/zero-rtt.md`. | `core/src/transport/handshake.rs` (`ZeroRttAntiReplay`, `set_early_data_enabled`), `core/src/transport/session_cache.rs`, `PROTOCOL.md` §6.6 |
@@ -136,9 +140,9 @@ process is a weaker boundary (we trust the caller and the OS).
 
 | Threat | Mitigation | Code |
 | --- | --- | --- |
-| Bit-flip in ciphertext | AEAD tag check fails → packet dropped | `core/src/crypto/adaptive_crypto.rs::decrypt_with_nonce` (`:466-467`) |
-| Mutation of header on the wire | The header is serialized by `PacketHeader::to_wire` (15 big-endian wire bytes, wholly HP-masked); the AEAD AAD is the separate 47-byte `PacketHeader::to_aad_image()` (which additionally binds the off-wire 32-byte `session_id`), so any mutation invalidates the tag | `core/src/transport/types.rs:393, 415`, `core/src/transport/session.rs` |
-| Tampering with handshake messages | Transcript signature covers every field of `ClientHello`/`ServerHello` | `core/src/transport/handshake.rs:441-453` (`HandshakeTranscript`) + `::process_server_hello` (`:1345-1360`, client-side verify) |
+| Bit-flip in ciphertext | AEAD tag check fails → packet dropped | `core/src/crypto/adaptive_crypto.rs::decrypt_with_nonce` |
+| Mutation of header on the wire | The header is serialized by `PacketHeader::to_wire` (15 big-endian wire bytes, wholly HP-masked); the AEAD AAD is the separate 47-byte `PacketHeader::to_aad_image()` (which additionally binds the off-wire 32-byte `session_id`), so any mutation invalidates the tag | `core/src/transport/types.rs::{PacketHeader::to_wire, PacketHeader::to_aad_image}`, `core/src/transport/session.rs` |
+| Tampering with handshake messages | Transcript signature covers every field of `ClientHello`/`ServerHello` | `core/src/transport/handshake.rs::HandshakeTranscript` + `::process_server_hello` (client-side verify) |
 | Packet-number mutation (replay or skip) | After AEAD verify, `Session::decrypt_packet` consults a single per-direction `ReplayWindow` (keyed on the `u64` packet number) and rejects duplicates / out-of-window-old | `core/src/transport/session.rs`, `core/src/security/replay_window.rs` |
 
 ### R — Repudiation
@@ -152,10 +156,10 @@ for a real-time secure transport.
 
 | Threat | Mitigation | Code |
 | --- | --- | --- |
-| Plaintext leak on the wire | AEAD encryption (post-handshake invariant `PacketFlags::ENCRYPTED`); unencrypted post-handshake packets dropped | `core/src/api/session.rs:2611-2619` |
+| Plaintext leak on the wire | AEAD encryption (post-handshake invariant `PacketFlags::ENCRYPTED`); unencrypted post-handshake packets dropped | `core/src/api/session.rs::handle_packet` (the `ENCRYPTED` branch and the `else` arm that drops everything else) |
 | Plaintext leak via error message | Error variants carry only the error class, not the payload; no `format!("{:?}", plaintext)` anywhere | grep `format!.*plaintext\|payload` in `core/src/` → 2 hits, both formatting a transport *error* under the literal label "write payload" (`transport/legs/wasi.rs:188`, `transport/legs/embedded/mod.rs:82`) — no call site interpolates application plaintext |
 | Memory disclosure of keys after session close | Key-bearing structs zeroize on drop: `ZeroizeOnDrop` on `CryptoState` (`session.rs`), `HandshakeServer` / `HandshakeClient` (`handshake.rs`), and `ResumptionTicket` (`session_cache.rs`, T5.1); the rekey master `Session.traffic_secret` is zeroized in `Session::drop` (T5.1) along with `resumption_secret`; the transient handshake KEM secret is held in `Zeroizing` (T5.1). Mid-session rekey also zeroizes each superseded epoch secret. | `session.rs` (`CryptoState`, `Session::drop`), `handshake.rs` (`HandshakeServer`/`HandshakeClient` + `Zeroizing` KEM secret), `session_cache.rs` (`ResumptionTicket`) |
-| Timing leak on cookie comparison | `subtle::ConstantTimeEq::ct_eq` — never branches on cookie content | `core/src/transport/handshake.rs::validate_cookie` (`:1592-1597`) |
+| Timing leak on cookie comparison | `subtle::ConstantTimeEq::ct_eq` — never branches on cookie content | `core/src/transport/handshake.rs::validate_cookie` |
 | DPI fingerprinting | **Partial (WIRE v6) + opt-in TLS mimicry (`mimicry` feature):** the data-plane wire has **no constant cleartext byte** (the version byte is HP-masked) and **no cleartext length-prefix pattern** (dropped — §4.1/§4.6), removing the two structural tells a stateless DPI box keyed on; opt-in size padding / timing jitter / cover traffic (§4.8) blunt the statistical tells. The outer 8-byte `ConnId` + opaque-blob datagram *shape* is still recognizable on bare UDP — the **`mimicry` feature** (TLS-over-TCP `MimicTlsLeg`) makes a flow look like HTTPS instead. **Residual:** the mimicry defeats passive/light-stateful DPI but **not active probing** (§6.1). | PROTOCOL.md §4.1 / §4.6 / §4.8 ; threat-model §6.1 |
 
 ### D — Denial of service
@@ -164,10 +168,80 @@ for a real-time secure transport.
 | --- | --- | --- |
 | Handshake flood / IP spoof amplification | Stateless cookie (HMAC over rotating secret + IP + bucket) forces attacker to receive a packet at the spoofed IP before consuming server resources | `core/src/transport/handshake.rs::generate_cookie`, `validate_cookie` |
 | CPU-exhaustion via cheap handshake attempts | Adaptive PoW difficulty tiers from 0 → 16 (~64k hash evals) based on per-minute load | `core/src/transport/handshake.rs::adaptive_difficulty` (Phase 1.14) |
-| Panic-on-malformed input | `#![deny(clippy::unwrap_used, expect_used, panic, unreachable, todo, unimplemented, missing_safety_doc)]` (`core/src/lib.rs:43-51`) plus `.clippy.toml`'s `disallowed-methods` ban on `Option::unwrap` / `Result::unwrap`; no `.unwrap()` on the recv/handshake hot path; fuzz harnesses in `fuzz/` | Phase 1.3, 6.4 |
-| AEAD nonce exhaustion (theoretical) | Hard ceiling `AEAD_MAX_INVOCATIONS = 1 << 48` → `CryptoError::NonceExhausted` | `core/src/crypto/adaptive_crypto.rs:24-44` |
+| Panic-on-malformed input | `#![deny(clippy::unwrap_used, expect_used, panic, unreachable, todo, unimplemented, missing_safety_doc)]` (the crate-root `deny` block in `core/src/lib.rs`) plus `.clippy.toml`'s `disallowed-methods` ban on `Option::unwrap` / `Result::unwrap`; no `.unwrap()` on the recv/handshake hot path; fuzz harnesses in `fuzz/` | Phase 1.3, 6.4 |
+| AEAD nonce exhaustion (theoretical) | Hard ceiling `AEAD_MAX_INVOCATIONS = 1 << 48` → `CryptoError::NonceExhausted` | `core/src/crypto/adaptive_crypto.rs::AEAD_MAX_INVOCATIONS` |
 | Replay-window memory amplification | One per-direction `ReplayWindow` (~144 bytes) per session — no per-stream growth | `core/src/security/replay_window.rs` |
+| **Receive-side memory amplification by an authenticated peer** | See the dedicated treatment below — the bound is per session, and every term in it is a quantity the peer chooses | `core/src/transport/stream.rs`, `core/src/api/session.rs::SESSION_RECV_MEMORY_COMMITMENT` |
 | Connection-migration amplification: known CID + spoofed source used as a reflector toward a victim | To an unvalidated address the server is **challenge-only** and caps bytes sent to **≤ 3× bytes received** (RFC 9000 §8.2); a spoofed address never echoes the challenge so it is never switched-to | `core/src/api/udp_transport.rs` (anti-amp budget), `PROTOCOL.md` §12.3 |
+
+#### D.1 — Receive-side memory amplification by an authenticated peer
+
+Authentication is not trust (§4). Once a peer holds session keys it decides how
+many streams to open, how much to send, and — the part that matters here — how
+long to leave a reassembly hole open. Every receive-side buffer is therefore a
+memory commitment this side makes on the peer's word, and the commitments
+multiply:
+
+```text
+  advertised window   sizes one stream's unconsumed data AND the reorder budget
+        ×             that tracks it (recv_reorder_byte_limit = window + 64 KiB)
+  reorder buffer      out-of-order segments held above a hole, which flow control
+        ×             never counts — only delivered data is
+  streams             the peer opens them; the recv path auto-creates one per
+        ×             stream_id it sees
+  sessions            the peer opens those too
+```
+
+The chain has a bound at each link, and the arithmetic is worth stating in full
+because the largest term is not the one design discussions usually focus on:
+
+| link | bound | worst case per session |
+| --- | --- | --- |
+| advertised window | `MAX_RECV_WINDOW` = 1 MiB per stream, but growth above the 64 KiB initial window is drawn from one session-wide `SESSION_RECV_WINDOW_GROWTH_BUDGET` = 8 MiB | 256 × 64 KiB + 8 MiB = **24 MiB** of window |
+| reorder payload | `Stream::recv_reorder_byte_limit` = window + 64 KiB, refused past that (the refused segment is not SACKed, so the sender retransmits) | Σ (window + 64 KiB) = **40 MiB** |
+| reorder structure | `MAX_RECV_REORDER` = 2048 held entries per stream, ~128 B of deque slot + `Vec<Bytes>` + retained plaintext each — the byte budget counts payload only, so tiny segments above a hole fill this without moving any window | 256 × 2048 × 128 B = **64 MiB** |
+| delivery backlog | `RECV_DELIVERY_HARD_CAP` = 4 MiB, past which the session is torn down rather than buffered | **4 MiB** |
+| streams | `MAX_STREAMS` = 256, enforced on the auto-create path | — |
+
+Windows are a promise rather than an allocation (the bytes they admit come to
+rest in the reorder buffer or the delivery backlog, both counted), so the
+resident total is **108 MiB per session** — published as
+`SESSION_RECV_MEMORY_COMMITMENT` and computed there from the constants above, so
+raising any one of them moves the published figure rather than silently
+invalidating it. `security_invariants.rs` pins both halves: that N sessions of M
+streams hold no more than N budgets between them, and that the published figure
+still covers what the constants permit.
+
+**Mitigation, and its honest limit.** The growth budget is the mechanism that
+makes a *per-stream* ceiling safe — it is what stops 256 streams each reaching
+1 MiB — and window growth is earned only by bytes the local application has
+actually consumed, never by arrival, so a peer that floods an application which
+never reads moves nothing. But the budget is worth 8 MiB of the 108 MiB, and the
+bound is **per session**: nothing divides it between concurrent sessions, so a
+process admitting `N` sessions commits `N × 108 MiB` (`1024 × 108 MiB ≈ 108 GiB`
+at the reference server's default `PHANTOM_MAX_SESSIONS`). Admission control is
+what bounds the process, and it belongs to the embedder —
+`--max-recv-memory-mib` lets an operator state the memory figure and have the
+session cap follow from it (`docs/operations/deployment.md`).
+
+A process-wide second tier over the growth budget was considered and rejected.
+It would bound 8 GiB of that ~108 GiB, and it would do so by putting one peer's
+growth decisions in charge of another peer's window: growth is first-come, so a
+peer that opens sessions and drains them just fast enough to earn doublings
+exhausts the process allowance and pins every session admitted afterwards at the
+64 KiB initial window — 2.6 Mbit/s on a 200 ms path. That is a remote peer
+steering a local control loop, which §4's adversary model forbids outright.
+
+**Consequences for review.** Any change that widens a term above — a larger
+window ceiling, a larger reorder entry cap or byte budget, more streams, a
+larger delivery cap — is a change to this bound and needs the arithmetic redone,
+not an assurance that the new value is still "small". Two such changes were
+rejected during the receive-path work for exactly this reason. The same applies
+to anything that would let a peer's own timing or acknowledgements decide how
+much this side holds: the growth trigger is local consumption on purpose, and
+the RTT reference auto-tuning divides by is a constant on purpose
+(`AUTOTUNE_RTT_FALLBACK`), because a peer that could inflate it would be lowering
+the bar its own doublings have to clear.
 
 ### E — Elevation of privilege
 
@@ -257,7 +331,7 @@ and the specialist docs in this directory. Cross-reference quick map:
 - STRIDE-D (DoS) → Phase 1.10, 1.11, 1.14 cookie/PoW rotation + adaptive.
 - LINDDUN — partially mitigated; full anonymity is out of scope.
 - Connection migration (Phase 4) -> path validation (path.rs, Invariant 6), 3x
-  anti-amplification (udp_transport.rs), PATH-001 strict send-gate + relaxed
+  anti-amplification (`core/src/api/udp_transport.rs`), PATH-001 strict send-gate + relaxed
   recv-delivery, and PTO-based liveness. See PROTOCOL.md §12.
 ---
 
@@ -331,3 +405,4 @@ and the specialist docs in this directory. Cross-reference quick map:
 | 2026-06-17 | A2b 0-RTT anti-replay controls | Turned the documented 0-RTT scale-out replay residual into a mitigable item. Added a pluggable `ZeroRttAntiReplay` trait (`HandshakeServer::set_zero_rtt_anti_replay`, exposed on both listeners) so a horizontally-scaled deployment can make the one-shot ticket consume atomic across nodes via a shared store (Redis `SET NX`, a conditional put — the embedder's infra; the transport ships the seam, default single-node), and a `set_early_data_enabled(false)` switch to disable 0-RTT early-data entirely (the zero-infrastructure default — early-data is rejected and resent 1-RTT). Loud deploy guide at `docs/operations/zero-rtt.md`. The single-node guarantee (Invariant 9) is unchanged. No wire change. |
 | 2026-06-17 | A2a server migration (EPS-02 closed) | Made server-initiated migration a real, symmetric, unlinkable feature. The UDP client socket became unconnected (so it can hear a server that moves to a new address); the server gained `migrate_server(local_addr)` (Rust-only) that rebinds its send socket + rotates s2c in lock-step; the client now follows a migrated server (commits the new source post-AEAD/M-1, path-validates under the 3× anti-amp cap, switches its c2s target on a valid echo) and **reflects** the CID rotation (bumps its path_id + rotates c2s), which slides the server's c2s window so it stays routable (no stranding) with no ping-pong (the server's s2c re-rotation is path_id-silent). **LINDDUN-L / EPS-02 is now closed for migration by *either* peer** — a client move and a server failover are both unlinkable in both directions. No wire change (behavioural extension on v6). The not-forward-secret CID-chain caveat is unchanged. |
 | 2026-06-16 | v6 anti-fingerprint (WIRE 6) | Removed the two structural data-plane fingerprints and added opt-in traffic shaping. **(a)** the `version` byte is now HP-masked (the whole 15-byte header is masked — no constant cleartext byte); **(b)** the cleartext `payload_len` / `ext_len` prefixes are dropped (`payload` is the message remainder; `extensions` off the wire) — PROTOCOL.md §4.1/§4.6. **Opt-in (off by default):** **(c)** PADÉ size padding (bounded ≈ ≤12% overhead, inside the AEAD), **(d)** uniform `[0, jitter_ms]` send-timing jitter, **(e)** `COVER` cover traffic (authenticated dummy packets, dropped by the peer) — PROTOCOL.md §4.8, via `TrafficShapingConfig`. Narrows LINDDUN-D ("No mitigation" → opt-in size/timing/volume controls) and the DPI-fingerprinting row (structural tells gone). **Honest residuals:** shaping is off by default; PADÉ reduces but doesn't eliminate size classes; the datagram *shape* + global statistical traffic analysis remain out of scope; full active protocol-mimicry is a separate future transport mode. |
+| 2026-08-15 | Receive-side memory amplification | Added STRIDE-D §D.1: the class was absent, which is how two changes widening receive-side buffers reached review before being rejected on grounds this document did not state. Records the mechanism (advertised window × reorder buffer × streams × sessions), the bound at each link with the arithmetic, and the resident total of **108 MiB per session** (`SESSION_RECV_MEMORY_COMMITMENT`, computed from those constants). States honestly that the growth budget covers 8 MiB of it and that the bound is **per session** — a process commits `N ×` that figure, bounded only by admission control — and why a process-wide tier was rejected (it would let one peer's growth decisions pin another peer's window). Also re-keyed §5's code pointers from line numbers to enclosing items: five had drifted into unrelated code, including the Invariant-2 `ENCRYPTED` gate, which pointed into `flush_deferred_sends`. |
