@@ -401,8 +401,19 @@ async fn a_saturating_upload_does_not_starve_the_download() {
     // bottleneck rate instead of releasing a whole congestion window at once, so the queue
     // the upload's acknowledgements queue behind is the residue of one round trip rather
     // than a window's worth.
+    //
+    // It is 32 KiB now, and lowered rather than raised, because 96 KiB sat *inside* the
+    // healthy population rather than below it: the range recorded two paragraphs above is
+    // 38–124 KB, so the bar was failing runs that were merely at the slow end of correct.
+    // Observed at roughly one run in twenty, which in a suite that gates every merge is a
+    // coin flip rather than a measurement. The two populations this has to separate are
+    // 5–10 KB with the defect present and 38 KB at the healthy floor; 32 KiB clears the
+    // first by better than 3x and sits under the second, which is the whole margin there
+    // is. Raising it again means first making the measurement scale-free — every figure
+    // here is a wall-clock byte count and a contended runner lowers it while the constant
+    // does not move.
     assert!(
-        up_bytes > 96 * 1024,
+        up_bytes > 32 * 1024,
         "the upload stalled ({up_bytes} B reached the peer) — the pump stopped draining"
     );
     // The two directions are independent on this link, so a fair pump keeps most
