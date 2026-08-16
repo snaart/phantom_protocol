@@ -454,6 +454,12 @@ pub enum SendBlocked {
     CongestionWindow,
     /// The peer's advertised flow-control window has no room for the head
     /// unsent segment. Clears on a `WINDOW_UPDATE`, not on an acknowledgement.
+    ///
+    /// Reported only once there is nothing left to ask: a stream with nothing outstanding
+    /// gets an empty persist probe from `Stream::poll_send` instead, so this answer also
+    /// says that one of the probe's three preconditions failed — an acknowledgement is still
+    /// owed, the probe interval has not elapsed, or the peer has acknowledged no offset yet
+    /// and there is none to repeat.
     FlowControl,
 }
 
@@ -649,7 +655,8 @@ pub struct Stream {
     /// Bytes the **peer** has granted us to send — decremented as we
     /// emit payload bytes, replenished by inbound `WINDOW_UPDATE`
     /// frames (Phase 4.3). When it hits zero, `poll_send` stalls
-    /// until the next `WINDOW_UPDATE`.
+    /// until the next `WINDOW_UPDATE` — sending, meanwhile, the empty persist probe
+    /// [`Stream::try_persist_probe`] issues when no such frame can be counted on.
     peer_send_window: AtomicU32,
     /// Bytes the local side has granted the peer — replenished as
     /// the application drains `recv_ready`. We periodically emit a
@@ -665,6 +672,12 @@ pub struct Stream {
     /// Total bytes the local side has consumed since the last
     /// emitted `WINDOW_UPDATE`. Used to decide when to send the
     /// next update (avoid flooding the wire with tiny updates).
+    ///
+    /// Two paths on two tasks mutate it — [`Stream::record_app_consumed`] on the delivery
+    /// task and [`Stream::take_owed_window_credit`] on the receive task — so each of its
+    /// operations has to be a single atomic transition rather than a read followed by a
+    /// write. Either function's justification for its compare-exchange or swap is the other
+    /// one existing.
     bytes_since_last_update: AtomicU32,
     /// Pending **relative** flow-control credit to advertise in a
     /// `WINDOW_UPDATE`, staged by the receive **delivery** task (which credits
@@ -686,6 +699,17 @@ pub struct Stream {
     /// the SACK's `ack_delay_us` (`now − recv_at`). A plain sync mutex; the guard
     /// is never held across an `.await`.
     last_data_recv_at: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// When the last flow-control persist probe left, or `None` if this stream has never
+    /// needed one. See [`Stream::try_persist_probe`]. A plain sync mutex, taken only from
+    /// `poll_send` and never held across an `.await`.
+    persist_probe_at: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// One past the highest reliable offset the peer has acknowledged, or `0` when it has
+    /// acknowledged none — offsets start at zero, so the count is what distinguishes "never"
+    /// from "offset 0". It is the offset [`Stream::try_persist_probe`] repeats, and it is
+    /// deliberately the *acknowledged* high-water mark rather than the sent one: an offset
+    /// the peer has already delivered is one it will discard as a duplicate, which is what
+    /// keeps a probe from disturbing its reassembly or its SACK.
+    highest_acked_plus_one: AtomicU32,
     /// Receive-window growth budget shared with every other stream of the same session.
     recv_tuning: Arc<SharedRecvTuning>,
 }
@@ -729,6 +753,8 @@ impl Stream {
             pending_window_update: AtomicU32::new(0),
             rto: std::sync::Mutex::new(RtoEstimator::new()),
             last_data_recv_at: std::sync::Mutex::new(None),
+            persist_probe_at: std::sync::Mutex::new(None),
+            highest_acked_plus_one: AtomicU32::new(0),
             recv_tuning,
         }
     }
@@ -819,6 +845,23 @@ impl Stream {
 
     // ── Flow control (Phase 4.3) ──
 
+    /// Record that the peer has acknowledged `offset`, keeping the high-water mark the
+    /// persist probe repeats. `fetch_max` because acknowledgements arrive out of order and
+    /// a SACK re-acks offsets already retired.
+    fn note_acked_offset(&self, offset: SequenceNumber) {
+        self.highest_acked_plus_one
+            .fetch_max(offset.saturating_add(1), Ordering::AcqRel);
+    }
+
+    /// The highest reliable offset the peer has acknowledged, or `None` if it has
+    /// acknowledged none.
+    fn last_acked_offset(&self) -> Option<SequenceNumber> {
+        match self.highest_acked_plus_one.load(Ordering::Acquire) {
+            0 => None,
+            n => Some(n - 1),
+        }
+    }
+
     /// Bytes the peer currently allows us to send.
     pub fn peer_send_window(&self) -> u32 {
         self.peer_send_window.load(Ordering::Acquire)
@@ -859,6 +902,17 @@ impl Stream {
     /// are bounded by `initial`. An absolute u32 window could not express this
     /// for sessions exceeding 4 GiB and over-committed the receiver's buffer.
     pub fn apply_peer_window_update(&self, credit: u32) {
+        self.credit_send_window(credit);
+    }
+
+    /// Add `credit` bytes to the peer's send window, saturating at
+    /// [`MAX_SEND_WINDOW`].
+    ///
+    /// Two callers, and the distinction is worth keeping in the names rather than here:
+    /// [`Self::apply_peer_window_update`] adds credit the peer granted, and
+    /// [`Self::mark_unsent`] puts back credit this side debited for bytes that never
+    /// reached the wire. Only the first is a value a peer writes.
+    fn credit_send_window(&self, credit: u32) {
         let mut cur = self.peer_send_window.load(Ordering::Acquire);
         loop {
             let next = cur.saturating_add(credit).min(MAX_SEND_WINDOW);
@@ -1061,17 +1115,42 @@ impl Stream {
     /// update threshold: it is precisely the case where the peer is stalled waiting.
     pub fn record_app_consumed(&self, n: u32) -> Option<u32> {
         let growth = self.tune_recv_window(n);
-        let pending = self.bytes_since_last_update.fetch_add(n, Ordering::AcqRel) + n;
         let threshold = INITIAL_STREAM_WINDOW / 2;
-        let consumed_credit = if pending >= threshold {
-            // Grant exactly the bytes we accumulated since the last update and
-            // reset the accumulator. Use a CAS-free `fetch_sub` of the granted
-            // amount rather than `store(0)` so a concurrent consume isn't lost.
-            self.bytes_since_last_update
-                .fetch_sub(pending, Ordering::AcqRel);
-            pending
-        } else {
-            0
+        // Accumulate and — on crossing the threshold — take the whole accumulator, in one
+        // transition. The counter has a second mutator: [`Self::take_owed_window_credit`]
+        // swaps it to zero on the receive task when the peer's persist probe arrives, while
+        // this runs on the delivery task. Adding `n` and then subtracting the total just read
+        // is two transitions, and the swap fits between them: the subtraction would run
+        // against a counter the other path had already emptied, so on a `u32` it lands at
+        // `2^32` minus the bytes taken. The next probe reads that as bytes owed and grants
+        // it, taking the peer's send window to `MAX_SEND_WINDOW` with nothing consumed to pay
+        // for it — and since the peer chooses when to probe, and the probe is what performs
+        // the swap, an accumulator that can be caught mid-update is a window the peer opens
+        // for itself. `pending_window_update` next door — staged by this task, flushed by
+        // another — is a compare-exchange against a swap already: the same two-task shape,
+        // resolved the same way. The cost here is an acquire load and one locked
+        // compare-exchange against the pair's one or two locked read-modify-writes, so the
+        // per-chunk path this sits on gets no slower.
+        let mut cur = self.bytes_since_last_update.load(Ordering::Acquire);
+        let consumed_credit = loop {
+            // Saturating rather than wrapping: what keeps this sum small is the reset in the
+            // same transition, not the width of the type, and `n` is the length of something
+            // a peer sent.
+            let pending = cur.saturating_add(n);
+            let (next, credit) = if pending >= threshold {
+                (0, pending)
+            } else {
+                (pending, 0)
+            };
+            match self.bytes_since_last_update.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break credit,
+                Err(actual) => cur = actual,
+            }
         };
         let credit = consumed_credit.saturating_add(growth);
         if credit == 0 {
@@ -1345,6 +1424,120 @@ impl Stream {
         self.unreliable_buffer.lock().await.push_back(data);
     }
 
+    /// Hand back the flow-control persist probe, if a stream the peer's window has stopped
+    /// is due one.
+    ///
+    /// Flow-control credit is *relative*: a `WINDOW_UPDATE` says "add this much", never
+    /// "your window is this". The receiver clears the bytes off its own accumulator as it
+    /// composes the frame ([`Self::record_app_consumed`]), the frame is sent once,
+    /// unacknowledged, and nothing retransmits it — so a datagram that does not arrive
+    /// subtracts its credit from this side's window for the rest of the connection. Once the
+    /// accumulated deficit reaches the initial window the sender is left in a state no
+    /// message can leave: window below one segment, nothing outstanding, data still queued.
+    /// No acknowledgement can arrive because nothing is in flight, and the one frame that
+    /// could free it is the class of frame that went missing.
+    ///
+    /// What leaves that state is asking. The probe is a **zero-length** reliable segment —
+    /// the [`Self::queue_fin`] sentinel's shape without the `FIN` flag — so it carries no
+    /// application byte past a window that has no room for one. That is the whole of why it
+    /// is safe: the sender cannot tell a receiver whose grant was lost from one whose
+    /// application has simply stopped reading, and with an empty probe it does not have to.
+    /// A receiver holding a full window of unconsumed data is charged nothing at all and
+    /// stays entitled to keep this side stopped for as long as its application is not
+    /// reading — which is flow control working, not failing.
+    ///
+    /// It repeats the **highest offset the peer has already acknowledged**, and that choice
+    /// is load-bearing rather than economical. A probe on a fresh offset would necessarily
+    /// sit above the data the window is holding back, so the peer would park it in its
+    /// reorder buffer as an out-of-order island and SACK it there — and an island above the
+    /// gap raises `Sack::largest_acked` past every offset this stream sends next, which is
+    /// precisely the input RFC 9002's packet threshold reads as loss. Measured on that
+    /// design: with a probe SACKed at offset 8, the next two segments were declared lost the
+    /// instant they were acknowledged. An acknowledged offset moves nothing, and it is worth
+    /// being exact about why, because acknowledged is the weaker of the two properties: a
+    /// peer building its SACK the way [`Self::received_sack`] does acknowledges what it has
+    /// delivered and what its reorder buffer still holds, and nothing else. If the offset was
+    /// delivered, [`Self::accept_in_order`] discards the repeat as a duplicate before it
+    /// touches the reorder buffer; if it is still an island, the repeat finds it already
+    /// held and is dropped without adding an entry or charging a byte against the reorder
+    /// budget. Either way the peer's SACK is unchanged, no offset is consumed and no state
+    /// accrues on either side.
+    ///
+    /// It is therefore not tracked as in flight and nothing retransmits it — an unanswered
+    /// probe is simply asked again at the next interval, which is what TCP's persist timer
+    /// does too. What bounds it is [`RtoEstimator::MIN_RTO`] under that interval, and the
+    /// bound is meaningful because a probe is one small frame carrying nothing: there is no
+    /// volume for a second bound to limit. Neither the trigger nor the interval is a value
+    /// the peer writes — withholding credit is what causes a probe, and withholding it
+    /// faster does not make one come sooner.
+    ///
+    /// The answer, when there is one, comes from the receiver: an empty reliable segment is
+    /// recognised there as a probe and flushes whatever credit that side already owes but
+    /// has held back below its emission threshold (see [`Self::take_owed_window_credit`]).
+    /// That is credit its application really did consume, so a stalled application produces
+    /// none of it and a probing peer can extract nothing it has not earned. Credit already
+    /// written off into a lost frame is *not* recoverable this way, by this side or any
+    /// other: nothing on either end remembers it. Closing that gap needs an absolute window
+    /// on the wire, which is a protocol change and not this.
+    fn try_persist_probe(
+        &self,
+        now: tokio::time::Instant,
+        anything_in_flight: bool,
+    ) -> Option<OutboundSegment> {
+        if anything_in_flight {
+            return None;
+        }
+        // A stream the peer has acknowledged nothing on has no offset to repeat, so it does
+        // not probe. It should not arrive here — the window only closes by sending, and the
+        // precondition above says everything sent has been retired — but declining is the
+        // answer to that state rather than inventing an offset, which would land above the
+        // gap and cost precisely what repeating one avoids.
+        let stream_offset = self.last_acked_offset()?;
+        let interval = self.current_rto();
+        let mut last = match self.persist_probe_at.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if last.is_some_and(|at| now.duration_since(at) < interval) {
+            return None;
+        }
+        *last = Some(now);
+        Some(OutboundSegment {
+            stream_offset,
+            data: Bytes::new(),
+            reliable: true,
+            retransmit: false,
+            fin: false,
+        })
+    }
+
+    /// Take every byte of flow-control credit this side owes the peer and has not yet
+    /// advertised, whatever [`Self::record_app_consumed`]'s emission threshold says.
+    ///
+    /// That threshold — half the initial window — trades frames against peer stalls, and it
+    /// is right while data keeps arriving to push the accumulator over it. Once the peer has
+    /// stopped, nothing will: the last few kilobytes the application consumed sit
+    /// unadvertised for the rest of the connection, and if the peer stopped *because* its
+    /// window is empty, that withheld credit is precisely what it is waiting for. A persist
+    /// probe is the peer saying so, and this is the answer.
+    ///
+    /// It grants only bytes the local application actually took, so it cannot over-commit
+    /// this side's buffers however often it is asked: a receiver whose application has
+    /// stopped reading owes nothing and returns `None`, emitting no frame at all.
+    ///
+    /// A single swap, not a read and a store, because the peer decides when this runs and
+    /// [`Self::record_app_consumed`] is accumulating into the same counter on another task —
+    /// see the compare-exchange there for what a half-applied update to it is worth to a peer.
+    pub fn take_owed_window_credit(&self) -> Option<u32> {
+        let owed = self.bytes_since_last_update.swap(0, Ordering::AcqRel);
+        if owed == 0 {
+            return None;
+        }
+        // Keep the (informational) local_recv_window in step, as the threshold path does.
+        self.local_recv_window.fetch_add(owed, Ordering::AcqRel);
+        Some(owed)
+    }
+
     /// Get the next segment to (re)transmit, or the reason nothing is due.
     ///
     /// The failure side is a [`SendBlocked`] rather than a bare `None` because
@@ -1374,6 +1567,13 @@ impl Stream {
     /// proceed — but a first transmission is withheld when it would exceed the
     /// budget, so the next drain resumes once ACKs free the window. Pass
     /// `u64::MAX` to disable the limit.
+    ///
+    /// The peer's flow-control window bounds a first transmission as well, and it is the
+    /// one budget whose replenishment depends on a frame arriving. A stream it has stopped
+    /// with nothing outstanding — the state in which no other event can ever come — is
+    /// handed the empty persist probe instead of `SendBlocked::FlowControl`. It carries no
+    /// application byte, so it is not an exception to the rule that new data stays within
+    /// `min(cwnd, window)`; see `try_persist_probe` below.
     pub async fn poll_send(
         &self,
         cwnd_budget: u64,
@@ -1454,6 +1654,14 @@ impl Stream {
         // unsent segment doesn't fit, stop (don't skip). Retransmissions (Pass 1)
         // bypass both budgets — those bytes were already accounted on first send
         // (Karn), and loss recovery must always proceed.
+        //
+        // Whether anything is outstanding is settled here, once, before the pass hands
+        // any segment out — inside the loop the answer would change under it. It is the
+        // precondition of the persist probe below: nothing outstanding is what proves no
+        // acknowledgement is on its way, and so distinguishes a sender the window has
+        // merely slowed from one it has stopped for good.
+        let anything_in_flight = buffer.iter().any(|p| p.sent_at.is_some());
+        let mut flow_control_blocked = false;
         for pending in buffer.iter_mut() {
             if pending.sent_at.is_none() {
                 let len = pending.data.len() as u64;
@@ -1466,9 +1674,11 @@ impl Stream {
                 // flow-control window check — it consumes no peer window.
                 // For non-FIN segments, enforce the peer's flow-control window.
                 if !pending.fin && !self.try_consume_send_window(len as u32) {
-                    // The peer's receive window is the binding constraint —
-                    // wait for a WINDOW_UPDATE, not for an acknowledgement.
-                    return Err(SendBlocked::FlowControl);
+                    // The peer's receive window is the binding constraint — wait for a
+                    // WINDOW_UPDATE, not for an acknowledgement. Answered below, once the
+                    // borrow on the buffer is gone.
+                    flow_control_blocked = true;
+                    break;
                 }
                 let is_fin = pending.fin;
                 pending.sent_at = Some(now);
@@ -1483,6 +1693,18 @@ impl Stream {
                     fin: is_fin,
                 });
             }
+        }
+
+        if flow_control_blocked {
+            // Waiting is right while an acknowledgement is still owed — it may carry the
+            // window open behind it. With nothing outstanding there is no acknowledgement
+            // to wait for, and the only frame that could free this stream is the one class
+            // of frame nothing retransmits, so this side asks instead of waiting. The probe
+            // carries no application byte; see `try_persist_probe`.
+            if let Some(probe) = self.try_persist_probe(now, anything_in_flight) {
+                return Ok(probe);
+            }
+            return Err(SendBlocked::FlowControl);
         }
 
         Err(SendBlocked::Idle)
@@ -1500,6 +1722,7 @@ impl Stream {
             let retries = buffer[pos].retries;
             let size = buffer[pos].data.len() as u64;
             buffer.remove(pos);
+            self.note_acked_offset(stream_offset);
 
             // Released space, add permit back
             self.send_semaphore.add_permits(1);
@@ -1525,10 +1748,29 @@ impl Stream {
     /// `sent_at` — the bytes never reached the wire, so the segment must not be
     /// treated as in-flight. No-op if the segment was already acknowledged and
     /// removed.
-    pub async fn mark_unsent(&self, stream_offset: SequenceNumber) {
-        let mut buffer = self.send_buffer.lock().await;
-        if let Some(pending) = buffer.iter_mut().find(|p| p.stream_offset == stream_offset) {
-            pending.sent_at = None;
+    ///
+    /// `was_first_transmission` says whether the attempt that failed was the one that
+    /// debited the peer's flow-control window, and it has to, because only the caller
+    /// knows: a retransmission was paid for on its original send and must not be refunded,
+    /// while a first transmission that never reached the wire has taken credit off a
+    /// counter that no acknowledgement will ever put back. Left unrefunded, every refused
+    /// write shrank the window by a segment for the rest of the connection, which arrives
+    /// at the same dead end as a lost `WINDOW_UPDATE` — window below one segment, nothing
+    /// outstanding — by a route entirely inside this side.
+    pub async fn mark_unsent(&self, stream_offset: SequenceNumber, was_first_transmission: bool) {
+        // Zero for the FIN sentinel and the persist probe, which never debited the window.
+        let mut refund = 0u32;
+        {
+            let mut buffer = self.send_buffer.lock().await;
+            if let Some(pending) = buffer.iter_mut().find(|p| p.stream_offset == stream_offset) {
+                pending.sent_at = None;
+                if was_first_transmission {
+                    refund = pending.data.len() as u32;
+                }
+            }
+        }
+        if refund > 0 {
+            self.credit_send_window(refund);
         }
     }
 
@@ -1625,6 +1867,7 @@ impl Stream {
                 #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
                 let pending = buffer.remove(i).unwrap();
                 freed += 1;
+                self.note_acked_offset(pending.stream_offset);
                 let was_retransmit = pending.retries > 0;
                 let size = pending.data.len() as u64;
                 if let Some(sent_at) = pending.sent_at {
@@ -2106,7 +2349,7 @@ mod tests {
 
         // Simulate a send that failed *after* `poll_send` stamped the segment:
         // clear `sent_at` so it is no longer considered in-flight.
-        stream.mark_unsent(0).await;
+        stream.mark_unsent(0, true).await;
 
         // It is re-offered immediately — without advancing past the RTO — and as
         // a fresh send (Pass 2), not a retransmission.
@@ -2121,7 +2364,7 @@ mod tests {
 
         // `mark_unsent` on an already-acked (removed) segment is a no-op.
         assert!(stream.ack(0).await.is_some());
-        stream.mark_unsent(0).await; // no panic, no effect
+        stream.mark_unsent(0, true).await; // no panic, no effect
         assert!(stream
             .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
@@ -3801,5 +4044,535 @@ mod tests {
             "EOF surfaces now — strictly AFTER the gap-filling data"
         );
         assert!(!s.take_in_order_fin(), "EOF is one-shot");
+    }
+
+    // ── Flow-control credit that never arrives ──
+
+    /// What the data pump hands a stream: one application chunk, one segment, one datagram.
+    const HARNESS_SEG: usize = crate::transport::mtu::MAX_APP_CHUNK;
+
+    /// Simulated round trip. Above [`RtoEstimator::MIN_RTO`] so a round is also long enough
+    /// for anything the retransmit clock owes to come due — the harness must not hide a
+    /// stall behind a timer that has not fired yet.
+    const HARNESS_ROUND: Duration = Duration::from_millis(250);
+
+    /// Whether a segment `poll_send` handed back is the flow-control persist probe: an empty
+    /// reliable segment that is not the FIN sentinel. This is the same test the receive path
+    /// applies, and it is stated once here so the harness recognises a probe by what is on
+    /// the wire rather than by anything only the sender knows.
+    fn is_persist_probe(seg: &OutboundSegment) -> bool {
+        seg.reliable && !seg.fin && seg.data.is_empty()
+    }
+
+    /// Move `total` bytes from `sender` to `receiver` a round trip at a time, delivering
+    /// every segment and every acknowledgement, and dropping the flow-control grants `lose`
+    /// selects — by ordinal, so a test names which `WINDOW_UPDATE` datagrams the path ate.
+    ///
+    /// Dropping a grant is exactly what losing that datagram does to both ends: the receiver
+    /// has already taken the bytes off its own books as it composed the frame, and the
+    /// sender never hears about them. Nothing else is impaired — no data is dropped, no
+    /// acknowledgement is delayed — so anything the sender fails to move is attributable to
+    /// the credit alone.
+    ///
+    /// The receiver's answer to a probe is modelled the way the pump implements it: an empty
+    /// reliable segment flushes the credit this side owes, and that frame takes an ordinal
+    /// like any other and can be lost like any other.
+    ///
+    /// Returns the number of rounds it took, or `Err(bytes_delivered)` when `max_rounds` ran
+    /// out. A stall must report as a bounded assertion, never as a test that hangs.
+    async fn move_bytes_losing_grants(
+        sender: &Stream,
+        receiver: &Stream,
+        total: usize,
+        max_rounds: usize,
+        lose: impl Fn(u64) -> bool,
+    ) -> Result<usize, usize> {
+        let mut queued = 0usize;
+        while queued < total {
+            let len = HARNESS_SEG.min(total - queued);
+            sender
+                .send_reliable(Bytes::from(vec![0u8; len]))
+                .await
+                .unwrap();
+            queued += len;
+        }
+
+        let mut delivered = 0usize;
+        let mut grant_ordinal = 0u64;
+        let mut grant = |sender: &Stream, credit: Option<u32>| {
+            if let Some(credit) = credit {
+                grant_ordinal += 1;
+                if !lose(grant_ordinal) {
+                    sender.apply_peer_window_update(credit);
+                }
+            }
+        };
+        for round in 1..=max_rounds {
+            // Everything this round allows goes out at once. The congestion window is
+            // deliberately unlimited, so flow control is the only thing that can stop it.
+            let mut flight = Vec::new();
+            while let Ok(seg) = sender
+                .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+                .await
+            {
+                flight.push(seg);
+            }
+            for seg in &flight {
+                for released in receiver
+                    .accept_in_order(seg.stream_offset, vec![seg.data.clone()])
+                    .await
+                {
+                    if released.is_empty() {
+                        continue; // a probe reaching its turn in the reassembly order
+                    }
+                    delivered += released.len();
+                    grant(sender, receiver.record_app_consumed(released.len() as u32));
+                }
+                if is_persist_probe(seg) {
+                    grant(sender, receiver.take_owed_window_credit());
+                }
+            }
+            for seg in &flight {
+                sender.ack(seg.stream_offset).await;
+            }
+            if delivered >= total {
+                return Ok(round);
+            }
+            tokio::time::advance(HARNESS_ROUND).await;
+        }
+        Err(delivered)
+    }
+
+    /// **The upload that stops and never resumes.**
+    ///
+    /// Flow-control credit is relative — a `WINDOW_UPDATE` says "add this much", not "your
+    /// window is this" — and it is emitted once, in a single unacknowledged frame, after the
+    /// receiver has already cleared it from its own accumulator. A datagram that does not
+    /// arrive therefore subtracts its credit from the sender's window permanently. Once the
+    /// deficit puts the window under one segment the sender is left in a state nothing can
+    /// leave: no acknowledgement can arrive, because nothing is outstanding, and the only
+    /// frame that could free it is the class of frame that just went missing.
+    ///
+    /// One lost grant is enough here. The transfer is eight times the initial window, so it
+    /// cannot finish on the initial credit; the first grant closes the gap and is lost; the
+    /// receiver is left holding the rest of what it owes below its emission threshold, where
+    /// nothing will ever push it over. What frees the sender is asking for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_transfer_completes_when_the_grant_that_would_continue_it_is_lost() {
+        let sender = Stream::new(1);
+        let receiver = Stream::new(1);
+        const TOTAL: usize = 8 * INITIAL_STREAM_WINDOW as usize;
+
+        match move_bytes_losing_grants(&sender, &receiver, TOTAL, 200, |n| n == 1).await {
+            Ok(rounds) => eprintln!("delivered {TOTAL} B in {rounds} rounds, first grant lost"),
+            Err(delivered) => panic!(
+                "the sender stopped after {delivered} of {TOTAL} bytes and never resumed: \
+                 its peer window is {} bytes — under one {HARNESS_SEG}-byte segment — with \
+                 nothing in flight, so no acknowledgement can free it and the only frame \
+                 that could is the one that was lost",
+                sender.peer_send_window()
+            ),
+        }
+    }
+
+    /// **What the probe recovers, and what it cannot.**
+    ///
+    /// The probe asks; the receiver answers with the credit its application really did
+    /// consume and it had held back below its emission threshold. Credit that reached that
+    /// threshold, went out in a frame and was lost is not recoverable by asking: neither end
+    /// remembers it — the receiver cleared it as it composed the frame and the sender never
+    /// saw it. Closing *that* gap needs an absolute window on the wire.
+    ///
+    /// So this pins the boundary rather than pretending there is none: with every grant
+    /// lost, including the answers to the probes, the transfer does **not** complete. The
+    /// test above and this one differ in exactly one bit — whether the answer gets through —
+    /// which is what makes them evidence about the mechanism instead of about the harness.
+    #[tokio::test(start_paused = true)]
+    async fn credit_already_lost_in_flight_is_not_recovered_by_asking() {
+        let sender = Stream::new(1);
+        let receiver = Stream::new(1);
+        const TOTAL: usize = 8 * INITIAL_STREAM_WINDOW as usize;
+
+        let outcome = move_bytes_losing_grants(&sender, &receiver, TOTAL, 40, |_| true).await;
+        let delivered = outcome.expect_err(
+            "no local mechanism can recover credit both ends have forgotten — a transfer \
+             that completes with every grant lost is one whose sender stopped obeying the \
+             window",
+        );
+        assert!(
+            delivered < TOTAL,
+            "delivered {delivered} of {TOTAL} bytes with no grant ever arriving"
+        );
+    }
+
+    /// A stream whose peer window is closed, with `n` full segments queued behind it and one
+    /// earlier segment already delivered — which is how a window closes in the first place,
+    /// and which leaves the peer holding an acknowledged offset for a probe to repeat.
+    async fn blocked_stream_with_queued_segments(n: usize) -> Stream {
+        let s = Stream::new(1);
+        s.send_reliable(Bytes::from(vec![0u8; HARNESS_SEG]))
+            .await
+            .unwrap();
+        let first = poll_once(&s)
+            .await
+            .expect("the initial window admits the first segment");
+        s.ack(first.stream_offset).await;
+        assert!(s.try_consume_send_window(s.peer_send_window()));
+        assert_eq!(s.peer_send_window(), 0, "the window is closed");
+        for _ in 0..n {
+            s.send_reliable(Bytes::from(vec![0u8; HARNESS_SEG]))
+                .await
+                .unwrap();
+        }
+        s
+    }
+
+    async fn poll_once(s: &Stream) -> Result<OutboundSegment, SendBlocked> {
+        s.poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+            .await
+    }
+
+    /// **The bound that makes probing safe: no application byte ever crosses a closed
+    /// window.**
+    ///
+    /// The sender cannot distinguish a receiver whose grant was lost from one whose
+    /// application has simply stopped reading — the two look identical from here — so
+    /// whatever it does when blocked, it does to both. An empty probe is what makes that
+    /// acceptable: the second receiver is charged one stream offset per probe and not one
+    /// byte of buffer, and it stays entitled to keep this side stopped for as long as it is
+    /// not reading.
+    ///
+    /// Twenty timeouts of a receiver that acknowledges everything and grants nothing — the
+    /// non-reading receiver exactly — and the bound asserted is zero: not "little", not
+    /// "bounded per interval". Give the probe a payload and it fails on the first one.
+    #[tokio::test(start_paused = true)]
+    async fn a_receiver_that_grants_nothing_is_sent_no_application_bytes() {
+        let s = blocked_stream_with_queued_segments(64).await;
+
+        let mut probes = 0usize;
+        let mut payload_past_the_window = 0usize;
+        for _ in 0..20 {
+            while let Ok(seg) = poll_once(&s).await {
+                assert!(
+                    is_persist_probe(&seg),
+                    "a stream with a closed window handed back a {}-byte segment",
+                    seg.data.len()
+                );
+                payload_past_the_window += seg.data.len();
+                probes += 1;
+            }
+            tokio::time::advance(RtoEstimator::MAX_RTO).await;
+        }
+
+        assert!(probes > 0, "the stream never probed at all");
+        assert_eq!(
+            payload_past_the_window, 0,
+            "{probes} probes put {payload_past_the_window} application bytes past a window \
+             that had no room for any of them; a receiver whose application has stopped \
+             reading must be able to keep this side stopped"
+        );
+        assert_eq!(
+            s.peer_send_window(),
+            0,
+            "the probe must not debit a window that has nothing in it"
+        );
+    }
+
+    /// **The probe's rate bound.** One per retransmit timeout, and the floor under that
+    /// timeout is what keeps the rate finite on a short path — poll a blocked stream in a
+    /// tight loop and it would otherwise emit a frame as fast as the loop turns. Remove the
+    /// interval check and the middle assertion fails; remove the probe itself and the first
+    /// does.
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_stream_probes_no_more_than_once_per_retransmit_timeout() {
+        let s = blocked_stream_with_queued_segments(2).await;
+
+        // Closed window, nothing outstanding, data queued: the state no acknowledgement can
+        // leave. One probe goes out.
+        let probe = poll_once(&s).await.expect(
+            "a stream with a closed window, nothing outstanding and data queued must probe \
+             — nothing else can ever free it",
+        );
+        assert!(is_persist_probe(&probe));
+        assert!(!probe.retransmit, "the probe is a first transmission");
+
+        // Acknowledged, so nothing is outstanding again — but the interval has not passed.
+        s.ack(probe.stream_offset).await;
+        assert_eq!(
+            poll_once(&s).await.unwrap_err(),
+            SendBlocked::FlowControl,
+            "a probe left before the retransmit timeout had elapsed: on a short path that \
+             is an unbounded rate of frames the peer did not ask for"
+        );
+
+        tokio::time::advance(RtoEstimator::MAX_RTO).await;
+        let second = poll_once(&s)
+            .await
+            .expect("the next interval is due, so the next probe is too");
+        assert!(is_persist_probe(&second));
+        assert_eq!(
+            second.stream_offset, probe.stream_offset,
+            "each probe must repeat the same delivered offset — a fresh one would land in \
+             the peer's reorder buffer above the gap"
+        );
+    }
+
+    /// **The trigger.** Nothing outstanding is what proves no acknowledgement is on its way,
+    /// and so what separates a sender the window has merely slowed from one it has stopped
+    /// for good. A stream with a segment still in flight must wait for it: the acknowledgement
+    /// may carry the window open behind it, and asking early is asking about a silence that
+    /// has not happened. Remove the precondition and the second assertion fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_with_something_outstanding_waits_instead_of_probing() {
+        let s = Stream::new(1);
+        for _ in 0..3 {
+            s.send_reliable(Bytes::from(vec![0u8; HARNESS_SEG]))
+                .await
+                .unwrap();
+        }
+        // One segment delivered — so an offset to probe on exists and this test cannot pass
+        // for want of one — and a second still unacknowledged when the window closes.
+        let delivered = poll_once(&s).await.expect("the initial window admits it");
+        s.ack(delivered.stream_offset).await;
+        let inflight = poll_once(&s).await.expect("and the next");
+        assert!(!is_persist_probe(&inflight));
+        assert!(s.try_consume_send_window(s.peer_send_window()));
+
+        assert_eq!(
+            poll_once(&s).await.unwrap_err(),
+            SendBlocked::FlowControl,
+            "a stream still owed an acknowledgement probed instead of waiting for it"
+        );
+
+        // Acknowledged: now nothing is outstanding and the same poll probes.
+        s.ack(inflight.stream_offset).await;
+        assert!(is_persist_probe(
+            &poll_once(&s)
+                .await
+                .expect("nothing outstanding — the probe is due")
+        ));
+    }
+
+    /// **A probe must not move the peer's `largest_acked`.**
+    ///
+    /// This is what decides the offset a probe carries. A probe on a fresh offset sits above
+    /// the data the window is holding back, so the peer parks it in its reorder buffer and
+    /// SACKs it as an island — and `Sack::largest_acked` then stands `PACKET_THRESHOLD` or
+    /// more above every offset this stream sends next, which RFC 9002's packet threshold
+    /// reads as loss. On that design this test reported `declared lost: [1, 2]` for two
+    /// segments that had just left. Repeating a delivered offset is what makes the probe
+    /// invisible to the peer's acknowledgement: it is discarded as a duplicate before the
+    /// reorder buffer is touched, so the SACK it produces is the one it would have produced
+    /// anyway.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_does_not_make_the_next_segments_look_lost() {
+        let sender = blocked_stream_with_queued_segments(8).await;
+        // A real receiver, holding exactly what the sender's first segment delivered. The
+        // acknowledgement below is derived from it rather than written by hand, because what
+        // is under test is precisely what the peer's SACK says after it has seen a probe.
+        let receiver = Stream::new(1);
+        receiver
+            .accept_in_order(0, vec![Bytes::from(vec![0u8; HARNESS_SEG])])
+            .await;
+
+        let probe = poll_once(&sender)
+            .await
+            .expect("blocked with nothing outstanding");
+        assert!(is_persist_probe(&probe));
+        receiver
+            .accept_in_order(probe.stream_offset, vec![probe.data.clone()])
+            .await;
+
+        // The window reopens and two segments genuinely go into flight — not yet delivered,
+        // so the peer's next acknowledgement says nothing about them either way.
+        sender.apply_peer_window_update(10_000);
+        let a = poll_once(&sender).await.expect("the window admits it");
+        let b = poll_once(&sender).await.expect("and the next");
+        assert!(!is_persist_probe(&a) && !is_persist_probe(&b));
+        assert_eq!(a.stream_offset + 1, b.stream_offset);
+
+        let sack = receiver
+            .received_sack(0)
+            .await
+            .expect("the receiver has delivered data, so it has a SACK to send");
+        let result = sender.on_sack(&sack).await;
+        assert!(
+            result.lost_offsets().is_empty(),
+            "offsets {:?} — in flight, and acknowledged by nothing — were declared lost; \
+             the probe raised the peer's largest_acked past them",
+            result.lost_offsets()
+        );
+    }
+
+    /// **A receiver that is not reading owes nothing, and says so by saying nothing.**
+    ///
+    /// The answer to a probe is the credit the local application has already consumed. An
+    /// application that has consumed nothing leaves that quantity at zero however much has
+    /// arrived, so the reply is `None` — no frame, no credit — and the peer stays stopped.
+    /// This is the discrimination the sender cannot make and does not have to: it is made
+    /// here, on the side that knows.
+    #[tokio::test]
+    async fn a_receiver_whose_application_has_not_read_owes_no_credit() {
+        let r = Stream::new(1);
+        for offset in 0..16 {
+            r.accept_in_order(offset, vec![Bytes::from(vec![0u8; HARNESS_SEG])])
+                .await;
+        }
+        assert_eq!(
+            r.take_owed_window_credit(),
+            None,
+            "credit was granted for bytes that arrived rather than for bytes the \
+             application took"
+        );
+
+        // One chunk consumed — below the emission threshold, so `record_app_consumed`
+        // withholds it and nothing would ever push it over once the peer has stopped.
+        assert_eq!(r.record_app_consumed(HARNESS_SEG as u32), None);
+        assert_eq!(
+            r.take_owed_window_credit(),
+            Some(HARNESS_SEG as u32),
+            "the withheld credit is exactly the bytes the application consumed"
+        );
+        assert_eq!(
+            r.take_owed_window_credit(),
+            None,
+            "credit is owed once; a second ask must not grant it again"
+        );
+    }
+
+    /// **The owed-credit accumulator has two mutators, and the peer picks when the second
+    /// one runs.**
+    ///
+    /// `record_app_consumed` runs on the delivery task. `take_owed_window_credit` runs on the
+    /// receive task, and what calls it is a persist probe arriving — a frame the peer emits
+    /// whenever it chooses. Accumulating by adding `n` and then subtracting the total just
+    /// read is two transitions, and the swap fits between them: the subtraction then runs
+    /// against a counter the other path has already emptied, so on a `u32` it lands at `2^32`
+    /// minus the bytes taken. The next probe reads that as bytes owed and grants it, and the
+    /// peer's send window goes to [`MAX_SEND_WINDOW`] without one byte of it having been
+    /// consumed by anybody — a window the peer opens for itself, by asking.
+    ///
+    /// Two threads, because the defect lives strictly inside one function's body: no ordering
+    /// of the two public calls expresses it, since every sequential ordering leaves the
+    /// counter non-negative. What is asserted is the counter itself rather than anything
+    /// downstream of it. With a single recorder it can never hold more than the emission
+    /// threshold plus one call's worth, so a value above that is a wrap and nothing else;
+    /// the second assertion adds conservation — every byte recorded is either still in the
+    /// accumulator or was handed out exactly once. Replace the compare-exchange with an add
+    /// and a subtract and this fails.
+    #[test]
+    fn the_owed_credit_accumulator_survives_a_probe_landing_mid_update() {
+        const ROUNDS: u32 = 200_000;
+        let threshold = INITIAL_STREAM_WINDOW / 2;
+        // Each call carries the whole threshold, so each one takes the accumulator instead of
+        // one call in twenty-eight. The take is the half of the operation a swap has to land
+        // inside, and this makes every iteration a chance at it rather than every 28th.
+        let chunk = threshold;
+
+        let s = Arc::new(Stream::new(1));
+        // Pin the advertised window at its ceiling so `tune_recv_window` returns on its first
+        // load, before it reads a clock or takes a lock. This is a measurement of the
+        // accumulator alone; growth credit would be summed into the totals below and hide the
+        // arithmetic under it.
+        s.advertised_recv_window
+            .store(MAX_RECV_WINDOW, Ordering::SeqCst);
+
+        let delivery = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                let mut granted = 0u64;
+                let mut high_water = 0u32;
+                for _ in 0..ROUNDS {
+                    granted += u64::from(s.record_app_consumed(chunk).unwrap_or(0));
+                    high_water = high_water.max(s.bytes_since_last_update.load(Ordering::Acquire));
+                }
+                (granted, high_water)
+            })
+        };
+        let probing = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                let mut granted = 0u64;
+                for _ in 0..ROUNDS {
+                    granted += u64::from(s.take_owed_window_credit().unwrap_or(0));
+                }
+                granted
+            })
+        };
+
+        let (granted_on_consumption, high_water) = delivery.join().expect(
+            "the delivery side panicked: the accumulator wrapped and the next call's \
+             `old + n` overflowed",
+        );
+        let granted_on_probe = probing.join().expect("the probing side panicked");
+        let still_owed = s.bytes_since_last_update.load(Ordering::SeqCst);
+
+        assert!(
+            high_water <= threshold + chunk,
+            "the accumulator reached {high_water} B against a {threshold} B threshold and \
+             {chunk} B per call: it was decremented past zero and wrapped, and the next probe \
+             hands that figure to the peer as relative credit"
+        );
+        assert_eq!(
+            granted_on_consumption + granted_on_probe + u64::from(still_owed),
+            u64::from(ROUNDS) * u64::from(chunk),
+            "granted {granted_on_consumption} B on consumption and {granted_on_probe} B on \
+             probes with {still_owed} B still owed, against {ROUNDS} × {chunk} B consumed — \
+             credit was granted for bytes nobody consumed"
+        );
+    }
+
+    /// **A write the transport refused must not cost the window.**
+    ///
+    /// `poll_send` debits the peer's window as it hands a first transmission out, so a write
+    /// that then fails has taken credit off a counter no acknowledgement will put back — the
+    /// segment is re-offered and debited a second time for the same bytes. Every refusal
+    /// therefore shrank the window by a segment for the rest of the connection, arriving at
+    /// the same dead end as a lost grant by a route entirely inside this side. Drop the
+    /// refund from `mark_unsent` and the second assertion fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_write_returns_the_flow_control_credit_it_debited() {
+        let s = Stream::new(1);
+        s.send_reliable(Bytes::from(vec![0u8; HARNESS_SEG]))
+            .await
+            .unwrap();
+
+        let seg = poll_once(&s).await.expect("first transmission");
+        assert!(!seg.retransmit);
+        assert_eq!(
+            s.peer_send_window(),
+            INITIAL_STREAM_WINDOW - HARNESS_SEG as u32,
+            "a first transmission debits the window"
+        );
+
+        // The write failed after `poll_send` had stamped the segment: the bytes never
+        // reached the wire, so the debit was for nothing.
+        s.mark_unsent(seg.stream_offset, !seg.retransmit).await;
+        assert_eq!(
+            s.peer_send_window(),
+            INITIAL_STREAM_WINDOW,
+            "the window kept credit for bytes that never left"
+        );
+
+        // The re-offer is a first transmission again and debits once, not twice.
+        let again = poll_once(&s).await.expect("re-offered immediately");
+        assert!(!again.retransmit);
+        assert_eq!(again.stream_offset, seg.stream_offset);
+        assert_eq!(
+            s.peer_send_window(),
+            INITIAL_STREAM_WINDOW - HARNESS_SEG as u32
+        );
+
+        // A retransmission was accounted on its original send (Karn), so its failure must
+        // refund nothing — that would credit the window for bytes it never held.
+        tokio::time::advance(RtoEstimator::MAX_RTO).await;
+        let rtx = poll_once(&s).await.expect("retransmission");
+        assert!(rtx.retransmit);
+        s.mark_unsent(rtx.stream_offset, !rtx.retransmit).await;
+        assert_eq!(
+            s.peer_send_window(),
+            INITIAL_STREAM_WINDOW - HARNESS_SEG as u32,
+            "a failed retransmission credited the window for bytes it never debited"
+        );
     }
 }

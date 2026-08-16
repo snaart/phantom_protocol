@@ -372,6 +372,91 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **An upload could stop for good, with nothing in flight and data still queued, because
+  flow-control credit is destroyed the moment it is put on the wire.** A `WINDOW_UPDATE`
+  carries *relative* credit — "add this much", never "your window is this" — the receiver
+  clears the bytes off its own accumulator as it composes the frame, and the frame goes out
+  once, unacknowledged, with nothing retransmitting it. A datagram that does not arrive
+  therefore subtracts its credit from the sender's window for the rest of the connection, and
+  the deficit only ever grows: at a loss rate `p` it accumulates at `p` × the bytes
+  transferred, so on any lossy path it reaches the 64 KiB initial window in finite time and
+  the sender is left with a window under one segment, nothing outstanding, and data still
+  queued. Nothing can leave that state. No acknowledgement is coming, because nothing is in
+  flight; the only frame that could free it is the class of frame that just went missing.
+
+  Measured on a route losing 9.5–15.9 % of its UDP round trips at ~300 ms: an upload's
+  congestion window froze at 45 881 bytes with `inflight` at 0 and delivered bytes frozen at
+  163 469 for the remaining 70 seconds of the run, never leaving Startup. Peak inflight had
+  been 3.2 % of the ARQ send buffer, so no volume limit was involved. The TCP and mimicry
+  legs in the same run ran to completion.
+
+  A stream that is flow-control blocked *and has nothing outstanding* — the state that proves
+  no acknowledgement is on its way — now asks. The **persist probe** is a zero-length reliable
+  segment, the FIN sentinel's shape without the `FIN` flag, and it carries **no application
+  byte**. That is the whole of why it is safe. A sender cannot tell a receiver whose grant was
+  lost from one whose application has simply stopped reading — the two are the same
+  observation from here — and with an empty probe it does not have to: the second receiver is
+  charged nothing at all and keeps this side stopped for as long as it is not reading, which
+  is flow control working. The trigger and the `MIN_RTO` floor under the interval are both
+  local values; withholding credit is what causes a probe, and withholding it faster does not
+  make one come sooner.
+
+  The offset it carries is the highest the peer has already acknowledged, and that is
+  load-bearing rather than economical. A probe on a fresh offset necessarily sits above the
+  data the window is holding back, so the peer parks it in its reorder buffer and SACKs it as
+  an island — and an island above the gap raises `largest_acked` past every offset the stream
+  sends next, which RFC 9002's packet threshold reads as loss. That design was built and
+  measured before this one: with a probe SACKed at offset 8, the next two segments were
+  declared lost the instant they were acknowledged, and
+  `a_probe_does_not_make_the_next_segments_look_lost` fails on it with `[1, 2]`. Repeating an
+  acknowledged offset moves nothing, and the reason has to cover both of the things being
+  acknowledged means: a receiver acknowledges what it has delivered and what its reorder
+  buffer still holds, so the repeat is either discarded as a duplicate before the reorder
+  buffer is consulted, or found already buffered and dropped without adding an entry. So a
+  probe consumes no offset, occupies no reorder entry, is not tracked in flight and is never
+  retransmitted; an unanswered one is simply asked again next interval.
+
+  The answer comes from the receiver, which is the side that knows. An empty reliable segment
+  is recognised there and flushes the credit that side already owes — bytes its application
+  really consumed, sitting below the half-window threshold that governs when a credit is
+  emitted. That threshold is right while data keeps arriving to push the accumulator over it;
+  once the peer has stopped, nothing will, and the withheld bytes are exactly what it is
+  waiting for. Because the answer is bounded by consumption, a receiver that is not reading
+  owes nothing, emits no frame at all, and a peer that probes repeatedly extracts nothing it
+  has not earned.
+
+  Answering makes the peer a second concurrent mutator of that accumulator, on a second task,
+  at a moment it picks, which is why each of the accumulator's two operations is a single
+  atomic transition: a compare-exchange on the consumption side and a swap on the probe side.
+  An add followed by a subtract of the total just read would be two, and a swap landing
+  between the halves leaves the subtraction running against an emptied counter — on a `u32`
+  that lands at `2^32` minus the bytes taken, which the next probe reads as bytes owed and
+  grants, taking the peer's send window to `MAX_SEND_WINDOW` with nothing consumed to pay for
+  it. `pending_window_update` beside it has the same two-task staged-and-flushed shape and is
+  written the same way.
+
+  Two things are deliberately not claimed. Credit that was already emitted into a lost frame
+  is **not** recovered: the receiver cleared it as it composed the frame and the sender never
+  saw it, so neither end retains it, and no local mechanism on either side can produce it
+  again — `credit_already_lost_in_flight_is_not_recovered_by_asking` pins that boundary rather
+  than papering over it. Closing it needs an absolute window on the wire, which 0.2.x peers
+  would add rather than assign, and that is a protocol decision taken elsewhere. And a peer
+  that does not implement the answer stays interoperable: it acknowledges the probe and its
+  sender remains blocked exactly as it would have been without one. Nothing on the wire
+  changes, and no value the peer writes enters the sender's side of the mechanism.
+
+- **A write the transport refused cost the peer's flow-control window a segment, permanently.**
+  `Stream::poll_send` debits the peer's window as it hands a first transmission out, so a
+  write that then failed — a datagram socket out of buffer space, a byte pipe that went away —
+  had taken credit off a counter no acknowledgement would ever put back: `mark_unsent` cleared
+  the send timestamp so the segment would be re-offered, and the re-offer debited the window a
+  second time for the same bytes. Every refusal therefore shrank the window by one segment for
+  the rest of the connection, arriving at the same dead end as a lost `WINDOW_UPDATE` by a
+  route entirely inside this endpoint, with no peer and no path involved. `mark_unsent` now
+  takes whether the failed attempt was the first transmission and returns exactly what that
+  attempt debited; a retransmission was accounted on its original send (Karn) and refunds
+  nothing.
+
 - **The PhantomUDP handshake abandoned paths a mature implementation completes, because its
   retransmission timer asserted a number about the path instead of adapting to it.** The
   client-side stop-and-wait shim used a fixed 400 ms retransmit timeout and a cap of six

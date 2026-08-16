@@ -1576,6 +1576,12 @@ enum DrainStop {
     /// At least one stream still had data, and the *peer's* advertised
     /// flow-control window had no room for it. Nothing to schedule — a
     /// `WINDOW_UPDATE` wakes the pump.
+    ///
+    /// Nothing to schedule, but not nothing to fall back on: the credit that would
+    /// clear this rides in a single unacknowledged frame, so it may simply never
+    /// arrive. The 10 ms heartbeat re-enters the drain regardless, and it is there
+    /// that `Stream::try_persist_probe` lets a stream with nothing outstanding ask
+    /// the peer for what it is owed rather than wait for a frame that is not coming.
     FlowControlled,
     /// The transport refused a write — a datagram socket out of buffer space,
     /// a stream transport that has gone away. The segment was re-marked unsent
@@ -2918,10 +2924,13 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
                 // `poll_send` already stamped `sent_at` on this reliable
                 // segment, but the bytes never reached the wire. Clear it so the
                 // next drain re-offers it immediately instead of stalling a full
-                // RTO before the retransmit pass. Unreliable segments were
-                // removed by `poll_send` (fire-and-forget) — nothing to reset.
+                // RTO before the retransmit pass, and — on a first transmission —
+                // put back the flow-control credit that same pass debited, which
+                // otherwise leaves the window a segment smaller for good.
+                // Unreliable segments were removed by `poll_send`
+                // (fire-and-forget) — nothing to reset.
                 if seg.reliable {
-                    stream.mark_unsent(seg.stream_offset).await;
+                    stream.mark_unsent(seg.stream_offset, !seg.retransmit).await;
                 }
                 transport_refused = true;
                 break;
@@ -4253,6 +4262,9 @@ async fn handle_packet<T: SessionTransport>(
         let pt = Bytes::from(plaintext);
         let stream_offset = u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]);
         let data = pt.slice(4..);
+        // Read before the payload is handed on: an empty one is the peer's persist probe,
+        // and the answer to it is composed further down, after the reassembly step.
+        let is_persist_probe = data.is_empty() && !packet.header.flags.contains(PacketFlags::FIN);
 
         // H-3: cap concurrent receive streams. A new stream_id is auto-created only while
         // under MAX_STREAMS; past the cap the segment is refused (and, being unrecorded, not
@@ -4356,8 +4368,24 @@ async fn handle_packet<T: SessionTransport>(
         }
 
         // Deliver the in-order run released by the reorder buffer (empty if this
-        // segment filled a future hole — it waits for the gap to close).
+        // segment filled a future hole — it waits for the gap to close). A
+        // zero-length payload contributes nothing to it and is dropped there.
         deliver_in_order_run(delivered, stream_id, deliver_tx, undelivered_bytes);
+
+        // A zero-length reliable segment that is not the FIN sentinel is the peer's
+        // flow-control persist probe: it is stopped on this side's window and has nothing
+        // outstanding to wait on, so it is asking whether anything is owed. Answer with
+        // whatever credit the local application has already consumed and this side has been
+        // holding below its emission threshold — that threshold assumes more data is coming
+        // to push the accumulator over it, and once the peer has stopped, none is. It is a
+        // grant of bytes really taken by the application, so a receiver that is not reading
+        // owes nothing, emits no frame, and leaves its peer stopped.
+        if is_persist_probe {
+            if let Some(credit) = local.take_owed_window_credit() {
+                local.stage_window_update_credit(credit);
+                crypto_recv.notify_outbound_ready();
+            }
+        }
 
         // Record a FIN's reliable offset; emit the per-stream Close (EOF) ONLY once
         // the reorder buffer has released that offset IN ORDER (after all preceding
@@ -9920,6 +9948,158 @@ mod tests {
         // to the current 1000 (it does not jump to an absolute value).
         client_stream.apply_peer_window_update(announced);
         assert_eq!(client_stream.peer_send_window(), 1000 + credit);
+    }
+
+    /// The flow-control persist probe as it actually reaches the wire.
+    ///
+    /// A stream the peer's window has stopped, with nothing outstanding, has no event left
+    /// that could free it: no acknowledgement is coming, and the credit that would arrive
+    /// rides in a frame nothing retransmits. The drain therefore emits a probe — and what it
+    /// emits has to be checked here rather than at the stream, because it is this path that
+    /// decides what the peer actually receives. The frame is `RELIABLE | ENCRYPTED`, carries
+    /// its four-byte stream offset and **not one byte of the payload queued behind it**, and
+    /// is not a FIN.
+    #[tokio::test]
+    async fn a_window_blocked_drain_puts_an_empty_probe_on_the_wire() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+
+        let (tx_a, mut rx_a) = mpsc::channel::<Vec<u8>>(32);
+        let (tx_b, rx_b) = mpsc::channel::<Vec<u8>>(32);
+        let transport: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: tx_a,
+            rx: Mutex::new(rx_b),
+        });
+        let _keep = tx_b;
+
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let blocked = Arc::new(TransportStream::new(7));
+        // A window closes by sending, so one segment has already gone out and been
+        // acknowledged — which is also the delivered offset a probe repeats.
+        blocked
+            .send_reliable(Bytes::from_static(b"delivered"))
+            .await
+            .unwrap();
+        let sent = blocked
+            .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+            .await
+            .expect("the initial window admits the first segment");
+        blocked.ack(sent.stream_offset).await;
+        assert!(blocked.try_consume_send_window(blocked.peer_send_window()));
+        blocked
+            .send_reliable(Bytes::from_static(b"queued-behind-a-closed-window"))
+            .await
+            .unwrap();
+        streams.insert(7, blocked.clone());
+
+        let obs = Observability::new(ObservabilityConfig::default());
+        drain_streams_priority_ordered(&transport, &client_session, session_id, &streams, &obs)
+            .await;
+
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(100), rx_a.recv())
+            .await
+            .expect("a blocked stream with nothing outstanding must probe")
+            .expect("channel open");
+        let v2 = server_session.parse_protected(&frame).unwrap();
+        assert!(v2.header.flags.contains(PacketFlags::RELIABLE));
+        assert!(v2.header.flags.contains(PacketFlags::ENCRYPTED));
+        assert!(
+            !v2.header.flags.contains(PacketFlags::FIN),
+            "the probe must not be mistaken for the FIN sentinel"
+        );
+        let plaintext = server_session
+            .decrypt_packet(&v2.header, &v2.payload, &[])
+            .expect("decrypt the probe");
+        assert_eq!(
+            plaintext.len(),
+            4,
+            "the probe carried {} application bytes past a closed window",
+            plaintext.len() - 4
+        );
+        assert_eq!(
+            blocked.peer_send_window(),
+            0,
+            "the probe must not debit a window that has nothing in it"
+        );
+        assert!(
+            rx_a.try_recv().is_err(),
+            "one probe per interval — the drain emitted more than one"
+        );
+    }
+
+    /// The other half of the same exchange: what the receiver does with a probe.
+    ///
+    /// It answers with the credit it already owes — bytes its application consumed that sat
+    /// below `record_app_consumed`'s emission threshold, where nothing would ever push them
+    /// once the peer stopped sending. That is the whole of the answer: a receiver whose
+    /// application has consumed nothing owes nothing and says nothing, which is what leaves
+    /// it able to hold a peer still.
+    #[tokio::test]
+    async fn a_probe_is_answered_with_the_credit_the_receiver_owes() {
+        use crate::transport::stream::INITIAL_STREAM_WINDOW;
+
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 9;
+
+        // Two receiving streams, differing only in whether their application read anything.
+        let consumed = INITIAL_STREAM_WINDOW / 4; // below the half-window emission threshold
+        let reading = Arc::new(TransportStream::new(stream_id));
+        assert_eq!(
+            reading.record_app_consumed(consumed),
+            None,
+            "below the threshold the credit is withheld — that is the state a probe finds"
+        );
+        let idle = Arc::new(TransportStream::new(stream_id));
+
+        for (stream, expected) in [(reading, Some(consumed)), (idle, None)] {
+            let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+            streams.insert(stream_id as u32, stream.clone());
+
+            let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+            let demux = Arc::new(demux);
+            let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
+            let undelivered = AtomicU64::new(0);
+            let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
+            let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+                tx: ack_a,
+                rx: Mutex::new(ack_b),
+            });
+            let obs = Observability::new(ObservabilityConfig::default());
+            let mut scratch = test_recv_scratch(&obs, 256);
+            let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+
+            // A reliable frame with an empty payload: the probe, exactly as the drain above
+            // puts it on the wire.
+            let frame = build_app_frame(&client_session, session_id, stream_id, 0, b"");
+            handle_packet(
+                decode_recv_frame(&frame, session_id),
+                session_id,
+                &server_session,
+                &streams,
+                &demux,
+                &transport_send,
+                &transport_send,
+                &deliver_tx,
+                &undelivered,
+                &mut scratch,
+                &obs,
+                LegType::Tcp,
+                &no_cmd_tx,
+                &no_inc_tx,
+            )
+            .await;
+
+            assert_eq!(
+                stream.take_pending_window_update(),
+                expected,
+                "the answer to a probe must be exactly the credit the application earned"
+            );
+            assert!(
+                deliver_rx.try_recv().is_err(),
+                "an empty probe was handed to the application as data"
+            );
+        }
     }
 
     /// Phase 4.3 — priority scheduler ordering. Two streams enqueue
