@@ -23,6 +23,7 @@ use crate::observability::attrs::{
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN};
+use crate::transport::mtu::MAX_APP_CHUNK;
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::packet_coalescer_codec::unwrap_coalesced_packet;
 use crate::transport::path_validation_codec::build_path_validation_packet;
@@ -597,7 +598,7 @@ impl PhantomSession {
         liveness: Option<crate::transport::liveness::LivenessConfig>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
-        let (recv_tx, recv_rx) = mpsc::channel(256);
+        let (recv_tx, recv_rx) = mpsc::channel(RAW_APP_RECV_CHANNEL_DEPTH);
         // Channel for peer-initiated streams exposed via accept_stream().
         let (incoming_stream_tx, incoming_stream_rx) = mpsc::channel(128);
 
@@ -730,7 +731,7 @@ impl PhantomSession {
         leg: LegType,
     ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
-        let (recv_tx, recv_rx) = mpsc::channel(256);
+        let (recv_tx, recv_rx) = mpsc::channel(RAW_APP_RECV_CHANNEL_DEPTH);
         // Channel for peer-initiated streams exposed via accept_stream().
         let (incoming_stream_tx, incoming_stream_rx) = mpsc::channel(128);
 
@@ -1421,13 +1422,26 @@ fn duration_ns(started: std::time::Instant) -> u64 {
 /// ordered after any data frames for the same stream, and lets the delivery task
 /// dispatch without a separate close channel.
 enum DeliverItem {
-    /// Inbound data payload `(stream_id, bytes)`. The reader adds the byte
-    /// length to `undelivered_bytes` on enqueue; the delivery task subtracts it
-    /// once the frame is forwarded to a bounded downstream channel.
+    /// Inbound data payload `(stream_id, bytes)`. The reader adds
+    /// [`delivery_charge`] to `undelivered_bytes` on enqueue; the delivery task
+    /// subtracts the same figure once the frame is forwarded to a bounded
+    /// downstream channel.
     Data(u32, Bytes),
     /// Peer sent FIN on `stream_id`. Ordered after any `Data` items already
     /// queued for that stream so the consumer sees EOF last.
     Close(u32),
+}
+
+/// Bytes charged to the delivery backlog for one queued item.
+///
+/// The payload is what the application will eventually read; the rest is what parking the
+/// item costs regardless of how little it carries. Charging both is what makes
+/// [`RECV_DELIVERY_HARD_CAP`] a bound on resident bytes — a peer choosing minimum-size
+/// segments pays the item cost, which is where the memory actually goes. A FIN carries no
+/// payload and is charged the structure alone.
+#[inline]
+fn delivery_charge(payload_len: usize) -> u64 {
+    payload_len as u64 + DELIVERY_ITEM_OVERHEAD_BYTES
 }
 
 /// Outbound work the pump has taken off the command channel but that the target
@@ -1731,6 +1745,15 @@ async fn run_data_pump<T: SessionTransport>(
     // `undelivered_bytes` is incremented by the reader and decremented by Task A
     // or Task B on dequeue — BEFORE the blocking downstream send — so the
     // hard-cap check in the reader is accurate and no byte is leaked on failure.
+    // What it counts is `delivery_charge`: payload plus the structure a queued item
+    // costs, because the item count is what a peer minimising segment size controls.
+    //
+    // It stops counting at the hand-off. What is resident downstream — the raw-app
+    // channel and the per-stream demux channels — is bounded by those channels' own
+    // depths and is counted in `SESSION_RECV_MEMORY_COMMITMENT` instead. Folding it
+    // into this counter would mean tearing a session down because the local
+    // application stopped reading, which is neither the peer's fault nor what the
+    // hard cap is for.
     //
     // Flow-control credit is issued in Task A / Task B immediately on dequeue
     // (one item of look-ahead, cancel-safe: mpsc send drops the item on cancel
@@ -1759,8 +1782,9 @@ async fn run_data_pump<T: SessionTransport>(
             while let Some(bytes) = raw_deliver_rx.recv().await {
                 let len = bytes.len() as u64;
                 // Decrement backlog counter before the blocking send — see comment
-                // on `undelivered_bytes` above.
-                undelivered_a.fetch_sub(len, Ordering::AcqRel);
+                // on `undelivered_bytes` above. The figure released is the one the
+                // reader charged: payload plus item structure.
+                undelivered_a.fetch_sub(delivery_charge(bytes.len()), Ordering::AcqRel);
                 // Credit the flow-control window for the raw-app stream (id 1).
                 if let Some(stream) = streams_a.get(&RAW_APP_STREAM_ID) {
                     if let Some(credit) = stream.record_app_consumed(len as u32) {
@@ -1788,7 +1812,7 @@ async fn run_data_pump<T: SessionTransport>(
                 match item {
                     DeliverItem::Data(stream_id, bytes) => {
                         let len = bytes.len() as u64;
-                        undelivered_b.fetch_sub(len, Ordering::AcqRel);
+                        undelivered_b.fetch_sub(delivery_charge(bytes.len()), Ordering::AcqRel);
                         // Credit flow-control for this opened stream.
                         if let Some(stream) = streams_b.get(&stream_id) {
                             if let Some(credit) = stream.record_app_consumed(len as u32) {
@@ -1806,6 +1830,7 @@ async fn run_data_pump<T: SessionTransport>(
                         }
                     }
                     DeliverItem::Close(stream_id) => {
+                        undelivered_b.fetch_sub(delivery_charge(0), Ordering::AcqRel);
                         // Lossless FIN delivery (ordered after any data above).
                         if !demux_b.route_close_async(stream_id).await {
                             log::debug!(
@@ -1828,6 +1853,7 @@ async fn run_data_pump<T: SessionTransport>(
     {
         let raw_tx_r = raw_deliver_tx;
         let streams_tx_r = streams_deliver_tx;
+        let undelivered_r = undelivered_bytes.clone();
         runtime.spawn(Box::pin(async move {
             while let Some(item) = deliver_router_rx.recv().await {
                 match item {
@@ -1842,8 +1868,14 @@ async fn run_data_pump<T: SessionTransport>(
                     DeliverItem::Close(stream_id) => {
                         if stream_id > RAW_APP_STREAM_ID {
                             let _ = streams_tx_r.send(DeliverItem::Close(stream_id));
+                        } else {
+                            // Close on id 0/1 is not used in the current protocol; discard.
+                            // Discarding is where the charge has to be released — nothing
+                            // downstream will see this item, and a charge nobody releases is
+                            // a counter that only climbs, which a peer emitting FINs on the
+                            // raw-app id would ride into a false teardown.
+                            undelivered_r.fetch_sub(delivery_charge(0), Ordering::AcqRel);
                         }
-                        // Close on id 0/1 is not used in the current protocol; discard.
                     }
                 }
             }
@@ -3460,7 +3492,45 @@ pub const MAX_STREAMS: usize = 256;
 /// derived from the window ceiling, or raising that ceiling would silently raise how much a
 /// peer can make this side hold. 4 MiB is four times what one auto-tuned stream can
 /// legitimately have outstanding, so honest traffic does not approach it.
+///
+/// The cap bounds *resident* bytes only because every queued item is charged
+/// [`DELIVERY_ITEM_OVERHEAD_BYTES`] on top of its payload — see there for what a cap
+/// counting payload alone would really admit.
 pub const RECV_DELIVERY_HARD_CAP: u64 = 4 * 1024 * 1024;
+
+/// Bytes of *structure* one queued delivery item costs beyond its payload: a slot in the
+/// channel block the item is parked in, and — for reliable data, which arrives as
+/// `plaintext.slice(4..)` — the reference block that slice allocates plus the
+/// decrypted-packet allocation it keeps alive.
+///
+/// It exists because the item count, not the byte count, is what a peer minimising segment
+/// size controls. A cap counting payload alone admits `RECV_DELIVERY_HARD_CAP` **items** when
+/// each carries one byte, and an item costs far more than a byte: measured against the real
+/// channel it is a little over 64 B, so a 4 MiB payload cap really admitted about 300 MiB.
+/// Charging this figure per item makes the cap bound what is resident rather than what is
+/// nominal. 128 B is a deliberate over-estimate of the measured cost, because this is what a
+/// published memory bound rests on and erring high there is the safe direction.
+///
+/// It is charged on FIN items too, which carry no payload at all: a peer can emit those
+/// without limit, and an uncharged item is an uncapped one.
+pub const DELIVERY_ITEM_OVERHEAD_BYTES: u64 = 128;
+
+/// Depth, in items, of the bounded channel between the delivery task and one opened stream's
+/// [`PhantomStream::recv`](crate::api::stream::PhantomStream::recv).
+///
+/// A bounded channel is its own enforcement — the delivery task blocks rather than growing it
+/// — so this needs no separate gate. What it does need is *counting*: at `MAX_STREAMS`
+/// streams it is by far the largest term in [`SESSION_RECV_MEMORY_COMMITMENT`], and it is
+/// resident whenever the application is slower than the peer.
+pub const STREAM_RECV_CHANNEL_DEPTH: usize = 1024;
+
+/// Depth, in items, of the bounded channel behind
+/// [`PhantomSession::recv`](PhantomSession::recv) — the raw-app stream (id 1), which is the
+/// path `send`/`recv` use and the one every WAN measurement in the tree ran through.
+///
+/// One per session rather than one per stream, hence a small term next to
+/// [`STREAM_RECV_CHANNEL_DEPTH`], but resident on the same terms.
+pub const RAW_APP_RECV_CHANNEL_DEPTH: usize = 256;
 
 /// Receive-side memory one session may commit, in bytes — the figure a host is sized from.
 ///
@@ -3469,19 +3539,33 @@ pub const RECV_DELIVERY_HARD_CAP: u64 = 4 * 1024 * 1024;
 /// bound for the receive path and it is stated in full rather than by its largest term:
 ///
 /// ```text
-///   advertised windows   MAX_STREAMS × 64 KiB + growth budget       = 24 MiB
-///   reorder payload      Σ (window_i + 64 KiB)                      = 40 MiB
-///   reorder structure    MAX_STREAMS × 2048 × 128 B                 = 64 MiB
-///   delivery backlog     RECV_DELIVERY_HARD_CAP                     =  4 MiB
+///   advertised windows   MAX_STREAMS × 64 KiB + growth budget       =  24 MiB
+///   reorder payload      Σ (window_i + 64 KiB)                      =  40 MiB
+///   reorder structure    MAX_STREAMS × 2048 × 128 B                 =  64 MiB
+///   delivery backlog     RECV_DELIVERY_HARD_CAP                     =   4 MiB
+///   per-stream channels  MAX_STREAMS × 1024 × (1156 B + 128 B)      = 321 MiB
+///   raw-app channel      256 × (1156 B + 128 B)                     = 0.3 MiB
 ///                                                                   ─────────
-///                                                        resident    108 MiB
+///                                                        resident    429 MiB
 /// ```
 ///
 /// The advertised windows are a promise rather than an allocation — the bytes they admit
-/// come to rest in the reorder buffer or the delivery backlog, both counted above — so the
-/// resident total is the last three terms. `SESSION_RECV_WINDOW_GROWTH_BUDGET` bounds 8 MiB
-/// of it; the rest follows from `MAX_STREAMS`, the reorder entry cap and the delivery cap,
-/// which is why raising any of those is a memory decision and not a tuning one.
+/// come to rest in one of the buffers below — so the resident total is the terms under them.
+/// `SESSION_RECV_WINDOW_GROWTH_BUDGET` bounds 8 MiB of it; the rest follows from
+/// `MAX_STREAMS`, the reorder entry cap, the delivery cap and the two channel depths, which
+/// is why raising any of those is a memory decision and not a tuning one.
+///
+/// Three quarters of the figure is the per-stream delivery channels, and that is a
+/// consequence of `MAX_STREAMS` (256) times [`STREAM_RECV_CHANNEL_DEPTH`] (1024) rather than
+/// of anything the transport needs: those two are the lever on this number, at the cost of
+/// less tolerance for a slow consumer before the delivery task head-of-line blocks the other
+/// opened streams. The channels are bounded by construction — they cannot exceed their depth
+/// — so what was missing was never enforcement, only counting.
+///
+/// Unlike the delivery backlog, the channels are deliberately **not** gated by
+/// `RECV_DELIVERY_HARD_CAP`: what fills them is the local application not reading, and
+/// tearing a session down for that would both punish an honest peer and mislabel the cause.
+/// Their bound is their depth.
 ///
 /// **This is per session, and nothing divides it between concurrent sessions.** A process
 /// admitting `N` sessions commits `N ×` this figure in the worst case, so the bound at
@@ -3499,7 +3583,13 @@ pub const SESSION_RECV_MEMORY_COMMITMENT: u64 = {
     // above a hole it never fills is bounded by the entry cap alone.
     let reorder_structure =
         MAX_STREAMS as u64 * MAX_RECV_REORDER as u64 * REORDER_ENTRY_OVERHEAD_BYTES as u64;
-    reorder_payload + reorder_structure + RECV_DELIVERY_HARD_CAP
+    // Delivery channels: a full-size chunk per slot is the peer's best play — small items
+    // cost it a datagram each and hold less — so the per-item worst case is one chunk plus
+    // the structure the slot costs.
+    let per_slot = MAX_APP_CHUNK as u64 + DELIVERY_ITEM_OVERHEAD_BYTES;
+    let stream_channels = MAX_STREAMS as u64 * STREAM_RECV_CHANNEL_DEPTH as u64 * per_slot;
+    let raw_app_channel = RAW_APP_RECV_CHANNEL_DEPTH as u64 * per_slot;
+    reorder_payload + reorder_structure + RECV_DELIVERY_HARD_CAP + stream_channels + raw_app_channel
 };
 
 /// EPS-02 symmetric-rotation step — extracted from [`handle_packet`] so the role
@@ -3858,8 +3948,10 @@ async fn handle_packet<T: SessionTransport>(
         // delivery). Route FIN through the delivery channel so it is ordered
         // after any in-flight data frames and is delivered losslessly for id ≥ 2.
         demux_recv.route_ack(stream_id, sack.largest_acked);
-        if packet.header.flags.contains(PacketFlags::FIN) {
-            let _ = deliver_tx.send(DeliverItem::Close(stream_id));
+        if packet.header.flags.contains(PacketFlags::FIN)
+            && deliver_tx.send(DeliverItem::Close(stream_id)).is_ok()
+        {
+            undelivered_bytes.fetch_add(delivery_charge(0), Ordering::AcqRel);
         }
         return;
     }
@@ -4151,7 +4243,7 @@ async fn handle_packet<T: SessionTransport>(
                     // guarded by the DashMap entry). The matching retire is the
                     // FIN-acked removal above, or the session-teardown drain.
                     scratch.stream_gauge.opened(stream_id);
-                    let handle = demux_recv.register_stream(stream_id, 1024);
+                    let handle = demux_recv.register_stream(stream_id, STREAM_RECV_CHANNEL_DEPTH);
                     let phantom_stream = Arc::new(crate::api::stream::PhantomStream::new(
                         handle,
                         cmd_tx_for_stream.clone(),
@@ -4227,8 +4319,8 @@ async fn handle_packet<T: SessionTransport>(
         if packet.header.flags.contains(PacketFlags::FIN) {
             local.note_remote_fin(stream_offset);
         }
-        if local.take_in_order_fin() {
-            let _ = deliver_tx.send(DeliverItem::Close(stream_id));
+        if local.take_in_order_fin() && deliver_tx.send(DeliverItem::Close(stream_id)).is_ok() {
+            undelivered_bytes.fetch_add(delivery_charge(0), Ordering::AcqRel);
         }
         return;
     }
@@ -4238,18 +4330,20 @@ async fn handle_packet<T: SessionTransport>(
     // never stalls on a slow `recv()` consumer; counted toward the backlog only on
     // a successful enqueue (a dead delivery task can't inflate `undelivered_bytes`).
     if !plaintext.is_empty() {
-        let len = plaintext.len() as u64;
+        let charge = delivery_charge(plaintext.len());
         if deliver_tx
             .send(DeliverItem::Data(stream_id, Bytes::from(plaintext)))
             .is_ok()
         {
-            undelivered_bytes.fetch_add(len, Ordering::AcqRel);
+            undelivered_bytes.fetch_add(charge, Ordering::AcqRel);
         }
     }
 
     if packet.header.flags.contains(PacketFlags::FIN) {
         // Route FIN through the delivery channel (ordered after any data above).
-        let _ = deliver_tx.send(DeliverItem::Close(stream_id));
+        if deliver_tx.send(DeliverItem::Close(stream_id)).is_ok() {
+            undelivered_bytes.fetch_add(delivery_charge(0), Ordering::AcqRel);
+        }
     }
 }
 
@@ -4268,9 +4362,9 @@ fn deliver_in_order_run(
         if chunk.is_empty() {
             continue;
         }
-        let len = chunk.len() as u64;
+        let charge = delivery_charge(chunk.len());
         if deliver_tx.send(DeliverItem::Data(stream_id, chunk)).is_ok() {
-            undelivered_bytes.fetch_add(len, Ordering::AcqRel);
+            undelivered_bytes.fetch_add(charge, Ordering::AcqRel);
         }
     }
 }
@@ -4399,7 +4493,7 @@ impl PhantomSession {
 
     /// Open a new multiplexed stream
     pub fn open_stream(&self) -> Arc<crate::api::stream::PhantomStream> {
-        let handle = self.demux.open_stream(1024);
+        let handle = self.demux.open_stream(STREAM_RECV_CHANNEL_DEPTH);
         let stream_id = handle.stream_id;
 
         let transport_stream = Arc::new(Stream::with_recv_tuning(
@@ -4455,7 +4549,7 @@ impl PhantomSession {
     /// # ⚠ This is a byte stream, not a message channel
     ///
     /// **Message boundaries are not preserved.** The data pump splits `data`
-    /// into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
+    /// into chunks of [`MAX_APP_CHUNK`]
     /// bytes — one chunk plus its packet overhead is exactly one PhantomUDP
     /// datagram — and writes each chunk separately, so the peer's
     /// [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
@@ -7324,9 +7418,11 @@ mod tests {
         };
         assert_eq!(sid, stream_id as u32);
         assert_eq!(&received[..], b"hello-v2");
+        // The backlog is charged the payload plus what parking one item costs, so the
+        // hard cap it feeds bounds resident bytes rather than a count.
         assert_eq!(
             undelivered.load(Ordering::Acquire),
-            b"hello-v2".len() as u64
+            delivery_charge(b"hello-v2".len())
         );
     }
 
@@ -9065,7 +9161,11 @@ mod tests {
         assert_eq!(&a[..], b"alpha");
         assert_eq!(&b[..], b"bravo");
         assert_eq!(&c[..], b"charlie");
-        assert_eq!(undelivered.load(Ordering::Acquire), (5 + 5 + 7) as u64);
+        assert_eq!(
+            undelivered.load(Ordering::Acquire),
+            delivery_charge(5) + delivery_charge(5) + delivery_charge(7),
+            "each sub-payload is charged its own item structure, not just its bytes"
+        );
     }
 
     /// Ordering across two COALESCED bundles: the single FIFO delivery channel

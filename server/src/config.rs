@@ -155,8 +155,10 @@ mod tests {
         }
     }
 
+    /// Rounded up: a budget of exactly `N × floor(commitment)` MiB holds `N − 1` sessions,
+    /// not `N`, so the tests below would be asserting the wrong arithmetic.
     fn per_session_mib() -> usize {
-        (SESSION_RECV_MEMORY_COMMITMENT / (1024 * 1024)) as usize
+        SESSION_RECV_MEMORY_COMMITMENT.div_ceil(1024 * 1024) as usize
     }
 
     /// The flag is opt-in: with no budget stated the operator's cap stands exactly as typed,

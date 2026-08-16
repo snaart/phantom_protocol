@@ -97,35 +97,42 @@ env vars):
   `~1000 sessions → 512 MiB limit` line is sized from. It is a typical figure,
   not a bound.
 
-  The bound is **108 MiB per session** — `SESSION_RECV_MEMORY_COMMITMENT` in
+  The bound is **429 MiB per session** — `SESSION_RECV_MEMORY_COMMITMENT` in
   `core/src/api/session.rs`, which computes it from the transport's own
   constants so the two cannot drift:
 
   ```text
-    reorder payload    Σ (window_i + 64 KiB), windows ≤ 256 × 64 KiB + 8 MiB   =  40 MiB
-    reorder structure  256 streams × 2048 held entries × 128 B                 =  64 MiB
-    delivery backlog   the per-session hard cap that tears a flooding peer down =  4 MiB
-                                                                                ────────
-                                                                                 108 MiB
+    reorder payload      Σ (window_i + 64 KiB), windows ≤ 256 × 64 KiB + 8 MiB   =  40 MiB
+    reorder structure    256 streams × 2048 held entries × 128 B                 =  64 MiB
+    delivery backlog     the per-session hard cap that tears a flooding peer down =  4 MiB
+    per-stream channels  256 streams × 1024 queued chunks × (1156 B + 128 B)     = 321 MiB
+    raw-app channel      256 queued chunks × (1156 B + 128 B)                    = 0.3 MiB
+                                                                                  ────────
+                                                                                   429 MiB
   ```
 
   Every term is something the peer picks — how many streams it opens, how much
   it sends, how long it leaves a reassembly hole open — so this is what one
   **authenticated but hostile** peer can make a session hold. It is bounded per
   session; the transport does **not** divide it between concurrent sessions, so
-  a process admitting `N` sessions commits `N × 108 MiB` in the worst case
-  (`1024 × 108 MiB ≈ 108 GiB` at the default cap). Admission control is the only
+  a process admitting `N` sessions commits `N × 429 MiB` in the worst case
+  (`1024 × 429 MiB ≈ 429 GiB` at the default cap). Admission control is the only
   thing that bounds it at process scale, which is why the session cap is a
   memory setting whether or not it was set as one.
+
+  Three quarters of the figure is the delivery channels, one per opened stream,
+  and those fill only when the *application* is slower than the peer — 256
+  streams' worth of unread data is a shape most embedders never approach. It is
+  in the bound because it is resident, not because it is likely.
 
   Pick a posture:
 
   - **Trusted or authenticated-and-accountable clients** (the common case):
     size from the typical figure, leave `--max-recv-memory-mib` off, and watch
     RSS. The worst case needs a peer deliberately holding reassembly holes
-    open on hundreds of streams.
+    open on hundreds of streams while the application reads none of them.
   - **Open to the internet**: state the budget. `--max-recv-memory-mib 8192`
-    on an 8 GiB host lowers the cap to 75 sessions and logs that it did. That
+    on an 8 GiB host lowers the cap to 19 sessions and logs that it did. That
     is a small number because the guarantee is strong; if it is too small for
     the deployment, the honest fix is more hosts or the first posture, not a
     larger cap.

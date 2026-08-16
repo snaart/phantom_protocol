@@ -25,13 +25,16 @@
 
 use bytes::Bytes;
 use phantom_protocol::api::session::{
-    MAX_STREAMS, RECV_DELIVERY_HARD_CAP, SESSION_RECV_MEMORY_COMMITMENT,
+    DELIVERY_ITEM_OVERHEAD_BYTES, MAX_STREAMS, RAW_APP_RECV_CHANNEL_DEPTH, RECV_DELIVERY_HARD_CAP,
+    SESSION_RECV_MEMORY_COMMITMENT, STREAM_RECV_CHANNEL_DEPTH,
 };
 use phantom_protocol::crypto::adaptive_crypto::{CipherSuite, CryptoSession, AEAD_OVERHEAD};
 use phantom_protocol::crypto::hybrid_sign::{HybridSigningKey, HybridVerifyingKey};
 use phantom_protocol::transport::handshake::{
     ClientHello, HandshakeClient, HandshakeError, HandshakeResponse, HandshakeServer, ServerHello,
 };
+use phantom_protocol::transport::mtu::MAX_APP_CHUNK;
+use phantom_protocol::transport::multiplexer::{StreamDemultiplexer, StreamMessage};
 use phantom_protocol::transport::path::PathStateKind;
 use phantom_protocol::transport::session::{
     CryptoState, Session, MAX_REKEY_CATCHUP, REBIND_VALIDATION_PATH_ID,
@@ -44,8 +47,60 @@ use phantom_protocol::transport::stream::{
 use phantom_protocol::transport::types::{
     PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
 };
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Duration;
+
+// ── Heap accounting ────────────────────────────────────────────────────────
+//
+// The receive-memory tests below are the only place in this suite that asserts a
+// *quantity* rather than a behaviour, and a quantity asserted against the expression it
+// came from proves nothing. So they measure: this allocator reports live heap bytes, and
+// the published commitment is checked against what the real buffers are observed to take.
+//
+// The counter is per thread, not global, so a measurement is unaffected by whatever the
+// other tests in this binary are allocating in parallel. Measured regions therefore keep
+// all of their work on the calling thread (`flavor = "current_thread"`).
+
+thread_local! {
+    /// Live heap bytes attributed to this thread. `const`-initialised and destructor-free
+    /// so that touching it from inside the allocator cannot itself allocate or recurse.
+    static LIVE_HEAP: Cell<isize> = const { Cell::new(0) };
+}
+
+struct AccountingAllocator;
+
+// SAFETY: every method forwards to `System` unchanged; the added work is a `Cell` update on
+// a `const`-initialised, destructor-free thread-local, which allocates nothing and so cannot
+// re-enter the allocator. `try_with` tolerates the window during thread teardown when the
+// thread-local is no longer accessible.
+unsafe impl GlobalAlloc for AccountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _ = LIVE_HEAP.try_with(|c| c.set(c.get() + layout.size() as isize));
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let _ = LIVE_HEAP.try_with(|c| c.set(c.get() + layout.size() as isize));
+        unsafe { System.alloc_zeroed(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _ = LIVE_HEAP.try_with(|c| c.set(c.get() - layout.size() as isize));
+        unsafe { System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let _ = LIVE_HEAP.try_with(|c| c.set(c.get() - layout.size() as isize + new_size as isize));
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static HEAP: AccountingAllocator = AccountingAllocator;
+
+/// Live heap bytes this thread currently holds.
+fn live_heap() -> isize {
+    LIVE_HEAP.with(|c| c.get())
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -2531,28 +2586,156 @@ async fn recv_window_growth_is_bounded_per_session_not_per_stream() {
     );
 }
 
-/// The published per-session receive-memory commitment has to keep covering what the
-/// constants actually permit, or the number an operator sizes a host with is fiction.
-/// Recomputed here from the constants themselves so that raising any one of them — the
-/// window ceiling, the growth budget, the stream cap, the reorder entry cap — fails here
-/// rather than silently invalidating `docs/operations/deployment.md`.
-#[test]
-fn the_published_session_recv_commitment_covers_what_the_constants_permit() {
-    // Reorder payload: every stream's budget tracks its own window plus one initial
-    // window of headroom, and the windows themselves are one initial window each plus,
-    // between them, one growth budget.
-    let windows = MAX_STREAMS as u64 * u64::from(INITIAL_STREAM_WINDOW)
-        + u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET);
-    let reorder_payload = windows + MAX_STREAMS as u64 * u64::from(INITIAL_STREAM_WINDOW);
-    // Reorder structure: the byte budget counts payload only, so a peer sending tiny
-    // segments above a hole it never fills is bounded by the entry cap alone.
-    let reorder_structure =
-        MAX_STREAMS as u64 * MAX_RECV_REORDER as u64 * REORDER_ENTRY_OVERHEAD_BYTES as u64;
-    let worst_case = reorder_payload + reorder_structure + RECV_DELIVERY_HARD_CAP;
+/// Bytes the real delivery queue takes to park `n` one-byte items, over and above the
+/// payload — measured, not modelled. The payloads are allocated before the measurement
+/// starts and sliced inside it, exactly as the reliable receive path does
+/// (`plaintext.slice(4..)`), so what the delta captures is the queue slot plus the
+/// reference block that slice allocates.
+fn measured_backlog_structure_per_item(n: usize) -> f64 {
+    let payloads: Vec<Bytes> = (0..n).map(|_| Bytes::from(vec![0u8; 1])).collect();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<StreamMessage>();
+    let before = live_heap();
+    for p in &payloads {
+        tx.send(StreamMessage::Data(p.slice(0..1)))
+            .expect("receiver alive");
+    }
+    let used = live_heap() - before;
+    drop(rx);
+    drop(payloads);
+    used as f64 / n as f64
+}
 
+/// A queued delivery item costs more than the bytes it carries, so a cap that counts only
+/// payload does not cap memory.
+///
+/// The item count, not the byte count, is what a peer choosing minimum-size segments
+/// controls: at one byte per item a payload-only cap of `RECV_DELIVERY_HARD_CAP` admits
+/// four million items, and an item is not one byte. This measures what one really costs
+/// and requires `DELIVERY_ITEM_OVERHEAD_BYTES` — the figure the accounting charges on top
+/// of the payload — to cover it, which is what turns the cap into a bound on resident
+/// bytes.
+#[test]
+fn a_queued_delivery_item_costs_more_than_the_payload_it_carries() {
+    let per_item = measured_backlog_structure_per_item(1 << 15);
+
+    // Positive control: a measurement that cannot see anything would satisfy the bound
+    // below for free.
+    assert!(
+        per_item > 8.0,
+        "the heap measurement saw only {per_item:.1} B per queued item — it is not \
+         observing the queue, so the bound below would hold vacuously"
+    );
+    assert!(
+        per_item <= DELIVERY_ITEM_OVERHEAD_BYTES as f64,
+        "one queued delivery item really costs {per_item:.1} B of structure, but the \
+         backlog charges {DELIVERY_ITEM_OVERHEAD_BYTES} B for it — with that charge \
+         {RECV_DELIVERY_HARD_CAP} B of counted backlog is {:.0} MiB resident, so the cap \
+         bounds a number rather than a memory",
+        RECV_DELIVERY_HARD_CAP as f64 / (1.0 + DELIVERY_ITEM_OVERHEAD_BYTES as f64) * per_item
+            / (1024.0 * 1024.0)
+    );
+}
+
+/// The published per-session receive commitment must not sit below what the buffers it
+/// names are measured to take. It is the figure a host is sized from and the figure the
+/// reference server divides an operator's memory budget by, so understating it
+/// under-provisions the host by exactly the factor it is out.
+///
+/// One stream is driven to both of its per-stream ceilings — a reorder buffer held at
+/// `MAX_RECV_REORDER` entries by a hole that never fills, and a delivery channel filled to
+/// `STREAM_RECV_CHANNEL_DEPTH` with full-size chunks — and the live heap is observed. That
+/// figure is then scaled by `MAX_STREAMS`, which is how many of those a peer may open, and
+/// the session-wide backlog is added at the item count its own cap admits. Nothing here is
+/// re-derived from the commitment's expression: it is a measurement of the real structures
+/// against the published number.
+#[tokio::test(flavor = "current_thread")]
+async fn the_published_session_recv_commitment_is_not_below_what_the_buffers_measure() {
+    // ── One stream's reorder buffer, held at its entry cap ──
+    // Offset 0 is never delivered, so every segment above it stays resident. One-byte
+    // segments are the peer's play here: they reach the entry cap without approaching the
+    // byte budget, which is the case the byte budget alone does not bound.
+    let stream = Stream::new(11);
+    let before = live_heap();
+    for i in 0..MAX_RECV_REORDER {
+        let offset = 1 + i as u32 * 2;
+        stream
+            .accept_in_order(offset, vec![Bytes::from(vec![0u8; 1])])
+            .await;
+    }
+    let reorder_resident = (live_heap() - before).max(0) as u64;
+    assert!(
+        reorder_resident
+            <= MAX_RECV_REORDER as u64 * REORDER_ENTRY_OVERHEAD_BYTES as u64
+                + MAX_RECV_REORDER as u64,
+        "a reorder buffer held at its entry cap takes {reorder_resident} B, above the \
+         {REORDER_ENTRY_OVERHEAD_BYTES} B per entry the commitment charges for it"
+    );
+
+    // ── One stream's delivery channel, filled to its depth with full-size chunks ──
+    // Full-size chunks are the worst case per slot: a smaller item costs the peer a
+    // datagram of its own and holds less.
+    let (demux, _control_rx) = StreamDemultiplexer::new_with_role(16, false);
+    let handle = demux.register_stream(21, STREAM_RECV_CHANNEL_DEPTH);
+    let before = live_heap();
+    for _ in 0..STREAM_RECV_CHANNEL_DEPTH {
+        assert!(
+            demux
+                .route_data_async(21, Bytes::from(vec![0u8; MAX_APP_CHUNK]))
+                .await,
+            "the registered stream must accept up to its channel depth"
+        );
+    }
+    let channel_resident = (live_heap() - before).max(0) as u64;
+    drop(handle);
+
+    // Positive control: both measurements have to be seeing the structures they name, or
+    // the comparison below is satisfied by measuring nothing.
+    assert!(
+        reorder_resident > MAX_RECV_REORDER as u64
+            && channel_resident > (STREAM_RECV_CHANNEL_DEPTH * MAX_APP_CHUNK) as u64,
+        "the heap measurement is not observing the buffers: reorder {reorder_resident} B, \
+         channel {channel_resident} B"
+    );
+
+    // ── Scale to what one session permits ──
+    let per_stream = reorder_resident + channel_resident;
+    let backlog_items = RECV_DELIVERY_HARD_CAP / (1 + DELIVERY_ITEM_OVERHEAD_BYTES);
+    let backlog_resident =
+        backlog_items * measured_backlog_structure_per_item(1 << 15).ceil() as u64;
+    let raw_app_resident =
+        RAW_APP_RECV_CHANNEL_DEPTH as u64 * (channel_resident / STREAM_RECV_CHANNEL_DEPTH as u64);
+    let measured = per_stream * MAX_STREAMS as u64 + backlog_resident + raw_app_resident;
+
+    assert!(
+        SESSION_RECV_MEMORY_COMMITMENT >= measured,
+        "the published per-session commitment is {} MiB, but the buffers it names measure \
+         {} MiB at their own caps ({} MiB per stream × {MAX_STREAMS} streams, plus {} MiB \
+         of delivery backlog). A host sized from the published figure is short by that \
+         factor",
+        SESSION_RECV_MEMORY_COMMITMENT / (1024 * 1024),
+        measured / (1024 * 1024),
+        per_stream / (1024 * 1024),
+        backlog_resident / (1024 * 1024)
+    );
+}
+
+/// The published commitment is quoted verbatim in prose — `docs/security/threat-model.md`,
+/// `docs/operations/deployment.md`, `server/README.md`, `.env.example` — where nothing
+/// recomputes it. This pins the constant to the figure those documents state, so any change
+/// to a term it is built from (the stream cap, the growth budget, the reorder entry cap,
+/// either channel depth, the delivery cap) lands here and forces the prose to move with it.
+///
+/// It is a lockstep guard against documentation drift, not a check of the arithmetic;
+/// `the_published_session_recv_commitment_is_not_below_what_the_buffers_measure` is what
+/// checks the arithmetic against reality.
+#[test]
+fn the_published_session_recv_commitment_matches_the_figure_the_documentation_quotes() {
     assert_eq!(
-        SESSION_RECV_MEMORY_COMMITMENT, worst_case,
-        "the published commitment ({SESSION_RECV_MEMORY_COMMITMENT} B) no longer matches \
-         what the constants permit ({worst_case} B)"
+        SESSION_RECV_MEMORY_COMMITMENT,
+        450_167_808,
+        "the per-session receive commitment moved to {} MiB; update the figure in \
+         docs/security/threat-model.md, docs/operations/deployment.md, server/README.md \
+         and .env.example in the same change",
+        SESSION_RECV_MEMORY_COMMITMENT / (1024 * 1024)
     );
 }

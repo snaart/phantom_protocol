@@ -250,26 +250,39 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   *growth*, so it is worth 8 MiB of what one session can be made to hold; it does not touch
   the 16 MiB of initial windows 256 streams start with, the 64 MiB of reorder structure a
   peer can pin with tiny segments above a hole it never fills (the byte budget counts payload,
-  the entry cap counts entries), or the 4 MiB delivery backlog. The resident total is
-  **108 MiB per session**, now published as `api::session::SESSION_RECV_MEMORY_COMMITMENT`
-  and computed there from `MAX_STREAMS`, `INITIAL_STREAM_WINDOW`, the growth budget,
-  `MAX_RECV_REORDER` × `REORDER_ENTRY_OVERHEAD_BYTES` and `RECV_DELIVERY_HARD_CAP`, so
-  raising any of them moves the published figure instead of quietly invalidating it. All
-  five constants are now public, and a second test asserts the figure still equals what they
-  permit.
+  the entry cap counts entries), the delivery backlog, or the 321 MiB of per-stream delivery
+  channels that fill when the application reads slower than the peer sends. The resident
+  total is **429 MiB per session**, now published as
+  `api::session::SESSION_RECV_MEMORY_COMMITMENT` and computed there from `MAX_STREAMS`,
+  `INITIAL_STREAM_WINDOW`, the growth budget, `MAX_RECV_REORDER` ×
+  `REORDER_ENTRY_OVERHEAD_BYTES`, `RECV_DELIVERY_HARD_CAP` and the two channel depths, so
+  raising any of them moves the published figure instead of quietly invalidating it.
+
+  Two of those terms had been counted at zero. The delivery backlog was counted in payload
+  bytes with no per-item term, and an item is not a byte: measured against the real queue one
+  costs about 65 B, so a 4 MiB payload cap really admitted around 300 MiB when a peer chose
+  one-byte segments. Every queued item — FIN signals included, since an uncharged item is an
+  uncapped one — is now charged `DELIVERY_ITEM_OVERHEAD_BYTES` on top of its payload, which
+  is what makes the cap bound memory rather than a count. The per-stream delivery channels
+  were outside both the cap and the published figure; they stay outside the cap deliberately
+  (what fills them is the local application not reading, and a bounded channel already bounds
+  itself) but they are now in the figure, where they are three quarters of it. The tests that
+  pin this measure rather than restate: a thread-local counting allocator observes what a real
+  reorder buffer, a real delivery channel and a real delivery queue take at their own caps,
+  and requires the published figure to cover them.
 
   It is a bound **per session**, and nothing divides it between concurrent sessions: a
-  process admitting N sessions commits N × 108 MiB in the worst case, which at the reference
-  server's default `PHANTOM_MAX_SESSIONS=1024` is ~108 GiB. Admission control is what bounds
+  process admitting N sessions commits N × 429 MiB in the worst case, which at the reference
+  server's default `PHANTOM_MAX_SESSIONS=1024` is ~429 GiB. Admission control is what bounds
   the process, so `phantom-server` gained `--max-recv-memory-mib` /
   `PHANTOM_MAX_RECV_MEMORY_MIB`: state the receive-memory figure and the session cap follows
   from it, refusing to start on a budget too small for one session. A process-wide second
   tier over the growth budget was considered and rejected — it would bound 8 GiB of that
-  ~108 GiB by letting one peer's growth decisions pin another peer's window at the 64 KiB
+  ~429 GiB by letting one peer's growth decisions pin another peer's window at the 64 KiB
   initial size, which is a remote peer steering a local control loop. The reasoning is in
   `docs/security/threat-model.md` §5 §D.1, which is also where this whole class of threat
   now has a row; `docs/operations/deployment.md` carries the operator-facing arithmetic and
-  the distinction between the ~512 KiB a typical session occupies and the 108 MiB bound.
+  the distinction between the ~512 KiB a typical session occupies and the 429 MiB bound.
 
 - **A SACK carrying more than 32 islands threw away the one range that retires data.**
   `Stream::received_sack` builds its range list with the contiguous delivered run first —
@@ -312,7 +325,7 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   draws on one handle, so the bound holds rather than merely being intended. Growth remains
   driven by what the application consumed, never by what arrived. What the budget bounds and
   what it does not is set out in the entry below and in `docs/security/threat-model.md`
-  §5 §D.1; the short form is that it is 8 MiB of a 108 MiB per-session commitment, and that
+  §5 §D.1; the short form is that it is 8 MiB of a 429 MiB per-session commitment, and that
   the commitment is per session rather than per process. The round-trip reference
   the interval is derived from is a constant on a receive-only stream, which is the flow
   auto-tuning exists for, because such a stream never measures a round trip of its own. On a
