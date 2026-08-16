@@ -83,10 +83,19 @@ pub const MAX_APP_CHUNK: usize = MAX_INNER_UNFRAGMENTED - PER_PACKET_OVERHEAD;
 /// per-stream delivery slot whose only limit is a slot *count*. A queue bounded
 /// in items holds whatever the items weigh, so the weight has to be bounded here.
 ///
-/// This is the same budget read from the other side: a frame this side would
-/// never emit is one it will not accept. Nothing on the wire changes — the format
-/// is untouched and no field carries a length — it is a receive-side rejection,
-/// so a peer that respects the chunking rule cannot tell it exists.
+/// It is **not** this side's own budget read backwards. "A frame this side would
+/// never emit is one it will not accept" is the tempting formulation and it is
+/// wrong, because it assumes every peer runs this build. The published 0.2.2
+/// chunks at [`LEGACY_APP_CHUNK`], which is 144 bytes more than this build does,
+/// and a gate set to this side's own budget would silently drop every full-size
+/// data frame such a peer sends. Nothing would report it: the frame is refused
+/// before the AEAD, so it is never acknowledged, its retransmits meet the same
+/// gate, and the session simply stops making progress. The ceiling is therefore
+/// the largest frame *any released version* emits, not the largest this one does.
+///
+/// Nothing on the wire changes — the format is untouched and no field carries a
+/// length — it is a receive-side rejection, so a peer that respects the chunking
+/// rule cannot tell it exists.
 ///
 /// Three things set the post-handshake ceiling, and the asserts below hold each
 /// of them under it separately: a full reliable data chunk, which fills the budget
@@ -97,7 +106,22 @@ pub const MAX_APP_CHUNK: usize = MAX_INNER_UNFRAGMENTED - PER_PACKET_OVERHEAD;
 /// are tens of bytes. Handshake messages are far larger, since a `ServerHello`
 /// carries an ML-DSA-65 signature, but they are exchanged before the pump exists
 /// and never reach this gate.
-pub const MAX_RECV_FRAME: usize = MAX_INNER_UNFRAGMENTED;
+pub const MAX_RECV_FRAME: usize = LEGACY_APP_CHUNK + PER_PACKET_OVERHEAD;
+
+/// The application chunk size shipped in 0.2.2, and the reason the receive gate
+/// above is not simply [`MAX_APP_CHUNK`].
+///
+/// That release chunked at a flat 1300 bytes, chosen without reference to the
+/// datagram budget it had to fit — which is the defect that moved the chunk size
+/// to a derived figure in the first place. A 0.2.2 peer is still a legitimate
+/// peer, so its largest frame has to pass, and the two ends of the connection
+/// must agree on what is deliverable even when they are different builds.
+///
+/// This is a compatibility floor and never a target: nothing emits chunks of this
+/// size any more. It can be lowered only when no reachable peer sends them, which
+/// is a release-policy question rather than a code one — see
+/// `docs/policy/versioning.md`.
+pub const LEGACY_APP_CHUNK: usize = 1300;
 
 /// Largest AEAD plaintext a peer can deliver in one frame: [`MAX_RECV_FRAME`]
 /// less the header it carries and the tag it is sealed with.
@@ -121,6 +145,10 @@ const _: () = assert!(MAX_APP_CHUNK + PER_PACKET_OVERHEAD <= MAX_INNER_UNFRAGMEN
 // the kind of claim that stops being true one shape at a time.
 const _: () = assert!(MAX_APP_CHUNK + PER_PACKET_OVERHEAD <= MAX_RECV_FRAME);
 const _: () = assert!(crate::transport::shaping::MAX_SHAPED_WIRE <= MAX_RECV_FRAME);
+// And the shape that is not ours: the largest frame a released peer emits. Held
+// separately from the assert above because the two move independently — lowering
+// this side's chunk size must not narrow what the other side is allowed to send.
+const _: () = assert!(LEGACY_APP_CHUNK + PER_PACKET_OVERHEAD <= MAX_RECV_FRAME);
 const _: () = assert!(
     PacketHeader::SIZE + crate::transport::sack::MAX_SACK_WIRE + AEAD_OVERHEAD <= MAX_RECV_FRAME
 );

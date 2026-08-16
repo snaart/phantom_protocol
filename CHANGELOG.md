@@ -322,8 +322,14 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   application that is not reading.
 
   The receive path now refuses an inbound frame larger than `MAX_RECV_FRAME`
-  (`transport::mtu`), which is the same datagram budget the sender already works to, read
-  from the other end. It is checked in the pump's reader before header protection and before
+  (`transport::mtu`). That ceiling is **not** this side's own chunk budget read backwards:
+  the published 0.2.2 chunks at a flat 1300 bytes, 144 more than this build's derived
+  figure, so a gate set to our own budget would have refused every full-size data frame a
+  released peer sends — before the AEAD, so never acknowledged, with its retransmits meeting
+  the same gate. That session would not fail, it would stop, silently and with nothing in a
+  counter. `MAX_RECV_FRAME` is therefore derived from `LEGACY_APP_CHUNK`, the largest chunk
+  any released version emits, and a compile-time assertion holds it there independently of
+  this side's own budget so that lowering ours cannot narrow what a peer may send. It is checked in the pump's reader before header protection and before
   the AEAD, so an oversized frame costs a length comparison. It is a **drop**, not a
   teardown: nothing has been authenticated at that point, so tearing the session down would
   hand anyone who guesses a connection id a one-datagram kill. A peer that really sends

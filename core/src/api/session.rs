@@ -10723,6 +10723,72 @@ mod tests {
         assert_eq!(data.as_deref(), Some(&b"within budget"[..]));
     }
 
+    /// A frame the size 0.2.2 emits must still be delivered, or the gate breaks every
+    /// session with a peer running the published release.
+    ///
+    /// That release chunks application data at a flat 1300 bytes, 144 more than this
+    /// build's derived budget, so its largest data frame is 1335 bytes on the wire.
+    /// A gate set to this side's own budget would refuse it — before the AEAD, so
+    /// never acknowledged, and its retransmits would meet the same gate. The session
+    /// would not fail: it would stop, with no error on either end and nothing in a
+    /// counter, which is the worst shape a compatibility break can take.
+    ///
+    /// The frame here is built at exactly the released size rather than at
+    /// `MAX_RECV_FRAME`, so the test is about the peer this gate has to admit and not
+    /// about the constant restating itself. Lowering `MAX_RECV_FRAME` to this side's
+    /// own chunk size fails it.
+    #[tokio::test]
+    async fn a_frame_the_released_version_emits_is_still_delivered() {
+        // Both sizes are constants, so the relation between them belongs to the
+        // compile-time assertions beside them in `transport::mtu` rather than here —
+        // one of those already refuses a build where the gate stops admitting the
+        // released chunk, whichever of the two moved.
+        use crate::transport::mtu::{LEGACY_APP_CHUNK, MAX_RECV_FRAME};
+
+        let session_id = fixed_session_id();
+        let (client_inner, server_inner) = paired_sessions(session_id);
+        let (client_t, server_t) = ChannelTransport::pair();
+
+        let server = PhantomSession::from_accepted_server_session(
+            "legacy-chunk-test".to_string(),
+            server_t,
+            server_inner,
+        );
+
+        let client_t = Arc::new(client_t);
+        let drain_t = client_t.clone();
+        let _drainer = tokio::spawn(async move { while drain_t.recv_bytes().await.is_ok() {} });
+
+        let payload = vec![0x5Au8; LEGACY_APP_CHUNK];
+        let frame = encrypt_outgoing_at(&client_inner, session_id, 3, 0, 0, &payload);
+        assert!(
+            frame.len() <= MAX_RECV_FRAME,
+            "a released peer's full-size frame is {} B and the gate admits {MAX_RECV_FRAME} B — \
+             every such peer would stall here",
+            frame.len()
+        );
+        client_t
+            .send_bytes(&frame)
+            .await
+            .expect("send legacy frame");
+
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(5), server.accept_stream())
+                .await
+                .expect("a released peer's frame must open the stream")
+                .expect("accept_stream returned Err");
+
+        let data = tokio::time::timeout(std::time::Duration::from_secs(5), accepted.recv())
+            .await
+            .expect("timeout waiting for recv")
+            .expect("recv returned Err");
+        assert_eq!(
+            data.as_ref().map_or(0, Vec::len),
+            LEGACY_APP_CHUNK,
+            "the released peer's chunk must arrive whole"
+        );
+    }
+
     /// Nothing the pump emits may exceed the frame gate the peer applies, or the gate
     /// would be silently breaking legitimate sessions.
     ///
