@@ -227,6 +227,7 @@ impl Observability {
 
     #[inline]
     pub fn record_unencrypted_dropped(&self, leg: LegType) {
+        self.atomics.record_unencrypted_dropped();
         self.instruments.record_unencrypted_dropped(leg);
     }
 
@@ -281,14 +282,17 @@ mod tests {
         let s = obs.snapshot();
         assert_eq!(s.replay_rejected_total, 0);
         assert_eq!(s.aead_failure_total, 0);
+        assert_eq!(s.unencrypted_dropped_total, 0);
 
         obs.record_replay_rejected(ReplayReason::Duplicate);
         obs.record_replay_rejected(ReplayReason::Duplicate);
         obs.record_aead_failure(LegType::Tcp, AeadAlgorithm::Aes256Gcm);
+        obs.record_unencrypted_dropped(LegType::Tcp);
 
         let s = obs.snapshot();
         assert_eq!(s.replay_rejected_total, 2);
         assert_eq!(s.aead_failure_total, 1);
+        assert_eq!(s.unencrypted_dropped_total, 1);
     }
 
     #[test]

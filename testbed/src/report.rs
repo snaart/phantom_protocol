@@ -549,10 +549,11 @@ pub struct WireCheckSample {
     pub findings: crate::wirecheck::Findings,
     /// The session's own counters at the end of the exchange.
     ///
-    /// `replay_rejected_total` and `aead_failure_total` are the only run-time
-    /// security numbers this check can read; the counter that would show the
-    /// unencrypted-packet gate firing is not among them, which is one of the
-    /// things `findings.encrypted_flag` says.
+    /// Three of them are security numbers: `replay_rejected_total`,
+    /// `aead_failure_total`, and `unencrypted_dropped_total`. The last is the
+    /// only run-time evidence that the `ENCRYPTED` gate ran at all — a refused
+    /// packet is otherwise indistinguishable from one that never arrived, and a
+    /// capture cannot see the flag either way.
     pub session_counters: Option<ClientMetrics>,
 }
 
@@ -590,6 +591,11 @@ pub struct ClientMetrics {
     pub handshake_latency_count: u64,
     pub replay_rejected_total: u64,
     pub aead_failure_total: u64,
+    /// Post-handshake packets refused for arriving without the `ENCRYPTED` flag.
+    /// Carried because it is the only externally visible difference between "the
+    /// gate refused something" and "nothing arrived" — a capture cannot tell them
+    /// apart, since header protection hides the flag it turns on.
+    pub unencrypted_dropped_total: u64,
     pub uptime_secs: u64,
 }
 
@@ -613,6 +619,7 @@ impl From<phantom_protocol::observability::MetricsSnapshotFfi> for ClientMetrics
             handshake_latency_count: s.handshake_latency_count,
             replay_rejected_total: s.replay_rejected_total,
             aead_failure_total: s.aead_failure_total,
+            unencrypted_dropped_total: s.unencrypted_dropped_total,
             uptime_secs: s.uptime_secs,
         }
     }

@@ -151,8 +151,70 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 - **`PhantomUdpListener::accept()` now takes an owned receiver** (`self: Arc<Self>`
   instead of `self: &Arc<Self>`) — required by its new UniFFI export. Rust callers
   write `listener.clone().accept().await`. Breaking, within the pre-1.0 0.2.x window.
+- **`MetricsSnapshotFfi` gained a field, which breaks every FFI consumer built against
+  0.2.2 — and breaks the C one silently.** `unencrypted_dropped_total` (see Added) sits
+  between `aead_failure_total` and `uptime_secs`, and a UniFFI record is lowered as its
+  fields in declaration order with nothing on the wire naming them. Nothing catches this at
+  load time: UniFFI's per-function checksums are computed from the function's name and the
+  *names* of its argument and return types, so adding a field to a record leaves every
+  checksum and the contract version unchanged. Python, Swift and Kotlin fail at the call
+  instead — their generated lift asserts the buffer was fully consumed and raises "junk
+  data left in buffer" / `incompleteData` — which is loud but says nothing about the cause.
+  A C consumer walking the buffer per the layout documented in
+  `tests/bindings/c/phantom_protocol.h` gets no error at all: it reads the new counter as
+  `uptime_secs` and stops one field short.
+
+  What a consumer must do: regenerate. `tests/bindings/generate_{python,swift,kotlin}.sh`
+  produce the updated glue and the in-tree bindings are already regenerated with it; C
+  consumers must re-copy `phantom_protocol.h` and re-check any hand-written decoder against
+  the `PhantomMetricsSnapshotFfi` layout in it. Bindings and native library must be shipped
+  as a matched pair — a new `libphantom_protocol` under an old binding is the failure above.
+  Breaking, within the pre-1.0 0.2.x window.
 
 ### Added
+
+- **`unencrypted_dropped_total` in the metrics snapshot, and an always-on test that drives the
+  gate it counts.** The receive path drops every unencrypted post-handshake packet — the
+  stripped-flag downgrade defence, and the one thing standing between a forged standalone
+  `FIN` and a torn-down stream. Two things were wrong with how that was carried. The drop was
+  recorded only into an OpenTelemetry instrument, which is a no-op ZST unless the
+  `telemetry-otel` feature is on, so on a default build neither an operator nor a test could
+  see the gate fire; a dropped frame leaves no other trace, and "nothing arrived" and "we
+  refused what arrived" looked identical. It now increments a lock-free counter alongside
+  `replay_rejected_total` and `aead_failure_total` and surfaces through `MetricsSnapshot` /
+  `MetricsSnapshotFfi`, so it is readable from every language binding with no exporter
+  configured. The FFI record gains one `u64` field, and the Python, Swift, Kotlin and
+  hand-curated C surfaces are regenerated with it. The testbed's own `ClientMetrics` carries
+  it too, so a wire-capture record now shows whether the gate fired — the one thing a capture
+  cannot establish, since header protection hides the flag the gate reads.
+
+  And `core/tests/security_invariants.rs` — the file this project points auditors at as the
+  place its numbered invariants are pinned — did not drive that receive path at all. What it
+  held was the neighbouring AEAD property, that the flag cannot be stripped from a *genuine*
+  packet without breaking the tag, which is a different statement from a freshly forged
+  unencrypted packet being refused. The gate was covered by two in-crate tests under
+  `cargo test --lib`, so it was gated; it just was not where a reviewer following the
+  documentation would look, and an inventory that does not contain what it claims turns a
+  security review into theatre. The suite now runs a live session against a hand-driven
+  server and puts four frames on the wire, all on an `open_stream()` stream — the only place
+  a `FIN` means anything, since the delivery router discards a close for the reserved
+  raw-app ids and the `recv()` behind them has no EOF to deliver. An empty-payload forged
+  `FIN`, which on the v6 wire cannot reach the flag gate at all because header protection
+  samples sixteen ciphertext bytes it does not have; the same forgery at the smallest size
+  the wire admits, laid out so that a receiver skipping the gate would hand its bytes to the
+  application; an authentic frame, whose delivery is what keeps the test from passing on a
+  receive path that drops everything; and a second authentic frame on the same stream.
+
+  The last two fail for different regressions, which is the reason both are there. Deleting
+  the gate delivers the forgery's bytes and the third assertion reads `downgraded!!` where
+  it wanted `authentic`. A gate that refuses the bytes but still records the `FIN` leaves
+  that assertion passing — the `FIN`'s EOF is released only once the in-order cursor passes
+  its offset, and it is the authentic frame that advances the cursor — and surfaces one
+  frame later as a `None` in place of the fourth. Both were run: the gate was removed, then
+  narrowed to note the `FIN` only, and each failure was observed where predicted.
+
+  The always-on suite is now 64 tests; `CONTRIBUTING.md`, `README.md` and the Common Criteria
+  mapping carried 60.
 
 - **The testbed's raw UDP controls now report a reorder *distance* distribution, in both
   directions.** They counted a datagram as reordered when it arrived below the highest

@@ -4917,6 +4917,8 @@ data class MetricsSnapshotFfi (
     , 
     var `aeadFailureTotal`: kotlin.ULong
     , 
+    var `unencryptedDroppedTotal`: kotlin.ULong
+    , 
     var `uptimeSecs`: kotlin.ULong
     
 ){
@@ -4952,6 +4954,7 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
         )
     }
 
@@ -4973,6 +4976,7 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.allocationSize(value.`handshakeLatencyCount`) +
             FfiConverterULong.allocationSize(value.`replayRejectedTotal`) +
             FfiConverterULong.allocationSize(value.`aeadFailureTotal`) +
+            FfiConverterULong.allocationSize(value.`unencryptedDroppedTotal`) +
             FfiConverterULong.allocationSize(value.`uptimeSecs`)
     )
 
@@ -4994,6 +4998,7 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.write(value.`handshakeLatencyCount`, buf)
             FfiConverterULong.write(value.`replayRejectedTotal`, buf)
             FfiConverterULong.write(value.`aeadFailureTotal`, buf)
+            FfiConverterULong.write(value.`unencryptedDroppedTotal`, buf)
             FfiConverterULong.write(value.`uptimeSecs`, buf)
     }
 }

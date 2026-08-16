@@ -8,7 +8,8 @@
 //! Scope: this struct mirrors the lock-free `HotPathAtomics` — packet /
 //! byte / timing totals, the session/stream gauges, the handshake
 //! sum+count fields, and the always-on security counters
-//! (`replay_rejected_total`, `aead_failure_total`). The snapshot is always
+//! (`replay_rejected_total`, `aead_failure_total`,
+//! `unencrypted_dropped_total`). The snapshot is always
 //! available regardless of the `telemetry-otel` feature, since the atomics
 //! always exist. The labeled OTel instruments in `instruments.rs` carry
 //! the same events with attribution; both paths are populated together.
@@ -45,10 +46,15 @@ pub struct MetricsSnapshot {
     pub handshake_latency_count: u64,
 
     /// Always-on security counters. Populated by the `Observability` facade's
-    /// `record_replay_rejected` / `record_aead_failure` methods regardless of
-    /// whether the `telemetry-otel` feature is enabled.
+    /// `record_replay_rejected` / `record_aead_failure` /
+    /// `record_unencrypted_dropped` methods regardless of whether the
+    /// `telemetry-otel` feature is enabled.
     pub replay_rejected_total: u64,
     pub aead_failure_total: u64,
+    /// Post-handshake packets dropped for arriving without `ENCRYPTED`
+    /// (Invariant 2, the stripped-flag downgrade defence). A non-zero value on a
+    /// healthy peer means someone on the path is rewriting header flags.
+    pub unencrypted_dropped_total: u64,
 
     pub uptime_secs: u64,
 }
@@ -85,6 +91,7 @@ impl Default for MetricsSnapshot {
             handshake_latency_count: 0,
             replay_rejected_total: 0,
             aead_failure_total: 0,
+            unencrypted_dropped_total: 0,
             uptime_secs: 0,
         }
     }
@@ -160,6 +167,7 @@ impl MetricsSnapshot {
             handshake_latency_count: h.handshake_latency_count(),
             replay_rejected_total: h.replay_rejected_total(),
             aead_failure_total: h.aead_failure_total(),
+            unencrypted_dropped_total: h.unencrypted_dropped_total(),
             uptime_secs: h.uptime_secs(),
         }
     }
@@ -200,6 +208,7 @@ pub struct MetricsSnapshotFfi {
     pub handshake_latency_count: u64,
     pub replay_rejected_total: u64,
     pub aead_failure_total: u64,
+    pub unencrypted_dropped_total: u64,
     pub uptime_secs: u64,
 }
 
@@ -223,6 +232,7 @@ impl From<MetricsSnapshot> for MetricsSnapshotFfi {
             handshake_latency_count: s.handshake_latency_count,
             replay_rejected_total: s.replay_rejected_total,
             aead_failure_total: s.aead_failure_total,
+            unencrypted_dropped_total: s.unencrypted_dropped_total,
             uptime_secs: s.uptime_secs,
         }
     }
@@ -278,6 +288,7 @@ mod tests {
         assert_eq!(ffi.handshake_latency_count, 0);
         assert_eq!(ffi.replay_rejected_total, 0);
         assert_eq!(ffi.aead_failure_total, 0);
+        assert_eq!(ffi.unencrypted_dropped_total, 0);
         assert_eq!(ffi.uptime_secs, 0);
     }
 
@@ -295,6 +306,7 @@ mod tests {
         h.record_handshake_failure();
         h.record_replay_rejected();
         h.record_aead_failure();
+        h.record_unencrypted_dropped();
 
         let snap = MetricsSnapshot::capture(&h);
         let ffi = snap.to_ffi();
@@ -316,6 +328,7 @@ mod tests {
         assert_eq!(ffi.handshake_latency_count, 1);
         assert_eq!(ffi.replay_rejected_total, 1);
         assert_eq!(ffi.aead_failure_total, 1);
+        assert_eq!(ffi.unencrypted_dropped_total, 1);
     }
 
     #[test]

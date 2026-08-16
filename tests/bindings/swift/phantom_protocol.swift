@@ -3007,11 +3007,12 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
     public var handshakeLatencyCount: UInt64
     public var replayRejectedTotal: UInt64
     public var aeadFailureTotal: UInt64
+    public var unencryptedDroppedTotal: UInt64
     public var uptimeSecs: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(packetsSent: UInt64, packetsRecv: UInt64, bytesSent: UInt64, bytesRecv: UInt64, avgEncryptNs: UInt64, avgDecryptNs: UInt64, encryptCount: UInt64, decryptCount: UInt64, rttUsPath0: UInt64, activeSessions: Int64, activeStreams: Int64, handshakesSuccess: UInt64, handshakesFailure: UInt64, handshakeLatencyNsSum: UInt64, handshakeLatencyCount: UInt64, replayRejectedTotal: UInt64, aeadFailureTotal: UInt64, uptimeSecs: UInt64) {
+    public init(packetsSent: UInt64, packetsRecv: UInt64, bytesSent: UInt64, bytesRecv: UInt64, avgEncryptNs: UInt64, avgDecryptNs: UInt64, encryptCount: UInt64, decryptCount: UInt64, rttUsPath0: UInt64, activeSessions: Int64, activeStreams: Int64, handshakesSuccess: UInt64, handshakesFailure: UInt64, handshakeLatencyNsSum: UInt64, handshakeLatencyCount: UInt64, replayRejectedTotal: UInt64, aeadFailureTotal: UInt64, unencryptedDroppedTotal: UInt64, uptimeSecs: UInt64) {
         self.packetsSent = packetsSent
         self.packetsRecv = packetsRecv
         self.bytesSent = bytesSent
@@ -3029,6 +3030,7 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
         self.handshakeLatencyCount = handshakeLatencyCount
         self.replayRejectedTotal = replayRejectedTotal
         self.aeadFailureTotal = aeadFailureTotal
+        self.unencryptedDroppedTotal = unencryptedDroppedTotal
         self.uptimeSecs = uptimeSecs
     }
 
@@ -3065,6 +3067,7 @@ public struct FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer {
                 handshakeLatencyCount: FfiConverterUInt64.read(from: &buf), 
                 replayRejectedTotal: FfiConverterUInt64.read(from: &buf), 
                 aeadFailureTotal: FfiConverterUInt64.read(from: &buf), 
+                unencryptedDroppedTotal: FfiConverterUInt64.read(from: &buf), 
                 uptimeSecs: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -3087,6 +3090,7 @@ public struct FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.handshakeLatencyCount, into: &buf)
         FfiConverterUInt64.write(value.replayRejectedTotal, into: &buf)
         FfiConverterUInt64.write(value.aeadFailureTotal, into: &buf)
+        FfiConverterUInt64.write(value.unencryptedDroppedTotal, into: &buf)
         FfiConverterUInt64.write(value.uptimeSecs, into: &buf)
     }
 }
