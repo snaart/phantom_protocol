@@ -780,11 +780,16 @@ fn tampered_epoch_or_path_id_is_rejected() {
     assert!(server.decrypt_packet(&tampered_path, &ct2, &[]).is_err());
 }
 
-/// Replay window: re-feeding a fresh ciphertext that reuses an
-/// already-accepted `(stream_id, sequence)` must fail with
-/// `CoreError::ReplayDetected`, and the per-session counter must increment.
-/// The window keys on `(stream_id, sequence)` only — independent of epoch /
-/// path_id.
+/// Replay window: re-feeding a fresh ciphertext that reuses an already-accepted
+/// packet number must fail with `CoreError::ReplayDetected`, and the per-session
+/// counter must increment. There is one window per direction, keyed on the u64
+/// `packet_number` alone — not per stream, and independent of epoch and path_id;
+/// `per_direction_window_accepts_interleaved_streams` is the test for that half.
+///
+/// What this does not establish is the *ordering* against the AEAD open (the other
+/// half of Invariant 4). The replayed ciphertext here is freshly sealed and opens
+/// cleanly, so a window consulted before the open would reject it identically. The
+/// ordering is a property of `Session::decrypt_packet`'s structure.
 #[test]
 fn replay_window_rejects_duplicate_sequence() {
     use phantom_protocol::CoreError;
@@ -1563,6 +1568,14 @@ fn concurrent_rekeys_keep_epoch_and_key_in_lockstep() {
 }
 
 // ── Multi-path / migration (Phase 4.2) ────────────────────────────────────
+//
+// The four path-validation tests below pin the state-machine half of Invariant 6:
+// a path is not trusted until it answers its own challenge, a wrong answer fails it
+// for good, and an unchallenged path cannot be completed at all. They say nothing
+// about the other half — that the comparison is constant-time. A functional test
+// cannot: `subtle::ConstantTimeEq` and `==` agree on every input, so a rewrite to
+// `==` would leave all four green. That half is held by code review, recorded in
+// `docs/compliance/constant-time-audit.md`.
 
 /// New paths must NOT be implicitly trusted. After session creation,
 /// path 0 is the validated default; an unfamiliar path id starts at
@@ -2758,10 +2771,6 @@ impl phantom_protocol::api::session::SessionTransport for PipeTransport {
     }
 }
 
-/// Reserved stream id of the connectionless `send()` / `recv()` surface. Mirrors the
-/// crate-private `RAW_APP_STREAM_ID`; a frame stamped with it is what `recv()` returns.
-const RAW_APP_STREAM: u16 = 1;
-
 /// **Invariant 2.** A post-handshake packet that arrives without `ENCRYPTED` is
 /// dropped by the receive path — it is never decrypted, never routed to a stream,
 /// and its `FIN` never closes one. This is the stripped-flag downgrade defence, and
@@ -2769,7 +2778,14 @@ const RAW_APP_STREAM: u16 = 1;
 /// carrying no application data, which under the pre-M-2 rule (drop only *non-empty*
 /// unencrypted payloads) would have torn a stream down without any AEAD verification.
 ///
-/// Four frames go down the wire, in order, and the client's own `recv()` is the
+/// The frames ride an `open_stream()` stream rather than the reserved raw-app id,
+/// because that is the only place a FIN means anything: the delivery router discards
+/// `DeliverItem::Close` for ids 0 and 1 outright ("not used in the current
+/// protocol"), and the raw-app `recv()` reads a plain channel that has no EOF at
+/// all. A forged FIN aimed there could not close a thing even with the gate deleted,
+/// so an assertion about it would be unfalsifiable.
+///
+/// Four frames go down the wire, in order, and the stream's own `recv()` is the
 /// barrier that proves each was processed before the next was read:
 ///
 ///  1. a forged FIN with a literally empty payload. On the v6 wire this cannot even
@@ -2783,16 +2799,26 @@ const RAW_APP_STREAM: u16 = 1;
 ///     offset 0, so a receiver that skipped the gate would hand `downgraded!!` to
 ///     the application;
 ///  3. a genuine `ENCRYPTED | RELIABLE` frame on the same stream and path;
-///  4. a second genuine frame, the next segment on the same stream, which arrives
-///     only if the forged FIN did not half-close the stream. Discarding a forgery's
-///     bytes and ignoring its FIN are two separate obligations, so they are asserted
-///     separately.
+///  4. a second genuine frame, the next segment on the same stream.
 ///
-/// The two-sidedness is (3) and (4): a receive path that dropped everything would
-/// pass any assertion about the forgeries and fail both of these. Deleting the gate
-/// fails the test three ways over — `recv()` yields the forged bytes instead of the
-/// authentic ones, the FIN that rode with them closes the stream out from under (4),
-/// and the drop counter reads zero.
+/// (3) and (4) fail for different regressions, which is why both are here.
+///
+/// (3) is what a *deleted* gate breaks: the forgery's bytes are delivered and the
+/// stream yields `downgraded!!` where `authentic` was expected.
+///
+/// (4) is what a *partial* gate breaks — one that refuses the forgery's payload but
+/// still records its FIN. That the two come apart at all is a consequence of the FIN
+/// release being order-gated: `note_remote_fin` only files the offset, and
+/// `take_in_order_fin` releases the EOF later, once the in-order cursor has passed
+/// it. So a gate that drops the bytes and notes the FIN leaves (3) intact — the
+/// authentic frame is delivered, and is itself what advances the cursor past the
+/// forged offset — and surfaces one frame later as `Ok(None)` in place of (4). Only
+/// (4) catches that; hoisting the FIN bookkeeping above the gate, on the reasoning
+/// that a FIN arriving over a reorder gap must not be lost, produces exactly it.
+///
+/// Both are also the two-sidedness: a receive path that dropped *everything* would
+/// satisfy any assertion about the forgeries and fail (3) and (4) both. The drop
+/// counter is the third leg — it separates "refused" from "never arrived".
 #[tokio::test]
 async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() {
     use phantom_protocol::api::PhantomSession;
@@ -2852,13 +2878,23 @@ async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() 
 
     let session_id = *server_session.id();
 
+    // The target stream. `open_stream()` registers it in the demux and in the stream
+    // table the pump reads, both of which the session created before the pump was
+    // spawned, so no wire traffic and no cooperation from the server side is needed
+    // to make the client route frames stamped with this id to it.
+    let app_stream = session.open_stream();
+    let target: u16 = app_stream
+        .stream_id()
+        .try_into()
+        .expect("a locally-opened stream id fits the wire field");
+
     // (1) The empty-payload forged FIN. Unmasked on purpose: there is nothing to
     // mask it against, since header protection derives its mask from a ciphertext
     // sample this frame does not have.
     let empty_fin = PhantomPacket::new(
         PacketHeader::new(
             session_id,
-            RAW_APP_STREAM,
+            target,
             1,
             PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::FIN),
         ),
@@ -2884,7 +2920,7 @@ async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() 
     let forged_fin = PhantomPacket::new(
         PacketHeader::new(
             session_id,
-            RAW_APP_STREAM,
+            target,
             2,
             PacketFlags::new(PacketFlags::RELIABLE | PacketFlags::FIN),
         ),
@@ -2902,7 +2938,7 @@ async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() 
     // its gap-free stream offset is 0.
     let genuine_header = PacketHeader::new(
         session_id,
-        RAW_APP_STREAM,
+        target,
         3,
         PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     )
@@ -2922,12 +2958,13 @@ async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() 
 
     // The pipe is FIFO and the reader task drains it in order, so a delivered
     // authentic payload proves both forgeries were seen and disposed of first. The
-    // timeout is only there so that a gate-less build fails instead of hanging when
-    // the forged FIN closes the stream the authentic frame needs.
-    let delivered = tokio::time::timeout(Duration::from_secs(10), session.recv())
+    // timeout is only there so that a build which swallowed the frame fails instead
+    // of hanging.
+    let delivered = tokio::time::timeout(Duration::from_secs(10), app_stream.recv())
         .await
         .expect("the authentic frame is delivered")
-        .expect("recv");
+        .expect("recv")
+        .expect("the stream is open, so this is data and not a peer FIN");
     assert_eq!(
         delivered, b"authentic",
         "the forged unencrypted frame must not reach the application"
@@ -2935,15 +2972,15 @@ async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() 
 
     // (4) The other half of what a forged FIN would have done. Not delivering its
     // bytes is only one of the two effects the gate prevents; the other is the FIN
-    // itself, which would have half-closed the stream and made everything after it
-    // unreachable. A second authentic frame on the same stream is what distinguishes
-    // "the bytes were discarded" from "the stream is still open", and only the second
-    // is the property Invariant 2 states. Its prefix is 1, not the byte length of the
+    // itself, which half-closes the stream and makes everything after it unreachable.
+    // A second authentic frame is what separates "the forged bytes were discarded"
+    // from "the forged FIN was not acted on" — a receiver that did the first but not
+    // the second returns `Ok(None)` here. Its prefix is 1, not the byte length of the
     // frame before it: the `[stream_offset: u32 BE]` field the reliable path reorders
     // on counts segments, one per frame, whatever each one carries.
     let second_header = PacketHeader::new(
         session_id,
-        RAW_APP_STREAM,
+        target,
         4,
         PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
     )
@@ -2961,13 +2998,15 @@ async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() 
         .await
         .expect("send follow-up frame");
 
-    let after_fin = tokio::time::timeout(Duration::from_secs(10), session.recv())
+    let after_fin = tokio::time::timeout(Duration::from_secs(10), app_stream.recv())
         .await
-        .expect("the stream is still open after the forged FIN")
+        .expect("a follow-up frame arrives")
         .expect("recv");
     assert_eq!(
-        after_fin, b"still-open",
-        "the forged FIN must not have closed the stream"
+        after_fin.as_deref(),
+        Some(&b"still-open"[..]),
+        "the forged FIN must not have half-closed the stream — `None` here is the \
+         peer's EOF, released from a FIN that was never authenticated"
     );
 
     // The counter is what separates "the gate refused something" from "nothing ever

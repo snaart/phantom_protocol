@@ -557,7 +557,19 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   been hardened against real-world adversarial network conditions or externally
   reviewed — treat the data plane as functional-but-not-battle-tested.
 - **Negative-security suite: 64 always-on tests** in
-  `core/tests/security_invariants.rs`, pinning every documented invariant.
+  `core/tests/security_invariants.rs`, covering most — not all — of the eleven
+  numbered security invariants: identity pinning, the unencrypted-packet receive
+  gate, replay rejection, rekey and epoch handling, path validation, transcript
+  binding of the 0-RTT verdict, and 0-RTT ticket handling. Three are pinned
+  elsewhere and deliberately not here: the two FIPS invariants (build-mode
+  transcript binding, power-on self-tests) belong to a build this suite does not
+  compile and are gated by the `fips-feature` CI job, and the TLS-mimicry parser
+  bounds ride the off-by-default `mimicry` feature and its own job. Two more are
+  pinned in part — the AEAD nonce ceiling (2^48) is not reachable from a test, so
+  what is pinned is the counter feeding it, and the path-validation tests cover
+  the state machine rather than its constant-timeness, which is an audit
+  (`docs/compliance/constant-time-audit.md`) and not a measurement. Where only
+  part of an invariant is pinned, the tests say so.
   Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
   400+ library unit tests, and `#[ignore]`-gated loopback integration suites
   (TCP, UDP — including injected loss/reorder via the fault transport — WASI,
