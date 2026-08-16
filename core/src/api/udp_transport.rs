@@ -51,12 +51,32 @@ const HANDSHAKE_INITIAL_RTO: Duration = Duration::from_secs(1);
 /// the last retransmit a full second to be answered.
 ///
 /// The ceiling is sized against [`CLIENT_HANDSHAKE_DEADLINE`], the session-level bound this
-/// shim runs underneath: the client spends roughly 0.6 s generating its hybrid keypairs
-/// before the first flight leaves, so 0.6 s + 8 s of waiting still refuses inside the 10 s
-/// deadline with margin. Spending more than that would mean the last retransmit is sent
-/// after the session has already abandoned the connect — the work would be pure waste — and
-/// the reported error would come from the session's timer rather than from the transport
-/// that actually knows the path went silent.
+/// shim runs underneath. What precedes the first flight is one hybrid KEM keypair and one
+/// hybrid signing keypair: 48.7 µs and 225.7 µs at the criterion medians of
+/// `transport_bench`'s `pqc_keygen` group on an Apple Silicon release build, so under 0.3 ms
+/// together — around 10 ms in an unoptimized test build. Key generation is therefore not a
+/// term in this comparison at all, and 8 s of waiting refuses with the better part of two
+/// seconds of the deadline still in hand. (The half-second a handshake takes end to end on
+/// the measured WAN route is round trips, not key generation; attributing it to the keypairs
+/// is what made this margin look far tighter than it is.) Spending more than the budget
+/// would mean the last retransmit is sent after the session has already abandoned the
+/// connect — the work would be pure waste — and the reported error would come from the
+/// session's timer rather than from the transport that actually knows the path went silent.
+///
+/// The budget is also what a rejection costs. `run_client_handshake` reads past a bounded
+/// number of `ServerReject`s before believing one, and over PhantomUDP each of those reads
+/// is answered only once this schedule retransmits the flight — a version check is
+/// stateless, so a retransmitted hello is rejected again. A server that does not speak our
+/// version is therefore believed after three of these intervals rather than three 400 ms
+/// ones: 3.0 s measured, against 1.2 s before. That is accepted rather than worked around.
+/// The only way to shorten it is a first interval short enough to be the timer that
+/// abandoned honest connects on a path whose minimum round trip was 267 ms, and a rare
+/// terminal outcome paying two extra seconds is the cheaper side of that trade. Carrying
+/// one schedule across the successive
+/// reads instead of restarting it per read does not help either — it moves the retransmits
+/// to 1 s, 3 s and 7 s, so the same case costs 7 s. Should the path also fall silent after
+/// the reject, the cost is the whole budget, exactly as for any silent path, because the
+/// loop gives up on the first read that fails rather than on the fourth.
 ///
 /// [`CLIENT_HANDSHAKE_DEADLINE`]: crate::api::session::CLIENT_HANDSHAKE_DEADLINE
 const HANDSHAKE_RETRANSMIT_BUDGET: Duration = Duration::from_secs(8);
@@ -332,13 +352,21 @@ impl SessionTransport for UdpClientTransport {
         let mut buf_prev: Vec<u8> = Vec::new();
         // Handshake-phase retransmission state: how many intervals have expired (which sets
         // the backoff) and how much waiting they have cost (which is what the budget is
-        // charged against). Both are deliberately monotonic across the loop's `continue`
-        // paths: a datagram that does not complete a frame — a fragment of a reply whose
-        // remaining pieces were lost, an advisory ICMP error, a malformed spray — must not
-        // buy more time, or an off-path source could hold the shim past the session deadline
-        // by trickling bytes at it.
+        // charged against).
         let mut attempt = 0u32;
         let mut spent = Duration::ZERO;
+        // When the current interval expires, as an absolute instant rather than a length.
+        //
+        // The loop below re-enters its `select!` on every datagram that does not complete a
+        // frame — a fragment whose siblings were lost, an advisory ICMP error, an
+        // undecodable spray — and each entry builds the timer future afresh. A future built
+        // from a *length* restarts the interval on every such re-entry, so anything arriving
+        // faster than the interval postpones the timer for as long as it keeps arriving, and
+        // the budget is never charged. The socket is unconnected and accepts datagrams from
+        // any source, so that "anything" is a quantity an off-path sender picks. Anchoring
+        // the interval to an instant computed once makes the re-entry cost nothing: the
+        // schedule advances on the clock, not on inbound traffic.
+        let mut retransmit_at: Option<tokio::time::Instant> = None;
         loop {
             let in_handshake = self.phase.load(Ordering::Relaxed) == PHASE_HANDSHAKE;
             // Snapshot both sockets as owned `Arc`s (never hold an `ArcSwap` guard
@@ -365,6 +393,7 @@ impl SessionTransport for UdpClientTransport {
                 let Some(wait) = next_handshake_wait(attempt, spent) else {
                     return Err(CoreError::Timeout);
                 };
+                let deadline = *retransmit_at.get_or_insert(tokio::time::Instant::now() + wait);
                 tokio::select! {
                     // `biased;` polls the recv arm first: the RTO must be a true
                     // "no data arrived for the whole interval" timer, not a coin-flip against an
@@ -385,16 +414,22 @@ impl SessionTransport for UdpClientTransport {
                             return Err(CoreError::NetworkError(format!("udp recv: {e}")))
                         }
                     },
-                    _ = tokio::time::sleep(wait) => {
+                    _ = tokio::time::sleep_until(deadline) => {
                         spent = spent.saturating_add(wait);
                         attempt = attempt.saturating_add(1);
                         // The budget can only be exhausted by a wait that was clipped to
                         // land on it, so this is the give-up point rather than the top of
                         // the loop: retransmitting here would send a flight with no time
                         // left to answer it.
-                        if next_handshake_wait(attempt, spent).is_none() {
+                        let Some(next) = next_handshake_wait(attempt, spent) else {
                             return Err(CoreError::Timeout);
-                        }
+                        };
+                        // The next interval hangs off the deadline that just passed, not off
+                        // the current instant, so the retransmits themselves do not push the
+                        // schedule out: the sum of the intervals actually waited is the
+                        // budget, which is what makes the comparison against the session
+                        // deadline hold in practice and not just on paper.
+                        retransmit_at = Some(deadline + next);
                         for d in self.last_sent.lock().await.iter() {
                             let _ = active.send_to(d, server).await;
                         }
@@ -1110,6 +1145,55 @@ mod tests {
         assert!(
             elapsed >= HANDSHAKE_RETRANSMIT_BUDGET / 2,
             "gave up after only {elapsed:?}; the retransmission schedule was not spent"
+        );
+    }
+
+    /// The client socket is unconnected, so anyone who can reach it can put datagrams on
+    /// it; a datagram that fails to decode is dropped and the read resumes. That resumption
+    /// must not buy the sender any time. Here nothing the spray sends ever completes a
+    /// frame, and the honest peer never answers, so the read has to refuse on its own
+    /// schedule — a timer rearmed by arriving bytes would instead last exactly as long as
+    /// the spray does, which is a quantity the sender picks.
+    #[tokio::test]
+    async fn an_off_path_spray_cannot_postpone_the_handshake_refusal() {
+        let black_hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = black_hole.local_addr().unwrap();
+        let client = UdpClientTransport::connect(server).await.unwrap();
+        client.send_bytes(b"client-hello").await.unwrap();
+
+        // A third socket, neither end of the session: it learns where to aim from the
+        // flight the black hole receives, which is all an on-path observer needs.
+        let off_path = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spray = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (_n, victim) = black_hole.recv_from(&mut buf).await.unwrap();
+            loop {
+                // Four bytes cannot hold an envelope header, so this is dropped by the
+                // decode and influences nothing but the timer.
+                let _ = off_path.send_to(&[0xFFu8; 4], victim).await;
+                tokio::time::sleep(HANDSHAKE_INITIAL_RTO / 10).await;
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            client.recv_bytes(),
+        )
+        .await;
+        spray.abort();
+        let elapsed = started.elapsed();
+
+        let outcome =
+            outcome.expect("a spray of undecodable datagrams held the read past the deadline");
+        assert!(
+            matches!(outcome, Err(CoreError::Timeout)),
+            "a path that never answers is a Timeout, got {outcome:?}"
+        );
+        assert!(
+            elapsed < crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            "the spray stretched the refusal to {elapsed:?}, past the {:?} session deadline",
+            crate::api::session::CLIENT_HANDSHAKE_DEADLINE
         );
     }
 

@@ -368,19 +368,34 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   transmission with no round-trip sample: a 1 s initial timeout, doubling on every expiry
   (RFC 6298 §5.5, RFC 9002 §6.2.1), bounded by a total of 8 s. That spends as 1 s → 3 s → 7 s
   — three retransmits, four flights in all, against seven flights before — and gives up at
-  8 s, which with the roughly 0.6 s the client spends generating its hybrid keypairs still
-  refuses inside the 10 s deadline with margin, and leaves the last retransmit a full second
-  to be answered. Client patience against a slow path goes from 2.8 s to 8 s while the
-  duplicate flights a slow path provokes are more than halved.
+  8 s, leaving the last retransmit a full second to be answered. Nothing meaningful precedes
+  the first flight: the two hybrid keypairs the client generates measure 48.7 µs and 225.7 µs
+  at the criterion medians of `transport_bench`'s `pqc_keygen` group on an Apple Silicon
+  release build, under 0.3 ms together, so the 8 s refuses with most of two seconds of the
+  10 s deadline still in hand. (The half-second a handshake takes end to end on the measured
+  route is round trips; it is not key generation, and reading it as key generation is what
+  made this margin look tight.) Client patience against a slow path goes from 2.8 s to 8 s
+  while the duplicate flights a slow path provokes are more than halved.
+
+  What it costs is the speed of a refusal. A `ServerReject` is read past up to three times
+  before the client believes it, and over PhantomUDP each of those reads is answered only
+  once the schedule retransmits the flight — a version check is stateless, so a retransmitted
+  hello is rejected again — which makes a server that does not speak our version take 3.0 s
+  to be believed where the old timer took 1.2 s. That is accepted: the only way to shorten it
+  is the short first interval that abandoned honest connects, and if the path also falls
+  silent after the reject the cost is the 8 s any silent path costs, because the loop gives up
+  on the first read that fails.
 
   Nothing in the schedule is derived from anything the peer supplies. A round-trip sample is
   the interval between our transmission and *its* reply, so learning from one would let a
   peer that answers slowly dictate our timer; the handshake is a few flights long and has no
-  sample for the first one regardless, so the fixed conservative start costs nothing. For the
-  same reason the schedule is now monotonic across the receive loop's retry paths — a
-  datagram that does not complete a frame no longer resets the budget, so an off-path source
-  cannot hold the shim open past the session deadline by trickling bytes at it. The wire is
-  unchanged: this is a local timer, not a negotiated parameter.
+  sample for the first one regardless, so the fixed conservative start costs nothing. Nor can
+  a peer stretch the schedule by arriving: the client socket is unconnected, the loop resumes
+  after every datagram that fails to complete a frame, and a timer built from a *length*
+  restarts its interval on each resumption — so it is now an absolute deadline computed once
+  and carried across those resumptions, and a source that sprays undecodable datagrams faster
+  than the interval no longer postpones the refusal at all. The wire is unchanged: this is a
+  local timer, not a negotiated parameter.
 
   No server-side change accompanies it. A retransmitted `ClientHello` carries the same
   bootstrap connection id, so the demux routes it to the existing session rather than opening

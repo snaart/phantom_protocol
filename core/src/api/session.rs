@@ -5963,6 +5963,70 @@ mod tests {
         );
     }
 
+    /// A rejection is a definitive answer, so the client must not spend the whole connect
+    /// arriving at it. The tolerance loop reads past up to `MAX_CLIENT_REJECT_ROUNDS`
+    /// rejects before it believes one, and over PhantomUDP each of those reads is answered
+    /// only after the transport retransmits the flight — so the cost of the reject path is
+    /// set by the handshake retransmission schedule, and this pins that it stays well
+    /// inside the deadline the session would otherwise report a timeout at.
+    ///
+    /// The peer here answers every flight, which is what a server that does not speak the
+    /// client's version does: the version check is stateless, so a retransmitted hello is
+    /// rejected again rather than ignored.
+    #[tokio::test]
+    async fn a_rejecting_server_is_believed_well_inside_the_session_deadline() {
+        use crate::api::udp_transport::UdpClientTransport;
+        use crate::transport::handshake::{ServerReject, ServerReply};
+        use crate::transport::phantom_udp::datagram::{
+            encode_datagrams, push_datagram, FragmentAssembler,
+        };
+        use crate::transport::phantom_udp::envelope::PacketType;
+
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+        // The reject path errors before any key verification, so any key works.
+        let (_sk, expected_vk) = crate::crypto::hybrid_sign::HybridSigningKey::generate();
+
+        let serve = tokio::spawn(async move {
+            let reject = ServerReply::Reject(ServerReject::unsupported_version())
+                .to_wire()
+                .unwrap();
+            let mut asm = FragmentAssembler::new();
+            let mut buf = vec![0u8; 2048];
+            let mut pkt_id = 0u32;
+            loop {
+                let Ok((n, from)) = peer.recv_from(&mut buf).await else {
+                    return;
+                };
+                let Ok((hdr, Some(_frame))) = push_datagram(&mut asm, &buf[..n]) else {
+                    continue; // a fragment, or garbage: wait for the rest
+                };
+                pkt_id += 1;
+                for d in encode_datagrams(PacketType::Initial, &hdr.cid, pkt_id, &reject).unwrap() {
+                    let _ = peer.send_to(&d, from).await;
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let result = run_client_handshake(&client, &expected_vk, None).await;
+        let elapsed = started.elapsed();
+        serve.abort();
+
+        let err = result.expect_err("client must surface the reject as an error");
+        assert!(
+            matches!(err, CoreError::ProtocolRejected(_)),
+            "expected a typed rejection, got: {err:?}"
+        );
+        assert!(
+            elapsed < CLIENT_HANDSHAKE_DEADLINE,
+            "the rejection took {elapsed:?} to surface, which is not inside the \
+             {CLIENT_HANDSHAKE_DEADLINE:?} the session gives the whole connect — the user \
+             would see a timeout instead of the reason"
+        );
+    }
+
     /// An **injected** `ServerReject` (a tiny, pre-crypto blob a network
     /// attacker can spray) during a HEALTHY handshake must NOT abort it. The client remembers
     /// the reject and keeps waiting for a valid `ServerHello`; it gives up (surfacing the
