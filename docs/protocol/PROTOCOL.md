@@ -599,17 +599,22 @@ frame that went missing. In that state a sender MAY emit a **persist probe** —
 `RELIABLE` frame carrying an empty payload after its 4-byte stream offset, i.e. the
 FIN sentinel's shape without the `FIN` flag.
 
-The offset a probe carries MUST be one the receiver has already delivered; this
-implementation repeats the highest offset the peer has acknowledged. A probe on a
-fresh offset would sit above the data the closed window is holding back, so the
-receiver would hold it as an out-of-order island and SACK it there, raising
-`largest_acked` past every offset the sender transmits next — which the sender's
-loss detector reads as loss. Repeating a delivered offset is discarded as a
-duplicate before reassembly is touched, so it changes neither the receiver's SACK
-nor its buffers. It follows that a probe consumes no offset, is not tracked as in
-flight and is not retransmitted: an unanswered probe is simply asked again. This
-implementation sends no more than one per retransmit timeout, and only while
-nothing is outstanding.
+The offset a probe carries MUST be one the receiver has already acknowledged, never
+a fresh one; this implementation repeats the highest such offset. A probe on a fresh
+offset would sit above the data the closed window is holding back, so the receiver
+would hold it as an out-of-order island and SACK it there, raising `largest_acked`
+past every offset the sender transmits next — which the sender's loss detector reads
+as loss. An acknowledged offset cannot do that, because a receiver deriving its SACK
+from live reorder state (as above) never acknowledges an offset it did not keep: it
+has either delivered that offset or is still holding it out of order. A repeat of the
+first is discarded as a duplicate before the reorder buffer is consulted; a repeat of
+the second finds the offset already buffered and is dropped without adding an entry
+or charging a byte. In both cases the SACK the receiver returns is the one it would
+have sent anyway, and `largest_acked` does not move. It follows that a probe consumes
+no offset, is not tracked as in flight and is not retransmitted: an unanswered probe
+is simply asked again. This implementation sends no more than one per retransmit
+timeout, and only while nothing is outstanding — and only on a stream the peer has
+acknowledged something on, since otherwise there is no offset to repeat.
 
 A receiver MUST deliver nothing to the application for an empty reliable segment.
 It SHOULD answer one by emitting whatever credit it owes but has held back below

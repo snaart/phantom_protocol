@@ -457,8 +457,9 @@ pub enum SendBlocked {
     ///
     /// Reported only once there is nothing left to ask: a stream with nothing outstanding
     /// gets an empty persist probe from `Stream::poll_send` instead, so this answer also
-    /// says that an acknowledgement is still owed or that the probe interval has not
-    /// elapsed.
+    /// says that one of the probe's three preconditions failed — an acknowledgement is still
+    /// owed, the probe interval has not elapsed, or the peer has acknowledged no offset yet
+    /// and there is none to repeat.
     FlowControl,
 }
 
@@ -671,6 +672,12 @@ pub struct Stream {
     /// Total bytes the local side has consumed since the last
     /// emitted `WINDOW_UPDATE`. Used to decide when to send the
     /// next update (avoid flooding the wire with tiny updates).
+    ///
+    /// Two paths on two tasks mutate it — [`Stream::record_app_consumed`] on the delivery
+    /// task and [`Stream::take_owed_window_credit`] on the receive task — so each of its
+    /// operations has to be a single atomic transition rather than a read followed by a
+    /// write. Either function's justification for its compare-exchange or swap is the other
+    /// one existing.
     bytes_since_last_update: AtomicU32,
     /// Pending **relative** flow-control credit to advertise in a
     /// `WINDOW_UPDATE`, staged by the receive **delivery** task (which credits
@@ -1108,17 +1115,42 @@ impl Stream {
     /// update threshold: it is precisely the case where the peer is stalled waiting.
     pub fn record_app_consumed(&self, n: u32) -> Option<u32> {
         let growth = self.tune_recv_window(n);
-        let pending = self.bytes_since_last_update.fetch_add(n, Ordering::AcqRel) + n;
         let threshold = INITIAL_STREAM_WINDOW / 2;
-        let consumed_credit = if pending >= threshold {
-            // Grant exactly the bytes we accumulated since the last update and
-            // reset the accumulator. Use a CAS-free `fetch_sub` of the granted
-            // amount rather than `store(0)` so a concurrent consume isn't lost.
-            self.bytes_since_last_update
-                .fetch_sub(pending, Ordering::AcqRel);
-            pending
-        } else {
-            0
+        // Accumulate and — on crossing the threshold — take the whole accumulator, in one
+        // transition. The counter has a second mutator: [`Self::take_owed_window_credit`]
+        // swaps it to zero on the receive task when the peer's persist probe arrives, while
+        // this runs on the delivery task. Adding `n` and then subtracting the total just read
+        // is two transitions, and the swap fits between them: the subtraction would run
+        // against a counter the other path had already emptied, so on a `u32` it lands at
+        // `2^32` minus the bytes taken. The next probe reads that as bytes owed and grants
+        // it, taking the peer's send window to `MAX_SEND_WINDOW` with nothing consumed to pay
+        // for it — and since the peer chooses when to probe, and the probe is what performs
+        // the swap, an accumulator that can be caught mid-update is a window the peer opens
+        // for itself. `pending_window_update` next door — staged by this task, flushed by
+        // another, same problem — has always been a compare-exchange against a swap for this
+        // reason. The cost here is a plain load and one locked compare-exchange against the
+        // pair's one or two locked read-modify-writes, so the per-chunk path this sits on
+        // gets no slower.
+        let mut cur = self.bytes_since_last_update.load(Ordering::Acquire);
+        let consumed_credit = loop {
+            // Saturating rather than wrapping: what keeps this sum small is the reset in the
+            // same transition, not the width of the type, and `n` is the length of something
+            // a peer sent.
+            let pending = cur.saturating_add(n);
+            let (next, credit) = if pending >= threshold {
+                (0, pending)
+            } else {
+                (pending, 0)
+            };
+            match self.bytes_since_last_update.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break credit,
+                Err(actual) => cur = actual,
+            }
         };
         let credit = consumed_credit.saturating_add(growth);
         if credit == 0 {
@@ -1421,10 +1453,15 @@ impl Stream {
     /// gap raises `Sack::largest_acked` past every offset this stream sends next, which is
     /// precisely the input RFC 9002's packet threshold reads as loss. Measured on that
     /// design: with a probe SACKed at offset 8, the next two segments were declared lost the
-    /// instant they were acknowledged. Repeating a delivered offset moves nothing: the peer
-    /// discards it as a duplicate ([`Self::accept_in_order`] returns before touching the
-    /// reorder buffer), its SACK is unchanged, no offset is consumed and no state accrues on
-    /// either side.
+    /// instant they were acknowledged. An acknowledged offset moves nothing, and it is worth
+    /// being exact about why, because acknowledged is the weaker of the two properties: a
+    /// peer building its SACK the way [`Self::received_sack`] does acknowledges what it has
+    /// delivered and what its reorder buffer still holds, and nothing else. If the offset was
+    /// delivered, [`Self::accept_in_order`] discards the repeat as a duplicate before it
+    /// touches the reorder buffer; if it is still an island, the repeat finds it already
+    /// held and is dropped without adding an entry or charging a byte against the reorder
+    /// budget. Either way the peer's SACK is unchanged, no offset is consumed and no state
+    /// accrues on either side.
     ///
     /// It is therefore not tracked as in flight and nothing retransmits it — an unanswered
     /// probe is simply asked again at the next interval, which is what TCP's persist timer
@@ -1450,7 +1487,7 @@ impl Stream {
         if anything_in_flight {
             return None;
         }
-        // A stream with nothing acknowledged has no delivered offset to repeat, so it does
+        // A stream the peer has acknowledged nothing on has no offset to repeat, so it does
         // not probe. It should not arrive here — the window only closes by sending, and the
         // precondition above says everything sent has been retired — but declining is the
         // answer to that state rather than inventing an offset, which would land above the
@@ -1487,6 +1524,10 @@ impl Stream {
     /// It grants only bytes the local application actually took, so it cannot over-commit
     /// this side's buffers however often it is asked: a receiver whose application has
     /// stopped reading owes nothing and returns `None`, emitting no frame at all.
+    ///
+    /// A single swap, not a read and a store, because the peer decides when this runs and
+    /// [`Self::record_app_consumed`] is accumulating into the same counter on another task —
+    /// see the compare-exchange there for what a half-applied update to it is worth to a peer.
     pub fn take_owed_window_credit(&self) -> Option<u32> {
         let owed = self.bytes_since_last_update.swap(0, Ordering::AcqRel);
         if owed == 0 {
@@ -4396,6 +4437,88 @@ mod tests {
             r.take_owed_window_credit(),
             None,
             "credit is owed once; a second ask must not grant it again"
+        );
+    }
+
+    /// **The owed-credit accumulator has two mutators, and the peer picks when the second
+    /// one runs.**
+    ///
+    /// `record_app_consumed` runs on the delivery task. `take_owed_window_credit` runs on the
+    /// receive task, and what calls it is a persist probe arriving — a frame the peer emits
+    /// whenever it chooses. Accumulating by adding `n` and then subtracting the total just
+    /// read is two transitions, and the swap fits between them: the subtraction then runs
+    /// against a counter the other path has already emptied, so on a `u32` it lands at `2^32`
+    /// minus the bytes taken. The next probe reads that as bytes owed and grants it, and the
+    /// peer's send window goes to [`MAX_SEND_WINDOW`] without one byte of it having been
+    /// consumed by anybody — a window the peer opens for itself, by asking.
+    ///
+    /// Two threads, because the defect lives strictly inside one function's body: no ordering
+    /// of the two public calls expresses it, since every sequential ordering leaves the
+    /// counter non-negative. What is asserted is the counter itself rather than anything
+    /// downstream of it. With a single recorder it can never hold more than the emission
+    /// threshold plus one call's worth, so a value above that is a wrap and nothing else;
+    /// the second assertion adds conservation — every byte recorded is either still in the
+    /// accumulator or was handed out exactly once. Replace the compare-exchange with an add
+    /// and a subtract and this fails.
+    #[test]
+    fn the_owed_credit_accumulator_survives_a_probe_landing_mid_update() {
+        const ROUNDS: u32 = 200_000;
+        let threshold = INITIAL_STREAM_WINDOW / 2;
+        // Each call carries the whole threshold, so each one takes the accumulator instead of
+        // one call in twenty-eight. The take is the half of the operation a swap has to land
+        // inside, and this makes every iteration a chance at it rather than every 28th.
+        let chunk = threshold;
+
+        let s = Arc::new(Stream::new(1));
+        // Pin the advertised window at its ceiling so `tune_recv_window` returns on its first
+        // load, before it reads a clock or takes a lock. This is a measurement of the
+        // accumulator alone; growth credit would be summed into the totals below and hide the
+        // arithmetic under it.
+        s.advertised_recv_window
+            .store(MAX_RECV_WINDOW, Ordering::SeqCst);
+
+        let delivery = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                let mut granted = 0u64;
+                let mut high_water = 0u32;
+                for _ in 0..ROUNDS {
+                    granted += u64::from(s.record_app_consumed(chunk).unwrap_or(0));
+                    high_water = high_water.max(s.bytes_since_last_update.load(Ordering::Acquire));
+                }
+                (granted, high_water)
+            })
+        };
+        let probing = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                let mut granted = 0u64;
+                for _ in 0..ROUNDS {
+                    granted += u64::from(s.take_owed_window_credit().unwrap_or(0));
+                }
+                granted
+            })
+        };
+
+        let (granted_on_consumption, high_water) = delivery.join().expect(
+            "the delivery side panicked: the accumulator wrapped and the next call's \
+             `old + n` overflowed",
+        );
+        let granted_on_probe = probing.join().expect("the probing side panicked");
+        let still_owed = s.bytes_since_last_update.load(Ordering::SeqCst);
+
+        assert!(
+            high_water <= threshold + chunk,
+            "the accumulator reached {high_water} B against a {threshold} B threshold and \
+             {chunk} B per call: it was decremented past zero and wrapped, and the next probe \
+             hands that figure to the peer as relative credit"
+        );
+        assert_eq!(
+            granted_on_consumption + granted_on_probe + u64::from(still_owed),
+            u64::from(ROUNDS) * u64::from(chunk),
+            "granted {granted_on_consumption} B on consumption and {granted_on_probe} B on \
+             probes with {still_owed} B still owed, against {ROUNDS} × {chunk} B consumed — \
+             credit was granted for bytes nobody consumed"
         );
     }
 

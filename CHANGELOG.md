@@ -408,10 +408,13 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   sends next, which RFC 9002's packet threshold reads as loss. That design was built and
   measured before this one: with a probe SACKed at offset 8, the next two segments were
   declared lost the instant they were acknowledged, and
-  `a_probe_does_not_make_the_next_segments_look_lost` fails on it with `[1, 2]`. Repeating a
-  delivered offset moves nothing — the peer discards it as a duplicate before reassembly is
-  touched — so a probe consumes no offset, occupies no reorder entry, is not tracked in
-  flight and is never retransmitted; an unanswered one is simply asked again next interval.
+  `a_probe_does_not_make_the_next_segments_look_lost` fails on it with `[1, 2]`. Repeating an
+  acknowledged offset moves nothing, and the reason has to cover both of the things being
+  acknowledged means: a receiver acknowledges what it has delivered and what its reorder
+  buffer still holds, so the repeat is either discarded as a duplicate before the reorder
+  buffer is consulted, or found already buffered and dropped without adding an entry. So a
+  probe consumes no offset, occupies no reorder entry, is not tracked in flight and is never
+  retransmitted; an unanswered one is simply asked again next interval.
 
   The answer comes from the receiver, which is the side that knows. An empty reliable segment
   is recognised there and flushes the credit that side already owes — bytes its application
@@ -421,6 +424,16 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   waiting for. Because the answer is bounded by consumption, a receiver that is not reading
   owes nothing, emits no frame at all, and a peer that probes repeatedly extracts nothing it
   has not earned.
+
+  Answering makes the peer a second concurrent mutator of that accumulator, on a second task,
+  at a moment it picks, which is why each of the accumulator's two operations is a single
+  atomic transition: a compare-exchange on the consumption side and a swap on the probe side.
+  An add followed by a subtract of the total just read would be two, and a swap landing
+  between the halves leaves the subtraction running against an emptied counter — on a `u32`
+  that lands at `2^32` minus the bytes taken, which the next probe reads as bytes owed and
+  grants, taking the peer's send window to `MAX_SEND_WINDOW` with nothing consumed to pay for
+  it. `pending_window_update` beside it has the same two-task staged-and-flushed shape and is
+  written the same way.
 
   Two things are deliberately not claimed. Credit that was already emitted into a lost frame
   is **not** recovered: the receiver cleared it as it composed the frame and the sender never
