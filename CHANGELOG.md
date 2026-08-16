@@ -310,6 +310,51 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **The PhantomUDP handshake abandoned paths a mature implementation completes, because its
+  retransmission timer asserted a number about the path instead of adapting to it.** The
+  client-side stop-and-wait shim used a fixed 400 ms retransmit timeout and a cap of six
+  retransmits — 2.8 s of waiting in total, ending in `CoreError::Timeout`. On a route
+  measuring 267 ms minimum / 298 ms average / 367 ms maximum round trip with 11.7 % ICMP
+  loss, quinn completed ten handshakes out of ten while PhantomUDP completed eight, five and
+  eight across three runs of ten, every failure taking exactly 3.40 s. The reference
+  implementation finishing on the same path in the same run is what identifies this as ours
+  rather than the network's, and the server side confirms it: for one run of ten attempts the
+  daemon logged eleven session opens — it completed handshakes for attempts the client had
+  abandoned roughly half a second earlier. The replies were not being dropped. They were
+  merely later than the timer allowed.
+
+  Two things were wrong. The interval was shorter than the path's round trip plus the
+  server's hybrid-KEM and dual-signature work, so honest replies arrived after the timer had
+  already fired and each one spent a retransmit on a reply nothing had lost. And the total,
+  2.8 s, was far tighter than the 10 s session-level handshake deadline it runs underneath —
+  the transport refused while 72 % of the budget it was given remained unspent.
+
+  The schedule is now the one both RFC 6298 §2.1 and RFC 9002 §6.2.2 arrive at for a first
+  transmission with no round-trip sample: a 1 s initial timeout, doubling on every expiry
+  (RFC 6298 §5.5, RFC 9002 §6.2.1), bounded by a total of 8 s. That spends as 1 s → 3 s → 7 s
+  — three retransmits, four flights in all, against seven flights before — and gives up at
+  8 s, which with the roughly 0.6 s the client spends generating its hybrid keypairs still
+  refuses inside the 10 s deadline with margin, and leaves the last retransmit a full second
+  to be answered. Client patience against a slow path goes from 2.8 s to 8 s while the
+  duplicate flights a slow path provokes are more than halved.
+
+  Nothing in the schedule is derived from anything the peer supplies. A round-trip sample is
+  the interval between our transmission and *its* reply, so learning from one would let a
+  peer that answers slowly dictate our timer; the handshake is a few flights long and has no
+  sample for the first one regardless, so the fixed conservative start costs nothing. For the
+  same reason the schedule is now monotonic across the receive loop's retry paths — a
+  datagram that does not complete a frame no longer resets the budget, so an off-path source
+  cannot hold the shim open past the session deadline by trickling bytes at it. The wire is
+  unchanged: this is a local timer, not a negotiated parameter.
+
+  No server-side change accompanies it. A retransmitted `ClientHello` carries the same
+  bootstrap connection id, so the demux routes it to the existing session rather than opening
+  a second one; the in-flight state an abandoned attempt occupies is already bounded by the
+  server's own 10 s handshake deadline, one of 256 concurrency permits, and a route reaped as
+  soon as the task ends. Telling the server to stop would mean either a new wire message or a
+  teardown an unauthenticated source could trigger, and the state it would reclaim is
+  measured in seconds.
+
 - **A peer could put a 4 MiB frame in a delivery-queue slot sized for 1156 B.** The
   per-stream queues between the delivery task and `PhantomStream::recv` are bounded in slots,
   not in bytes, so what a session holds is the slot count times whatever a peer can put in a

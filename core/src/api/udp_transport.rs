@@ -23,10 +23,78 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Notify};
 
-/// Retransmit timeout for the Handshake phase stop-and-wait shim.
-const HANDSHAKE_RTO: Duration = Duration::from_millis(400);
-/// Max Handshake-phase retransmits before giving up (the outer 10s connect deadline still applies).
-const MAX_HANDSHAKE_RETX: u32 = 6;
+/// First retransmit timeout of the Handshake-phase stop-and-wait shim, used while the
+/// client has no round-trip measurement of its own.
+///
+/// One second is what RFC 6298 §2.1 asks of TCP before any RTT sample exists ("the sender
+/// SHOULD set RTO <- 1 second") and what RFC 9002 §6.2.2 arrives at for QUIC by a different
+/// route (a 333 ms assumed initial RTT "results in handshakes starting with a PTO of 1
+/// second, as recommended for TCP's initial RTO"). Both pick it because the cost of guessing
+/// low is asymmetric: a timer shorter than the path's round trip does not recover a lost
+/// flight any sooner — the reply was already on its way — it merely duplicates work at both
+/// ends and, if the budget is spent that way, abandons a connect that was about to succeed.
+///
+/// The value is deliberately not derived from anything measured on this connection. A
+/// round-trip sample is a quantity the peer writes: it is the interval between our
+/// transmission and *its* reply, so a peer that answers slowly dictates our timer. The
+/// handshake is at most a few flights long and has no sample for the first one anyway, so
+/// there is nothing to learn from and a fixed conservative start costs nothing.
+const HANDSHAKE_INITIAL_RTO: Duration = Duration::from_secs(1);
+
+/// Total time one `recv_bytes` call may spend waiting out the Handshake-phase
+/// retransmission schedule before reporting [`CoreError::Timeout`].
+///
+/// This is the whole reason the schedule terminates: the interval doubles on every expiry
+/// (RFC 6298 §5.5, "the host MUST set RTO <- RTO * 2"; RFC 9002 §6.2.1 says the same for the
+/// PTO), so only a ceiling on the *sum* bounds it. Eight seconds spends the schedule as
+/// 1 s → 3 s → 7 s (three retransmits, four flights in all) and gives up at 8 s, which leaves
+/// the last retransmit a full second to be answered.
+///
+/// The ceiling is sized against [`CLIENT_HANDSHAKE_DEADLINE`], the session-level bound this
+/// shim runs underneath: the client spends roughly 0.6 s generating its hybrid keypairs
+/// before the first flight leaves, so 0.6 s + 8 s of waiting still refuses inside the 10 s
+/// deadline with margin. Spending more than that would mean the last retransmit is sent
+/// after the session has already abandoned the connect — the work would be pure waste — and
+/// the reported error would come from the session's timer rather than from the transport
+/// that actually knows the path went silent.
+///
+/// [`CLIENT_HANDSHAKE_DEADLINE`]: crate::api::session::CLIENT_HANDSHAKE_DEADLINE
+const HANDSHAKE_RETRANSMIT_BUDGET: Duration = Duration::from_secs(8);
+
+// The budget is only meaningful if it really is inside the deadline it is sized against;
+// a later edit to either constant that inverts them is a compile error rather than a
+// connect that fails one second before it would have succeeded.
+const _: () = assert!(
+    HANDSHAKE_RETRANSMIT_BUDGET.as_millis()
+        < crate::api::session::CLIENT_HANDSHAKE_DEADLINE.as_millis()
+);
+
+/// How long the Handshake-phase shim should wait before its `attempt`-th retransmit, given
+/// the time it has already spent waiting in this `recv_bytes` call.
+///
+/// `None` means the budget is exhausted and the call must report a timeout. Otherwise the
+/// wait is [`HANDSHAKE_INITIAL_RTO`] doubled once per expiry so far (RFC 6298 §5.5, "the
+/// host MUST set RTO <- RTO * 2"; RFC 9002 §6.2.1 requires the same of the PTO), clipped so
+/// the schedule lands exactly on [`HANDSHAKE_RETRANSMIT_BUDGET`] rather than overshooting it
+/// on the last doubling.
+///
+/// The whole schedule is here rather than spread across the receive loop because this is the
+/// part carrying an arithmetic obligation — that it backs off, that it terminates, and that
+/// it terminates inside the session deadline — and that obligation is worth checking without
+/// a socket or a clock.
+fn next_handshake_wait(attempt: u32, spent: Duration) -> Option<Duration> {
+    let remaining = HANDSHAKE_RETRANSMIT_BUDGET.checked_sub(spent)?;
+    if remaining.is_zero() {
+        return None;
+    }
+    // A doubling that would overflow is already far past the budget, so saturating to the
+    // budget and letting the clip below take over is exact, not an approximation.
+    let doublings = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+    let rto = HANDSHAKE_INITIAL_RTO
+        .checked_mul(doublings)
+        .unwrap_or(HANDSHAKE_RETRANSMIT_BUDGET);
+    Some(rto.min(remaining))
+}
 
 const PHASE_HANDSHAKE: u8 = 0;
 const PHASE_ESTABLISHED: u8 = 1;
@@ -262,7 +330,15 @@ impl SessionTransport for UdpClientTransport {
         // Second recv buffer, lazily sized only during a migration overlap; the common
         // no-migration path keeps the single `buf`.
         let mut buf_prev: Vec<u8> = Vec::new();
-        let mut retx = 0u32;
+        // Handshake-phase retransmission state: how many intervals have expired (which sets
+        // the backoff) and how much waiting they have cost (which is what the budget is
+        // charged against). Both are deliberately monotonic across the loop's `continue`
+        // paths: a datagram that does not complete a frame — a fragment of a reply whose
+        // remaining pieces were lost, an advisory ICMP error, a malformed spray — must not
+        // buy more time, or an off-path source could hold the shim past the session deadline
+        // by trickling bytes at it.
+        let mut attempt = 0u32;
+        let mut spent = Duration::ZERO;
         loop {
             let in_handshake = self.phase.load(Ordering::Relaxed) == PHASE_HANDSHAKE;
             // Snapshot both sockets as owned `Arc`s (never hold an `ArcSwap` guard
@@ -286,15 +362,18 @@ impl SessionTransport for UdpClientTransport {
                 // Migration is post-handshake only, so there is never a `prev` socket
                 // here; keep the original single-socket + RTO-retransmit logic.
                 let server = **self.server_addr.load();
+                let Some(wait) = next_handshake_wait(attempt, spent) else {
+                    return Err(CoreError::Timeout);
+                };
                 tokio::select! {
                     // `biased;` polls the recv arm first: the RTO must be a true
-                    // "no data arrived for HANDSHAKE_RTO" timer, not a coin-flip against an
+                    // "no data arrived for the whole interval" timer, not a coin-flip against an
                     // already-queued datagram. With the default unbiased select, when BOTH a datagram
                     // is ready AND the sleep has elapsed (common under contention from concurrent PQ
                     // handshakes), the recv arm is starved ~50% of the time, so the client spuriously
-                    // retransmits instead of processing the already-arrived ServerHello — exhausting
-                    // MAX_HANDSHAKE_RETX and timing the handshake out. Biasing toward received data
-                    // makes the RTO fire only when recv is genuinely pending.
+                    // retransmits instead of processing the already-arrived ServerHello — spending
+                    // the retransmission budget and timing the handshake out. Biasing toward received
+                    // data makes the RTO fire only when recv is genuinely pending.
                     biased;
                     r = active.recv_from(&mut buf) => match classify_recv(r) {
                         RecvAction::Got(n, src) => (n, false, src),
@@ -306,9 +385,14 @@ impl SessionTransport for UdpClientTransport {
                             return Err(CoreError::NetworkError(format!("udp recv: {e}")))
                         }
                     },
-                    _ = tokio::time::sleep(HANDSHAKE_RTO) => {
-                        retx += 1;
-                        if retx > MAX_HANDSHAKE_RETX {
+                    _ = tokio::time::sleep(wait) => {
+                        spent = spent.saturating_add(wait);
+                        attempt = attempt.saturating_add(1);
+                        // The budget can only be exhausted by a wait that was clipped to
+                        // land on it, so this is the give-up point rather than the top of
+                        // the loop: retransmitting here would send a flight with no time
+                        // left to answer it.
+                        if next_handshake_wait(attempt, spent).is_none() {
                             return Err(CoreError::Timeout);
                         }
                         for d in self.last_sent.lock().await.iter() {
@@ -377,7 +461,6 @@ impl SessionTransport for UdpClientTransport {
                     }
                 }
             };
-            retx = 0; // progress: reset the RTO budget
             let datagram = if from_prev { &buf_prev[..n] } else { &buf[..n] };
             let mut asm = self.reasm.lock().await;
             let decoded = push_datagram(&mut asm, datagram);
@@ -821,6 +904,47 @@ mod tests {
     use crate::transport::phantom_udp::envelope::PacketType;
     use tokio::net::UdpSocket;
 
+    /// The Handshake-phase retransmission schedule, walked without a socket or a clock:
+    /// it must back off, it must terminate, and its total must be the budget exactly —
+    /// which is what makes the comparison against the session deadline meaningful.
+    #[test]
+    fn the_handshake_schedule_backs_off_and_terminates_on_the_budget() {
+        let mut attempt = 0u32;
+        let mut spent = Duration::ZERO;
+        let mut waits = Vec::new();
+        while let Some(wait) = next_handshake_wait(attempt, spent) {
+            waits.push(wait);
+            spent += wait;
+            attempt += 1;
+            assert!(
+                waits.len() < 64,
+                "the schedule must terminate; it reached {spent:?} in {} waits",
+                waits.len()
+            );
+        }
+        assert_eq!(
+            waits,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(1),
+            ],
+            "expected 1 s, 2 s, 4 s of backoff and a final 1 s clipped to the budget"
+        );
+        assert_eq!(
+            spent, HANDSHAKE_RETRANSMIT_BUDGET,
+            "the schedule must land on the budget, not overshoot or undershoot it"
+        );
+        // Three retransmits (the last wait is spent waiting, not retransmitting), so four
+        // flights leave the client in all.
+        assert_eq!(waits.len() - 1, 3);
+        assert!(
+            spent < crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            "the whole schedule must fit inside the session-level handshake deadline"
+        );
+    }
+
     /// A framed frame round-trips client -> raw peer -> client, including a >MTU
     /// (fragmented) reply that `recv_bytes` reassembles.
     #[tokio::test]
@@ -910,6 +1034,210 @@ mod tests {
         let (_s, n, r) = tokio::join!(send, recv, recv_client);
         assert!(n >= super::HDR_LEN);
         assert_eq!(&r.unwrap().unwrap()[..], &b"reply"[..]);
+    }
+
+    /// The handshake shim must still be waiting when an honest reply arrives later than a
+    /// degraded path's round trip — a reply that is merely late is not a lost reply, and
+    /// abandoning the connect while it is still in flight throws away the whole attempt.
+    ///
+    /// The reply here lands at 3.5 s, past the 2.8 s a fixed 400 ms timer × 6 retransmits
+    /// spends in total, and well inside the session-level [`CLIENT_HANDSHAKE_DEADLINE`].
+    /// The assertion is on the outcome (a completed exchange), not on how long it took.
+    #[tokio::test]
+    async fn handshake_outlasts_a_reply_slower_than_the_old_fixed_budget() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+        // Default phase is Handshake — the retransmitting stop-and-wait shim.
+
+        let send = async {
+            client.send_bytes(b"client-hello").await.unwrap();
+        };
+        // The peer answers the first flight, but only after a delay longer than the
+        // retransmission budget the shim used to have. Its retransmits pile up unread in
+        // the socket buffer, exactly as a loaded server's backlog would.
+        let serve = async {
+            let mut buf = vec![0u8; 2048];
+            let (_n, from) = peer.recv_from(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(3500)).await;
+            for d in encode_datagrams(PacketType::Initial, &client.cid(), 0, b"server-hello")
+                .expect("encode")
+            {
+                peer.send_to(&d, from).await.unwrap();
+            }
+        };
+        let receive =
+            async { tokio::time::timeout(Duration::from_secs(8), client.recv_bytes()).await };
+        let (_s, _p, r) = tokio::join!(send, serve, receive);
+        let frame = r
+            .expect("recv_bytes must not be abandoned while the reply is still in flight")
+            .expect("a late but honest reply is not a failed handshake");
+        assert_eq!(&frame[..], b"server-hello");
+    }
+
+    /// A path that never answers must still be refused, and refused inside the
+    /// session-level deadline that governs the whole handshake — a shim that keeps
+    /// retransmitting past it turns a refusal into a hang whose error the session, not the
+    /// transport, ends up reporting.
+    #[tokio::test]
+    async fn a_silent_path_is_refused_inside_the_session_handshake_deadline() {
+        // A bound-but-never-read socket is a true black hole: datagrams are accepted by the
+        // kernel and answered by nobody, so no ICMP unreachable masks the silence.
+        let black_hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = black_hole.local_addr().unwrap();
+        let client = UdpClientTransport::connect(addr).await.unwrap();
+        client.send_bytes(b"client-hello").await.unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(20), client.recv_bytes())
+            .await
+            .expect("a silent path must be refused, not hang");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, Err(CoreError::Timeout)),
+            "a silent path is a Timeout, got {outcome:?}"
+        );
+        // Upper bound: the refusal has to land before the session gives up, or the shim's
+        // last retransmit is spent after the connect has already been abandoned.
+        assert!(
+            elapsed < crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            "gave up after {elapsed:?}, which is not inside the {:?} session deadline",
+            crate::api::session::CLIENT_HANDSHAKE_DEADLINE
+        );
+        // Lower bound: it must actually have spent its retransmission schedule rather than
+        // refusing on the first tick. Half the budget is a wide margin against scheduling.
+        assert!(
+            elapsed >= HANDSHAKE_RETRANSMIT_BUDGET / 2,
+            "gave up after only {elapsed:?}; the retransmission schedule was not spent"
+        );
+    }
+
+    /// A lost first flight must be retransmitted promptly. "Promptly" is
+    /// [`HANDSHAKE_INITIAL_RTO`]: soon enough that a dropped flight costs one interval
+    /// rather than the whole connect, late enough that a reply merely in flight on a
+    /// long path is not raced by a duplicate. The bounds are a factor of two either side,
+    /// so a schedule that retransmits in a storm and one that simply waits longer
+    /// everywhere both fail.
+    #[tokio::test]
+    async fn a_lost_first_flight_is_retransmitted_at_the_initial_rto() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+
+        let send = async {
+            client.send_bytes(b"client-hello").await.unwrap();
+        };
+        let serve = async {
+            let mut buf = vec![0u8; 2048];
+            let (_n, _from) = peer.recv_from(&mut buf).await.unwrap(); // the flight, dropped
+            let dropped_at = std::time::Instant::now();
+            let (_n2, from) = peer.recv_from(&mut buf).await.unwrap(); // the retransmit
+            let gap = dropped_at.elapsed();
+            for d in encode_datagrams(PacketType::Initial, &client.cid(), 0, b"server-hello")
+                .expect("encode")
+            {
+                peer.send_to(&d, from).await.unwrap();
+            }
+            gap
+        };
+        let receive =
+            async { tokio::time::timeout(Duration::from_secs(8), client.recv_bytes()).await };
+        let (_s, gap, r) = tokio::join!(send, serve, receive);
+
+        assert!(
+            gap >= HANDSHAKE_INITIAL_RTO / 2,
+            "retransmitted after {gap:?}, sooner than half the {HANDSHAKE_INITIAL_RTO:?} \
+             initial timeout — a duplicate flight this eager races honest replies"
+        );
+        assert!(
+            gap <= HANDSHAKE_INITIAL_RTO * 2,
+            "retransmitted after {gap:?}, later than twice the {HANDSHAKE_INITIAL_RTO:?} \
+             initial timeout — a lost flight costs that long to notice"
+        );
+        assert_eq!(&r.expect("no timeout").expect("recv")[..], b"server-hello");
+    }
+
+    /// Consecutive retransmits must be spaced further and further apart. A fixed interval
+    /// repeats the same duplicate work at exactly the moment the path has shown it needs
+    /// patience, and it is what spent the old budget in 2.8 s; the backoff is the mechanism
+    /// that buys a slow path time without buying a dead one a longer hang.
+    #[tokio::test]
+    async fn consecutive_handshake_retransmits_back_off() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+
+        let send = async {
+            client.send_bytes(b"client-hello").await.unwrap();
+        };
+        let serve = async {
+            let mut buf = vec![0u8; 2048];
+            let _ = peer.recv_from(&mut buf).await.unwrap(); // the flight, dropped
+            let first = std::time::Instant::now();
+            let _ = peer.recv_from(&mut buf).await.unwrap(); // retransmit 1, dropped
+            let second = std::time::Instant::now();
+            let (_n, from) = peer.recv_from(&mut buf).await.unwrap(); // retransmit 2
+            let gaps = (second - first, second.elapsed());
+            for d in encode_datagrams(PacketType::Initial, &client.cid(), 0, b"server-hello")
+                .expect("encode")
+            {
+                peer.send_to(&d, from).await.unwrap();
+            }
+            gaps
+        };
+        let receive =
+            async { tokio::time::timeout(Duration::from_secs(10), client.recv_bytes()).await };
+        let (_s, (gap1, gap2), r) = tokio::join!(send, serve, receive);
+
+        // The schedule is 1 s then 2 s, so the second gap is twice the first. The band is
+        // 1.5×–3× — wide enough that scheduling jitter cannot move it, narrow enough that a
+        // constant interval (1×) sits outside it.
+        assert!(
+            gap2 >= gap1.mul_f32(1.5) && gap2 <= gap1 * 3,
+            "second retransmit gap {gap2:?} did not back off from the first {gap1:?}"
+        );
+        assert_eq!(&r.expect("no timeout").expect("recv")[..], b"server-hello");
+    }
+
+    /// A path fast enough to answer inside the first timeout costs exactly one flight.
+    /// This is the guard against "fix" the slow-path defect by waiting longer everywhere:
+    /// nothing here may delay the first transmission, and no duplicate may be emitted.
+    #[tokio::test]
+    async fn a_prompt_reply_costs_exactly_one_flight() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+
+        let send = async {
+            client.send_bytes(b"client-hello").await.unwrap();
+        };
+        let serve = async {
+            let mut buf = vec![0u8; 2048];
+            let (_n, from) = peer.recv_from(&mut buf).await.unwrap();
+            for d in encode_datagrams(PacketType::Initial, &client.cid(), 0, b"server-hello")
+                .expect("encode")
+            {
+                peer.send_to(&d, from).await.unwrap();
+            }
+        };
+        let receive =
+            async { tokio::time::timeout(Duration::from_secs(5), client.recv_bytes()).await };
+        let (_s, _p, r) = tokio::join!(send, serve, receive);
+        assert_eq!(
+            &r.expect("a loopback reply is never slow").expect("recv")[..],
+            b"server-hello"
+        );
+
+        // No second copy of the flight: the reply beat the first timeout, so the schedule
+        // never fired. A probe well under HANDSHAKE_INITIAL_RTO distinguishes "no
+        // retransmit" from "a retransmit that has not come due yet".
+        let mut buf = vec![0u8; 2048];
+        let extra = tokio::time::timeout(HANDSHAKE_INITIAL_RTO / 4, peer.recv_from(&mut buf)).await;
+        assert!(
+            extra.is_err(),
+            "a flight answered inside the first timeout must not be retransmitted"
+        );
     }
 
     #[tokio::test]
