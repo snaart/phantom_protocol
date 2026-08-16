@@ -34,7 +34,53 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   The Linux-only `libc` dependency went with it, since nothing in `core/src` names `libc::`
   any more.
 
+- **`transport::device_profile` — a public tier table that contradicted the crypto layer.**
+  `DeviceProfile`, `DeviceTier`, `PqKemLevel` and `PqSignLevel` were exported and referenced
+  by nothing: not by the handshake, not by the crypto layer whose parameters they described,
+  and not by any bench, example, integration test, fuzz target or sibling crate. Being merely
+  unused would have been an argument for leaving them alone. What decided the removal is that
+  they were unused *and wrong in a direction that costs the reader something*: the table
+  offered `PqKemLevel::Kyber512` and `PqSignLevel::Dilithium2` for a constrained tier, and the
+  handshake negotiates one fixed hybrid suite — X25519 + ML-KEM-768 with Ed25519 + ML-DSA-65 —
+  with no mechanism to select a lighter post-quantum level for anything. Someone sizing an
+  embedded target against that table would have planned for key material the protocol will
+  never send, and would have had no way to find that out short of reading the handshake. The
+  non-crypto knobs beside them (`buffer_size`, `max_streams`, `coalescing`, MTU) steered
+  nothing either. This is a public API removal in the pre-1.0 breaking window; nothing could
+  have depended on it for behaviour, since constructing a `DeviceProfile` changed no bytes and
+  no timing.
+
 ### Changed
+
+- **`transport::{compression, fallback, scheduler, packet_coalescer}` stay public and now say
+  on their first documented line that nothing calls them.** These four are exported, compiled
+  and tested, and no send or receive path reaches any of them; `PacketFlags::COMPRESSED` is set
+  by no code in the crate, so the adaptive compressor in the public API compresses nothing that
+  has ever been sent. Each was checked individually rather than inherited from an inventory:
+  `compression` has no caller at all; `fallback` is constructed into every `Session` behind
+  `#[allow(dead_code)]` and none of `record_sent` / `record_success` / `record_failure` /
+  `check_and_fallback` / `upgrade` is called outside its own tests; `scheduler` is likewise
+  constructed into every `Session` and reachable through `Session::scheduler()`, but
+  `select_paths` steers nothing; and `packet_coalescer` is split — `Decoalescer` is live in the
+  receive path via `packet_coalescer_codec`, while `PacketCoalescer` is constructed only under
+  `#[cfg(test)]`. `transport`'s own module documentation lost its claim that adaptive fallback
+  tiers are a property of this transport and gained the list instead.
+
+  The rejected alternatives are worth recording, because each looks better than it is.
+  `pub(crate)` is unavailable to three of the four: with no in-crate caller the compiler
+  reports every item as dead, and silencing that with `#[allow(dead_code)]` states the opposite
+  of what is true. Deleting `compression` was the tempting one — it is the only consumer of
+  either `lz4_flex` or `zstd` in the crate, so it alone is what puts the C-bound `zstd-sys` in
+  a default build's graph. But the module is the visible tip of that cost and not the cost
+  itself: `compression-zstd` is a default feature named in `server/Cargo.toml`,
+  `testbed/Cargo.toml`, `examples/wasm-demo/Cargo.toml`, the FIPS and cross-target CI command
+  lines, the version string `phantom-cli` prints, and eight compliance and operations
+  documents. Deleting the module alone would leave a feature flag that toggles nothing —
+  trading a false promise a reader can see for one they cannot — and deleting the flag as well
+  is a coordinated manifest and CI change across three sibling crates, which is a maintainer's
+  decision rather than a module edit. Deleting `fallback` or `scheduler` means editing
+  `Session`, and `SchedulerMode` has to survive either way: it is a required argument of
+  `Session::from_derived` and genuinely live.
 
 - **`Stream::poll_send` (public, `phantom_protocol::transport::stream`) returns
   `Result<OutboundSegment, SendBlocked>` instead of `Option<OutboundSegment>`, and takes a
