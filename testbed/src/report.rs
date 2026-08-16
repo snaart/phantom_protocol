@@ -519,6 +519,43 @@ pub struct RekeySample {
     pub error: Option<String>,
 }
 
+/// One run of the wire-level encryption check.
+///
+/// The record deliberately keeps three different kinds of statement apart. The
+/// `findings` are what a packet capture established. The `session_counters` are
+/// what the session's own instruments reported over the same interval — related
+/// evidence, but from a different instrument. And `findings.encrypted_flag` is
+/// not a measurement at all: it is the part of security invariant 2 that a
+/// capture cannot reach, answered from the source and labelled as such. Folding
+/// any two of those together is exactly how the claim would come to be
+/// overstated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireCheckSample {
+    pub leg: Leg,
+    pub t_unix_ns: u64,
+    /// When the session reported itself established. This is the instant that
+    /// splits the capture into its handshake and established halves, and it
+    /// comes from the same host clock the capture is stamped with.
+    pub established_unix_ns: u64,
+    /// Application messages the probe generated and then searched for.
+    pub probe_messages: usize,
+    pub probe_payload_bytes: usize,
+    pub echo_ok: usize,
+    pub echo_failed: usize,
+    /// The capture command, verbatim, so the evidence can be reproduced by hand.
+    pub capture_command: String,
+    /// Where the capture was kept. `None` when none was taken.
+    pub capture_path: Option<String>,
+    pub findings: crate::wirecheck::Findings,
+    /// The session's own counters at the end of the exchange.
+    ///
+    /// `replay_rejected_total` and `aead_failure_total` are the only run-time
+    /// security numbers this check can read; the counter that would show the
+    /// unencrypted-packet gate firing is not among them, which is one of the
+    /// things `findings.encrypted_flag` says.
+    pub session_counters: Option<ClientMetrics>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorRecord {
     pub t_unix_ns: u64,

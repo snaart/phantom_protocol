@@ -126,18 +126,85 @@ the longest scenario for almost no extra information.
 
 Useful flags: `--legs udp,tcp,mimic,quic,raw_tcp,raw_udp`,
 `--only rtt_sweep,upload`, `--rtt-sizes 64,1024,8192`, `--soak-secs`,
-`--concurrency`, `--no-upload`.
+`--concurrency`, `--capture-iface`, `--no-upload`.
 
 ## Scenarios
 
-`clock_sync`, `handshake`, `rtt_sweep`, `message_integrity`, `upload`,
-`download`, `bidir`, `streams`, `zero_rtt`, `rekey`, `migration`,
+`clock_sync`, `handshake`, `wire_capture`, `rtt_sweep`, `message_integrity`,
+`upload`, `download`, `bidir`, `streams`, `zero_rtt`, `rekey`, `migration`,
 `concurrency`, `negative`, `liveness_soak`, and the raw-leg baselines
 (`rtt_sweep`, `throughput`).
 
 `upload`, `download` and `bidir` additionally record the sender's congestion-control
 state throughout, and the daemon reports its own in `STATS` — during a download the
 server is the sender, so the client's window is not the one that governs it.
+
+### `wire_capture`: is the application's data on the wire?
+
+Runs on every Phantom leg, early, on its own fresh session. It takes a packet
+capture, drives a short exchange whose payloads it generated itself, and then
+searches the captured bytes for them.
+
+```bash
+# on its own, against a running daemon
+sudo -E ./phantom-probe --host <server> --pin-file ./pin.hex \
+    --only wire_capture --legs udp --capture-iface any
+```
+
+Capturing is privileged. On Linux the alternative to `sudo` is to grant it once
+to the tool instead of the run:
+
+```bash
+sudo setcap cap_net_raw,cap_net_admin+eip "$(command -v tcpdump)"
+```
+
+`--capture-iface` defaults to `any`, which is a Linux pseudo-interface. macOS
+and BSD have no such thing and need a real name (`en0`, `lo0`). Ethernet, raw
+IP, both Linux cooked-capture formats, BSD loopback and a VLAN tag are all
+decoded; anything else is counted as undecodable in the record rather than
+quietly dropped.
+
+**It searches for two things, and that is the point.** The payloads must not be
+there — a hit is plaintext on the wire, and the record names the message. The
+build's `PROTOCOL_VARIANT` tag must be there, because the handshake is signed
+rather than encrypted and carries it in the clear. Without that second search a
+clean first result is indistinguishable from a search that could not find
+anything at all — a wrong interface, an empty file, a decoder that gave up — so
+**a run whose negative search is clean and whose positive control is missing is
+reported as `failed`, not as `pass`.** So is a capture with no post-handshake
+traffic in it: "no application bytes on the wire" says nothing when no
+application bytes were sent.
+
+Entropy over the captured payloads is reported alongside, as evidence that the
+bytes are unstructured rather than as proof that they are encrypted, and split
+in two because a short packet is bounded by arithmetic: a 40-byte
+acknowledgement cannot exceed log2(40) ≈ 5.3 bits per byte whatever produced
+it. The record therefore carries raw bits per byte over payloads of at least
+256 B — where 8.0 is reachable — and, over all of them, entropy as a fraction
+of each payload's own ceiling. Both come with their sample size, and the
+handshake and established phases are summarised separately because they are
+different populations.
+
+**What it cannot establish, and says so in the artifact.** Security invariant 2
+requires every post-handshake packet to carry the `ENCRYPTED` flag. That flag is
+in the packet header, header protection masks the header from byte 0, and so no
+capture can read it. The record answers that question from the source instead
+and labels it as such: it names the mechanism in `core/src/api/session.rs`, the
+in-lib tests that pin both the send and receive halves, the fact that
+`core/tests/security_invariants.rs` — the suite documented as pinning the
+numbered invariants — contains no test of either gate, and the fact that the
+counter which would show the gate firing is an OpenTelemetry instrument that
+compiles away on a default build. Those five statements travel in every record,
+including a skipped one.
+
+Without capture rights the scenario records a skip and the reason, quoting
+tcpdump, exactly as the reference leg does for a missing certificate. It is
+never a silent pass: the run's caveats say that a run carrying that skip has not
+examined the wire at all.
+
+The capture is kept at `samples/<leg>/wire_capture.pcap` alongside the record,
+and the record carries the `tcpdump` command line that produced it, so the whole
+result can be re-derived by hand.
 
 ### Reordering: how far back, and how long after
 
@@ -199,6 +266,7 @@ in what was already filler, at the same datagram size, on the same rate ladder.
 | `zero_rtt` | skipped — quinn's 0-RTT needs a ticket cache and a separate accept path; not wired |
 | `rekey`, `migration` | skipped — driven through Phantom-specific API with no counterpart used here |
 | `negative` | skipped — it asserts Phantom's typed errors; asserting quinn's would be testing quinn |
+| `wire_capture` | skipped — its positive control is this build's own `PROTOCOL_VARIANT` tag; the equivalent for quinn would be a string out of rustls, and finding it would be evidence about rustls |
 | `liveness_soak` | skipped — the soak runs on exactly one leg by design |
 
 Each skip is written into `summary.json` with its reason, so a gap in coverage is
@@ -224,6 +292,9 @@ Client, under `results/<run-id>/`:
   total or app-limited flag, so those stay zero rather than being approximated,
   and `state` reads `quic:cubic`. quinn's loss and MTU counters, which have no
   field in the record, appear in each transfer's summary notes instead
+- `samples/<leg>/wire_capture.pcap` — the raw capture the encryption check was
+  derived from, kept next to its own `wire_capture.jsonl`. Absent when the run
+  had no capture rights, in which case the record says so and why
 - `samples/raw_udp/downstream.jsonl` and `samples/raw_udp/throughput.jsonl` — one
   record per rate rung of each raw control, carrying both ends' accounts and the
   reorder distributions described above. `analyze.py` prints them under

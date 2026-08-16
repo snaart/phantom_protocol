@@ -14,10 +14,12 @@
 //! `migration`, `streams`, `negative`, `liveness_soak`) hold the concrete
 //! session, and the reference leg records a [`skipped`] note saying why.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use phantom_protocol::transport::handshake::PROTOCOL_VARIANT;
 use phantom_protocol::CoreError;
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -31,9 +33,13 @@ use crate::proto::{Msg, PayloadGen};
 use crate::report::{
     unix_nanos, BuildId, ConcurrencySample, ErrorRecord, HandshakeSample, Leg,
     MessageIntegritySample, MigrationSample, NegativeSample, RekeySample, RttSample, SampleSink,
-    ScenarioSummary, SoakSample, StreamSample, ThroughputSample, ZeroRttSample,
+    ScenarioSummary, SoakSample, StreamSample, ThroughputSample, WireCheckSample, ZeroRttSample,
 };
 use crate::stats::{Summary, Throughput};
+use crate::wirecheck::{
+    self, filter_for, needles_for, probe_marker, tcpdump_args, Capture, CaptureRequest, Needle,
+    Polarity, PROBE_PAYLOAD_BYTES,
+};
 use crate::{downlink, pacing};
 
 /// What one scenario produced.
@@ -1858,7 +1864,344 @@ async fn flood_junk(ep: &Endpoints, leg: Leg) -> usize {
     sent
 }
 
-// ── 14. raw baselines ───────────────────────────────────────────────────────
+// ── 14. wire_capture ────────────────────────────────────────────────────────
+
+/// Take a packet capture while driving a session whose application payloads
+/// this probe generated, then search the captured bytes for them.
+///
+/// The search looks for two things at once, and that is the whole design. The
+/// payloads must not be there — a hit is plaintext on the wire. The build's
+/// `PROTOCOL_VARIANT` tag must be there, because the handshake is signed rather
+/// than encrypted and carries it in the clear. Without the second, a clean
+/// first result is indistinguishable from a search that could not find anything
+/// at all, and [`crate::wirecheck::analyze`] reports that case as a failure
+/// rather than a pass.
+///
+/// Capture is privileged. When this host cannot take one the scenario records a
+/// skip with the reason — the same shape the reference leg uses for a missing
+/// certificate — because a security check that quietly did not run is worse
+/// than one that is plainly absent.
+///
+/// One thing this cannot reach, and the record says so in full: whether every
+/// post-handshake packet carries the `ENCRYPTED` flag. Header protection masks
+/// the whole packet header, so no capture can read that field. See
+/// [`crate::wirecheck::ENCRYPTED_FLAG_STATEMENT`].
+pub async fn wire_capture(
+    ep: &Endpoints,
+    pin: &[u8],
+    leg: Leg,
+    interface: &str,
+    messages: usize,
+    run_dir: &Path,
+) -> ScenarioOutput {
+    let mut out = ScenarioOutput::new(leg, "wire_capture");
+
+    // Alongside the scenario's own samples, so the raw evidence and the numbers
+    // derived from it travel together.
+    let pcap_path = run_dir
+        .join("samples")
+        .join(leg.as_str())
+        .join("wire_capture.pcap");
+
+    // Resolve the peer here rather than handing tcpdump a hostname: tcpdump
+    // would resolve it itself, possibly to a wider set than the one address the
+    // session uses, and would put a DNS lookup on the wire mid-capture.
+    let addr = ep.addr_for(leg);
+    let Some(peer) = tokio::net::lookup_host(&addr)
+        .await
+        .ok()
+        .and_then(|mut it| it.next())
+        .map(|a| a.ip().to_string())
+    else {
+        record_wire_check(
+            &mut out,
+            skipped_sample(
+                leg,
+                String::new(),
+                format!("{addr} did not resolve, so no capture filter could be built"),
+            ),
+        );
+        return out;
+    };
+
+    let req = CaptureRequest {
+        interface: interface.to_string(),
+        filter: filter_for(&peer, ep.port_for(leg)),
+        path: pcap_path.clone(),
+    };
+    let command = format!("tcpdump {}", tcpdump_args(&req).join(" "));
+
+    let capture = match Capture::start(&req).await {
+        Ok(c) => c,
+        Err(why) => {
+            record_wire_check(&mut out, skipped_sample(leg, command, why));
+            return out;
+        }
+    };
+
+    // Build every payload before any of them touches the network, so the bytes
+    // searched for are exactly the bytes sent rather than a regeneration of
+    // them.
+    let nonce = unix_nanos();
+    let mut gen = PayloadGen::new(nonce);
+    let probes: Vec<(String, Vec<u8>)> = (0..messages)
+        .map(|i| {
+            let marker = probe_marker(nonce, i);
+            let mut payload = marker.as_bytes().to_vec();
+            payload.extend_from_slice(&gen.fill(PROBE_PAYLOAD_BYTES.saturating_sub(marker.len())));
+            (marker, payload)
+        })
+        .collect();
+
+    let mut needles = needles_for(&probes, PROTOCOL_VARIANT);
+    if leg == Leg::Mimic {
+        // The mimicry leg's outer TLS ClientHello presents an SNI in the clear.
+        // That is the leg's entire purpose and no secret rides in it, so it is
+        // recorded either way rather than being made a verdict: its presence is
+        // by design and its absence would be a change worth seeing, but neither
+        // is a defect.
+        needles.push(Needle::new(
+            "mimic_sni",
+            ep.sni.as_bytes().to_vec(),
+            Polarity::Observed,
+        ));
+    }
+
+    let framed = match connect_framed(leg, ep, pin).await {
+        Ok(f) => f,
+        Err(e) => {
+            out.error(leg, "wire_capture", "connect", &e);
+            let _ = capture.finish().await;
+            let _ = std::fs::remove_file(&pcap_path);
+            record_wire_check(
+                &mut out,
+                skipped_sample(
+                    leg,
+                    command,
+                    format!(
+                        "no session could be established on this leg ({}), so nothing was sent \
+                         for the capture to be searched for",
+                        error_kind(&e)
+                    ),
+                ),
+            );
+            return out;
+        }
+    };
+
+    // The instant that splits the capture. Taken after `await_ready()` and
+    // before the first application byte, on the same host clock the capture is
+    // stamped with.
+    let established_unix_ns = unix_nanos();
+    mark(&framed, "wire_capture:established").await;
+
+    let mut echo_ok = 0usize;
+    let mut echo_failed = 0usize;
+    for (i, (_, payload)) in probes.iter().enumerate() {
+        match echo_once(&framed, i as u64, payload.clone()).await {
+            Ok(_) => echo_ok += 1,
+            Err(e) => {
+                echo_failed += 1;
+                out.error(leg, "wire_capture", "echo", &e);
+            }
+        }
+    }
+
+    let counters = Some(framed.session().metrics_snapshot().into());
+    conn::close_session(framed.session()).await;
+    // Let the closing frames land before the capture stops. Without this the
+    // tail of the exchange is missing from exactly the phase being searched.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A capture that was written but could not be read is still evidence about
+    // why, so its path is reported whenever the file exists — not only when the
+    // analysis got something out of it.
+    let (findings, capture_path) = match capture.finish().await {
+        Ok(bytes) => (
+            match wirecheck::analyze(&bytes, &needles, established_unix_ns) {
+                Ok(f) => f,
+                Err(e) => {
+                    wirecheck::Findings::skipped(format!("the capture could not be read: {e}"))
+                }
+            },
+            Some(pcap_path.display().to_string()),
+        ),
+        Err(why) => (wirecheck::Findings::skipped(why), None),
+    };
+
+    record_wire_check(
+        &mut out,
+        WireCheckSample {
+            leg,
+            t_unix_ns: unix_nanos(),
+            established_unix_ns,
+            probe_messages: probes.len(),
+            probe_payload_bytes: PROBE_PAYLOAD_BYTES,
+            echo_ok,
+            echo_failed,
+            capture_command: command,
+            capture_path,
+            findings,
+            session_counters: counters,
+        },
+    );
+    out
+}
+
+/// A run where no capture was taken, with the reason that will be recorded.
+fn skipped_sample(leg: Leg, command: String, why: String) -> WireCheckSample {
+    WireCheckSample {
+        leg,
+        t_unix_ns: unix_nanos(),
+        established_unix_ns: 0,
+        probe_messages: 0,
+        probe_payload_bytes: PROBE_PAYLOAD_BYTES,
+        echo_ok: 0,
+        echo_failed: 0,
+        capture_command: command,
+        capture_path: None,
+        findings: wirecheck::Findings::skipped(why),
+        session_counters: None,
+    }
+}
+
+/// Turn one check into its sample record and the notes a reader sees.
+///
+/// The notes are ordered so the verdict and the reasons for it come first: a
+/// reader scanning `summary.json` must not have to reach the end of a paragraph
+/// about entropy to learn that the search proved nothing.
+fn record_wire_check(out: &mut ScenarioOutput, sample: WireCheckSample) {
+    let f = &sample.findings;
+    match f.verdict {
+        wirecheck::Verdict::Pass => {
+            out.summary.ok_count += 1;
+            out.note(format!(
+                "VERDICT pass: the {} application payload(s) this probe generated appear nowhere \
+                 in {} captured frames, and the positive control does appear — so the search was \
+                 capable of finding something",
+                sample.probe_messages, f.frames_total
+            ));
+        }
+        wirecheck::Verdict::Failed => {
+            out.summary.error_count += 1;
+            out.note("VERDICT failed: this run did not establish that the wire carries no application bytes".to_string());
+        }
+        wirecheck::Verdict::Skipped => {
+            out.note(
+                "VERDICT skipped: no capture was taken, so the wire was not examined at all"
+                    .to_string(),
+            );
+        }
+    }
+    for r in &f.reasons {
+        out.note(format!("  reason: {r}"));
+    }
+
+    if f.verdict != wirecheck::Verdict::Skipped {
+        let undecodable: usize = f.undecodable.iter().map(|u| u.frames).sum();
+        out.note(format!(
+            "capture: {} frames ({} link type), {} decoded to a transport payload, {} not ({}); \
+             {} before the session was established, {} after{}",
+            f.frames_total,
+            f.link_type_name,
+            f.frames_decoded,
+            undecodable,
+            if f.undecodable.is_empty() {
+                "none".to_string()
+            } else {
+                f.undecodable
+                    .iter()
+                    .map(|u| format!("{}: {}", u.reason, u.frames))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            f.handshake_frames,
+            f.established_frames,
+            if f.capture_truncated {
+                "; the file ends mid-record, which is the expected shape when the capture is stopped"
+            } else {
+                ""
+            }
+        ));
+
+        let negative: usize = f
+            .needles
+            .iter()
+            .filter(|n| n.polarity == wirecheck::Polarity::MustNotAppear)
+            .count();
+        out.note(format!(
+            "negative search: {negative} needles over {} B payloads the probe generated \
+             (each message searched for whole and by its leading marker), {} hits",
+            sample.probe_payload_bytes,
+            f.needles
+                .iter()
+                .filter(|n| n.polarity == wirecheck::Polarity::MustNotAppear)
+                .map(|n| n.frames_hit)
+                .sum::<usize>()
+        ));
+        for n in &f.needles {
+            match n.polarity {
+                wirecheck::Polarity::MustAppear => out.note(format!(
+                    "positive control `{}` ({} B): {} frame(s), {} of them before establishment \
+                     — this is what shows the search can find anything at all",
+                    n.label, n.needle_bytes, n.frames_hit, n.hits_in_handshake
+                )),
+                wirecheck::Polarity::Observed => out.note(format!(
+                    "observed (open by design, not a verdict) `{}` ({} B): {} frame(s)",
+                    n.label, n.needle_bytes, n.frames_hit
+                )),
+                wirecheck::Polarity::MustNotAppear => {}
+            }
+        }
+
+        let e = &f.established_entropy;
+        out.note(format!(
+            "entropy of established-session payloads — evidence of unstructured bytes, not proof \
+             of encryption: {} payloads, {} of them at least {} B where 8.0 bits/byte is \
+             reachable. Over those {}: min {:.2}, p50 {:.2}, max {:.2} bits/byte. As a fraction \
+             of each payload's own arithmetic ceiling, over all {} non-trivial payloads: min \
+             {:.3}, p50 {:.3}. A short packet cannot reach 8 bits/byte for reasons that have \
+             nothing to do with cryptography, which is why the second figure exists",
+            e.payloads,
+            e.full_scale_payloads,
+            wirecheck::FULL_SCALE_LEN,
+            e.bits_per_byte.count,
+            e.bits_per_byte.min,
+            e.bits_per_byte.p50,
+            e.bits_per_byte.max,
+            e.ratio_of_ceiling.count,
+            e.ratio_of_ceiling.min,
+            e.ratio_of_ceiling.p50,
+        ));
+
+        if let Some(c) = &sample.session_counters {
+            out.note(format!(
+                "session counters over the same exchange: {} replay rejections, {} AEAD failures, \
+                 {} packets sent, {} received",
+                c.replay_rejected_total, c.aead_failure_total, c.packets_sent, c.packets_recv
+            ));
+        }
+    }
+
+    // Outside the block above: a capture that was taken but could not be read
+    // still has a path worth naming, and its verdict is a skip.
+    if let Some(p) = &sample.capture_path {
+        out.note(format!(
+            "capture kept at {p}; reproduce with: {}",
+            sample.capture_command
+        ));
+    }
+
+    // Always last, and always in full: the part of invariant 2 a capture cannot
+    // reach, and where the answer actually comes from.
+    for line in &f.encrypted_flag {
+        out.note(line.clone());
+    }
+
+    out.sink.push(&sample);
+}
+
+// ── 15. raw baselines ───────────────────────────────────────────────────────
 
 /// Raw TCP echo round trips, length-prefixed to match `TcpSessionTransport`.
 pub async fn raw_tcp_rtt(ep: &Endpoints, sizes: &[usize], per_size: usize) -> ScenarioOutput {
@@ -2875,6 +3218,273 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("this is a finding")),
             "a failed negative case must be called out, not buried in counts"
+        );
+    }
+
+    // ── wire_capture reporting ──────────────────────────────────────────────
+    //
+    // The scenario itself needs a network and a privileged capture; everything
+    // between the capture and the artifact does not, and that is where a wrong
+    // result would be written. These drive it with constructed captures.
+
+    /// Deterministic non-repeating bytes, so a constructed payload is
+    /// unstructured without depending on an RNG.
+    fn filler(len: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed | 1;
+        (0..len)
+            .map(|_| {
+                s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                (s >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// A minimal classic-pcap file over Ethernet/IPv4/UDP frames.
+    fn capture_of(frames: &[(u64, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xa1b2_c3d4u32.to_le_bytes());
+        out.extend_from_slice(&[2, 0, 4, 0]);
+        out.extend_from_slice(&[0u8; 8]);
+        out.extend_from_slice(&65_535u32.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        for (ns, body) in frames {
+            let mut f = vec![0u8; 14];
+            f[12] = 0x08;
+            let mut ip = vec![0u8; 20];
+            ip[0] = 0x45;
+            ip[2..4].copy_from_slice(&((20 + 8 + body.len()) as u16).to_be_bytes());
+            ip[9] = 17;
+            f.extend_from_slice(&ip);
+            let mut udp = vec![0u8; 8];
+            udp[4..6].copy_from_slice(&((8 + body.len()) as u16).to_be_bytes());
+            f.extend_from_slice(&udp);
+            f.extend_from_slice(body);
+            out.extend_from_slice(&((ns / 1_000_000_000) as u32).to_le_bytes());
+            out.extend_from_slice(&((ns % 1_000_000_000 / 1_000) as u32).to_le_bytes());
+            out.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            out.extend_from_slice(&f);
+        }
+        out
+    }
+
+    fn probe_messages(count: usize) -> Vec<(String, Vec<u8>)> {
+        (0..count)
+            .map(|i| {
+                let m = probe_marker(0xFEED, i);
+                let mut p = m.as_bytes().to_vec();
+                p.extend_from_slice(&filler(PROBE_PAYLOAD_BYTES - m.len(), i as u64 + 1));
+                (m, p)
+            })
+            .collect()
+    }
+
+    fn sample_for(findings: wirecheck::Findings, messages: usize) -> WireCheckSample {
+        WireCheckSample {
+            leg: Leg::Udp,
+            t_unix_ns: 1,
+            established_unix_ns: 2_000_000_000,
+            probe_messages: messages,
+            probe_payload_bytes: PROBE_PAYLOAD_BYTES,
+            echo_ok: messages,
+            echo_failed: 0,
+            capture_command: "tcpdump -i any -n -s 0 -U -w x.pcap host 10.0.0.1".to_string(),
+            capture_path: Some("x.pcap".to_string()),
+            findings,
+            session_counters: None,
+        }
+    }
+
+    /// A capture where the control is present and the payloads are not: the
+    /// only shape that may be reported as a pass, and the notes have to state
+    /// the sample size the entropy figures rest on.
+    #[test]
+    fn a_clean_check_reports_a_pass_with_its_sample_size() {
+        let msgs = probe_messages(3);
+        let needles = needles_for(&msgs, PROTOCOL_VARIANT);
+        let mut hello = PROTOCOL_VARIANT.to_vec();
+        hello.extend_from_slice(&filler(1000, 11));
+        let cap = capture_of(&[
+            (1_000_000_000, hello),
+            (3_000_000_000, filler(1100, 12)),
+            (3_100_000_000, filler(1100, 13)),
+        ]);
+        let findings = wirecheck::analyze(&cap, &needles, 2_000_000_000).expect("analyze");
+        assert_eq!(findings.verdict, wirecheck::Verdict::Pass, "{findings:?}");
+
+        let mut out = ScenarioOutput::new(Leg::Udp, "wire_capture");
+        record_wire_check(&mut out, sample_for(findings, msgs.len()));
+
+        assert_eq!(out.summary.ok_count, 1);
+        assert_eq!(out.summary.error_count, 0);
+        assert_eq!(out.sink.len(), 1, "the record reaches the artifact");
+        let notes = out.summary.notes.join("\n");
+        assert!(notes.contains("VERDICT pass"), "{notes}");
+        assert!(
+            notes.contains("positive control `protocol_variant`"),
+            "the control must be reported, not merely consulted: {notes}"
+        );
+        assert!(
+            notes.contains("2 payloads, 2 of them at least 256 B"),
+            "the entropy sample size must travel with the figure: {notes}"
+        );
+        assert!(
+            notes.contains("arithmetic ceiling"),
+            "and so must the reason short packets score low: {notes}"
+        );
+    }
+
+    /// The rule the design turns on, at the reporting layer: a clean negative
+    /// search whose control failed is an error in the summary, not an ok.
+    #[test]
+    fn a_search_that_proved_nothing_is_counted_as_a_failure_not_a_pass() {
+        let msgs = probe_messages(3);
+        let needles = needles_for(&msgs, PROTOCOL_VARIANT);
+        // Nothing in this capture is a payload — and nothing is the control.
+        let cap = capture_of(&[
+            (1_000_000_000, filler(1000, 21)),
+            (3_000_000_000, filler(1100, 22)),
+        ]);
+        let findings = wirecheck::analyze(&cap, &needles, 2_000_000_000).expect("analyze");
+
+        let mut out = ScenarioOutput::new(Leg::Udp, "wire_capture");
+        record_wire_check(&mut out, sample_for(findings, msgs.len()));
+
+        assert_eq!(out.summary.ok_count, 0);
+        assert_eq!(out.summary.error_count, 1);
+        let notes = out.summary.notes.join("\n");
+        assert!(notes.contains("VERDICT failed"), "{notes}");
+        assert!(notes.contains("positive control"), "{notes}");
+        assert!(notes.contains("worth nothing"), "{notes}");
+    }
+
+    /// A payload on the wire has to name the message it belongs to, or the
+    /// finding cannot be chased.
+    #[test]
+    fn a_leaked_payload_is_reported_as_a_failure_naming_the_message() {
+        let msgs = probe_messages(3);
+        let needles = needles_for(&msgs, PROTOCOL_VARIANT);
+        let mut hello = PROTOCOL_VARIANT.to_vec();
+        hello.extend_from_slice(&filler(1000, 31));
+        let cap = capture_of(&[(1_000_000_000, hello), (3_000_000_000, msgs[2].1.clone())]);
+        let findings = wirecheck::analyze(&cap, &needles, 2_000_000_000).expect("analyze");
+
+        let mut out = ScenarioOutput::new(Leg::Udp, "wire_capture");
+        record_wire_check(&mut out, sample_for(findings, msgs.len()));
+        assert_eq!(out.summary.error_count, 1);
+        let notes = out.summary.notes.join("\n");
+        assert!(notes.contains("plaintext on the wire"), "{notes}");
+        assert!(
+            notes.contains(&msgs[2].0),
+            "the message must be named: {notes}"
+        );
+    }
+
+    /// The skip path, which is the one an operator without capture rights will
+    /// actually hit. It must read as an absence with a cause — never as a pass,
+    /// and never as a silent omission.
+    #[test]
+    fn a_run_that_could_not_capture_records_the_reason_and_counts_neither_way() {
+        let why = "capturing needs elevated rights on this host and the probe has none";
+        let mut out = ScenarioOutput::new(Leg::Udp, "wire_capture");
+        record_wire_check(
+            &mut out,
+            skipped_sample(Leg::Udp, "tcpdump -i any ...".to_string(), why.to_string()),
+        );
+
+        assert_eq!(out.summary.ok_count, 0, "a skip is not a pass");
+        assert_eq!(out.summary.error_count, 0, "and it is not a failure either");
+        assert_eq!(out.sink.len(), 1, "but it is recorded");
+        let notes = out.summary.notes.join("\n");
+        assert!(notes.contains("VERDICT skipped"), "{notes}");
+        assert!(
+            notes.contains(why),
+            "the reason must reach the artifact: {notes}"
+        );
+        assert!(
+            notes.contains("the wire was not examined at all"),
+            "and it must say what was not done: {notes}"
+        );
+        assert!(
+            !notes.contains("negative search"),
+            "a skip must not report figures it never computed: {notes}"
+        );
+    }
+
+    /// Whatever the verdict, the record has to carry the statement about the
+    /// one question a capture cannot reach — including on a skip, where it is
+    /// the only thing the scenario has to say.
+    #[test]
+    fn every_outcome_carries_the_encrypted_flag_statement() {
+        for sample in [
+            skipped_sample(Leg::Udp, String::new(), "no tcpdump".to_string()),
+            sample_for(
+                wirecheck::analyze(&capture_of(&[]), &[], 1).expect("analyze"),
+                0,
+            ),
+        ] {
+            let mut out = ScenarioOutput::new(Leg::Udp, "wire_capture");
+            record_wire_check(&mut out, sample);
+            let notes = out.summary.notes.join("\n");
+            assert!(
+                notes.contains("Answered from the source, not from the capture"),
+                "{notes}"
+            );
+            assert!(
+                notes.contains("core/tests/security_invariants.rs"),
+                "{notes}"
+            );
+        }
+    }
+
+    /// The mimic leg's SNI is open by design. Recording it must not move the
+    /// verdict in either direction, or a deliberate property of that leg would
+    /// read as a defect.
+    #[test]
+    fn an_observed_string_is_reported_without_becoming_a_verdict() {
+        let msgs = probe_messages(2);
+        let mut needles = needles_for(&msgs, PROTOCOL_VARIANT);
+        needles.push(Needle::new(
+            "mimic_sni",
+            b"www.example.com".to_vec(),
+            Polarity::Observed,
+        ));
+        let mut hello = PROTOCOL_VARIANT.to_vec();
+        hello.extend_from_slice(b"www.example.com");
+        hello.extend_from_slice(&filler(1000, 41));
+        let cap = capture_of(&[(1_000_000_000, hello), (3_000_000_000, filler(1100, 42))]);
+        let findings = wirecheck::analyze(&cap, &needles, 2_000_000_000).expect("analyze");
+        assert_eq!(findings.verdict, wirecheck::Verdict::Pass, "{findings:?}");
+
+        let mut out = ScenarioOutput::new(Leg::Udp, "wire_capture");
+        record_wire_check(&mut out, sample_for(findings, msgs.len()));
+        let notes = out.summary.notes.join("\n");
+        assert!(
+            notes.contains("observed (open by design, not a verdict) `mimic_sni`"),
+            "{notes}"
+        );
+        assert_eq!(out.summary.ok_count, 1);
+    }
+
+    /// The control this scenario relies on has to be a string that is really on
+    /// the wire in the clear, and really this build's. If the tag ever became
+    /// something a peer could not read before the AEAD, the positive control
+    /// would start failing every run and the reason would not be obvious.
+    #[test]
+    fn the_positive_control_is_the_builds_own_protocol_variant_tag() {
+        assert!(!PROTOCOL_VARIANT.is_empty());
+        assert!(
+            PROTOCOL_VARIANT.starts_with(b"phantom-"),
+            "{:?}",
+            std::str::from_utf8(PROTOCOL_VARIANT)
+        );
+        assert!(
+            PROTOCOL_VARIANT.len() >= 12,
+            "a short tag would match by chance somewhere in a capture"
+        );
+        assert!(
+            PROTOCOL_VARIANT.iter().all(|b| b.is_ascii_graphic()),
+            "the control has to be findable as a literal byte string"
         );
     }
 }

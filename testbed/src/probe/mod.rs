@@ -87,6 +87,15 @@ pub struct Params {
     pub soak_interval: Duration,
     pub concurrency: usize,
     pub concurrency_ops: usize,
+    /// Application messages the wire-encryption check sends while a capture is
+    /// running.
+    ///
+    /// Every one of them becomes two needles searched against every captured
+    /// frame, so this is the size of the negative search as well as the volume
+    /// of established-session traffic the entropy distribution is drawn from.
+    /// Small numbers make both weak; large ones buy little, because a leak
+    /// would show in the first message.
+    pub wire_messages: usize,
 }
 
 impl Params {
@@ -122,6 +131,7 @@ impl Params {
                 soak_interval: Duration::from_secs(5),
                 concurrency: 8,
                 concurrency_ops: 5,
+                wire_messages: 32,
             },
             Profile::Standard => Self {
                 clock_probes: 40,
@@ -152,6 +162,7 @@ impl Params {
                 soak_interval: Duration::from_secs(10),
                 concurrency: 32,
                 concurrency_ops: 10,
+                wire_messages: 96,
             },
             Profile::Deep => Self {
                 clock_probes: 60,
@@ -182,6 +193,7 @@ impl Params {
                 soak_interval: Duration::from_secs(15),
                 concurrency: 128,
                 concurrency_ops: 20,
+                wire_messages: 192,
             },
         }
     }
@@ -197,6 +209,12 @@ pub struct ProbeConfig {
     pub upload_results: bool,
     /// When set, only these scenario names run. Everything else is skipped.
     pub only: Option<std::collections::HashSet<String>>,
+    /// Interface the `wire_capture` scenario captures on.
+    ///
+    /// `any` is the Linux pseudo-interface and is the useful default there; it
+    /// does not exist on macOS or BSD, where a real interface name is required.
+    /// Getting it wrong costs a recorded skip rather than a wrong answer.
+    pub capture_iface: String,
 }
 
 impl ProbeConfig {
@@ -441,6 +459,15 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
                 scenarios::handshake(ep, pin, leg, p.handshake_count).await,
             )?;
         }
+        // Early, and on its own fresh session: the capture has to be running
+        // before the handshake it needs for a positive control.
+        if cfg.wants("wire_capture") {
+            st.absorb(
+                leg,
+                scenarios::wire_capture(ep, pin, leg, &cfg.capture_iface, p.wire_messages, &dir)
+                    .await,
+            )?;
+        }
         if cfg.wants("rtt_sweep") {
             st.absorb(
                 leg,
@@ -582,6 +609,7 @@ const RAW_SCENARIOS: &[&str] = &["rtt_sweep", "throughput", "downstream"];
 const PHANTOM_SCENARIOS: &[&str] = &[
     "clock_sync",
     "handshake",
+    "wire_capture",
     "rtt_sweep",
     "message_integrity",
     "upload",
@@ -647,6 +675,10 @@ const QUIC_SKIPPED: &[(&str, &str)] = &[
     (
         "liveness_soak",
         "the soak runs on exactly one leg by design — see the run's caveats for which",
+    ),
+    (
+        "wire_capture",
+        "the check turns on a positive control that is specific to the protocol under test: the build's PROTOCOL_VARIANT tag, which rides in the clear in a signed-but-unencrypted ClientHello. quinn's handshake has no field this probe generates, so the control would have to be a string out of rustls, and finding it would be evidence about rustls rather than about anything measured here",
     ),
 ];
 
@@ -768,6 +800,14 @@ fn caveats(cfg: &ProbeConfig) -> Vec<String> {
         );
         v.push(
             "The quic leg pins the daemon's self-signed certificate as its only trust anchor and performs ordinary rustls path and name validation against it; certificate verification is not disabled anywhere.".to_string(),
+        );
+    }
+    if cfg.wants("wire_capture") && cfg.legs.iter().any(|l| l.is_phantom()) {
+        v.push(
+            "The wire_capture scenario needs elevated capture rights on the machine running the probe. Where it could not get them it records a skip with the reason instead of a result, so a run carrying that skip has not examined the wire at all — check its verdict before quoting anything about encryption from this run.".to_string(),
+        );
+        v.push(
+            "No capture can show that every post-handshake packet carries the ENCRYPTED flag: header protection masks the whole packet header on the wire. The wire_capture record answers that from the source and says so; nothing measured in this run is evidence about it.".to_string(),
         );
     }
     if let Some(l) = cfg.soak_leg() {
@@ -972,7 +1012,43 @@ mod tests {
                 "{:?}: too few exchanges to cross the rekey threshold even once",
                 p
             );
+            // The wire check draws its entropy distribution from these
+            // messages, and a distribution over a handful of samples is not a
+            // distribution.
+            assert!(
+                x.wire_messages >= 16,
+                "{p:?}: {} messages is too few to say anything about the payload distribution",
+                x.wire_messages
+            );
         }
+    }
+
+    /// The wire check is only as good as the traffic it searches, so the
+    /// heavier profiles must search more of it — and the caveat that a skipped
+    /// check examined nothing has to travel with every run that asks for one.
+    #[test]
+    fn the_wire_check_scales_with_the_profile_and_states_what_a_skip_means() {
+        let s = Params::for_profile(Profile::Smoke);
+        let m = Params::for_profile(Profile::Standard);
+        let d = Params::for_profile(Profile::Deep);
+        assert!(s.wire_messages < m.wire_messages && m.wire_messages < d.wire_messages);
+
+        let c = caveats(&demo_cfg(vec![Leg::Udp, Leg::RawUdp], Profile::Standard)).join("\n");
+        assert!(c.contains("elevated capture rights"), "{c}");
+        assert!(
+            c.contains("has not examined the wire at all"),
+            "a skipped security check must not read as a passed one: {c}"
+        );
+        assert!(
+            c.contains("header protection masks the whole packet header"),
+            "the one question a capture cannot answer must be named: {c}"
+        );
+
+        // A run with no Phantom leg never reaches the scenario, so it must not
+        // carry caveats about a check it did not attempt.
+        let raw_only =
+            caveats(&demo_cfg(vec![Leg::RawTcp, Leg::RawUdp], Profile::Smoke)).join("\n");
+        assert!(!raw_only.contains("wire_capture"), "{raw_only}");
     }
 
     #[test]
@@ -1060,6 +1136,7 @@ mod tests {
             params: Params::for_profile(profile),
             upload_results: false,
             only: None,
+            capture_iface: "any".into(),
         }
     }
 

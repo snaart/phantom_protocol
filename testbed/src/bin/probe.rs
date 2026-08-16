@@ -123,6 +123,15 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     only: Option<Vec<String>>,
 
+    /// Interface the `wire_capture` scenario captures on.
+    ///
+    /// `any` is a Linux pseudo-interface; macOS and BSD need a real name
+    /// (`en0`, `lo0`). Capturing at all needs elevated rights — without them
+    /// the scenario records why it was skipped rather than reporting a check it
+    /// did not run.
+    #[arg(long, default_value = "any")]
+    capture_iface: String,
+
     /// Skip uploading the result bundle back to the daemon.
     #[arg(long)]
     no_upload: bool,
@@ -202,6 +211,7 @@ async fn main() -> Result<()> {
         params,
         upload_results: !args.no_upload,
         only: args.only.map(|v| v.into_iter().collect()),
+        capture_iface: args.capture_iface,
     };
 
     probe::run(cfg).await?;

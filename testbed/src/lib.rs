@@ -48,3 +48,4 @@ pub mod report;
 pub mod stats;
 pub mod sysinfo;
 pub mod testd;
+pub mod wirecheck;
