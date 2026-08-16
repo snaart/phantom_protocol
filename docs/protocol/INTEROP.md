@@ -107,18 +107,29 @@ A `PhantomPacket` is not self-delimiting, so something has to carry it. This run
 has no `.bin` because the framing sits *outside* the frozen wire — but a peer
 that skips it cannot exchange a byte, and the framing differs per transport:
 
-| Transport | Framing | Spec |
+| Transport | Framing | Source |
 | --- | --- | --- |
-| PhantomUDP (the production transport) | 9-byte cleartext envelope `[flags: u8][ConnId: 8]` per datagram, plus an 8-byte fragment subheader when the `FRAG_BIT` is set | PROTOCOL.md § 4.9 |
-| TCP (and the mimicry leg's inner stream) | 4-byte big-endian `u32` message length, phase-capped at 64 KiB before the session establishes and 4 MiB after | PROTOCOL.md § 9 |
-| WebSocket / WASI / embedded | already message-framed by the substrate; no additional prefix | — |
+| PhantomUDP (the production transport) | 9-byte cleartext envelope `[flags: u8][ConnId: 8]` per datagram, plus an 8-byte fragment subheader when the `FRAG_BIT` is set — PROTOCOL.md § 4.9 | `transport/phantom_udp/envelope.rs` |
+| TCP | `[len: u32 big-endian] ‖ message`, the declared length capped at 64 KiB before the session establishes and 4 MiB after — PROTOCOL.md § 9 | `api/tcp_transport.rs` |
+| WASI (`wasi:sockets/tcp`) | the same `[len: u32 big-endian] ‖ message`; the cap is a flat 4 MiB rather than phase-gated | `transport/legs/wasi.rs` |
+| Embedded (UART/USB) | the same `[len: u32 big-endian] ‖ message`; the cap is the leg's fixed buffer size `N` | `transport/legs/embedded/framing.rs` |
+| Mimicry (TLS-over-TCP, `mimicry` feature) | the same `[len: u32 big-endian] ‖ message` byte-stream, then chunked `[chunk_len: u16 big-endian] ‖ chunk` into TLS ApplicationData records — PROTOCOL.md § 9.1 | `transport/legs/mimic_tls/record.rs` |
+| WebSocket (browser) | none — the substrate delivers whole binary messages | `transport/legs/websocket.rs` |
 
-Two properties of the envelope are easy to get wrong and fail closed only later:
-the reserved low five flag bits **must be zero** (a datagram with any of them set
-is rejected outright), and the `Initial` packet type carries a *bare* borsh
-`ClientHello` from the client but a **discriminant-framed** `ServerReply`
+**Four of the five stream transports share one framing**, byte-for-byte: a
+4-byte big-endian message length. Only the caps differ, and a cap is a receive-side
+refusal, not an encoding — so an embedded client and a TCP server frame each
+other's messages identically. WebSocket is the sole leg whose substrate already
+carries message boundaries, and it is the only one that adds no prefix; assuming
+that of the others desynchronizes the stream on the first message, which is the
+failure this rung exists to prevent.
+
+Two properties of the PhantomUDP envelope are easy to get wrong and fail closed
+only later: the reserved low five flag bits **must be zero** (a datagram with any
+of them set is rejected outright), and the `Initial` packet type carries a *bare*
+borsh `ClientHello` from the client but a **discriminant-framed** `ServerReply`
 (`[kind: u8] ‖ borsh(body)`) from the server — the asymmetry is deliberate
-(PROTOCOL.md § 6).
+(PROTOCOL.md § 4.9 / § 6).
 
 Because `recv_bytes` is message-framed on every transport, `payload` is simply
 the remainder after the 15-byte header (Rung 1) — which is exactly why v6 could
@@ -198,6 +209,22 @@ inside the AEAD, so none of them is frozen by a `.bin` and none of them is a
 `WIRE_VERSION` concern — but a mismatch here reads as data corruption, not as a
 parse error.
 
+Three of those shapes — `RELIABLE`, `ACK`, `WINDOW_UPDATE` — are scoped by the
+header's `stream_id`, and that id is allocated by parity: initiator odd from 3,
+responder even from 2, with 0 and 1 reserved (PROTOCOL.md § 4.4). It is the rule
+here with the least behind it: every
+committed vector carries a single hard-coded id, so a peer that allocates in the
+wrong parity passes every check in this guide and then quietly merges its stream
+with its peer's.
+
+The flags combine, so the table above is only half the rule: which branch claims
+a packet carrying several of them is fixed, and PROTOCOL.md § 4.3 gives the
+receiver's dispatch order end to end — including the two orderings that are not
+guessable (`PADDED` strips before anything parses, and `KEEPALIVE` is tested
+before `ACK`, because a PONG is `KEEPALIVE | ACK` and is not a `Sack`). The same
+section states what to do with a flag you do not recognise: ignore it, never
+reject the packet.
+
 ### Rung 5 — Migration & liveness (optional for a minimal peer)
 
 The rotating outer connection ID, path validation, and liveness machinery are
@@ -251,7 +278,8 @@ A peer is wire-conformant with the default build of this repository when:
 - [ ] It agrees with its peer on the AEAD suite (not negotiated — § 1) and assigns the per-direction keys by role, initiator un-swapped and responder swapped (§ 1).
 - [ ] Its AEAD / KDF / hash / ML-KEM / ML-DSA primitives reproduce every KAT in `cavp.rs` (Rung 0).
 - [ ] `encode(value)` equals each packet `.bin`, and `decode(.bin)` equals the value, for the four packet fixtures (Rung 1).
-- [ ] It frames packets for its transport — the 9-byte PhantomUDP envelope with zeroed reserved bits, or the 4-byte big-endian TCP prefix (Rung 1b).
+- [ ] It frames packets for its transport — the 9-byte PhantomUDP envelope with zeroed reserved bits, or the 4-byte big-endian message prefix every stream leg except WebSocket carries (Rung 1b).
+- [ ] It allocates stream ids in its own parity — odd from 3 as the initiator, even from 2 as the responder, with 0 and 1 reserved (PROTOCOL.md § 4.4).
 - [ ] The same holds for all borsh handshake / sub-struct fixtures (Rung 2).
 - [ ] Its transcript hash equals `transcript_hash.bin` (Rung 3).
 - [ ] Its AEAD nonce/AAD construction and HP masking reproduce PROTOCOL.md § 4.6 / § 5; a tampered AAD byte (version included) fails decryption with no oracle (Rung 4).
@@ -279,4 +307,6 @@ to nothing under `--features fips`). See `docs/compliance/fips-readiness.md`.
 Checked against the source on **2026-08-15**, commit `41183f49` — the same
 sync as PROTOCOL.md § 13, which carries the itemised list of what was
 re-derived. Every fixture byte count quoted above was read off
-the committed `.bin` files at that commit.
+the committed `.bin` files at that commit, and every row of the Rung 1b framing
+table was read out of the leg named in its Source column rather than inferred
+from the transport's name.
