@@ -881,9 +881,9 @@ impl Stream {
     /// Bytes the peer currently allows us to send: its cumulative limit less what has
     /// already gone out. Zero means the stream is stopped until a later `WINDOW_UPDATE`
     /// raises the limit. Reported as a `u32` because it is a difference between two totals
-    /// that [`Self::apply_peer_window_limit`] keeps within [`MAX_SEND_WINDOW`] of each
-    /// other, and clamped rather than truncated so it can never read as small when it is
-    /// large.
+    /// that [`Self::apply_peer_window_limit`] brings within [`MAX_SEND_WINDOW`] of each
+    /// other every time it applies an advertisement, and clamped rather than truncated so
+    /// it can never read as small when it is large.
     pub fn peer_send_window(&self) -> u32 {
         let limit = self.peer_send_limit.load(Ordering::Acquire);
         let sent = self.bytes_sent.load(Ordering::Acquire);
