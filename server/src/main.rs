@@ -112,15 +112,6 @@ impl Drop for PerIpGuard {
 async fn main() -> Result<()> {
     let cfg = Config::parse();
 
-    // Resolve admission control before anything is bound or generated. The transport bounds
-    // its receive buffers per session and not per process, so the session cap is what bounds
-    // this process's memory whether or not it was set with that in mind;
-    // `--max-recv-memory-mib` lets an operator state the memory figure instead and have the
-    // cap follow from it. A budget that cannot hold one session is a refusal, and it has to
-    // land here: past this point the listen socket opens, and a readiness probe that sees the
-    // port must never be looking at a process that is about to exit on its own configuration.
-    let max_sessions = cfg.effective_max_sessions().map_err(anyhow::Error::msg)?;
-
     // OTel must be installed BEFORE the tracing subscriber so the
     // `tracing-opentelemetry` layer has a tracer to bridge into. The
     // subscriber then composes the OTel layer alongside the fmt layer.
@@ -185,28 +176,25 @@ async fn main() -> Result<()> {
     // Admission control: a global session cap (backpressure — stop accepting
     // when full rather than exhausting fds/memory) plus a per-IP cap so one
     // source can't monopolise the pool. `max_sessions == 0` → unbounded.
-    // `max_sessions` was resolved against `--max-recv-memory-mib` at startup.
-    let session_slots = Arc::new(Semaphore::new(if max_sessions == 0 {
+    //
+    // The cap is also this process's memory setting: receive buffers are bounded
+    // per session and nothing divides them between sessions, so what the process
+    // holds is this number times what one session holds. The library publishes no
+    // single figure for the second factor — the receive path's buffers each carry
+    // their own bound, and adding them up produces something that reads as a total
+    // while omitting whatever it has not enumerated — so sizing here comes from
+    // measurement under the traffic the deployment actually carries.
+    let session_slots = Arc::new(Semaphore::new(if cfg.max_sessions == 0 {
         Semaphore::MAX_PERMITS
     } else {
-        max_sessions
+        cfg.max_sessions
     }));
     let per_ip = PerIpLimiter::new(cfg.max_sessions_per_ip);
     tracing::info!(
-        max_sessions,
+        max_sessions = cfg.max_sessions,
         max_sessions_per_ip = cfg.max_sessions_per_ip,
-        max_recv_memory_mib = cfg.max_recv_memory_mib,
-        session_recv_memory_commitment_mib =
-            phantom_protocol::api::session::SESSION_RECV_MEMORY_COMMITMENT / (1024 * 1024),
         "session admission control active"
     );
-    if max_sessions != cfg.max_sessions {
-        tracing::warn!(
-            requested = cfg.max_sessions,
-            enforced = max_sessions,
-            "session cap lowered to fit --max-recv-memory-mib"
-        );
-    }
 
     // JoinSet tracks every spawned handler so we can give them a
     // bounded drain window on shutdown.

@@ -13,6 +13,42 @@
 //! the keep-alive / cover / window-update / path-validation senders), so any
 //! change to encrypt/decrypt, framing, or stream routing happens here, in one
 //! place, for both sides.
+//!
+//! # Receive-side memory
+//!
+//! An authenticated peer decides how many streams a session opens, how much it
+//! sends, and how long it leaves a reassembly hole open, so what a session holds
+//! on the receive side is a quantity the *other end* picks. Each of the buffers
+//! it picks between has a bound, and each bound has something that enforces it:
+//!
+//! | bound | what it limits | enforced by |
+//! | --- | --- | --- |
+//! | [`MAX_STREAMS`] | concurrent receive streams | `handle_packet` refuses the stream-creating segment past the cap; unrecorded, so it is not SACKed either |
+//! | [`MAX_RECV_FRAME`] | one inbound frame, hence one queued item | the pump's reader drops the frame before decrypting it |
+//! | [`MAX_RECV_REORDER`](crate::transport::stream::MAX_RECV_REORDER) entries and `Stream::recv_reorder_byte_limit` | one stream's out-of-order backlog | `Stream::accept_in_order` refuses the segment; the sender retransmits |
+//! | [`SESSION_RECV_WINDOW_GROWTH_BUDGET`](crate::transport::stream::SESSION_RECV_WINDOW_GROWTH_BUDGET) | window growth across all streams of a session | `SharedRecvTuning` hands growth out of one allowance |
+//! | [`RECV_DELIVERY_HARD_CAP`] + [`MAX_DELIVERY_CHARGE_PER_FRAME`] | the session's delivery backlog | the reader tears the session down; the second term is the frame that crossed the line |
+//! | [`STREAM_RECV_CHANNEL_DEPTH`], [`RAW_APP_RECV_CHANNEL_DEPTH`] | one delivered-stream queue | the channel is bounded; the delivery task blocks rather than growing it |
+//!
+//! Two things are **observed rather than enforced**, and reading them as bounds
+//! is the mistake this section exists to prevent. The advertised receive window
+//! is a promise about what this side will admit, not an allocation and not a
+//! gate: nothing on the receive path refuses in-order data for exceeding it, so
+//! it constrains a compliant sender and no one else. And the per-stream delivery
+//! channels are bounded in slots; their byte figure is the slot count times
+//! `MAX_RECV_FRAME`'s payload, which is a bound only because that frame gate
+//! exists — remove it and the same channel holds whatever the byte pipe carries.
+//!
+//! **There is deliberately no published per-session total.** Adding the rows up
+//! produces a number that reads as a bound and is not one: the sum covers the
+//! buffers this module owns and not the ones underneath it — the transport's own
+//! receive accumulator, PhantomUDP's fragment reassembly
+//! (`MAX_CONCURRENT_ASSEMBLIES × MAX_REASSEMBLED_LEN` per session), the `Stream`
+//! structures themselves — and each attempt to state such a total has been
+//! corrected upward by a term it had left out. Size a host from measurement
+//! under the traffic it will actually carry, use the rows above to reason about
+//! what a hostile peer can move, and treat any single figure claiming to cover
+//! the receive path as an estimate.
 
 use crate::crypto::hybrid_sign::HybridVerifyingKey;
 use crate::errors::CoreError;
@@ -23,16 +59,13 @@ use crate::observability::attrs::{
 use crate::observability::{Observability, ObservabilityConfig};
 use crate::runtime::{Runtime, TokioRuntime};
 use crate::transport::handshake::{HandshakeClient, ServerReject, ServerReply, EARLY_DATA_MAX_LEN};
-use crate::transport::mtu::MAX_APP_CHUNK;
+use crate::transport::mtu::{MAX_RECV_FRAME, MAX_RECV_PAYLOAD};
 use crate::transport::multiplexer::StreamDemultiplexer;
 use crate::transport::packet_coalescer_codec::unwrap_coalesced_packet;
 use crate::transport::path_validation_codec::build_path_validation_packet;
 use crate::transport::session::{Session, SessionState};
 use crate::transport::shaping::{self, PaddingPolicy};
-use crate::transport::stream::{
-    SendBlocked, SharedRecvTuning, Stream, INITIAL_STREAM_WINDOW, MAX_RECV_REORDER,
-    REORDER_ENTRY_OVERHEAD_BYTES, SESSION_RECV_WINDOW_GROWTH_BUDGET,
-};
+use crate::transport::stream::{SendBlocked, SharedRecvTuning, Stream};
 use crate::transport::types::{
     LegType, PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
     WIRE_VERSION,
@@ -1750,10 +1783,10 @@ async fn run_data_pump<T: SessionTransport>(
     //
     // It stops counting at the hand-off. What is resident downstream — the raw-app
     // channel and the per-stream demux channels — is bounded by those channels' own
-    // depths and is counted in `SESSION_RECV_MEMORY_COMMITMENT` instead. Folding it
-    // into this counter would mean tearing a session down because the local
-    // application stopped reading, which is neither the peer's fault nor what the
-    // hard cap is for.
+    // depths, and in bytes by the frame gate that decides what a slot can hold.
+    // Folding it into this counter would mean tearing a session down because the
+    // local application stopped reading, which is neither the peer's fault nor what
+    // the hard cap is for.
     //
     // Flow-control credit is issued in Task A / Task B immediately on dequeue
     // (one item of look-ahead, cancel-safe: mpsc send drops the item on cancel
@@ -1936,6 +1969,30 @@ async fn run_data_pump<T: SessionTransport>(
                 Ok(b) => b,
                 Err(_) => break,
             };
+
+            // Frame-size gate. Everything below this line ends up in a queue that is
+            // bounded in slots rather than in bytes, so a slot holds whatever a peer
+            // chooses to put in it unless something refuses the oversized frame first.
+            // The chunk size the sender works to is not that something: it is this
+            // side's budget, and the byte pipe underneath will hand over megabytes
+            // (`STEADY_STATE_FRAME_CAP` on the TCP and mimicry legs, a reassembled
+            // datagram on PhantomUDP). `MAX_RECV_FRAME` is the same budget read from
+            // the receiving end.
+            //
+            // Dropped, not fatal. The frame is unauthenticated at this point — nothing
+            // has been through the AEAD yet — so tearing the session down here would
+            // hand an off-path attacker who guesses a connection id a way to kill a
+            // session with one datagram. A peer that really is sending oversized frames
+            // stalls instead: the segment is never delivered, never SACKed, and its
+            // retransmits meet the same gate.
+            if data.len() > MAX_RECV_FRAME {
+                log::debug!(
+                    "PhantomSession: dropping {} B frame; the receive budget is \
+                     {MAX_RECV_FRAME} B",
+                    data.len()
+                );
+                continue;
+            }
 
             // Remove header protection (T4.6) and parse: a malformed / unparseable
             // / short-of-the-AEAD-tag frame (no legitimate peer produces one) is
@@ -3472,14 +3529,18 @@ async fn send_path_validation<T: SessionTransport>(
     true
 }
 
-/// Hard cap on concurrent receive streams a peer can open on one session (H-3). The recv
-/// path auto-creates a `Stream` for any of the 2^32 `stream_id`s; without a cap a peer can
-/// spray distinct ids to explode the stream table. It bounds the session's reorder memory
-/// together with — not by multiplying — the per-stream ceiling: what a session may hold is
-/// `MAX_STREAMS × MAX_RECV_REORDER_BYTES` plus one
-/// `SESSION_RECV_WINDOW_GROWTH_BUDGET`, because every byte of window above the initial one
-/// is drawn from that single session-wide allowance rather than granted per stream.
-/// Sized well above QUIC's ~100-stream default so real multiplexing is unaffected.
+/// Hard cap on concurrent receive streams a peer can open on one session (H-3).
+///
+/// The recv path auto-creates a `Stream` for any of the 2^32 `stream_id`s; without a cap a
+/// peer can spray distinct ids to explode the stream table. Enforced in `handle_packet`,
+/// on the arm that would create the stream: past the cap the segment is refused, and being
+/// unrecorded it is not SACKed either, so the sender retransmits rather than believing the
+/// stream exists. Sized well above QUIC's ~100-stream default so real multiplexing is
+/// unaffected.
+///
+/// It is a multiplier on several of the per-stream bounds below, so raising it raises what
+/// one session can be made to hold — see the receive-memory section in this module's
+/// documentation for which of them it multiplies.
 pub const MAX_STREAMS: usize = 256;
 
 /// Ceiling on the app-delivery backlog one session may hold, in bytes.
@@ -3496,7 +3557,29 @@ pub const MAX_STREAMS: usize = 256;
 /// The cap bounds *resident* bytes only because every queued item is charged
 /// [`DELIVERY_ITEM_OVERHEAD_BYTES`] on top of its payload — see there for what a cap
 /// counting payload alone would really admit.
+///
+/// **The backlog can stand at this cap plus [`MAX_DELIVERY_CHARGE_PER_FRAME`], and that sum
+/// is the figure to size from.** The charge for a frame is only known once the frame has
+/// been decrypted and routed, so the reader checks the counter around the frame rather than
+/// inside it and one frame's worth always lands past the line. Moving the check below the
+/// charge instead of above it does not change that — the same frame is the one that crosses
+/// — so the overshoot is stated here rather than designed away.
 pub const RECV_DELIVERY_HARD_CAP: u64 = 4 * 1024 * 1024;
+
+/// The most one inbound frame can add to the delivery backlog, in bytes — the overshoot
+/// [`RECV_DELIVERY_HARD_CAP`] can be standing at when the reader notices it has been passed.
+///
+/// A frame usually enqueues one item, but a `COALESCED` bundle is split into one item per
+/// non-empty sub-payload, and each of those is charged [`DELIVERY_ITEM_OVERHEAD_BYTES`]. So
+/// the worst frame is not the fullest one: it is the one carrying the most sub-payloads, and
+/// a sub-payload costs a peer only its two-byte length prefix and the single byte that keeps
+/// it from being skipped as empty. Derived from the bundle framing rather than stated, so a
+/// change to either takes this with it.
+pub const MAX_DELIVERY_CHARGE_PER_FRAME: u64 = {
+    let bundle = MAX_RECV_PAYLOAD - crate::transport::packet_coalescer::HEADER_SIZE;
+    let per_sub = crate::transport::packet_coalescer::SUB_HEADER_SIZE + 1;
+    (bundle / per_sub) as u64 * (1 + DELIVERY_ITEM_OVERHEAD_BYTES)
+};
 
 /// Bytes of *structure* one queued delivery item costs beyond its payload: a slot in the
 /// channel block the item is parked in, and — for reliable data, which arrives as
@@ -3519,9 +3602,15 @@ pub const DELIVERY_ITEM_OVERHEAD_BYTES: u64 = 128;
 /// [`PhantomStream::recv`](crate::api::stream::PhantomStream::recv).
 ///
 /// A bounded channel is its own enforcement — the delivery task blocks rather than growing it
-/// — so this needs no separate gate. What it does need is *counting*: at `MAX_STREAMS`
-/// streams it is by far the largest term in [`SESSION_RECV_MEMORY_COMMITMENT`], and it is
-/// resident whenever the application is slower than the peer.
+/// — so the slot count needs no separate gate. The bytes did: a queue bounded in slots holds
+/// whatever the slots weigh, and until the receive path refused oversized frames a slot held
+/// as much as the byte pipe would carry. With
+/// [`MAX_RECV_PAYLOAD`] enforced on the way in, this
+/// depth times that payload is a real byte bound, and both halves of it are things this side
+/// decides.
+///
+/// It is resident whenever the application is slower than the peer, and there are
+/// [`MAX_STREAMS`] of it.
 pub const STREAM_RECV_CHANNEL_DEPTH: usize = 1024;
 
 /// Depth, in items, of the bounded channel behind
@@ -3531,66 +3620,6 @@ pub const STREAM_RECV_CHANNEL_DEPTH: usize = 1024;
 /// One per session rather than one per stream, hence a small term next to
 /// [`STREAM_RECV_CHANNEL_DEPTH`], but resident on the same terms.
 pub const RAW_APP_RECV_CHANNEL_DEPTH: usize = 256;
-
-/// Receive-side memory one session may commit, in bytes — the figure a host is sized from.
-///
-/// Every term is something an authenticated peer chooses (how many streams it opens, how
-/// much it sends, how long it leaves a reassembly hole open), so this is the amplification
-/// bound for the receive path and it is stated in full rather than by its largest term:
-///
-/// ```text
-///   advertised windows   MAX_STREAMS × 64 KiB + growth budget       =  24 MiB
-///   reorder payload      Σ (window_i + 64 KiB)                      =  40 MiB
-///   reorder structure    MAX_STREAMS × 2048 × 128 B                 =  64 MiB
-///   delivery backlog     RECV_DELIVERY_HARD_CAP                     =   4 MiB
-///   per-stream channels  MAX_STREAMS × 1024 × (1156 B + 128 B)      = 321 MiB
-///   raw-app channel      256 × (1156 B + 128 B)                     = 0.3 MiB
-///                                                                   ─────────
-///                                                        resident    429 MiB
-/// ```
-///
-/// The advertised windows are a promise rather than an allocation — the bytes they admit
-/// come to rest in one of the buffers below — so the resident total is the terms under them.
-/// `SESSION_RECV_WINDOW_GROWTH_BUDGET` bounds 8 MiB of it; the rest follows from
-/// `MAX_STREAMS`, the reorder entry cap, the delivery cap and the two channel depths, which
-/// is why raising any of those is a memory decision and not a tuning one.
-///
-/// Three quarters of the figure is the per-stream delivery channels, and that is a
-/// consequence of `MAX_STREAMS` (256) times [`STREAM_RECV_CHANNEL_DEPTH`] (1024) rather than
-/// of anything the transport needs: those two are the lever on this number, at the cost of
-/// less tolerance for a slow consumer before the delivery task head-of-line blocks the other
-/// opened streams. The channels are bounded by construction — they cannot exceed their depth
-/// — so what was missing was never enforcement, only counting.
-///
-/// Unlike the delivery backlog, the channels are deliberately **not** gated by
-/// `RECV_DELIVERY_HARD_CAP`: what fills them is the local application not reading, and
-/// tearing a session down for that would both punish an honest peer and mislabel the cause.
-/// Their bound is their depth.
-///
-/// **This is per session, and nothing divides it between concurrent sessions.** A process
-/// admitting `N` sessions commits `N ×` this figure in the worst case, so the bound at
-/// process scale is admission control — the embedder's, not the library's. The reference
-/// server derives its session cap from this constant when
-/// `--max-recv-memory-mib` is set; see `docs/operations/deployment.md`.
-pub const SESSION_RECV_MEMORY_COMMITMENT: u64 = {
-    // Reorder payload: each stream's budget tracks its own window plus one initial window of
-    // headroom, and the windows are one initial window each plus, between them, one growth
-    // budget.
-    let windows = MAX_STREAMS as u64 * INITIAL_STREAM_WINDOW as u64
-        + SESSION_RECV_WINDOW_GROWTH_BUDGET as u64;
-    let reorder_payload = windows + MAX_STREAMS as u64 * INITIAL_STREAM_WINDOW as u64;
-    // Reorder structure: the byte budget counts payload only, so a peer sending tiny segments
-    // above a hole it never fills is bounded by the entry cap alone.
-    let reorder_structure =
-        MAX_STREAMS as u64 * MAX_RECV_REORDER as u64 * REORDER_ENTRY_OVERHEAD_BYTES as u64;
-    // Delivery channels: a full-size chunk per slot is the peer's best play — small items
-    // cost it a datagram each and hold less — so the per-item worst case is one chunk plus
-    // the structure the slot costs.
-    let per_slot = MAX_APP_CHUNK as u64 + DELIVERY_ITEM_OVERHEAD_BYTES;
-    let stream_channels = MAX_STREAMS as u64 * STREAM_RECV_CHANNEL_DEPTH as u64 * per_slot;
-    let raw_app_channel = RAW_APP_RECV_CHANNEL_DEPTH as u64 * per_slot;
-    reorder_payload + reorder_structure + RECV_DELIVERY_HARD_CAP + stream_channels + raw_app_channel
-};
 
 /// EPS-02 symmetric-rotation step — extracted from [`handle_packet`] so the role
 /// branch is unit-tested always-on (not only by the `#[ignore]` `udp_integration`
@@ -4549,7 +4578,7 @@ impl PhantomSession {
     /// # ⚠ This is a byte stream, not a message channel
     ///
     /// **Message boundaries are not preserved.** The data pump splits `data`
-    /// into chunks of [`MAX_APP_CHUNK`]
+    /// into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
     /// bytes — one chunk plus its packet overhead is exactly one PhantomUDP
     /// datagram — and writes each chunk separately, so the peer's
     /// [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
@@ -6199,16 +6228,40 @@ mod tests {
         sequence: u32,
         payload: &[u8],
     ) -> Vec<u8> {
+        encrypt_outgoing_at(
+            server_session,
+            session_id,
+            stream_id,
+            sequence as u64,
+            sequence,
+            payload,
+        )
+    }
+
+    /// The same frame builder with the two counters separated. The packet number is
+    /// per-direction and never repeats (a repeat is a replay and the window drops it),
+    /// while the stream offset is per-stream and starts at zero — so a test that sends
+    /// two frames competing for the same offset has to advance the packet number on its
+    /// own. `encrypt_outgoing` ties them together for the common case where a test sends
+    /// one frame per offset.
+    fn encrypt_outgoing_at(
+        server_session: &crate::transport::session::Session,
+        session_id: SessionId,
+        stream_id: TransportStreamId,
+        packet_number: u64,
+        stream_offset: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let flag_bits = PacketFlags::RELIABLE | PacketFlags::ENCRYPTED;
         let header = PacketHeader::new(
             session_id,
             stream_id,
-            sequence as u64,
+            packet_number,
             PacketFlags::new(flag_bits),
         )
         .with_epoch(server_session.current_epoch());
         let mut pt = Vec::with_capacity(4 + payload.len());
-        pt.extend_from_slice(&sequence.to_be_bytes());
+        pt.extend_from_slice(&stream_offset.to_be_bytes());
         pt.extend_from_slice(payload);
         let ct = server_session
             .encrypt_packet(&header, &pt, &[])
@@ -9168,6 +9221,101 @@ mod tests {
         );
     }
 
+    /// The delivery backlog stands at its cap plus one frame's charge before the reader
+    /// notices, and [`MAX_DELIVERY_CHARGE_PER_FRAME`] is what that second term is published
+    /// as. The cap is a flat 4 MiB everywhere it is quoted, so if a frame can charge more
+    /// than the published overshoot then what a session really holds is more than what is
+    /// written down.
+    ///
+    /// The expensive frame is not the fullest one. A `COALESCED` bundle becomes one queued
+    /// item per non-empty sub-payload and each item carries the full structure charge, so
+    /// the worst frame is the one carrying the most sub-payloads: a two-byte length prefix
+    /// and the single byte that keeps the sub-payload from being skipped as empty. This
+    /// builds exactly that frame at the largest size the receive gate admits and puts it
+    /// through the real receive path.
+    #[tokio::test]
+    async fn one_frame_cannot_charge_the_backlog_more_than_the_published_overshoot() {
+        use crate::transport::mtu::{MAX_RECV_FRAME, MAX_RECV_PAYLOAD};
+        use crate::transport::packet_coalescer::{HEADER_SIZE, SUB_HEADER_SIZE};
+
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+
+        // A bundle packed with the smallest sub-payload that still gets queued.
+        let subs = (MAX_RECV_PAYLOAD - HEADER_SIZE) / (SUB_HEADER_SIZE + 1);
+        let mut bundle = Vec::with_capacity(MAX_RECV_PAYLOAD);
+        bundle.extend_from_slice(&(subs as u16).to_be_bytes());
+        for _ in 0..subs {
+            bundle.extend_from_slice(&1u16.to_be_bytes());
+            bundle.push(0xA5);
+        }
+
+        let stream_id: TransportStreamId = 3;
+        let flag_bits = PacketFlags::ENCRYPTED | PacketFlags::COALESCED;
+        let header = PacketHeader::new(session_id, stream_id, 0, PacketFlags::new(flag_bits))
+            .with_epoch(client_session.current_epoch());
+        let ciphertext = client_session
+            .encrypt_packet(&header, &bundle, &[])
+            .expect("encrypt bundle");
+        let packet = PhantomPacket::new(header, ciphertext);
+        let wire = client_session
+            .protect_packet(&packet)
+            .expect("header protection");
+        assert!(
+            wire.len() <= MAX_RECV_FRAME,
+            "this frame must be one the gate admits, or it is not the worst case the \
+             backlog can be charged: {} B against {MAX_RECV_FRAME} B",
+            wire.len()
+        );
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, _deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
+        let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+
+        let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        handle_packet(
+            packet,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &transport_send,
+            &transport_send,
+            &deliver_tx,
+            &undelivered,
+            &mut scratch,
+            &obs,
+            LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
+        )
+        .await;
+
+        let charged = undelivered.load(Ordering::Acquire);
+        // Positive control: a frame that queued one item, or none, would satisfy the bound
+        // below without being the shape it is meant to test.
+        assert!(
+            charged > 100 * delivery_charge(1),
+            "the frame queued almost nothing ({charged} B charged), so it is not \
+             exercising the many-items case the overshoot is sized for"
+        );
+        assert!(
+            charged <= MAX_DELIVERY_CHARGE_PER_FRAME,
+            "one frame charged the backlog {charged} B against a published overshoot of \
+             {MAX_DELIVERY_CHARGE_PER_FRAME} B — the backlog can stand higher above \
+             {RECV_DELIVERY_HARD_CAP} B than the documentation says"
+        );
+    }
+
     /// Ordering across two COALESCED bundles: the single FIFO delivery channel
     /// must hand the first bundle's `[A, B, C]` and the second bundle's `[D]` to
     /// the consumer in exactly `A, B, C, D` — decoupling delivery from the reader
@@ -9398,6 +9546,12 @@ mod tests {
     /// down (state → `Closed`) instead of buffering unboundedly. The app here
     /// never calls `recv()`, so the delivery channel fills and the reader's
     /// pre-decrypt cap gate fires.
+    ///
+    /// The flood uses the largest frame the receive gate admits, which is also the
+    /// fastest way to the cap: bigger frames are refused before they are decrypted, and
+    /// smaller ones cost the flooder a frame each for less backlog. That the cap still
+    /// trips at that size is the part worth checking — a gate that made the cap
+    /// unreachable would have quietly replaced one bound with another.
     #[tokio::test]
     async fn peer_ignoring_flow_control_trips_delivery_hard_cap_and_closes_session() {
         let session_id = fixed_session_id();
@@ -9422,10 +9576,13 @@ mod tests {
         // Malicious client: flood valid RELIABLE app packets with unique
         // monotonic sequences (so none are replay-dropped) and never honor a
         // WINDOW_UPDATE — i.e. ignore flow control entirely.
-        let payload = vec![0xABu8; 64 * 1024];
+        let payload = vec![0xABu8; crate::transport::mtu::MAX_APP_CHUNK];
         let mut seq: u32 = 0;
         let mut torn_down = false;
-        for _ in 0..4000 {
+        // Comfortably more than `RECV_DELIVERY_HARD_CAP / (MAX_APP_CHUNK +
+        // DELIVERY_ITEM_OVERHEAD_BYTES)`, so the cap is reached well before the loop runs
+        // out and a failure means the cap did not trip rather than that the flood was short.
+        for _ in 0..8000 {
             if server.connection_state() == ConnectionState::Closed {
                 torn_down = true;
                 break;
@@ -10478,6 +10635,160 @@ mod tests {
             data,
             Some(b"hello-from-peer".to_vec()),
             "recv must return the payload sent by the client"
+        );
+    }
+
+    /// A frame larger than anything this side emits must not reach a delivery slot.
+    ///
+    /// The per-stream delivery channels are bounded in slots, not in bytes, so what a
+    /// session holds is the slot count times whatever a peer can put in a slot. Nothing
+    /// downstream of the pump limits that: the reorder buffer's byte budget only governs
+    /// segments that arrive *out* of order, and in-order data goes straight to the queue.
+    /// The pipe itself will hand over 4 MiB on the TCP leg once the frame phase is
+    /// `Established`, so without a gate one slot holds 4 MiB and a slot is 1156 B in every
+    /// figure that describes this session.
+    ///
+    /// Two-sided on purpose. The oversized frame claims stream offset 0 on a new stream,
+    /// so if it were admitted it would both surface that stream and consume the offset;
+    /// the legal frame that follows carries the same offset under a fresh packet number.
+    /// Accepting the first therefore makes the second a duplicate and this test reads the
+    /// megabyte back instead of the sentence — and refusing *everything* fails it just as
+    /// loudly, because then the stream is never accepted at all.
+    #[tokio::test]
+    async fn an_oversized_inbound_frame_is_refused_without_taking_the_session_down() {
+        use crate::transport::mtu::MAX_RECV_FRAME;
+
+        let session_id = fixed_session_id();
+        let (client_inner, server_inner) = paired_sessions(session_id);
+        let (client_t, server_t) = ChannelTransport::pair();
+
+        let server = PhantomSession::from_accepted_server_session(
+            "oversize-test".to_string(),
+            server_t,
+            server_inner,
+        );
+
+        let client_t = Arc::new(client_t);
+        let drain_t = client_t.clone();
+        let _drainer = tokio::spawn(async move { while drain_t.recv_bytes().await.is_ok() {} });
+
+        // A single reliable segment several hundred times the largest frame the sender
+        // budget produces. Nothing about it is malformed — it decrypts, its offset is 0,
+        // its stream id is a legal client-allocated one. Only its size is unreasonable.
+        let oversized =
+            encrypt_outgoing_at(&client_inner, session_id, 3, 0, 0, &vec![0x7Eu8; 1 << 19]);
+        assert!(
+            oversized.len() > MAX_RECV_FRAME,
+            "the frame under test must actually exceed the gate: {} B vs {MAX_RECV_FRAME} B",
+            oversized.len()
+        );
+        client_t
+            .send_bytes(&oversized)
+            .await
+            .expect("send oversized frame");
+
+        // Same stream, same offset, next packet number — the frame a compliant peer
+        // would have sent.
+        let legal = encrypt_outgoing_at(&client_inner, session_id, 3, 1, 0, b"within budget");
+        client_t.send_bytes(&legal).await.expect("send legal frame");
+
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(5), server.accept_stream())
+                .await
+                .expect("the legal frame must still open the stream")
+                .expect("accept_stream returned Err");
+        assert_eq!(accepted.stream_id(), 3);
+
+        let data = tokio::time::timeout(std::time::Duration::from_secs(5), accepted.recv())
+            .await
+            .expect("timeout waiting for recv")
+            .expect("recv returned Err");
+        // Length first, and without printing the payload: on the failing path the payload
+        // is half a megabyte and the length is the whole story.
+        let delivered = data.as_ref().map_or(0, Vec::len);
+        assert_eq!(
+            delivered,
+            b"within budget".len(),
+            "the stream delivered {delivered} B — the oversized frame was admitted, so a \
+             delivery slot holds whatever the byte pipe will carry rather than one chunk"
+        );
+        assert_eq!(data.as_deref(), Some(&b"within budget"[..]));
+    }
+
+    /// Nothing the pump emits may exceed the frame gate the peer applies, or the gate
+    /// would be silently breaking legitimate sessions.
+    ///
+    /// This is the other half of the gate: the constant asserts in `transport::mtu` pin
+    /// the three frame shapes against the budget arithmetic, and this watches the wire
+    /// while a live pump produces them — chunked application data with padding armed,
+    /// SACKs answering inbound reliable segments, window updates as the peer's data is
+    /// consumed, and cover traffic filling the idle gaps. A frame shape that grows past
+    /// the budget lands here rather than as a peer that stops receiving.
+    #[tokio::test]
+    async fn no_frame_the_pump_emits_exceeds_the_gate_the_peer_applies() {
+        use crate::transport::mtu::{MAX_APP_CHUNK, MAX_RECV_FRAME};
+        use std::sync::atomic::AtomicUsize;
+
+        let session_id = fixed_session_id();
+        let (client_inner, server_inner) = paired_sessions(session_id);
+        let (client_t, server_t) = ChannelTransport::pair();
+
+        let server = Arc::new(PhantomSession::from_accepted_server_session(
+            "budget-test".to_string(),
+            server_t,
+            server_inner,
+        ));
+        // Padding and cover are the two shapes that grow a frame after the payload is
+        // fixed, so arm both rather than measuring only the unshaped path.
+        server
+            .set_traffic_shaping(TrafficShapingConfig {
+                padding: PaddingPolicy::Padme,
+                jitter_ms: 0,
+                cover_interval_ms: 5,
+            })
+            .await;
+
+        let widest = Arc::new(AtomicUsize::new(0));
+        let seen = widest.clone();
+        let client_t = Arc::new(client_t);
+        let drain_t = client_t.clone();
+        let _drainer = tokio::spawn(async move {
+            while let Ok(frame) = drain_t.recv_bytes().await {
+                seen.fetch_max(frame.len(), Ordering::Relaxed);
+            }
+        });
+
+        // Inbound reliable data, so the pump answers with SACKs and eventually window
+        // updates as the delivery side consumes it.
+        for i in 0..16u32 {
+            let wire = encrypt_outgoing(
+                &client_inner,
+                session_id,
+                3,
+                i,
+                &vec![0x33u8; MAX_APP_CHUNK],
+            );
+            client_t.send_bytes(&wire).await.expect("send inbound data");
+        }
+
+        // Outbound application data far past one window, so the pump chunks it and keeps
+        // the wire busy for long enough that the cover timer also fires.
+        let bulk = vec![0xC7u8; MAX_APP_CHUNK * 64];
+        server.send(bulk).await.expect("bulk send");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let widest = widest.load(Ordering::Relaxed);
+        // Positive control: a measurement that never saw a full-size data frame would
+        // satisfy the bound below without observing anything the gate governs.
+        assert!(
+            widest > MAX_APP_CHUNK,
+            "the wire was never carrying a full-size data frame (widest {widest} B), so \
+             the bound below holds vacuously"
+        );
+        assert!(
+            widest <= MAX_RECV_FRAME,
+            "the pump put a {widest} B frame on the wire against a {MAX_RECV_FRAME} B \
+             receive gate — a compliant peer would drop it"
         );
     }
 

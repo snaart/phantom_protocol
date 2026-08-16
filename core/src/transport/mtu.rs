@@ -73,10 +73,55 @@ pub const PER_PACKET_OVERHEAD: usize = PacketHeader::SIZE + RELIABLE_OFFSET_LEN 
 /// chunk automatically, and nothing else has to move.
 pub const MAX_APP_CHUNK: usize = MAX_INNER_UNFRAGMENTED - PER_PACKET_OVERHEAD;
 
+/// Largest inner frame the data pump will accept from a peer, in bytes.
+///
+/// Everything above is a sender-side budget: it says how this side chunks, and a
+/// peer is under no obligation to have read it. What the receive path was left
+/// with instead was whatever its byte pipe would hand over — 4 MiB on the TCP and
+/// mimicry legs once the frame phase goes to `Established`, a quarter-megabyte
+/// reassembly on PhantomUDP — and every one of those bytes came to rest in a
+/// per-stream delivery slot whose only limit is a slot *count*. A queue bounded
+/// in items holds whatever the items weigh, so the weight has to be bounded here.
+///
+/// This is the same budget read from the other side: a frame this side would
+/// never emit is one it will not accept. Nothing on the wire changes — the format
+/// is untouched and no field carries a length — it is a receive-side rejection,
+/// so a peer that respects the chunking rule cannot tell it exists.
+///
+/// The three post-handshake frame shapes are all under it by construction, and
+/// the asserts below are what keep them there: a full reliable data chunk fills
+/// it exactly, anti-fingerprint padding has its own lower ceiling
+/// (`shaping::MAX_SHAPED_WIRE`), and the largest control frame is a full SACK,
+/// which is an order of magnitude smaller. Handshake messages are far larger —
+/// a `ServerHello` carries an ML-DSA-65 signature — but they are exchanged before
+/// the pump exists and never reach this gate.
+pub const MAX_RECV_FRAME: usize = MAX_INNER_UNFRAGMENTED;
+
+/// Largest AEAD plaintext a peer can deliver in one frame: [`MAX_RECV_FRAME`]
+/// less the header it carries and the tag it is sealed with.
+///
+/// This is the figure that bounds one queued delivery item, and it is the reason
+/// the per-stream channels can be described in bytes at all rather than only in
+/// slots. The reliable path spends four more bytes of it on the in-plaintext
+/// stream offset, so a reliable segment is [`MAX_APP_CHUNK`]; an unreliable one
+/// keeps the whole plaintext, which is why the bound is stated here and not as
+/// the chunk size.
+pub const MAX_RECV_PAYLOAD: usize = MAX_RECV_FRAME - PacketHeader::SIZE - AEAD_OVERHEAD;
+
 // A full-size chunk must still fit the unfragmented budget. Tautological as long
 // as `MAX_APP_CHUNK` stays derived — which is the point: the day someone replaces
 // the derivation with a literal, this is what stops the build.
 const _: () = assert!(MAX_APP_CHUNK + PER_PACKET_OVERHEAD <= MAX_INNER_UNFRAGMENTED);
+
+// The receive gate has to admit everything this side sends, or the two ends of a
+// legitimate session disagree about what is deliverable. Each post-handshake
+// frame shape is checked against it separately, because "they all fit" is exactly
+// the kind of claim that stops being true one shape at a time.
+const _: () = assert!(MAX_APP_CHUNK + PER_PACKET_OVERHEAD <= MAX_RECV_FRAME);
+const _: () = assert!(crate::transport::shaping::MAX_SHAPED_WIRE <= MAX_RECV_FRAME);
+const _: () = assert!(
+    PacketHeader::SIZE + crate::transport::sack::MAX_SACK_WIRE + AEAD_OVERHEAD <= MAX_RECV_FRAME
+);
 
 // Anti-fingerprint size padding rounds a packet *up* to a PADÉ bucket inside the
 // AEAD plaintext, so it has its own ceiling on the inner wire image. That ceiling

@@ -10,6 +10,30 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Removed
 
+- **`api::session::SESSION_RECV_MEMORY_COMMITMENT`, and `phantom-server`'s
+  `--max-recv-memory-mib` / `PHANTOM_MAX_RECV_MEMORY_MIB` with it.** The constant published a
+  single per-session resident total for the receive path, and the flag divided an operator's
+  memory budget by it to derive a session cap. It was wrong three times. Each correction
+  raised it, and each time the error had the same shape: a figure this endpoint chooses was
+  treated as though it bounded the peer. The last of them charged a delivery-queue slot the
+  sender's own chunk size while the receive path would have accepted a frame three thousand
+  times larger.
+
+  The frame ceiling above fixes the mechanism, but the total is withdrawn rather than
+  restated. A per-session total has to enumerate every allocation the receive path makes,
+  including the ones beneath this layer — the byte pipe's receive accumulator, the
+  per-session PhantomUDP fragment reassembler, the `Stream` structures themselves — and a sum
+  that misses one reads as a bound while being an estimate. What is published in its place is
+  the per-buffer table in the module documentation of `api::session`: each bound, what it
+  limits, and the code that enforces it, with the two that are *not* enforced marked as such
+  — the advertised receive window, which nothing on the receive path consults, and the
+  delivery hard cap, which one frame's charge crosses before the reader notices (that
+  overshoot is now published as `MAX_DELIVERY_CHARGE_PER_FRAME` rather than rounded away).
+  `docs/security/threat-model.md` §5 §D.1 and `docs/operations/deployment.md` carry the same
+  split. A cap derived from an estimate under-provisions a host by exactly the factor the
+  estimate is out, which is worse than no flag, so sizing goes back to measurement against
+  `PHANTOM_MAX_SESSIONS`.
+
 - **`transport::udp_transport` — a public module nothing could reach, carrying the crate's
   only native `unsafe`.** `UdpTransport`, `UdpHandshakeListener`, `PacedSender` and
   `FastSender` were exported from `phantom_protocol::transport::udp_transport` and had no
@@ -104,10 +128,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   (8 MiB) is what the ledger holds and `SharedRecvTuning::remaining_growth_budget` reports
   what is left of it. `MAX_SEND_WINDOW` and `MAX_RECV_WINDOW` doubled from 512 KiB to 1 MiB
   with the ceiling above. `MAX_RECV_REORDER` and the new `REORDER_ENTRY_OVERHEAD_BYTES` are
-  public alongside them, and `api::session` exports `MAX_STREAMS`, `RECV_DELIVERY_HARD_CAP`
-  and `SESSION_RECV_MEMORY_COMMITMENT` — the five constants the per-session receive-memory
-  bound is computed from, so an embedder can size a host from the same arithmetic the
-  transport enforces rather than from a figure copied out of a document.
+  public alongside them, and `api::session` exports `MAX_STREAMS`,
+  `RECV_DELIVERY_HARD_CAP`, `DELIVERY_ITEM_OVERHEAD_BYTES`,
+  `MAX_DELIVERY_CHARGE_PER_FRAME`, `STREAM_RECV_CHANNEL_DEPTH` and
+  `RAW_APP_RECV_CHANNEL_DEPTH`, with `transport::mtu` exporting `MAX_RECV_FRAME` and
+  `MAX_RECV_PAYLOAD` and `transport::sack` exporting `MAX_SACK_WIRE`. Each names one
+  receive-side bound the transport enforces; the module documentation of `api::session`
+  lists them together with what enforces each and marks the two that are observed rather
+  than enforced. They are deliberately not summed into a per-session total — see the
+  Removed entry below.
 - **`migrate()` on a non-migration transport now returns `Err(CoreError::Unsupported)`**
   instead of a silent `Ok(())` no-op. Real migration requires a UDP-backed session
   (`connect_pinned_udp*`); on TCP / WebSocket / WASI / Embedded it now errors honestly.
@@ -281,6 +310,35 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **A peer could put a 4 MiB frame in a delivery-queue slot sized for 1156 B.** The
+  per-stream queues between the delivery task and `PhantomStream::recv` are bounded in slots,
+  not in bytes, so what a session holds is the slot count times whatever a peer can put in a
+  slot — and nothing bounded the second factor. `MAX_APP_CHUNK` is a *sender-side* budget
+  describing how this side chunks; the receive path never applied it, the reorder buffer's
+  byte budget governs out-of-order segments only (in-order data goes straight to the queue),
+  and the byte pipe underneath hands over whatever its own frame cap allows — 4 MiB on the
+  TCP and mimicry legs once the frame phase is `Established`. Across `MAX_STREAMS` × the
+  channel depth that is a quarter of a terabyte reachable by an authenticated peer against an
+  application that is not reading.
+
+  The receive path now refuses an inbound frame larger than `MAX_RECV_FRAME`
+  (`transport::mtu`), which is the same datagram budget the sender already works to, read
+  from the other end. It is checked in the pump's reader before header protection and before
+  the AEAD, so an oversized frame costs a length comparison. It is a **drop**, not a
+  teardown: nothing has been authenticated at that point, so tearing the session down would
+  hand anyone who guesses a connection id a one-datagram kill. A peer that really sends
+  oversized frames stalls instead — the segment is never delivered, never SACKed, and its
+  retransmits meet the same gate.
+
+  Nothing on the wire changes and no field carries a length; this is a receive-side
+  rejection, invisible to a peer that respects the chunking rule. That nothing legitimate
+  exceeds it is checked on both sides: `transport::mtu` asserts each of the three
+  post-handshake frame shapes against the budget at compile time (a full reliable chunk,
+  which fills it exactly; anti-fingerprint padding, which has its own lower ceiling; and the
+  largest SACK, now `sack::MAX_SACK_WIRE`), and a unit test watches the wire while a live
+  pump produces all of them with padding and cover traffic armed. Handshake messages are far
+  larger and are unaffected — they are exchanged before the pump exists.
+
 - **The receive-window growth budget was handed out per stream on the raw session API, and
   described as bounding more than it does.** `Session::open_stream` — the Rust-only
   transport-level API, distinct from `PhantomSession::open_stream` — built each of its
@@ -296,39 +354,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   *growth*, so it is worth 8 MiB of what one session can be made to hold; it does not touch
   the 16 MiB of initial windows 256 streams start with, the 64 MiB of reorder structure a
   peer can pin with tiny segments above a hole it never fills (the byte budget counts payload,
-  the entry cap counts entries), the delivery backlog, or the 321 MiB of per-stream delivery
-  channels that fill when the application reads slower than the peer sends. The resident
-  total is **429 MiB per session**, now published as
-  `api::session::SESSION_RECV_MEMORY_COMMITMENT` and computed there from `MAX_STREAMS`,
-  `INITIAL_STREAM_WINDOW`, the growth budget, `MAX_RECV_REORDER` ×
-  `REORDER_ENTRY_OVERHEAD_BYTES`, `RECV_DELIVERY_HARD_CAP` and the two channel depths, so
-  raising any of them moves the published figure instead of quietly invalidating it.
-
-  Two of those terms had been counted at zero. The delivery backlog was counted in payload
-  bytes with no per-item term, and an item is not a byte: measured against the real queue one
-  costs about 65 B, so a 4 MiB payload cap really admitted around 300 MiB when a peer chose
-  one-byte segments. Every queued item — FIN signals included, since an uncharged item is an
-  uncapped one — is now charged `DELIVERY_ITEM_OVERHEAD_BYTES` on top of its payload, which
-  is what makes the cap bound memory rather than a count. The per-stream delivery channels
-  were outside both the cap and the published figure; they stay outside the cap deliberately
-  (what fills them is the local application not reading, and a bounded channel already bounds
-  itself) but they are now in the figure, where they are three quarters of it. The tests that
-  pin this measure rather than restate: a thread-local counting allocator observes what a real
-  reorder buffer, a real delivery channel and a real delivery queue take at their own caps,
-  and requires the published figure to cover them.
-
-  It is a bound **per session**, and nothing divides it between concurrent sessions: a
-  process admitting N sessions commits N × 429 MiB in the worst case, which at the reference
-  server's default `PHANTOM_MAX_SESSIONS=1024` is ~429 GiB. Admission control is what bounds
-  the process, so `phantom-server` gained `--max-recv-memory-mib` /
-  `PHANTOM_MAX_RECV_MEMORY_MIB`: state the receive-memory figure and the session cap follows
-  from it, refusing to start on a budget too small for one session. A process-wide second
-  tier over the growth budget was considered and rejected — it would bound 8 GiB of that
-  ~429 GiB by letting one peer's growth decisions pin another peer's window at the 64 KiB
-  initial size, which is a remote peer steering a local control loop. The reasoning is in
-  `docs/security/threat-model.md` §5 §D.1, which is also where this whole class of threat
-  now has a row; `docs/operations/deployment.md` carries the operator-facing arithmetic and
-  the distinction between the ~512 KiB a typical session occupies and the 429 MiB bound.
+  the entry cap counts entries), the delivery backlog, or the per-stream delivery channels
+  that fill when the application reads slower than the peer sends. `REORDER_ENTRY_OVERHEAD_BYTES`
+  is the per-entry structure charge that makes the reorder figure a memory rather than a
+  count, and `DELIVERY_ITEM_OVERHEAD_BYTES` does the same for the delivery backlog: an item
+  is not a byte, and measured against the real queue one costs about 65 B, so a 4 MiB
+  payload-only cap really admitted around 300 MiB when a peer chose one-byte segments. Every
+  queued item is charged it, FIN signals included, since an uncharged item is an uncapped
+  one. `docs/security/threat-model.md` §5 §D.1 is where this whole class of threat now has a
+  row; `docs/operations/deployment.md` carries the operator-facing version.
 
 - **A SACK carrying more than 32 islands threw away the one range that retires data.**
   `Stream::received_sack` builds its range list with the contiguous delivered run first —

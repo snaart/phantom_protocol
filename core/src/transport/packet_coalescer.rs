@@ -39,9 +39,14 @@ pub const MAX_ASSEMBLED_DATAGRAM: usize = 65507;
 pub const DEFAULT_MAX_DATAGRAM: usize = 1200;
 
 /// Size of the bundle header (2-byte `count` prefix at the start of the datagram).
-const HEADER_SIZE: usize = 2;
+///
+/// Public alongside [`SUB_HEADER_SIZE`] because the receive path sizes an accounting
+/// bound against them: these two decide how many separately-queued sub-payloads a
+/// bundle of a given size can carry, and that count is what one inbound frame costs
+/// the delivery backlog in the worst case.
+pub const HEADER_SIZE: usize = 2;
 /// Size of each sub-packet header (2-byte big-endian `length` before each payload).
-const SUB_HEADER_SIZE: usize = 2;
+pub const SUB_HEADER_SIZE: usize = 2;
 
 /// Coalescer tuning parameters.
 #[derive(Debug, Clone)]

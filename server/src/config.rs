@@ -6,7 +6,6 @@
 //! local development.
 
 use clap::Parser;
-use phantom_protocol::api::session::SESSION_RECV_MEMORY_COMMITMENT;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -72,28 +71,18 @@ pub struct Config {
 
     /// Maximum number of concurrent sessions. Once this many are active the
     /// accept loop stops accepting (new connections queue in the OS backlog)
-    /// until a session closes — backpressure, not a hard drop. Size it against
-    /// `LimitNOFILE` and per-session memory — see `--max-recv-memory-mib` and
-    /// `docs/operations/deployment.md`. `0` means unbounded (not recommended).
+    /// until a session closes — backpressure, not a hard drop.
+    ///
+    /// This is the process's memory setting whether or not it was set as one: the
+    /// transport bounds its receive buffers per session and nothing divides them
+    /// between concurrent sessions, so what a process holds is this number times
+    /// what one session holds. There is no single library constant for the second
+    /// factor — see the receive-memory section of `phantom_protocol::api::session`
+    /// for why, and `docs/operations/deployment.md` for how to size against it.
+    /// Also keep it comfortably below `LimitNOFILE`. `0` means unbounded (not
+    /// recommended).
     #[arg(long, env = "PHANTOM_MAX_SESSIONS", default_value = "1024")]
     pub max_sessions: usize,
-
-    /// Receive-side memory this process may commit to peers, in MiB. `0` (the
-    /// default) states no budget and leaves `--max-sessions` alone.
-    ///
-    /// The transport's receive buffers are bounded **per session**, not per
-    /// process: a session's advertised windows, reorder buffers and delivery
-    /// backlog together come to `SESSION_RECV_MEMORY_COMMITMENT`, and every term
-    /// is something an authenticated peer chooses. Nothing divides that between
-    /// concurrent sessions, so the only thing that bounds the process is how many
-    /// sessions it admits — which makes the session cap a memory setting whether
-    /// or not it is written as one.
-    ///
-    /// Setting this ties the two together: the cap is lowered to the largest
-    /// number of sessions that fits the stated budget, and a budget too small for
-    /// even one session refuses to start rather than admitting one anyway.
-    #[arg(long, env = "PHANTOM_MAX_RECV_MEMORY_MIB", default_value = "0")]
-    pub max_recv_memory_mib: usize,
 
     /// Maximum concurrent sessions from a single source IP. A peer already at
     /// this many active sessions has further connections rejected (closed right
@@ -101,102 +90,4 @@ pub struct Config {
     /// `0` disables the per-IP cap.
     #[arg(long, env = "PHANTOM_MAX_SESSIONS_PER_IP", default_value = "64")]
     pub max_sessions_per_ip: usize,
-}
-
-impl Config {
-    /// The session cap actually enforced, after `--max-recv-memory-mib` has been applied.
-    ///
-    /// Returns `Err` when the stated receive-memory budget cannot hold a single session:
-    /// admitting one anyway would put the process over the figure the operator sized the
-    /// host with, which is exactly what stating a budget was meant to prevent.
-    pub fn effective_max_sessions(&self) -> Result<usize, String> {
-        if self.max_recv_memory_mib == 0 {
-            return Ok(self.max_sessions);
-        }
-        let budget = (self.max_recv_memory_mib as u64).saturating_mul(1024 * 1024);
-        let fits = budget / SESSION_RECV_MEMORY_COMMITMENT;
-        if fits == 0 {
-            return Err(format!(
-                "--max-recv-memory-mib {} is below the {} MiB one session may commit; raise the \
-                 budget, or state none and size the host from --max-sessions",
-                self.max_recv_memory_mib,
-                SESSION_RECV_MEMORY_COMMITMENT.div_ceil(1024 * 1024)
-            ));
-        }
-        // `usize` is at least 32 bits on every target this binary builds for, and `fits` is a
-        // session count divided down from a budget an operator typed, so the clamp is a
-        // formality rather than a reachable path.
-        let fits = usize::try_from(fits).unwrap_or(usize::MAX);
-        Ok(if self.max_sessions == 0 {
-            // Unbounded means "no cap of my own"; the budget then supplies one.
-            fits
-        } else {
-            self.max_sessions.min(fits)
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cfg(max_sessions: usize, max_recv_memory_mib: usize) -> Config {
-        Config {
-            bind: "0.0.0.0:4242".parse().expect("bind addr"),
-            signing_key_file: PathBuf::from("/dev/null"),
-            otlp_endpoint: String::new(),
-            otel_trace_sample_ratio: 1.0,
-            otel_service_name: String::new(),
-            log_json: false,
-            log_filter: String::new(),
-            max_sessions,
-            max_recv_memory_mib,
-            max_sessions_per_ip: 0,
-        }
-    }
-
-    /// Rounded up: a budget of exactly `N × floor(commitment)` MiB holds `N − 1` sessions,
-    /// not `N`, so the tests below would be asserting the wrong arithmetic.
-    fn per_session_mib() -> usize {
-        SESSION_RECV_MEMORY_COMMITMENT.div_ceil(1024 * 1024) as usize
-    }
-
-    /// The flag is opt-in: with no budget stated the operator's cap stands exactly as typed,
-    /// including the unbounded form.
-    #[test]
-    fn no_budget_leaves_the_session_cap_alone() {
-        assert_eq!(cfg(1024, 0).effective_max_sessions(), Ok(1024));
-        assert_eq!(cfg(0, 0).effective_max_sessions(), Ok(0));
-    }
-
-    /// The point of the flag: a budget that cannot hold the default 1024 sessions lowers the
-    /// cap to what it can hold, so the process commitment stays under the stated figure.
-    #[test]
-    fn a_budget_lowers_the_cap_to_what_it_can_hold() {
-        let ten_sessions = 10 * per_session_mib();
-        assert_eq!(cfg(1024, ten_sessions).effective_max_sessions(), Ok(10));
-        // An unbounded cap takes the budget's answer rather than staying unbounded — that
-        // combination is the one where the memory bound has nothing else to come from.
-        assert_eq!(cfg(0, ten_sessions).effective_max_sessions(), Ok(10));
-    }
-
-    /// A generous budget is not licence to raise the cap: the operator asked for at most
-    /// `max_sessions`, and the memory figure is a ceiling rather than a target.
-    #[test]
-    fn a_generous_budget_does_not_raise_the_cap() {
-        assert_eq!(
-            cfg(8, 1000 * per_session_mib()).effective_max_sessions(),
-            Ok(8)
-        );
-    }
-
-    /// A budget below one session's commitment refuses to start. Admitting one session
-    /// anyway would put the process over the figure the host was sized with, quietly.
-    #[test]
-    fn a_budget_too_small_for_one_session_is_refused() {
-        let err = cfg(1024, 1)
-            .effective_max_sessions()
-            .expect_err("a budget that cannot hold one session must refuse");
-        assert!(err.contains("below"), "unhelpful message: {err}");
-    }
 }

@@ -171,7 +171,7 @@ for a real-time secure transport.
 | Panic-on-malformed input | `#![deny(clippy::unwrap_used, expect_used, panic, unreachable, todo, unimplemented, missing_safety_doc)]` (the crate-root `deny` block in `core/src/lib.rs`) plus `.clippy.toml`'s `disallowed-methods` ban on `Option::unwrap` / `Result::unwrap`; no `.unwrap()` on the recv/handshake hot path; fuzz harnesses in `fuzz/` | Phase 1.3, 6.4 |
 | AEAD nonce exhaustion (theoretical) | Hard ceiling `AEAD_MAX_INVOCATIONS = 1 << 48` → `CryptoError::NonceExhausted` | `core/src/crypto/adaptive_crypto.rs::AEAD_MAX_INVOCATIONS` |
 | Replay-window memory amplification | One per-direction `ReplayWindow` (~144 bytes) per session — no per-stream growth | `core/src/security/replay_window.rs` |
-| **Receive-side memory amplification by an authenticated peer** | See the dedicated treatment below — the bound is per session, and every term in it is a quantity the peer chooses | `core/src/transport/stream.rs`, `core/src/api/session.rs::SESSION_RECV_MEMORY_COMMITMENT` |
+| **Receive-side memory amplification by an authenticated peer** | See the dedicated treatment below. Each receive buffer has a bound with something enforcing it; **no single per-session total is published**, and two of the terms are observed rather than enforced | `core/src/transport/stream.rs`, `core/src/api/session.rs` (receive-memory section of the module documentation) |
 | Connection-migration amplification: known CID + spoofed source used as a reflector toward a victim | To an unvalidated address the server is **challenge-only** and caps bytes sent to **≤ 3× bytes received** (RFC 9000 §8.2); a spoofed address never echoes the challenge so it is never switched-to | `core/src/api/udp_transport.rs` (anti-amp budget), `PROTOCOL.md` §12.3 |
 
 #### D.1 — Receive-side memory amplification by an authenticated peer
@@ -192,75 +192,101 @@ multiply:
   sessions            the peer opens those too
 ```
 
-The chain has a bound at each link, and the arithmetic is worth stating in full
-because the largest term is not the one design discussions usually focus on:
+**What is enforced, and by what.** Each row below states a bound and the code
+that refuses to exceed it. The "enforced" column is the whole point of the
+table: a limit nothing checks is a convention, and a convention constrains a
+compliant peer and nobody else.
 
-| link | bound | worst case per session |
-| --- | --- | --- |
-| advertised window | `MAX_RECV_WINDOW` = 1 MiB per stream, but growth above the 64 KiB initial window is drawn from one session-wide `SESSION_RECV_WINDOW_GROWTH_BUDGET` = 8 MiB | 256 × 64 KiB + 8 MiB = **24 MiB** of window |
-| reorder payload | `Stream::recv_reorder_byte_limit` = window + 64 KiB, refused past that (the refused segment is not SACKed, so the sender retransmits) | Σ (window + 64 KiB) = **40 MiB** |
-| reorder structure | `MAX_RECV_REORDER` = 2048 held entries per stream, ~128 B of deque slot + `Vec<Bytes>` + retained plaintext each — the byte budget counts payload only, so tiny segments above a hole fill this without moving any window | 256 × 2048 × 128 B = **64 MiB** |
-| delivery backlog | `RECV_DELIVERY_HARD_CAP` = 4 MiB, past which the session is torn down rather than buffered. Counted per item as payload + `DELIVERY_ITEM_OVERHEAD_BYTES` = 128 B, because the item count is what a peer minimising segment size controls: at one byte per item a payload-only cap admits four million items | **4 MiB** |
-| per-stream channels | the bounded channel between the delivery task and each `PhantomStream::recv` — `STREAM_RECV_CHANNEL_DEPTH` = 1024 items, a full chunk (1156 B) each in the worst case. Bounded by construction; what fills it is the local application not reading | 256 × 1024 × 1284 B = **321 MiB** |
-| raw-app channel | the same, once per session, behind `PhantomSession::recv` — `RAW_APP_RECV_CHANNEL_DEPTH` = 256 items | **0.3 MiB** |
-| streams | `MAX_STREAMS` = 256, enforced on the auto-create path | — |
+| link | bound | enforced by | enforced? |
+| --- | --- | --- | --- |
+| streams | `MAX_STREAMS` = 256 | `handle_packet` refuses the segment that would create the 257th; unrecorded, so it is not SACKed either | **yes** |
+| inbound frame | `MAX_RECV_FRAME` = 1191 B, i.e. `MAX_RECV_PAYLOAD` = 1160 B of plaintext | the pump's reader drops a larger frame before decrypting it | **yes** |
+| advertised window | `MAX_RECV_WINDOW` = 1 MiB per stream | *nothing* — the receive path admits in-order data without consulting it | **no — observed** |
+| window growth | one session-wide `SESSION_RECV_WINDOW_GROWTH_BUDGET` = 8 MiB over the 64 KiB every stream starts with | `SharedRecvTuning` draws every doubling from the one allowance | **yes** |
+| reorder buffer | `MAX_RECV_REORDER` = 2048 entries and `Stream::recv_reorder_byte_limit` bytes, per stream; ~128 B of structure per entry, which the byte budget does not count | `Stream::accept_in_order` refuses the segment (not SACKed → the sender retransmits) | **yes, on out-of-order segments only** |
+| delivery backlog | `RECV_DELIVERY_HARD_CAP` = 4 MiB **plus `MAX_DELIVERY_CHARGE_PER_FRAME` ≈ 49 KiB**, charged per item as payload + `DELIVERY_ITEM_OVERHEAD_BYTES` = 128 B | the reader tears the session down past the cap | **yes** |
+| per-stream delivery queues | `STREAM_RECV_CHANNEL_DEPTH` = 1024 slots per stream, `RAW_APP_RECV_CHANNEL_DEPTH` = 256 once per session | the channel is bounded and the delivery task blocks rather than growing it; the slot *contents* are bounded by the frame gate above | **yes, in slots; in bytes only because of the frame gate** |
 
-Windows are a promise rather than an allocation (the bytes they admit come to
-rest in one of the buffers below them, all counted), so the resident total is
-**429 MiB per session** — published as `SESSION_RECV_MEMORY_COMMITMENT` and
-computed there from the constants above, so raising any one of them moves the
-published figure rather than silently invalidating it.
+Two entries are deliberately marked otherwise.
 
-Three quarters of that is the per-stream delivery channels, which follow from
-`MAX_STREAMS` × `STREAM_RECV_CHANNEL_DEPTH` rather than from anything the
-transport needs; those two are the lever on this number, at the cost of less
-tolerance for a slow consumer before the delivery task head-of-line blocks the
-other opened streams. They are deliberately outside the delivery hard cap: what
-fills them is the local application not reading, and tearing a session down for
-that would punish an honest peer and mislabel the cause. Their bound is their
-depth, which a bounded channel enforces on its own.
+The **advertised window** is a promise about what this side will admit, not a
+gate. Nothing on the receive path refuses in-order data for exceeding it, so it
+shapes a compliant sender's behaviour and constrains a hostile one not at all.
+It is listed because it is the number design discussions usually focus on
+and because reading it as a bound is the specific mistake this row exists to
+prevent.
 
-`security_invariants.rs` pins three things, none by restating the arithmetic:
-that N sessions of M streams hold no more than N growth budgets between them;
-that a real reorder buffer, a real delivery channel and a real delivery queue,
-each driven to its own cap, measure **no more** on the heap than the published
-figure allows them; and that the figure equals the one this document quotes, so
-a constant that moves takes the prose with it.
+The **delivery backlog's cap is crossed before it is noticed**. The charge a
+frame adds is only known once the frame has been decrypted and routed, so the
+counter is read around the frame rather than inside it and one frame's worth
+always lands past the line. Checking below the charge instead of above it does
+not change that — the same frame is the one that crosses — so the overshoot is
+published (`MAX_DELIVERY_CHARGE_PER_FRAME`) instead of being designed away. Its
+size is set by the most sub-payloads a single `COALESCED` bundle can carry,
+each of which becomes a separately-charged queue item.
+
+**Why there is no per-session total.** Adding the rows up gives a number that
+reads as a bound and is not one. The sum covers the buffers the session layer
+owns and not the ones beneath it: the byte pipe's own receive accumulator, the
+per-session PhantomUDP fragment reassembler
+(`MAX_CONCURRENT_ASSEMBLIES × MAX_REASSEMBLED_LEN`), the `Stream` structures
+themselves. Three successive attempts to publish such a total were each
+corrected upward by a term the previous one had left out, so the total was
+withdrawn rather than restated a fourth time. Sizing a host is a measurement
+exercise against the deployment's own traffic; the table above is for reasoning
+about what a hostile peer can move, not for arithmetic.
+
+The dominant term, on any accounting, is unread data in the per-stream delivery
+queues — `MAX_STREAMS` × `STREAM_RECV_CHANNEL_DEPTH` slots, which follows from
+those two constants rather than from anything the transport needs. They fill
+only when the local application is slower than the peer, which is why they are
+deliberately outside the delivery hard cap: tearing a session down for a slow
+consumer would punish an honest peer and mislabel the cause.
+
+`security_invariants.rs` and the session unit tests pin these by measurement
+rather than by restating the arithmetic: that N sessions of M streams hold no
+more than N growth budgets between them; that a real reorder buffer at its entry
+cap and a real delivery channel at its depth take no more heap than the figures
+published for them; that a queued item costs more than its payload, so the
+backlog charge is not fiction; that one frame cannot charge the backlog more
+than the published overshoot; and — two-sided — that an oversized frame is
+refused while the session survives it, and that nothing the pump itself emits
+exceeds the gate the peer applies.
 
 **Mitigation, and its honest limit.** The growth budget is the mechanism that
-makes a *per-stream* ceiling safe — it is what stops 256 streams each reaching
-1 MiB — and window growth is earned only by bytes the local application has
+makes a *per-stream* window ceiling safe — it is what stops 256 streams each
+reaching 1 MiB — and growth is earned only by bytes the local application has
 actually consumed, never by arrival, so a peer that floods an application which
-never reads moves nothing. But the budget is worth 8 MiB of the 429 MiB, and the
-bound is **per session**: nothing divides it between concurrent sessions, so a
-process admitting `N` sessions commits `N × 429 MiB` (`1024 × 429 MiB ≈ 429 GiB`
-at the reference server's default `PHANTOM_MAX_SESSIONS`). Admission control is
-what bounds the process, and it belongs to the embedder —
-`--max-recv-memory-mib` lets an operator state the memory figure and have the
-session cap follow from it (`docs/operations/deployment.md`).
+never reads moves nothing. The frame gate is what makes the queue depths mean
+something in bytes. Neither bounds the process: nothing divides any of this
+between concurrent sessions, so admission control is what bounds a process and
+it belongs to the embedder (`PHANTOM_MAX_SESSIONS` in the reference server; see
+`docs/operations/deployment.md`).
 
 A process-wide second tier over the growth budget was considered and rejected.
-It would bound 8 GiB of that ~429 GiB, and it would do so by putting one peer's
-growth decisions in charge of another peer's window: growth is first-come, so a
-peer that opens sessions and drains them just fast enough to earn doublings
-exhausts the process allowance and pins every session admitted afterwards at the
-64 KiB initial window — 2.6 Mbit/s on a 200 ms path. That is a remote peer
-steering a local control loop, which §4's adversary model forbids outright.
+It would bound 8 GiB across a 1024-session process, and it would do so by
+putting one peer's growth decisions in charge of another peer's window: growth
+is first-come, so a peer that opens sessions and drains them just fast enough to
+earn doublings exhausts the process allowance and pins every session admitted
+afterwards at the 64 KiB initial window — 2.6 Mbit/s on a 200 ms path. That is a
+remote peer steering a local control loop, which §4's adversary model forbids
+outright.
 
 **Consequences for review.** Any change that widens a term above — a larger
 window ceiling, a larger reorder entry cap or byte budget, more streams, a
-larger delivery cap, a deeper delivery channel — is a change to this bound and
-needs the arithmetic redone, not an assurance that the new value is still
-"small". Nor is a term small because its unit is small: the delivery backlog was
-counted in payload bytes with no per-item term for exactly as long as it took
-someone to measure it, and a bound understated fourfold is worse than none,
-because it gets quoted. Two such changes were
-rejected during the receive-path work for exactly this reason. The same applies
-to anything that would let a peer's own timing or acknowledgements decide how
-much this side holds: the growth trigger is local consumption on purpose, and
-the RTT reference auto-tuning divides by is a constant on purpose
-(`AUTOTUNE_RTT_FALLBACK`), because a peer that could inflate it would be lowering
-the bar its own doublings have to clear.
+larger delivery cap, a deeper delivery channel, a larger frame gate — is a
+change to what a peer can make this side hold. Two such changes were rejected
+during the receive-path work for exactly this reason. Nor is a term small
+because its unit is small: the delivery backlog was counted in payload bytes
+with no per-item term until someone measured it, and the delivery *queues* were
+sized against the sender's own chunk constant — a number this side picks — while
+the peer was free to send frames three thousand times larger. Both errors have
+the same shape, which is treating a figure this endpoint chose as though it
+bounded the other one. The same applies to anything that would let a peer's
+timing or acknowledgements decide how much this side holds: the growth trigger
+is local consumption on purpose, and the RTT reference auto-tuning divides by is
+a constant on purpose (`AUTOTUNE_RTT_FALLBACK`), because a peer that could
+inflate it would be lowering the bar its own doublings have to clear.
 
 ### E — Elevation of privilege
 
@@ -424,4 +450,5 @@ and the specialist docs in this directory. Cross-reference quick map:
 | 2026-06-17 | A2b 0-RTT anti-replay controls | Turned the documented 0-RTT scale-out replay residual into a mitigable item. Added a pluggable `ZeroRttAntiReplay` trait (`HandshakeServer::set_zero_rtt_anti_replay`, exposed on both listeners) so a horizontally-scaled deployment can make the one-shot ticket consume atomic across nodes via a shared store (Redis `SET NX`, a conditional put — the embedder's infra; the transport ships the seam, default single-node), and a `set_early_data_enabled(false)` switch to disable 0-RTT early-data entirely (the zero-infrastructure default — early-data is rejected and resent 1-RTT). Loud deploy guide at `docs/operations/zero-rtt.md`. The single-node guarantee (Invariant 9) is unchanged. No wire change. |
 | 2026-06-17 | A2a server migration (EPS-02 closed) | Made server-initiated migration a real, symmetric, unlinkable feature. The UDP client socket became unconnected (so it can hear a server that moves to a new address); the server gained `migrate_server(local_addr)` (Rust-only) that rebinds its send socket + rotates s2c in lock-step; the client now follows a migrated server (commits the new source post-AEAD/M-1, path-validates under the 3× anti-amp cap, switches its c2s target on a valid echo) and **reflects** the CID rotation (bumps its path_id + rotates c2s), which slides the server's c2s window so it stays routable (no stranding) with no ping-pong (the server's s2c re-rotation is path_id-silent). **LINDDUN-L / EPS-02 is now closed for migration by *either* peer** — a client move and a server failover are both unlinkable in both directions. No wire change (behavioural extension on v6). The not-forward-secret CID-chain caveat is unchanged. |
 | 2026-06-16 | v6 anti-fingerprint (WIRE 6) | Removed the two structural data-plane fingerprints and added opt-in traffic shaping. **(a)** the `version` byte is now HP-masked (the whole 15-byte header is masked — no constant cleartext byte); **(b)** the cleartext `payload_len` / `ext_len` prefixes are dropped (`payload` is the message remainder; `extensions` off the wire) — PROTOCOL.md §4.1/§4.6. **Opt-in (off by default):** **(c)** PADÉ size padding (bounded ≈ ≤12% overhead, inside the AEAD), **(d)** uniform `[0, jitter_ms]` send-timing jitter, **(e)** `COVER` cover traffic (authenticated dummy packets, dropped by the peer) — PROTOCOL.md §4.8, via `TrafficShapingConfig`. Narrows LINDDUN-D ("No mitigation" → opt-in size/timing/volume controls) and the DPI-fingerprinting row (structural tells gone). **Honest residuals:** shaping is off by default; PADÉ reduces but doesn't eliminate size classes; the datagram *shape* + global statistical traffic analysis remain out of scope; full active protocol-mimicry is a separate future transport mode. |
-| 2026-08-15 | Receive-side memory amplification | Added STRIDE-D §D.1: the class was absent, which is how two changes widening receive-side buffers reached review before being rejected on grounds this document did not state. Records the mechanism (advertised window × reorder buffer × streams × sessions), the bound at each link with the arithmetic, and the resident total of **429 MiB per session** (`SESSION_RECV_MEMORY_COMMITMENT`, computed from those constants) — including the two terms a payload-only accounting had left at zero: the per-item structure of the delivery backlog, and the per-stream delivery channels, which are three quarters of the figure. States honestly that the growth budget covers 8 MiB of it and that the bound is **per session** — a process commits `N ×` that figure, bounded only by admission control — and why a process-wide tier was rejected (it would let one peer's growth decisions pin another peer's window). Also re-keyed §5's code pointers from line numbers to enclosing items: five had drifted into unrelated code, including the Invariant-2 `ENCRYPTED` gate, which pointed into `flush_deferred_sends`. |
+| 2026-08-15 | Receive-side memory amplification | Added STRIDE-D §D.1: the class was absent, which is how two changes widening receive-side buffers reached review before being rejected on grounds this document did not state. Records the mechanism (advertised window × reorder buffer × streams × sessions) and the bound at each link. Also re-keyed §5's code pointers from line numbers to enclosing items: five had drifted into unrelated code, including the Invariant-2 `ENCRYPTED` gate, which pointed into `flush_deferred_sends`. |
+| 2026-08-16 | §D.1 rewritten around what is enforced | The section published a single per-session resident total. It was wrong three times, each time because a figure this endpoint chooses was read as a bound on what the peer can do — most recently by charging a delivery-queue slot the *sender's* chunk size while the receive path would accept a frame three thousand times larger. Two changes: the receive path now **enforces** an inbound frame ceiling (`MAX_RECV_FRAME`, dropped pre-AEAD, so an oversized frame cannot reach a queue slot at all), which is what makes the queue depths mean anything in bytes; and the total is **withdrawn**. §D.1 now lists each bound with the code that enforces it and marks the two that are not enforced — the advertised window, which nothing on the receive path consults, and the delivery cap, which is crossed by one frame's charge before it is noticed (`MAX_DELIVERY_CHARGE_PER_FRAME`, published rather than designed away). A total is not restated because it would have to enumerate the buffers under this layer too — the byte pipe's accumulator, PhantomUDP's fragment reassembler, the per-stream structures — and each previous attempt was corrected upward by a term it had omitted. The reference server's `--max-recv-memory-mib` is removed for the same reason: it divided an operator's budget by that figure. |

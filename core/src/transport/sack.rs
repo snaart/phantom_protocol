@@ -84,6 +84,12 @@ const MIN_WIRE_LEN: usize = 14;
 /// Fixed header before the variable-length range array.
 const FIXED_HDR_LEN: usize = 10; // largest_acked(4) + ack_delay_us(4) + range_count(2)
 
+/// Wire size of the largest SACK either side can produce: the minimum form plus a
+/// continuation for every range after the first. Public because the receive path
+/// sizes its frame gate against the biggest control frame the protocol emits, and
+/// that gate must move if this does.
+pub const MAX_SACK_WIRE: usize = MIN_WIRE_LEN + CONTINUATION_BYTES * (MAX_SACK_RANGES - 1);
+
 /// Per-range continuation bytes after the first range.
 const CONTINUATION_BYTES: usize = 8; // gap(4) + len(4)
 

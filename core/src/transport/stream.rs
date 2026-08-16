@@ -48,9 +48,9 @@ pub const MAX_RECV_REORDER: usize = 2048;
 /// high there is the safe direction.
 ///
 /// It exists as a named constant because it is the multiplier on the one part of the receive
-/// commitment that [`SESSION_RECV_WINDOW_GROWTH_BUDGET`] does **not** bound — a peer sending
-/// tiny segments above a hole it never fills fills the entry cap without ever moving the
-/// window — so any published per-session figure has to carry it.
+/// path that [`SESSION_RECV_WINDOW_GROWTH_BUDGET`] does **not** bound — a peer sending tiny
+/// segments above a hole it never fills reaches the entry cap without ever moving the window
+/// — so any statement about what a stream holds has to carry it.
 pub const REORDER_ENTRY_OVERHEAD_BYTES: usize = 128;
 
 // The entry cap is squeezed from both sides, and moving the window ceiling moves one of
@@ -75,9 +75,14 @@ const _: () = assert!(MAX_RECV_REORDER * REORDER_ENTRY_OVERHEAD_BYTES <= 256 * 1
 /// reorderable) data within one advertised window; the [`INITIAL_STREAM_WINDOW`] of headroom
 /// absorbs a boundary segment. A future hole that would push the buffered total past the
 /// budget is refused (dropped → retransmitted via the "refused segment is not SACKed"
-/// contract), so per-stream reorder memory is bounded regardless of the per-entry frame size
-/// (~253 KiB UDP / 4 MiB TCP) — the entry cap alone is not, since one entry can dwarf the
-/// window.
+/// contract), so per-stream reorder memory is bounded in bytes and not only in entries — the
+/// entry cap alone would not be, since nothing about it says how heavy an entry is.
+///
+/// It governs the out-of-order arm only. A segment that arrives *in* order is released
+/// straight to the delivery path and never sits here, so this budget says nothing about what
+/// a peer sending a gap-free stream can make the session hold; what bounds that is
+/// [`MAX_RECV_FRAME`](crate::transport::mtu::MAX_RECV_FRAME) on the way in and the delivery
+/// queue's own cap once it is through.
 ///
 /// Since the advertised window auto-tunes (see [`Stream::advertised_recv_window`]) the live
 /// budget is [`Stream::recv_reorder_byte_limit`], which tracks it; this constant is that
@@ -129,9 +134,11 @@ pub const MAX_SEND_WINDOW: u32 = 16 * INITIAL_STREAM_WINDOW;
 /// structural cap, pinned by
 /// `the_recv_window_ceiling_stays_within_what_the_send_buffer_can_put_in_flight`.
 ///
-/// The ceiling is not a memory commitment on its own: what a session may hold is
-/// [`SESSION_RECV_WINDOW_GROWTH_BUDGET`] of window growth however its streams divide it up,
-/// and the whole per-session figure is `crate::api::session::SESSION_RECV_MEMORY_COMMITMENT`.
+/// The ceiling is not a memory commitment on its own, and it is not even a gate: it is what
+/// this side *advertises*, and the receive path admits in-order data without consulting it.
+/// What a session may grant across all its streams is
+/// [`SESSION_RECV_WINDOW_GROWTH_BUDGET`], which is enforced; the rest of the receive path's
+/// bounds are catalogued in `crate::api::session`'s module documentation.
 pub const MAX_RECV_WINDOW: u32 = MAX_SEND_WINDOW;
 
 // The ceiling must stay above the 512 KiB the measured path was pinned flat against, and at
@@ -168,14 +175,16 @@ const _: () =
 ///
 /// ## What it does not bound
 ///
-/// It bounds *growth*, so it is worth 8 MiB of a session's receive commitment and no more.
-/// It does not touch the 16 MiB of initial windows 256 streams start with, the reorder
-/// structure a peer can pin without moving any window at all
-/// ([`REORDER_ENTRY_OVERHEAD_BYTES`]), or the delivery backlog. The whole figure — the one
-/// a host is sized from — is `crate::api::session::SESSION_RECV_MEMORY_COMMITMENT`, and it
-/// is per **session**: nothing here divides it between concurrent sessions, so a process
-/// commits it once per session it admits. Admission control is what bounds the process, and
-/// it is the embedder's (`PHANTOM_MAX_SESSIONS` in the reference server).
+/// It bounds *growth*, so it is worth 8 MiB and no more. It does not touch the 16 MiB of
+/// initial windows 256 streams start with, the reorder structure a peer can pin without
+/// moving any window at all ([`REORDER_ENTRY_OVERHEAD_BYTES`]), the delivery backlog, or the
+/// per-stream delivery channels. Those have bounds of their own, each with something
+/// different enforcing it; `crate::api::session`'s module documentation lists them together
+/// and says which are enforced and which are only observed.
+///
+/// It is also per **session**: nothing here divides it between concurrent sessions, so a
+/// process draws it once per session it admits. Admission control is what bounds the
+/// process, and it is the embedder's (`PHANTOM_MAX_SESSIONS` in the reference server).
 pub const SESSION_RECV_WINDOW_GROWTH_BUDGET: u32 = 8 * 1024 * 1024;
 
 /// RTT reference used by receive-window auto-tuning when the stream has no RTT sample of

@@ -81,7 +81,6 @@ env vars):
 | --- | --- | --- | --- |
 | `--max-sessions` | `PHANTOM_MAX_SESSIONS` | `1024` | Global concurrent-session ceiling. At the cap the accept loop stops accepting — new connections queue in the OS backlog (`somaxconn` / `tcp_max_syn_backlog`) until a session closes. Backpressure, not a hard drop. `0` = unbounded. |
 | `--max-sessions-per-ip` | `PHANTOM_MAX_SESSIONS_PER_IP` | `64` | Per-source-IP concurrent-session ceiling. A peer already at the cap has further connections rejected (closed right after the handshake), so one source cannot monopolise the global pool. `0` disables. |
-| `--max-recv-memory-mib` | `PHANTOM_MAX_RECV_MEMORY_MIB` | `0` (off) | Receive-side memory the process may commit to peers, in MiB. Lowers `--max-sessions` to the largest number of sessions that fits; refuses to start if the budget cannot hold one. See "Memory" below. |
 
 **Size `PHANTOM_MAX_SESSIONS` against two limits:**
 
@@ -97,45 +96,50 @@ env vars):
   `~1000 sessions → 512 MiB limit` line is sized from. It is a typical figure,
   not a bound.
 
-  The bound is **429 MiB per session** — `SESSION_RECV_MEMORY_COMMITMENT` in
-  `core/src/api/session.rs`, which computes it from the transport's own
-  constants so the two cannot drift:
+  The second number is what an **authenticated but hostile** peer can make one
+  session hold, and *there is no single published figure for it*. Every
+  receive-side buffer has a bound and each bound has something enforcing it, but
+  a sum over them is not a bound on the session: it covers the buffers the
+  session layer owns and not the ones underneath — the byte pipe's own receive
+  accumulator, PhantomUDP's fragment reassembly, the per-stream structures
+  themselves. Three successive attempts to state such a total were each
+  corrected upward by a term the previous one had omitted, so the total was
+  withdrawn rather than corrected a fourth time. What is published instead is
+  the per-buffer table in the API documentation of
+  `phantom_protocol::api::session`, which names each bound, what it limits, and
+  what enforces it — and marks the two things that are observed rather than
+  enforced.
 
-  ```text
-    reorder payload      Σ (window_i + 64 KiB), windows ≤ 256 × 64 KiB + 8 MiB   =  40 MiB
-    reorder structure    256 streams × 2048 held entries × 128 B                 =  64 MiB
-    delivery backlog     the per-session hard cap that tears a flooding peer down =  4 MiB
-    per-stream channels  256 streams × 1024 queued chunks × (1156 B + 128 B)     = 321 MiB
-    raw-app channel      256 queued chunks × (1156 B + 128 B)                    = 0.3 MiB
-                                                                                  ────────
-                                                                                   429 MiB
-  ```
+  The rows worth knowing when sizing:
 
-  Every term is something the peer picks — how many streams it opens, how much
-  it sends, how long it leaves a reassembly hole open — so this is what one
-  **authenticated but hostile** peer can make a session hold. It is bounded per
-  session; the transport does **not** divide it between concurrent sessions, so
-  a process admitting `N` sessions commits `N × 429 MiB` in the worst case
-  (`1024 × 429 MiB ≈ 429 GiB` at the default cap). Admission control is the only
-  thing that bounds it at process scale, which is why the session cap is a
-  memory setting whether or not it was set as one.
+  | buffer | worst case a peer can drive it to | enforced by |
+  | --- | --- | --- |
+  | receive windows | one session-wide growth budget of 8 MiB over the 16 MiB of initial windows 256 streams start with | the growth budget; the advertised window itself is **not** a gate |
+  | reorder buffers | 256 streams × 2048 held entries × ~128 B of structure ≈ 64 MiB, plus payload within each stream's byte budget | per-stream entry cap and byte budget, on out-of-order segments only |
+  | delivery backlog | 4 MiB, plus the ~49 KiB of the frame that crossed the line | the session is torn down past the cap |
+  | per-stream delivery queues | 256 streams × 1024 slots × 1160 B ≈ 290 MiB | bounded channels; the slot *contents* are bounded by the inbound frame gate |
 
-  Three quarters of the figure is the delivery channels, one per opened stream,
-  and those fill only when the *application* is slower than the peer — 256
-  streams' worth of unread data is a shape most embedders never approach. It is
-  in the bound because it is resident, not because it is likely.
+  So the honest statement is: a hostile peer can move a session's receive
+  footprint into the hundreds of megabytes, the dominant term is unread data
+  sitting in per-stream delivery queues, and that term is a function of the
+  application not reading rather than of anything the transport needs. None of
+  it is divided between concurrent sessions, so a process admitting `N` sessions
+  is exposed to `N ×` whatever one session reaches — which is why the session
+  cap is a memory setting whether or not it was set as one.
 
   Pick a posture:
 
   - **Trusted or authenticated-and-accountable clients** (the common case):
-    size from the typical figure, leave `--max-recv-memory-mib` off, and watch
-    RSS. The worst case needs a peer deliberately holding reassembly holes
-    open on hundreds of streams while the application reads none of them.
-  - **Open to the internet**: state the budget. `--max-recv-memory-mib 8192`
-    on an 8 GiB host lowers the cap to 19 sessions and logs that it did. That
-    is a small number because the guarantee is strong; if it is too small for
-    the deployment, the honest fix is more hosts or the first posture, not a
-    larger cap.
+    size from the typical figure and watch RSS. The worst case needs a peer
+    deliberately holding reassembly holes open on hundreds of streams while the
+    application reads none of them.
+  - **Open to the internet**: measure. Run the deployment's own traffic against
+    a session cap you can afford to be wrong about, watch peak RSS per session
+    under load, and set `PHANTOM_MAX_SESSIONS` from that with headroom for the
+    rows above. A flag that divided a memory budget by a per-session constant
+    used to live here; it was removed because the constant it divided by was an
+    estimate, and a cap derived from an estimate under-provisions the host by
+    exactly the factor the estimate is out.
 
 The per-IP cap is a *session-count* cap, not a handshake-rate limit — an
 abusive IP can still trigger (cheap, PoW/cookie-gated) handshakes that are then

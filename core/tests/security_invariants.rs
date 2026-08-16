@@ -25,15 +25,14 @@
 
 use bytes::Bytes;
 use phantom_protocol::api::session::{
-    DELIVERY_ITEM_OVERHEAD_BYTES, MAX_STREAMS, RAW_APP_RECV_CHANNEL_DEPTH, RECV_DELIVERY_HARD_CAP,
-    SESSION_RECV_MEMORY_COMMITMENT, STREAM_RECV_CHANNEL_DEPTH,
+    DELIVERY_ITEM_OVERHEAD_BYTES, RECV_DELIVERY_HARD_CAP, STREAM_RECV_CHANNEL_DEPTH,
 };
 use phantom_protocol::crypto::adaptive_crypto::{CipherSuite, CryptoSession, AEAD_OVERHEAD};
 use phantom_protocol::crypto::hybrid_sign::{HybridSigningKey, HybridVerifyingKey};
 use phantom_protocol::transport::handshake::{
     ClientHello, HandshakeClient, HandshakeError, HandshakeResponse, HandshakeServer, ServerHello,
 };
-use phantom_protocol::transport::mtu::MAX_APP_CHUNK;
+use phantom_protocol::transport::mtu::MAX_RECV_PAYLOAD;
 use phantom_protocol::transport::multiplexer::{StreamDemultiplexer, StreamMessage};
 use phantom_protocol::transport::path::PathStateKind;
 use phantom_protocol::transport::session::{
@@ -57,7 +56,8 @@ use std::time::Duration;
 // The receive-memory tests below are the only place in this suite that asserts a
 // *quantity* rather than a behaviour, and a quantity asserted against the expression it
 // came from proves nothing. So they measure: this allocator reports live heap bytes, and
-// the published commitment is checked against what the real buffers are observed to take.
+// each published per-buffer figure is checked against what that buffer is observed to take
+// when it is driven to its own cap.
 //
 // The counter is per thread, not global, so a measurement is unaffected by whatever the
 // other tests in this binary are allocating in parallel. Measured regions therefore keep
@@ -2507,9 +2507,7 @@ async fn client_server_migration_candidate_is_anti_amp_capped_and_never_the_send
 ///
 /// The bound is per **session**, deliberately (a process-wide pool would let one peer's
 /// growth decide another peer's window). What this pins is that the per-session bound
-/// really is per-session — N sessions of M streams hold no more than N budgets between
-/// them — and that the arithmetic published in `SESSION_RECV_MEMORY_COMMITMENT` still
-/// covers what the constants allow.
+/// really is per-session: N sessions of M streams hold no more than N budgets between them.
 #[tokio::test]
 async fn recv_window_growth_is_bounded_per_session_not_per_stream() {
     tokio::time::pause();
@@ -2636,24 +2634,23 @@ fn a_queued_delivery_item_costs_more_than_the_payload_it_carries() {
     );
 }
 
-/// The published per-session receive commitment must not sit below what the buffers it
-/// names are measured to take. It is the figure a host is sized from and the figure the
-/// reference server divides an operator's memory budget by, so understating it
-/// under-provisions the host by exactly the factor it is out.
+/// Each of the two per-stream receive buffers must stay inside the figure published for it.
 ///
-/// One stream is driven to both of its per-stream ceilings — a reorder buffer held at
-/// `MAX_RECV_REORDER` entries by a hole that never fills, and a delivery channel filled to
-/// `STREAM_RECV_CHANNEL_DEPTH` with full-size chunks — and the live heap is observed. That
-/// figure is then scaled by `MAX_STREAMS`, which is how many of those a peer may open, and
-/// the session-wide backlog is added at the item count its own cap admits. Nothing here is
-/// re-derived from the commitment's expression: it is a measurement of the real structures
-/// against the published number.
+/// These are stated separately and never added up. A per-session total has to enumerate
+/// every allocation the receive path makes, including the ones under this crate's own
+/// abstractions — the byte pipe's accumulator, PhantomUDP's fragment reassembly, the
+/// `Stream` structures — and a total that misses one reads as a bound while being an
+/// estimate. What is checked here is what each row of the published table claims, measured
+/// against the real structure driven to its own cap.
+///
+/// The reorder buffer is held at its entry cap by a hole that never fills, using one-byte
+/// segments: that is the shape the byte budget does not bound, and the entry-structure
+/// figure is what covers it. The delivery channel is filled to its depth with the largest
+/// payload the frame gate admits, which is now a figure this side enforces rather than the
+/// chunk size the *sender* happens to use.
 #[tokio::test(flavor = "current_thread")]
-async fn the_published_session_recv_commitment_is_not_below_what_the_buffers_measure() {
+async fn the_per_stream_receive_buffers_stay_inside_the_figures_published_for_them() {
     // ── One stream's reorder buffer, held at its entry cap ──
-    // Offset 0 is never delivered, so every segment above it stays resident. One-byte
-    // segments are the peer's play here: they reach the entry cap without approaching the
-    // byte budget, which is the case the byte budget alone does not bound.
     let stream = Stream::new(11);
     let before = live_heap();
     for i in 0..MAX_RECV_REORDER {
@@ -2663,24 +2660,15 @@ async fn the_published_session_recv_commitment_is_not_below_what_the_buffers_mea
             .await;
     }
     let reorder_resident = (live_heap() - before).max(0) as u64;
-    assert!(
-        reorder_resident
-            <= MAX_RECV_REORDER as u64 * REORDER_ENTRY_OVERHEAD_BYTES as u64
-                + MAX_RECV_REORDER as u64,
-        "a reorder buffer held at its entry cap takes {reorder_resident} B, above the \
-         {REORDER_ENTRY_OVERHEAD_BYTES} B per entry the commitment charges for it"
-    );
 
-    // ── One stream's delivery channel, filled to its depth with full-size chunks ──
-    // Full-size chunks are the worst case per slot: a smaller item costs the peer a
-    // datagram of its own and holds less.
+    // ── One stream's delivery channel, filled to its depth at the largest admitted item ──
     let (demux, _control_rx) = StreamDemultiplexer::new_with_role(16, false);
     let handle = demux.register_stream(21, STREAM_RECV_CHANNEL_DEPTH);
     let before = live_heap();
     for _ in 0..STREAM_RECV_CHANNEL_DEPTH {
         assert!(
             demux
-                .route_data_async(21, Bytes::from(vec![0u8; MAX_APP_CHUNK]))
+                .route_data_async(21, Bytes::from(vec![0u8; MAX_RECV_PAYLOAD]))
                 .await,
             "the registered stream must accept up to its channel depth"
         );
@@ -2689,53 +2677,28 @@ async fn the_published_session_recv_commitment_is_not_below_what_the_buffers_mea
     drop(handle);
 
     // Positive control: both measurements have to be seeing the structures they name, or
-    // the comparison below is satisfied by measuring nothing.
+    // the comparisons below are satisfied by measuring nothing.
     assert!(
         reorder_resident > MAX_RECV_REORDER as u64
-            && channel_resident > (STREAM_RECV_CHANNEL_DEPTH * MAX_APP_CHUNK) as u64,
+            && channel_resident > (STREAM_RECV_CHANNEL_DEPTH * MAX_RECV_PAYLOAD) as u64,
         "the heap measurement is not observing the buffers: reorder {reorder_resident} B, \
          channel {channel_resident} B"
     );
 
-    // ── Scale to what one session permits ──
-    let per_stream = reorder_resident + channel_resident;
-    let backlog_items = RECV_DELIVERY_HARD_CAP / (1 + DELIVERY_ITEM_OVERHEAD_BYTES);
-    let backlog_resident =
-        backlog_items * measured_backlog_structure_per_item(1 << 15).ceil() as u64;
-    let raw_app_resident =
-        RAW_APP_RECV_CHANNEL_DEPTH as u64 * (channel_resident / STREAM_RECV_CHANNEL_DEPTH as u64);
-    let measured = per_stream * MAX_STREAMS as u64 + backlog_resident + raw_app_resident;
-
+    let reorder_published = MAX_RECV_REORDER as u64 * (REORDER_ENTRY_OVERHEAD_BYTES as u64 + 1);
     assert!(
-        SESSION_RECV_MEMORY_COMMITMENT >= measured,
-        "the published per-session commitment is {} MiB, but the buffers it names measure \
-         {} MiB at their own caps ({} MiB per stream × {MAX_STREAMS} streams, plus {} MiB \
-         of delivery backlog). A host sized from the published figure is short by that \
-         factor",
-        SESSION_RECV_MEMORY_COMMITMENT / (1024 * 1024),
-        measured / (1024 * 1024),
-        per_stream / (1024 * 1024),
-        backlog_resident / (1024 * 1024)
+        reorder_resident <= reorder_published,
+        "a reorder buffer held at its entry cap takes {reorder_resident} B against a \
+         published {reorder_published} B ({REORDER_ENTRY_OVERHEAD_BYTES} B of structure \
+         per entry)"
     );
-}
 
-/// The published commitment is quoted verbatim in prose — `docs/security/threat-model.md`,
-/// `docs/operations/deployment.md`, `server/README.md`, `.env.example` — where nothing
-/// recomputes it. This pins the constant to the figure those documents state, so any change
-/// to a term it is built from (the stream cap, the growth budget, the reorder entry cap,
-/// either channel depth, the delivery cap) lands here and forces the prose to move with it.
-///
-/// It is a lockstep guard against documentation drift, not a check of the arithmetic;
-/// `the_published_session_recv_commitment_is_not_below_what_the_buffers_measure` is what
-/// checks the arithmetic against reality.
-#[test]
-fn the_published_session_recv_commitment_matches_the_figure_the_documentation_quotes() {
-    assert_eq!(
-        SESSION_RECV_MEMORY_COMMITMENT,
-        450_167_808,
-        "the per-session receive commitment moved to {} MiB; update the figure in \
-         docs/security/threat-model.md, docs/operations/deployment.md, server/README.md \
-         and .env.example in the same change",
-        SESSION_RECV_MEMORY_COMMITMENT / (1024 * 1024)
+    let channel_published =
+        STREAM_RECV_CHANNEL_DEPTH as u64 * (MAX_RECV_PAYLOAD as u64 + DELIVERY_ITEM_OVERHEAD_BYTES);
+    assert!(
+        channel_resident <= channel_published,
+        "one stream's delivery channel at its depth takes {channel_resident} B against a \
+         published {channel_published} B ({STREAM_RECV_CHANNEL_DEPTH} slots of \
+         {MAX_RECV_PAYLOAD} B plus {DELIVERY_ITEM_OVERHEAD_BYTES} B of structure each)"
     );
 }
