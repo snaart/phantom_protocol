@@ -1127,10 +1127,10 @@ impl Stream {
         // for it — and since the peer chooses when to probe, and the probe is what performs
         // the swap, an accumulator that can be caught mid-update is a window the peer opens
         // for itself. `pending_window_update` next door — staged by this task, flushed by
-        // another, same problem — has always been a compare-exchange against a swap for this
-        // reason. The cost here is a plain load and one locked compare-exchange against the
-        // pair's one or two locked read-modify-writes, so the per-chunk path this sits on
-        // gets no slower.
+        // another — is a compare-exchange against a swap already: the same two-task shape,
+        // resolved the same way. The cost here is an acquire load and one locked
+        // compare-exchange against the pair's one or two locked read-modify-writes, so the
+        // per-chunk path this sits on gets no slower.
         let mut cur = self.bytes_since_last_update.load(Ordering::Acquire);
         let consumed_credit = loop {
             // Saturating rather than wrapping: what keeps this sum small is the reset in the
