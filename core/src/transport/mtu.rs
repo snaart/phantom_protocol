@@ -88,13 +88,15 @@ pub const MAX_APP_CHUNK: usize = MAX_INNER_UNFRAGMENTED - PER_PACKET_OVERHEAD;
 /// is untouched and no field carries a length — it is a receive-side rejection,
 /// so a peer that respects the chunking rule cannot tell it exists.
 ///
-/// The three post-handshake frame shapes are all under it by construction, and
-/// the asserts below are what keep them there: a full reliable data chunk fills
-/// it exactly, anti-fingerprint padding has its own lower ceiling
-/// (`shaping::MAX_SHAPED_WIRE`), and the largest control frame is a full SACK,
-/// which is an order of magnitude smaller. Handshake messages are far larger —
-/// a `ServerHello` carries an ML-DSA-65 signature — but they are exchanged before
-/// the pump exists and never reach this gate.
+/// Three things set the post-handshake ceiling, and the asserts below hold each
+/// of them under it separately: a full reliable data chunk, which fills the budget
+/// exactly; anti-fingerprint padding, which has a lower ceiling of its own
+/// (`shaping::MAX_SHAPED_WIRE`) and so covers every padded frame including cover
+/// traffic; and the largest control frame, a full SACK at a few hundred bytes.
+/// The remaining control frames — keep-alive, window update, path challenge —
+/// are tens of bytes. Handshake messages are far larger, since a `ServerHello`
+/// carries an ML-DSA-65 signature, but they are exchanged before the pump exists
+/// and never reach this gate.
 pub const MAX_RECV_FRAME: usize = MAX_INNER_UNFRAGMENTED;
 
 /// Largest AEAD plaintext a peer can deliver in one frame: [`MAX_RECV_FRAME`]

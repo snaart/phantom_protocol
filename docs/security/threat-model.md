@@ -207,7 +207,7 @@ compliant peer and nobody else.
 | delivery backlog | `RECV_DELIVERY_HARD_CAP` = 4 MiB **plus `MAX_DELIVERY_CHARGE_PER_FRAME` ≈ 49 KiB**, charged per item as payload + `DELIVERY_ITEM_OVERHEAD_BYTES` = 128 B | the reader tears the session down past the cap | **yes** |
 | per-stream delivery queues | `STREAM_RECV_CHANNEL_DEPTH` = 1024 slots per stream, `RAW_APP_RECV_CHANNEL_DEPTH` = 256 once per session | the channel is bounded and the delivery task blocks rather than growing it; the slot *contents* are bounded by the frame gate above | **yes, in slots; in bytes only because of the frame gate** |
 
-Two entries are deliberately marked otherwise.
+Four of those entries are qualified, and the qualifications are the point.
 
 The **advertised window** is a promise about what this side will admit, not a
 gate. Nothing on the receive path refuses in-order data for exceeding it, so it
@@ -215,6 +215,12 @@ shapes a compliant sender's behaviour and constrains a hostile one not at all.
 It is listed because it is the number design discussions usually focus on
 and because reading it as a bound is the specific mistake this row exists to
 prevent.
+
+The **reorder bounds cover the out-of-order arm only.** A segment that arrives
+in order is released straight to the delivery path and never enters the reorder
+buffer, so neither the entry cap nor the byte budget says anything about what a
+peer sending a gap-free stream can make the session hold. What bounds that is
+the frame gate on the way in and the delivery cap once it is through.
 
 The **delivery backlog's cap is crossed before it is noticed**. The charge a
 frame adds is only known once the frame has been decrypted and routed, so the
@@ -224,6 +230,13 @@ not change that — the same frame is the one that crosses — so the overshoot 
 published (`MAX_DELIVERY_CHARGE_PER_FRAME`) instead of being designed away. Its
 size is set by the most sub-payloads a single `COALESCED` bundle can carry,
 each of which becomes a separately-charged queue item.
+
+The **per-stream delivery queues are bounded in slots intrinsically, and in
+bytes only because of the frame gate.** That distinction is not academic: it is
+exactly what the published figure for those queues got wrong. It charged a slot
+`MAX_APP_CHUNK` — the size *this* side chunks to — while the receive path would
+have accepted a frame three thousand times larger, so the figure was understated
+by three orders of magnitude for as long as it stood.
 
 **Why there is no per-session total.** Adding the rows up gives a number that
 reads as a bound and is not one. The sum covers the buffers the session layer

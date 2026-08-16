@@ -30,14 +30,22 @@
 //! | [`RECV_DELIVERY_HARD_CAP`] + [`MAX_DELIVERY_CHARGE_PER_FRAME`] | the session's delivery backlog | the reader tears the session down; the second term is the frame that crossed the line |
 //! | [`STREAM_RECV_CHANNEL_DEPTH`], [`RAW_APP_RECV_CHANNEL_DEPTH`] | one delivered-stream queue | the channel is bounded; the delivery task blocks rather than growing it |
 //!
-//! Two things are **observed rather than enforced**, and reading them as bounds
-//! is the mistake this section exists to prevent. The advertised receive window
-//! is a promise about what this side will admit, not an allocation and not a
-//! gate: nothing on the receive path refuses in-order data for exceeding it, so
-//! it constrains a compliant sender and no one else. And the per-stream delivery
-//! channels are bounded in slots; their byte figure is the slot count times
-//! `MAX_RECV_FRAME`'s payload, which is a bound only because that frame gate
-//! exists — remove it and the same channel holds whatever the byte pipe carries.
+//! One number that looks like it belongs in that table is **observed rather than
+//! enforced**, and reading it as a bound is the mistake this section exists to
+//! prevent: the advertised receive window. It is a promise about what this side
+//! will admit, not an allocation and not a gate — nothing on the receive path
+//! refuses in-order data for exceeding it — so it constrains a compliant sender
+//! and no one else.
+//!
+//! Three of the rows above are also qualified, and the qualifications matter.
+//! The reorder bounds cover the *out-of-order* arm only; a segment arriving in
+//! order is released straight to the delivery path and never enters the reorder
+//! buffer. The delivery cap is crossed before it is noticed, which is why its
+//! row carries a second term. And the per-stream channels are bounded in slots
+//! intrinsically but in *bytes* only because [`MAX_RECV_FRAME`] bounds what a
+//! slot can hold — remove that gate and the same channel holds whatever the byte
+//! pipe carries, which is how the figure published for them came to be understated
+//! by three orders of magnitude.
 //!
 //! **There is deliberately no published per-session total.** Adding the rows up
 //! produces a number that reads as a bound and is not one: the sum covers the
