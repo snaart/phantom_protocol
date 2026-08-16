@@ -150,10 +150,13 @@ impl PacketFlags {
     /// Payload is a coalesced bundle of inner packets in
     /// `[count: u16][len1: u16][payload1]...` format (Phase 2.5).
     pub const COALESCED: u16 = 0x0400;
-    /// Per-stream flow control update (Phase 4.3). Payload is a
-    /// big-endian `u32` carrying the receiver's newly-available
-    /// window in bytes (absolute window size, NOT a delta — simpler
-    /// and self-correcting under packet loss).
+    /// Per-stream flow control update (Phase 4.3). Payload is a big-endian
+    /// `u32` of **relative** credit — the bytes the receiver's application has
+    /// just consumed, which the peer adds to its send window (saturating at
+    /// `MAX_SEND_WINDOW`). Relative rather than absolute is what keeps the
+    /// ledger correct past 4 GiB of transfer: the sender's window is
+    /// `initial + Σ granted − Σ sent`, so the receiver's unconsumed bytes stay
+    /// bounded by the initial window however long the session runs.
     pub const WINDOW_UPDATE: u16 = 0x0800;
     /// Idle keep-alive PING (download-only liveness). A small
     /// `ENCRYPTED | KEEPALIVE` packet with an **empty** payload that an idle

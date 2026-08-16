@@ -370,7 +370,47 @@ processing. An ACK's own `header.packet_number` is drawn from the acker's single
 per-direction packet-number space (shared with its data / `WINDOW_UPDATE` sends),
 so the AEAD nonce never collides, and it obeys the §5 rekey discipline.
 
-### 4.4 `SessionId`
+**Receiver dispatch order, and what an unknown bit means.** The flags are a
+bitfield, not a tag: several are legitimately set at once (`ENCRYPTED | RELIABLE |
+FIN`, `ENCRYPTED | KEEPALIVE | ACK`, `ENCRYPTED | COVER | PADDED`), so *which
+branch claims the packet* is part of the format rather than an implementation
+detail. A receiver dispatches in this order, each step consuming the packet:
+
+1. `header.version != WIRE_VERSION` → drop (§ 4.1).
+2. `ENCRYPTED` absent on a post-handshake frame → drop, unconditionally, empty
+   payload included (Invariant 2 / M-2). Handshake messages never reach this
+   dispatcher: they ride the transport's own framing (§ 4.9, § 9) and are
+   consumed by § 6.
+3. AEAD open (§ 5), then the replay window (Invariant 4). Only now is anything
+   below trustworthy.
+4. `PADDED` → strip the trailer (§ 4.8) *before* any further parse, so every
+   branch below sees the true inner plaintext.
+5. `KEEPALIVE` → a bare one is a PING, answer `KEEPALIVE | ACK`; one already
+   carrying `ACK` is the PONG, nothing further. This **precedes** the `ACK`
+   branch: a PONG is not a SACK and must not be parsed as one.
+6. `COVER` → drop after the liveness bookkeeping; it carries no application data.
+7. `ACK` → the plaintext is a `Sack` (§ 4.5); a `FIN` riding the same packet
+   closes the stream behind the data already queued for delivery.
+8. `WINDOW_UPDATE` → exactly 4 bytes of relative credit.
+9. `PATH_VALIDATION` → exactly 32 bytes of challenge or echo (§ 12.1).
+10. `COALESCED` → split the bundle and deliver each sub-payload in order (§ 4.5).
+11. Otherwise it is application data. `RELIABLE` reassembles by the
+    `stream_offset` prefix and is acknowledged (§ 4.5), and a `FIN` on it
+    half-closes the stream only once the in-order cursor has passed the FIN's own
+    offset — so a FIN that overtakes a gap cannot truncate the data behind it.
+    Anything else is delivered as it arrives, with a `FIN` closing the stream
+    immediately after this packet's bytes.
+
+A bit this implementation does not recognise — today only `0x8000` (§ 7) — takes
+no branch and causes no rejection: the packet is dispatched on the bits that *are*
+known and the unknown one is ignored. That is safe rather than lax, because the
+flags word is inside the AEAD AAD (§ 4.2): an unknown bit can only have been set
+by the peer holding the session key, never by the network, and a network flip
+fails the tag. A receiver must not reject a packet for an unrecognised flag, and a
+sender must not set one — a reserved bit is spent by a version bump, not by
+unilateral use.
+
+### 4.4 Identifiers: `SessionId` and `stream_id`
 
 `SessionId` (`[u8; 32]`, 32 bytes; `types.rs`) is the negotiated session
 identifier. It is bound into the AEAD AAD (§ 4.2) but is **off-wire** since v5 —
@@ -380,9 +420,44 @@ migration and demux routing are by the outer rotating `ConnId` (§ 4.7), not by
 || client_nonce)` (`transport/handshake.rs`); the client adopts the
 `session_id` echoed in the `ServerHello`.
 
-### 4.5 AEAD-plaintext payload codecs (SACK / reliable frame / COALESCED)
+**`stream_id` allocation.** The header's `stream_id` (u16 big-endian at wire
+offset 11, § 4.2) names one logical stream inside the session. There is no
+stream-open handshake: a stream exists the moment a packet carries its id, so the
+two peers must be unable to *invent the same id independently*. That is arranged
+by parity, QUIC-style, and it is the one rule a second implementation cannot
+derive from the frozen vectors — every fixture carries a single hard-coded id.
 
-These three are the **AEAD plaintext** that lives *inside* `PhantomPacket.payload`
+| Id | Owner | Meaning |
+| --- | --- | --- |
+| `0` | — | Session control channel. Reserved; never allocated to an application stream |
+| `1` | — | The raw-application stream behind `send()` / `recv()`, and the id stamped on keep-alives (§ 12.4). Reserved |
+| odd, `3, 5, 7, …` | the **initiator** (the peer that sent the `ClientHello`) | Streams it opens |
+| even, `2, 4, 6, …` | the **responder** | Streams it opens |
+
+Each side allocates from its own parity in steps of two, so no id one peer
+produces can ever be an id the other produces, and concurrent stream opens on
+both ends never collide. Source: `transport/multiplexer.rs`
+(`StreamDemultiplexer::new_with_role`), wired at both call sites in
+`api/session.rs` (`is_client = true` for the connecting side, `false` for the
+accepting side).
+
+The parity is an **allocation** discipline, not a receive-side check: a receiver
+creates a stream on first sight of any id greater than 1 and never asks whose
+parity it is. That is deliberate — an id is not a capability, and rejecting the
+wrong parity would buy nothing an authenticated peer could not sidestep — but it
+does mean a peer that allocates in the wrong parity produces no error anywhere.
+Its stream and its peer's stream of the same id merge into one, which surfaces as
+interleaved application bytes, not as a parse failure. Get this wrong and every
+byte-level vector in `INTEROP.md` still passes.
+
+Concurrent *receive* streams are capped at `MAX_STREAMS = 256` per session
+(`api/session.rs`); a reliable segment naming a new id past that cap is refused
+rather than admitted, and — being unrecorded — is not acknowledged, so the peer
+retransmits and that stream stalls instead of the table growing without bound.
+
+### 4.5 AEAD-plaintext payload codecs (SACK / reliable frame / COALESCED / WINDOW_UPDATE)
+
+These are the **AEAD plaintext** that lives *inside* `PhantomPacket.payload`
 once the AEAD opens — they are NOT the frozen outer `PhantomPacket` container
 (§ 4.1) and changing them does **not** require a `WIRE_VERSION` bump or invalidate
 `core/tests/wire_vectors`. They are authenticated (inside the AEAD) and invisible
@@ -422,6 +497,25 @@ Minimum wire size = `10 + 4 + 8 × (N − 1)`: 14 bytes for one range, 22 for tw
 a `gap == 0` (adjacent ranges — sender must coalesce), and any gap/len that
 underflows the sequence space (`Malformed`); a buffer shorter than the declared
 ranges is `Truncated`. The peer acts on a SACK **only after AEAD verify** (H1).
+
+**When an acknowledgement is required.** Exactly one class of packet is
+acknowledged: a `RELIABLE` application-data frame. Every one that survives the
+AEAD open and the replay window is acknowledged **immediately and individually** —
+the receiver accepts the segment into its reorder buffer, derives a fresh `Sack`
+from the live reorder state, and emits an `ENCRYPTED | ACK` inline on the same
+stream, stamped with the `path_id` the data arrived on. There is no delayed-ACK
+timer and no every-other-packet rule; a second implementation may add one, since
+the SACK is cumulative and a sender's loss detection reads only what a SACK
+covers, but nothing here waits for it.
+
+Nothing else is acknowledged: unreliable data, `COALESCED` bundles (their
+sub-payloads are not independently sequenced), `WINDOW_UPDATE`,
+`PATH_VALIDATION` and `COVER` frames all take their own dispatch branch and
+produce no ACK. An ACK is itself never `RELIABLE` and is never acknowledged —
+a lost one costs nothing, because the next SACK re-covers the same offsets.
+`PATH_VALIDATION` and `KEEPALIVE` have their own replies (the 32-byte echo,
+§ 12.1, and the `KEEPALIVE | ACK` PONG, § 12.4); neither is an acknowledgement of
+data and neither carries a `Sack`.
 
 **Reduction policy when a receiver holds more than `MAX_SACK_RANGES` islands.**
 The cap is a decode rule, so an over-full reorder buffer has to give something
@@ -476,6 +570,25 @@ sub-payloads actually present (`TruncatedSubPacket`). The default coalescer caps
 flushed bundle at `DEFAULT_MAX_DATAGRAM = 1200` bytes (path-MTU-safe). The decode
 side is wired into the recv pump; the send-side wrap helper is a tested primitive
 not yet driven from the live send path.
+
+**`WINDOW_UPDATE` plaintext** (`transport/stream.rs`). Exactly four bytes: a u32
+big-endian *relative* credit, scoped like a SACK to the stream named by the
+enclosing header. The receiver adds it to that stream's send window; it is not an
+absolute window, so it cannot be reordered into a smaller one and it stays correct
+past 4 GiB of transfer (`send_window = initial + Σ credit − Σ sent`, which bounds
+the receiver's unconsumed bytes by `initial` for a session of any length). A
+plaintext of any other length is dropped.
+
+The two ends of that ledger are numbers, not encodings, and a second
+implementation has to match them or the credit it grants is silently discarded:
+every stream starts with `INITIAL_STREAM_WINDOW = 64 KiB` of send credit before
+any `WINDOW_UPDATE` is seen — an implementation that treats the opening window as
+zero deadlocks, because the first credit is only emitted once the peer's
+application has consumed bytes it would never have been sent — and the
+accumulated window saturates at `MAX_SEND_WINDOW = 1 MiB`, which is equally the
+ceiling a conforming receiver's auto-tuning must not grant past. When to emit
+a credit is a local choice (this implementation emits on application consumption);
+how much is not.
 
 ### 4.6 Header protection (T4.6, QUIC RFC 9001 § 5.4)
 
@@ -750,6 +863,12 @@ becomes exactly one unfragmented PhantomUDP datagram:
   1156   MAX_APP_CHUNK
 ```
 
+Because the chunk is a sender-side split, **a stream is a byte stream and carries
+no message boundaries**: a `send` larger than the chunk budget is written as
+several packets, each delivered on its own, so the peer sees one `recv` per chunk
+and nothing marks where one `send` ended. An application that needs messages
+frames them itself, above this layer.
+
 The derivation, not the number, is the thing to copy: raising `PATH_MTU` (once
 path-MTU discovery exists) widens the chunk with nothing else to move.
 Overshooting it by a single byte is what makes the choice worth stating — the
@@ -983,6 +1102,28 @@ ticket. The ticket is consumed eagerly (race-free) and re-inserted with its
 original expiry if the handshake later fails (ZERORTT-2). Field order
 (`resume_session_id` → `resumption_binder` → `protocol_variant`) is borsh
 wire-load-bearing.
+
+**Bounded decode (M-7) — an admission rule, not just a hardening detail.** The
+`ClientHello` is the one message an unauthenticated stranger can send, so both
+listeners walk its borsh layout *before* decoding it, reading only the `Vec<u8>`
+length prefixes and the `Option` tags and rejecting the frame without allocating
+if any variable field is over its true maximum
+(`client_hello_lengths_within_bounds`, called from `api/listener.rs` and
+`api/udp_listener.rs`). A second implementation has to stay inside the same
+bounds or its hello is dropped before anything reads a field:
+
+| Field | Maximum |
+| --- | --- |
+| `client_key_package.ml_kem_pk` | 1184 B (FIPS 203, exact) |
+| `client_verify_key.ml_dsa_pk` | 1952 B (FIPS 204, exact) |
+| `protocol_variant` | 64 B |
+| `early_data` | `EARLY_DATA_MAX_LEN` = 16 KiB (§ 6.6) |
+
+Trailing bytes are rejected too: the walk must land exactly on the end of the
+buffer, and `borsh::from_slice` would reject a surplus anyway. There is therefore
+**no forward-compatible trailer** in any handshake message — borsh messages are
+fixed-shape, and an unrecognised field cannot be appended for an older peer to
+skip. Extending a handshake message means bumping `PROTOCOL_VERSION` (§ 1).
 
 Source: `core/src/transport/handshake.rs`.
 
@@ -1253,6 +1394,16 @@ Adaptive difficulty (`HandshakeServer::adaptive_difficulty`,
 | 2000–9999 | 12 | ~4096 |
 | 10000+ | 16 | ~65536 |
 
+That table is a floor, not the whole demand. The difficulty actually asked of a
+client is `max(adaptive_difficulty(), reputation_difficulty(ip, has_ticket))`
+(`api/listener.rs`, over `transport/reputation.rs`), so a source with recent
+handshake violations is singled out — up to `MAX_DIFFICULTY = 20` — even while
+the global load tier sits at 0. A verified resumption ticket zeroes the per-IP
+term only, never the load tier (M-5: a junk resume id must not buy an abusive
+source its reputation back). A client implementation should therefore solve
+whatever it is handed, up to its own ceiling of 24, rather than assume the 16 in
+this table is the most it can be asked for.
+
 ### 6.10 `ServerReject` (borsh) — unsupported-version signal
 
 ```rust
@@ -1288,7 +1439,17 @@ three messages — it leaves the frozen wire vectors (§11) untouched.
   `migrate_server()` for the server; Phase 4, § 12); `epoch`: the rekey
   generation (Phase 1.5). Both default to 0.
   Since P4.0 (§ 5) `path_id` no longer feeds the AEAD nonce — it is AAD-only — so a
-  `path_id` becomes safely reusable once its path is retired.
+  `path_id` becomes safely reusable once its path is retired. Two of its 256
+  values are reserved and are never handed out by an allocation:
+
+  | `path_id` | Meaning |
+  | --- | --- |
+  | `0` | The handshake path. Permanently *validated* — never challenged, never allocated to a migration. A passive NAT rebind keeps it (§ 12.1) |
+  | `1 … 254` | Migration labels, allocated in ascending order and wrapping `254 → 1` so `0` is skipped forever |
+  | `255` | `REBIND_VALIDATION_PATH_ID` — the slot the passive-rebind challenge validates on (M-3, § 12.1), kept out of the migration cycle so an active-migration echo and a rebind echo can never resolve each other's registry entry |
+
+  Reuse after a wrap is safe for the same reason retirement is: `path_id` is
+  authenticated in the AAD but absent from the nonce (§ 5).
 - `PhantomPacket.extensions`: TLV headroom that is **no longer on the wire**
   (v6 — § 4.1). It survives as a struct field bound into the AEAD AAD as an
   empty slice, so the headroom is authenticated but not transmitted; reaching it
@@ -1644,6 +1805,16 @@ that has moved in `core/src/transport/`,
 `core/src/crypto/` or `core/src/api/session.rs` since then has not been
 re-checked here.
 
+The same pass closed a set of silences, which are harder to notice than
+contradictions because nothing in the document points at them: the `stream_id`
+allocation rule (§ 4.4), the receiver's flag-dispatch order and what an
+unrecognised flag means (§ 4.3), when an acknowledgement is required and what is
+never acknowledged (§ 4.5), the `WINDOW_UPDATE` plaintext with the initial and
+maximum window that make its credit meaningful (§ 4.5), the reserved `path_id`
+values (§ 7), the bounded `ClientHello` decode a stranger's hello must satisfy
+and the absence of any forward-compatible trailer (§ 6.2), and the per-source
+term that puts the real PoW demand above the load-tier table (§ 6.9).
+
 The sync covered, in order: `WIRE_VERSION` / `PROTOCOL_VERSION` / `PROTOCOL_VARIANT`;
 the 15-byte `PacketHeader` grammar and `HP_PROTECTED_OFFSET`; the 47-byte AAD
 image and the off-wire `session_id`; the nonce construction and which header
@@ -1653,3 +1824,40 @@ padding trailer and its bucket cap; the PhantomUDP envelope and its
 fragmentation bounds; the derived application chunk size; the four handshake
 messages, their borsh field order and the transcript's leading and trailing
 fields; the cookie and PoW constructions; and the frozen vector inventory.
+
+---
+
+## 14. What this document does not specify
+
+Recorded rather than left silent, because a specification's failure mode is the
+thing it never mentions. Nothing below is a contradiction anyone could catch by
+reading; each is something a second implementation would discover only by
+building against a real peer.
+
+- **Loss recovery, congestion control and pacing.** The `Sack` encoding (§ 4.5)
+  is the entire contract. The retransmission timer, the packet- and
+  time-threshold loss rules, the initial and maximum congestion window, the
+  bandwidth estimator and the pacer are all sender-local: two peers with
+  completely different ones interoperate byte-for-byte. This omission is
+  deliberate — nothing about them is observable to the receiver except as
+  timing — but an implementer should not go looking here for them.
+- **Every timer except the keep-alive interval.** § 12.4 gives the keep-alive
+  default (15 s) and states the liveness rules qualitatively (`N × PTO` of
+  inbound silence while reliable data is outstanding; a migration-idle timeout
+  to `Dead`). The numbers behind `N`, that idle timeout, and the client's
+  handshake deadline are configuration, and a peer cannot work out from this
+  document how long it may stay silent before the other side declares its path
+  down. Anything built to sit idle should send keep-alives rather than infer a
+  budget.
+- **A ceiling on stream ids.** § 4.4 fixes the parity rule and the two reserved
+  ids, but not a maximum, and this implementation does not enforce one: its
+  allocator counts in 32 bits while the header field is 16 (§ 4.2), so a session
+  that opens more than about 32 767 streams wraps its ids back onto low values —
+  the reserved `0` and `1` included. Far outside any plausible use (the
+  concurrent cap is 256), but it is a truncation, not a refusal, so nothing
+  reports it.
+- **How to interoperate with a `fips` build.** § 6.7 explains why a fips peer
+  and a default peer cannot talk, and § 11 notes the frozen vectors compile to
+  nothing under that feature. What a fips-to-fips conformance set would contain
+  is therefore unspecified — its 65-byte classical key changes the byte lengths
+  this document quotes throughout.
