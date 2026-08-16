@@ -590,6 +590,37 @@ ceiling a conforming receiver's auto-tuning must not grant past. When to emit
 a credit is a local choice (this implementation emits on application consumption);
 how much is not.
 
+**Persist probe.** Relative credit is emitted once, in a frame nothing
+acknowledges or retransmits, so a `WINDOW_UPDATE` that does not arrive subtracts
+its credit from the sender's window permanently. A sender left with a window under
+one segment, data queued and *nothing outstanding* has no event that can free it:
+no acknowledgement is due, and the frame that would open the window is the class of
+frame that went missing. In that state a sender MAY emit a **persist probe** — a
+`RELIABLE` frame carrying an empty payload after its 4-byte stream offset, i.e. the
+FIN sentinel's shape without the `FIN` flag.
+
+The offset a probe carries MUST be one the receiver has already delivered; this
+implementation repeats the highest offset the peer has acknowledged. A probe on a
+fresh offset would sit above the data the closed window is holding back, so the
+receiver would hold it as an out-of-order island and SACK it there, raising
+`largest_acked` past every offset the sender transmits next — which the sender's
+loss detector reads as loss. Repeating a delivered offset is discarded as a
+duplicate before reassembly is touched, so it changes neither the receiver's SACK
+nor its buffers. It follows that a probe consumes no offset, is not tracked as in
+flight and is not retransmitted: an unanswered probe is simply asked again. This
+implementation sends no more than one per retransmit timeout, and only while
+nothing is outstanding.
+
+A receiver MUST deliver nothing to the application for an empty reliable segment.
+It SHOULD answer one by emitting whatever credit it owes but has held back below
+its own emission threshold; a receiver whose application has consumed nothing owes
+nothing, emits nothing, and correctly leaves the sender stopped. A receiver that
+does not implement the answer is interoperable — it acknowledges the probe and its
+peer stays blocked exactly as it would have without it. Credit that was already
+emitted into a lost frame is not recoverable by this or any other means at either
+end, since neither retains it; recovering *that* would require an absolute window
+on the wire, which this version does not have.
+
 ### 4.6 Header protection (T4.6, QUIC RFC 9001 § 5.4)
 
 **WIRE v6:** the **whole 15-byte `[0..15]` header** (`version ‖ packet_number ‖

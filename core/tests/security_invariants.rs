@@ -1702,6 +1702,49 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     );
 }
 
+/// The one frame a closed window does not stop is the flow-control persist probe, and the
+/// reason it is not an exception to the invariant above is that it carries **no application
+/// payload**. A stream the peer's window has stopped with nothing outstanding has no event
+/// left that could free it — no acknowledgement is coming, and the credit that would arrive
+/// rides in a frame nothing retransmits — so it asks, with an empty reliable segment. What
+/// the peer is charged for the asking is one stream offset; what it is charged in buffer is
+/// nothing, which is what keeps a receiver whose application has stopped reading able to
+/// hold this side still.
+///
+/// Pinned here, next to the bound it must not breach: a probe that ever carried queued data
+/// would be new data admitted past the advertised window, and this fails on the first one.
+#[tokio::test]
+async fn the_persist_probe_carries_no_application_payload() {
+    tokio::time::pause();
+    let s = Stream::new(1);
+    // A window closes by sending, so one segment has already gone out and been acknowledged.
+    s.send_reliable(Bytes::from(vec![0u8; 1200])).await.unwrap();
+    let sent = s
+        .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+        .await
+        .expect("the initial window admits the first segment");
+    s.ack(sent.stream_offset).await;
+    // Close what is left of it, with a full segment still queued behind.
+    assert!(s.try_consume_send_window(s.peer_send_window()));
+    s.send_reliable(Bytes::from(vec![0u8; 1200])).await.unwrap();
+
+    let probe = s
+        .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
+        .await
+        .expect("a blocked stream with nothing outstanding probes rather than waiting");
+    assert!(
+        probe.data.is_empty(),
+        "the probe carried {} application bytes past a closed flow-control window",
+        probe.data.len()
+    );
+    assert!(probe.reliable && !probe.fin);
+    assert_eq!(
+        s.peer_send_window(),
+        0,
+        "the probe must not debit a window that has nothing in it"
+    );
+}
+
 /// Retransmissions bypass BOTH the congestion window and the flow-control
 /// window: a timed-out segment is re-offered even when `cwnd_budget == 0` and
 /// the peer's window is fully closed — loss recovery must always proceed, and
