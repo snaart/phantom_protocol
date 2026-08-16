@@ -556,7 +556,7 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   `test_harness/fault_transport.rs` (injected loss + reorder), but has **not**
   been hardened against real-world adversarial network conditions or externally
   reviewed — treat the data plane as functional-but-not-battle-tested.
-- **Negative-security suite: 60 always-on tests** in
+- **Negative-security suite: 64 always-on tests** in
   `core/tests/security_invariants.rs`, pinning every documented invariant.
   Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
   400+ library unit tests, and `#[ignore]`-gated loopback integration suites

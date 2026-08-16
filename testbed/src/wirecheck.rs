@@ -23,9 +23,10 @@
 //! wire, so an observer without the session's header-protection key cannot read
 //! the flag field at all — no capture, however clean, can show that every
 //! post-handshake packet carries it. That question is answered from the source,
-//! and [`ENCRYPTED_FLAG_STATEMENT`] says exactly where the answer comes from
-//! and where it is and is not pinned by a test. It travels into the artifact
-//! with the numbers so a reader cannot mistake one for the other.
+//! and [`ENCRYPTED_FLAG_STATEMENT`] says exactly where the answer comes from,
+//! which tests hold it, and which run-time counter shows the gate firing. It
+//! travels into the artifact with the numbers so a reader cannot mistake one
+//! for the other.
 //!
 //! Entropy is reported for the same reason it is reported carefully: it is
 //! evidence that the payload is not structured, not proof that it is
@@ -599,26 +600,31 @@ pub const ENCRYPTED_FLAG_STATEMENT: &[&str] = &[
      every application frame's flags before sealing, and the receive path drops any \
      post-handshake packet that arrives without it — including an empty-payload one, which \
      closes the forged-standalone-FIN case.",
-    "Where it is pinned: the in-lib tests in core/src/api/session.rs. \
+    "Where it is pinned, inside the crate: the in-lib tests in core/src/api/session.rs. \
      `v2_recv_drops_unencrypted_non_empty_post_handshake_payload` drives handle_packet with an \
      unencrypted, non-empty packet and asserts nothing is delivered; \
      `forged_unencrypted_fin_does_not_close_a_stream` does the same for the empty-payload FIN. \
      The send-side property is asserted by the `decrypt_incoming` helper the handshake \
      round-trip tests use, which fails if a frame arrives without the flag. All of these run \
      under `cargo test --lib`.",
-    "Where it is NOT pinned, and this is a gap worth knowing about: \
-     core/tests/security_invariants.rs — the always-on suite documented as pinning the numbered \
-     invariants — contains no test of either gate. It exercises the AEAD layer directly and \
-     never calls handle_packet. What it does hold is the neighbouring property: the header flags \
-     are covered by the AEAD associated data, so ENCRYPTED cannot be stripped from a genuine \
-     packet without breaking the tag (tampered_header_is_rejected_via_aad, padded_flag_is_aead_bound). \
-     That is a different statement from \"an unencrypted packet is dropped\", and a reader who \
-     goes to that file for invariant 2 will not find the gate there.",
-    "There is no run-time counter to fall back on either: the drop is recorded through \
-     Observability::record_unencrypted_dropped, which is an OpenTelemetry instrument only. It \
-     compiles to a no-op without the telemetry-otel feature and has no field in \
-     MetricsSnapshotFfi, so neither this probe nor an operator on a default build can observe \
-     the gate firing.",
+    "Where it is pinned in the always-on suite: core/tests/security_invariants.rs — the file \
+     documented as holding the numbered invariants — runs \
+     `forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path`, which drives a live \
+     PhantomSession against a hand-run server and puts a forged unencrypted FIN on the wire, \
+     masked with the server's real send key, ahead of an authentic frame. The authentic frame \
+     arriving and the forged bytes not arriving are both asserted, so a receive path that dropped \
+     everything would fail it too. That suite also holds the neighbouring but distinct property: \
+     the header flags are covered by the AEAD associated data, so ENCRYPTED cannot be stripped \
+     from a genuine packet without breaking the tag (tampered_header_is_rejected_via_aad, \
+     padded_flag_is_aead_bound). Stripping a flag and forging a packet that never had one are \
+     different attacks and are pinned separately.",
+    "There is a run-time counter, and it is in this record: the drop increments \
+     unencrypted_dropped_total, a lock-free counter next to replay_rejected_total and \
+     aead_failure_total, surfaced through MetricsSnapshot and MetricsSnapshotFfi on every build. \
+     The session_counters block above carries its value for this exchange, so a non-zero reading \
+     is evidence the gate fired rather than evidence nothing arrived. The labelled OpenTelemetry \
+     instrument for the same event still compiles to a no-op without the telemetry-otel feature; \
+     the counter does not.",
 ];
 
 // ── pcap reading ────────────────────────────────────────────────────────────
@@ -1856,12 +1862,28 @@ mod tests {
             "the tests that do pin it must be named"
         );
         assert!(
-            all.contains("core/tests/security_invariants.rs") && all.contains("contains no test"),
-            "and the gap must be stated, not papered over"
+            all.contains("core/tests/security_invariants.rs")
+                && all.contains(
+                    "forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path"
+                ),
+            "the always-on suite that drives the gate must be named, by file and by test"
+        );
+        // The statement once said that suite contained no test of the gate and that
+        // no counter existed. Both were true when they were written and neither is
+        // now, and an instrument that keeps reporting a closed gap is worse than one
+        // that never mentioned it. These two assertions exist to make the stale
+        // wording fail rather than merely go unnoticed.
+        assert!(
+            !all.contains("contains no test") && !all.contains("Where it is NOT pinned"),
+            "the statement still reports the gap as open"
         );
         assert!(
-            all.contains("record_unencrypted_dropped") && all.contains("no-op"),
-            "including that there is no counter to fall back on"
+            all.contains("unencrypted_dropped_total") && all.contains("MetricsSnapshotFfi"),
+            "and the counter an operator can actually read must be named"
+        );
+        assert!(
+            !all.contains("no run-time counter"),
+            "the statement still denies the counter it now depends on"
         );
         // Every line has to stand on its own in a summary; none may be a stub.
         for line in ENCRYPTED_FLAG_STATEMENT {

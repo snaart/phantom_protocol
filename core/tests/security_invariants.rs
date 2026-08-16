@@ -629,13 +629,19 @@ fn server_identity_mismatch_aborts_handshake() {
     }
 }
 
-/// The `AEAD_MAX_INVOCATIONS` ceiling must be reachable: when the per-direction
-/// counter reaches the limit, encrypt/decrypt return `CryptoError::NonceExhausted`
-/// rather than wrapping past safe usage.
+/// **Invariant 8, the reachable half.** The `AEAD_MAX_INVOCATIONS` ceiling is
+/// checked against a per-direction counter, and this pins that the counter is
+/// real: it starts at zero, advances once per encrypt, and is readable through
+/// the API the check itself reads.
 ///
-/// We can't actually push the counter to 2^48 in a test (~9 years of packets);
-/// instead we encrypt one record and observe that the API exposes the counter,
-/// confirming the safety-check plumbing exists.
+/// It does not reach the ceiling and does not claim to. Driving a counter to
+/// 2^48 is roughly nine years of packets, and no test in this repository takes
+/// the `NonceExhausted` branch — it is held by inspection of the five sites in
+/// `crypto/adaptive_crypto.rs` that compare against the limit, and nothing more.
+/// The complement that *is* driven is
+/// `failed_decrypt_does_not_advance_recv_invocation_counter`, the property an
+/// attacker could otherwise abuse: a forged packet must not push anyone toward
+/// the ceiling.
 #[test]
 fn aead_invocations_counter_increments_per_op() {
     let secret = [0xC3u8; 32];
@@ -2763,25 +2769,29 @@ const RAW_APP_STREAM: u16 = 1;
 /// carrying no application data, which under the pre-M-2 rule (drop only *non-empty*
 /// unencrypted payloads) would have torn a stream down without any AEAD verification.
 ///
-/// Three frames go down the wire, in order, and the client's own `recv()` is the
-/// barrier that proves all three were processed:
+/// Four frames go down the wire, in order, and the client's own `recv()` is the
+/// barrier that proves each was processed before the next was read:
 ///
 ///  1. a forged FIN with a literally empty payload. On the v6 wire this cannot even
 ///     reach the flag gate: header protection samples the first 16 ciphertext bytes,
 ///     so a frame with no payload fails to unmask and is dropped one layer earlier.
-///     Pinned here because it is the shape the audit named, and because it is what
-///     makes the counter below mean "the flag gate fired" rather than "something,
-///     somewhere, dropped a frame";
+///     Pinned here because it is the shape the audit named — the gate is required to
+///     hold it, whichever layer happens to reach it first;
 ///  2. a forged FIN at the smallest size header protection admits — 16 payload
 ///     bytes, masked with the server's real send key so it unmasks into a valid
 ///     header on the client. Its bytes are laid out as a reliable frame at stream
 ///     offset 0, so a receiver that skipped the gate would hand `downgraded!!` to
 ///     the application;
-///  3. a genuine `ENCRYPTED | RELIABLE` frame on the same stream and path.
+///  3. a genuine `ENCRYPTED | RELIABLE` frame on the same stream and path;
+///  4. a second genuine frame, the next segment on the same stream, which arrives
+///     only if the forged FIN did not half-close the stream. Discarding a forgery's
+///     bytes and ignoring its FIN are two separate obligations, so they are asserted
+///     separately.
 ///
-/// The two-sidedness is (3): a receive path that dropped everything would pass an
-/// assertion about the forgeries and fail this one. And deleting the gate fails the
-/// test twice over — `recv()` yields the forged bytes instead of the authentic ones,
+/// The two-sidedness is (3) and (4): a receive path that dropped everything would
+/// pass any assertion about the forgeries and fail both of these. Deleting the gate
+/// fails the test three ways over — `recv()` yields the forged bytes instead of the
+/// authentic ones, the FIN that rode with them closes the stream out from under (4),
 /// and the drop counter reads zero.
 #[tokio::test]
 async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() {
@@ -2923,11 +2933,55 @@ async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() 
         "the forged unencrypted frame must not reach the application"
     );
 
+    // (4) The other half of what a forged FIN would have done. Not delivering its
+    // bytes is only one of the two effects the gate prevents; the other is the FIN
+    // itself, which would have half-closed the stream and made everything after it
+    // unreachable. A second authentic frame on the same stream is what distinguishes
+    // "the bytes were discarded" from "the stream is still open", and only the second
+    // is the property Invariant 2 states. Its prefix is 1, not the byte length of the
+    // frame before it: the `[stream_offset: u32 BE]` field the reliable path reorders
+    // on counts segments, one per frame, whatever each one carries.
+    let second_header = PacketHeader::new(
+        session_id,
+        RAW_APP_STREAM,
+        4,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
+    )
+    .with_epoch(server_session.current_epoch());
+    let mut second_plaintext = 1u32.to_be_bytes().to_vec();
+    second_plaintext.extend_from_slice(b"still-open");
+    let second_ciphertext = server_session
+        .encrypt_packet(&second_header, &second_plaintext, &[])
+        .expect("seal the follow-up frame");
+    let second_wire = server_session
+        .protect_packet(&PhantomPacket::new(second_header, second_ciphertext))
+        .expect("protect the follow-up frame");
+    to_client_tx
+        .send(Bytes::from(second_wire))
+        .await
+        .expect("send follow-up frame");
+
+    let after_fin = tokio::time::timeout(Duration::from_secs(10), session.recv())
+        .await
+        .expect("the stream is still open after the forged FIN")
+        .expect("recv");
     assert_eq!(
-        session.metrics_snapshot().unencrypted_dropped_total,
-        1,
-        "exactly one frame reached the ENCRYPTED gate and was dropped by it: the \
-         empty-payload forgery never got past header protection, and the authentic \
-         frame carried the flag"
+        after_fin, b"still-open",
+        "the forged FIN must not have closed the stream"
+    );
+
+    // The counter is what separates "the gate refused something" from "nothing ever
+    // arrived" — the two are otherwise indistinguishable from outside. It is asserted
+    // as a floor rather than as an exact figure on purpose: today it reads exactly 1,
+    // because forgery (1) is refused one layer earlier by header protection, whose
+    // mask needs a 16-byte ciphertext sample an empty payload cannot supply
+    // (`Session::hp_sample`). Which layer catches the empty case is that layer's
+    // business and is pinned with it; pinning it here would turn a change in the
+    // header-protection minimum into a failure of an invariant-2 test.
+    let dropped = session.metrics_snapshot().unencrypted_dropped_total;
+    assert!(
+        dropped >= 1,
+        "the ENCRYPTED gate never fired, so nothing above shows the forgery was \
+         refused rather than lost (unencrypted_dropped_total = {dropped})"
     );
 }

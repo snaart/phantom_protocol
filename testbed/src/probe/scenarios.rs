@@ -2177,8 +2177,12 @@ fn record_wire_check(out: &mut ScenarioOutput, sample: WireCheckSample) {
         if let Some(c) = &sample.session_counters {
             out.note(format!(
                 "session counters over the same exchange: {} replay rejections, {} AEAD failures, \
-                 {} packets sent, {} received",
-                c.replay_rejected_total, c.aead_failure_total, c.packets_sent, c.packets_recv
+                 {} unencrypted post-handshake packets refused, {} packets sent, {} received",
+                c.replay_rejected_total,
+                c.aead_failure_total,
+                c.unencrypted_dropped_total,
+                c.packets_sent,
+                c.packets_recv
             ));
         }
     }

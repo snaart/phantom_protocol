@@ -234,6 +234,7 @@ mod tests {
                 handshake_latency_count: 0,
                 replay_rejected_total: 0,
                 aead_failure_total: 0,
+                unencrypted_dropped_total: 0,
                 uptime_secs: 1,
             },
             per_leg: vec![],

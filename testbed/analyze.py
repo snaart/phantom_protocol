@@ -407,6 +407,7 @@ def analyze_server(server_dir):
         print(
             f"  {leg:8} handshakes ok {m.get('handshakes_success')} / failed {m.get('handshakes_failure')}"
             f", replay rejected {m.get('replay_rejected_total')}, aead failures {m.get('aead_failure_total')}"
+            f", unencrypted refused {m.get('unencrypted_dropped_total')}"
         )
 
     section("Server: events worth reading")

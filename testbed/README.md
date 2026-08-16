@@ -190,12 +190,13 @@ requires every post-handshake packet to carry the `ENCRYPTED` flag. That flag is
 in the packet header, header protection masks the header from byte 0, and so no
 capture can read it. The record answers that question from the source instead
 and labels it as such: it names the mechanism in `core/src/api/session.rs`, the
-in-lib tests that pin both the send and receive halves, the fact that
-`core/tests/security_invariants.rs` — the suite documented as pinning the
-numbered invariants — contains no test of either gate, and the fact that the
-counter which would show the gate firing is an OpenTelemetry instrument that
-compiles away on a default build. Those five statements travel in every record,
-including a skipped one.
+in-lib tests that pin both the send and receive halves, the test in
+`core/tests/security_invariants.rs` that drives a forged unencrypted packet
+through a live session and the neighbouring AAD property that is *not* the same
+statement, and the `unencrypted_dropped_total` counter — always on, in
+`MetricsSnapshotFfi`, and carried in this record — which is the only run-time
+evidence that a refusal happened rather than nothing arriving. Those five
+statements travel in every record, including a skipped one.
 
 Without capture rights the scenario records a skip and the reason, quoting
 tcpdump, exactly as the reference leg does for a missing certificate. It is

@@ -321,6 +321,10 @@ typedef struct PhantomMetricsSnapshotFfi {
     uint64_t handshake_latency_count;
     uint64_t replay_rejected_total;
     uint64_t aead_failure_total;
+    /* Post-handshake packets refused for arriving without the ENCRYPTED
+     * flag. Always populated; a non-zero value means the downgrade defence
+     * fired, which is otherwise indistinguishable from nothing arriving. */
+    uint64_t unencrypted_dropped_total;
     uint64_t uptime_secs;
 } PhantomMetricsSnapshotFfi;
 
