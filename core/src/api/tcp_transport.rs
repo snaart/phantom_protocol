@@ -171,6 +171,51 @@ mod tests {
         )
     }
 
+    /// The framing bytes themselves, in both directions, against a raw socket
+    /// rather than against the other half of this type.
+    ///
+    /// `docs/protocol/INTEROP.md` Rung 1b tells a second implementation that
+    /// every stream leg but WebSocket prefixes each message with a 4-byte
+    /// big-endian length — it is the one interop-load-bearing byte format with
+    /// no committed vector behind it, because it sits outside the frozen wire.
+    /// A round-trip through two `TcpSessionTransport`s would pass just as
+    /// happily on little-endian or on a 2-byte prefix, so this drives one side
+    /// with a plain `TcpStream` and reads the bytes.
+    #[tokio::test]
+    async fn message_framing_is_a_four_byte_big_endian_length_prefix() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (raw, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let mut raw = raw.expect("connect");
+        let (framed, _) = accepted.expect("accept");
+        let framed = TcpSessionTransport::new(framed);
+
+        // Send side: 0x0102_0304 chosen so a byte-order slip cannot alias.
+        let payload: Vec<u8> = (0..258u32).map(|i| i as u8).collect();
+        assert_eq!(payload.len(), 0x0102, "the length must span two bytes");
+        framed.send_bytes(&payload).await.expect("send");
+
+        let mut on_the_wire = vec![0u8; 4 + payload.len()];
+        raw.read_exact(&mut on_the_wire).await.expect("read frame");
+        assert_eq!(
+            &on_the_wire[..4],
+            &[0x00, 0x00, 0x01, 0x02],
+            "the length prefix must be 4 bytes, big-endian"
+        );
+        assert_eq!(&on_the_wire[4..], &payload[..], "payload follows verbatim");
+
+        // Receive side: a peer that framed by hand must be understood.
+        let reply = b"the responder speaks the same framing".to_vec();
+        let mut hand_framed = (reply.len() as u32).to_be_bytes().to_vec();
+        hand_framed.extend_from_slice(&reply);
+        raw.write_all(&hand_framed).await.expect("write frame");
+        raw.flush().await.expect("flush");
+        let got = framed.recv_bytes().await.expect("recv");
+        assert_eq!(&got[..], &reply[..]);
+    }
+
     /// **WIRE-001.** During the unauthenticated handshake phase the recv cap is
     /// tight (64 KiB): an oversized DECLARED frame is rejected right after the
     /// 4-byte prefix, before any body is buffered — no 4-byte → big-alloc
