@@ -423,17 +423,13 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
-- **An upload could stop for good, with nothing in flight and data still queued, because
-  flow-control credit is destroyed the moment it is put on the wire.** A `WINDOW_UPDATE`
-  carries *relative* credit — "add this much", never "your window is this" — the receiver
-  clears the bytes off its own accumulator as it composes the frame, and the frame goes out
-  once, unacknowledged, with nothing retransmitting it. A datagram that does not arrive
-  therefore subtracts its credit from the sender's window for the rest of the connection, and
-  the deficit only ever grows: at a loss rate `p` it accumulates at `p` × the bytes
-  transferred, so on any lossy path it reaches the 64 KiB initial window in finite time and
-  the sender is left with a window under one segment, nothing outstanding, and data still
-  queued. Nothing can leave that state. No acknowledgement is coming, because nothing is in
-  flight; the only frame that could free it is the class of frame that just went missing.
+- **A stream stopped on its flow-control limit with nothing outstanding had no way to ask, and
+  no answer was on its way.** Blocked with nothing in flight is the one state a sender cannot
+  leave on its own: what would free it is an acknowledgement, and an acknowledgement only comes
+  back for something sent. Until then it waits on the receiver volunteering a `WINDOW_UPDATE`
+  — which that side emits only when its application consumes enough to cross the half-window
+  threshold governing emission. A peer that has stopped reading never crosses it, and neither
+  does one whose earlier frame the path ate.
 
   Measured on a route losing 9.5–15.9 % of its UDP round trips at ~300 ms: an upload's
   congestion window froze at 45 881 bytes with `inflight` at 0 and delivered bytes frozen at
@@ -468,33 +464,16 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   retransmitted; an unanswered one is simply asked again next interval.
 
   The answer comes from the receiver, which is the side that knows. An empty reliable segment
-  is recognised there and flushes the credit that side already owes — bytes its application
-  really consumed, sitting below the half-window threshold that governs when a credit is
-  emitted. That threshold is right while data keeps arriving to push the accumulator over it;
-  once the peer has stopped, nothing will, and the withheld bytes are exactly what it is
-  waiting for. Because the answer is bounded by consumption, a receiver that is not reading
-  owes nothing, emits no frame at all, and a peer that probes repeatedly extracts nothing it
-  has not earned.
+  is recognised there and re-states the cumulative limit that side is currently advertising —
+  bytes its application has really consumed, plus the window it is offering on top. Because a
+  limit is a total, one answer repairs however many earlier `WINDOW_UPDATE` frames the path
+  ate; because both of its terms move only on real consumption, a receiver that is not reading
+  re-states the very number its peer is already stopped at and leaves it stopped. A peer that
+  probes repeatedly extracts nothing it has not earned.
 
-  Answering makes the peer a second concurrent mutator of that accumulator, on a second task,
-  at a moment it picks, which is why each of the accumulator's two operations is a single
-  atomic transition: a compare-exchange on the consumption side and a swap on the probe side.
-  An add followed by a subtract of the total just read would be two, and a swap landing
-  between the halves leaves the subtraction running against an emptied counter — on a `u32`
-  that lands at `2^32` minus the bytes taken, which the next probe reads as bytes owed and
-  grants, taking the peer's send window to `MAX_SEND_WINDOW` with nothing consumed to pay for
-  it. `pending_window_update` beside it has the same two-task staged-and-flushed shape and is
-  written the same way.
-
-  Two things are deliberately not claimed. Credit that was already emitted into a lost frame
-  is **not** recovered: the receiver cleared it as it composed the frame and the sender never
-  saw it, so neither end retains it, and no local mechanism on either side can produce it
-  again — `credit_already_lost_in_flight_is_not_recovered_by_asking` pins that boundary rather
-  than papering over it. Closing it needs an absolute window on the wire, which 0.2.x peers
-  would add rather than assign, and that is a protocol decision taken elsewhere. And a peer
-  that does not implement the answer stays interoperable: it acknowledges the probe and its
-  sender remains blocked exactly as it would have been without one. Nothing on the wire
-  changes, and no value the peer writes enters the sender's side of the mechanism.
+  A peer that does not answer stays interoperable: it acknowledges the probe and its sender
+  remains blocked exactly as it would have been without one. No frame kind is added, and no
+  value the peer writes enters the sender's side of the mechanism.
 
 - **A write the transport refused cost the peer's flow-control window a segment, permanently.**
   `Stream::poll_send` debits the peer's window as it hands a first transmission out, so a
@@ -843,9 +822,9 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   out-of-order segments refused and retransmitted on exactly the lossy long paths a large
   window is for. Session-wide, the number that bounds buffered-but-undelivered bytes is
   unchanged: the pump still tears a session down at 4 MiB of delivery backlog.
-  **Receiver-local: `WINDOW_UPDATE` already carries relative credit, so a wider window is
-  expressed as more of the credit the frame already encodes. No wire-format change, and the
-  byte-exact wire vectors are untouched.**
+  **Receiver-local: a wider window is expressed as a larger number in the `WINDOW_UPDATE`
+  frame the receiver already sends, so no field, frame kind or layout changes here and this
+  change on its own leaves the byte-exact wire vectors untouched.**
 - **BBR had no concept of a round trip, so the sender left its only growth phase within
   the first one and then stopped probing for bandwidth entirely.** Both of the estimator's
   round-scaled rules — the Startup exit test and the ProbeBW gain cycle — were driven off
