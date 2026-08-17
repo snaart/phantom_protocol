@@ -1151,6 +1151,18 @@ impl Session {
         self.bandwidth_estimator.lock().on_send(bytes);
     }
 
+    /// The smallest round trip this session has actually timed, or `None` while
+    /// the estimator's `min_rtt` is still its opening guess.
+    ///
+    /// Exposed for
+    /// [`ack_delay_adjusted_rtt`](crate::transport::bandwidth_estimator::ack_delay_adjusted_rtt):
+    /// a caller that samples the same acknowledgement for its own purposes needs
+    /// the estimator's reference so it applies the identical bound to the
+    /// peer-reported ack delay rather than inventing a second, looser one.
+    pub fn rtt_floor(&self) -> Option<std::time::Duration> {
+        self.bandwidth_estimator.lock().rtt_floor()
+    }
+
     /// Record that an ACK arrived with delivery sample `sample`. The
     /// returned `u64` is the updated bottleneck bandwidth estimate; we
     /// reflect it into the pacer so the outbound rate tracks the
