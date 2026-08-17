@@ -306,14 +306,25 @@ Server, under `/var/lib/phantom-testd/`:
 
 - `sessions.jsonl`, `snapshots.jsonl` (per-leg counters + RSS/CPU),
   `windows.jsonl` (the sending side's congestion window, keyed
-  `server:session:<uid>`), `events.jsonl`, and uploaded client bundles under
+  `server:session:<uid>`), `events.jsonl`, `session-uid.hwm` (bookkeeping — the
+  uid range this host has already used), and uploaded client bundles under
   `results/client/`
 
 These are append-only and outlive the daemon, so one directory holds several
-runs. `session_uid` is seeded from the daemon's start time and is unique across
-restarts — but in artifacts written before that it restarts at 1 on every boot,
-and a uid alone joins one session's marks to another session's windows. Bound
-such a join by the marks' timestamps, as `stall_verdict.py` does.
+runs. `session_uid` is unique across restarts: the daemon starts it at the
+larger of its own start time in microseconds and one past the mark it left in
+`session-uid.hwm`, so a clock that steps backwards, a host with no
+battery-backed clock, or a clock reading zero cannot make two runs share a
+range. Uids skip forward across a restart — a run reserves a block and a crash
+abandons the unused tail — so gaps are expected and mean nothing.
+
+Two caveats when reading. Artifacts written before this existed restart the
+counter at 1 on every boot, and a uid alone then joins one session's marks to
+another session's windows; bound such a join by the marks' timestamps, as
+`stall_verdict.py` does. And if the daemon could not read or write the mark it
+says so, once, as a `session_uid_degraded` record in `events.jsonl` — a run
+carrying one of those is back to the clock alone and its uids should be treated
+the same way.
 
 Results are flushed after **every scenario**, so an interrupted run keeps
 everything completed so far. The client also uploads its bundle to the daemon
@@ -377,10 +388,11 @@ Two things it does deliberately, both of which cost a wrong answer once. It
 excludes the QUIC reference leg and the client's own `download` series, because
 neither is the sending side and both therefore read as a permanent stall. And
 it joins the server's windows to a scenario by *time*, not by `session_uid`
-alone: the daemon restarts that counter, so a uid is shared across runs, and a
-uid-only join silently pairs one session's marks with another session's
-windows. It prints a warning wherever that ambiguity exists rather than
-resolving it quietly.
+alone, because a uid-only join silently pairs one session's marks with another
+session's windows in any archive whose uids were once reissued. Live daemons no
+longer reissue them, but archived files do not change, so the time bound stays:
+it is the only defence for data already written. It prints a warning wherever
+that ambiguity exists rather than resolving it quietly.
 
 ## Tests
 
