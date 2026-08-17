@@ -48,7 +48,7 @@ The relevant runtime-visible knobs are:
 | Listen address | `PhantomListener::bind(addr)` | "host:port" |
 | Adaptive PoW difficulty | automatic | Tiered by handshake rate; see Phase 1.14. |
 | Cipher suite | not negotiated | AES-256-GCM is pinned for every session (the `ClientHello` carries no suite field). `ChaCha20Poly1305` survives as an enum variant for wire stability and is rejected outright under `--features fips`. |
-| Wire format version | pinned constant (not negotiated) | `WIRE_VERSION = 7` — a single pinned value; the receive path drops any frame whose version differs. (`PROTOCOL_VERSION = 4` is the borsh handshake version.) |
+| Wire format version | pinned constant (not negotiated) | `WIRE_VERSION` = <!--pinned:WIRE_VERSION-->7 — a single pinned value; the receive path drops any frame whose version differs. (`PROTOCOL_VERSION` = <!--pinned:PROTOCOL_VERSION-->4 is the borsh handshake version.) |
 | Rekey trigger | automatic (`REKEY_SOFT_LIMIT` = 2^32 AEAD invocations) | The data pump rotates the traffic secret itself; `PhantomSession::set_rekey_threshold(u64)` (Rust-only) lowers the watermark for tests. |
 | Tracing level | `RUST_LOG` | Standard `tracing_subscriber` filter syntax. |
 
