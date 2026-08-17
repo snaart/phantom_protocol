@@ -351,6 +351,29 @@ Recomputes everything from the raw JSONL rather than trusting `summary.json`,
 using the same nearest-rank percentile definition as the Rust side. Standard
 library only.
 
+```bash
+./stall_verdict.py client results/<run-id>
+./stall_verdict.py server <data-dir> --since <RFC-3339 instant>
+```
+
+Answers one question the summary above cannot: did a sender stop with its
+window still open. The shape is invisible in peaks — a stalled transfer keeps
+the window it had reached — so this reads the *distribution* of
+`inflight / cwnd` instead, and reports a stall only when the median sits at the
+floor, the window is above the congestion-window minimum, the sender is not
+application-limited, and delivery has not moved for five seconds. On the
+reference path a stalled upload measured a median of 0.000 against 0.85–1.00
+for a healthy one.
+
+Two things it does deliberately, both of which cost a wrong answer once. It
+excludes the QUIC reference leg and the client's own `download` series, because
+neither is the sending side and both therefore read as a permanent stall. And
+it joins the server's windows to a scenario by *time*, not by `session_uid`
+alone: the daemon restarts that counter, so a uid is shared across runs, and a
+uid-only join silently pairs one session's marks with another session's
+windows. It prints a warning wherever that ambiguity exists rather than
+resolving it quietly.
+
 ## Tests
 
 ```bash
