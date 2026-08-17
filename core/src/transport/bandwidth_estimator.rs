@@ -334,6 +334,58 @@ const INFLIGHT_HI_FLOOR_GAIN: f64 = 1.25;
 /// minute carries the cap for the rest of its life.
 const INFLIGHT_HI_RELAX_GAIN: f64 = 1.25;
 
+/// Turn a locally timed round trip and the peer's claimed acknowledgement delay
+/// into the RTT sample this endpoint is willing to believe.
+///
+/// `latest_rtt` is measured end to end by this endpoint's own clock.
+/// `ack_delay_us` is the `Sack::ack_delay_us` the *peer* wrote — the only term
+/// in the sample nobody local observed. `rtt_floor` is the smallest round trip
+/// this endpoint has actually timed on the path, or `None` before it has timed
+/// any; see [`BandwidthEstimator::rtt_floor`].
+///
+/// Two bounds, both from RFC 9002. The clamp to `latest_rtt` applies §5.3's
+/// "lesser of the acknowledgment delay and the peer's max_ack_delay" in the
+/// absence of a negotiated `max_ack_delay`: the peer cannot have held the
+/// acknowledgement longer than the whole trip took, so a larger figure is
+/// nonsense on its face, and clamping rather than saturating stops it from
+/// *erasing* an honest local measurement down to zero. The comparison against
+/// `rtt_floor` is §5.3's "MUST NOT subtract the acknowledgment delay from the
+/// RTT sample if the resulting value is smaller than the min_rtt", with §5.2's
+/// first-sample rule as the `None` arm.
+///
+/// The invariant those buy, inductively: the returned value is either the raw
+/// locally observed round trip or a value at or above `rtt_floor`. A peer can
+/// decline to lower a reading, which is all reporting nothing would achieve; it
+/// cannot push one below what this endpoint's own clock has seen.
+///
+/// It is a free function rather than a method because both consumers of an
+/// acknowledgement need it and neither may reach its own conclusion: the
+/// estimator feeds `min_rtt`, which sizes the congestion window, and the data
+/// pump publishes the same figure to the per-path RTT gauge an operator reads.
+/// Two subtractions written separately is exactly how the gauge came to accept
+/// a subtraction the window already refused.
+pub fn ack_delay_adjusted_rtt(
+    latest_rtt: Duration,
+    rtt_floor: Option<Duration>,
+    ack_delay_us: u64,
+) -> Duration {
+    let observed_us = u64::try_from(latest_rtt.as_micros()).unwrap_or(u64::MAX);
+    let ack_delay = Duration::from_micros(ack_delay_us.min(observed_us));
+
+    match rtt_floor {
+        // No round trip has been timed yet, so there is no measurement to
+        // protect and nothing trustworthy to compare against — the opening
+        // `min_rtt` is a guess, and anchoring the guard on it would let a peer
+        // on a slower path subtract its way down to that guess on the very
+        // first acknowledgement.
+        None => latest_rtt,
+        Some(floor) if latest_rtt >= floor.saturating_add(ack_delay) => {
+            latest_rtt.saturating_sub(ack_delay)
+        }
+        Some(_) => latest_rtt,
+    }
+}
+
 // ─── Estimator ──────────────────────────────────────────────────────────────
 
 /// BBR-like Bandwidth Estimator
@@ -560,36 +612,12 @@ impl BandwidthEstimator {
         // exactly what reporting nothing at all would achieve.
         let latest_rtt = send_elapsed;
 
-        // §5.3 also says to use "the lesser of the acknowledgment delay and the
-        // peer's max_ack_delay". Phantom negotiates no max_ack_delay; there is
-        // no transport parameter to compare against, so the only ceiling this
-        // endpoint can know for itself is the round trip it just timed — a peer
-        // cannot have spent longer holding the acknowledgement than the entire
-        // trip took, so anything above that is nonsense on its face.
-        //
-        // The guard below already renders an absurd value harmless (it simply
-        // fails, and the raw sample is used), so this clamp is defence in depth
-        // rather than the load-bearing check. It is kept for two reasons: it
-        // makes the bound local to the arithmetic instead of an emergent
-        // property of a comparison someone might later refactor, and it stops a
-        // nonsense report from *suppressing* an honest measurement — the old
-        // `saturating_sub` turned any delay past the round trip into a zero
-        // sample, which the `rtt_us > 0` check below then dropped, discarding a
-        // perfectly good local RTT on the peer's say-so.
-        let observed_us = u64::try_from(latest_rtt.as_micros()).unwrap_or(u64::MAX);
-        let ack_delay = Duration::from_micros(sample.ack_delay_us.min(observed_us));
-
-        let adjusted_rtt = if !self.rtt_filter_seeded {
-            // §5.2, first sample: seed the minimum from the raw round trip. The
-            // 100 ms this estimator opens with is a guess, not an observation,
-            // and using it as the guard's reference would let a peer on a
-            // slower path subtract down to it before any measurement existed.
-            latest_rtt
-        } else if latest_rtt >= self.min_rtt.saturating_add(ack_delay) {
-            latest_rtt.saturating_sub(ack_delay)
-        } else {
-            latest_rtt
-        };
+        // The arithmetic that turns those two into a usable sample lives in
+        // [`ack_delay_adjusted_rtt`], because the observability path samples the
+        // same round trip and must not reach its own, second conclusion about
+        // what the peer's claim is worth.
+        let adjusted_rtt =
+            ack_delay_adjusted_rtt(latest_rtt, self.rtt_floor(), sample.ack_delay_us);
 
         // Update min RTT using that adjusted sample, but only from a
         // sample whose round trip is unambiguous — Karn's algorithm.
@@ -859,6 +887,17 @@ impl BandwidthEstimator {
     /// Get minimum observed RTT.
     pub fn min_rtt(&self) -> Duration {
         self.min_rtt
+    }
+
+    /// [`Self::min_rtt`] when it reflects a round trip this endpoint actually
+    /// timed, and `None` while it is still the opening guess.
+    ///
+    /// This is the reference [`ack_delay_adjusted_rtt`] guards against, so the
+    /// distinction is the whole point: handing out the placeholder as though it
+    /// were a measurement would give a peer a number to subtract down to before
+    /// any measurement existed.
+    pub fn rtt_floor(&self) -> Option<Duration> {
+        self.rtt_filter_seeded.then_some(self.min_rtt)
     }
 
     /// Get current BBR state.
@@ -1627,6 +1666,71 @@ mod tests {
              segments; the estimate is {} B/s against {} B/s delivered",
             est.bottleneck_bandwidth(),
             fast
+        );
+    }
+
+    /// The bound the two consumers of an acknowledgement share, stated on its
+    /// own and without a clock.
+    ///
+    /// `ack_delay_adjusted_rtt` is called from two places — the min-RTT filter
+    /// here and the per-path RTT gauge in the data pump — and the property both
+    /// rely on is a single sentence: once this endpoint has timed a round trip,
+    /// no value the peer can put in `Sack::ack_delay_us` returns a sample below
+    /// that floor. The sweep below is exhaustive in spirit rather than in
+    /// number: it walks the delay from nothing, through the honest range, past
+    /// the whole round trip, to `u64::MAX`, which is where the arithmetic would
+    /// wrap or saturate to zero if either bound were dropped.
+    ///
+    /// The companion half is that an honest delay is still subtracted — a guard
+    /// that simply ignored the field would pass the bound above and quietly
+    /// turn the estimator's propagation delay back into a queuing delay.
+    #[test]
+    fn no_reported_ack_delay_drives_the_shared_sample_below_the_timed_floor() {
+        let floor = Duration::from_millis(200);
+        let latest = Duration::from_millis(260);
+
+        for delay_us in [
+            0,
+            1_000,
+            59_000,
+            60_000,
+            60_001,
+            199_000,
+            259_999,
+            260_000,
+            260_001,
+            4_000_000,
+            u64::MAX,
+        ] {
+            let adjusted = ack_delay_adjusted_rtt(latest, Some(floor), delay_us);
+            assert!(
+                adjusted >= floor,
+                "a claimed ack delay of {delay_us} µs pulled the sample to {adjusted:?}, \
+                 below the {floor:?} this endpoint timed itself"
+            );
+            assert!(
+                adjusted <= latest,
+                "a claimed ack delay of {delay_us} µs inflated the sample to {adjusted:?}, \
+                 above the {latest:?} round trip actually observed"
+            );
+        }
+
+        // 60 ms of the 260 ms trip leaves 200 ms, which is exactly the floor and
+        // therefore the largest subtraction §5.3 permits here — the boundary the
+        // sweep straddles above.
+        assert_eq!(
+            ack_delay_adjusted_rtt(latest, Some(floor), 60_000),
+            floor,
+            "a delay that lands the sample exactly on the floor must still be subtracted"
+        );
+
+        // Before any round trip has been timed there is nothing to protect and
+        // no trustworthy reference, so the raw local measurement stands whatever
+        // the peer says — RFC 9002 §5.2's first-sample rule.
+        assert_eq!(
+            ack_delay_adjusted_rtt(latest, None, u64::MAX),
+            latest,
+            "the first sample must be the round trip this endpoint observed"
         );
     }
 

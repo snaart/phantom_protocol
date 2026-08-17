@@ -3023,9 +3023,13 @@ async fn drain_streams_fully<T: SessionTransport>(
 /// subtracted from the observed RTT to yield the propagation delay. Pass 0 when
 /// no peer-side delay is known (the estimator treats it as "no delay reported").
 ///
-/// This is also the RTT-sampling site: the same `acked_at − sent_at − ack_delay`
-/// propagation figure the estimator folds into its `min_rtt` filter is published
-/// to `Observability::record_rtt_us` for `path_id`. `sampled_rtt` is Karn's
+/// This is also the RTT-sampling site: the propagation figure the estimator
+/// folds into its `min_rtt` filter is published to `Observability::record_rtt_us`
+/// for `path_id`. Literally the same figure — both go through
+/// [`ack_delay_adjusted_rtt`](crate::transport::bandwidth_estimator::ack_delay_adjusted_rtt),
+/// which bounds what the peer's claimed delay may subtract, so the gauge an
+/// operator reads cannot be talked below a round trip this endpoint timed
+/// itself. `sampled_rtt` is Karn's
 /// condition and gates **both** consumers — pass `false` for a retransmitted
 /// segment so the per-path RTT gauge and the estimator's min-RTT filter obey
 /// Karn's algorithm exactly like `Stream`'s own srtt (an ACK for a retransmit is
@@ -3054,14 +3058,31 @@ fn feed_bbr_on_ack(
     let acked_at = std::time::Instant::now();
     let sent_at_std = sent_at.into_std();
     if sampled_rtt {
-        // Mirror `BandwidthEstimator::on_ack`: propagation = elapsed − peer ack
-        // delay, saturating so a peer-reported delay larger than the observed
-        // elapsed time yields 0 rather than wrapping. A zero sample carries no
-        // information for a "last observed RTT" gauge, so it is skipped.
-        let rtt_us = acked_at
-            .saturating_duration_since(sent_at_std)
-            .saturating_sub(std::time::Duration::from_micros(ack_delay_us))
-            .as_micros() as u64;
+        // The peer's claimed ack delay is subtracted through the *same* guard
+        // the estimator's min-RTT filter applies — the session's own timed floor
+        // is fetched and handed to the shared
+        // [`ack_delay_adjusted_rtt`](crate::transport::bandwidth_estimator::ack_delay_adjusted_rtt),
+        // so the figure published here and the figure fed to the filter below
+        // are one number reached once.
+        //
+        // Subtracting it here on its own terms, which is what this used to do,
+        // made the gauge say whatever the peer wanted. Nothing in the control
+        // loop reads it, so that was never a safety problem — but an operator
+        // judging a path by `MetricsSnapshotFfi::rtt_us_path_0` could not tell
+        // "the path got faster" from "the peer claimed a long ack delay", and a
+        // claim past the whole round trip drove the reading to zero, where the
+        // guard below then discarded it and left the last honest sample
+        // standing. A metric a remote party can dictate is worse than no metric.
+        let rtt_us = crate::transport::bandwidth_estimator::ack_delay_adjusted_rtt(
+            acked_at.saturating_duration_since(sent_at_std),
+            crypto_session.rtt_floor(),
+            ack_delay_us,
+        )
+        .as_micros() as u64;
+        // A zero sample carries no information for a "last observed RTT" gauge,
+        // so it is skipped; after the guard above it means the two clock
+        // readings landed in the same microsecond, not that a peer talked the
+        // sample down.
         if rtt_us > 0 {
             observability.record_rtt_us(rtt_us, path_id);
         }
@@ -8984,6 +9005,51 @@ mod tests {
         assert!(
             obs.snapshot().rtt_us_path_0 > 0,
             "retiring a never-retransmitted segment must publish an RTT sample"
+        );
+    }
+
+    /// `Sack::ack_delay_us` is a number the *peer* writes, and it is the only
+    /// term in the RTT sample this endpoint did not measure. The gauge behind
+    /// `MetricsSnapshotFfi::rtt_us_path_0` is what an operator reads to judge a
+    /// path, so a peer that can drive it at will turns "the path got faster"
+    /// and "the peer said so" into the same reading. The estimator's minimum
+    /// filter already refuses a peer-supplied subtraction that would undercut
+    /// what the local clock saw (RFC 9002 §5.2/§5.3); the gauge must be fed the
+    /// same guarded figure rather than a second, unguarded subtraction.
+    ///
+    /// The segment is deliberately aged before the acknowledgement arrives, so
+    /// the local clock has a floor under it that no scheduling delay can lower:
+    /// the assertion is that the published sample is at least the age this
+    /// endpoint itself observed, whatever the peer claims about its own delay.
+    #[tokio::test]
+    async fn a_peers_claimed_ack_delay_cannot_erase_the_rtt_gauge() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let (_stream, streams, seq) = staged_pending_segment().await;
+        let stream_id: TransportStreamId = 1;
+
+        // The locally observed floor: the acknowledgement cannot arrive before
+        // this much of the segment's life has elapsed.
+        let observed_floor = std::time::Duration::from_millis(20);
+        tokio::time::sleep(observed_floor).await;
+
+        // The peer claims it sat on the acknowledgement for over an hour —
+        // orders of magnitude more than the round trip it rides on.
+        let sack = crate::transport::sack::Sack::from_received(&[seq], u32::MAX)
+            .expect("single-seq sack")
+            .to_wire();
+        let frame =
+            build_encrypted_ack_with_payload(&client_session, session_id, stream_id, 777, &sack);
+        let ack_pkt = decode_recv_frame(&frame, session_id);
+        let obs = run_recv(ack_pkt, session_id, &server_session, &streams).await;
+
+        let published = obs.snapshot().rtt_us_path_0;
+        assert!(
+            published >= observed_floor.as_micros() as u64,
+            "a peer's claimed ack delay must not push the published RTT below \
+             the {} µs this endpoint measured itself; got {} µs",
+            observed_floor.as_micros(),
+            published
         );
     }
 
