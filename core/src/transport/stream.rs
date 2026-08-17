@@ -136,7 +136,7 @@ pub const MAX_SEND_WINDOW: u32 = 16 * INITIAL_STREAM_WINDOW;
 /// It is not raised further because nothing above it is reachable: a stream's ARQ send
 /// buffer holds at most `MAX_PENDING_PACKETS` unacked segments of at most
 /// [`crate::transport::mtu::MAX_APP_CHUNK`] bytes, so 1 183 744 B is all one stream can ever
-/// have outstanding whatever credit it is granted. Above roughly that figure the send
+/// have outstanding however large a window it is granted. Above roughly that figure the send
 /// buffer, not the window, is the binding constraint, and window granted past it is memory
 /// the receiver commits to hold for data that cannot arrive. Moving both together is a
 /// separate change with a memory case of its own to make; this constant sits just under the
@@ -3505,7 +3505,7 @@ mod tests {
         s.apply_peer_window_limit(sent + 1100);
         assert_eq!(s.peer_send_window(), 1100);
 
-        // Idempotent: the same limit again is not more credit.
+        // Idempotent: the same total restated is the same room, not more of it.
         s.apply_peer_window_limit(sent + 1100);
         assert_eq!(s.peer_send_window(), 1100);
 
@@ -3637,7 +3637,7 @@ mod tests {
         );
     }
 
-    /// **The ceiling defect, and the constraint that bounds the fix.** A credit window of
+    /// **The ceiling defect, and the constraint that bounds the fix.** A window of
     /// `W` bytes admits `W / RTT` bytes per second whatever else is true, so the ceiling on
     /// `W` is a hard rate ceiling on every stream. On the path this was measured on — 235 ms
     /// RTT — the old 512 KiB ceiling admitted 2 230 828 B/s, i.e. 17.85 Mbit/s, while raw
@@ -3647,9 +3647,11 @@ mod tests {
     ///
     /// What stops the answer being "make it enormous" is measured here rather than asserted
     /// in prose: a stream's ARQ send buffer holds a fixed number of segments, so there is a
-    /// hard limit on what one stream can have outstanding no matter how much credit it is
+    /// hard limit on what one stream can have outstanding however large a window it is
     /// granted, and receive window above that limit is memory committed for data that cannot
-    /// arrive. The ceiling must sit under it.
+    /// arrive. The ceiling must sit under it — shrink the send buffer and the assertion
+    /// below is what says so, since the constant that would otherwise catch it is checked
+    /// against `MAX_PENDING_PACKETS` rather than against the permits actually issued.
     #[tokio::test]
     async fn the_recv_window_ceiling_stays_within_what_the_send_buffer_can_put_in_flight() {
         tokio::time::pause();
@@ -3673,10 +3675,10 @@ mod tests {
 
         assert!(
             MAX_RECV_WINDOW as usize <= buffered,
-            "the window ceiling ({MAX_RECV_WINDOW} B) grants more credit than one stream can \
-             ever have in flight ({buffered} B): the send buffer, not the window, is what \
-             decides the rate above that point, and the excess is memory held for data that \
-             cannot arrive"
+            "the window ceiling ({MAX_RECV_WINDOW} B) advertises room for more than one \
+             stream can ever have in flight ({buffered} B): the send buffer, not the \
+             window, is what decides the rate above that point, and the excess is memory \
+             held for data that cannot arrive"
         );
         // What that admits on the measured path, in the units the defect was reported in:
         // 1 MiB / 0.235 s = 4 461 655 B/s = 35.7 Mbit/s, against 17.85 Mbit/s before.
@@ -4377,20 +4379,26 @@ mod tests {
         }
     }
 
-    /// **The stall the persist probe cannot reach.**
+    /// **A share of the frames, not one of them.**
     ///
-    /// A lossy path does not eat one flow-control frame, it eats a share of them, and the
-    /// deficit that leaves behind is monotone: at loss rate `p` it accrues as `p ×` the bytes
-    /// transferred, so on a long enough transfer it reaches the initial window and the sender
-    /// stops for good. Here two frames in every three are lost. The transfer is eight times
-    /// the initial window, so a third of the credit is nowhere near enough to carry it.
+    /// A lossy path does not eat one flow-control frame, it eats a share of them. While the
+    /// frame stated the room earned since the last one, that share was a debt neither end
+    /// could settle — the receiver had cleared those bytes out of its emission accumulator
+    /// as it composed the frame the path then ate, and the sender never heard of them — so
+    /// at loss rate `p` the allowance fell behind by `p ×` the bytes transferred and, on a
+    /// long enough transfer, stopped for good. Here two frames in every three are lost and
+    /// the transfer is eight times the initial window, so a third of the frames carries it
+    /// only if each one carries the whole truth.
     ///
-    /// The probe cannot close this, and the reason is structural rather than a matter of
-    /// tuning: it can only return credit still sitting in the receiver's accumulator, and the
-    /// bytes that went missing are exactly the ones the receiver had already cleared out of it
-    /// as it composed the frame the path ate. Neither end retains them. What completes this
-    /// transfer is a frame that states the sender's total allowance outright, so that the next
-    /// one to arrive repairs every one that did not.
+    /// Each one does, and the transfer needs both halves of that to be true. The limit is a
+    /// total measured from the stream's first byte: put the retired pair back — a receiver
+    /// stating the bytes earned since its last frame, a sender adding them to its allowance
+    /// — and this stalls at the first grant the path eats. Take the persist probe away
+    /// instead, leaving the total in place, and it stalls in the same place, because a round
+    /// that loses every grant ends with nothing outstanding and no acknowledgement owed. The
+    /// two are not redundant with each other: the probe is what makes a frame happen at all,
+    /// and the total is what makes the one frame that survives worth as much as the two that
+    /// did not.
     #[tokio::test(start_paused = true)]
     async fn a_transfer_survives_losing_two_flow_control_frames_in_every_three() {
         let sender = Stream::new(1);
@@ -4403,9 +4411,10 @@ mod tests {
             }
             Err(delivered) => panic!(
                 "the sender stopped after {delivered} of {TOTAL} bytes: its peer window is \
-                 {} bytes with nothing in flight, so no acknowledgement can free it, and the \
-                 grants that were lost are gone from both ends — the surviving frames carry \
-                 an increment rather than a total, so they cannot make up for them",
+                 {} bytes with nothing in flight, so no acknowledgement can free it — and \
+                 the frames that did arrive, or the answer to a probe, should each have \
+                 carried the whole allowance forward, which is the only thing that lets one \
+                 frame in three finish this transfer",
                 sender.peer_send_window()
             ),
         }

@@ -313,9 +313,12 @@ fn spawn_counting_receiver(
 /// pump's `select!` serviced the command channel by pushing straight into the
 /// stream's send buffer, and that push blocks on the stream's backpressure
 /// semaphore; with the upload saturating, the buffer stayed full, so the pump
-/// sat parked in that arm and stopped running the arms that emit the download's
-/// `WINDOW_UPDATE` credit. The download then advanced only as fast as the pump
-/// happened to escape.
+/// sat parked in that arm and stopped running the arms that put the download's
+/// `WINDOW_UPDATE` frames on the wire. The download then advanced only as fast
+/// as the pump happened to escape — stop emitting those frames altogether and
+/// the whole download is one initial window, which the warm-up spends before
+/// the baseline is even measured: the comparison then has a zero in its
+/// denominator and the harness assertion, not the ratio, is what fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_saturating_upload_does_not_starve_the_download() {
     let (client, server) = establish(ONE_WAY).await;
@@ -394,13 +397,13 @@ async fn a_saturating_upload_does_not_starve_the_download() {
     // This bound has moved twice. It was 96 KiB while a fixed 64 KiB receive window held
     // the download to 43% of the link; receive-window auto-tuning removed that accidental
     // throttle and the upload fell to 38–124 KB, because the upload's acknowledgements and
-    // flow-control credit return over the saturated direction behind whatever standing
-    // queue the download sender's inflight builds. It was lowered to 24 KiB with a note to
-    // raise it again once inflight was bounded near the bandwidth-delay product — which is
-    // what pacing does: the download sender now meters onto the wire at the estimated
-    // bottleneck rate instead of releasing a whole congestion window at once, so the queue
-    // the upload's acknowledgements queue behind is the residue of one round trip rather
-    // than a window's worth.
+    // the limits that raise its window both come back over the saturated direction, behind
+    // whatever standing queue the download sender's inflight builds. It was lowered to
+    // 24 KiB with a note to raise it again once inflight was bounded near the
+    // bandwidth-delay product — which is what pacing does: the download sender now meters
+    // onto the wire at the estimated bottleneck rate instead of releasing a whole
+    // congestion window at once, so the queue the upload's acknowledgements queue behind is
+    // the residue of one round trip rather than a window's worth.
     //
     // It is 32 KiB now, and lowered rather than raised, because 96 KiB sat *inside* the
     // healthy population rather than below it: the range recorded two paragraphs above is
@@ -468,8 +471,8 @@ async fn a_control_frame_is_accepted_while_the_upload_saturates() {
     // magnitude in both directions.
     const HAND_OFF_BUDGET: Duration = Duration::from_secs(2);
 
-    // Drain at the server throughout so the client's upload is credited and the
-    // contention is real rather than a peer-flow-control stall.
+    // Drain at the server throughout so the client's upload keeps being granted
+    // room, and the contention is real rather than a peer-flow-control stall.
     let stop_rx = Arc::new(AtomicBool::new(false));
     let received = Arc::new(AtomicU64::new(0));
     let saw_marker = Arc::new(AtomicBool::new(false));

@@ -1728,8 +1728,10 @@ fn an_older_peer_is_refused_at_the_handshake_rather_than_dropped_on_the_wire() {
 
 /// New (first-transmission) data is admitted only within the advertised
 /// flow-control window AND the congestion window — `min` of the two. A segment
-/// that does not fit is withheld and, crucially, does NOT debit the window (so
-/// the credit is not leaked while the segment waits).
+/// that does not fit is withheld and, crucially, does not advance the sent
+/// total. The window is the peer's cumulative limit less what has gone out, so
+/// charging bytes the wire never carried would retire room against nothing, and
+/// only a later and larger limit could ever return it.
 #[tokio::test]
 async fn flow_control_bounds_new_data_to_the_advertised_window() {
     // ── Flow-control window bound ──
@@ -1765,7 +1767,8 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
     assert_eq!(
         s.peer_send_window(),
         40,
-        "a withheld segment must NOT debit the window (no credit leak)"
+        "a withheld segment advanced the sent total — the room it costs was spent on bytes \
+         the wire never carried"
     );
 
     // ── Congestion window bound ──
@@ -1790,11 +1793,11 @@ async fn flow_control_bounds_new_data_to_the_advertised_window() {
 /// The one frame a closed window does not stop is the flow-control persist probe, and the
 /// reason it is not an exception to the invariant above is that it carries **no application
 /// payload**. A stream the peer's window has stopped with nothing outstanding has no event
-/// left that could free it — no acknowledgement is coming, and the credit that would arrive
-/// rides in a frame nothing retransmits — so it asks, with an empty reliable segment. What
-/// the peer is charged for the asking is one stream offset; what it is charged in buffer is
-/// nothing, which is what keeps a receiver whose application has stopped reading able to
-/// hold this side still.
+/// left that could free it — no acknowledgement is coming, and the raised limit that would
+/// free it rides in a frame nothing retransmits — so it asks, with an empty reliable
+/// segment. What the peer is charged for the asking is one stream offset; what it is
+/// charged in buffer is nothing, which is what keeps a receiver whose application has
+/// stopped reading able to hold this side still.
 ///
 /// Pinned here, next to the bound it must not breach: a probe that ever carried queued data
 /// would be new data admitted past the advertised window, and this fails on the first one.
