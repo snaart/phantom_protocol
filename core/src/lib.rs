@@ -38,7 +38,14 @@
 // full README rather than a thin stub. All code fences in the README use
 // ```rust,no_run```, ```bash```, or ```text``` so they are not executed as
 // doctests (they require a live peer and cannot run standalone).
-#![doc = include_str!("../../README.md")]
+//
+// The path stays inside `core/` because it has to: a `cargo package` archive
+// contains only what sits under the manifest directory, and there `src/lib.rs`
+// is one level below the archive root rather than two below the repository
+// root. `core/README.md` is a byte-identical copy of the repository-root
+// `README.md`, kept in step by `scripts/sync_readme.sh` and by the
+// `packaged_readme` tests further down this file.
+#![doc = include_str!("../README.md")]
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -189,6 +196,133 @@ pub use api::session::{
 #[cfg(feature = "bindings")]
 uniffi::setup_scaffolding!();
 
+/// Keeps the crate's landing page reachable from inside the published archive.
+///
+/// A `cargo package` tarball contains only what sits under the manifest directory,
+/// and inside it `src/lib.rs` is one level below the archive root where in the
+/// repository it is two levels below the repository root. A relative path that
+/// leaves `core/` therefore resolves to different files in the two layouts — in the
+/// archive it addresses the parent of the extracted directory, which is whatever the
+/// build host happened to have there. That is not a path that can be made correct on
+/// both sides: the only paths that survive packaging are the ones that stay inside
+/// the package, so the landing page has to exist there as a file.
+///
+/// It does, as `core/README.md`, kept byte-identical to the repository-root
+/// `README.md`. Duplication rather than a symlink, because a checkout without
+/// symlink support turns the link into a twelve-byte file whose entire contents are
+/// the text `../README.md`; `include_str!` compiles that happily and both crates.io
+/// and the docs.rs front page then ship the string, with every exit code zero. A
+/// duplicate cannot fail that way — it can only drift, and drift is what the two
+/// tests below and `scripts/sync_readme.sh` exist to make impossible.
+#[cfg(test)]
+mod packaged_readme {
+    /// The repository-root README: the page GitHub renders, and the one the
+    /// `#![doc]` attribute at the top of this file inlines into the crate docs.
+    const LANDING_PAGE: &str = include_str!("../../README.md");
+
+    /// The copy that travels inside the archive. `core/Cargo.toml`'s
+    /// `readme = "README.md"` resolves relative to the manifest directory, so this
+    /// is the file crates.io renders — and the only README a tarball carries.
+    const PACKAGED: &str = include_str!("../README.md");
+
+    /// This file's own source, so the attribute's argument can be read as text.
+    /// Nothing else can see it: `include_str!` leaves no trace of its argument in
+    /// the expansion, so a path that escapes the package is invisible to the
+    /// compiler on this side of packaging and only surfaces minutes into the cold
+    /// verification build of an extracted crate.
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// The literal opening of the crate-level doc attribute. Written with an escaped
+    /// quote, so this constant's own text does not match the pattern it carries and
+    /// the search below cannot find itself.
+    const DOC_INCLUDE: &str = "#![doc = include_str!(\"";
+
+    /// The path named by the crate-level doc attribute.
+    fn crate_doc_include_path(source: &str) -> Option<&str> {
+        let rest = source.split_once(DOC_INCLUDE)?.1;
+        rest.split_once('"').map(|(path, _)| path)
+    }
+
+    /// Where `path`, read from `core/src/`, lands — as components rooted at the
+    /// repository — or `None` when it climbs above the repository root entirely.
+    fn resolve_from_core_src(path: &str) -> Option<Vec<&str>> {
+        let mut at = vec!["core", "src"];
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    at.pop()?;
+                }
+                name => at.push(name),
+            }
+        }
+        Some(at)
+    }
+
+    /// The two copies must agree byte for byte, or the page crates.io renders is not
+    /// the page this repository maintains. The failure is stated in sizes rather than
+    /// as a diff: the way this goes wrong is that one file is edited and the other is
+    /// forgotten, and the sizes say which one at a glance.
+    #[test]
+    fn packaged_readme_is_the_landing_page() {
+        assert_eq!(
+            PACKAGED,
+            LANDING_PAGE,
+            "core/README.md ({} bytes) has drifted from README.md ({} bytes); \
+             run scripts/sync_readme.sh",
+            PACKAGED.len(),
+            LANDING_PAGE.len()
+        );
+    }
+
+    /// The attribute's argument must name a file inside `core/`. Checking the text
+    /// rather than the resolved contents is deliberate: in this working copy both
+    /// `../README.md` and `../../README.md` compile, so no assertion about the
+    /// inlined string can tell them apart. Only the shape of the path can.
+    #[test]
+    fn crate_doc_include_stays_inside_the_package() {
+        assert_eq!(
+            SOURCE.matches(DOC_INCLUDE).count(),
+            1,
+            "expected exactly one crate-level `#![doc = include_str!(\"…\")]`; \
+             a second one would be unchecked here"
+        );
+
+        let path = crate_doc_include_path(SOURCE)
+            .expect("lib.rs carries a crate-level `#![doc = include_str!(\"…\")]`");
+        let landed = resolve_from_core_src(path).unwrap_or_else(|| {
+            panic!("`#![doc = include_str!(\"{path}\")]` climbs above the repository root")
+        });
+
+        assert_eq!(
+            landed.first().copied(),
+            Some("core"),
+            "`#![doc = include_str!(\"{path}\")]` resolves to {} — outside core/, so it \
+             is absent from the crate archive and `cargo package` cannot compile the lib",
+            landed.join("/")
+        );
+    }
+
+    /// The resolver is what decides the verdict above, so a resolver that answered
+    /// "inside the package" for everything would leave that test green forever.
+    #[test]
+    fn resolver_separates_paths_that_escape_the_package() {
+        assert_eq!(
+            resolve_from_core_src("../README.md"),
+            Some(vec!["core", "README.md"])
+        );
+        assert_eq!(
+            resolve_from_core_src("../../README.md"),
+            Some(vec!["README.md"])
+        );
+        assert_eq!(
+            resolve_from_core_src("./api/mod.rs"),
+            Some(vec!["core", "src", "api", "mod.rs"])
+        );
+        assert_eq!(resolve_from_core_src("../../../README.md"), None);
+    }
+}
+
 /// Keeps the version bytes stated in prose tied to the constants they describe.
 ///
 /// Three documents outside the code name `WIRE_VERSION` and `PROTOCOL_VERSION` as
@@ -243,11 +377,14 @@ mod pinned_version_claims {
     /// A document that states pinned version bytes in prose.
     ///
     /// `text` is inlined at compile time, so renaming or deleting a listed document
-    /// is a build failure rather than a check that quietly stops running. None of
-    /// these files ships inside the crate package and that costs nothing: the
-    /// packaged `README.md` is `core/README.md`, the repository-root files are not
-    /// in the archive at all, and `cargo package --verify` builds the crate, which
-    /// never compiles a `cfg(test)` module.
+    /// is a build failure rather than a check that quietly stops running. These
+    /// paths reach outside `core/`, where nothing survives packaging — the archive
+    /// carries only what sits under the manifest directory, and its `README.md` is
+    /// the `core/README.md` copy rather than the file addressed here. That costs
+    /// nothing, because `cargo package` verifies by building the crate and a build
+    /// never compiles a `cfg(test)` module. Production code cannot borrow the same
+    /// licence: see `packaged_readme` above, which is why the `#![doc]` attribute at
+    /// the top of this file reads its README from inside `core/`.
     struct VersionedDoc {
         path: &'static str,
         text: &'static str,

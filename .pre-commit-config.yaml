@@ -66,6 +66,20 @@ repos:
         files: ^(core/src/.*\.rs|docs/security/panic-sites\.md)$
         pass_filenames: false
 
+      # ── Landing-page copy that ships inside the crate ─────────────────
+      - id: sync-readme
+        name: core/README.md mirrors README.md
+        # Copies rather than complains: the file is derived, the author who
+        # edited the root README has no reason to know a second copy exists,
+        # and a hook that repairs and then stops for re-staging costs them one
+        # `git add`. CI runs the same script with --check, which asserts and
+        # never writes — a job that repaired the tree would report success for
+        # a state nobody committed.
+        entry: scripts/sync_readme.sh
+        language: system
+        files: ^(README\.md|core/README\.md)$
+        pass_filenames: false
+
       # ── Binding manifest version sync ─────────────────────────────────
       - id: check-binding-versions
         name: bindings — manifest version sync

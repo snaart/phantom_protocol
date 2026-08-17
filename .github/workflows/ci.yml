@@ -198,6 +198,45 @@ jobs:
             exit 1
           fi
 
+  package:
+    # Nothing in this workflow ever built the crate the way crates.io does, and
+    # the publication path was broken for two months without a single red tick:
+    # `#![doc = include_str!("../../README.md")]` resolves in the repository and
+    # not inside an extracted archive, where `src/lib.rs` sits one level below
+    # the root rather than two. `cargo package` verifies by unpacking its own
+    # tarball and building it, which is the only build that sees that layout.
+    #
+    # Cold by construction: the extracted crate compiles in its own target
+    # directory under target/package/, so rust-cache cannot warm it. The cache
+    # is still worth having for the registry downloads (~180 crates), but expect
+    # this job to spend minutes compiling dependencies on every run.
+    name: cargo package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "."
+      # The archive's README is core/README.md, which is a copy of the
+      # repository-root landing page. Assert, never repair: a CI step that
+      # rewrote the tree would go green on a state nobody committed.
+      - run: scripts/sync_readme.sh --check
+      # Build the tarball first without verifying it. Seconds, and it produces
+      # the archive the next step reads — so the payload is checked even when
+      # the verification build below fails.
+      - run: cargo package --manifest-path core/Cargo.toml --no-verify --locked
+      # What --verify structurally cannot see: it compiles the archive, and a
+      # crate compiles just as happily around the wrong README. This is the
+      # check that tells a stale 5 KiB stub from the 35 KiB landing page.
+      - name: Archive ships the landing-page README
+        run: |
+          CRATE=$(ls target/package/phantom-protocol-*.crate)
+          NAME=$(basename "${CRATE}" .crate)
+          tar -xzOf "${CRATE}" "${NAME}/README.md" | cmp - README.md
+      # Full verification: unpack and build the crate as a consumer would.
+      - run: cargo package --manifest-path core/Cargo.toml --locked
+
   panic-sites:
     # The inventory in docs/security/panic-sites.md is the entry point for an
     # adversarial review, and it had drifted a whole row out of step with the
