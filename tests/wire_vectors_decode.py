@@ -26,7 +26,9 @@ What it covers:
   * **the `WINDOW_UPDATE` plaintext** — an 8-byte big-endian cumulative limit, together
     with the monotone-maximum rule a receiver of one must apply. It has no frozen fixture
     (it is an AEAD plaintext, not an outer container), so what is stated here is the codec
-    and the rule, in a second language.
+    and the rule, in a second language: the encoding against written-out byte strings, and
+    the rule as an explicit three-branch function fed from the decoder, graded against a
+    written-out transcript.
 
 Run:``python3 tests/wire_vectors_decode.py`` (stdlib only; exits non-zero on
 any mismatch). Regenerate the fixtures from Rust with
@@ -37,6 +39,7 @@ from __future__ import annotations
 
 import struct
 import sys
+from itertools import permutations
 from pathlib import Path
 
 VECTORS_DIR = Path(__file__).resolve().parent.parent / "core" / "tests" / "wire_vectors"
@@ -475,11 +478,14 @@ def packet_header():
     check(enc_packet_header(h) == raw, "header re-encode != fixture")
 
 
-def _packet_roundtrip(name: str, payload: bytes, ext: bytes):
+def _packet_roundtrip(name: str, payload: bytes):
+    # No `extensions` comparison here: the decoder returns a constant empty slice,
+    # so comparing it to an empty literal would assert nothing about the fixture.
+    # What actually pins "extensions are off the wire" is that the payload the
+    # caller writes out is the whole remainder after the 15-byte header.
     raw = load(name)
     p = dec_phantom_packet(raw)
     check(p["payload"] == payload, f"{name}: payload")
-    check(p["extensions"] == ext, f"{name}: extensions")
     check(p["header"]["version"] == WIRE_VERSION, f"{name}: header version")
     check(enc_phantom_packet(p) == raw, f"{name}: re-encode != fixture")
     return p
@@ -487,14 +493,14 @@ def _packet_roundtrip(name: str, payload: bytes, ext: bytes):
 
 @vector
 def phantom_packet_data():
-    p = _packet_roundtrip("phantom_packet_data.bin", pat(0x11, 64), b"")
+    p = _packet_roundtrip("phantom_packet_data.bin", pat(0x11, 64))
     fl = p["header"]["flags"]
     check(fl & 0x0020 != 0 and fl & 0x0001 != 0, "data packet ENCRYPTED|RELIABLE")
 
 
 @vector
 def phantom_packet_ack():
-    p = _packet_roundtrip("phantom_packet_ack.bin", b"", b"")
+    p = _packet_roundtrip("phantom_packet_ack.bin", b"")
     check(p["header"]["flags"] == 0x0002, "ack packet flags == ACK only")
 
 
@@ -503,7 +509,7 @@ def phantom_packet_extensions():
     # WIRE v6: the struct that produced this fixture had extensions set, but
     # they are DROPPED from the wire — the fixture is just header(15) ‖ payload(16),
     # and decoding yields EMPTY extensions. This pins "extensions off the wire".
-    _packet_roundtrip("phantom_packet_extensions.bin", pat(0x11, 16), b"")
+    _packet_roundtrip("phantom_packet_extensions.bin", pat(0x11, 16))
     check(len(load("phantom_packet_extensions.bin")) == HEADER_SIZE + 16,
           "v6 ext fixture is header || payload only (no extension bytes)")
 
@@ -519,30 +525,55 @@ def dec_window_update(raw: bytes) -> int:
     return struct.unpack(">Q", raw)[0]
 
 
-@vector
-def window_update_plaintext():
-    """The flow-control plaintext, stated independently of the Rust.
+def apply_window_limit(held: int, advertised: int) -> int:
+    """Fold one WINDOW_UPDATE into the total a sender is already holding.
 
-    There is no frozen fixture — this is an AEAD plaintext, not an outer container — so
-    what is checked is the codec and the rule a second implementation has to follow: an
-    8-byte big-endian total, and a receiver that takes the MAXIMUM of it and the limit it
-    already holds. That maximum is what makes the frame idempotent, reorder-safe and
-    loss-tolerant, and it is the whole reason the frame needs no acknowledgement.
+    Deliberately not written as ``max``. This file earns its keep by stating the
+    rule a second implementation has to follow, and ``max(a, b)`` states nothing
+    a reader could disagree with — it asserts that a builtin behaves like itself.
+    Spelling the three cases out names what the frame is actually required to
+    survive on a lossy, reordering path.
     """
-    initial = 64 * 1024
-    limit = initial + 100_000
-    raw = enc_window_update(limit)
-    check(raw == bytes([0, 0, 0, 0, 0, 0x02, 0x86, 0xA0]),
-          f"WINDOW_UPDATE big-endian encoding: got {raw.hex()}")
-    check(dec_window_update(raw) == limit, "WINDOW_UPDATE decode != encode input")
+    if advertised > held:
+        # A genuine grant: the receiver has drained, and the total it is now
+        # willing to have sent is the number on the wire — not that number added
+        # to anything. The field counts from the stream's first byte, so adding
+        # would credit the same bytes a second time and let the sender overrun a
+        # receiver that never opened that much room.
+        return advertised
+    if advertised == held:
+        # A duplicate — the same frame retransmitted, or a peer restating an
+        # unchanged total. It must move nothing. That idempotence is precisely
+        # why the frame carries no sequence number and needs no acknowledgement.
+        return held
+    # A smaller total is an older frame that lost the race with a newer one.
+    # Discarding it is what keeps the window monotone: a receiver never revokes
+    # room it has already granted, so a sender that acted on the larger total
+    # cannot be retroactively put in the wrong by the network's ordering.
+    return held
 
-    # Applying limits: monotone maximum, never a sum and never a decrease.
-    held = initial
-    for advertised, expected in [(limit, limit), (limit, limit), (initial, limit),
-                                 (limit + 1, limit + 1)]:
-        held = max(held, advertised)
-        check(held == expected,
-              f"applying {advertised} to {held} gave {held}, expected {expected}")
+
+@vector
+def window_update_codec():
+    """The flow-control plaintext's bytes, stated independently of the Rust.
+
+    There is no frozen fixture — this is an AEAD plaintext, not an outer container —
+    so the encoding is pinned against written-out byte strings rather than against
+    itself. One of them needs all 64 bits on purpose: a reader that quietly truncated
+    the cumulative total to 32 bits agrees with every small limit and diverges only on
+    a long-lived stream, which is the hardest place to notice it.
+    """
+    for limit, encoded in [
+        (165_536, "00000000000286a0"),
+        (281_474_976_710_657, "0001000000000001"),
+        (18_446_744_073_709_551_615, "ffffffffffffffff"),
+    ]:
+        raw = enc_window_update(limit)
+        check(raw.hex() == encoded,
+              f"WINDOW_UPDATE encoding of {limit}: got {raw.hex()}, expected {encoded}")
+        check(dec_window_update(bytes.fromhex(encoded)) == limit,
+              f"WINDOW_UPDATE decode of {encoded}: got "
+              f"{dec_window_update(bytes.fromhex(encoded))}, expected {limit}")
 
     for bad in (b"", b"\x00\x00\x00\x01", b"\x00" * 9):
         try:
@@ -550,6 +581,52 @@ def window_update_plaintext():
         except Failure:
             continue
         raise Failure(f"a {len(bad)}-byte WINDOW_UPDATE plaintext was accepted")
+
+
+@vector
+def window_update_limit_rule():
+    """The rule a receiver of a WINDOW_UPDATE has to apply, on decoded frames.
+
+    Every advertised total below reaches the rule the way a real one does — through
+    the decoder — so a codec that misreads the field and a rule that misapplies it
+    both land on this check instead of only one of them. The expected column is
+    written out rather than computed, because a table filled in by the very
+    expression under test grades its own homework and would accept any rule at all.
+    """
+    # (frame bytes, total already held, total held afterwards)
+    transcript = [
+        ("00000000000286a0", 65_536, 165_536),                            # grant: opens
+        ("00000000000286a0", 165_536, 165_536),                           # duplicate: no-op
+        ("0000000000010000", 165_536, 165_536),                           # stale: discarded
+        ("00000000000286a1", 165_536, 165_537),                           # one byte more
+        ("0001000000000001", 165_537, 281_474_976_710_657),               # past 32 bits
+        ("0000000100000000", 281_474_976_710_657, 281_474_976_710_657),   # stale, still >32b
+    ]
+    for encoded, held, expected in transcript:
+        advertised = dec_window_update(bytes.fromhex(encoded))
+        after = apply_window_limit(held, advertised)
+        check(after == expected,
+              f"applying {advertised} to a held total of {held} gave {after}, "
+              f"expected {expected}")
+
+    # Stated as its own assertion because a sum also grows, so "the total went up"
+    # is not evidence against one. Summing is what a port of the older relative-credit
+    # frame arrives at by inertia, and it is the single wrong rule this second
+    # implementation exists to refuse.
+    for held, advertised in [(65_536, 165_536), (165_536, 165_536)]:
+        check(apply_window_limit(held, advertised) != held + advertised,
+              f"applying {advertised} to {held} summed to {held + advertised}")
+
+    # Order-independence is the property the frame is built around: the same grants
+    # delivered in any order have to leave the sender holding one settled total.
+    grants = [0x0000_0000_0002_86A0, 0x0000_0000_0002_8000, 0x0001_0000_0000_0001]
+    for order in permutations(grants):
+        held = 65_536
+        for grant in order:
+            held = apply_window_limit(held, dec_window_update(enc_window_update(grant)))
+        check(held == 281_474_976_710_657,
+              f"grants delivered as {[hex(g) for g in order]} settled at {held}, "
+              "expected 281474976710657")
 
 
 def main() -> int:
