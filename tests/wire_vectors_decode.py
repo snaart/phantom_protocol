@@ -24,11 +24,13 @@ What it covers:
     Fully decoded **and** re-encoded, same as the borsh structs.
 
   * **the `WINDOW_UPDATE` plaintext** — an 8-byte big-endian cumulative limit, together
-    with the monotone-maximum rule a receiver of one must apply. It has no frozen fixture
-    (it is an AEAD plaintext, not an outer container), so what is stated here is the codec
-    and the rule, in a second language: the encoding against written-out byte strings, and
-    the rule as an explicit three-branch function fed from the decoder, graded against a
-    written-out transcript.
+    with the rule a receiver of one must apply. It has no frozen fixture (it is an AEAD
+    plaintext, not an outer container), so what is stated here is the codec and the rule,
+    in a second language: the encoding against written-out byte strings, and the rule as
+    an explicit function fed from the decoder, graded against a written-out transcript.
+    The rule has two halves and both are stated — the monotone maximum against the limit
+    already held, *and* the local clamp to one `MAX_SEND_WINDOW` past what has been sent,
+    which is the half that exists because the number is written by the peer.
 
 Run:``python3 tests/wire_vectors_decode.py`` (stdlib only; exits non-zero on
 any mismatch). Regenerate the fixtures from Rust with
@@ -62,6 +64,23 @@ WIRE_VERSION = 7  # bumped 6->7 with it, so a peer speaking the older flow contr
 # this file has to get the length and the meaning right, so both are stated here and the
 # length is asserted against the spec below.
 WINDOW_UPDATE_PAYLOAD_LEN = 8
+
+# The three numbers PROTOCOL.md § 4.5 puts on the flow-control ledger. They are not
+# encodings, so no fixture can carry them, and a second implementation that guesses them
+# wrong stalls or overruns without ever mis-parsing a byte — which is why they are written
+# out here under the names the spec uses rather than left as literals in a table.
+#
+# The limit both ends assume before any WINDOW_UPDATE has been seen. Starting from zero
+# instead deadlocks: the first frame is only emitted once the peer's application has
+# consumed bytes that, at a zero opening limit, would never have been sent to it.
+INITIAL_STREAM_WINDOW = 64 * 1024
+# The ceiling on what a receiver may advertise beyond what its application has consumed.
+MAX_RECV_WINDOW = 1024 * 1024
+# The ceiling on what a sender will honour beyond what it has already sent, whatever
+# number arrives. Written out independently of MAX_RECV_WINDOW rather than defined from
+# it, so that the two being equal is something this file checks rather than something it
+# arranges — see `window_update_limit_rule`.
+MAX_SEND_WINDOW = 1024 * 1024
 
 
 def pat(seed: int, n: int) -> bytes:
@@ -525,32 +544,58 @@ def dec_window_update(raw: bytes) -> int:
     return struct.unpack(">Q", raw)[0]
 
 
-def apply_window_limit(held: int, advertised: int) -> int:
-    """Fold one WINDOW_UPDATE into the total a sender is already holding.
+def apply_window_limit(held: int, sent: int, advertised: int) -> tuple[int, str]:
+    """Fold one WINDOW_UPDATE into the state a sender is already holding.
+
+    The state is two numbers, not one. ``held`` is the highest limit honoured so
+    far; ``sent`` is the total this side has already put on the wire, counted the
+    way § 4.5 counts it — each reliable application byte once, retransmissions not
+    counted again. Both are needed, because half the rule is a bound the peer's
+    number is measured against rather than a comparison between two peer numbers,
+    and a model carrying only ``held`` cannot express that half at all.
 
     Deliberately not written as ``max``. This file earns its keep by stating the
-    rule a second implementation has to follow, and ``max(a, b)`` states nothing
-    a reader could disagree with — it asserts that a builtin behaves like itself.
-    Spelling the three cases out names what the frame is actually required to
-    survive on a lossy, reordering path.
+    rule a second implementation has to follow, and ``max(a, b)`` states nothing a
+    reader could disagree with — it asserts that a builtin behaves like itself.
+    Worse, it states the wrong rule: it honours whatever number arrives, and the
+    number arrives from a peer that is authenticated but not trusted.
+
+    Returns the settled total *and* which of the four cases the frame fell into.
+    The case is returned because two of them settle on the same total — a
+    duplicate and a stale frame both leave ``held`` where it was — so a rule that
+    only reports the total makes "a duplicate grants nothing extra" and "a stale
+    frame is discarded" one claim wearing two names, and the second of them is
+    unverifiable prose. § 4.5 lists them as separate properties; naming which one
+    a frame exercised is what keeps them separate here.
     """
+    # What this side is willing to honour, whoever is writing the number. A peer
+    # advertising u64::MAX buys exactly one window of permission beyond what has
+    # already gone out and must send another frame for more — so the field is a
+    # rate of permission per frame rather than a lever the peer can hold down.
+    ceiling = sent + MAX_SEND_WINDOW
+    if advertised > ceiling:
+        # The local bound, not the peer's number, decided the outcome. It still
+        # settles by maximum against `held`: a clamp is not a revocation, so an
+        # oversized frame arriving after the ceiling has already been spent
+        # leaves the total exactly where it was.
+        return max(held, ceiling), "clamped"
     if advertised > held:
         # A genuine grant: the receiver has drained, and the total it is now
         # willing to have sent is the number on the wire — not that number added
         # to anything. The field counts from the stream's first byte, so adding
         # would credit the same bytes a second time and let the sender overrun a
         # receiver that never opened that much room.
-        return advertised
+        return advertised, "grant"
     if advertised == held:
         # A duplicate — the same frame retransmitted, or a peer restating an
         # unchanged total. It must move nothing. That idempotence is precisely
         # why the frame carries no sequence number and needs no acknowledgement.
-        return held
+        return held, "duplicate"
     # A smaller total is an older frame that lost the race with a newer one.
     # Discarding it is what keeps the window monotone: a receiver never revokes
     # room it has already granted, so a sender that acted on the larger total
     # cannot be retroactively put in the wrong by the network's ordering.
-    return held
+    return held, "stale"
 
 
 @vector
@@ -589,44 +634,90 @@ def window_update_limit_rule():
 
     Every advertised total below reaches the rule the way a real one does — through
     the decoder — so a codec that misreads the field and a rule that misapplies it
-    both land on this check instead of only one of them. The expected column is
+    both land on this check instead of only one of them. The expected columns are
     written out rather than computed, because a table filled in by the very
     expression under test grades its own homework and would accept any rule at all.
     """
-    # (frame bytes, total already held, total held afterwards)
-    transcript = [
-        ("00000000000286a0", 65_536, 165_536),                            # grant: opens
-        ("00000000000286a0", 165_536, 165_536),                           # duplicate: no-op
-        ("0000000000010000", 165_536, 165_536),                           # stale: discarded
-        ("00000000000286a1", 165_536, 165_537),                           # one byte more
-        ("0001000000000001", 165_537, 281_474_976_710_657),               # past 32 bits
-        ("0000000100000000", 281_474_976_710_657, 281_474_976_710_657),   # stale, still >32b
-    ]
-    for encoded, held, expected in transcript:
-        advertised = dec_window_update(bytes.fromhex(encoded))
-        after = apply_window_limit(held, advertised)
-        check(after == expected,
-              f"applying {advertised} to a held total of {held} gave {after}, "
-              f"expected {expected}")
+    # The two ends of the ledger are the same figure, and the spec says so in both
+    # directions. Checked rather than arranged: were the sender's ceiling the smaller
+    # of the two, a receiver advertising the whole window it is entitled to would have
+    # the top of its grant silently discarded, and the stall that follows looks like a
+    # slow path rather than a disagreement about a constant.
+    check(MAX_SEND_WINDOW == MAX_RECV_WINDOW,
+          f"the sender honours at most {MAX_SEND_WINDOW} but the receiver may advertise "
+          f"up to {MAX_RECV_WINDOW}; § 4.5 makes them the same figure")
 
-    # Stated as its own assertion because a sum also grows, so "the total went up"
-    # is not evidence against one. Summing is what a port of the older relative-credit
-    # frame arrives at by inertia, and it is the single wrong rule this second
-    # implementation exists to refuse.
-    for held, advertised in [(65_536, 165_536), (165_536, 165_536)]:
-        check(apply_window_limit(held, advertised) != held + advertised,
+    # The rule's shape is part of what is being stated, and it is checked before anything
+    # is asked of its arithmetic. A rule that reports only a total cannot tell a duplicate
+    # from a stale frame — they settle on the same number — so collapsing this back to
+    # `max(held, advertised)` is not a simplification but the loss of a claim, and it is
+    # the exact restatement this vector exists to refuse. Checked here rather than inside
+    # a loop so the collapse is reported as a broken contract and not as an unpacking
+    # accident three assertions later.
+    shape = apply_window_limit(INITIAL_STREAM_WINDOW, INITIAL_STREAM_WINDOW, 165_536)
+    check(isinstance(shape, tuple) and len(shape) == 2 and isinstance(shape[1], str),
+          f"the rule must report the settled total and which case it took, got {shape!r}")
+
+    # Stated first among the arithmetic, and by name, because a sum also grows: "the
+    # total went up" is not evidence against one, so a summing rule caught below would
+    # be reported as an arithmetic mismatch rather than as the wrong rule. Summing is
+    # what a port of the older relative-credit frame arrives at by inertia, and it is
+    # the single wrong rule this second implementation exists to refuse.
+    for held, sent, advertised in [(65_536, 65_536, 165_536), (165_536, 65_536, 165_536)]:
+        settled, _ = apply_window_limit(held, sent, advertised)
+        check(settled != held + advertised,
               f"applying {advertised} to {held} summed to {held + advertised}")
 
+    # (frame bytes, held, already sent, held afterwards, which case the frame was)
+    transcript = [
+        # An opening grant against the limit every stream starts at.
+        ("00000000000286a0", INITIAL_STREAM_WINDOW, 65_536, 165_536, "grant"),
+        ("00000000000286a0", 165_536, 65_536, 165_536, "duplicate"),
+        ("0000000000010000", 165_536, 65_536, 165_536, "stale"),
+        ("00000000000286a1", 165_536, 65_536, 165_537, "grant"),
+        # 0x0001_0000_0000_0001 is 281_474_976_710_657 — a peer buying itself room it
+        # never granted. What it actually buys is one MAX_SEND_WINDOW past the 165_537
+        # bytes already sent, and it has to send another frame for more.
+        ("0001000000000001", 165_537, 165_537, 1_214_113, "clamped"),
+        # Absurd again with nothing sent since: the ceiling is where it was, so this
+        # frame moves nothing at all. The permission is per frame, not cumulative.
+        ("ffffffffffffffff", 1_214_113, 165_537, 1_214_113, "clamped"),
+        # ...and once those bytes have gone out, the same absurd number buys exactly
+        # one more window. The clamp tracks what was sent; it is not a one-off ceiling.
+        ("ffffffffffffffff", 1_214_113, 1_214_113, 2_262_689, "clamped"),
+        # A grant genuinely past 2^32 and genuinely under the ceiling, so nothing but
+        # the decoder's width decides it. A reader that took only the low four bytes
+        # sees 0 here and calls a real grant stale — the one failure that stays hidden
+        # until a stream has run past four gigabytes, where it reads as a stall.
+        ("0000000100000000", 4_294_000_000, 4_294_000_000, 4_294_967_296, "grant"),
+        ("00000000ffffffff", 4_294_967_296, 4_294_000_000, 4_294_967_296, "stale"),
+    ]
+    for encoded, held, sent, expected, expected_case in transcript:
+        advertised = dec_window_update(bytes.fromhex(encoded))
+        after, case = apply_window_limit(held, sent, advertised)
+        check(after == expected,
+              f"applying {advertised} to a held total of {held} with {sent} sent gave "
+              f"{after}, expected {expected}")
+        check(case == expected_case,
+              f"applying {advertised} to a held total of {held} with {sent} sent was "
+              f"read as {case!r}, expected {expected_case!r}")
+
     # Order-independence is the property the frame is built around: the same grants
-    # delivered in any order have to leave the sender holding one settled total.
+    # delivered in any order have to leave the sender holding one settled total. The
+    # clamp does not disturb it — the ceiling is fixed by what this side has sent, not
+    # by what arrived when — so a peer's oversized frame is free to sit anywhere in the
+    # order. Only which frame gets *called* clamped moves with the order, which is why
+    # this checks the settled total alone.
+    sent = 65_536
     grants = [0x0000_0000_0002_86A0, 0x0000_0000_0002_8000, 0x0001_0000_0000_0001]
     for order in permutations(grants):
-        held = 65_536
+        held = INITIAL_STREAM_WINDOW
         for grant in order:
-            held = apply_window_limit(held, dec_window_update(enc_window_update(grant)))
-        check(held == 281_474_976_710_657,
+            held, _ = apply_window_limit(
+                held, sent, dec_window_update(enc_window_update(grant)))
+        check(held == 1_114_112,
               f"grants delivered as {[hex(g) for g in order]} settled at {held}, "
-              "expected 281474976710657")
+              "expected 1114112")
 
 
 def main() -> int:
