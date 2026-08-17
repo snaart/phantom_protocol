@@ -274,6 +274,119 @@ pub fn encode_framed(msg: &Msg) -> Vec<u8> {
     out
 }
 
+/// A [`MsgLink`] that answers from a script instead of from a network.
+///
+/// Both of the harness's silent-loss defects live on the failure side of this
+/// trait — a send that does not land, a window the stack cannot yet describe —
+/// and neither is reachable through a real session without a real peer and a
+/// real path. Scripting the link is what makes them deterministic, and a shared
+/// double is what keeps the daemon's tests and the probe's tests agreeing on
+/// what a failing link looks like.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use phantom_protocol::CoreError;
+
+    use super::{Arrival, BoxFut, MsgLink};
+    use crate::proto::Msg;
+    use crate::report::{unix_nanos, Leg, WindowSample};
+
+    pub(crate) struct ScriptedLink {
+        /// When set, every send fails the way a link whose peer has gone away
+        /// fails — the case in which `download:end` was lost, since the mark is
+        /// the last thing written before the session is closed.
+        pub(crate) send_fails: bool,
+        /// When false, `window_sample` yields nothing, standing in for a
+        /// `bandwidth_snapshot()` that has produced no estimate yet.
+        pub(crate) window_available: bool,
+        /// Window sweeps served so far. A test reads this to know the sampler
+        /// has actually run, instead of guessing with a sleep.
+        pub(crate) window_calls: Arc<AtomicU64>,
+        /// `recv` parks until this many sweeps have been served and then yields
+        /// `BYE`, which ends a session handler. Zero ends it immediately.
+        pub(crate) recv_bye_after_window_calls: u64,
+    }
+
+    impl Default for ScriptedLink {
+        fn default() -> Self {
+            Self {
+                send_fails: false,
+                window_available: true,
+                window_calls: Arc::new(AtomicU64::new(0)),
+                recv_bye_after_window_calls: 0,
+            }
+        }
+    }
+
+    impl ScriptedLink {
+        /// A link on which nothing can be sent.
+        pub(crate) fn failing_sends() -> Self {
+            Self {
+                send_fails: true,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl MsgLink for ScriptedLink {
+        fn protocol(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn send_encoded(&self, _wire: Vec<u8>) -> BoxFut<'_, Result<(), CoreError>> {
+            let fails = self.send_fails;
+            Box::pin(async move {
+                if fails {
+                    Err(CoreError::ConnectionClosed)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn recv(&self) -> BoxFut<'_, Result<(Msg, Arrival), CoreError>> {
+            Box::pin(async move {
+                while self.window_calls.load(Ordering::Relaxed) < self.recv_bye_after_window_calls {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Ok((Msg::Bye, Arrival::default()))
+            })
+        }
+
+        fn close(&self) -> BoxFut<'_, ()> {
+            Box::pin(async {})
+        }
+
+        fn window_sample(
+            &self,
+            leg: Leg,
+            phase: String,
+            elapsed_ms: u64,
+        ) -> BoxFut<'_, Option<WindowSample>> {
+            self.window_calls.fetch_add(1, Ordering::Relaxed);
+            let available = self.window_available;
+            Box::pin(async move {
+                available.then(|| WindowSample {
+                    leg,
+                    phase,
+                    t_unix_ns: unix_nanos(),
+                    elapsed_ms,
+                    cwnd_bytes: 5600,
+                    inflight_bytes: 1400,
+                    bottleneck_bw_bps: 125_000,
+                    pacing_rate_bps: 125_000,
+                    min_rtt_us: 230_000,
+                    delivered_bytes: 1400,
+                    state: "probe_bw".to_string(),
+                    app_limited: false,
+                })
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
