@@ -122,6 +122,37 @@ fn key_from_seed(seed: &[u8]) -> Result<HybridSigningKey> {
     HybridSigningKey::from_bytes(seed).map_err(|e| anyhow::anyhow!("signing key from seed: {e}"))
 }
 
+/// Mint the counter every accepted session draws its `session_uid` from,
+/// seeded with the daemon's start time.
+///
+/// The seed is the whole point. `sessions.jsonl`, `events.jsonl` and
+/// `windows.jsonl` are append-only and outlive the process that wrote them, so
+/// a counter starting at 1 on every boot hands the same uid to a session in
+/// this run and a session in the last one. Joining a session's marks against
+/// its window series by uid then crosses two unrelated sessions, and their
+/// intervals do not intersect — which is indistinguishable from a series that
+/// was never sampled. That is not hypothetical: one download's windows were
+/// reported missing while they sat in the file under a twin's uid, and the
+/// daemon's own data said why — 730 session records carrying 280 distinct uids.
+///
+/// Seeding with microseconds since the epoch makes two runs' ranges disjoint
+/// unless one accepts more sessions than there are microseconds between the two
+/// starts: a million per second, against a harness that has recorded a few
+/// hundred in its life. It also keeps uids ascending across restarts, so
+/// ordering by uid still orders by time — which a random per-run prefix would
+/// have thrown away for nothing.
+///
+/// Microseconds and not nanoseconds. The alternative fix — a per-run id beside
+/// the uid — was rejected because the uid is also carried inside the
+/// `server:session:<uid>` phase string that keys `windows.jsonl`, and widening
+/// that would have moved the break from the daemon into every reader of the
+/// archive. A nanosecond stamp is ~1.7e18, past the 2^53 an IEEE-754 double
+/// represents exactly, and these files are read by tools that parse JSON
+/// numbers as doubles; a microsecond stamp stays exact until the 23rd century.
+fn new_session_uid_counter() -> Arc<AtomicU64> {
+    Arc::new(AtomicU64::new(crate::report::unix_nanos() / 1_000))
+}
+
 /// Where a snapshot's observability comes from, per listener.
 ///
 /// TCP and mimic expose `observability()` directly. `PhantomUdpListener` does
@@ -181,7 +212,7 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
 
     let (collector, collector_task) = collector::spawn(&cfg.data_dir)?;
     let obs = Arc::new(ObsRegistry::default());
-    let uid = Arc::new(AtomicU64::new(1));
+    let uid = new_session_uid_counter();
     let slots = Arc::new(Semaphore::new(cfg.max_sessions.max(1)));
 
     // `PhantomConfig` is `#[non_exhaustive]`, so start from the server preset
@@ -723,6 +754,68 @@ mod tests {
             "a truncated key must fail at load, not at the first handshake"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The journals are append-only and outlive the process, so two daemon
+    /// runs writing into the same data directory must not both claim the same
+    /// `session_uid`. A uid reissued after a restart makes the marks of one
+    /// session join the windows of another, and the intersection is empty —
+    /// which reads exactly like a series that was never recorded.
+    #[test]
+    fn session_uids_do_not_repeat_across_a_restart() {
+        let first = new_session_uid_counter();
+        let a: Vec<u64> = (0..64)
+            .map(|_| first.fetch_add(1, Ordering::Relaxed))
+            .collect();
+
+        // No restart is instantaneous — a bind plus a power-on self-test is
+        // hundreds of milliseconds — so 2 ms is far below the shortest real
+        // gap and still separates two runs.
+        std::thread::sleep(Duration::from_millis(2));
+
+        let second = new_session_uid_counter();
+        let b: Vec<u64> = (0..64)
+            .map(|_| second.fetch_add(1, Ordering::Relaxed))
+            .collect();
+
+        let mut all: Vec<u64> = a.iter().chain(b.iter()).copied().collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            128,
+            "the second run reissued a uid from the first: {:?} then {:?}",
+            &a[..4],
+            &b[..4]
+        );
+        assert!(
+            b[0] > a[63],
+            "uids must keep ascending across a restart, got {} then {}",
+            a[63],
+            b[0]
+        );
+    }
+
+    /// What makes the ranges disjoint is that the counter starts at the
+    /// daemon's own start time. Pinning that — rather than only the uniqueness
+    /// it buys — is what keeps a later "just start at 1 again" from passing.
+    #[test]
+    fn a_session_uid_carries_the_daemons_start_time() {
+        let before = crate::report::unix_nanos() / 1_000;
+        let first = new_session_uid_counter().fetch_add(1, Ordering::Relaxed);
+        let after = crate::report::unix_nanos() / 1_000;
+
+        assert!(
+            (before..=after).contains(&first),
+            "uid {first} is not the start time in microseconds ({before}..={after})"
+        );
+        // The artifacts are read by tools that parse JSON numbers as doubles,
+        // which are exact only below 2^53. A microsecond stamp clears that by
+        // two centuries; a nanosecond one would not clear it today.
+        assert!(
+            first < (1u64 << 53),
+            "uid {first} is past the range a double holds exactly"
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use crate::clock::{self, ClockSample};
 use crate::framing::{Framed, MsgLink};
 use crate::probe::conn::{
     self, connect_framed, connect_leg, connect_leg_resumed, connect_link, connect_link_staged,
-    echo_once, error_kind, mark, Endpoints, DRAIN_TIMEOUT, OP_TIMEOUT,
+    echo_once, error_kind, Endpoints, DRAIN_TIMEOUT, OP_TIMEOUT,
 };
 use crate::proto::{Msg, PayloadGen};
 use crate::report::{
@@ -85,6 +85,26 @@ impl ScenarioOutput {
 
     fn note(&mut self, s: impl Into<String>) {
         self.summary.notes.push(s.into());
+    }
+
+    /// Mark the server's journal for this scenario, filing a mark that did not
+    /// land as an error of the run.
+    ///
+    /// The mark stays best-effort — the scenario runs on either way, and the
+    /// measurement never depends on an annotation. What changes is that losing
+    /// one is no longer invisible. A pair of marks is what bounds the interval
+    /// the daemon's window series is joined against, so a `download:end` that
+    /// never arrived leaves an interval with no end and a join with no rows,
+    /// and that is indistinguishable from a sender whose window was never
+    /// sampled at all. Recording the loss beside the leg, the scenario and the
+    /// label turns an unanswerable gap into a one-line fact in `errors.jsonl`.
+    async fn mark(&mut self, framed: &dyn MsgLink, label: impl Into<String>) {
+        let label = label.into();
+        if let Err(e) = conn::mark(framed, label.clone()).await {
+            let leg = self.summary.leg;
+            let scenario = self.summary.scenario.clone();
+            self.error(leg, &scenario, &format!("mark {label}"), &e);
+        }
     }
 
     fn error(&mut self, leg: Leg, scenario: &str, context: &str, e: &CoreError) {
@@ -300,7 +320,7 @@ pub async fn clock_sync(ep: &Endpoints, pin: &[u8], leg: Leg, probes: usize) -> 
             return out;
         }
     };
-    mark(&framed, "clock_sync:begin").await;
+    out.mark(&framed, "clock_sync:begin").await;
 
     let mut gen = PayloadGen::new(1);
     let mut samples = Vec::with_capacity(probes);
@@ -355,7 +375,7 @@ pub async fn clock_sync(ep: &Endpoints, pin: &[u8], leg: Leg, probes: usize) -> 
     }
 
     out.summary.latency_ns = Some(Summary::of_u64(&rtts));
-    mark(&framed, "clock_sync:end").await;
+    out.mark(&framed, "clock_sync:end").await;
     conn::close_session(framed.session()).await;
     out
 }
@@ -457,7 +477,7 @@ pub async fn rtt_sweep(
             return out;
         }
     };
-    mark(framed.as_ref(), "rtt_sweep:begin").await;
+    out.mark(framed.as_ref(), "rtt_sweep:begin").await;
 
     let mut gen = PayloadGen::new(3);
     let mut all = Vec::new();
@@ -543,7 +563,7 @@ pub async fn rtt_sweep(
     if let Some(n) = framed.transport_note() {
         out.note(n);
     }
-    mark(framed.as_ref(), "rtt_sweep:end").await;
+    out.mark(framed.as_ref(), "rtt_sweep:end").await;
     framed.close().await;
     out
 }
@@ -576,7 +596,7 @@ pub async fn message_integrity(
             return out;
         }
     };
-    mark(&framed, "message_integrity:begin").await;
+    out.mark(&framed, "message_integrity:begin").await;
 
     let mut gen = PayloadGen::new(31);
     let mut first_split: Option<usize> = None;
@@ -642,7 +662,7 @@ pub async fn message_integrity(
         "largest payload round-tripped byte-exact after reassembly: {max_intact} B"
     ));
 
-    mark(&framed, "message_integrity:end").await;
+    out.mark(&framed, "message_integrity:end").await;
     conn::close_session(framed.session()).await;
     out
 }
@@ -664,7 +684,7 @@ pub async fn upload(
             return out;
         }
     };
-    mark(framed.as_ref(), "upload:begin").await;
+    out.mark(framed.as_ref(), "upload:begin").await;
     let recorder = WindowRecorder::start(framed.clone(), leg, "upload");
 
     let mut gen = PayloadGen::new(4);
@@ -771,7 +791,7 @@ pub async fn upload(
     if let Some(n) = framed.transport_note() {
         out.note(n);
     }
-    mark(framed.as_ref(), "upload:end").await;
+    out.mark(framed.as_ref(), "upload:end").await;
     framed.close().await;
     out
 }
@@ -853,7 +873,7 @@ pub async fn download(
             return out;
         }
     };
-    mark(framed.as_ref(), "download:begin").await;
+    out.mark(framed.as_ref(), "download:begin").await;
     // The *server* is the sender here, so this series is the client's own
     // window — near-idle by design. The server's side comes back in STATS.
     let recorder = WindowRecorder::start(framed.clone(), leg, "download");
@@ -940,7 +960,7 @@ pub async fn download(
     if let Some(n) = framed.transport_note() {
         out.note(n);
     }
-    mark(framed.as_ref(), "download:end").await;
+    out.mark(framed.as_ref(), "download:end").await;
     framed.close().await;
     out
 }
@@ -963,7 +983,7 @@ pub async fn bidir(
             return out;
         }
     };
-    mark(framed.as_ref(), "bidir:begin").await;
+    out.mark(framed.as_ref(), "bidir:begin").await;
     let recorder = WindowRecorder::start(framed.clone(), leg, "bidir");
 
     if let Err(e) = conn::send_msg(
@@ -1067,7 +1087,7 @@ pub async fn bidir(
     if let Some(n) = framed.transport_note() {
         out.note(n);
     }
-    mark(framed.as_ref(), "bidir:end").await;
+    out.mark(framed.as_ref(), "bidir:end").await;
     framed.close().await;
     out
 }
@@ -1090,7 +1110,7 @@ pub async fn streams(
             return out;
         }
     };
-    mark(&framed, "streams:begin").await;
+    out.mark(&framed, "streams:begin").await;
 
     let mut handles = Vec::with_capacity(stream_count);
     for i in 0..stream_count {
@@ -1180,7 +1200,7 @@ pub async fn streams(
     out.note(format!(
         "{stream_count} concurrent streams; client-opened ids are odd (QUIC-style parity split)"
     ));
-    mark(&framed, "streams:end").await;
+    out.mark(&framed, "streams:end").await;
     conn::close_session(framed.session()).await;
     out
 }
@@ -1369,7 +1389,7 @@ pub async fn migration(
                 continue;
             }
         };
-        mark(&framed, format!("migration:{round}:begin")).await;
+        out.mark(&framed, format!("migration:{round}:begin")).await;
 
         let mut gen = PayloadGen::new(90 + round);
         let switch_at = echoes_per_round / 2;
@@ -1382,7 +1402,8 @@ pub async fn migration(
 
         for i in 0..echoes_per_round {
             if i == switch_at {
-                mark(&framed, format!("migration:{round}:migrate")).await;
+                out.mark(&framed, format!("migration:{round}:migrate"))
+                    .await;
                 let t0 = Instant::now();
                 // Port 0 asks the OS for a fresh ephemeral port: a genuine local
                 // rebind, and the trigger for the server's path-validation
@@ -1429,7 +1450,7 @@ pub async fn migration(
             out.summary.error_count += 1;
         }
 
-        mark(&framed, format!("migration:{round}:end")).await;
+        out.mark(&framed, format!("migration:{round}:end")).await;
         out.sink.push(&MigrationSample {
             seq: round,
             leg,
@@ -1469,7 +1490,7 @@ pub async fn rekey(
             return out;
         }
     };
-    mark(&framed, "rekey:begin").await;
+    out.mark(&framed, "rekey:begin").await;
 
     // Force epochs to rotate every few packets. Waiting for the production
     // REKEY_SOFT_LIMIT of 2^32 invocations is not a test that finishes.
@@ -1531,7 +1552,7 @@ pub async fn rekey(
         _ => out.note("no epoch rotation observed — treat continuity here as untested"),
     }
 
-    mark(&framed, "rekey:end").await;
+    out.mark(&framed, "rekey:end").await;
     conn::close_session(framed.session()).await;
     out
 }
@@ -1553,7 +1574,7 @@ pub async fn liveness_soak(
             return out;
         }
     };
-    mark(&framed, "liveness_soak:begin").await;
+    out.mark(&framed, "liveness_soak:begin").await;
 
     let started = Instant::now();
     let mut gen = PayloadGen::new(11);
@@ -1615,7 +1636,7 @@ pub async fn liveness_soak(
         seq,
         states.join(" -> ")
     ));
-    mark(&framed, "liveness_soak:end").await;
+    out.mark(&framed, "liveness_soak:end").await;
     conn::close_session(framed.session()).await;
     out
 }
@@ -1993,7 +2014,7 @@ pub async fn wire_capture(
     // before the first application byte, on the same host clock the capture is
     // stamped with.
     let established_unix_ns = unix_nanos();
-    mark(&framed, "wire_capture:established").await;
+    out.mark(&framed, "wire_capture:established").await;
 
     let mut echo_ok = 0usize;
     let mut echo_failed = 0usize;
@@ -3084,6 +3105,52 @@ pub async fn raw_udp_rtt(ep: &Endpoints, sizes: &[usize], per_size: usize) -> Sc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framing::testing::ScriptedLink;
+
+    /// A mark is best-effort, but its loss is not free: `download:begin` and
+    /// `download:end` bracket the interval the server's window series is joined
+    /// against, so a missing `end` collapses that interval and the join comes
+    /// back empty — reading as a series that was never sampled. Seven sessions
+    /// across two runs lost their `download:end` and neither artifact said so.
+    #[tokio::test]
+    async fn a_mark_that_never_reached_the_server_is_recorded_as_a_run_error() {
+        let link = ScriptedLink::failing_sends();
+        let mut out = ScenarioOutput::new(Leg::Udp, "download");
+
+        out.mark(&link, "download:end").await;
+
+        assert_eq!(
+            out.errors.len(),
+            1,
+            "a mark that could not be sent left no trace in the run's errors"
+        );
+        let e = &out.errors[0];
+        assert_eq!(e.leg, Some(Leg::Udp), "the leg must be named");
+        assert_eq!(e.scenario, "download", "the scenario must be named");
+        assert!(
+            e.context.contains("download:end"),
+            "the mark itself must be named: {}",
+            e.context
+        );
+        assert_eq!(e.error_kind, "ConnectionClosed");
+        assert_eq!(
+            out.summary.error_count, 1,
+            "the run's error tally must count it too"
+        );
+    }
+
+    /// And the converse, or the counter would just be a second name for "a
+    /// mark was attempted": a mark that lands is not an error.
+    #[tokio::test]
+    async fn a_mark_that_lands_records_nothing() {
+        let link = ScriptedLink::default();
+        let mut out = ScenarioOutput::new(Leg::Udp, "download");
+
+        out.mark(&link, "download:begin").await;
+
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.summary.error_count, 0);
+    }
 
     #[test]
     fn window_tracker_emits_one_sample_per_elapsed_second() {

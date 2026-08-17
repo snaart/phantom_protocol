@@ -51,6 +51,10 @@ pub struct Counters {
     pub streams_accepted: AtomicU64,
     /// Logical messages that arrived split across more than one transport read.
     pub split_messages: AtomicU64,
+    /// Congestion-window sweeps that produced a sample and were recorded.
+    pub window_samples: AtomicU64,
+    /// Sweeps that produced nothing because the link had no window to describe.
+    pub window_samples_skipped: AtomicU64,
 }
 
 pub struct SessionCtx {
@@ -128,6 +132,8 @@ pub async fn run(link: Arc<dyn MsgLink>, ctx: Arc<SessionCtx>, collector: Collec
         source_frames: c.source_frames.load(Ordering::Relaxed),
         streams_accepted: c.streams_accepted.load(Ordering::Relaxed),
         split_messages: c.split_messages.load(Ordering::Relaxed),
+        window_samples: c.window_samples.load(Ordering::Relaxed),
+        window_samples_skipped: c.window_samples_skipped.load(Ordering::Relaxed),
         marks,
         close_reason: close_reason.clone(),
     });
@@ -633,6 +639,13 @@ async fn source_stream(
 /// On a download the server is the sender, so this is the window that governs
 /// the transfer — and sampling it here rather than answering a client poll
 /// keeps the measurement off the path being measured.
+///
+/// A sweep that the link cannot answer is counted rather than merely skipped.
+/// `window_sample` yields nothing while the stack has no bandwidth estimate to
+/// report, and a series that is short for that reason looks on disk exactly
+/// like a series that is short because the samples were lost — the file has no
+/// row either way. Counting the empty sweeps beside the recorded ones makes the
+/// two readings different numbers instead of the same silence.
 async fn window_loop(link: Arc<dyn MsgLink>, ctx: Arc<SessionCtx>, collector: CollectorHandle) {
     // 500 ms: fine enough to watch a window open over a few round trips on a
     // ~200 ms path, coarse enough to be free.
@@ -645,8 +658,12 @@ async fn window_loop(link: Arc<dyn MsgLink>, ctx: Arc<SessionCtx>, collector: Co
         tick.tick().await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let Some(w) = link.window_sample(leg, phase.clone(), elapsed_ms).await else {
+            ctx.counters
+                .window_samples_skipped
+                .fetch_add(1, Ordering::Relaxed);
             continue;
         };
+        ctx.counters.window_samples.fetch_add(1, Ordering::Relaxed);
         collector.window(w);
     }
 }
@@ -805,6 +822,98 @@ mod tests {
         assert!(len <= 128, "component length {len} not truncated");
         drop(st);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Drive one session to completion over a scripted link and return the
+    /// `SessionRecord` it wrote, as it appears in `sessions.jsonl`.
+    ///
+    /// Asserting on the parsed artifact rather than on the in-memory counters
+    /// is deliberate: the counter only helps an analysis if it survives
+    /// serialisation, and a field that exists in the struct but never reaches
+    /// the file is the same absence the sampler had.
+    async fn one_session(tag: &str, window_available: bool) -> (serde_json::Value, String) {
+        let dir = root_for(tag);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let (collector, task) = crate::testd::collector::spawn(&dir).expect("collector");
+
+        let link: Arc<dyn MsgLink> = Arc::new(crate::framing::testing::ScriptedLink {
+            window_available,
+            // End the session only once the sampler has swept twice, so the
+            // test waits on the mechanism rather than on a clock.
+            recv_bye_after_window_calls: 2,
+            ..Default::default()
+        });
+        let ctx = Arc::new(SessionCtx {
+            uid: 7,
+            listener: "udp".to_string(),
+            peer: "1.2.3.4:5".to_string(),
+            early_data_bytes: 0,
+            upload_root: dir.join("uploads"),
+            counters: Counters::default(),
+            marks: Default::default(),
+        });
+
+        run(link, ctx, collector.clone()).await;
+        drop(collector);
+        task.await.expect("collector joins");
+
+        let sessions = std::fs::read_to_string(dir.join("sessions.jsonl")).expect("sessions");
+        let windows = std::fs::read_to_string(dir.join("windows.jsonl")).unwrap_or_default();
+        let record = serde_json::from_str(sessions.lines().next().expect("one session record"))
+            .expect("json");
+        let _ = std::fs::remove_dir_all(&dir);
+        (record, windows)
+    }
+
+    /// A sweep that found no window to describe must leave a count behind.
+    ///
+    /// Without it the series is simply shorter, and nothing in the artifact
+    /// distinguishes "this sender never had an estimate" from "the estimates
+    /// were taken and lost" — the two readings differ in what they say about
+    /// the transport, and picking between them by eye is guessing.
+    #[tokio::test]
+    async fn a_window_the_link_cannot_describe_is_counted_in_the_session_record() {
+        let (rec, windows) = one_session("win-skip", false).await;
+
+        assert!(
+            rec["window_samples_skipped"].as_u64().unwrap_or(0) >= 2,
+            "the skipped sweeps left no count in the record: {rec}"
+        );
+        assert_eq!(
+            rec["window_samples"].as_u64(),
+            Some(0),
+            "nothing was recorded, so the taken count must say zero: {rec}"
+        );
+        assert!(
+            windows.trim().is_empty(),
+            "no sample existed, so none may appear in windows.jsonl: {windows}"
+        );
+    }
+
+    /// The converse, or the pair would just be two names for "the sampler ran":
+    /// a sweep that did produce a window counts as taken and not as skipped,
+    /// and the row is in the file under this session's own key.
+    #[tokio::test]
+    async fn a_window_that_was_recorded_counts_as_taken_and_not_as_skipped() {
+        let (rec, windows) = one_session("win-ok", true).await;
+
+        assert!(
+            rec["window_samples"].as_u64().unwrap_or(0) >= 2,
+            "recorded sweeps left no count in the record: {rec}"
+        );
+        assert_eq!(
+            rec["window_samples_skipped"].as_u64(),
+            Some(0),
+            "nothing was skipped: {rec}"
+        );
+        assert!(
+            windows.lines().count() >= 2,
+            "the samples themselves must reach windows.jsonl: {windows}"
+        );
+        assert!(
+            windows.contains("server:session:7"),
+            "the series must be keyed on this session: {windows}"
+        );
     }
 
     /// Bytes written must round-trip through the same checksum the client used,

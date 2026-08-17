@@ -429,14 +429,19 @@ pub async fn send_msg(framed: &dyn MsgLink, msg: Msg) -> Result<(), CoreError> {
 ///
 /// Best-effort by design: a failed marker must never abort a scenario, because
 /// the marker exists to annotate the data, not to be part of the measurement.
-pub async fn mark(framed: &dyn MsgLink, label: impl Into<String>) {
-    let _ = send_msg(
+/// The failure is nevertheless returned rather than dropped here, because
+/// best-effort is a statement about control flow and not a licence to lose the
+/// fact. Scenarios call `ScenarioOutput::mark`, which keeps the best-effort
+/// behaviour and files the failure in `errors.jsonl`; the `Result` is what
+/// makes a future caller that ignores it visible to the compiler.
+pub async fn mark(framed: &dyn MsgLink, label: impl Into<String>) -> Result<(), CoreError> {
+    send_msg(
         framed,
         Msg::Mark {
             label: label.into(),
         },
     )
-    .await;
+    .await
 }
 
 /// Ask for the server's metric snapshot.

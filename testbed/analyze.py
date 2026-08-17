@@ -331,6 +331,22 @@ def analyze_server(server_dir):
             f"{sum(r.get('split_messages', 0) for r in v):>11}"
         )
 
+    # The congestion-window series in windows.jsonl can be short for two very
+    # different reasons — the sender had no estimate to describe, or samples
+    # that were taken never reached the file — and the series alone shows the
+    # same missing rows either way. The daemon counts both, so report them.
+    # Artifacts written before it did carry neither field, and saying "0 and 0"
+    # for those would be the very confusion this line exists to remove.
+    if any("window_samples_skipped" in r for r in rows):
+        took = sum(r.get("window_samples", 0) for r in rows)
+        empty = sum(r.get("window_samples_skipped", 0) for r in rows)
+        print(f"\n  congestion-window sweeps: {took} recorded, {empty} found nothing to record")
+        if empty:
+            print("    a series short by up to that many samples is short because the sender had no")
+            print("    estimate at the time — not because rows went missing")
+    else:
+        print("\n  congestion-window sweeps: not counted in this artifact")
+
     reasons = defaultdict(int)
     for r in rows:
         reasons[r["close_reason"]] += 1

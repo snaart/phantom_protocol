@@ -181,14 +181,34 @@ def run_client(run_dir):
     return 2 if worst == "STALLED" else 0
 
 
+def sampler_note(records):
+    """Say what the sampler did for a session whose interval holds no windows.
+
+    Without this the empty interval is a dead end: it looks the same whether
+    the sender never had a bandwidth estimate to report or the samples were
+    taken and lost. The session record carries both counts, so the distinction
+    is available — for artifacts new enough to have it. Older ones are told
+    apart from a genuine zero rather than folded into one.
+    """
+    if not records:
+        return ""
+    if not any("window_samples_skipped" in r for r in records):
+        return "  (this artifact predates the sampler's own count)"
+    took = sum(r.get("window_samples", 0) for r in records)
+    empty = sum(r.get("window_samples_skipped", 0) for r in records)
+    return f"  (the sampler recorded {took}, and found nothing to record {empty} times)"
+
+
 def run_server(data_dir, since_ns):
     data_dir = pathlib.Path(data_dir)
 
-    # `session_uid` is not unique across runs (the daemon restarts its counter),
-    # so a uid alone joins marks from one session to windows from another. The
-    # timestamps disambiguate: every window is required to fall inside the
-    # scenario's own begin/end marks, and a uid seen more than once is reported
-    # rather than silently collapsed.
+    # In archived artifacts `session_uid` is not unique: the daemon used to
+    # restart its counter at 1 on every boot, so a uid alone joins the marks of
+    # one session to the windows of another. It is seeded from the start time
+    # now, but the old files do not change, and this is the tool that reads
+    # them. The timestamps disambiguate either way: every window is required to
+    # fall inside the scenario's own begin/end marks, and a uid seen more than
+    # once is reported rather than silently collapsed.
     spans = defaultdict(list)
     for event in read_jsonl(data_dir / "events.jsonl"):
         if event.get("kind") != "mark" or event.get("session_uid") is None:
@@ -202,6 +222,14 @@ def run_server(data_dir, since_ns):
             spans[uid].append({"begin": event["t_unix_ns"], "end": None, "leg": event.get("listener")})
         elif spans[uid]:
             spans[uid][-1]["end"] = event["t_unix_ns"]
+
+    # What the daemon's own sampler says it did, per session. An interval with
+    # no window rows is either a sender that never had an estimate to describe
+    # or a series that went missing, and the rows cannot tell those apart —
+    # they are absent in both cases. The session record can.
+    sampler = defaultdict(list)
+    for record in read_jsonl(data_dir / "sessions.jsonl"):
+        sampler[record.get("session_uid")].append(record)
 
     windows = defaultdict(list)
     for sample in read_jsonl(data_dir / "windows.jsonl"):
@@ -237,7 +265,7 @@ def run_server(data_dir, since_ns):
                 # transfer that never ended.
                 name += " (no end mark)"
             if not rows:
-                print(f"{name:34}    0  no windows inside the marked interval")
+                print(f"{name:34}    0  no windows inside the marked interval{sampler_note(sampler.get(uid))}")
                 continue
             figures = series_verdict(rows, leg != "quic")
             print_row(name, figures)
