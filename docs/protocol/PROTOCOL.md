@@ -509,10 +509,22 @@ indistinguishable from data as far as nonce and replay-window bookkeeping go.
 
 `ack_delay_us` is the one number in an acknowledgement that the receiving side
 did not measure itself, so it is **advisory**: a conforming sender may subtract
-it from a round-trip sample only where doing so cannot undercut a locally
-observed minimum (RFC 9002 § 5.2/§ 5.3), and must clamp it to the round trip it
-just timed. Subtracting it unconditionally hands an authenticated-but-hostile
-peer the local congestion window. Emitting `0` is always legal.
+it from a round-trip sample only where the result stays at or above a locally
+observed minimum (RFC 9002 § 5.2/§ 5.3), and drops the claim whole rather than
+trimming it to fit when it does not — which also disposes of a claim larger than
+the round trip it rides on, since such a claim fails the same test. Subtracting
+it unconditionally hands an authenticated-but-hostile peer the local congestion
+window. Emitting `0` is always legal.
+
+That rule is a **lower** bound and only a lower bound. Anywhere between the
+locally observed minimum and the round trip just timed the peer's claim still
+chooses the answer, so a sender must not treat an adjusted sample as a
+measurement of the path: a peer claiming the whole difference on every
+acknowledgement holds every derived reading at the best round trip the path ever
+had. That is harmless for a minimum filter, which a peer could equally starve by
+reporting nothing, and it is a real limitation for anything reporting the
+*latest* round trip — see `phantom.path.rtt` in
+[`docs/observability/metrics-catalog.md`](../observability/metrics-catalog.md).
 
 Minimum wire size = `10 + 4 + 8 × (N − 1)`: 14 bytes for one range, 22 for two.
 `from_wire` rejects `range_count == 0` / `> 32` (`Malformed` / `TooManyRanges`),

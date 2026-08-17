@@ -50,7 +50,7 @@ These are read from lock-free atomics on each SDK collection cycle.
 | `phantom.crypto.encrypt.invocations` | ObservableCounter | — (no unit set) | — | live — same call site; **successful seals only**, so the count is "packets actually sealed" |
 | `phantom.crypto.decrypt.duration_sum` | ObservableCounter | `ns` | — | live — `handle_packet` (`api/session.rs`) times `decrypt_packet_accepting_rekey`; the timer stops before any routing |
 | `phantom.crypto.decrypt.invocations` | ObservableCounter | — (no unit set) | — | live — same call site; **successful opens only**, so a rejected forgery cannot skew the average |
-| `phantom.path.rtt` | ObservableGauge | `us` | `path_id` — the **inbound** `header.path_id` of the ACK. Stored slots are `0..=15` (`MAX_PATHS = 16`); a sample on a higher id is silently dropped by the atomics, and the gauge observes only paths whose last sample is non-zero | live — `feed_bbr_on_ack` (`api/session.rs`) on the authenticated-SACK path. Karn-gated: an ACK for a retransmit is not sampled, and a zero-µs sample is skipped. The sample is the locally timed round trip less the peer's claimed `Sack::ack_delay_us`, and that subtraction goes through the same `ack_delay_adjusted_rtt` bound the estimator's min-RTT filter uses (RFC 9002 §5.3), so once this endpoint has timed a round trip no reported delay can pull the reading below it — a peer can decline to lower the gauge, it cannot dictate it |
+| `phantom.path.rtt` | ObservableGauge | `us` | `path_id` — the **inbound** `header.path_id` of the ACK. Stored slots are `0..=15` (`MAX_PATHS = 16`); a sample on a higher id is silently dropped by the atomics, and the gauge observes only paths whose last sample is non-zero | live — `feed_bbr_on_ack` (`api/session.rs`) on the authenticated-SACK path. Karn-gated: an ACK for a retransmit is not sampled, and a zero-µs sample is skipped. The sample is the locally timed round trip less the peer's claimed `Sack::ack_delay_us`, and it is the figure the estimator itself accepted (returned from `Session::on_packet_acked`), so it carries the `ack_delay_adjusted_rtt` bound the min-RTT filter applies (RFC 9002 §5.3). **Read that bound as exactly what it is: a floor.** Once this endpoint has timed a round trip, no reported delay pulls the reading below it — but between that floor and the round trip just observed the peer's claim still decides, so a peer claiming the whole difference on every ACK holds this gauge at the path's best-ever reading and hides a degradation. Alert on it rising; do not read a flat line as proof the path is healthy |
 
 ## Synchronous labeled instruments
 
@@ -112,7 +112,10 @@ that used to read zero:
   crypto-duration counters, so they count successful seals / opens only.
 - `rtt_us_path_0` — the only per-path RTT slot the FFI snapshot exposes.
   It is keyed on the **inbound** `path_id`, which stays 0 until the *peer*
-  migrates, so it keeps reporting across a local `migrate()`.
+  migrates, so it keeps reporting across a local `migrate()`. It carries the
+  same sample as `phantom.path.rtt` above, and the same caveat: the peer's
+  claimed ack delay is bounded below by a round trip this endpoint timed, not
+  bounded above, so a flat reading is not evidence of a healthy path.
 - `active_streams` — the balanced `StreamGauge`, user-visible streams only
   (reserved ids 0 and 1 excluded).
 - `unencrypted_dropped_total` — the Invariant-2 receive gate firing. It sits

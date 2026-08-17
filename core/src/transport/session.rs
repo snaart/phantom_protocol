@@ -1151,22 +1151,18 @@ impl Session {
         self.bandwidth_estimator.lock().on_send(bytes);
     }
 
-    /// The smallest round trip this session has actually timed, or `None` while
-    /// the estimator's `min_rtt` is still its opening guess.
+    /// Record that an ACK arrived with delivery sample `sample`. The estimator's
+    /// pacing decision is mirrored onto the pacer here, so the outbound rate
+    /// tracks the peer's actual receive throughput.
     ///
-    /// Exposed for
-    /// [`ack_delay_adjusted_rtt`](crate::transport::bandwidth_estimator::ack_delay_adjusted_rtt):
-    /// a caller that samples the same acknowledgement for its own purposes needs
-    /// the estimator's reference so it applies the identical bound to the
-    /// peer-reported ack delay rather than inventing a second, looser one.
-    pub fn rtt_floor(&self) -> Option<std::time::Duration> {
-        self.bandwidth_estimator.lock().rtt_floor()
-    }
-
-    /// Record that an ACK arrived with delivery sample `sample`. The
-    /// returned `u64` is the updated bottleneck bandwidth estimate; we
-    /// reflect it into the pacer so the outbound rate tracks the
-    /// peer's actual receive throughput.
+    /// The returned `Duration` is the RTT sample the estimator accepted for this
+    /// acknowledgement — the locally timed round trip, less as much of the
+    /// peer's claimed ack delay as the min-RTT floor permits. It is returned
+    /// because the data pump publishes that same figure to its per-path RTT
+    /// gauge, and the two must be one number rather than two conclusions: the
+    /// floor the bound is taken against lives behind this lock, so a caller
+    /// asking for it separately paid a second acquisition of it for every
+    /// segment a cumulative acknowledgement retires.
     ///
     /// This is also where pacing is switched on, and the condition is the
     /// bootstrap answer: not before the estimator has measured a bottleneck
@@ -1175,12 +1171,9 @@ impl Session {
     /// worst stopped. Until then the congestion window alone governs, exactly
     /// as it always did — an initial window is a small enough burst that
     /// pacing it buys nothing anyway.
-    pub fn on_packet_acked(&self, sample: DeliverySample) -> u64 {
+    pub fn on_packet_acked(&self, sample: DeliverySample) -> std::time::Duration {
         let mut est = self.bandwidth_estimator.lock();
-        let bw = est.on_ack(sample);
-        // Mirror the estimator's pacing decision onto the pacer so the
-        // two stay in lock-step.
-        let rate = est.pacing_rate();
+        let (rate, rtt_sample) = est.on_ack(sample);
         let measured = est.bottleneck_bandwidth() > 0;
         drop(est);
         self.pacer.set_rate(rate);
@@ -1191,7 +1184,7 @@ impl Session {
         if measured && !self.pacer.is_enabled() {
             self.pacer.set_enabled(true);
         }
-        bw
+        rtt_sample
     }
 
     /// Whether the pacer will admit another segment onto the wire right now.
