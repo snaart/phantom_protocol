@@ -343,34 +343,64 @@ const INFLIGHT_HI_RELAX_GAIN: f64 = 1.25;
 /// this endpoint has actually timed on the path, or `None` before it has timed
 /// any; see [`BandwidthEstimator::rtt_floor`].
 ///
-/// Two bounds, both from RFC 9002. The clamp to `latest_rtt` applies §5.3's
-/// "lesser of the acknowledgment delay and the peer's max_ack_delay" in the
-/// absence of a negotiated `max_ack_delay`: the peer cannot have held the
-/// acknowledgement longer than the whole trip took, so a larger figure is
-/// nonsense on its face, and clamping rather than saturating stops it from
-/// *erasing* an honest local measurement down to zero. The comparison against
-/// `rtt_floor` is §5.3's "MUST NOT subtract the acknowledgment delay from the
-/// RTT sample if the resulting value is smaller than the min_rtt", with §5.2's
-/// first-sample rule as the `None` arm.
+/// One bound, from RFC 9002 §5.3: "MUST NOT subtract the acknowledgment delay
+/// from the RTT sample if the resulting value is smaller than the min_rtt",
+/// with §5.2's first-sample rule as the `None` arm. It is all-or-nothing — a
+/// claim that would land the sample under the floor is dropped whole rather
+/// than trimmed to fit — which is what makes a nonsensical claim harmless
+/// without a separate guard against nonsense: a delay exceeding the round trip
+/// it rides on exceeds `floor + delay` too, so the test fails and the
+/// endpoint's own measurement stands. An earlier revision also clamped the
+/// claim to `latest_rtt` first, in the spirit of §5.3's "lesser of the
+/// acknowledgment delay and the peer's max_ack_delay". That clamp changed the
+/// answer for exactly one input this crate cannot produce — a floor of zero,
+/// which the seeding rule below forbids — and changed it for the worse, to the
+/// zero it was supposed to prevent. A redundant guard that is wrong wherever it
+/// is not redundant is worse than none, so it is gone and the function is
+/// crate-private, which is what makes "cannot produce" a statement about the
+/// whole program rather than about this file.
 ///
-/// The invariant those buy, inductively: the returned value is either the raw
-/// locally observed round trip or a value at or above `rtt_floor`. A peer can
-/// decline to lower a reading, which is all reporting nothing would achieve; it
-/// cannot push one below what this endpoint's own clock has seen.
+/// The invariant that buys, inductively: the returned value is either the raw
+/// locally observed round trip or a value at or above `rtt_floor`. Read it as
+/// exactly what it is — one bound, and a *lower* one. Anywhere inside
+/// `[rtt_floor, latest_rtt]` the peer still picks the answer, because a claim of
+/// `latest_rtt - rtt_floor` is subtracted in full and lands exactly on the
+/// floor. What the peer cannot do is invent a path faster than one this
+/// endpoint's own clock timed; what it can do is choose any point of that
+/// interval, on every acknowledgement, forever.
 ///
-/// It is a free function rather than a method because both consumers of an
-/// acknowledgement need it and neither may reach its own conclusion: the
-/// estimator feeds `min_rtt`, which sizes the congestion window, and the data
-/// pump publishes the same figure to the per-path RTT gauge an operator reads.
-/// Two subtractions written separately is exactly how the gauge came to accept
-/// a subtraction the window already refused.
-pub fn ack_delay_adjusted_rtt(
+/// "Forever" is not a figure of speech, and it is the part a reader is most
+/// likely to assume away. A sample landing exactly on the floor does not merely
+/// fail to lower it: `WindowFilter::update_min` back-pops every entry at or
+/// above the new value — the incumbent minimum included, since the comparison is
+/// `>=` — and pushes the new pair with the current timestamp. The floor is
+/// therefore re-dated by the very sample that ties it, so the ten-second window
+/// whose job is to let `min_rtt` rise when the path degrades never expires it.
+///
+/// For the minimum filter itself that residue is tolerable: the peer's best play
+/// is to keep the minimum where it is, which is also what reporting nothing
+/// would achieve, and a `min_rtt` held low only shrinks `cwnd = 2 × btl_bw ×
+/// min_rtt`. It is a peer conceding bandwidth to itself, not taking any. For a
+/// gauge reporting the *latest* round trip it is a real limitation and belongs
+/// in the operator's hands rather than in a footnote: a peer claiming
+/// `latest_rtt - rtt_floor` every time pins the published reading at the best
+/// round trip the path ever had and hides every degradation since.
+///
+/// One acknowledgement has two consumers — `min_rtt`, which sizes the
+/// congestion window, and the per-path RTT gauge an operator reads — and this
+/// is called exactly once for the pair, from [`BandwidthEstimator::on_ack`],
+/// which hands the result back for the gauge to publish. It is a free function
+/// so that the arithmetic can be stated and tested without a clock or an
+/// estimator, but the single call site is the load-bearing part: two
+/// subtractions written separately is exactly how the gauge came to accept one
+/// the window already refused, and giving the gauge its own call to this
+/// function would only have made the two agree until the next edit.
+pub(crate) fn ack_delay_adjusted_rtt(
     latest_rtt: Duration,
     rtt_floor: Option<Duration>,
     ack_delay_us: u64,
 ) -> Duration {
-    let observed_us = u64::try_from(latest_rtt.as_micros()).unwrap_or(u64::MAX);
-    let ack_delay = Duration::from_micros(ack_delay_us.min(observed_us));
+    let ack_delay = Duration::from_micros(ack_delay_us);
 
     match rtt_floor {
         // No round trip has been timed yet, so there is no measurement to
@@ -550,8 +580,18 @@ impl BandwidthEstimator {
 
     /// Process an ACK and update bandwidth estimates.
     ///
-    /// Returns the new recommended pacing rate (bytes/sec).
-    pub fn on_ack(&mut self, sample: DeliverySample) -> u64 {
+    /// Returns the new recommended pacing rate (bytes/sec) and the RTT sample
+    /// this acknowledgement yielded — the round trip this endpoint timed, less
+    /// as much of the peer's claimed ack delay as the `ack_delay_adjusted_rtt`
+    /// guard permits (RFC 9002 §5.2/§5.3). The sample is handed back rather than
+    /// left for a caller to reconstruct because the floor bounding it lives
+    /// behind the same lock as the filter: fetching that floor separately meant
+    /// a second acquisition per retired segment, and a cumulative
+    /// acknowledgement retires a whole flight at once. It is also the only way
+    /// the figure stays *one* figure — the per-path RTT gauge publishes exactly
+    /// what the filter was offered, and two subtractions written separately is
+    /// how the gauge came to accept one the window already refused.
+    pub fn on_ack(&mut self, sample: DeliverySample) -> (u64, Duration) {
         let now = sample.acked_at;
 
         // Update inflight tracking
@@ -728,8 +768,9 @@ impl BandwidthEstimator {
         // Run state machine
         self.update_state(now, sample.is_app_limited);
 
-        // Return pacing rate
-        self.pacing_rate()
+        // Return pacing rate, and the sample the filter above was offered — the
+        // one figure this acknowledgement is worth, reached once.
+        (self.pacing_rate(), adjusted_rtt)
     }
 
     /// Notify a packet loss — BBRv2/v3's `BBRHandleLostPacket`.
@@ -896,7 +937,12 @@ impl BandwidthEstimator {
     /// distinction is the whole point: handing out the placeholder as though it
     /// were a measurement would give a peer a number to subtract down to before
     /// any measurement existed.
-    pub fn rtt_floor(&self) -> Option<Duration> {
+    ///
+    /// The filter is seeded only from a sample of at least one microsecond
+    /// (`on_ack`, at the `rtt_us > 0` gate), so a returned `Some` is never zero
+    /// — which is what lets the guard above carry a single comparison instead of
+    /// a second one against the round trip.
+    pub(crate) fn rtt_floor(&self) -> Option<Duration> {
         self.rtt_filter_seeded.then_some(self.min_rtt)
     }
 
@@ -1673,13 +1719,15 @@ mod tests {
     /// own and without a clock.
     ///
     /// `ack_delay_adjusted_rtt` is called from two places — the min-RTT filter
-    /// here and the per-path RTT gauge in the data pump — and the property both
-    /// rely on is a single sentence: once this endpoint has timed a round trip,
-    /// no value the peer can put in `Sack::ack_delay_us` returns a sample below
-    /// that floor. The sweep below is exhaustive in spirit rather than in
-    /// number: it walks the delay from nothing, through the honest range, past
-    /// the whole round trip, to `u64::MAX`, which is where the arithmetic would
-    /// wrap or saturate to zero if either bound were dropped.
+    /// here and, by way of the sample `on_ack` hands back, the per-path RTT
+    /// gauge in the data pump — and the property both rely on is a single
+    /// sentence: once this endpoint has timed a round trip, no value the peer
+    /// can put in `Sack::ack_delay_us` returns a sample below that floor. The
+    /// sweep below is exhaustive in spirit rather than in number: it walks the
+    /// delay from nothing, through the honest range, past the whole round trip,
+    /// to `u64::MAX`, which is where the arithmetic would wrap or saturate to
+    /// zero if the comparison against the floor were dropped or written as a
+    /// subtraction.
     ///
     /// The companion half is that an honest delay is still subtracted — a guard
     /// that simply ignored the field would pass the bound above and quietly
@@ -1731,6 +1779,69 @@ mod tests {
             ack_delay_adjusted_rtt(latest, None, u64::MAX),
             latest,
             "the first sample must be the round trip this endpoint observed"
+        );
+    }
+
+    /// The premise the guard above rests on, pinned separately from the guard.
+    ///
+    /// `ack_delay_adjusted_rtt` carries one comparison, and one is enough only
+    /// because a floor it is handed is never zero: at a zero floor the test
+    /// `latest_rtt >= 0 + ack_delay` admits any claim up to the whole round trip
+    /// and the sample lands on zero — the outcome the floor exists to prevent.
+    /// Nothing in the function can see that, so the property lives here, where
+    /// the floor is made.
+    ///
+    /// Two ways an acknowledgement could produce one, and both are exercised: a
+    /// round trip that measures under a microsecond, which is ordinary on
+    /// loopback, and one that measures exactly nothing, which two clock readings
+    /// in the same tick give. The `rtt_us > 0` gate in `on_ack` is what refuses
+    /// both, so this fails the moment that gate is relaxed — including by
+    /// someone who has just proved to their own satisfaction that a zero sample
+    /// is harmless to a minimum filter, which it is, and who has no reason to be
+    /// looking at a subtraction in the observability path.
+    #[test]
+    fn a_sub_microsecond_round_trip_does_not_seed_a_zero_floor() {
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+
+        assert_eq!(
+            est.rtt_floor(),
+            None,
+            "an estimator that has acknowledged nothing has timed no round trip"
+        );
+
+        for elapsed in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_nanos(999),
+        ] {
+            est.on_send(1200);
+            est.on_ack(DeliverySample {
+                delivered_bytes: 0,
+                delivered_at: start,
+                sent_at: start,
+                acked_at: start + elapsed,
+                packet_bytes: 1200,
+                is_app_limited: false,
+                ack_delay_us: 0,
+                rtt_sampled: true,
+            });
+            assert_eq!(
+                est.rtt_floor(),
+                None,
+                "a round trip of {elapsed:?} rounds to zero microseconds and must leave the \
+                 filter unseeded — a zero floor is a floor that bounds nothing"
+            );
+        }
+
+        // And once a round trip does measure, the floor it publishes is that
+        // measurement rather than the opening guess.
+        est.on_send(1200);
+        est.on_ack(make_sample(start, 50, 1200));
+        assert_eq!(
+            est.rtt_floor(),
+            Some(Duration::from_millis(50)),
+            "the first sample of at least a microsecond must seed the filter with itself"
         );
     }
 

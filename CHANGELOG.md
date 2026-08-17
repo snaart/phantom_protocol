@@ -127,6 +127,24 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Changed
 
+- **`BandwidthEstimator::on_ack` and `Session::on_packet_acked` now hand back the RTT sample
+  the acknowledgement produced.** `on_ack` returns `(u64, Duration)` where it returned the
+  pacing rate alone, and `on_packet_acked` returns that `Duration` where it returned a
+  bandwidth figure no caller in the tree read. The sample is the locally timed round trip less
+  as much of the peer's claimed `Sack::ack_delay_us` as RFC 9002 §5.2/§5.3 permits, and the
+  per-path RTT gauge now publishes exactly it.
+
+  Two reasons, one of each kind. The correctness one: the gauge previously re-derived the
+  figure at its own call site, and two subtractions written separately is how the gauge came
+  to accept one the congestion window already refused. The cost one: the floor that bounds the
+  subtraction lives behind the estimator's mutex, so fetching it from the gauge's side meant a
+  second acquisition for every segment retired — and a cumulative SACK retires a whole flight
+  in a loop, so the price was 2N acquisitions where N is right. Handing the conclusion back
+  from the acquisition that already holds the lock settles both at once. The helper the two
+  call sites share, `ack_delay_adjusted_rtt`, and the floor accessor `rtt_floor` are
+  deliberately `pub(crate)`: both call sites are in-crate, and a bound of this shape has no
+  meaning outside the estimator that supplies the floor.
+
 - **`transport::{compression, fallback, scheduler, packet_coalescer}` stay public and now say
   on their first documented line that nothing calls them.** These four are exported, compiled
   and tested, and no send or receive path reaches any of them; `PacketFlags::COMPRESSED` is set

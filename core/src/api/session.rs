@@ -3025,11 +3025,20 @@ async fn drain_streams_fully<T: SessionTransport>(
 ///
 /// This is also the RTT-sampling site: the propagation figure the estimator
 /// folds into its `min_rtt` filter is published to `Observability::record_rtt_us`
-/// for `path_id`. Literally the same figure — both go through
-/// [`ack_delay_adjusted_rtt`](crate::transport::bandwidth_estimator::ack_delay_adjusted_rtt),
-/// which bounds what the peer's claimed delay may subtract, so the gauge an
-/// operator reads cannot be talked below a round trip this endpoint timed
-/// itself. `sampled_rtt` is Karn's
+/// for `path_id`. Literally the same figure — the estimator hands it back from
+/// [`Session::on_packet_acked`](crate::transport::session::Session::on_packet_acked)
+/// rather than the gauge re-deriving it, and it carries
+/// [`ack_delay_adjusted_rtt`](crate::transport::bandwidth_estimator::ack_delay_adjusted_rtt)'s
+/// bound on the peer's claimed delay. That bound is a floor and nothing more:
+/// the published sample never falls below a round trip this endpoint timed
+/// itself, but between that floor and the round trip just observed the peer's
+/// claim still chooses, so a peer claiming the whole difference every time keeps
+/// the gauge pinned at the path's best-ever reading. That caveat has to travel
+/// with the number rather than sit here, because the slot has two readers and
+/// neither passes through this file: `MetricsSnapshotFfi::rtt_us_path_0` in
+/// `observability::snapshot`, and the `phantom.path.rtt` `ObservableGauge`
+/// callback in `observability::bridge` under `telemetry-otel`. Both are
+/// documented in `docs/observability/metrics-catalog.md`. `sampled_rtt` is Karn's
 /// condition and gates **both** consumers — pass `false` for a retransmitted
 /// segment so the per-path RTT gauge and the estimator's min-RTT filter obey
 /// Karn's algorithm exactly like `Stream`'s own srtt (an ACK for a retransmit is
@@ -3057,36 +3066,6 @@ fn feed_bbr_on_ack(
 ) {
     let acked_at = std::time::Instant::now();
     let sent_at_std = sent_at.into_std();
-    if sampled_rtt {
-        // The peer's claimed ack delay is subtracted through the *same* guard
-        // the estimator's min-RTT filter applies — the session's own timed floor
-        // is fetched and handed to the shared
-        // [`ack_delay_adjusted_rtt`](crate::transport::bandwidth_estimator::ack_delay_adjusted_rtt),
-        // so the figure published here and the figure fed to the filter below
-        // are one number reached once.
-        //
-        // Subtracting it here on its own terms, which is what this used to do,
-        // made the gauge say whatever the peer wanted. Nothing in the control
-        // loop reads it, so that was never a safety problem — but an operator
-        // judging a path by `MetricsSnapshotFfi::rtt_us_path_0` could not tell
-        // "the path got faster" from "the peer claimed a long ack delay", and a
-        // claim past the whole round trip drove the reading to zero, where the
-        // guard below then discarded it and left the last honest sample
-        // standing. A metric a remote party can dictate is worse than no metric.
-        let rtt_us = crate::transport::bandwidth_estimator::ack_delay_adjusted_rtt(
-            acked_at.saturating_duration_since(sent_at_std),
-            crypto_session.rtt_floor(),
-            ack_delay_us,
-        )
-        .as_micros() as u64;
-        // A zero sample carries no information for a "last observed RTT" gauge,
-        // so it is skipped; after the guard above it means the two clock
-        // readings landed in the same microsecond, not that a peer talked the
-        // sample down.
-        if rtt_us > 0 {
-            observability.record_rtt_us(rtt_us, path_id);
-        }
-    }
     let sample = crate::transport::bandwidth_estimator::DeliverySample {
         // The connection's delivered counter when this segment went out. The
         // estimator subtracts it from the current total to get the bytes
@@ -3115,7 +3094,30 @@ fn feed_bbr_on_ack(
         // so the elapsed time to this acknowledgement is not a round trip.
         rtt_sampled: sampled_rtt,
     };
-    let _ = crypto_session.on_packet_acked(sample);
+    // The gauge publishes what the estimator concluded, not a second opinion.
+    // The peer's claimed ack delay is a number nobody here measured, and the
+    // estimator subtracts it only as far as the round trip this endpoint has
+    // already timed allows (RFC 9002 §5.3, in `ack_delay_adjusted_rtt`).
+    // Subtracting it again here on its own terms, which is what this used to do,
+    // made the gauge say whatever the peer wanted: an operator judging a path by
+    // `MetricsSnapshotFfi::rtt_us_path_0` or the `phantom.path.rtt` OTel gauge
+    // could not tell "the path got faster" from "the peer claimed a long ack
+    // delay", and a claim past the whole round trip drove the reading to zero,
+    // where the guard below then discarded it and left the last honest sample
+    // standing. Nothing in the control loop reads the gauge, so this was never a
+    // safety problem — but a metric a remote party can dictate is worse than no
+    // metric.
+    let rtt_sample = crypto_session.on_packet_acked(sample);
+    if sampled_rtt {
+        let rtt_us = rtt_sample.as_micros() as u64;
+        // A zero sample carries no information for a "last observed RTT" gauge,
+        // so it is skipped; under the bound above it means the two clock
+        // readings landed in the same microsecond, not that a peer talked the
+        // sample down.
+        if rtt_us > 0 {
+            observability.record_rtt_us(rtt_us, path_id);
+        }
+    }
 }
 
 /// Anti-fingerprint send-timing jitter (WIRE v6): when enabled,
@@ -9050,6 +9052,182 @@ mod tests {
              the {} µs this endpoint measured itself; got {} µs",
             observed_floor.as_micros(),
             published
+        );
+    }
+
+    /// The same guard, on the arm this endpoint spends its life in.
+    ///
+    /// The test above acknowledges the *first* segment of the session, so the
+    /// estimator's minimum filter is still unseeded and the guard's "no local
+    /// measurement to protect yet" arm ignores the peer's claim wholesale. That
+    /// arm is indistinguishable from having no guard at all — both publish the
+    /// raw locally timed round trip — so it cannot show that the guard is wired
+    /// into the pump. Every acknowledgement after the first takes the other arm,
+    /// where the claim *is* subtracted and only the floor bounds it, and that is
+    /// the arm an operator's gauge actually rides on.
+    ///
+    /// So: seed the filter with a short round trip, then let a much longer one
+    /// arrive carrying a claim the guard must subtract in full. What the gauge
+    /// publishes is then the endpoint's own round trip less exactly that claim,
+    /// which the wall time this test measures around the exchange bounds from
+    /// above — arithmetic rather than a tuned constant, and never below the
+    /// floor already timed.
+    ///
+    /// The claim is *derived* from the two clock readings rather than fixed,
+    /// which is what keeps the arm under test from moving. Half the headroom
+    /// between the floor and a round trip already known to have elapsed is a
+    /// claim §5.3 must subtract whole, whatever a loaded machine did to either
+    /// sleep. A constant chosen against the sleeps instead would quietly slide
+    /// the test onto the *other* arm the moment the seeding round trip
+    /// overshot — where it would fail while nothing was wrong.
+    #[tokio::test]
+    async fn a_seeded_paths_gauge_bounds_what_a_peers_ack_delay_subtracts() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        // Round one: an honest acknowledgement, claiming no delay, whose only
+        // job is to give the estimator a round trip it timed itself. What the
+        // gauge publishes for it is that same figure, which is therefore the
+        // floor every later sample is measured against.
+        let (_seed_stream, seed_streams, seed_seq) = staged_pending_segment().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let seed_frame = build_encrypted_ack(&client_session, session_id, stream_id, 501, seed_seq);
+        let seed_pkt = decode_recv_frame(&seed_frame, session_id);
+        let seeded = run_recv(seed_pkt, session_id, &server_session, &seed_streams).await;
+        let floor_us = seeded.snapshot().rtt_us_path_0;
+        assert!(
+            floor_us > 0,
+            "the seeding acknowledgement must leave the estimator with a timed round trip"
+        );
+
+        // Round two, on the same session and so against that floor.
+        let round_started = std::time::Instant::now();
+        let (_stream, streams, seq) = staged_pending_segment().await;
+        // Taken once the segment is staged, so the send stamp the pump measures
+        // from is at or before this reading.
+        let staged_at = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // The acknowledgement has not been handled yet, so the round trip the
+        // pump will time is at least this wide.
+        let at_least_us = staged_at.elapsed().as_micros() as u64;
+        let claimed_delay_us = at_least_us.saturating_sub(floor_us) / 2;
+        assert!(
+            claimed_delay_us > 0,
+            "the second round trip ({at_least_us} µs) must leave headroom above the \
+             {floor_us} µs floor for a claim the guard is obliged to subtract"
+        );
+        let claimed_delay_field =
+            u32::try_from(claimed_delay_us).expect("claim fits the wire field");
+        let sack = crate::transport::sack::Sack::from_received(&[seq], claimed_delay_field)
+            .expect("single-seq sack")
+            .to_wire();
+        let frame =
+            build_encrypted_ack_with_payload(&client_session, session_id, stream_id, 502, &sack);
+        let ack_pkt = decode_recv_frame(&frame, session_id);
+        let obs = run_recv(ack_pkt, session_id, &server_session, &streams).await;
+        // Measured after the exchange and around all of it, so it strictly
+        // contains the interval the pump timed internally.
+        let round_span_us = round_started.elapsed().as_micros() as u64;
+
+        let published = obs.snapshot().rtt_us_path_0;
+        assert!(
+            published.saturating_add(claimed_delay_us) <= round_span_us,
+            "the gauge published {published} µs for a round trip of at most {round_span_us} µs \
+             while the peer claimed {claimed_delay_us} µs of ack delay — the claim was not \
+             subtracted, so the pump is not applying the estimator's bound at all"
+        );
+        assert!(
+            published >= floor_us,
+            "the gauge published {published} µs, below the {floor_us} µs round trip this \
+             endpoint had already timed itself"
+        );
+    }
+
+    /// The other half of the seeded arm: the subtraction stops at the floor.
+    ///
+    /// The test above shows an honest claim reaching the gauge; this one shows a
+    /// dishonest one being refused, on the same arm. The distinction matters
+    /// because the two failures look nothing alike from the pump's side — a
+    /// guard that subtracts nothing and a guard that subtracts everything both
+    /// publish a plausible number — and only one existing test covers the
+    /// refusal, on the *unseeded* arm, where the claim is ignored wholesale for
+    /// a different reason (RFC 9002 §5.2's first-sample rule) and no floor is
+    /// consulted at all. An endpoint spends one acknowledgement there and the
+    /// rest of its life here.
+    ///
+    /// So: seed the filter, then claim an ack delay of an hour on a round trip
+    /// of tens of milliseconds. §5.3 permits a subtraction only where the
+    /// remainder stays at or above the floor, and no part of an hour does, so
+    /// the whole claim is dropped and the endpoint's own round trip stands.
+    /// Subtracting it regardless — what this call site used to do on its own
+    /// terms — saturates the reading at zero, where the pump's zero guard
+    /// discards it and the gauge reports nothing at all for the path. A fresh
+    /// `Observability` per acknowledgement is what makes that visible rather
+    /// than leaving the previous honest sample standing in the slot.
+    ///
+    /// What the published figure is checked against is the endpoint's own round
+    /// trip, bracketed from both sides by clock readings this test takes around
+    /// the exchange: the interval from the segment being staged to just before
+    /// the acknowledgement is handled sits strictly inside the interval the pump
+    /// times, which in turn sits inside the span measured around the whole
+    /// round. No constant is tuned, so neither a fast machine nor a stalled one
+    /// can move the verdict. Note that the *seeding* sample is deliberately not
+    /// the reference: the floor is a minimum, and a later round trip is free to
+    /// come in under an earlier one and become the new minimum.
+    #[tokio::test]
+    async fn a_seeded_paths_gauge_refuses_a_claim_that_would_undercut_the_floor() {
+        // An hour, in a field that is a u32 of microseconds — beyond any round
+        // trip a loopback test can produce, so no scheduling delay can turn this
+        // into a claim the floor would legitimately accommodate.
+        const CLAIMED_DELAY_US: u64 = 3_600_000_000;
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let stream_id: TransportStreamId = 1;
+
+        // Round one seeds the estimator's minimum filter, exactly as above.
+        let (_seed_stream, seed_streams, seed_seq) = staged_pending_segment().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let seed_frame = build_encrypted_ack(&client_session, session_id, stream_id, 601, seed_seq);
+        let seed_pkt = decode_recv_frame(&seed_frame, session_id);
+        let seeded = run_recv(seed_pkt, session_id, &server_session, &seed_streams).await;
+        assert!(
+            seeded.snapshot().rtt_us_path_0 > 0,
+            "the seeding acknowledgement must leave the estimator with a timed round trip"
+        );
+
+        // Round two carries the impossible claim.
+        let round_started = std::time::Instant::now();
+        let (_stream, streams, seq) = staged_pending_segment().await;
+        // Taken once the segment is staged, so the send stamp the pump measures
+        // from is at or before this reading.
+        let staged_at = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let sack = crate::transport::sack::Sack::from_received(&[seq], CLAIMED_DELAY_US as u32)
+            .expect("single-seq sack")
+            .to_wire();
+        let frame =
+            build_encrypted_ack_with_payload(&client_session, session_id, stream_id, 602, &sack);
+        let ack_pkt = decode_recv_frame(&frame, session_id);
+        // Taken before the acknowledgement is handled, so the pump's own
+        // acknowledgement stamp is at or after this reading: the round trip it
+        // times is at least this wide.
+        let at_least_us = staged_at.elapsed().as_micros() as u64;
+        let obs = run_recv(ack_pkt, session_id, &server_session, &streams).await;
+        let at_most_us = round_started.elapsed().as_micros() as u64;
+
+        let published = obs.snapshot().rtt_us_path_0;
+        assert!(
+            published >= at_least_us,
+            "the gauge published {published} µs for an acknowledgement claiming \
+             {CLAIMED_DELAY_US} µs of ack delay, below the {at_least_us} µs this endpoint's \
+             own clock had already run — the claim was subtracted with nothing bounding it \
+             (a published 0 means the subtraction reached zero and the sample was discarded, \
+             leaving the path with no reading at all)"
+        );
+        assert!(
+            published <= at_most_us,
+            "the gauge published {published} µs for a round trip of at most {at_most_us} µs"
         );
     }
 
