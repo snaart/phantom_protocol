@@ -272,8 +272,8 @@ security invariants are catalogued in
   `ClientHello` (with the optional 0-RTT `early_data` blob folded in) and three
   server replies — `ServerHello`, `HelloRetryRequest`, `ServerReject` — carried
   under a one-byte-discriminant `ServerReply` wrapper; one signed
-  `HandshakeTranscript` leads with `protocol_variant`. `WIRE_VERSION` is `6`
-  (`PROTOCOL_VERSION` is `3`); both pinned bytes are tamper-check anchors and a
+  `HandshakeTranscript` leads with `protocol_variant`. `WIRE_VERSION` is `7`
+  (`PROTOCOL_VERSION` is `4`); both pinned bytes are tamper-check anchors and a
   hook for a future deliberate bump.
 - **Path validation (wired into the live UDP data plane).** `PathRegistry` +
   constant-time challenge/response; path 0 pre-validated, secondary paths
@@ -288,7 +288,7 @@ security invariants are catalogued in
 Reference numbers on **Apple M1 Pro (8P + 2E, 16 GiB), macOS 26.0, rustc 1.93.0,
 `ring` with ARMv8 AES-PMULL** (snapshot 2026-05-17, criterion `--quick`, default
 `target-cpu`). The snapshot predates the current wire — it was captured under
-`WIRE_VERSION = 2`, whereas the shipped format is `WIRE_VERSION = 6` — so the
+`WIRE_VERSION = 2`, whereas the shipped format is `WIRE_VERSION = 7` — so the
 crypto / throughput shape is representative but re-capture before quoting these
 as live figures (see [`BENCHMARKS.md`](BENCHMARKS.md)):
 

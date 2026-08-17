@@ -188,3 +188,54 @@ pub use api::session::{
 // Python / C bindings) see the historical surface unchanged.
 #[cfg(feature = "bindings")]
 uniffi::setup_scaffolding!();
+
+#[cfg(test)]
+mod readme_version_claims {
+    use crate::transport::{handshake::PROTOCOL_VERSION, types::WIRE_VERSION};
+
+    /// The README included above is the docs.rs landing page, and it states both
+    /// pinned version bytes in prose. Prose does not move when a constant does, so
+    /// the two drift apart silently and the drift is invisible to every other test
+    /// in the tree: the wire vectors pin bytes, not sentences.
+    ///
+    /// The check is deliberately keyed on the *claim shapes* rather than on the bare
+    /// constant name, because the README also names an earlier wire version for a
+    /// legitimate reason — the reference benchmark snapshot was captured under one,
+    /// and saying so is what keeps those figures from being read as current. A scan
+    /// that merely forbade every digit but the current one would have to be defeated
+    /// there, which is how a drift gate turns into a gate nobody may fix.
+    ///
+    /// Each claim shape is required to occur at least once, so deleting the sentence
+    /// is not a way to pass.
+    fn assert_claim(readme: &str, prefix: &str, expected: u8) {
+        let mut seen = 0usize;
+        let mut rest = readme;
+        while let Some(at) = rest.find(prefix) {
+            rest = &rest[at + prefix.len()..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            let claimed: &str = &rest[..end];
+            assert_eq!(
+                claimed,
+                expected.to_string(),
+                "README claims \"{prefix}{claimed}\" but the code pins {expected}"
+            );
+            seen += 1;
+        }
+        assert!(seen > 0, "README no longer states \"{prefix}…\" at all");
+    }
+
+    #[test]
+    fn readme_states_the_shipped_wire_and_protocol_versions() {
+        const README: &str = include_str!("../../README.md");
+
+        assert_claim(README, "`WIRE_VERSION` is `", WIRE_VERSION);
+        assert_claim(README, "`PROTOCOL_VERSION` is `", PROTOCOL_VERSION);
+        assert_claim(
+            README,
+            "the shipped format is `WIRE_VERSION = ",
+            WIRE_VERSION,
+        );
+    }
+}

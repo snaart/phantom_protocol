@@ -248,8 +248,8 @@ server detects a vanished client symmetrically.
 - **Stream layer:** the gap-free per-stream `u32` `stream_offset` in the reliable AEAD
   plaintext — feeds reassembly, SACK, loss detection, retransmit dedup.
 
-> Migration is now **unlinkable in both directions** for a move by *either* peer: WIRE v6
-> header protection masks the whole 15-byte header (the `version` byte included), the inner
+> Migration is now **unlinkable in both directions** for a move by *either* peer: header
+> protection masks the whole 15-byte header (the `version` byte included), the inner
 > 32-byte `session_id` left the wire, and the routing `ConnId` **rotates** per migration
 > (the ε / A2a work — EPS-02 closed). The honest residual: the HP keys and CID chain are
 > session-stable (not forward-secret), so a session-key compromise can link a *recorded*
@@ -345,7 +345,7 @@ are now wiped (T5.1), closing the former audit gap.
   `MimicTlsLeg` / `bind_mimic` / `connect_pinned_mimic` — a framing-only, anti-DPI-only
   outer wrapper detectable by active probing; see PROTOCOL.md § 9.1.)*
 
-The inner `PhantomPacket` wire image (WIRE v6) is one bare packet, `header(15) ‖ payload`
+The inner `PhantomPacket` wire image is one bare packet, `header(15) ‖ payload`
 — there are **no** cleartext length prefixes (the v5 `payload_len` / `ext_len` `u32`
 prefixes were dropped as a structural fingerprint, and `extensions` is off the data-plane
 wire). The 47-byte figure is the reconstructed **AEAD AAD image** only, not the on-wire
@@ -377,7 +377,7 @@ A wrong-key / wrong-AAD / wrong-PN failure all surface as a single opaque "decry
 
 Per-packet wire overhead is **31 bytes** (the 15-byte on-wire header + the 16-byte AEAD
 tag) — the 32-byte `session_id` is **off the wire** (AAD only, reconstructed from session
-context) and there are **no** cleartext length prefixes (WIRE v6, § 8). The
+context) and there are **no** cleartext length prefixes (dropped in WIRE v6, § 8). The
 header-protection phase that delivered this — QUIC-style header masking, the rotating CID
 chain, and the wire diet — is **shipped**, not future (PROTOCOL.md § 4.2 / § 4.6 / § 4.7).
 
