@@ -615,9 +615,17 @@ Both ends count the same quantity in the same units, which is what lets the numb
 compared without either end inferring the other's state: the sender counts every reliable
 application byte it puts on the wire, counting each byte **once** — a retransmission is not
 counted again, and a first transmission that the transport refused (so those bytes never
-left) is subtracted back — and the receiver counts every byte it has delivered to its
-application. A sender MUST NOT transmit a byte whose position in that count would exceed
-the highest limit it has received.
+left) is subtracted back — and the receiver counts every **reliable** byte it has delivered
+to its application. A sender MUST NOT transmit a byte whose position in that count would
+exceed the highest limit it has received.
+
+Unreliable data is outside this count on both ends, and has to be: a sender does not consult
+the window before emitting it — nothing retransmits it, so no window could hold it back — and
+a receiver that counted it would advertise a limit running ahead of the total its peer keeps
+by exactly the unreliable volume. The consequence is not a lost byte but a lost promise: the
+advertisement of a conforming peer would then be cut down by the local ceiling below, which
+exists for a peer inventing numbers. Unreliable bytes are still delivered and still bounded,
+by the receiver's own delivery backlog rather than by this window.
 
 Three properties follow from the value being a monotone total rather than an increment, and
 between them they are why this frame is never acknowledged and never retransmitted. A

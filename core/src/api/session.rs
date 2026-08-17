@@ -1475,11 +1475,17 @@ fn duration_ns(started: std::time::Instant) -> u64 {
 /// ordered after any data frames for the same stream, and lets the delivery task
 /// dispatch without a separate close channel.
 enum DeliverItem {
-    /// Inbound data payload `(stream_id, bytes)`. The reader adds
+    /// Inbound data payload `(stream_id, bytes, reliable)`. The reader adds
     /// [`delivery_charge`] to `undelivered_bytes` on enqueue; the delivery task
     /// subtracts the same figure once the frame is forwarded to a bounded
     /// downstream channel.
-    Data(u32, Bytes),
+    ///
+    /// The third field says which path the bytes arrived on, and it is carried this
+    /// far because only the reader knows it and only the delivery task can act on it:
+    /// flow control counts reliable bytes and nothing else, since those are the only
+    /// ones the sending end charged against the window. Delivery, ordering and the
+    /// backlog charge treat both alike.
+    Data(u32, Bytes, bool),
     /// Peer sent FIN on `stream_id`. Ordered after any `Data` items already
     /// queued for that stream so the consumer sees EOF last.
     Close(u32),
@@ -1826,7 +1832,7 @@ async fn run_data_pump<T: SessionTransport>(
     // tasks are future work. The raw-app path is NOT affected.
 
     // Downstream UNBOUNDED channels (the Router → Tasks A/B paths never block).
-    let (raw_deliver_tx, mut raw_deliver_rx) = mpsc::unbounded_channel::<Bytes>();
+    let (raw_deliver_tx, mut raw_deliver_rx) = mpsc::unbounded_channel::<(Bytes, bool)>();
     let (streams_deliver_tx, mut streams_deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
 
     let undelivered_bytes = Arc::new(AtomicU64::new(0));
@@ -1838,7 +1844,7 @@ async fn run_data_pump<T: SessionTransport>(
         let crypto_a = crypto_session.clone();
         let undelivered_a = undelivered_bytes.clone();
         runtime.spawn(Box::pin(async move {
-            while let Some(bytes) = raw_deliver_rx.recv().await {
+            while let Some((bytes, reliable)) = raw_deliver_rx.recv().await {
                 let len = bytes.len() as u64;
                 // Decrement backlog counter before the blocking send — see comment
                 // on `undelivered_bytes` above. The figure released is the one the
@@ -1846,7 +1852,7 @@ async fn run_data_pump<T: SessionTransport>(
                 undelivered_a.fetch_sub(delivery_charge(bytes.len()), Ordering::AcqRel);
                 // Credit the flow-control window for the raw-app stream (id 1).
                 if let Some(stream) = streams_a.get(&RAW_APP_STREAM_ID) {
-                    if let Some(limit) = stream.record_app_consumed(len as u32) {
+                    if let Some(limit) = stream.record_app_consumed(len as u32, reliable) {
                         stream.stage_window_update_limit(limit);
                         crypto_a.notify_outbound_ready();
                     }
@@ -1869,12 +1875,12 @@ async fn run_data_pump<T: SessionTransport>(
         runtime.spawn(Box::pin(async move {
             while let Some(item) = streams_deliver_rx.recv().await {
                 match item {
-                    DeliverItem::Data(stream_id, bytes) => {
+                    DeliverItem::Data(stream_id, bytes, reliable) => {
                         let len = bytes.len() as u64;
                         undelivered_b.fetch_sub(delivery_charge(bytes.len()), Ordering::AcqRel);
                         // Credit flow-control for this opened stream.
                         if let Some(stream) = streams_b.get(&stream_id) {
-                            if let Some(limit) = stream.record_app_consumed(len as u32) {
+                            if let Some(limit) = stream.record_app_consumed(len as u32, reliable) {
                                 stream.stage_window_update_limit(limit);
                                 crypto_b.notify_outbound_ready();
                             }
@@ -1916,12 +1922,13 @@ async fn run_data_pump<T: SessionTransport>(
         runtime.spawn(Box::pin(async move {
             while let Some(item) = deliver_router_rx.recv().await {
                 match item {
-                    DeliverItem::Data(stream_id, bytes) => {
+                    DeliverItem::Data(stream_id, bytes, reliable) => {
                         if stream_id <= RAW_APP_STREAM_ID {
                             // UNBOUNDED → never blocks; error only if Task A dropped.
-                            let _ = raw_tx_r.send(bytes);
+                            let _ = raw_tx_r.send((bytes, reliable));
                         } else {
-                            let _ = streams_tx_r.send(DeliverItem::Data(stream_id, bytes));
+                            let _ =
+                                streams_tx_r.send(DeliverItem::Data(stream_id, bytes, reliable));
                         }
                     }
                     DeliverItem::Close(stream_id) => {
@@ -4429,7 +4436,7 @@ async fn handle_packet<T: SessionTransport>(
     if !plaintext.is_empty() {
         let charge = delivery_charge(plaintext.len());
         if deliver_tx
-            .send(DeliverItem::Data(stream_id, Bytes::from(plaintext)))
+            .send(DeliverItem::Data(stream_id, Bytes::from(plaintext), false))
             .is_ok()
         {
             undelivered_bytes.fetch_add(charge, Ordering::AcqRel);
@@ -4460,7 +4467,10 @@ fn deliver_in_order_run(
             continue;
         }
         let charge = delivery_charge(chunk.len());
-        if deliver_tx.send(DeliverItem::Data(stream_id, chunk)).is_ok() {
+        if deliver_tx
+            .send(DeliverItem::Data(stream_id, chunk, true))
+            .is_ok()
+        {
             undelivered_bytes.fetch_add(charge, Ordering::AcqRel);
         }
     }
@@ -7608,7 +7618,7 @@ mod tests {
         // tagged with its stream id, and counted toward the undelivered backlog.
         let item = deliver_rx.recv().await.expect("delivery hand-off");
         let (sid, received) = match item {
-            DeliverItem::Data(sid, bytes) => (sid, bytes),
+            DeliverItem::Data(sid, bytes, _) => (sid, bytes),
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) in deliver channel"),
         };
         assert_eq!(sid, stream_id as u32);
@@ -8422,7 +8432,7 @@ mod tests {
             .expect("recv-relax must deliver promptly (no drop / hang)")
             .expect("delivery channel open");
         let (sid, received) = match item {
-            DeliverItem::Data(sid, bytes) => (sid, bytes),
+            DeliverItem::Data(sid, bytes, _) => (sid, bytes),
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) in deliver channel"),
         };
         assert_eq!(sid, stream_id as u32);
@@ -9559,15 +9569,15 @@ mod tests {
         // delivery channel, every one tagged with the outer stream id, and the
         // total counted toward the undelivered backlog.
         let (sa, a) = match deliver_rx.recv().await.expect("alpha") {
-            DeliverItem::Data(sid, bytes) => (sid, bytes),
+            DeliverItem::Data(sid, bytes, _) => (sid, bytes),
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) for alpha"),
         };
         let (sb, b) = match deliver_rx.recv().await.expect("bravo") {
-            DeliverItem::Data(sid, bytes) => (sid, bytes),
+            DeliverItem::Data(sid, bytes, _) => (sid, bytes),
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) for bravo"),
         };
         let (sc, c) = match deliver_rx.recv().await.expect("charlie") {
-            DeliverItem::Data(sid, bytes) => (sid, bytes),
+            DeliverItem::Data(sid, bytes, _) => (sid, bytes),
             DeliverItem::Close(sid) => panic!("unexpected Close({sid}) for charlie"),
         };
         assert_eq!(
@@ -9754,7 +9764,7 @@ mod tests {
         // Drain the FIFO delivery channel — order must be exactly A, B, C, D.
         let mut got: Vec<Bytes> = Vec::new();
         while let Ok(item) = deliver_rx.try_recv() {
-            if let DeliverItem::Data(_sid, b) = item {
+            if let DeliverItem::Data(_sid, b, _) = item {
                 got.push(b);
             }
         }
@@ -9819,7 +9829,7 @@ mod tests {
 
         let mut got: Vec<Bytes> = Vec::new();
         while let Ok(item) = deliver_rx.try_recv() {
-            if let DeliverItem::Data(_sid, b) = item {
+            if let DeliverItem::Data(_sid, b, _) = item {
                 got.push(b);
             }
         }
@@ -9890,7 +9900,7 @@ mod tests {
 
         let mut got: Vec<Bytes> = Vec::new();
         while let Ok(item) = deliver_rx.try_recv() {
-            if let DeliverItem::Data(_sid, x) = item {
+            if let DeliverItem::Data(_sid, x, _) = item {
                 got.push(x);
             }
         }
@@ -10134,7 +10144,7 @@ mod tests {
         // `run_data_pump`'s delivery task does.
         let consumed = INITIAL_STREAM_WINDOW / 2 + 1;
         let limit = server_stream
-            .record_app_consumed(consumed)
+            .record_app_consumed(consumed, true)
             .expect("threshold crossed → limit advertised");
         server_stream.stage_window_update_limit(limit);
 
@@ -10303,7 +10313,7 @@ mod tests {
         let consumed = INITIAL_STREAM_WINDOW / 4; // below the half-window emission threshold
         let reading = Arc::new(TransportStream::new(stream_id));
         assert_eq!(
-            reading.record_app_consumed(consumed),
+            reading.record_app_consumed(consumed, true),
             None,
             "below the threshold no frame is emitted — that is the state a probe finds"
         );
@@ -10986,6 +10996,114 @@ mod tests {
     }
 
     /// NO DOUBLE-DELIVERY: frames sent on an opened stream (id ≥ 2) must
+    /// **A delivered frame must carry which path it arrived on.**
+    ///
+    /// Flow control counts reliable bytes and only those, because those are the only ones
+    /// the sending end charged against the window — unreliable data leaves `poll_send`
+    /// before the window is consulted. The end that has to act on the distinction is the
+    /// delivery task, which sees only what the reader put in the queue, so the reader has
+    /// to say. Mislabel an unreliable frame here and the receiving side advertises a limit
+    /// its peer never charged itself for, which is the accounting the local ceiling then
+    /// has to cut down — spending a bound written for a peer inventing numbers on one
+    /// telling the truth.
+    ///
+    /// Both directions are asserted, because the failure is a boolean: a reader that tagged
+    /// everything reliable and one that tagged everything unreliable are different defects,
+    /// and the second silently stops the window from ever opening.
+    #[tokio::test]
+    async fn delivery_says_which_path_a_frame_arrived_on() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let _handle = demux.register_stream(2, 64);
+
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(16);
+        let transport_send: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 256);
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+
+        // A reliable frame: `[stream_offset: u32 BE][payload]`, the live sender's framing.
+        let reliable = decode_recv_frame(
+            &build_app_frame(&client_session, session_id, 2, 0, b"reliable"),
+            session_id,
+        );
+        handle_packet(
+            reliable,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &transport_send,
+            &transport_send,
+            &deliver_tx,
+            &undelivered,
+            &mut scratch,
+            &obs,
+            LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
+        )
+        .await;
+
+        // An unreliable frame on the same stream: no offset prefix, since nothing
+        // reassembles it, and the UNRELIABLE flag in place of RELIABLE.
+        let header = PacketHeader::new(
+            session_id,
+            2,
+            1,
+            PacketFlags::new(PacketFlags::UNRELIABLE | PacketFlags::ENCRYPTED),
+        )
+        .with_epoch(client_session.current_epoch());
+        let ciphertext = client_session
+            .encrypt_packet(&header, b"unreliable", &[])
+            .expect("encrypt_packet");
+        let unreliable = decode_recv_frame(
+            &PhantomPacket::new(header, ciphertext).to_wire(),
+            session_id,
+        );
+        handle_packet(
+            unreliable,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &transport_send,
+            &transport_send,
+            &deliver_tx,
+            &undelivered,
+            &mut scratch,
+            &obs,
+            LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
+        )
+        .await;
+
+        let mut seen: Vec<(Vec<u8>, bool)> = Vec::new();
+        while let Ok(item) = deliver_rx.try_recv() {
+            if let DeliverItem::Data(_sid, bytes, reliable) = item {
+                seen.push((bytes.to_vec(), reliable));
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (b"reliable".to_vec(), true),
+                (b"unreliable".to_vec(), false)
+            ],
+            "each delivered frame must carry the path it arrived on"
+        );
+    }
+
     /// NOT appear in session.recv(); frames sent on the raw-app stream (id 1) must
     /// NOT appear in any PhantomStream's rx.
     ///
@@ -11042,7 +11160,7 @@ mod tests {
             .expect("deliver channel must have item")
             .expect("channel open");
         match &item {
-            DeliverItem::Data(sid, _) => assert_eq!(
+            DeliverItem::Data(sid, _, _) => assert_eq!(
                 *sid, 2,
                 "opened-stream frame must be tagged stream_id=2, not raw-app"
             ),
@@ -11096,7 +11214,7 @@ mod tests {
                 .expect("deliver channel must have item for raw-app")
                 .expect("channel open");
         match &raw_item {
-            DeliverItem::Data(sid, bytes) => {
+            DeliverItem::Data(sid, bytes, _) => {
                 assert_eq!(*sid, 1, "raw-app frame must be tagged stream_id=1");
                 // The RELIABLE path in handle_packet strips the 4-byte stream_offset
                 // prefix before handing data to deliver_in_order_run, so the

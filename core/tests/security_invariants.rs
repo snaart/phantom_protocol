@@ -2655,12 +2655,12 @@ async fn recv_window_growth_is_bounded_per_session_not_per_stream() {
             .map(|_| session.open_stream())
             .collect();
         for s in &streams {
-            s.record_app_consumed(1); // open each measurement interval
+            s.record_app_consumed(1, true); // open each measurement interval
         }
         for _ in 0..40 {
             tokio::time::advance(Duration::from_millis(400)).await;
             for s in &streams {
-                s.record_app_consumed(MAX_RECV_WINDOW);
+                s.record_app_consumed(MAX_RECV_WINDOW, true);
             }
         }
         per_session_growth.push(
@@ -2695,12 +2695,12 @@ async fn recv_window_growth_is_bounded_per_session_not_per_stream() {
             .map(|id| Stream::with_recv_tuning(id as u16, Arc::new(SharedRecvTuning::default())))
             .collect();
         for s in &streams {
-            s.record_app_consumed(1);
+            s.record_app_consumed(1, true);
         }
         for _ in 0..40 {
             tokio::time::advance(Duration::from_millis(400)).await;
             for s in &streams {
-                s.record_app_consumed(MAX_RECV_WINDOW);
+                s.record_app_consumed(MAX_RECV_WINDOW, true);
             }
         }
         unshared_total += streams

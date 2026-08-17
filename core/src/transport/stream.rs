@@ -974,6 +974,14 @@ impl Stream {
     /// clamp denies is the peer that writes an enormous number to buy itself unlimited
     /// permission: it buys one [`MAX_SEND_WINDOW`] beyond what has already gone out, the
     /// same as any other advertisement, and must send another frame for more.
+    ///
+    /// The middle step of that argument — that the peer cannot have consumed more than this
+    /// side has sent — is a property of what each end counts, not a law of nature: it holds
+    /// because both ends count reliable bytes and only those. Unreliable data is charged by
+    /// neither ([`Stream::record_app_consumed`] declines it, and `poll_send` emits it without
+    /// consulting the window), so it cannot walk one end's total past the other's. Count it
+    /// on the receiving end alone and the sentence above becomes false by exactly its volume,
+    /// with the clamp — written for a peer inventing numbers — spent on one telling the truth.
     pub fn apply_peer_window_limit(&self, limit: u64) {
         let ceiling = self
             .bytes_sent
@@ -1173,7 +1181,22 @@ impl Stream {
     /// A limit needs no arithmetic on the wire and no separate frame for growth: whatever
     /// moved, the answer is the same sentence, and the peer takes the larger of it and what
     /// it already had.
-    pub fn record_app_consumed(&self, n: u32) -> Option<u64> {
+    ///
+    /// `reliable` says whether the bytes arrived on the reliable path, and it decides
+    /// whether they count at all. The two ends of this ledger have to measure the same
+    /// quantity, and the sending end charges only reliable bytes — unreliable ones leave
+    /// `poll_send` before the window is consulted, because nothing retransmits them and no
+    /// window can stop them. Counting them here would walk the advertised limit ahead of the
+    /// total the peer keeps, by exactly the unreliable volume, and the peer would then have
+    /// its own honest advertisement cut down by this side's `bytes_sent + MAX_SEND_WINDOW`
+    /// clamp — a bound written for a peer inventing numbers, applied instead to one telling
+    /// the truth. They are still delivered, still counted against the delivery backlog, and
+    /// still bounded by it; what they are not is a claim about a window neither end applies
+    /// to them.
+    pub fn record_app_consumed(&self, n: u32, reliable: bool) -> Option<u64> {
+        if !reliable {
+            return None;
+        }
         self.bytes_consumed
             .fetch_add(u64::from(n), Ordering::AcqRel);
         let grew = self.tune_recv_window(n);
@@ -3567,12 +3590,12 @@ mod tests {
     async fn slow_consumption_never_grows_the_window() {
         tokio::time::pause();
         let s = Stream::new(1);
-        s.record_app_consumed(1); // opens the first interval
+        s.record_app_consumed(1, true); // opens the first interval
 
         // 16 KiB per 400 ms interval = 40 KiB/s, under a third of the 128 KiB/s threshold.
         for _ in 0..10 {
             tokio::time::advance(Duration::from_millis(400)).await;
-            s.record_app_consumed(16 * 1024);
+            s.record_app_consumed(16 * 1024, true);
         }
 
         assert_eq!(
@@ -3588,12 +3611,12 @@ mod tests {
     async fn fast_consumption_doubles_the_window_up_to_the_cap() {
         tokio::time::pause();
         let s = Stream::new(1);
-        s.record_app_consumed(1);
+        s.record_app_consumed(1, true);
 
         // 128 KiB per 400 ms = 320 KiB/s, two and a half times the 128 KiB/s threshold at
         // the initial window — one doubling per closed interval.
         tokio::time::advance(Duration::from_millis(400)).await;
-        s.record_app_consumed(128 * 1024);
+        s.record_app_consumed(128 * 1024, true);
         assert_eq!(s.advertised_recv_window(), 2 * INITIAL_STREAM_WINDOW);
         assert_eq!(
             s.recv_reorder_byte_limit(),
@@ -3604,7 +3627,7 @@ mod tests {
         // Keep outrunning it: the window climbs to the cap and then stops for good.
         for _ in 0..12 {
             tokio::time::advance(Duration::from_millis(400)).await;
-            s.record_app_consumed(MAX_RECV_WINDOW);
+            s.record_app_consumed(MAX_RECV_WINDOW, true);
         }
         assert_eq!(s.advertised_recv_window(), MAX_RECV_WINDOW);
         assert_eq!(
@@ -3669,11 +3692,11 @@ mod tests {
         // closed measurement interval, so the ceiling is 1.6 s of sustained consumption away
         // — not a ladder that outlives the transfer it is meant to accelerate.
         let t = Stream::new(2);
-        t.record_app_consumed(1);
+        t.record_app_consumed(1, true);
         let mut intervals = 0u32;
         while t.advertised_recv_window() < MAX_RECV_WINDOW {
             tokio::time::advance(Duration::from_millis(400)).await;
-            t.record_app_consumed(MAX_RECV_WINDOW);
+            t.record_app_consumed(MAX_RECV_WINDOW, true);
             intervals += 1;
             assert!(
                 intervals <= 6,
@@ -3698,7 +3721,7 @@ mod tests {
             .collect();
 
         for s in &streams {
-            s.record_app_consumed(1); // open each interval
+            s.record_app_consumed(1, true); // open each interval
         }
         // Far more sustained consumption than the whole budget is worth, on every stream at
         // once — the growth has to stop because the session ran out, not because the
@@ -3706,7 +3729,7 @@ mod tests {
         for _ in 0..40 {
             tokio::time::advance(Duration::from_millis(400)).await;
             for s in &streams {
-                s.record_app_consumed(MAX_RECV_WINDOW);
+                s.record_app_consumed(MAX_RECV_WINDOW, true);
             }
         }
 
@@ -3753,10 +3776,10 @@ mod tests {
         let tuning = Arc::new(SharedRecvTuning::default());
         {
             let s = Stream::with_recv_tuning(1, tuning.clone());
-            s.record_app_consumed(1);
+            s.record_app_consumed(1, true);
             for _ in 0..8 {
                 tokio::time::advance(Duration::from_millis(400)).await;
-                s.record_app_consumed(MAX_RECV_WINDOW);
+                s.record_app_consumed(MAX_RECV_WINDOW, true);
             }
             assert_eq!(s.advertised_recv_window(), MAX_RECV_WINDOW);
             assert!(tuning.remaining_growth_budget() < SESSION_RECV_WINDOW_GROWTH_BUDGET);
@@ -3788,10 +3811,10 @@ mod tests {
         // reference demands (0.8 × 64 KiB / 0.4 s). Sustained for eight minutes of simulated
         // time — far longer than any handshake gap a peer could introduce and then exploit.
         let s = Stream::new(1);
-        s.record_app_consumed(1);
+        s.record_app_consumed(1, true);
         for _ in 0..480 {
             tokio::time::advance(Duration::from_secs(1)).await;
-            s.record_app_consumed(30_000);
+            s.record_app_consumed(30_000, true);
         }
         assert_eq!(
             s.advertised_recv_window(),
@@ -3803,10 +3826,10 @@ mod tests {
         // And the bar is still met by an application that genuinely keeps up, so the test
         // above is not passing merely because growth is broken.
         let fast = Stream::new(2);
-        fast.record_app_consumed(1);
+        fast.record_app_consumed(1, true);
         for _ in 0..8 {
             tokio::time::advance(Duration::from_millis(400)).await;
-            fast.record_app_consumed(MAX_RECV_WINDOW);
+            fast.record_app_consumed(MAX_RECV_WINDOW, true);
         }
         assert_eq!(fast.advertised_recv_window(), MAX_RECV_WINDOW);
     }
@@ -3820,11 +3843,11 @@ mod tests {
     async fn a_burst_shorter_than_the_interval_does_not_climb_the_ladder() {
         tokio::time::pause();
         let s = Stream::new(1);
-        s.record_app_consumed(1);
+        s.record_app_consumed(1, true);
 
         // 256 KiB drains through in 50 ms — four windows' worth, at 5 MiB/s.
         for _ in 0..256 {
-            s.record_app_consumed(1024);
+            s.record_app_consumed(1024, true);
             tokio::time::advance(Duration::from_micros(195)).await;
         }
         assert_eq!(
@@ -3835,13 +3858,13 @@ mod tests {
 
         // The interval closes and the burst buys exactly one doubling …
         tokio::time::advance(Duration::from_millis(400)).await;
-        s.record_app_consumed(1024);
+        s.record_app_consumed(1024, true);
         assert_eq!(s.advertised_recv_window(), 2 * INITIAL_STREAM_WINDOW);
 
         // … after which the real reader rate governs, and it is far below the threshold.
         for _ in 0..10 {
             tokio::time::advance(Duration::from_millis(400)).await;
-            s.record_app_consumed(1024);
+            s.record_app_consumed(1024, true);
         }
         assert_eq!(
             s.advertised_recv_window(),
@@ -3857,13 +3880,13 @@ mod tests {
     async fn window_growth_is_advertised_immediately_as_a_raised_limit() {
         tokio::time::pause();
         let s = Stream::new(1);
-        s.record_app_consumed(1);
+        s.record_app_consumed(1, true);
 
         // Mid-interval, consumption crosses its own update threshold and is flushed …
         tokio::time::advance(Duration::from_millis(200)).await;
         let consumed = 60u64 * 1024 + 1;
         assert_eq!(
-            s.record_app_consumed(60 * 1024),
+            s.record_app_consumed(60 * 1024, true),
             Some(consumed + u64::from(INITIAL_STREAM_WINDOW))
         );
 
@@ -3871,7 +3894,7 @@ mod tests {
         // emitting: the 8 KiB of consumption is nowhere near the threshold on its own.
         tokio::time::advance(Duration::from_millis(200)).await;
         let limit = s
-            .record_app_consumed(8 * 1024)
+            .record_app_consumed(8 * 1024, true)
             .expect("growth is advertised");
         assert_eq!(
             limit,
@@ -3891,13 +3914,13 @@ mod tests {
         let threshold = INITIAL_STREAM_WINDOW / 2;
 
         // Small drains move the limit but are not worth a frame.
-        assert!(s.record_app_consumed(100).is_none());
-        assert!(s.record_app_consumed(200).is_none());
+        assert!(s.record_app_consumed(100, true).is_none());
+        assert!(s.record_app_consumed(200, true).is_none());
 
         // Drain across the half-window threshold → advertise the cumulative limit:
         // everything consumed so far plus one advertised window of room beyond it.
         assert_eq!(
-            s.record_app_consumed(threshold),
+            s.record_app_consumed(threshold, true),
             Some(u64::from(300 + threshold + INITIAL_STREAM_WINDOW)),
             "WINDOW_UPDATE carries the total the peer may send, not the increment"
         );
@@ -3905,10 +3928,89 @@ mod tests {
         // The emission accumulator resets — small further drains do not re-emit — but the
         // limit itself keeps rising underneath, so the next frame states the truth including
         // everything withheld in between.
-        assert!(s.record_app_consumed(10).is_none());
+        assert!(s.record_app_consumed(10, true).is_none());
         assert_eq!(
             s.recv_limit(),
             u64::from(310 + threshold + INITIAL_STREAM_WINDOW)
+        );
+    }
+
+    /// **Both ends of the ledger must count the same bytes.**
+    ///
+    /// The sending end charges reliable bytes only — unreliable ones leave `poll_send`
+    /// before the window is consulted, and nothing about them is retransmitted or
+    /// windowed. If the receiving end counted them, the limit it advertises would run
+    /// ahead of the total its peer keeps by exactly the unreliable volume, and the peer's
+    /// honest advertisement would then be cut down by this side's `bytes_sent +
+    /// MAX_SEND_WINDOW` clamp — a bound written for a peer inventing numbers, spent on one
+    /// telling the truth. The two documents that describe the clamp say a conforming peer
+    /// is never clamped by it; this is the arithmetic that has to hold for that to be true.
+    #[test]
+    fn unreliable_bytes_do_not_move_the_limit_the_sender_is_measured_against() {
+        let s = Stream::new(1);
+        let opening = s.recv_limit();
+
+        // A whole window of unreliable data, delivered and consumed. It is real traffic and
+        // the application really read it — what it is not is bytes the peer charged itself
+        // for, so the number this side puts on the wire must not move.
+        for _ in 0..8 {
+            assert!(
+                s.record_app_consumed(INITIAL_STREAM_WINDOW / 8, false)
+                    .is_none(),
+                "unreliable consumption asked for a WINDOW_UPDATE"
+            );
+        }
+        assert_eq!(
+            s.recv_limit(),
+            opening,
+            "unreliable bytes advanced the limit the sender is measured against"
+        );
+
+        // Reliable consumption on the same stream still moves it, so the guard above is a
+        // distinction between two paths rather than an accounting that stopped working.
+        let threshold = INITIAL_STREAM_WINDOW / 2;
+        assert_eq!(
+            s.record_app_consumed(threshold, true),
+            Some(opening + u64::from(threshold)),
+            "reliable consumption must still advertise the cumulative total"
+        );
+    }
+
+    /// The clamp's promise, stated as arithmetic on the two halves of the ledger.
+    ///
+    /// A conforming peer advertises `its consumed total + its advertised window`; this side
+    /// honours at most `bytes_sent + MAX_SEND_WINDOW`. The promise that the first never
+    /// exceeds the second holds only while both ends count the same bytes: the peer cannot
+    /// have consumed more than this side has sent, and the two windows are the same figure.
+    /// Count unreliable bytes on one end only and the promise fails by exactly their volume,
+    /// which is what this pins.
+    #[test]
+    fn a_conforming_peers_advertisement_stays_under_the_local_ceiling() {
+        let sender = Stream::new(1);
+        let receiver = Stream::new(1);
+
+        // The sender puts one full window of reliable data on the wire, and the receiving
+        // application drains exactly that much of it.
+        assert!(sender.try_consume_send_window(INITIAL_STREAM_WINDOW));
+        receiver.record_app_consumed(INITIAL_STREAM_WINDOW, true);
+
+        // Alongside it flows unreliable traffic, and the application drains that too.
+        // Neither end charged it: `poll_send` never consulted the window for those bytes.
+        // The volume is one `MAX_SEND_WINDOW`, which is what it takes for the difference to
+        // reach the ceiling rather than merely dent the slack under it — a smaller figure
+        // would leave the assertion true whichever way the bytes were counted, and prove
+        // nothing about the counting.
+        let chunk = INITIAL_STREAM_WINDOW;
+        for _ in 0..(MAX_SEND_WINDOW / chunk) {
+            receiver.record_app_consumed(chunk, false);
+        }
+
+        let ceiling = sender.bytes_sent() + u64::from(MAX_SEND_WINDOW);
+        assert!(
+            receiver.recv_limit() <= ceiling,
+            "a conforming peer advertised {} against a local ceiling of {ceiling} — the \
+             clamp exists for a peer inventing numbers, not for this one",
+            receiver.recv_limit()
         );
     }
 
@@ -3927,7 +4029,7 @@ mod tests {
         // Receiver consumes one threshold's worth → advertises that much past the initial
         // window it had already granted.
         let limit = receiver
-            .record_app_consumed(threshold)
+            .record_app_consumed(threshold, true)
             .expect("threshold crossed");
         sender.apply_peer_window_limit(limit);
         assert_eq!(
@@ -4226,7 +4328,10 @@ mod tests {
                         continue; // a probe reaching its turn in the reassembly order
                     }
                     delivered += released.len();
-                    grant(sender, receiver.record_app_consumed(released.len() as u32));
+                    grant(
+                        sender,
+                        receiver.record_app_consumed(released.len() as u32, true),
+                    );
                 }
                 if is_persist_probe(seg) {
                     grant(sender, Some(receiver.recv_limit()));
@@ -4562,7 +4667,7 @@ mod tests {
         // One chunk consumed — below the emission threshold, so `record_app_consumed`
         // withholds the frame; the limit itself has still moved by exactly that chunk, and a
         // probe would state it.
-        assert_eq!(r.record_app_consumed(HARNESS_SEG as u32), None);
+        assert_eq!(r.record_app_consumed(HARNESS_SEG as u32, true), None);
         assert_eq!(
             r.recv_limit(),
             opening + HARNESS_SEG as u64,
@@ -4596,7 +4701,7 @@ mod tests {
             let s = s.clone();
             std::thread::spawn(move || {
                 for _ in 0..ROUNDS {
-                    s.record_app_consumed(chunk);
+                    s.record_app_consumed(chunk, true);
                 }
             })
         };
