@@ -202,11 +202,13 @@ def sampler_note(records):
 def run_server(data_dir, since_ns):
     data_dir = pathlib.Path(data_dir)
 
-    # `session_uid` is not unique across runs (the daemon restarts its counter),
-    # so a uid alone joins marks from one session to windows from another. The
-    # timestamps disambiguate: every window is required to fall inside the
-    # scenario's own begin/end marks, and a uid seen more than once is reported
-    # rather than silently collapsed.
+    # In archived artifacts `session_uid` is not unique: the daemon used to
+    # restart its counter at 1 on every boot, so a uid alone joins the marks of
+    # one session to the windows of another. It is seeded from the start time
+    # now, but the old files do not change, and this is the tool that reads
+    # them. The timestamps disambiguate either way: every window is required to
+    # fall inside the scenario's own begin/end marks, and a uid seen more than
+    # once is reported rather than silently collapsed.
     spans = defaultdict(list)
     for event in read_jsonl(data_dir / "events.jsonl"):
         if event.get("kind") != "mark" or event.get("session_uid") is None:

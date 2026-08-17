@@ -305,7 +305,15 @@ Client, under `results/<run-id>/`:
 Server, under `/var/lib/phantom-testd/`:
 
 - `sessions.jsonl`, `snapshots.jsonl` (per-leg counters + RSS/CPU),
-  `events.jsonl`, and uploaded client bundles under `results/client/`
+  `windows.jsonl` (the sending side's congestion window, keyed
+  `server:session:<uid>`), `events.jsonl`, and uploaded client bundles under
+  `results/client/`
+
+These are append-only and outlive the daemon, so one directory holds several
+runs. `session_uid` is seeded from the daemon's start time and is unique across
+restarts — but in artifacts written before that it restarts at 1 on every boot,
+and a uid alone joins one session's marks to another session's windows. Bound
+such a join by the marks' timestamps, as `stall_verdict.py` does.
 
 Results are flushed after **every scenario**, so an interrupted run keeps
 everything completed so far. The client also uploads its bundle to the daemon
