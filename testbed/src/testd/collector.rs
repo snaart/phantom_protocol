@@ -197,6 +197,8 @@ mod tests {
             source_frames: 0,
             streams_accepted: 0,
             split_messages: 0,
+            window_samples: 0,
+            window_samples_skipped: 0,
             marks: vec![MarkRecord {
                 t_unix_ns: 1,
                 label: "x".into(),

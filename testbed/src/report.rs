@@ -689,6 +689,25 @@ pub struct SessionRecord {
     /// Logical messages the server had to reassemble from more than one
     /// `PhantomSession::recv()` result — the session split them in transit.
     pub split_messages: u64,
+    /// Congestion-window sweeps this session recorded into `windows.jsonl`.
+    ///
+    /// The series there is keyed on `server:session:<uid>`, so its rows can be
+    /// counted directly — but rows only ever account for sweeps that produced a
+    /// sample. Comparing them against this figure is what separates a sample
+    /// the sampler never took from one the collector dropped under load: two
+    /// different faults that look identical in the file.
+    pub window_samples: u64,
+    /// Sweeps that produced nothing, because the sender had no window estimate
+    /// to describe at that instant.
+    ///
+    /// This is the field that keeps a short series readable: rows present plus
+    /// this count is every sweep the sampler ran, so "there was nothing to
+    /// record" and "what was recorded is gone" stop being the same absence. It
+    /// belongs on the session record rather than in `snapshots.jsonl` because
+    /// the sampler is per-session — the periodic listener sweep could only
+    /// report a sum across sessions, and that sum is exactly the attribution
+    /// that was missing.
+    pub window_samples_skipped: u64,
     pub marks: Vec<MarkRecord>,
     pub close_reason: String,
 }
