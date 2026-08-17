@@ -550,9 +550,15 @@ def apply_window_limit(held: int, sent: int, advertised: int) -> tuple[int, str]
     The state is two numbers, not one. ``held`` is the highest limit honoured so
     far; ``sent`` is the total this side has already put on the wire, counted the
     way § 4.5 counts it — each reliable application byte once, retransmissions not
-    counted again. Both are needed, because half the rule is a bound the peer's
-    number is measured against rather than a comparison between two peer numbers,
-    and a model carrying only ``held`` cannot express that half at all.
+    counted again, **and a first transmission the transport refused subtracted
+    back**, since those bytes never left. Both are needed, because half the rule is
+    a bound the peer's number is measured against rather than a comparison between
+    two peer numbers, and a model carrying only ``held`` cannot express that half
+    at all.
+
+    That ``sent`` can fall is what makes the two halves independent rather than one
+    rule wearing two names: the ceiling it fixes can drop below a limit already
+    honoured, and the transcript exercises that state deliberately.
 
     Deliberately not written as ``max``. This file earns its keep by stating the
     rule a second implementation has to follow, and ``max(a, b)`` states nothing a
@@ -572,6 +578,12 @@ def apply_window_limit(held: int, sent: int, advertised: int) -> tuple[int, str]
     # advertising u64::MAX buys exactly one window of permission beyond what has
     # already gone out and must send another frame for more — so the field is a
     # rate of permission per frame rather than a lever the peer can hold down.
+    # Saturating in the normative implementation, where both are u64
+    # (`core/src/transport/stream.rs`, `apply_peer_window_limit`). Python's integers
+    # do not overflow, so the plain sum here is right by accident rather than by
+    # construction — a port to a fixed-width language has to saturate, or a peer
+    # writing a total near the type's maximum wraps the ceiling to a small number and
+    # stops the stream.
     ceiling = sent + MAX_SEND_WINDOW
     if advertised > ceiling:
         # The local bound, not the peer's number, decided the outcome. It still
@@ -685,6 +697,25 @@ def window_update_limit_rule():
         # ...and once those bytes have gone out, the same absurd number buys exactly
         # one more window. The clamp tracks what was sent; it is not a one-off ceiling.
         ("ffffffffffffffff", 1_214_113, 1_214_113, 2_262_689, "clamped"),
+        # The ceiling below a limit already honoured — the one state that tells a clamp
+        # apart from a revocation, and the reason the rule settles by maximum rather
+        # than returning the ceiling outright. It is reachable, not hypothetical: § 4.5
+        # subtracts a first transmission the transport refused back out of the sent
+        # total, so the ceiling falls while the honoured limit stays where it was. A
+        # rule that answered with the ceiling here would take back room this side has
+        # already told itself it may use, and the sender would stop with permission it
+        # had been granted.
+        ("ffffffffffffffff", 1_214_113, 100_000, 1_214_113, "clamped"),
+        # Exactly on the ceiling. § 4.5 bounds what a sender honours *at most* at one
+        # window past the bytes already sent, so the boundary belongs to the grant: a
+        # rule that clamps here settles on the same total by a different route and
+        # reports a peer within its rights as one exceeding them.
+        ("0000000000110000", 165_536, 65_536, 1_114_112, "grant"),
+        # A total below the limit every stream starts at, offered before anything has
+        # moved. It is stale, and only because that opening limit is 64 KiB: a second
+        # implementation that started lower would read this frame as a duplicate and
+        # conclude the peer had restated an unchanged total.
+        ("0000000000008000", INITIAL_STREAM_WINDOW, 0, INITIAL_STREAM_WINDOW, "stale"),
         # A grant genuinely past 2^32 and genuinely under the ceiling, so nothing but
         # the decoder's width decides it. A reader that took only the low four bytes
         # sees 0 here and calls a real grant stale — the one failure that stays hidden
