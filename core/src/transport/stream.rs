@@ -357,6 +357,17 @@ struct PendingData {
     /// flags when it sees this segment. Stays in the send buffer until SACKed so
     /// the FIN is retransmitted like any reliable segment.
     fin: bool,
+    /// Whether these bytes have been charged against the peer's flow-control limit and
+    /// have not been given back. The charge belongs to the segment for as long as it is
+    /// buffered, not to the attempt that carried it: `poll_send`'s unsent pass is the only
+    /// place that levies one, and a segment reaches that pass again whenever a refused
+    /// write clears its send stamp. Without a mark saying the room is already reserved, the
+    /// same bytes would be paid for once per refusal — and the peer, which computes its
+    /// limit from what it received, would never give any of it back. The FIN sentinel is
+    /// exempt from the charge and so stays `false` here for its whole life; the persist
+    /// probe never occupies a `PendingData` at all, being synthesised from an offset the
+    /// peer has already acknowledged.
+    charged: bool,
 }
 
 /// One reliable segment retired by [`Stream::on_sack`] — a segment whose
@@ -662,11 +673,18 @@ pub struct Stream {
     /// Backpressure semaphore
     send_semaphore: Arc<Semaphore>,
     /// Total reliable application bytes this side has put on the wire for this stream,
-    /// counting each byte once: a first transmission adds, a retransmission does not (those
-    /// bytes were counted when they first left), and a write the transport refused subtracts
-    /// again ([`Stream::mark_unsent`]). It is one half of the flow-control ledger and the
-    /// peer counts the other half in the same units, which is what lets an absolute limit be
-    /// compared against it without either end inferring the other's state.
+    /// counting each byte once however many times the path makes it repeat them. A segment
+    /// is charged the first time the unsent pass hands it out and carries the mark
+    /// ([`PendingData::charged`]) that keeps a later pass from charging it again; the only
+    /// thing that gives a charge back is a write the transport refused before any copy had
+    /// ever left ([`Stream::mark_unsent`]). An acknowledgement leaves the charge standing,
+    /// which is the point: the bytes arrived, and a total that shed them would be counting
+    /// what is outstanding rather than what has been sent. The one thing a hostile peer can
+    /// do to this total is acknowledge an offset whose write was refused a moment ago and
+    /// so keep a charge for bytes it never saw — an overcount, which costs this side room
+    /// and buys the peer none. It is one half of the flow-control ledger and the peer counts
+    /// the other half in the same units, which is what lets an absolute limit be compared
+    /// against it without either end inferring the other's state.
     bytes_sent: AtomicU64,
     /// The largest cumulative total the peer has said may be sent on this stream, as this
     /// side honours it. Starts at [`INITIAL_STREAM_WINDOW`] — the allowance both ends assume
@@ -899,6 +917,16 @@ impl Stream {
     /// Atomically charge `n` bytes against the peer's cumulative limit.
     /// Returns `true` if the bytes fit under the limit (and the sent-byte total was
     /// advanced); `false` if they do not — the caller must wait for a `WINDOW_UPDATE`.
+    ///
+    /// A total plus a charge that will not fit in a `u64` is refused rather than reduced to
+    /// something that will. The limit is a `u64` as well, so a sum past the top of the range
+    /// is above every number the peer is able to state, and refusing it is the same answer
+    /// this method already gives any other overrun rather than a special case. Computing the
+    /// sum first and comparing it afterwards is what makes the state reachable at all: the
+    /// clamp on an advertisement saturates, so a sent total near the top of the range leaves
+    /// a peer that writes `u64::MAX` holding a limit of exactly `u64::MAX`, a few bytes of
+    /// window under it, and an addition that wraps — or, in a debug build, ends the task
+    /// draining every stream on the session.
     pub fn try_consume_send_window(&self, n: u32) -> bool {
         let n = u64::from(n);
         let mut sent = self.bytes_sent.load(Ordering::Acquire);
@@ -906,12 +934,15 @@ impl Stream {
             // Re-read the limit on every attempt: a `WINDOW_UPDATE` applied on the receive
             // task between two attempts of this loop is a raise this pass may as well use.
             let limit = self.peer_send_limit.load(Ordering::Acquire);
-            if sent.saturating_add(n) > limit {
+            let Some(next) = sent.checked_add(n) else {
+                return false;
+            };
+            if next > limit {
                 return false;
             }
             match self.bytes_sent.compare_exchange_weak(
                 sent,
-                sent + n,
+                next,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -1261,6 +1292,7 @@ impl Stream {
             retries: 0,
             lost: false,
             fin: false,
+            charged: false,
         };
 
         self.send_buffer.lock().await.push_back(pending);
@@ -1304,6 +1336,7 @@ impl Stream {
             retries: 0,
             lost: false,
             fin: false,
+            charged: false,
         });
         Ok(true)
     }
@@ -1330,6 +1363,7 @@ impl Stream {
             retries: 0,
             lost: false,
             fin: true,
+            charged: false,
         });
         Ok(true)
     }
@@ -1375,6 +1409,7 @@ impl Stream {
             retries: 0,
             lost: false,
             fin: true,
+            charged: false,
         };
 
         // Mark local side finished now so `is_fin_acked()` knows the FIN
@@ -1652,12 +1687,23 @@ impl Stream {
                 // The reliable FIN sentinel (len == 0) bypasses the
                 // flow-control window check — it consumes no peer window.
                 // For non-FIN segments, enforce the peer's flow-control window.
-                if !pending.fin && !self.try_consume_send_window(len as u32) {
-                    // The peer's receive window is the binding constraint — wait for a
-                    // WINDOW_UPDATE, not for an acknowledgement. Answered below, once the
-                    // borrow on the buffer is gone.
-                    flow_control_blocked = true;
-                    break;
+                //
+                // Once, though, and not once per attempt. This pass is reached again by
+                // any segment whose send stamp a refused write cleared, and a segment that
+                // still holds its charge holds room the peer has already granted for
+                // exactly these bytes: asking for that room a second time would both count
+                // bytes the wire carries once and — on a window that closed on this very
+                // segment — refuse it forever, since the frame that would raise the limit
+                // is the one the peer sends after receiving it.
+                if !pending.fin && !pending.charged {
+                    if !self.try_consume_send_window(len as u32) {
+                        // The peer's receive window is the binding constraint — wait for a
+                        // WINDOW_UPDATE, not for an acknowledgement. Answered below, once
+                        // the borrow on the buffer is gone.
+                        flow_control_blocked = true;
+                        break;
+                    }
+                    pending.charged = true;
                 }
                 let is_fin = pending.fin;
                 pending.sent_at = Some(now);
@@ -1728,28 +1774,47 @@ impl Stream {
     /// treated as in-flight. No-op if the segment was already acknowledged and
     /// removed.
     ///
-    /// `was_first_transmission` says whether the attempt that failed was the one that
-    /// charged the peer's flow-control limit, and it has to, because only the caller knows:
-    /// a retransmission was paid for on its original send and must not be uncharged, while a
-    /// first transmission that never reached the wire has advanced a total that counts bytes
-    /// on the wire. Left uncorrected, the sent total would drift permanently above the bytes
-    /// the peer will ever see, so the peer's limit — which it computes from what it received
-    /// — would stay a refusal's worth behind for the rest of the connection, one refusal at
-    /// a time.
-    pub async fn mark_unsent(&self, stream_offset: SequenceNumber, was_first_transmission: bool) {
-        // Zero for the FIN sentinel and the persist probe, which never charged the limit.
-        let mut uncharge = 0u64;
-        {
-            let mut buffer = self.send_buffer.lock().await;
-            if let Some(pending) = buffer.iter_mut().find(|p| p.stream_offset == stream_offset) {
-                pending.sent_at = None;
-                if was_first_transmission {
-                    uncharge = pending.data.len() as u64;
-                }
+    /// The charge these bytes hold against the peer's limit comes back only when no copy of
+    /// them has ever been on the wire, and the segment itself is what says so.
+    /// `PendingData::retries` is bumped by the two retransmit passes and by nothing else,
+    /// so `retries == 0` on a segment whose write was just refused means this attempt was
+    /// the only one there has ever been. It is read here rather than taken from the caller
+    /// because the caller cannot see it: the charging pass hands out more than first
+    /// transmissions — a segment whose retransmission was refused comes back through it —
+    /// so "the unsent pass emitted this" and "these bytes have never left" are two different
+    /// statements, and only the second one licenses the correction. A retransmission's
+    /// charge stays where it is: it was levied when the original left, the peer has those
+    /// bytes, and giving it back would put the sent total below what the receiver has
+    /// counted — this side granting itself room to overrun a window nobody opened.
+    ///
+    /// The `PendingData::charged` mark is cleared along with the bytes, so a second call
+    /// on one offset takes nothing more, and the subtraction saturates because the two
+    /// halves of the ledger are advanced by different paths and an underflow here is not a
+    /// small error. Wrapped, the sent total lands just under `u64::MAX`, and the two ends of
+    /// that are opposite. Against a peer advertising an honest limit — a finite number far
+    /// below the total — [`Self::peer_send_window`] is zero from then on and the stream
+    /// never sends again. Against a peer advertising `u64::MAX` the clamp in
+    /// [`Self::apply_peer_window_limit`] degenerates, because the ceiling it clamps to is
+    /// the sent total plus [`MAX_SEND_WINDOW`] and that addition saturates as well: the
+    /// peer's own number is then honoured in full, it holds a few bytes of window under it,
+    /// and the charge for them is an addition at the very top of the range —
+    /// [`Self::try_consume_send_window`] refuses that one rather than wrapping on it.
+    pub async fn mark_unsent(&self, stream_offset: SequenceNumber) {
+        // Held across the correction so the bytes and the mark that records them move
+        // together: the pass that levies a charge runs under this same lock, and the
+        // acknowledgement that retires a segment outright runs under it on another task.
+        let mut buffer = self.send_buffer.lock().await;
+        if let Some(pending) = buffer.iter_mut().find(|p| p.stream_offset == stream_offset) {
+            pending.sent_at = None;
+            if pending.charged && pending.retries == 0 {
+                let uncharge = pending.data.len() as u64;
+                pending.charged = false;
+                let _ = self
+                    .bytes_sent
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |sent| {
+                        Some(sent.saturating_sub(uncharge))
+                    });
             }
-        }
-        if uncharge > 0 {
-            self.bytes_sent.fetch_sub(uncharge, Ordering::AcqRel);
         }
     }
 
@@ -2328,7 +2393,7 @@ mod tests {
 
         // Simulate a send that failed *after* `poll_send` stamped the segment:
         // clear `sent_at` so it is no longer considered in-flight.
-        stream.mark_unsent(0, true).await;
+        stream.mark_unsent(0).await;
 
         // It is re-offered immediately — without advancing past the RTO — and as
         // a fresh send (Pass 2), not a retransmission.
@@ -2343,7 +2408,7 @@ mod tests {
 
         // `mark_unsent` on an already-acked (removed) segment is a no-op.
         assert!(stream.ack(0).await.is_some());
-        stream.mark_unsent(0, true).await; // no panic, no effect
+        stream.mark_unsent(0).await; // no panic, no effect
         assert!(stream
             .poll_send(u64::MAX, 0, std::time::Instant::now(), false)
             .await
@@ -4601,7 +4666,7 @@ mod tests {
 
         // The write failed after `poll_send` had stamped the segment: the bytes never
         // reached the wire, so the charge was for nothing.
-        s.mark_unsent(seg.stream_offset, !seg.retransmit).await;
+        s.mark_unsent(seg.stream_offset).await;
         assert_eq!(s.bytes_sent(), 0);
         assert_eq!(
             s.peer_send_window(),
@@ -4620,11 +4685,208 @@ mod tests {
         tokio::time::advance(RtoEstimator::MAX_RTO).await;
         let rtx = poll_once(&s).await.expect("retransmission");
         assert!(rtx.retransmit);
-        s.mark_unsent(rtx.stream_offset, !rtx.retransmit).await;
+        s.mark_unsent(rtx.stream_offset).await;
         assert_eq!(
             s.bytes_sent(),
             HARNESS_SEG as u64,
             "a failed retransmission uncharged bytes it never charged"
         );
+    }
+
+    /// **One segment's bytes are one segment's worth of the peer's window, however many
+    /// times the path makes this side repeat them.**
+    ///
+    /// The charge is levied in one place — the pass that hands out a segment carrying no
+    /// send stamp — and clearing that stamp is what returns a segment to it. A refused
+    /// retransmission clears the stamp and rightly keeps the charge, so the re-offer walks
+    /// back through the charging pass and pays for the same bytes again. Nothing gives that
+    /// back: the peer's limit is computed from what it received, so each refusal leaves this
+    /// side a segment short of its room for the rest of the connection, and enough of them
+    /// stop the stream with no peer and no path involved.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_retransmit_is_not_charged_a_second_time() {
+        let s = Stream::new(1);
+        s.send_reliable(Bytes::from(vec![0u8; HARNESS_SEG]))
+            .await
+            .unwrap();
+
+        let first = poll_once(&s).await.expect("first transmission");
+        assert!(!first.retransmit);
+        assert_eq!(s.bytes_sent(), HARNESS_SEG as u64);
+
+        for round in 1..=3u32 {
+            tokio::time::advance(RtoEstimator::MAX_RTO).await;
+            let rtx = poll_once(&s).await.expect("retransmission");
+            assert!(rtx.retransmit);
+
+            // The write of the retransmission failed: that copy never reached the wire,
+            // but the original did, so the charge must stand.
+            s.mark_unsent(rtx.stream_offset).await;
+
+            // Cleared of its stamp, the segment comes back through the charging pass.
+            let again = poll_once(&s).await.expect("re-offered as unsent");
+            assert_eq!(again.stream_offset, first.stream_offset);
+            assert_eq!(
+                s.bytes_sent(),
+                HARNESS_SEG as u64,
+                "after {round} refused retransmit(s) the sent total counts {} bytes for \
+                 the {HARNESS_SEG} the peer will ever see",
+                s.bytes_sent()
+            );
+            assert_eq!(
+                s.peer_send_window(),
+                INITIAL_STREAM_WINDOW - HARNESS_SEG as u32,
+                "a refused retransmit took room the peer never spent"
+            );
+        }
+    }
+
+    /// **An acknowledgement that overtakes the re-offer must not carry the charge away.**
+    ///
+    /// This is why the correction cannot simply follow the send stamp. After a refused
+    /// write the pump leaves the drain and reads its inbound packets first, so a SACK for
+    /// the *original* copy can land before the segment is offered again — and `on_sack`
+    /// retires a segment by offset whether or not it currently carries a stamp. Return the
+    /// charge on a refused retransmission and there is no re-offer left to take it back: the
+    /// sent total ends below the bytes the peer actually received, which is this side
+    /// granting itself room to overrun the receiver's window.
+    #[tokio::test(start_paused = true)]
+    async fn an_original_acknowledged_after_a_refused_retransmit_keeps_its_charge() {
+        let s = Stream::new(1);
+        s.send_reliable(Bytes::from(vec![0u8; HARNESS_SEG]))
+            .await
+            .unwrap();
+
+        let first = poll_once(&s).await.expect("first transmission");
+        assert_eq!(s.bytes_sent(), HARNESS_SEG as u64);
+
+        tokio::time::advance(RtoEstimator::MAX_RTO).await;
+        let rtx = poll_once(&s).await.expect("retransmission");
+        assert!(rtx.retransmit);
+        s.mark_unsent(rtx.stream_offset).await;
+
+        // The peer had the original all along; its SACK arrives before the drain runs again.
+        let sack = Sack::from_inclusive_ranges(vec![(first.stream_offset, first.stream_offset)], 0)
+            .expect("sack");
+        assert_eq!(s.on_sack(&sack).await.retired.len(), 1);
+
+        assert_eq!(
+            s.bytes_sent(),
+            HARNESS_SEG as u64,
+            "the peer received {HARNESS_SEG} bytes and the sent total says {} — this side \
+             may now overrun the window by the difference",
+            s.bytes_sent()
+        );
+    }
+
+    /// **A segment already holding its charge goes out though the window has no room left.**
+    ///
+    /// The charge is room reserved for those bytes, not a toll collected per attempt, so a
+    /// segment that still holds one is entitled to the wire whatever the window says. Charge
+    /// it afresh on the re-offer and a stream whose window closed exactly on it can never
+    /// send it again: the retransmit passes want a send stamp it no longer has, the charging
+    /// pass wants room the peer has already granted and this side has already spent, and the
+    /// only frame that would raise the limit is one the peer sends after receiving the very
+    /// segment that is stuck.
+    #[tokio::test(start_paused = true)]
+    async fn a_segment_still_holding_its_charge_is_re_offered_through_a_closed_window() {
+        let s = Stream::new(1);
+        s.send_reliable(Bytes::from(vec![0u8; HARNESS_SEG]))
+            .await
+            .unwrap();
+
+        let first = poll_once(&s).await.expect("first transmission");
+        // Spend the rest of the peer's grant elsewhere: the window now has room for nothing.
+        assert!(s.try_consume_send_window(s.peer_send_window()));
+        assert_eq!(s.peer_send_window(), 0);
+
+        tokio::time::advance(RtoEstimator::MAX_RTO).await;
+        let rtx = poll_once(&s).await.expect("retransmission");
+        s.mark_unsent(rtx.stream_offset).await;
+
+        let again = poll_once(&s)
+            .await
+            .expect("a segment that already paid for its room is offered again");
+        assert_eq!(again.stream_offset, first.stream_offset);
+    }
+
+    /// **Returning more than was charged must not turn the window inside out.**
+    ///
+    /// The correction is a subtraction on a `u64` between two totals that different paths
+    /// maintain, so "more returned than charged" is a state to survive rather than one to
+    /// assume away. Wrapped, the sent total lands just under `u64::MAX` and neither outcome
+    /// is a small error. Against an honest peer the stream stops for good: its advertised
+    /// limit is a finite number, `peer_send_window` is that limit less the total, and the
+    /// subtraction is zero from then on. Against a peer that advertises `u64::MAX` the
+    /// opposite happens — `apply_peer_window_limit`'s ceiling is the total plus
+    /// `MAX_SEND_WINDOW`, which saturates, so the limit it honours is the peer's own number
+    /// and the check that bounds a sender by its receiver stops binding at all; the few
+    /// bytes of window that leaves are the ones the test below charges for. Saturation costs
+    /// one compare and leaves an ordinary open window.
+    #[tokio::test(start_paused = true)]
+    async fn returning_more_than_was_charged_saturates_at_zero() {
+        let s = Stream::new(1);
+        s.send_reliable(Bytes::from(vec![0u8; HARNESS_SEG]))
+            .await
+            .unwrap();
+        let seg = poll_once(&s).await.expect("first transmission");
+        assert_eq!(s.bytes_sent(), HARNESS_SEG as u64);
+
+        // Stand the two totals apart by one byte — the smallest divergence that makes the
+        // correction larger than what it is correcting.
+        s.bytes_sent
+            .store(HARNESS_SEG as u64 - 1, Ordering::Release);
+        s.mark_unsent(seg.stream_offset).await;
+
+        assert_eq!(
+            s.bytes_sent(),
+            0,
+            "the sent total wrapped instead of stopping at zero"
+        );
+        assert_eq!(
+            s.peer_send_window(),
+            INITIAL_STREAM_WINDOW,
+            "an underflowed total leaves the peer unable to open the window at all"
+        );
+    }
+
+    /// **A charge that will not fit in a `u64` is refused, not wrapped.**
+    ///
+    /// The clamp that normally holds an advertisement to one `MAX_SEND_WINDOW` past what has
+    /// gone out is a saturating addition, so it degenerates at the top of the range: a peer
+    /// that writes `u64::MAX` there is honoured verbatim and is left holding a handful of
+    /// bytes of window. Charging for them is then an addition that leaves the range, and
+    /// deciding whether it fits by computing it first answers with a wrapped number — in a
+    /// debug build, by ending the task that drains every stream on the session, which a
+    /// peer's advertisement must never be able to do. Refusing is not a conservative
+    /// approximation either: `peer_send_limit` is a `u64`, so a sum above the range is above
+    /// any limit that can be advertised.
+    #[test]
+    fn a_charge_that_leaves_the_u64_range_is_refused_rather_than_wrapped() {
+        let s = Stream::new(1);
+        s.bytes_sent.store(u64::MAX - 4, Ordering::Release);
+        s.apply_peer_window_limit(u64::MAX);
+        assert_eq!(
+            s.peer_send_limit.load(Ordering::Acquire),
+            u64::MAX,
+            "the ceiling did not saturate, so this is not the state under test"
+        );
+        assert_eq!(s.peer_send_window(), 4);
+
+        assert!(
+            !s.try_consume_send_window(5),
+            "five bytes were charged against four bytes of window"
+        );
+        assert_eq!(
+            s.bytes_sent(),
+            u64::MAX - 4,
+            "a refused charge advanced the sent total"
+        );
+
+        // The exact fit still goes through: the refusal above is about the sum leaving the
+        // range, not about backing away from the boundary.
+        assert!(s.try_consume_send_window(4));
+        assert_eq!(s.bytes_sent(), u64::MAX);
+        assert_eq!(s.peer_send_window(), 0);
     }
 }

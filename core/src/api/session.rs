@@ -2921,14 +2921,14 @@ async fn drain_streams_priority_ordered<T: SessionTransport>(
                 // `poll_send` already stamped `sent_at` on this reliable
                 // segment, but the bytes never reached the wire. Clear it so the
                 // next drain re-offers it immediately instead of stalling a full
-                // RTO before the retransmit pass, and — on a first transmission —
-                // uncharge the sent total that same pass advanced, which otherwise
-                // counts bytes the peer will never see and leaves this side a
-                // segment short of its limit for good.
+                // RTO before the retransmit pass. Whether the bytes also owe the
+                // peer's flow-control limit a refund is not this loop's to judge
+                // and not asked here: the send buffer records how many copies of
+                // the segment have gone out, and `mark_unsent` reads it.
                 // Unreliable segments were removed by `poll_send`
                 // (fire-and-forget) — nothing to reset.
                 if seg.reliable {
-                    stream.mark_unsent(seg.stream_offset, !seg.retransmit).await;
+                    stream.mark_unsent(seg.stream_offset).await;
                 }
                 transport_refused = true;
                 break;

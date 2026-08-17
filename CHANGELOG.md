@@ -482,10 +482,31 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   the send timestamp so the segment would be re-offered, and the re-offer debited the window a
   second time for the same bytes. Every refusal therefore shrank the window by one segment for
   the rest of the connection, arriving at the same dead end as a lost `WINDOW_UPDATE` by a
-  route entirely inside this endpoint, with no peer and no path involved. `mark_unsent` now
-  takes whether the failed attempt was the first transmission and returns exactly what that
-  attempt debited; a retransmission was accounted on its original send (Karn) and refunds
-  nothing.
+  route entirely inside this endpoint, with no peer and no path involved.
+
+  The debit is now marked on the segment that carries it, so the pass that levies one skips a
+  segment already holding it, and a refused write returns it only when the send buffer says no
+  copy of those bytes has ever left — `retries == 0`, which the two retransmit passes and
+  nothing else move. Reading that from the buffer rather than from the caller is what makes
+  the accounting idempotent at both ends. A refused *retransmission* keeps its charge, because
+  the original did reach the wire; returning it and re-levying it on the re-offer would be
+  correct only if the two happened together, and they do not — an acknowledgement of the
+  original is processed on the receive task and can land in between, retiring the segment by
+  offset whether or not it is currently stamped, so there would be no re-offer left to take
+  the credit back. The sent total would then sit below the bytes the receiver has counted,
+  which is this side granting itself room to overrun a window nobody opened, ending at the
+  delivery hard cap where a conforming peer closes the session.
+
+- **A number the peer writes could end the task that drains every stream on the session.**
+  `Stream::try_consume_send_window` decided whether a charge fit by adding it to the sent
+  total and comparing afterwards, and the addition was an ordinary one. The clamp that holds
+  an advertisement to one `MAX_SEND_WINDOW` past what has gone out is a saturating add, so it
+  degenerates at the top of the `u64` range: a peer advertising exactly `u64::MAX` against a
+  sent total near it is honoured verbatim, is left holding a few bytes of window, and the
+  charge for those bytes is a sum that leaves the range — a wrap in release, a panic in the
+  drain task in debug. The comparison is now made on `checked_add`, and a sum that cannot be
+  represented reads as the ordinary refusal rather than as a special case: `peer_send_limit`
+  is a `u64` too, so such a sum is above every limit the peer is able to state.
 
 - **The PhantomUDP handshake abandoned paths a mature implementation completes, because its
   retransmission timer asserted a number about the path instead of adapting to it.** The
