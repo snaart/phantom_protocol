@@ -259,8 +259,25 @@ mod packaged_readme {
         rest.split_once('"').map(|(path, _)| path)
     }
 
+    /// Whether `path` is anchored at a filesystem root rather than at the file that
+    /// names it.
+    ///
+    /// Three spellings, because the argument is only text and the machine that wrote
+    /// it is not necessarily the machine that reads it: a leading `/`, a Windows
+    /// drive letter, and a UNC share. A backslash anywhere is treated as a root
+    /// anchor too — it is a separator this resolver does not model, and refusing a
+    /// path it cannot walk is the only answer it can give honestly.
+    fn is_root_anchored(path: &str) -> bool {
+        let drive_letter = path
+            .split('/')
+            .next()
+            .is_some_and(|first| first.len() == 2 && first.ends_with(':'));
+        path.starts_with('/') || path.contains('\\') || drive_letter
+    }
+
     /// Where `path`, read from `core/src/`, lands inside the package — as components
-    /// below `core/` — or `None` if the walk ever rises above `core/`.
+    /// below `core/` — or `None` if it does not stay inside `core/` for the whole of
+    /// its walk.
     ///
     /// The verdict is about the traversal, not the destination. `core/` is the
     /// archive root, so there is nothing above it to descend from: a path that
@@ -271,7 +288,20 @@ mod packaged_readme {
     /// same file here. So the stack below starts at `["src"]` — rooted at `core`,
     /// not at the repository — and popping it empty is fatal on the spot, however
     /// the rest of the path continues.
+    ///
+    /// An absolute path is rejected before the walk begins, and it has to be,
+    /// because counting `..` cannot see it: it never rises above anything. Left to
+    /// the loop, its leading empty component would be skipped by the same arm that
+    /// tolerates `./` and a doubled slash, and `/Users/someone/README.md` would
+    /// resolve to `src/Users/someone/README.md` — a location inside the package, and
+    /// a verdict of "fine". Nothing downstream disagrees either: `cargo package`
+    /// verifies by building the extracted crate on the host that wrote the path,
+    /// where the path still resolves, so the archive is built, published, and
+    /// unbuildable everywhere else.
     fn resolve_from_core_src(path: &str) -> Option<Vec<&str>> {
+        if is_root_anchored(path) {
+            return None;
+        }
         let mut below_core = vec!["src"];
         for part in path.split('/') {
             match part {
@@ -728,10 +758,12 @@ mod packaged_readme {
         let landed = resolve_from_core_src(path);
         assert!(
             landed.is_some(),
-            "`#![doc = include_str!(\"{path}\")]` walks above core/, so the file it \
-             names is absent from the crate archive and `cargo package` cannot \
-             compile the lib — even if the path descends back into core/ afterwards, \
-             because in the archive core/ is the root"
+            "`#![doc = include_str!(\"{path}\")]` does not stay inside core/, so the \
+             file it names is absent from the crate archive. Either it walks above \
+             core/ — which is fatal even if it descends back in afterwards, because \
+             in the archive core/ is the root and `cargo package` fails on it — or \
+             it is anchored at a filesystem root, which is worse: that one builds \
+             here, packages here, publishes, and is unbuildable everywhere else"
         );
     }
 
@@ -774,6 +806,47 @@ mod packaged_readme {
         // correct: the walk touches `core/` but never rises past it.
         assert_eq!(
             resolve_from_core_src("api/../../README.md"),
+            Some(vec!["README.md"])
+        );
+    }
+
+    /// An absolute path is the one escape no later gate can catch.
+    ///
+    /// It never rises above `core/` — it never walks at all — so a resolver that
+    /// only counts `..` sees nothing wrong and answers with a plausible-looking
+    /// location inside the package. Downstream is no better: `cargo package`
+    /// verifies by building the extracted crate on the host that wrote the path,
+    /// where the path still resolves, so the archive is produced and published with
+    /// one machine's directory layout compiled into `src/lib.rs`. The first failure
+    /// is on a consumer's machine and on docs.rs, and by then the version is
+    /// immutable.
+    #[test]
+    fn resolver_rejects_absolute_paths() {
+        assert_eq!(resolve_from_core_src("/README.md"), None);
+        assert_eq!(
+            resolve_from_core_src("/Users/someone/phantom_core_rust/README.md"),
+            None
+        );
+        assert_eq!(resolve_from_core_src("/tmp/README.md"), None);
+        // A root-anchored path that walks back down into a directory named like the
+        // package is the shape most likely to look right in review.
+        assert_eq!(
+            resolve_from_core_src("/home/ci/checkout/core/README.md"),
+            None
+        );
+        // Windows spellings, since a path written on one is still text here.
+        assert_eq!(resolve_from_core_src("C:/Users/someone/README.md"), None);
+        assert_eq!(resolve_from_core_src("C:\\Users\\someone\\README.md"), None);
+        assert_eq!(resolve_from_core_src("\\\\server\\share\\README.md"), None);
+
+        // Relative paths are untouched by the rejection: a leading `./` is still a
+        // walk that starts where the file sits.
+        assert_eq!(
+            resolve_from_core_src("./README.md"),
+            Some(vec!["src", "README.md"])
+        );
+        assert_eq!(
+            resolve_from_core_src("../README.md"),
             Some(vec!["README.md"])
         );
     }
