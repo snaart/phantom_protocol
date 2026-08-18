@@ -467,6 +467,14 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   page. Verification compiles the archive, and a crate compiles just as happily around the
   wrong README — which is exactly the failure that shipped.
 
+  The landing page's two Rust examples also stop hiding their `#[tokio::main]` and their `fn
+  main` behind rustdoc's `# ` line marker. rustdoc strips those, so docs.rs was clean, but
+  crates.io renders the same file as CommonMark, which has no such convention and prints them:
+  a visitor met two headline examples interrupted by stray hashes and apparently having no
+  `main`, and pasting either produced a syntax error on the first line. The stub being replaced
+  here had no such problem, so it would have arrived as a regression on the exact surface this
+  change set out to repair. The fences stay `rust,no_run` and still compile.
+
 - **A stream stopped on its flow-control limit with nothing outstanding had no way to ask, and
   no answer was on its way.** Blocked with nothing in flight is the one state a sender cannot
   leave on its own: what would free it is an acknowledgement, and an acknowledgement only comes
