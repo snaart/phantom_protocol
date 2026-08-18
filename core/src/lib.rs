@@ -243,20 +243,30 @@ mod packaged_readme {
         rest.split_once('"').map(|(path, _)| path)
     }
 
-    /// Where `path`, read from `core/src/`, lands — as components rooted at the
-    /// repository — or `None` when it climbs above the repository root entirely.
+    /// Where `path`, read from `core/src/`, lands inside the package — as components
+    /// below `core/` — or `None` if the walk ever rises above `core/`.
+    ///
+    /// The verdict is about the traversal, not the destination. `core/` is the
+    /// archive root, so there is nothing above it to descend from: a path that
+    /// leaves and comes back names a file that exists in a repository checkout and
+    /// does not exist in an extracted crate, and `cargo package` fails on it with
+    /// `couldn't read src/../../core/README.md`. Judging where the path lands
+    /// cannot tell that apart from a path that never left, because both land on the
+    /// same file here. So the stack below starts at `["src"]` — rooted at `core`,
+    /// not at the repository — and popping it empty is fatal on the spot, however
+    /// the rest of the path continues.
     fn resolve_from_core_src(path: &str) -> Option<Vec<&str>> {
-        let mut at = vec!["core", "src"];
+        let mut below_core = vec!["src"];
         for part in path.split('/') {
             match part {
                 "" | "." => {}
                 ".." => {
-                    at.pop()?;
+                    below_core.pop()?;
                 }
-                name => at.push(name),
+                name => below_core.push(name),
             }
         }
-        Some(at)
+        Some(below_core)
     }
 
     /// The two copies must agree byte for byte, or the page crates.io renders is not
@@ -275,10 +285,11 @@ mod packaged_readme {
         );
     }
 
-    /// The attribute's argument must name a file inside `core/`. Checking the text
-    /// rather than the resolved contents is deliberate: in this working copy both
-    /// `../README.md` and `../../README.md` compile, so no assertion about the
-    /// inlined string can tell them apart. Only the shape of the path can.
+    /// The attribute's argument must stay inside `core/` for the whole of its walk.
+    /// Checking the text rather than the resolved contents is deliberate: in this
+    /// working copy `../README.md`, `../../README.md` and `../../core/README.md` all
+    /// compile, and the first and third even inline the same bytes, so no assertion
+    /// about the inlined string can tell them apart. Only the shape of the path can.
     #[test]
     fn crate_doc_include_stays_inside_the_package() {
         assert_eq!(
@@ -290,36 +301,58 @@ mod packaged_readme {
 
         let path = crate_doc_include_path(SOURCE)
             .expect("lib.rs carries a crate-level `#![doc = include_str!(\"…\")]`");
-        let landed = resolve_from_core_src(path).unwrap_or_else(|| {
-            panic!("`#![doc = include_str!(\"{path}\")]` climbs above the repository root")
-        });
 
-        assert_eq!(
-            landed.first().copied(),
-            Some("core"),
-            "`#![doc = include_str!(\"{path}\")]` resolves to {} — outside core/, so it \
-             is absent from the crate archive and `cargo package` cannot compile the lib",
-            landed.join("/")
+        let landed = resolve_from_core_src(path);
+        assert!(
+            landed.is_some(),
+            "`#![doc = include_str!(\"{path}\")]` walks above core/, so the file it \
+             names is absent from the crate archive and `cargo package` cannot \
+             compile the lib — even if the path descends back into core/ afterwards, \
+             because in the archive core/ is the root"
         );
     }
 
     /// The resolver is what decides the verdict above, so a resolver that answered
     /// "inside the package" for everything would leave that test green forever.
+    ///
+    /// The cases that matter are the ones that leave `core/` and come back.
+    /// `../../core/README.md` is what a contributor writes when thinking from the
+    /// repository root, and it addresses the right file *here* — so a resolver that
+    /// judges the destination accepts it, and `cargo package` then fails on
+    /// `couldn't read src/../../core/README.md`, which is the exact failure this
+    /// whole mechanism exists to prevent. The verdict has to be about the walk.
     #[test]
-    fn resolver_separates_paths_that_escape_the_package() {
+    fn resolver_rejects_every_path_that_leaves_core() {
+        // Escapes and returns. Lands on a file that exists in this checkout and
+        // is absent from the archive, because in the archive there is nothing
+        // above the package root to descend from.
+        assert_eq!(resolve_from_core_src("../../core/README.md"), None);
+        assert_eq!(resolve_from_core_src("../../core/src/../README.md"), None);
+        assert_eq!(
+            resolve_from_core_src("../../core/src/api/../../README.md"),
+            None
+        );
+
+        // Escapes, and never returns.
+        assert_eq!(resolve_from_core_src("../../README.md"), None);
+        assert_eq!(resolve_from_core_src("../../../README.md"), None);
+
+        // Inside, and where the crate-level attribute actually points.
         assert_eq!(
             resolve_from_core_src("../README.md"),
-            Some(vec!["core", "README.md"])
-        );
-        assert_eq!(
-            resolve_from_core_src("../../README.md"),
             Some(vec!["README.md"])
         );
         assert_eq!(
             resolve_from_core_src("./api/mod.rs"),
-            Some(vec!["core", "src", "api", "mod.rs"])
+            Some(vec!["src", "api", "mod.rs"])
         );
-        assert_eq!(resolve_from_core_src("../../../README.md"), None);
+        // Dips to the package root and descends again without ever rising above it.
+        // A resolver that merely refused any `..` would reject this, and it is
+        // correct: the walk touches `core/` but never rises past it.
+        assert_eq!(
+            resolve_from_core_src("api/../../README.md"),
+            Some(vec!["README.md"])
+        );
     }
 }
 
