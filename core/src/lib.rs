@@ -320,11 +320,100 @@ mod packaged_readme {
         None
     }
 
-    /// Whether a fence carrying this info string is compiled as Rust. rustdoc reads
-    /// an empty info string as Rust, and `rust,no_run` as Rust with an attribute.
+    /// Languages this repository's Markdown fences are written in, plus the common
+    /// ones a future page is likely to reach for. Nothing else about a fence is
+    /// consulted; this list alone decides what the hidden-line scan skips.
+    ///
+    /// Kept sorted so an addition is a one-line diff in an obvious place.
+    const NON_RUST_FENCE_LANGUAGES: &[&str] = &[
+        "asm",
+        "bash",
+        "c",
+        "c++",
+        "cmake",
+        "console",
+        "cpp",
+        "cs",
+        "csharp",
+        "css",
+        "diff",
+        "dockerfile",
+        "go",
+        "gradle",
+        "groovy",
+        "hcl",
+        "html",
+        "http",
+        "ini",
+        "java",
+        "javascript",
+        "js",
+        "json",
+        "kotlin",
+        "kt",
+        "lua",
+        "makefile",
+        "markdown",
+        "md",
+        "mermaid",
+        "nix",
+        "none",
+        "objc",
+        "patch",
+        "perl",
+        "php",
+        "plain",
+        "powershell",
+        "protobuf",
+        "ps1",
+        "py",
+        "python",
+        "rb",
+        "ruby",
+        "scala",
+        "sh",
+        "shell",
+        "sql",
+        "swift",
+        "text",
+        "toml",
+        "ts",
+        "typescript",
+        "wat",
+        "wit",
+        "xml",
+        "yaml",
+        "yml",
+        "zsh",
+    ];
+
+    /// Whether a fence carrying this info string is compiled as Rust by rustdoc.
+    ///
+    /// The rule is inverted from the way an info string reads. rustdoc does not
+    /// look for the word `rust`: it starts from "this is Rust" and only a token it
+    /// recognises as another language talks it out of that. Every token it does not
+    /// recognise is an attribute — `no_run`, `ignore`, `should_panic`,
+    /// `compile_fail`, `edition2021`, `test_harness` and anything added after this
+    /// sentence was written — and a fence carrying one is Rust that rustdoc
+    /// compiles, hidden lines and all.
+    ///
+    /// Reading it the other way round, as "Rust unless the first token is `rust` or
+    /// absent", loses every one of those spellings, and the loss is silent: the scan
+    /// below skips the fence, the gate stays green, and the `# ` lines land on
+    /// crates.io. So the verdict is taken from a list of languages rather than from
+    /// a list of Rust-isms, and an unlisted token is Rust. That errs towards
+    /// scanning a fence that did not need it, whose worst outcome is a failing
+    /// assertion naming the language to add here.
     fn fence_is_rust(info: &str) -> bool {
-        let language = info.split(',').next().unwrap_or("").trim();
-        language.is_empty() || language == "rust"
+        // Both separators, because rustdoc accepts either and the language is
+        // whichever token comes first under both readings.
+        let language = info
+            .split([',', ' ', '\t'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        !NON_RUST_FENCE_LANGUAGES.contains(&language.as_str())
     }
 
     /// Whether `line`, inside a Rust fence, is a rustdoc hidden-line marker: a `#`
@@ -493,7 +582,10 @@ mod packaged_readme {
             "README.md {hidden:?} (1-based) are rustdoc hidden-line markers inside a \
              Rust fence. rustdoc strips them and docs.rs stays clean, but crates.io \
              renders this file as CommonMark and prints them verbatim. Drop the \
-             `# ` prefixes and let the lines show."
+             `# ` prefixes and let the lines show. If the fence is not Rust at all, \
+             its language is missing from NON_RUST_FENCE_LANGUAGES above — an \
+             unlisted info string is read as Rust on purpose, because the reverse \
+             mistake is silent."
         );
     }
 
@@ -528,6 +620,38 @@ mod packaged_readme {
             rustdoc_hidden_lines("```rust\n# hidden\n```\n\n# Heading\n"),
             vec![2]
         );
+
+        // A bare attribute is the spelling that matters most, because it is the
+        // one an author reaches for. Every token here is a rustdoc attribute, not
+        // a language, so every one of these fences is compiled as Rust and every
+        // marker inside it is stripped on docs.rs and printed on crates.io.
+        for info in [
+            "no_run",
+            "ignore",
+            "should_panic",
+            "compile_fail",
+            "edition2021",
+            "test_harness",
+            "no_run,rust",
+            "ignore,should_panic",
+        ] {
+            assert_eq!(
+                rustdoc_hidden_lines(&format!("```{info}\n# fn main() {{}}\n```\n")),
+                vec![2],
+                "a ```{info} fence is Rust with an attribute, and its hidden lines \
+                 reach crates.io verbatim"
+            );
+        }
+
+        // Genuine other languages, which is the whole of what the fence check is
+        // allowed to skip.
+        for info in ["bash", "toml", "text", "console", "yaml", "TOML"] {
+            assert!(
+                rustdoc_hidden_lines(&format!("```{info}\n# a comment\ncmd\n```\n")).is_empty(),
+                "```{info} is not Rust, so a `# ` line in it is that language's own \
+                 syntax and not a rustdoc marker"
+            );
+        }
     }
 
     /// Everything else here protects the *file* `core/README.md`, and nothing else
