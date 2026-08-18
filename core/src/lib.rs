@@ -275,9 +275,9 @@ mod packaged_readme {
         path.starts_with('/') || path.contains('\\') || drive_letter
     }
 
-    /// Where `path`, read from `core/src/`, lands inside the package — as components
-    /// below `core/` — or `None` if it does not stay inside `core/` for the whole of
-    /// its walk.
+    /// Where `path`, read from a file whose directory is `start` components below
+    /// `core/`, lands inside the package — or `None` if it does not stay inside
+    /// `core/` for the whole of its walk.
     ///
     /// The verdict is about the traversal, not the destination. `core/` is the
     /// archive root, so there is nothing above it to descend from: a path that
@@ -285,9 +285,9 @@ mod packaged_readme {
     /// does not exist in an extracted crate, and `cargo package` fails on it with
     /// `couldn't read src/../../core/README.md`. Judging where the path lands
     /// cannot tell that apart from a path that never left, because both land on the
-    /// same file here. So the stack below starts at `["src"]` — rooted at `core`,
-    /// not at the repository — and popping it empty is fatal on the spot, however
-    /// the rest of the path continues.
+    /// same file here. So the stack below starts at the naming file's own directory
+    /// — rooted at `core`, not at the repository — and popping it empty is fatal on
+    /// the spot, however the rest of the path continues.
     ///
     /// An absolute path is rejected before the walk begins, and it has to be,
     /// because counting `..` cannot see it: it never rises above anything. Left to
@@ -298,11 +298,11 @@ mod packaged_readme {
     /// verifies by building the extracted crate on the host that wrote the path,
     /// where the path still resolves, so the archive is built, published, and
     /// unbuildable everywhere else.
-    fn resolve_from_core_src(path: &str) -> Option<Vec<&str>> {
+    fn resolve_below_core<'a>(start: &[&'a str], path: &'a str) -> Option<Vec<&'a str>> {
         if is_root_anchored(path) {
             return None;
         }
-        let mut below_core = vec!["src"];
+        let mut below_core = start.to_vec();
         for part in path.split('/') {
             match part {
                 "" | "." => {}
@@ -314,6 +314,126 @@ mod packaged_readme {
         }
         Some(below_core)
     }
+
+    /// The same verdict for the common case: a path written in a file that sits
+    /// directly in `core/src/`.
+    fn resolve_from_core_src(path: &str) -> Option<Vec<&str>> {
+        resolve_below_core(&["src"], path)
+    }
+
+    /// The two macros that name a file from inside a source file, and so the two
+    /// that can name one the archive does not carry. Written without their opening
+    /// parenthesis on purpose: this constant is itself text in this file, and the
+    /// scan below would otherwise find itself.
+    const INCLUDE_MACROS: &[&str] = &["include_str!", "include_bytes!"];
+
+    /// One occurrence of an inclusion macro, as found in a source file.
+    struct IncludeSite<'a> {
+        /// Which of `INCLUDE_MACROS` was written.
+        macro_name: &'a str,
+        /// The path literal, or `None` when the argument is not a plain string
+        /// literal — a raw string, a nested macro, anything this scan declines to
+        /// interpret rather than guess at.
+        argument: Option<&'a str>,
+        line: usize,
+    }
+
+    /// Every inclusion-macro occurrence in `source` that carries an argument.
+    ///
+    /// Two occurrences are deliberately not reported. One is a bare mention with no
+    /// parenthesis after it, which is prose about the macro rather than a use of it.
+    /// The other is an occurrence whose argument opens with a backslash, which can
+    /// only happen when the whole thing sits inside a Rust string literal — this
+    /// file quotes the crate-level attribute in several assertion messages, and
+    /// those are text, not includes.
+    ///
+    /// Everything else is reported, including arguments the scan cannot read. An
+    /// unreadable argument is a finding rather than a skip: silently passing over
+    /// the one spelling nobody anticipated is how the narrow version of this check
+    /// came to cover a single site.
+    fn include_sites(source: &str) -> Vec<IncludeSite<'_>> {
+        let mut sites = Vec::new();
+        for name in INCLUDE_MACROS {
+            let mut cursor = 0usize;
+            while let Some(rel) = source[cursor..].find(name) {
+                let at = cursor + rel;
+                cursor = at + name.len();
+                // `my_include_str!` is somebody else's macro.
+                if source[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let Some(inside) = source[cursor..].trim_start().strip_prefix('(') else {
+                    continue;
+                };
+                let inside = inside.trim_start();
+                if inside.starts_with('\\') {
+                    continue;
+                }
+                sites.push(IncludeSite {
+                    macro_name: name,
+                    argument: inside
+                        .strip_prefix('"')
+                        .and_then(|rest| rest.split_once('"'))
+                        .map(|(literal, _)| literal),
+                    line: source[..at].bytes().filter(|b| *b == b'\n').count() + 1,
+                });
+            }
+        }
+        sites.sort_by_key(|site| site.line);
+        sites
+    }
+
+    /// Every `.rs` file under `dir`, recursively, in a stable order.
+    fn rust_sources_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            let entries = std::fs::read_dir(&next)
+                .unwrap_or_else(|why| panic!("cannot read {}: {why}", next.display()));
+            for entry in entries {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// `file`'s location relative to `root`, spelled with forward slashes whatever
+    /// the host separator is, so the listing below reads the same everywhere.
+    fn relative_slash_path(root: &std::path::Path, file: &std::path::Path) -> String {
+        file.strip_prefix(root)
+            .expect("every scanned file sits under the manifest directory")
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// The inclusion arguments allowed to name a file outside `core/`, as
+    /// (source file below `core/`, argument as written).
+    ///
+    /// Each of these sits in a `#[cfg(test)]` module, which `cargo package`'s
+    /// verification build never compiles, so the file it names does not have to
+    /// exist in the archive. The scan cannot establish that for itself: it reads
+    /// text, and telling a `cfg(test)` module from production code by text alone
+    /// means parsing `cfg` attributes and module nesting, which would be a second
+    /// mechanism able to fail quietly. So every site is checked and the exceptions
+    /// are written here by hand. Adding a line is a deliberate act; a production
+    /// include slipping past because nobody looked is not available.
+    const ESCAPES_OUTSIDE_THE_PACKAGE: &[(&str, &str)] = &[
+        ("src/lib.rs", "../../README.md"),
+        ("src/lib.rs", "../../BENCHMARKS.md"),
+        ("src/lib.rs", "../../docs/operations/deployment.md"),
+    ];
 
     /// The `readme` value from the manifest's `[package]` table, as written.
     ///
@@ -848,6 +968,94 @@ mod packaged_readme {
         assert_eq!(
             resolve_from_core_src("../README.md"),
             Some(vec!["README.md"])
+        );
+    }
+
+    /// The check above reads one attribute in one file, and that is not where the
+    /// next escape will be.
+    ///
+    /// A `#[doc = …]` attribute on a module pulling in the protocol specification
+    /// is the obvious next thing somebody writes, and a plain include of a fixture
+    /// or a table is the next after that. Neither is the crate-level attribute, so
+    /// neither was looked at, and `cargo test --lib` — the required
+    /// branch-protection context — would have stayed green through both. Only the
+    /// packaging job would have failed, and it is not required, so the failure lands
+    /// on whoever next runs a release rather than on whoever wrote the line.
+    ///
+    /// So the whole of `core/src` is walked, cfg-gated modules included: a
+    /// `wasm32`-only or `fips`-only file's include still ships in the archive and
+    /// still has to resolve there, and the fact that this host does not compile it
+    /// says nothing about the host that will.
+    #[test]
+    fn no_include_reaches_outside_the_package() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut problems: Vec<String> = Vec::new();
+        let mut exercised: Vec<(String, String)> = Vec::new();
+
+        for file in rust_sources_under(&manifest_dir.join("src")) {
+            let shown = relative_slash_path(manifest_dir, &file);
+            let source = std::fs::read_to_string(&file)
+                .unwrap_or_else(|why| panic!("cannot read {shown}: {why}"));
+
+            // The naming file's own directory is where its relative argument starts
+            // walking, so a file three levels down gets three levels of slack.
+            let mut directory: Vec<&str> = shown.split('/').collect();
+            directory.pop();
+
+            for site in include_sites(&source) {
+                let at = format!("{shown}:{}", site.line);
+                let Some(argument) = site.argument else {
+                    problems.push(format!(
+                        "{at}: `{}` is given an argument this check cannot read as a \
+                         plain string literal, so where it points is unknown. Write \
+                         the path as an ordinary literal, or add the spelling to \
+                         `include_sites`.",
+                        site.macro_name
+                    ));
+                    continue;
+                };
+                if resolve_below_core(&directory, argument).is_some() {
+                    continue;
+                }
+                if ESCAPES_OUTSIDE_THE_PACKAGE.contains(&(shown.as_str(), argument)) {
+                    exercised.push((shown.clone(), argument.to_owned()));
+                    continue;
+                }
+                problems.push(format!(
+                    "{at}: `{}` names `{argument}`, which does not stay inside core/. \
+                     A cargo package archive carries only what sits under the manifest \
+                     directory, so the file is absent from it and the crate cannot be \
+                     built by anyone who downloads it or by docs.rs. Copy the file \
+                     under core/ and point at the copy — that is what core/README.md \
+                     is. If this line is inside a #[cfg(test)] module, which the \
+                     packaging build never compiles, add it to \
+                     ESCAPES_OUTSIDE_THE_PACKAGE.",
+                    site.macro_name
+                ));
+            }
+        }
+
+        // A listed exception that no longer matches anything is an allowance nobody
+        // asked for, sitting ready for the next path that happens to be spelled the
+        // same way.
+        for (file, argument) in ESCAPES_OUTSIDE_THE_PACKAGE {
+            if !exercised
+                .iter()
+                .any(|(seen_file, seen_argument)| seen_file == file && seen_argument == argument)
+            {
+                problems.push(format!(
+                    "{file}: the listed exception for `{argument}` matches nothing in \
+                     the tree any more. Delete the entry rather than leaving it to \
+                     pre-approve some later include."
+                ));
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "an inclusion in core/src names a file the published archive will not \
+             carry:\n\n{}\n",
+            problems.join("\n")
         );
     }
 }
