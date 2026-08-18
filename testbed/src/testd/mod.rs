@@ -24,7 +24,7 @@ use crate::quic::QuicLink;
 use crate::report::{unix_nanos, BuildId, PerLegCounters, ServerStats};
 use crate::testd::collector::CollectorHandle;
 use crate::testd::handler::{Counters, SessionCtx};
-use crate::testd::session_uid::{SessionUidCounter, UidLevel};
+use crate::testd::session_uid::{NoticeSink, SessionUidCounter, UidLevel, UidNotice};
 
 /// How long shutdown waits for the collector to drain before giving up.
 ///
@@ -154,25 +154,49 @@ fn key_from_seed(seed: &[u8]) -> Result<HybridSigningKey> {
 /// where the range came from — including any degradation — are logged and
 /// written into the archive here, because a run whose uid range is not
 /// guaranteed must say so in the same files the range keys.
+///
+/// That holds for a failure raised later in the run as well as at boot: the
+/// counter is handed a sink that reports through the same path, built over a
+/// `Weak` handle so the thread that owns it cannot hold the collector's channel
+/// open past the drain wait in [`run`].
 fn new_session_uid_counter(
     clock_us: u64,
     data_dir: &Path,
-    collector: Option<&CollectorHandle>,
+    collector: Option<&Arc<CollectorHandle>>,
 ) -> Arc<SessionUidCounter> {
-    let (counter, notices) = SessionUidCounter::open(clock_us, data_dir);
-    for n in notices {
-        match n.level {
-            UidLevel::Info => tracing::info!(detail = %n.detail, "session uid range"),
-            UidLevel::Warn => tracing::warn!(detail = %n.detail, "session uid range"),
-            UidLevel::Degraded => {
-                tracing::error!(detail = %n.detail, "session uid range degraded")
-            }
-        }
-        if let Some(c) = collector {
-            c.event("daemon", n.kind, None, None, n.detail);
-        }
+    let sink: Option<NoticeSink> = collector.map(|c| {
+        let weak = Arc::downgrade(c);
+        let sink: NoticeSink = Arc::new(move |n: UidNotice| {
+            // Once shutdown has released the archive route the notice still
+            // reaches the log, which is the same treatment a run with no
+            // collector at all gets.
+            report_uid_notice(weak.upgrade().as_deref(), &n);
+        });
+        sink
+    });
+    let (counter, notices) = SessionUidCounter::open_with_sink(clock_us, data_dir, sink);
+    for n in &notices {
+        report_uid_notice(collector.map(|c| c.as_ref()), n);
     }
     Arc::new(counter)
+}
+
+/// Log a uid notice, and put it in the archive too when there is one to write.
+///
+/// One function for every notice the allocator produces, whenever it produces
+/// it: an operator who greps `events.jsonl` for `session_uid_degraded` must not
+/// have to know which of them the daemon happened to route differently.
+fn report_uid_notice(collector: Option<&CollectorHandle>, n: &UidNotice) {
+    match n.level {
+        UidLevel::Info => tracing::info!(detail = %n.detail, "session uid range"),
+        UidLevel::Warn => tracing::warn!(detail = %n.detail, "session uid range"),
+        UidLevel::Degraded => {
+            tracing::error!(detail = %n.detail, "session uid range degraded")
+        }
+    }
+    if let Some(c) = collector {
+        c.event("daemon", n.kind, None, None, n.detail.clone());
+    }
 }
 
 /// Where a snapshot's observability comes from, per listener.
@@ -234,7 +258,13 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
 
     let (collector, collector_task) = collector::spawn(&cfg.data_dir)?;
     let obs = Arc::new(ObsRegistry::default());
-    let uid = new_session_uid_counter(unix_nanos() / 1_000, &cfg.data_dir, Some(&collector));
+    // A second handle behind an `Arc`, so the counter's mark writer can hold a
+    // `Weak` to it. That thread lives as long as the counter, which is past the
+    // point where shutdown drops its own handle and waits for the collector to
+    // drain; an owning clone would hold the channel open and make that wait
+    // expire every time. Dropped explicitly at shutdown, below.
+    let uid_collector = Arc::new(collector.clone());
+    let uid = new_session_uid_counter(unix_nanos() / 1_000, &cfg.data_dir, Some(&uid_collector));
     let slots = Arc::new(Semaphore::new(cfg.max_sessions.max(1)));
 
     // `PhantomConfig` is `#[non_exhaustive]`, so start from the server preset
@@ -446,6 +476,16 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
     // Give in-flight handlers a moment to emit their final session records
     // before the collector's channel closes.
     tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Release the counter while the archive is still open: its last act is to
+    // push the mark up to the uids this run actually handed out, and if that
+    // write fails the record saying so still has somewhere to land.
+    drop(uid);
+    // And release the counter's route into the archive before the drain wait,
+    // so a mark writer that outlives this point can no longer upgrade its
+    // `Weak` into a handle that keeps the channel open.
+    drop(uid_collector);
+
     collector.event(
         "daemon",
         "stop",
@@ -837,14 +877,16 @@ mod tests {
     /// still orders by run. Pinning that — rather than only the uniqueness it
     /// buys — is what keeps a later "just start at 1 again" from passing.
     ///
-    /// Against a fixed reading rather than the host clock. The earlier form
-    /// bracketed the uid between two readings of the same clock, which on a
-    /// host reading zero — `report::unix_nanos()`'s documented fallback for a
-    /// clock set before the epoch — collapsed to `0..=0` and was satisfied by
-    /// the counter starting at 0, the very sequence it was written to reject.
+    /// Every number here comes from the injected reading and from the uid that
+    /// was actually issued. Reading the host clock is the thing this test must
+    /// not do: `report::unix_nanos()` returns 0 on a clock set before the
+    /// epoch, which is precisely the host the seed exists to survive, and an
+    /// assertion about the host's own clock fails there while the code under
+    /// test is behaving correctly.
     #[test]
     fn a_session_uid_carries_the_daemons_start_time() {
         let dir = tmpdir("starttime");
+        // A microsecond reading of a wall clock in 2027.
         const READING_US: u64 = 1_800_000_000_000_000;
 
         let first = new_session_uid_counter(READING_US, &dir, None).next();
@@ -854,16 +896,17 @@ mod tests {
         );
 
         // The artifacts are read by tools that parse JSON numbers as doubles,
-        // which are exact only below 2^53. A microsecond stamp clears that by
-        // two centuries; a nanosecond one would not clear it today.
-        let now_us = crate::report::unix_nanos() / 1_000;
+        // which are exact only below 2^53. The uid that was issued clears that
+        // by two centuries; the nanosecond form of the same instant does not
+        // clear it at all, which is why the reading is divided down before it
+        // ever becomes a uid.
         assert!(
-            now_us < (1u64 << 53),
-            "a microsecond stamp ({now_us}) is past the range a double holds exactly"
+            first < (1u64 << 53),
+            "the issued uid ({first}) must stay inside the range a double holds exactly"
         );
         assert!(
-            crate::report::unix_nanos() >= (1u64 << 53),
-            "the nanosecond stamp this deliberately avoids should still be out of range"
+            first.saturating_mul(1_000) >= (1u64 << 53),
+            "the nanosecond stamp this deliberately avoids should be out of that range"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -877,6 +920,7 @@ mod tests {
         std::fs::write(dir.join("session-uid.hwm"), b"not a number\n").expect("write");
 
         let (collector, task) = collector::spawn(&dir).expect("spawn collector");
+        let collector = Arc::new(collector);
         let counter = new_session_uid_counter(1_800_000_000_000_000, &dir, Some(&collector));
         assert_eq!(
             counter.next(),
@@ -907,6 +951,85 @@ mod tests {
             degraded[0]["detail"]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The README tells an operator to grep `events.jsonl` for
+    /// `session_uid_degraded` and treat a run carrying one as unguaranteed. A
+    /// mark that stops being writable *during* a run is exactly that case, and
+    /// it left the journals affirming a clean run while a restart went on to
+    /// reissue everything past the last reservation.
+    #[tokio::test]
+    async fn a_uid_mark_that_fails_mid_run_is_recorded_in_the_archive() {
+        let dir = tmpdir("uid-runtime");
+        let (collector, task) = collector::spawn(&dir).expect("spawn collector");
+        let collector = Arc::new(collector);
+        let counter = new_session_uid_counter(1_800_000_000_000_000, &dir, Some(&collector));
+
+        // Wedge the data directory after boot: the boot-time write has already
+        // succeeded, so only the run-time arm can report what follows.
+        std::fs::create_dir_all(dir.join("session-uid.hwm.tmp")).expect("mkdir");
+        for _ in 0..session_uid::LEASE {
+            counter.next();
+        }
+
+        // Dropping the counter joins its writer, so the record has been offered
+        // to the collector by the time this returns.
+        drop(counter);
+        drop(collector);
+        task.await.expect("collector joins");
+
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
+        let degraded: Vec<serde_json::Value> = events
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["kind"] == "session_uid_degraded")
+            .collect();
+        assert_eq!(
+            degraded.len(),
+            1,
+            "a run-time mark failure must reach the archive exactly once: {events}"
+        );
+        assert!(
+            degraded[0]["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("session-uid.hwm"),
+            "the record must name the file it could not write: {}",
+            degraded[0]["detail"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two shipped documents describe this allocator to someone reading an
+    /// archive, and a document that describes the wrong allocator is worse than
+    /// none: it is believed. `stall_verdict.py` is the one the README now sends
+    /// readers to, so what it says about where a uid comes from has to be what
+    /// the daemon does.
+    #[test]
+    fn the_shipped_documents_describe_the_allocator_that_exists() {
+        let verdict = include_str!("../../stall_verdict.py");
+        assert!(
+            !verdict.contains("seeded from the start time"),
+            "stall_verdict.py still describes the start time as the seed; it is a floor, and the \
+             mark in session-uid.hwm is what makes two runs disjoint"
+        );
+        assert!(
+            verdict.contains("session-uid.hwm"),
+            "stall_verdict.py must name what actually separates two runs"
+        );
+        // The reader-side defences the comment exists to explain must still be
+        // there: archived files do not change, so the time-bounded join and the
+        // duplicate warning are the only protection for data already written.
+        assert!(
+            verdict.contains("begin") && verdict.contains("end"),
+            "the time-bounded join must survive whatever the comment says"
+        );
+
+        let readme = include_str!("../../README.md");
+        assert!(
+            readme.contains("session_uid_degraded"),
+            "the README must keep naming the record it tells operators to grep for"
+        );
     }
 
     #[test]

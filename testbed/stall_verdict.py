@@ -204,11 +204,14 @@ def run_server(data_dir, since_ns):
 
     # In archived artifacts `session_uid` is not unique: the daemon used to
     # restart its counter at 1 on every boot, so a uid alone joins the marks of
-    # one session to the windows of another. It is seeded from the start time
-    # now, but the old files do not change, and this is the tool that reads
-    # them. The timestamps disambiguate either way: every window is required to
-    # fall inside the scenario's own begin/end marks, and a uid seen more than
-    # once is reported rather than silently collapsed.
+    # one session to the windows of another. A live daemon now starts each run
+    # at the larger of its own start time in microseconds and one past the mark
+    # it left in `session-uid.hwm` — the start time is only a floor, and the
+    # mark is what actually makes two runs disjoint when the clock repeats or
+    # steps backwards. The old files do not change, though, and this is the tool
+    # that reads them. The timestamps disambiguate either way: every window is
+    # required to fall inside the scenario's own begin/end marks, and a uid seen
+    # more than once is reported rather than silently collapsed.
     spans = defaultdict(list)
     for event in read_jsonl(data_dir / "events.jsonl"):
         if event.get("kind") != "mark" or event.get("session_uid") is None:
