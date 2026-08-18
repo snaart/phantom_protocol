@@ -39,6 +39,11 @@
 // ```rust,no_run```, ```bash```, or ```text``` so they are not executed as
 // doctests (they require a live peer and cannot run standalone).
 //
+// The Rust fences carry no `# ` hidden lines, and must not gain any. rustdoc
+// strips them, but this same file is what crates.io renders as CommonMark,
+// which has no such convention and prints them; the `packaged_readme` tests
+// below hold the two renderers to the same text.
+//
 // The path stays inside `core/` because it has to: a `cargo package` archive
 // contains only what sits under the manifest directory, and there `src/lib.rs`
 // is one level below the archive root rather than two below the repository
@@ -315,6 +320,45 @@ mod packaged_readme {
         None
     }
 
+    /// Whether a fence carrying this info string is compiled as Rust. rustdoc reads
+    /// an empty info string as Rust, and `rust,no_run` as Rust with an attribute.
+    fn fence_is_rust(info: &str) -> bool {
+        let language = info.split(',').next().unwrap_or("").trim();
+        language.is_empty() || language == "rust"
+    }
+
+    /// Whether `line`, inside a Rust fence, is a rustdoc hidden-line marker: a `#`
+    /// alone or followed by a space. `#[attr]`, `#![attr]` and the `##` escape are
+    /// code, and a fence is the only place any of this applies.
+    fn is_rustdoc_hidden_line(line: &str) -> bool {
+        match line.trim_start().strip_prefix('#') {
+            None => false,
+            Some(rest) => rest.is_empty() || rest.starts_with(' '),
+        }
+    }
+
+    /// The 1-based lines of `markdown` that rustdoc would hide from a Rust fence.
+    ///
+    /// Fence-aware because it has to be: the quickstart is shell, and `# Generate a
+    /// persistent server identity` is a comment there, not a marker.
+    fn rustdoc_hidden_lines(markdown: &str) -> Vec<usize> {
+        let mut hidden = Vec::new();
+        let mut open_fence_is_rust: Option<bool> = None;
+        for (index, line) in markdown.lines().enumerate() {
+            if let Some(info) = line.trim_start().strip_prefix("```") {
+                open_fence_is_rust = match open_fence_is_rust {
+                    Some(_) => None,
+                    None => Some(fence_is_rust(info)),
+                };
+                continue;
+            }
+            if open_fence_is_rust == Some(true) && is_rustdoc_hidden_line(line) {
+                hidden.push(index + 1);
+            }
+        }
+        hidden
+    }
+
     /// The byte offset at which the two pages first differ, or `None` when they
     /// agree. One page being a prefix of the other counts as differing where the
     /// shorter one ends.
@@ -425,6 +469,64 @@ mod packaged_readme {
         assert!(
             message.contains("scripts/sync_readme.sh"),
             "the drift message does not say how to repair the tree: {message}"
+        );
+    }
+
+    /// This page has two renderers and only one of them knows rustdoc's
+    /// conventions.
+    ///
+    /// rustdoc hides a fenced line that begins `# `, so an example can carry its
+    /// `#[tokio::main]` and its `fn main` without showing them, and docs.rs is
+    /// clean. crates.io renders the same file as CommonMark, which has no such
+    /// convention: it prints the `# ` lines as written, and a reader sees a
+    /// headline example interrupted by stray hashes and apparently having no
+    /// `main`, which fails to compile on the first line if pasted. The 5 KiB stub
+    /// this page replaced had no such problem, so a marker here is a regression on
+    /// exactly the surface the landing page was enlarged to fix.
+    ///
+    /// The rule that keeps both renderers honest is to write the lines out.
+    #[test]
+    fn readme_rust_examples_carry_no_rustdoc_hidden_lines() {
+        let hidden = rustdoc_hidden_lines(LANDING_PAGE);
+        assert!(
+            hidden.is_empty(),
+            "README.md {hidden:?} (1-based) are rustdoc hidden-line markers inside a \
+             Rust fence. rustdoc strips them and docs.rs stays clean, but crates.io \
+             renders this file as CommonMark and prints them verbatim. Drop the \
+             `# ` prefixes and let the lines show."
+        );
+    }
+
+    /// The scanner decides the verdict above, and the two ways it could be wrong
+    /// pull in opposite directions: blind to fences it would call the quickstart's
+    /// `# Generate a persistent server identity` a marker, and blind to markers it
+    /// would pass anything. Both directions are covered here.
+    #[test]
+    fn hidden_line_scanner_reads_rust_fences_only() {
+        // Shell comments, prose headings, attributes and the `##` escape are not
+        // markers.
+        assert!(rustdoc_hidden_lines("```bash\n# Generate a key\ncargo run\n```\n").is_empty());
+        assert!(rustdoc_hidden_lines("# Heading\n\nprose\n").is_empty());
+        assert!(rustdoc_hidden_lines("```rust\n#[derive(Debug)]\nstruct S;\n```\n").is_empty());
+        assert!(rustdoc_hidden_lines("```rust\n#![allow(dead_code)]\n```\n").is_empty());
+        assert!(rustdoc_hidden_lines("```rust\n##[cfg(test)]\n```\n").is_empty());
+
+        // Markers, in each of the forms rustdoc recognises and each fence spelling
+        // this README uses.
+        assert_eq!(
+            rustdoc_hidden_lines("```rust,no_run\n# fn main() {}\n```\n"),
+            vec![2]
+        );
+        assert_eq!(
+            rustdoc_hidden_lines("```rust\n#\nlet x = 1;\n```\n"),
+            vec![2]
+        );
+        // An unlabelled fence is Rust to rustdoc.
+        assert_eq!(rustdoc_hidden_lines("```\n# hidden\n```\n"), vec![2]);
+        // Fences close: a marker-shaped line after one is prose again.
+        assert_eq!(
+            rustdoc_hidden_lines("```rust\n# hidden\n```\n\n# Heading\n"),
+            vec![2]
         );
     }
 

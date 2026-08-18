@@ -150,32 +150,32 @@ PhantomUDP is the recommended transport: it supports seamless `migrate()`.
 use std::sync::Arc;
 use phantom_protocol::api::{PhantomUdpListener, PhantomSession};
 
-# #[tokio::main]
-# async fn main() -> Result<(), phantom_protocol::CoreError> {
-// ── Server ────────────────────────────────────────────────────────────────
-let listener = PhantomUdpListener::builder("127.0.0.1:0").bind().await?;
-let server_addr = listener.local_addr();                // e.g. "127.0.0.1:54321"
-let pinned_key  = listener.verifying_key_bytes();       // share out-of-band
+#[tokio::main]
+async fn main() -> Result<(), phantom_protocol::CoreError> {
+    // ── Server ────────────────────────────────────────────────────────────────
+    let listener = PhantomUdpListener::builder("127.0.0.1:0").bind().await?;
+    let server_addr = listener.local_addr();                // e.g. "127.0.0.1:54321"
+    let pinned_key  = listener.verifying_key_bytes();       // share out-of-band
 
-let listener = Arc::clone(&listener);
-tokio::spawn(async move {
-    let outcome = listener.accept().await?;
-    let session = outcome.session();
-    let _req = session.recv().await?;
-    session.send(b"hello, post-quantum world".to_vec()).await?;
-    Ok::<_, phantom_protocol::CoreError>(())
-});
+    let listener = Arc::clone(&listener);
+    tokio::spawn(async move {
+        let outcome = listener.accept().await?;
+        let session = outcome.session();
+        let _req = session.recv().await?;
+        session.send(b"hello, post-quantum world".to_vec()).await?;
+        Ok::<_, phantom_protocol::CoreError>(())
+    });
 
-// ── Client ────────────────────────────────────────────────────────────────
-let port: u16 = server_addr.parse::<std::net::SocketAddr>().unwrap().port();
-let session = phantom_protocol::connect_pinned_udp(
-    "127.0.0.1".into(), port, pinned_key,
-).await?;
-session.await_ready().await?;
-session.send(b"ping".to_vec()).await?;
-let _reply = session.recv().await?;
-# Ok(())
-# }
+    // ── Client ────────────────────────────────────────────────────────────────
+    let port: u16 = server_addr.parse::<std::net::SocketAddr>().unwrap().port();
+    let session = phantom_protocol::connect_pinned_udp(
+        "127.0.0.1".into(), port, pinned_key,
+    ).await?;
+    session.await_ready().await?;
+    session.send(b"ping".to_vec()).await?;
+    let _reply = session.recv().await?;
+    Ok(())
+}
 ```
 
 ### Minimal client / server (TCP — simpler, no `migrate()`)
@@ -185,30 +185,30 @@ use std::sync::Arc;
 use phantom_protocol::api::{PhantomListener, PhantomSession, TcpSessionTransport};
 use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
 
-# #[tokio::main]
-# async fn main() -> Result<(), phantom_protocol::CoreError> {
-let listener = PhantomListener::builder("127.0.0.1:0").bind().await?;
-let server_addr = listener.local_addr();
-let pinned_key  = listener.verifying_key_bytes();
+#[tokio::main]
+async fn main() -> Result<(), phantom_protocol::CoreError> {
+    let listener = PhantomListener::builder("127.0.0.1:0").bind().await?;
+    let server_addr = listener.local_addr();
+    let pinned_key  = listener.verifying_key_bytes();
 
-let listener = Arc::clone(&listener);
-tokio::spawn(async move {
-    let outcome = listener.accept().await?;
-    let session = outcome.session();
-    let _req = session.recv().await?;
-    session.send(b"hello, post-quantum world".to_vec()).await?;
-    Ok::<_, phantom_protocol::CoreError>(())
-});
+    let listener = Arc::clone(&listener);
+    tokio::spawn(async move {
+        let outcome = listener.accept().await?;
+        let session = outcome.session();
+        let _req = session.recv().await?;
+        session.send(b"hello, post-quantum world".to_vec()).await?;
+        Ok::<_, phantom_protocol::CoreError>(())
+    });
 
-let session = phantom_protocol::connect_pinned(
-    "127.0.0.1".into(),
-    server_addr.parse::<std::net::SocketAddr>().unwrap().port(),
-    pinned_key,
-).await?;
-session.send(b"ping".to_vec()).await?;
-let _reply = session.recv().await?;
-# Ok(())
-# }
+    let session = phantom_protocol::connect_pinned(
+        "127.0.0.1".into(),
+        server_addr.parse::<std::net::SocketAddr>().unwrap().port(),
+        pinned_key,
+    ).await?;
+    session.send(b"ping".to_vec()).await?;
+    let _reply = session.recv().await?;
+    Ok(())
+}
 ```
 
 Runnable forms: [`core/examples/loopback_demo.rs`](https://github.com/snaart/phantom_protocol/blob/main/core/examples/loopback_demo.rs),
