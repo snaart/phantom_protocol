@@ -232,6 +232,17 @@ mod packaged_readme {
     /// verification build of an extracted crate.
     const SOURCE: &str = include_str!("lib.rs");
 
+    /// The crate manifest, which is inside the package and so readable from here.
+    /// Read as text for one key: nothing else in this file, in the sync script, or
+    /// in the archive assertion is derived from it, and the whole arrangement is
+    /// built on what it says.
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+
+    /// The file name every other part of this arrangement assumes: the copy under
+    /// the manifest directory, the target of `scripts/sync_readme.sh`, and the
+    /// archive entry the packaging job compares against the landing page.
+    const PACKAGED_FILE_NAME: &str = "README.md";
+
     /// The literal opening of the crate-level doc attribute. Written with an escaped
     /// quote, so this constant's own text does not match the pattern it carries and
     /// the search below cannot find itself.
@@ -269,6 +280,41 @@ mod packaged_readme {
         Some(below_core)
     }
 
+    /// The `readme` value from the manifest's `[package]` table, as written.
+    ///
+    /// A hand-rolled scan rather than a TOML parser: one key is wanted, out of one
+    /// table, from a file this crate already carries, and a dependency added to read
+    /// it would be a dependency of the published crate.
+    ///
+    /// Section tracking is what makes it a scan of `[package]` and not of the whole
+    /// file — `[package.metadata.docs.rs]` is a different table, and a `readme` key
+    /// under some future table is not the one crates.io reads.
+    fn package_readme_key(manifest: &str) -> Option<&str> {
+        let mut in_package = false;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if let Some(header) = line.strip_prefix('[') {
+                in_package = header.starts_with("package]");
+                continue;
+            }
+            if !in_package {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() != "readme" {
+                continue;
+            }
+            return value
+                .trim_start()
+                .strip_prefix('"')
+                .and_then(|quoted| quoted.split_once('"'))
+                .map(|(name, _)| name);
+        }
+        None
+    }
+
     /// The two copies must agree byte for byte, or the page crates.io renders is not
     /// the page this repository maintains. The failure is stated in sizes rather than
     /// as a diff: the way this goes wrong is that one file is edited and the other is
@@ -283,6 +329,60 @@ mod packaged_readme {
             PACKAGED.len(),
             LANDING_PAGE.len()
         );
+    }
+
+    /// Everything else here protects the *file* `core/README.md`, and nothing else
+    /// here reads the manifest key that decides which file crates.io renders.
+    ///
+    /// `core/README.md` reaches the archive because it is an ordinary tracked file
+    /// under the manifest directory, not because `readme` names it — so repointing
+    /// `readme` at a stub leaves the sync script green, the drift test green,
+    /// `cargo package` green, and the archive comparison green, while the page on
+    /// crates.io becomes the stub. Every gate agreeing is not the same as every
+    /// gate being right, and this is the one that reads the key itself.
+    #[test]
+    fn manifest_readme_key_names_the_packaged_copy() {
+        let named = package_readme_key(MANIFEST)
+            .expect("core/Cargo.toml's [package] table carries a `readme` key");
+
+        assert_eq!(
+            named, PACKAGED_FILE_NAME,
+            "core/Cargo.toml says readme = \"{named}\", but every other part of this \
+             arrangement — scripts/sync_readme.sh, the drift test above, and the \
+             archive comparison in CI's package job — maintains \
+             core/{PACKAGED_FILE_NAME}. crates.io would render {named}, which \
+             nothing checks"
+        );
+    }
+
+    /// The scanner decides the verdict above, so one that answered `README.md` for
+    /// any input would leave that test green through exactly the repointing it
+    /// exists to catch. The `[package.metadata.docs.rs]` case is the one that makes
+    /// section tracking load-bearing rather than decorative.
+    #[test]
+    fn readme_key_scanner_reads_the_package_table_only() {
+        assert_eq!(
+            package_readme_key("[package]\nreadme = \"README.md\"\n"),
+            Some("README.md")
+        );
+        assert_eq!(
+            package_readme_key("[package]\nname = \"x\"\nreadme = \"CRATE_README.md\"\n"),
+            Some("CRATE_README.md")
+        );
+        // A `readme` key belonging to another table is not the one crates.io reads.
+        assert_eq!(
+            package_readme_key(
+                "[package]\nname = \"x\"\n\n[package.metadata.docs.rs]\nreadme = \"other.md\"\n"
+            ),
+            None
+        );
+        assert_eq!(
+            package_readme_key("[features]\nreadme = \"other.md\"\n"),
+            None
+        );
+        // Absent entirely — cargo then falls back to an untracked default, which is
+        // not the arrangement the rest of this module maintains.
+        assert_eq!(package_readme_key("[package]\nname = \"x\"\n"), None);
     }
 
     /// The attribute's argument must stay inside `core/` for the whole of its walk.

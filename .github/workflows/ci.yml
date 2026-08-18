@@ -229,6 +229,13 @@ jobs:
       # What --verify structurally cannot see: it compiles the archive, and a
       # crate compiles just as happily around the wrong README. This is the
       # check that tells a stale 5 KiB stub from the 35 KiB landing page.
+      #
+      # It checks the file, not the manifest key. README.md reaches the archive
+      # because it is a tracked file under the manifest directory, so this step
+      # stays green if `readme` is repointed at some other file — and that file
+      # is what crates.io renders. The key itself is asserted from
+      # `cargo test --lib` (packaged_readme::manifest_readme_key_names_the_packaged_copy),
+      # which is a required context where this job is not.
       - name: Archive ships the landing-page README
         run: |
           CRATE=$(ls target/package/phantom-protocol-*.crate)
