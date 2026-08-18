@@ -37,6 +37,8 @@ set -euo pipefail
 # The same agreement is also asserted from `cargo test --lib`
 # (`packaged_readme::packaged_readme_is_the_landing_page`), which is where a
 # contributor who has not installed pre-commit meets it.
+#
+# This script's own cases live in `scripts/sync_readme_test.sh`.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -71,7 +73,13 @@ if cmp -s "${SOURCE}" "${DERIVED}"; then
 fi
 
 if [ "${MODE}" = "check" ]; then
+    # Sizes alone cannot describe the usual drift. An edit that substitutes text
+    # of the same length — a word swapped for another of equal width, a
+    # character corrected — leaves the two numbers identical, and the report
+    # then names nothing. `cmp` without -s locates the first differing byte and
+    # the line it falls on, which is where to look.
     echo "DRIFT: core/README.md is not README.md" >&2
+    cmp "${SOURCE}" "${DERIVED}" >&2 || true
     echo "  README.md      $(wc -c <"${SOURCE}" | tr -d ' ') bytes" >&2
     echo "  core/README.md $(wc -c <"${DERIVED}" | tr -d ' ') bytes" >&2
     echo "" >&2

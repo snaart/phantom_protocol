@@ -315,19 +315,116 @@ mod packaged_readme {
         None
     }
 
+    /// The byte offset at which the two pages first differ, or `None` when they
+    /// agree. One page being a prefix of the other counts as differing where the
+    /// shorter one ends.
+    fn first_difference(landing: &str, packaged: &str) -> Option<usize> {
+        landing
+            .as_bytes()
+            .iter()
+            .zip(packaged.as_bytes())
+            .position(|(a, b)| a != b)
+            .or_else(|| {
+                (landing.len() != packaged.len()).then(|| landing.len().min(packaged.len()))
+            })
+    }
+
+    /// Up to eighty bytes of `page` around `at`, escaped onto a single line.
+    ///
+    /// Bytes rather than characters, and lossy rather than sliced, because the
+    /// window can land mid-codepoint — this README is full of box-drawing and
+    /// em-dashes — and a panic inside the reporter would replace the diagnosis
+    /// with a byte-boundary error. Escaping keeps the excerpt to one line, which
+    /// is what makes two of them readable side by side.
+    fn excerpt(page: &str, at: usize) -> String {
+        const RADIUS: usize = 40;
+        let bytes = page.as_bytes();
+        let from = at.saturating_sub(RADIUS);
+        let to = at.saturating_add(RADIUS).min(bytes.len());
+        String::from_utf8_lossy(&bytes[from..to])
+            .escape_debug()
+            .to_string()
+    }
+
+    /// What a contributor sees when the two copies have drifted apart.
+    ///
+    /// Sizes alone cannot describe the common case: an edit that substitutes text
+    /// of the same length leaves them identical, and the message then names two
+    /// equal numbers and nothing else. The offset says where to look and the two
+    /// excerpts say what changed, in a few hundred bytes rather than in both
+    /// pages — this runs in `cargo test --lib`, whose log is read.
+    fn drift_report(landing: &str, packaged: &str) -> String {
+        let Some(at) = first_difference(landing, packaged) else {
+            return String::from("README.md and core/README.md agree");
+        };
+        format!(
+            "core/README.md has drifted from README.md at byte {at} (README.md {} \
+             bytes, core/README.md {} bytes); run scripts/sync_readme.sh\n  \
+             README.md      …{}…\n  core/README.md …{}…",
+            landing.len(),
+            packaged.len(),
+            excerpt(landing, at),
+            excerpt(packaged, at),
+        )
+    }
+
+    /// The drift assertion, as a function, so a test can drive it with two pages
+    /// that differ and read the message a contributor would actually see.
+    fn assert_landing_pages_agree(landing: &str, packaged: &str) {
+        assert!(landing == packaged, "{}", drift_report(landing, packaged));
+    }
+
+    /// The message the assertion above produces when the two pages differ.
+    fn drift_message(landing: &str, packaged: &str) -> String {
+        let unwound = std::panic::catch_unwind(|| assert_landing_pages_agree(landing, packaged));
+        let payload = unwound.expect_err("two differing pages must fail the drift assertion");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("the drift assertion panics with a string payload")
+    }
+
     /// The two copies must agree byte for byte, or the page crates.io renders is not
-    /// the page this repository maintains. The failure is stated in sizes rather than
-    /// as a diff: the way this goes wrong is that one file is edited and the other is
-    /// forgotten, and the sizes say which one at a glance.
+    /// the page this repository maintains.
     #[test]
     fn packaged_readme_is_the_landing_page() {
-        assert_eq!(
-            PACKAGED,
-            LANDING_PAGE,
-            "core/README.md ({} bytes) has drifted from README.md ({} bytes); \
-             run scripts/sync_readme.sh",
-            PACKAGED.len(),
-            LANDING_PAGE.len()
+        assert_landing_pages_agree(LANDING_PAGE, PACKAGED);
+    }
+
+    /// A failing gate has to say what went wrong, and this one runs inside
+    /// `cargo test --lib` — a required context whose log a contributor reads.
+    ///
+    /// The two things it must not do are both things it did: print the whole of
+    /// both pages, and describe the difference only as two sizes. Sizes say
+    /// nothing at all about an edit that replaces one byte with another, which is
+    /// most of them; the pair below is deliberately equal-length for that reason.
+    #[test]
+    fn drift_is_reported_by_location_and_not_by_reprinting_both_pages() {
+        let landing = format!("{}phantom{}", "a".repeat(19_000), "b".repeat(19_000));
+        let packaged = format!("{}phantoM{}", "a".repeat(19_000), "b".repeat(19_000));
+        let message = drift_message(&landing, &packaged);
+
+        assert!(
+            message.len() < 1024,
+            "the drift message is {} bytes for two {}-byte pages; it is reprinting \
+             them rather than locating the difference",
+            message.len(),
+            landing.len()
+        );
+        assert!(
+            message.contains("19006"),
+            "the drift message does not give the byte offset of the first \
+             difference: {message}"
+        );
+        assert!(
+            message.contains("phantom") && message.contains("phantoM"),
+            "the drift message does not quote both sides around the difference, so \
+             two equal-length pages are indistinguishable in it: {message}"
+        );
+        assert!(
+            message.contains("scripts/sync_readme.sh"),
+            "the drift message does not say how to repair the tree: {message}"
         );
     }
 

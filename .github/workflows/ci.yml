@@ -221,6 +221,11 @@ jobs:
       # The archive's README is core/README.md, which is a copy of the
       # repository-root landing page. Assert, never repair: a CI step that
       # rewrote the tree would go green on a state nobody committed.
+      #
+      # The script's own cases run first. A gate whose report says only that two
+      # files have different sizes stops being useful the moment the drift is a
+      # same-length substitution, and nothing but these cases notices that.
+      - run: scripts/sync_readme_test.sh
       - run: scripts/sync_readme.sh --check
       # Build the tarball first without verifying it. Seconds, and it produces
       # the archive the next step reads — so the payload is checked even when
