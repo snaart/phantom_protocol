@@ -158,8 +158,16 @@ impl WindowFilter {
         }
     }
 
-    fn update_max(&mut self, now: Instant, value: u64) -> u64 {
-        // Remove expired entries
+    /// Drop every entry older than the horizon.
+    ///
+    /// Split out of `update_max`/`update_min` because ageing a window and
+    /// admitting a sample into it are two different statements, and a caller
+    /// may well want the first without the second. While the loop lived inside
+    /// the update calls, every rule that declined to offer a sample also
+    /// silently declined to age the window, and "ten seconds" quietly meant
+    /// "ten seconds of the samples we happened to like". See the call in
+    /// [`BandwidthEstimator::on_ack`] for what that cost.
+    fn expire(&mut self, now: Instant) {
         while let Some(&(ts, _)) = self.window.front() {
             if now.duration_since(ts) > self.window_size {
                 self.window.pop_front();
@@ -167,6 +175,18 @@ impl WindowFilter {
                 break;
             }
         }
+    }
+
+    /// The extremum currently retained — the front of the deque, which is the
+    /// maximum for a filter driven by [`Self::update_max`] and the minimum for
+    /// one driven by [`Self::update_min`] — or `None` once the horizon has
+    /// emptied.
+    fn head(&self) -> Option<u64> {
+        self.window.front().map(|&(_, v)| v)
+    }
+
+    fn update_max(&mut self, now: Instant, value: u64) -> u64 {
+        self.expire(now);
         // Remove entries smaller than the new value (they're dominated)
         while let Some(&(_, v)) = self.window.back() {
             if v <= value {
@@ -177,17 +197,11 @@ impl WindowFilter {
         }
         self.window.push_back((now, value));
         // The maximum is always at the front
-        self.window.front().map(|&(_, v)| v).unwrap_or(value)
+        self.head().unwrap_or(value)
     }
 
     fn update_min(&mut self, now: Instant, value: u64) -> u64 {
-        while let Some(&(ts, _)) = self.window.front() {
-            if now.duration_since(ts) > self.window_size {
-                self.window.pop_front();
-            } else {
-                break;
-            }
-        }
+        self.expire(now);
         while let Some(&(_, v)) = self.window.back() {
             if v >= value {
                 self.window.pop_back();
@@ -196,7 +210,7 @@ impl WindowFilter {
             }
         }
         self.window.push_back((now, value));
-        self.window.front().map(|&(_, v)| v).unwrap_or(value)
+        self.head().unwrap_or(value)
     }
 }
 
@@ -734,6 +748,44 @@ impl BandwidthEstimator {
         } else {
             0
         };
+
+        // ── Age the horizon, on every acknowledgement and before anything is
+        // decided from it ───────────────────────────────────────────────────
+        //
+        // The expiry loop used to live only inside `update_max`, and the
+        // admission test below reaches that call for only some acknowledgements:
+        // an app-limited sample under the current maximum short-circuits it, and
+        // so does one that retired no bytes at all — the zero-length reliable FIN
+        // sentinel that stream close sends is exactly that shape. The window then
+        // did not age on that acknowledgement, nor on any number of them in a
+        // row, so a peak taken during one fast burst could outlive its horizon by
+        // an unbounded amount of wall clock. A flow that opens with a burst and
+        // then settles into request/response keeps that opening figure for the
+        // life of the connection and paces every later write against a rate the
+        // path never offered. Ten seconds has to mean ten seconds however the
+        // samples that follow are labelled, or it is not a horizon.
+        //
+        // Ageing and admission are separate statements and are now written
+        // separately. Admission is deliberately unchanged, and the ordering
+        // matters: expiring first means the test below compares against the
+        // maximum over the horizon *as it stands now* rather than against a
+        // figure the horizon has already released.
+        //
+        // Only the bandwidth filter is aged here. The min-RTT filter's entries
+        // are gated by Karn's algorithm, and ageing it on acknowledgements it
+        // has no usable round trip from would let `min_rtt` climb on a path
+        // where every sample was ambiguous — a different mechanism answering a
+        // different signal, and not one this argument covers.
+        self.bw_filter.expire(now);
+        // Take the estimate from whatever survived. An emptied horizon means no
+        // delivery rate has been observed for the whole window, and the honest
+        // reading of a maximum over nothing is nothing: `cwnd()` falls back to
+        // its four-packet floor and the pacer to `pacing_rate_floor`, which is
+        // the bootstrap regime a connection that has measured nothing for ten
+        // seconds belongs in, and which the very next rate-bearing sample lifts
+        // it out of. Holding the last known figure instead would be the
+        // unbounded retention above wearing prudence as a disguise.
+        self.btl_bw = self.bw_filter.head().unwrap_or(0);
 
         // An app-limited sample measures how fast the application wrote, not how
         // fast the path carries, so it must not be allowed to *set* the maximum
@@ -3329,6 +3381,216 @@ mod tests {
             "one lost segment out of {in_flight} took the window from {healthy} B \
              to {} B",
             est.cwnd()
+        );
+    }
+
+    // ── The bandwidth horizon ───────────────────────────────────────────────
+    //
+    // Everything below drives the estimator on synthetic `Instant`s, which is
+    // what lets a test cover half a minute of estimator time in microseconds of
+    // real time. No wall clock is read and none is paused: `on_ack` takes its
+    // notion of "now" from `sample.acked_at`, so the schedule the test writes is
+    // the schedule the estimator sees. Pausing tokio's clock instead would zero
+    // `min_rtt` and make several of these assertions true for reasons that have
+    // nothing to do with what they claim to test.
+
+    /// One acknowledgement that delivers exactly `bytes` over exactly `span`.
+    ///
+    /// The sample's delivery mark is the connection's counter as it stands
+    /// *before* this acknowledgement, so the estimator's numerator is `bytes`
+    /// and nothing else; both the send stamp and the delivery stamp sit one
+    /// `span` in the past, so `max(send_elapsed, ack_elapsed)` — the interval
+    /// the estimator divides by — is exactly `span`. The rate a test asks for is
+    /// therefore the rate the estimator computes, with no arithmetic left
+    /// implicit for a reader to reconstruct.
+    fn ack_delivering(
+        est: &BandwidthEstimator,
+        at: Instant,
+        span: Duration,
+        bytes: u64,
+        app_limited: bool,
+    ) -> DeliverySample {
+        DeliverySample {
+            delivered_bytes: est.delivered_bytes(),
+            delivered_at: at - span,
+            sent_at: at - span,
+            acked_at: at,
+            packet_bytes: bytes,
+            is_app_limited: app_limited,
+            ack_delay_us: 0,
+            rtt_sampled: true,
+        }
+    }
+
+    /// A burst nobody could sustain, used by the horizon tests below as the peak
+    /// that has to be released: one megabyte acknowledged inside ten
+    /// milliseconds is 100 MB/s, four orders of magnitude above the 10 KB/s the
+    /// tails then run at. The separation is chosen by the test rather than tuned
+    /// against the code, so no assertion below has to name a threshold.
+    const HORIZON_BURST_BYTES: u64 = 1_000_000;
+    const HORIZON_BURST_SPAN: Duration = Duration::from_millis(10);
+    /// The honest rate the tails run at: 5 KB per half second.
+    const HORIZON_TAIL_BYTES: u64 = 5_000;
+    const HORIZON_TAIL_SPAN: Duration = Duration::from_millis(500);
+
+    /// Raise the estimate with one unsustainable burst and hand back both the
+    /// estimator and the peak it now reports.
+    fn estimator_holding_a_burst_peak(start: Instant) -> (BandwidthEstimator, u64) {
+        let mut est = BandwidthEstimator::new();
+        est.on_send(HORIZON_BURST_BYTES);
+        let sample = ack_delivering(
+            &est,
+            start + HORIZON_BURST_SPAN,
+            HORIZON_BURST_SPAN,
+            HORIZON_BURST_BYTES,
+            false,
+        );
+        est.on_ack(sample);
+        let peak = est.bottleneck_bandwidth();
+        assert!(
+            peak > 0,
+            "precondition: the burst should have set a maximum to release"
+        );
+        (est, peak)
+    }
+
+    /// The horizon does what it says: a peak the path cannot sustain is released
+    /// once it is older than the window, and the estimate settles on what the
+    /// path is actually delivering.
+    ///
+    /// This is the positive control for the two tests after it. Both of those
+    /// assert that ageing happens under conditions where it previously did not,
+    /// and an assertion of that shape is worthless until it has been shown that
+    /// the mechanism it is asking for exists at all.
+    #[test]
+    fn a_burst_peak_is_released_once_the_horizon_has_passed() {
+        let start = Instant::now();
+        let (mut est, peak) = estimator_holding_a_burst_peak(start);
+
+        // Forty half-second acknowledgements — twenty seconds, twice the
+        // horizon — each carrying an honest, slow delivery rate.
+        for i in 1..=40u32 {
+            let at = start + HORIZON_TAIL_SPAN * i;
+            let sample = ack_delivering(&est, at, HORIZON_TAIL_SPAN, HORIZON_TAIL_BYTES, false);
+            est.on_ack(sample);
+        }
+
+        let settled = est.bottleneck_bandwidth();
+        assert!(
+            settled * 1000 < peak,
+            "twenty seconds past a ten-second horizon the estimate is {settled} B/s \
+             against a burst peak of {peak} B/s — the peak was never released"
+        );
+        assert!(
+            settled > 0,
+            "the estimate collapsed to zero while acknowledgements were still \
+             carrying {HORIZON_TAIL_BYTES} B every {HORIZON_TAIL_SPAN:?}"
+        );
+    }
+
+    /// The same run with the tail labelled application-limited, which is the
+    /// half of the horizon that was never bounded.
+    ///
+    /// An app-limited sample below the current maximum is refused admission —
+    /// correctly, since it measures how fast the application wrote rather than
+    /// how fast the path carries. The expiry loop used to sit *inside* the same
+    /// call that admission short-circuited, so refusing the sample also refused
+    /// to age the window. Retention was then bounded by nothing at all: a flow
+    /// that bursts once and then goes request/response keeps its opening
+    /// estimate for the life of the connection, and paces every later write
+    /// against a rate the path never offered.
+    #[test]
+    fn an_app_limited_tail_still_ages_the_bandwidth_horizon() {
+        let start = Instant::now();
+        let (mut est, peak) = estimator_holding_a_burst_peak(start);
+
+        est.note_app_limited_drain();
+        for i in 1..=40u32 {
+            let at = start + HORIZON_TAIL_SPAN * i;
+            let sample = ack_delivering(&est, at, HORIZON_TAIL_SPAN, HORIZON_TAIL_BYTES, true);
+            est.on_ack(sample);
+        }
+
+        let settled = est.bottleneck_bandwidth();
+        assert!(
+            settled * 1000 < peak,
+            "the estimate is still {settled} B/s twenty seconds after a {peak} B/s \
+             burst, because every acknowledgement since was app-limited and the \
+             horizon only ages on the ones it admits"
+        );
+        // ...and the horizon must not have been traded for an estimate of
+        // nothing: an app-limited sample is still a valid lower bound on the
+        // path, and once the window is empty it is the only measurement there is.
+        assert!(
+            settled > 0,
+            "the horizon released the peak but left no estimate behind, on a \
+             connection that was still delivering {HORIZON_TAIL_BYTES} B every \
+             {HORIZON_TAIL_SPAN:?}"
+        );
+    }
+
+    /// The other way an acknowledgement reaches the estimator without producing
+    /// a rate: it retires no bytes.
+    ///
+    /// A zero-length reliable segment is not hypothetical — stream close sends
+    /// exactly one, the FIN sentinel that rides the ARQ path — and any
+    /// acknowledgement whose delivery mark equals the current counter yields a
+    /// numerator of zero. There is no rate to admit, so the admission test
+    /// short-circuits, so the window did not age. Here the horizon is fed
+    /// nothing but such acknowledgements for twice its length, and afterwards it
+    /// has to report the honest answer for a maximum over an empty set.
+    #[test]
+    fn acknowledgements_carrying_no_delivery_still_age_the_horizon() {
+        let start = Instant::now();
+        let (mut est, peak) = estimator_holding_a_burst_peak(start);
+
+        for i in 1..=40u32 {
+            let at = start + HORIZON_TAIL_SPAN * i;
+            let sample = ack_delivering(&est, at, HORIZON_TAIL_SPAN, 0, false);
+            est.on_ack(sample);
+        }
+
+        assert_eq!(
+            est.bottleneck_bandwidth(),
+            0,
+            "twenty seconds of acknowledgements that delivered nothing left the \
+             estimate at {} B/s, still carrying a {peak} B/s burst from before \
+             the horizon opened",
+            est.bottleneck_bandwidth()
+        );
+    }
+
+    /// The counter-test, and the reason the three above are a fix rather than a
+    /// deletion.
+    ///
+    /// A maximum filter exists to hold a peak *across* the samples that follow
+    /// it, because a sender whose estimate tracked its latest sample would
+    /// abandon a rate the path can carry the moment one acknowledgement came
+    /// back slow — and one acknowledgement always eventually comes back slow.
+    /// Inside the horizon the high sample must still govern, whatever arrives
+    /// afterwards. Replacing the filter with a direct assignment, with an
+    /// exponential average, or with a reset-on-drop rule each satisfies the
+    /// ageing tests above and fails this one.
+    #[test]
+    fn a_high_sample_still_governs_for_the_whole_horizon() {
+        let start = Instant::now();
+        let (mut est, peak) = estimator_holding_a_burst_peak(start);
+
+        // Nine seconds of slow, honest samples — inside the ten-second horizon
+        // by a full second, so nothing here is a question about expiry timing.
+        for i in 1..=18u32 {
+            let at = start + HORIZON_TAIL_SPAN * i;
+            let sample = ack_delivering(&est, at, HORIZON_TAIL_SPAN, HORIZON_TAIL_BYTES, false);
+            est.on_ack(sample);
+        }
+
+        assert_eq!(
+            est.bottleneck_bandwidth(),
+            peak,
+            "nine seconds into a ten-second horizon the estimate has already \
+             fallen from {peak} B/s to {} B/s — the peak is not being retained, \
+             it is being tracked",
+            est.bottleneck_bandwidth()
         );
     }
 }
