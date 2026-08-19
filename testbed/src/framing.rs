@@ -251,6 +251,7 @@ impl MsgLink for Framed {
                 cwnd_bytes: bw.cwnd_bytes,
                 inflight_bytes: bw.inflight_bytes,
                 bottleneck_bw_bps: bw.bottleneck_bw_bps,
+                last_delivery_rate_bps: bw.last_delivery_rate_bps,
                 pacing_rate_bps: bw.pacing_rate_bps,
                 min_rtt_us: bw.min_rtt.as_micros() as u64,
                 delivered_bytes: bw.delivered_bytes,
@@ -376,6 +377,11 @@ pub(crate) mod testing {
                     cwnd_bytes: 5600,
                     inflight_bytes: 1400,
                     bottleneck_bw_bps: 125_000,
+                    // Deliberately under the filtered maximum above: the double
+                    // stands in for a live session, and on a live session the
+                    // two readings differ exactly when the filter is holding a
+                    // peak the latest sample no longer supports.
+                    last_delivery_rate_bps: 100_000,
                     pacing_rate_bps: 125_000,
                     min_rtt_us: 230_000,
                     delivered_bytes: 1400,

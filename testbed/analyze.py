@@ -405,6 +405,51 @@ def analyze_server(server_dir):
                 f"bw peak {max(bw) * 8 / 1e6:6.2f} Mbit/s"
             )
             print(f"  {'':26} phases: {' → '.join(states)}")
+            # How far the advertised estimate sits above what the connection
+            # actually delivered over the same interval — and, beside it, the
+            # same ratio taken on the raw per-ack sample the estimator computed
+            # before its filter had a say.
+            #
+            # The two answer different halves of one question. The advertised
+            # figure is a maximum over a ten-second horizon and the denominator
+            # is a mean over the gap between two samples, so a ratio modestly
+            # above one is partly the two statistics disagreeing rather than the
+            # estimator being wrong; the probing round of the gain cycle alone
+            # delivers about a quarter more than the cycle's own mean. The raw
+            # column has no such excuse. If it tracks the delivered rate while
+            # the estimate does not, the filter is holding a peak; if it reads
+            # high too, the sample arithmetic is.
+            #
+            # Only intervals of real delivery count. A window where nothing was
+            # delivered has no rate to be a multiple of.
+            est_ratio, raw_ratio = [], []
+            for a, b in zip(rows, rows[1:]):
+                span_s = (b["t_unix_ns"] - a["t_unix_ns"]) / 1e9
+                grew = b["delivered_bytes"] - a["delivered_bytes"]
+                if span_s <= 0 or grew <= 0:
+                    continue
+                actual = grew / span_s
+                est_ratio.append(b["bottleneck_bw_bps"] / actual)
+                raw = b.get("last_delivery_rate_bps", 0)
+                if raw:
+                    raw_ratio.append(raw / actual)
+            if est_ratio:
+                print(
+                    f"  {'':26} estimate/delivered over {len(est_ratio)} intervals: "
+                    f"median {pct(est_ratio, 0.5):.2f}×, p90 {pct(est_ratio, 0.9):.2f}×, "
+                    f"max {max(est_ratio):.0f}×"
+                )
+                if raw_ratio:
+                    print(
+                        f"  {'':26} raw sample/delivered over {len(raw_ratio)} intervals: "
+                        f"median {pct(raw_ratio, 0.5):.2f}×, p90 {pct(raw_ratio, 0.9):.2f}×, "
+                        f"max {max(raw_ratio):.0f}×"
+                    )
+                else:
+                    print(
+                        f"  {'':26} (no raw delivery-rate column — run predates it; "
+                        f"the split above cannot be made)"
+                    )
             if max(cw) <= 5600:
                 print("  \033[33m" + " " * 26 + "never left the 5600 B floor — sender-bound\033[0m")
 

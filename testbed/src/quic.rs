@@ -487,6 +487,7 @@ impl MsgLink for QuicLink {
                 cwnd_bytes: s.path.cwnd,
                 inflight_bytes: 0,
                 bottleneck_bw_bps: 0,
+                last_delivery_rate_bps: 0,
                 pacing_rate_bps: 0,
                 min_rtt_us: s.path.rtt.as_micros() as u64,
                 delivered_bytes: 0,

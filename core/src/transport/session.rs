@@ -1273,6 +1273,7 @@ impl Session {
         let est = self.bandwidth_estimator.lock();
         BandwidthSnapshot {
             bottleneck_bw_bps: est.bottleneck_bandwidth(),
+            last_delivery_rate_bps: est.last_delivery_rate(),
             min_rtt: est.min_rtt(),
             pacing_rate_bps: est.pacing_rate(),
             cwnd_bytes: est.cwnd(),
@@ -1613,6 +1614,20 @@ impl Session {
 #[derive(Debug, Clone, Copy)]
 pub struct BandwidthSnapshot {
     pub bottleneck_bw_bps: u64,
+    /// The most recent delivery-rate sample, before the estimator's maximum
+    /// filter decided whether to keep it.
+    ///
+    /// It travels beside `bottleneck_bw_bps` rather than replacing it because
+    /// the pair is what makes a recorded run readable. That field is a maximum
+    /// over a ten-second horizon; the throughput a run gets compared against is
+    /// a mean over a much shorter interval, and a maximum over the longer window
+    /// exceeds a mean over the shorter one for reasons that have nothing to do
+    /// with the estimator being wrong. Which of those two a high-looking ratio
+    /// is cannot be settled from the filtered figure alone: a raw sample that
+    /// tracks the delivered rate while the estimate sits far above it is the
+    /// filter retaining a peak, and a raw sample that itself reads high is the
+    /// sample arithmetic.
+    pub last_delivery_rate_bps: u64,
     pub min_rtt: Duration,
     pub pacing_rate_bps: u64,
     pub cwnd_bytes: u64,

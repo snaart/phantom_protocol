@@ -616,6 +616,32 @@ pub struct BandwidthEstimator {
     /// Bytes reported lost over the life of the connection. Diagnostics, and
     /// the observable that proves the send path reports loss at all.
     bytes_lost: u64,
+
+    /// The most recent per-acknowledgement delivery rate this endpoint
+    /// computed, before the filter had any say in it. Diagnostics only —
+    /// nothing in this file reads it back.
+    ///
+    /// It exists because [`Self::btl_bw`] answers a different question than a
+    /// recorded series usually needs. `btl_bw` is a *maximum* over a
+    /// ten-second horizon; the throughput a run is compared against is a *mean*
+    /// over a much shorter observation interval. A maximum over the longer
+    /// window exceeds a mean over the shorter one by construction, and with the
+    /// probe gain in [`PROBE_BW_GAINS`] applied one round trip in four the
+    /// probing round genuinely delivers about a quarter more than the cycle's
+    /// own mean. So a recorded ratio of estimate to delivered bytes that sits
+    /// modestly above one is, in part, an artefact of comparing two different
+    /// statistics — and there is no way to tell how much of it is that from
+    /// the filtered figure alone. With the raw sample beside it the two
+    /// hypotheses come apart: a raw sample tracking the delivered rate while
+    /// the estimate sits far above it is the filter retaining a peak, and a raw
+    /// sample that itself reads high is the sample arithmetic.
+    ///
+    /// This is an observable and not an input. It is derived from quantities
+    /// the estimator already consumes, it feeds no decision, and reading it
+    /// hands a peer no new influence over anything — which is what keeps it
+    /// outside the rule that no control-loop quantity may be under the peer's
+    /// control.
+    last_delivery_rate: u64,
 }
 
 impl BandwidthEstimator {
@@ -651,6 +677,7 @@ impl BandwidthEstimator {
             round_bytes_lost: 0,
             round_delivered_mark: 0,
             bytes_lost: 0,
+            last_delivery_rate: 0,
         }
     }
 
@@ -817,6 +844,16 @@ impl BandwidthEstimator {
         } else {
             0
         };
+
+        // Publish the raw sample before the filter gets a say in it, so a
+        // recorded series can tell a retained peak from a high sample. Guarded
+        // on there being a sample at all: an acknowledgement that retired no
+        // bytes is not a rate of zero, it is the absence of a rate, and writing
+        // it down as zero would put a reading in the series that no measurement
+        // supports. See the field for what the pair is for.
+        if delivery_rate > 0 {
+            self.last_delivery_rate = delivery_rate;
+        }
 
         // ── Age the horizon, on every acknowledgement and before anything is
         // decided from it ───────────────────────────────────────────────────
@@ -1044,6 +1081,19 @@ impl BandwidthEstimator {
     /// Get estimated bottleneck bandwidth (bytes/sec).
     pub fn bottleneck_bandwidth(&self) -> u64 {
         self.btl_bw
+    }
+
+    /// The most recent delivery-rate sample (bytes/sec), as computed, before
+    /// the filter decided whether to keep it.
+    ///
+    /// Read this next to [`Self::bottleneck_bandwidth`], never instead of it.
+    /// That one is the maximum the controller acts on; this one is the single
+    /// observation the last acknowledgement yielded, and the gap between them
+    /// is the only direct evidence of how much of a high-looking estimate is
+    /// the filter holding a peak and how much is the samples themselves. Zero
+    /// until the connection has produced a sample that delivered something.
+    pub fn last_delivery_rate(&self) -> u64 {
+        self.last_delivery_rate
     }
 
     /// Get minimum observed RTT.
@@ -3758,6 +3808,65 @@ mod tests {
             saw_truncation,
             "the ceiling never actually discarded anything over {SAMPLES} samples, \
              so this run proves nothing about the direction it errs in"
+        );
+    }
+
+    /// The retained maximum and the raw sample must be separately readable, and
+    /// the raw one must be published even when the filter declines it.
+    ///
+    /// This is the whole point of the observable. A recorded series carrying
+    /// only the filtered figure cannot distinguish "the filter is holding a peak
+    /// the path has stopped offering" from "the samples themselves are reading
+    /// high", and those two want opposite fixes. The moment the two readings
+    /// diverge is exactly the moment a sample was refused admission, so a field
+    /// that only updated on admitted samples would answer the question by
+    /// definition and never by measurement.
+    #[test]
+    fn the_raw_delivery_rate_is_published_even_when_the_filter_declines_it() {
+        let start = Instant::now();
+        let (mut est, peak) = estimator_holding_a_burst_peak(start);
+        assert_eq!(
+            est.last_delivery_rate(),
+            peak,
+            "the burst's own sample set the maximum, so the two readings should \
+             agree before anything has been refused"
+        );
+
+        // One app-limited sample, well inside the horizon and far below the
+        // maximum: refused admission, and correctly so.
+        est.note_app_limited_drain();
+        let at = start + HORIZON_TAIL_SPAN;
+        let sample = ack_delivering(&est, at, HORIZON_TAIL_SPAN, HORIZON_TAIL_BYTES, true);
+        est.on_ack(sample);
+
+        assert_eq!(
+            est.bottleneck_bandwidth(),
+            peak,
+            "the app-limited sample was allowed to lower the maximum"
+        );
+        assert_eq!(
+            est.last_delivery_rate(),
+            HORIZON_TAIL_BYTES * 1000 / HORIZON_TAIL_SPAN.as_millis() as u64,
+            "the refused sample never reached the published reading, so a \
+             recorded series cannot tell a retained peak from a high sample"
+        );
+
+        // An acknowledgement that retires nothing is not a rate of zero, it is
+        // the absence of a rate — publishing it as zero would put a reading in
+        // the series that no measurement supports.
+        let quiet = ack_delivering(
+            &est,
+            start + HORIZON_TAIL_SPAN * 2,
+            HORIZON_TAIL_SPAN,
+            0,
+            false,
+        );
+        est.on_ack(quiet);
+        assert_eq!(
+            est.last_delivery_rate(),
+            HORIZON_TAIL_BYTES * 1000 / HORIZON_TAIL_SPAN.as_millis() as u64,
+            "an acknowledgement that delivered nothing overwrote the last real \
+             delivery-rate sample with a zero"
         );
     }
 }

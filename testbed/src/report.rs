@@ -321,7 +321,8 @@ pub struct MessageIntegritySample {
 /// `cwnd` and a smoothed RTT and nothing else of this shape, so only
 /// `cwnd_bytes` and `min_rtt_us` carry values there — and `min_rtt_us` holds
 /// quinn's *smoothed* RTT, which is a different statistic from Phantom's
-/// windowed minimum. `inflight_bytes`, `bottleneck_bw_bps`, `pacing_rate_bps`,
+/// windowed minimum. `inflight_bytes`, `bottleneck_bw_bps`,
+/// `last_delivery_rate_bps`, `pacing_rate_bps`,
 /// `delivered_bytes` and `app_limited` stay zero/false rather than being filled
 /// with an approximation, and `state` reads `quic:cubic` — quinn's default
 /// controller is loss-based, so it has no BBR phase to report and its window
@@ -338,6 +339,24 @@ pub struct WindowSample {
     pub inflight_bytes: u64,
     /// Estimated bottleneck bandwidth, bytes/sec.
     pub bottleneck_bw_bps: u64,
+    /// The single most recent delivery-rate sample, bytes/sec — the figure the
+    /// estimator computed for the last acknowledgement, before its maximum
+    /// filter decided whether to retain it.
+    ///
+    /// Recorded because the field above cannot answer the question a run
+    /// actually asks of it. `bottleneck_bw_bps` is a maximum over a ten-second
+    /// horizon, and it gets compared against bytes delivered over a 500 ms
+    /// sample interval; a maximum over the longer window exceeds a mean over
+    /// the shorter one by construction, so a ratio modestly above one is partly
+    /// an artefact of comparing two different statistics rather than evidence of
+    /// anything. With the raw sample in the same row the two come apart: a raw
+    /// sample tracking the delivered rate while the estimate sits far above it
+    /// is a retained peak, and a raw sample that itself reads high is the sample
+    /// arithmetic. Defaulted on deserialize so runs recorded before it existed
+    /// still load; it reads zero on the `quic` leg and on any run older than
+    /// this field.
+    #[serde(default)]
+    pub last_delivery_rate_bps: u64,
     pub pacing_rate_bps: u64,
     pub min_rtt_us: u64,
     pub delivered_bytes: u64,
