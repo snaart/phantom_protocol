@@ -185,6 +185,24 @@ impl WindowFilter {
         self.window.front().map(|&(_, v)| v)
     }
 
+    /// Append a sample, evicting from the back first if the deque is at its
+    /// ceiling.
+    ///
+    /// The back is where both orderings keep the entry that is *least* useful to
+    /// the answer: the smallest retained value in a maximum filter, the largest
+    /// in a minimum one. It is also, after the domination loop above, strictly
+    /// on the far side of the incoming sample, so dropping it and pushing keeps
+    /// the newest observation — which is what stops a full filter from becoming
+    /// one that cannot respond to fresh data at all. See
+    /// [`WINDOW_FILTER_MAX_ENTRIES`] for why the ceiling exists and which
+    /// direction it is allowed to err in.
+    fn push_bounded(&mut self, now: Instant, value: u64) {
+        if self.window.len() >= WINDOW_FILTER_MAX_ENTRIES {
+            self.window.pop_back();
+        }
+        self.window.push_back((now, value));
+    }
+
     fn update_max(&mut self, now: Instant, value: u64) -> u64 {
         self.expire(now);
         // Remove entries smaller than the new value (they're dominated)
@@ -195,7 +213,7 @@ impl WindowFilter {
                 break;
             }
         }
-        self.window.push_back((now, value));
+        self.push_bounded(now, value);
         // The maximum is always at the front
         self.head().unwrap_or(value)
     }
@@ -209,12 +227,63 @@ impl WindowFilter {
                 break;
             }
         }
-        self.window.push_back((now, value));
+        self.push_bounded(now, value);
         self.head().unwrap_or(value)
     }
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
+
+/// Most entries either sliding-window filter retains, and the reason it is
+/// bounded at all rather than "however many arrive".
+///
+/// The deque is pruned from the front by the horizon and from the back by
+/// domination — a new sample evicts every retained entry it dominates. That
+/// second rule is what normally keeps it short, and it is exactly the rule a
+/// monotone sequence defeats: a strictly falling run of delivery rates dominates
+/// nothing, so every one of its samples is appended and none is removed until
+/// the horizon reaches it. At 40 Mbit/s with 1156-byte segments that is on the
+/// order of forty thousand entries per direction per session, and the cadence
+/// shaping the sequence is the peer's — it chooses when to acknowledge, and so
+/// what interval each sample is divided by and therefore what rate it works out
+/// to. An allocation whose length a remote party picks is the shape this
+/// transport removes rather than defends, so the deque gets a ceiling.
+///
+/// **Which end the ceiling evicts from decides whether it can lie, and only one
+/// direction is admissible.** In the maximum filter the deque runs largest at
+/// the front to smallest at the back, so the back is the least of everything
+/// retained. Discarding it removes a candidate that was smaller than every
+/// entry ahead of it and could only ever have been promoted to the top after
+/// all of those expired; whatever remains is still a real, unexpired
+/// observation. A bounded maximum is therefore at or below the unbounded one at
+/// every instant. It under-states the path and never over-states it, which is
+/// the side of the error that matters: an under-stated bottleneck costs
+/// throughput, an over-stated one paces into a queue of the sender's own
+/// making. `a_bounded_filter_never_reports_a_higher_maximum_than_the_unbounded_one`
+/// pins that direction rather than leaving it as an argument in a comment.
+///
+/// The minimum filter runs the other way round, and there the same eviction can
+/// leave `min_rtt` reading *higher* than an unbounded filter would have. That is
+/// admissible for a reason particular to this quantity rather than by symmetry
+/// with the one above: every entry in that deque is a round trip this endpoint
+/// timed itself within the horizon, so a truncated minimum is still one of the
+/// path's own recent round trips and can never exceed the largest of them. The
+/// peer gains nothing it did not already hold — it can raise every sample in the
+/// window simply by sitting on its acknowledgements, which raises the true
+/// minimum — and a bound that cannot push the reading outside the range of
+/// honestly observed round trips adds no lever to that.
+///
+/// 1024 because that is the ARQ send buffer's segment cap (`Stream`'s
+/// `MAX_PENDING_PACKETS`): the most segments one stream can have outstanding,
+/// hence the most acknowledgements a single round trip can return, hence the
+/// longest monotone run one round trip can produce. A filter that holds a full
+/// flight's worth of candidates represents any one round trip exactly, and what
+/// it declines to hold is cross-round-trip history — which is the horizon's job,
+/// not the length's. An entry is at most three machine words, so the two filters
+/// together cost tens of kilobytes per session, against the 8 MiB of
+/// receive-window growth (`SESSION_RECV_WINDOW_GROWTH_BUDGET`) a single session
+/// may already draw.
+const WINDOW_FILTER_MAX_ENTRIES: usize = 1024;
 
 /// Probe cycle gains for ProbeBW phase (BBR cycle: 1.25, 0.75, 1.0, 1.0)
 ///
@@ -3591,6 +3660,104 @@ mod tests {
              fallen from {peak} B/s to {} B/s — the peak is not being retained, \
              it is being tracked",
             est.bottleneck_bandwidth()
+        );
+    }
+
+    /// A strictly falling run of delivery rates dominates nothing, so every
+    /// sample in it is appended and none is removed until the horizon reaches
+    /// it — and the peer picks the acknowledgement cadence that shapes the run.
+    ///
+    /// The length of that deque is a local memory commitment sized by a remote
+    /// party, which is the shape this transport removes rather than defends. The
+    /// assertion is on the retained length rather than on any reported value,
+    /// because the value is the subject of the test after this one.
+    #[test]
+    fn a_strictly_falling_run_cannot_grow_the_bandwidth_filter_without_bound() {
+        // Four times the ceiling, so the test fails by a wide margin if the
+        // ceiling is absent rather than merely by the last few entries.
+        const SAMPLES: u64 = 4 * WINDOW_FILTER_MAX_ENTRIES as u64;
+
+        let mut est = BandwidthEstimator::new();
+        let start = Instant::now();
+        let span = Duration::from_millis(1);
+
+        // Each acknowledgement lands one millisecond after the last and carries
+        // one byte less than the one before it, so no sample ever dominates its
+        // predecessor and the whole run stays inside the horizon.
+        for i in 1..=SAMPLES {
+            let at = start + span * (i as u32);
+            let bytes = SAMPLES + 1 - i;
+            let sample = ack_delivering(&est, at, span, bytes, false);
+            est.on_ack(sample);
+        }
+
+        assert!(
+            est.bw_filter.window.len() <= WINDOW_FILTER_MAX_ENTRIES,
+            "{SAMPLES} strictly falling acknowledgements left {} entries in the \
+             bandwidth filter, against a ceiling of {WINDOW_FILTER_MAX_ENTRIES} — \
+             the deque is as long as the peer cares to make it",
+            est.bw_filter.window.len()
+        );
+    }
+
+    /// The ceiling must cost accuracy in one direction only.
+    ///
+    /// A bounded filter that could report a *higher* maximum than the unbounded
+    /// one would be worse than no bound: an over-stated bottleneck is what paces
+    /// a sender into a queue of its own making. Here the same sequence is fed to
+    /// the real filter and to a brute-force reference — the maximum over every
+    /// sample still inside the horizon — and the two are compared at every step.
+    ///
+    /// The last assertion is the positive control. Without it the test would
+    /// pass on a filter whose ceiling never engaged, which proves the direction
+    /// of a truncation that never happened.
+    #[test]
+    fn a_bounded_filter_never_reports_a_higher_maximum_than_the_unbounded_one() {
+        const HORIZON: Duration = Duration::from_secs(10);
+        const STEP: Duration = Duration::from_millis(5);
+        // Long enough that the horizon rolls twice over a run that fills the
+        // ceiling, which is what puts truncated entries inside the window.
+        const SAMPLES: usize = 8 * WINDOW_FILTER_MAX_ENTRIES;
+
+        let base = Instant::now();
+        let mut filter = WindowFilter::new(HORIZON);
+        let mut history: Vec<(Instant, u64)> = Vec::with_capacity(SAMPLES);
+        let mut saw_truncation = false;
+
+        for i in 0..SAMPLES {
+            // Strictly falling, so nothing is ever dominated and the deque grows
+            // by one per sample until something stops it.
+            let value = (SAMPLES - i) as u64;
+            let at = base + STEP * (i as u32);
+            history.push((at, value));
+
+            let reported = filter.update_max(at, value);
+            let reference = history
+                .iter()
+                .filter(|(ts, _)| at.duration_since(*ts) <= HORIZON)
+                .map(|&(_, v)| v)
+                .max()
+                .unwrap_or(0);
+
+            assert!(
+                filter.window.len() <= WINDOW_FILTER_MAX_ENTRIES,
+                "sample {i}: the filter holds {} entries, past the \
+                 {WINDOW_FILTER_MAX_ENTRIES} ceiling",
+                filter.window.len()
+            );
+            assert!(
+                reported <= reference,
+                "sample {i}: the bounded filter reports {reported} where the \
+                 unbounded one reports {reference} — the ceiling is inventing \
+                 bandwidth, not conceding it"
+            );
+            saw_truncation |= reported < reference;
+        }
+
+        assert!(
+            saw_truncation,
+            "the ceiling never actually discarded anything over {SAMPLES} samples, \
+             so this run proves nothing about the direction it errs in"
         );
     }
 }
