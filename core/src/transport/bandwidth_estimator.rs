@@ -334,6 +334,63 @@ const INITIAL_MIN_RTT: Duration = Duration::from_millis(100);
 /// ProbeRTT interval — enter ProbeRTT every 10 seconds
 const PROBE_RTT_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long a delivery-rate sample is retained in [`BandwidthEstimator::bw_filter`]
+/// — the horizon over which `btl_bw` is a maximum.
+///
+/// **The unit is the interesting part, and it is not the draft's.** Linux BBR
+/// ages this filter in *round trips*: `bbr_bw_rtts` is `CYCLE_LEN + 2` = 10, so
+/// a peak survives ten round trips and no longer. Ten wall-clock seconds is a
+/// different quantity on every path — about forty-two round trips on the 235 ms
+/// route this transport is measured over, four times the canonical residency,
+/// and only ten on a 1 s satellite hop. Measured against the draft, this
+/// endpoint retains a peak far longer than intended on any fast path, and that
+/// over-retention is real rather than notional.
+///
+/// It is still wall clock, and the reason is what a round trip is counted by.
+/// `update_round` closes a round when an acknowledgement arrives for a packet
+/// that was *sent* at or beyond the mark taken when the round opened. A sender
+/// that cannot send — congestion window full, acknowledgements trickling back —
+/// puts no new packet on the wire, so no acknowledgement can carry a mark past
+/// the round's, and the round count simply stops. That is not a corner case; it
+/// is precisely the state the worst recorded over-estimates came out of, where
+/// one leg sat on 684 KB in flight while its acknowledgement rate collapsed to
+/// 6–12 KB/s and the advertised estimate stood unchanged across four
+/// consecutive half-second samples. A horizon counted in round trips would have
+/// stopped ageing exactly there — it would lengthen the freeze it was adopted to
+/// shorten. A wall clock ages through a stall; a round counter is gated by the
+/// peer's acknowledgements and does not.
+///
+/// So the unit stays, and the length is left where it is until there are numbers
+/// to move it against: the raw per-acknowledgement sample now recorded beside
+/// the filtered maximum is what will say how much of the gap between the
+/// estimate and the delivered rate is this horizon retaining a peak and how much
+/// is the arithmetic of the samples themselves. Changing a value later is cheap;
+/// changing the unit is not, which is why the unit is argued here and the value
+/// is not yet.
+const BW_FILTER_WINDOW: Duration = Duration::from_secs(10);
+
+/// How long an RTT sample is retained in [`BandwidthEstimator::rtt_filter`] —
+/// the horizon over which `min_rtt` is a minimum. BBR's `MinRTTFilterLen`.
+///
+/// This one is wall clock in the draft too, and it is tied to
+/// [`PROBE_RTT_INTERVAL`] rather than chosen independently: ProbeRTT exists to
+/// put a fresh sample into this filter, taken across a pipe it has deliberately
+/// emptied. A refresh interval longer than the horizon would leave the filter
+/// with nothing in it between refreshes; one shorter would pay the floored
+/// window more often than the measurement it is buying needs. The two are the
+/// same figure in the draft for that reason, and the assertion below keeps them
+/// the same figure here — a divergence between them is not a tuning choice, it
+/// is one of those two failures.
+const RTT_FILTER_WINDOW: Duration = Duration::from_secs(10);
+
+const _: () = assert!(
+    RTT_FILTER_WINDOW.as_secs() == PROBE_RTT_INTERVAL.as_secs(),
+    "ProbeRTT refreshes the min-RTT filter, so its interval and that filter's \
+     horizon are one figure: a longer interval empties the filter between \
+     refreshes, a shorter one floors the window more often than the measurement \
+     needs"
+);
+
 /// How long ProbeRTT holds the floored window **after the pipe has drained**,
 /// or one round trip if that is longer.
 ///
@@ -509,9 +566,9 @@ pub struct BandwidthEstimator {
     btl_bw: u64,
     /// Minimum observed RTT
     min_rtt: Duration,
-    /// Sliding-window max filter for bandwidth (10-second window — see `new`)
+    /// Sliding-window max filter for bandwidth, over [`BW_FILTER_WINDOW`].
     bw_filter: WindowFilter,
-    /// Sliding-window min filter for RTT (10-second window — see `new`)
+    /// Sliding-window min filter for RTT, over [`RTT_FILTER_WINDOW`].
     rtt_filter: WindowFilter,
     /// Whether [`Self::rtt_filter`] has ever been fed a sample — i.e. whether
     /// [`Self::min_rtt`] reflects an observation rather than the opening guess.
@@ -652,8 +709,8 @@ impl BandwidthEstimator {
             state: BbrState::Startup,
             btl_bw: 0,
             min_rtt: INITIAL_MIN_RTT,
-            bw_filter: WindowFilter::new(Duration::from_secs(10)),
-            rtt_filter: WindowFilter::new(Duration::from_secs(10)),
+            bw_filter: WindowFilter::new(BW_FILTER_WINDOW),
+            rtt_filter: WindowFilter::new(RTT_FILTER_WINDOW),
             rtt_filter_seeded: false,
             delivered_bytes: 0,
             last_delivery: now,
@@ -3551,6 +3608,15 @@ mod tests {
     /// The honest rate the tails run at: 5 KB per half second.
     const HORIZON_TAIL_BYTES: u64 = 5_000;
     const HORIZON_TAIL_SPAN: Duration = Duration::from_millis(500);
+    /// Enough tail acknowledgements to carry the run twice past the horizon,
+    /// derived from the horizon rather than written down beside it so that
+    /// moving [`BW_FILTER_WINDOW`] moves the tests with it instead of quietly
+    /// turning them into assertions about a boundary they no longer straddle.
+    const HORIZON_TAIL_ACKS: u32 =
+        2 * (BW_FILTER_WINDOW.as_millis() / HORIZON_TAIL_SPAN.as_millis()) as u32;
+    /// ...and enough to stop a full second short of it, for the test that has to
+    /// stay inside.
+    const IN_HORIZON_TAIL_ACKS: u32 = HORIZON_TAIL_ACKS / 2 - 2;
 
     /// Raise the estimate with one unsustainable burst and hand back both the
     /// estimator and the peak it now reports.
@@ -3586,9 +3652,9 @@ mod tests {
         let start = Instant::now();
         let (mut est, peak) = estimator_holding_a_burst_peak(start);
 
-        // Forty half-second acknowledgements — twenty seconds, twice the
-        // horizon — each carrying an honest, slow delivery rate.
-        for i in 1..=40u32 {
+        // Twice the horizon in half-second acknowledgements, each carrying an
+        // honest, slow delivery rate.
+        for i in 1..=HORIZON_TAIL_ACKS {
             let at = start + HORIZON_TAIL_SPAN * i;
             let sample = ack_delivering(&est, at, HORIZON_TAIL_SPAN, HORIZON_TAIL_BYTES, false);
             est.on_ack(sample);
@@ -3597,8 +3663,8 @@ mod tests {
         let settled = est.bottleneck_bandwidth();
         assert!(
             settled * 1000 < peak,
-            "twenty seconds past a ten-second horizon the estimate is {settled} B/s \
-             against a burst peak of {peak} B/s — the peak was never released"
+            "twice the horizon later the estimate is {settled} B/s against a burst \
+             peak of {peak} B/s — the peak was never released"
         );
         assert!(
             settled > 0,
@@ -3624,7 +3690,7 @@ mod tests {
         let (mut est, peak) = estimator_holding_a_burst_peak(start);
 
         est.note_app_limited_drain();
-        for i in 1..=40u32 {
+        for i in 1..=HORIZON_TAIL_ACKS {
             let at = start + HORIZON_TAIL_SPAN * i;
             let sample = ack_delivering(&est, at, HORIZON_TAIL_SPAN, HORIZON_TAIL_BYTES, true);
             est.on_ack(sample);
@@ -3633,7 +3699,7 @@ mod tests {
         let settled = est.bottleneck_bandwidth();
         assert!(
             settled * 1000 < peak,
-            "the estimate is still {settled} B/s twenty seconds after a {peak} B/s \
+            "the estimate is still {settled} B/s twice the horizon after a {peak} B/s \
              burst, because every acknowledgement since was app-limited and the \
              horizon only ages on the ones it admits"
         );
@@ -3663,7 +3729,7 @@ mod tests {
         let start = Instant::now();
         let (mut est, peak) = estimator_holding_a_burst_peak(start);
 
-        for i in 1..=40u32 {
+        for i in 1..=HORIZON_TAIL_ACKS {
             let at = start + HORIZON_TAIL_SPAN * i;
             let sample = ack_delivering(&est, at, HORIZON_TAIL_SPAN, 0, false);
             est.on_ack(sample);
@@ -3672,9 +3738,9 @@ mod tests {
         assert_eq!(
             est.bottleneck_bandwidth(),
             0,
-            "twenty seconds of acknowledgements that delivered nothing left the \
-             estimate at {} B/s, still carrying a {peak} B/s burst from before \
-             the horizon opened",
+            "twice the horizon of acknowledgements that delivered nothing left the \
+             estimate at {} B/s, still carrying a {peak} B/s burst from before it \
+             opened",
             est.bottleneck_bandwidth()
         );
     }
@@ -3695,9 +3761,9 @@ mod tests {
         let start = Instant::now();
         let (mut est, peak) = estimator_holding_a_burst_peak(start);
 
-        // Nine seconds of slow, honest samples — inside the ten-second horizon
-        // by a full second, so nothing here is a question about expiry timing.
-        for i in 1..=18u32 {
+        // Slow, honest samples stopping a full second inside the horizon, so
+        // nothing here is a question about expiry timing.
+        for i in 1..=IN_HORIZON_TAIL_ACKS {
             let at = start + HORIZON_TAIL_SPAN * i;
             let sample = ack_delivering(&est, at, HORIZON_TAIL_SPAN, HORIZON_TAIL_BYTES, false);
             est.on_ack(sample);
@@ -3706,9 +3772,9 @@ mod tests {
         assert_eq!(
             est.bottleneck_bandwidth(),
             peak,
-            "nine seconds into a ten-second horizon the estimate has already \
-             fallen from {peak} B/s to {} B/s — the peak is not being retained, \
-             it is being tracked",
+            "a second short of the horizon the estimate has already fallen from \
+             {peak} B/s to {} B/s — the peak is not being retained, it is being \
+             tracked",
             est.bottleneck_bandwidth()
         );
     }
@@ -3763,7 +3829,7 @@ mod tests {
     /// of a truncation that never happened.
     #[test]
     fn a_bounded_filter_never_reports_a_higher_maximum_than_the_unbounded_one() {
-        const HORIZON: Duration = Duration::from_secs(10);
+        const HORIZON: Duration = BW_FILTER_WINDOW;
         const STEP: Duration = Duration::from_millis(5);
         // Long enough that the horizon rolls twice over a run that fills the
         // ceiling, which is what puts truncated entries inside the window.
