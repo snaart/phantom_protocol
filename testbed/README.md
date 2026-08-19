@@ -306,14 +306,55 @@ Server, under `/var/lib/phantom-testd/`:
 
 - `sessions.jsonl`, `snapshots.jsonl` (per-leg counters + RSS/CPU),
   `windows.jsonl` (the sending side's congestion window, keyed
-  `server:session:<uid>`), `events.jsonl`, and uploaded client bundles under
+  `server:session:<uid>`), `events.jsonl`, `session-uid.hwm` (bookkeeping — the
+  uid range this host has already used), and uploaded client bundles under
   `results/client/`
 
 These are append-only and outlive the daemon, so one directory holds several
-runs. `session_uid` is seeded from the daemon's start time and is unique across
-restarts — but in artifacts written before that it restarts at 1 on every boot,
-and a uid alone joins one session's marks to another session's windows. Bound
-such a join by the marks' timestamps, as `stall_verdict.py` does.
+runs. `session_uid` is unique across restarts: the daemon starts each run at the
+larger of its own start time in microseconds and one past the mark it left in
+`session-uid.hwm`, and that mark is on disk before the first uid it covers is
+handed out. A clock that steps backwards, a host with no battery-backed clock,
+or a clock reading zero therefore cannot make two runs share a range. Uids skip
+forward across a restart — a run reserves a block, a crash abandons the unused
+tail — so gaps are expected and mean nothing. On a host with no usable mark, the
+floor is recovered by scanning `events.jsonl` and `sessions.jsonl`, both retained
+generations: a uid is written to the events journal the moment it is minted, at
+accept, while the session record is written at close, so the sessions that were
+still running when a daemon died are in the first and not the second. That
+recovery runs on the boot that introduces the mark file and equally on a boot
+that had to refuse the mark it found — refusing costs exactly the range the
+journals still hold, so the two are the same position and get the same treatment.
+
+The mark is brought up to what a run actually issued by a timer inside the
+daemon that fires every 2 seconds, off the accept path. Shutdown also releases
+the counter, which does the same write promptly and in order, but that is the
+prompt path rather than the guarantee: the counter is shared, and a task running
+when shutdown begins — an accept loop whose abort has not landed, or a QUIC
+connection whose handler is parked on a peer that went away — holds it past that
+point. The timer is set well inside the drain shutdown waits out for that reason.
+
+The guarantee holds except where the daemon says it does not, and it says so in
+`events.jsonl`, as a `session_uid_degraded` record whose `detail` states the
+failure and names the file it involves. One record per distinct failure, not one
+per boot: a boot that both refused its mark and could not read its journals
+writes one for each, while a repeated failure — a data directory that refuses
+every write for the rest of the run — is declared once and not once per session.
+The failures covered are a mark the daemon could not read, parse or write, at
+boot **or** later in the run, whether it was extending a reservation or bringing
+the mark up to what the run had actually issued; a mark holding a value past what
+these files can carry, which is refused and replaced rather than adopted, because
+adopting it would wrap the counter and wedge every later boot; and a boot that
+found journals it could not turn into a floor, whether they were unreadable, past
+the scan bound, or held no uid at all — that last one is a single record naming
+every generation involved, so counting records counts failures rather than files.
+A run carrying one of these is back to whatever floor it could establish, which
+may be the clock alone, and its uids should be read the way archived ones are.
+
+One caveat for older artifacts. Those written before any of this restart the
+counter at 1 on every boot, and a uid alone then joins one session's marks to
+another session's windows; bound such a join by the marks' timestamps, as
+`stall_verdict.py` does.
 
 Results are flushed after **every scenario**, so an interrupted run keeps
 everything completed so far. The client also uploads its bundle to the daemon
@@ -377,10 +418,12 @@ Two things it does deliberately, both of which cost a wrong answer once. It
 excludes the QUIC reference leg and the client's own `download` series, because
 neither is the sending side and both therefore read as a permanent stall. And
 it joins the server's windows to a scenario by *time*, not by `session_uid`
-alone: the daemon restarts that counter, so a uid is shared across runs, and a
-uid-only join silently pairs one session's marks with another session's
-windows. It prints a warning wherever that ambiguity exists rather than
-resolving it quietly.
+alone, because a uid-only join silently pairs one session's marks with another
+session's windows in any archive whose uids were once reissued. A live daemon no
+longer reissues them unless it has declared that it cannot promise otherwise,
+but archived files do not change, so the time bound stays: it is the only
+defence for data already written. It prints a warning wherever that ambiguity
+exists rather than resolving it quietly.
 
 ## Tests
 
