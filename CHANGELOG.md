@@ -441,6 +441,40 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **The crate could not be packaged, and nothing in CI noticed for two months.**
+  `core/src/lib.rs` inlined the repository-root README into the crate documentation with
+  `#![doc = include_str!("../../README.md")]`. That path is correct in this repository, where
+  `src/lib.rs` sits two levels below the root, and wrong inside a `cargo package` archive,
+  where it sits one level below the archive root and the two dots address the parent of the
+  extracted directory. `cargo package` verifies by unpacking its own tarball and building it,
+  so every run since the line landed ended in `couldn't read src/../../README.md`. No path can
+  be right in both layouts: an archive carries only what sits under the manifest directory, so
+  the file has to be inside `core/`.
+
+  It is, as `core/README.md`, now a byte-identical copy of the landing page rather than the
+  five-kilobyte stub that had been sitting there since before the `include_str!` — a stub
+  whose status line still read "Pre-1.0 (`0.1.x`)" and which is what crates.io has been
+  rendering for 0.2.2. A symlink was considered and rejected: on a checkout without symlink
+  support it becomes a twelve-byte file whose entire contents are the text `../README.md`,
+  which packages, compiles, and ships that string as both the crates.io page and the docs.rs
+  front page, with every exit code zero. A duplicate can only drift, and drift is checkable —
+  `scripts/sync_readme.sh` repairs it from a pre-commit hook and asserts it in CI, and
+  `cargo test --lib` fails on it in a required branch-protection context.
+
+  The reason this survived is that no job ever built the crate the way a consumer receives it.
+  A new `cargo package` CI job now does, and before that build it asserts something the
+  verification build structurally cannot: that the README inside the tarball is the landing
+  page. Verification compiles the archive, and a crate compiles just as happily around the
+  wrong README — which is exactly the failure that shipped.
+
+  The landing page's two Rust examples also stop hiding their `#[tokio::main]` and their `fn
+  main` behind rustdoc's `# ` line marker. rustdoc strips those, so docs.rs was clean, but
+  crates.io renders the same file as CommonMark, which has no such convention and prints them:
+  a visitor met two headline examples interrupted by stray hashes and apparently having no
+  `main`, and pasting either produced a syntax error on the first line. The stub being replaced
+  here had no such problem, so it would have arrived as a regression on the exact surface this
+  change set out to repair. The fences stay `rust,no_run` and still compile.
+
 - **A stream stopped on its flow-control limit with nothing outstanding had no way to ask, and
   no answer was on its way.** Blocked with nothing in flight is the one state a sender cannot
   leave on its own: what would free it is an acknowledgement, and an acknowledgement only comes

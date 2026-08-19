@@ -59,7 +59,7 @@ cargo run --manifest-path cli/Cargo.toml -- ping --host 127.0.0.1 --port 4242 \
 ```
 
 **Language bindings (15 minutes):** see
-[`tests/bindings/PACKAGING.md`](tests/bindings/PACKAGING.md) for Swift, Kotlin,
+[`tests/bindings/PACKAGING.md`](https://github.com/snaart/phantom_protocol/blob/main/tests/bindings/PACKAGING.md) for Swift, Kotlin,
 Python, and C packaging workflows.
 
 ### Choosing a transport
@@ -137,8 +137,8 @@ cargo test --manifest-path core/Cargo.toml --test tcp_integration -- --ignored
 ```
 
 More commands (benches, fuzz, miri, cross-targets, embedded) live in the CI
-workflow files under [`.github/workflows/`](.github/workflows/); the PR
-checklist is in [CONTRIBUTING.md](CONTRIBUTING.md).
+workflow files under [`.github/workflows/`](https://github.com/snaart/phantom_protocol/tree/main/.github/workflows/); the PR
+checklist is in [CONTRIBUTING.md](https://github.com/snaart/phantom_protocol/blob/main/CONTRIBUTING.md).
 
 ### Minimal client / server (UDP — production path)
 
@@ -150,32 +150,32 @@ PhantomUDP is the recommended transport: it supports seamless `migrate()`.
 use std::sync::Arc;
 use phantom_protocol::api::{PhantomUdpListener, PhantomSession};
 
-# #[tokio::main]
-# async fn main() -> Result<(), phantom_protocol::CoreError> {
-// ── Server ────────────────────────────────────────────────────────────────
-let listener = PhantomUdpListener::builder("127.0.0.1:0").bind().await?;
-let server_addr = listener.local_addr();                // e.g. "127.0.0.1:54321"
-let pinned_key  = listener.verifying_key_bytes();       // share out-of-band
+#[tokio::main]
+async fn main() -> Result<(), phantom_protocol::CoreError> {
+    // ── Server ────────────────────────────────────────────────────────────────
+    let listener = PhantomUdpListener::builder("127.0.0.1:0").bind().await?;
+    let server_addr = listener.local_addr();                // e.g. "127.0.0.1:54321"
+    let pinned_key  = listener.verifying_key_bytes();       // share out-of-band
 
-let listener = Arc::clone(&listener);
-tokio::spawn(async move {
-    let outcome = listener.accept().await?;
-    let session = outcome.session();
-    let _req = session.recv().await?;
-    session.send(b"hello, post-quantum world".to_vec()).await?;
-    Ok::<_, phantom_protocol::CoreError>(())
-});
+    let listener = Arc::clone(&listener);
+    tokio::spawn(async move {
+        let outcome = listener.accept().await?;
+        let session = outcome.session();
+        let _req = session.recv().await?;
+        session.send(b"hello, post-quantum world".to_vec()).await?;
+        Ok::<_, phantom_protocol::CoreError>(())
+    });
 
-// ── Client ────────────────────────────────────────────────────────────────
-let port: u16 = server_addr.parse::<std::net::SocketAddr>().unwrap().port();
-let session = phantom_protocol::connect_pinned_udp(
-    "127.0.0.1".into(), port, pinned_key,
-).await?;
-session.await_ready().await?;
-session.send(b"ping".to_vec()).await?;
-let _reply = session.recv().await?;
-# Ok(())
-# }
+    // ── Client ────────────────────────────────────────────────────────────────
+    let port: u16 = server_addr.parse::<std::net::SocketAddr>().unwrap().port();
+    let session = phantom_protocol::connect_pinned_udp(
+        "127.0.0.1".into(), port, pinned_key,
+    ).await?;
+    session.await_ready().await?;
+    session.send(b"ping".to_vec()).await?;
+    let _reply = session.recv().await?;
+    Ok(())
+}
 ```
 
 ### Minimal client / server (TCP — simpler, no `migrate()`)
@@ -185,35 +185,35 @@ use std::sync::Arc;
 use phantom_protocol::api::{PhantomListener, PhantomSession, TcpSessionTransport};
 use phantom_protocol::crypto::hybrid_sign::HybridVerifyingKey;
 
-# #[tokio::main]
-# async fn main() -> Result<(), phantom_protocol::CoreError> {
-let listener = PhantomListener::builder("127.0.0.1:0").bind().await?;
-let server_addr = listener.local_addr();
-let pinned_key  = listener.verifying_key_bytes();
+#[tokio::main]
+async fn main() -> Result<(), phantom_protocol::CoreError> {
+    let listener = PhantomListener::builder("127.0.0.1:0").bind().await?;
+    let server_addr = listener.local_addr();
+    let pinned_key  = listener.verifying_key_bytes();
 
-let listener = Arc::clone(&listener);
-tokio::spawn(async move {
-    let outcome = listener.accept().await?;
-    let session = outcome.session();
-    let _req = session.recv().await?;
-    session.send(b"hello, post-quantum world".to_vec()).await?;
-    Ok::<_, phantom_protocol::CoreError>(())
-});
+    let listener = Arc::clone(&listener);
+    tokio::spawn(async move {
+        let outcome = listener.accept().await?;
+        let session = outcome.session();
+        let _req = session.recv().await?;
+        session.send(b"hello, post-quantum world".to_vec()).await?;
+        Ok::<_, phantom_protocol::CoreError>(())
+    });
 
-let session = phantom_protocol::connect_pinned(
-    "127.0.0.1".into(),
-    server_addr.parse::<std::net::SocketAddr>().unwrap().port(),
-    pinned_key,
-).await?;
-session.send(b"ping".to_vec()).await?;
-let _reply = session.recv().await?;
-# Ok(())
-# }
+    let session = phantom_protocol::connect_pinned(
+        "127.0.0.1".into(),
+        server_addr.parse::<std::net::SocketAddr>().unwrap().port(),
+        pinned_key,
+    ).await?;
+    session.send(b"ping".to_vec()).await?;
+    let _reply = session.recv().await?;
+    Ok(())
+}
 ```
 
-Runnable forms: [`core/examples/loopback_demo.rs`](core/examples/loopback_demo.rs),
-[`core/examples/embedded_demo.rs`](core/examples/embedded_demo.rs),
-[`core/examples/crypto_bench.rs`](core/examples/crypto_bench.rs).
+Runnable forms: [`core/examples/loopback_demo.rs`](https://github.com/snaart/phantom_protocol/blob/main/core/examples/loopback_demo.rs),
+[`core/examples/embedded_demo.rs`](https://github.com/snaart/phantom_protocol/blob/main/core/examples/embedded_demo.rs),
+[`core/examples/crypto_bench.rs`](https://github.com/snaart/phantom_protocol/blob/main/core/examples/crypto_bench.rs).
 
 ## Cryptography
 
@@ -253,11 +253,11 @@ RustCrypto FIPS-203 / FIPS-204 implementations. The crate compiles on
 ```
 
 The formal architecture spec is
-[`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md);
+[`docs/architecture/ARCHITECTURE.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/architecture/ARCHITECTURE.md);
 the unified wire protocol (incl. 0-RTT) is
-[`docs/protocol/PROTOCOL.md`](docs/protocol/PROTOCOL.md). Per-subsystem
+[`docs/protocol/PROTOCOL.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/protocol/PROTOCOL.md). Per-subsystem
 security invariants are catalogued in
-[`docs/security/threat-model.md`](docs/security/threat-model.md).
+[`docs/security/threat-model.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/security/threat-model.md).
 
 ## Transport features
 
@@ -292,7 +292,7 @@ Reference numbers on **Apple M1 Pro (8P + 2E, 16 GiB), macOS 26.0, rustc 1.93.0,
 `WIRE_VERSION = 2`, whereas the shipped format is
 `WIRE_VERSION` = <!--pinned:WIRE_VERSION-->7 — so the crypto / throughput shape
 is representative but re-capture before quoting these as live figures (see
-[`BENCHMARKS.md`](BENCHMARKS.md)):
+[`BENCHMARKS.md`](https://github.com/snaart/phantom_protocol/blob/main/BENCHMARKS.md)):
 
 | Path | Number | Notes |
 | --- | --- | --- |
@@ -311,7 +311,7 @@ adds another +5–10% on stable workloads. The release profile (`opt-level=3`,
 `lto="fat"`, `codegen-units=1`, `panic="abort"`) is set at the workspace root.
 Linux x86_64 with AES-NI lands in similar ballparks. Full methodology and
 production tuning (`bbr`, `fq`, `LimitNOFILE`, allocator swap, CPU pinning) in
-[`BENCHMARKS.md`](BENCHMARKS.md) and [`docs/operations/perf-tuning.md`](docs/operations/perf-tuning.md).
+[`BENCHMARKS.md`](https://github.com/snaart/phantom_protocol/blob/main/BENCHMARKS.md) and [`docs/operations/perf-tuning.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/perf-tuning.md).
 
 ## Deploying
 
@@ -355,14 +355,14 @@ docker compose up -d
 ### Kubernetes / Helm
 
 Production-shape chart at
-[`docs/operations/helm/phantom-protocol/`](docs/operations/helm/phantom-protocol/).
+[`docs/operations/helm/phantom-protocol/`](https://github.com/snaart/phantom_protocol/tree/main/docs/operations/helm/phantom-protocol/).
 `appVersion: 0.2.2`, ClusterIP service on `4242`, 3 replicas,
 `tcpSocket` liveness / readiness. Raw manifests + walkthrough in
-[`docs/operations/kubernetes.md`](docs/operations/kubernetes.md).
+[`docs/operations/kubernetes.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/kubernetes.md).
 
 ### systemd
 
-Hardened unit text in [`docs/operations/systemd.md`](docs/operations/systemd.md)
+Hardened unit text in [`docs/operations/systemd.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/systemd.md)
 (`NoNewPrivileges`, `ProtectSystem=strict`, `MemoryDenyWriteExecute`,
 `SystemCallFilter`, 30s `TimeoutStopSec`) plus a multi-instance template using
 `SO_REUSEPORT`.
@@ -374,12 +374,12 @@ hand-rolled Prometheus endpoint). The reference server pushes to
 `OTEL_EXPORTER_OTLP_ENDPOINT`; backends supported include OTel Collector
 (→ Prometheus / Tempo / Loki), Datadog, Honeycomb, Grafana Cloud, AWS
 CloudWatch — anything OTLP-compatible. Pre-built Grafana dashboard at
-[`docs/observability/grafana/phantom-otel-dashboard.json`](docs/observability/grafana/phantom-otel-dashboard.json)
+[`docs/observability/grafana/phantom-otel-dashboard.json`](https://github.com/snaart/phantom_protocol/blob/main/docs/observability/grafana/phantom-otel-dashboard.json)
 and Prometheus alert rules at
-[`docs/observability/prometheus/alerts.yml`](docs/observability/prometheus/alerts.yml).
+[`docs/observability/prometheus/alerts.yml`](https://github.com/snaart/phantom_protocol/blob/main/docs/observability/prometheus/alerts.yml).
 End-to-end docker-compose demo in
-[`examples/observability-demo/`](examples/observability-demo/). Full setup
-recipes in [`docs/observability/otlp-setup.md`](docs/observability/otlp-setup.md).
+[`examples/observability-demo/`](https://github.com/snaart/phantom_protocol/tree/main/examples/observability-demo/). Full setup
+recipes in [`docs/observability/otlp-setup.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/observability/otlp-setup.md).
 
 ### CLI
 
@@ -405,17 +405,17 @@ cargo run --manifest-path cli/Cargo.toml -- version
 | `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` | hard gate |
 | `wasm32-unknown-unknown` | hard gate |
 | `thumbv7em-none-eabihf` | hard gate (`--no-default-features --features embedded,no-std`) |
-| `wasm32-wasip2` | hard gate (compile + host round-trip; WASI is client-side framing-only — see [`docs/operations/wasi.md`](docs/operations/wasi.md)) |
+| `wasm32-wasip2` | hard gate (compile + host round-trip; WASI is client-side framing-only — see [`docs/operations/wasi.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/wasi.md)) |
 
 ### Language bindings (`tests/bindings/`)
 
 | Binding | Maturity | Notes |
 | --- | --- | --- |
-| **Swift** | Production-shape | Auto-gen via UniFFI 0.31; iOS XCFramework recipe in [`docs/operations/mobile.md`](docs/operations/mobile.md) |
+| **Swift** | Production-shape | Auto-gen via UniFFI 0.31; iOS XCFramework recipe in [`docs/operations/mobile.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/mobile.md) |
 | **Kotlin** | Production-shape | Auto-gen; Android NDK + Gradle `jniLibs` recipe in `mobile.md` |
 | **Python** | UniFFI surface auto-gen | Demo harness `tests/run_test.py` |
 | **C** | Experimental | **Hand-curated** header — UniFFI 0.31 has no C generator. Covers `connect_pinned` / `connect_pinned_udp` (incl. `_with_config` / `_with_resumption`), the `bind*_with_signing_key_bytes` / `bind*_with_config_bytes` constructors, `generate_signing_key`, and `PhantomConfig`; the typed `HybridSigningKey` / `HybridVerifyingKey` objects and runtime injection stay Rust-only. README recommends Swift / Kotlin / Python instead |
-| **WASM (browser)** | Demo shipped | [`examples/wasm-demo/`](examples/wasm-demo/) pairs with [`docs/operations/wasm.md`](docs/operations/wasm.md); uses `WebSocketLeg` + `WasmRuntime` |
+| **WASM (browser)** | Demo shipped | [`examples/wasm-demo/`](https://github.com/snaart/phantom_protocol/tree/main/examples/wasm-demo/) pairs with [`docs/operations/wasm.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/wasm.md); uses `WebSocketLeg` + `WasmRuntime` |
 
 Regen: `tests/bindings/{generate_python,generate_swift,generate_kotlin,generate_c}.sh`.
 
@@ -434,15 +434,15 @@ shape as `TcpSessionTransport`. Pure-Rust, no_std + alloc, target-arch-agnostic
 (builds on host x86_64 for unit tests _and_ on bare-metal `thumbv7em-none-eabihf`).
 Per-`(R, W)` `SessionTransport` impl via the `impl_embedded_session_transport!`
 macro. `RngProvider` trait injects a hardware RNG when `getrandom` isn't
-available. [`core/examples/embedded_demo.rs`](core/examples/embedded_demo.rs) runs
+available. [`core/examples/embedded_demo.rs`](https://github.com/snaart/phantom_protocol/blob/main/core/examples/embedded_demo.rs) runs
 the full session over a mock byte stream **on a host** (std), demonstrating the
 leg — not a bare-metal handshake.
 
 ## Security
 
 Full threat model, mitigations, and disclosure policy are in
-[`SECURITY.md`](SECURITY.md) and
-[`docs/security/threat-model.md`](docs/security/threat-model.md). Headline points:
+[`SECURITY.md`](https://github.com/snaart/phantom_protocol/blob/main/SECURITY.md) and
+[`docs/security/threat-model.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/security/threat-model.md). Headline points:
 
 - **Mandatory server identity pinning** — `connect_with_transport` requires a
   `HybridVerifyingKey`; no skip path.
@@ -466,12 +466,12 @@ Full threat model, mitigations, and disclosure policy are in
   cross-language-boundary glue, so a native build compiles no `unsafe` at all.
 - Cancel-safety audit: zero bugs found across all `tokio::select!` sites.
 - Documented production panic sites with `PANIC-SAFETY:` invariants — see
-  [`docs/security/panic-sites.md`](docs/security/panic-sites.md).
+  [`docs/security/panic-sites.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/security/panic-sites.md).
 
 ### FIPS 140-3 / Common Criteria — exploratory only, NOT validated
 
 > **No FIPS validation and no Common Criteria evaluation exist, and none is in
-> progress.** The files under [`docs/compliance/`](docs/compliance/) are
+> progress.** The files under [`docs/compliance/`](https://github.com/snaart/phantom_protocol/tree/main/docs/compliance/) are
 > self-authored *readiness/gap analyses*, not certifications — do not rely on
 > them for any compliance claim.
 
@@ -479,17 +479,17 @@ Full threat model, mitigations, and disclosure policy are in
   ML-DSA-65, Ed25519, SHA-256, HMAC/HKDF-SHA-256), and an optional `fips` Cargo
   feature swaps the remaining non-approved primitives toward an `aws-lc-rs`
   substrate. This is *not* a validated cryptographic module (no CMVP). Gap
-  analysis: [`docs/compliance/fips-readiness.md`](docs/compliance/fips-readiness.md);
-  CAVP-style known-answer vectors in [`core/tests/cavp.rs`](core/tests/cavp.rs).
+  analysis: [`docs/compliance/fips-readiness.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/compliance/fips-readiness.md);
+  CAVP-style known-answer vectors in [`core/tests/cavp.rs`](https://github.com/snaart/phantom_protocol/blob/main/core/tests/cavp.rs).
 - **Common Criteria:** an internal SFR gap-mapping exercise against NIAP
   PP-Module VPN Client exists for design reference only
-  ([`docs/compliance/cc-pp-mapping.md`](docs/compliance/cc-pp-mapping.md)). No
+  ([`docs/compliance/cc-pp-mapping.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/compliance/cc-pp-mapping.md)). No
   lab evaluation is planned.
 
 ### Disclosure
 
 Report privately, **not** via public issues. Embargo SLA 90 days; ack within
-5 business days, triage within 14. Contact in [`SECURITY.md`](SECURITY.md).
+5 business days, triage within 14. Contact in [`SECURITY.md`](https://github.com/snaart/phantom_protocol/blob/main/SECURITY.md).
 
 ### Supply chain
 
@@ -538,19 +538,19 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   determined active-probing censor that completes a real TLS handshake detects it
   in one round trip, and against such an adversary it is net-negative. Use only
   where the threat is passive/commercial DPI, not active probing. Honest residuals
-  + SAFE/UNSAFE guidance in [`docs/security/threat-model.md`](docs/security/threat-model.md) §6.1.
+  + SAFE/UNSAFE guidance in [`docs/security/threat-model.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/security/threat-model.md) §6.1.
 - **Mobile connection migration (Wi-Fi ↔ LTE): use the UDP transport for real
   migration, or reconnect with 0-RTT on TCP.** `PhantomSession.migrate()` performs
   real single-path seamless migration when the session is backed by
   `UdpClientTransport` (via `connect_pinned_udp`). On TCP-backed sessions it returns
   `Err(CoreError::Unsupported)`. On a network change with TCP, reconnect — folding
   the first request in via `connect_pinned_with_resumption` to minimise cost. The
-  [`examples/mobile/`](examples/mobile/) sample apps demonstrate the reconnect-with-0-RTT
-  model; see [`docs/operations/mobile.md`](docs/operations/mobile.md) for the UDP
+  [`examples/mobile/`](https://github.com/snaart/phantom_protocol/tree/main/examples/mobile/) sample apps demonstrate the reconnect-with-0-RTT
+  model; see [`docs/operations/mobile.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/mobile.md) for the UDP
   migration path.
 - **Work deferred past 0.2.0** — hermetic/reproducible builds, the `no-std` PQ
   handshake, WASI server-side sessions, and ECN congestion feedback — is
-  consolidated with rationale in [`docs/DEFERRED_WORK.md`](docs/DEFERRED_WORK.md).
+  consolidated with rationale in [`docs/DEFERRED_WORK.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/DEFERRED_WORK.md).
 - **Loss recovery: SACK + fast-retransmit, validated over a fault rig (not yet in
   the wild).** The UDP data plane has RFC-9002-style SACK + dup-ACK
   fast-retransmit, an RFC-6298 RTO, a BBR-style congestion window, and
@@ -607,30 +607,30 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 
 ## Documentation
 
-- **Architecture:** [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md);
-  contributor workflow in [CONTRIBUTING.md](CONTRIBUTING.md)
-- **Wire protocol:** [`docs/protocol/PROTOCOL.md`](docs/protocol/PROTOCOL.md)
+- **Architecture:** [`docs/architecture/ARCHITECTURE.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/architecture/ARCHITECTURE.md);
+  contributor workflow in [CONTRIBUTING.md](https://github.com/snaart/phantom_protocol/blob/main/CONTRIBUTING.md)
+- **Wire protocol:** [`docs/protocol/PROTOCOL.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/protocol/PROTOCOL.md)
   (the single unified protocol, incl. 0-RTT)
-- **Security:** [`SECURITY.md`](SECURITY.md),
-  [`docs/security/threat-model.md`](docs/security/threat-model.md),
-  [`docs/security/incident-response.md`](docs/security/incident-response.md),
-  [`docs/security/cancel-safety-audit.md`](docs/security/cancel-safety-audit.md),
-  [`docs/security/panic-sites.md`](docs/security/panic-sites.md)
-- **Compliance:** [`docs/compliance/`](docs/compliance/) —
+- **Security:** [`SECURITY.md`](https://github.com/snaart/phantom_protocol/blob/main/SECURITY.md),
+  [`docs/security/threat-model.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/security/threat-model.md),
+  [`docs/security/incident-response.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/security/incident-response.md),
+  [`docs/security/cancel-safety-audit.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/security/cancel-safety-audit.md),
+  [`docs/security/panic-sites.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/security/panic-sites.md)
+- **Compliance:** [`docs/compliance/`](https://github.com/snaart/phantom_protocol/tree/main/docs/compliance/) —
   `fips-readiness.md`, `cc-pp-mapping.md`, `constant-time-audit.md`,
   `rng-audit.md`, `key-management.md`, `self-tests.md`,
   `fips-security-policy.md`
-- **Operations:** [`docs/operations/`](docs/operations/) —
+- **Operations:** [`docs/operations/`](https://github.com/snaart/phantom_protocol/tree/main/docs/operations/) —
   `perf-tuning.md`, `deployment.md`, `docker.md`, `systemd.md`,
   `kubernetes.md` (+ `helm/`), `mobile.md`, `wasm.md`, `wasi.md`,
   `zero-rtt.md`
-- **Policy:** [`docs/policy/versioning.md`](docs/policy/versioning.md)
-- **Performance:** [`BENCHMARKS.md`](BENCHMARKS.md)
-- **Change log:** [`CHANGELOG.md`](CHANGELOG.md)
+- **Policy:** [`docs/policy/versioning.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/policy/versioning.md)
+- **Performance:** [`BENCHMARKS.md`](https://github.com/snaart/phantom_protocol/blob/main/BENCHMARKS.md)
+- **Change log:** [`CHANGELOG.md`](https://github.com/snaart/phantom_protocol/blob/main/CHANGELOG.md)
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). PRs must pass `cargo fmt --check`,
+See [CONTRIBUTING.md](https://github.com/snaart/phantom_protocol/blob/main/CONTRIBUTING.md). PRs must pass `cargo fmt --check`,
 `cargo clippy --lib -- -D warnings`, `cargo test --lib`, and `cargo deny check`.
 The `cli-check` CI job requires that `core` API edits keep
 `cli/` building.
