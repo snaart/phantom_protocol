@@ -31,6 +31,20 @@ use crate::testd::session_uid::{NoticeSink, SessionUidCounter, UidLevel, UidNoti
 /// Shutdown must not be able to block on a session that never ends.
 const COLLECTOR_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
+// The uid mark's final write is guaranteed by that counter's top-up timer and
+// not by `drop(uid)` below, because a per-connection task holding a clone of the
+// `Arc` keeps the counter alive past that point — the same tasks this grace
+// exists to wait out. So the tick has to fit inside the grace with room for one
+// full period, or the process can exit with uids the mark does not cover, which
+// is the reissue the whole module exists to prevent. Held here rather than
+// described, because the two constants live in different files and the coupling
+// is invisible from either one.
+const _: () = assert!(
+    2 * session_uid::TOPUP_INTERVAL.as_millis() <= COLLECTOR_DRAIN_GRACE.as_millis(),
+    "the session-uid top-up tick must fit inside the collector drain grace with a full period \
+     to spare, or a run can exit with uids past its mark"
+);
+
 /// How long an accepted QUIC connection may go without opening its stream.
 ///
 /// The probe opens one immediately. A connection that does not is holding a
@@ -477,9 +491,20 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
     // before the collector's channel closes.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Release the counter while the archive is still open: its last act is to
-    // push the mark up to the uids this run actually handed out, and if that
-    // write fails the record saying so still has somewhere to land.
+    // Release this handle while the archive is still open. When it is the last
+    // one the counter's last act is to push the mark up to the uids this run
+    // actually handed out, and if that write fails the record saying so still
+    // has somewhere to land.
+    //
+    // It is often not the last one. Every accept loop holds a clone and their
+    // aborts above are asynchronous, and `accept_quic` clones again into each
+    // connection's own task — which is not tracked, and which the drain wait
+    // below exists precisely because one parked on a peer that went away can
+    // outlive this point. What covers that case is the counter's own top-up
+    // timer, set well inside `COLLECTOR_DRAIN_GRACE` so its last tick lands
+    // before the process exits. Dropping here makes the write prompt and
+    // ordered; it does not make it certain, and nothing downstream should be
+    // written as though it did.
     drop(uid);
     // And release the counter's route into the archive before the drain wait,
     // so a mark writer that outlives this point can no longer upgrade its
@@ -1029,6 +1054,34 @@ mod tests {
         assert!(
             readme.contains("session_uid_degraded"),
             "the README must keep naming the record it tells operators to grep for"
+        );
+
+        // Whitespace-normalised: these are claims about behaviour, and where a
+        // sentence happens to wrap is not one of them.
+        let flat = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !flat.contains("it says so once"),
+            "the README promises one degraded record per boot. A boot that refuses its mark and \
+             then cannot read its journals writes one for each, so either the count changes or \
+             the sentence does"
+        );
+        assert!(
+            flat.contains("One record per distinct failure"),
+            "the README must state what a reader counting these records is counting"
+        );
+        assert!(
+            flat.contains(&format!(
+                "fires every {} seconds",
+                session_uid::TOPUP_INTERVAL.as_secs()
+            )),
+            "the README states how often the mark is brought up to date, and it must be the \
+             interval the daemon uses rather than the one it used when the paragraph was written"
+        );
+        assert!(
+            flat.contains("prompt path rather than the guarantee"),
+            "the README must not credit the shutdown drop with the guarantee: the counter is \
+             shared, so that drop can release a handle rather than the value and the write never \
+             happens on that path at all"
         );
     }
 

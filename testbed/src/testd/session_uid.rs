@@ -49,9 +49,18 @@
 //! The extension is asked for from `next()`, which is the only place that knows
 //! a uid has been handed out — and therefore the one place that stops asking
 //! when a burst ends. So the same writer thread also tops the mark up on a
-//! timer and once more when the counter is released, and what it records then
-//! is what was issued rather than what was last reserved. Without that, a run
-//! ends with uids above the mark, and they are the ones a restart reissues.
+//! timer, and what it records then is what was issued rather than what was last
+//! reserved. Without that, a run ends with uids above the mark, and they are the
+//! ones a restart reissues.
+//!
+//! Releasing the counter tops the mark up as well, promptly and in order — but
+//! the timer is the guarantee and the release is not, and the difference
+//! matters. The daemon holds the counter behind an `Arc` and hands clones to
+//! per-connection tasks, so shutdown drops a handle rather than the value: a
+//! task still parked on a peer that went away keeps the counter alive past the
+//! point shutdown proceeds from, and `Drop` then does not run at all. The tick
+//! is shorter than the drain the daemon waits out around it for exactly that
+//! reason.
 //!
 //! ## Saying so
 //!
@@ -104,7 +113,13 @@ const EXTEND_MARGIN: u64 = LEASE / 4;
 /// counter above what disk covers with nothing left to trigger a write — the
 /// uids in that gap were issued and are not recorded. The check costs nothing
 /// while the mark is ahead, which is every tick of an idle daemon.
-const TOPUP_INTERVAL: Duration = Duration::from_secs(2);
+///
+/// This tick, and not the top-up on release, is what actually closes that gap
+/// in the daemon: the counter is shared behind an `Arc`, so shutdown can drop
+/// its handle while a per-connection task still holds another and `Drop` never
+/// runs. The interval is therefore kept well inside the grace the daemon spends
+/// draining its collector, so the last tick lands before the process exits.
+pub const TOPUP_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The journals a `session_uid` can appear in, both retained generations.
 ///
@@ -232,8 +247,9 @@ pub struct SessionUidCounter {
     /// `None` once persistence is known to be impossible — the counter still
     /// hands out uids, it just cannot promise the next boot will clear them.
     extend: Option<Sender<u64>>,
-    /// Joined on drop, so the writer's final top-up is ordered before the run
-    /// that owns this counter reports itself finished.
+    /// Joined on drop, so no write this run asked for can still be in flight
+    /// once it reports itself finished — see the `Drop` impl for what that
+    /// ordering is worth and what it is not.
     writer: Option<std::thread::JoinHandle<()>>,
     sink: Option<NoticeSink>,
 }
@@ -347,14 +363,27 @@ impl SessionUidCounter {
 }
 
 impl Drop for SessionUidCounter {
-    /// Record what this run actually handed out.
+    /// Record what this run actually handed out — promptly, and in order.
     ///
-    /// Dropping the sender ends the writer's loop, and joining it is what
-    /// orders its last top-up before this returns; the inline attempt after
-    /// covers a run that never had a writer at all. Neither is on the accept
-    /// path — the counter is released at shutdown, and an `fsync` between
-    /// `accept()` and the handler is measured as protocol behaviour, which is
-    /// the one thing this harness must not manufacture.
+    /// Dropping the sender ends the writer's loop. The join that follows is not
+    /// politeness about thread lifetimes: a reservation is composed on the
+    /// accept path and served later, and `store_target`'s read of what is
+    /// already recorded is not atomic with the write that follows it. A request
+    /// still in flight here can therefore land *after* the final top-up and
+    /// leave the mark describing less than the run issued, which is a reissue
+    /// rather than a lost extension. Joining removes the concurrency instead of
+    /// narrowing it. The inline attempt after covers a run that never had a
+    /// writer at all.
+    ///
+    /// What this does *not* do is guarantee that any of it happens. The daemon
+    /// shares the counter behind an `Arc`, so the drop at shutdown releases a
+    /// handle and a per-connection task holding another keeps the value alive;
+    /// the mark is brought up to date by [`TOPUP_INTERVAL`] in that case, and
+    /// this path is the prompt one rather than the guaranteed one.
+    ///
+    /// Neither is on the accept path — an `fsync` between `accept()` and the
+    /// handler is measured as protocol behaviour, which is the one thing this
+    /// harness must not manufacture.
     fn drop(&mut self) {
         self.extend.take();
         if let Some(h) = self.writer.take() {
@@ -387,6 +416,11 @@ fn top_up(shared: &Shared, paths: &MarkPaths) -> std::io::Result<()> {
 /// accept path and can be overtaken by a top-up before it is served, and
 /// rewriting the smaller number would retract a range that is already recorded
 /// — which is a reissue, the one outcome this module has to prevent.
+///
+/// The clamp reads `reserved` before the write rather than during it, so it
+/// answers a request that was already stale when it arrived; a top-up that
+/// lands while this write is in flight is a different problem, and the only
+/// other writer is the one joined in [`SessionUidCounter::drop`].
 fn store_target(shared: &Shared, paths: &MarkPaths, target: u64) -> std::io::Result<()> {
     let target = target.max(shared.reserved.load(Ordering::Acquire));
     paths.store(target)?;
@@ -492,8 +526,42 @@ fn spawn_writer(
 /// mark exists to protect — the failure this module was written for. So the
 /// ceiling is what the archive can express, and it follows the clock only on a
 /// host whose own clock has passed that point.
+///
+/// Refusing a mark is not a choice between the mark and the clock, either. It
+/// leaves the boot knowing only what the journals know, which is exactly the
+/// position a host with no mark at all is in — so it takes the same route out.
 fn uid_ceiling(clock_us: u64) -> u64 {
     MAX_EXACT_UID.max(clock_us)
+}
+
+/// Why a boot is deriving its floor from the journals rather than from a mark.
+///
+/// The two cases are not the same finding and must not read as the same one: a
+/// host that has not run under a mark yet is ordinary, while a host whose mark
+/// held a number this archive cannot carry has lost the record of a range it
+/// really did use. They also differ in what "nothing recovered" means — a boot
+/// that refused a mark has evidence of an earlier run and cannot call itself
+/// fresh.
+#[derive(Clone, Copy)]
+enum MarkGap {
+    /// No mark file. The one boot that introduces it.
+    Absent,
+    /// A mark was read and refused.
+    Refused,
+}
+
+impl MarkGap {
+    fn describe(self) -> String {
+        match self {
+            MarkGap::Absent => format!("no {MARK_FILE} yet"),
+            MarkGap::Refused => format!("the {MARK_FILE} mark was refused"),
+        }
+    }
+
+    /// Whether a boot that recovered nothing may report itself a fresh host.
+    fn can_be_fresh(self) -> bool {
+        matches!(self, MarkGap::Absent)
+    }
 }
 
 /// Decide where this boot's range begins.
@@ -510,11 +578,16 @@ fn resolve_start(
             // but adopting the value costs every future range as well.
             notices.push(UidNotice::degraded(format!(
                 "mark {persisted} in {} is past {ceiling}, the largest uid this archive can \
-                 carry — not adopted, and replaced; uids from {clock_us} may collide with an \
-                 earlier run's",
+                 carry — not adopted, and replaced; the range it described is recovered from \
+                 the journals as far as they reach, and beyond that this run's uids may collide \
+                 with an earlier run's",
                 paths.mark.display()
             )));
-            clock_us
+            // The mark is gone; the uids it was covering are not. They are in
+            // the journals, and a floor above them is the difference between a
+            // forward gap — which means nothing — and a run walking back
+            // through uids that already key marks and a window series.
+            start_from_journals(clock_us, dir, ceiling, MarkGap::Refused, notices)
         }
         Ok(Some(persisted)) => {
             // The stored value is treated as already consumed. It is the top of
@@ -531,65 +604,7 @@ fn resolve_start(
             ));
             start
         }
-        Ok(None) => {
-            let (found, coverage) = scan_journals_for_max_uid(dir, ceiling, notices);
-            match found {
-                // A floor derived from journals that were read end to end. It
-                // is the highest uid the files *record*, which is not the same
-                // claim as the highest uid ever issued — a uid reaches a
-                // journal through a bounded queue and a buffered writer — so
-                // the notice says which one it is.
-                Some(max) if coverage.complete() => {
-                    let start = clock_us.max(max.saturating_add(1));
-                    notices.push(UidNotice::warn(
-                        "session_uid_bootstrap",
-                        format!(
-                            "no {} yet; scanned the journals in {}, highest uid recorded there \
-                             {max}, first uid {start}",
-                            MARK_FILE,
-                            dir.display()
-                        ),
-                    ));
-                    start
-                }
-                Some(max) => {
-                    let start = clock_us.max(max.saturating_add(1));
-                    notices.push(UidNotice::degraded(format!(
-                        "no {MARK_FILE}, and the journals in {} were not read in full ({}); the \
-                         highest uid recorded in what could be read is {max}, so uids from \
-                         {start} may collide with an earlier run's",
-                        dir.display(),
-                        coverage.describe()
-                    )));
-                    start
-                }
-                // Nothing recovered. Whether that means a new host or a floor
-                // this boot could not establish is the whole question: the
-                // collector creates its journals at every boot, so their
-                // presence proves nothing, but a journal holding records does.
-                None if coverage.saw_records() => {
-                    notices.push(UidNotice::degraded(format!(
-                        "no {MARK_FILE}, and the journals in {} yielded no uid ({}); an earlier \
-                         run's range cannot be established, so uids from {clock_us} may collide \
-                         with it",
-                        dir.display(),
-                        coverage.describe()
-                    )));
-                    clock_us
-                }
-                None => {
-                    notices.push(UidNotice::info(
-                        "session_uid_fresh",
-                        format!(
-                            "no {MARK_FILE} and no journal in {} holding a record; first uid \
-                             {clock_us}",
-                            dir.display()
-                        ),
-                    ));
-                    clock_us
-                }
-            }
-        }
+        Ok(None) => start_from_journals(clock_us, dir, ceiling, MarkGap::Absent, notices),
         Err(e) => {
             // Not fatal, and deliberately not recovered from the journals
             // either: a mark that exists and cannot be read describes a host
@@ -600,6 +615,82 @@ fn resolve_start(
                  collide with an earlier run's",
                 paths.mark.display()
             )));
+            clock_us
+        }
+    }
+}
+
+/// Derive this boot's floor from the journals, for a boot that has no usable
+/// mark — because there is none yet, or because the one there was refused.
+///
+/// Both callers are in the same position afterwards, so they take the same
+/// route; what differs is what an operator has to be told about how they got
+/// there, which `gap` carries.
+fn start_from_journals(
+    clock_us: u64,
+    dir: &Path,
+    ceiling: u64,
+    gap: MarkGap,
+    notices: &mut Vec<UidNotice>,
+) -> u64 {
+    let (found, coverage) = scan_journals_for_max_uid(dir, ceiling, notices);
+    match found {
+        // A floor derived from journals that were read end to end. It is the
+        // highest uid the files *record*, which is not the same claim as the
+        // highest uid ever issued — a uid reaches a journal through a bounded
+        // queue and a buffered writer — so the notice says which one it is.
+        Some(max) if coverage.complete() => {
+            let start = clock_us.max(max.saturating_add(1));
+            notices.push(UidNotice::warn(
+                "session_uid_bootstrap",
+                format!(
+                    "{}; scanned the journals in {}, highest uid recorded there {max}, first \
+                     uid {start}",
+                    gap.describe(),
+                    dir.display()
+                ),
+            ));
+            start
+        }
+        Some(max) => {
+            let start = clock_us.max(max.saturating_add(1));
+            notices.push(UidNotice::degraded(format!(
+                "{}, and the journals in {} were not read in full ({}); the highest uid \
+                 recorded in what could be read is {max}, so uids from {start} may collide with \
+                 an earlier run's",
+                gap.describe(),
+                dir.display(),
+                coverage.describe()
+            )));
+            start
+        }
+        // Nothing recovered. Whether that means a new host or a floor this boot
+        // could not establish is the whole question: the collector creates its
+        // journals at every boot, so their presence proves nothing, but a
+        // journal holding records does.
+        None if coverage.saw_records() => {
+            notices.push(UidNotice::degraded(format!(
+                "{}, and the journals in {} yielded no uid ({}); an earlier run's range cannot \
+                 be established, so uids from {clock_us} may collide with it",
+                gap.describe(),
+                dir.display(),
+                coverage.describe()
+            )));
+            clock_us
+        }
+        // A refused mark is itself evidence of an earlier run, and its own
+        // record already says the range is unguaranteed; the point here is only
+        // that such a boot must not additionally claim there was nothing before
+        // it, which is the one thing the mark it just read disproves.
+        None if !gap.can_be_fresh() => clock_us,
+        None => {
+            notices.push(UidNotice::info(
+                "session_uid_fresh",
+                format!(
+                    "no {MARK_FILE} and no journal in {} holding a record; first uid {clock_us}",
+                    dir.display()
+                ),
+            ));
             clock_us
         }
     }
@@ -694,10 +785,20 @@ fn scan_journals_for_max_uid(
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(e) => {
-                notices.push(UidNotice::degraded(format!(
-                    "cannot scan {} for a previous uid range: {e}",
-                    path.display()
-                )));
+                // A finding, not a declaration. The scan's own summary is what
+                // declares the boot degraded, and it already enumerates every
+                // generation recorded here — so raising this one to
+                // `session_uid_degraded` would turn a single failure to
+                // establish a floor into as many records as there are
+                // journals, and an operator counting the kind they were told
+                // to grep for would read four failures out of one.
+                notices.push(UidNotice::warn(
+                    "session_uid_bootstrap",
+                    format!(
+                        "cannot scan {} for a previous uid range: {e}",
+                        path.display()
+                    ),
+                ));
                 coverage
                     .unread
                     .push(format!("cannot open {}: {e}", path.display()));
@@ -1328,10 +1429,22 @@ mod tests {
     /// A mark is a number this process did not produce this run, and one bad
     /// value must not be permanent. Adopting `u64::MAX` wraps the counter —
     /// duplicates inside a single run — and no later boot can climb past it.
+    ///
+    /// Refusing it costs the range the mark described, which is why the boot
+    /// then has to go and find that range somewhere else: the journals hold the
+    /// uids the refused mark was covering, and a run that steps back below them
+    /// reissues uids that already key marks and a window series.
     #[test]
     fn a_mark_past_what_the_archive_can_carry_is_refused_and_declared() {
         let dir = tmpdir("ceiling");
         std::fs::write(dir.join(MARK_FILE), format!("{}\n", u64::MAX)).expect("write");
+        // The run whose mark this was left its uids here.
+        const RECORDED: u64 = 1_800_000_000_000_500;
+        std::fs::write(
+            dir.join("events.jsonl"),
+            format!("{{\"kind\":\"session_open\",\"session_uid\":{RECORDED}}}\n"),
+        )
+        .expect("write");
 
         let (c, notices) = SessionUidCounter::open(1_800_000_000_000_000, &dir);
         let uids: Vec<u64> = (0..4).map(|_| c.next()).collect();
@@ -1344,6 +1457,11 @@ mod tests {
             "every uid must stay in the range the archive carries exactly: {uids:?}"
         );
         assert!(
+            uids[0] > RECORDED,
+            "refusing the mark walked the run back through uid {RECORDED}, which the journals \
+             already record: {uids:?} ({notices:?})"
+        );
+        assert!(
             notices.iter().any(|n| n.level == UidLevel::Degraded),
             "refusing a mark costs the previous range and must be declared: {notices:?}"
         );
@@ -1352,7 +1470,47 @@ mod tests {
         let mark = read_mark(&dir.join(MARK_FILE))
             .expect("readable")
             .expect("rewritten");
-        assert_eq!(mark, 1_800_000_000_000_000 + LEASE);
+        assert_eq!(mark, RECORDED + 1 + LEASE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mark does not have to be absurd to be refused. One flipped ASCII digit
+    /// puts it past what the archive can carry while leaving it nowhere near
+    /// `u64::MAX`, and the boot that refuses it is a boot whose only record of
+    /// the previous range is the journals — the same position a host with no
+    /// mark at all is in, and it must do the same thing about it.
+    #[test]
+    fn a_refused_mark_still_takes_its_floor_from_the_journals() {
+        let dir = tmpdir("refused-floor");
+        // 1800000000000000 with its leading digit flipped: above MAX_EXACT_UID,
+        // and small enough to look like a mark rather than like corruption.
+        std::fs::write(dir.join(MARK_FILE), b"9800000000000000\n").expect("write");
+        const RECORDED: u64 = 1_800_000_000_000_500;
+        std::fs::write(
+            dir.join("events.jsonl"),
+            format!("{{\"kind\":\"session_open\",\"session_uid\":{RECORDED}}}\n"),
+        )
+        .expect("write");
+
+        // A clock that has not moved past the recorded uids, so only the scan
+        // stands between this run and the range the last one used.
+        let (c, notices) = SessionUidCounter::open(1_800_000_000_000_000, &dir);
+        let first = c.next();
+        assert!(
+            first > RECORDED,
+            "the run restarted at {first}, inside the uids the journals record up to \
+             {RECORDED}: {notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.level == UidLevel::Degraded),
+            "the mark was still refused, and that still costs something: {notices:?}"
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.kind == "session_uid_bootstrap" && n.detail.contains("recorded")),
+            "and the recovery that replaced it must say where its number came from: {notices:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1527,6 +1685,190 @@ mod tests {
             "the mark {mark} never caught up with the {} uids handed out",
             past - 1
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One boot, one declaration. The scan reads four journal generations and
+    /// the finding it produces already names every one it could not read, so a
+    /// separate record per generation says nothing the summary does not — while
+    /// an operator counting `session_uid_degraded` records reads three failures
+    /// out of one, and the README's "once" out of a run that emitted three.
+    #[cfg(unix)]
+    #[test]
+    fn a_boot_that_cannot_read_its_journals_declares_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("many-degraded");
+        for name in ["events.jsonl", "sessions.jsonl"] {
+            let path = dir.join(name);
+            std::fs::write(&path, "{\"session_uid\":4242}\n").expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        }
+        if File::open(dir.join("events.jsonl")).is_ok() {
+            // Running as root, where mode 000 grants read anyway; the case this
+            // test describes cannot be produced here.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let (_, notices) = SessionUidCounter::open(7, &dir);
+        let degraded: Vec<&UidNotice> = notices
+            .iter()
+            .filter(|n| n.level == UidLevel::Degraded)
+            .collect();
+        assert_eq!(
+            degraded.len(),
+            1,
+            "two unreadable journals are one failure to establish a floor, got {} records: \
+             {notices:?}",
+            degraded.len()
+        );
+        for name in ["events.jsonl", "sessions.jsonl"] {
+            assert!(
+                degraded[0].detail.contains(name),
+                "and the one record must still name {name}: {}",
+                degraded[0].detail
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Releasing the counter is ordered after the writer's pending work, not
+    /// merely concurrent with it.
+    ///
+    /// A reservation is composed on the accept path and served later, and the
+    /// writer's read of what is already recorded is not atomic with its write.
+    /// So a request still in flight when the run ends can land after the final
+    /// top-up and leave the mark describing less than was issued. Joining the
+    /// thread is what removes the concurrency; the assertion below is exact,
+    /// and the margin it stands on is the couple of hundred durable writes the
+    /// writer must complete against the single file read that follows the drop.
+    #[test]
+    fn releasing_the_counter_waits_for_the_writes_it_asked_for() {
+        let dir = tmpdir("drop-orders");
+        const CLOCK_US: u64 = 1_800_000_000_000_000;
+        const QUEUED: u64 = 256;
+        let (c, _) = SessionUidCounter::open(CLOCK_US, &dir);
+
+        // No uid is issued past the reservation, so the inline top-up on the
+        // way out is a no-op and the mark can only be moved by the writer.
+        let base = c.reserved();
+        let tx = c.extend.as_ref().expect("a writer was started").clone();
+        for i in 1..=QUEUED {
+            tx.send(base + i).expect("the writer is alive");
+        }
+        drop(tx);
+        drop(c);
+
+        let mark = read_mark(&dir.join(MARK_FILE))
+            .expect("readable")
+            .expect("written");
+        assert_eq!(
+            mark,
+            base + QUEUED,
+            "the run reported itself finished with {} of its own writes still in flight",
+            (base + QUEUED).saturating_sub(mark)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reservation is composed on the accept path with the numbers that were
+    /// current when it was composed, and the top-up timer can overtake it
+    /// before the writer serves it. Writing that smaller number then retracts a
+    /// range already on disk — which is not a lost extension, it is a reissue.
+    #[test]
+    fn a_stale_extension_request_cannot_lower_the_mark() {
+        let dir = tmpdir("stale-extend");
+        const CLOCK_US: u64 = 1_800_000_000_000_000;
+        let (c, _) = SessionUidCounter::open(CLOCK_US, &dir);
+
+        // What `next()` would have asked for, before the burst that followed.
+        let stale = c.reserved() + 1;
+
+        // The burst, and the top-up that records where it actually got to.
+        c.shared.next.store(c.reserved() + 900, Ordering::Release);
+        top_up(&c.shared, &c.paths).expect("the mark is writable");
+        let recorded = c.reserved();
+        let highest_issued = c.shared.next.load(Ordering::Acquire) - 1;
+        assert!(stale < recorded, "the request is genuinely stale");
+
+        // Served now, after the write it was overtaken by. The join in `Drop`
+        // is what makes this ordering observable rather than raced for.
+        c.extend
+            .as_ref()
+            .expect("a writer was started")
+            .send(stale)
+            .expect("the writer is alive");
+        drop(c);
+
+        let mark = read_mark(&dir.join(MARK_FILE))
+            .expect("readable")
+            .expect("written");
+        assert!(
+            mark >= recorded,
+            "the mark was rewritten downwards from {recorded} to {mark}"
+        );
+
+        // And the consequence, in the terms the archive is read in.
+        let (b, _) = run(CLOCK_US, &dir, 4);
+        assert!(
+            b[0] > highest_issued,
+            "a restart reissued uid {}, already handed out up to {highest_issued}",
+            b[0]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The daemon holds its counter behind an `Arc` and hands clones to
+    /// per-connection tasks, so `drop(uid)` at shutdown drops a handle and not
+    /// necessarily the value: a task still parked in `recv` keeps the counter
+    /// alive past the point shutdown proceeds from. `Drop` is therefore the
+    /// prompt path and not the guarantee — the timer is, and it has to be able
+    /// to close the gap with the last reference still held.
+    #[test]
+    fn a_counter_outliving_shutdown_is_caught_up_by_the_timer() {
+        let dir = tmpdir("arc-outlives");
+        const CLOCK_US: u64 = 1_800_000_000_000_000;
+        let (c, _) = SessionUidCounter::open(CLOCK_US, &dir);
+        let c = Arc::new(c);
+        // The per-connection task's clone, in the shape `accept_quic` has it.
+        let held = c.clone();
+
+        let past = held.reserved() + 900;
+        held.shared.next.store(past, Ordering::Release);
+        let highest_issued = past - 1;
+
+        // What shutdown does. `held` still owns the value, so `Drop` provably
+        // has not run and cannot be what closes the gap below.
+        drop(c);
+        let at_shutdown = read_mark(&dir.join(MARK_FILE))
+            .expect("readable")
+            .expect("written");
+        assert!(
+            at_shutdown < highest_issued,
+            "the fixture must leave uids past the mark for the timer to catch: mark \
+             {at_shutdown}, issued up to {highest_issued}"
+        );
+
+        // Bounded: a mark that never catches up fails the test rather than
+        // hanging it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut mark = at_shutdown;
+        while std::time::Instant::now() < deadline {
+            mark = read_mark(&dir.join(MARK_FILE))
+                .expect("readable")
+                .expect("written");
+            if mark >= highest_issued {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            mark >= highest_issued,
+            "the mark {mark} never covered the {highest_issued} uids issued, and only a task \
+             holding the last reference stood between shutdown and a reissue"
+        );
+
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
