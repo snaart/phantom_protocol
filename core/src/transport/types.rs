@@ -68,11 +68,15 @@ pub type SequenceNumber = u32;
 pub type PacketNumber = u64;
 
 /// The sole on-wire packet-header version byte. Pinned — the wire format is not
-/// negotiated (pre-1.0, no users); a decoder rejects anything else. `7` changes the
+/// negotiated (pre-1.0, no users); a decoder rejects anything else. `8` gives
+/// [`PacketFlags::CONTROL`] a meaning: its AEAD plaintext now leads with a
+/// [`ControlSubtype`] byte, and the first assignment is the session-close announcement
+/// (see [`ControlSubtype::CLOSE`]). A `7` receiver has no branch that claims a `CONTROL`
+/// frame, so the subtype byte would reach it as one byte of application data —
+/// [`crate::transport::handshake::PROTOCOL_VERSION`] moved with this so such a peer is
+/// refused at the handshake instead of corrupting its own byte stream. `7` changes the
 /// `WINDOW_UPDATE` plaintext from a 4-byte relative credit to an 8-byte cumulative limit
-/// (see [`PacketFlags::WINDOW_UPDATE`]); [`crate::transport::handshake::PROTOCOL_VERSION`]
-/// moved with it, so a peer speaking the older format is refused at the handshake with a
-/// typed `ServerReject` rather than having its packets dropped by the check on this byte.
+/// (see [`PacketFlags::WINDOW_UPDATE`]); `PROTOCOL_VERSION` moved with it too.
 /// `6` was the anti-fingerprint diet: the version byte became itself HP-masked (the WHOLE
 /// 15-byte header `[0..15]` is masked — no constant cleartext byte), and the two
 /// cleartext `u32` length prefixes are dropped (`payload` is the message
@@ -83,7 +87,44 @@ pub type PacketNumber = u64;
 /// header to 15 bytes. `4` (T4.6) added QUIC-style header protection (RFC 9001
 /// §5.4) over a 47-byte header; `3` (Phase 4) widened the packet number to `u64`.
 /// See PROTOCOL.md § 4.2.
-pub const WIRE_VERSION: u8 = 7;
+pub const WIRE_VERSION: u8 = 8;
+
+/// Subtype byte leading the AEAD **plaintext** of an `ENCRYPTED | CONTROL` frame
+/// (WIRE v8) — see [`PacketFlags::CONTROL`].
+///
+/// It is a one-byte enumeration rather than a length-prefixed record because every
+/// in-session control frame this protocol has needed so far is a bare signal, and a
+/// receiver that dispatches on a fixed set of bytes has nothing to parse and therefore
+/// nothing to be tricked into allocating. A frame that needs a body carries it after the
+/// subtype byte, and the branch for that subtype — which knows the exact shape it
+/// expects — is what reads it.
+///
+/// Assignments grow from the bottom. `0x00` is deliberately left unassigned so that a
+/// zeroed buffer is not a valid control frame; a receiver treats it, and every other
+/// unassigned byte, as unknown and drops the frame.
+pub struct ControlSubtype;
+
+impl ControlSubtype {
+    /// The sender is closing this session and will send nothing further on it.
+    ///
+    /// It exists because PhantomUDP has no socket-level end-of-stream. On a byte pipe a
+    /// departing peer's transport drop makes the other side's read fail, and its pump
+    /// exits within the second; on a datagram socket that same departure is
+    /// indistinguishable from silence, so the slot survived until the liveness timer
+    /// eventually declared it dead — over two minutes, during which the server kept
+    /// firing keep-alives at a closed port and kept a NAT binding warm for a
+    /// conversation that had ended.
+    ///
+    /// The frame is **not** an acknowledged part of the protocol: it is sent
+    /// best-effort, it is never retransmitted, and a session that never receives one
+    /// still ends by the timer exactly as before. What it changes is the common case, in
+    /// which the peer did have one last chance to speak.
+    pub const CLOSE: u8 = 0x01;
+}
+
+/// Length of the [`ControlSubtype`] byte that leads a `CONTROL` frame's plaintext. A
+/// control frame with a shorter plaintext than this names no subtype and is dropped.
+pub const CONTROL_SUBTYPE_LEN: usize = 1;
 
 /// Exact `WINDOW_UPDATE` AEAD-plaintext length: a big-endian `u64` cumulative limit. The
 /// receive path rejects any other length outright rather than reading a prefix, so a frame
@@ -148,7 +189,18 @@ impl PacketFlags {
     pub const ENCRYPTED: u16 = 0x0020;
     /// Payload is compressed
     pub const COMPRESSED: u16 = 0x0040;
-    /// Control message (handshake, migration)
+    /// In-session control frame (WIRE v8). The AEAD **plaintext** leads with a
+    /// one-byte [`ControlSubtype`] and carries whatever that subtype defines after it
+    /// (nothing, for every subtype assigned so far); the frame is always padded to a
+    /// bucket, because an unpadded one would be a distinctive fixed-size datagram at a
+    /// distinctive moment. It carries no application bytes, so it never reaches
+    /// `recv()`.
+    ///
+    /// The subtype byte is the reason this rides the already-declared `CONTROL` bit
+    /// rather than the single remaining spare (`0x8000`): three in-session control
+    /// frames were added in the two revisions before this one, and spending the last
+    /// bit on the first of them would have left the fourth with nowhere to go. One
+    /// flag plus a byte of namespace costs the same on the wire and does not run out.
     pub const CONTROL: u16 = 0x0080;
     /// Sender is rekeying — receiver must derive the next AEAD key from the
     /// traffic-secret rekey chain (`HKDF-Expand(current, "phantom-rekey-v1", 32)`,
@@ -953,10 +1005,13 @@ mod tests {
             "v6 masks the whole 15-byte header"
         );
         // The layout below is the one the anti-fingerprint diet introduced at version 6 and
-        // is unchanged since; the constant has moved on to 7, which changed the
-        // `WINDOW_UPDATE` plaintext rather than anything in the header.
+        // is unchanged since; the constant has moved on to 8. Both moves since — the
+        // `WINDOW_UPDATE` plaintext at 7 and the `CONTROL` subtype byte at 8 — changed an
+        // AEAD plaintext rather than anything in the header, which is precisely why they
+        // still had to move the version: the header check is the only thing that could
+        // have refused a peer reading those bytes by the older rules, and it reads this.
         assert_eq!(
-            WIRE_VERSION, 7,
+            WIRE_VERSION, 8,
             "the wire version must move whenever anything on the wire does"
         );
 

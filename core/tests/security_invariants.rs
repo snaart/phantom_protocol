@@ -49,7 +49,8 @@ use phantom_protocol::transport::stream::{
     MAX_RECV_WINDOW, REORDER_ENTRY_OVERHEAD_BYTES, SESSION_RECV_WINDOW_GROWTH_BUDGET,
 };
 use phantom_protocol::transport::types::{
-    PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId, WIRE_VERSION,
+    ControlSubtype, PacketFlags, PacketHeader, PhantomPacket, SchedulerMode, SessionId,
+    WIRE_VERSION,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -2517,6 +2518,112 @@ fn idle_keepalive_is_encrypted_authenticated_and_replay_protected() {
     );
 }
 
+/// The session-close frame (WIRE v8) is invariant-safe by exactly the mechanisms that
+/// make every other in-session control frame safe, and by nothing of its own:
+///  (1) it rides the already-declared `CONTROL` bit, which overlaps no other flag, and
+///      it does **not** spend `0x8000` — the one bit still unassigned. That is the
+///      point of putting a subtype byte inside the plaintext: a flag is a scarce
+///      16-entry namespace and three in-session control frames were added in the two
+///      revisions before this one, so the next one still has somewhere to go;
+///  (2) it carries `ENCRYPTED`, which is what the receive gate requires of it. That
+///      the gate holds is pinned by
+///      `forged_unencrypted_close_frame_cannot_end_a_session`, driven through a live
+///      pump; the header here is one this test built, so this is a statement about
+///      the frame's shape;
+///  (3) it AEAD-seals a one-byte plaintext and opens back to that byte — an off-path
+///      peer cannot forge one;
+///  (4) it draws a per-direction packet number, so a replay of a captured close is
+///      refused by the sliding window **after** AEAD verify (Inv-4). That is what
+///      makes the receive branch idempotent without the branch doing anything: a
+///      recorded close datagram is not a session-kill primitive.
+#[test]
+fn session_close_frame_is_encrypted_authenticated_and_replay_protected() {
+    use phantom_protocol::CoreError;
+
+    // (1a) CONTROL overlaps nothing else on the wire.
+    for other in [
+        PacketFlags::RELIABLE,
+        PacketFlags::ACK,
+        PacketFlags::FIN,
+        PacketFlags::UNRELIABLE,
+        PacketFlags::PRIORITY,
+        PacketFlags::ENCRYPTED,
+        PacketFlags::COMPRESSED,
+        PacketFlags::REKEY,
+        PacketFlags::PATH_VALIDATION,
+        PacketFlags::COALESCED,
+        PacketFlags::WINDOW_UPDATE,
+        PacketFlags::KEEPALIVE,
+        PacketFlags::PADDED,
+        PacketFlags::COVER,
+    ] {
+        assert_eq!(
+            PacketFlags::CONTROL & other,
+            0,
+            "CONTROL (0x{:04x}) must not overlap an existing flag (0x{other:04x})",
+            PacketFlags::CONTROL
+        );
+    }
+
+    // (1b) The last free bit is still free. A close frame that had taken it would
+    // have left the next in-session control frame with no bit at all.
+    let assigned = PacketFlags::RELIABLE
+        | PacketFlags::ACK
+        | PacketFlags::FIN
+        | PacketFlags::UNRELIABLE
+        | PacketFlags::PRIORITY
+        | PacketFlags::ENCRYPTED
+        | PacketFlags::COMPRESSED
+        | PacketFlags::CONTROL
+        | PacketFlags::REKEY
+        | PacketFlags::PATH_VALIDATION
+        | PacketFlags::COALESCED
+        | PacketFlags::WINDOW_UPDATE
+        | PacketFlags::KEEPALIVE
+        | PacketFlags::PADDED
+        | PacketFlags::COVER;
+    assert_eq!(
+        assigned & 0x8000,
+        0,
+        "0x8000 is the only unassigned flag bit; the close frame must not have spent it"
+    );
+
+    let (client, server) = make_session_pair([0x3Cu8; 32]);
+    let pn = client.next_send_pn();
+    let header = PacketHeader::new(
+        *server.id(),
+        1,
+        pn,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::CONTROL),
+    )
+    .with_epoch(client.current_epoch());
+    // (2) it carries ENCRYPTED.
+    assert!(
+        header.flags.contains(PacketFlags::ENCRYPTED),
+        "a close frame must be ENCRYPTED (Inv-2 downgrade defense)"
+    );
+
+    // (3) it AEAD-seals the subtype byte and opens back to it — authenticated.
+    let body = [ControlSubtype::CLOSE];
+    let ct = client
+        .encrypt_packet(&header, &body, &[])
+        .expect("seal close frame");
+    let pt = server
+        .decrypt_packet(&header, &ct, &[])
+        .expect("authenticated close frame opens");
+    assert_eq!(
+        pt, body,
+        "the control body is the close subtype and nothing else"
+    );
+
+    // (4) a replayed close (same PN) is rejected AFTER AEAD verify (Inv-4).
+    let replay = server.decrypt_packet(&header, &ct, &[]);
+    assert!(
+        matches!(replay, Err(CoreError::ReplayDetected(_))),
+        "a replayed close must be rejected by the replay window (Inv-4); got {replay:?}"
+    );
+}
+
 /// T5.5 (audit recv-counter-on-fail LOW): a FAILED AEAD open must NOT advance the per-direction
 /// recv invocation counter. Otherwise a stream of forged same-epoch packets drives the counter
 /// toward the `AEAD_MAX_INVOCATIONS` (2^48) `NonceExhausted` ceiling — only a successful,
@@ -3129,6 +3236,142 @@ async fn forged_unencrypted_post_handshake_packet_is_dropped_by_the_recv_path() 
     assert!(
         dropped >= 1,
         "the ENCRYPTED gate never fired, so nothing above shows the forgery was \
+         refused rather than lost (unencrypted_dropped_total = {dropped})"
+    );
+}
+
+/// **Invariant 2, for the close frame.** A `CONTROL` frame that arrives without
+/// `ENCRYPTED` must not end a session.
+///
+/// This is the one new attack surface the close frame opens, and it is the reason the
+/// receive branch sits below the AEAD gate rather than above it. Above the gate, a
+/// single short datagram — a header, a `CONTROL` flag and one plaintext byte — sent by
+/// anyone who can guess a connection id would tear down a live session. Below it, the
+/// forgery is refused before anything reads its subtype, because a frame that no key
+/// sealed is not a frame the peer sent.
+///
+/// The liveness probe afterwards is the two-sidedness: a receive path that dropped
+/// *everything* would satisfy any assertion about the forgery alone. The authentic
+/// frame delivered after it proves the session survived rather than that the pipe went
+/// quiet, and the drop counter separates "refused" from "never arrived".
+#[tokio::test]
+async fn forged_unencrypted_close_frame_cannot_end_a_session() {
+    use phantom_protocol::api::PhantomSession;
+    use phantom_protocol::transport::handshake::ServerReply;
+
+    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let (to_server_tx, mut to_server_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let client_transport = PipeTransport {
+        to_peer: to_server_tx,
+        from_peer: tokio::sync::Mutex::new(to_client_rx),
+    };
+
+    let server_hs = HandshakeServer::new().expect("server handshake state");
+    let pinned = server_hs.verifying_key().clone();
+    let session = PhantomSession::connect_with_transport("pipe-peer:0", client_transport, pinned);
+
+    let client_ip = "127.0.0.1".parse().expect("client ip");
+    let server_session = loop {
+        let hello_bytes = to_server_rx.recv().await.expect("client hello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("decode client hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let wire = ServerReply::Retry(retry).to_wire().expect("encode retry");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send retry");
+            }
+            HandshakeResponse::Success(server_hello, negotiated, _) => {
+                let wire = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("encode server hello");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send server hello");
+                break negotiated;
+            }
+            HandshakeResponse::Reject(r) => panic!("server rejected its own client: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    };
+
+    session
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+    let session_id = *server_session.id();
+    let app_stream = session.open_stream();
+    let target: u16 = app_stream
+        .stream_id()
+        .try_into()
+        .expect("a locally-opened stream id fits the wire field");
+
+    // The forgery. Its payload IS its plaintext (nothing sealed it), laid out exactly
+    // as the control path reads one — the close subtype first — so that a branch which
+    // ran above the AEAD gate would find a well-formed close and act on it. Sixteen
+    // bytes because that is the smallest ciphertext sample header protection can mask
+    // against; anything shorter is refused a layer earlier and would prove nothing
+    // about this gate.
+    let mut forged_body = vec![ControlSubtype::CLOSE];
+    forged_body.resize(16, 0);
+    let forged = PhantomPacket::new(
+        PacketHeader::new(
+            session_id,
+            target,
+            1,
+            PacketFlags::new(PacketFlags::CONTROL),
+        ),
+        forged_body,
+    );
+    let forged_wire = server_session
+        .protect_packet(&forged)
+        .expect("mask the forgery with the real send key");
+    to_client_tx
+        .send(Bytes::from(forged_wire))
+        .await
+        .expect("send forged close");
+
+    // The liveness probe: first reliable frame server→client on this stream, so its
+    // gap-free stream offset is 0.
+    let genuine_header = PacketHeader::new(
+        session_id,
+        target,
+        2,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
+    )
+    .with_epoch(server_session.current_epoch());
+    let mut genuine_plaintext = 0u32.to_be_bytes().to_vec();
+    genuine_plaintext.extend_from_slice(b"still-here");
+    let ciphertext = server_session
+        .encrypt_packet(&genuine_header, &genuine_plaintext, &[])
+        .expect("seal the authentic frame");
+    let genuine_wire = server_session
+        .protect_packet(&PhantomPacket::new(genuine_header, ciphertext))
+        .expect("protect the authentic frame");
+    to_client_tx
+        .send(Bytes::from(genuine_wire))
+        .await
+        .expect("send authentic frame");
+
+    // The pipe is FIFO and the reader drains it in order, so a delivered authentic
+    // payload proves the forgery was seen and disposed of first. The timeout is only
+    // there so that a build which tore the session down fails instead of hanging.
+    let delivered = tokio::time::timeout(Duration::from_secs(10), app_stream.recv())
+        .await
+        .expect("the session is still alive after the forged close")
+        .expect("recv")
+        .expect("the stream is open, so this is data and not a peer FIN");
+    assert_eq!(
+        delivered, b"still-here",
+        "a forged unencrypted close must not end the session"
+    );
+
+    let dropped = session.metrics_snapshot().unencrypted_dropped_total;
+    assert!(
+        dropped >= 1,
+        "the ENCRYPTED gate never fired, so nothing above shows the forged close was \
          refused rather than lost (unencrypted_dropped_total = {dropped})"
     );
 }

@@ -2172,3 +2172,91 @@ async fn udp_integration_bulk_transfer_never_fragments_application_datagrams() {
 
     server.await.unwrap();
 }
+
+/// A departing client must free its server-side slot at once, not on a timer.
+///
+/// PhantomUDP has no socket-level end-of-stream. On the byte-pipe legs the peer's
+/// `read_exact` returns `UnexpectedEof` the moment the socket is dropped, so a
+/// departing client's server session ends within a second; on a datagram socket the
+/// same departure is indistinguishable from a quiet moment, and the only thing that
+/// ever noticed was the liveness timer — keep-alive to `Migrating`, then
+/// `session_timeout` to `Dead`, more than two minutes later. For all that time the
+/// session slot stayed occupied, the server kept firing keep-alives into a closed
+/// client port, and those keep-alives kept a NAT binding warm for a conversation
+/// that had ended.
+///
+/// The observable the operator has for that slot is the demux route table: an
+/// established session owns its bootstrap route plus the 19-CID rotating window, and
+/// they are reclaimed only by triggers a departed client no longer fires. So this
+/// asserts on `active_route_count()` falling to zero, within a window far shorter
+/// than any liveness deadline — which is exactly the difference the close frame
+/// makes, and nothing else in the session's teardown can produce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_client_close_reclaims_the_server_routes_promptly() {
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let listener_for_server = listener.clone();
+    let server = tokio::spawn(async move {
+        let session = listener_for_server
+            .accept()
+            .await
+            .expect("accept")
+            .session();
+        let msg = session.recv().await.expect("server recv");
+        assert_eq!(msg, b"ping");
+        session.send(b"pong".to_vec()).await.expect("server send");
+        // Hold the accepted handle across the client's departure: the routes must be
+        // reclaimed because the peer said it was leaving, not because this side let
+        // go of its session object.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+    });
+
+    let transport = UdpClientTransport::connect(addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+    client.send(b"ping".to_vec()).await.expect("client send");
+    let reply = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(reply, b"pong");
+
+    let established = listener.active_route_count();
+    assert!(
+        established > 1,
+        "an established session must hold its bootstrap route plus the CID window; got {established}"
+    );
+
+    // The client leaves.
+    client.disconnect().await.expect("disconnect");
+    drop(client);
+
+    // Five seconds is generous for a frame that crosses loopback, and still an order
+    // of magnitude below the shortest liveness deadline that could reclaim the slot
+    // on its own — so a pass here cannot be the timer in disguise.
+    let left_at = std::time::Instant::now();
+    let deadline = left_at + Duration::from_secs(5);
+    while listener.active_route_count() > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let reclaimed_after = left_at.elapsed();
+    println!(
+        "routes while established: {established}; after close: {} (reclaimed within {:?})",
+        listener.active_route_count(),
+        reclaimed_after
+    );
+    assert_eq!(
+        listener.active_route_count(),
+        0,
+        "the server must reclaim every route of a session whose peer announced its close \
+         (was {established} while established)"
+    );
+
+    server.await.unwrap();
+}

@@ -180,6 +180,31 @@ impl CryptoState {
     }
 }
 
+/// A message from a live session to the UDP listener's datagram demux, carried on
+/// the channel the server's accept path installs with
+/// [`Session::set_demux_signal_tx`].
+///
+/// Both variants exist because the demux's route table is keyed on a connection id
+/// that only the session can compute, so the demux cannot tell on its own when a
+/// session's window has moved or when the session is over. Its fallback triggers —
+/// reclaiming a route when a datagram arrives for it, and a periodic sweep — are all
+/// reactive to *traffic*, which is exactly what a peer that has left stops producing.
+#[derive(Clone, Debug)]
+pub enum DemuxSignal {
+    /// Slide this session's inbound CID window one or more steps as its peer migrates.
+    Slide(CidSlide),
+    /// This session has ended: drop every demux route that leads to it.
+    ///
+    /// Sent from the data pump's teardown, which runs on every way a session can
+    /// end. `anchor` is a CID currently routed for the session, through which the
+    /// demux identifies which routes are its. The signal is what makes reclamation
+    /// deterministic rather than dependent on the departed peer sending something.
+    Retire {
+        /// A CID currently routed for this session.
+        anchor: [u8; CID_LEN],
+    },
+}
+
 /// A one-step slide of the inbound CID demux window (ε / WIRE v5), produced
 /// by [`Session::note_migration_path`] when the peer migrates. The demux applies
 /// it: `add` are the CIDs to register at the new leading edge, `remove` the CIDs
@@ -366,12 +391,21 @@ pub struct Session {
     /// instead of waiting for the next 10 ms `poll_interval` tick.
     /// The pump keeps the tick as a retransmit-timer fallback.
     send_notify: Arc<tokio::sync::Notify>,
-    /// Optional channel to the UDP demux for sliding this session's inbound CID
-    /// window (ε / WIRE v5). Set once post-handshake by the server's accept
-    /// path ([`Self::set_cid_slide_tx`]); `None` on the client and on socket-routed
-    /// transports (which have no CID demux). `handle_packet` signals a slide
-    /// through it when [`Self::note_migration_path`] reports the peer migrated.
-    cid_slide_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<CidSlide>>>,
+    /// Optional channel to the UDP demux carrying this session's [`DemuxSignal`]s —
+    /// inbound CID-window slides (ε / WIRE v5) and the end-of-session route
+    /// retirement. Set once post-handshake by the server's accept path
+    /// ([`Self::set_demux_signal_tx`]); `None` on the client and on socket-routed
+    /// transports (which have no CID demux), where signalling is a no-op.
+    demux_signal_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<DemuxSignal>>>,
+    /// The peer announced it is closing this session (a `CONTROL` frame carrying
+    /// [`ControlSubtype::CLOSE`](crate::transport::types::ControlSubtype::CLOSE)).
+    ///
+    /// Set only from the post-AEAD receive path, so it records something an
+    /// authenticated peer said rather than something an off-path attacker asserted.
+    /// The receive loop reads it after each packet and ends, which is what lets the
+    /// pump tear down at once instead of waiting for the liveness timer to conclude
+    /// from silence what the peer already stated.
+    peer_closed: AtomicBool,
     /// An idle keep-alive PING is in flight, awaiting the peer's PONG (download-only
     /// liveness). Set when the pump emits a `KEEPALIVE` ping on an idle path;
     /// cleared when the peer's `KEEPALIVE | ACK` echo arrives (or any
@@ -435,7 +469,8 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
-            cid_slide_tx: Mutex::new(None),
+            demux_signal_tx: Mutex::new(None),
+            peer_closed: AtomicBool::new(false),
             keepalive_outstanding: AtomicBool::new(false),
         })
     }
@@ -491,7 +526,8 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
-            cid_slide_tx: Mutex::new(None),
+            demux_signal_tx: Mutex::new(None),
+            peer_closed: AtomicBool::new(false),
             keepalive_outstanding: AtomicBool::new(false),
         }
     }
@@ -542,7 +578,8 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
-            cid_slide_tx: Mutex::new(None),
+            demux_signal_tx: Mutex::new(None),
+            peer_closed: AtomicBool::new(false),
             keepalive_outstanding: AtomicBool::new(false),
         })
     }
@@ -633,18 +670,48 @@ impl Session {
         })
     }
 
-    /// Install the demux slide channel (ε / WIRE v5) — called once by the
-    /// server's accept path so `handle_packet` can signal inbound-window slides.
-    pub fn set_cid_slide_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<CidSlide>) {
-        *self.cid_slide_tx.lock() = Some(tx);
+    /// Install the demux signal channel (ε / WIRE v5) — called once by the
+    /// server's accept path so the session can report window slides and its own end.
+    pub fn set_demux_signal_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<DemuxSignal>) {
+        *self.demux_signal_tx.lock() = Some(tx);
     }
 
     /// Signal the demux to apply a [`CidSlide`] (ε / WIRE v5). A no-op when no
-    /// slide channel is installed (the client and socket-routed transports).
+    /// signal channel is installed (the client and socket-routed transports).
     pub fn signal_cid_slide(&self, slide: CidSlide) {
-        if let Some(tx) = self.cid_slide_tx.lock().as_ref() {
-            let _ = tx.send(slide);
+        self.signal_demux(DemuxSignal::Slide(slide));
+    }
+
+    /// Signal the demux that this session is over and its routes can go.
+    ///
+    /// The anchor is the centre of the current inbound window, so it is a CID the
+    /// demux registered — either at establishment or as the leading edge of the last
+    /// slide, both of which are the same index this reads. A no-op when no signal
+    /// channel is installed.
+    pub fn signal_route_retire(&self) {
+        let anchor = self
+            .cid_chain
+            .inbound_cid(self.inbound_cid_highest_seen.load(Ordering::Relaxed));
+        self.signal_demux(DemuxSignal::Retire { anchor });
+    }
+
+    fn signal_demux(&self, signal: DemuxSignal) {
+        if let Some(tx) = self.demux_signal_tx.lock().as_ref() {
+            let _ = tx.send(signal);
         }
+    }
+
+    /// Record that the peer announced it is closing this session. Call **post-AEAD
+    /// only** — see [`Session::peer_closed`]. Idempotent by construction: a second
+    /// announcement stores the same value, and the replay window has already refused
+    /// a byte-identical one before this could be reached.
+    pub fn note_peer_closed(&self) {
+        self.peer_closed.store(true, Ordering::Release);
+    }
+
+    /// Whether the peer announced it is closing this session.
+    pub fn peer_closed(&self) -> bool {
+        self.peer_closed.load(Ordering::Acquire)
     }
 
     /// The inbound CIDs the demux should route to this session (ε / WIRE v5): the
