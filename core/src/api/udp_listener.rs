@@ -20,7 +20,7 @@ use crate::transport::handshake::{
 };
 use crate::transport::phantom_udp::datagram::{encode_datagrams, push_datagram, FragmentAssembler};
 use crate::transport::phantom_udp::envelope::{ConnId, PacketType};
-use crate::transport::session::CidSlide;
+use crate::transport::session::{CidSlide, DemuxSignal};
 use crate::transport::types::LegType;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -430,6 +430,29 @@ impl RouteTable {
         }
         self.sync();
     }
+
+    /// Drop every route belonging to the session `anchor` currently routes to (WIRE v8):
+    /// its bootstrap CID, its whole rotating window, and any leading-edge CID a slide
+    /// added — reclaimed together the moment the session ends, rather than one at a time
+    /// as datagrams that will never arrive would have reclaimed them.
+    ///
+    /// Membership is decided by channel identity rather than by a list of CIDs, because a
+    /// session's routes are not all derivable from the session: the bootstrap CID the
+    /// client chose for its first datagram is known only here. Every route the session
+    /// owns points at the one inbound channel it was accepted with, so that channel *is*
+    /// the session's identity in this table.
+    ///
+    /// A no-op if `anchor` is gone — the routes were already reclaimed, and there is
+    /// nothing to identify the session by. The scan is linear in the table, which is the
+    /// same cost `reap_dead` already pays on its periodic sweep, and it is paid once per
+    /// session that ends rather than per datagram.
+    fn retire_session(&mut self, anchor: &ConnId) {
+        let Some(target) = self.routes.get(anchor).cloned() else {
+            return;
+        };
+        self.routes.retain(|_, tx| !tx.same_channel(&target));
+        self.sync();
+    }
 }
 
 /// Max concurrent in-flight (un-established) handshakes one source IP may hold (H-2). Bounds
@@ -496,7 +519,7 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
     // CID-window slide here (post-AEAD, from handle_packet via the session's
     // slide channel). The demux registers the new leading-edge CID and drops the
     // trailing one, keeping the window tracking the peer's outbound index.
-    let (slide_tx, mut slide_rx) = mpsc::unbounded_channel::<CidSlide>();
+    let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<DemuxSignal>();
     // NOTE (Phase 1): one assembler shared across ALL CIDs. Its key includes the cid, but a fragment
     // spray shares the single 256-slot assembly table with every live session's in-flight
     // reassemblies. Bounded — the assembler self-caps at MAX_CONCURRENT_ASSEMBLIES with
@@ -529,10 +552,17 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
                 routes.register_window(&cids, &tx);
                 continue;
             }
-            // ε / WIRE v5: slide a session's inbound CID window as its peer
-            // migrates (add the new leading CID, drop the trailing one).
-            Some(slide) = slide_rx.recv() => {
-                routes.apply_slide(&slide);
+            // Signals from an established session: a CID-window slide as its peer
+            // migrates (ε / WIRE v5), or the retirement of its whole route set
+            // when it ends (WIRE v8). Both are processed ahead of reading more
+            // datagrams (biased select) — the slide so the window is in place before
+            // the next frame could arrive on it, the retirement so a departed peer's
+            // routes are gone before the table is consulted again.
+            Some(signal) = signal_rx.recv() => {
+                match signal {
+                    DemuxSignal::Slide(slide) => routes.apply_slide(&slide),
+                    DemuxSignal::Retire { anchor } => routes.retire_session(&anchor),
+                }
                 continue;
             }
             r = listener.socket.recv_from(&mut buf) => match r {
@@ -614,7 +644,7 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
             reap_tx.clone(),
             tx,
             register_tx.clone(),
-            slide_tx.clone(),
+            signal_tx.clone(),
         );
         // DoS-hardening parity with the TCP acceptor: periodically drop expired reputation
         // entries AND reap dead routes so both bounded maps stay small under churn.
@@ -664,7 +694,7 @@ fn spawn_handshake_task(
     register_tx: mpsc::UnboundedSender<CidWindowRegistration>,
     // ε / WIRE v5: handed to the established session so it can signal
     // inbound-window slides as the peer migrates.
-    slide_tx: mpsc::UnboundedSender<CidSlide>,
+    signal_tx: mpsc::UnboundedSender<DemuxSignal>,
 ) {
     let hs = listener.handshake_server.clone();
     let runtime = listener.runtime.clone();
@@ -700,7 +730,7 @@ fn spawn_handshake_task(
                 let _ = register_tx.send((server_session.inbound_window_cids(), tx));
                 // ε / WIRE v5: give the session the demux slide channel so
                 // it can advance its inbound CID window as the peer migrates.
-                server_session.set_cid_slide_tx(slide_tx);
+                server_session.set_demux_signal_tx(signal_tx);
                 let arc_session = Arc::new(server_session);
                 if let Some(live) = liveness {
                     arc_session.set_liveness_config(live);

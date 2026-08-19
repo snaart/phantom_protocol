@@ -54,8 +54,18 @@ ML_DSA_PK_LEN = 1952
 ML_DSA_SIG_LEN = 3309
 CLASSICAL_PK_LEN = 32
 PROTOCOL_VARIANT = b"phantom-default-1"
-PROTOCOL_VERSION = 4  # bumped 3->4: WINDOW_UPDATE carries a cumulative limit (see below)
-WIRE_VERSION = 7  # bumped 6->7 with it, so a peer speaking the older flow control is refused
+PROTOCOL_VERSION = 5  # bumped 4->5: CONTROL frames lead with a subtype byte (see below)
+WIRE_VERSION = 8  # bumped 7->8 with it, so a peer without a CONTROL branch is refused
+
+# CONTROL AEAD plaintext: a one-byte subtype, then whatever that subtype defines (nothing,
+# for the only assignment so far). Like WINDOW_UPDATE it has no frozen fixture — it is an
+# AEAD plaintext, not an outer container — so the registry is written out here for a second
+# implementation reading only this file. 0x00 is deliberately unassigned, so a zeroed body
+# is not a valid control frame; every unassigned byte is unknown and the frame is dropped.
+# A receiver that instead let an unknown subtype fall through to its data path would hand
+# the subtype byte to its application as one byte of the caller's stream.
+CONTROL_SUBTYPE_LEN = 1
+CONTROL_SUBTYPE_CLOSE = 0x01
 
 # WINDOW_UPDATE AEAD plaintext: 8 big-endian bytes, the cumulative total the receiver is
 # willing to have sent on that stream, counted from the stream's first byte. It replaced a
@@ -749,6 +759,59 @@ def window_update_limit_rule():
         check(held == 1_114_112,
               f"grants delivered as {[hex(g) for g in order]} settled at {held}, "
               "expected 1114112")
+
+
+def dec_control_subtype(raw: bytes) -> int:
+    """Read the subtype byte leading a CONTROL frame's AEAD plaintext."""
+    check(len(raw) >= CONTROL_SUBTYPE_LEN,
+          "a CONTROL plaintext must be at least one byte: it names its subtype")
+    return raw[0]
+
+
+def dispatch_control(raw: bytes) -> str:
+    """What a conforming receiver does with a CONTROL frame, as a word.
+
+    Written as a total function over the byte rather than as a lookup that may
+    return nothing, because "nothing" is exactly the outcome that is wrong here: a
+    receiver which falls out of its control dispatch lands in the data path, and the
+    subtype byte is then delivered to its application. Every byte has to name an
+    action, and for all but the assigned ones that action is to drop the frame.
+    """
+    subtype = dec_control_subtype(raw)
+    if subtype == CONTROL_SUBTYPE_CLOSE:
+        return "close"
+    return "drop"
+
+
+@vector
+def control_subtype_registry():
+    """The CONTROL frame's plaintext rule, stated independently of the Rust.
+
+    No fixture can carry it — it is an AEAD plaintext — so the three things a second
+    implementation has to get right are written out: the close subtype's value, that
+    an unassigned byte (including 0x00) is dropped rather than guessed at, and that a
+    body naming no subtype is refused instead of read as its default.
+    """
+    check(dispatch_control(bytes([CONTROL_SUBTYPE_CLOSE])) == "close",
+          "0x01 is the session-close subtype")
+
+    for unassigned in (0x00, 0x02, 0x7F, 0xFE, 0xFF):
+        got = dispatch_control(bytes([unassigned]))
+        check(got == "drop",
+              f"subtype 0x{unassigned:02x} is unassigned and must be dropped, got {got!r}")
+
+    # A close body carries nothing after the subtype, but the rule is stated for a
+    # body that does: trailing bytes belong to the subtype's own branch and never to
+    # the dispatch, so their presence cannot change which branch is taken.
+    check(dispatch_control(bytes([CONTROL_SUBTYPE_CLOSE]) + b"\xde\xad") == "close",
+          "dispatch reads the first byte only; a subtype's body is that branch's business")
+
+    try:
+        dispatch_control(b"")
+    except Failure:
+        pass
+    else:
+        raise Failure("an empty CONTROL plaintext names no subtype and must be refused")
 
 
 def main() -> int:
