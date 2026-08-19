@@ -242,6 +242,22 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **`BandwidthSnapshot::last_delivery_rate_bps` — the raw per-acknowledgement delivery rate,
+  beside the filtered maximum.** A recorded run is read by dividing `bottleneck_bw_bps` by the
+  growth of the delivered-byte counter over the same interval, and that ratio cannot be
+  interpreted on its own: the numerator is a maximum over a ten-second horizon and the
+  denominator a mean over a much shorter sample interval, so a maximum over the longer window
+  exceeds a mean over the shorter one by construction — and the probing round of the gain
+  cycle adds to it honestly, since one round in four deliberately asks the path for a quarter
+  more than the estimate. The estimator already computed the figure that separates the two and
+  then discarded it. It is now kept, exposed through `BandwidthEstimator::last_delivery_rate`
+  and carried into the WAN harness's window series, where `analyze.py` reports both ratios per
+  session: a raw sample tracking the delivered rate while the estimate sits far above it is
+  the filter holding a peak, and a raw sample that itself reads high is the sample arithmetic.
+  It is an observable and not an input — nothing in the control loop reads it back. Note that
+  `BandwidthSnapshot` has public fields and no `#[non_exhaustive]`, so code that constructs
+  one literally needs the new field.
+
 - **`unencrypted_dropped_total` in the metrics snapshot, and an always-on test that drives the
   gate it counts.** The receive path drops every unencrypted post-handshake packet — the
   stripped-flag downgrade defence, and the one thing standing between a forged standalone
@@ -440,6 +456,32 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   only unreadable.
 
 ### Fixed
+
+- **The bandwidth estimator's ten-second horizon only aged on the samples it admitted.** The
+  expiry loop lived inside `WindowFilter::update_max`, and `on_ack` reaches that call only for
+  samples it accepts: an application-limited sample below the current maximum short-circuits
+  the admission test, and so does any acknowledgement that retired no bytes — the zero-length
+  reliable FIN sentinel stream close sends is exactly that shape. Neither aged the window, and
+  neither did any number of them in a row, so a peak taken during one fast burst could outlive
+  its horizon by an unbounded amount of wall clock. A flow that opened with a burst and then
+  settled into request/response kept that opening estimate for the life of the connection and
+  paced every later write against a rate the path never offered. Ageing now runs on every
+  acknowledgement, before anything is decided from it; admission is unchanged, so an
+  app-limited sample still may not *set* a lower maximum. An emptied horizon reads as no
+  estimate, which returns the window to its four-packet floor until the next rate-bearing
+  sample arrives.
+
+- **Both sliding filters were as long as the peer cared to make them.** `WindowFilter`'s deque
+  is pruned from the front by the horizon and from the back by domination, and a monotone
+  sequence defeats the second rule entirely: a strictly falling run of delivery rates
+  dominates nothing, so every sample is appended and none removed until the horizon reaches
+  it. At 40 Mbit/s with 1156-byte segments that is on the order of forty thousand entries per
+  direction per session, and the acknowledgement cadence shaping the sequence is the peer's.
+  The min-RTT filter had the same shape through a strictly rising run. The deque is now capped
+  at 1024 entries — the ARQ send buffer's segment cap, hence the most acknowledgements one
+  round trip can return — evicting from the back, which in a maximum filter is the least of
+  everything retained, so a bounded maximum sits at or below the unbounded one at every
+  instant and never above it.
 
 - **The crate could not be packaged, and nothing in CI noticed for two months.**
   `core/src/lib.rs` inlined the repository-root README into the crate documentation with
