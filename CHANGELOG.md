@@ -76,6 +76,67 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Changed (wire-breaking)
 
+- **A session announces its own end instead of leaving the peer to infer it from silence —
+  `WIRE_VERSION` 7 → 8, `PROTOCOL_VERSION` 4 → 5.** The long-declared `CONTROL` flag
+  (`0x0080`) now has a meaning: the AEAD plaintext of an `ENCRYPTED | CONTROL` frame leads
+  with a one-byte subtype, and the first assignment, `0x01`, says the sender is closing this
+  session and will send nothing further on it. The frame is Padme-padded to a bucket like any
+  other short frame, carries no application bytes, and is emitted three times from the data
+  pump's teardown after the existing flush and drain.
+
+  The defect is a slot that outlives the client holding it. `SessionCommand::Close` flushed
+  the send queue and left the pump without putting a byte on the wire. On a byte pipe that
+  costs nothing — dropping the transport makes the peer's read fail, its reader loop ends and
+  its pump exits, which is the 0.74 s figure the TCP leg shows. A datagram socket has no
+  equivalent: an unconnected server socket surfaces no ICMP, so a departing client's last
+  observable act is the absence of datagrams and only the liveness timer ever noticed —
+  keep-alive to `Migrating`, then `session_timeout` to `Dead`. Measured over 37 UDP sessions
+  in each of two runs, the tail after the last scenario marker was 135.01 s for every one of
+  them and 0.00 s for every TCP and mimic session. For those two minutes the slot stayed
+  occupied, the server fired a keep-alive into a closed client port every 15 s, and those
+  keep-alives held a NAT binding open for a conversation that had ended.
+
+  It rides `CONTROL` rather than `0x8000`, the last unassigned flag bit. Three in-session
+  control frames were added in the two revisions before this one, so spending the last bit on
+  the first of four would have left the next one nowhere to go; a subtype byte inside the
+  already-padded plaintext costs the same on the wire and does not run out. `0x00` is left
+  unassigned so a zeroed body is not a valid control frame, and every unassigned byte is
+  dropped.
+
+  The receive branch sits after the AEAD gate and after the replay window, and before
+  anything that could deliver data. Below the gate, a forged plaintext close cannot reach it;
+  below the window, a byte-identical replay of a captured close is already refused, which is
+  what makes the branch idempotent without holding any state and why a recorded datagram is
+  not a session-kill primitive. Every arm returns, the unknown subtype included — the
+  receive path ends in a fall-through that hands non-empty plaintext to the application, so a
+  subtype nobody claimed would otherwise arrive at `recv()` as a byte of the caller's stream.
+
+  That fall-through is why both versions move. A peer at `WIRE_VERSION` 7 has no branch that
+  claims a `CONTROL` frame and would deliver the subtype byte as data, which is worse than
+  the silent stall a data-plane check produces; with `PROTOCOL_VERSION` moved too, it is
+  refused with a typed `ServerReject` before a session exists. A version increment moves a
+  value and not a field: `protocol_variant` remains the leading transcript field and
+  `early_data_accepted` remains the last. The same seven frozen fixtures moved as at 6 → 7 —
+  four packet vectors and two `ClientHello` vectors by their version byte, and
+  `transcript_hash.bin` because the hello it covers changed. `tests/wire_vectors_decode.py`
+  gained an independent statement of the subtype registry and its dispatch.
+
+  Emitting the frame is not by itself enough for an operator to see anything. A server
+  session's 19 CID routes were reclaimed only by triggers reactive to traffic a departed
+  client no longer sends: a datagram arriving for the route, a once-per-handshake reap signal
+  that already fired at accept, and an every-256th-connection sweep. So the session now tells
+  the demux directly, on the channel it already uses for CID-window slides, and the demux
+  drops every route sharing that session's inbound channel. In the integration test the route
+  count falls from 18 to 0 within 27 ms of the client leaving, against liveness deadlines two
+  orders of magnitude longer.
+
+  Nothing is required to be delivered. The frame is unacknowledged, never retransmitted, and
+  takes no part in the SACK machinery; a peer that receives none falls back to concluding the
+  same thing from silence, exactly as before. `docs/protocol/PROTOCOL.md` §4.11 specifies the
+  frame and §7 records the subtype registry as the extension point a future in-session signal
+  should take in preference to the last flag bit; `docs/protocol/INTEROP.md` carries the
+  receiver obligation for a second implementation.
+
 - **`WINDOW_UPDATE` carries a cumulative limit instead of a relative credit —
   `WIRE_VERSION` 6 → 7, `PROTOCOL_VERSION` 3 → 4.** The frame's AEAD plaintext is now eight
   big-endian bytes stating the *total* the receiver will let its peer send on that stream,

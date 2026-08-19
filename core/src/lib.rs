@@ -1075,8 +1075,8 @@ mod packaged_readme {
 /// a version the code does not speak:
 ///
 /// - "the `WIRE_VERSION` 6 → 7 bump landed in 0.3"
-/// - "captured under `WIRE_VERSION = 2`, whereas the shipped format is 7"
-/// - "the shipped format is 7 (`WIRE_VERSION`)"
+/// - "captured under `WIRE_VERSION = 2`, whereas the shipped format is 8"
+/// - "the shipped format is 8 (`WIRE_VERSION`)"
 ///
 /// A parser guessing at those gets some wrong in each direction, and the two
 /// directions are not equally priced. A missed drift is caught by the next person
@@ -1090,7 +1090,7 @@ mod packaged_readme {
 /// nowhere else, the author writes an HTML comment naming the constant:
 ///
 /// ```text
-/// The current on-wire format is **WIRE_VERSION=<!--pinned:WIRE_VERSION-->7**.
+/// The current on-wire format is **WIRE_VERSION=<!--pinned:WIRE_VERSION-->8**.
 /// ```
 ///
 /// Markdown renders the comment as nothing, so the sentence reads unchanged on

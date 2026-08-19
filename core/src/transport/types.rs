@@ -362,7 +362,7 @@ impl fmt::Debug for PacketFlags {
 /// ε CID collapse), reconstructed by the receiver from session context.
 ///
 /// ```text
-/// off  0  version        u8       (= WIRE_VERSION = 7)            HP-MASKED ┐
+/// off  0  version        u8       (= WIRE_VERSION = 8)            HP-MASKED ┐
 /// off  1  packet_number  u64 be   (per-direction monotonic)      HP-MASKED │
 /// off  9  flags          u16 be                                  HP-MASKED │ [0..15]
 /// off 11  stream_id      u16 be                                  HP-MASKED │
