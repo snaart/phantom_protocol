@@ -254,9 +254,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   and carried into the WAN harness's window series, where `analyze.py` reports both ratios per
   session: a raw sample tracking the delivered rate while the estimate sits far above it is
   the filter holding a peak, and a raw sample that itself reads high is the sample arithmetic.
-  It is an observable and not an input — nothing in the control loop reads it back. Note that
-  `BandwidthSnapshot` has public fields and no `#[non_exhaustive]`, so code that constructs
-  one literally needs the new field.
+  Each printed line names the statistic behind it — `filtered max over 10s horizon` and
+  `single-ack sample (unfiltered, point)`, both against `delivered (mean over each interval)` —
+  because the pair is only readable if the two cannot be mistaken for the same kind of number.
+  The raw column is reported as a median alone: it is whichever acknowledgement happened to
+  land last before the sampler's instant, so its spread across a sweep describes the sampler's
+  cadence rather than the connection, and a percentile of it would be the mismatch the column
+  exists to expose, one size down. It is an observable and not an input — nothing in the
+  control loop reads it back. Note that `BandwidthSnapshot` has public fields and no
+  `#[non_exhaustive]`, so code that constructs one literally needs the new field.
 
 - **`unencrypted_dropped_total` in the metrics snapshot, and an always-on test that drives the
   gate it counts.** The receive path drops every unencrypted post-handshake packet — the

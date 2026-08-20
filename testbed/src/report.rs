@@ -352,9 +352,20 @@ pub struct WindowSample {
     /// anything. With the raw sample in the same row the two come apart: a raw
     /// sample tracking the delivered rate while the estimate sits far above it
     /// is a retained peak, and a raw sample that itself reads high is the sample
-    /// arithmetic. Defaulted on deserialize so runs recorded before it existed
-    /// still load; it reads zero on the `quic` leg and on any run older than
-    /// this field.
+    /// arithmetic.
+    ///
+    /// **It is a point sample and only its central value across a sweep means
+    /// anything.** The sampler takes whichever acknowledgement happened to be
+    /// the last one before its instant, so the spread of this column over a run
+    /// describes the sampler's cadence rather than the connection — reading a
+    /// p90 or a peak off it would put the instrument back inside the very
+    /// mismatch between statistics it was added to separate. `analyze.py` prints
+    /// a median here and percentiles only for `bottleneck_bw_bps`, and names the
+    /// statistic behind each line so the two cannot be read as the same kind of
+    /// number.
+    ///
+    /// Defaulted on deserialize so runs recorded before it existed still load;
+    /// it reads zero on the `quic` leg and on any run older than this field.
     #[serde(default)]
     pub last_delivery_rate_bps: u64,
     pub pacing_rate_bps: u64,

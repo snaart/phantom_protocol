@@ -1224,6 +1224,14 @@ impl BandwidthEstimator {
     /// is the only direct evidence of how much of a high-looking estimate is
     /// the filter holding a peak and how much is the samples themselves. Zero
     /// until the connection has produced a sample that delivered something.
+    ///
+    /// A caller sampling this on a timer is reading whichever acknowledgement
+    /// arrived last before the instant it asked, so a series of these has a
+    /// meaningful central value and a meaningless spread: the tail describes the
+    /// sampling cadence, not the path. That distinction is the point of the
+    /// figure — comparing a maximum over a horizon with a mean over an interval
+    /// is what it exists to disentangle, and taking a percentile of a point
+    /// sample would be the same mistake one size down.
     pub fn last_delivery_rate(&self) -> u64 {
         self.last_delivery_rate
     }

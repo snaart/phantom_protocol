@@ -1627,6 +1627,15 @@ pub struct BandwidthSnapshot {
     /// tracks the delivered rate while the estimate sits far above it is the
     /// filter retaining a peak, and a raw sample that itself reads high is the
     /// sample arithmetic.
+    ///
+    /// **It is a point sample, and reading a spread off it would repeat in
+    /// miniature the mismatch it exists to expose.** Whoever takes this snapshot
+    /// gets whichever single acknowledgement happened to arrive last before the
+    /// instant they asked; the value's variation across a sweep is a fact about
+    /// when the sampler ticked, not about the connection. A central value over
+    /// many intervals is meaningful and a tail of them is not — `analyze.py`
+    /// prints a median for this column and percentiles only for the filtered
+    /// one, and labels each with the statistic behind it for that reason.
     pub last_delivery_rate_bps: u64,
     pub min_rtt: Duration,
     pub pacing_rate_bps: u64,
