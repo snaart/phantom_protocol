@@ -3517,3 +3517,144 @@ async fn an_authenticated_close_drains_trailing_data_and_then_ends_the_session()
          peer left is a resource a peer decided to hold"
     );
 }
+
+/// A frame stamped at the **previous** wire version is dropped before the flag
+/// dispatch, so it can neither end a session nor reach an application.
+///
+/// This is the mechanism the version-pairing rule actually rests on, and it is worth
+/// a test because the natural way to describe that rule is the wrong way round. The
+/// tempting story is that an older peer *misreads* a newer frame — that a `CONTROL`
+/// frame it has no branch for falls through to its data path and its subtype byte
+/// arrives at the caller as a byte of the stream. It does not: the version check is
+/// step 1 of the receive dispatch and nothing downstream of it runs. What the older
+/// peer does instead is drop the whole flow — every data-plane packet carries the
+/// version byte — so it completes a handshake and then moves nothing, with no error
+/// at either end. That, and not corruption, is why `PROTOCOL_VERSION` moves with
+/// `WIRE_VERSION`: it converts a silent total stall into a typed refusal before a
+/// session exists.
+///
+/// The close subtype is the sharpest probe available for it, because acting on that
+/// one byte is the most consequential thing a receiver could do with a frame it was
+/// never meant to see.
+#[tokio::test]
+async fn a_previous_wire_version_frame_is_dropped_before_the_flag_dispatch() {
+    use phantom_protocol::api::session::ConnectionState;
+    use phantom_protocol::api::PhantomSession;
+    use phantom_protocol::transport::handshake::ServerReply;
+
+    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let (to_server_tx, mut to_server_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let client_transport = PipeTransport {
+        to_peer: to_server_tx,
+        from_peer: tokio::sync::Mutex::new(to_client_rx),
+    };
+
+    let server_hs = HandshakeServer::new().expect("server handshake state");
+    let pinned = server_hs.verifying_key().clone();
+    let session = PhantomSession::connect_with_transport("pipe-peer:0", client_transport, pinned);
+
+    let client_ip = "127.0.0.1".parse().expect("client ip");
+    let server_session = loop {
+        let hello_bytes = to_server_rx.recv().await.expect("client hello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("decode client hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let wire = ServerReply::Retry(retry).to_wire().expect("encode retry");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send retry");
+            }
+            HandshakeResponse::Success(server_hello, negotiated, _) => {
+                let wire = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("encode server hello");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send server hello");
+                break negotiated;
+            }
+            HandshakeResponse::Reject(r) => panic!("server rejected its own client: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    };
+
+    session
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+    let session_id = *server_session.id();
+    let app_stream = session.open_stream();
+    let target: u16 = app_stream
+        .stream_id()
+        .try_into()
+        .expect("a locally-opened stream id fits the wire field");
+
+    // A close sealed by the real key, and correct in every respect except its version
+    // byte — stamped before the seal, so the AEAD it carries is self-consistent at the
+    // older version and the frame is refused by the version check rather than by a tag
+    // mismatch. That is the whole point: it is the version alone that refuses it.
+    let mut close_header = PacketHeader::new(
+        session_id,
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::CONTROL),
+    )
+    .with_epoch(server_session.current_epoch());
+    close_header.version = WIRE_VERSION - 1;
+    let close_ct = server_session
+        .encrypt_packet(&close_header, &[ControlSubtype::CLOSE], &[])
+        .expect("seal the previous-version close");
+    let close_wire = server_session
+        .protect_packet(&PhantomPacket::new(close_header, close_ct))
+        .expect("protect the previous-version close");
+    to_client_tx
+        .send(Bytes::from(close_wire))
+        .await
+        .expect("send previous-version close");
+
+    // The probe behind it, at the current version. The pipe is FIFO and the reader
+    // drains it in order, so a delivered payload proves the older frame was seen and
+    // disposed of first rather than still sitting unread.
+    let data_header = PacketHeader::new(
+        session_id,
+        target,
+        2,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
+    )
+    .with_epoch(server_session.current_epoch());
+    let mut data_plaintext = 0u32.to_be_bytes().to_vec();
+    data_plaintext.extend_from_slice(b"still-here");
+    let data_ct = server_session
+        .encrypt_packet(&data_header, &data_plaintext, &[])
+        .expect("seal the probe");
+    let data_wire = server_session
+        .protect_packet(&PhantomPacket::new(data_header, data_ct))
+        .expect("protect the probe");
+    to_client_tx
+        .send(Bytes::from(data_wire))
+        .await
+        .expect("send probe");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(10), app_stream.recv())
+        .await
+        .expect("the session survives a previous-version frame")
+        .expect("recv")
+        .expect("the stream is open, so this is data and not a peer FIN");
+    assert_eq!(
+        delivered, b"still-here",
+        "a previous-version frame must be dropped, not delivered and not acted on"
+    );
+
+    // Long enough that a close which *had* been acted on would have finished draining
+    // and published `Closed`, which is the state this asserts the absence of. The
+    // ceiling on the draining window is well under a second.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        session.connection_state(),
+        ConnectionState::Connected,
+        "a close stamped at the previous wire version must not end the session — the \
+         version check runs before anything reads a flag"
+    );
+}
