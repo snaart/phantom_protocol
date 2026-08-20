@@ -84,9 +84,18 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   reads as a bucket rather than a length — a control frame with a one-, two- or three-byte
   body is one size on the wire, so the size does not name the subtype — carries no
   application bytes, and is emitted three times from the data pump's teardown after the
-  existing flush and drain. Padding does not hide that a session ended: on a default-
-  configured session nothing else pads, so three same-size datagrams before silence stay
-  legible, and hiding that would take the session padding its data too.
+  existing flush and drain.
+
+  Be precise about the padding, because the broad claim is false and the counterexample is
+  one line of arithmetic. It removes the *body length* from the wire size: a control frame
+  with a one-, two- or three-byte body is one size, so the size says a control frame went
+  out without saying which subtype it carried. It does **not** put the frame on a size
+  nothing else emits — a default session's one-byte reliable application write is the same
+  45-byte datagram, because a padded one-byte control body and a four-byte stream offset
+  plus one application byte are both five bytes of plaintext. And it does not hide that a
+  session ended: three identical datagrams back to back followed by silence is a pattern,
+  and per-frame padding does not remove patterns. Hiding *that* would take the session
+  padding its data frames too, which is the opt-in policy and a deployment's decision.
 
   The defect is a slot that outlives the client holding it. `SessionCommand::Close` flushed
   the send queue and left the pump without putting a byte on the wire. On a byte pipe that

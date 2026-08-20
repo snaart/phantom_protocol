@@ -3695,12 +3695,17 @@ const CLOSE_FRAME_COPIES: usize = 3;
 /// size says a control frame went out and does not say which one, which is what keeps
 /// a later subtype from being told apart from a close by an observer counting bytes.
 ///
-/// It does **not** hide that a session ended. On a default-configured session the
-/// data path pads nothing (`PaddingPolicy::None`), so 45 bytes is a size no other
-/// frame produces, and [`CLOSE_FRAME_COPIES`] of it back to back followed by silence
-/// remain legible to anyone watching datagram sizes. Hiding that would take the
-/// session padding its data frames too, which is the opt-in policy and costs
-/// bandwidth on every packet — a decision for the deployment, not for this frame.
+/// Two things it does **not** do, and the second is the one that was claimed here and
+/// is false. It does not put the frame on a size nothing else emits: a default
+/// session's one-byte reliable application write is the same 45 bytes, because the
+/// padded control plaintext and a four-byte stream offset plus one application byte
+/// are both five bytes. So a close is not distinguishable *by size alone* from every
+/// other frame — only from most of them, and from every control frame the registry
+/// might later add. And it does not hide that a session ended: [`CLOSE_FRAME_COPIES`]
+/// identical datagrams back to back followed by silence is a *pattern*, and no amount
+/// of per-frame padding removes a pattern. Hiding that would take the session padding
+/// its data frames too, which is the opt-in policy and costs bandwidth on every
+/// packet — a decision for the deployment, not for this frame.
 ///
 /// Everything about it is best-effort: a rekey saturation, a seal failure or a dead
 /// transport all just mean the peer will fall back to noticing the silence, which is
@@ -10032,28 +10037,34 @@ mod tests {
 
     /// The close frame the live emitter actually puts on the wire: an
     /// `ENCRYPTED | CONTROL` packet whose sealed plaintext is the single
-    /// [`ControlSubtype::CLOSE`] byte, header-protected, and padded to a bucket.
+    /// [`ControlSubtype::CLOSE`] byte, header-protected, padded — and **the same size
+    /// as an ordinary one-byte reliable application write from the same session**.
     ///
-    /// The padding assertion is deliberately the narrow one, because the broad one is
-    /// not true and a test that asserted it would pass anyway. Padding does not hide
-    /// that a session ended: on a default-configured session nothing else pads, so the
-    /// emitted size is unique to this frame and three copies before silence stay
-    /// legible. What it does is collapse the *body length* into a bucket, so the size
-    /// says a control frame went out and does not say which one — which is what keeps
-    /// a later subtype from being told apart from a close by an observer counting
-    /// bytes.
+    /// That last clause is the assertion this test exists for, and it is the opposite
+    /// of what the emitter's documentation used to claim. Padding was described as
+    /// putting the close on a size nothing else emits; a default session's one-byte
+    /// reliable write produces the identical datagram, because the padded control
+    /// plaintext and a four-byte stream offset plus one application byte are both five
+    /// bytes. So the close is *not* distinguishable by size alone from every other
+    /// frame — only from most of them.
     ///
-    /// That claim spans two things and the assertions below split it accordingly. One,
-    /// the emitted frame is exactly the size the shaping policy asks for, not merely
-    /// bigger than its bare size: a step that announced `PADDED` and added the minimum
-    /// two-byte trailer would satisfy "bigger" and land in no bucket at all. Two, the
-    /// policy really does collapse a range of body lengths onto one size, checked over
-    /// one-, two- and three-byte bodies. The emitter cannot be asked for a two-byte
-    /// body — `CLOSE` is the only subtype and its body is empty — so the second half is
-    /// necessarily a statement about the policy, and the first is what ties the emitter
-    /// to it.
+    /// What padding does buy, stated no wider than it is: the wire size no longer
+    /// carries the control body's length. An unpadded control frame is exactly its
+    /// plaintext length read off the wire, so a later subtype with a two- or
+    /// three-byte body would be a different size and an observer counting bytes could
+    /// tell them apart. What it does not buy is hiding that a session ended — three
+    /// copies back to back followed by silence is a pattern, not a size, and no amount
+    /// of per-frame padding removes a pattern.
+    ///
+    /// Both halves are measured off emitters rather than recomputed from the padding
+    /// step. The earlier version of this test built its comparison size by calling
+    /// `padding_trailer_len` itself, which is the same function the emitter calls: it
+    /// compared one copy of the padding logic against another, and would have been
+    /// satisfied by whatever that function did. Here the close comes out of
+    /// `send_control_close` and the frame it is compared against comes out of the
+    /// ordinary reliable drain, so the equality is a statement about two emitters.
     #[tokio::test]
-    async fn close_frame_seals_the_close_subtype_and_pads_its_body_length_into_a_bucket() {
+    async fn a_close_frame_is_padded_and_shares_its_size_with_a_one_byte_reliable_write() {
         use crate::crypto::adaptive_crypto::AEAD_OVERHEAD;
 
         let session_id = fixed_session_id();
@@ -10066,45 +10077,50 @@ mod tests {
             send_control_close(&client_transport, &client_session, session_id, &obs).await,
             "sealing and sending a close frame must succeed on a healthy session"
         );
-
-        let wire = server_transport
+        let close_wire = server_transport
             .recv_bytes()
             .await
             .expect("the close frame reaches the peer");
+
+        // The counterexample, emitted by the ordinary data path of the same session —
+        // default shaping, so `PaddingPolicy::None` and no trailer of its own.
+        let stream = Arc::new(TransportStream::new(1));
+        stream
+            .send_reliable(Bytes::from_static(b"x"))
+            .await
+            .expect("one application byte");
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(1u32, stream);
+        drain_streams_priority_ordered(
+            &client_transport,
+            &client_session,
+            session_id,
+            &streams,
+            &obs,
+        )
+        .await;
+        let data_wire = server_transport
+            .recv_bytes()
+            .await
+            .expect("the one-byte write reaches the peer");
+
         let bare = PacketHeader::SIZE + CONTROL_SUBTYPE_LEN + AEAD_OVERHEAD;
         assert!(
-            wire.len() > bare,
+            close_wire.len() > bare,
             "an unpadded close frame is {bare} B, which is its exact plaintext length \
              read off the wire; got {} B",
-            wire.len()
+            close_wire.len()
         );
-
-        // One: the emitter landed on the bucket, not merely somewhere above `bare`.
-        let bucketed = |body_len: usize| {
-            PacketHeader::SIZE
-                + body_len
-                + shaping::padding_trailer_len(body_len, PaddingPolicy::Padme)
-                + AEAD_OVERHEAD
-        };
         assert_eq!(
-            wire.len(),
-            bucketed(CONTROL_SUBTYPE_LEN),
-            "the close must be padded to the shaping policy's bucket; a trailer chosen \
-             any other way lands between buckets and is a size of its own"
-        );
-
-        // Two: the policy collapses a range of body lengths onto that one size, so the
-        // size cannot be read back as the subtype's body length.
-        let sizes: Vec<usize> = (1..=3).map(bucketed).collect();
-        assert!(
-            sizes.iter().all(|s| *s == wire.len()),
-            "control bodies of 1..=3 bytes must be one size on the wire; got {sizes:?} \
-             against the close's {}",
-            wire.len()
+            close_wire.len(),
+            data_wire.len(),
+            "the close and a one-byte reliable write are one size on the wire, so a \
+             claim that the padded close lands on a size nothing else emits is false — \
+             and a reader who believed it would misjudge what the frame leaks"
         );
 
         let pkt = server_session
-            .parse_protected(&wire)
+            .parse_protected(&close_wire)
             .expect("the close frame is header-protected like any other packet");
         assert!(
             pkt.header.flags.contains(PacketFlags::ENCRYPTED),
@@ -10118,6 +10134,11 @@ mod tests {
         let plaintext = server_session
             .decrypt_packet(&pkt.header, &pkt.payload, &pkt.extensions)
             .expect("the peer's key opens it");
+        assert!(
+            plaintext.len() > CONTROL_SUBTYPE_LEN,
+            "the sealed plaintext must be longer than the body it carries, or the wire \
+             size is still the body length and the padding bought nothing"
+        );
         assert_eq!(
             shaping::strip_padding(&plaintext).expect("well-formed padding trailer"),
             &[ControlSubtype::CLOSE],

@@ -1057,14 +1057,19 @@ two- or three-byte body is one size, and the size therefore says a control frame
 out without saying which subtype it carried. That is what keeps a later subtype from
 being told apart from a `CLOSE` by an observer counting bytes.
 
-What it does **not** do is hide that a session ended. On a session whose data path
-pads nothing — the default (§ 4.8) — the padded control size is still a size nothing
-else emits, and one or more copies of it followed by silence remain legible. Removing
-*that* takes the session padding its data frames too, which is a deployment's
-decision and costs bandwidth on every packet, not something this frame can achieve on
-its own. A receiver, in any case, **must not** require the flag: `PADDED` means only
-"a trailer is present", so a control frame that arrives without it is well-formed and
-its plaintext is read as-is.
+Two things it does **not** do. It does not put the frame on a size nothing else emits:
+even on a session whose data path pads nothing — the default (§ 4.8) — a one-byte
+reliable application write produces an identical datagram, because a padded one-byte
+control body and a four-byte stream offset plus one application byte are both five
+bytes of plaintext. A `CLOSE` is therefore not distinguishable *by size alone* from
+every other frame, only from most of them and from every control subtype the registry
+below might later carry. And it does not hide that a session ended: one or more
+identical datagrams followed by silence is a pattern rather than a size, and per-frame
+padding does not remove patterns. Removing *that* takes the session padding its data
+frames too, which is a deployment's decision and costs bandwidth on every packet, not
+something this frame can achieve on its own. A receiver, in any case, **must not**
+require the flag: `PADDED` means only "a trailer is present", so a control frame that
+arrives without it is well-formed and its plaintext is read as-is.
 
 **Subtype registry.** Assignments grow from the bottom. `0x00` is deliberately left
 unassigned so that a zeroed buffer is not a valid control frame.
