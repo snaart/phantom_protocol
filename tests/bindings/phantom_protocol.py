@@ -531,17 +531,17 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_connection_state() != 25030:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 34217:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_disconnect() != 61489:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_early_data_accepted() != 8121:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue() != 15985:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_flush_queue() != 18912:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_id() != 42609:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_is_data_ready() != 25961:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_last_error() != 3339:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_last_error() != 1347:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_metrics_snapshot() != 36430:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -551,13 +551,13 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_peer_addr() != 58516:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 50067:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_queued_count() != 34723:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_recv() != 44409:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 31785:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 56893:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -565,13 +565,13 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_traffic_shaping() != 8294:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 34625:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_disconnect() != 21465:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 18540:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 49288:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 31956:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 21344:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 14127:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 56290:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1964,6 +1964,31 @@ class ConnectionState(enum.Enum):
     with no recovery. Terminal — `recv()` errors instead of hanging (P4.3).
 """
     
+    DRAINING = 9
+    """
+    The peer announced its own close (WIRE v8) and this side is reading out
+    whatever was still in flight behind it before letting go.
+
+    Reading continues; **writing does not**. The peer's session is over, so a
+    payload accepted here would be one the pump discards, and the whole point of
+    publishing this state is that no caller is told otherwise:
+    [`PhantomSession::send`], [`PhantomStream::send_reliable`],
+    [`PhantomStream::send_unreliable`] and [`PhantomStream::disconnect`] all
+    refuse with [`CoreError::ConnectionClosed`] rather than returning `Ok` for
+    bytes that will never reach the wire, `is_data_ready()` is `false`, and
+    `queued_count()` stays `0` because a refused write is refused rather than
+    queued. It is not a failure: nothing went wrong, so `last_error()` stays
+    `None` unless something else already failed.
+
+    The window is bounded and short — see `peer_close_drain_window` — after which
+    the session settles into [`Closed`](Self::Closed).
+
+    [`PhantomStream`]: crate::api::stream::PhantomStream
+    [`PhantomStream::send_reliable`]: crate::api::stream::PhantomStream::send_reliable
+    [`PhantomStream::send_unreliable`]: crate::api::stream::PhantomStream::send_unreliable
+    [`PhantomStream::disconnect`]: crate::api::stream::PhantomStream::disconnect
+"""
+    
 
 
 class _UniffiFfiConverterTypeConnectionState(_UniffiConverterRustBuffer):
@@ -1982,6 +2007,8 @@ class _UniffiFfiConverterTypeConnectionState(_UniffiConverterRustBuffer):
             return ConnectionState.MIGRATING
         if variant == 6:
             return ConnectionState.DEAD
+        if variant == 7:
+            return ConnectionState.DRAINING
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -1997,6 +2024,8 @@ class _UniffiFfiConverterTypeConnectionState(_UniffiConverterRustBuffer):
         if value == ConnectionState.MIGRATING:
             return
         if value == ConnectionState.DEAD:
+            return
+        if value == ConnectionState.DRAINING:
             return
         raise ValueError(value)
 
@@ -2014,6 +2043,8 @@ class _UniffiFfiConverterTypeConnectionState(_UniffiConverterRustBuffer):
             buf.write_i32(5)
         if value == ConnectionState.DEAD:
             buf.write_i32(6)
+        if value == ConnectionState.DRAINING:
+            buf.write_i32(7)
 
 
 
@@ -2695,6 +2726,11 @@ class PhantomStreamProtocol(typing.Protocol):
         Named `disconnect` rather than `close` for the same reason as
         `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
         `AutoCloseable.close()` on every object.
+
+        The FIN is a reliable write like any other, so this returns
+        [`CoreError::ConnectionClosed`] once the owning session is
+        [`Draining`](crate::api::session::ConnectionState::Draining): the peer would
+        never see the EOF, and the stream is about to end with the session anyway.
 """
         raise NotImplementedError
     async def recv(self, ) -> typing.Optional[bytes]:
@@ -2728,6 +2764,11 @@ class PhantomStreamProtocol(typing.Protocol):
         Frame the messages yourself if you need them: write a length prefix ahead
         of each payload and accumulate `recv` results until the declared length is
         complete. `testbed/src/framing.rs` in this repository is a worked example.
+
+        Returns [`CoreError::ConnectionClosed`] once the owning session is
+        [`Draining`](crate::api::session::ConnectionState::Draining) the peer's close,
+        without queueing anything: the peer's session is over, so this call cannot put
+        `data` on the wire.
 """
         raise NotImplementedError
     async def send_unreliable(self, data: bytes) -> None:
@@ -2749,6 +2790,10 @@ class PhantomStreamProtocol(typing.Protocol):
         prefix and sequence number and drop incomplete messages —
         `testbed/src/framing.rs` in this repository is a worked example of the
         framing half.
+
+        Returns [`CoreError::ConnectionClosed`] once the owning session is
+        [`Draining`](crate::api::session::ConnectionState::Draining) the peer's close,
+        for the same reason as [`send_reliable`](Self::send_reliable).
 """
         raise NotImplementedError
     async def set_priority(self, priority: int) -> None:
@@ -2802,6 +2847,11 @@ class PhantomStream(PhantomStreamProtocol):
         Named `disconnect` rather than `close` for the same reason as
         `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
         `AutoCloseable.close()` on every object.
+
+        The FIN is a reliable write like any other, so this returns
+        [`CoreError::ConnectionClosed`] once the owning session is
+        [`Draining`](crate::api::session::ConnectionState::Draining): the peer would
+        never see the EOF, and the stream is about to end with the session anyway.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
@@ -2859,6 +2909,11 @@ class PhantomStream(PhantomStreamProtocol):
         Frame the messages yourself if you need them: write a length prefix ahead
         of each payload and accumulate `recv` results until the declared length is
         complete. `testbed/src/framing.rs` in this repository is a worked example.
+
+        Returns [`CoreError::ConnectionClosed`] once the owning session is
+        [`Draining`](crate::api::session::ConnectionState::Draining) the peer's close,
+        without queueing anything: the peer's session is over, so this call cannot put
+        `data` on the wire.
 """
         
         _UniffiFfiConverterBytes.check_lower(data)
@@ -2895,6 +2950,10 @@ class PhantomStream(PhantomStreamProtocol):
         prefix and sequence number and drop incomplete messages —
         `testbed/src/framing.rs` in this repository is a worked example of the
         framing half.
+
+        Returns [`CoreError::ConnectionClosed`] once the owning session is
+        [`Draining`](crate::api::session::ConnectionState::Draining) the peer's close,
+        for the same reason as [`send_reliable`](Self::send_reliable).
 """
         
         _UniffiFfiConverterBytes.check_lower(data)
@@ -3191,7 +3250,35 @@ class PhantomSessionProtocol(typing.Protocol):
         raise NotImplementedError
     async def disconnect(self, ) -> None:
         """
-        Send the graceful close frame and shut the session down.
+        Ask the background pump to push out what it can, tell the peer this session is
+        over, and shut it down.
+
+        **What a caller can rely on.** That the session ends, and that this returns
+        promptly — it queues the request and returns; the work happens on the pump
+        afterwards. Nothing here is a delivery guarantee. The pump pushes queued bytes
+        until the socket, the congestion window or the peer's flow-control limit
+        refuses the next one, and then stops; it does not wait for an acknowledgement,
+        so "pushed" means "handed to the transport", not "the peer has it". A payload
+        larger than one congestion window is therefore mostly discarded — half a
+        mebibyte handed to `send()` immediately before this call arrives as a few
+        kibibytes — and a process that exits right afterwards can leave before any of
+        it, or the announcement, reaches the wire. Dropping the handle is the same path
+        with no await to hold the process still.
+
+        **If delivery matters, do not use this to obtain it.** There is no
+        transport-level signal that could be waited on here: the close announcement is
+        itself unacknowledged. Have the peer say it received the data, at the
+        application level, and close after that answer arrives.
+
+        The announcement is a best-effort `CONTROL` frame carrying
+        [`ControlSubtype::CLOSE`]: it is not acknowledged and not retransmitted, so a
+        peer that never receives it falls back to concluding the same thing from
+        silence, on its liveness timer. It is what lets a PhantomUDP server release
+        the session's slot in under a second instead of two minutes later, because a
+        datagram socket gives it no other end-of-stream to observe. A peer that does
+        receive it keeps reading for a short bounded window before tearing down, so
+        data this side put on the wire just before the close is still delivered if it
+        is merely reordered behind it.
 
         Named `disconnect` rather than `close` because UniFFI's Kotlin
         generator unconditionally adds `AutoCloseable.close()` to every
@@ -3213,6 +3300,11 @@ class PhantomSessionProtocol(typing.Protocol):
     async def flush_queue(self, ) -> int:
         """
         Flush all queued messages (called when handshake completes).
+
+        Refuses with [`CoreError::ConnectionClosed`] once the peer has announced its
+        close: the count this returns is a count of payloads handed to the pump, and
+        while draining the pump discards them, so returning one would be the same
+        dishonest `Ok` that [`send`](Self::send) refuses to give.
 """
         raise NotImplementedError
     def id(self, ) -> str:
@@ -3233,8 +3325,16 @@ class PhantomSessionProtocol(typing.Protocol):
     async def last_error(self, ) -> typing.Optional[CoreError]:
         """
         Returns the terminal error from a failed handshake or a dead session,
-        or `None` if the session has not failed (still connecting, connected, or
-        cleanly closed).
+        or `None` if the session has not failed (still connecting, connected,
+        draining the peer's close, or cleanly closed).
+
+        A [`Draining`](ConnectionState::Draining) session reads `None` here on
+        purpose, and that is not in tension with `send()` returning
+        [`CoreError::ConnectionClosed`] at the same moment: nothing failed, the peer
+        left. The question "can I still write?" is answered by
+        [`connection_state`](Self::connection_state) and
+        [`is_data_ready`](Self::is_data_ready); the question this answers is "what
+        went wrong?", and for an orderly departure the answer is nothing.
 
         The error is written once by the background task immediately before the
         state transitions to `Failed` or `Dead`, so callers that read this after
@@ -3296,6 +3396,12 @@ class PhantomSessionProtocol(typing.Protocol):
     async def queued_count(self, ) -> int:
         """
         Number of messages queued (waiting for handshake).
+
+        This counter only ever holds pre-handshake writes, so it reads `0` on a
+        [`Draining`](ConnectionState::Draining) session — and that reading is
+        accurate rather than a gap: a write offered while draining is refused at
+        [`send`](Self::send), not accepted into this queue, so there is nothing here
+        for it to be missing from.
 """
         raise NotImplementedError
     async def recv(self, ) -> bytes:
@@ -3334,6 +3440,11 @@ class PhantomSessionProtocol(typing.Protocol):
 
         - If the session is connected: sends immediately
         - If still handshaking: queues the data for auto-flush later
+        - If the peer has announced its close ([`ConnectionState::Draining`]):
+        returns [`CoreError::ConnectionClosed`] without queueing anything. The
+        peer's session is over, so this call cannot put `data` on the wire, and
+        an `Ok` here would be the same silent loss the draining window exists to
+        prevent on the receive side.
         - If the session is `Failed` or `Dead`: returns the captured terminal
         error (from the handshake or the data pump) so the caller gets the
         *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
@@ -3618,7 +3729,35 @@ class PhantomSession(PhantomSessionProtocol):
         return _uniffi_lift_return(_uniffi_ffi_result)
     async def disconnect(self, ) -> None:
         """
-        Send the graceful close frame and shut the session down.
+        Ask the background pump to push out what it can, tell the peer this session is
+        over, and shut it down.
+
+        **What a caller can rely on.** That the session ends, and that this returns
+        promptly — it queues the request and returns; the work happens on the pump
+        afterwards. Nothing here is a delivery guarantee. The pump pushes queued bytes
+        until the socket, the congestion window or the peer's flow-control limit
+        refuses the next one, and then stops; it does not wait for an acknowledgement,
+        so "pushed" means "handed to the transport", not "the peer has it". A payload
+        larger than one congestion window is therefore mostly discarded — half a
+        mebibyte handed to `send()` immediately before this call arrives as a few
+        kibibytes — and a process that exits right afterwards can leave before any of
+        it, or the announcement, reaches the wire. Dropping the handle is the same path
+        with no await to hold the process still.
+
+        **If delivery matters, do not use this to obtain it.** There is no
+        transport-level signal that could be waited on here: the close announcement is
+        itself unacknowledged. Have the peer say it received the data, at the
+        application level, and close after that answer arrives.
+
+        The announcement is a best-effort `CONTROL` frame carrying
+        [`ControlSubtype::CLOSE`]: it is not acknowledged and not retransmitted, so a
+        peer that never receives it falls back to concluding the same thing from
+        silence, on its liveness timer. It is what lets a PhantomUDP server release
+        the session's slot in under a second instead of two minutes later, because a
+        datagram socket gives it no other end-of-stream to observe. A peer that does
+        receive it keeps reading for a short bounded window before tearing down, so
+        data this side put on the wire just before the close is still delivered if it
+        is merely reordered behind it.
 
         Named `disconnect` rather than `close` because UniFFI's Kotlin
         generator unconditionally adds `AutoCloseable.close()` to every
@@ -3664,6 +3803,11 @@ class PhantomSession(PhantomSessionProtocol):
     async def flush_queue(self, ) -> int:
         """
         Flush all queued messages (called when handshake completes).
+
+        Refuses with [`CoreError::ConnectionClosed`] once the peer has announced its
+        close: the count this returns is a count of payloads handed to the pump, and
+        while draining the pump discards them, so returning one would be the same
+        dishonest `Ok` that [`send`](Self::send) refuses to give.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
@@ -3716,8 +3860,16 @@ class PhantomSession(PhantomSessionProtocol):
     async def last_error(self, ) -> typing.Optional[CoreError]:
         """
         Returns the terminal error from a failed handshake or a dead session,
-        or `None` if the session has not failed (still connecting, connected, or
-        cleanly closed).
+        or `None` if the session has not failed (still connecting, connected,
+        draining the peer's close, or cleanly closed).
+
+        A [`Draining`](ConnectionState::Draining) session reads `None` here on
+        purpose, and that is not in tension with `send()` returning
+        [`CoreError::ConnectionClosed`] at the same moment: nothing failed, the peer
+        left. The question "can I still write?" is answered by
+        [`connection_state`](Self::connection_state) and
+        [`is_data_ready`](Self::is_data_ready); the question this answers is "what
+        went wrong?", and for an orderly departure the answer is nothing.
 
         The error is written once by the background task immediately before the
         state transitions to `Failed` or `Dead`, so callers that read this after
@@ -3836,6 +3988,12 @@ class PhantomSession(PhantomSessionProtocol):
     async def queued_count(self, ) -> int:
         """
         Number of messages queued (waiting for handshake).
+
+        This counter only ever holds pre-handshake writes, so it reads `0` on a
+        [`Draining`](ConnectionState::Draining) session — and that reading is
+        accurate rather than a gap: a write offered while draining is refused at
+        [`send`](Self::send), not accepted into this queue, so there is nothing here
+        for it to be missing from.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
@@ -3910,6 +4068,11 @@ class PhantomSession(PhantomSessionProtocol):
 
         - If the session is connected: sends immediately
         - If still handshaking: queues the data for auto-flush later
+        - If the peer has announced its close ([`ConnectionState::Draining`]):
+        returns [`CoreError::ConnectionClosed`] without queueing anything. The
+        peer's session is over, so this call cannot put `data` on the wire, and
+        an `Ok` here would be the same silent loss the draining window exists to
+        prevent on the receive side.
         - If the session is `Failed` or `Dead`: returns the captured terminal
         error (from the handshake or the data pump) so the caller gets the
         *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
