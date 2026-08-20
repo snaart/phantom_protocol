@@ -457,20 +457,6 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
-- **The bandwidth estimator's ten-second horizon only aged on the samples it admitted.** The
-  expiry loop lived inside `WindowFilter::update_max`, and `on_ack` reaches that call only for
-  samples it accepts: an application-limited sample below the current maximum short-circuits
-  the admission test, and so does any acknowledgement that retired no bytes — the zero-length
-  reliable FIN sentinel stream close sends is exactly that shape. Neither aged the window, and
-  neither did any number of them in a row, so a peak taken during one fast burst could outlive
-  its horizon by an unbounded amount of wall clock. A flow that opened with a burst and then
-  settled into request/response kept that opening estimate for the life of the connection and
-  paced every later write against a rate the path never offered. Ageing now runs on every
-  acknowledgement, before anything is decided from it; admission is unchanged, so an
-  app-limited sample still may not *set* a lower maximum. An emptied horizon reads as no
-  estimate, which returns the window to its four-packet floor until the next rate-bearing
-  sample arrives.
-
 - **Both sliding filters were as long as the peer cared to make them.** `WindowFilter`'s deque
   is pruned from the front by the horizon and from the back by domination, and a monotone
   sequence defeats the second rule entirely: a strictly falling run of delivery rates
@@ -482,6 +468,30 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   round trip can return — evicting from the back, which in a maximum filter is the least of
   everything retained, so a bounded maximum sits at or below the unbounded one at every
   instant and never above it.
+
+- **Withdrawn during this window, recorded because the measurement is worth more than the
+  silence: ageing the bandwidth horizon on every acknowledgement rather than on the ones it
+  admits.** The expiry loop lives inside `WindowFilter::update_max`, which `on_ack` reaches
+  only for samples that pass the application-limited gate, so a peak can outlive its ten
+  seconds while a flow stays application-limited. Running `expire` unconditionally at the top
+  of `on_ack` was tried as the stricter reading of "ten seconds". It defeats the gate instead
+  of tightening it: the gate's escape clause admits an application-limited sample that is at or
+  above the current maximum, and against a freshly emptied horizon that maximum is zero, so the
+  clause becomes vacuously true and the application's own write rate is installed as the path's
+  capacity — the one thing the gate exists to refuse. Extending the existing
+  `test_app_limited_filtering` by a single acknowledgement, enough to cross the horizon, took
+  the estimate from 700,000 B/s to 7,600 B/s. On a 1 MB/s, 200 ms bottleneck simulation driven
+  by the estimator's own window and pacing rate — six seconds of bulk, sixteen of 4 KB
+  request/response, then bulk again — it left `btl_bw` at 33,740 B/s against 1,000,000, the
+  window at 13,552 B against 401,688 B, delivered 166,996 B in the first second after the
+  application resumed against 803,952 B, and took 9,070 ms rather than 1,963 ms to reach 90% of
+  the link, never recovering the ~710 KB shortfall. Retention keyed to admitted samples is what
+  the algorithm this estimator implements does (`bbr_update_bw`'s
+  `if (!rs->is_app_limited || bw >= bbr_max_bw(sk))` guards the filter update, expiry included),
+  and it stays. The horizon's residency on a fast path remains longer than the draft's ten round
+  trips; that is a question about `BW_FILTER_WINDOW`'s length, and it is left for the raw
+  per-acknowledgement sample now recorded beside the filtered maximum to answer with numbers
+  from a path.
 
 - **The crate could not be packaged, and nothing in CI noticed for two months.**
   `core/src/lib.rs` inlined the repository-root README into the crate documentation with
