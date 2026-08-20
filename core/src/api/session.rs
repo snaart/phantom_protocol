@@ -10038,12 +10038,20 @@ mod tests {
     /// not true and a test that asserted it would pass anyway. Padding does not hide
     /// that a session ended: on a default-configured session nothing else pads, so the
     /// emitted size is unique to this frame and three copies before silence stay
-    /// legible. What it does is collapse the *body length* into a bucket — pinned
-    /// below by emitting one-, two- and three-byte control bodies and requiring one
-    /// wire length between them — so the size says a control frame went out and does
-    /// not say which one. That is what keeps a later subtype from being told apart
-    /// from a close by an observer counting bytes, and a single frame measured on its
-    /// own could never have shown it.
+    /// legible. What it does is collapse the *body length* into a bucket, so the size
+    /// says a control frame went out and does not say which one — which is what keeps
+    /// a later subtype from being told apart from a close by an observer counting
+    /// bytes.
+    ///
+    /// That claim spans two things and the assertions below split it accordingly. One,
+    /// the emitted frame is exactly the size the shaping policy asks for, not merely
+    /// bigger than its bare size: a step that announced `PADDED` and added the minimum
+    /// two-byte trailer would satisfy "bigger" and land in no bucket at all. Two, the
+    /// policy really does collapse a range of body lengths onto one size, checked over
+    /// one-, two- and three-byte bodies. The emitter cannot be asked for a two-byte
+    /// body — `CLOSE` is the only subtype and its body is empty — so the second half is
+    /// necessarily a statement about the policy, and the first is what ties the emitter
+    /// to it.
     #[tokio::test]
     async fn close_frame_seals_the_close_subtype_and_pads_its_body_length_into_a_bucket() {
         use crate::crypto::adaptive_crypto::AEAD_OVERHEAD;
@@ -10071,26 +10079,27 @@ mod tests {
             wire.len()
         );
 
-        // The bucket. Bodies of one, two and three bytes must all leave at the size the
-        // close leaves at — a padding step that only ever added a fixed trailer, or one
-        // that padded to a multiple of something the body length survives, fails here
-        // while still satisfying the "larger than bare" assertion above.
-        let mut sizes = Vec::new();
-        for body_len in 1..=3usize {
-            let mut body = vec![ControlSubtype::CLOSE];
-            body.resize(body_len, 0xEE);
-            let pkt = build_control_frame(&client_session, session_id, &body);
-            sizes.push(
-                client_session
-                    .protect_packet(&pkt)
-                    .expect("protect a control frame")
-                    .len(),
-            );
-        }
+        // One: the emitter landed on the bucket, not merely somewhere above `bare`.
+        let bucketed = |body_len: usize| {
+            PacketHeader::SIZE
+                + body_len
+                + shaping::padding_trailer_len(body_len, PaddingPolicy::Padme)
+                + AEAD_OVERHEAD
+        };
+        assert_eq!(
+            wire.len(),
+            bucketed(CONTROL_SUBTYPE_LEN),
+            "the close must be padded to the shaping policy's bucket; a trailer chosen \
+             any other way lands between buckets and is a size of its own"
+        );
+
+        // Two: the policy collapses a range of body lengths onto that one size, so the
+        // size cannot be read back as the subtype's body length.
+        let sizes: Vec<usize> = (1..=3).map(bucketed).collect();
         assert!(
             sizes.iter().all(|s| *s == wire.len()),
-            "control bodies of 1..=3 bytes must be one size on the wire, so the size \
-             does not name the subtype; got {sizes:?} against the close's {}",
+            "control bodies of 1..=3 bytes must be one size on the wire; got {sizes:?} \
+             against the close's {}",
             wire.len()
         );
 
