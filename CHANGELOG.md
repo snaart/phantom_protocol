@@ -80,9 +80,13 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `WIRE_VERSION` 7 → 8, `PROTOCOL_VERSION` 4 → 5.** The long-declared `CONTROL` flag
   (`0x0080`) now has a meaning: the AEAD plaintext of an `ENCRYPTED | CONTROL` frame leads
   with a one-byte subtype, and the first assignment, `0x01`, says the sender is closing this
-  session and will send nothing further on it. The frame is Padme-padded to a bucket like any
-  other short frame, carries no application bytes, and is emitted three times from the data
-  pump's teardown after the existing flush and drain.
+  session and will send nothing further on it. The frame is Padme-padded so its body length
+  reads as a bucket rather than a length — a control frame with a one-, two- or three-byte
+  body is one size on the wire, so the size does not name the subtype — carries no
+  application bytes, and is emitted three times from the data pump's teardown after the
+  existing flush and drain. Padding does not hide that a session ended: on a default-
+  configured session nothing else pads, so three same-size datagrams before silence stay
+  legible, and hiding that would take the session padding its data too.
 
   The defect is a slot that outlives the client holding it. `SessionCommand::Close` flushed
   the send queue and left the pump without putting a byte on the wire. On a byte pipe that

@@ -1048,13 +1048,23 @@ as on any other packet. The frame carries no application bytes, so one never rea
 `recv()`.
 
 **Padding.** A sender **must** pad a `CONTROL` frame to a § 4.8 bucket, setting
-`PADDED`, regardless of the session's data-padding policy — an unpadded `CLOSE` is
-`15 + 1 + 16 = 32` bytes of header-plus-ciphertext, a size nothing else in the
-protocol emits, occurring exactly once, immediately before a session goes quiet.
-That is a shape an observer reads without breaking anything. A receiver, however,
-**must not** require the flag: `PADDED` means only "a trailer is present", so a
-control frame that arrives without it is well-formed and its plaintext is read
-as-is.
+`PADDED`, regardless of the session's data-padding policy. Be precise about what this
+buys, because the broad claim is false and a receiver that believed it would be
+misled about its own exposure. An unpadded `CLOSE` is `15 + 1 + 16 = 32` bytes of
+header-plus-ciphertext — a length that *is* its plaintext length, read straight off
+the wire. Padding collapses that into a bucket, so a `CONTROL` frame with a one-,
+two- or three-byte body is one size, and the size therefore says a control frame went
+out without saying which subtype it carried. That is what keeps a later subtype from
+being told apart from a `CLOSE` by an observer counting bytes.
+
+What it does **not** do is hide that a session ended. On a session whose data path
+pads nothing — the default (§ 4.8) — the padded control size is still a size nothing
+else emits, and one or more copies of it followed by silence remain legible. Removing
+*that* takes the session padding its data frames too, which is a deployment's
+decision and costs bandwidth on every packet, not something this frame can achieve on
+its own. A receiver, in any case, **must not** require the flag: `PADDED` means only
+"a trailer is present", so a control frame that arrives without it is well-formed and
+its plaintext is read as-is.
 
 **Subtype registry.** Assignments grow from the bottom. `0x00` is deliberately left
 unassigned so that a zeroed buffer is not a valid control frame.
