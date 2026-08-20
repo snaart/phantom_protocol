@@ -18,6 +18,24 @@ import pathlib
 import sys
 from collections import defaultdict
 
+def filtered_max_label(rows):
+    """Name the statistic `bottleneck_bw_bps` is, using the run's own horizon.
+
+    The horizon travels in every window row (`bw_filter_window_ms`), written by
+    the daemon from the constant its estimator was built with, so this reads it
+    off the artifact instead of holding a copy. A copy is how the one line whose
+    job is to say which window a maximum was taken over comes to name a window
+    the run was never taken over — and a label naming the wrong window is worse
+    than a label naming none, which is what the rows without the field get.
+    """
+    horizons = {r.get("bw_filter_window_ms", 0) for r in rows}
+    horizons.discard(0)
+    if len(horizons) != 1:
+        # Either an older archive that predates the field, or a mixed one. Both
+        # cases are answered by declining to name a number.
+        return "filtered max over the estimator's horizon"
+    return f"filtered max over {horizons.pop() / 1000:g}s horizon"
+
 
 def read_jsonl(path):
     """Yield records, skipping lines a truncated run left half-written."""
@@ -405,6 +423,71 @@ def analyze_server(server_dir):
                 f"bw peak {max(bw) * 8 / 1e6:6.2f} Mbit/s"
             )
             print(f"  {'':26} phases: {' → '.join(states)}")
+            # Two readings of the estimator against what the connection actually
+            # delivered, printed so that the statistic behind each is impossible
+            # to mistake for the other's.
+            #
+            # That is the whole reason both are here. The advertised figure
+            # (`bottleneck_bw_bps`) is a **maximum over the estimator's
+            # horizon**, which the rows themselves name and the line below
+            # prints; the denominator is a **mean over the gap between two
+            # samples**. A
+            # maximum over the longer window exceeds a mean over the shorter one
+            # by construction, and the probing round of the gain cycle adds to
+            # that honestly — one round in four asks the path for a quarter more
+            # than the estimate. So a ratio modestly above one is partly the two
+            # statistics disagreeing and partly the estimator, and the filtered
+            # column alone cannot say in what proportion. The second reading
+            # (`last_delivery_rate_bps`) is a **single acknowledgement's rate**,
+            # taken before the filter had a say: unfiltered, so it carries none
+            # of the horizon's memory. If it tracks the delivered mean while the
+            # advertised figure sits far above it, the filter is holding a peak;
+            # if it reads high too, the sample arithmetic is.
+            #
+            # Reporting the two with the same summary statistics would put the
+            # instrument back inside the error it exists to separate, so it does
+            # not. The maximum is a windowed statistic and its own distribution
+            # across a sweep is meaningful, so it gets a median, a p90 and a
+            # peak. The raw column is a point sample landing wherever the
+            # sampler's instant happened to fall, so its spread across a sweep is
+            # sampling noise rather than a property of the connection: only its
+            # median is printed, and the line says so. Anything read off a tail
+            # of that column would be a statement about when the sampler ticked.
+            #
+            # Only intervals of real delivery count. A window where nothing was
+            # delivered has no rate to be a multiple of.
+            est_ratio, raw_ratio = [], []
+            for a, b in zip(rows, rows[1:]):
+                span_s = (b["t_unix_ns"] - a["t_unix_ns"]) / 1e9
+                grew = b["delivered_bytes"] - a["delivered_bytes"]
+                if span_s <= 0 or grew <= 0:
+                    continue
+                actual = grew / span_s
+                est_ratio.append(b["bottleneck_bw_bps"] / actual)
+                raw = b.get("last_delivery_rate_bps", 0)
+                if raw:
+                    raw_ratio.append(raw / actual)
+            if est_ratio:
+                print(
+                    f"  {'':26} vs delivered (mean over each interval), "
+                    f"{len(est_ratio)} intervals:"
+                )
+                print(
+                    f"  {'':26}   {filtered_max_label(rows)}: "
+                    f"median {pct(est_ratio, 0.5):.2f}×, p90 {pct(est_ratio, 0.9):.2f}×, "
+                    f"peak {max(est_ratio):.2f}×"
+                )
+                if raw_ratio:
+                    print(
+                        f"  {'':26}   single-ack sample (unfiltered, point): "
+                        f"median {pct(raw_ratio, 0.5):.2f}× over {len(raw_ratio)} "
+                        f"intervals — spread omitted, it is sampler noise"
+                    )
+                else:
+                    print(
+                        f"  {'':26}   single-ack sample: absent — run predates the "
+                        f"column, so the split above cannot be made"
+                    )
             if max(cw) <= 5600:
                 print("  \033[33m" + " " * 26 + "never left the 5600 B floor — sender-bound\033[0m")
 
@@ -438,11 +521,51 @@ def analyze_server(server_dir):
         print(f"  {n:>5}x  {kind:18} {detail}")
 
 
+def self_test():
+    """Check that the filtered-maximum label is read off the rows, not held here.
+
+    The label is the one line whose job is to say which window the maximum was
+    taken over, so it is the one line that must never state a horizon from
+    memory. Three shapes cover it: rows carrying a horizon (name it), rows
+    predating the field (name none), and rows disagreeing (name none, because
+    naming either would be naming the wrong one for half the run).
+    """
+    cases = [
+        ([{"bw_filter_window_ms": 10000}] * 3, "filtered max over 10s horizon"),
+        ([{"bw_filter_window_ms": 4500}] * 3, "filtered max over 4.5s horizon"),
+        ([{}, {}], "filtered max over the estimator's horizon"),
+        ([{"bw_filter_window_ms": 0}], "filtered max over the estimator's horizon"),
+        (
+            [{"bw_filter_window_ms": 10000}, {"bw_filter_window_ms": 4000}],
+            "filtered max over the estimator's horizon",
+        ),
+    ]
+    failures = 0
+    for rows, want in cases:
+        got = filtered_max_label(rows)
+        status = "ok" if got == want else "FAIL"
+        if got != want:
+            failures += 1
+        print(f"  {status}: {rows} -> {got!r} (want {want!r})")
+    print(f"{len(cases) - failures}/{len(cases)} ok")
+    return 1 if failures else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir", type=pathlib.Path, help="client run directory (contains run.json)")
+    ap.add_argument("run_dir", type=pathlib.Path, nargs="?", help="client run directory (contains run.json)")
     ap.add_argument("--server-dir", type=pathlib.Path, help="server data directory (sessions.jsonl etc.)")
+    ap.add_argument(
+        "--self-test",
+        action="store_true",
+        help="check the label derivations against fixed inputs and exit",
+    )
     args = ap.parse_args()
+
+    if args.self_test:
+        sys.exit(self_test())
+    if args.run_dir is None:
+        ap.error("run_dir is required unless --self-test is given")
 
     analyze_client(args.run_dir)
     if args.server_dir:

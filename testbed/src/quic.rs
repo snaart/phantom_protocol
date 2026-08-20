@@ -487,6 +487,11 @@ impl MsgLink for QuicLink {
                 cwnd_bytes: s.path.cwnd,
                 inflight_bytes: 0,
                 bottleneck_bw_bps: 0,
+                last_delivery_rate_bps: 0,
+                // Zero rather than the library's horizon: quinn's controller has
+                // no windowed maximum, so naming one here would attach a window
+                // to a column that carries no reading.
+                bw_filter_window_ms: 0,
                 pacing_rate_bps: 0,
                 min_rtt_us: s.path.rtt.as_micros() as u64,
                 delivered_bytes: 0,

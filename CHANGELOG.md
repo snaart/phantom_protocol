@@ -386,6 +386,60 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **`core/examples/bottleneck_sim.rs` — a bottleneck-link model driven by the real congestion
+  controller, so a claim about it can be checked from the tree.** A fixed-rate link with a FIFO
+  queue and a fixed propagation delay, ticked a millisecond at a time, with the sender's window
+  and pacing rate read from `BandwidthEstimator` on every acknowledgement, against three
+  scripted demands: a resume after a quiet stretch longer than the filter horizon, the same with
+  the link degrading while the application is quiet, and a fall in capacity long enough to fill
+  the sliding filters and outlive one horizon. It exists because loopback cannot see this class
+  of defect at all — at a round trip of microseconds a five-kilobyte window still yields a
+  hundred megabits — and the WAN harness under `testbed/`, which is where any published
+  performance number comes from, needs two hosts and a campaign.
+
+  It is a model and not a measurement, and the distinction is load-bearing: what it settles is a
+  *comparison* between two builds of one file, so no figure it prints belongs in a document
+  describing a path. Beside the throughput figures each scenario reports the estimator's reading
+  against an unbounded windowed maximum kept inside the harness and fed the samples the
+  estimator's own gate admits, plus how many candidates that unbounded filter held at its
+  longest — the run's only evidence that a length rule was engaged at all, since below the bound
+  the two cannot disagree. The congestion-control figures in this changelog's `Fixed` section
+  are reproducible by running it.
+
+- **`transport::bandwidth_estimator::BW_FILTER_WINDOW` is public, and the WAN harness's
+  `WindowSample` carries it as `bw_filter_window_ms`.** A recorded run's `bottleneck_bw_bps` is
+  a maximum over that horizon and gets read against a mean over a much shorter sample interval,
+  so the line reporting the two has to name the window the first was taken over. It named it
+  from a constant restated in `analyze.py`, which is right until the horizon moves and then
+  becomes a label confidently naming a window the run was never taken over — worse than a label
+  naming none. The daemon now writes the horizon into every window row from the library it was
+  built with, and `analyze.py` derives the label from the rows, printing no figure at all when
+  the rows carry none. Defaulted on deserialize, so archives recorded before the field still
+  load and read as unknown rather than as zero seconds; zero on the `quic` reference leg, whose
+  controller has no such filter.
+
+- **`BandwidthSnapshot::last_delivery_rate_bps` — the raw per-acknowledgement delivery rate,
+  beside the filtered maximum.** A recorded run is read by dividing `bottleneck_bw_bps` by the
+  growth of the delivered-byte counter over the same interval, and that ratio cannot be
+  interpreted on its own: the numerator is a maximum over a ten-second horizon and the
+  denominator a mean over a much shorter sample interval, so a maximum over the longer window
+  exceeds a mean over the shorter one by construction — and the probing round of the gain
+  cycle adds to it honestly, since one round in four deliberately asks the path for a quarter
+  more than the estimate. The estimator already computed the figure that separates the two and
+  then discarded it. It is now kept, exposed through `BandwidthEstimator::last_delivery_rate`
+  and carried into the WAN harness's window series, where `analyze.py` reports both ratios per
+  session: a raw sample tracking the delivered rate while the estimate sits far above it is
+  the filter holding a peak, and a raw sample that itself reads high is the sample arithmetic.
+  Each printed line names the statistic behind it — `filtered max over 10s horizon` and
+  `single-ack sample (unfiltered, point)`, both against `delivered (mean over each interval)` —
+  because the pair is only readable if the two cannot be mistaken for the same kind of number.
+  The raw column is reported as a median alone: it is whichever acknowledgement happened to
+  land last before the sampler's instant, so its spread across a sweep describes the sampler's
+  cadence rather than the connection, and a percentile of it would be the mismatch the column
+  exists to expose, one size down. It is an observable and not an input — nothing in the
+  control loop reads it back. Note that `BandwidthSnapshot` has public fields and no
+  `#[non_exhaustive]`, so code that constructs one literally needs the new field.
+
 - **`unencrypted_dropped_total` in the metrics snapshot, and an always-on test that drives the
   gate it counts.** The receive path drops every unencrypted post-handshake packet — the
   stripped-flag downgrade defence, and the one thing standing between a forged standalone
@@ -584,6 +638,100 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   only unreadable.
 
 ### Fixed
+
+- **Both sliding filters were as long as the peer cared to make them.** `WindowFilter`'s deque
+  is pruned from the front by the horizon and from the back by domination, and a monotone
+  sequence defeats the second rule entirely: a strictly falling run of delivery rates
+  dominates nothing, so every sample is appended and none removed until the horizon reaches
+  it. At 40 Mbit/s with 1156-byte segments that is on the order of forty thousand entries per
+  direction per session, and the acknowledgement cadence shaping the sequence is the peer's.
+  The min-RTT filter has the same shape through a strictly rising run, and a peer holds that
+  end too — it cannot lower a round trip below the path's, but it can raise every one of them
+  by sitting on its acknowledgements a little longer each time.
+
+  Both deques are now bounded at 1024 entries — the ARQ send buffer's segment cap, hence the
+  most acknowledgements one round trip can return, and tied to `MAX_PENDING_PACKETS` by a
+  compile-time assertion rather than by a comment claiming the derivation. **Neither is
+  truncated**, and the count is one neither of them counts. Each is bounded by a minimum time
+  separation between retained entries, applied to the half of the deque its reading does not
+  come from: a sample that would move the reading — higher in the maximum filter, lower in the
+  minimum one — is admitted whatever the length rule would prefer, and only *successors*, which
+  can be read at all once everything ahead of them has expired, are thinned. Thinning them by
+  time costs at most one separation of the horizon each covers, so the reading is at every
+  instant between the unbounded windowed extremum and the unbounded extremum over a horizon one
+  separation shorter. The length then follows as arithmetic rather than as a cap someone checks,
+  and the separation is derived from the horizon to land on exactly this figure — the divisor is
+  one *less* than the ceiling, and both halves of that are pinned by a test.
+
+  The two rules are mirror images and deliberately not one shared rule. The deques run in
+  opposite directions, so the rule that thins a maximum filter's successors admits every sample
+  of a rising run in a minimum filter and vice versa; each filter driven by the other's rule
+  grows as long as the peer cares to make it, which is the failure the bound exists for. Both
+  substitutions are applied in the test suite and both go red.
+
+  **Count-truncation was tried on the maximum filter first and is recorded because it does not
+  err in the direction it was argued to.** Evicting the deque's back at a ceiling looks safe
+  from one step: the back is the least of everything retained, so the survivors are real
+  unexpired observations and a bounded maximum sits at or below an unbounded one. That argument
+  is about a single instant and holds only while the front survives. The back of a falling run is
+  where the recent, larger candidates are, so eviction strands the deque as "the oldest entries
+  plus the newest" — it removes the head's successors, and when the head ages out the reading
+  drops to a value the path stopped offering a horizon ago instead of to the next-best thing
+  still standing. On the `thin` scenario of `core/examples/bottleneck_sim.rs` — a link falling
+  from 4 MB/s to 0.4 MB/s over three seconds, held there past one horizon, then restored, with
+  an unbounded filter holding up to 2307 candidates against the 1024 bound — truncation's worst
+  instant reads 0.71 of the honest windowed maximum against 0.99 for the separation rule. The
+  same substitution is applied in the test suite and goes red by 3.1× at the first instant past
+  the retained prefix's expiry.
+
+- **Withdrawn during this window, recorded because the measurement is worth more than the
+  silence: ageing the bandwidth horizon on every acknowledgement rather than on the ones it
+  admits.** The expiry loop lives inside `WindowFilter::update_max`, which `on_ack` reaches
+  only for samples that pass the application-limited gate, so a peak can outlive its ten
+  seconds while a flow stays application-limited. Running `expire` unconditionally at the top
+  of `on_ack` was tried as the stricter reading of "ten seconds". It defeats the gate instead
+  of tightening it: the gate's escape clause admits an application-limited sample that is at or
+  above the current maximum, and against a freshly emptied horizon that maximum is zero, so the
+  clause becomes vacuously true and the application's own write rate is installed as the path's
+  capacity — the one thing the gate exists to refuse. Extending the existing
+  `test_app_limited_filtering` by a single acknowledgement, enough to cross the horizon, took
+  the estimate from 700,000 B/s to 7,600 B/s.
+
+  The figures below are this tree's, from `core/examples/bottleneck_sim.rs`, which is committed
+  for exactly that reason: a number nothing in the repository can re-derive is an assertion, not
+  a measurement. Reproduce the withdrawn arm by inserting `self.bw_filter.expire(now);` and
+  `self.btl_bw = self.bw_filter.head().unwrap_or(0);` immediately above the admission test in
+  `BandwidthEstimator::on_ack` and running the harness on both builds. Its `resume` scenario —
+  a 1 MB/s link at a 200 ms round trip, six seconds of bulk, sixteen of 4 KB request/response,
+  then twelve of bulk again — reads, withdrawn arm against shipped:
+
+  - `btl_bw` when the application resumed: **34,653 B/s against 1,003,984** on a link offering
+    1,000,000; the window with it, **13,860 B against 401,592**.
+  - Delivered in the first second after the resume: **49,000 B against 796,600**; in the
+    second, **124,600 B against 1,787,800**.
+  - Reached 90% of the link at **11,387 ms against 1,107 ms**, and over the whole twelve-second
+    phase delivered **4,064,200 B against 11,249,000** — a shortfall of about 7.2 MB that a
+    longer run does not recover, because `Session::on_packet_acked` sets the pacer from that
+    figure on every acknowledgement and never disables it.
+
+  **The other side of the trade, which the first account of it left out.** The change is *for*
+  the case where the path degrades while the application is quiet, and there it buys something
+  real. The harness's `degrade` scenario is the same script with the link losing three quarters
+  of its capacity during the quiet stretch: the withdrawn arm holds the widest round trip in the
+  recovery phase to **272 ms against 1,602 ms** — the shipped build spends that time draining a
+  queue it sized from an estimate the path no longer supports. It pays for it in the same
+  currency as above: **49,000 B against 205,800** delivered in the first second, and 90% of the
+  (slower) link at **6,442 ms against 1,095 ms**. A sixfold cut in the worst queueing delay
+  after a degradation, against a fifteenfold cut in throughput at every resume, on a shape the
+  quiet stretch is the normal case for — that is the trade, and it is the wrong way round.
+
+  Retention keyed to admitted samples is also what the algorithm this estimator implements does
+  (`bbr_update_bw`'s `if (!rs->is_app_limited || bw >= bbr_max_bw(sk))` guards the filter
+  update, expiry included), so this is a divergence from it rather than a repair of it, and it
+  stays out on the numbers rather than on the citation. The horizon's residency on a fast path
+  remains longer than the draft's ten round trips; that is a question about `BW_FILTER_WINDOW`'s
+  length, and it is left for the raw per-acknowledgement sample now recorded beside the filtered
+  maximum to answer with numbers from a path rather than from a model.
 
 - **The crate could not be packaged, and nothing in CI noticed for two months.**
   `core/src/lib.rs` inlined the repository-root README into the crate documentation with

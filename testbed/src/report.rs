@@ -321,7 +321,8 @@ pub struct MessageIntegritySample {
 /// `cwnd` and a smoothed RTT and nothing else of this shape, so only
 /// `cwnd_bytes` and `min_rtt_us` carry values there — and `min_rtt_us` holds
 /// quinn's *smoothed* RTT, which is a different statistic from Phantom's
-/// windowed minimum. `inflight_bytes`, `bottleneck_bw_bps`, `pacing_rate_bps`,
+/// windowed minimum. `inflight_bytes`, `bottleneck_bw_bps`,
+/// `last_delivery_rate_bps`, `bw_filter_window_ms`, `pacing_rate_bps`,
 /// `delivered_bytes` and `app_limited` stay zero/false rather than being filled
 /// with an approximation, and `state` reads `quic:cubic` — quinn's default
 /// controller is loss-based, so it has no BBR phase to report and its window
@@ -338,6 +339,52 @@ pub struct WindowSample {
     pub inflight_bytes: u64,
     /// Estimated bottleneck bandwidth, bytes/sec.
     pub bottleneck_bw_bps: u64,
+    /// The single most recent delivery-rate sample, bytes/sec — the figure the
+    /// estimator computed for the last acknowledgement, before its maximum
+    /// filter decided whether to retain it.
+    ///
+    /// Recorded because the field above cannot answer the question a run
+    /// actually asks of it. `bottleneck_bw_bps` is a maximum over the
+    /// estimator's horizon — the one `bw_filter_window_ms` below names — and it
+    /// gets compared against bytes delivered over a 500 ms
+    /// sample interval; a maximum over the longer window exceeds a mean over
+    /// the shorter one by construction, so a ratio modestly above one is partly
+    /// an artefact of comparing two different statistics rather than evidence of
+    /// anything. With the raw sample in the same row the two come apart: a raw
+    /// sample tracking the delivered rate while the estimate sits far above it
+    /// is a retained peak, and a raw sample that itself reads high is the sample
+    /// arithmetic.
+    ///
+    /// **It is a point sample and only its central value across a sweep means
+    /// anything.** The sampler takes whichever acknowledgement happened to be
+    /// the last one before its instant, so the spread of this column over a run
+    /// describes the sampler's cadence rather than the connection — reading a
+    /// p90 or a peak off it would put the instrument back inside the very
+    /// mismatch between statistics it was added to separate. `analyze.py` prints
+    /// a median here and percentiles only for `bottleneck_bw_bps`, and names the
+    /// statistic behind each line so the two cannot be read as the same kind of
+    /// number.
+    ///
+    /// Defaulted on deserialize so runs recorded before it existed still load;
+    /// it reads zero on the `quic` leg and on any run older than this field.
+    #[serde(default)]
+    pub last_delivery_rate_bps: u64,
+    /// The horizon `bottleneck_bw_bps` is a maximum over, in milliseconds, read
+    /// from the library this binary was built against.
+    ///
+    /// It rides in the row because the row is what someone reads a year later,
+    /// and the two numbers beside each other are only interpretable if the
+    /// window behind the first one is known. Carrying it here is the difference
+    /// between an analysis script *deriving* that window and *remembering* it: a
+    /// remembered copy goes stale the day the constant moves, and the failure is
+    /// a label confidently naming a window the run was never taken over, which
+    /// is worse than a label naming none at all.
+    ///
+    /// Zero on the `quic` reference leg, whose controller has no such filter,
+    /// and on any run recorded before this field existed. `analyze.py` prints
+    /// the horizon only when the rows carry one.
+    #[serde(default)]
+    pub bw_filter_window_ms: u64,
     pub pacing_rate_bps: u64,
     pub min_rtt_us: u64,
     pub delivered_bytes: u64,
@@ -1205,6 +1252,85 @@ mod tests {
             "and its unmeasured profile must read as empty, not as zero reordering"
         );
         assert_eq!(s.reorder.horizon, 0, "a zero horizon marks it unmeasured");
+    }
+
+    /// A window row has to name the horizon its filtered maximum was taken
+    /// over, because the analysis that reads the row a year later must not have
+    /// to remember it.
+    ///
+    /// The alternative was a copy of the constant in `analyze.py`, and a copy is
+    /// only ever right until the constant moves — after which the one line whose
+    /// job is to name the statistic names the wrong window, silently and with
+    /// full confidence. So the horizon travels in the artifact, and the reader
+    /// derives the label from it.
+    #[test]
+    fn a_window_row_names_the_horizon_its_filtered_maximum_was_taken_over() {
+        let row = phantom_leg_window_row();
+        assert_ne!(
+            row.bw_filter_window_ms, 0,
+            "a Phantom-leg row that names no horizon leaves the reader to guess \
+             which window `bottleneck_bw_bps` is a maximum over"
+        );
+        assert_eq!(
+            row.bw_filter_window_ms,
+            phantom_protocol::transport::bandwidth_estimator::BW_FILTER_WINDOW.as_millis() as u64,
+            "the recorded horizon has to be the one the estimator in this binary \
+             was built with, not a figure restated beside it"
+        );
+
+        let back: WindowSample = serde_json::from_str(
+            &serde_json::to_string(&row).expect("a window row must serialize"),
+        )
+        .expect("and load back");
+        assert_eq!(back.bw_filter_window_ms, row.bw_filter_window_ms);
+    }
+
+    /// Every archive recorded before the horizon was written down still has to
+    /// load — the whole reason a run is kept is that it can be re-read against a
+    /// later change.
+    ///
+    /// Such a row reads zero, which is the signal `analyze.py` turns into a
+    /// label that names no window at all. Naming one would be worse: the reader
+    /// would be told a horizon nobody recorded.
+    #[test]
+    fn a_window_row_recorded_before_the_horizon_was_named_still_loads() {
+        let old = r#"{"leg":"udp","phase":"upload","t_unix_ns":1,"elapsed_ms":500,
+            "cwnd_bytes":401688,"inflight_bytes":120000,"bottleneck_bw_bps":1000000,
+            "pacing_rate_bps":1000000,"min_rtt_us":235000,"delivered_bytes":500000,
+            "state":"probe_bw","app_limited":false}"#;
+        let s: WindowSample = serde_json::from_str(old).expect("an older window row must load");
+        assert_eq!(s.bottleneck_bw_bps, 1_000_000);
+        assert_eq!(
+            s.bw_filter_window_ms, 0,
+            "a row from before the field marks its horizon unknown, so the label \
+             declines to name one"
+        );
+        assert_eq!(
+            s.last_delivery_rate_bps, 0,
+            "and the raw sample it also predates stays absent rather than reading \
+             as a measured zero"
+        );
+    }
+
+    /// A window row shaped the way the Phantom legs record one.
+    fn phantom_leg_window_row() -> WindowSample {
+        WindowSample {
+            leg: Leg::Udp,
+            phase: "upload".to_string(),
+            t_unix_ns: 1,
+            elapsed_ms: 500,
+            cwnd_bytes: 401_688,
+            inflight_bytes: 120_000,
+            bottleneck_bw_bps: 1_000_000,
+            last_delivery_rate_bps: 980_000,
+            bw_filter_window_ms: phantom_protocol::transport::bandwidth_estimator::BW_FILTER_WINDOW
+                .as_millis() as u64,
+            pacing_rate_bps: 1_000_000,
+            min_rtt_us: 235_000,
+            delivered_bytes: 500_000,
+            state: "probe_bw".to_string(),
+            app_limited: false,
+        }
     }
 
     #[test]

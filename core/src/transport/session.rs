@@ -1372,6 +1372,7 @@ impl Session {
         let est = self.bandwidth_estimator.lock();
         BandwidthSnapshot {
             bottleneck_bw_bps: est.bottleneck_bandwidth(),
+            last_delivery_rate_bps: est.last_delivery_rate(),
             min_rtt: est.min_rtt(),
             pacing_rate_bps: est.pacing_rate(),
             cwnd_bytes: est.cwnd(),
@@ -1712,6 +1713,30 @@ impl Session {
 #[derive(Debug, Clone, Copy)]
 pub struct BandwidthSnapshot {
     pub bottleneck_bw_bps: u64,
+    /// The most recent delivery-rate sample, before the estimator's maximum
+    /// filter decided whether to keep it.
+    ///
+    /// It travels beside `bottleneck_bw_bps` rather than replacing it because
+    /// the pair is what makes a recorded run readable. That field is a maximum
+    /// over [`BW_FILTER_WINDOW`](crate::transport::bandwidth_estimator::BW_FILTER_WINDOW);
+    /// the throughput a run gets compared against is
+    /// a mean over a much shorter interval, and a maximum over the longer window
+    /// exceeds a mean over the shorter one for reasons that have nothing to do
+    /// with the estimator being wrong. Which of those two a high-looking ratio
+    /// is cannot be settled from the filtered figure alone: a raw sample that
+    /// tracks the delivered rate while the estimate sits far above it is the
+    /// filter retaining a peak, and a raw sample that itself reads high is the
+    /// sample arithmetic.
+    ///
+    /// **It is a point sample, and reading a spread off it would repeat in
+    /// miniature the mismatch it exists to expose.** Whoever takes this snapshot
+    /// gets whichever single acknowledgement happened to arrive last before the
+    /// instant they asked; the value's variation across a sweep is a fact about
+    /// when the sampler ticked, not about the connection. A central value over
+    /// many intervals is meaningful and a tail of them is not — `analyze.py`
+    /// prints a median for this column and percentiles only for the filtered
+    /// one, and labels each with the statistic behind it for that reason.
+    pub last_delivery_rate_bps: u64,
     pub min_rtt: Duration,
     pub pacing_rate_bps: u64,
     pub cwnd_bytes: u64,
