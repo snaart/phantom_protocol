@@ -3518,6 +3518,195 @@ async fn an_authenticated_close_drains_trailing_data_and_then_ends_the_session()
     );
 }
 
+/// While a session is draining its peer's close, **no API returns `Ok` for a payload
+/// it will not send**, and every accessor that describes the session agrees about it.
+///
+/// The draining window removed a silent data loss on the receive side and, left at
+/// that, would have installed the same defect on the send side. For the 200–600 ms
+/// the window lasts the pump refuses application writes — it has to, the peer's
+/// session is over — and the API in front of it kept reporting `Connected`,
+/// data-ready, nothing queued, no error, and returned `Ok(())` for every byte the
+/// pump then dropped. A caller in any of the four bound languages had no way to learn
+/// its write was discarded, which is the thing the window was built to stop.
+///
+/// So the session publishes `ConnectionState::Draining` at the packet that carried
+/// the close, and this pins the whole surface against it at once: the state, the
+/// readiness answer derived from it, the session write, the stream writes, the queue
+/// depth, the readiness wait and the error slot. They are asserted together on
+/// purpose — the failure this reproduces was not any one of them being wrong, it was
+/// four of them agreeing with each other and disagreeing with the pump.
+///
+/// The final assertion that the window still ends is what stops this passing on a
+/// build that simply never leaves `Draining`: refusing every write forever would
+/// satisfy everything above it and would be a worse session than the one it replaced.
+#[tokio::test]
+async fn a_draining_session_refuses_writes_instead_of_discarding_them_behind_an_ok() {
+    use phantom_protocol::api::session::ConnectionState;
+    use phantom_protocol::api::PhantomSession;
+    use phantom_protocol::transport::handshake::ServerReply;
+    use phantom_protocol::CoreError;
+
+    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let (to_server_tx, mut to_server_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let client_transport = PipeTransport {
+        to_peer: to_server_tx,
+        from_peer: tokio::sync::Mutex::new(to_client_rx),
+    };
+
+    let server_hs = HandshakeServer::new().expect("server handshake state");
+    let pinned = server_hs.verifying_key().clone();
+    let session = PhantomSession::connect_with_transport("pipe-peer:0", client_transport, pinned);
+
+    let client_ip = "127.0.0.1".parse().expect("client ip");
+    let server_session = loop {
+        let hello_bytes = to_server_rx.recv().await.expect("client hello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("decode client hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let wire = ServerReply::Retry(retry).to_wire().expect("encode retry");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send retry");
+            }
+            HandshakeResponse::Success(server_hello, negotiated, _) => {
+                let wire = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("encode server hello");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send server hello");
+                break negotiated;
+            }
+            HandshakeResponse::Reject(r) => panic!("server rejected its own client: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    };
+
+    session
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+
+    // Everything below the close has to be true of a healthy session first, or the
+    // assertions after it would be satisfied by a session that was never usable.
+    assert_eq!(session.connection_state(), ConnectionState::Connected);
+    assert!(session.is_data_ready());
+    let app_stream = session.open_stream();
+    session
+        .send(b"before-the-close".to_vec())
+        .await
+        .expect("a connected session accepts a write");
+
+    let session_id = *server_session.id();
+    let close_header = PacketHeader::new(
+        session_id,
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::CONTROL),
+    )
+    .with_epoch(server_session.current_epoch());
+    let close_ct = server_session
+        .encrypt_packet(&close_header, &[ControlSubtype::CLOSE], &[])
+        .expect("seal the close frame");
+    let close_wire = server_session
+        .protect_packet(&PhantomPacket::new(close_header, close_ct))
+        .expect("protect the close frame");
+    to_client_tx
+        .send(Bytes::from(close_wire))
+        .await
+        .expect("send close");
+
+    // Poll rather than sleep: the state has to be published at the packet, not at the
+    // send loop's next tick, and a sleep long enough to hide that difference is
+    // exactly the interval the defect lived in. The cap is far above the window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while session.connection_state() != ConnectionState::Draining
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        session.connection_state(),
+        ConnectionState::Draining,
+        "a session whose peer has announced its close must say so; reporting Connected \
+         while the pump discards every write is the silent loss this window exists to \
+         remove, moved to the other direction"
+    );
+    assert!(
+        !session.is_data_ready(),
+        "data-ready must not claim a session can carry data the pump will discard"
+    );
+
+    match session.send(b"after-the-close".to_vec()).await {
+        Err(CoreError::ConnectionClosed) => {}
+        Err(other) => panic!("send() while draining must be ConnectionClosed, got {other:?}"),
+        Ok(()) => panic!(
+            "send() returned Ok for a payload the pump discards — the caller has no \
+             way to learn its write was dropped"
+        ),
+    }
+    match app_stream.send_reliable(b"after-the-close".to_vec()).await {
+        Err(CoreError::ConnectionClosed) => {}
+        Err(other) => {
+            panic!("stream send_reliable while draining must be ConnectionClosed, got {other:?}")
+        }
+        Ok(()) => {
+            panic!("a stream write reaches the same pump and must be refused the same way")
+        }
+    }
+    match app_stream
+        .send_unreliable(b"after-the-close".to_vec())
+        .await
+    {
+        Err(CoreError::ConnectionClosed) => {}
+        Err(other) => {
+            panic!("stream send_unreliable while draining must be ConnectionClosed, got {other:?}")
+        }
+        Ok(()) => panic!("an unreliable stream write is discarded by the same arm"),
+    }
+    match app_stream.disconnect().await {
+        Err(CoreError::ConnectionClosed) => {}
+        Err(other) => {
+            panic!("stream disconnect while draining must be ConnectionClosed, got {other:?}")
+        }
+        Ok(()) => panic!("the FIN is a reliable write and the peer will never see it"),
+    }
+
+    assert_eq!(
+        session.queued_count().await,
+        0,
+        "a refused write must not be queued either — a non-zero depth here would mean \
+         bytes are waiting for a pump that will never send them"
+    );
+    match session.await_ready().await {
+        Err(CoreError::ConnectionClosed) => {}
+        other => {
+            panic!("await_ready() must not report a draining session ready to send; got {other:?}")
+        }
+    }
+    assert!(
+        session.last_error().await.is_none(),
+        "a peer leaving in an orderly way is not a failure, and reporting one would be \
+         as misleading in the other direction"
+    );
+
+    // The window is still bounded. Without this, refusing every write forever would
+    // satisfy every assertion above.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while session.connection_state() != ConnectionState::Closed
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        session.connection_state(),
+        ConnectionState::Closed,
+        "draining must end; a session that never leaves it is a resource the peer holds"
+    );
+}
+
 /// A frame stamped at the **previous** wire version is dropped before the flag
 /// dispatch, so it can neither end a session nor reach an application.
 ///

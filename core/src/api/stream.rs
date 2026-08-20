@@ -1,9 +1,13 @@
-use crate::api::session::SessionCommand;
-use crate::errors::CoreError;
-use crate::transport::multiplexer::{StreamHandle, StreamMessage};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+
+use crate::api::session::{ConnectionState, SessionCommand};
+use crate::errors::CoreError;
+use crate::transport::multiplexer::{StreamHandle, StreamMessage};
 
 /// A single multiplexed stream inside an established [`PhantomSession`].
 ///
@@ -21,15 +25,48 @@ pub struct PhantomStream {
     tx: mpsc::Sender<SessionCommand>,
     /// Receiver for incoming demultiplexed stream data
     rx: Mutex<mpsc::Receiver<StreamMessage>>,
+    /// The owning session's published [`ConnectionState`], shared with the session
+    /// handle and written by its data pump.
+    ///
+    /// A stream's writes go down the same command channel as the session's and are
+    /// refused by the same pump for the same reason, so they have to be able to ask
+    /// the same question before returning `Ok` to a caller. Without it a
+    /// `send_reliable` during the peer's draining window reports success for bytes
+    /// that never reach the wire — the session-level defect, one layer down.
+    session_state: Arc<AtomicU8>,
 }
 
 impl PhantomStream {
-    pub fn new(handle: StreamHandle, tx: mpsc::Sender<SessionCommand>) -> Self {
+    pub fn new(
+        handle: StreamHandle,
+        tx: mpsc::Sender<SessionCommand>,
+        session_state: Arc<AtomicU8>,
+    ) -> Self {
         Self {
             stream_id: handle.stream_id,
             tx,
             rx: Mutex::new(handle.rx),
+            session_state,
         }
+    }
+
+    /// The owning session's current state.
+    fn session_state(&self) -> ConnectionState {
+        ConnectionState::from_u8(self.session_state.load(Ordering::Relaxed))
+    }
+
+    /// Refuse an outbound command the pump would discard.
+    ///
+    /// Only [`ConnectionState::Draining`] is refused here. Every other state either
+    /// still carries writes or already fails at the channel — a torn-down pump drops
+    /// the receiver, so `tx.send` errors on its own. Draining is the one state in
+    /// which the channel is alive, the command is accepted by it, and the pump then
+    /// throws the payload away.
+    fn refuse_while_draining(&self) -> Result<(), CoreError> {
+        if self.session_state() == ConnectionState::Draining {
+            return Err(CoreError::ConnectionClosed);
+        }
+        Ok(())
     }
 }
 
@@ -55,7 +92,13 @@ impl PhantomStream {
     /// Frame the messages yourself if you need them: write a length prefix ahead
     /// of each payload and accumulate `recv` results until the declared length is
     /// complete. `testbed/src/framing.rs` in this repository is a worked example.
+    ///
+    /// Returns [`CoreError::ConnectionClosed`] once the owning session is
+    /// [`Draining`](crate::api::session::ConnectionState::Draining) the peer's close,
+    /// without queueing anything: the peer's session is over, so this call cannot put
+    /// `data` on the wire.
     pub async fn send_reliable(&self, data: Vec<u8>) -> Result<(), CoreError> {
+        self.refuse_while_draining()?;
         self.tx
             .send(SessionCommand::SendStreamReliable {
                 stream_id: self.stream_id,
@@ -82,7 +125,12 @@ impl PhantomStream {
     /// prefix and sequence number and drop incomplete messages —
     /// `testbed/src/framing.rs` in this repository is a worked example of the
     /// framing half.
+    ///
+    /// Returns [`CoreError::ConnectionClosed`] once the owning session is
+    /// [`Draining`](crate::api::session::ConnectionState::Draining) the peer's close,
+    /// for the same reason as [`send_reliable`](Self::send_reliable).
     pub async fn send_unreliable(&self, data: Vec<u8>) -> Result<(), CoreError> {
+        self.refuse_while_draining()?;
         self.tx
             .send(SessionCommand::SendStreamUnreliable {
                 stream_id: self.stream_id,
@@ -151,7 +199,13 @@ impl PhantomStream {
     /// Named `disconnect` rather than `close` for the same reason as
     /// `PhantomSession::disconnect` — UniFFI's Kotlin generator emits
     /// `AutoCloseable.close()` on every object.
+    ///
+    /// The FIN is a reliable write like any other, so this returns
+    /// [`CoreError::ConnectionClosed`] once the owning session is
+    /// [`Draining`](crate::api::session::ConnectionState::Draining): the peer would
+    /// never see the EOF, and the stream is about to end with the session anyway.
     pub async fn disconnect(&self) -> Result<(), CoreError> {
+        self.refuse_while_draining()?;
         self.tx
             .send(SessionCommand::CloseStream {
                 stream_id: self.stream_id,
@@ -182,8 +236,78 @@ mod tests {
             stream_id,
             rx: stream_msg_rx,
         };
-        let ps = PhantomStream::new(handle, cmd_tx.clone());
+        let ps = PhantomStream::new(
+            handle,
+            cmd_tx.clone(),
+            Arc::new(AtomicU8::new(ConnectionState::Connected as u8)),
+        );
         (ps, stream_msg_tx, cmd_tx)
+    }
+
+    /// Every outbound call on a stream whose session is draining its peer's close is
+    /// refused, and refused without putting anything in the command channel.
+    ///
+    /// The channel is the point. It is alive and has room — the pump is still running,
+    /// still reading commands, and still needs to so that a `Close` can land — so a
+    /// write offered here is *accepted* by the channel and *discarded* by the pump,
+    /// which is a success return for bytes that never reach the wire. Asserting the
+    /// channel is still empty afterwards is what distinguishes a genuine refusal from
+    /// an error that happens to be returned by a queue that took the payload anyway.
+    ///
+    /// `recv()` is deliberately not refused and is checked here so that stays true: a
+    /// draining session is still reading, and the data behind the peer's close is the
+    /// whole reason the window exists.
+    #[tokio::test]
+    async fn a_draining_session_refuses_every_stream_write_without_queueing_it() {
+        let (stream_msg_tx, stream_msg_rx) = mpsc::channel::<StreamMessage>(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<SessionCommand>(16);
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let handle = StreamHandle {
+            stream_id: 3,
+            rx: stream_msg_rx,
+        };
+        let ps = PhantomStream::new(handle, cmd_tx, state.clone());
+
+        ps.send_reliable(b"connected".to_vec())
+            .await
+            .expect("a connected session accepts a stream write");
+        assert!(
+            cmd_rx.try_recv().is_ok(),
+            "the healthy case has to reach the channel, or the assertions below are \
+             satisfied by a stream that never worked"
+        );
+
+        state.store(ConnectionState::Draining as u8, Ordering::Relaxed);
+
+        assert!(matches!(
+            ps.send_reliable(b"draining".to_vec()).await,
+            Err(CoreError::ConnectionClosed)
+        ));
+        assert!(matches!(
+            ps.send_unreliable(b"draining".to_vec()).await,
+            Err(CoreError::ConnectionClosed)
+        ));
+        assert!(matches!(
+            ps.disconnect().await,
+            Err(CoreError::ConnectionClosed)
+        ));
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a refused write must not be sitting in the command channel — an error \
+             returned over a payload that was queued anyway is still a payload the \
+             pump will discard"
+        );
+
+        stream_msg_tx
+            .send(StreamMessage::Data(Bytes::from_static(b"behind-the-close")))
+            .await
+            .expect("the delivery channel is untouched");
+        assert_eq!(
+            ps.recv().await.expect("draining still reads"),
+            Some(b"behind-the-close".to_vec()),
+            "a draining session must keep delivering what was in flight behind the \
+             close; refusing reads too would restore the loss the window removed"
+        );
     }
 
     /// `recv()` returns `Ok(Some(bytes))` for a Data message.

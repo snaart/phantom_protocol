@@ -159,9 +159,24 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   The window is three times the session's own measured `min_rtt`, floored at 200 ms because a
   sub-millisecond measurement cannot size a timeout, and capped at 600 ms because that
   measurement is one a peer can inflate by delaying its acknowledgements — the length of a
-  local commitment must not be a number a remote party writes. Typically 300 ms, against the
-  135 s it replaces. While draining, the session accepts no new application writes and sends
-  nothing of its own.
+  local commitment must not be a number a remote party writes. On any real path it is one of
+  those two bounds and not the multiplication between them: a loopback session measures
+  `min_rtt` at 175–384 µs, so three of it is under a millisecond and the **floor** is what
+  binds, and on the 235 ms reference WAN path three of it is 705 ms so the **ceiling** does.
+  The 300 ms that falls out of the arithmetic belongs to a session that has never timed a
+  round trip — it is `3 ×` the estimator's opening guess — and one acknowledged packet
+  replaces it.
+
+  While draining, the session accepts no new application writes, and the API in front of it
+  says so rather than accepting them and dropping them. `connection_state()` publishes a new
+  `ConnectionState::Draining` at the packet that carried the close; `is_data_ready()` is
+  false; `PhantomSession::send`, `flush_queue`, `PhantomStream::send_reliable`,
+  `send_unreliable` and `PhantomStream::disconnect` all return
+  `CoreError::ConnectionClosed` without queueing anything; `await_ready()` answers the same;
+  `queued_count()` stays 0 because a refused write is refused rather than queued; and
+  `last_error()` stays `None`, because a peer leaving in an orderly way is not a failure.
+  `ConnectionState` is `#[non_exhaustive]`, so the added variant does not break exhaustive
+  matches in downstream crates, but it does widen the enum the bindings generate.
 
   Emitting the frame is not by itself enough for an operator to see anything. A server
   session's 19 CID routes were reclaimed only by triggers reactive to traffic a departed

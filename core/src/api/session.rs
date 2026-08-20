@@ -138,6 +138,28 @@ pub enum ConnectionState {
     /// The session is dead: the path stayed down past the migration idle-timeout
     /// with no recovery. Terminal — `recv()` errors instead of hanging (P4.3).
     Dead = 8,
+    /// The peer announced its own close (WIRE v8) and this side is reading out
+    /// whatever was still in flight behind it before letting go.
+    ///
+    /// Reading continues; **writing does not**. The peer's session is over, so a
+    /// payload accepted here would be one the pump discards, and the whole point of
+    /// publishing this state is that no caller is told otherwise:
+    /// [`PhantomSession::send`], [`PhantomStream::send_reliable`],
+    /// [`PhantomStream::send_unreliable`] and [`PhantomStream::disconnect`] all
+    /// refuse with [`CoreError::ConnectionClosed`] rather than returning `Ok` for
+    /// bytes that will never reach the wire, `is_data_ready()` is `false`, and
+    /// `queued_count()` stays `0` because a refused write is refused rather than
+    /// queued. It is not a failure: nothing went wrong, so `last_error()` stays
+    /// `None` unless something else already failed.
+    ///
+    /// The window is bounded and short — see `peer_close_drain_window` — after which
+    /// the session settles into [`Closed`](Self::Closed).
+    ///
+    /// [`PhantomStream`]: crate::api::stream::PhantomStream
+    /// [`PhantomStream::send_reliable`]: crate::api::stream::PhantomStream::send_reliable
+    /// [`PhantomStream::send_unreliable`]: crate::api::stream::PhantomStream::send_unreliable
+    /// [`PhantomStream::disconnect`]: crate::api::stream::PhantomStream::disconnect
+    Draining = 9,
 }
 
 /// Anti-fingerprint traffic-shaping configuration (WIRE v6). Set on
@@ -179,7 +201,10 @@ fn apply_shaping(session: &Session, cfg: TrafficShapingConfig) {
 }
 
 impl ConnectionState {
-    fn from_u8(v: u8) -> Self {
+    /// Read a state back out of the atomic the pump publishes it into. `pub(crate)`
+    /// because the stream handles read the same atomic to answer the same question
+    /// their session does.
+    pub(crate) fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::Connecting,
             4 => Self::Connected,
@@ -187,6 +212,7 @@ impl ConnectionState {
             6 => Self::Closed,
             7 => Self::Migrating,
             8 => Self::Dead,
+            9 => Self::Draining,
             // Includes the retired 1..=3: a value nothing writes any more is not
             // a state, and `Failed` is the safe reading of a number we cannot
             // interpret — it makes the session unusable rather than pretending
@@ -198,6 +224,13 @@ impl ConnectionState {
     /// Whether data can flow. `Migrating` counts as ready: the keep-alive window
     /// still accepts `send()` (buffered + retransmitted until the path recovers),
     /// so the embedder's send path doesn't error mid-migration.
+    ///
+    /// [`Draining`](Self::Draining) does **not**, and the distinction between it and
+    /// `Migrating` is the whole reason it is a separate state. Both keep reading;
+    /// only one of them still has somewhere to put a write. A migrating session's
+    /// peer is still there and its buffered bytes go out when the path returns; a
+    /// draining session's peer has said it is gone, so a byte accepted here is a
+    /// byte discarded at teardown.
     pub fn is_data_ready(&self) -> bool {
         matches!(self, Self::Connected | Self::Migrating)
     }
@@ -1953,6 +1986,10 @@ async fn run_data_pump<T: SessionTransport>(
     let transport_recv = transport.clone();
     let transport_send_ack = transport.clone();
     let crypto_recv = crypto_session.clone();
+    // The FFI-visible state, written from the receive side too: the peer's close
+    // arrives here, and the accessors that must stop claiming the session can carry a
+    // write read this atomic (see `ConnectionState::Draining`).
+    let state_recv = state.clone();
     let demux_recv = demux.clone();
     let streams_recv = streams.clone();
     let undelivered_reader = undelivered_bytes.clone();
@@ -2062,6 +2099,7 @@ async fn run_data_pump<T: SessionTransport>(
                 leg,
                 &cmd_tx_recv,
                 &incoming_stream_tx_recv,
+                &state_recv,
             )
             .await;
             // The peer announced its close on the packet just handled (WIRE v8).
@@ -2080,6 +2118,14 @@ async fn run_data_pump<T: SessionTransport>(
             // on the first copy, and never moved — a peer that keeps sending cannot
             // hold this loop open by talking.
             if crypto_recv.peer_closed() {
+                // Publish the draining state from here — the packet boundary at which
+                // the close is recorded — rather than leaving it to the send loop's
+                // next 10 ms tick. `send()` reads this atomic and nothing else, so for
+                // however long it lags the recorded close, the API is handing callers
+                // `Ok` for payloads the pump has already decided to discard. That is
+                // the defect the state exists to remove, so the two must not be
+                // separated by a scheduling interval.
+                state_recv.store(ConnectionState::Draining as u8, Ordering::Relaxed);
                 let deadline = *drain_deadline.get_or_insert_with(|| {
                     std::time::Instant::now() + peer_close_drain_window(&crypto_recv)
                 });
@@ -2181,6 +2227,13 @@ async fn run_data_pump<T: SessionTransport>(
                         "PhantomSession: peer announced session close; draining for {window:?}"
                     );
                     draining_until = Some(std::time::Instant::now() + window);
+                    // The receive task normally publishes this first, at the packet
+                    // that carried the close. Repeated here because the flag is set
+                    // inside `handle_packet`, so this loop can in principle observe it
+                    // before the receive loop reaches its own check — and a state that
+                    // still says `Connected` while this arm refuses writes is exactly
+                    // the disagreement between accessors that has to not exist.
+                    state.store(ConnectionState::Draining as u8, Ordering::Relaxed);
                 }
                 if let Some(until) = draining_until {
                     if std::time::Instant::now() >= until {
@@ -2311,10 +2364,15 @@ async fn run_data_pump<T: SessionTransport>(
                 // Draining (WIRE v8): the local side may still hand this pump writes
                 // after the peer has announced its close. They are refused rather than
                 // queued — the peer's session is over, so a byte accepted here would
-                // be a byte silently dropped at teardown, and the caller is better
-                // served by the session ending than by an `Ok` that means nothing. The
-                // arm keeps *reading* commands so `disconnect()` and a dropped handle
-                // still land; only the writes are declined.
+                // be a byte silently dropped at teardown. This is the second half of
+                // that refusal and not the first: `ConnectionState::Draining` is
+                // published the moment the close is recorded, and the send API reads it
+                // and returns an error, so what reaches here is only what was already
+                // in the channel or what raced the publish by less than a scheduling
+                // point. Dropping those silently is the residue of a genuine race and
+                // not a window — which is what the state moved it from. The arm keeps
+                // *reading* commands so `disconnect()` and a dropped handle still land;
+                // only the writes are declined.
                 if draining_until.is_some()
                     && matches!(
                         cmd_opt,
@@ -4070,6 +4128,10 @@ async fn handle_packet<T: SessionTransport>(
     // Sink where newly-registered peer-initiated streams are
     // pushed so `accept_stream()` can hand them to the embedder.
     incoming_stream_tx: &mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
+    // The session's published `ConnectionState`. Handed to every `PhantomStream`
+    // built here so a peer-initiated stream can refuse a write the pump would
+    // discard, exactly as a locally-opened one does.
+    session_state: &Arc<AtomicU8>,
 ) {
     let stream_id: u32 = packet.header.stream_id.into();
     let path_id = packet.header.path_id;
@@ -4715,6 +4777,7 @@ async fn handle_packet<T: SessionTransport>(
                     let phantom_stream = Arc::new(crate::api::stream::PhantomStream::new(
                         handle,
                         cmd_tx_for_stream.clone(),
+                        session_state.clone(),
                     ));
                     // Non-blocking push: a full incoming channel is a backpressure
                     // signal from the embedder (not consuming); don't block the reader.
@@ -4994,6 +5057,7 @@ impl PhantomSession {
         Arc::new(crate::api::stream::PhantomStream::new(
             handle,
             self.cmd_tx.clone(),
+            self.state.clone(),
         ))
     }
 
@@ -5025,6 +5089,11 @@ impl PhantomSession {
     ///
     /// - If the session is connected: sends immediately
     /// - If still handshaking: queues the data for auto-flush later
+    /// - If the peer has announced its close ([`ConnectionState::Draining`]):
+    ///   returns [`CoreError::ConnectionClosed`] without queueing anything. The
+    ///   peer's session is over, so this call cannot put `data` on the wire, and
+    ///   an `Ok` here would be the same silent loss the draining window exists to
+    ///   prevent on the receive side.
     /// - If the session is `Failed` or `Dead`: returns the captured terminal
     ///   error (from the handshake or the data pump) so the caller gets the
     ///   *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
@@ -5052,6 +5121,13 @@ impl PhantomSession {
     pub async fn send(&self, data: Vec<u8>) -> Result<(), CoreError> {
         let state = self.connection_state();
 
+        if state == ConnectionState::Draining {
+            // Refused before the branch below can read it as a terminal failure: the
+            // session has not failed, and reporting a failure for a peer's orderly
+            // departure would be as wrong in the other direction. `ConnectionClosed`
+            // says the one thing that is true of this call and of every one after it.
+            return Err(CoreError::ConnectionClosed);
+        }
         if state.is_data_ready() {
             // Channel is up — send directly
             self.cmd_tx
@@ -5096,8 +5172,16 @@ impl PhantomSession {
     }
 
     /// Returns the terminal error from a failed handshake or a dead session,
-    /// or `None` if the session has not failed (still connecting, connected, or
-    /// cleanly closed).
+    /// or `None` if the session has not failed (still connecting, connected,
+    /// draining the peer's close, or cleanly closed).
+    ///
+    /// A [`Draining`](ConnectionState::Draining) session reads `None` here on
+    /// purpose, and that is not in tension with `send()` returning
+    /// [`CoreError::ConnectionClosed`] at the same moment: nothing failed, the peer
+    /// left. The question "can I still write?" is answered by
+    /// [`connection_state`](Self::connection_state) and
+    /// [`is_data_ready`](Self::is_data_ready); the question this answers is "what
+    /// went wrong?", and for an orderly departure the answer is nothing.
     ///
     /// The error is written once by the background task immediately before the
     /// state transitions to `Failed` or `Dead`, so callers that read this after
@@ -5144,6 +5228,11 @@ impl PhantomSession {
         // (Connected, and also Migrating — the keys exist, the path is moving)
         // counts as ready; only a genuine failure surfaces the captured error.
         match self.connection_state() {
+            // The peer announced its close while we were waiting. The handshake did
+            // succeed, but answering `Ok(())` would tell the caller to go on and send,
+            // and the very next `send()` refuses — so the readiness answer has to be
+            // the same one, and it is not "failed" either.
+            ConnectionState::Draining => Err(CoreError::ConnectionClosed),
             ConnectionState::Failed | ConnectionState::Dead | ConnectionState::Closed => {
                 // Surface the captured terminal error, or a generic fallback.
                 Err(self
@@ -5180,7 +5269,15 @@ impl PhantomSession {
     }
 
     /// Flush all queued messages (called when handshake completes).
+    ///
+    /// Refuses with [`CoreError::ConnectionClosed`] once the peer has announced its
+    /// close: the count this returns is a count of payloads handed to the pump, and
+    /// while draining the pump discards them, so returning one would be the same
+    /// dishonest `Ok` that [`send`](Self::send) refuses to give.
     pub async fn flush_queue(&self) -> Result<u32, CoreError> {
+        if self.connection_state() == ConnectionState::Draining {
+            return Err(CoreError::ConnectionClosed);
+        }
         let mut queue = self.send_queue.lock().await;
         let count = queue.len() as u32;
         for msg in queue.drain(..) {
@@ -5193,6 +5290,12 @@ impl PhantomSession {
     }
 
     /// Number of messages queued (waiting for handshake).
+    ///
+    /// This counter only ever holds pre-handshake writes, so it reads `0` on a
+    /// [`Draining`](ConnectionState::Draining) session — and that reading is
+    /// accurate rather than a gap: a write offered while draining is refused at
+    /// [`send`](Self::send), not accepted into this queue, so there is nothing here
+    /// for it to be missing from.
     pub async fn queued_count(&self) -> u32 {
         self.send_queue.lock().await.len() as u32
     }
@@ -5363,6 +5466,21 @@ impl PhantomSession {
     /// Get the stream demultiplexer (internal use, not exposed to UniFFI)
     pub fn demux(&self) -> Arc<StreamDemultiplexer> {
         self.demux.clone()
+    }
+
+    /// The established inner [`Session`], or `None` while the handshake is still
+    /// running.
+    ///
+    /// Crate-internal and deliberately not on the public surface: the inner session
+    /// is where the machinery lives that the API in front of it exists to hide, and
+    /// handing it out would make every internal invariant a compatibility promise.
+    /// The callers are in-crate tests that need to reach a listener-installed
+    /// [`DemuxLink`](crate::transport::session::DemuxLink) — a wire between two
+    /// internals that no public accessor names — so it is compiled only for them
+    /// rather than left in the production build as a door nobody walks through.
+    #[cfg(test)]
+    pub(crate) async fn inner_session_handle(&self) -> Option<Arc<Session>> {
+        self.inner_session.lock().await.clone()
     }
 
     /// Current rekey epoch of the established session (`None` while still
@@ -6225,6 +6343,7 @@ mod tests {
             ConnectionState::Closed,
             ConnectionState::Migrating,
             ConnectionState::Dead,
+            ConnectionState::Draining,
         ] {
             // The session keeps the state in an `AtomicU8`, so every reachable
             // variant has to survive the round trip through it.
@@ -6247,6 +6366,9 @@ mod tests {
                 ConnectionState::Migrating => ("apply_liveness/PathDown", true),
                 // `apply_liveness` once the migration idle timeout expires.
                 ConnectionState::Dead => ("apply_liveness/Dead", false),
+                // The receive task, at the packet carrying the peer's close (WIRE
+                // v8), and the send loop when it arms the draining window.
+                ConnectionState::Draining => ("peer-close draining", false),
             };
             assert_eq!(
                 state.is_data_ready(),
@@ -6268,6 +6390,13 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::channel(1);
         let (inc_tx, _inc_rx) = mpsc::channel(1);
         (cmd_tx, inc_tx)
+    }
+
+    /// The published-state handle a direct `handle_packet` call needs. `Connected`,
+    /// because a test driving one packet by hand is standing in for a live session;
+    /// the tests that care about the draining state build their own and assert on it.
+    fn connected_state() -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(ConnectionState::Connected as u8))
     }
 
     /// Reader-task scratch for a direct `handle_packet` call in a test, wired to
@@ -7962,6 +8091,7 @@ mod tests {
             LegType::Tcp,
             &cmd_tx,
             &inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -8016,6 +8146,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -8088,6 +8219,7 @@ mod tests {
                 LegType::Tcp,
                 &no_cmd_tx,
                 &no_inc_tx,
+                &connected_state(),
             )
             .await;
         }
@@ -8144,6 +8276,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -8834,6 +8967,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -8930,6 +9064,7 @@ mod tests {
             LegType::Udp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -9047,6 +9182,7 @@ mod tests {
             LegType::Udp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -9186,6 +9322,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
         obs
@@ -9799,6 +9936,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -9908,6 +10046,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -9996,6 +10135,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -10045,6 +10185,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
         deliver_rx.try_recv().ok()
@@ -10387,6 +10528,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -10495,6 +10637,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -10582,6 +10725,7 @@ mod tests {
                 LegType::Tcp,
                 &no_cmd_tx,
                 &no_inc_tx,
+                &connected_state(),
             )
             .await;
         }
@@ -10648,6 +10792,7 @@ mod tests {
                 LegType::Tcp,
                 &no_cmd_tx,
                 &no_inc_tx,
+                &connected_state(),
             )
             .await;
         }
@@ -10719,6 +10864,7 @@ mod tests {
                 LegType::Tcp,
                 &no_cmd_tx,
                 &no_inc_tx,
+                &connected_state(),
             )
             .await;
         }
@@ -11197,6 +11343,7 @@ mod tests {
                 LegType::Tcp,
                 &no_cmd_tx,
                 &no_inc_tx,
+                &connected_state(),
             )
             .await;
 
@@ -11352,6 +11499,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -11876,6 +12024,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -11910,6 +12059,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -11976,6 +12126,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -12030,6 +12181,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -12523,6 +12675,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
