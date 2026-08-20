@@ -167,7 +167,10 @@ impl WindowFilter {
             // horizon, so at most `WINDOW_FILTER_MAX_ENTRIES - 1` gaps fit
             // inside the window and at most that many entries plus one sit in
             // the deque. Dividing by one less than the ceiling is what makes the
-            // bound exactly the ceiling rather than one past it.
+            // bound exactly the ceiling rather than one past it, and dividing by
+            // anything larger leaves a filter that cannot fill to the flight it
+            // is sized to hold — both directions are pinned by
+            // `the_separation_fills_each_filter_to_exactly_its_ceiling`.
             min_separation: window_size / (WINDOW_FILTER_MAX_ENTRIES as u32 - 1),
         }
     }
@@ -410,7 +413,8 @@ impl WindowFilter {
 /// and `the_maximum_survives_the_horizon_rolling_over_a_falling_run` for the
 /// maximum's two directions,
 /// `a_rising_round_trip_run_cannot_inflate_the_minimum_it_is_read_from` for the
-/// minimum's.
+/// minimum's, and `the_separation_fills_each_filter_to_exactly_its_ceiling` for
+/// the length itself and for the divisor it is derived through.
 ///
 /// 1024 because that is the ARQ send buffer's segment cap
 /// ([`MAX_PENDING_PACKETS`](crate::transport::stream)): the most segments one
@@ -4279,6 +4283,199 @@ mod tests {
             self.window.push_back((now, value));
             self.window.front().map_or(value, |&(_, v)| v)
         }
+    }
+
+    /// The separation's divisor, pinned in both directions.
+    ///
+    /// `min_separation` is the horizon over one *less* than the ceiling, and
+    /// both halves of that are load-bearing. Divide by the ceiling itself and a
+    /// filter fed at exactly the separation holds one entry more than the bound;
+    /// divide by anything smaller and it can never fill to the flight's worth of
+    /// candidates the ceiling is derived from, so the bound stops meaning what
+    /// its documentation says. Nothing else in the suite can see either, because
+    /// every other run either arrives faster than the separation (so the count
+    /// is set by declines) or slower (so it never approaches the bound).
+    ///
+    /// Both filters are driven, at exactly one separation apart and in the
+    /// direction that dominates nothing, so each one's own rule is what decides
+    /// the length.
+    #[test]
+    fn the_separation_fills_each_filter_to_exactly_its_ceiling() {
+        const HORIZON: Duration = BW_FILTER_WINDOW;
+        // Two entries past the bound, so a filter that overshoots by one is
+        // caught while the run is still going rather than at its end.
+        const SAMPLES: usize = WINDOW_FILTER_MAX_ENTRIES + 2;
+
+        let base = Instant::now();
+        let mut highest = WindowFilter::new(HORIZON);
+        let mut lowest = WindowFilter::new(HORIZON);
+        let separation = highest.min_separation;
+        let mut longest_max = 0usize;
+        let mut longest_min = 0usize;
+
+        for i in 0..SAMPLES {
+            let at = base + separation * (i as u32);
+            // Falling for the maximum filter and rising for the minimum one:
+            // in each case nothing is dominated, so every sample is offered to
+            // the length rule and none is removed by anything else.
+            highest.update_max(at, (SAMPLES - i) as u64);
+            lowest.update_min(at, (i + 1) as u64);
+
+            assert!(
+                highest.window.len() <= WINDOW_FILTER_MAX_ENTRIES,
+                "sample {i}: the maximum filter holds {} entries at exactly one \
+                 separation apart, past the {WINDOW_FILTER_MAX_ENTRIES} bound — \
+                 the separation is derived through too large a divisor",
+                highest.window.len()
+            );
+            assert!(
+                lowest.window.len() <= WINDOW_FILTER_MAX_ENTRIES,
+                "sample {i}: the minimum filter holds {} entries at exactly one \
+                 separation apart, past the {WINDOW_FILTER_MAX_ENTRIES} bound",
+                lowest.window.len()
+            );
+            longest_max = longest_max.max(highest.window.len());
+            longest_min = longest_min.max(lowest.window.len());
+        }
+
+        assert_eq!(
+            longest_max, WINDOW_FILTER_MAX_ENTRIES,
+            "the maximum filter reached {longest_max} entries where the ceiling \
+             is {WINDOW_FILTER_MAX_ENTRIES} — a horizon's worth of entries one \
+             separation apart is exactly the ceiling, so a filter that stops \
+             short of it is separating by too much and holding less than the \
+             flight it is sized for"
+        );
+        assert_eq!(
+            longest_min, WINDOW_FILTER_MAX_ENTRIES,
+            "the minimum filter reached {longest_min} entries where the ceiling \
+             is {WINDOW_FILTER_MAX_ENTRIES}"
+        );
+    }
+
+    /// The minimum filter's length bound must not be able to raise the round
+    /// trip the congestion window is sized from.
+    ///
+    /// `cwnd = cwnd_gain × btl_bw × min_rtt` takes this reading as a
+    /// multiplicand, so an over-stated minimum inflates the window — and a
+    /// sender that inflates its window builds a queue, whose round trips are the
+    /// next samples this filter sees. That is a loop the maximum filter's
+    /// truncation cannot enter and this one can, which is why the two are
+    /// bounded by different rules.
+    ///
+    /// The shape is the one that produces it: a strictly rising run of round
+    /// trips, which is what a filling bottleneck queue looks like from the
+    /// sender, carried far enough that the horizon rolls and the run's own
+    /// prefix ages out. Under back-eviction the deque degenerates to "the oldest
+    /// entries plus the newest", and once the prefix expires the sole survivor is
+    /// the newest — the *largest* round trip in the window, reported as its
+    /// minimum.
+    ///
+    /// The reference is what a filter with no length bound at all would report,
+    /// over a horizon shorter by exactly one separation and not a nanosecond
+    /// more. That figure is the derivation's, not an allowance: declining an
+    /// incoming sample costs the reading the gap between that sample and the
+    /// smaller entry that stood in for it, and the test that declined it is
+    /// precisely `gap < separation`. Slack beyond that would be this test
+    /// conceding an error the code does not make, which is how a bound comes to
+    /// pin something weaker than what is shipped.
+    #[test]
+    fn a_rising_round_trip_run_cannot_inflate_the_minimum_it_is_read_from() {
+        const HORIZON: Duration = RTT_FILTER_WINDOW;
+        // Faster than the separation, so most samples are declined and the rule
+        // under test is engaged continuously rather than incidentally.
+        const STEP: Duration = Duration::from_millis(5);
+        // The run has to outlive the prefix a count-truncating filter would
+        // strand, or it measures the prefix instead of the rule. Such a filter
+        // fills after [`WINDOW_FILTER_MAX_ENTRIES`] samples and holds "that
+        // prefix plus the newest" from then on; the prefix expires one horizon
+        // after it is complete, and only past *that* instant is the newest
+        // sample all that is left to report. Everything before it agrees with an
+        // unbounded filter, which is exactly how a run that stops short passes
+        // while reporting the largest round trip in the window.
+        const SAMPLES: usize = WINDOW_FILTER_MAX_ENTRIES
+            + (HORIZON.as_millis() / STEP.as_millis()) as usize
+            + WINDOW_FILTER_MAX_ENTRIES / 2;
+
+        let base = Instant::now();
+        let mut filter = WindowFilter::new(HORIZON);
+        let separation = filter.min_separation;
+        assert!(
+            STEP < separation,
+            "precondition: samples arriving slower than the separation are never \
+             declined, and this run would prove nothing"
+        );
+        let reference_horizon = HORIZON - separation;
+
+        let mut history: VecDeque<(Instant, u64)> = VecDeque::new();
+        let mut worst_overshoot = 0u64;
+        let mut declined = 0usize;
+        let mut longest = 0usize;
+
+        for i in 0..SAMPLES {
+            // Strictly rising, so nothing is ever dominated: every sample either
+            // lengthens the deque or is declined by the separation rule.
+            let value = (i + 1) as u64;
+            let at = base + STEP * (i as u32);
+            history.push_back((at, value));
+            while history
+                .front()
+                .is_some_and(|(ts, _)| at.duration_since(*ts) > reference_horizon)
+            {
+                history.pop_front();
+            }
+
+            let reported = filter.update_min(at, value);
+            // Whether this sample was taken, read off the deque directly: a
+            // length comparison would confuse a decline with an expiry that
+            // happened in the same call.
+            if filter.window.back().is_none_or(|&(ts, _)| ts != at) {
+                declined += 1;
+            }
+
+            let reference = history.iter().map(|&(_, v)| v).min().unwrap_or(value);
+            worst_overshoot = worst_overshoot.max(reported.saturating_sub(reference));
+            assert!(
+                reported <= reference,
+                "sample {i}: the bounded minimum filter reports {reported} where an \
+                 unbounded one over a horizon one separation shorter reports \
+                 {reference} — the length bound is inventing a round trip, and \
+                 `cwnd` multiplies by it"
+            );
+            assert!(
+                filter.window.len() <= WINDOW_FILTER_MAX_ENTRIES,
+                "sample {i}: the minimum filter holds {} entries, past the \
+                 {WINDOW_FILTER_MAX_ENTRIES} the separation is derived to bound it \
+                 to",
+                filter.window.len()
+            );
+            longest = longest.max(filter.window.len());
+        }
+
+        // Positive controls. Without the first two the run never engaged the
+        // rule, and the assertions above would be about a deque that had room
+        // to spare; without the third the horizon never rolled, so the old
+        // prefix that back-eviction strands was never put to the test.
+        assert!(
+            declined >= SAMPLES / 2,
+            "only {declined} of {SAMPLES} samples were declined, so the length \
+             bound was barely exercised"
+        );
+        assert!(
+            longest * 10 > WINDOW_FILTER_MAX_ENTRIES * 9,
+            "the filter never grew past {longest} entries against a bound of \
+             {WINDOW_FILTER_MAX_ENTRIES}, so this run says nothing about what \
+             happens at it"
+        );
+        assert!(
+            STEP * (SAMPLES as u32) > HORIZON,
+            "the run finished inside one horizon, so nothing ever expired"
+        );
+        assert_eq!(
+            worst_overshoot, 0,
+            "the reading rose above the unbounded reference by {worst_overshoot} \
+             at its worst"
+        );
     }
 
     /// The retained maximum and the raw sample must be separately readable, and

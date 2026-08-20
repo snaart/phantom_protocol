@@ -504,7 +504,8 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   time costs at most one separation of the horizon each covers, so the reading is at every
   instant between the unbounded windowed extremum and the unbounded extremum over a horizon one
   separation shorter. The length then follows as arithmetic rather than as a cap someone checks,
-  and the separation is derived from the horizon to land on exactly this figure.
+  and the separation is derived from the horizon to land on exactly this figure — the divisor is
+  one *less* than the ceiling, and both halves of that are pinned by a test.
 
   The two rules are mirror images and deliberately not one shared rule. The deques run in
   opposite directions, so the rule that thins a maximum filter's successors admits every sample
