@@ -233,9 +233,24 @@ receive-only in this implementation (nothing emits a bundle), and `PADDED` /
 inside the AEAD, so none of them is frozen by a `.bin` — but do not read that as
 meaning they are not a `WIRE_VERSION` concern. Two of the last two revisions changed
 nothing but a plaintext in this table (`WINDOW_UPDATE` at v7, `CONTROL` at v8) and
-both bumped the version pair, for the reason § 1 gives: a mismatch here reads as data
-corruption rather than as a parse error, so the version check is the only place it
-can be caught.
+both bumped the version pair.
+
+The reason is the one § 1 gives, and it is the opposite way round from the obvious
+one, so read it in that direction. **Nothing inside a plaintext identifies which
+grammar it was written to.** A peer built for the old one opens the AEAD
+successfully — the seal is over bytes, not over meaning — and then reads the result
+by the wrong rule: eight bytes of cumulative limit taken as four bytes of credit, a
+subtype byte taken as the first byte of a payload. That is the corruption, and
+nothing downstream of the plaintext can detect it, because there is nothing down
+there to detect it *with*. The version byte on the header is the only place the
+difference is visible at all, which is why moving it is not a formality: with the
+bump, the frame is dropped at step 1 of § 4.3 before any flag is read, and the
+corruption never happens. Without it, there is no gate anywhere in the receive path
+that the change would trip.
+
+So the `WIRE_VERSION` half is what converts a misreading into a drop, and — as § 1
+sets out — the `PROTOCOL_VERSION` half is what converts that drop into a diagnosis
+rather than a session that establishes and then moves nothing.
 
 **`CONTROL` is the one row a peer may not skip.** The others degrade gracefully —
 never emit a `COALESCED` bundle and you simply never receive one; ignore `PADDED` and

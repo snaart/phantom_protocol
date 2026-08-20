@@ -55,7 +55,13 @@ ML_DSA_SIG_LEN = 3309
 CLASSICAL_PK_LEN = 32
 PROTOCOL_VARIANT = b"phantom-default-1"
 PROTOCOL_VERSION = 5  # bumped 4->5: CONTROL frames lead with a subtype byte (see below)
-WIRE_VERSION = 8  # bumped 7->8 with it, so a peer without a CONTROL branch is refused
+# Bumped 7->8 with it. What the pair refuses is a peer built for the *previous* wire: the
+# header version is checked before any flag, so a v7 receiver drops every v8 frame rather
+# than misreading the new plaintext, and PROTOCOL_VERSION turns that silent drop into a
+# typed rejection at the handshake. It does not refuse a v8 peer that simply omits the
+# CONTROL branch -- nothing on the wire can, which is why that obligation is written out
+# below and enforced only by conformance.
+WIRE_VERSION = 8
 
 # CONTROL AEAD plaintext: a one-byte subtype, then whatever that subtype defines (nothing,
 # for the only assignment so far). Like WINDOW_UPDATE it has no frozen fixture — it is an
