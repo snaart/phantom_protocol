@@ -262,6 +262,18 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   the two cannot disagree. The congestion-control figures in this changelog's `Fixed` section
   are reproducible by running it.
 
+- **`transport::bandwidth_estimator::BW_FILTER_WINDOW` is public, and the WAN harness's
+  `WindowSample` carries it as `bw_filter_window_ms`.** A recorded run's `bottleneck_bw_bps` is
+  a maximum over that horizon and gets read against a mean over a much shorter sample interval,
+  so the line reporting the two has to name the window the first was taken over. It named it
+  from a constant restated in `analyze.py`, which is right until the horizon moves and then
+  becomes a label confidently naming a window the run was never taken over — worse than a label
+  naming none. The daemon now writes the horizon into every window row from the library it was
+  built with, and `analyze.py` derives the label from the rows, printing no figure at all when
+  the rows carry none. Defaulted on deserialize, so archives recorded before the field still
+  load and read as unknown rather than as zero seconds; zero on the `quic` reference leg, whose
+  controller has no such filter.
+
 - **`BandwidthSnapshot::last_delivery_rate_bps` — the raw per-acknowledgement delivery rate,
   beside the filtered maximum.** A recorded run is read by dividing `bottleneck_bw_bps` by the
   growth of the delivered-byte counter over the same interval, and that ratio cannot be

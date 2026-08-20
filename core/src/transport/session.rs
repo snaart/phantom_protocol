@@ -1619,7 +1619,8 @@ pub struct BandwidthSnapshot {
     ///
     /// It travels beside `bottleneck_bw_bps` rather than replacing it because
     /// the pair is what makes a recorded run readable. That field is a maximum
-    /// over a ten-second horizon; the throughput a run gets compared against is
+    /// over [`BW_FILTER_WINDOW`](crate::transport::bandwidth_estimator::BW_FILTER_WINDOW);
+    /// the throughput a run gets compared against is
     /// a mean over a much shorter interval, and a maximum over the longer window
     /// exceeds a mean over the shorter one for reasons that have nothing to do
     /// with the estimator being wrong. Which of those two a high-looking ratio

@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use phantom_protocol::api::session::PhantomSession;
+use phantom_protocol::transport::bandwidth_estimator::BW_FILTER_WINDOW;
 use phantom_protocol::CoreError;
 use tokio::sync::Mutex;
 
@@ -252,6 +253,10 @@ impl MsgLink for Framed {
                 inflight_bytes: bw.inflight_bytes,
                 bottleneck_bw_bps: bw.bottleneck_bw_bps,
                 last_delivery_rate_bps: bw.last_delivery_rate_bps,
+                // Read from the library rather than restated here, so the
+                // recorded row names the horizon this binary's estimator
+                // actually used.
+                bw_filter_window_ms: BW_FILTER_WINDOW.as_millis() as u64,
                 pacing_rate_bps: bw.pacing_rate_bps,
                 min_rtt_us: bw.min_rtt.as_micros() as u64,
                 delivered_bytes: bw.delivered_bytes,
@@ -290,7 +295,7 @@ pub(crate) mod testing {
 
     use phantom_protocol::CoreError;
 
-    use super::{Arrival, BoxFut, MsgLink};
+    use super::{Arrival, BoxFut, MsgLink, BW_FILTER_WINDOW};
     use crate::proto::Msg;
     use crate::report::{unix_nanos, Leg, WindowSample};
 
@@ -382,6 +387,7 @@ pub(crate) mod testing {
                     // two readings differ exactly when the filter is holding a
                     // peak the latest sample no longer supports.
                     last_delivery_rate_bps: 100_000,
+                    bw_filter_window_ms: BW_FILTER_WINDOW.as_millis() as u64,
                     pacing_rate_bps: 125_000,
                     min_rtt_us: 230_000,
                     delivered_bytes: 1400,

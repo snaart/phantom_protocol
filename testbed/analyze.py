@@ -18,13 +18,23 @@ import pathlib
 import sys
 from collections import defaultdict
 
-# `BW_FILTER_WINDOW` in core/src/transport/bandwidth_estimator.rs, in seconds.
-# Named here only so the printed label states which horizon the filtered maximum
-# is a maximum over — the whole point of the two lines it appears in is that a
-# reader can see which statistic each ratio was taken on. It is read by no
-# calculation, so a drift between the two costs a wrong word in a label rather
-# than a wrong number, but it is still worth correcting if that constant moves.
-BW_FILTER_WINDOW_S = 10
+def filtered_max_label(rows):
+    """Name the statistic `bottleneck_bw_bps` is, using the run's own horizon.
+
+    The horizon travels in every window row (`bw_filter_window_ms`), written by
+    the daemon from the constant its estimator was built with, so this reads it
+    off the artifact instead of holding a copy. A copy is how the one line whose
+    job is to say which window a maximum was taken over comes to name a window
+    the run was never taken over — and a label naming the wrong window is worse
+    than a label naming none, which is what the rows without the field get.
+    """
+    horizons = {r.get("bw_filter_window_ms", 0) for r in rows}
+    horizons.discard(0)
+    if len(horizons) != 1:
+        # Either an older archive that predates the field, or a mixed one. Both
+        # cases are answered by declining to name a number.
+        return "filtered max over the estimator's horizon"
+    return f"filtered max over {horizons.pop() / 1000:g}s horizon"
 
 
 def read_jsonl(path):
@@ -418,8 +428,10 @@ def analyze_server(server_dir):
             # to mistake for the other's.
             #
             # That is the whole reason both are here. The advertised figure
-            # (`bottleneck_bw_bps`) is a **maximum over a ten-second horizon**;
-            # the denominator is a **mean over the gap between two samples**. A
+            # (`bottleneck_bw_bps`) is a **maximum over the estimator's
+            # horizon**, which the rows themselves name and the line below
+            # prints; the denominator is a **mean over the gap between two
+            # samples**. A
             # maximum over the longer window exceeds a mean over the shorter one
             # by construction, and the probing round of the gain cycle adds to
             # that honestly — one round in four asks the path for a quarter more
@@ -461,7 +473,7 @@ def analyze_server(server_dir):
                     f"{len(est_ratio)} intervals:"
                 )
                 print(
-                    f"  {'':26}   filtered max over {int(BW_FILTER_WINDOW_S)}s horizon: "
+                    f"  {'':26}   {filtered_max_label(rows)}: "
                     f"median {pct(est_ratio, 0.5):.2f}×, p90 {pct(est_ratio, 0.9):.2f}×, "
                     f"peak {max(est_ratio):.2f}×"
                 )
@@ -509,11 +521,51 @@ def analyze_server(server_dir):
         print(f"  {n:>5}x  {kind:18} {detail}")
 
 
+def self_test():
+    """Check that the filtered-maximum label is read off the rows, not held here.
+
+    The label is the one line whose job is to say which window the maximum was
+    taken over, so it is the one line that must never state a horizon from
+    memory. Three shapes cover it: rows carrying a horizon (name it), rows
+    predating the field (name none), and rows disagreeing (name none, because
+    naming either would be naming the wrong one for half the run).
+    """
+    cases = [
+        ([{"bw_filter_window_ms": 10000}] * 3, "filtered max over 10s horizon"),
+        ([{"bw_filter_window_ms": 4500}] * 3, "filtered max over 4.5s horizon"),
+        ([{}, {}], "filtered max over the estimator's horizon"),
+        ([{"bw_filter_window_ms": 0}], "filtered max over the estimator's horizon"),
+        (
+            [{"bw_filter_window_ms": 10000}, {"bw_filter_window_ms": 4000}],
+            "filtered max over the estimator's horizon",
+        ),
+    ]
+    failures = 0
+    for rows, want in cases:
+        got = filtered_max_label(rows)
+        status = "ok" if got == want else "FAIL"
+        if got != want:
+            failures += 1
+        print(f"  {status}: {rows} -> {got!r} (want {want!r})")
+    print(f"{len(cases) - failures}/{len(cases)} ok")
+    return 1 if failures else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir", type=pathlib.Path, help="client run directory (contains run.json)")
+    ap.add_argument("run_dir", type=pathlib.Path, nargs="?", help="client run directory (contains run.json)")
     ap.add_argument("--server-dir", type=pathlib.Path, help="server data directory (sessions.jsonl etc.)")
+    ap.add_argument(
+        "--self-test",
+        action="store_true",
+        help="check the label derivations against fixed inputs and exit",
+    )
     args = ap.parse_args()
+
+    if args.self_test:
+        sys.exit(self_test())
+    if args.run_dir is None:
+        ap.error("run_dir is required unless --self-test is given")
 
     analyze_client(args.run_dir)
     if args.server_dir:
