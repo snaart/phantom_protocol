@@ -242,6 +242,26 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **`core/examples/bottleneck_sim.rs` — a bottleneck-link model driven by the real congestion
+  controller, so a claim about it can be checked from the tree.** A fixed-rate link with a FIFO
+  queue and a fixed propagation delay, ticked a millisecond at a time, with the sender's window
+  and pacing rate read from `BandwidthEstimator` on every acknowledgement, against three
+  scripted demands: a resume after a quiet stretch longer than the filter horizon, the same with
+  the link degrading while the application is quiet, and a fall in capacity long enough to fill
+  the sliding filters and outlive one horizon. It exists because loopback cannot see this class
+  of defect at all — at a round trip of microseconds a five-kilobyte window still yields a
+  hundred megabits — and the WAN harness under `testbed/`, which is where any published
+  performance number comes from, needs two hosts and a campaign.
+
+  It is a model and not a measurement, and the distinction is load-bearing: what it settles is a
+  *comparison* between two builds of one file, so no figure it prints belongs in a document
+  describing a path. Beside the throughput figures each scenario reports the estimator's reading
+  against an unbounded windowed maximum kept inside the harness and fed the samples the
+  estimator's own gate admits, plus how many candidates that unbounded filter held at its
+  longest — the run's only evidence that a length rule was engaged at all, since below the bound
+  the two cannot disagree. The congestion-control figures in this changelog's `Fixed` section
+  are reproducible by running it.
+
 - **`BandwidthSnapshot::last_delivery_rate_bps` — the raw per-acknowledgement delivery rate,
   beside the filtered maximum.** A recorded run is read by dividing `bottleneck_bw_bps` by the
   growth of the delivered-byte counter over the same interval, and that ratio cannot be
@@ -502,18 +522,43 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   clause becomes vacuously true and the application's own write rate is installed as the path's
   capacity — the one thing the gate exists to refuse. Extending the existing
   `test_app_limited_filtering` by a single acknowledgement, enough to cross the horizon, took
-  the estimate from 700,000 B/s to 7,600 B/s. On a 1 MB/s, 200 ms bottleneck simulation driven
-  by the estimator's own window and pacing rate — six seconds of bulk, sixteen of 4 KB
-  request/response, then bulk again — it left `btl_bw` at 33,740 B/s against 1,000,000, the
-  window at 13,552 B against 401,688 B, delivered 166,996 B in the first second after the
-  application resumed against 803,952 B, and took 9,070 ms rather than 1,963 ms to reach 90% of
-  the link, never recovering the ~710 KB shortfall. Retention keyed to admitted samples is what
-  the algorithm this estimator implements does (`bbr_update_bw`'s
-  `if (!rs->is_app_limited || bw >= bbr_max_bw(sk))` guards the filter update, expiry included),
-  and it stays. The horizon's residency on a fast path remains longer than the draft's ten round
-  trips; that is a question about `BW_FILTER_WINDOW`'s length, and it is left for the raw
-  per-acknowledgement sample now recorded beside the filtered maximum to answer with numbers
-  from a path.
+  the estimate from 700,000 B/s to 7,600 B/s.
+
+  The figures below are this tree's, from `core/examples/bottleneck_sim.rs`, which is committed
+  for exactly that reason: a number nothing in the repository can re-derive is an assertion, not
+  a measurement. Reproduce the withdrawn arm by inserting `self.bw_filter.expire(now);` and
+  `self.btl_bw = self.bw_filter.head().unwrap_or(0);` immediately above the admission test in
+  `BandwidthEstimator::on_ack` and running the harness on both builds. Its `resume` scenario —
+  a 1 MB/s link at a 200 ms round trip, six seconds of bulk, sixteen of 4 KB request/response,
+  then twelve of bulk again — reads, withdrawn arm against shipped:
+
+  - `btl_bw` when the application resumed: **34,653 B/s against 1,003,984** on a link offering
+    1,000,000; the window with it, **13,860 B against 401,592**.
+  - Delivered in the first second after the resume: **49,000 B against 796,600**; in the
+    second, **124,600 B against 1,787,800**.
+  - Reached 90% of the link at **11,387 ms against 1,107 ms**, and over the whole twelve-second
+    phase delivered **4,064,200 B against 11,249,000** — a shortfall of about 7.2 MB that a
+    longer run does not recover, because `Session::on_packet_acked` sets the pacer from that
+    figure on every acknowledgement and never disables it.
+
+  **The other side of the trade, which the first account of it left out.** The change is *for*
+  the case where the path degrades while the application is quiet, and there it buys something
+  real. The harness's `degrade` scenario is the same script with the link losing three quarters
+  of its capacity during the quiet stretch: the withdrawn arm holds the widest round trip in the
+  recovery phase to **272 ms against 1,602 ms** — the shipped build spends that time draining a
+  queue it sized from an estimate the path no longer supports. It pays for it in the same
+  currency as above: **49,000 B against 205,800** delivered in the first second, and 90% of the
+  (slower) link at **6,442 ms against 1,095 ms**. A sixfold cut in the worst queueing delay
+  after a degradation, against a fifteenfold cut in throughput at every resume, on a shape the
+  quiet stretch is the normal case for — that is the trade, and it is the wrong way round.
+
+  Retention keyed to admitted samples is also what the algorithm this estimator implements does
+  (`bbr_update_bw`'s `if (!rs->is_app_limited || bw >= bbr_max_bw(sk))` guards the filter
+  update, expiry included), so this is a divergence from it rather than a repair of it, and it
+  stays out on the numbers rather than on the citation. The horizon's residency on a fast path
+  remains longer than the draft's ten round trips; that is a question about `BW_FILTER_WINDOW`'s
+  length, and it is left for the raw per-acknowledgement sample now recorded beside the filtered
+  maximum to answer with numbers from a path rather than from a model.
 
 - **The crate could not be packaged, and nothing in CI noticed for two months.**
   `core/src/lib.rs` inlined the repository-root README into the crate documentation with
