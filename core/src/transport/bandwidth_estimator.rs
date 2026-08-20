@@ -379,6 +379,13 @@ const _: () = assert!(
      without this would leave the filters holding a fraction of a flight"
 );
 
+const _: () = assert!(
+    WINDOW_FILTER_MAX_ENTRIES >= 2,
+    "the minimum filter's separation is the horizon divided by one less than this \
+     ceiling, so a ceiling of one divides by zero and a ceiling of zero describes a \
+     filter that cannot hold the sample it was just given"
+);
+
 /// Probe cycle gains for ProbeBW phase (BBR cycle: 1.25, 0.75, 1.0, 1.0)
 ///
 /// The average is exactly 1.0, so a converged flow paces at the bottleneck
