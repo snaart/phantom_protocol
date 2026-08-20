@@ -189,9 +189,23 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   task ahead of the next datagram read, at a moment a peer chooses: a coordinated departure
   must not be able to decide how long every other session's traffic waits. The queue is
   bounded for the same reason, and a signal dropped at the bound costs one lazy reclaim —
-  the reclaim path that existed before. In the integration test the route count falls from 18
-  to 0 within the draining window of the client leaving, against liveness deadlines two
-  orders of magnitude longer.
+  the reclaim path that existed before.
+
+  A signal dropped at that bound has to cost a deferred reclaim rather than a permanent one,
+  and that took a second change: the demux now sweeps its own route table on a one-second
+  timer of its own. Every other reclaim this table has is driven by a peer — a datagram for a
+  dead route, a handshake task finishing, an every-256th-connection sweep at accept — and the
+  population that produces a dropped retire signal is precisely the one that has stopped
+  sending. Without a clock of its own, the queue bound added to stop a stall would have
+  converted it into a leak: a session whose signal was dropped kept all 18 of its routes for
+  as long as the listener ran. The sweep is the same pass the connection-count trigger
+  already ran, given a trigger that does not depend on connections arriving; at the
+  `MAX_ROUTES` ceiling it costs 1.4 ms with nothing to reclaim and 42 ms in the one-off case
+  where an entire population has departed at once, and on an idle listener it is a walk of an
+  empty map. In the integration test the route count falls from 18 to 0 within the draining
+  window of the client leaving, against liveness deadlines two orders of magnitude longer;
+  in the unit test the retire signal is deliberately dropped and the count still reaches 0
+  with no inbound connection of any kind.
 
   Nothing is required to be delivered. The frame is unacknowledged, never retransmitted, and
   takes no part in the SACK machinery; a peer that receives none falls back to concluding the

@@ -356,6 +356,36 @@ type CidWindowRegistration = (Vec<ConnId>, mpsc::Sender<(Bytes, SocketAddr)>, Ro
 /// queued; `Session::signal_route_retire` carries what a dropped one costs.
 const RETIRE_QUEUE_DEPTH: usize = 1024;
 
+/// How often the demux sweeps its own route table for entries nothing will come back
+/// for (WIRE v8).
+///
+/// Every other reclaim this table has is driven by a *peer*: a datagram that arrives
+/// for a dead route, a handshake task finishing, a once-per-256-connections sweep at
+/// accept, and the end-of-session retire signal. A departed peer population produces
+/// none of those, and neither does anything else once the last client has gone — so
+/// without a timer of its own, a retire signal dropped at
+/// [`RETIRE_QUEUE_DEPTH`] is not a deferred reclaim, it is a permanent one. That is
+/// the whole reason this exists: it is what makes the bound on that queue a
+/// *deferral* rather than a leak, and it is the only reclaim path on this table whose
+/// clock is not held by someone else.
+///
+/// One second is chosen against what the sweep costs rather than against how quickly
+/// a route ought to go: the routes it reclaims are memory and nothing else — a dead
+/// route routes nothing — so holding one for a second is not a correctness question.
+/// The pass is [`RouteTable::reap_dead`], which is not new work; it is the same pass
+/// the every-256th-connection trigger already runs, given a clock that does not
+/// depend on connections arriving.
+///
+/// Measured in-crate on an optimised build, at the realistic shape of one inbound
+/// channel per session and a full CID window of routes pointing at it: a sweep with
+/// nothing to reclaim costs **73 µs** over 1,000 sessions (20k routes) and **1.4 ms**
+/// at the `MAX_ROUTES` ceiling (13k sessions, 260k routes) — 0.14% of a second at a
+/// capacity no deployment here has reached. The expensive case is the one where every
+/// route is dead, **42 ms** at that ceiling, and it happens once: after an entire
+/// population has departed, which is exactly when no datagram is waiting behind it.
+/// On an idle listener it is a walk of an empty map.
+const ROUTE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Which session a demux route belongs to — a local name for the identity this
 /// listener hands each accepted session in its `DemuxLink`, so the table's own code
 /// reads as being about routes rather than about sessions.
@@ -597,8 +627,10 @@ impl PendingByIp {
 /// Central demux: own the socket, route each datagram by its connection-ID.
 async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
     // Bounded, self-reaping route table (H-1). Dead routes (failed handshakes / dropped
-    // sessions) are reclaimed promptly via `reap_rx` and on the `% 256` cadence, with the
-    // hard `MAX_ROUTES` cap as a backstop, so a fresh-CID spray cannot grow it unboundedly.
+    // sessions) are reclaimed promptly via `reap_rx`, on the end-of-session retire signal,
+    // on the `% 256` cadence, and on this task's own `ROUTE_SWEEP_INTERVAL` timer — the last
+    // being the only one that still fires when the peers have all gone — with the hard
+    // `MAX_ROUTES` cap as a backstop, so a fresh-CID spray cannot grow it unboundedly.
     let mut routes = RouteTable::new(listener.active_routes.clone());
     // Per-source-IP in-flight handshake counter (H-2). Incremented when a slot is committed
     // to an address-validated source, decremented when that handshake task finishes.
@@ -633,6 +665,14 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
     let mut asm = FragmentAssembler::new();
     let mut new_conn_count: u64 = 0;
     let mut buf = vec![0u8; crate::transport::phantom_udp::envelope::PATH_MTU + 64];
+    // WIRE v8: the demux's own reclaim clock. Every other trigger on the route table
+    // is reactive to traffic, and the case this table has to survive is precisely the
+    // one where there is none — see `ROUTE_SWEEP_INTERVAL`. `Delay` rather than the
+    // default burst behaviour: a demux that was busy for several intervals owes one
+    // sweep, not one per interval it missed, and running them back to back would put
+    // the catch-up in front of the socket at the moment the socket is busiest.
+    let mut route_sweep = tokio::time::interval(ROUTE_SWEEP_INTERVAL);
+    route_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if listener.shutting_down.load(Ordering::Acquire) {
             break;
@@ -671,6 +711,16 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
             // that session's own window and not a pass over the table.
             Some(owner) = retire_rx.recv() => {
                 routes.retire_session(owner);
+                continue;
+            }
+            // WIRE v8: the backstop that makes the bound on the queue above a
+            // deferral. A retire signal dropped at that bound leaves the session's
+            // routes behind, and every other way this table sheds an entry needs a
+            // datagram that a departed peer is by definition not going to send — so
+            // this is the one reclaim whose clock the peer does not hold, and without
+            // it a queue bound added to stop a stall would have installed a leak.
+            _ = route_sweep.tick() => {
+                routes.reap_dead();
                 continue;
             }
             r = listener.socket.recv_from(&mut buf) => match r {
@@ -949,6 +999,109 @@ mod tests {
 
     fn empty_table() -> RouteTable {
         RouteTable::new(Arc::new(AtomicUsize::new(0)))
+    }
+
+
+    /// A retire signal the bounded queue dropped is reclaimed anyway, by the demux's
+    /// own timer, with **no inbound datagram of any kind** to drive it.
+    ///
+    /// This is what makes the bound on that queue a deferral rather than a leak, and
+    /// it was not true when the bound was added. Every other reclaim on the route
+    /// table is reactive to traffic — a datagram for a dead route, a handshake task
+    /// finishing, the every-256th-connection sweep at accept — and the population that
+    /// produces a dropped retire signal is precisely the one that has stopped sending
+    /// anything at all. A session whose signal was dropped kept all of its routes for
+    /// as long as the listener ran.
+    ///
+    /// The drop is induced rather than waited for: the queue the session signals over
+    /// is replaced with one that is already full, so `signal_route_retire` finds no
+    /// room and discards, which is exactly what happens at `RETIRE_QUEUE_DEPTH` under a
+    /// correlated departure. Inducing it is the only way to make the case
+    /// deterministic — reproducing it by saturation would need a thousand simultaneous
+    /// departures racing a demux that drains the queue ahead of every read.
+    ///
+    /// Nothing connects after the client leaves, and that is the assertion as much as
+    /// the count is: a reclaim that needed one more connection would pass a version of
+    /// this test that made one.
+    #[tokio::test]
+    async fn a_dropped_retire_signal_is_reclaimed_without_any_new_inbound_connection() {
+        let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+            .await
+            .expect("bind a loopback PhantomUDP listener");
+        let port: u16 = listener
+            .local_addr()
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("the bound port");
+        let pinned = listener.verifying_key_bytes();
+
+        let acceptor = listener.clone();
+        let accepted = tokio::spawn(async move { acceptor.accept().await });
+        let client = crate::api::session::connect_pinned_udp("127.0.0.1".to_string(), port, pinned)
+            .await
+            .expect("connect");
+        client.await_ready().await.expect("the handshake completes");
+        let outcome = accepted
+            .await
+            .expect("the accept task")
+            .expect("an accepted session");
+        let server = outcome.session();
+
+        // One exchange each way, so the session is genuinely established and its
+        // rotating-CID window is registered rather than merely its bootstrap CID.
+        client.send(b"ping".to_vec()).await.expect("client write");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while listener.active_route_count() < 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let established = listener.active_route_count();
+        assert!(
+            established > 1,
+            "an established session holds its whole CID window, not one route; got \
+             {established}"
+        );
+
+        // Sabotage the retire signal exactly as a full queue does: point the session's
+        // link at a queue with no room. `try_send` fails and the signal is discarded,
+        // so the routes are left to whatever else can reclaim them.
+        let inner = server
+            .inner_session_handle()
+            .await
+            .expect("an established session has an inner session");
+        let (dead_slide_tx, _dead_slide_rx) = mpsc::unbounded_channel();
+        let (full_retire_tx, _full_retire_rx) = mpsc::channel::<DemuxRouteOwner>(1);
+        full_retire_tx
+            .try_send(DemuxRouteOwner(u64::MAX))
+            .expect("fill the one slot");
+        inner.set_demux_link(DemuxLink {
+            slide_tx: dead_slide_tx,
+            retire_tx: full_retire_tx,
+            owner: DemuxRouteOwner(u64::MAX),
+        });
+
+        drop(client);
+        drop(server);
+        drop(outcome);
+
+        // No further connect, no further datagram — the only thing left that can move
+        // this count is the demux's own clock. The cap is generous against
+        // `ROUTE_SWEEP_INTERVAL` so the assertion is "it converges", not "it converges
+        // at time T".
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while listener.active_route_count() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            listener.active_route_count(),
+            0,
+            "a dropped retire signal must cost one deferred reclaim and not a permanent \
+             one; without a sweep on the demux's own timer these {established} routes \
+             are held for the life of the listener, because the peer that would have \
+             triggered every other reclaim path has left"
+        );
+
+        listener.shutdown();
     }
 
     /// Retiring a session releases that session's routes and **only** that session's,

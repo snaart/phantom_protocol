@@ -198,9 +198,11 @@ pub struct DemuxRouteOwner(pub u64);
 ///
 /// It exists because the demux's route table is keyed on connection ids only the
 /// session can compute, so the demux cannot tell on its own when a session's window
-/// has moved or when the session is over. Its own reclaim triggers — dropping a route
-/// when a datagram arrives for a dead one, and a periodic sweep — are reactive to
-/// *traffic*, which is exactly what a peer that has left stops producing.
+/// has moved or when the session is over. Two of its three other reclaim triggers —
+/// dropping a route when a datagram arrives for a dead one, and the sweep it runs
+/// every 256th new connection — are reactive to *traffic*, which is exactly what a
+/// peer that has left stops producing; the third, the demux's own timed sweep, is the
+/// backstop that runs when neither of those ever fires again.
 #[derive(Clone, Debug)]
 pub struct DemuxLink {
     /// ε / WIRE v5: inbound CID-window slides, as the peer migrates. Unbounded,
@@ -709,10 +711,16 @@ impl Session {
     /// called from a session's teardown, a peer decides when its session ends, and a
     /// correlated departure — a deployment rollout, a carrier network transition, a
     /// load balancer draining — would otherwise let a peer population decide how much
-    /// work sits in front of the demux's next datagram read. A dropped retire costs
-    /// one lazy reclaim: the routes stay until the periodic sweep or the next datagram
-    /// finds the channel closed, which is precisely how they were reclaimed before
-    /// this signal existed.
+    /// work sits in front of the demux's next datagram read.
+    ///
+    /// A dropped retire costs one deferred reclaim, and the thing that makes that
+    /// sentence true is the demux's **own** sweep timer rather than any of the reclaim
+    /// paths that predate this signal. Those all wait for a datagram — one arriving for
+    /// a dead route, or a new connection tripping the every-256th sweep — and a
+    /// correlated departure is precisely the population that has stopped sending
+    /// datagrams, so leaving the routes to them would leave them held for the life of
+    /// the listener. The timer is what turns the bound above from a stall into a
+    /// deferral rather than into a leak.
     pub fn signal_route_retire(&self) {
         let guard = self.demux_link.lock();
         let Some(link) = guard.as_ref() else {
