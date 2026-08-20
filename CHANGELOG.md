@@ -463,11 +463,27 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   dominates nothing, so every sample is appended and none removed until the horizon reaches
   it. At 40 Mbit/s with 1156-byte segments that is on the order of forty thousand entries per
   direction per session, and the acknowledgement cadence shaping the sequence is the peer's.
-  The min-RTT filter had the same shape through a strictly rising run. The deque is now capped
-  at 1024 entries — the ARQ send buffer's segment cap, hence the most acknowledgements one
-  round trip can return — evicting from the back, which in a maximum filter is the least of
-  everything retained, so a bounded maximum sits at or below the unbounded one at every
-  instant and never above it.
+  The min-RTT filter has the same shape through a strictly rising run, and a peer holds that
+  end too — it cannot lower a round trip below the path's, but it can raise every one of them
+  by sitting on its acknowledgements a little longer each time.
+
+  Both deques are now bounded at 1024 entries — the ARQ send buffer's segment cap, hence the
+  most acknowledgements one round trip can return, and tied to `MAX_PENDING_PACKETS` by a
+  compile-time assertion rather than by a comment claiming the derivation. They reach it by
+  different rules, because the same rule is safe in one filter and dangerous in the other. The
+  **bandwidth maximum** is truncated, evicting from the back, which there is the least of
+  everything retained, so a bounded maximum sits at or below the unbounded one at every instant
+  and never above it. The **min-RTT filter is not truncated at all**: its reading is the minimum
+  of the retained set and removing an element from a set can only raise that minimum, so no
+  eviction end errs in the safe direction — and back-eviction in particular strands the deque as
+  "the oldest entries plus the newest", which once the prefix ages out reports the *largest*
+  round trip in the window as its minimum. `cwnd = cwnd_gain × btl_bw × min_rtt` multiplies by
+  that reading, so the sender would size its window from a queue it built and then add to the
+  queue. It is bounded instead by a minimum time separation between retained entries, which
+  declines an incoming sample only when it stands above everything held and a smaller, more
+  recent entry is less than one separation older. A sample that would lower the reading always
+  enters, so the bound can shorten the horizon the reading is a minimum over by at most one
+  separation and can never raise it above a round trip this endpoint actually timed.
 
 - **Withdrawn during this window, recorded because the measurement is worth more than the
   silence: ageing the bandwidth horizon on every acknowledgement rather than on the ones it

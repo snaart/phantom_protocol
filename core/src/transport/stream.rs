@@ -19,7 +19,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, Semaphore};
 
-const MAX_PENDING_PACKETS: usize = 1024;
+/// Segments one stream's ARQ send buffer may hold outstanding at once, and so
+/// the most acknowledgements a single round trip of that stream can return.
+///
+/// Visible to the crate rather than to this file alone because that second
+/// reading of it is load-bearing elsewhere: it is the length of the longest
+/// monotone run one round trip can put into either of the estimator's sliding
+/// filters, which is what
+/// [`WINDOW_FILTER_MAX_ENTRIES`](crate::transport::bandwidth_estimator) is sized
+/// from. A comment claiming that tie is not the same thing as the compiler
+/// holding it, and this constant is a live tuning dial — the receive window is
+/// already const-asserted against it below.
+pub(crate) const MAX_PENDING_PACKETS: usize = 1024;
 
 /// Upper bound on out-of-order segments held for reassembly per stream. A peer that floods
 /// past its window with huge gaps is refused here (the refused segment is NOT recorded as
