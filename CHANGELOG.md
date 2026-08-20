@@ -103,11 +103,25 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   its pump exits, which is the 0.74 s figure the TCP leg shows. A datagram socket has no
   equivalent: an unconnected server socket surfaces no ICMP, so a departing client's last
   observable act is the absence of datagrams and only the liveness timer ever noticed —
-  keep-alive to `Migrating`, then `session_timeout` to `Dead`. Measured over 37 UDP sessions
-  in each of two runs, the tail after the last scenario marker was 135.01 s for every one of
-  them and 0.00 s for every TCP and mimic session. For those two minutes the slot stayed
-  occupied, the server fired a keep-alive into a closed client port every 15 s, and those
-  keep-alives held a NAT binding open for a conversation that had ended.
+  keep-alive to `Migrating`, then `session_timeout` to `Dead`. The WAN harness saw the shape
+  of it first: over 37 UDP sessions in each of two runs, the tail after the last scenario
+  marker was 135.01 s for every one of them and 0.00 s for every TCP and mimic session,
+  while the server fired a keep-alive into a closed client port every 15 s and each one held
+  a NAT binding open for a conversation that had ended.
+
+  That 135.01 s is a harness observation and not a measurement of either resource this
+  change frees, so the improvement is stated against the two resources directly, measured on
+  loopback at the revision before this frame existed and at this one. They are different
+  things with different reclaim paths and are kept apart here for that reason:
+
+  | Quantity | Before | After |
+  | --- | --- | --- |
+  | Embedder-visible session slot (the accepted session's `recv()` returns) | 44.80 s | 0.20 s |
+  | Demux route table (`active_route_count()` back to 0, from 18 routes) | not reclaimed within 250 s | 0.22 s |
+
+  The slot figure is a factor of about 220. The route-table figure is not a ratio at all:
+  nothing at the old revision reclaimed those routes, because every trigger the table had
+  was waiting for a datagram the departed client was never going to send.
 
   It rides `CONTROL` rather than `0x8000`, the last unassigned flag bit. Three in-session
   control frames were added in the two revisions before this one, so spending the last bit on

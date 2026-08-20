@@ -3607,14 +3607,29 @@ const DRAIN_WINDOW_MAX: std::time::Duration = std::time::Duration::from_millis(6
 
 /// How long this side keeps reading after the peer announces its close (WIRE v8).
 ///
-/// What this buys, and what it costs, both belong in the open: the session's slot —
-/// on the PhantomUDP server, its demux routes and its accept permit — is held for the
-/// window rather than released the instant the close lands. Against the 135 s it
-/// replaces, a typical 0.3 s here is better by a factor of ~450, and unlike that 135 s
-/// it is a duration this side chose rather than one imposed by the absence of any
-/// signal at all. The peer cannot lengthen it past [`DRAIN_WINDOW_MAX`], and cannot
-/// re-arm it by sending more: the deadline is taken once, from this value, at the
-/// first close copy.
+/// What this buys and what it costs both belong in the open, and the two things it
+/// moves are different resources with different reclaim paths — conflating them is
+/// how the improvement gets overstated. Measured on loopback against the revision
+/// before this frame existed, one client connecting to one listener and then dropped:
+///
+/// * The **embedder-visible session slot** — how long the accepted session's `recv()`
+///   goes on blocking, which is how long a handler loop is held — was **44.8 s** and
+///   is **0.20 s**, a factor of about 220. The 44.8 s is the liveness path doing its
+///   job slowly: an idle keep-alive fired into a closed port, a path-down verdict,
+///   then the migration idle timeout.
+/// * The **demux route table** — the 18 CID routes the listener holds for that
+///   session — was **not reclaimed at all** within a 250 s observation, and is
+///   reclaimed in **0.22 s**. That one is not a ratio and should not be written as
+///   one: at the old revision nothing reclaimed it, because every trigger the table
+///   had was waiting for a datagram the departed client was never going to send.
+///
+/// The window is held rather than released the instant the close lands, and unlike
+/// either figure above it is a duration this side chose. The peer cannot lengthen it
+/// past [`DRAIN_WINDOW_MAX`], and cannot re-arm it by sending more: the deadline is
+/// taken once, from this value, at the first close copy. On a fast path it is
+/// [`DRAIN_WINDOW_MIN`] — a measured loopback `min_rtt` is a few hundred
+/// microseconds, so three of it is nowhere near the floor — and on the 235 ms
+/// reference WAN path it is the ceiling.
 fn peer_close_drain_window(crypto_session: &Session) -> std::time::Duration {
     // `min_rtt` is the only round-trip figure kept at session scope. RFC 9002's PTO
     // is larger — it adds the variance term and the peer's maximum acknowledgement
