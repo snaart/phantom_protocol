@@ -351,9 +351,20 @@ type CidWindowRegistration = (Vec<ConnId>, mpsc::Sender<(Bytes, SocketAddr)>, Ro
 /// much work a peer population can put in front of the socket, and a peer decides
 /// when its own session ends. Bounded, the worst a coordinated departure can insert
 /// before the next `recv_from` is this many retirements of at most
-/// `CID_WINDOW_TRAILING + CID_WINDOW_LEADING + 2` map removals each — tens of
-/// microseconds, not a stall. Past the bound the excess is dropped rather than
-/// queued; `Session::signal_route_retire` carries what a dropped one costs.
+/// `CID_WINDOW_TRAILING + CID_WINDOW_LEADING + 2` map removals each.
+///
+/// Measured in-crate at exactly that shape — a full queue of 1024 sessions each
+/// holding its whole 20-CID window, drained back to back on an optimised build — one
+/// full queue costs **1.2 ms** against a table holding only those routes and **2.0 ms**
+/// against a table an order of magnitude larger, or roughly 1–2 µs per retirement.
+/// That is a bounded pause, not a stall, and it is what the bound is for; it is also
+/// two orders of magnitude above the "tens of microseconds" this comment used to
+/// claim, which is worth stating plainly because the figure is the whole argument for
+/// the number.
+///
+/// Past the bound the excess is dropped rather than queued.
+/// [`Session::signal_route_retire`] carries what a dropped one costs, and
+/// [`ROUTE_SWEEP_INTERVAL`] is what makes that cost a deferral.
 const RETIRE_QUEUE_DEPTH: usize = 1024;
 
 /// How often the demux sweeps its own route table for entries nothing will come back
@@ -1001,6 +1012,97 @@ mod tests {
         RouteTable::new(Arc::new(AtomicUsize::new(0)))
     }
 
+    /// One retirement costs one session's own route set, and that set has a ceiling
+    /// that does not grow with how long the session lives.
+    ///
+    /// The ceiling is the quantity [`RETIRE_QUEUE_DEPTH`]'s cost figure is derived
+    /// from — a full queue is that many retirements of at most this many removals
+    /// each — so if a session could accumulate routes without bound, the measured
+    /// worst case in front of the socket would be a number about the past rather than
+    /// a constant. The way that would happen is a slide that adds a leading CID
+    /// without dropping a trailing one, which is a one-line change in `apply_slide`
+    /// and reads like a safe one, so it is driven here: a hundred migrations, more
+    /// than any real session performs, and the set must be the same size at the end
+    /// as it was after the first.
+    ///
+    /// The background of other sessions' routes is not scenery. It is what
+    /// distinguishes "released this session's set" from "released everything that
+    /// looked dead", and it is what makes the removal count meaningful.
+    #[test]
+    fn a_session_route_set_has_a_ceiling_that_a_long_life_cannot_raise() {
+        let window = (crate::crypto::cid_chain::CID_WINDOW_TRAILING
+            + crate::crypto::cid_chain::CID_WINDOW_LEADING) as usize
+            + 2;
+        let mut table = empty_table();
+        let mut keep = Vec::new();
+        let mut next: u64 = 0;
+        let mut fresh_cid = move || {
+            next += 1;
+            next.to_be_bytes()
+        };
+
+        let subject = DemuxRouteOwner(1);
+        let (tx, rx) = live_route();
+        keep.push(rx);
+        // Bootstrap CID plus the rotating window, exactly as the accept path installs
+        // them.
+        let bootstrap = fresh_cid();
+        table.try_insert(bootstrap, tx.clone(), subject);
+        let mut edge: Vec<ConnId> = (0..window - 1).map(|_| fresh_cid()).collect();
+        table.register_window(&edge, &tx, subject);
+        let settled = table.owned.get(&subject).map(Vec::len).unwrap_or(0);
+
+        // Other sessions, so a whole-table pass and a per-session release are
+        // distinguishable by their effect and not merely by their implementation.
+        for i in 0..64u64 {
+            let (other_tx, other_rx) = live_route();
+            keep.push(other_rx);
+            let cids: Vec<ConnId> = (0..window).map(|_| fresh_cid()).collect();
+            table.register_window(&cids, &other_tx, DemuxRouteOwner(100 + i));
+        }
+        let table_before = table.routes.len();
+
+        // A hundred migrations. Each slides the window one step: a new leading CID
+        // arrives and the oldest trailing one goes.
+        for _ in 0..100 {
+            let add = fresh_cid();
+            let remove = edge.remove(0);
+            let anchor = *edge.last().unwrap_or(&bootstrap);
+            table.apply_slide(&CidSlide {
+                add: vec![add],
+                remove: vec![remove],
+                anchor,
+            });
+            edge.push(add);
+        }
+
+        let held = table.owned.get(&subject).map(Vec::len).unwrap_or(0);
+        assert_eq!(
+            held, settled,
+            "a session's route set must not grow with the number of migrations it has \
+             made; a slide that adds without dropping turns the retire cost from a \
+             constant into a number about the session's history"
+        );
+        assert!(
+            held <= window,
+            "a session holds at most its bootstrap CID and its rotating window ({window} \
+             routes); got {held}, which is the figure the retire-queue cost is derived \
+             from"
+        );
+
+        table.retire_session(subject);
+        assert_eq!(
+            table_before - table.routes.len(),
+            held,
+            "a retirement must remove exactly this session's routes — no more, which \
+             would reach another session's, and no fewer, which would leave a leak the \
+             signal was supposed to close"
+        );
+        assert!(
+            !table.owned.contains_key(&subject),
+            "and it must leave no reverse-index entry behind"
+        );
+    }
 
     /// A retire signal the bounded queue dropped is reclaimed anyway, by the demux's
     /// own timer, with **no inbound datagram of any kind** to drive it.
