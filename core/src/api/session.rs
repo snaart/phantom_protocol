@@ -5299,20 +5299,35 @@ impl PhantomSession {
             .map_err(|_| CoreError::NetworkError("Session closed".into()))
     }
 
-    /// Finish sending what is queued, tell the peer this session is over, and shut
-    /// it down.
+    /// Ask the background pump to push out what it can, tell the peer this session is
+    /// over, and shut it down.
+    ///
+    /// **What a caller can rely on.** That the session ends, and that this returns
+    /// promptly — it queues the request and returns; the work happens on the pump
+    /// afterwards. Nothing here is a delivery guarantee. The pump pushes queued bytes
+    /// until the socket, the congestion window or the peer's flow-control limit
+    /// refuses the next one, and then stops; it does not wait for an acknowledgement,
+    /// so "pushed" means "handed to the transport", not "the peer has it". A payload
+    /// larger than one congestion window is therefore mostly discarded — half a
+    /// mebibyte handed to `send()` immediately before this call arrives as a few
+    /// kibibytes — and a process that exits right afterwards can leave before any of
+    /// it, or the announcement, reaches the wire. Dropping the handle is the same path
+    /// with no await to hold the process still.
+    ///
+    /// **If delivery matters, do not use this to obtain it.** There is no
+    /// transport-level signal that could be waited on here: the close announcement is
+    /// itself unacknowledged. Have the peer say it received the data, at the
+    /// application level, and close after that answer arrives.
     ///
     /// The announcement is a best-effort `CONTROL` frame carrying
     /// [`ControlSubtype::CLOSE`]: it is not acknowledged and not retransmitted, so a
     /// peer that never receives it falls back to concluding the same thing from
     /// silence, on its liveness timer. It is what lets a PhantomUDP server release
-    /// the session's slot at once instead of two minutes later, because a datagram
-    /// socket gives it no other end-of-stream to observe.
-    ///
-    /// It is composed by the background pump, so it goes out after this returns. A
-    /// process that exits immediately afterwards can leave without it ever reaching
-    /// the wire — as can one that only drops the handle, which is the same path with
-    /// no await to hold the process still.
+    /// the session's slot in under a second instead of two minutes later, because a
+    /// datagram socket gives it no other end-of-stream to observe. A peer that does
+    /// receive it keeps reading for a short bounded window before tearing down, so
+    /// data this side put on the wire just before the close is still delivered if it
+    /// is merely reordered behind it.
     ///
     /// Named `disconnect` rather than `close` because UniFFI's Kotlin
     /// generator unconditionally adds `AutoCloseable.close()` to every
