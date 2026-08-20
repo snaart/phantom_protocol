@@ -121,21 +121,44 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `transcript_hash.bin` because the hello it covers changed. `tests/wire_vectors_decode.py`
   gained an independent statement of the subtype registry and its dispatch.
 
+  A receiver **drains** rather than tearing down on the first copy. The frame is not
+  `RELIABLE`, carries no stream offset and is never acknowledged, so nothing re-sends data it
+  overtakes — and on a datagram path a single one-position reorder is enough for it to arrive
+  ahead of bytes the peer's `send()` already returned `Ok` for. Send order is the only
+  ordering a sender can impose and it is not arrival order. So a receiver records the close
+  and keeps reading for a bounded window, and only then tears down and releases its routes.
+  The window is three times the session's own measured `min_rtt`, floored at 200 ms because a
+  sub-millisecond measurement cannot size a timeout, and capped at 600 ms because that
+  measurement is one a peer can inflate by delaying its acknowledgements — the length of a
+  local commitment must not be a number a remote party writes. Typically 300 ms, against the
+  135 s it replaces. While draining, the session accepts no new application writes and sends
+  nothing of its own.
+
   Emitting the frame is not by itself enough for an operator to see anything. A server
   session's 19 CID routes were reclaimed only by triggers reactive to traffic a departed
   client no longer sends: a datagram arriving for the route, a once-per-handshake reap signal
   that already fired at accept, and an every-256th-connection sweep. So the session now tells
-  the demux directly, on the channel it already uses for CID-window slides, and the demux
-  drops every route sharing that session's inbound channel. In the integration test the route
-  count falls from 18 to 0 within 27 ms of the client leaving, against liveness deadlines two
+  the demux directly, over a bounded queue, naming itself by an identity the listener
+  assigned at accept and never put on the wire; the demux keeps a reverse index from that
+  identity to the session's CIDs and drops exactly those. The cost is that session's own
+  route set and never the size of the table, which matters because this runs on the demux
+  task ahead of the next datagram read, at a moment a peer chooses: a coordinated departure
+  must not be able to decide how long every other session's traffic waits. The queue is
+  bounded for the same reason, and a signal dropped at the bound costs one lazy reclaim —
+  the reclaim path that existed before. In the integration test the route count falls from 18
+  to 0 within the draining window of the client leaving, against liveness deadlines two
   orders of magnitude longer.
 
   Nothing is required to be delivered. The frame is unacknowledged, never retransmitted, and
   takes no part in the SACK machinery; a peer that receives none falls back to concluding the
-  same thing from silence, exactly as before. `docs/protocol/PROTOCOL.md` §4.11 specifies the
-  frame and §7 records the subtype registry as the extension point a future in-session signal
-  should take in preference to the last flag bit; `docs/protocol/INTEROP.md` carries the
-  receiver obligation for a second implementation.
+  same thing from silence, exactly as before. `PhantomSession::disconnect` says so in its own
+  documentation, along with what it does *not* promise: it queues the request and returns,
+  the pump pushes what the socket and the congestion window will take and does not wait for
+  an acknowledgement, so a payload larger than one window is mostly discarded and delivery
+  has to be established at the application level. `docs/protocol/PROTOCOL.md` §4.11 specifies
+  the frame, its draining rule and the subtype registry, and §7 records that registry as the
+  extension point a future in-session signal should take in preference to the last flag bit;
+  `docs/protocol/INTEROP.md` carries the receiver obligation for a second implementation.
 
 - **`WINDOW_UPDATE` carries a cumulative limit instead of a relative credit —
   `WIRE_VERSION` 6 → 7, `PROTOCOL_VERSION` 3 → 4.** The frame's AEAD plaintext is now eight

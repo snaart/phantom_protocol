@@ -3375,3 +3375,145 @@ async fn forged_unencrypted_close_frame_cannot_end_a_session() {
          refused rather than lost (unencrypted_dropped_total = {dropped})"
     );
 }
+
+/// An authenticated close does not discard what is behind it, and the window in which
+/// it does not is **bounded**.
+///
+/// Both halves are one property and neither is safe alone. The close is not
+/// `RELIABLE`, carries no stream offset and is never acknowledged, so nothing re-sends
+/// data it overtakes; a receiver that tore down on the first copy would destroy bytes
+/// the peer's `send()` had already returned `Ok` for, silently at both ends. But a
+/// receiver that simply kept reading would have turned an unacknowledged one-byte
+/// frame into a way for a peer to decide how long this side holds a session's
+/// resources. So it drains: it keeps reading for a window it computes itself, and
+/// then it goes.
+///
+/// The two frames go down a FIFO pipe in the order a reordering path would deliver
+/// them — close first, data behind it — and the stream's own `recv()` is the barrier
+/// proving the close was processed before the data was read. The teardown assertion
+/// afterwards is what stops this from passing on a build that never closes at all.
+#[tokio::test]
+async fn an_authenticated_close_drains_trailing_data_and_then_ends_the_session() {
+    use phantom_protocol::api::session::ConnectionState;
+    use phantom_protocol::api::PhantomSession;
+    use phantom_protocol::transport::handshake::ServerReply;
+
+    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let (to_server_tx, mut to_server_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let client_transport = PipeTransport {
+        to_peer: to_server_tx,
+        from_peer: tokio::sync::Mutex::new(to_client_rx),
+    };
+
+    let server_hs = HandshakeServer::new().expect("server handshake state");
+    let pinned = server_hs.verifying_key().clone();
+    let session = PhantomSession::connect_with_transport("pipe-peer:0", client_transport, pinned);
+
+    let client_ip = "127.0.0.1".parse().expect("client ip");
+    let server_session = loop {
+        let hello_bytes = to_server_rx.recv().await.expect("client hello");
+        let hello = borsh::from_slice::<ClientHello>(&hello_bytes).expect("decode client hello");
+        match server_hs.process_client_hello(&hello, 0, client_ip) {
+            HandshakeResponse::Retry(retry) => {
+                let wire = ServerReply::Retry(retry).to_wire().expect("encode retry");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send retry");
+            }
+            HandshakeResponse::Success(server_hello, negotiated, _) => {
+                let wire = ServerReply::Hello(server_hello)
+                    .to_wire()
+                    .expect("encode server hello");
+                to_client_tx
+                    .send(Bytes::from(wire))
+                    .await
+                    .expect("send server hello");
+                break negotiated;
+            }
+            HandshakeResponse::Reject(r) => panic!("server rejected its own client: {r:?}"),
+            HandshakeResponse::Fail(e) => panic!("handshake failed: {e:?}"),
+        }
+    };
+
+    session
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+    let session_id = *server_session.id();
+    let app_stream = session.open_stream();
+    let target: u16 = app_stream
+        .stream_id()
+        .try_into()
+        .expect("a locally-opened stream id fits the wire field");
+
+    // The close, sealed by the real key. Deliberately unpadded: a receiver must not
+    // require `PADDED` — the flag means only "a trailer is present" — so this is also
+    // the conformance case for a peer whose shaping policy differs from ours.
+    let close_header = PacketHeader::new(
+        session_id,
+        1,
+        1,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::CONTROL),
+    )
+    .with_epoch(server_session.current_epoch());
+    let close_ct = server_session
+        .encrypt_packet(&close_header, &[ControlSubtype::CLOSE], &[])
+        .expect("seal the close frame");
+    let close_wire = server_session
+        .protect_packet(&PhantomPacket::new(close_header, close_ct))
+        .expect("protect the close frame");
+    to_client_tx
+        .send(Bytes::from(close_wire))
+        .await
+        .expect("send close");
+
+    // The data the close overtook: first reliable frame server→client on this stream,
+    // so its gap-free stream offset is 0.
+    let data_header = PacketHeader::new(
+        session_id,
+        target,
+        2,
+        PacketFlags::new(PacketFlags::ENCRYPTED | PacketFlags::RELIABLE),
+    )
+    .with_epoch(server_session.current_epoch());
+    let mut data_plaintext = 0u32.to_be_bytes().to_vec();
+    data_plaintext.extend_from_slice(b"behind-the-close");
+    let data_ct = server_session
+        .encrypt_packet(&data_header, &data_plaintext, &[])
+        .expect("seal the trailing frame");
+    let data_wire = server_session
+        .protect_packet(&PhantomPacket::new(data_header, data_ct))
+        .expect("protect the trailing frame");
+    to_client_tx
+        .send(Bytes::from(data_wire))
+        .await
+        .expect("send trailing data");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(10), app_stream.recv())
+        .await
+        .expect("data behind an authenticated close is still delivered")
+        .expect("recv")
+        .expect("the stream is open, so this is data and not a peer FIN");
+    assert_eq!(
+        delivered, b"behind-the-close",
+        "a close that overtook a data frame must not discard it"
+    );
+
+    // …and the draining window ends. Polled rather than slept on so the assertion is
+    // "this happens", not "this happens at time T": the window is derived from the
+    // session's own round-trip measurement, so its length is not a constant this test
+    // is entitled to know. The cap is far above any value the window can take.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while session.connection_state() != ConnectionState::Closed
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        session.connection_state(),
+        ConnectionState::Closed,
+        "the draining window must be bounded — a session that keeps reading after its \
+         peer left is a resource a peer decided to hold"
+    );
+}

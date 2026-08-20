@@ -242,6 +242,14 @@ subtype byte to its caller. So implement the branch first and its contents secon
 - Read the leading byte after the padding trailer is off. `0x01` is `CLOSE` — the
   peer is ending the session; tear down as you would on any other teardown. It is
   unacknowledged: do not `ACK` it, do not answer it with a close of your own.
+- **Do not tear down on the copy you first see — drain first.** The `CLOSE` is not
+  `RELIABLE` and nothing retransmits the application data it may have overtaken, and
+  on a datagram path one position of reordering is enough for it to. Record the close,
+  keep processing inbound for a bounded window (PROTOCOL.md § 4.11 gives the sizing
+  and both of its bounds), deliver what arrives, send nothing new, and tear down at
+  the end of it. This is the receiver rule most likely to be missed, because a peer
+  that omits it interoperates perfectly on a loopback test and silently truncates its
+  peers' last writes in production.
 - Drop the frame on **every** other byte, `0x00` included, and drop it if the
   plaintext is empty. Never read a missing or zero byte as a default.
 - **Return on all of those paths.** That, not the `CLOSE` handling, is the

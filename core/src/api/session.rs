@@ -1985,6 +1985,10 @@ async fn run_data_pump<T: SessionTransport>(
         // the observability bookkeeping the receive path needs.
         let mut scratch =
             RecvScratch::new(256, stream_gauge_recv, path_challenges_recv, recv_tuning);
+        // Draining (WIRE v8): the instant this loop stops reading once the peer has
+        // announced its close. `None` until the first close copy is handled, and
+        // computed exactly once from a window the peer cannot extend.
+        let mut drain_deadline: Option<std::time::Instant> = None;
         loop {
             // Flow-control / anti-flood gate: if the app-delivery backlog
             // has blown past the cap, the peer is not honouring the window —
@@ -2065,8 +2069,23 @@ async fn run_data_pump<T: SessionTransport>(
             // ends the same way it ends for a dead transport — everything already
             // delivered stays queued for the delivery task, and the pump learns of
             // it through the one signal it already watches.
+            //
+            // It does not end *now*, though. The close is not `RELIABLE`, carries no
+            // stream offset and is never acknowledged, so nothing re-sends whatever
+            // it overtakes; on a datagram path a single one-position reorder is
+            // enough for it to arrive ahead of data the peer's `send()` already
+            // returned `Ok` for, and stopping here would discard those bytes with no
+            // error at either end. So the session drains instead: it keeps reading
+            // for a bounded window and only then lets go. The deadline is taken once,
+            // on the first copy, and never moved — a peer that keeps sending cannot
+            // hold this loop open by talking.
             if crypto_recv.peer_closed() {
-                break;
+                let deadline = *drain_deadline.get_or_insert_with(|| {
+                    std::time::Instant::now() + peer_close_drain_window(&crypto_recv)
+                });
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
             }
         }
         // Reader exiting → drop `deliver_tx` so the delivery task drains any
@@ -2124,6 +2143,12 @@ async fn run_data_pump<T: SessionTransport>(
     // collapsed the download under a saturating upload. Pacing must slow the
     // sender, not stop the session.
     let mut paced_until: Option<tokio::time::Instant> = None;
+    // Draining (WIRE v8): the instant this pump tears down once the peer has
+    // announced its close, or `None` while it has not. The receive task runs the same
+    // deadline at a packet boundary, which is the clean exit; this one covers the case
+    // the receive task cannot see, namely that nothing further arrives at all — a
+    // reader parked in `recv_bytes()` has no boundary at which to notice a deadline.
+    let mut draining_until: Option<std::time::Instant> = None;
     // Outbound WINDOW_UPDATE control packets are emitted on the send loop — the
     // sole outbound writer — so the encrypted control frame is always sealed under
     // the epoch live when it stamps. The epoch has two writers (this loop's own
@@ -2143,6 +2168,30 @@ async fn run_data_pump<T: SessionTransport>(
             .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
         tokio::select! {
             _ = poll_interval.tick() => {
+                // Draining (WIRE v8). The peer said it is leaving, so this side stops
+                // producing and keeps consuming for a bounded window: the receive task
+                // is still delivering whatever was in flight behind the close, and the
+                // demux route retire at the foot of this function is deferred until
+                // this loop exits, which is what keeps those datagrams routable while
+                // it is. Armed once from a window computed once — see
+                // `peer_close_drain_window` for why the peer cannot lengthen it.
+                if draining_until.is_none() && crypto_session.peer_closed() {
+                    let window = peer_close_drain_window(&crypto_session);
+                    log::info!(
+                        "PhantomSession: peer announced session close; draining for {window:?}"
+                    );
+                    draining_until = Some(std::time::Instant::now() + window);
+                }
+                if let Some(until) = draining_until {
+                    if std::time::Instant::now() >= until {
+                        break;
+                    }
+                    // Nothing outbound while draining: the peer's session is ending, so
+                    // new data has nowhere to arrive, a keep-alive has nobody to answer
+                    // it, and a liveness verdict about a path the peer has abandoned
+                    // would only publish a state this teardown is about to overwrite.
+                    continue;
+                }
                 flush_deferred_sends(
                     &mut deferred, &transport, &crypto_session, session_id, &streams,
                     &demux, &stream_gauge, &observability,
@@ -2205,7 +2254,10 @@ async fn run_data_pump<T: SessionTransport>(
                     break;
                 }
             }
-            _ = send_notify.notified() => {
+            // Disabled while draining: this arm exists to put newly-queued bytes on
+            // the wire promptly, and a session whose peer has announced its close has
+            // nowhere to put them.
+            _ = send_notify.notified(), if draining_until.is_none() => {
                 // Same drain logic as the tick arm — fast-wake path. Also admit
                 // whatever the send buffers have room for now (an acknowledgement
                 // that freed a slot wakes us here) and flush any flow-control
@@ -2237,7 +2289,8 @@ async fn run_data_pump<T: SessionTransport>(
             // to be a pacing clock: at a 16 KiB burst allowance, waking only
             // every 10 ms caps the sender at 1.6 MB/s no matter what rate
             // congestion control asked for.
-            _ = tokio::time::sleep_until(paced_wake), if paced_until.is_some() => {
+            _ = tokio::time::sleep_until(paced_wake),
+                if paced_until.is_some() && draining_until.is_none() => {
                 paced_until = apply_drain_outcome(
                     &crypto_session,
                     drain_streams_priority_ordered(
@@ -2255,6 +2308,28 @@ async fn run_data_pump<T: SessionTransport>(
             // per-stream byte ordering and lets the bounded command channel carry
             // the backpressure back to the caller.
             cmd_opt = cmd_rx.recv(), if deferred.is_empty() => {
+                // Draining (WIRE v8): the local side may still hand this pump writes
+                // after the peer has announced its close. They are refused rather than
+                // queued — the peer's session is over, so a byte accepted here would
+                // be a byte silently dropped at teardown, and the caller is better
+                // served by the session ending than by an `Ok` that means nothing. The
+                // arm keeps *reading* commands so `disconnect()` and a dropped handle
+                // still land; only the writes are declined.
+                if draining_until.is_some()
+                    && matches!(
+                        cmd_opt,
+                        Some(SessionCommand::Send(_))
+                            | Some(SessionCommand::SendStreamReliable { .. })
+                            | Some(SessionCommand::SendStreamUnreliable { .. })
+                            | Some(SessionCommand::CloseStream { .. })
+                    )
+                {
+                    log::debug!(
+                        "PhantomSession: refusing an application write while draining the \
+                         peer's close"
+                    );
+                    continue;
+                }
                 match cmd_opt {
                     Some(SessionCommand::Send(data)) => {
                         // Route through the raw-app stream so the payload is
@@ -2426,27 +2501,17 @@ async fn run_data_pump<T: SessionTransport>(
                     }
                     Some(SessionCommand::Close) => {
                         log::info!("PhantomSession: closing");
-                        // `disconnect()` is a *graceful* close (doc: "Send the
-                        // graceful close frame and shut the session down" — TCP-FIN
-                        // semantics: finish sending, then close). Mirror the
-                        // handle-drop (`None`) arm so buffered `send()` data still
-                        // reaches the peer: `session.send(x); session.disconnect()`
-                        // must not lose `x`, just like `send(x); drop(session)`.
-                        flush_pending_window_updates(
+                        // `disconnect()` is a *graceful* close with TCP-FIN shape:
+                        // push what is queued, then close. Mirror the handle-drop
+                        // (`None`) arm so buffered `send()` data still reaches the
+                        // peer: `session.send(x); session.disconnect()` must not lose
+                        // `x`, just like `send(x); drop(session)` — bearing in mind
+                        // that "push" is what the drain does and not "deliver", which
+                        // is what the method's own documentation says out loud.
+                        finish_and_announce(
                             &transport, &crypto_session, session_id, &streams, &observability,
                         )
                         .await;
-                        drain_streams_fully(
-                            &transport, &crypto_session, session_id, &streams, &observability,
-                        )
-                        .await;
-                        // Only now — the close frame ends the peer's session, so a peer
-                        // that acts on it before the drained data has arrived would lose
-                        // that data. On a datagram transport the two are separate
-                        // datagrams with no ordering between them, so the ordering that
-                        // exists is the one this side imposes by sending them in turn.
-                        announce_close(&transport, &crypto_session, session_id, &observability)
-                            .await;
                         break;
                     }
                     None => {
@@ -2459,28 +2524,20 @@ async fn run_data_pump<T: SessionTransport>(
                         // handle still reaches the peer — otherwise a freshly-accepted
                         // server session that does `recv(); send(echo)` then drops loses
                         // the echo, and the client's `recv()` hangs to its timeout.
-                        flush_pending_window_updates(
+                        finish_and_announce(
                             &transport, &crypto_session, session_id, &streams, &observability,
                         )
                         .await;
-                        drain_streams_fully(
-                            &transport, &crypto_session, session_id, &streams, &observability,
-                        )
-                        .await;
-                        // Same ordering as the `Close` arm: the peer only learns the
-                        // session is over once everything it was owed is on the wire.
-                        announce_close(&transport, &crypto_session, session_id, &observability)
-                            .await;
                         break;
                     }
                 }
             }
             _ = &mut recv_done_rx => {
                 if crypto_session.peer_closed() {
-                    // The peer announced its close and the receive loop ended on it.
-                    // Nothing is wrong and nothing is owed back: answering a close with
-                    // a close would only make two sessions each wait for the other's
-                    // last word.
+                    // The peer announced its close and the receive loop has finished
+                    // draining behind it. Nothing is wrong and nothing is owed back:
+                    // answering a close with a close would only make two sessions each
+                    // wait for the other's last word.
                     log::info!("PhantomSession: peer closed the session");
                 } else {
                     log::error!(
@@ -2501,6 +2558,13 @@ async fn run_data_pump<T: SessionTransport>(
     // that a departed peer will never send. Placed on the common teardown path rather
     // than in the graceful-close arm, because a session ends five ways and the routes
     // should go on all of them. A no-op everywhere but the UDP server.
+    //
+    // Reaching it is what ends the draining window on the receiving side, and that
+    // ordering is load-bearing rather than incidental: retiring the routes is the
+    // second way a late datagram gets discarded — one that finds no route is not an
+    // `Initial`, so the demux drops it before any session sees it — so the retire has
+    // to wait for the same deadline the receive loop does, and it does that by being
+    // here rather than at the moment the close was read.
     crypto_session.signal_route_retire();
     // A liveness idle-timeout death already published `ConnectionState::Dead`; only a
     // normal teardown (graceful close / transport drop) publishes `Closed`.
@@ -3514,6 +3578,100 @@ async fn send_cover<T: SessionTransport>(
     true
 }
 
+/// Round trips the draining window spans, once the peer has announced its close
+/// (WIRE v8). QUIC's draining period is three PTOs and this is the same shape and
+/// the same reason: three round trips is long enough that a datagram already on the
+/// path when the close was sent has arrived, and short enough that nothing waits on
+/// a session neither side is using.
+const DRAIN_ROUND_TRIPS: u32 = 3;
+
+/// Floor on the draining window.
+///
+/// The round-trip figure it multiplies is a *measurement*, and on a loopback or a
+/// datacentre path that measurement is a few hundred microseconds — three of which
+/// would drain nothing at all, because the displacement this window exists to absorb
+/// is produced by the path's queues and not by its length. It is the same judgement
+/// the retransmit timer already makes with its own 200 ms floor: below this, a
+/// round-trip measurement is too small to size a timeout with.
+const DRAIN_WINDOW_MIN: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Absolute ceiling on the draining window, and the reason it exists is the peer.
+///
+/// The round-trip figure is one the peer can inflate — delaying its own
+/// acknowledgements raises what this side measures — so without a ceiling the length
+/// of a *local* commitment would be a number a remote party writes. The cost of the
+/// ceiling is that a genuinely very long path drains for fewer than
+/// [`DRAIN_ROUND_TRIPS`] round trips; the cost of not having one is a lever, and a
+/// lever is worse.
+const DRAIN_WINDOW_MAX: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// How long this side keeps reading after the peer announces its close (WIRE v8).
+///
+/// What this buys, and what it costs, both belong in the open: the session's slot —
+/// on the PhantomUDP server, its demux routes and its accept permit — is held for the
+/// window rather than released the instant the close lands. Against the 135 s it
+/// replaces, a typical 0.3 s here is better by a factor of ~450, and unlike that 135 s
+/// it is a duration this side chose rather than one imposed by the absence of any
+/// signal at all. The peer cannot lengthen it past [`DRAIN_WINDOW_MAX`], and cannot
+/// re-arm it by sending more: the deadline is taken once, from this value, at the
+/// first close copy.
+fn peer_close_drain_window(crypto_session: &Session) -> std::time::Duration {
+    // `min_rtt` is the only round-trip figure kept at session scope. RFC 9002's PTO
+    // is larger — it adds the variance term and the peer's maximum acknowledgement
+    // delay — so multiplying this one gives a deliberately modest window rather than
+    // a generous one, which is the right direction for a value that holds a resource.
+    drain_window_for_rtt(crypto_session.bandwidth_snapshot().min_rtt)
+}
+
+/// The draining window for one measured round trip. Split out from
+/// [`peer_close_drain_window`] because the bounds are the part with a security
+/// argument behind them, and they should be checkable without a session to hang a
+/// round-trip measurement on.
+fn drain_window_for_rtt(rtt: std::time::Duration) -> std::time::Duration {
+    rtt.saturating_mul(DRAIN_ROUND_TRIPS)
+        .clamp(DRAIN_WINDOW_MIN, DRAIN_WINDOW_MAX)
+}
+
+/// Put what this session still owes the peer on the wire, then tell the peer it is
+/// over. The shared tail of `disconnect()` and of dropping the handle.
+///
+/// Both do nothing when the peer has already announced its own close: there is
+/// nobody left to flush to, and answering a close with a close would only make two
+/// sessions each wait for the other's last word.
+async fn finish_and_announce<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    streams: &Arc<DashMap<u32, Arc<Stream>>>,
+    observability: &Observability,
+) {
+    if crypto_session.peer_closed() {
+        return;
+    }
+    flush_pending_window_updates(
+        transport,
+        crypto_session,
+        session_id,
+        streams,
+        observability,
+    )
+    .await;
+    drain_streams_fully(
+        transport,
+        crypto_session,
+        session_id,
+        streams,
+        observability,
+    )
+    .await;
+    // Only now — the close frame ends the peer's session, so a peer that acted on it
+    // before the drained data arrived would lose that data. Sending them in turn is
+    // the only ordering this side can impose, and on a datagram transport it is not
+    // arrival order; what covers the rest is the peer's own draining window, not
+    // anything achievable from here.
+    announce_close(transport, crypto_session, session_id, observability).await;
+}
+
 /// How many close frames a departing session emits back to back.
 ///
 /// The frame is unacknowledged and never retransmitted, so redundancy is the only
@@ -4105,10 +4263,13 @@ async fn handle_packet<T: SessionTransport>(
         }
         match plaintext[0] {
             ControlSubtype::CLOSE => {
-                // The peer said it is leaving. Record it; the receive loop reads this
-                // after each packet and ends, which drops the transport and lets the
-                // pump run its ordinary teardown — the same teardown that publishes
-                // the state, retires the stream gauge and releases the demux routes.
+                // The peer said it is leaving. Recorded here and acted on nowhere near
+                // here: the receive loop reads this after each packet and starts its
+                // draining window, at the end of which it ends and the pump runs its
+                // ordinary teardown — the same teardown that publishes the state,
+                // retires the stream gauge and releases the demux routes. Recording
+                // rather than tearing down is what keeps a close that overtook a data
+                // frame from discarding it; nothing re-sends what this frame passes.
                 log::info!("PhantomSession: peer announced session close");
                 crypto_recv.note_peer_closed();
             }
@@ -9903,6 +10064,57 @@ mod tests {
             &[ControlSubtype::CLOSE],
             "the control body is the close subtype and nothing else"
         );
+    }
+
+    /// The draining window is bounded at both ends, and the upper bound is the one
+    /// that matters.
+    ///
+    /// A peer's close starts a window during which this side holds the session's
+    /// resources — on the PhantomUDP server, its demux routes and its accept permit.
+    /// The window is sized from a round-trip *measurement*, and a peer can inflate
+    /// what this side measures by delaying its own acknowledgements, so without a
+    /// ceiling the length of a local commitment would be a number written by a remote
+    /// party. The floor is the other half of the same judgement: a sub-millisecond
+    /// measurement on a loopback or datacentre path would drain nothing, because the
+    /// displacement this window absorbs comes from the path's queues rather than from
+    /// its length.
+    ///
+    /// The final row is the arithmetic case: an absurd measurement must clamp, not
+    /// overflow the multiplication on its way there.
+    #[test]
+    fn the_draining_window_is_bounded_at_both_ends() {
+        use std::time::Duration;
+
+        for tiny in [
+            Duration::ZERO,
+            Duration::from_micros(1),
+            Duration::from_millis(10),
+        ] {
+            assert_eq!(
+                drain_window_for_rtt(tiny),
+                DRAIN_WINDOW_MIN,
+                "a round trip too small to size a timeout with must fall back to the floor"
+            );
+        }
+
+        // The ordinary case sits strictly between the bounds, so neither of them is
+        // silently doing all the work.
+        let ordinary = drain_window_for_rtt(Duration::from_millis(100));
+        assert_eq!(ordinary, Duration::from_millis(300));
+        assert!(ordinary > DRAIN_WINDOW_MIN && ordinary < DRAIN_WINDOW_MAX);
+
+        for inflated in [
+            Duration::from_secs(1),
+            Duration::from_secs(3600),
+            Duration::MAX,
+        ] {
+            assert_eq!(
+                drain_window_for_rtt(inflated),
+                DRAIN_WINDOW_MAX,
+                "no round-trip measurement, however inflated, may lengthen the window \
+                 past its ceiling — the peer supplies that measurement"
+            );
+        }
     }
 
     /// An authenticated close frame ends the session and hands the application

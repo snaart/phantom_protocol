@@ -1112,6 +1112,43 @@ transition, the same gauges, the same resource release — and must not answer i
 a close of its own, or two departing sessions would each wait on the other's last
 word.
 
+**Draining: a receiver must not end the session on the copy it first sees.** This is
+the receiver obligation the frame cannot work without, and it exists because of what
+the frame is not. A `CLOSE` is not `RELIABLE`, carries no `stream_offset`, is never
+acknowledged and is never retransmitted, so nothing re-sends application data it
+overtakes. On a datagram transport it overtakes data routinely: one position of
+displacement is enough, and ECMP/LAG rehash, a link-layer retry and the brief
+two-live-paths window after a migration all produce that much as a matter of course.
+A receiver that tore down on arrival would therefore destroy bytes whose sender's
+`send()` had already returned success, with no error at either end — the sender's
+close returns normally and the receiver's error is indistinguishable from an ordinary
+teardown. Note that the sender cannot fix this from its side: emitting the close last
+orders the *transmissions*, and transmission order is not arrival order. This is the
+same hazard § 4.3's step-12 rule addresses at stream scope, where a `FIN` half-closes
+only once the in-order cursor has passed its own offset; `CLOSE` has no offset to
+compare, so the rule takes the form of a timer instead.
+
+On receiving a `CLOSE`, a receiver **records** it and **keeps processing inbound
+frames for a bounded draining window** before tearing down and releasing the
+session's resources. Within the window it delivers what arrives, exactly as before.
+It **must not** accept new application writes from its local side, and **must not**
+treat the peer's close as licence to send data of its own — the peer has stated it is
+leaving, so anything sent has nowhere to arrive.
+
+The window is derived from the connection's own round-trip measurement — a small
+multiple of it, this implementation using three, which is the shape of QUIC's
+draining period — and it **must** be bounded absolutely. Both bounds are load-bearing
+and for opposite reasons. A floor, because a sub-millisecond measurement on a
+loopback or datacentre path would drain nothing, the displacement being produced by
+the path's queues rather than by its length; this implementation floors at 200 ms. A
+ceiling, because the round-trip figure is one the peer can inflate by delaying its
+own acknowledgements, and without a ceiling the duration of a *local* commitment
+would be a number a remote party writes; this implementation caps at 600 ms. The
+deadline is taken once, when the first copy is seen, and is never extended by
+anything that arrives afterwards — otherwise a peer could hold the session open by
+continuing to talk. In the ordinary case that is 300 ms of held slot, against the
+timer-driven alternative of § 12.4, which is over two minutes.
+
 **If it is lost entirely**, nothing breaks and nothing is retried: the receiver falls
 back to concluding the same thing from silence, on the liveness timer of § 12.4,
 exactly as it did before v8. That is the whole compatibility story of the frame — it
@@ -1119,11 +1156,16 @@ improves the common case and changes no worst case — and it is why an implemen
 that chooses never to send one is still conformant, while one that fails to dispatch
 a received one is not.
 
-A sender emits it **after** flushing everything it owes the peer, and never before:
-on a datagram transport the close and the trailing data are separate datagrams with
-no ordering between them, so the only ordering that exists is the one the sender
-imposes by sending them in turn. Emitted only from an established session; one that
-never got past the handshake has no keys to seal with and no peer state to release.
+A sender emits it **after** pushing out everything it owes the peer, and never
+before. That is worth doing and is not sufficient: on a datagram transport the close
+and the trailing data are separate datagrams with no ordering between them, so
+sending them in turn orders the transmissions and nothing more — what covers the rest
+is the receiver's draining window above, and a specification that asked only this of
+the sender would be asking for a guarantee the sender cannot give. Note also that
+"pushing out" is not "delivering": nothing acknowledges the flush either, so an
+application that needs its last bytes delivered establishes that at its own level and
+closes afterwards. Emitted only from an established session; one that never got past
+the handshake has no keys to seal with and no peer state to release.
 
 Why it exists is § 12.4's blind spot. On a byte pipe a departing peer's transport
 drop makes the other side's read fail and its session ends within a second; a
@@ -2048,9 +2090,11 @@ So a session that is ending now says so first: a `CONTROL` frame carrying
 `ControlSubtype::CLOSE` (§ 4.11), emitted after the final flush. It is
 best-effort — unacknowledged, never retransmitted — and it **replaces nothing**.
 Every timer above still runs and still reaches the same verdict on its own schedule;
-the frame only lets the common case be decided in one round trip instead of two
-minutes. A receiver that never gets one behaves exactly as it did before v8, which is
-why an implementation is free to send none and not free to ignore one.
+the frame only lets the common case be decided in one draining window (§ 4.11,
+typically 300 ms) instead of two minutes. A receiver that never gets one behaves
+exactly as it did before v8, which is why an implementation is free to send none and
+not free to ignore one — and, having got one, not free to act on it immediately
+either.
 
 ### 12.5 Threat model & residual risk (honest)
 
