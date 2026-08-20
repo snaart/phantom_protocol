@@ -20,7 +20,7 @@ use crate::transport::handshake::{
 };
 use crate::transport::phantom_udp::datagram::{encode_datagrams, push_datagram, FragmentAssembler};
 use crate::transport::phantom_udp::envelope::{ConnId, PacketType};
-use crate::transport::session::{CidSlide, DemuxSignal};
+use crate::transport::session::{CidSlide, DemuxLink, DemuxRouteOwner};
 use crate::transport::types::LegType;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -340,17 +340,48 @@ impl Drop for PhantomUdpListener {
 const MAX_ROUTES: usize = 1 << 18;
 
 /// ε / WIRE v5: a session's inbound rotating-CID window paired with its inbound
-/// channel — the payload the handshake task sends the demux to install the
-/// window CIDs (N:1) so the client's `CID_0..` datagrams route to the session.
-type CidWindowRegistration = (Vec<ConnId>, mpsc::Sender<(Bytes, SocketAddr)>);
+/// channel and the identity of its routes — the payload the handshake task sends the
+/// demux to install the window CIDs (N:1) so the client's `CID_0..` datagrams route
+/// to the session.
+type CidWindowRegistration = (Vec<ConnId>, mpsc::Sender<(Bytes, SocketAddr)>, RouteOwner);
+
+/// Depth of the end-of-session route-retire queue (WIRE v8).
+///
+/// The demux drains this queue ahead of every datagram read, so its length is how
+/// much work a peer population can put in front of the socket, and a peer decides
+/// when its own session ends. Bounded, the worst a coordinated departure can insert
+/// before the next `recv_from` is this many retirements of at most
+/// `CID_WINDOW_TRAILING + CID_WINDOW_LEADING + 2` map removals each — tens of
+/// microseconds, not a stall. Past the bound the excess is dropped rather than
+/// queued; see [`Session::signal_route_retire`] for what a dropped one costs.
+const RETIRE_QUEUE_DEPTH: usize = 1024;
+
+/// Which session a demux route belongs to. Re-exported name for the identity the
+/// demux hands each accepted session in its [`DemuxLink`].
+type RouteOwner = DemuxRouteOwner;
+
+/// One demux route: the session's inbound channel and which session it is.
+struct RouteEntry {
+    tx: mpsc::Sender<(Bytes, SocketAddr)>,
+    owner: RouteOwner,
+}
 
 /// Bounded, self-reaping demux route table keyed on the unauthenticated 8-byte CID (H-1).
 /// A route's liveness is exactly its inbound channel's: a closed `Sender` (`is_closed()`)
 /// means the handshake task failed or the established session was dropped, so the entry is
 /// reclaimable. The `gauge` mirrors `len()` so `active_route_count()` can read the size
 /// without a lock. A live session's route is never evicted to admit a new connection.
+///
+/// `owned` is the reverse index: every CID currently routed to a given session. It is
+/// what makes releasing a whole session's routes cost the size of that session's own
+/// window rather than the size of the table, and it is also what makes the operation
+/// safe — the released set is the set that was inserted under that identity, so a
+/// session cannot reach another's routes even in principle. It is maintained by
+/// [`Self::insert_route`] and [`Self::remove_route`], which every mutator funnels
+/// through, and it holds no entry for a session with no routes.
 struct RouteTable {
-    routes: HashMap<ConnId, mpsc::Sender<(Bytes, SocketAddr)>>,
+    routes: HashMap<ConnId, RouteEntry>,
+    owned: HashMap<RouteOwner, Vec<ConnId>>,
     gauge: Arc<AtomicUsize>,
 }
 
@@ -359,6 +390,7 @@ impl RouteTable {
         gauge.store(0, Ordering::Relaxed);
         Self {
             routes: HashMap::new(),
+            owned: HashMap::new(),
             gauge,
         }
     }
@@ -368,26 +400,83 @@ impl RouteTable {
     }
 
     fn get(&self, cid: &ConnId) -> Option<&mpsc::Sender<(Bytes, SocketAddr)>> {
-        self.routes.get(cid)
+        self.routes.get(cid).map(|e| &e.tx)
+    }
+
+    /// Record `cid → (tx, owner)` in both directions. The single insertion point, so
+    /// the reverse index cannot fall behind the forward one.
+    fn insert_route(
+        &mut self,
+        cid: ConnId,
+        tx: mpsc::Sender<(Bytes, SocketAddr)>,
+        owner: RouteOwner,
+    ) {
+        if let Some(previous) = self.routes.insert(cid, RouteEntry { tx, owner }) {
+            self.forget_owned(previous.owner, &cid);
+        }
+        self.owned.entry(owner).or_default().push(cid);
+    }
+
+    /// Drop `cid` from `owner`'s reverse-index entry, and the entry itself once it is
+    /// empty, so a session that has lost its last route leaves nothing behind.
+    fn forget_owned(&mut self, owner: RouteOwner, cid: &ConnId) {
+        if let Some(cids) = self.owned.get_mut(&owner) {
+            cids.retain(|c| c != cid);
+            if cids.is_empty() {
+                self.owned.remove(&owner);
+            }
+        }
+    }
+
+    /// Drop one route from both directions. The single removal point.
+    fn remove_route(&mut self, cid: &ConnId) {
+        if let Some(entry) = self.routes.remove(cid) {
+            self.forget_owned(entry.owner, cid);
+        }
     }
 
     /// Reclaim every route whose receiver was dropped (failed handshake / gone session).
     fn reap_dead(&mut self) {
-        self.routes.retain(|_, tx| !tx.is_closed());
+        let dead: Vec<ConnId> = self
+            .routes
+            .iter()
+            .filter(|(_, entry)| entry.tx.is_closed())
+            .map(|(cid, _)| *cid)
+            .collect();
+        for cid in &dead {
+            self.remove_route(cid);
+        }
         self.sync();
     }
 
     /// Insert a fresh route, enforcing `MAX_ROUTES`. Reaps dead entries first when at the
     /// cap; returns `false` (inserting nothing) only if still full of *live* routes, so the
     /// caller drops the new `Initial`. A live route is never evicted to admit a new one.
-    fn try_insert(&mut self, cid: ConnId, tx: mpsc::Sender<(Bytes, SocketAddr)>) -> bool {
+    ///
+    /// That last sentence is checked here as well as at the cap. The key is a connection
+    /// id chosen by whoever sent the datagram, so an unconditional insert would let one
+    /// party silently repoint a route a live session is being reached through; a slot
+    /// already held by *another* live session is refused instead. Re-inserting a CID this
+    /// same session already holds is a no-op, which is the ordinary case — its bootstrap
+    /// CID arrives again as part of its window.
+    fn try_insert(
+        &mut self,
+        cid: ConnId,
+        tx: mpsc::Sender<(Bytes, SocketAddr)>,
+        owner: RouteOwner,
+    ) -> bool {
+        match self.routes.get(&cid) {
+            Some(entry) if entry.owner == owner => return true,
+            Some(entry) if !entry.tx.is_closed() => return false,
+            _ => {}
+        }
         if self.routes.len() >= MAX_ROUTES {
             self.reap_dead();
             if self.routes.len() >= MAX_ROUTES {
                 return false;
             }
         }
-        self.routes.insert(cid, tx);
+        self.insert_route(cid, tx, owner);
         self.sync();
         true
     }
@@ -395,8 +484,8 @@ impl RouteTable {
     /// Remove a CID iff its route is dead. Safe for any CID — a live session's route (its
     /// `Sender` still held by the running session) is left untouched.
     fn remove_if_dead(&mut self, cid: &ConnId) {
-        if self.routes.get(cid).is_some_and(|tx| tx.is_closed()) {
-            self.routes.remove(cid);
+        if self.routes.get(cid).is_some_and(|e| e.tx.is_closed()) {
+            self.remove_route(cid);
             self.sync();
         }
     }
@@ -407,10 +496,15 @@ impl RouteTable {
     /// at the cap; a CID that can't be inserted (table full of *live* routes) is
     /// skipped — the peer retransmits, and the window stays bounded by MAX_ROUTES.
     /// The bootstrap CID (registered separately at Initial accept) stays alongside
-    /// the window until the whole session's routes are reaped on disconnect.
-    fn register_window(&mut self, cids: &[ConnId], tx: &mpsc::Sender<(Bytes, SocketAddr)>) {
+    /// the window until the whole session's routes are released on disconnect.
+    fn register_window(
+        &mut self,
+        cids: &[ConnId],
+        tx: &mpsc::Sender<(Bytes, SocketAddr)>,
+        owner: RouteOwner,
+    ) {
         for &cid in cids {
-            self.try_insert(cid, tx.clone());
+            self.try_insert(cid, tx.clone(), owner);
         }
     }
 
@@ -419,38 +513,41 @@ impl RouteTable {
     /// channel through `anchor` (a CID still routed for it). A no-op if `anchor` is
     /// gone (the session ended), so a late slide for a dead session does nothing.
     fn apply_slide(&mut self, slide: &CidSlide) {
-        let Some(tx) = self.routes.get(&slide.anchor).cloned() else {
+        let Some(entry) = self.routes.get(&slide.anchor) else {
             return;
         };
+        let (tx, owner) = (entry.tx.clone(), entry.owner);
         for &cid in &slide.add {
-            self.try_insert(cid, tx.clone());
+            self.try_insert(cid, tx.clone(), owner);
         }
         for cid in &slide.remove {
-            self.routes.remove(cid);
+            self.remove_route(cid);
         }
         self.sync();
     }
 
-    /// Drop every route belonging to the session `anchor` currently routes to (WIRE v8):
-    /// its bootstrap CID, its whole rotating window, and any leading-edge CID a slide
-    /// added — reclaimed together the moment the session ends, rather than one at a time
-    /// as datagrams that will never arrive would have reclaimed them.
+    /// Drop every route belonging to `owner` (WIRE v8): its bootstrap CID, its whole
+    /// rotating window, and any leading-edge CID a slide added — released together the
+    /// moment the session ends, rather than one at a time as datagrams that will never
+    /// arrive would have released them.
     ///
-    /// Membership is decided by channel identity rather than by a list of CIDs, because a
-    /// session's routes are not all derivable from the session: the bootstrap CID the
-    /// client chose for its first datagram is known only here. Every route the session
-    /// owns points at the one inbound channel it was accepted with, so that channel *is*
-    /// the session's identity in this table.
+    /// The cost is the size of that session's own route set, at most
+    /// `CID_WINDOW_TRAILING + CID_WINDOW_LEADING + 2`, and never the size of the table.
+    /// That distinction is the whole reason the reverse index exists: this runs on the
+    /// demux task, ahead of the next datagram read, at a moment a peer chooses, so a
+    /// version of it that scanned the table would let a coordinated departure decide how
+    /// long every other session's traffic waits.
     ///
-    /// A no-op if `anchor` is gone — the routes were already reclaimed, and there is
-    /// nothing to identify the session by. The scan is linear in the table, which is the
-    /// same cost `reap_dead` already pays on its periodic sweep, and it is paid once per
-    /// session that ends rather than per datagram.
-    fn retire_session(&mut self, anchor: &ConnId) {
-        let Some(target) = self.routes.get(anchor).cloned() else {
+    /// `owner` is an identity this listener assigned and never put on the wire, and the
+    /// released set is exactly the set inserted under it, so this can only ever release
+    /// the routes of the session that asked. A no-op if the session has none left.
+    fn retire_session(&mut self, owner: RouteOwner) {
+        let Some(cids) = self.owned.remove(&owner) else {
             return;
         };
-        self.routes.retain(|_, tx| !tx.same_channel(&target));
+        for cid in &cids {
+            self.routes.remove(cid);
+        }
         self.sync();
     }
 }
@@ -519,7 +616,14 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
     // CID-window slide here (post-AEAD, from handle_packet via the session's
     // slide channel). The demux registers the new leading-edge CID and drops the
     // trailing one, keeping the window tracking the peer's outbound index.
-    let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<DemuxSignal>();
+    let (slide_tx, mut slide_rx) = mpsc::unbounded_channel::<CidSlide>();
+    // WIRE v8: a session that has ended signals it here so its whole route set goes at
+    // once. Bounded, unlike the slide channel above, because when a session ends is a
+    // decision its peer makes and this queue is drained ahead of the socket.
+    let (retire_tx, mut retire_rx) = mpsc::channel::<DemuxRouteOwner>(RETIRE_QUEUE_DEPTH);
+    // Identity assigned to each accepted session's routes. Monotonic and never on the
+    // wire, so it names a session in the route table without a peer being able to.
+    let mut next_route_owner: u64 = 0;
     // NOTE (Phase 1): one assembler shared across ALL CIDs. Its key includes the cid, but a fragment
     // spray shares the single 256-slot assembly table with every live session's in-flight
     // reassemblies. Bounded — the assembler self-caps at MAX_CONCURRENT_ASSEMBLIES with
@@ -548,21 +652,24 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
             // window so its client's CID_0.. datagrams route to it. Processed
             // before reading more datagrams (biased select) so the window is in
             // place by the time the client's first CID_0 frame could arrive.
-            Some((cids, tx)) = register_rx.recv() => {
-                routes.register_window(&cids, &tx);
+            Some((cids, tx, owner)) = register_rx.recv() => {
+                routes.register_window(&cids, &tx, owner);
                 continue;
             }
-            // Signals from an established session: a CID-window slide as its peer
-            // migrates (ε / WIRE v5), or the retirement of its whole route set
-            // when it ends (WIRE v8). Both are processed ahead of reading more
-            // datagrams (biased select) — the slide so the window is in place before
-            // the next frame could arrive on it, the retirement so a departed peer's
-            // routes are gone before the table is consulted again.
-            Some(signal) = signal_rx.recv() => {
-                match signal {
-                    DemuxSignal::Slide(slide) => routes.apply_slide(&slide),
-                    DemuxSignal::Retire { anchor } => routes.retire_session(&anchor),
-                }
+            // ε / WIRE v5: slide a session's inbound CID window as its peer
+            // migrates (add the new leading CID, drop the trailing one). Processed
+            // ahead of reading more datagrams (biased select) so the window is in
+            // place before the next frame could arrive on it.
+            Some(slide) = slide_rx.recv() => {
+                routes.apply_slide(&slide);
+                continue;
+            }
+            // WIRE v8: an ended session's whole route set goes at once. Also ahead of
+            // the socket, so a departed peer's routes are gone before the table is
+            // consulted again — which is affordable precisely because each one costs
+            // that session's own window and not a pass over the table.
+            Some(owner) = retire_rx.recv() => {
+                routes.retire_session(owner);
                 continue;
             }
             r = listener.socket.recv_from(&mut buf) => match r {
@@ -627,8 +734,10 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
         // server migration spawns a recv loop on the new socket that feeds this same channel,
         // so c2s frames arriving on the migrated address reach `recv_bytes` transparently.
         let st = UdpServerTransport::new(listener.socket.clone(), peer, hdr.cid, tx.clone(), rx);
+        next_route_owner = next_route_owner.wrapping_add(1);
+        let owner = DemuxRouteOwner(next_route_owner);
         // H-1: refuse the route (and the slot) when the table is full of *live* routes.
-        if !routes.try_insert(hdr.cid, tx.clone()) {
+        if !routes.try_insert(hdr.cid, tx.clone(), owner) {
             drop(permit);
             drop(st);
             continue;
@@ -644,7 +753,11 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
             reap_tx.clone(),
             tx,
             register_tx.clone(),
-            signal_tx.clone(),
+            DemuxLink {
+                slide_tx: slide_tx.clone(),
+                retire_tx: retire_tx.clone(),
+                owner,
+            },
         );
         // DoS-hardening parity with the TCP acceptor: periodically drop expired reputation
         // entries AND reap dead routes so both bounded maps stay small under churn.
@@ -692,9 +805,10 @@ fn spawn_handshake_task(
     // paired with the rotating-CID window so those CIDs route to this session.
     tx: mpsc::Sender<(Bytes, SocketAddr)>,
     register_tx: mpsc::UnboundedSender<CidWindowRegistration>,
-    // ε / WIRE v5: handed to the established session so it can signal
-    // inbound-window slides as the peer migrates.
-    signal_tx: mpsc::UnboundedSender<DemuxSignal>,
+    // Handed to the established session so it can signal inbound-window slides as the
+    // peer migrates (ε / WIRE v5) and release its routes when it ends (WIRE v8).
+    // Carries the identity this listener assigned those routes.
+    demux_link: DemuxLink,
 ) {
     let hs = listener.handshake_server.clone();
     let runtime = listener.runtime.clone();
@@ -727,10 +841,12 @@ fn spawn_handshake_task(
                 // client's post-handshake rotating CID_0.. datagrams route to it
                 // (sent BEFORE moving `server_session` into the API session). The
                 // bootstrap CID stays until the route is reaped on disconnect.
-                let _ = register_tx.send((server_session.inbound_window_cids(), tx));
-                // ε / WIRE v5: give the session the demux slide channel so
-                // it can advance its inbound CID window as the peer migrates.
-                server_session.set_demux_signal_tx(signal_tx);
+                let _ =
+                    register_tx.send((server_session.inbound_window_cids(), tx, demux_link.owner));
+                // ε / WIRE v5 + WIRE v8: give the session its end of the demux
+                // so it can advance its inbound CID window as the peer migrates, and
+                // release its routes when it ends.
+                server_session.set_demux_link(demux_link);
                 let arc_session = Arc::new(server_session);
                 if let Some(live) = liveness {
                     arc_session.set_liveness_config(live);
@@ -814,6 +930,234 @@ impl UdpListenerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A live inbound channel for a demux route. The receiver is returned so the caller
+    /// can keep it alive: a route's liveness *is* its channel's, so dropping it would
+    /// silently make the route reclaimable and change what every assertion below means.
+    #[allow(clippy::type_complexity)]
+    fn live_route() -> (
+        mpsc::Sender<(Bytes, SocketAddr)>,
+        mpsc::Receiver<(Bytes, SocketAddr)>,
+    ) {
+        mpsc::channel(4)
+    }
+
+    fn cid(n: u8) -> ConnId {
+        [n; crate::crypto::cid_chain::CID_LEN]
+    }
+
+    fn empty_table() -> RouteTable {
+        RouteTable::new(Arc::new(AtomicUsize::new(0)))
+    }
+
+    /// Retiring a session releases that session's routes and **only** that session's,
+    /// and it releases them by the identity this listener assigned — not by which
+    /// channel the entries happen to point at.
+    ///
+    /// The two halves are one claim looked at from both sides. Two ordinary sessions
+    /// with their own channels cover the normal case; the pair that *shares* a channel
+    /// is the discriminator, because deciding membership by channel identity — which is
+    /// what a whole-table scan for matching senders does — cannot tell them apart and
+    /// would take both. Membership has to be the thing that was assigned, or a table-wide
+    /// delete is authorised by a lookup nothing owns.
+    #[test]
+    fn retire_releases_only_the_asking_sessions_routes() {
+        let mut table = empty_table();
+        let (tx_a, _rx_a) = live_route();
+        let (tx_b, _rx_b) = live_route();
+        let a = DemuxRouteOwner(1);
+        let b = DemuxRouteOwner(2);
+        // A third session sharing A's channel: distinct identity, same `Sender`.
+        let shared = DemuxRouteOwner(3);
+
+        table.register_window(&[cid(1), cid(2), cid(3)], &tx_a, a);
+        table.register_window(&[cid(10), cid(11)], &tx_b, b);
+        table.register_window(&[cid(20)], &tx_a, shared);
+        assert_eq!(table.routes.len(), 6);
+
+        table.retire_session(a);
+
+        assert!(
+            table.get(&cid(1)).is_none() && table.get(&cid(2)).is_none(),
+            "the retiring session's own routes must go"
+        );
+        assert!(
+            table.get(&cid(10)).is_some() && table.get(&cid(11)).is_some(),
+            "another session's routes must survive"
+        );
+        assert!(
+            table.get(&cid(20)).is_some(),
+            "a route belonging to a different session must survive even when it shares \
+             the retiring session's channel — membership is identity, not channel"
+        );
+        assert_eq!(table.routes.len(), 3);
+        assert_eq!(
+            table.gauge.load(Ordering::Relaxed),
+            3,
+            "the gauge the operator reads must track the table"
+        );
+        assert!(
+            !table.owned.contains_key(&a),
+            "a retired session must leave no reverse-index entry behind"
+        );
+        // Idempotent: a second retire (a duplicate signal, or one that raced the reap)
+        // finds nothing and does nothing.
+        table.retire_session(a);
+        assert_eq!(table.routes.len(), 3);
+    }
+
+    /// The reverse index is the only thing that keeps a retire off the size of the
+    /// table, so it must not be able to drift from the routes it describes. Every
+    /// mutator is exercised here — insert, window register, slide (which both adds and
+    /// removes), the dead-route reclaim and the periodic sweep — and afterwards the two
+    /// directions must agree exactly.
+    ///
+    /// Drift in the cheap direction leaks routes past a retire; drift in the expensive
+    /// direction has a retire delete a CID that has since been re-registered to somebody
+    /// else, which is the failure the identity check exists to prevent.
+    #[test]
+    fn the_reverse_index_never_drifts_from_the_routes() {
+        let mut table = empty_table();
+        let (tx_a, _rx_a) = live_route();
+        let (tx_b, rx_b) = live_route();
+        let a = DemuxRouteOwner(1);
+        let b = DemuxRouteOwner(2);
+
+        table.register_window(&[cid(1), cid(2), cid(3)], &tx_a, a);
+        table.register_window(&[cid(10), cid(11)], &tx_b, b);
+        table.apply_slide(&CidSlide {
+            add: vec![cid(4), cid(5)],
+            remove: vec![cid(1)],
+            anchor: cid(2),
+        });
+        // B's session goes away without signalling: its channel closes, and the lazy
+        // reclaim paths are what notice.
+        drop(rx_b);
+        table.remove_if_dead(&cid(10));
+        table.reap_dead();
+
+        let mut indexed: Vec<(RouteOwner, ConnId)> = table
+            .owned
+            .iter()
+            .flat_map(|(owner, cids)| cids.iter().map(move |c| (*owner, *c)))
+            .collect();
+        let mut actual: Vec<(RouteOwner, ConnId)> = table
+            .routes
+            .iter()
+            .map(|(c, entry)| (entry.owner, *c))
+            .collect();
+        indexed.sort();
+        actual.sort();
+        assert_eq!(
+            indexed, actual,
+            "the reverse index and the route table must describe the same set"
+        );
+        assert!(
+            !table.owned.contains_key(&b),
+            "a session whose every route was reclaimed must leave no index entry"
+        );
+
+        // And the retire that rides on it still takes exactly A's set.
+        table.retire_session(a);
+        assert!(table.routes.is_empty() && table.owned.is_empty());
+    }
+
+    /// A route's key is a connection id chosen by whoever sent the datagram, so an
+    /// unconditional insert would let one party repoint a route a *live* session is
+    /// being reached through — the table promises the opposite in as many words. The
+    /// slot is refused instead, and refused without disturbing what is already there.
+    ///
+    /// The same-session case is the one that must still succeed: a session's bootstrap
+    /// CID is registered at accept and arrives again inside its own window, and treating
+    /// that as a collision would leave the window a CID short.
+    #[test]
+    fn a_live_route_is_never_repointed_to_another_session() {
+        let mut table = empty_table();
+        let (tx_a, _rx_a) = live_route();
+        let (tx_b, _rx_b) = live_route();
+        let a = DemuxRouteOwner(1);
+        let b = DemuxRouteOwner(2);
+
+        assert!(table.try_insert(cid(7), tx_a.clone(), a));
+        assert!(
+            !table.try_insert(cid(7), tx_b.clone(), b),
+            "a live route must not be handed to another session"
+        );
+        assert!(
+            table.get(&cid(7)).is_some_and(|tx| tx.same_channel(&tx_a)),
+            "the refused insert must leave the live route pointing where it did"
+        );
+        assert!(
+            !table.owned.contains_key(&b),
+            "a refused insert must record no ownership"
+        );
+
+        assert!(
+            table.try_insert(cid(7), tx_a.clone(), a),
+            "re-registering a CID this session already owns is a no-op, not a collision"
+        );
+        assert_eq!(
+            table.owned.get(&a).map(Vec::len),
+            Some(1),
+            "the no-op must not double-count the CID in the reverse index"
+        );
+
+        // A *dead* route is not a live one: the slot is reclaimable and admits the
+        // newcomer, which is what keeps a failed handshake from parking a CID.
+        let (tx_c, rx_c) = live_route();
+        let c = DemuxRouteOwner(3);
+        assert!(table.try_insert(cid(8), tx_c, c));
+        drop(rx_c);
+        let (tx_d, _rx_d) = live_route();
+        assert!(
+            table.try_insert(cid(8), tx_d.clone(), DemuxRouteOwner(4)),
+            "a dead route must not hold its slot against a new connection"
+        );
+        assert!(
+            !table.owned.contains_key(&c),
+            "the displaced session must lose its claim on the CID"
+        );
+    }
+
+    /// The retire signal is dropped, not queued, when the demux is behind.
+    ///
+    /// A session ends when its peer decides it does, so an unbounded queue here would
+    /// let a correlated departure choose how much work sits in front of the demux's next
+    /// datagram read. The bound is what refuses that, and the cost of the refusal is one
+    /// lazy reclaim — exactly the reclaim path that existed before the signal did. What
+    /// this pins is that the overflow is silent and non-blocking rather than a wait, a
+    /// panic, or an unbounded backlog.
+    #[test]
+    fn a_full_retire_queue_drops_the_signal_instead_of_waiting() {
+        let session = crate::transport::session::Session::new(
+            crate::transport::types::SessionId::from_bytes([0x5A; 32]),
+            &[0x11u8; 32],
+            true,
+        )
+        .expect("session");
+        let (slide_tx, _slide_rx) = mpsc::unbounded_channel();
+        let (retire_tx, mut retire_rx) = mpsc::channel::<DemuxRouteOwner>(1);
+        let owner = DemuxRouteOwner(42);
+        session.set_demux_link(DemuxLink {
+            slide_tx,
+            retire_tx,
+            owner,
+        });
+
+        // Fills the one slot, then overflows. Neither call may block or panic.
+        session.signal_route_retire();
+        session.signal_route_retire();
+
+        assert_eq!(
+            retire_rx.try_recv().ok(),
+            Some(owner),
+            "the signal names the identity the demux assigned, and nothing from the wire"
+        );
+        assert!(
+            retire_rx.try_recv().is_err(),
+            "the overflowing signal must be dropped rather than queued behind the first"
+        );
+    }
 
     /// H-2: the per-source-IP pending counter tracks admit/release symmetrically, so the
     /// demux's `count(ip) >= MAX_PENDING_PER_IP` gate bounds one source's in-flight slots and

@@ -8147,9 +8147,16 @@ mod tests {
         let (client_session, server_session) = paired_sessions(session_id);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
 
-        // Install the demux signal channel and snapshot the inbound CID window.
+        use crate::transport::session::{DemuxLink, DemuxRouteOwner};
+
+        // Install the demux link and snapshot the inbound CID window.
         let (slide_tx, mut slide_rx) = mpsc::unbounded_channel();
-        server_session.set_demux_signal_tx(slide_tx);
+        let (retire_tx, _retire_rx) = mpsc::channel(4);
+        server_session.set_demux_link(DemuxLink {
+            slide_tx,
+            retire_tx,
+            owner: DemuxRouteOwner(1),
+        });
         let window_before = server_session.inbound_window_cids();
 
         // A valid frame on a NEW path_id (1, the migration signal), then corrupt
