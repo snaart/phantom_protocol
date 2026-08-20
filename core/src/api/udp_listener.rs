@@ -353,11 +353,12 @@ type CidWindowRegistration = (Vec<ConnId>, mpsc::Sender<(Bytes, SocketAddr)>, Ro
 /// before the next `recv_from` is this many retirements of at most
 /// `CID_WINDOW_TRAILING + CID_WINDOW_LEADING + 2` map removals each — tens of
 /// microseconds, not a stall. Past the bound the excess is dropped rather than
-/// queued; see [`Session::signal_route_retire`] for what a dropped one costs.
+/// queued; `Session::signal_route_retire` carries what a dropped one costs.
 const RETIRE_QUEUE_DEPTH: usize = 1024;
 
-/// Which session a demux route belongs to. Re-exported name for the identity the
-/// demux hands each accepted session in its [`DemuxLink`].
+/// Which session a demux route belongs to — a local name for the identity this
+/// listener hands each accepted session in its `DemuxLink`, so the table's own code
+/// reads as being about routes rather than about sessions.
 type RouteOwner = DemuxRouteOwner;
 
 /// One demux route: the session's inbound channel and which session it is.
