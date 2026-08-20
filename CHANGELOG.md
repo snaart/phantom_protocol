@@ -495,21 +495,37 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
   Both deques are now bounded at 1024 entries — the ARQ send buffer's segment cap, hence the
   most acknowledgements one round trip can return, and tied to `MAX_PENDING_PACKETS` by a
-  compile-time assertion rather than by a comment claiming the derivation. They reach it by
-  different rules, because the same rule is safe in one filter and dangerous in the other. The
-  **bandwidth maximum** is truncated, evicting from the back, which there is the least of
-  everything retained, so a bounded maximum sits at or below the unbounded one at every instant
-  and never above it. The **min-RTT filter is not truncated at all**: its reading is the minimum
-  of the retained set and removing an element from a set can only raise that minimum, so no
-  eviction end errs in the safe direction — and back-eviction in particular strands the deque as
-  "the oldest entries plus the newest", which once the prefix ages out reports the *largest*
-  round trip in the window as its minimum. `cwnd = cwnd_gain × btl_bw × min_rtt` multiplies by
-  that reading, so the sender would size its window from a queue it built and then add to the
-  queue. It is bounded instead by a minimum time separation between retained entries, which
-  declines an incoming sample only when it stands above everything held and a smaller, more
-  recent entry is less than one separation older. A sample that would lower the reading always
-  enters, so the bound can shorten the horizon the reading is a minimum over by at most one
-  separation and can never raise it above a round trip this endpoint actually timed.
+  compile-time assertion rather than by a comment claiming the derivation. **Neither is
+  truncated**, and the count is one neither of them counts. Each is bounded by a minimum time
+  separation between retained entries, applied to the half of the deque its reading does not
+  come from: a sample that would move the reading — higher in the maximum filter, lower in the
+  minimum one — is admitted whatever the length rule would prefer, and only *successors*, which
+  can be read at all once everything ahead of them has expired, are thinned. Thinning them by
+  time costs at most one separation of the horizon each covers, so the reading is at every
+  instant between the unbounded windowed extremum and the unbounded extremum over a horizon one
+  separation shorter. The length then follows as arithmetic rather than as a cap someone checks,
+  and the separation is derived from the horizon to land on exactly this figure.
+
+  The two rules are mirror images and deliberately not one shared rule. The deques run in
+  opposite directions, so the rule that thins a maximum filter's successors admits every sample
+  of a rising run in a minimum filter and vice versa; each filter driven by the other's rule
+  grows as long as the peer cares to make it, which is the failure the bound exists for. Both
+  substitutions are applied in the test suite and both go red.
+
+  **Count-truncation was tried on the maximum filter first and is recorded because it does not
+  err in the direction it was argued to.** Evicting the deque's back at a ceiling looks safe
+  from one step: the back is the least of everything retained, so the survivors are real
+  unexpired observations and a bounded maximum sits at or below an unbounded one. That argument
+  is about a single instant and holds only while the front survives. The back of a falling run is
+  where the recent, larger candidates are, so eviction strands the deque as "the oldest entries
+  plus the newest" — it removes the head's successors, and when the head ages out the reading
+  drops to a value the path stopped offering a horizon ago instead of to the next-best thing
+  still standing. On the `thin` scenario of `core/examples/bottleneck_sim.rs` — a link falling
+  from 4 MB/s to 0.4 MB/s over three seconds, held there past one horizon, then restored, with
+  an unbounded filter holding up to 2307 candidates against the 1024 bound — truncation's worst
+  instant reads 0.71 of the honest windowed maximum against 0.99 for the separation rule. The
+  same substitution is applied in the test suite and goes red by 3.1× at the first instant past
+  the retained prefix's expiry.
 
 - **Withdrawn during this window, recorded because the measurement is worth more than the
   silence: ageing the bandwidth horizon on every acknowledgement rather than on the ones it

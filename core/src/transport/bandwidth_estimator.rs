@@ -148,12 +148,13 @@ pub struct DeliverySample {
 struct WindowFilter {
     window: VecDeque<(Instant, u64)>,
     window_size: Duration,
-    /// Smallest gap in time the minimum filter keeps between two retained
-    /// entries — the rule that bounds its length, in place of the truncation
-    /// the maximum filter uses. Derived from the horizon in [`Self::new`] so
-    /// that the resulting entry count is [`WINDOW_FILTER_MAX_ENTRIES`] whatever
-    /// horizon a filter is built with; see [`Self::push_separated`] for why the
-    /// two filters cannot share one rule.
+    /// Smallest gap in time either filter keeps between two retained entries —
+    /// the rule that bounds the deque's length, and the only rule that does.
+    /// Derived from the horizon in [`Self::new`] so that the resulting entry
+    /// count is [`WINDOW_FILTER_MAX_ENTRIES`] whatever horizon a filter is
+    /// built with. The two filters apply it to opposite halves of their own
+    /// ordering — see [`Self::push_separated_max`] and
+    /// [`Self::push_separated_min`] — and neither may use the other's.
     min_separation: Duration,
 }
 
@@ -202,73 +203,123 @@ impl WindowFilter {
         self.window.front().map(|&(_, v)| v)
     }
 
-    /// Append a sample to the **maximum** filter, evicting from the back first
-    /// if the deque is at its ceiling.
+    /// Whether the deque's newest entry is too recent for a second one to sit
+    /// beside it — the whole of the length bound, and the only thing either
+    /// filter does about length.
     ///
-    /// The maximum filter's deque runs largest at the front to smallest at the
-    /// back, so the back is the least of everything retained: an entry smaller
-    /// than every one ahead of it, which could only ever have been promoted to
-    /// the top once all of those had expired. Discarding it leaves a set of real
-    /// unexpired observations whose maximum is at or below the unbounded one, so
-    /// the ceiling under-states the path and never over-states it. The back is
-    /// also, after the domination loop above, strictly on the far side of the
-    /// incoming sample, so dropping it and pushing keeps the newest observation
-    /// — which is what stops a full filter from becoming one that cannot respond
-    /// to fresh data at all.
+    /// The length that follows is arithmetic rather than a cap to be checked:
+    /// retained timestamps are at least one separation apart and none is older
+    /// than the horizon, so at most `horizon / separation` gaps fit inside the
+    /// window and at most one more entry than that sits in the deque.
+    fn too_soon(&self, now: Instant) -> bool {
+        self.window
+            .back()
+            .is_some_and(|&(newest, _)| now.duration_since(newest) < self.min_separation)
+    }
+
+    /// Offer a sample to the **maximum** filter: taken unconditionally when it
+    /// is at or above the current reading, thinned by [`Self::min_separation`]
+    /// when it is below.
     ///
-    /// **The minimum filter must not use this**, and the reason is in
-    /// [`Self::push_separated`]. See [`WINDOW_FILTER_MAX_ENTRIES`] for the
-    /// ceiling's derivation.
-    fn push_bounded(&mut self, now: Instant, value: u64) {
-        if self.window.len() >= WINDOW_FILTER_MAX_ENTRIES {
-            self.window.pop_back();
+    /// **The rule this replaces lowered the reading it was argued never to
+    /// touch.** Evicting the deque's back once a fixed entry count is reached
+    /// looks safe from one step. The back is the least of everything retained,
+    /// so what survives is still a set of real unexpired observations and its
+    /// maximum is at or below the unbounded one — under-stating the path, which
+    /// is the side of the error that costs throughput rather than building a
+    /// queue. That argument is about one instant, and it holds only while the
+    /// front survives. When the front ages out the reading passes to whatever is
+    /// left, and on a falling run what is left is the oldest entries plus the
+    /// newest, because the back is exactly where each eviction found the recent,
+    /// larger candidates. Truncation does not merely decline to remember old
+    /// history; it removes the head's *successor*, and the filter then reports a
+    /// rate far under one the path was still offering seconds earlier.
+    ///
+    /// The rule below follows from what the two ends of the deque are for. The
+    /// front is the reading. A sample at or above it dominates every entry
+    /// retained — the loop above will have emptied the deque — so admitting it
+    /// costs nothing, and declining it would be declining the answer. Everything
+    /// behind the front is a *successor*: an entry that can only ever be read
+    /// once every entry ahead of it has expired. Successors are the only thing a
+    /// length rule may touch, and time is the right axis to thin them on,
+    /// because what a successor is worth is the span of horizon it covers.
+    ///
+    /// So nothing retained is ever discarded, and an incoming sample is declined
+    /// only when it is strictly below the reading **and** a larger, more recent
+    /// entry stands less than one separation ahead of it. Two consequences,
+    /// stated plainly because they are the point.
+    ///
+    /// The reading cannot be lowered at any instant. A sample at or above
+    /// everything held is admitted whatever the length rule would prefer, so the
+    /// current maximum is never a casualty of it — the head is lost only to the
+    /// horizon or to a larger sample taking its place.
+    ///
+    /// What the thinning costs is the *granularity of the successor*, and it is
+    /// paid only after the head expires. If a sample `s` is declined, the entry
+    /// `b` it was declined against is larger than `s` and less than one
+    /// separation older, so for as long as `b` is unexpired the reading is at or
+    /// above `s` regardless; all that is lost is the extra separation of horizon
+    /// `s` would have covered after `b` aged out. Inductively — `s` is either
+    /// retained until it expires or dominated by something at least as large —
+    /// the reading is at every instant at or above the unbounded maximum over a
+    /// horizon one separation shorter, and, being drawn from a subset of the
+    /// same samples, at or below the unbounded maximum over the full horizon.
+    /// `the_maximum_survives_the_horizon_rolling_over_a_falling_run` holds both
+    /// of those bounds against a reference the test computes for itself.
+    ///
+    /// **The minimum filter must not use this**: see
+    /// [`Self::push_separated_min`]. Wiring this rule into it admits every
+    /// sample of a rising run, since each one stands above that filter's
+    /// reading, and the deque grows as long as the peer cares to make it.
+    fn push_separated_max(&mut self, now: Instant, value: u64) {
+        if self.head().is_some_and(|reading| value < reading) && self.too_soon(now) {
+            return;
         }
         self.window.push_back((now, value));
     }
 
-    /// Append a sample to the **minimum** filter, unless a smaller and more
-    /// recent entry already makes it redundant for the next
-    /// [`Self::min_separation`] — the length bound that replaces truncation
-    /// there.
+    /// Offer a sample to the **minimum** filter: taken unconditionally when it
+    /// is at or below the current reading, thinned by [`Self::min_separation`]
+    /// when it is above.
     ///
-    /// **A minimum filter cannot be truncated safely at either end.** Its
-    /// reading is the minimum of the retained set, and removing an element from
-    /// a set can only raise its minimum; there is no end to evict from that
-    /// escapes that. Evicting the front discards the current minimum outright.
-    /// Evicting the back is worse than it looks: the deque runs smallest at the
-    /// front to largest at the back, so the back is the *newest* surviving
-    /// entry, and repeatedly dropping it leaves "the oldest entries plus the
-    /// newest one". Once that old prefix ages out the sole survivor is the
-    /// newest sample, which on a path building a queue is the largest round trip
-    /// in the window. `min_rtt` is a multiplicand of
-    /// `cwnd = cwnd_gain × btl_bw × min_rtt`, so that reading inflates the
-    /// window, which deepens the queue, which raises the next round of samples.
-    /// The maximum filter's truncation errs downward and costs throughput; this
-    /// one errs upward and pays for it in a queue of the sender's own making.
+    /// The mirror image of [`Self::push_separated_max`], and it has to be
+    /// written as its own rule rather than shared, because the two filters order
+    /// their deques in opposite directions and a rule that thins one's successors
+    /// admits all of the other's.
     ///
-    /// So nothing retained is ever discarded here. What is declined is an
+    /// **A minimum filter cannot be truncated safely at either end**, which is
+    /// how this rule came to be the one both filters use. Its reading is the
+    /// minimum of the retained set, and removing an element from a set can only
+    /// raise its minimum; there is no end to evict from that escapes that.
+    /// Evicting the front discards the current minimum outright. Evicting the
+    /// back is worse than it looks: the deque runs smallest at the front to
+    /// largest at the back, so the back is the *newest* surviving entry, and
+    /// repeatedly dropping it leaves "the oldest entries plus the newest one".
+    /// Once that old prefix ages out the sole survivor is the newest sample,
+    /// which on a path building a queue is the largest round trip in the window.
+    /// `min_rtt` is a multiplicand of `cwnd = cwnd_gain × btl_bw × min_rtt`, so
+    /// that reading inflates the window, which deepens the queue, which raises
+    /// the next round of samples.
+    ///
+    /// So nothing retained is discarded here either. What is declined is an
     /// *incoming* sample, and only in the one case where declining it cannot
-    /// move the reading: this runs after the domination loop, so the deque's
-    /// back is strictly smaller than the incoming value, and a sample larger
-    /// than everything held cannot be the minimum until every one of those has
-    /// expired. Its whole window of relevance is the gap between its own
-    /// timestamp and the back's — under one separation, by the test below — so
-    /// declining it can shorten the horizon over which the reading is a minimum
-    /// by at most that, and can never raise the reading above a round trip this
-    /// endpoint actually timed. A sample that would *lower* the reading never
-    /// reaches this test at all: it dominates, the loop above clears the entries
-    /// it is smaller than, and if it is below everything the deque is emptied
-    /// and the push is unconditional.
+    /// move the reading: a sample above everything held cannot be the minimum
+    /// until every one of those has expired, and its whole window of relevance
+    /// is the gap back to the smaller, more recent entry that stands in for it —
+    /// under one separation, by the test that declined it. Declining it can
+    /// therefore shorten the horizon over which the reading is a minimum by at
+    /// most one separation, and can never raise the reading above a round trip
+    /// this endpoint actually timed. A sample that would *lower* the reading is
+    /// admitted whatever the length rule would prefer, and in practice never
+    /// reaches the test at all: it dominates, the loop above clears every entry
+    /// it is smaller than, and the deque it is pushed onto is empty.
     ///
-    /// The length that follows is arithmetic rather than a cap to be checked:
-    /// retained timestamps are at least one separation apart and none is older
-    /// than the horizon, so there are at most `horizon / separation` gaps and
-    /// one more entry than that.
-    fn push_separated(&mut self, now: Instant, value: u64) {
-        if let Some(&(newest, _)) = self.window.back() {
-            if now.duration_since(newest) < self.min_separation {
-                return;
-            }
+    /// **The maximum filter must not use this**: it admits every sample of a
+    /// falling run, since each one stands below that filter's reading, and the
+    /// deque grows without bound.
+    fn push_separated_min(&mut self, now: Instant, value: u64) {
+        if self.head().is_some_and(|reading| value > reading) && self.too_soon(now) {
+            return;
         }
         self.window.push_back((now, value));
     }
@@ -283,7 +334,7 @@ impl WindowFilter {
                 break;
             }
         }
-        self.push_bounded(now, value);
+        self.push_separated_max(now, value);
         // The maximum is always at the front
         self.head().unwrap_or(value)
     }
@@ -297,7 +348,7 @@ impl WindowFilter {
                 break;
             }
         }
-        self.push_separated(now, value);
+        self.push_separated_min(now, value);
         self.head().unwrap_or(value)
     }
 }
@@ -323,37 +374,43 @@ impl WindowFilter {
 /// shape this transport removes rather than defends, so both deques are bounded
 /// at this many entries.
 ///
-/// **They reach it by different rules, because one rule is safe in a maximum
-/// filter and dangerous in a minimum one.** The maximum filter is truncated: at
-/// the ceiling it evicts its own back, which is the least of everything
-/// retained, so what is discarded is a candidate smaller than every entry ahead
-/// of it and whatever remains is still a real, unexpired observation. A bounded
-/// maximum therefore sits at or below the unbounded one at every instant. It
-/// under-states the path and never over-states it, which is the side of the
-/// error that matters: an under-stated bottleneck costs throughput, an
-/// over-stated one paces into a queue of the sender's own making.
+/// **Neither deque is truncated, and this is a count neither of them counts.**
+/// Truncation was tried on the maximum filter, evicting the back — the least of
+/// everything retained — on the argument that the survivors are still real
+/// unexpired observations, so a bounded maximum sits at or below an unbounded
+/// one and errs in the direction that costs throughput rather than building a
+/// queue. That argument is about a single instant and holds only while the front
+/// survives. The back of a falling run is where the recent, larger candidates
+/// are, so evicting it strands the deque as "the oldest entries plus the
+/// newest": the head's successors are gone, and the instant the head ages out
+/// the reading falls to a value the path stopped offering a horizon ago rather
+/// than to the next-best thing still standing.
 ///
-/// The minimum filter is **not** truncated, at either end. Its reading is the
-/// minimum of the retained set, and removing an element from a set can only
-/// raise that minimum — there is no end to evict from which escapes it, so no
-/// truncation of a minimum filter errs in the safe direction. Back-eviction in
-/// particular is not the mirror image of the maximum filter's: that deque runs
-/// smallest at the front to largest at the back, so its back is the newest
-/// entry, and dropping the newest repeatedly leaves the oldest entries plus one
-/// recent one. When the old prefix ages out, the survivor is the largest round
-/// trip in the window rather than the smallest — and `min_rtt` multiplies
-/// `btl_bw` in `cwnd = cwnd_gain × btl_bw × min_rtt`, so the sender would size
-/// its window from a queue it built and then add to the queue. That filter is
-/// bounded by [`WindowFilter::push_separated`] instead, which declines incoming
-/// samples that cannot move the reading rather than discarding retained ones,
-/// and which reaches this same length because that is what its separation is
-/// derived from.
+/// Both filters are bounded instead by a minimum time separation between
+/// retained entries, applied to the half of the deque the reading does not come
+/// from ([`WindowFilter::push_separated_max`],
+/// [`WindowFilter::push_separated_min`]). A sample that would move the reading —
+/// higher in the maximum filter, lower in the minimum one — is always admitted;
+/// only successors, which can be read at all once everything ahead of them has
+/// expired, are thinned, and thinning them by time costs at most one separation
+/// of the horizon each covers. The length then follows as arithmetic rather than
+/// as a cap someone checks: entries sit at least one separation apart inside one
+/// horizon, so there are at most `horizon / separation` gaps and one more entry
+/// than that. The separation is derived from the horizon to land on exactly this
+/// figure.
 ///
-/// The tests hold both directions rather than leaving them as arguments in a
+/// The two rules are mirror images and are deliberately not one shared rule,
+/// because the deques run in opposite directions: the rule that thins a maximum
+/// filter's successors admits every sample of a rising run in a minimum filter,
+/// and vice versa, so each filter driven by the other's rule grows as long as
+/// the peer cares to make it — which is the failure the bound exists for.
+///
+/// The tests hold all of that rather than leaving it as an argument in a
 /// comment: `a_bounded_filter_never_reports_a_higher_maximum_than_the_unbounded_one`
-/// and `the_ceiling_evicts_the_least_of_a_maximum_filter_not_the_greatest` for
-/// the first, `a_rising_round_trip_run_cannot_inflate_the_minimum_it_is_read_from`
-/// for the second.
+/// and `the_maximum_survives_the_horizon_rolling_over_a_falling_run` for the
+/// maximum's two directions,
+/// `a_rising_round_trip_run_cannot_inflate_the_minimum_it_is_read_from` for the
+/// minimum's.
 ///
 /// 1024 because that is the ARQ send buffer's segment cap
 /// ([`MAX_PENDING_PACKETS`](crate::transport::stream)): the most segments one
@@ -381,9 +438,9 @@ const _: () = assert!(
 
 const _: () = assert!(
     WINDOW_FILTER_MAX_ENTRIES >= 2,
-    "the minimum filter's separation is the horizon divided by one less than this \
-     ceiling, so a ceiling of one divides by zero and a ceiling of zero describes a \
-     filter that cannot hold the sample it was just given"
+    "both filters' separation is the horizon divided by one less than this ceiling, \
+     so a ceiling of one divides by zero and a ceiling of zero describes a filter \
+     that cannot hold the sample it was just given"
 );
 
 /// Probe cycle gains for ProbeBW phase (BBR cycle: 1.25, 0.75, 1.0, 1.0)
@@ -435,8 +492,9 @@ const INITIAL_MIN_RTT: Duration = Duration::from_millis(100);
 /// ProbeRTT interval — enter ProbeRTT every 10 seconds
 const PROBE_RTT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How long a delivery-rate sample is retained in [`BandwidthEstimator::bw_filter`]
-/// — the horizon over which `btl_bw` is a maximum.
+/// How long a delivery-rate sample is retained in the bandwidth filter — the
+/// horizon over which [`BandwidthEstimator::bottleneck_bandwidth`] is a
+/// maximum.
 ///
 /// **The unit is the interesting part, and it is not the draft's.** Linux BBR
 /// ages this filter in *round trips*: `bbr_bw_rtts` is `CYCLE_LEN + 2` = 10, so
@@ -468,7 +526,15 @@ const PROBE_RTT_INTERVAL: Duration = Duration::from_secs(10);
 /// is the arithmetic of the samples themselves. Changing a value later is cheap;
 /// changing the unit is not, which is why the unit is argued here and the value
 /// is not yet.
-const BW_FILTER_WINDOW: Duration = Duration::from_secs(10);
+///
+/// Public because a recorded run has to be able to say which horizon its
+/// `bottleneck_bw_bps` column is a maximum over. The measurement harness writes
+/// this figure into every window row it records, so the reader of an archive
+/// gets the horizon the daemon was built with rather than whatever the analysis
+/// script's author last believed it to be — a label naming the wrong window is
+/// worse than one naming none, and a second copy of a number is how a label
+/// comes to name the wrong window.
+pub const BW_FILTER_WINDOW: Duration = Duration::from_secs(10);
 
 /// How long an RTT sample is retained in [`BandwidthEstimator::rtt_filter`] —
 /// the horizon over which `min_rtt` is a minimum. BBR's `MinRTTFilterLen`.
@@ -3933,7 +3999,7 @@ mod tests {
         );
     }
 
-    /// The ceiling must cost accuracy in one direction only.
+    /// The length bound must cost accuracy in one direction only.
     ///
     /// A bounded filter that could report a *higher* maximum than the unbounded
     /// one would be worse than no bound: an over-stated bottleneck is what paces
@@ -3941,21 +4007,27 @@ mod tests {
     /// the real filter and to a brute-force reference — the maximum over every
     /// sample still inside the horizon — and the two are compared at every step.
     ///
+    /// This is one side of the bound and the weaker one. It cannot tell
+    /// "concedes a separation" from "throws the answer away", both of which
+    /// satisfy `reported <= reference`; the other side, and the one the shipped
+    /// truncation failed, is
+    /// `the_maximum_survives_the_horizon_rolling_over_a_falling_run`.
+    ///
     /// The last assertion is the positive control. Without it the test would
-    /// pass on a filter whose ceiling never engaged, which proves the direction
-    /// of a truncation that never happened.
+    /// pass on a filter whose length rule never engaged, which proves the
+    /// direction of a thinning that never happened.
     #[test]
     fn a_bounded_filter_never_reports_a_higher_maximum_than_the_unbounded_one() {
         const HORIZON: Duration = BW_FILTER_WINDOW;
         const STEP: Duration = Duration::from_millis(5);
         // Long enough that the horizon rolls twice over a run that fills the
-        // ceiling, which is what puts truncated entries inside the window.
+        // deque, which is what puts declined samples inside the window.
         const SAMPLES: usize = 8 * WINDOW_FILTER_MAX_ENTRIES;
 
         let base = Instant::now();
         let mut filter = WindowFilter::new(HORIZON);
         let mut history: Vec<(Instant, u64)> = Vec::with_capacity(SAMPLES);
-        let mut saw_truncation = false;
+        let mut saw_a_concession = false;
 
         for i in 0..SAMPLES {
             // Strictly falling, so nothing is ever dominated and the deque grows
@@ -3981,43 +4053,33 @@ mod tests {
             assert!(
                 reported <= reference,
                 "sample {i}: the bounded filter reports {reported} where the \
-                 unbounded one reports {reference} — the ceiling is inventing \
-                 bandwidth, not conceding it"
+                 unbounded one reports {reference} — the length bound is \
+                 inventing bandwidth, not conceding it"
             );
-            saw_truncation |= reported < reference;
+            saw_a_concession |= reported < reference;
         }
 
         assert!(
-            saw_truncation,
-            "the ceiling never actually discarded anything over {SAMPLES} samples, \
-             so this run proves nothing about the direction it errs in"
+            saw_a_concession,
+            "the length bound never declined anything over {SAMPLES} samples, so \
+             this run proves nothing about the direction it errs in"
         );
     }
 
-    /// Which end the ceiling evicts from, asserted so that reversing it fails.
+    /// The length rule must never displace the entry the reading comes from.
     ///
-    /// The test above compares a bounded filter against an unbounded one and
-    /// requires the bounded reading to be no higher. That is a one-sided bound
-    /// and it cannot tell "concedes a little" from "throws the answer away":
-    /// front-eviction — discarding the largest retained entry, the maximum
-    /// itself — satisfies it trivially at every step, and the whole lib suite
-    /// stays green under the one-word change. So the direction needs an
-    /// assertion of its own, and it needs a shape in which the two evictions
-    /// disagree by orders of magnitude rather than by an entry.
-    ///
-    /// That shape is one peak followed by a long strictly falling run, all
-    /// inside the horizon: nothing is ever dominated, so the deque fills, and
-    /// from the ceiling onward every further sample forces an eviction. Evicting
-    /// the back discards the smallest retained candidate and the peak — at the
-    /// front, the oldest and the largest — governs for its whole horizon, which
-    /// is what a maximum filter is for. Evicting the front discards the peak on
-    /// the very first sample past the ceiling and hands the reading to a run of
-    /// values the path is no longer offering.
+    /// A peak followed by a long strictly falling run, all inside the horizon:
+    /// nothing is ever dominated, so every further sample is a candidate the
+    /// length rule has to decide about, and it has to decide the same way every
+    /// time. A rule that discards a retained entry to make room — whichever end
+    /// it takes it from — eventually reaches the peak, and the reading falls to
+    /// a run of values the path is no longer offering while the peak is still
+    /// well inside its horizon.
     #[test]
-    fn the_ceiling_evicts_the_least_of_a_maximum_filter_not_the_greatest() {
+    fn the_length_rule_never_displaces_the_maximum_it_reports() {
         const PEAK: u64 = 100_000_000;
-        // Four times the ceiling, so eviction is forced for three quarters of
-        // the run rather than for its last few entries.
+        // Four times the ceiling, so the length rule is what is being asked
+        // about for the great majority of the run rather than for its tail.
         const FALLING: usize = 4 * WINDOW_FILTER_MAX_ENTRIES;
         const STEP: Duration = Duration::from_millis(1);
 
@@ -4027,72 +4089,86 @@ mod tests {
 
         // Strictly falling and an order of magnitude below the peak, so the run
         // dominates nothing and any reading taken from it is unmistakable.
+        let mut declined = 0usize;
         for i in 1..=FALLING {
             let at = base + STEP * (i as u32);
             assert!(
                 at.duration_since(base) <= BW_FILTER_WINDOW,
                 "the run left the horizon at sample {i}, so what follows would be \
-                 an expiry test rather than an eviction one"
+                 an expiry test rather than a length one"
             );
             filter.update_max(at, (FALLING - i + 1) as u64);
+            if filter.window.back().is_none_or(|&(ts, _)| ts != at) {
+                declined += 1;
+            }
         }
 
         assert!(
+            declined * 2 >= FALLING,
+            "precondition: only {declined} of {FALLING} samples were declined, so \
+             the length rule was barely asked anything"
+        );
+        assert!(
             filter.window.len() <= WINDOW_FILTER_MAX_ENTRIES,
-            "precondition: the ceiling has to have engaged for this to be about \
-             eviction at all, and the filter holds {} entries",
+            "the filter holds {} entries, past the {WINDOW_FILTER_MAX_ENTRIES} \
+             bound",
             filter.window.len()
         );
         assert_eq!(
             filter.head(),
             Some(PEAK),
             "{FALLING} falling samples inside the horizon took the maximum off \
-             {PEAK} — the ceiling is evicting the front of the deque, which in a \
-             maximum filter is the maximum itself"
+             {PEAK} — the length rule is discarding retained entries, and one of \
+             them is the reading"
         );
     }
 
-    /// The minimum filter's length bound must not be able to raise the round
-    /// trip the congestion window is sized from.
+    /// The other side of the maximum filter's bound, and the one truncation
+    /// failed: the reading may not be *lowered* by the length rule either.
     ///
-    /// `cwnd = cwnd_gain × btl_bw × min_rtt` takes this reading as a
-    /// multiplicand, so an over-stated minimum inflates the window — and a
-    /// sender that inflates its window builds a queue, whose round trips are the
-    /// next samples this filter sees. That is a loop the maximum filter's
-    /// truncation cannot enter and this one can, which is why the two are
-    /// bounded by different rules.
+    /// `a_bounded_filter_never_reports_a_higher_maximum_than_the_unbounded_one`
+    /// asks only that the bounded reading be no higher than the unbounded one,
+    /// which is satisfied by any rule that throws information away, including
+    /// one that throws all of it away. The cost of a length rule shows up
+    /// somewhere else entirely: not while the head is alive — every rule agrees
+    /// there — but at the instant the head ages out and the reading passes to
+    /// whatever the rule left behind it. A run that stops short of that instant
+    /// cannot see the difference, which is why this one is carried a horizon and
+    /// a half past its own peak.
     ///
-    /// The shape is the one that produces it: a strictly rising run of round
-    /// trips, which is what a filling bottleneck queue looks like from the
-    /// sender, carried far enough that the horizon rolls and the run's own
-    /// prefix ages out. Under back-eviction the deque degenerates to "the oldest
-    /// entries plus the newest", and once the prefix expires the sole survivor is
-    /// the newest — the *largest* round trip in the window, reported as its
-    /// minimum.
+    /// The shape is a steep falling run, which is what a path shedding capacity
+    /// or a peer stretching its acknowledgements produces, followed by a rise
+    /// back through everything retained. Truncation strands the deque as "the
+    /// oldest entries plus the newest" during the fall, so once the prefix
+    /// expires the sole survivor is the newest and smallest sample; separation
+    /// thinning leaves a successor every `min_separation` across the whole run.
     ///
-    /// The reference is what a filter with no length bound at all would report,
-    /// over a horizon one separation shorter: declining an incoming sample can
-    /// cost the reading at most the gap between that sample and the smaller
-    /// entry that stood in for it, which is under one separation by the test
-    /// that declined it. Anything above that reference is truncation inventing a
-    /// round trip.
+    /// Both references are unbounded filters written out here rather than
+    /// borrowed from the code under test. The upper one is the plain windowed
+    /// maximum: the bounded reading is drawn from a subset of the same samples,
+    /// so it can never exceed it. The lower one runs a horizon one separation
+    /// shorter, which is exactly what declining a successor can cost — the
+    /// entry it was declined against is larger and less than one separation
+    /// older, so it covers everything the declined sample would have, up to
+    /// that gap.
     #[test]
-    fn a_rising_round_trip_run_cannot_inflate_the_minimum_it_is_read_from() {
-        const HORIZON: Duration = RTT_FILTER_WINDOW;
-        // Faster than the separation, so most samples are declined and the rule
-        // under test is engaged continuously rather than incidentally.
-        const STEP: Duration = Duration::from_millis(5);
-        // The run has to outlive the prefix a count-truncating filter would
-        // strand, or it measures the prefix instead of the rule. Such a filter
-        // fills after [`WINDOW_FILTER_MAX_ENTRIES`] samples and holds "that
-        // prefix plus the newest" from then on; the prefix expires one horizon
-        // after it is complete, and only past *that* instant is the newest
-        // sample all that is left to report. Everything before it agrees with an
-        // unbounded filter, which is exactly how a run that stops short passes
-        // while reporting the largest round trip in the window.
-        const SAMPLES: usize = WINDOW_FILTER_MAX_ENTRIES
-            + (HORIZON.as_millis() / STEP.as_millis()) as usize
-            + WINDOW_FILTER_MAX_ENTRIES / 2;
+    fn the_maximum_survives_the_horizon_rolling_over_a_falling_run() {
+        const HORIZON: Duration = BW_FILTER_WINDOW;
+        const STEP: Duration = Duration::from_millis(1);
+        const PEAK: u64 = 100_000_000;
+        // Down by this much per step: steep enough that a reading taken from
+        // the wrong end of the deque is off by an order of magnitude rather
+        // than by a rounding.
+        const FALL_PER_STEP: u64 = 7_000;
+        // A horizon and a half of falling, so the peak and then the whole
+        // prefix a truncating filter retains both age out while the run is
+        // still going.
+        const FALLING: usize = 14_000;
+        // Rising fast enough to climb back through every retained entry, which
+        // is what asks whether a fresh maximum is admitted the moment it
+        // arrives rather than thinned like a successor.
+        const RISE_PER_STEP: u64 = 100_000;
+        const RISING: usize = 2_000;
 
         let base = Instant::now();
         let mut filter = WindowFilter::new(HORIZON);
@@ -4102,78 +4178,107 @@ mod tests {
             "precondition: samples arriving slower than the separation are never \
              declined, and this run would prove nothing"
         );
-        // One step of slack absorbs the nanosecond rounding in the separation.
-        let reference_horizon = HORIZON - separation - STEP;
 
-        let mut history: VecDeque<(Instant, u64)> = VecDeque::new();
-        let mut worst_overshoot = 0u64;
-        let mut declined = 0usize;
-        let mut longest = 0usize;
+        let mut full = UnboundedMaxFilter::new(HORIZON);
+        let mut shortened = UnboundedMaxFilter::new(HORIZON - separation);
+        let mut worst_shortfall = 0u64;
+        let mut last = (base, 0u64, 0u64);
 
-        for i in 0..SAMPLES {
-            // Strictly rising, so nothing is ever dominated: every sample either
-            // lengthens the deque or is declined by the separation rule.
-            let value = (i + 1) as u64;
+        for i in 0..(FALLING + RISING) {
+            let value = if i < FALLING {
+                PEAK - FALL_PER_STEP * i as u64
+            } else {
+                PEAK - FALL_PER_STEP * FALLING as u64 + RISE_PER_STEP * (i - FALLING) as u64
+            };
             let at = base + STEP * (i as u32);
-            history.push_back((at, value));
-            while history
-                .front()
-                .is_some_and(|(ts, _)| at.duration_since(*ts) > reference_horizon)
-            {
-                history.pop_front();
-            }
 
-            let reported = filter.update_min(at, value);
-            // Whether this sample was taken, read off the deque directly: a
-            // length comparison would confuse a decline with an expiry that
-            // happened in the same call.
-            if filter.window.back().is_none_or(|&(ts, _)| ts != at) {
-                declined += 1;
-            }
+            let reported = filter.update_max(at, value);
+            let ceiling = full.update(at, value);
+            let floor = shortened.update(at, value);
 
-            let reference = history.iter().map(|&(_, v)| v).min().unwrap_or(value);
-            worst_overshoot = worst_overshoot.max(reported.saturating_sub(reference));
             assert!(
-                reported <= reference,
-                "sample {i}: the bounded minimum filter reports {reported} where an \
+                reported <= ceiling,
+                "sample {i}: the bounded filter reports {reported} where the \
+                 unbounded one over the same horizon reports {ceiling} — it is \
+                 inventing bandwidth"
+            );
+            assert!(
+                reported >= floor,
+                "sample {i}: the bounded filter reports {reported} where an \
                  unbounded one over a horizon one separation shorter reports \
-                 {reference} — the length bound is inventing a round trip, and \
-                 `cwnd` multiplies by it"
+                 {floor} — the length rule has taken the reading off a peak the \
+                 path is still offering, which is the one thing it may not do"
             );
             assert!(
                 filter.window.len() <= WINDOW_FILTER_MAX_ENTRIES,
-                "sample {i}: the minimum filter holds {} entries, past the \
-                 {WINDOW_FILTER_MAX_ENTRIES} the separation is derived to bound it \
-                 to",
+                "sample {i}: the filter holds {} entries, past the \
+                 {WINDOW_FILTER_MAX_ENTRIES} bound",
                 filter.window.len()
             );
-            longest = longest.max(filter.window.len());
+            worst_shortfall = worst_shortfall.max(ceiling.saturating_sub(reported));
+            last = (at, value, reported);
         }
 
-        // Positive controls. Without the first two the run never engaged the
-        // rule, and the assertions above would be about a deque that had room
-        // to spare; without the third the horizon never rolled, so the old
-        // prefix that back-eviction strands was never put to the test.
+        // Positive controls. Without the first the run never outlived its own
+        // peak and every rule would agree; without the second it never engaged
+        // the length rule at all.
         assert!(
-            declined >= SAMPLES / 2,
-            "only {declined} of {SAMPLES} samples were declined, so the length \
-             bound was barely exercised"
+            STEP * (FALLING as u32) > HORIZON,
+            "the falling run finished inside one horizon, so the peak never aged \
+             out and nothing was asked of the successors"
         );
         assert!(
-            longest * 10 > WINDOW_FILTER_MAX_ENTRIES * 9,
-            "the filter never grew past {longest} entries against a bound of \
-             {WINDOW_FILTER_MAX_ENTRIES}, so this run says nothing about what \
-             happens at it"
+            worst_shortfall > 0,
+            "the bounded reading matched the unbounded one at every step, so the \
+             length rule never declined a sample this run went on to read"
         );
-        assert!(
-            STEP * (SAMPLES as u32) > HORIZON,
-            "the run finished inside one horizon, so nothing ever expired"
-        );
+        // The rise ends above everything retained, so the last sample is the
+        // maximum of its own horizon and has to be the reading immediately —
+        // a new head is never thinned.
+        let (_, final_value, final_reported) = last;
         assert_eq!(
-            worst_overshoot, 0,
-            "the reading rose above the unbounded reference by {worst_overshoot} \
-             at its worst"
+            final_reported, final_value,
+            "the run ended above every retained entry, so the reading should be \
+             the sample that just arrived"
         );
+    }
+
+    /// A windowed maximum with no length bound at all, for the tests above to
+    /// compare against.
+    ///
+    /// Written out here rather than reached for in the code under test, because
+    /// a reference that shares an implementation with its subject agrees with it
+    /// by construction. The horizon is a parameter so the same type serves as
+    /// both the upper reference (the plain windowed maximum, which the bounded
+    /// filter may not exceed) and the lower one (a horizon one separation
+    /// shorter, which it may not fall below).
+    struct UnboundedMaxFilter {
+        window: VecDeque<(Instant, u64)>,
+        horizon: Duration,
+    }
+
+    impl UnboundedMaxFilter {
+        fn new(horizon: Duration) -> Self {
+            Self {
+                window: VecDeque::new(),
+                horizon,
+            }
+        }
+
+        fn update(&mut self, now: Instant, value: u64) -> u64 {
+            while self
+                .window
+                .front()
+                .is_some_and(|&(ts, _)| now.duration_since(ts) > self.horizon)
+            {
+                self.window.pop_front();
+            }
+            while self.window.back().is_some_and(|&(_, v)| v <= value) {
+                self.window.pop_back();
+            }
+            self.window.push_back((now, value));
+            self.window.front().map_or(value, |&(_, v)| v)
+        }
     }
 
     /// The retained maximum and the raw sample must be separately readable, and
