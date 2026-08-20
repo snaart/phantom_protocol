@@ -556,9 +556,15 @@ uint64_t uniffi_phantom_protocol_fn_method_phantomsession_disconnect(
 
 /* connection_state() -> ConnectionState enum (sync). Lowered into a
  * RustBuffer holding a 4-byte big-endian discriminant. UniFFI numbers
- * enum variants from 1 on the wire, so the buffer holds:
- *   1=Connecting 2=ClassicalReady 3=PqcUpgrading 4=PqcReady 5=Connected
- *   6=Failed 7=Closed 8=Migrating 9=Dead. */
+ * enum variants from 1 in DECLARATION order, which is not the Rust
+ * discriminant: the Rust enum leaves 1..=3 as holes for a staged upgrade the
+ * protocol never shipped, and those holes are not on the wire. The buffer
+ * holds:
+ *   1=Connecting 2=Connected 3=Failed 4=Closed 5=Migrating 6=Dead
+ *   7=Draining.
+ * Draining means the peer announced its own close and this side is reading
+ * out what was still in flight behind it: reads still deliver, every write
+ * returns ConnectionClosed, and is_data_ready() below is false. */
 PhantomRustBuffer uniffi_phantom_protocol_fn_method_phantomsession_connection_state(
     void                    *ptr,
     PhantomRustCallStatus   *call_status);

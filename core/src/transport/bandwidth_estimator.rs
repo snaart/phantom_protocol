@@ -246,7 +246,12 @@ const STARTUP_ROUNDS_LIMIT: u32 = 3;
 ///
 /// A guess, not an observation, and the distinction matters wherever the figure
 /// is treated as a bound: nothing prevents the true path from being slower.
-const INITIAL_MIN_RTT: Duration = Duration::from_millis(100);
+///
+/// `pub(crate)` because it is also the value that decides what any *other* timer
+/// derived from `min_rtt` computes on a session that has not yet timed a round trip —
+/// see `api::session::drain_window_for_rtt`, whose test names it rather than
+/// repeating 100 ms as if it were a measured figure.
+pub(crate) const INITIAL_MIN_RTT: Duration = Duration::from_millis(100);
 
 /// ProbeRTT interval — enter ProbeRTT every 10 seconds
 const PROBE_RTT_INTERVAL: Duration = Duration::from_secs(10);

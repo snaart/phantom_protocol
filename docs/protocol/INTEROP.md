@@ -31,8 +31,8 @@ downgrade). Pin these first:
 
 | Constant | Value (default build) | Source of truth | Wire role |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `7` | `core/src/transport/types.rs` | `PacketHeader.version` (byte 0, HP-masked) |
-| `PROTOCOL_VERSION` | `4` | `core/src/transport/handshake.rs` | `ClientHello.version`, transcript-bound |
+| `WIRE_VERSION` | `8` | `core/src/transport/types.rs` | `PacketHeader.version` (byte 0, HP-masked) |
+| `PROTOCOL_VERSION` | `5` | `core/src/transport/handshake.rs` | `ClientHello.version`, transcript-bound |
 | `PROTOCOL_VARIANT` | `b"phantom-default-1"` | `core/src/transport/handshake.rs` | leading field of the signed transcript |
 
 A receiver **drops** any data frame whose `header.version != WIRE_VERSION`
@@ -46,8 +46,25 @@ Note the asymmetry between those two refusals, because it decides which one you 
 actually observe while building: the data-frame drop is **silent** — no reply, nothing the
 sender can distinguish from a black hole — while the `ServerReject` names both versions.
 That is why the two constants move together even when only the data plane changed, as at
-`WIRE_VERSION 6 → 7` / `PROTOCOL_VERSION 3 → 4`. If your peer establishes a session and
-then moves no data, check the version pair before anything else.
+`WIRE_VERSION 6 → 7` / `PROTOCOL_VERSION 3 → 4` and again at `7 → 8` / `4 → 5`. If your
+peer establishes a session and then moves no data, check the version pair before anything
+else.
+
+The `7 → 8` bump is worth reading as a worked example, because it is the case where nothing
+on the header moved at all and the pairing rule is doing all the work. v8 gave the `CONTROL`
+flag a one-byte subtype inside its AEAD plaintext (PROTOCOL.md § 4.11); the header is byte
+for byte what it was at v7 apart from the version constant itself. Note carefully which half
+of the pair does what, because it is easy to get backwards. The `WIRE_VERSION` half is what
+stops a v7 receiver from ever reaching its flag dispatch with a v8 frame: the version check
+is step 1 of § 4.3 and it **drops** the frame there, before any flag is examined, so nothing
+is misread and nothing is corrupted. What that leaves is a peer that completes a handshake
+and then silently discards every packet it is sent — the most expensive failure a protocol
+can hand an implementer, because it looks like a working connection. The `PROTOCOL_VERSION`
+half is what converts that into a diagnosis: a typed `ServerReject` naming both versions,
+before a session exists. If you take one habit from this section, take this one: a change to
+what is *inside* the AEAD is a wire revision exactly as much as a change to the header —
+the header version will enforce it either way, and your only choice is whether the
+enforcement is legible.
 
 **A fourth constant is agreed off the wire: the AEAD suite.** There is no cipher
 field in any message; each peer independently resolves AES-256-GCM vs
@@ -206,15 +223,64 @@ the (authenticated) flags, and each shape has its own grammar in PROTOCOL.md
 | `WINDOW_UPDATE` | exactly 8 bytes: a big-endian `u64` **cumulative limit** — the total the receiver will let you send on that stream. Apply it as a maximum, never a sum |
 | `PATH_VALIDATION` | exactly 32 bytes: a challenge or its echo |
 | `KEEPALIVE` | empty (PING); `KEEPALIVE \| ACK` is the PONG |
+| `CONTROL` | `[subtype: u8]` then whatever that subtype defines — nothing, for the only assignment so far (PROTOCOL.md § 4.11) |
 | `COALESCED` | `[count: u16][len: u16][payload]…` |
 | `PADDED` | strip the `‹zeros› ‖ pad_n: u16 be` trailer **first**, then interpret the rest by the other flags |
 
 A minimal peer needs `RELIABLE` and `ACK` to move data at all; `COALESCED` is
 receive-only in this implementation (nothing emits a bundle), and `PADDED` /
 `COVER` are opt-in shaping a peer may simply never enable. Every one of these is
-inside the AEAD, so none of them is frozen by a `.bin` and none of them is a
-`WIRE_VERSION` concern — but a mismatch here reads as data corruption, not as a
-parse error.
+inside the AEAD, so none of them is frozen by a `.bin` — but do not read that as
+meaning they are not a `WIRE_VERSION` concern. Two of the last two revisions changed
+nothing but a plaintext in this table (`WINDOW_UPDATE` at v7, `CONTROL` at v8) and
+both bumped the version pair.
+
+The reason is the one § 1 gives, and it is the opposite way round from the obvious
+one, so read it in that direction. **Nothing inside a plaintext identifies which
+grammar it was written to.** A peer built for the old one opens the AEAD
+successfully — the seal is over bytes, not over meaning — and then reads the result
+by the wrong rule: eight bytes of cumulative limit taken as four bytes of credit, a
+subtype byte taken as the first byte of a payload. That is the corruption, and
+nothing downstream of the plaintext can detect it, because there is nothing down
+there to detect it *with*. The version byte on the header is the only place the
+difference is visible at all, which is why moving it is not a formality: with the
+bump, the frame is dropped at step 1 of § 4.3 before any flag is read, and the
+corruption never happens. Without it, there is no gate anywhere in the receive path
+that the change would trip.
+
+So the `WIRE_VERSION` half is what converts a misreading into a drop, and — as § 1
+sets out — the `PROTOCOL_VERSION` half is what converts that drop into a diagnosis
+rather than a session that establishes and then moves nothing.
+
+**`CONTROL` is the one row a peer may not skip.** The others degrade gracefully —
+never emit a `COALESCED` bundle and you simply never receive one; ignore `PADDED` and
+you were never sent a padded frame. `CONTROL` is different because the dispatch is
+not optional even when the *frame* is. A peer that omits the branch does not fail to
+act on a control frame; it falls through to its application-data path and hands the
+subtype byte to its caller. So implement the branch first and its contents second:
+
+- Read the leading byte after the padding trailer is off. `0x01` is `CLOSE` — the
+  peer is ending the session; tear down as you would on any other teardown. It is
+  unacknowledged: do not `ACK` it, do not answer it with a close of your own.
+- **Do not tear down on the copy you first see — drain first.** The `CLOSE` is not
+  `RELIABLE` and nothing retransmits the application data it may have overtaken, and
+  on a datagram path one position of reordering is enough for it to. Record the close,
+  keep processing inbound for a bounded window (PROTOCOL.md § 4.11 gives the sizing
+  and both of its bounds), deliver what arrives, send nothing new, and tear down at
+  the end of it. This is the receiver rule most likely to be missed, because a peer
+  that omits it interoperates perfectly on a loopback test and silently truncates its
+  peers' last writes in production.
+- Drop the frame on **every** other byte, `0x00` included, and drop it if the
+  plaintext is empty. Never read a missing or zero byte as a default.
+- **Return on all of those paths.** That, not the `CLOSE` handling, is the
+  conformance requirement: sending the frame is optional and receiving it correctly
+  is not.
+
+A peer that never sends a `CLOSE` is fully conformant — its peer falls back to the
+liveness timer of PROTOCOL.md § 12.4 and reaches the same verdict more slowly, which
+is what every peer did before v8. Sending one is a courtesy to the other end's
+resources; dispatching one is a correctness obligation to your own caller's byte
+stream.
 
 Three of those shapes — `RELIABLE`, `ACK`, `WINDOW_UPDATE` — are scoped by the
 header's `stream_id`, and that id is allocated by parity: initiator odd from 3,
@@ -226,11 +292,16 @@ with its peer's.
 
 The flags combine, so the table above is only half the rule: which branch claims
 a packet carrying several of them is fixed, and PROTOCOL.md § 4.3 gives the
-receiver's dispatch order end to end — including the two orderings that are not
-guessable (`PADDED` strips before anything parses, and `KEEPALIVE` is tested
-before `ACK`, because a PONG is `KEEPALIVE | ACK` and is not a `Sack`). The same
-section states what to do with a flag you do not recognise: ignore it, never
-reject the packet.
+receiver's dispatch order end to end — including the three orderings that are not
+guessable (`PADDED` strips before anything parses; `KEEPALIVE` is tested before
+`ACK`, because a PONG is `KEEPALIVE | ACK` and is not a `Sack`; and `CONTROL` is
+dispatched *after* the AEAD open and the replay window but *before* everything that
+could deliver data). That last one is a security property, not a layout choice:
+above the AEAD gate a one-byte `CLOSE` would end any session whose connection id
+could be guessed, and above the replay window a recorded one would be the same
+primitive with a capture step in front of it. Below both, a repeat is refused before
+your branch runs, so the branch needs no state of its own. The same section states
+what to do with a flag you do not recognise: ignore it, never reject the packet.
 
 ### Rung 5 — Migration & liveness (optional for a minimal peer)
 
@@ -281,7 +352,7 @@ Never hand-edit a `.bin`. See `core/tests/wire_vectors/README.md`.
 
 A peer is wire-conformant with the default build of this repository when:
 
-- [ ] It is built for `WIRE_VERSION = 7`, `PROTOCOL_VERSION = 4`, `PROTOCOL_VARIANT = phantom-default-1`, and treats a mismatch as a hard error (no downgrade).
+- [ ] It is built for `WIRE_VERSION = 8`, `PROTOCOL_VERSION = 5`, `PROTOCOL_VARIANT = phantom-default-1`, and treats a mismatch as a hard error (no downgrade).
 - [ ] It agrees with its peer on the AEAD suite (not negotiated — § 1) and assigns the per-direction keys by role, initiator un-swapped and responder swapped (§ 1).
 - [ ] Its AEAD / KDF / hash / ML-KEM / ML-DSA primitives reproduce every KAT in `cavp.rs` (Rung 0).
 - [ ] `encode(value)` equals each packet `.bin`, and `decode(.bin)` equals the value, for the four packet fixtures (Rung 1).
@@ -291,6 +362,7 @@ A peer is wire-conformant with the default build of this repository when:
 - [ ] Its transcript hash equals `transcript_hash.bin` (Rung 3).
 - [ ] Its AEAD nonce/AAD construction and HP masking reproduce PROTOCOL.md § 4.6 / § 5; a tampered AAD byte (version included) fails decryption with no oracle (Rung 4).
 - [ ] It reads the AEAD plaintext by flag — reliable offset prefix, SACK, cumulative window limit, path challenge, padding trailer (Rung 4b).
+- [ ] It dispatches a `CONTROL` frame on its leading subtype byte and **returns on every arm**, the unknown subtype and the empty plaintext included, so no control byte can reach its application (Rung 4b, PROTOCOL.md § 4.11). Emitting a `CLOSE` is optional; dispatching one is not.
 - [ ] It applies an inbound `WINDOW_UPDATE` as a maximum, counts its own sent bytes once per byte, and never sends past the highest limit received (§ 4.5 of PROTOCOL.md).
 - [ ] `tests/wire_vectors_decode.py` agrees with the peer's serializer in both directions (§ 3).
 - [ ] (If migrating) the CID chain and path-validation grammar match PROTOCOL.md § 4.7 / § 12 (Rung 5).
@@ -318,3 +390,10 @@ re-derived. Every fixture byte count quoted above was read off
 the committed `.bin` files at that commit, and every row of the Rung 1b framing
 table was read out of the leg named in its Source column rather than inferred
 from the transport's name.
+
+Two data-plane revisions have landed since and are reflected above:
+`WIRE_VERSION 6 → 7` / `PROTOCOL_VERSION 3 → 4` (the cumulative `WINDOW_UPDATE`
+limit) and `7 → 8` / `4 → 5` (the `CONTROL` subtype byte and the `CLOSE`
+announcement, Rung 4b). Both changed an AEAD plaintext and no header byte, so no
+fixture grammar moved — only the version byte inside the four packet fixtures and
+the two `ClientHello` fixtures, and `transcript_hash.bin` with them.

@@ -75,8 +75,8 @@ use crate::transport::session::{Session, SessionState};
 use crate::transport::shaping::{self, PaddingPolicy};
 use crate::transport::stream::{SendBlocked, SharedRecvTuning, Stream};
 use crate::transport::types::{
-    LegType, PacketFlags, PacketHeader, PhantomPacket, SessionId, StreamId as TransportStreamId,
-    WINDOW_UPDATE_PAYLOAD_LEN, WIRE_VERSION,
+    ControlSubtype, LegType, PacketFlags, PacketHeader, PhantomPacket, SessionId,
+    StreamId as TransportStreamId, CONTROL_SUBTYPE_LEN, WINDOW_UPDATE_PAYLOAD_LEN, WIRE_VERSION,
 };
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -138,6 +138,28 @@ pub enum ConnectionState {
     /// The session is dead: the path stayed down past the migration idle-timeout
     /// with no recovery. Terminal — `recv()` errors instead of hanging (P4.3).
     Dead = 8,
+    /// The peer announced its own close (WIRE v8) and this side is reading out
+    /// whatever was still in flight behind it before letting go.
+    ///
+    /// Reading continues; **writing does not**. The peer's session is over, so a
+    /// payload accepted here would be one the pump discards, and the whole point of
+    /// publishing this state is that no caller is told otherwise:
+    /// [`PhantomSession::send`], [`PhantomStream::send_reliable`],
+    /// [`PhantomStream::send_unreliable`] and [`PhantomStream::disconnect`] all
+    /// refuse with [`CoreError::ConnectionClosed`] rather than returning `Ok` for
+    /// bytes that will never reach the wire, `is_data_ready()` is `false`, and
+    /// `queued_count()` stays `0` because a refused write is refused rather than
+    /// queued. It is not a failure: nothing went wrong, so `last_error()` stays
+    /// `None` unless something else already failed.
+    ///
+    /// The window is bounded and short — see `peer_close_drain_window` — after which
+    /// the session settles into [`Closed`](Self::Closed).
+    ///
+    /// [`PhantomStream`]: crate::api::stream::PhantomStream
+    /// [`PhantomStream::send_reliable`]: crate::api::stream::PhantomStream::send_reliable
+    /// [`PhantomStream::send_unreliable`]: crate::api::stream::PhantomStream::send_unreliable
+    /// [`PhantomStream::disconnect`]: crate::api::stream::PhantomStream::disconnect
+    Draining = 9,
 }
 
 /// Anti-fingerprint traffic-shaping configuration (WIRE v6). Set on
@@ -179,7 +201,10 @@ fn apply_shaping(session: &Session, cfg: TrafficShapingConfig) {
 }
 
 impl ConnectionState {
-    fn from_u8(v: u8) -> Self {
+    /// Read a state back out of the atomic the pump publishes it into. `pub(crate)`
+    /// because the stream handles read the same atomic to answer the same question
+    /// their session does.
+    pub(crate) fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::Connecting,
             4 => Self::Connected,
@@ -187,6 +212,7 @@ impl ConnectionState {
             6 => Self::Closed,
             7 => Self::Migrating,
             8 => Self::Dead,
+            9 => Self::Draining,
             // Includes the retired 1..=3: a value nothing writes any more is not
             // a state, and `Failed` is the safe reading of a number we cannot
             // interpret — it makes the session unusable rather than pretending
@@ -198,6 +224,13 @@ impl ConnectionState {
     /// Whether data can flow. `Migrating` counts as ready: the keep-alive window
     /// still accepts `send()` (buffered + retransmitted until the path recovers),
     /// so the embedder's send path doesn't error mid-migration.
+    ///
+    /// [`Draining`](Self::Draining) does **not**, and the distinction between it and
+    /// `Migrating` is the whole reason it is a separate state. Both keep reading;
+    /// only one of them still has somewhere to put a write. A migrating session's
+    /// peer is still there and its buffered bytes go out when the path returns; a
+    /// draining session's peer has said it is gone, so a byte accepted here is a
+    /// byte discarded at teardown.
     pub fn is_data_ready(&self) -> bool {
         matches!(self, Self::Connected | Self::Migrating)
     }
@@ -1953,6 +1986,10 @@ async fn run_data_pump<T: SessionTransport>(
     let transport_recv = transport.clone();
     let transport_send_ack = transport.clone();
     let crypto_recv = crypto_session.clone();
+    // The FFI-visible state, written from the receive side too: the peer's close
+    // arrives here, and the accessors that must stop claiming the session can carry a
+    // write read this atomic (see `ConnectionState::Draining`).
+    let state_recv = state.clone();
     let demux_recv = demux.clone();
     let streams_recv = streams.clone();
     let undelivered_reader = undelivered_bytes.clone();
@@ -1985,6 +2022,10 @@ async fn run_data_pump<T: SessionTransport>(
         // the observability bookkeeping the receive path needs.
         let mut scratch =
             RecvScratch::new(256, stream_gauge_recv, path_challenges_recv, recv_tuning);
+        // Draining (WIRE v8): the instant this loop stops reading once the peer has
+        // announced its close. `None` until the first close copy is handled, and
+        // computed exactly once from a window the peer cannot extend.
+        let mut drain_deadline: Option<std::time::Instant> = None;
         loop {
             // Flow-control / anti-flood gate: if the app-delivery backlog
             // has blown past the cap, the peer is not honouring the window —
@@ -2058,8 +2099,40 @@ async fn run_data_pump<T: SessionTransport>(
                 leg,
                 &cmd_tx_recv,
                 &incoming_stream_tx_recv,
+                &state_recv,
             )
             .await;
+            // The peer announced its close on the packet just handled (WIRE v8).
+            // Checked here rather than acted on inside `handle_packet` so the loop
+            // ends the same way it ends for a dead transport — everything already
+            // delivered stays queued for the delivery task, and the pump learns of
+            // it through the one signal it already watches.
+            //
+            // It does not end *now*, though. The close is not `RELIABLE`, carries no
+            // stream offset and is never acknowledged, so nothing re-sends whatever
+            // it overtakes; on a datagram path a single one-position reorder is
+            // enough for it to arrive ahead of data the peer's `send()` already
+            // returned `Ok` for, and stopping here would discard those bytes with no
+            // error at either end. So the session drains instead: it keeps reading
+            // for a bounded window and only then lets go. The deadline is taken once,
+            // on the first copy, and never moved — a peer that keeps sending cannot
+            // hold this loop open by talking.
+            if crypto_recv.peer_closed() {
+                // Publish the draining state from here — the packet boundary at which
+                // the close is recorded — rather than leaving it to the send loop's
+                // next 10 ms tick. `send()` reads this atomic and nothing else, so for
+                // however long it lags the recorded close, the API is handing callers
+                // `Ok` for payloads the pump has already decided to discard. That is
+                // the defect the state exists to remove, so the two must not be
+                // separated by a scheduling interval.
+                state_recv.store(ConnectionState::Draining as u8, Ordering::Relaxed);
+                let deadline = *drain_deadline.get_or_insert_with(|| {
+                    std::time::Instant::now() + peer_close_drain_window(&crypto_recv)
+                });
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
         }
         // Reader exiting → drop `deliver_tx` so the delivery task drains any
         // queued items and then sees the channel closed and exits.
@@ -2116,6 +2189,12 @@ async fn run_data_pump<T: SessionTransport>(
     // collapsed the download under a saturating upload. Pacing must slow the
     // sender, not stop the session.
     let mut paced_until: Option<tokio::time::Instant> = None;
+    // Draining (WIRE v8): the instant this pump tears down once the peer has
+    // announced its close, or `None` while it has not. The receive task runs the same
+    // deadline at a packet boundary, which is the clean exit; this one covers the case
+    // the receive task cannot see, namely that nothing further arrives at all — a
+    // reader parked in `recv_bytes()` has no boundary at which to notice a deadline.
+    let mut draining_until: Option<std::time::Instant> = None;
     // Outbound WINDOW_UPDATE control packets are emitted on the send loop — the
     // sole outbound writer — so the encrypted control frame is always sealed under
     // the epoch live when it stamps. The epoch has two writers (this loop's own
@@ -2135,6 +2214,37 @@ async fn run_data_pump<T: SessionTransport>(
             .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
         tokio::select! {
             _ = poll_interval.tick() => {
+                // Draining (WIRE v8). The peer said it is leaving, so this side stops
+                // producing and keeps consuming for a bounded window: the receive task
+                // is still delivering whatever was in flight behind the close, and the
+                // demux route retire at the foot of this function is deferred until
+                // this loop exits, which is what keeps those datagrams routable while
+                // it is. Armed once from a window computed once — see
+                // `peer_close_drain_window` for why the peer cannot lengthen it.
+                if draining_until.is_none() && crypto_session.peer_closed() {
+                    let window = peer_close_drain_window(&crypto_session);
+                    log::info!(
+                        "PhantomSession: peer announced session close; draining for {window:?}"
+                    );
+                    draining_until = Some(std::time::Instant::now() + window);
+                    // The receive task normally publishes this first, at the packet
+                    // that carried the close. Repeated here because the flag is set
+                    // inside `handle_packet`, so this loop can in principle observe it
+                    // before the receive loop reaches its own check — and a state that
+                    // still says `Connected` while this arm refuses writes is exactly
+                    // the disagreement between accessors that has to not exist.
+                    state.store(ConnectionState::Draining as u8, Ordering::Relaxed);
+                }
+                if let Some(until) = draining_until {
+                    if std::time::Instant::now() >= until {
+                        break;
+                    }
+                    // Nothing outbound while draining: the peer's session is ending, so
+                    // new data has nowhere to arrive, a keep-alive has nobody to answer
+                    // it, and a liveness verdict about a path the peer has abandoned
+                    // would only publish a state this teardown is about to overwrite.
+                    continue;
+                }
                 flush_deferred_sends(
                     &mut deferred, &transport, &crypto_session, session_id, &streams,
                     &demux, &stream_gauge, &observability,
@@ -2197,7 +2307,10 @@ async fn run_data_pump<T: SessionTransport>(
                     break;
                 }
             }
-            _ = send_notify.notified() => {
+            // Disabled while draining: this arm exists to put newly-queued bytes on
+            // the wire promptly, and a session whose peer has announced its close has
+            // nowhere to put them.
+            _ = send_notify.notified(), if draining_until.is_none() => {
                 // Same drain logic as the tick arm — fast-wake path. Also admit
                 // whatever the send buffers have room for now (an acknowledgement
                 // that freed a slot wakes us here) and flush any flow-control
@@ -2229,7 +2342,8 @@ async fn run_data_pump<T: SessionTransport>(
             // to be a pacing clock: at a 16 KiB burst allowance, waking only
             // every 10 ms caps the sender at 1.6 MB/s no matter what rate
             // congestion control asked for.
-            _ = tokio::time::sleep_until(paced_wake), if paced_until.is_some() => {
+            _ = tokio::time::sleep_until(paced_wake),
+                if paced_until.is_some() && draining_until.is_none() => {
                 paced_until = apply_drain_outcome(
                     &crypto_session,
                     drain_streams_priority_ordered(
@@ -2247,6 +2361,33 @@ async fn run_data_pump<T: SessionTransport>(
             // per-stream byte ordering and lets the bounded command channel carry
             // the backpressure back to the caller.
             cmd_opt = cmd_rx.recv(), if deferred.is_empty() => {
+                // Draining (WIRE v8): the local side may still hand this pump writes
+                // after the peer has announced its close. They are refused rather than
+                // queued — the peer's session is over, so a byte accepted here would
+                // be a byte silently dropped at teardown. This is the second half of
+                // that refusal and not the first: `ConnectionState::Draining` is
+                // published the moment the close is recorded, and the send API reads it
+                // and returns an error, so what reaches here is only what was already
+                // in the channel or what raced the publish by less than a scheduling
+                // point. Dropping those silently is the residue of a genuine race and
+                // not a window — which is what the state moved it from. The arm keeps
+                // *reading* commands so `disconnect()` and a dropped handle still land;
+                // only the writes are declined.
+                if draining_until.is_some()
+                    && matches!(
+                        cmd_opt,
+                        Some(SessionCommand::Send(_))
+                            | Some(SessionCommand::SendStreamReliable { .. })
+                            | Some(SessionCommand::SendStreamUnreliable { .. })
+                            | Some(SessionCommand::CloseStream { .. })
+                    )
+                {
+                    log::debug!(
+                        "PhantomSession: refusing an application write while draining the \
+                         peer's close"
+                    );
+                    continue;
+                }
                 match cmd_opt {
                     Some(SessionCommand::Send(data)) => {
                         // Route through the raw-app stream so the payload is
@@ -2418,17 +2559,14 @@ async fn run_data_pump<T: SessionTransport>(
                     }
                     Some(SessionCommand::Close) => {
                         log::info!("PhantomSession: closing");
-                        // `disconnect()` is a *graceful* close (doc: "Send the
-                        // graceful close frame and shut the session down" — TCP-FIN
-                        // semantics: finish sending, then close). Mirror the
-                        // handle-drop (`None`) arm so buffered `send()` data still
-                        // reaches the peer: `session.send(x); session.disconnect()`
-                        // must not lose `x`, just like `send(x); drop(session)`.
-                        flush_pending_window_updates(
-                            &transport, &crypto_session, session_id, &streams, &observability,
-                        )
-                        .await;
-                        drain_streams_fully(
+                        // `disconnect()` is a *graceful* close with TCP-FIN shape:
+                        // push what is queued, then close. Mirror the handle-drop
+                        // (`None`) arm so buffered `send()` data still reaches the
+                        // peer: `session.send(x); session.disconnect()` must not lose
+                        // `x`, just like `send(x); drop(session)` — bearing in mind
+                        // that "push" is what the drain does and not "deliver", which
+                        // is what the method's own documentation says out loud.
+                        finish_and_announce(
                             &transport, &crypto_session, session_id, &streams, &observability,
                         )
                         .await;
@@ -2444,11 +2582,7 @@ async fn run_data_pump<T: SessionTransport>(
                         // handle still reaches the peer — otherwise a freshly-accepted
                         // server session that does `recv(); send(echo)` then drops loses
                         // the echo, and the client's `recv()` hangs to its timeout.
-                        flush_pending_window_updates(
-                            &transport, &crypto_session, session_id, &streams, &observability,
-                        )
-                        .await;
-                        drain_streams_fully(
+                        finish_and_announce(
                             &transport, &crypto_session, session_id, &streams, &observability,
                         )
                         .await;
@@ -2457,7 +2591,17 @@ async fn run_data_pump<T: SessionTransport>(
                 }
             }
             _ = &mut recv_done_rx => {
-                log::error!("PhantomSession: receive task ended unexpectedly (transport closed)");
+                if crypto_session.peer_closed() {
+                    // The peer announced its close and the receive loop has finished
+                    // draining behind it. Nothing is wrong and nothing is owed back:
+                    // answering a close with a close would only make two sessions each
+                    // wait for the other's last word.
+                    log::info!("PhantomSession: peer closed the session");
+                } else {
+                    log::error!(
+                        "PhantomSession: receive task ended unexpectedly (transport closed)"
+                    );
+                }
                 break;
             }
         }
@@ -2466,6 +2610,20 @@ async fn run_data_pump<T: SessionTransport>(
     // Abort the recv task if it's still running; idempotent on a finished
     // handle. Goes through the runtime-agnostic `SpawnHandle::abort`.
     recv_handle.abort();
+    // Release this session's demux routes (WIRE v8). On the PhantomUDP server this is
+    // what actually frees the slot: the route table is keyed on connection ids the
+    // demux cannot recompute, and its other reclaim triggers all wait for a datagram
+    // that a departed peer will never send. Placed on the common teardown path rather
+    // than in the graceful-close arm, because a session ends five ways and the routes
+    // should go on all of them. A no-op everywhere but the UDP server.
+    //
+    // Reaching it is what ends the draining window on the receiving side, and that
+    // ordering is load-bearing rather than incidental: retiring the routes is the
+    // second way a late datagram gets discarded — one that finds no route is not an
+    // `Initial`, so the demux drops it before any session sees it — so the retire has
+    // to wait for the same deadline the receive loop does, and it does that by being
+    // here rather than at the moment the close was read.
+    crypto_session.signal_route_retire();
     // A liveness idle-timeout death already published `ConnectionState::Dead`; only a
     // normal teardown (graceful close / transport drop) publishes `Closed`.
     if !died {
@@ -3478,6 +3636,236 @@ async fn send_cover<T: SessionTransport>(
     true
 }
 
+/// Round trips the draining window spans, once the peer has announced its close
+/// (WIRE v8). QUIC's draining period is three PTOs and this is the same shape and
+/// the same reason: three round trips is long enough that a datagram already on the
+/// path when the close was sent has arrived, and short enough that nothing waits on
+/// a session neither side is using.
+const DRAIN_ROUND_TRIPS: u32 = 3;
+
+/// Floor on the draining window.
+///
+/// The round-trip figure it multiplies is a *measurement*, and on a loopback or a
+/// datacentre path that measurement is a few hundred microseconds — three of which
+/// would drain nothing at all, because the displacement this window exists to absorb
+/// is produced by the path's queues and not by its length. It is the same judgement
+/// the retransmit timer already makes with its own 200 ms floor: below this, a
+/// round-trip measurement is too small to size a timeout with.
+const DRAIN_WINDOW_MIN: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Absolute ceiling on the draining window, and the reason it exists is the peer.
+///
+/// The round-trip figure is one the peer can inflate — delaying its own
+/// acknowledgements raises what this side measures — so without a ceiling the length
+/// of a *local* commitment would be a number a remote party writes. The cost of the
+/// ceiling is that a genuinely very long path drains for fewer than
+/// [`DRAIN_ROUND_TRIPS`] round trips; the cost of not having one is a lever, and a
+/// lever is worse.
+const DRAIN_WINDOW_MAX: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// How long this side keeps reading after the peer announces its close (WIRE v8).
+///
+/// What this buys and what it costs both belong in the open, and the two things it
+/// moves are different resources with different reclaim paths — conflating them is
+/// how the improvement gets overstated. Measured on loopback against the revision
+/// before this frame existed, one client connecting to one listener and then dropped:
+///
+/// * The **embedder-visible session slot** — how long the accepted session's `recv()`
+///   goes on blocking, which is how long a handler loop is held — was **44.8 s** and
+///   is **0.20 s**, a factor of about 220. The 44.8 s is the liveness path doing its
+///   job slowly: an idle keep-alive fired into a closed port, a path-down verdict,
+///   then the migration idle timeout.
+/// * The **demux route table** — the 18 CID routes the listener holds for that
+///   session — was **not reclaimed at all** within a 250 s observation, and is
+///   reclaimed in **0.22 s**. That one is not a ratio and should not be written as
+///   one: at the old revision nothing reclaimed it, because every trigger the table
+///   had was waiting for a datagram the departed client was never going to send.
+///
+/// The window is held rather than released the instant the close lands, and unlike
+/// either figure above it is a duration this side chose. The peer cannot lengthen it
+/// past [`DRAIN_WINDOW_MAX`], and cannot re-arm it by sending more: the deadline is
+/// taken once, from this value, at the first close copy. On a fast path it is
+/// [`DRAIN_WINDOW_MIN`] — a measured loopback `min_rtt` is a few hundred
+/// microseconds, so three of it is nowhere near the floor — and on the 235 ms
+/// reference WAN path it is the ceiling.
+fn peer_close_drain_window(crypto_session: &Session) -> std::time::Duration {
+    // `min_rtt` is the only round-trip figure kept at session scope. RFC 9002's PTO
+    // is larger — it adds the variance term and the peer's maximum acknowledgement
+    // delay — so multiplying this one gives a deliberately modest window rather than
+    // a generous one, which is the right direction for a value that holds a resource.
+    drain_window_for_rtt(crypto_session.bandwidth_snapshot().min_rtt)
+}
+
+/// The draining window for one measured round trip. Split out from
+/// [`peer_close_drain_window`] because the bounds are the part with a security
+/// argument behind them, and they should be checkable without a session to hang a
+/// round-trip measurement on.
+fn drain_window_for_rtt(rtt: std::time::Duration) -> std::time::Duration {
+    rtt.saturating_mul(DRAIN_ROUND_TRIPS)
+        .clamp(DRAIN_WINDOW_MIN, DRAIN_WINDOW_MAX)
+}
+
+/// Put what this session still owes the peer on the wire, then tell the peer it is
+/// over. The shared tail of `disconnect()` and of dropping the handle.
+///
+/// Both do nothing when the peer has already announced its own close: there is
+/// nobody left to flush to, and answering a close with a close would only make two
+/// sessions each wait for the other's last word.
+async fn finish_and_announce<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    streams: &Arc<DashMap<u32, Arc<Stream>>>,
+    observability: &Observability,
+) {
+    if crypto_session.peer_closed() {
+        return;
+    }
+    flush_pending_window_updates(
+        transport,
+        crypto_session,
+        session_id,
+        streams,
+        observability,
+    )
+    .await;
+    drain_streams_fully(
+        transport,
+        crypto_session,
+        session_id,
+        streams,
+        observability,
+    )
+    .await;
+    // Only now — the close frame ends the peer's session, so a peer that acted on it
+    // before the drained data arrived would lose that data. Sending them in turn is
+    // the only ordering this side can impose, and on a datagram transport it is not
+    // arrival order; what covers the rest is the peer's own draining window, not
+    // anything achievable from here.
+    announce_close(transport, crypto_session, session_id, observability).await;
+}
+
+/// How many close frames a departing session emits back to back.
+///
+/// The frame is unacknowledged and never retransmitted, so redundancy is the only
+/// loss tolerance available to it, and this is a fixed count rather than a loop with
+/// a condition on purpose: the condition would have to be something about the peer,
+/// and the peer is by then the thing we have stopped being able to observe. Three
+/// datagrams survive an independent 10% loss rate with probability 0.999, and cost
+/// three packet numbers out of a `u64` — nothing against the nonce budget Invariant 8
+/// guards, which is why the number is small rather than merely finite.
+const CLOSE_FRAME_COPIES: usize = 3;
+
+/// Emit one session-close announcement (WIRE v8): an `ENCRYPTED | CONTROL` packet
+/// whose AEAD plaintext is the single byte [`ControlSubtype::CLOSE`], Padme-padded to
+/// a bucket.
+///
+/// What the padding does, stated narrowly because the broad version is not true.
+/// Unpadded this frame is 41 bytes on the PhantomUDP wire — a 9-byte envelope, a
+/// 15-byte header and a 16-byte tag over a one-byte plaintext — and the Padme trailer
+/// takes it to 45. That collapses the *body length* into a bucket: a control frame
+/// with a one-, two- or three-byte body is the same size on the wire, so the emitted
+/// size says a control frame went out and does not say which one, which is what keeps
+/// a later subtype from being told apart from a close by an observer counting bytes.
+///
+/// Two things it does **not** do, and the second is the one that was claimed here and
+/// is false. It does not put the frame on a size nothing else emits: a default
+/// session's one-byte reliable application write is the same 45 bytes, because the
+/// padded control plaintext and a four-byte stream offset plus one application byte
+/// are both five bytes. So a close is not distinguishable *by size alone* from every
+/// other frame — only from most of them, and from every control frame the registry
+/// might later add. And it does not hide that a session ended: [`CLOSE_FRAME_COPIES`]
+/// identical datagrams back to back followed by silence is a *pattern*, and no amount
+/// of per-frame padding removes a pattern. Hiding that would take the session padding
+/// its data frames too, which is the opt-in policy and costs bandwidth on every
+/// packet — a decision for the deployment, not for this frame.
+///
+/// Everything about it is best-effort: a rekey saturation, a seal failure or a dead
+/// transport all just mean the peer will fall back to noticing the silence, which is
+/// exactly what it did before this frame existed. Nothing here is allowed to be fatal
+/// to a session that is ending anyway.
+async fn send_control_close<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    observability: &Observability,
+) -> bool {
+    let mut flag_bits = PacketFlags::ENCRYPTED | PacketFlags::CONTROL;
+    // Same direction-wide rekey discipline as any other send (Invariant 5). On
+    // `None` the direction has run out of epochs, and the only correct thing left to
+    // do is stop sending: retrying a best-effort teardown frame against a saturated
+    // key schedule spends nonce budget on a session nobody is listening to.
+    match rekey_before_stamp(crypto_session, observability) {
+        Some(extra) => flag_bits |= extra,
+        None => return false,
+    }
+    let mut plaintext = vec![ControlSubtype::CLOSE];
+    let trailer = shaping::padding_trailer_len(plaintext.len(), PaddingPolicy::Padme);
+    if trailer > 0 {
+        shaping::append_padding(&mut plaintext, trailer);
+        flag_bits |= PacketFlags::PADDED;
+    }
+    let packet_number = crypto_session.next_send_pn();
+    let header = PacketHeader::new(
+        session_id,
+        RAW_APP_STREAM_ID as TransportStreamId,
+        packet_number,
+        PacketFlags::new(flag_bits),
+    )
+    .with_epoch(crypto_session.current_epoch())
+    .with_path_id(crypto_session.current_send_path_id());
+    let ciphertext = match timed_encrypt(crypto_session, observability, &header, &plaintext, &[]) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("PhantomSession: close-frame encrypt failed: {}", e);
+            return false;
+        }
+    };
+    let packet = PhantomPacket::new(header, ciphertext);
+    let buf = match crypto_session.protect_packet(&packet) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!(
+                "PhantomSession: close-frame header protection failed: {}",
+                e
+            );
+            return false;
+        }
+    };
+    if let Err(e) = transport.send_bytes(&buf).await {
+        log::error!("PhantomSession: close-frame send failed: {}", e);
+        return false;
+    }
+    true
+}
+
+/// Tell the peer this session is over, [`CLOSE_FRAME_COPIES`] times.
+///
+/// Each copy draws its own packet number, so the peer's replay window accepts the
+/// first to arrive and refuses the rest without the receive branch needing to be
+/// idempotent itself. Emitted only from a session that reached the wire: a handshake
+/// that never established has no keys to seal with and no peer state to release.
+async fn announce_close<T: SessionTransport>(
+    transport: &Arc<T>,
+    crypto_session: &Arc<Session>,
+    session_id: SessionId,
+    observability: &Observability,
+) {
+    if !matches!(
+        crypto_session.state(),
+        SessionState::Connected | SessionState::Migrating
+    ) {
+        return;
+    }
+    for _ in 0..CLOSE_FRAME_COPIES {
+        if !send_control_close(transport, crypto_session, session_id, observability).await {
+            // The first failure is the transport or the key schedule telling us the
+            // remaining copies would fail the same way; stop rather than log thrice.
+            break;
+        }
+    }
+}
+
 /// Maintain a minimum outbound packet rate with cover traffic (WIRE v6): when
 /// no packet has gone out for `cover_interval`, emit a COVER dummy so
 /// silence + volume no longer leak (idle-fill + a floor rate of `1000 / interval_ms`
@@ -3740,6 +4128,10 @@ async fn handle_packet<T: SessionTransport>(
     // Sink where newly-registered peer-initiated streams are
     // pushed so `accept_stream()` can hand them to the embedder.
     incoming_stream_tx: &mpsc::Sender<Arc<crate::api::stream::PhantomStream>>,
+    // The session's published `ConnectionState`. Handed to every `PhantomStream`
+    // built here so a peer-initiated stream can refuse a write the pump would
+    // discard, exactly as a locally-opened one does.
+    session_state: &Arc<AtomicU8>,
 ) {
     let stream_id: u32 = packet.header.stream_id.into();
     let path_id = packet.header.path_id;
@@ -3928,6 +4320,53 @@ async fn handle_packet<T: SessionTransport>(
                 observability,
             )
             .await;
+        }
+        return;
+    }
+
+    // In-session control frame (WIRE v8). The AEAD plaintext leads with a one-byte
+    // `ControlSubtype`; the branch for that subtype owns whatever follows it.
+    //
+    // Where this sits is the whole of its security argument, and moving it earlier to
+    // save work would give away the only thing that makes it safe:
+    //
+    //  * it is BELOW the ENCRYPTED gate above, whose `else` arm drops every
+    //    unencrypted post-handshake frame including an empty one (Invariant 2), so a
+    //    forged plaintext close cannot reach it — a control frame that arrived here
+    //    was sealed by the peer's key;
+    //  * it is BELOW the replay window inside `decrypt_packet_accepting_rekey`
+    //    (Invariant 4), so a byte-identical replay of a captured close was already
+    //    refused before this line runs. That is what makes the branch idempotent for
+    //    free rather than something it has to implement — and it is why an off-path
+    //    attacker holding a recorded datagram has no session-kill primitive.
+    //
+    // Every path returns, including the unknown-subtype one. The function ends in a
+    // fall-through that hands non-empty plaintext to the application, so a control
+    // body that fell out of here would be delivered as a byte of the caller's stream.
+    if packet.header.flags.contains(PacketFlags::CONTROL) {
+        if plaintext.len() < CONTROL_SUBTYPE_LEN {
+            // Names no subtype. An authenticated peer does not produce this, so it is
+            // a peer bug rather than an attack — dropped either way, and in
+            // particular it is not read as a close: a zeroed or truncated body must
+            // not be able to end a session.
+            log::debug!("PhantomSession: dropping control frame with no subtype byte");
+            return;
+        }
+        match plaintext[0] {
+            ControlSubtype::CLOSE => {
+                // The peer said it is leaving. Recorded here and acted on nowhere near
+                // here: the receive loop reads this after each packet and starts its
+                // draining window, at the end of which it ends and the pump runs its
+                // ordinary teardown — the same teardown that publishes the state,
+                // retires the stream gauge and releases the demux routes. Recording
+                // rather than tearing down is what keeps a close that overtook a data
+                // frame from discarding it; nothing re-sends what this frame passes.
+                log::info!("PhantomSession: peer announced session close");
+                crypto_recv.note_peer_closed();
+            }
+            other => {
+                log::debug!("PhantomSession: dropping control frame with unknown subtype {other}");
+            }
         }
         return;
     }
@@ -4338,6 +4777,7 @@ async fn handle_packet<T: SessionTransport>(
                     let phantom_stream = Arc::new(crate::api::stream::PhantomStream::new(
                         handle,
                         cmd_tx_for_stream.clone(),
+                        session_state.clone(),
                     ));
                     // Non-blocking push: a full incoming channel is a backpressure
                     // signal from the embedder (not consuming); don't block the reader.
@@ -4617,6 +5057,7 @@ impl PhantomSession {
         Arc::new(crate::api::stream::PhantomStream::new(
             handle,
             self.cmd_tx.clone(),
+            self.state.clone(),
         ))
     }
 
@@ -4648,6 +5089,11 @@ impl PhantomSession {
     ///
     /// - If the session is connected: sends immediately
     /// - If still handshaking: queues the data for auto-flush later
+    /// - If the peer has announced its close ([`ConnectionState::Draining`]):
+    ///   returns [`CoreError::ConnectionClosed`] without queueing anything. The
+    ///   peer's session is over, so this call cannot put `data` on the wire, and
+    ///   an `Ok` here would be the same silent loss the draining window exists to
+    ///   prevent on the receive side.
     /// - If the session is `Failed` or `Dead`: returns the captured terminal
     ///   error (from the handshake or the data pump) so the caller gets the
     ///   *specific* cause (e.g. [`CoreError::ServerIdentityMismatch`]) rather
@@ -4675,6 +5121,13 @@ impl PhantomSession {
     pub async fn send(&self, data: Vec<u8>) -> Result<(), CoreError> {
         let state = self.connection_state();
 
+        if state == ConnectionState::Draining {
+            // Refused before the branch below can read it as a terminal failure: the
+            // session has not failed, and reporting a failure for a peer's orderly
+            // departure would be as wrong in the other direction. `ConnectionClosed`
+            // says the one thing that is true of this call and of every one after it.
+            return Err(CoreError::ConnectionClosed);
+        }
         if state.is_data_ready() {
             // Channel is up — send directly
             self.cmd_tx
@@ -4719,8 +5172,16 @@ impl PhantomSession {
     }
 
     /// Returns the terminal error from a failed handshake or a dead session,
-    /// or `None` if the session has not failed (still connecting, connected, or
-    /// cleanly closed).
+    /// or `None` if the session has not failed (still connecting, connected,
+    /// draining the peer's close, or cleanly closed).
+    ///
+    /// A [`Draining`](ConnectionState::Draining) session reads `None` here on
+    /// purpose, and that is not in tension with `send()` returning
+    /// [`CoreError::ConnectionClosed`] at the same moment: nothing failed, the peer
+    /// left. The question "can I still write?" is answered by
+    /// [`connection_state`](Self::connection_state) and
+    /// [`is_data_ready`](Self::is_data_ready); the question this answers is "what
+    /// went wrong?", and for an orderly departure the answer is nothing.
     ///
     /// The error is written once by the background task immediately before the
     /// state transitions to `Failed` or `Dead`, so callers that read this after
@@ -4767,6 +5228,11 @@ impl PhantomSession {
         // (Connected, and also Migrating — the keys exist, the path is moving)
         // counts as ready; only a genuine failure surfaces the captured error.
         match self.connection_state() {
+            // The peer announced its close while we were waiting. The handshake did
+            // succeed, but answering `Ok(())` would tell the caller to go on and send,
+            // and the very next `send()` refuses — so the readiness answer has to be
+            // the same one, and it is not "failed" either.
+            ConnectionState::Draining => Err(CoreError::ConnectionClosed),
             ConnectionState::Failed | ConnectionState::Dead | ConnectionState::Closed => {
                 // Surface the captured terminal error, or a generic fallback.
                 Err(self
@@ -4803,7 +5269,15 @@ impl PhantomSession {
     }
 
     /// Flush all queued messages (called when handshake completes).
+    ///
+    /// Refuses with [`CoreError::ConnectionClosed`] once the peer has announced its
+    /// close: the count this returns is a count of payloads handed to the pump, and
+    /// while draining the pump discards them, so returning one would be the same
+    /// dishonest `Ok` that [`send`](Self::send) refuses to give.
     pub async fn flush_queue(&self) -> Result<u32, CoreError> {
+        if self.connection_state() == ConnectionState::Draining {
+            return Err(CoreError::ConnectionClosed);
+        }
         let mut queue = self.send_queue.lock().await;
         let count = queue.len() as u32;
         for msg in queue.drain(..) {
@@ -4816,6 +5290,12 @@ impl PhantomSession {
     }
 
     /// Number of messages queued (waiting for handshake).
+    ///
+    /// This counter only ever holds pre-handshake writes, so it reads `0` on a
+    /// [`Draining`](ConnectionState::Draining) session — and that reading is
+    /// accurate rather than a gap: a write offered while draining is refused at
+    /// [`send`](Self::send), not accepted into this queue, so there is nothing here
+    /// for it to be missing from.
     pub async fn queued_count(&self) -> u32 {
         self.send_queue.lock().await.len() as u32
     }
@@ -4942,7 +5422,35 @@ impl PhantomSession {
             .map_err(|_| CoreError::NetworkError("Session closed".into()))
     }
 
-    /// Send the graceful close frame and shut the session down.
+    /// Ask the background pump to push out what it can, tell the peer this session is
+    /// over, and shut it down.
+    ///
+    /// **What a caller can rely on.** That the session ends, and that this returns
+    /// promptly — it queues the request and returns; the work happens on the pump
+    /// afterwards. Nothing here is a delivery guarantee. The pump pushes queued bytes
+    /// until the socket, the congestion window or the peer's flow-control limit
+    /// refuses the next one, and then stops; it does not wait for an acknowledgement,
+    /// so "pushed" means "handed to the transport", not "the peer has it". A payload
+    /// larger than one congestion window is therefore mostly discarded — half a
+    /// mebibyte handed to `send()` immediately before this call arrives as a few
+    /// kibibytes — and a process that exits right afterwards can leave before any of
+    /// it, or the announcement, reaches the wire. Dropping the handle is the same path
+    /// with no await to hold the process still.
+    ///
+    /// **If delivery matters, do not use this to obtain it.** There is no
+    /// transport-level signal that could be waited on here: the close announcement is
+    /// itself unacknowledged. Have the peer say it received the data, at the
+    /// application level, and close after that answer arrives.
+    ///
+    /// The announcement is a best-effort `CONTROL` frame carrying
+    /// [`ControlSubtype::CLOSE`]: it is not acknowledged and not retransmitted, so a
+    /// peer that never receives it falls back to concluding the same thing from
+    /// silence, on its liveness timer. It is what lets a PhantomUDP server release
+    /// the session's slot in under a second instead of two minutes later, because a
+    /// datagram socket gives it no other end-of-stream to observe. A peer that does
+    /// receive it keeps reading for a short bounded window before tearing down, so
+    /// data this side put on the wire just before the close is still delivered if it
+    /// is merely reordered behind it.
     ///
     /// Named `disconnect` rather than `close` because UniFFI's Kotlin
     /// generator unconditionally adds `AutoCloseable.close()` to every
@@ -4958,6 +5466,21 @@ impl PhantomSession {
     /// Get the stream demultiplexer (internal use, not exposed to UniFFI)
     pub fn demux(&self) -> Arc<StreamDemultiplexer> {
         self.demux.clone()
+    }
+
+    /// The established inner [`Session`], or `None` while the handshake is still
+    /// running.
+    ///
+    /// Crate-internal and deliberately not on the public surface: the inner session
+    /// is where the machinery lives that the API in front of it exists to hide, and
+    /// handing it out would make every internal invariant a compatibility promise.
+    /// The callers are in-crate tests that need to reach a listener-installed
+    /// [`DemuxLink`](crate::transport::session::DemuxLink) — a wire between two
+    /// internals that no public accessor names — so it is compiled only for them
+    /// rather than left in the production build as a door nobody walks through.
+    #[cfg(test)]
+    pub(crate) async fn inner_session_handle(&self) -> Option<Arc<Session>> {
+        self.inner_session.lock().await.clone()
     }
 
     /// Current rekey epoch of the established session (`None` while still
@@ -5820,6 +6343,7 @@ mod tests {
             ConnectionState::Closed,
             ConnectionState::Migrating,
             ConnectionState::Dead,
+            ConnectionState::Draining,
         ] {
             // The session keeps the state in an `AtomicU8`, so every reachable
             // variant has to survive the round trip through it.
@@ -5842,6 +6366,9 @@ mod tests {
                 ConnectionState::Migrating => ("apply_liveness/PathDown", true),
                 // `apply_liveness` once the migration idle timeout expires.
                 ConnectionState::Dead => ("apply_liveness/Dead", false),
+                // The receive task, at the packet carrying the peer's close (WIRE
+                // v8), and the send loop when it arms the draining window.
+                ConnectionState::Draining => ("peer-close draining", false),
             };
             assert_eq!(
                 state.is_data_ready(),
@@ -5863,6 +6390,13 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::channel(1);
         let (inc_tx, _inc_rx) = mpsc::channel(1);
         (cmd_tx, inc_tx)
+    }
+
+    /// The published-state handle a direct `handle_packet` call needs. `Connected`,
+    /// because a test driving one packet by hand is standing in for a live session;
+    /// the tests that care about the draining state build their own and assert on it.
+    fn connected_state() -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(ConnectionState::Connected as u8))
     }
 
     /// Reader-task scratch for a direct `handle_packet` call in a test, wired to
@@ -7557,6 +8091,7 @@ mod tests {
             LegType::Tcp,
             &cmd_tx,
             &inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -7611,6 +8146,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -7683,6 +8219,7 @@ mod tests {
                 LegType::Tcp,
                 &no_cmd_tx,
                 &no_inc_tx,
+                &connected_state(),
             )
             .await;
         }
@@ -7739,6 +8276,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -7947,9 +8485,16 @@ mod tests {
         let (client_session, server_session) = paired_sessions(session_id);
         let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
 
-        // Install the demux slide channel and snapshot the inbound CID window.
+        use crate::transport::session::{DemuxLink, DemuxRouteOwner};
+
+        // Install the demux link and snapshot the inbound CID window.
         let (slide_tx, mut slide_rx) = mpsc::unbounded_channel();
-        server_session.set_cid_slide_tx(slide_tx);
+        let (retire_tx, _retire_rx) = mpsc::channel(4);
+        server_session.set_demux_link(DemuxLink {
+            slide_tx,
+            retire_tx,
+            owner: DemuxRouteOwner(1),
+        });
         let window_before = server_session.inbound_window_cids();
 
         // A valid frame on a NEW path_id (1, the migration signal), then corrupt
@@ -8422,6 +8967,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -8518,6 +9064,7 @@ mod tests {
             LegType::Udp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -8635,6 +9182,7 @@ mod tests {
             LegType::Udp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -8774,6 +9322,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
         obs
@@ -9387,6 +9936,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -9496,6 +10046,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -9506,6 +10057,421 @@ mod tests {
             "unencrypted post-handshake payload must NOT be handed off for delivery"
         );
         assert_eq!(undelivered.load(Ordering::Acquire), 0);
+    }
+
+    /// Seal an `ENCRYPTED | CONTROL` frame from the client side carrying `plaintext`
+    /// as the control body, Padme-padded exactly as the live emitter pads it. Used by
+    /// the control-frame tests to feed hand-built bodies — including ones no emitter
+    /// would ever produce — through the real receive path.
+    fn build_control_frame(
+        client_session: &InnerSession,
+        session_id: SessionId,
+        body: &[u8],
+    ) -> PhantomPacket {
+        let mut flag_bits = PacketFlags::ENCRYPTED | PacketFlags::CONTROL;
+        let mut plaintext = body.to_vec();
+        let trailer = shaping::padding_trailer_len(plaintext.len(), PaddingPolicy::Padme);
+        if trailer > 0 {
+            shaping::append_padding(&mut plaintext, trailer);
+            flag_bits |= PacketFlags::PADDED;
+        }
+        let header = PacketHeader::new(
+            session_id,
+            RAW_APP_STREAM_ID as TransportStreamId,
+            client_session.next_send_pn(),
+            PacketFlags::new(flag_bits),
+        )
+        .with_epoch(client_session.current_epoch());
+        let ciphertext = client_session
+            .encrypt_packet(&header, &plaintext, &[])
+            .expect("seal control frame");
+        PhantomPacket::new(header, ciphertext)
+    }
+
+    /// An in-session control frame is dispatched on a **fixed** enumeration of subtype
+    /// bytes, and a subtype outside it is dropped.
+    ///
+    /// The failure this pins is not "we ignored something we did not understand" — it is
+    /// the opposite. `handle_packet` ends in a fall-through that hands any non-empty
+    /// plaintext to the application, so a control body that no branch claims does not
+    /// vanish: it arrives at `recv()` as a byte of the caller's stream. A peer speaking a
+    /// later revision of the subtype registry would silently corrupt the byte stream of
+    /// one speaking an earlier one. The subtype registry is only an extension point if
+    /// the unknown arm returns.
+    #[tokio::test]
+    async fn control_frame_with_unknown_subtype_is_not_delivered_as_application_data() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+
+        // 0xFE is assigned to nothing and never will be by accident — the registry
+        // grows from the bottom.
+        let pkt = build_control_frame(&client_session, session_id, &[0xFE]);
+
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
+        let transport: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 64);
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        handle_packet(
+            pkt,
+            session_id,
+            &server_session,
+            &streams,
+            &demux,
+            &transport,
+            &transport,
+            &deliver_tx,
+            &undelivered,
+            &mut scratch,
+            &obs,
+            LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
+            &connected_state(),
+        )
+        .await;
+
+        assert!(
+            deliver_rx.try_recv().is_err(),
+            "an unknown control subtype must be dropped, never handed to the application"
+        );
+        assert_eq!(
+            undelivered.load(Ordering::Acquire),
+            0,
+            "a dropped control frame must not be charged to the delivery backlog"
+        );
+    }
+
+    /// Run one inbound packet through `handle_packet` and report both what was handed
+    /// to the delivery task and whether the receive path recorded the peer's close.
+    async fn run_recv_watching_close(
+        pkt: PhantomPacket,
+        session_id: SessionId,
+        server_session: &Arc<InnerSession>,
+    ) -> Option<DeliverItem> {
+        let (demux, _ctrl_rx) = StreamDemultiplexer::new(16);
+        let demux = Arc::new(demux);
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        let (deliver_tx, mut deliver_rx) = mpsc::unbounded_channel::<DeliverItem>();
+        let undelivered = AtomicU64::new(0);
+        let (ack_a, ack_b) = mpsc::channel::<Vec<u8>>(4);
+        let transport: Arc<ChannelTransport> = Arc::new(ChannelTransport {
+            tx: ack_a,
+            rx: Mutex::new(ack_b),
+        });
+        let obs = Observability::new(ObservabilityConfig::default());
+        let mut scratch = test_recv_scratch(&obs, 64);
+        let (no_cmd_tx, no_inc_tx) = noop_accept_sinks();
+        handle_packet(
+            pkt,
+            session_id,
+            server_session,
+            &streams,
+            &demux,
+            &transport,
+            &transport,
+            &deliver_tx,
+            &undelivered,
+            &mut scratch,
+            &obs,
+            LegType::Tcp,
+            &no_cmd_tx,
+            &no_inc_tx,
+            &connected_state(),
+        )
+        .await;
+        deliver_rx.try_recv().ok()
+    }
+
+    /// The close frame the live emitter actually puts on the wire: an
+    /// `ENCRYPTED | CONTROL` packet whose sealed plaintext is the single
+    /// [`ControlSubtype::CLOSE`] byte, header-protected, padded — and **the same size
+    /// as an ordinary one-byte reliable application write from the same session**.
+    ///
+    /// That last clause is the assertion this test exists for, and it is the opposite
+    /// of what the emitter's documentation used to claim. Padding was described as
+    /// putting the close on a size nothing else emits; a default session's one-byte
+    /// reliable write produces the identical datagram, because the padded control
+    /// plaintext and a four-byte stream offset plus one application byte are both five
+    /// bytes. So the close is *not* distinguishable by size alone from every other
+    /// frame — only from most of them.
+    ///
+    /// What padding does buy, stated no wider than it is: the wire size no longer
+    /// carries the control body's length. An unpadded control frame is exactly its
+    /// plaintext length read off the wire, so a later subtype with a two- or
+    /// three-byte body would be a different size and an observer counting bytes could
+    /// tell them apart. What it does not buy is hiding that a session ended — three
+    /// copies back to back followed by silence is a pattern, not a size, and no amount
+    /// of per-frame padding removes a pattern.
+    ///
+    /// Both halves are measured off emitters rather than recomputed from the padding
+    /// step. The earlier version of this test built its comparison size by calling
+    /// `padding_trailer_len` itself, which is the same function the emitter calls: it
+    /// compared one copy of the padding logic against another, and would have been
+    /// satisfied by whatever that function did. Here the close comes out of
+    /// `send_control_close` and the frame it is compared against comes out of the
+    /// ordinary reliable drain, so the equality is a statement about two emitters.
+    #[tokio::test]
+    async fn a_close_frame_is_padded_and_shares_its_size_with_a_one_byte_reliable_write() {
+        use crate::crypto::adaptive_crypto::AEAD_OVERHEAD;
+
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let (client_transport, server_transport) = ChannelTransport::pair();
+        let client_transport = Arc::new(client_transport);
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        assert!(
+            send_control_close(&client_transport, &client_session, session_id, &obs).await,
+            "sealing and sending a close frame must succeed on a healthy session"
+        );
+        let close_wire = server_transport
+            .recv_bytes()
+            .await
+            .expect("the close frame reaches the peer");
+
+        // The counterexample, emitted by the ordinary data path of the same session —
+        // default shaping, so `PaddingPolicy::None` and no trailer of its own.
+        let stream = Arc::new(TransportStream::new(1));
+        stream
+            .send_reliable(Bytes::from_static(b"x"))
+            .await
+            .expect("one application byte");
+        let streams: Arc<DashMap<u32, Arc<TransportStream>>> = Arc::new(DashMap::new());
+        streams.insert(1u32, stream);
+        drain_streams_priority_ordered(
+            &client_transport,
+            &client_session,
+            session_id,
+            &streams,
+            &obs,
+        )
+        .await;
+        let data_wire = server_transport
+            .recv_bytes()
+            .await
+            .expect("the one-byte write reaches the peer");
+
+        let bare = PacketHeader::SIZE + CONTROL_SUBTYPE_LEN + AEAD_OVERHEAD;
+        assert!(
+            close_wire.len() > bare,
+            "an unpadded close frame is {bare} B, which is its exact plaintext length \
+             read off the wire; got {} B",
+            close_wire.len()
+        );
+        assert_eq!(
+            close_wire.len(),
+            data_wire.len(),
+            "the close and a one-byte reliable write are one size on the wire, so a \
+             claim that the padded close lands on a size nothing else emits is false — \
+             and a reader who believed it would misjudge what the frame leaks"
+        );
+
+        let pkt = server_session
+            .parse_protected(&close_wire)
+            .expect("the close frame is header-protected like any other packet");
+        assert!(
+            pkt.header.flags.contains(PacketFlags::ENCRYPTED),
+            "a close frame must be ENCRYPTED — the recv gate drops anything else (Inv-2)"
+        );
+        assert!(pkt.header.flags.contains(PacketFlags::CONTROL));
+        assert!(
+            pkt.header.flags.contains(PacketFlags::PADDED),
+            "the padding trailer must be announced so the receiver strips it"
+        );
+        let plaintext = server_session
+            .decrypt_packet(&pkt.header, &pkt.payload, &pkt.extensions)
+            .expect("the peer's key opens it");
+        assert!(
+            plaintext.len() > CONTROL_SUBTYPE_LEN,
+            "the sealed plaintext must be longer than the body it carries, or the wire \
+             size is still the body length and the padding bought nothing"
+        );
+        assert_eq!(
+            shaping::strip_padding(&plaintext).expect("well-formed padding trailer"),
+            &[ControlSubtype::CLOSE],
+            "the control body is the close subtype and nothing else"
+        );
+    }
+
+    /// The draining window is bounded at both ends, and on any real path it is one of
+    /// the two bounds — never the multiplication between them.
+    ///
+    /// That is worth pinning because the arithmetic invites the opposite reading. The
+    /// window is `3 × min_rtt` clamped to `[200 ms, 600 ms]`, and `min_rtt` opens at
+    /// [`INITIAL_MIN_RTT`] (100 ms), which lands at exactly 300 ms — so 300 ms looks
+    /// like the ordinary case and was written down as one. It is not: it is the value
+    /// for a session that has never timed a round trip, and a session that has
+    /// exchanged one acknowledged packet has replaced the guess with a measurement.
+    ///
+    /// The two measurements below are the ones this project actually has. On loopback,
+    /// `min_rtt` after a single exchange is a few hundred microseconds — 213 µs
+    /// server-side and 384 µs client-side in the run these figures come from — so
+    /// three of it is under a millisecond and **the floor decides**: every fast-path
+    /// session drains for 200 ms. On the WAN path the performance campaign measures,
+    /// 235 ms, three of it is 705 ms and **the ceiling decides**: 600 ms. Between them
+    /// they cover the range a deployment is in, which is why the bounds are the
+    /// interesting part of this function and the multiplication is not.
+    ///
+    /// The floor exists because a sub-millisecond measurement would drain nothing —
+    /// the displacement the window absorbs comes from the path's queues, not its
+    /// length. The ceiling exists because the measurement is one the peer can inflate
+    /// by delaying its own acknowledgements, and the length of a *local* commitment
+    /// must not be a number a remote party writes. The last row is the arithmetic
+    /// case: an absurd measurement must clamp, not overflow on its way there.
+    #[test]
+    fn the_draining_window_is_one_of_its_two_bounds_on_any_real_path() {
+        use crate::transport::bandwidth_estimator::INITIAL_MIN_RTT;
+        use std::time::Duration;
+
+        // Loopback, measured: the floor binds, and by three orders of magnitude.
+        for measured in [
+            Duration::ZERO,
+            Duration::from_micros(213),
+            Duration::from_micros(384),
+            Duration::from_millis(10),
+        ] {
+            assert_eq!(
+                drain_window_for_rtt(measured),
+                DRAIN_WINDOW_MIN,
+                "on a fast path a round-trip measurement is too small to size a timeout \
+                 with, so the floor is what the window is — not a value derived from \
+                 {measured:?}"
+            );
+        }
+
+        // The campaign's WAN path: the ceiling binds.
+        assert_eq!(
+            drain_window_for_rtt(Duration::from_millis(235)),
+            DRAIN_WINDOW_MAX,
+            "three round trips on the reference WAN path is 705 ms, so the ceiling is \
+             what the window is there"
+        );
+
+        // The one value that is neither bound is the one nothing has measured: the
+        // opening guess, which a single acknowledged packet replaces.
+        let unmeasured = drain_window_for_rtt(INITIAL_MIN_RTT);
+        assert_eq!(unmeasured, Duration::from_millis(300));
+        assert!(
+            unmeasured > DRAIN_WINDOW_MIN && unmeasured < DRAIN_WINDOW_MAX,
+            "the 300 ms figure belongs to a session with no round-trip measurement at \
+             all; calling it the ordinary case misreads the guess as an observation"
+        );
+
+        for inflated in [
+            Duration::from_secs(1),
+            Duration::from_secs(3600),
+            Duration::MAX,
+        ] {
+            assert_eq!(
+                drain_window_for_rtt(inflated),
+                DRAIN_WINDOW_MAX,
+                "no round-trip measurement, however inflated, may lengthen the window \
+                 past its ceiling — the peer supplies that measurement"
+            );
+        }
+    }
+
+    /// An authenticated close frame ends the session and hands the application
+    /// nothing. Both halves matter: the subtype byte must not surface as data, and
+    /// the pump must learn that the peer left — which is the whole point of the frame
+    /// and the only thing that makes a PhantomUDP slot free before the timer.
+    #[tokio::test]
+    async fn authenticated_close_frame_records_the_peer_close_and_delivers_nothing() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+        let pkt = build_control_frame(&client_session, session_id, &[ControlSubtype::CLOSE]);
+
+        assert!(
+            !server_session.peer_closed(),
+            "no close has been announced yet"
+        );
+        let delivered = run_recv_watching_close(pkt, session_id, &server_session).await;
+
+        assert!(
+            server_session.peer_closed(),
+            "an authenticated close frame must be recorded so the pump can tear down"
+        );
+        assert!(
+            delivered.is_none(),
+            "a close frame carries no application bytes"
+        );
+    }
+
+    /// A `CONTROL` frame whose plaintext names no subtype must not end the session.
+    ///
+    /// The close is the lowest assigned subtype and `0x00` is assigned to nothing, so
+    /// the two shapes closest to "accidentally a close" are an empty body and a zeroed
+    /// one. Neither may work: a receiver that read a missing subtype as its default,
+    /// or treated an empty control body as a close, would let a peer bug — or a
+    /// truncation that survived AEAD because it was produced before sealing — end a
+    /// session that nobody asked to end.
+    #[tokio::test]
+    async fn control_frame_without_a_subtype_byte_does_not_end_the_session() {
+        let session_id = fixed_session_id();
+        let (client_session, server_session) = paired_sessions(session_id);
+
+        for body in [b"".as_slice(), b"\x00".as_slice()] {
+            let pkt = build_control_frame(&client_session, session_id, body);
+            let delivered = run_recv_watching_close(pkt, session_id, &server_session).await;
+            assert!(
+                !server_session.peer_closed(),
+                "a {}-byte control body must not read as a close",
+                body.len()
+            );
+            assert!(
+                delivered.is_none(),
+                "a control frame never reaches the application"
+            );
+        }
+    }
+
+    /// The announcement is a fixed small number of copies, and only from a session
+    /// that reached the wire.
+    ///
+    /// The count is fixed rather than retried-until-something because the frame is
+    /// unacknowledged: there is no signal that could terminate a retry loop except
+    /// one from the peer we have just stopped hearing from, and a loop without one
+    /// spends packet numbers — the resource Invariant 8 bounds — on a session that is
+    /// over. The `Handshaking` half pins that a connection which never established
+    /// announces nothing: it has no peer state to release and its keys were never
+    /// agreed.
+    #[tokio::test]
+    async fn close_is_announced_a_fixed_number_of_times_and_only_once_established() {
+        let session_id = fixed_session_id();
+        let (client_session, _server_session) = paired_sessions(session_id);
+        let (client_transport, mut server_transport) = ChannelTransport::pair();
+        let client_transport = Arc::new(client_transport);
+        let obs = Observability::new(ObservabilityConfig::default());
+
+        // A session still handshaking announces nothing.
+        client_session.set_state(SessionState::Handshaking);
+        announce_close(&client_transport, &client_session, session_id, &obs).await;
+        assert!(
+            server_transport.rx.get_mut().try_recv().is_err(),
+            "a session that never established must announce no close"
+        );
+
+        client_session.set_state(SessionState::Connected);
+        announce_close(&client_transport, &client_session, session_id, &obs).await;
+        let mut copies = 0usize;
+        while server_transport.rx.get_mut().try_recv().is_ok() {
+            copies += 1;
+        }
+        assert_eq!(
+            copies, CLOSE_FRAME_COPIES,
+            "the close must be announced exactly {CLOSE_FRAME_COPIES} times — redundancy \
+             is the only loss tolerance an unacknowledged frame has, and a fixed count \
+             is the only one that cannot run away"
+        );
     }
 
     #[tokio::test]
@@ -9562,6 +10528,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -9670,6 +10637,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -9757,6 +10725,7 @@ mod tests {
                 LegType::Tcp,
                 &no_cmd_tx,
                 &no_inc_tx,
+                &connected_state(),
             )
             .await;
         }
@@ -9823,6 +10792,7 @@ mod tests {
                 LegType::Tcp,
                 &no_cmd_tx,
                 &no_inc_tx,
+                &connected_state(),
             )
             .await;
         }
@@ -9894,6 +10864,7 @@ mod tests {
                 LegType::Tcp,
                 &no_cmd_tx,
                 &no_inc_tx,
+                &connected_state(),
             )
             .await;
         }
@@ -10372,6 +11343,7 @@ mod tests {
                 LegType::Tcp,
                 &no_cmd_tx,
                 &no_inc_tx,
+                &connected_state(),
             )
             .await;
 
@@ -10527,6 +11499,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -11051,6 +12024,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -11085,6 +12059,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -11151,6 +12126,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -11205,6 +12181,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 
@@ -11698,6 +12675,7 @@ mod tests {
             LegType::Tcp,
             &no_cmd_tx,
             &no_inc_tx,
+            &connected_state(),
         )
         .await;
 

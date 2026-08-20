@@ -180,6 +180,44 @@ impl CryptoState {
     }
 }
 
+/// Identity of the demux routes belonging to one accepted UDP session (WIRE v8).
+///
+/// Allocated by the listener's demux when it commits a slot to an `Initial`, and
+/// handed to the session that grows out of that handshake. The route table's other
+/// key — the 8-byte connection id — is chosen by whoever sent the first datagram, so
+/// it is the wrong thing to authorise a table mutation with; this is not on the wire
+/// and cannot be named by a peer. A `u64` does not wrap at any rate a socket can
+/// deliver: a million accepted sessions a second exhausts it in about 584,000 years.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct DemuxRouteOwner(pub u64);
+
+/// A live session's end of the UDP listener's datagram demux: the two things it tells
+/// the demux, and the identity the demux gave its routes. Installed once by the
+/// server's accept path ([`Session::set_demux_link`]) and absent on the client and on
+/// socket-routed transports, where both signals are no-ops.
+///
+/// It exists because the demux's route table is keyed on connection ids only the
+/// session can compute, so the demux cannot tell on its own when a session's window
+/// has moved or when the session is over. Two of its three other reclaim triggers —
+/// dropping a route when a datagram arrives for a dead one, and the sweep it runs
+/// every 256th new connection — are reactive to *traffic*, which is exactly what a
+/// peer that has left stops producing; the third, the demux's own timed sweep, is the
+/// backstop that runs when neither of those ever fires again.
+#[derive(Clone, Debug)]
+pub struct DemuxLink {
+    /// ε / WIRE v5: inbound CID-window slides, as the peer migrates. Unbounded,
+    /// as it has been since WIRE v5: one message per authenticated migration, so its rate
+    /// is bounded by the peer's packet rate, and a *dropped* slide would erode this
+    /// session's leading-edge headroom permanently (EPS-01) rather than costing a
+    /// reclaim that something else will get to.
+    pub slide_tx: tokio::sync::mpsc::UnboundedSender<CidSlide>,
+    /// WIRE v8: this session has ended and its routes can go. Bounded, and dropped
+    /// rather than queued when full — see [`Session::signal_route_retire`].
+    pub retire_tx: tokio::sync::mpsc::Sender<DemuxRouteOwner>,
+    /// Which routes in the demux table are this session's.
+    pub owner: DemuxRouteOwner,
+}
+
 /// A one-step slide of the inbound CID demux window (ε / WIRE v5), produced
 /// by [`Session::note_migration_path`] when the peer migrates. The demux applies
 /// it: `add` are the CIDs to register at the new leading edge, `remove` the CIDs
@@ -366,12 +404,24 @@ pub struct Session {
     /// instead of waiting for the next 10 ms `poll_interval` tick.
     /// The pump keeps the tick as a retransmit-timer fallback.
     send_notify: Arc<tokio::sync::Notify>,
-    /// Optional channel to the UDP demux for sliding this session's inbound CID
-    /// window (ε / WIRE v5). Set once post-handshake by the server's accept
-    /// path ([`Self::set_cid_slide_tx`]); `None` on the client and on socket-routed
-    /// transports (which have no CID demux). `handle_packet` signals a slide
-    /// through it when [`Self::note_migration_path`] reports the peer migrated.
-    cid_slide_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<CidSlide>>>,
+    /// Optional link to the UDP demux carrying this session's inbound CID-window
+    /// slides (ε / WIRE v5) and its end-of-session route retirement (WIRE v8),
+    /// together with the identity the demux gave its routes. Set once post-handshake
+    /// by the server's accept path ([`Self::set_demux_link`]); `None` on the client
+    /// and on socket-routed transports (which have no CID demux), where signalling is
+    /// a no-op.
+    demux_link: Mutex<Option<DemuxLink>>,
+    /// The peer announced it is closing this session (a `CONTROL` frame carrying
+    /// [`ControlSubtype::CLOSE`](crate::transport::types::ControlSubtype::CLOSE)).
+    ///
+    /// Set only from the post-AEAD receive path, so it records something an
+    /// authenticated peer said rather than something an off-path attacker asserted.
+    /// The receive loop reads it after each packet and starts a bounded draining
+    /// window, at the end of which it ends — which is what lets the pump tear down in
+    /// well under a second instead of waiting for the liveness timer to conclude from
+    /// silence what the peer already stated, while still delivering anything the close
+    /// overtook on the way in.
+    peer_closed: AtomicBool,
     /// An idle keep-alive PING is in flight, awaiting the peer's PONG (download-only
     /// liveness). Set when the pump emits a `KEEPALIVE` ping on an idle path;
     /// cleared when the peer's `KEEPALIVE | ACK` echo arrives (or any
@@ -435,7 +485,8 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
-            cid_slide_tx: Mutex::new(None),
+            demux_link: Mutex::new(None),
+            peer_closed: AtomicBool::new(false),
             keepalive_outstanding: AtomicBool::new(false),
         })
     }
@@ -491,7 +542,8 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
-            cid_slide_tx: Mutex::new(None),
+            demux_link: Mutex::new(None),
+            peer_closed: AtomicBool::new(false),
             keepalive_outstanding: AtomicBool::new(false),
         }
     }
@@ -542,7 +594,8 @@ impl Session {
             pacer: Arc::new(Pacer::unlimited()),
             bandwidth_estimator: parking_lot::Mutex::new(BandwidthEstimator::new()),
             send_notify: Arc::new(tokio::sync::Notify::new()),
-            cid_slide_tx: Mutex::new(None),
+            demux_link: Mutex::new(None),
+            peer_closed: AtomicBool::new(false),
             keepalive_outstanding: AtomicBool::new(false),
         })
     }
@@ -633,18 +686,64 @@ impl Session {
         })
     }
 
-    /// Install the demux slide channel (ε / WIRE v5) — called once by the
-    /// server's accept path so `handle_packet` can signal inbound-window slides.
-    pub fn set_cid_slide_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<CidSlide>) {
-        *self.cid_slide_tx.lock() = Some(tx);
+    /// Install the [`DemuxLink`] (ε / WIRE v5; WIRE v8) — called once by the
+    /// server's accept path so the session can report window slides and its own end.
+    pub fn set_demux_link(&self, link: DemuxLink) {
+        *self.demux_link.lock() = Some(link);
     }
 
     /// Signal the demux to apply a [`CidSlide`] (ε / WIRE v5). A no-op when no
-    /// slide channel is installed (the client and socket-routed transports).
+    /// link is installed (the client and socket-routed transports).
     pub fn signal_cid_slide(&self, slide: CidSlide) {
-        if let Some(tx) = self.cid_slide_tx.lock().as_ref() {
-            let _ = tx.send(slide);
+        if let Some(link) = self.demux_link.lock().as_ref() {
+            let _ = link.slide_tx.send(slide);
         }
+    }
+
+    /// Signal the demux that this session is over and its routes can go (WIRE v8).
+    /// A no-op when no link is installed.
+    ///
+    /// The signal names the session by the identity the demux itself assigned, not by
+    /// anything from the wire, so it can only ever release this session's own routes.
+    ///
+    /// The queue it goes on is bounded, and a full queue means the signal is
+    /// **dropped** rather than waited for. That is the point of the bound: this is
+    /// called from a session's teardown, a peer decides when its session ends, and a
+    /// correlated departure — a deployment rollout, a carrier network transition, a
+    /// load balancer draining — would otherwise let a peer population decide how much
+    /// work sits in front of the demux's next datagram read.
+    ///
+    /// A dropped retire costs one deferred reclaim, and the thing that makes that
+    /// sentence true is the demux's **own** sweep timer rather than any of the reclaim
+    /// paths that predate this signal. Those all wait for a datagram — one arriving for
+    /// a dead route, or a new connection tripping the every-256th sweep — and a
+    /// correlated departure is precisely the population that has stopped sending
+    /// datagrams, so leaving the routes to them would leave them held for the life of
+    /// the listener. The timer is what turns the bound above from a stall into a
+    /// deferral rather than into a leak.
+    pub fn signal_route_retire(&self) {
+        let guard = self.demux_link.lock();
+        let Some(link) = guard.as_ref() else {
+            return;
+        };
+        if link.retire_tx.try_send(link.owner).is_err() {
+            log::debug!(
+                "Session: demux retire queue full; leaving these routes to the lazy reclaim"
+            );
+        }
+    }
+
+    /// Record that the peer announced it is closing this session. Call **post-AEAD
+    /// only** — see [`Session::peer_closed`]. Idempotent by construction: a second
+    /// announcement stores the same value, and the replay window has already refused
+    /// a byte-identical one before this could be reached.
+    pub fn note_peer_closed(&self) {
+        self.peer_closed.store(true, Ordering::Release);
+    }
+
+    /// Whether the peer announced it is closing this session.
+    pub fn peer_closed(&self) -> bool {
+        self.peer_closed.load(Ordering::Acquire)
     }
 
     /// The inbound CIDs the demux should route to this session (ε / WIRE v5): the

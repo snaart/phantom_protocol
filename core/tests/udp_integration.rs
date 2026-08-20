@@ -2172,3 +2172,297 @@ async fn udp_integration_bulk_transfer_never_fragments_application_datagrams() {
 
     server.await.unwrap();
 }
+
+/// A departing client must free its server-side slot at once, not on a timer.
+///
+/// PhantomUDP has no socket-level end-of-stream. On the byte-pipe legs the peer's
+/// `read_exact` returns `UnexpectedEof` the moment the socket is dropped, so a
+/// departing client's server session ends within a second; on a datagram socket the
+/// same departure is indistinguishable from a quiet moment, and the only thing that
+/// ever noticed was the liveness timer — keep-alive to `Migrating`, then
+/// `session_timeout` to `Dead`, more than two minutes later. For all that time the
+/// session slot stayed occupied, the server kept firing keep-alives into a closed
+/// client port, and those keep-alives kept a NAT binding warm for a conversation
+/// that had ended.
+///
+/// The observable the operator has for that slot is the demux route table: an
+/// established session owns its bootstrap route plus the 19-CID rotating window, and
+/// they are reclaimed only by triggers a departed client no longer fires. So this
+/// asserts on `active_route_count()` falling to zero, within a window far shorter
+/// than any liveness deadline — which is exactly the difference the close frame
+/// makes, and nothing else in the session's teardown can produce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_client_close_reclaims_the_server_routes_promptly() {
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let listener_for_server = listener.clone();
+    let server = tokio::spawn(async move {
+        let session = listener_for_server
+            .accept()
+            .await
+            .expect("accept")
+            .session();
+        let msg = session.recv().await.expect("server recv");
+        assert_eq!(msg, b"ping");
+        session.send(b"pong".to_vec()).await.expect("server send");
+        // Hold the accepted handle across the client's departure: the routes must be
+        // reclaimed because the peer said it was leaving, not because this side let
+        // go of its session object.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+    });
+
+    let transport = UdpClientTransport::connect(addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+    client.send(b"ping".to_vec()).await.expect("client send");
+    let reply = timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("no timeout")
+        .expect("client recv");
+    assert_eq!(reply, b"pong");
+
+    let established = listener.active_route_count();
+    assert!(
+        established > 1,
+        "an established session must hold its bootstrap route plus the CID window; got {established}"
+    );
+
+    // The client leaves.
+    client.disconnect().await.expect("disconnect");
+    drop(client);
+
+    // Five seconds is generous for a frame that crosses loopback plus the draining
+    // window the server holds it for afterwards, and still an order of magnitude below
+    // the shortest liveness deadline that could reclaim the slot on its own — so a
+    // pass here cannot be the timer in disguise.
+    let left_at = std::time::Instant::now();
+    let deadline = left_at + Duration::from_secs(5);
+    while listener.active_route_count() > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let reclaimed_after = left_at.elapsed();
+    println!(
+        "routes while established: {established}; after close: {} (reclaimed within {:?})",
+        listener.active_route_count(),
+        reclaimed_after
+    );
+    assert_eq!(
+        listener.active_route_count(),
+        0,
+        "the server must reclaim every route of a session whose peer announced its close \
+         (was {established} while established)"
+    );
+
+    server.await.unwrap();
+}
+
+/// Relay client→server datagrams to `server_addr`, holding back exactly one of them.
+///
+/// Once `armed` is set, the first client→server datagram larger than `hold_min_len`
+/// is released `hold` later instead of immediately; everything before it, after it,
+/// and everything in the reverse direction is forwarded untouched. That is a
+/// one-position reorder — the smallest displacement a datagram path can produce, and
+/// the one an ECMP/LAG rehash, a wireless link-layer retry, or the two-live-paths
+/// window right after a migration all produce as a matter of course.
+///
+/// The size gate is what makes the choice deterministic rather than positional: the
+/// caller sizes the payload it wants reordered well above every other frame the
+/// session emits at that moment (a close copy is 45 B on the wire, an ACK and a
+/// keep-alive are smaller still), so "the first big one after arming" names exactly
+/// one datagram no matter how the handshake before it was paced.
+async fn spawn_reordering_relay(
+    server_addr: std::net::SocketAddr,
+    hold_min_len: usize,
+    hold: Duration,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay_addr = relay.local_addr().unwrap();
+    let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    upstream.connect(server_addr).await.unwrap();
+    let armed = Arc::new(AtomicBool::new(false));
+    let armed_task = armed.clone();
+    tokio::spawn(async move {
+        let mut c2s = vec![0u8; 2048];
+        let mut s2c = vec![0u8; 2048];
+        let mut client_addr: Option<std::net::SocketAddr> = None;
+        let mut already_held = false;
+        loop {
+            tokio::select! {
+                r = relay.recv_from(&mut c2s) => {
+                    let (n, from) = match r { Ok(x) => x, Err(_) => continue };
+                    client_addr = Some(from);
+                    if !already_held && armed_task.load(Ordering::Relaxed) && n > hold_min_len {
+                        already_held = true;
+                        let held = c2s[..n].to_vec();
+                        let up = upstream.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(hold).await;
+                            let _ = up.send(&held).await;
+                        });
+                    } else {
+                        let _ = upstream.send(&c2s[..n]).await;
+                    }
+                }
+                r = upstream.recv(&mut s2c) => {
+                    let n = match r { Ok(x) => x, Err(_) => continue };
+                    if let Some(ca) = client_addr {
+                        let _ = relay.send_to(&s2c[..n], ca).await;
+                    }
+                }
+            }
+        }
+    });
+    (relay_addr, armed)
+}
+
+/// A single reordered datagram must not destroy application data the peer already
+/// sent and got `Ok` for.
+///
+/// The close announcement is not `RELIABLE`, carries no stream offset and is never
+/// acknowledged, so nothing re-sends the data it overtakes: if the receiver acts on
+/// the close the instant it lands, the bytes behind it are gone with no error at
+/// either end — the sender's `send()` already returned `Ok`, its `disconnect()`
+/// returns `Ok`, and the receiver's error is indistinguishable from a normal close.
+/// Send order is the only ordering a sender can impose, and send order is not arrival
+/// order; that difference is the whole of what separates a datagram path from a byte
+/// pipe, and it is why the byte-pipe legs never needed this.
+///
+/// So the receiver drains: it records the close and keeps reading for a bounded
+/// window before tearing down. This pins that behaviour at the smallest displacement
+/// that can occur — one position, 60 ms — because the hazard is reordering as such
+/// and not reordering of some magnitude. It runs over a real socket because the
+/// discard has two independent causes on the server, the receive loop and the demux
+/// route table, and only an end-to-end run crosses both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_close_overtaking_data_does_not_discard_it() {
+    use std::sync::atomic::Ordering;
+
+    /// Comfortably larger than any other client→server frame in flight at that
+    /// moment, and comfortably under `MAX_APP_CHUNK` so it is exactly one datagram.
+    const REORDERED_PAYLOAD_LEN: usize = 600;
+    /// One position of displacement, held far enough inside the draining window that
+    /// a pass is the mechanism working and not a race with it.
+    const HOLD: Duration = Duration::from_millis(60);
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        received.push(session.recv().await.expect("server recv"));
+        let _ = first_tx.send(());
+        // Collect until the session ends. What ends it is the peer's close, once the
+        // draining window is over, so this loop is also the assertion that the drain
+        // terminates rather than lingering.
+        while let Ok(msg) = session.recv().await {
+            received.push(msg);
+        }
+        received
+    });
+
+    let (relay_addr, armed) =
+        spawn_reordering_relay(server_addr, REORDERED_PAYLOAD_LEN / 2, HOLD).await;
+    let transport = UdpClientTransport::connect(relay_addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&relay_addr.to_string(), transport, key);
+
+    client.send(b"first".to_vec()).await.expect("client send");
+    timeout(Duration::from_secs(10), first_rx)
+        .await
+        .expect("the server sees the first message")
+        .expect("server task alive");
+
+    // Everything the client sends from here is one datagram: the payload, then the
+    // close copies. The relay holds the payload back, so the close overtakes it.
+    armed.store(true, Ordering::Relaxed);
+    let payload = vec![0xABu8; REORDERED_PAYLOAD_LEN];
+    client.send(payload.clone()).await.expect("client send");
+    client.disconnect().await.expect("disconnect");
+    drop(client);
+
+    let received = timeout(Duration::from_secs(20), server)
+        .await
+        .expect("the server session ends within the draining window")
+        .expect("server task");
+    assert_eq!(
+        received,
+        vec![b"first".to_vec(), payload],
+        "a close that overtook one datagram discarded the data behind it"
+    );
+}
+
+/// `disconnect()` pushes what is queued before it announces the close, so a write
+/// that fits the wire is not lost to the call that follows it.
+///
+/// This pins the half of `disconnect()`'s contract that is real. The method makes no
+/// delivery guarantee and its documentation says so: it queues the request and
+/// returns, and the pump then pushes until the socket, the congestion window or the
+/// peer's flow-control limit refuses the next byte, without waiting for an
+/// acknowledgement — so a payload larger than one window is mostly discarded. What is
+/// guaranteed, and what an embedder does rely on, is the ordinary case: one chunk
+/// handed to `send()` and then a `disconnect()` in the next statement must arrive,
+/// exactly as `send(x); drop(session)` does.
+///
+/// The other half is deliberately not asserted here. A test requiring that a large
+/// payload is *truncated* would pin a shortcoming as a contract, and the next person
+/// to lengthen the drain would have to delete the test to do it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_disconnect_pushes_a_queued_write_before_announcing() {
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        session.recv().await
+    });
+
+    let transport = UdpClientTransport::connect(addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+    client
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+
+    // No await between these two beyond the ones they make themselves: the write is
+    // still in the pump's queue when the close request is enqueued behind it.
+    let report = b"the-last-thing-said".to_vec();
+    client.send(report.clone()).await.expect("client send");
+    client.disconnect().await.expect("disconnect");
+    drop(client);
+
+    let received = timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the server session ends promptly")
+        .expect("server task")
+        .expect("server recv");
+    assert_eq!(
+        received, report,
+        "a write queued immediately before disconnect() must still reach the peer"
+    );
+}

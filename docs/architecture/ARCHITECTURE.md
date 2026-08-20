@@ -63,7 +63,7 @@ metric-attribute enum. (The `session_transport` trait and `legs/embedded` are
 | `TcpSessionTransport` | Length-prefix-framed TCP impl of `SessionTransport` | No |
 | `PhantomStream` | Per-stream API on top of a session | Yes (`uniffi::Object`) |
 | `AcceptOutcome` | `accept()` result — `.session()` + take-once 0-RTT early-data | Yes (`uniffi::Object`) |
-| `ConnectionState` | Lifecycle enum: `Connecting`/`ClassicalReady`/`PqcUpgrading`/`PqcReady`/`Connected`/`Failed`/`Closed`/**`Migrating`**/**`Dead`** | Yes (`uniffi::Enum`) |
+| `ConnectionState` | Lifecycle enum: `Connecting`/`Connected`/`Failed`/`Closed`/`Migrating`/`Dead`/**`Draining`**. Discriminants are `0,4,5,6,7,8,9` — `1..=3` are holes left by a staged classical-then-PQC upgrade the protocol never shipped, so an old log's number cannot come back meaning something else | Yes (`uniffi::Enum`) |
 | `ResumptionHint` | 0-RTT `(session_id, resumption_secret)` record (redacting `Debug`) | Yes (`uniffi::Record`) |
 | `PhantomConfig` | User-tunable knobs | Yes (`uniffi::Record`) |
 | `SessionTransport` (trait) | Byte-pipe abstraction below the encryption layer; SocketAddr-free migration hooks (`has_migration_candidate` / `send_to_candidate` / `promote_candidate` / `migrate`) | No (Rust trait) |

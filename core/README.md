@@ -273,8 +273,8 @@ security invariants are catalogued in
   server replies — `ServerHello`, `HelloRetryRequest`, `ServerReject` — carried
   under a one-byte-discriminant `ServerReply` wrapper; one signed
   `HandshakeTranscript` leads with `protocol_variant`. The pinned bytes are
-  `WIRE_VERSION` = <!--pinned:WIRE_VERSION-->7 and
-  `PROTOCOL_VERSION` = <!--pinned:PROTOCOL_VERSION-->4; both are tamper-check
+  `WIRE_VERSION` = <!--pinned:WIRE_VERSION-->8 and
+  `PROTOCOL_VERSION` = <!--pinned:PROTOCOL_VERSION-->5; both are tamper-check
   anchors and a hook for a future deliberate bump.
 - **Path validation (wired into the live UDP data plane).** `PathRegistry` +
   constant-time challenge/response; path 0 pre-validated, secondary paths
@@ -290,7 +290,7 @@ Reference numbers on **Apple M1 Pro (8P + 2E, 16 GiB), macOS 26.0, rustc 1.93.0,
 `ring` with ARMv8 AES-PMULL** (snapshot 2026-05-17, criterion `--quick`, default
 `target-cpu`). The snapshot predates the current wire — it was captured under
 `WIRE_VERSION = 2`, whereas the shipped format is
-`WIRE_VERSION` = <!--pinned:WIRE_VERSION-->7 — so the crypto / throughput shape
+`WIRE_VERSION` = <!--pinned:WIRE_VERSION-->8 — so the crypto / throughput shape
 is representative but re-capture before quoting these as live figures (see
 [`BENCHMARKS.md`](https://github.com/snaart/phantom_protocol/blob/main/BENCHMARKS.md)):
 

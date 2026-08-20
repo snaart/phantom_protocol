@@ -30,20 +30,31 @@ that sees any other value drops the frame (packets) or rejects the handshake
 
 | Constant | Value | Source | Where it lives on the wire |
 | --- | --- | --- | --- |
-| `WIRE_VERSION` | `7` | `core/src/transport/types.rs` | `PacketHeader.version` byte (HP-masked, inside the 15-byte header — § 4.2) |
-| `PROTOCOL_VERSION` | `4` | `core/src/transport/handshake.rs` | `ClientHello.version`, transcript-bound |
+| `WIRE_VERSION` | `8` | `core/src/transport/types.rs` | `PacketHeader.version` byte (HP-masked, inside the 15-byte header — § 4.2) |
+| `PROTOCOL_VERSION` | `5` | `core/src/transport/handshake.rs` | `ClientHello.version`, transcript-bound |
 
-**The two move together.** `WIRE_VERSION 7` changed the `WINDOW_UPDATE` plaintext (§ 4.5)
-and nothing else; `PROTOCOL_VERSION` was incremented in the same change even though no
+**The two move together.** `WIRE_VERSION 8` gave the `CONTROL` flag a one-byte subtype in
+its AEAD plaintext (§ 4.11) and `WIRE_VERSION 7` changed the `WINDOW_UPDATE` plaintext
+(§ 4.5); in both cases `PROTOCOL_VERSION` was incremented in the same change even though no
 handshake message moved a byte. That is deliberate and is the rule for any future
 data-plane change: the packet-level check on `PacketHeader.version` **drops** a mismatched
 frame silently — no reply, nothing the sender can observe — so a wire bump on its own would
-let an older peer complete a handshake and then stall with no diagnosis. Incrementing
-`PROTOCOL_VERSION` alongside moves the refusal to the handshake, where it is a typed
-`ServerReject` naming both versions, delivered before any session exists. An implementation
-that bumps only one of the two is not interoperating; it is failing quietly.
+let an older peer complete a handshake and then stall with no diagnosis. At v8 that stall is
+total rather than partial, which is what makes it worth spelling out: the version byte is on
+every data-plane packet, so a v7 receiver drops the whole flow and not merely the `CONTROL`
+frames it has no branch for. It would finish a handshake, agree keys, and then never deliver
+a byte, with nothing at either end to say why — the version check fires at step 1 of § 4.3's
+dispatch, before any flag is looked at, so nothing downstream of it ever runs.
+Incrementing `PROTOCOL_VERSION` alongside moves the refusal to
+the handshake, where it is a typed `ServerReject` naming both versions, delivered before
+any session exists. An implementation that bumps only one of the two is not interoperating;
+it is failing quietly.
 
-`WIRE_VERSION` is `7`: it went `1 → 2` when the packet codec moved from
+A version increment moves a *value*. It is never licence to move a field: in particular
+`protocol_variant` remains the leading field of the signed transcript and
+`early_data_accepted` remains the last (§ 7).
+
+`WIRE_VERSION` is `8`: it went `1 → 2` when the packet codec moved from
 `alkahest` to the explicit big-endian layout in § 4.2, then `2 → 3` (Phase 4 /
 P4.0) when the AEAD packet identity became a single **per-direction monotonic
 `u64` packet number** — the header dropped the dead `ack_delay` field and widened
@@ -66,18 +77,25 @@ redundancy) and `extensions` left the data-plane wire — saving 8 bytes/packet
 bucketing, the `PADDED` flag) so the datagram size no longer tracks the payload
 size (§ 4.8). Then `6 → 7` (**cumulative flow control**) changed the `WINDOW_UPDATE`
 plaintext from a 4-byte *relative credit* to an 8-byte *cumulative limit* (§ 4.5) — the only
-byte that moved, and the reason it had to move is in that section. The sole routing
+byte that moved, and the reason it had to move is in that section. Then `7 → 8`
+(**in-session control frames**) gave the long-declared `CONTROL` flag a meaning: its AEAD
+plaintext now leads with a one-byte **subtype**, and the first assignment is the
+session-close announcement (§ 4.11). No header byte moved. The sole routing
 identifier is the outer 8-byte UDP `ConnId`, which **rotates** on each migration (§ 4.7) —
 symmetrically for **both** a client- and a server-initiated migration (both directions,
-EPS-02 closed by A2a; § 12.5). The handshake byte grammar is unchanged by T4.6, ε, v6 or v7.
-`PROTOCOL_VERSION` is `4` (bumped
+EPS-02 closed by A2a; § 12.5). The handshake byte grammar is unchanged by T4.6, ε, v6, v7
+or v8.
+`PROTOCOL_VERSION` is `5` (bumped
 `1 → 2` when the signed transcript began covering the 0-RTT verdict
 `early_data_accepted` (H2) and `ClientHello` gained the `resumption_binder`
 proof-of-possession field (HS-03); `2 → 3` (T4.3) when `ServerHello`'s
 `server_key_package` was replaced by a 32-byte `server_nonce`, changing the
 signed-transcript content; `3 → 4` alongside `WIRE_VERSION 6 → 7` — no handshake field
 changed, but a peer that speaks the older flow control must be refused here rather than
-left to stall, per the rule above; handshakes across these versions cannot interoperate).
+left to stall, per the rule above; `4 → 5` alongside `WIRE_VERSION 7 → 8`, likewise with no
+handshake field changed, so that a peer speaking the older data plane is refused here rather
+than left to drop every frame it is sent; handshakes across these versions
+cannot interoperate).
 They exist so that:
 
 - a tampered frame / hello that flips the byte is rejected up front
@@ -357,7 +375,7 @@ Source: `core/src/transport/types.rs`.
 | `0x0010` | `PRIORITY` | Voice/video frame priority hint |
 | `0x0020` | `ENCRYPTED` | Payload is AEAD ciphertext |
 | `0x0040` | `COMPRESSED` | _Defined but unused_ — no send path sets it and the recv path never decompresses (`transport/compression.rs`'s `AdaptiveCompressor` is not wired to the packet path). Treat as reserved; do not emit |
-| `0x0080` | `CONTROL` | Handshake / migration control message |
+| `0x0080` | `CONTROL` | In-session control frame: the AEAD plaintext leads with a one-byte subtype (§ 4.11). Always `PADDED`; carries no application bytes |
 | `0x0100` | `REKEY` | Sender rekeyed; receiver trial-decrypts at `header.epoch` and commits the ratchet on AEAD success (§ 5) |
 | `0x0200` | `PATH_VALIDATION` | AEAD plaintext is exactly a 32-byte challenge or its echo (connection migration — § 12; a plaintext of any other length is dropped) |
 | `0x0400` | `COALESCED` | Payload bundles inner packets as `[count: u16][len1: u16][p1]…` (full byte layout — § 4.5) |
@@ -403,13 +421,22 @@ detail. A receiver dispatches in this order, each step consuming the packet:
 5. `KEEPALIVE` → a bare one is a PING, answer `KEEPALIVE | ACK`; one already
    carrying `ACK` is the PONG, nothing further. This **precedes** the `ACK`
    branch: a PONG is not a SACK and must not be parsed as one.
-6. `COVER` → drop after the liveness bookkeeping; it carries no application data.
-7. `ACK` → the plaintext is a `Sack` (§ 4.5); a `FIN` riding the same packet
+6. `CONTROL` → dispatch on the leading subtype byte (§ 4.11) and consume the
+   packet on **every** arm, the unknown subtype included. It sits here — after the
+   AEAD open and the replay window of step 3, before everything below — and both
+   sides of that placement are the format, not an implementation choice: earlier and
+   a forged or replayed one-byte datagram would end a session; later and an unknown
+   subtype would fall through to step 12 and be delivered as application data. It
+   follows `KEEPALIVE` for the same reason `KEEPALIVE` precedes `ACK`: the two
+   branches are disjoint on today's frames, and ordering them fixes which one would
+   claim a frame that ever set both.
+7. `COVER` → drop after the liveness bookkeeping; it carries no application data.
+8. `ACK` → the plaintext is a `Sack` (§ 4.5); a `FIN` riding the same packet
    closes the stream behind the data already queued for delivery.
-8. `WINDOW_UPDATE` → exactly 8 bytes of cumulative limit (§ 4.5).
-9. `PATH_VALIDATION` → exactly 32 bytes of challenge or echo (§ 12.1).
-10. `COALESCED` → split the bundle and deliver each sub-payload in order (§ 4.5).
-11. Otherwise it is application data. `RELIABLE` reassembles by the
+9. `WINDOW_UPDATE` → exactly 8 bytes of cumulative limit (§ 4.5).
+10. `PATH_VALIDATION` → exactly 32 bytes of challenge or echo (§ 12.1).
+11. `COALESCED` → split the bundle and deliver each sub-payload in order (§ 4.5).
+12. Otherwise it is application data. `RELIABLE` reassembles by the
     `stream_offset` prefix and is acknowledged (§ 4.5), and a `FIN` on it
     half-closes the stream only once the in-order cursor has passed the FIN's own
     offset — so a FIN that overtakes a gap cannot truncate the data behind it.
@@ -996,6 +1023,187 @@ handed and never fragment — so sizing for the datagram budget only costs them 
 slightly higher share of per-packet overhead. Source:
 `core/src/transport/mtu.rs`.
 
+### 4.11 In-session control frames (WIRE v8)
+
+An `ENCRYPTED | CONTROL` packet is a signal from one end of a live session to the
+other. Either end may send one, at any point after the handshake has established the
+session and before its own teardown. Its AEAD **plaintext**, after the § 4.8 padding
+trailer has been stripped, is:
+
+```text
+  [subtype: u8] ‖ ‹subtype-defined body›
+```
+
+and, for every subtype assigned so far, the body is empty — so the whole inner
+plaintext of a `CLOSE` is the single byte `0x01`. The full plaintext handed to the
+AEAD is therefore `[subtype][body][pad-zeros][pad_n: u16be]`, and the trailer comes
+off at step 4 of § 4.3's dispatch, before anything reads the subtype byte.
+
+A `CONTROL` frame is a **session**-level signal, not a stream-level one. Its
+`stream_id` header field is not part of its meaning: a sender stamps whatever it
+normally would (this implementation uses the reserved raw-app id `1`) and a receiver
+must not route the frame by it, must not create a stream for it, and must not treat
+an unfamiliar value as an error. `path_id` and `epoch` are stamped and read exactly
+as on any other packet. The frame carries no application bytes, so one never reaches
+`recv()`.
+
+**Padding.** A sender **must** pad a `CONTROL` frame to a § 4.8 bucket, setting
+`PADDED`, regardless of the session's data-padding policy. Be precise about what this
+buys, because the broad claim is false and a receiver that believed it would be
+misled about its own exposure. An unpadded `CLOSE` is `15 + 1 + 16 = 32` bytes of
+header-plus-ciphertext — a length that *is* its plaintext length, read straight off
+the wire. Padding collapses that into a bucket, so a `CONTROL` frame with a one-,
+two- or three-byte body is one size, and the size therefore says a control frame went
+out without saying which subtype it carried. That is what keeps a later subtype from
+being told apart from a `CLOSE` by an observer counting bytes.
+
+Two things it does **not** do. It does not put the frame on a size nothing else emits:
+even on a session whose data path pads nothing — the default (§ 4.8) — a one-byte
+reliable application write produces an identical datagram, because a padded one-byte
+control body and a four-byte stream offset plus one application byte are both five
+bytes of plaintext. A `CLOSE` is therefore not distinguishable *by size alone* from
+every other frame, only from most of them and from every control subtype the registry
+below might later carry. And it does not hide that a session ended: one or more
+identical datagrams followed by silence is a pattern rather than a size, and per-frame
+padding does not remove patterns. Removing *that* takes the session padding its data
+frames too, which is a deployment's decision and costs bandwidth on every packet, not
+something this frame can achieve on its own. A receiver, in any case, **must not**
+require the flag: `PADDED` means only "a trailer is present", so a control frame that
+arrives without it is well-formed and its plaintext is read as-is.
+
+**Subtype registry.** Assignments grow from the bottom. `0x00` is deliberately left
+unassigned so that a zeroed buffer is not a valid control frame.
+
+| Subtype | Name | Body | Meaning |
+| --- | --- | --- | --- |
+| `0x00` | _unassigned_ | — | Not a valid subtype; drop |
+| `0x01` | `CLOSE` | empty | The sender is closing this session and will send nothing further on it |
+| `0x02`–`0xFF` | _unassigned_ | — | Drop |
+
+The subtype byte is why this frame rides the already-declared `CONTROL` bit rather
+than `0x8000`, the one flag bit still free (§ 7). A flag is a 16-entry namespace and
+three in-session control frames were added in the two revisions before v8; spending
+the last bit on the first of four would have left the next one nowhere to go. One
+flag plus a byte of namespace costs the same on the wire and does not run out.
+
+**Receiver rules.** All four are load-bearing:
+
+1. A plaintext shorter than one byte — that is, an inner plaintext that is empty
+   once the padding trailer is off — names no subtype. Drop it, and in particular do
+   not read a missing subtype as a default: `0x00` is unassigned precisely so that
+   neither a zeroed buffer nor an absent byte can be mistaken for the lowest
+   assignment, which is `CLOSE`.
+2. Dispatch on the first byte against a **fixed** enumeration. There is no
+   length-prefixed record to walk and no field sized by the peer, so a control frame
+   gives an authenticated-but-hostile peer nothing to make a receiver allocate.
+3. Every arm consumes the packet, **including the unknown one**. This is the rule a
+   `WIRE_VERSION` mismatch exists to protect and the reason v8 could not ship without
+   it: a receiver that falls out of its control dispatch lands in its
+   application-data path, and the subtype byte is then delivered to the caller as one
+   byte of the stream. Silence is the correct response to an unknown subtype;
+   delivery is not.
+4. Dispatch **after** the AEAD open and the replay window — step 6 of § 4.3's
+   order. Both matter. Before the AEAD gate, a `CLOSE` is a one-byte plaintext
+   datagram that ends any session whose connection id can be guessed. Before the
+   replay window, a recorded `CLOSE` datagram is the same primitive with a capture
+   step in front of it. After both, the frame is idempotent for free — the second
+   copy of a byte-identical close is refused before the branch runs — which is why
+   the branch itself holds no state.
+
+**A `CONTROL` frame is never acknowledged.** It takes no part in the reliability
+machinery of § 4.5: it is not `RELIABLE`, it carries no `stream_offset`, it is never
+entered into a send buffer, it is never retransmitted, and it never appears in a
+`Sack` — the SACK ranges are stream offsets, not packet numbers, and a frame with no
+offset has nothing to be named by. A receiver must not answer one with an `ACK`, and
+a sender must not wait for one.
+
+**`CLOSE` semantics.** It is announced, not negotiated. A sender emits **one or
+more** copies back to back (this implementation emits 3) because redundancy is the
+only loss tolerance an unacknowledged frame has, and the count is fixed rather than
+conditional because the only signal that could end a retry loop would have to come
+from the peer we have just stopped being able to observe. Each copy draws its own
+packet number from the ordinary per-direction space, so the peer's replay window
+accepts whichever arrives first and refuses the rest; a receiver must therefore
+tolerate any number of copies and must not treat the second as an error. A receiver
+that gets one ends the session as it would on any other teardown — the same state
+transition, the same gauges, the same resource release — and must not answer it with
+a close of its own, or two departing sessions would each wait on the other's last
+word.
+
+**Draining: a receiver must not end the session on the copy it first sees.** This is
+the receiver obligation the frame cannot work without, and it exists because of what
+the frame is not. A `CLOSE` is not `RELIABLE`, carries no `stream_offset`, is never
+acknowledged and is never retransmitted, so nothing re-sends application data it
+overtakes. On a datagram transport it overtakes data routinely: one position of
+displacement is enough, and ECMP/LAG rehash, a link-layer retry and the brief
+two-live-paths window after a migration all produce that much as a matter of course.
+A receiver that tore down on arrival would therefore destroy bytes whose sender's
+`send()` had already returned success, with no error at either end — the sender's
+close returns normally and the receiver's error is indistinguishable from an ordinary
+teardown. Note that the sender cannot fix this from its side: emitting the close last
+orders the *transmissions*, and transmission order is not arrival order. This is the
+same hazard § 4.3's step-12 rule addresses at stream scope, where a `FIN` half-closes
+only once the in-order cursor has passed its own offset; `CLOSE` has no offset to
+compare, so the rule takes the form of a timer instead.
+
+On receiving a `CLOSE`, a receiver **records** it and **keeps processing inbound
+frames for a bounded draining window** before tearing down and releasing the
+session's resources. Within the window it delivers what arrives, exactly as before.
+It **must not** accept new application writes from its local side, and **must not**
+treat the peer's close as licence to send data of its own — the peer has stated it is
+leaving, so anything sent has nowhere to arrive.
+
+The window is derived from the connection's own round-trip measurement — a small
+multiple of it, this implementation using three, which is the shape of QUIC's
+draining period — and it **must** be bounded absolutely. Both bounds are load-bearing
+and for opposite reasons. A floor, because a sub-millisecond measurement on a
+loopback or datacentre path would drain nothing, the displacement being produced by
+the path's queues rather than by its length; this implementation floors at 200 ms. A
+ceiling, because the round-trip figure is one the peer can inflate by delaying its
+own acknowledgements, and without a ceiling the duration of a *local* commitment
+would be a number a remote party writes; this implementation caps at 600 ms. The
+deadline is taken once, when the first copy is seen, and is never extended by
+anything that arrives afterwards — otherwise a peer could hold the session open by
+continuing to talk.
+
+On any real path it is one of those two bounds rather than the multiple between them,
+and an implementer sizing a buffer against it should expect that. A loopback or
+datacentre session measures a round trip in the hundreds of microseconds, so three of
+it is nowhere near the floor and the window is the floor; on a 235 ms
+intercontinental path three of it is 705 ms and the window is the ceiling. The
+multiple only decides the answer in a band roughly 67–200 ms wide, and a session that
+has not yet timed a round trip at all sits wherever its estimator's opening guess puts
+it. Against the timer-driven alternative of § 12.4 — over two minutes for the slot,
+and for a server's demux routes no reclaim at all until traffic happens to trigger one
+— either bound is the same order of magnitude of improvement.
+
+**If it is lost entirely**, nothing breaks and nothing is retried: the receiver falls
+back to concluding the same thing from silence, on the liveness timer of § 12.4,
+exactly as it did before v8. That is the whole compatibility story of the frame — it
+improves the common case and changes no worst case — and it is why an implementation
+that chooses never to send one is still conformant, while one that fails to dispatch
+a received one is not.
+
+A sender emits it **after** pushing out everything it owes the peer, and never
+before. That is worth doing and is not sufficient: on a datagram transport the close
+and the trailing data are separate datagrams with no ordering between them, so
+sending them in turn orders the transmissions and nothing more — what covers the rest
+is the receiver's draining window above, and a specification that asked only this of
+the sender would be asking for a guarantee the sender cannot give. Note also that
+"pushing out" is not "delivering": nothing acknowledges the flush either, so an
+application that needs its last bytes delivered establishes that at its own level and
+closes afterwards. Emitted only from an established session; one that never got past
+the handshake has no keys to seal with and no peer state to release.
+
+Why it exists is § 12.4's blind spot. On a byte pipe a departing peer's transport
+drop makes the other side's read fail and its session ends within a second; a
+datagram socket has no equivalent — an unconnected server socket surfaces no ICMP —
+so a departure was indistinguishable from silence and the slot survived until the
+liveness timer declared it dead, over two minutes later, with keep-alives fired at a
+closed port throughout.
+
+Source: `core/src/transport/types.rs` (`ControlSubtype`), `core/src/api/session.rs`.
+
 ---
 
 ## 5. AEAD construction
@@ -1567,11 +1775,33 @@ three messages — it leaves the frozen wire vectors (§11) untouched.
 - `ServerHello.server_nonce`: a 32-byte server-contributed, transcript-bound
   value (T4.3, replacing the old discarded ~1184 B ephemeral `server_key_package`).
   A future second-KEM ring could repurpose this slot for real key material.
+- **`ControlSubtype` `0x00` and `0x02 … 0xFF`** (§ 4.11): 255 unassigned values in
+  the AEAD plaintext of an `ENCRYPTED | CONTROL` frame. This is now the *intended*
+  place for a new in-session signal, and it is where a reader should look first.
 - `PacketFlags 0x8000`: the sole remaining reserved bit (`0x1000` = `KEEPALIVE`
-  § 4.3 / § 12.4, `0x2000` = `PADDED` and `0x4000` = `COVER` § 4.8 are assigned).
+  § 4.3 / § 12.4, `0x2000` = `PADDED`, `0x4000` = `COVER` § 4.8 and `0x0080` =
+  `CONTROL` § 4.11 are assigned). It is still free **because** v8 spent a subtype
+  byte instead of it.
 
-A future protocol revision that needs more than this headroom increments
-`WIRE_VERSION` / `PROTOCOL_VERSION` (§ 1) as a deliberate, code-gated bump.
+The last two entries are the same decision seen from both ends, and the ordering
+between them is the forward-compatibility policy of this protocol, not a
+preference. The flags word is a 16-entry namespace of which one entry remains; the
+subtype registry is a 255-entry namespace that costs the same on the wire, because
+a control frame's plaintext is padded to a bucket either way and one byte inside it
+is free. Three in-session control frames — `KEEPALIVE`, `PADDED`/`COVER` shaping
+and `WINDOW_UPDATE` — were added in the two revisions before v8; had the fourth
+taken `0x8000`, the fifth would have had nowhere to go and would have forced a
+header change. So: **a new in-session signal takes a subtype, not a flag.** A flag
+is correct only for something the receiver must act on *before* it opens the AEAD,
+or something that must combine freely with an existing branch — neither of which
+describes a signal, and both of which are exactly what a header bit is scarce for.
+
+None of this is a licence for unilateral use. A sender must not emit an unassigned
+subtype or set an unassigned flag on a live session: an unknown subtype is dropped
+(§ 4.11 rule 3) and an unknown flag is ignored (§ 4.3), so in both cases the peer
+does nothing and the sender learns nothing. Both namespaces are spent by a
+`WIRE_VERSION` / `PROTOCOL_VERSION` increment (§ 1) as a deliberate, code-gated
+bump — which is what v8 was.
 
 ---
 
@@ -1662,9 +1892,9 @@ this spec as follows:
 | Invariant | Spec section |
 | --- | --- |
 | 1 — Server identity pinning | § 6.1 / § 6.3 / § 6.5 |
-| 2 — Post-handshake ENCRYPTED flag | § 4.3 / § 5 |
+| 2 — Post-handshake ENCRYPTED flag | § 4.3 / § 4.11 / § 5 |
 | 3 — Anti-DPI obfuscation carries no confidentiality of its own (framing-only `mimicry` leg) | § 9.1 |
-| 4 — Replay rejection after AEAD verify | § 5 |
+| 4 — Replay rejection after AEAD verify | § 5 / § 4.11 |
 | 5 — Rekey via HKDF `"phantom-rekey-v1"`, saturating epoch | § 5 |
 | 6 — Constant-time path-validation responses | § 4.3 (`PATH_VALIDATION`) / § 12.1 |
 | 7 — Transcript-bound version | § 1 / § 6.5 |
@@ -1689,9 +1919,12 @@ than driving Rust types ↔ Rust types, so a layout / endianness / discriminant
 regression in the packet codec or in `borsh` fails CI instead of silently
 breaking interop. `tests/wire_vectors_decode.py` is an independent (non-Rust)
 decoder + encoder over the same fixtures — cross-implementation evidence that the
-grammar is real. It also carries the `WINDOW_UPDATE` plaintext codec and its
-monotone-maximum rule (§ 4.5), which has no fixture of its own because it is an AEAD
-plaintext rather than an outer container.
+grammar is real. It also carries the two rules that have no fixture of their own,
+because they govern AEAD plaintexts rather than outer containers: the
+`WINDOW_UPDATE` plaintext codec with its monotone-maximum rule (§ 4.5), and the
+`CONTROL` subtype registry with its dispatch (§ 4.11) — including the assertions
+that an unassigned byte drops the frame and that a plaintext naming no subtype is
+refused rather than read as a default.
 
 | Fixture | Codec | Type |
 | --- | --- | --- |
@@ -1869,6 +2102,28 @@ fires only when the path is genuinely idle (Connected, nothing in flight, inboun
 silent ≥ interval, ≤ one PING per interval), so steady traffic pays nothing.
 `KEEPALIVE` is a spare flag bit — **no header layout or `WIRE_VERSION` change**.
 
+**Departure is announced, not only inferred (WIRE v8).** Everything above infers the
+peer's state from *silence*, which is the only evidence a datagram socket offers and
+is necessarily slow: a keep-alive interval to reach `Migrating`, then a migration-idle
+timeout to reach `Dead`. That is correct for a peer that vanished, and needlessly
+expensive for a peer that simply left — and it could not tell the two apart, because
+on PhantomUDP they look identical. There is no socket-level end-of-stream: on the
+byte-pipe legs a departing peer's transport drop makes the other side's read fail
+within the second, while an unconnected UDP server socket surfaces no ICMP at all, so
+a departure and a quiet moment are the same observation. For as long as the timers
+ran, the session slot stayed occupied and keep-alives were fired at a closed port,
+holding a NAT binding open for a conversation that had ended.
+
+So a session that is ending now says so first: a `CONTROL` frame carrying
+`ControlSubtype::CLOSE` (§ 4.11), emitted after the final flush. It is
+best-effort — unacknowledged, never retransmitted — and it **replaces nothing**.
+Every timer above still runs and still reaches the same verdict on its own schedule;
+the frame only lets the common case be decided in one draining window (§ 4.11,
+typically 300 ms) instead of two minutes. A receiver that never gets one behaves
+exactly as it did before v8, which is why an implementation is free to send none and
+not free to ignore one — and, having got one, not free to act on it immediately
+either.
+
 ### 12.5 Threat model & residual risk (honest)
 
 - **Worst achievable, even by a privileged attacker** who sees the plaintext CID
@@ -1916,11 +2171,17 @@ that has moved in `core/src/transport/`,
 `core/src/crypto/` or `core/src/api/session.rs` since then has not been
 re-checked here.
 
-One change has landed since that pass and is reflected above: `WIRE_VERSION 6 → 7` and
-`PROTOCOL_VERSION 3 → 4`, which replaced the `WINDOW_UPDATE` relative credit with a
-cumulative limit (§ 1, § 4.3, § 4.5) and moved seven frozen fixtures — the four packet
-vectors by their version byte, the two `ClientHello` vectors by theirs, and
-`transcript_hash.bin` because the hello it covers changed.
+Two changes have landed since that pass and are reflected above. `WIRE_VERSION 6 → 7`
+and `PROTOCOL_VERSION 3 → 4` replaced the `WINDOW_UPDATE` relative credit with a
+cumulative limit (§ 1, § 4.3, § 4.5). Then `WIRE_VERSION 7 → 8` and
+`PROTOCOL_VERSION 4 → 5` gave the `CONTROL` flag a one-byte subtype in its AEAD
+plaintext and assigned the first of them, the session-close announcement (§ 1, § 4.3,
+§ 4.11, § 7, § 12.4). Neither moved a header byte or a handshake field, and both
+moved the same seven frozen fixtures — the four packet vectors by their version byte,
+the two `ClientHello` vectors by theirs, and `transcript_hash.bin` because the hello
+it covers changed. That is the signature of a plaintext-format change, and it is
+precisely why both versions had to move each time: nothing in the header would
+otherwise have told a peer the rules for reading a payload had changed.
 
 The same pass closed a set of silences, which are harder to notice than
 contradictions because nothing in the document points at them: the `stream_id`

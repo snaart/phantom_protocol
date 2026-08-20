@@ -66,10 +66,10 @@ with, so there is nothing to negotiate against.
 
 Two constants pin the format:
 
-- `WIRE_VERSION = 7` — the packet-header version byte (`transport/types.rs`). It
+- `WIRE_VERSION = 8` — the packet-header version byte (`transport/types.rs`). It
   is bound into the AEAD AAD; since v6 it is itself header-protection–masked on the
   wire (no constant cleartext byte). See `docs/protocol/PROTOCOL.md` § 1 / § 4.2.
-- `PROTOCOL_VERSION = 4` — `ClientHello.version` (`transport/handshake.rs`),
+- `PROTOCOL_VERSION = 5` — `ClientHello.version` (`transport/handshake.rs`),
   bound into the signed handshake transcript.
 
 Both bumped several times pre-1.0, as a hard cut each time (no negotiation, no
@@ -96,18 +96,33 @@ deployed peers to keep compatible). The history, for the record:
   the old encoding would compute a wrong window rather than fail to parse, and
   because a relative credit in an unacknowledged frame is destroyed by loss —
   see `PROTOCOL.md` § 4.5.
+- **`7 → 8`** — in-session control frames: the AEAD plaintext of an
+  `ENCRYPTED | CONTROL` packet now leads with a one-byte subtype, and the first
+  assignment is the session-close announcement (`PROTOCOL.md` § 4.11). Again no
+  header byte moved, and again the data-plane version check is what enforces it: a v7
+  peer drops a v8 frame at step 1 of its dispatch, on the version byte, before any
+  flag is examined. So the failure it prevents is not misread data — it is a peer that
+  completes a handshake, agrees keys, and then **silently discards every packet**,
+  which is the exact shape of "failing quietly" this policy exists to rule out.
+  Bumping `PROTOCOL_VERSION` with it is what turns that into a typed refusal before a
+  session exists.
 
 `PROTOCOL_VERSION` bumped `1 → 2` (the signed transcript began covering the 0-RTT
 verdict `early_data_accepted` and `ClientHello` gained the `resumption_binder`
 proof-of-possession field), `2 → 3` (`ServerHello`'s `server_key_package` was
-replaced by a 32-byte `server_nonce`, changing the signed-transcript content), and
-`3 → 4` alongside `WIRE_VERSION 6 → 7` — no handshake field changed there; the
-bump exists so an older peer is refused with a typed `ServerReject` instead of
-completing a handshake and then having its packets dropped silently by the
-data-plane version check. **That pairing is the rule, not a one-off**: a data-plane
-change without a handshake bump converts a diagnosable refusal into a silent stall.
-Handshakes across any of these versions cannot interoperate. See PROTOCOL.md § 1
-for the authoritative narrative.
+replaced by a 32-byte `server_nonce`, changing the signed-transcript content),
+`3 → 4` alongside `WIRE_VERSION 6 → 7`, and `4 → 5` alongside `WIRE_VERSION 7 → 8`
+— no handshake field changed in either of the last two; the bump exists so an older
+peer is refused with a typed `ServerReject` instead of completing a handshake and
+then having its packets dropped silently by the data-plane version check. **That
+pairing is the rule, not a one-off**: a data-plane change without a handshake bump
+converts a diagnosable refusal into a silent stall, and at `7 → 8` into a total one —
+the version byte is on every packet, so the older peer moves no data at all rather
+than only losing the frames the change touched. A version increment moves a *value*,
+never a field:
+`protocol_variant` stays the leading transcript field and `early_data_accepted`
+stays the last, both times. Handshakes across any of these versions cannot
+interoperate. See PROTOCOL.md § 1 for the authoritative narrative.
 
 Both are **tamper-check anchors**, not negotiated sets:
 

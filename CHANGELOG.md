@@ -76,6 +76,150 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Changed (wire-breaking)
 
+- **A session announces its own end instead of leaving the peer to infer it from silence —
+  `WIRE_VERSION` 7 → 8, `PROTOCOL_VERSION` 4 → 5.** The long-declared `CONTROL` flag
+  (`0x0080`) now has a meaning: the AEAD plaintext of an `ENCRYPTED | CONTROL` frame leads
+  with a one-byte subtype, and the first assignment, `0x01`, says the sender is closing this
+  session and will send nothing further on it. The frame is Padme-padded so its body length
+  reads as a bucket rather than a length — a control frame with a one-, two- or three-byte
+  body is one size on the wire, so the size does not name the subtype — carries no
+  application bytes, and is emitted three times from the data pump's teardown after the
+  existing flush and drain.
+
+  Be precise about the padding, because the broad claim is false and the counterexample is
+  one line of arithmetic. It removes the *body length* from the wire size: a control frame
+  with a one-, two- or three-byte body is one size, so the size says a control frame went
+  out without saying which subtype it carried. It does **not** put the frame on a size
+  nothing else emits — a default session's one-byte reliable application write is the same
+  45-byte datagram, because a padded one-byte control body and a four-byte stream offset
+  plus one application byte are both five bytes of plaintext. And it does not hide that a
+  session ended: three identical datagrams back to back followed by silence is a pattern,
+  and per-frame padding does not remove patterns. Hiding *that* would take the session
+  padding its data frames too, which is the opt-in policy and a deployment's decision.
+
+  The defect is a slot that outlives the client holding it. `SessionCommand::Close` flushed
+  the send queue and left the pump without putting a byte on the wire. On a byte pipe that
+  costs nothing — dropping the transport makes the peer's read fail, its reader loop ends and
+  its pump exits, which is the 0.74 s figure the TCP leg shows. A datagram socket has no
+  equivalent: an unconnected server socket surfaces no ICMP, so a departing client's last
+  observable act is the absence of datagrams and only the liveness timer ever noticed —
+  keep-alive to `Migrating`, then `session_timeout` to `Dead`. The WAN harness saw the shape
+  of it first: over 37 UDP sessions in each of two runs, the tail after the last scenario
+  marker was 135.01 s for every one of them and 0.00 s for every TCP and mimic session,
+  while the server fired a keep-alive into a closed client port every 15 s and each one held
+  a NAT binding open for a conversation that had ended.
+
+  That 135.01 s is a harness observation and not a measurement of either resource this
+  change frees, so the improvement is stated against the two resources directly, measured on
+  loopback at the revision before this frame existed and at this one. They are different
+  things with different reclaim paths and are kept apart here for that reason:
+
+  | Quantity | Before | After |
+  | --- | --- | --- |
+  | Embedder-visible session slot (the accepted session's `recv()` returns) | 44.80 s | 0.20 s |
+  | Demux route table (`active_route_count()` back to 0, from 18 routes) | not reclaimed within 250 s | 0.22 s |
+
+  The slot figure is a factor of about 220. The route-table figure is not a ratio at all:
+  nothing at the old revision reclaimed those routes, because every trigger the table had
+  was waiting for a datagram the departed client was never going to send.
+
+  It rides `CONTROL` rather than `0x8000`, the last unassigned flag bit. Three in-session
+  control frames were added in the two revisions before this one, so spending the last bit on
+  the first of four would have left the next one nowhere to go; a subtype byte inside the
+  already-padded plaintext costs the same on the wire and does not run out. `0x00` is left
+  unassigned so a zeroed body is not a valid control frame, and every unassigned byte is
+  dropped.
+
+  The receive branch sits after the AEAD gate and after the replay window, and before
+  anything that could deliver data. Below the gate, a forged plaintext close cannot reach it;
+  below the window, a byte-identical replay of a captured close is already refused, which is
+  what makes the branch idempotent without holding any state and why a recorded datagram is
+  not a session-kill primitive. Every arm returns, the unknown subtype included — the
+  receive path ends in a fall-through that hands non-empty plaintext to the application, so a
+  subtype nobody claimed would otherwise arrive at `recv()` as a byte of the caller's stream.
+
+  Both versions move, and the reason is the stall rather than the fall-through. A peer at
+  `WIRE_VERSION` 7 never reaches its flag dispatch with a v8 frame at all — the version byte
+  is what it checks first, so it drops the whole flow, completes a handshake and then moves
+  no data with nothing at either end to say why. That is the "failing quietly" the version
+  policy exists to rule out; with `PROTOCOL_VERSION` moved too, it is
+  refused with a typed `ServerReject` before a session exists. A version increment moves a
+  value and not a field: `protocol_variant` remains the leading transcript field and
+  `early_data_accepted` remains the last. The same seven frozen fixtures moved as at 6 → 7 —
+  four packet vectors and two `ClientHello` vectors by their version byte, and
+  `transcript_hash.bin` because the hello it covers changed. `tests/wire_vectors_decode.py`
+  gained an independent statement of the subtype registry and its dispatch.
+
+  A receiver **drains** rather than tearing down on the first copy. The frame is not
+  `RELIABLE`, carries no stream offset and is never acknowledged, so nothing re-sends data it
+  overtakes — and on a datagram path a single one-position reorder is enough for it to arrive
+  ahead of bytes the peer's `send()` already returned `Ok` for. Send order is the only
+  ordering a sender can impose and it is not arrival order. So a receiver records the close
+  and keeps reading for a bounded window, and only then tears down and releases its routes.
+  The window is three times the session's own measured `min_rtt`, floored at 200 ms because a
+  sub-millisecond measurement cannot size a timeout, and capped at 600 ms because that
+  measurement is one a peer can inflate by delaying its acknowledgements — the length of a
+  local commitment must not be a number a remote party writes. On any real path it is one of
+  those two bounds and not the multiplication between them: a loopback session measures
+  `min_rtt` at 175–384 µs, so three of it is under a millisecond and the **floor** is what
+  binds, and on the 235 ms reference WAN path three of it is 705 ms so the **ceiling** does.
+  The 300 ms that falls out of the arithmetic belongs to a session that has never timed a
+  round trip — it is `3 ×` the estimator's opening guess — and one acknowledged packet
+  replaces it.
+
+  While draining, the session accepts no new application writes, and the API in front of it
+  says so rather than accepting them and dropping them. `connection_state()` publishes a new
+  `ConnectionState::Draining` at the packet that carried the close; `is_data_ready()` is
+  false; `PhantomSession::send`, `flush_queue`, `PhantomStream::send_reliable`,
+  `send_unreliable` and `PhantomStream::disconnect` all return
+  `CoreError::ConnectionClosed` without queueing anything; `await_ready()` answers the same;
+  `queued_count()` stays 0 because a refused write is refused rather than queued; and
+  `last_error()` stays `None`, because a peer leaving in an orderly way is not a failure.
+  `ConnectionState` is `#[non_exhaustive]`, so the added variant does not break exhaustive
+  matches in downstream crates, but it does widen the enum the bindings generate.
+
+  Emitting the frame is not by itself enough for an operator to see anything. A server
+  session's 19 CID routes were reclaimed only by triggers reactive to traffic a departed
+  client no longer sends: a datagram arriving for the route, a once-per-handshake reap signal
+  that already fired at accept, and an every-256th-connection sweep. So the session now tells
+  the demux directly, over a bounded queue, naming itself by an identity the listener
+  assigned at accept and never put on the wire; the demux keeps a reverse index from that
+  identity to the session's CIDs and drops exactly those. The cost is that session's own
+  route set and never the size of the table, which matters because this runs on the demux
+  task ahead of the next datagram read, at a moment a peer chooses: a coordinated departure
+  must not be able to decide how long every other session's traffic waits. Measured in-crate
+  at exactly that shape — a full queue of 1024 sessions each holding its whole 20-CID window
+  — draining one full queue costs 1.2 ms against a table holding only those routes and
+  2.0 ms against a table an order of magnitude larger. The queue is bounded for the same
+  reason as the per-session cost.
+
+  A signal dropped at that bound has to cost a deferred reclaim rather than a permanent one,
+  and that took a second change: the demux now sweeps its own route table on a one-second
+  timer of its own. Every other reclaim this table has is driven by a peer — a datagram for a
+  dead route, a handshake task finishing, an every-256th-connection sweep at accept — and the
+  population that produces a dropped retire signal is precisely the one that has stopped
+  sending. Without a clock of its own, the queue bound added to stop a stall would have
+  converted it into a leak: a session whose signal was dropped kept all 18 of its routes for
+  as long as the listener ran. The sweep is the same pass the connection-count trigger
+  already ran, given a trigger that does not depend on connections arriving; at the
+  `MAX_ROUTES` ceiling it costs 1.4 ms with nothing to reclaim and 42 ms in the one-off case
+  where an entire population has departed at once, and on an idle listener it is a walk of an
+  empty map. In the integration test the route count falls from 18 to 0 within the draining
+  window of the client leaving, against liveness deadlines two orders of magnitude longer;
+  in the unit test the retire signal is deliberately dropped and the count still reaches 0
+  with no inbound connection of any kind.
+
+  Nothing is required to be delivered. The frame is unacknowledged, never retransmitted, and
+  takes no part in the SACK machinery; a peer that receives none falls back to concluding the
+  same thing from silence, exactly as before. `PhantomSession::disconnect` says so in its own
+  documentation, along with what it does *not* promise: it queues the request and returns,
+  the pump pushes what the socket and the congestion window will take and does not wait for
+  an acknowledgement, so a payload larger than one window is mostly discarded and delivery
+  has to be established at the application level. `docs/protocol/PROTOCOL.md` §4.11 specifies
+  the frame, its draining rule and the subtype registry, and §7 records that registry as the
+  extension point a future in-session signal should take in preference to the last flag bit;
+  `docs/protocol/INTEROP.md` carries the receiver obligation for a second implementation.
+
 - **`WINDOW_UPDATE` carries a cumulative limit instead of a relative credit —
   `WIRE_VERSION` 6 → 7, `PROTOCOL_VERSION` 3 → 4.** The frame's AEAD plaintext is now eight
   big-endian bytes stating the *total* the receiver will let its peer send on that stream,
