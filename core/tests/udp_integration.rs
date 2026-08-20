@@ -2410,3 +2410,59 @@ async fn udp_integration_close_overtaking_data_does_not_discard_it() {
         "a close that overtook one datagram discarded the data behind it"
     );
 }
+
+/// `disconnect()` pushes what is queued before it announces the close, so a write
+/// that fits the wire is not lost to the call that follows it.
+///
+/// This pins the half of `disconnect()`'s contract that is real. The method makes no
+/// delivery guarantee and its documentation says so: it queues the request and
+/// returns, and the pump then pushes until the socket, the congestion window or the
+/// peer's flow-control limit refuses the next byte, without waiting for an
+/// acknowledgement — so a payload larger than one window is mostly discarded. What is
+/// guaranteed, and what an embedder does rely on, is the ordinary case: one chunk
+/// handed to `send()` and then a `disconnect()` in the next statement must arrive,
+/// exactly as `send(x); drop(session)` does.
+///
+/// The other half is deliberately not asserted here. A test requiring that a large
+/// payload is *truncated* would pin a shortcoming as a contract, and the next person
+/// to lengthen the drain would have to delete the test to do it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_integration_disconnect_pushes_a_queued_write_before_announcing() {
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let key = HybridVerifyingKey::from_bytes(&listener.verifying_key_bytes()).unwrap();
+
+    let server = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept").session();
+        session.recv().await
+    });
+
+    let transport = UdpClientTransport::connect(addr)
+        .await
+        .expect("udp connect");
+    let client = PhantomSession::connect_with_transport(&addr.to_string(), transport, key);
+    client
+        .await_ready()
+        .await
+        .expect("the pinned handshake completes");
+
+    // No await between these two beyond the ones they make themselves: the write is
+    // still in the pump's queue when the close request is enqueued behind it.
+    let report = b"the-last-thing-said".to_vec();
+    client.send(report.clone()).await.expect("client send");
+    client.disconnect().await.expect("disconnect");
+    drop(client);
+
+    let received = timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the server session ends promptly")
+        .expect("server task")
+        .expect("server recv");
+    assert_eq!(
+        received, report,
+        "a write queued immediately before disconnect() must still reach the peer"
+    );
+}
