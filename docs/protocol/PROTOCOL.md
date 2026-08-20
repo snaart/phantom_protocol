@@ -1159,8 +1159,18 @@ own acknowledgements, and without a ceiling the duration of a *local* commitment
 would be a number a remote party writes; this implementation caps at 600 ms. The
 deadline is taken once, when the first copy is seen, and is never extended by
 anything that arrives afterwards — otherwise a peer could hold the session open by
-continuing to talk. In the ordinary case that is 300 ms of held slot, against the
-timer-driven alternative of § 12.4, which is over two minutes.
+continuing to talk.
+
+On any real path it is one of those two bounds rather than the multiple between them,
+and an implementer sizing a buffer against it should expect that. A loopback or
+datacentre session measures a round trip in the hundreds of microseconds, so three of
+it is nowhere near the floor and the window is the floor; on a 235 ms
+intercontinental path three of it is 705 ms and the window is the ceiling. The
+multiple only decides the answer in a band roughly 67–200 ms wide, and a session that
+has not yet timed a round trip at all sits wherever its estimator's opening guess puts
+it. Against the timer-driven alternative of § 12.4 — over two minutes for the slot,
+and for a server's demux routes no reclaim at all until traffic happens to trigger one
+— either bound is the same order of magnitude of improvement.
 
 **If it is lost entirely**, nothing breaks and nothing is retried: the receiver falls
 back to concluding the same thing from silence, on the liveness timer of § 12.4,

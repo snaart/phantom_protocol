@@ -10125,42 +10125,69 @@ mod tests {
         );
     }
 
-    /// The draining window is bounded at both ends, and the upper bound is the one
-    /// that matters.
+    /// The draining window is bounded at both ends, and on any real path it is one of
+    /// the two bounds — never the multiplication between them.
     ///
-    /// A peer's close starts a window during which this side holds the session's
-    /// resources — on the PhantomUDP server, its demux routes and its accept permit.
-    /// The window is sized from a round-trip *measurement*, and a peer can inflate
-    /// what this side measures by delaying its own acknowledgements, so without a
-    /// ceiling the length of a local commitment would be a number written by a remote
-    /// party. The floor is the other half of the same judgement: a sub-millisecond
-    /// measurement on a loopback or datacentre path would drain nothing, because the
-    /// displacement this window absorbs comes from the path's queues rather than from
-    /// its length.
+    /// That is worth pinning because the arithmetic invites the opposite reading. The
+    /// window is `3 × min_rtt` clamped to `[200 ms, 600 ms]`, and `min_rtt` opens at
+    /// [`INITIAL_MIN_RTT`] (100 ms), which lands at exactly 300 ms — so 300 ms looks
+    /// like the ordinary case and was written down as one. It is not: it is the value
+    /// for a session that has never timed a round trip, and a session that has
+    /// exchanged one acknowledged packet has replaced the guess with a measurement.
     ///
-    /// The final row is the arithmetic case: an absurd measurement must clamp, not
-    /// overflow the multiplication on its way there.
+    /// The two measurements below are the ones this project actually has. On loopback,
+    /// `min_rtt` after a single exchange is a few hundred microseconds — 213 µs
+    /// server-side and 384 µs client-side in the run these figures come from — so
+    /// three of it is under a millisecond and **the floor decides**: every fast-path
+    /// session drains for 200 ms. On the WAN path the performance campaign measures,
+    /// 235 ms, three of it is 705 ms and **the ceiling decides**: 600 ms. Between them
+    /// they cover the range a deployment is in, which is why the bounds are the
+    /// interesting part of this function and the multiplication is not.
+    ///
+    /// The floor exists because a sub-millisecond measurement would drain nothing —
+    /// the displacement the window absorbs comes from the path's queues, not its
+    /// length. The ceiling exists because the measurement is one the peer can inflate
+    /// by delaying its own acknowledgements, and the length of a *local* commitment
+    /// must not be a number a remote party writes. The last row is the arithmetic
+    /// case: an absurd measurement must clamp, not overflow on its way there.
     #[test]
-    fn the_draining_window_is_bounded_at_both_ends() {
+    fn the_draining_window_is_one_of_its_two_bounds_on_any_real_path() {
+        use crate::transport::bandwidth_estimator::INITIAL_MIN_RTT;
         use std::time::Duration;
 
-        for tiny in [
+        // Loopback, measured: the floor binds, and by three orders of magnitude.
+        for measured in [
             Duration::ZERO,
-            Duration::from_micros(1),
+            Duration::from_micros(213),
+            Duration::from_micros(384),
             Duration::from_millis(10),
         ] {
             assert_eq!(
-                drain_window_for_rtt(tiny),
+                drain_window_for_rtt(measured),
                 DRAIN_WINDOW_MIN,
-                "a round trip too small to size a timeout with must fall back to the floor"
+                "on a fast path a round-trip measurement is too small to size a timeout \
+                 with, so the floor is what the window is — not a value derived from \
+                 {measured:?}"
             );
         }
 
-        // The ordinary case sits strictly between the bounds, so neither of them is
-        // silently doing all the work.
-        let ordinary = drain_window_for_rtt(Duration::from_millis(100));
-        assert_eq!(ordinary, Duration::from_millis(300));
-        assert!(ordinary > DRAIN_WINDOW_MIN && ordinary < DRAIN_WINDOW_MAX);
+        // The campaign's WAN path: the ceiling binds.
+        assert_eq!(
+            drain_window_for_rtt(Duration::from_millis(235)),
+            DRAIN_WINDOW_MAX,
+            "three round trips on the reference WAN path is 705 ms, so the ceiling is \
+             what the window is there"
+        );
+
+        // The one value that is neither bound is the one nothing has measured: the
+        // opening guess, which a single acknowledged packet replaces.
+        let unmeasured = drain_window_for_rtt(INITIAL_MIN_RTT);
+        assert_eq!(unmeasured, Duration::from_millis(300));
+        assert!(
+            unmeasured > DRAIN_WINDOW_MIN && unmeasured < DRAIN_WINDOW_MAX,
+            "the 300 ms figure belongs to a session with no round-trip measurement at \
+             all; calling it the ordinary case misreads the guess as an observation"
+        );
 
         for inflated in [
             Duration::from_secs(1),
