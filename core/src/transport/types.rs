@@ -71,10 +71,11 @@ pub type PacketNumber = u64;
 /// negotiated (pre-1.0, no users); a decoder rejects anything else. `8` gives
 /// [`PacketFlags::CONTROL`] a meaning: its AEAD plaintext now leads with a
 /// [`ControlSubtype`] byte, and the first assignment is the session-close announcement
-/// (see [`ControlSubtype::CLOSE`]). A `7` receiver has no branch that claims a `CONTROL`
-/// frame, so the subtype byte would reach it as one byte of application data —
+/// (see [`ControlSubtype::CLOSE`]). This byte is what a `7` receiver checks first, so it
+/// would drop every `8` frame before looking at a flag — completing a handshake and then
+/// moving no data at all, with nothing to say why.
 /// [`crate::transport::handshake::PROTOCOL_VERSION`] moved with this so such a peer is
-/// refused at the handshake instead of corrupting its own byte stream. `7` changes the
+/// refused at the handshake, where the refusal has a name. `7` changes the
 /// `WINDOW_UPDATE` plaintext from a 4-byte relative credit to an 8-byte cumulative limit
 /// (see [`PacketFlags::WINDOW_UPDATE`]); `PROTOCOL_VERSION` moved with it too.
 /// `6` was the anti-fingerprint diet: the version byte became itself HP-masked (the WHOLE

@@ -99,11 +99,13 @@ deployed peers to keep compatible). The history, for the record:
 - **`7 → 8`** — in-session control frames: the AEAD plaintext of an
   `ENCRYPTED | CONTROL` packet now leads with a one-byte subtype, and the first
   assignment is the session-close announcement (`PROTOCOL.md` § 4.11). Again no
-  header byte moved. It is a version concern for a sharper reason than `6 → 7`: a
-  v7 peer has no branch that claims a `CONTROL` frame, so the subtype byte would
-  fall through its dispatch and be **delivered to its application** as one byte of
-  the caller's stream. A change that turns a control signal into corrupt data is
-  the strongest case there is for the pairing rule below.
+  header byte moved, and again the data-plane version check is what enforces it: a v7
+  peer drops a v8 frame at step 1 of its dispatch, on the version byte, before any
+  flag is examined. So the failure it prevents is not misread data — it is a peer that
+  completes a handshake, agrees keys, and then **silently discards every packet**,
+  which is the exact shape of "failing quietly" this policy exists to rule out.
+  Bumping `PROTOCOL_VERSION` with it is what turns that into a typed refusal before a
+  session exists.
 
 `PROTOCOL_VERSION` bumped `1 → 2` (the signed transcript began covering the 0-RTT
 verdict `early_data_accepted` and `ClientHello` gained the `resumption_binder`
@@ -114,8 +116,10 @@ replaced by a 32-byte `server_nonce`, changing the signed-transcript content),
 peer is refused with a typed `ServerReject` instead of completing a handshake and
 then having its packets dropped silently by the data-plane version check. **That
 pairing is the rule, not a one-off**: a data-plane change without a handshake bump
-converts a diagnosable refusal into a silent stall — or, at `7 → 8`, into something
-worse than a stall. A version increment moves a *value*, never a field:
+converts a diagnosable refusal into a silent stall, and at `7 → 8` into a total one —
+the version byte is on every packet, so the older peer moves no data at all rather
+than only losing the frames the change touched. A version increment moves a *value*,
+never a field:
 `protocol_variant` stays the leading transcript field and `early_data_accepted`
 stays the last, both times. Handshakes across any of these versions cannot
 interoperate. See PROTOCOL.md § 1 for the authoritative narrative.

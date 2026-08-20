@@ -50,16 +50,21 @@ That is why the two constants move together even when only the data plane change
 peer establishes a session and then moves no data, check the version pair before anything
 else.
 
-The `7 → 8` bump is worth reading as a worked example, because its failure mode is worse
-than a stall and it is the reason the rule is stated as strongly as it is. v8 gave the
-`CONTROL` flag a one-byte subtype inside its AEAD plaintext (PROTOCOL.md § 4.11). A v7
-receiver has no branch that claims a `CONTROL` frame at all, so the frame would fall
-through its dispatch into its application-data path and the subtype byte would be
-**delivered to its caller as one byte of the stream** — silent corruption rather than a
-visible stall. No header byte moved; nothing but the version pair could have refused that
-peer. If you take one habit from this section, take this one: a change to what is *inside*
-the AEAD is a wire revision exactly as much as a change to the header, and the header
-version is the only thing that can enforce it.
+The `7 → 8` bump is worth reading as a worked example, because it is the case where nothing
+on the header moved at all and the pairing rule is doing all the work. v8 gave the `CONTROL`
+flag a one-byte subtype inside its AEAD plaintext (PROTOCOL.md § 4.11); the header is byte
+for byte what it was at v7 apart from the version constant itself. Note carefully which half
+of the pair does what, because it is easy to get backwards. The `WIRE_VERSION` half is what
+stops a v7 receiver from ever reaching its flag dispatch with a v8 frame: the version check
+is step 1 of § 4.3 and it **drops** the frame there, before any flag is examined, so nothing
+is misread and nothing is corrupted. What that leaves is a peer that completes a handshake
+and then silently discards every packet it is sent — the most expensive failure a protocol
+can hand an implementer, because it looks like a working connection. The `PROTOCOL_VERSION`
+half is what converts that into a diagnosis: a typed `ServerReject` naming both versions,
+before a session exists. If you take one habit from this section, take this one: a change to
+what is *inside* the AEAD is a wire revision exactly as much as a change to the header —
+the header version will enforce it either way, and your only choice is whether the
+enforcement is legible.
 
 **A fourth constant is agreed off the wire: the AEAD suite.** There is no cipher
 field in any message; each peer independently resolves AES-256-GCM vs

@@ -111,9 +111,11 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   receive path ends in a fall-through that hands non-empty plaintext to the application, so a
   subtype nobody claimed would otherwise arrive at `recv()` as a byte of the caller's stream.
 
-  That fall-through is why both versions move. A peer at `WIRE_VERSION` 7 has no branch that
-  claims a `CONTROL` frame and would deliver the subtype byte as data, which is worse than
-  the silent stall a data-plane check produces; with `PROTOCOL_VERSION` moved too, it is
+  Both versions move, and the reason is the stall rather than the fall-through. A peer at
+  `WIRE_VERSION` 7 never reaches its flag dispatch with a v8 frame at all — the version byte
+  is what it checks first, so it drops the whole flow, completes a handshake and then moves
+  no data with nothing at either end to say why. That is the "failing quietly" the version
+  policy exists to rule out; with `PROTOCOL_VERSION` moved too, it is
   refused with a typed `ServerReject` before a session exists. A version increment moves a
   value and not a field: `protocol_variant` remains the leading transcript field and
   `early_data_accepted` remains the last. The same seven frozen fixtures moved as at 6 → 7 —

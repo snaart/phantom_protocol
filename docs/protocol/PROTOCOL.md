@@ -39,10 +39,13 @@ its AEAD plaintext (§ 4.11) and `WIRE_VERSION 7` changed the `WINDOW_UPDATE` pl
 handshake message moved a byte. That is deliberate and is the rule for any future
 data-plane change: the packet-level check on `PacketHeader.version` **drops** a mismatched
 frame silently — no reply, nothing the sender can observe — so a wire bump on its own would
-let an older peer complete a handshake and then stall with no diagnosis. Worse, at v8 it
-would not even stall: a v7 receiver has no branch that claims a `CONTROL` frame, so the
-subtype byte would fall through its dispatch and be delivered to its application as one
-byte of the caller's stream. Incrementing `PROTOCOL_VERSION` alongside moves the refusal to
+let an older peer complete a handshake and then stall with no diagnosis. At v8 that stall is
+total rather than partial, which is what makes it worth spelling out: the version byte is on
+every data-plane packet, so a v7 receiver drops the whole flow and not merely the `CONTROL`
+frames it has no branch for. It would finish a handshake, agree keys, and then never deliver
+a byte, with nothing at either end to say why — the version check fires at step 1 of § 4.3's
+dispatch, before any flag is looked at, so nothing downstream of it ever runs.
+Incrementing `PROTOCOL_VERSION` alongside moves the refusal to
 the handshake, where it is a typed `ServerReject` naming both versions, delivered before
 any session exists. An implementation that bumps only one of the two is not interoperating;
 it is failing quietly.
@@ -90,8 +93,8 @@ proof-of-possession field (HS-03); `2 → 3` (T4.3) when `ServerHello`'s
 signed-transcript content; `3 → 4` alongside `WIRE_VERSION 6 → 7` — no handshake field
 changed, but a peer that speaks the older flow control must be refused here rather than
 left to stall, per the rule above; `4 → 5` alongside `WIRE_VERSION 7 → 8`, likewise with no
-handshake field changed, so that a peer with no `CONTROL` dispatch is refused here rather
-than left to deliver a subtype byte to its application; handshakes across these versions
+handshake field changed, so that a peer speaking the older data plane is refused here rather
+than left to drop every frame it is sent; handshakes across these versions
 cannot interoperate).
 They exist so that:
 
