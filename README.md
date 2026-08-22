@@ -64,12 +64,33 @@ Python, and C packaging workflows.
 
 ### Choosing a transport
 
-| Transport | Entry points | `migrate()`? | Firewall-friendly? |
-|---|---|---|---|
-| TCP | `connect_pinned` / `PhantomListener::bind` | No — returns `Err(Unsupported)`; reconnect with 0-RTT | Yes |
-| PhantomUDP | `connect_pinned_udp` / `PhantomUdpListener::bind_udp` | Yes | Mostly |
-| WebSocket | `WebSocketLeg` (wasm32 only) | No | Yes (port 443) |
-| Embedded | `EmbeddedLeg` | No | N/A |
+| Transport | Entry points | `migrate()`? | Firewall-friendly? | Use it for |
+|---|---|---|---|---|
+| PhantomUDP | `connect_pinned_udp` / `PhantomUdpListener::bind_udp` | Yes | Mostly | **the default** — the production transport |
+| TCP | `connect_pinned` / `PhantomListener::bind` | No — returns `Err(Unsupported)`; reconnect with 0-RTT | Yes | reach, where UDP is blocked — **not** speed |
+| WebSocket | `WebSocketLeg` (wasm32 only) | No | Yes (port 443) | browsers |
+| Embedded | `EmbeddedLeg` | No | N/A | UART / USB links |
+
+**If you can use PhantomUDP, use it.** The byte-pipe legs exist for reach — a
+network that blocks or throttles UDP, a proxy, a browser sandbox — and Phantom
+over TCP in particular pays for that reach with latency. Its reliability layer
+(ARQ, SACK loss detection, congestion control) is the same one PhantomUDP uses
+and runs unchanged, which over a socket that already retransmits and already has
+a congestion window means two control loops stacked on each other, communicating
+only through the queue between them. Measured consequence, from the WAN harness
+in [`testbed/`](https://github.com/snaart/phantom_protocol/tree/main/testbed):
+min-RTT on the TCP leg has been observed as high as **4112 ms** — that is queueing
+under our own sender, not a property of the route — and application throughput
+across campaign runs spans **0.75–4.33 Mbit/s**. In the one run whose figures sit
+in the repository with a control beside them, `20260822-062705`, the server
+received 4.83 Mbit/s over this leg while raw UDP echo on the same path in the same
+run measured 13.26 Mbit/s round-trip. Never quote a throughput number for this
+leg without the control from the same run.
+
+This is what the leg is, not a defect being worked on: the inner wire, the
+pinning, the AEAD and the replay window are identical on every transport, and TCP
+is fully conformant. It simply has no way to be quick under load, and no way to
+migrate.
 
 ### Two ways to send data
 

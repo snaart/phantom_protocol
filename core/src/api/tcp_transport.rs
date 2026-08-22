@@ -8,6 +8,46 @@
 //! accumulator across `recv_bytes` calls. Each frame is `split_to`-ed off
 //! into an owned `Bytes` which the caller takes — zero-copy from the
 //! accumulator to the returned frame, no per-packet `Vec::new` alloc.
+//!
+//! # What this leg is for
+//!
+//! **Compatibility and reach, not speed.** Use it where PhantomUDP cannot go —
+//! a network that blocks or throttles UDP, a corporate proxy, a platform whose
+//! sandbox offers only stream sockets — and use PhantomUDP everywhere else. A
+//! deployment that has the choice and picks this leg is paying for something it
+//! does not need.
+//!
+//! The reason is structural rather than a defect awaiting a fix. Phantom's own
+//! reliability layer — the ARQ, SACK loss detection and BBR-style congestion
+//! control of `transport::stream` and `transport::bandwidth_estimator` — runs
+//! unchanged on every leg, including this one. Over a datagram socket it is the
+//! only such layer. Over TCP it is the *second*: the kernel already retransmits,
+//! already sequences, already has a congestion window, and our loop sits on top
+//! of it with no visibility into it. The two controllers then interact through
+//! the only channel they share, which is the queue between them. What our side
+//! measures as the path's round trip includes however long the kernel's send
+//! buffer held the bytes, so a growing queue reads to us as a longer path and
+//! sizes our window accordingly — and a retransmission the kernel has already
+//! performed is invisible to us, so a loss the path recovered from is one we may
+//! recover from a second time.
+//!
+//! The measurement, from the WAN harness in `testbed/`: **min-RTT on this leg has
+//! been observed as high as 4112 ms**, which is not a property of any route the
+//! harness runs over — it is queueing delay under our own sender. Application
+//! throughput across campaign runs spans **0.75–4.33 Mbit/s**; the figure with a
+//! same-run control beside it is run `20260822-062705`, where the server received
+//! **4.83 Mbit/s** from this leg while raw UDP echo on the same path in the same
+//! run measured 13.26 Mbit/s round-trip. The harness records the equivalent
+//! PhantomUDP numbers the same way, each beside its own control and the run's
+//! caveats; do not quote any of them without the control from the same run.
+//!
+//! None of this affects correctness. The leg is fully conformant, carries the
+//! identical inner wire (`docs/protocol/PROTOCOL.md`), and has the same security
+//! properties as any other — the AEAD, the pinning and the replay window are
+//! above the transport and do not know which one they are on. What it does not
+//! have is PhantomUDP's latency under load, and it cannot migrate: `migrate()`
+//! returns `CoreError::Unsupported` here, because a TCP connection cannot change
+//! its 5-tuple.
 
 use crate::api::session::{FramePhase, SessionTransport};
 use crate::errors::CoreError;

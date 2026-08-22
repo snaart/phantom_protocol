@@ -876,6 +876,28 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   pinned for every session", which is true only under `--features fips`; it now carries the
   same per-target rule.
 
+- **Phantom over TCP is a compatibility leg, not a fast one, and it now says so.** Its
+  reliability layer — ARQ, SACK loss detection, congestion control — is transport-independent
+  and runs unchanged on every leg. Over a datagram socket it is the only such layer, which is
+  what it was designed for; over TCP it is the second, stacked on a kernel that already
+  retransmits and already has a congestion window, with no visibility into it. The two loops
+  then interact only through the queue between them, and that queue is inside the round-trip
+  figure our side measures. The WAN harness has observed **min-RTT up to 4112 ms** on this
+  leg — queueing under our own sender rather than any property of the route — against
+  application throughput spanning **0.75–4.33 Mbit/s** across campaign runs; in run
+  `20260822-062705`, both ends built from `8f710f69`, the server received 4.83 Mbit/s over
+  this leg while raw UDP echo on the same path in the same run measured 13.26 Mbit/s
+  round-trip.
+
+  Recorded as what the leg is for rather than as a defect awaiting a fix. Disabling the ARQ
+  on byte-pipe transports is a large change to `run_data_pump` on a leg that is not the
+  production transport, and it is not being made now. So `README.md`,
+  `docs/operations/deployment.md` and the leg's own module documentation now say the same
+  thing: use this leg for reach — a network that blocks or throttles UDP, a proxy, a browser
+  sandbox — use PhantomUDP wherever you have the choice, and expect worse latency under load
+  here. Correctness and security are untouched: the inner wire, the pinning, the AEAD and the
+  replay window are identical on every transport.
+
 ### Fixed
 
 - **The claim that a peer flooding a non-reading application moves no window growth, which
