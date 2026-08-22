@@ -8,7 +8,7 @@
 
 use crate::api::listener::{drive_server_handshake, AcceptOutcome};
 use crate::api::session::PhantomSession;
-use crate::api::udp_transport::UdpServerTransport;
+use crate::api::udp_transport::{HandshakeFlight, UdpServerTransport};
 use crate::crypto::hybrid_sign::HybridSigningKey;
 use crate::errors::CoreError;
 use crate::observability::attrs::{AeadAlgorithm, HandshakeOutcome, ProtocolVersion};
@@ -23,11 +23,13 @@ use crate::transport::phantom_udp::envelope::{ConnId, PacketType};
 use crate::transport::session::{CidSlide, DemuxLink, DemuxRouteOwner};
 use crate::transport::types::LegType;
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 
@@ -339,11 +341,26 @@ impl Drop for PhantomUdpListener {
 /// capacity: `(1 << 18) / 19 ≈ 13.8k` live sessions, above the prior `(1 << 16) / 7 ≈ 9.4k`.
 const MAX_ROUTES: usize = 1 << 18;
 
-/// ε / WIRE v5: a session's inbound rotating-CID window paired with its inbound
-/// channel and the identity of its routes — the payload the handshake task sends the
-/// demux to install the window CIDs (N:1) so the client's `CID_0..` datagrams route
-/// to the session.
-type CidWindowRegistration = (Vec<ConnId>, mpsc::Sender<(Bytes, SocketAddr)>, RouteOwner);
+/// What a handshake task hands the demux when it establishes a session.
+///
+/// ε / WIRE v5: a session's inbound rotating-CID window paired with its inbound channel and
+/// the identity of its routes, so the demux can install the window CIDs (N:1) and the
+/// client's `CID_0..` datagrams route to the session.
+///
+/// PROTOCOL § 6.1: and, when there is one, the reply flight to retain against a repeated
+/// client hello. It rides the same message as the window rather than a channel of its own
+/// because it is produced at the same instant, by the same task, for the same session — and
+/// because the demux drains this queue ahead of the socket, which is what puts the retention
+/// in place before a repeat could arrive on it.
+struct SessionRegistration {
+    cids: Vec<ConnId>,
+    tx: mpsc::Sender<(Bytes, SocketAddr)>,
+    owner: RouteOwner,
+    /// The bootstrap CID the handshake ran under — the key a repeated hello arrives on,
+    /// because a client that has not seen the reply has nothing to rotate its CID from.
+    bootstrap_cid: ConnId,
+    flight: Option<HandshakeFlight>,
+}
 
 /// Depth of the end-of-session route-retire queue (WIRE v8).
 ///
@@ -523,6 +540,23 @@ impl RouteTable {
         true
     }
 
+    /// Hand a reassembled frame to the session `cid` routes to, reclaiming the route if that
+    /// session has gone. Gives the frame back when nothing routes for the CID, which is the
+    /// caller's cue that this may be a new connection.
+    ///
+    /// Returning the frame rather than a flag is what keeps the common path to a single
+    /// lookup: the alternative is asking whether a route exists and then asking again to use
+    /// it, on every datagram a busy listener carries.
+    fn deliver(&mut self, cid: &ConnId, frame: Vec<u8>, peer: SocketAddr) -> Option<Vec<u8>> {
+        let Some(tx) = self.get(cid) else {
+            return Some(frame);
+        };
+        if tx.try_send((Bytes::from(frame), peer)).is_err() && tx.is_closed() {
+            self.remove_if_dead(cid);
+        }
+        None
+    }
+
     /// Remove a CID iff its route is dead. Safe for any CID — a live session's route (its
     /// `Sender` still held by the running session) is left untouched.
     fn remove_if_dead(&mut self, cid: &ConnId) {
@@ -594,11 +628,178 @@ impl RouteTable {
     }
 }
 
+/// How many times one retained reply flight will be repeated (PROTOCOL § 6.1).
+///
+/// Not chosen — it is the number of times the *client* repeats its own flight before giving
+/// up, and the coupling is checked by
+/// [`the_repeat_budget_matches_the_clients_retransmit_schedule`]. Fewer would leave the
+/// client's last question unanswered on a path that lost more than one reply; more would be
+/// capacity offered for a question that will never be asked, and every repeat is work an
+/// on-path attacker can trigger by replaying a captured hello.
+///
+/// [`the_repeat_budget_matches_the_clients_retransmit_schedule`]: self::tests::the_repeat_budget_matches_the_clients_retransmit_schedule
+const MAX_FLIGHT_REPEATS: u32 = 3;
+
+/// How long a reply flight is retained before it is dropped unanswered (PROTOCOL § 6.1).
+///
+/// Derived from the client's own budget rather than picked: [`HANDSHAKE_RETRANSMIT_BUDGET`]
+/// is the total time a client spends waiting for this reply before it abandons the connect,
+/// so retaining for exactly that long is retaining for exactly as long as anyone can still
+/// be asking. A shorter window would drop the answer while the question was still in flight;
+/// a longer one would hold kilobytes for a peer that has already gone.
+///
+/// [`HANDSHAKE_RETRANSMIT_BUDGET`]: crate::api::udp_transport::HANDSHAKE_RETRANSMIT_BUDGET
+const HANDSHAKE_FLIGHT_RETENTION: Duration = crate::api::udp_transport::HANDSHAKE_RETRANSMIT_BUDGET;
+
+/// How many reply flights the listener retains at once (PROTOCOL § 6.1).
+///
+/// This is the memory the repair costs, and the arithmetic is: a `ServerHello` is 6555 bytes
+/// of borsh in six datagrams, 6657 bytes on the wire once the outer envelope is counted, so
+/// **256 × 6657 B ≈ 1.63 MiB** — a floor on what the host must have, not a ceiling on what
+/// the process will use, since a listener also holds the in-flight copy of each reply until
+/// its handshake finishes.
+///
+/// It is [`MAX_INFLIGHT_HANDSHAKES`] on purpose: the listener already refuses to run more
+/// than that many unauthenticated handshakes at once, so retaining at most as many answers as
+/// it will entertain questions keeps one number governing both. Steady-state occupancy is far
+/// below it — an entry is released the moment its client sends anything authenticated, which
+/// on a healthy path is one round trip — and the cap matters only when a population of
+/// clients has stopped answering, which is the case the retention exists for.
+///
+/// Past the cap a new flight is simply not retained: the handshake still completes and the
+/// connect still works, it just has no repair if its reply is lost. Refusing the newcomer
+/// rather than evicting an incumbent is the safer half of that trade, because the incumbent
+/// is a session whose client may already be repeating its question.
+const MAX_RETAINED_FLIGHTS: usize = MAX_INFLIGHT_HANDSHAKES;
+
+/// The most a repeat may send for what triggered it (RFC 9000 § 8.2).
+///
+/// Checked once, when the flight is retained, so every entry in the table satisfies it by
+/// construction and the check costs nothing per repeat. Today's ratio is 6657 out for 3506
+/// in — 1.90×, the same ratio the first exchange already had, because a repeat is only ever
+/// owed to a peer that sent the whole hello again. The bound is here for the case where that
+/// stops being true: a reply that grew, or a hello that shrank, past the point where
+/// answering it twice would make this listener a useful amplifier is refused retention
+/// instead.
+const FLIGHT_AMPLIFICATION_LIMIT: usize = 3;
+
 /// Max concurrent in-flight (un-established) handshakes one source IP may hold (H-2). Bounds
 /// a single address-validated source from monopolising the `inflight` permits; sized below
 /// `MAX_INFLIGHT_HANDSHAKES` so several distinct sources always share, yet generous for a
 /// busy NAT.
 const MAX_PENDING_PER_IP: u32 = 64;
+
+/// One retained server reply flight, with the two things that end its life besides the
+/// client hearing it: a repeat budget and a deadline.
+struct RetainedFlight {
+    flight: HandshakeFlight,
+    repeats_left: u32,
+    expires_at: Instant,
+}
+
+/// The listener's retained reply flights, keyed on the bootstrap connection id a repeated
+/// hello arrives under (PROTOCOL § 6.1).
+///
+/// Everything here is about what an entry costs and how it ends. An entry is several
+/// kilobytes committed on behalf of a peer that has passed the cookie round but has not yet
+/// proved it received anything, so it is bounded three ways — by [`MAX_RETAINED_FLIGHTS`], by
+/// [`HANDSHAKE_FLIGHT_RETENTION`], and by the peer's own first authenticated packet — and the
+/// three are independent: none of them can be held open by anything the peer does.
+struct FlightTable {
+    flights: HashMap<ConnId, RetainedFlight>,
+}
+
+impl FlightTable {
+    fn new() -> Self {
+        Self {
+            flights: HashMap::new(),
+        }
+    }
+
+    /// Retain `flight` under `cid`, or decline to.
+    ///
+    /// Declining is not a failure path — it is the ordinary answer when the table is full of
+    /// live entries or when the flight would make this listener an amplifier — and it costs
+    /// exactly what the server did before this mechanism existed: a lost reply is a lost
+    /// connect for that one client. Returns whether the flight was kept, which is what the
+    /// tests assert against.
+    fn retain(&mut self, cid: ConnId, flight: HandshakeFlight, now: Instant) -> bool {
+        // RFC 9000 § 8.2, checked once so no repeat has to. A flight larger than the limit
+        // allows is refused rather than truncated: half a `ServerHello` is not an answer.
+        if flight.wire_bytes
+            > flight
+                .question_bytes
+                .saturating_mul(FLIGHT_AMPLIFICATION_LIMIT)
+        {
+            return false;
+        }
+        if self.flights.len() >= MAX_RETAINED_FLIGHTS {
+            self.sweep(now);
+            if self.flights.len() >= MAX_RETAINED_FLIGHTS {
+                return false;
+            }
+        }
+        self.flights.insert(
+            cid,
+            RetainedFlight {
+                flight,
+                repeats_left: MAX_FLIGHT_REPEATS,
+                expires_at: now + HANDSHAKE_FLIGHT_RETENTION,
+            },
+        );
+        true
+    }
+
+    /// The flight owed in answer to `question`, if one is: the datagrams to repeat and the
+    /// only address they may go to.
+    ///
+    /// `question` is the reassembled inbound frame. It is answered only when it is the same
+    /// frame the retained reply was computed over, which is both the security gate and a
+    /// correctness requirement — the reply's signature covers the whole hello, so it is not a
+    /// valid answer to any other one. An unrecognised frame leaves the entry exactly as it
+    /// was, budget included, so a third party cannot spend the repair on noise.
+    fn repeat(
+        &mut self,
+        cid: &ConnId,
+        question: &[u8],
+        now: Instant,
+    ) -> Option<(Arc<Vec<Vec<u8>>>, SocketAddr)> {
+        let entry = self.flights.get_mut(cid)?;
+        // The client has demonstrably heard us, or has run out of time to ask. Either way the
+        // bytes are dead weight and the reclaim happens here rather than waiting for a sweep.
+        if entry.flight.delivered.load(Ordering::Relaxed) || now >= entry.expires_at {
+            self.flights.remove(cid);
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(question);
+        let asked: [u8; 32] = hasher.finalize().into();
+        // Constant-time, though neither side of this comparison is a secret: it is a digest
+        // of a message that crossed the wire in clear. It costs nothing here and it keeps the
+        // rule — comparisons on inbound material are constant-time — from needing an
+        // exception that a later reader has to re-derive.
+        if !bool::from(asked.ct_eq(&entry.flight.question)) {
+            return None;
+        }
+        let datagrams = entry.flight.datagrams.clone();
+        let peer = entry.flight.peer;
+        entry.repeats_left -= 1;
+        if entry.repeats_left == 0 {
+            self.flights.remove(cid);
+        }
+        Some((datagrams, peer))
+    }
+
+    /// Drop every entry whose client has been heard from or whose window has closed.
+    ///
+    /// Runs on the demux's own clock, because both of those things happen without any
+    /// datagram arriving for the entry in question — a client that hears the reply sends its
+    /// next packet under a rotated connection id, and one that gives up sends nothing at all.
+    fn sweep(&mut self, now: Instant) {
+        self.flights
+            .retain(|_, e| !e.flight.delivered.load(Ordering::Relaxed) && now < e.expires_at);
+    }
+}
 
 /// Per-source-IP in-flight handshake counter (H-2 defense-in-depth). Bounds how many
 /// concurrent un-established handshakes a single source IP can hold once it has cleared the
@@ -643,6 +844,9 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
     // being the only one that still fires when the peers have all gone — with the hard
     // `MAX_ROUTES` cap as a backstop, so a fresh-CID spray cannot grow it unboundedly.
     let mut routes = RouteTable::new(listener.active_routes.clone());
+    // PROTOCOL § 6.1: the reply flights this listener can still repeat. Bounded by count, by
+    // time, and by each client's own first authenticated packet — see [`FlightTable`].
+    let mut flights = FlightTable::new();
     // Per-source-IP in-flight handshake counter (H-2). Incremented when a slot is committed
     // to an address-validated source, decremented when that handshake task finishes.
     let mut pending = PendingByIp::new();
@@ -655,7 +859,7 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
     // every window CID → the session's channel so the client's post-handshake
     // CID_0.. datagrams route to it (N:1). Same fire-and-forget pattern as the
     // reap channel above.
-    let (register_tx, mut register_rx) = mpsc::unbounded_channel::<CidWindowRegistration>();
+    let (register_tx, mut register_rx) = mpsc::unbounded_channel::<SessionRegistration>();
     // ε / WIRE v5: a session whose peer migrated signals a one-step inbound
     // CID-window slide here (post-AEAD, from handle_packet via the session's
     // slide channel). The demux registers the new leading-edge CID and drops the
@@ -704,8 +908,15 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
             // window so its client's CID_0.. datagrams route to it. Processed
             // before reading more datagrams (biased select) so the window is in
             // place by the time the client's first CID_0 frame could arrive.
-            Some((cids, tx, owner)) = register_rx.recv() => {
-                routes.register_window(&cids, &tx, owner);
+            Some(reg) = register_rx.recv() => {
+                routes.register_window(&reg.cids, &reg.tx, reg.owner);
+                // PROTOCOL § 6.1: and retain this session's reply, so a client whose copy
+                // was lost gets the same bytes back when it asks again. Same arm as the
+                // window for the same reason — both must be in place before the next
+                // datagram for this connection is read.
+                if let Some(flight) = reg.flight {
+                    flights.retain(reg.bootstrap_cid, flight, Instant::now());
+                }
                 continue;
             }
             // ε / WIRE v5: slide a session's inbound CID window as its peer
@@ -732,6 +943,11 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
             // it a queue bound added to stop a stall would have installed a leak.
             _ = route_sweep.tick() => {
                 routes.reap_dead();
+                // PROTOCOL § 6.1: the same argument, for the same reason. A retained flight
+                // ends when its client is heard from or when its window closes, and neither
+                // of those arrives as a datagram on that connection — the client that heard
+                // us moves to a rotated CID, and the one that gave up sends nothing.
+                flights.sweep(Instant::now());
                 continue;
             }
             r = listener.socket.recv_from(&mut buf) => match r {
@@ -739,19 +955,41 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
                 Err(e) => { log::warn!("PhantomUdpListener: recv_from: {e}"); continue; }
             },
         };
-        let (hdr, frame) = match push_datagram(&mut asm, &buf[..n]) {
-            Ok((h, Some(f))) => (h, f),
-            Ok((_h, None)) => continue, // partial fragment buffered
-            Err(_) => continue,         // malformed; drop (anti-DoS noise floor)
+        let (hdr, assembled) = match push_datagram(&mut asm, &buf[..n]) {
+            Ok(v) => v,
+            Err(_) => continue, // malformed; drop (anti-DoS noise floor)
         };
-        // Existing connection: deliver the inner frame.
-        if let Some(tx) = routes.get(&hdr.cid) {
-            let dead = tx.try_send((Bytes::from(frame), peer)).is_err() && tx.is_closed();
-            if dead {
-                routes.remove_if_dead(&hdr.cid);
-            }
-            continue;
+        // A handshake-type datagram arriving on a route that is already committed is a client
+        // repeating its flight — the thing this demux used to swallow. Counting it is the
+        // observability an investigation into lost connects could not get: it is what
+        // separates "one reply flight went missing downstream" from "the path fell silent
+        // both ways", and no artifact on either side could tell those apart. Unlabeled and
+        // per-listener, never per peer (the cardinality contract in `observability/attrs.rs`).
+        //
+        // Counted per datagram and before reassembly completes, because a flight that arrives
+        // in pieces is still a flight that arrived; and only for `Initial`, so the data path
+        // pays one comparison rather than a second hash lookup.
+        let on_committed_route = hdr.ty == PacketType::Initial && routes.get(&hdr.cid).is_some();
+        if on_committed_route {
+            listener.observability.record_initial_on_committed_route();
         }
+        let Some(frame) = assembled else {
+            continue; // partial fragment buffered
+        };
+        // PROTOCOL § 6.1: if this is the same question the retained reply answers, send that
+        // reply again, byte for byte, to the address it went to the first time. Ahead of
+        // route delivery because the session's pump does not parse handshake messages and
+        // would drop it — which is precisely how a single lost reply used to cost a connect.
+        if on_committed_route {
+            if let Some((datagrams, dst)) = flights.repeat(&hdr.cid, &frame, Instant::now()) {
+                send_flight_repeat(&listener.socket, &datagrams, dst).await;
+                continue;
+            }
+        }
+        // Existing connection: deliver the inner frame.
+        let Some(frame) = routes.deliver(&hdr.cid, frame, peer) else {
+            continue;
+        };
         // New connection: only an Initial (handshake) starts one.
         if hdr.ty != PacketType::Initial {
             continue; // unknown OneRtt/Retry -> drop
@@ -831,6 +1069,22 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
     }
 }
 
+/// Repeat a retained reply flight to `dst` (PROTOCOL § 6.1).
+///
+/// The datagrams are sent exactly as they were built the first time — same fragment ids,
+/// same chunk indices, same bytes — because that is what makes this a repeat rather than a
+/// second answer. Re-deriving the reply would draw fresh KEM randomness and a fresh session
+/// id, producing a valid `ServerHello` for a session this server never committed.
+///
+/// `dst` comes from the retained flight, never from the datagram that triggered the repeat,
+/// which is what keeps this off the list of things that can be pointed at a third party.
+/// Best-effort: a socket error is dropped, and the client's next repetition asks again.
+async fn send_flight_repeat(socket: &UdpSocket, datagrams: &[Vec<u8>], dst: SocketAddr) {
+    for d in datagrams {
+        let _ = socket.send_to(d, dst).await;
+    }
+}
+
 /// Send a stateless `HelloRetryRequest` (a cookie demand) to `peer` for `cid` without
 /// committing any per-connection state (H-2). Handshake messages ride the `Initial`
 /// (long-header) envelope, exactly as the per-connection task's Retry does; an HRR is small,
@@ -866,7 +1120,7 @@ fn spawn_handshake_task(
     // clone for the bootstrap route); on success the task hands it to the demux
     // paired with the rotating-CID window so those CIDs route to this session.
     tx: mpsc::Sender<(Bytes, SocketAddr)>,
-    register_tx: mpsc::UnboundedSender<CidWindowRegistration>,
+    register_tx: mpsc::UnboundedSender<SessionRegistration>,
     // Handed to the established session so it can signal inbound-window slides as the
     // peer migrates (ε / WIRE v5) and release its routes when it ends (WIRE v8).
     // Carries the identity this listener assigned those routes.
@@ -903,8 +1157,18 @@ fn spawn_handshake_task(
                 // client's post-handshake rotating CID_0.. datagrams route to it
                 // (sent BEFORE moving `server_session` into the API session). The
                 // bootstrap CID stays until the route is reaped on disconnect.
-                let _ =
-                    register_tx.send((server_session.inbound_window_cids(), tx, demux_link.owner));
+                //
+                // PROTOCOL § 6.1: the reply this handshake sent rides along, so the demux can
+                // repeat it if the client's copy was lost. Taken from the transport here, on
+                // the success arm only — a handshake that failed sent no answer worth
+                // repeating, and one that is still running is still reading its own channel.
+                let _ = register_tx.send(SessionRegistration {
+                    cids: server_session.inbound_window_cids(),
+                    tx,
+                    owner: demux_link.owner,
+                    bootstrap_cid: cid,
+                    flight: transport.take_handshake_flight(),
+                });
                 // ε / WIRE v5 + WIRE v8: give the session its end of the demux
                 // so it can advance its inbound CID window as the peer migrates, and
                 // release its routes when it ends.
@@ -1010,6 +1274,649 @@ mod tests {
 
     fn empty_table() -> RouteTable {
         RouteTable::new(Arc::new(AtomicUsize::new(0)))
+    }
+
+    /// A retained reply flight standing in for a real `ServerHello`: `datagrams` bytes of
+    /// answer to a `question_bytes`-byte hello, sized so the amplification bound is
+    /// satisfied unless a test deliberately breaks it.
+    fn test_flight(question: &[u8], answer: Vec<Vec<u8>>) -> HandshakeFlight {
+        let mut hasher = Sha256::new();
+        hasher.update(question);
+        let digest: [u8; 32] = hasher.finalize().into();
+        let wire_bytes = answer.iter().map(Vec::len).sum();
+        HandshakeFlight {
+            datagrams: Arc::new(answer),
+            peer: "203.0.113.7:41000".parse().expect("a peer address"),
+            question: digest,
+            wire_bytes,
+            question_bytes: question.len(),
+            delivered: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The server repeats its reply exactly as many times as the client repeats its
+    /// question, and that is a coupling rather than a coincidence.
+    ///
+    /// The two constants live in different files: the client's retransmission schedule is in
+    /// the transport, the server's repeat budget is in the listener, and neither can see the
+    /// other. A budget below the client's count leaves its last questions unanswered on
+    /// exactly the paths the repair exists for; a budget above it offers work nobody will
+    /// ask for, and every repeat is something an on-path attacker can trigger by replaying a
+    /// captured hello. So the count is walked out of the schedule itself and compared, and a
+    /// later edit to either side turns this red rather than showing up as a connect that
+    /// fails only when a datagram goes missing.
+    #[test]
+    fn the_repeat_budget_matches_the_clients_retransmit_schedule() {
+        let client_repeats = crate::api::udp_transport::handshake_retransmit_count();
+        assert_eq!(
+            MAX_FLIGHT_REPEATS, client_repeats,
+            "the server answers {MAX_FLIGHT_REPEATS} repeats while the client sends \
+             {client_repeats}; the two must be the same number, derived from the client's \
+             schedule and not restated"
+        );
+    }
+
+    /// A repeat is owed to the question the reply was computed for, and to no other.
+    ///
+    /// This is the security gate and a correctness requirement at once. The reply's signature
+    /// covers the whole `ClientHello` (Invariant 7), so the retained bytes are a valid answer
+    /// to that hello and would be rejected by the client's own transcript check if sent in
+    /// answer to a different one. And requiring the exact frame means a peer that wants a
+    /// repeat has to possess the hello that produced it — which it can only have by being the
+    /// client, or by being on the path and having captured it. Neither of those is a source
+    /// an unrepeated reply would have protected against.
+    ///
+    /// Deleting the comparison — repeating for any handshake datagram that lands on a
+    /// committed route — is the naive version of this mechanism, and it is what the second
+    /// half fails against.
+    #[test]
+    fn a_repeat_answers_only_the_question_its_reply_was_computed_for() {
+        let now = Instant::now();
+        let mut table = FlightTable::new();
+        let question = vec![0xA5u8; 3000];
+        let answer = vec![vec![0x11u8; 1200], vec![0x22u8; 1200]];
+        assert!(table.retain(cid(1), test_flight(&question, answer.clone()), now));
+
+        let (repeated, dst) = table
+            .repeat(&cid(1), &question, now)
+            .expect("the same question is answered");
+        assert_eq!(
+            *repeated, answer,
+            "a repeat must be the bytes that were already sent — re-deriving the reply would \
+             draw fresh KEM randomness and a fresh session id, producing a valid ServerHello \
+             for a session this server never committed"
+        );
+        assert_eq!(
+            dst,
+            "203.0.113.7:41000".parse::<SocketAddr>().expect("addr"),
+            "a repeat goes to the address the original went to, which is why it cannot be \
+             pointed at a third party: the destination comes from the server's own record of \
+             a completed handshake and never from the datagram that triggered it"
+        );
+
+        let mut altered = question.clone();
+        altered[0] ^= 0x01;
+        assert!(
+            table.repeat(&cid(1), &altered, now).is_none(),
+            "a hello that differs by one byte is a different question; answering it with \
+             this reply would send a signature the client is obliged to reject"
+        );
+        assert!(
+            table.repeat(&cid(1), b"not a hello at all", now).is_none(),
+            "and arbitrary bytes on the connection draw nothing"
+        );
+        assert!(
+            table.repeat(&cid(2), &question, now).is_none(),
+            "nor does the right question on the wrong connection"
+        );
+    }
+
+    /// An unrecognised frame must not spend the repair.
+    ///
+    /// The budget exists to bound what a replayed hello can cost; if a mismatched frame
+    /// consumed it, anyone able to send datagrams at a guessed connection id could exhaust
+    /// the repair with noise and leave the real client's question unanswered — turning a
+    /// defence against amplification into a way to suppress the repair.
+    #[test]
+    fn a_question_that_does_not_match_leaves_the_budget_untouched() {
+        let now = Instant::now();
+        let mut table = FlightTable::new();
+        let question = vec![0x5Au8; 2000];
+        assert!(table.retain(cid(3), test_flight(&question, vec![vec![0u8; 1000]]), now));
+
+        for _ in 0..(MAX_FLIGHT_REPEATS * 10) {
+            assert!(table.repeat(&cid(3), b"noise", now).is_none());
+        }
+        for n in 1..=MAX_FLIGHT_REPEATS {
+            assert!(
+                table.repeat(&cid(3), &question, now).is_some(),
+                "repeat {n} of {MAX_FLIGHT_REPEATS} must survive the noise before it"
+            );
+        }
+    }
+
+    /// The repeat budget is spent, and then the flight is gone.
+    ///
+    /// Both halves matter and they are the same statement about a bound: the listener answers
+    /// a fixed number of repeats, and having answered them it stops holding the kilobytes.
+    /// A budget that was enforced but never released the entry would leave the memory bound
+    /// resting on the deadline alone.
+    #[test]
+    fn the_repeat_budget_is_spent_and_the_flight_released() {
+        let now = Instant::now();
+        let mut table = FlightTable::new();
+        let question = vec![0x3Cu8; 2000];
+        assert!(table.retain(cid(4), test_flight(&question, vec![vec![0u8; 1500]]), now));
+
+        for n in 1..=MAX_FLIGHT_REPEATS {
+            assert!(
+                table.repeat(&cid(4), &question, now).is_some(),
+                "repeat {n} is inside the budget of {MAX_FLIGHT_REPEATS}"
+            );
+        }
+        assert!(
+            table.repeat(&cid(4), &question, now).is_none(),
+            "the {}th repeat is past the budget and must not be sent",
+            MAX_FLIGHT_REPEATS + 1
+        );
+        assert!(
+            table.flights.is_empty(),
+            "a spent flight must be released, not merely refused: otherwise the memory bound \
+             rests on the deadline alone"
+        );
+    }
+
+    /// The client has been heard from, so the answer it was owed is dead weight.
+    ///
+    /// An inbound packet that AEAD-opens can only have been produced from the session keys
+    /// the reply carried, so the latch is proof of receipt that nothing off-path can forge —
+    /// which is why it is allowed to end the retention early. Both routes out are checked:
+    /// the next repeat request, and the demux's own sweep, because a client that heard the
+    /// reply sends its next datagram under a rotated connection id and so never touches this
+    /// entry again.
+    #[test]
+    fn an_authenticated_inbound_packet_releases_the_retained_flight() {
+        let now = Instant::now();
+        let question = vec![0x77u8; 2000];
+
+        let mut table = FlightTable::new();
+        let flight = test_flight(&question, vec![vec![0u8; 1500]]);
+        let latch = flight.delivered.clone();
+        assert!(table.retain(cid(5), flight, now));
+        latch.store(true, Ordering::Relaxed);
+        assert!(
+            table.repeat(&cid(5), &question, now).is_none(),
+            "a client that has proved it received the reply is not owed another copy"
+        );
+        assert!(table.flights.is_empty(), "and the bytes go with the answer");
+
+        let mut table = FlightTable::new();
+        let flight = test_flight(&question, vec![vec![0u8; 1500]]);
+        let latch = flight.delivered.clone();
+        assert!(table.retain(cid(6), flight, now));
+        latch.store(true, Ordering::Relaxed);
+        table.sweep(now);
+        assert!(
+            table.flights.is_empty(),
+            "the sweep must reclaim it too — the client that heard us moves to a rotated \
+             connection id, so nothing will ever arrive on this entry to reclaim it lazily"
+        );
+    }
+
+    /// A retained flight outlives the client's last question by nothing.
+    ///
+    /// The window is the client's own retransmission budget, so at its far end there is by
+    /// construction nobody left to answer. Both the repeat path and the sweep enforce it,
+    /// because a peer that has gone produces neither.
+    #[test]
+    fn a_retained_flight_expires_on_its_own_deadline() {
+        let now = Instant::now();
+        let question = vec![0x11u8; 2000];
+        let mut table = FlightTable::new();
+        assert!(table.retain(cid(7), test_flight(&question, vec![vec![0u8; 1500]]), now));
+
+        let just_inside = now + HANDSHAKE_FLIGHT_RETENTION - Duration::from_millis(1);
+        assert!(
+            table.repeat(&cid(7), &question, just_inside).is_some(),
+            "a question that arrives inside the window is still answered"
+        );
+
+        let past = now + HANDSHAKE_FLIGHT_RETENTION;
+        assert!(
+            table.repeat(&cid(7), &question, past).is_none(),
+            "past the window the client has already abandoned the connect; an answer sent \
+             then is pure waste"
+        );
+        assert!(table.flights.is_empty());
+
+        let mut table = FlightTable::new();
+        assert!(table.retain(cid(8), test_flight(&question, vec![vec![0u8; 1500]]), now));
+        table.sweep(past);
+        assert!(
+            table.flights.is_empty(),
+            "and the sweep expires it with no datagram of any kind arriving"
+        );
+    }
+
+    /// The retention table does not grow past its bound, and the bound is the memory this
+    /// repair costs.
+    ///
+    /// A retained flight is several kilobytes committed for a peer that has cleared the
+    /// cookie round but has not yet proved it received anything, and how many such peers
+    /// exist at once is not something this listener chooses. So the cap is enforced, the
+    /// newcomer is refused rather than an incumbent evicted — an incumbent may be a session
+    /// whose client is already repeating its question — and space comes back only when
+    /// entries genuinely end.
+    #[test]
+    fn the_retention_table_refuses_to_grow_past_its_bound() {
+        let now = Instant::now();
+        let mut table = FlightTable::new();
+        let question = vec![0x2Bu8; 2000];
+        for i in 0..MAX_RETAINED_FLIGHTS {
+            let key = (i as u64).to_be_bytes();
+            assert!(
+                table.retain(key, test_flight(&question, vec![vec![0u8; 1500]]), now),
+                "entry {i} is inside the cap of {MAX_RETAINED_FLIGHTS}"
+            );
+        }
+        assert_eq!(table.flights.len(), MAX_RETAINED_FLIGHTS);
+
+        let overflow = u64::MAX.to_be_bytes();
+        assert!(
+            !table.retain(overflow, test_flight(&question, vec![vec![0u8; 1500]]), now),
+            "past the cap a flight is simply not retained: the handshake still completes, it \
+             just has no repair"
+        );
+        assert!(
+            table.flights.len() == MAX_RETAINED_FLIGHTS && !table.flights.contains_key(&overflow),
+            "and the refusal must not have displaced an incumbent, which may be a session \
+             whose client is repeating its question right now"
+        );
+
+        // Space comes back when entries end, not before.
+        let past = now + HANDSHAKE_FLIGHT_RETENTION;
+        assert!(
+            table.retain(
+                overflow,
+                test_flight(&question, vec![vec![0u8; 1500]]),
+                past
+            ),
+            "once the incumbents' windows have closed the newcomer is admitted"
+        );
+    }
+
+    /// A reply large enough to make this listener a useful amplifier is never retained.
+    ///
+    /// RFC 9000 § 8.2 in one line, checked once at retention so no repeat has to carry it.
+    /// Today the real ratio is far inside the limit — a repeat is only ever owed to a peer
+    /// that sent the whole hello again, so it is the same ratio the first exchange already
+    /// had — and this is what keeps that true if the reply grows or the hello shrinks.
+    #[test]
+    fn a_reply_that_would_amplify_is_never_retained() {
+        let now = Instant::now();
+        let mut table = FlightTable::new();
+        let question = vec![0u8; 1000];
+
+        let at_the_limit = vec![vec![0u8; 1000]; FLIGHT_AMPLIFICATION_LIMIT];
+        assert!(
+            table.retain(cid(9), test_flight(&question, at_the_limit), now),
+            "exactly {FLIGHT_AMPLIFICATION_LIMIT}× what triggered it is inside the limit"
+        );
+
+        let mut over = vec![vec![0u8; 1000]; FLIGHT_AMPLIFICATION_LIMIT];
+        over.push(vec![0u8; 1]);
+        assert!(
+            !table.retain(cid(10), test_flight(&question, over), now),
+            "one byte past it is refused: a listener that answers a small datagram with a \
+             large one is a reflector, whoever asked"
+        );
+        assert!(!table.flights.contains_key(&cid(10)));
+    }
+
+    /// The `ServerHello` this build actually sends is well inside the amplification limit.
+    ///
+    /// The bound above is a runtime refusal, which means a reply that outgrew it would stop
+    /// being retained and the repair would quietly stop working — green tests, connects
+    /// failing on lossy paths exactly as before. This measures the real messages instead:
+    /// the frozen `ClientHello` and `ServerHello` wire vectors, enveloped as the transport
+    /// envelopes them, so the ratio in the constant's documentation is a fact about this
+    /// tree rather than a recollection.
+    #[test]
+    fn the_real_reply_is_well_inside_the_amplification_limit() {
+        use crate::transport::phantom_udp::datagram::encode_datagrams;
+
+        let hello = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/wire_vectors/client_hello_full.bin"
+        ))
+        .expect("the frozen ClientHello vector");
+        let reply = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/wire_vectors/server_hello.bin"
+        ))
+        .expect("the frozen ServerHello vector");
+        // The reply carries the discriminant byte of `ServerReply` ahead of the borsh body.
+        let reply_frame_len = reply.len() + 1;
+
+        let question_bytes: usize = encode_datagrams(PacketType::Initial, &cid(1), 0, &hello)
+            .expect("the hello fragments")
+            .iter()
+            .map(Vec::len)
+            .sum();
+        let answer_bytes: usize =
+            encode_datagrams(PacketType::Initial, &cid(1), 0, &vec![0u8; reply_frame_len])
+                .expect("the reply fragments")
+                .iter()
+                .map(Vec::len)
+                .sum();
+
+        assert!(
+            answer_bytes <= question_bytes * FLIGHT_AMPLIFICATION_LIMIT,
+            "the reply this build sends ({answer_bytes} wire bytes) must stay inside \
+             {FLIGHT_AMPLIFICATION_LIMIT}× the hello that triggers it ({question_bytes} wire \
+             bytes), or it stops being retained and the repair silently stops working"
+        );
+    }
+
+    /// A UDP relay between a client and `server_addr` that swallows the **first**
+    /// fragmented server→client flight and forwards everything else untouched.
+    ///
+    /// Only one message in this handshake fragments — the `ServerHello` is thousands of
+    /// bytes against a `HelloRetryRequest`'s tens — so "the first fragmented downstream
+    /// flight" names the reply the connect turns on, without the relay having to parse a
+    /// handshake message or hold a key. The drop is addressed by fragment identity rather
+    /// than by a clock or a coin: the count comes from the flight's own `total_chunks`
+    /// field, so exactly one flight goes missing however many datagrams it is made of, and
+    /// every later flight — including the repair — arrives.
+    ///
+    /// Returns the address a client should connect to and how many datagrams were
+    /// swallowed, so a test can assert the loss it asked for actually happened rather than
+    /// passing because the path was clean.
+    async fn spawn_flight_swallowing_relay(
+        server_addr: SocketAddr,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        use crate::transport::phantom_udp::envelope::{decode_header, FRAG_SUBHDR_LEN};
+
+        let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("relay socket");
+        let relay_addr = downstream.local_addr().expect("relay addr");
+        let upstream = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("relay upstream");
+        upstream
+            .connect(server_addr)
+            .await
+            .expect("relay upstream connect");
+        let swallowed = Arc::new(AtomicUsize::new(0));
+        let counter = swallowed.clone();
+        tokio::spawn(async move {
+            let mut c2s = vec![0u8; crate::transport::phantom_udp::envelope::PATH_MTU + 64];
+            let mut s2c = vec![0u8; crate::transport::phantom_udp::envelope::PATH_MTU + 64];
+            let mut client: Option<SocketAddr> = None;
+            // Datagrams of the doomed flight still to be swallowed. `None` until the first
+            // fragmented downstream datagram names the size of its own flight.
+            let mut owed: Option<usize> = None;
+            loop {
+                tokio::select! {
+                    r = downstream.recv_from(&mut c2s) => {
+                        let Ok((n, from)) = r else { continue };
+                        client = Some(from);
+                        let _ = upstream.send(&c2s[..n]).await;
+                    }
+                    r = upstream.recv(&mut s2c) => {
+                        let Ok(n) = r else { continue };
+                        let datagram = &s2c[..n];
+                        if let Ok((hdr, rest)) = decode_header(datagram) {
+                            if hdr.fragmented && rest.len() >= FRAG_SUBHDR_LEN {
+                                let total = u16::from_be_bytes([rest[6], rest[7]]) as usize;
+                                let left = owed.get_or_insert(total);
+                                if *left > 0 {
+                                    *left -= 1;
+                                    counter.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(c) = client {
+                            let _ = downstream.send_to(datagram, c).await;
+                        }
+                    }
+                }
+            }
+        });
+        (relay_addr, swallowed)
+    }
+
+    /// A UDP relay that forwards both directions untouched and keeps a copy of every
+    /// client→server handshake datagram, grouped by the fragment id that identifies the
+    /// flight it belongs to.
+    ///
+    /// It exists so a test can play the part of an on-path attacker with perfect capture:
+    /// the strongest position anyone can be in against this mechanism, since the repeat gate
+    /// is possession of the exact hello.
+    #[allow(clippy::type_complexity)]
+    async fn spawn_recording_relay(
+        server_addr: SocketAddr,
+    ) -> (
+        SocketAddr,
+        Arc<parking_lot::Mutex<HashMap<u32, Vec<Vec<u8>>>>>,
+    ) {
+        use crate::transport::phantom_udp::envelope::{decode_header, FRAG_SUBHDR_LEN};
+
+        let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("relay socket");
+        let relay_addr = downstream.local_addr().expect("relay addr");
+        let upstream = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("relay upstream");
+        upstream
+            .connect(server_addr)
+            .await
+            .expect("relay upstream connect");
+        let captured: Arc<parking_lot::Mutex<HashMap<u32, Vec<Vec<u8>>>>> =
+            Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let sink = captured.clone();
+        tokio::spawn(async move {
+            let mut c2s = vec![0u8; crate::transport::phantom_udp::envelope::PATH_MTU + 64];
+            let mut s2c = vec![0u8; crate::transport::phantom_udp::envelope::PATH_MTU + 64];
+            let mut client: Option<SocketAddr> = None;
+            loop {
+                tokio::select! {
+                    r = downstream.recv_from(&mut c2s) => {
+                        let Ok((n, from)) = r else { continue };
+                        client = Some(from);
+                        let datagram = &c2s[..n];
+                        if let Ok((hdr, rest)) = decode_header(datagram) {
+                            if hdr.ty == PacketType::Initial
+                                && hdr.fragmented
+                                && rest.len() >= FRAG_SUBHDR_LEN
+                            {
+                                let pid = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+                                sink.lock().entry(pid).or_default().push(datagram.to_vec());
+                            }
+                        }
+                        let _ = upstream.send(datagram).await;
+                    }
+                    r = upstream.recv(&mut s2c) => {
+                        let Ok(n) = r else { continue };
+                        if let Some(c) = client {
+                            let _ = downstream.send_to(&s2c[..n], c).await;
+                        }
+                    }
+                }
+            }
+        });
+        (relay_addr, captured)
+    }
+
+    /// A repeat never goes to whoever triggered it.
+    ///
+    /// This is the whole amplification argument in one test. The gate on repeating is
+    /// possession of the exact hello, so the strongest attacker against it is one that sat on
+    /// the path and captured the flight verbatim — and even that attacker gets nothing back,
+    /// because the destination of a repeat comes from the server's record of a completed
+    /// handshake and not from the datagram that asked for it. The address in that record
+    /// belongs to a peer that echoed an IP-bound cookie (`udp_admit` is unconditional over
+    /// UDP), which is exactly what proves it is a real source rather than a spoofed one.
+    ///
+    /// The counter is what stops this being vacuous. Without it the test would pass equally
+    /// against a listener that dropped the replay on the floor for some entirely different
+    /// reason — a mistyped connection id, a relay that never forwarded. A non-zero count says
+    /// the datagrams reached the branch that decides whether to repeat, and chose not to send
+    /// anything here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeat_is_never_sent_to_the_source_that_triggered_it() {
+        let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+            .await
+            .expect("bind a loopback PhantomUDP listener");
+        let server_addr: SocketAddr = listener.local_addr().parse().expect("the bound address");
+        let pinned = listener.verifying_key_bytes();
+
+        let acceptor = listener.clone();
+        let accepted = tokio::spawn(async move { acceptor.accept().await });
+
+        let (relay_addr, captured) = spawn_recording_relay(server_addr).await;
+        let client = crate::api::session::connect_pinned_udp(
+            "127.0.0.1".to_string(),
+            relay_addr.port(),
+            pinned,
+        )
+        .await
+        .expect("the client socket binds");
+        client.await_ready().await.expect("the handshake completes");
+        let outcome = accepted
+            .await
+            .expect("the accept task")
+            .expect("an accepted session");
+
+        // The last flight the client sent is the cookie-bearing hello the reply answers;
+        // fragment ids are allocated in order, so the highest is the most recent.
+        let flight = {
+            let seen = captured.lock();
+            let newest = seen
+                .keys()
+                .copied()
+                .max()
+                .expect("a captured client flight");
+            seen.get(&newest).cloned().expect("its datagrams")
+        };
+        assert!(
+            flight.len() > 1,
+            "the captured hello must be the fragmented one — a single datagram would mean the \
+             recording caught the wrong message"
+        );
+
+        let before = listener.metrics_snapshot().initial_on_committed_route_total;
+        let attacker = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("attacker socket");
+        attacker
+            .connect(server_addr)
+            .await
+            .expect("attacker connect");
+        for d in &flight {
+            attacker.send(d).await.expect("replay a captured datagram");
+        }
+
+        // Nothing may come back to this socket. A generous window, because the assertion is
+        // "never" and the only way to get that wrong is to wait too little.
+        let mut buf = vec![0u8; crate::transport::phantom_udp::envelope::PATH_MTU + 64];
+        let heard = tokio::time::timeout(Duration::from_secs(2), attacker.recv(&mut buf)).await;
+        assert!(
+            heard.is_err(),
+            "a source that replayed a captured hello received {:?} back; a repeat must only \
+             ever go to the address the original reply went to",
+            heard.map(|r| r.map(|n| format!("{n} bytes")))
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while listener.metrics_snapshot().initial_on_committed_route_total == before
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            listener.metrics_snapshot().initial_on_committed_route_total > before,
+            "the replayed datagrams must have reached the branch that decides whether to \
+             repeat; if they did not, this test asserts nothing about that branch"
+        );
+
+        // And the session the attacker was aiming at is undisturbed.
+        let server = outcome.session();
+        client.send(b"ping".to_vec()).await.expect("client write");
+        let echoed = tokio::time::timeout(Duration::from_secs(10), server.recv())
+            .await
+            .expect("the session still carries data")
+            .expect("a frame");
+        assert_eq!(echoed, b"ping".to_vec());
+
+        listener.shutdown();
+    }
+
+    /// A `ServerHello` flight lost on the way down costs a retransmit, not the connect.
+    ///
+    /// Nothing under the handshake is reliable and the reply is the largest thing in it —
+    /// six datagrams of the thirteen a PhantomUDP handshake spends — so the reply flight is
+    /// where a lossy path most often takes the exchange. The client already repairs its own
+    /// half: it repeats its flight on a 1 s / 3 s / 7 s schedule. What that repetition used
+    /// to buy was nothing, because the demux routes by connection id before it looks at a
+    /// datagram's type, so a repeated hello landed in the established session's inbound
+    /// channel and was dropped by a pump that does not parse handshake messages. The server
+    /// had no trigger to answer again, and one lost datagram out of six was an
+    /// unrecoverable connect.
+    ///
+    /// The assertion is the connect completing, and the swallowed count is what makes it
+    /// mean something: a version of this test whose relay forwarded everything would pass
+    /// against a server with no repair at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_server_hello_flight_is_repaired_by_the_repeated_client_flight() {
+        let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+            .await
+            .expect("bind a loopback PhantomUDP listener");
+        let server_addr: SocketAddr = listener.local_addr().parse().expect("the bound address");
+        let pinned = listener.verifying_key_bytes();
+
+        let acceptor = listener.clone();
+        let accepted = tokio::spawn(async move { acceptor.accept().await });
+
+        let (relay_addr, swallowed) = spawn_flight_swallowing_relay(server_addr).await;
+        let client = crate::api::session::connect_pinned_udp(
+            "127.0.0.1".to_string(),
+            relay_addr.port(),
+            pinned,
+        )
+        .await
+        .expect("the client socket binds");
+
+        client
+            .await_ready()
+            .await
+            .expect("the handshake completes even though its reply flight was lost");
+
+        let lost = swallowed.load(Ordering::Relaxed);
+        assert!(
+            lost > 0,
+            "the relay must actually have swallowed a flight; against a clean path this \
+             test asserts nothing"
+        );
+        assert!(
+            listener.metrics_snapshot().initial_on_committed_route_total > 0,
+            "the repeated client flight must be visible to an operator: this counter is the \
+             only thing that distinguishes a reply lost on the way down from a path that \
+             went silent in both directions"
+        );
+
+        let outcome = accepted
+            .await
+            .expect("the accept task")
+            .expect("an accepted session");
+        let server = outcome.session();
+        client.send(b"ping".to_vec()).await.expect("client write");
+        let echoed = tokio::time::timeout(Duration::from_secs(10), server.recv())
+            .await
+            .expect("the repaired session carries data")
+            .expect("a frame");
+        assert_eq!(echoed, b"ping".to_vec());
+
+        listener.shutdown();
     }
 
     /// One retirement costs one session's own route set, and that set has a ceiling

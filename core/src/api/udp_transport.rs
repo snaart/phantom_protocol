@@ -16,8 +16,9 @@ use crate::transport::phantom_udp::envelope::{ConnId, PacketType, PATH_MTU};
 use crate::transport::phantom_udp::envelope::HDR_LEN;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -79,7 +80,7 @@ const HANDSHAKE_INITIAL_RTO: Duration = Duration::from_secs(1);
 /// loop gives up on the first read that fails rather than on the fourth.
 ///
 /// [`CLIENT_HANDSHAKE_DEADLINE`]: crate::api::session::CLIENT_HANDSHAKE_DEADLINE
-const HANDSHAKE_RETRANSMIT_BUDGET: Duration = Duration::from_secs(8);
+pub(crate) const HANDSHAKE_RETRANSMIT_BUDGET: Duration = Duration::from_secs(8);
 
 // The budget is only meaningful if it really is inside the deadline it is sized against;
 // a later edit to either constant that inverts them is a compile error rather than a
@@ -114,6 +115,36 @@ fn next_handshake_wait(attempt: u32, spent: Duration) -> Option<Duration> {
         .checked_mul(doublings)
         .unwrap_or(HANDSHAKE_RETRANSMIT_BUDGET);
     Some(rto.min(remaining))
+}
+
+/// How many times the Handshake-phase schedule repeats a flight before it gives up.
+///
+/// Walked out of [`next_handshake_wait`] rather than restated, because it is the number the
+/// **server's** repeat budget is sized against (PROTOCOL § 6.1): a server that answers fewer
+/// repeats than the client sends leaves the last ones unanswered, and one that answers more
+/// is offering work nobody will ask for. Restating "three" in the listener would let the two
+/// drift the moment the interval or the budget changed, and the drift would show up only as
+/// a connect that fails on a lossy path.
+///
+/// Test-only, because its whole job is to be compared against that constant: production
+/// reads the constant, and this is what makes the constant answerable to the schedule.
+#[cfg(test)]
+pub(crate) fn handshake_retransmit_count() -> u32 {
+    let mut attempt = 0u32;
+    let mut spent = Duration::ZERO;
+    let mut repeats = 0u32;
+    // Each expiry that still leaves time to be answered is one repeat; the expiry that
+    // exhausts the budget is the give-up point and repeats nothing, exactly as the receive
+    // loop spends it.
+    while let Some(wait) = next_handshake_wait(attempt, spent) {
+        spent = spent.saturating_add(wait);
+        attempt = attempt.saturating_add(1);
+        if next_handshake_wait(attempt, spent).is_none() {
+            break;
+        }
+        repeats = repeats.saturating_add(1);
+    }
+    repeats
 }
 
 const PHASE_HANDSHAKE: u8 = 0;
@@ -639,6 +670,49 @@ impl SessionTransport for UdpClientTransport {
     }
 }
 
+/// A server handshake reply exactly as it went on the wire, together with the question it
+/// answers, so the listener can repeat it if the client asks the same question again
+/// (PROTOCOL § 6.1).
+///
+/// Three things about its shape are load-bearing rather than convenient.
+///
+/// It holds **datagrams, not a message**. A repeat has to be the bytes that were already
+/// sent, not a re-derivation: `process_client_hello` draws fresh randomness for the KEM
+/// encapsulation and the session id, so running it again would produce a different, equally
+/// valid `ServerHello` for a session the server has already committed under different keys.
+/// Repeating is therefore the only safe answer, and re-deriving is the unsafe one.
+///
+/// `question` is the digest of the frame the reply answers, and it is what decides whether a
+/// repeat is owed. That is not a heuristic for "is this the same client": the reply's
+/// signature covers the whole `ClientHello` (Invariant 7), so a retained reply is a valid
+/// answer to *that* hello and to no other. A hello that differs in any byte — a fresh nonce,
+/// a different cookie — needs a fresh handshake and would be rejected by the client's own
+/// transcript check if it were answered from here. Same question, same answer; different
+/// question, no answer.
+///
+/// `delivered` is shared with the live session and set the first time an inbound packet
+/// AEAD-opens. A peer can only produce such a packet from the session keys the reply
+/// carried, so the latch is proof of receipt that nothing off-path can forge, and once it is
+/// set the retained bytes are dead weight.
+pub(crate) struct HandshakeFlight {
+    /// The reply flight as it was sent, datagram for datagram. `Arc` so repeating it costs a
+    /// refcount rather than a copy of several kilobytes on the demux thread.
+    pub(crate) datagrams: Arc<Vec<Vec<u8>>>,
+    /// The only address a repeat is ever sent to — the one the original went to. A resend is
+    /// therefore not a reflector: its destination comes from the server's own record of a
+    /// completed handshake, never from the datagram that triggered it.
+    pub(crate) peer: SocketAddr,
+    /// SHA-256 of the handshake frame this reply answers.
+    pub(crate) question: [u8; 32],
+    /// Total wire bytes of `datagrams`, kept beside them so the amplification bound can be
+    /// checked once, at retention, rather than on every repeat.
+    pub(crate) wire_bytes: usize,
+    /// Wire bytes of the question, for the same reason.
+    pub(crate) question_bytes: usize,
+    /// Set by the session the first time an inbound packet authenticates.
+    pub(crate) delivered: Arc<AtomicBool>,
+}
+
 /// Per-session server transport. The listener's demux task reassembles inbound datagrams and pushes
 /// the inner frames to `rx`; outbound frames are enveloped and sent to the captured `peer` from
 /// `send_socket`. A server migration ([`migrate_to`](Self::migrate_to)) swaps `send_socket` to a
@@ -687,6 +761,17 @@ pub struct UdpServerTransport {
     /// a spoofed (never-decrypting) datagram cannot clobber the candidate slot.
     last_recv_src: ArcSwap<Option<SocketAddr>>,
     last_frame_len: AtomicU64,
+    /// SHA-256 of the most recent frame received while still in the Handshake phase, with its
+    /// wire length — the question the next handshake-phase reply answers (PROTOCOL § 6.1).
+    /// Only the handshake task reads this channel before the phase flips, so at the moment a
+    /// reply is sent this really is the hello being replied to.
+    last_handshake_question: ArcSwap<Option<([u8; 32], usize)>>,
+    /// The most recent handshake-phase reply, retained for the listener to repeat. Taken
+    /// once, by the accept path, when the handshake succeeds; dropped with the transport on
+    /// every other path.
+    handshake_flight: parking_lot::Mutex<Option<HandshakeFlight>>,
+    /// Shared with any retained flight: set the first time an inbound packet AEAD-opens.
+    peer_authenticated: Arc<AtomicBool>,
 }
 
 impl UdpServerTransport {
@@ -712,7 +797,21 @@ impl UdpServerTransport {
             cand_sent: AtomicU64::new(0),
             last_recv_src: ArcSwap::from_pointee(None),
             last_frame_len: AtomicU64::new(0),
+            last_handshake_question: ArcSwap::from_pointee(None),
+            handshake_flight: parking_lot::Mutex::new(None),
+            peer_authenticated: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Take the retained handshake reply flight, if this transport sent one (PROTOCOL § 6.1).
+    ///
+    /// Taken rather than borrowed so exactly one holder owns the several kilobytes: the accept
+    /// path moves it into the listener's retention table when the handshake succeeds, and on
+    /// every other path it goes with the transport. A second call yields `None`, which makes
+    /// "at most one retained flight per handshake" a property of the type rather than of its
+    /// callers.
+    pub(crate) fn take_handshake_flight(&self) -> Option<HandshakeFlight> {
+        self.handshake_flight.lock().take()
     }
 
     /// Migrate the server's send path to a fresh local socket (the server-side mirror of
@@ -810,6 +909,26 @@ impl SessionTransport for UdpServerTransport {
                 .await
                 .map_err(|e| CoreError::NetworkError(format!("udp send_to: {e}")))?;
         }
+        // PROTOCOL § 6.1: keep a handshake reply as it went out, so the listener can repeat
+        // it byte for byte if the client's flight comes round again. Only the handshake phase
+        // retains: an established session's frames are carried by the ARQ, which is the
+        // mechanism this one exists to stand in for while there is none. The datagrams are
+        // moved rather than copied — they were built for this send and would otherwise be
+        // dropped here — and the question they answer is whatever `recv_bytes` last saw,
+        // which on this transport is the hello the handshake task is replying to.
+        if ty == PacketType::Initial {
+            if let Some((question, question_bytes)) = **self.last_handshake_question.load() {
+                let wire_bytes = dgrams.iter().map(Vec::len).sum();
+                *self.handshake_flight.lock() = Some(HandshakeFlight {
+                    datagrams: Arc::new(dgrams),
+                    peer,
+                    question,
+                    wire_bytes,
+                    question_bytes,
+                    delivered: self.peer_authenticated.clone(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -829,10 +948,26 @@ impl SessionTransport for UdpServerTransport {
         self.last_recv_src.store(Arc::new(Some(src)));
         self.last_frame_len
             .store(frame.len() as u64, Ordering::Relaxed);
+        // PROTOCOL § 6.1: while the handshake runs, remember what was asked. The digest is
+        // taken here rather than in the listener because this is the one place that sees the
+        // reassembled frame the reply is computed from, and it costs a hash of a few kilobytes
+        // once per handshake — never on the data path, which is what the phase gate buys.
+        if self.phase.load(Ordering::Relaxed) == PHASE_HANDSHAKE {
+            let mut hasher = Sha256::new();
+            hasher.update(&frame);
+            let digest: [u8; 32] = hasher.finalize().into();
+            self.last_handshake_question
+                .store(Arc::new(Some((digest, frame.len()))));
+        }
         Ok(frame)
     }
 
     fn confirm_authenticated_source(&self) {
+        // PROTOCOL § 6.1: an inbound packet has AEAD-opened, so the peer holds keys it could
+        // only have derived from the reply this session's handshake sent — proof of receipt
+        // that nothing off-path can forge. Latched before the same-address early return
+        // below, because whether the peer moved has nothing to do with whether it heard us.
+        self.peer_authenticated.store(true, Ordering::Relaxed);
         // M-1: the frame from `last_recv_src` just authenticated (AEAD-opened), so it really is
         // the established peer — possibly at a NEW address (migration / NAT rebind). Register it
         // as the candidate the session challenges before switching, and (re)seed its

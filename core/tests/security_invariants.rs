@@ -2420,6 +2420,184 @@ async fn udp_cookieless_initials_get_no_slot_until_address_validated() {
     );
 }
 
+/// PROTOCOL § 6.1: repeating a lost `ServerHello` must not turn the listener into an
+/// amplifier, and must never send anything to whoever asked for the repeat.
+///
+/// The repair being pinned here is the server answering a client that repeats its handshake
+/// flight, which before it existed was dropped: a single lost reply datagram cost the whole
+/// connect. The hazard it introduces is the obvious one — a ~3.5 KB question drawing a
+/// ~6.7 KB answer, now on demand rather than once — so both halves of the bound are measured
+/// against real traffic rather than argued.
+///
+/// The first half is RFC 9000 § 8.2 read as a ratio at the path: everything the server sent
+/// towards this client, including the flight the relay swallowed, against everything the
+/// client sent it. The relay swallows the first fragmented downstream flight, which is the
+/// `ServerHello` — the only message in this handshake large enough to fragment — so a repeat
+/// is genuinely required to complete the connect and the measurement covers the repair path
+/// rather than the quiet one.
+///
+/// The second half is stronger than a ratio: an off-path source that replays the captured
+/// hello verbatim — the best position anyone can occupy against a gate whose key is
+/// possession of the exact bytes — receives nothing at all. A repeat's destination comes
+/// from the server's record of a completed handshake, and the address in that record echoed
+/// an IP-bound cookie, which is what proves it is a real source. The listener's
+/// `initial_on_committed_route_total` is what keeps that half from being vacuous: it says
+/// the replay reached the branch that decides whether to repeat and chose to send nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_handshake_reply_repeat_stays_inside_the_anti_amplification_bound() {
+    use phantom_protocol::api::session::connect_pinned_udp;
+    use phantom_protocol::api::udp_listener::PhantomUdpListener;
+    use phantom_protocol::transport::phantom_udp::envelope::{
+        decode_header, PacketType, FRAG_SUBHDR_LEN, PATH_MTU,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::UdpSocket;
+
+    /// RFC 9000 § 8.2. The listener enforces this when it decides to retain a reply at all;
+    /// what is checked here is the traffic that results.
+    const AMPLIFICATION_LIMIT: usize = 3;
+
+    let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+        .await
+        .expect("bind_udp");
+    let server_addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+    let pinned = listener.verifying_key_bytes();
+    let acceptor = listener.clone();
+    let accepted = tokio::spawn(async move { acceptor.accept().await });
+
+    // Relay: counts both directions, swallows the first fragmented downstream flight, and
+    // keeps the client's handshake datagrams so they can be replayed from elsewhere.
+    let downstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = downstream.local_addr().unwrap();
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    upstream.connect(server_addr).await.unwrap();
+    let to_server = Arc::new(AtomicUsize::new(0));
+    let from_server = Arc::new(AtomicUsize::new(0));
+    let swallowed = Arc::new(AtomicUsize::new(0));
+    let captured: Arc<std::sync::Mutex<std::collections::HashMap<u32, Vec<Vec<u8>>>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    {
+        let (up, down) = (to_server.clone(), from_server.clone());
+        let lost = swallowed.clone();
+        let sink = captured.clone();
+        tokio::spawn(async move {
+            let mut c2s = vec![0u8; PATH_MTU + 64];
+            let mut s2c = vec![0u8; PATH_MTU + 64];
+            let mut client: Option<std::net::SocketAddr> = None;
+            let mut owed: Option<usize> = None;
+            loop {
+                tokio::select! {
+                    r = downstream.recv_from(&mut c2s) => {
+                        let Ok((n, from)) = r else { continue };
+                        client = Some(from);
+                        up.fetch_add(n, Ordering::Relaxed);
+                        let datagram = &c2s[..n];
+                        if let Ok((hdr, rest)) = decode_header(datagram) {
+                            if hdr.ty == PacketType::Initial
+                                && hdr.fragmented
+                                && rest.len() >= FRAG_SUBHDR_LEN
+                            {
+                                let pid = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+                                sink.lock()
+                                    .unwrap()
+                                    .entry(pid)
+                                    .or_default()
+                                    .push(datagram.to_vec());
+                            }
+                        }
+                        let _ = upstream.send(datagram).await;
+                    }
+                    r = upstream.recv(&mut s2c) => {
+                        let Ok(n) = r else { continue };
+                        down.fetch_add(n, Ordering::Relaxed);
+                        let datagram = &s2c[..n];
+                        if let Ok((hdr, rest)) = decode_header(datagram) {
+                            if hdr.fragmented && rest.len() >= FRAG_SUBHDR_LEN {
+                                let total = u16::from_be_bytes([rest[6], rest[7]]) as usize;
+                                let left = owed.get_or_insert(total);
+                                if *left > 0 {
+                                    *left -= 1;
+                                    lost.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(c) = client {
+                            let _ = downstream.send_to(datagram, c).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    let client = connect_pinned_udp("127.0.0.1".to_string(), relay_addr.port(), pinned)
+        .await
+        .expect("client socket");
+    client
+        .await_ready()
+        .await
+        .expect("the handshake completes through the repair");
+    // Snapshot before any application byte moves, so the ratio is the handshake's own.
+    let sent_by_server = from_server.load(Ordering::Relaxed);
+    let sent_by_client = to_server.load(Ordering::Relaxed);
+    let _outcome = accepted.await.expect("accept task").expect("session");
+
+    assert!(
+        swallowed.load(Ordering::Relaxed) > 0,
+        "the relay must have swallowed a reply flight, or this measures the path that never \
+         needed a repeat"
+    );
+    assert!(
+        sent_by_server <= sent_by_client * AMPLIFICATION_LIMIT,
+        "the server sent {sent_by_server} bytes for the client's {sent_by_client} — past the \
+         {AMPLIFICATION_LIMIT}× RFC 9000 §8.2 bound. A reply repeated on demand is only safe \
+         while each repeat costs the asker a whole flight"
+    );
+
+    // And an off-path source with a perfect capture gets nothing back.
+    let flight = {
+        let seen = captured.lock().unwrap();
+        let newest = seen
+            .keys()
+            .copied()
+            .max()
+            .expect("a captured client flight");
+        seen.get(&newest).cloned().expect("its datagrams")
+    };
+    let before = listener.metrics_snapshot().initial_on_committed_route_total;
+    let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    attacker.connect(server_addr).await.unwrap();
+    let mut asked = 0usize;
+    for _ in 0..8 {
+        for d in &flight {
+            attacker.send(d).await.expect("replay");
+            asked += d.len();
+        }
+    }
+    let mut buf = vec![0u8; PATH_MTU + 64];
+    let heard = tokio::time::timeout(Duration::from_secs(2), attacker.recv(&mut buf)).await;
+    assert!(
+        heard.is_err(),
+        "an off-path source that replayed {asked} bytes of captured hello received bytes \
+         back; the amplification factor towards whoever asks must be exactly zero"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while listener.metrics_snapshot().initial_on_committed_route_total == before
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        listener.metrics_snapshot().initial_on_committed_route_total > before,
+        "the replay must have reached the branch that decides whether to repeat; if it never \
+         got there, the zero above is about routing rather than about the bound"
+    );
+
+    listener.shutdown();
+}
+
 /// H-3 (audit 2026-06-11): the per-stream out-of-order reorder buffer must be bounded by
 /// BYTES, not just entries. A peer that leaves the head (offset 0) missing and streams future
 /// segments must not pin unbounded receiver RAM — each entry can be ~253 KiB (UDP) / 4 MiB
