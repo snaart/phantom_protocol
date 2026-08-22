@@ -567,9 +567,10 @@ jobs:
         with:
           workspaces: "."
           key: testbed
-      # `--all-targets` from the start: the crate is two binaries plus a library
-      # of shared measurement code, and a `--lib`-only lint would leave the
-      # binaries — the parts that actually run on the VPS — unlinted.
+      # `--all-targets` from the start: the crate is three binaries plus a
+      # library of shared measurement code, and a `--lib`-only lint would leave
+      # the binaries — the parts that actually run on the VPS, and the
+      # unprivileged wire check this job is the only home of — unlinted.
       - run: cargo clippy --manifest-path testbed/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path testbed/Cargo.toml
       # The deployed artifact is the release build, and it is the only

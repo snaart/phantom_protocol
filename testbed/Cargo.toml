@@ -18,6 +18,14 @@ path = "src/bin/testd.rs"
 name = "phantom-probe"
 path = "src/bin/probe.rs"
 
+# The wire-encryption check, on one machine and without privileges. Its
+# privileged, real-path counterpart is a scenario inside phantom-probe; this
+# binary exists so the question can be asked by anyone, anywhere, in one
+# command.
+[[bin]]
+name = "phantom-wirecheck"
+path = "src/bin/wirecheck.rs"
+
 [dependencies]
 # The testbed is a pure consumer of the published API. `mimicry` is on because
 # the harness measures that leg; `bindings` (UniFFI) is off because nothing here
