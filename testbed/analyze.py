@@ -319,17 +319,65 @@ def analyze_client(run_dir):
 
     # ── errors ───────────────────────────────────────────────────────────
     section("Errors")
-    counts = defaultdict(int)
+    groups = defaultdict(list)
     for r in read_jsonl(run_dir / "errors.jsonl"):
-        counts[(r["scenario"], r.get("context", ""), r["error_kind"])] += 1
-    if not counts:
+        key = (r["scenario"], r.get("context", ""), r["error_kind"])
+        groups[key].append(r.get("elapsed_ns"))
+    if not groups:
         print("  none")
-    for (scen, ctx, kind), n in sorted(counts.items(), key=lambda kv: -kv[1]):
-        print(f"  {n:>5}x  {scen:18} {ctx:18} {kind}")
+    for (scen, ctx, kind), took in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        # How long the failed operation ran is what separates the timers. A
+        # connect Timeout at ~8 s is the UDP transport giving up after
+        # retransmitting its handshake flight; at ~10 s it is the session's own
+        # deadline; at ~30 s it is this harness's wait. The kind alone says none
+        # of that.
+        timed = sorted(t for t in took if t is not None)
+        when = ""
+        if timed:
+            lo, hi = timed[0] / 1e6, timed[-1] / 1e6
+            when = f"   after {lo:.0f} ms" if hi - lo < 1 else f"   after {lo:.0f}–{hi:.0f} ms"
+        print(f"  {len(took):>5}x  {scen:18} {ctx:18} {kind}{when}")
 
     section("Caveats recorded with this run")
     for c in meta.get("caveats", []):
         print(f"  · {c}")
+
+
+def liveness_ceiling_s(detail):
+    """Seconds the daemon will hold a session whose peer has gone silent.
+
+    Read off the daemon's own start event rather than assumed, and `None` when
+    the artifact predates the daemon recording it — the whole reason it is
+    recorded is that inferring it from the session durations is circular.
+
+    The sum is the shape of the state machine: an idle session emits a keep-alive
+    after `keepalive_ms` of inbound silence, that probe going unanswered moves it
+    to `Migrating` within a probe timeout, and `session_timeout_ms` of no recovery
+    then declares it dead. The probe timeout is the omitted term and is around a
+    second, so this is a close lower bound rather than an exact figure.
+    """
+    if not detail:
+        return None
+    fields = {}
+    for tok in detail.split():
+        k, _, v = tok.partition("=")
+        if k in ("keepalive_ms", "session_timeout_ms"):
+            try:
+                fields[k] = int(v)
+            except ValueError:
+                return None
+    if len(fields) != 2:
+        return None
+    return (fields["keepalive_ms"] + fields["session_timeout_ms"]) / 1000.0
+
+
+def daemon_liveness_ceiling_s(server_dir):
+    """The ceiling from the most recent daemon start in this artifact."""
+    latest = None
+    for r in read_jsonl(server_dir / "events.jsonl"):
+        if r.get("listener") == "daemon" and r.get("kind") == "start":
+            latest = r.get("detail")
+    return liveness_ceiling_s(latest)
 
 
 def analyze_server(server_dir):
@@ -364,6 +412,55 @@ def analyze_server(server_dir):
             print("    estimate at the time — not because rows went missing")
     else:
         print("\n  congestion-window sweeps: not counted in this artifact")
+
+    # A session the daemon accepted and that then exchanged nothing is not by
+    # itself a fault: several scenarios connect, ask one question of the API and
+    # leave without sending an application frame. Those end promptly, because the
+    # client's departure reaches the daemon.
+    #
+    # The interesting set is the one that ends at the liveness ceiling instead:
+    # nothing arrived from that peer after its ClientHello, for as long as the
+    # daemon was willing to wait. The daemon records a session only once its
+    # ServerHello has gone to the socket, so each of these is a handshake the
+    # server completed and the client never took up — the reply did not arrive,
+    # or it arrived and was refused. Over UDP the client cannot ask again: a
+    # retransmitted ClientHello lands on a route that is already committed, and
+    # nothing answers it.
+    #
+    # Read these against the client's connect errors. One per Phantom leg per
+    # run is expected: the negative scenario connects with a deliberately wrong
+    # pin, which completes server-side and is thrown away client-side without a
+    # close. Any beyond that pairs with a connect the client reported as a
+    # timeout.
+    ceiling_s = daemon_liveness_ceiling_s(server_dir)
+    unused = [r for r in rows if r["frames_recv"] == 0 and r["frames_sent"] == 0]
+    print("\n  accepted and never used (handshake completed, nothing exchanged):")
+    if not unused:
+        print("    none")
+    else:
+        by_leg_unused = defaultdict(list)
+        for r in unused:
+            by_leg_unused[r["listener"]].append(r)
+        for leg, v in sorted(by_leg_unused.items()):
+            held = sorted(r["duration_ns"] / 1e9 for r in v)
+            print(
+                f"    {leg:8} {len(v):>3} of {len(by_leg[leg]):>3} sessions, "
+                f"held {held[0]:.1f}–{held[-1]:.1f} s"
+            )
+            if ceiling_s is None:
+                continue
+            # Half the ceiling separates the two populations by a wide margin: a
+            # departing client's close crosses the path in a round trip, and the
+            # ceiling is measured in tens of seconds.
+            reaped = [d for d in held if d >= ceiling_s / 2]
+            if reaped:
+                print(
+                    f"             {len(reaped)} of those ran out the liveness ceiling "
+                    f"(~{ceiling_s:.0f} s): nothing was heard from that peer at all"
+                )
+    if unused and ceiling_s is None:
+        print("    (the daemon's liveness settings are not in this artifact, so")
+        print("     'ran out the ceiling' cannot be separated from 'left early')")
 
     reasons = defaultdict(int)
     for r in rows:
@@ -522,15 +619,21 @@ def analyze_server(server_dir):
 
 
 def self_test():
-    """Check that the filtered-maximum label is read off the rows, not held here.
+    """Check the two derivations that must not be stated from memory.
 
-    The label is the one line whose job is to say which window the maximum was
-    taken over, so it is the one line that must never state a horizon from
-    memory. Three shapes cover it: rows carrying a horizon (name it), rows
-    predating the field (name none), and rows disagreeing (name none, because
-    naming either would be naming the wrong one for half the run).
+    The filtered-maximum label is the one line whose job is to say which window
+    the maximum was taken over, so it must be read off the rows. Three shapes
+    cover it: rows carrying a horizon (name it), rows predating the field (name
+    none), and rows disagreeing (name none, because naming either would be
+    naming the wrong one for half the run).
+
+    The liveness ceiling has the same obligation for the same reason: it decides
+    whether a session that exchanged nothing was reaped on schedule or left
+    early, and deriving it from the durations it is used to classify would be
+    circular. An artifact that does not carry it must produce `None`, not a
+    default that would read as measured.
     """
-    cases = [
+    label_cases = [
         ([{"bw_filter_window_ms": 10000}] * 3, "filtered max over 10s horizon"),
         ([{"bw_filter_window_ms": 4500}] * 3, "filtered max over 4.5s horizon"),
         ([{}, {}], "filtered max over the estimator's horizon"),
@@ -540,14 +643,33 @@ def self_test():
             "filtered max over the estimator's horizon",
         ),
     ]
+    ceiling_cases = [
+        ("build=abc version=0.2.2 keepalive_ms=15000 session_timeout_ms=120000 tcp=0.0.0.0:4242", 135.0),
+        ("keepalive_ms=1000 session_timeout_ms=5000", 6.0),
+        # Artifacts written before the daemon recorded either value.
+        ("build=abc version=0.2.2 tcp=0.0.0.0:4242 pin=deadbeef", None),
+        # Half of the pair is not the pair.
+        ("keepalive_ms=15000", None),
+        ("session_timeout_ms=120000", None),
+        # A malformed value is not a zero.
+        ("keepalive_ms=x session_timeout_ms=120000", None),
+        (None, None),
+    ]
     failures = 0
-    for rows, want in cases:
+    for rows, want in label_cases:
         got = filtered_max_label(rows)
         status = "ok" if got == want else "FAIL"
         if got != want:
             failures += 1
         print(f"  {status}: {rows} -> {got!r} (want {want!r})")
-    print(f"{len(cases) - failures}/{len(cases)} ok")
+    for detail, want in ceiling_cases:
+        got = liveness_ceiling_s(detail)
+        status = "ok" if got == want else "FAIL"
+        if got != want:
+            failures += 1
+        print(f"  {status}: {detail!r} -> {got!r} (want {want!r})")
+    total = len(label_cases) + len(ceiling_cases)
+    print(f"{total - failures}/{total} ok")
     return 1 if failures else 0
 
 

@@ -100,14 +100,51 @@ impl ScenarioOutput {
     /// label turns an unanswerable gap into a one-line fact in `errors.jsonl`.
     async fn mark(&mut self, framed: &dyn MsgLink, label: impl Into<String>) {
         let label = label.into();
+        let t0 = Instant::now();
         if let Err(e) = conn::mark(framed, label.clone()).await {
             let leg = self.summary.leg;
             let scenario = self.summary.scenario.clone();
-            self.error(leg, &scenario, &format!("mark {label}"), &e);
+            self.error_after(leg, &scenario, &format!("mark {label}"), &e, t0);
         }
     }
 
     fn error(&mut self, leg: Leg, scenario: &str, context: &str, e: &CoreError) {
+        self.push_error(leg, scenario, context, e, None)
+    }
+
+    /// As [`Self::error`], additionally recording how long the failed operation
+    /// ran before it failed.
+    ///
+    /// Preferred wherever the start of the operation is in hand — see
+    /// [`ErrorRecord::elapsed_ns`] for why a bare timestamp is not enough to
+    /// attribute a `Timeout` to the timer that produced it.
+    fn error_after(&mut self, leg: Leg, scenario: &str, context: &str, e: &CoreError, t0: Instant) {
+        let took = t0.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.error_lasting(leg, scenario, context, e, took)
+    }
+
+    /// As [`Self::error_after`], for a caller that measured the duration itself
+    /// — a concurrent task, whose own elapsed time is not the elapsed time of
+    /// the loop that collects it.
+    fn error_lasting(
+        &mut self,
+        leg: Leg,
+        scenario: &str,
+        context: &str,
+        e: &CoreError,
+        took_ns: u64,
+    ) {
+        self.push_error(leg, scenario, context, e, Some(took_ns))
+    }
+
+    fn push_error(
+        &mut self,
+        leg: Leg,
+        scenario: &str,
+        context: &str,
+        e: &CoreError,
+        elapsed_ns: Option<u64>,
+    ) {
         self.summary.error_count += 1;
         self.errors.push(ErrorRecord {
             t_unix_ns: unix_nanos(),
@@ -116,6 +153,7 @@ impl ScenarioOutput {
             context: context.to_string(),
             error: format!("{e:?}"),
             error_kind: error_kind(e),
+            elapsed_ns,
         });
     }
 }
@@ -313,10 +351,11 @@ impl WindowTracker {
 
 pub async fn clock_sync(ep: &Endpoints, pin: &[u8], leg: Leg, probes: usize) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "clock_sync");
+    let t0 = Instant::now();
     let framed = match connect_framed(leg, ep, pin).await {
         Ok(s) => s,
         Err(e) => {
-            out.error(leg, "clock_sync", "connect", &e);
+            out.error_after(leg, "clock_sync", "connect", &e, t0);
             return out;
         }
     };
@@ -434,7 +473,7 @@ pub async fn handshake(ep: &Endpoints, pin: &[u8], leg: Leg, count: usize) -> Sc
                 framed.close().await;
             }
             Err(e) => {
-                out.error(leg, "handshake", "connect", &e);
+                out.error_after(leg, "handshake", "connect", &e, t0);
                 out.sink.push(&HandshakeSample {
                     seq: i,
                     leg,
@@ -470,10 +509,11 @@ pub async fn rtt_sweep(
     per_size: usize,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "rtt_sweep");
+    let t0 = Instant::now();
     let framed = match connect_link(leg, ep, pin).await {
         Ok(s) => s,
         Err(e) => {
-            out.error(leg, "rtt_sweep", "connect", &e);
+            out.error_after(leg, "rtt_sweep", "connect", &e, t0);
             return out;
         }
     };
@@ -589,10 +629,11 @@ pub async fn message_integrity(
     sizes: &[usize],
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "message_integrity");
+    let t0 = Instant::now();
     let framed = match connect_framed(leg, ep, pin).await {
         Ok(s) => s,
         Err(e) => {
-            out.error(leg, "message_integrity", "connect", &e);
+            out.error_after(leg, "message_integrity", "connect", &e, t0);
             return out;
         }
     };
@@ -677,10 +718,11 @@ pub async fn upload(
     frame_size: usize,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "upload");
+    let t0 = Instant::now();
     let framed = match connect_link(leg, ep, pin).await {
         Ok(s) => s,
         Err(e) => {
-            out.error(leg, "upload", "connect", &e);
+            out.error_after(leg, "upload", "connect", &e, t0);
             return out;
         }
     };
@@ -866,10 +908,11 @@ pub async fn download(
     cap: Duration,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "download");
+    let t0 = Instant::now();
     let framed = match connect_link(leg, ep, pin).await {
         Ok(s) => s,
         Err(e) => {
-            out.error(leg, "download", "connect", &e);
+            out.error_after(leg, "download", "connect", &e, t0);
             return out;
         }
     };
@@ -976,10 +1019,11 @@ pub async fn bidir(
     cap: Duration,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "bidir");
+    let t0 = Instant::now();
     let framed = match connect_link(leg, ep, pin).await {
         Ok(s) => s,
         Err(e) => {
-            out.error(leg, "bidir", "connect", &e);
+            out.error_after(leg, "bidir", "connect", &e, t0);
             return out;
         }
     };
@@ -1103,10 +1147,11 @@ pub async fn streams(
     frame_size: usize,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "streams");
+    let t0 = Instant::now();
     let framed = match connect_framed(leg, ep, pin).await {
         Ok(s) => s,
         Err(e) => {
-            out.error(leg, "streams", "connect", &e);
+            out.error_after(leg, "streams", "connect", &e, t0);
             return out;
         }
     };
@@ -1226,7 +1271,7 @@ pub async fn zero_rtt(
         let cold = match connect_framed(leg, ep, pin).await {
             Ok(s) => s,
             Err(e) => {
-                out.error(leg, "zero_rtt", "cold connect", &e);
+                out.error_after(leg, "zero_rtt", "cold connect", &e, t0);
                 out.sink.push(&ZeroRttSample {
                     seq: i,
                     leg,
@@ -1346,6 +1391,7 @@ pub async fn migration(
         // Assert the documented contract rather than skipping quietly: every
         // non-UDP leg must answer `Unsupported`, and a silent no-op here was a
         // real regression once.
+        let t0 = Instant::now();
         match connect_framed(leg, ep, pin).await {
             Ok(framed) => {
                 let r = framed.session().migrate("0.0.0.0:0".to_string()).await;
@@ -1375,17 +1421,18 @@ pub async fn migration(
                 }
                 conn::close_session(framed.session()).await;
             }
-            Err(e) => out.error(leg, "migration", "connect", &e),
+            Err(e) => out.error_after(leg, "migration", "connect", &e, t0),
         }
         return out;
     }
 
     let mut gaps = Vec::new();
     for round in 0..rounds as u64 {
+        let t0 = Instant::now();
         let framed = match connect_framed(leg, ep, pin).await {
             Ok(s) => s,
             Err(e) => {
-                out.error(leg, "migration", "connect", &e);
+                out.error_after(leg, "migration", "connect", &e, t0);
                 continue;
             }
         };
@@ -1483,10 +1530,11 @@ pub async fn rekey(
     exchanges: usize,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "rekey");
+    let t0 = Instant::now();
     let framed = match connect_framed(leg, ep, pin).await {
         Ok(s) => s,
         Err(e) => {
-            out.error(leg, "rekey", "connect", &e);
+            out.error_after(leg, "rekey", "connect", &e, t0);
             return out;
         }
     };
@@ -1567,10 +1615,11 @@ pub async fn liveness_soak(
     interval: Duration,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "liveness_soak");
+    let t0 = Instant::now();
     let framed = match connect_framed(leg, ep, pin).await {
         Ok(s) => s,
         Err(e) => {
-            out.error(leg, "liveness_soak", "connect", &e);
+            out.error_after(leg, "liveness_soak", "connect", &e, t0);
             return out;
         }
     };
@@ -1643,6 +1692,27 @@ pub async fn liveness_soak(
 
 // ── 12. concurrency ─────────────────────────────────────────────────────────
 
+/// What one of the concurrent sessions did.
+///
+/// The failure is carried as the typed `CoreError` rather than a formatted
+/// string so the join below can file it exactly as every other scenario files a
+/// connect failure — with a leg, a context and a stable `error_kind`. Collapsing
+/// it to a string at the task boundary is what kept these failures out of the
+/// run's error log.
+struct ConcurrentAttempt {
+    idx: usize,
+    connect_ns: Option<u64>,
+    rtts: Vec<u64>,
+    /// `Some` iff this session did not complete its work: the stage that failed,
+    /// the error it failed with, and how long that stage had been running.
+    ///
+    /// The duration is measured inside the task. Timing the join instead would
+    /// report how long the slowest sibling took, which is a different quantity
+    /// and would make every failure in a burst look like it lasted as long as
+    /// the burst.
+    failure: Option<(&'static str, CoreError, u64)>,
+}
+
 pub async fn concurrency(
     ep: &Endpoints,
     pin: &[u8],
@@ -1660,58 +1730,98 @@ pub async fn concurrency(
             let t0 = Instant::now();
             let framed = match connect_link(leg, &ep, &pin).await {
                 Ok(s) => s,
-                Err(e) => return (idx, None, Vec::new(), 0u64, Some(format!("{e:?}"))),
+                Err(e) => {
+                    return ConcurrentAttempt {
+                        idx,
+                        connect_ns: None,
+                        rtts: Vec::new(),
+                        failure: Some(("connect", e, t0.elapsed().as_nanos() as u64)),
+                    }
+                }
             };
             let connect_ns = t0.elapsed().as_nanos() as u64;
             let mut gen = PayloadGen::new(120 + idx as u64);
             let mut rtts = Vec::with_capacity(ops_each);
-            let mut err = None;
+            let mut failure = None;
+            let ops_started = Instant::now();
             for seq in 0..ops_each as u64 {
+                let t_op = Instant::now();
                 match echo_once(framed.as_ref(), seq, gen.fill(128)).await {
                     Ok(o) => rtts.push(o.rtt_ns),
                     Err(e) => {
-                        err = Some(format!("{e:?}"));
+                        failure = Some(("echo", e, t_op.elapsed().as_nanos() as u64));
                         break;
                     }
                 }
             }
-            let ops = rtts.len() as u64;
+            // A session that connected and then attempted nothing is not a
+            // success: it contributes no round trip to the number this scenario
+            // exists to produce, so it is counted and named rather than folded
+            // into the ok tally by the absence of an error.
+            if failure.is_none() && rtts.is_empty() {
+                failure = Some((
+                    "echo",
+                    CoreError::InternalError("session performed no operations".into()),
+                    ops_started.elapsed().as_nanos() as u64,
+                ));
+            }
             framed.close().await;
-            (idx, Some(connect_ns), rtts, ops, err)
+            ConcurrentAttempt {
+                idx,
+                connect_ns: Some(connect_ns),
+                rtts,
+                failure,
+            }
         }));
     }
 
     let mut all_rtts = Vec::new();
     let mut connects = Vec::new();
-    for h in handles {
-        let Ok((idx, connect_ns, rtts, ops, err)) = h.await else {
-            out.summary.error_count += 1;
-            continue;
+    for (idx, h) in handles.into_iter().enumerate() {
+        let t_join = Instant::now();
+        let a = match h.await {
+            Ok(a) => a,
+            // A task that did not return at all still cost the run a session.
+            // Recording it keeps the error log's count equal to the summary's.
+            Err(e) => {
+                out.error_after(
+                    leg,
+                    "concurrency",
+                    "join",
+                    &CoreError::InternalError(format!("session task {idx} did not return: {e}")),
+                    t_join,
+                );
+                continue;
+            }
         };
-        if let Some(c) = connect_ns {
+        if let Some(c) = a.connect_ns {
             connects.push(c);
         }
-        let ok = err.is_none() && ops > 0;
-        if ok {
-            out.summary.ok_count += 1;
-        } else {
-            out.summary.error_count += 1;
-        }
-        let median = if rtts.is_empty() {
+        let error = match &a.failure {
+            Some((context, e, took_ns)) => {
+                out.error_lasting(leg, "concurrency", context, e, *took_ns);
+                Some(format!("{e:?}"))
+            }
+            None => {
+                out.summary.ok_count += 1;
+                None
+            }
+        };
+        let median = if a.rtts.is_empty() {
             None
         } else {
-            Some(Summary::of_u64(&rtts).p50 as u64)
+            Some(Summary::of_u64(&a.rtts).p50 as u64)
         };
-        all_rtts.extend_from_slice(&rtts);
+        all_rtts.extend_from_slice(&a.rtts);
         out.sink.push(&ConcurrencySample {
             leg,
-            session_index: idx,
+            session_index: a.idx,
             t_unix_ns: unix_nanos(),
-            connect_ns,
+            connect_ns: a.connect_ns,
             rtt_ns: median,
-            ops,
-            ok,
-            error: err,
+            ops: a.rtts.len() as u64,
+            ok: a.failure.is_none(),
+            error,
         });
     }
 
@@ -1988,10 +2098,11 @@ pub async fn wire_capture(
         ));
     }
 
+    let t0 = Instant::now();
     let framed = match connect_framed(leg, ep, pin).await {
         Ok(f) => f,
         Err(e) => {
-            out.error(leg, "wire_capture", "connect", &e);
+            out.error_after(leg, "wire_capture", "connect", &e, t0);
             let _ = capture.finish().await;
             let _ = std::fs::remove_file(&pcap_path);
             record_wire_check(
@@ -2984,8 +3095,103 @@ pub async fn raw_udp_rtt(ep: &Endpoints, sizes: &[usize], per_size: usize) -> Sc
 
 #[cfg(test)]
 mod tests {
+    use phantom_protocol::crypto::hybrid_sign::HybridSigningKey;
+
     use super::*;
     use crate::framing::testing::ScriptedLink;
+
+    /// Endpoints whose Phantom ports are all closed on loopback, so a connect
+    /// fails for a reason the test controls and without a network.
+    fn closed_endpoints() -> Endpoints {
+        Endpoints {
+            host: "127.0.0.1".into(),
+            tcp_port: 1,
+            udp_port: 1,
+            mimic_port: 1,
+            quic_port: 1,
+            raw_tcp_port: 1,
+            raw_udp_port: 1,
+            raw_udp_down_port: 1,
+            sni: "www.example.com".into(),
+            quic_cert: None,
+        }
+    }
+
+    /// A well-formed pin for an identity no listener holds. Well-formed matters:
+    /// a malformed one is refused before the connect is attempted, which would
+    /// exercise argument validation instead of the connect path.
+    fn unused_pin() -> Vec<u8> {
+        let (_sk, vk) = HybridSigningKey::generate();
+        vk.to_bytes()
+    }
+
+    /// A concurrent session that never connected is a session the run intended
+    /// to have and did not get — the same event every other scenario files as a
+    /// `connect` error. This was the one connect path in the harness that
+    /// counted its failures into the summary and wrote them nowhere: a run whose
+    /// `errors.jsonl` held a single row had in fact lost four sessions, and the
+    /// three that were missing were the ones that failed together and so said
+    /// the most about why.
+    #[tokio::test]
+    async fn concurrent_sessions_that_never_connected_are_recorded_as_run_errors() {
+        let out = concurrency(&closed_endpoints(), &unused_pin(), Leg::Tcp, 3, 1).await;
+
+        assert_eq!(out.summary.ok_count, 0, "nothing could have succeeded");
+        assert_eq!(out.summary.error_count, 3, "all three sessions failed");
+        assert_eq!(
+            out.errors.len(),
+            3,
+            "every failure the summary counted must be findable in the error log: {:?}",
+            out.errors
+        );
+        for r in &out.errors {
+            assert_eq!(r.leg, Some(Leg::Tcp), "the leg must be named");
+            assert_eq!(r.scenario, "concurrency", "the scenario must be named");
+            assert_eq!(r.context, "connect", "the stage that failed must be named");
+            // The refusal came from the socket, so the connect really was
+            // attempted rather than rejected by argument validation before it.
+            assert_eq!(r.error_kind, "NetworkError", "{r:?}");
+        }
+    }
+
+    /// The count in the summary and the rows in the error log are two views of
+    /// one quantity. They disagreed for a whole scenario, which is how three
+    /// failed handshakes reached an analysis that reported one.
+    #[tokio::test]
+    async fn the_concurrency_summary_and_its_error_log_agree() {
+        let out = concurrency(&closed_endpoints(), &unused_pin(), Leg::Tcp, 4, 2).await;
+        assert_eq!(out.summary.error_count, out.errors.len());
+    }
+
+    /// A `Timeout` reaching this log could have come from the UDP transport's
+    /// handshake-retransmission budget, from the session's whole-handshake
+    /// deadline, or from this harness's own wait around `await_ready()`. They
+    /// are three different diagnoses and the record carried no way to tell them
+    /// apart; the duration of the failed operation does tell them apart.
+    #[tokio::test]
+    async fn a_failed_connect_records_how_long_it_ran() {
+        let out = concurrency(&closed_endpoints(), &unused_pin(), Leg::Tcp, 1, 1).await;
+
+        let e = out.errors.first().expect("the connect failed");
+        let took = e
+            .elapsed_ns
+            .expect("a connect failure must say how long it took");
+        assert!(
+            took < conn::CONNECT_TIMEOUT.as_nanos() as u64,
+            "a refused connect cannot have outlasted the connect budget: {took} ns"
+        );
+    }
+
+    /// The same field, on the path every other scenario takes.
+    #[tokio::test]
+    async fn a_marks_failure_records_how_long_it_ran() {
+        let link = ScriptedLink::failing_sends();
+        let mut out = ScenarioOutput::new(Leg::Udp, "download");
+
+        out.mark(&link, "download:end").await;
+
+        assert!(out.errors[0].elapsed_ns.is_some());
+    }
 
     /// A mark is best-effort, but its loss is not free: `download:begin` and
     /// `download:end` bracket the interval the server's window series is joined

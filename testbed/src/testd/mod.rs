@@ -438,6 +438,14 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
     // every run's journal is guaranteed to contain, whatever else failed. A
     // comparison between two data sets can only claim they used different code
     // if both halves say which code they were.
+    //
+    // The liveness pair rides along for the same reason, one level down. How
+    // long the daemon holds a session whose peer has stopped speaking is set
+    // here and appeared in no artifact, so a reader looking at a session that
+    // opened, exchanged nothing and was reaped could not say whether it was
+    // reaped on schedule or abandoned early — the ceiling had to be guessed
+    // from the durations themselves, which is circular. Recording the two
+    // configured values turns that reading into a comparison.
     let build = BuildId::current();
     collector.event(
         "daemon",
@@ -445,9 +453,11 @@ pub async fn run(cfg: TestdConfig) -> Result<()> {
         None,
         None,
         format!(
-            "build={} version={} tcp={} udp={} mimic={} quic={} raw_tcp={} raw_udp={} raw_udp_down={} pin={}",
+            "build={} version={} keepalive_ms={} session_timeout_ms={} tcp={} udp={} mimic={} quic={} raw_tcp={} raw_udp={} raw_udp_down={} pin={}",
             build.label(),
             build.version,
+            cfg.keepalive.as_millis(),
+            cfg.session_timeout.as_millis(),
             cfg.tcp_bind,
             cfg.udp_bind,
             if cfg.enable_mimic {

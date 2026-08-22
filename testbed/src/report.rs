@@ -612,6 +612,23 @@ pub struct ErrorRecord {
     pub context: String,
     pub error: String,
     pub error_kind: String,
+    /// How long the operation that failed had been running, where the caller
+    /// could measure it.
+    ///
+    /// Load-bearing for one error kind in particular. A `Timeout` on a Phantom
+    /// connect can come from any of three independent timers — the UDP
+    /// transport's handshake-retransmission budget, the session's whole-handshake
+    /// deadline, or this harness's own `CONNECT_TIMEOUT` around `await_ready()` —
+    /// and they mean three different things: the transport gave up after
+    /// retransmitting its flight, the session gave up while the transport was
+    /// still trying, or the harness gave up on a session that had not yet
+    /// reported either way. `t_unix_ns` alone dates the failure without naming
+    /// which of them produced it, and separating them took reading the library's
+    /// constants and correlating against the daemon's clock. The duration says it
+    /// outright.
+    ///
+    /// `None` where the failure has no single operation to time.
+    pub elapsed_ns: Option<u64>,
 }
 
 /// Client-side view of the session's own counters.
