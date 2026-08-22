@@ -2269,6 +2269,133 @@ mod tests {
         listener.shutdown();
     }
 
+    /// Anyone who saw a hello can spend that connection's repair budget, and this is what
+    /// that costs — stated, bounded, and accepted rather than left to be discovered.
+    ///
+    /// The gate on a repeat is possession of the exact hello, so the party that can trigger
+    /// one is the client or someone who was on the path when the hello crossed it. Rule 3 of
+    /// PROTOCOL § 6.1 makes the repeat itself worthless to that observer: the bytes go to the
+    /// address the original went to, never to whoever asked, so the amplification factor
+    /// towards it is zero. What is left is this — the budget of rule 4 is finite, and a
+    /// replay spends it. Three matching replays and the real client's own repetition draws
+    /// nothing.
+    ///
+    /// It is accepted, and the reasoning is that the attacker who can do it already has a
+    /// strictly stronger move. Being on the path is what supplies the hello, and a party on
+    /// the path can simply drop the reply — which suppresses the connect completely instead
+    /// of suppressing a repair for one, and needs no timing and no captured bytes. Spending
+    /// the budget also *delivers* the reply to the client three more times on the way, which
+    /// is the opposite of what an attacker wants. There is no bound to add that the position
+    /// itself does not already defeat, so the honest thing is to write the extent down and
+    /// pin it here rather than imply a gate that is not there. The threat model records it in
+    /// the same terms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_on_path_observer_can_spend_a_connections_repair_budget() {
+        use crate::transport::phantom_udp::envelope::decode_header;
+
+        let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+            .await
+            .expect("bind a loopback PhantomUDP listener");
+        let server_addr: SocketAddr = listener.local_addr().parse().expect("the bound address");
+        let pinned = listener.verifying_key_bytes();
+
+        let acceptor = listener.clone();
+        let accepted = tokio::spawn(async move { acceptor.accept().await });
+        let (relay_addr, captured) = spawn_recording_relay(server_addr).await;
+        let client = crate::api::session::connect_pinned_udp(
+            "127.0.0.1".to_string(),
+            relay_addr.port(),
+            pinned,
+        )
+        .await
+        .expect("the client socket binds");
+        client.await_ready().await.expect("the handshake completes");
+        let _outcome = accepted
+            .await
+            .expect("the accept task")
+            .expect("an accepted session");
+
+        // What an on-path observer holds: the flight exactly as it crossed the path.
+        let flight = {
+            let seen = captured.lock();
+            let newest = seen
+                .keys()
+                .copied()
+                .max()
+                .expect("a captured client flight");
+            seen.get(&newest).cloned().expect("its datagrams")
+        };
+        let cid = decode_header(&flight[0]).expect("a captured header").0.cid;
+        assert_eq!(
+            cid,
+            decode_header(flight.last().expect("a datagram"))
+                .expect("a captured header")
+                .0
+                .cid,
+            "the captured datagrams must all belong to one flight"
+        );
+
+        let observer = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("observer socket");
+        observer
+            .connect(server_addr)
+            .await
+            .expect("observer connect");
+
+        // Every replay inside the budget is answered — and answered to the client, never
+        // here, which is what makes this an accepted cost rather than a reflector.
+        for n in 1..=MAX_FLIGHT_REPEATS {
+            let before = listener.metrics_snapshot().handshake_flight_repeated_total;
+            for d in &flight {
+                observer.send(d).await.expect("replay a captured datagram");
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while listener.metrics_snapshot().handshake_flight_repeated_total == before
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                listener.metrics_snapshot().handshake_flight_repeated_total,
+                before + 1,
+                "replay {n} of {MAX_FLIGHT_REPEATS} must be answered: a repeat is owed to \
+                 whoever presents the exact hello, and the listener cannot tell which of them \
+                 that is"
+            );
+        }
+
+        // Past the budget the repair for this connection is gone, which is the whole extent
+        // of what the observer achieved.
+        let spent = listener.metrics_snapshot();
+        for d in &flight {
+            observer.send(d).await.expect("replay past the budget");
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while listener.metrics_snapshot().initial_on_committed_route_total
+            < spent.initial_on_committed_route_total + flight.len() as u64
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let after = listener.metrics_snapshot();
+        assert!(
+            after.initial_on_committed_route_total > spent.initial_on_committed_route_total,
+            "the replay must have reached the branch that decides whether to repeat, or the \
+             assertion below is about routing rather than about the budget"
+        );
+        assert_eq!(
+            after.handshake_flight_repeated_total, spent.handshake_flight_repeated_total,
+            "the budget is finite and this is what spending it looks like: the real client's \
+             own repetition now draws nothing. Accepted — the position that supplies the hello \
+             can drop the reply outright, which is strictly stronger — but it must be a \
+             property this suite states rather than one a reader has to derive"
+        );
+
+        // And the session it all happened around is undisturbed.
+        listener.shutdown();
+    }
+
     /// The two handshake-repair counters answer different questions, and one of them cannot
     /// answer either question alone.
     ///

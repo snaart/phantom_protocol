@@ -947,6 +947,13 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   clients have gone quiet, so every session established afterwards would go unrepaired under
   exactly the burst of concurrent connects that motivated this. Evictions are counted.
 
+  One consequence is accepted rather than gated, and is written down in `threat-model.md`
+  § D.0 instead of being implied away: anyone holding the hello can present it three times
+  and leave the genuine client's own repetition unanswered. That party is on the path — it
+  is where the hello came from — and it can already drop the reply outright, which suppresses
+  the connect entirely rather than suppressing a repair for it, so there is no bound to add
+  that the position does not already defeat.
+
   **No serialized byte moved.** No message gained a field, no version was bumped, the frozen
   wire vectors are untouched. The one thing that changes for a client is that a
   retransmitted hello must be the previous hello unchanged, which is what the shipped client

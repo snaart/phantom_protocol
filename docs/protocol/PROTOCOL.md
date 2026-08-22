@@ -1628,6 +1628,17 @@ as part of the protocol rather than as an implementation detail:
    up — and it must not disturb the retransmit schedule, or a talkative peer
    could postpone the repetition indefinitely.
 
+**The budget of rule 4 is spendable by anyone holding the hello, and that is
+accepted rather than gated.** Rule 2 admits the client and anyone who was on the
+path when the hello crossed it; rule 3 leaves the second of those with nothing to
+receive, since the repeat goes to the recorded address. What it can still do is
+present the hello three times and leave the genuine client's own repetition
+unanswered. A second implementation should not add a gate for this and should not
+claim one: the position that supplies the hello is the position that can drop the
+reply outright, which suppresses the connect entirely rather than suppressing a
+repair for it, and every bound available here keys on a property that position
+controls. `threat-model.md` § D.0 records it in the same terms.
+
 A client therefore repairs a lost flight in either direction by re-sending its
 own flight unchanged, and the connect fails when the path loses every repetition
 — or when a repeat is not owed, which rules 2, 4 and 5 each describe a way to

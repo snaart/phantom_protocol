@@ -172,7 +172,45 @@ for a real-time secure transport.
 | AEAD nonce exhaustion (theoretical) | Hard ceiling `AEAD_MAX_INVOCATIONS = 1 << 48` → `CryptoError::NonceExhausted` | `core/src/crypto/adaptive_crypto.rs::AEAD_MAX_INVOCATIONS` |
 | Replay-window memory amplification | One per-direction `ReplayWindow` (~144 bytes) per session — no per-stream growth | `core/src/security/replay_window.rs` |
 | **Receive-side memory amplification by an authenticated peer** | See the dedicated treatment below. Each receive buffer has a bound with something enforcing it; **no single per-session total is published**, two of the terms are observed rather than enforced, and every bound is **per session** — the process multiplier is the embedder's admission control | `core/src/transport/stream.rs`, `core/src/transport/bandwidth_estimator.rs`, `core/src/api/session.rs` (receive-memory section of the module documentation) |
+| Handshake reply-repeat used as a reflector | A retained reply is repeated only to the address the original went to, taken from the server's record of a completed handshake and never from the datagram that triggered it, so the amplification factor towards whoever asks is **zero**. Towards the recorded address it is 1.99× — wire bytes both sides, against the smallest hello that can draw a repeat — inside RFC 9000 §8.2's 3×, and checked when the flight is retained rather than argued | `core/src/api/udp_listener.rs::FlightTable::retain`, `PROTOCOL.md` §6.1 rules 1–3 |
+| **On-path observer spends a connection's reply-repeat budget** | **Accepted, not mitigated.** See the treatment below | `core/src/api/udp_listener.rs::FlightTable::repeat`, `PROTOCOL.md` §6.1 rule 4 |
 | Connection-migration amplification: known CID + spoofed source used as a reflector toward a victim | To an unvalidated address the server is **challenge-only** and caps bytes sent to **≤ 3× bytes received** (RFC 9000 §8.2); a spoofed address never echoes the challenge so it is never switched-to | `core/src/api/udp_transport.rs` (anti-amp budget), `PROTOCOL.md` §12.3 |
+
+#### D.0 — On-path observer spends a connection's reply-repeat budget (accepted)
+
+A PhantomUDP listener retains the reply flight it sent and repeats it when the
+same `ClientHello` arrives again, because the reply is the only flight in the
+handshake with no retransmission under it and losing one of its six datagrams
+was costing whole connects (PROTOCOL.md §6.1). The gate on a repeat is possession
+of the exact hello, compared in full, and the budget is three repeats — the number
+of times the client repeats its own flight.
+
+**What that gate excludes and what it does not.** A party that never saw the hello
+cannot construct one: it carries the client's own 32-byte nonce and key package.
+So an off-path sender, and any spoofed source, is excluded. A party that *was* on
+the path when the hello crossed it holds the bytes, and it can present them. Rule 3
+means it gains nothing by doing so — the repeat is sent to the address the original
+went to, so the observer receives nothing and the bytes it triggers are delivered to
+the genuine client. What it can do is spend the budget: three replays and the real
+client's own repetition draws no answer, leaving that connect exactly as exposed to
+a lost reply as it was before the mechanism existed.
+
+**Accepted, with the reasoning.** The position that supplies the hello is the same
+position that can drop the reply. Dropping is strictly stronger — it suppresses the
+connect entirely rather than suppressing a repair for it, needs no captured bytes
+and no timing, and works against every connection on the path rather than the ones
+whose hellos were seen. Spending the budget also delivers the reply to the client
+three extra times on the way, which is the opposite of the attacker's goal. There is
+no bound available here that the position itself does not already defeat: rate-limits
+and per-source scoping both key on properties the on-path party controls, and
+tightening the gate further would mean refusing repeats the genuine client is owed.
+
+So the extent is written down rather than implied away, and pinned by
+`an_on_path_observer_can_spend_a_connections_repair_budget` in
+`core/src/api/udp_listener.rs`, which walks the budget to exhaustion from a
+third-party socket and asserts both halves: every replay inside the budget is
+answered (to the client, never to the asker), and past it the repair for that
+connection is gone.
 
 #### D.1 — Receive-side memory amplification by an authenticated peer
 
