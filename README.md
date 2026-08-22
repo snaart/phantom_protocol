@@ -21,7 +21,7 @@ makes a flow look like HTTPS to passive DPI; anti-DPI obfuscation only, detectab
 by active probing — see [Status & limitations](#status--limitations).)
 
 > **Pre-1.0 (`0.2.2`).** Wire format may break between minors; SemVer kicks in at
-> 1.0. 0 workspace warnings, 0 `unsafe` outside three audited opt-ins, MSRV Rust
+> 1.0. 0 workspace warnings, 0 `unsafe` outside two audited opt-ins, MSRV Rust
 > 1.93, CI green across the full cross-target matrix. See
 > [Status & limitations](#status--limitations).
 
@@ -99,8 +99,10 @@ independent multiplexed streams with per-stream flow control.
   flow look like HTTPS to passive DPI + JA3/JA4 fingerprinting; it is
   **anti-DPI obfuscation only and is detectable by active probing**
   (see [Status & limitations](#status--limitations)). Bandwidth *aggregation*
-  across transports is deliberately not pursued. The UDP data plane is validated
-  over a fault-injection rig but not yet soak-tested in the wild.
+  across transports is deliberately not pursued. The UDP data plane has been
+  measured on a real WAN route against a QUIC reference and raw no-protocol
+  controls (see [Performance](#performance)) — over one route, and with no
+  external audit.
 - **Multi-stream** — strict-priority scheduler, `WINDOW_UPDATE` per-stream
   flow control, BBRv2-inspired pacing (Startup / Drain / ProbeBW / ProbeRTT /
   FastRecovery).
@@ -286,6 +288,16 @@ security invariants are catalogued in
 
 ## Performance
 
+Two kinds of number live here and neither substitutes for the other. The first
+set is **loopback and in-process**: it measures the cryptography and the packet
+codec on one machine, and says nothing about how the transport behaves on a
+path. The second set is from a **real route**, and every figure there is printed
+beside the raw no-protocol control measured in the same run: on that route the
+one-way capacity ceiling moved by a factor of three between two campaigns five
+days apart, so a throughput number without its own control is not a result.
+
+### Cryptography and codec — loopback, single host
+
 Reference numbers on **Apple M1 Pro (8P + 2E, 16 GiB), macOS 26.0, rustc 1.93.0,
 `ring` with ARMv8 AES-PMULL** (snapshot 2026-05-17, criterion `--quick`, default
 `target-cpu`). The snapshot predates the current wire — it was captured under
@@ -312,6 +324,75 @@ adds another +5–10% on stable workloads. The release profile (`opt-level=3`,
 Linux x86_64 with AES-NI lands in similar ballparks. Full methodology and
 production tuning (`bbr`, `fq`, `LimitNOFILE`, allocator swap, CPU pinning) in
 [`BENCHMARKS.md`](https://github.com/snaart/phantom_protocol/blob/main/BENCHMARKS.md) and [`docs/operations/perf-tuning.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/operations/perf-tuning.md).
+
+### On a real route — WAN campaigns
+
+Measured by [`testbed/`](https://github.com/snaart/phantom_protocol/tree/main/testbed/): a probe on a
+workstation drives a scenario matrix against a daemon on a remote host. The
+daemon binds the three Phantom legs, a **quinn QUIC reference** leg — a mature
+implementation of the same class of protocol, on the same path, in the same run
+— and **raw TCP/UDP echo controls that carry no protocol at all**. The raw
+control is the denominator; the reference is a second opinion, not a ranking.
+
+Upload, as counted by the receiving server over its own observation interval. A
+client-side figure would be counting how fast `send()` filled a buffer:
+
+| Run | Phantom UDP | quinn (reference) | Raw UDP echo, same run |
+| --- | --- | --- | --- |
+| 2026-08-17 `124710` | **16.51 Mbit/s** | 5.81 | 18.02 round-trip, 9.9% loss |
+| 2026-08-17 `130955` | **18.96** | 40.52 | 18.28 round-trip, 8.6% loss |
+| 2026-08-22 `061422` | **1.96** | 9.13 | 12.17 round-trip |
+| 2026-08-22 `062705` | did not establish — `Timeout` on `connect` | 9.38 | 13.26 round-trip |
+
+The 2026-08-22 runs had both ends built from one commit, verified from the run
+manifest. Read the caveats before reusing any figure above:
+
+- **Rows from different campaigns are not comparable.** The route on 2026-08-22
+  was materially worse than on 2026-08-17: the same raw UDP echo control read
+  12.17 / 13.26 Mbit/s against 18.02 / 18.28, and the one-way downstream ceiling
+  read 21.09 / 20.90 against 60–63. Within one campaign the control holds steady
+  and the rows can be read against each other.
+- **The reference moved sevenfold between two adjacent runs** on the same route
+  (5.81, then 40.52). A single comparison against quinn is not a ranking, in
+  either direction.
+- **Downstream is not quoted at all.** In the 2026-08-17 campaign every leg
+  *including the reference* sat at the scenario's own ceiling, 0.55–0.95 Mbit/s,
+  while the one-way downstream control read 60–63. That describes the harness
+  and the route, not the protocol.
+- **The `Timeout` in run `062705` has no established cause.** Isolated timeouts
+  appeared in earlier campaigns too, and the keepalive hypothesis that would
+  have explained them has since been disproved by a fix.
+- **No one-way upstream control was taken on 2026-08-22**, so those upload
+  figures have only a round-trip echo to normalise against.
+- **Handshake: 524 ms against 234 ms for quinn.** That is the price of a hybrid
+  X25519 + ML-KEM-768 / Ed25519 + ML-DSA-65 handshake against a classical
+  TLS 1.3 one — expected, and not a defect to optimise away.
+
+An earlier campaign (2026-08-03, five runs) put upload at 3.0–3.7 Mbit/s against
+a steady 38.4–39.6 Mbit/s one-way upstream control. Cumulative `WINDOW_UPDATE`
+(the `WIRE_VERSION` 6 → 7 bump), a segment-idempotent flow-control charge, and
+symmetric reliable-byte accounting on both ends of the ledger landed between
+that campaign and the next. The two cannot be chained into a ratio: their
+controls are different instruments — a one-way capacity probe there, a
+round-trip echo afterwards.
+
+Two results from the most recent campaign are not about speed at all, and are
+the firmer part of it:
+
+- **A departed UDP client no longer holds a server session open.** Median
+  server-side UDP session lifetime fell from **135.55 s to 2.19 s**, and the
+  share of sessions living past 100 s from **32.5% to 2.3%** (986 sessions
+  before the change, 256 after, across all legs).
+- **The bandwidth estimator's overshoot is mostly filter memory, not bad
+  samples.** On a download session of that campaign the filtered ten-second
+  maximum ran at a median **1.52×** of what was actually delivered over the same
+  interval, while the **raw single sample ran at 1.02×** — one session per run,
+  because both quantities are only recorded where the server was the sender.
+
+The harness and its rules are documented in
+[`testbed/README.md`](https://github.com/snaart/phantom_protocol/blob/main/testbed/README.md),
+including the rule that governs every performance claim in this repository: a
+number never appears without the control from its own run.
 
 ## Deploying
 
@@ -505,12 +586,16 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 > **Maturity: early. Not production-ready.** This is a single implementation
 > with **no external security audit**. The cryptographic handshake + identity
 > layer and the UDP data plane (SACK loss recovery, congestion control,
-> connection migration) are implemented and tested — the data plane against a
-> deterministic fault-injection transport (loss / reorder) and the
-> `udp_integration` loopback suite. The gating limitation is the **absence of an
-> independent security audit** and the pre-1.0 wire churn — **not** an unfinished
-> data plane. Do not protect anything high-risk with this until it has been
-> independently audited and soak-tested on real networks.
+> connection migration) are implemented and tested — against a deterministic
+> fault-injection transport (loss / reorder), the `udp_integration` loopback
+> suite, and, since August 2026, a real WAN route measured against a QUIC
+> reference and raw no-protocol controls (see [Performance](#performance)).
+> What that measurement does **not** cover is route diversity: one server, one
+> client, one provider pair, no mobile carrier, no satellite, no lossy radio.
+> The gating limitations are the **absence of an independent security audit**,
+> the pre-1.0 wire churn, and that single route — **not** an unfinished data
+> plane. Do not protect anything high-risk with this until it has been
+> independently audited.
 
 - **Pre-1.0 (`0.2.2`).** Wire format may break between minors; SemVer applies
   once 1.0 ships. The current wire protocol is a single pinned version — the
@@ -528,7 +613,8 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   unused `TransportLeg` multipath trait were removed (never wired into the data
   plane). Bandwidth *aggregation* across transports is **not** planned — analysis
   showed it regresses for this workload and harms unobservability. What remains:
-  real-world soak + an external audit (not lab-rig coverage).
+  an external audit, and route diversity — every WAN figure in this README comes
+  from one route between one pair of hosts.
 - **TLS-mimicry transport (`mimicry` feature, off by default).** A `MimicTlsLeg`
   makes a Phantom flow look like ordinary HTTPS (a synthetic TLS 1.3 handshake,
   then the session inside ApplicationData records) to defeat DPI that blocks
@@ -551,14 +637,19 @@ carry **SLSA-3 OIDC build-provenance attestations** via
 - **Work deferred past 0.2.0** — hermetic/reproducible builds, the `no-std` PQ
   handshake, WASI server-side sessions, and ECN congestion feedback — is
   consolidated with rationale in [`docs/DEFERRED_WORK.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/DEFERRED_WORK.md).
-- **Loss recovery: SACK + fast-retransmit, validated over a fault rig (not yet in
-  the wild).** The UDP data plane has RFC-9002-style SACK + dup-ACK
-  fast-retransmit, an RFC-6298 RTO, a BBR-style congestion window, and
-  mid-session rekey. It is exercised by `udp_integration` over
-  `test_harness/fault_transport.rs` (injected loss + reorder), but has **not**
-  been hardened against real-world adversarial network conditions or externally
-  reviewed — treat the data plane as functional-but-not-battle-tested.
-- **Negative-security suite: 64 always-on tests** in
+- **Loss recovery and congestion control: measured on a real route — on one
+  route.** The UDP data plane has RFC-9002-style SACK + dup-ACK fast-retransmit,
+  an RFC-6298 RTO, a BBR-style congestion window, and mid-session rekey. It is
+  exercised by `udp_integration` over `test_harness/fault_transport.rs`
+  (injected loss + reorder) *and* by the WAN campaigns above, where it runs
+  beside a QUIC reference and raw controls on the same path in the same run.
+  That instrument is what found the congestion-control defects recorded in the
+  changelog, none of which the test suite could see: at a loopback round
+  trip of 0.4 ms a 5600-byte congestion window still yields 112 Mbit/s, and the
+  same window on a 210 ms path yields 0.213. What is still missing is a second
+  route and an external review — treat the data plane as measured-on-one-path,
+  not battle-tested.
+- **Negative-security suite: 72 always-on tests** in
   `core/tests/security_invariants.rs`, covering most — not all — of the eleven
   numbered security invariants: identity pinning, the unencrypted-packet receive
   gate, replay rejection, rekey and epoch handling, path validation, transcript
@@ -573,16 +664,16 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   (`docs/compliance/constant-time-audit.md`) and not a measurement. Where only
   part of an invariant is pinned, the tests say so.
   Plus the proptest, fuzz, wire-vector, runtime-integration, and CAVP suites,
-  400+ library unit tests, and `#[ignore]`-gated loopback integration suites
+  635 library unit tests, and `#[ignore]`-gated loopback integration suites
   (TCP, UDP — including injected loss/reorder via the fault transport — WASI,
   TLS-mimicry). 0 workspace warnings, 0 clippy warnings. **Note:** broad test
-  coverage + a fault-injection rig is *not* a substitute for an external security
-  audit or a real-world soak.
+  coverage, a fault-injection rig, and a WAN measurement campaign are *not* a
+  substitute for an external security audit.
 - **Broad feature coverage across the planned phases, but not production-ready.**
   The handshake / identity / data-plane / observability / cross-target work is in
   place and tested; what remains open is an **external security audit**, CMVP/CC
-  validation, formal verification (ProVerif / Tamarin), and a real-world soak —
-  none done.
+  validation, formal verification (ProVerif / Tamarin), and a soak across more
+  than one route — none done.
 - **`PhantomListener::bind()` generates a fresh signing key per process** —
   identities don't survive restart. Pin-stable production deployments must use
   `bind_with_signing_key()` with a key loaded from disk (`phantom-cli keygen`
@@ -626,6 +717,8 @@ carry **SLSA-3 OIDC build-provenance attestations** via
   `zero-rtt.md`
 - **Policy:** [`docs/policy/versioning.md`](https://github.com/snaart/phantom_protocol/blob/main/docs/policy/versioning.md)
 - **Performance:** [`BENCHMARKS.md`](https://github.com/snaart/phantom_protocol/blob/main/BENCHMARKS.md)
+  (loopback benches), [`testbed/README.md`](https://github.com/snaart/phantom_protocol/blob/main/testbed/README.md)
+  (the WAN measurement harness, and the rules every performance claim is held to)
 - **Change log:** [`CHANGELOG.md`](https://github.com/snaart/phantom_protocol/blob/main/CHANGELOG.md)
 
 ## Contributing
