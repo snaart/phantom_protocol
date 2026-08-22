@@ -1540,21 +1540,54 @@ has abandoned the attempt is pure waste, and the error would then come from the
 wrong timer. The byte-pipe legs need none of this: their transport is already
 reliable and ordered.
 
-The server is purely reactive and holds no timer of its own: it answers the hello
-in front of it and never re-sends a reply. That has two consequences a second
-implementation should design for rather than discover. A retransmitted hello may
-therefore be answered more than once — the stateless cookie and PoW checks
-(§ 6.8, § 6.9) re-pass by construction — so a client must tolerate a duplicate
-`HelloRetryRequest` or `ServerHello` and act on the first. And the repair is
-asymmetric in what it can recover: a lost `HelloRetryRequest` is repaired, because
-the server holds no state for it and re-derives the same answer from the
-retransmitted hello, while a lost **`ServerHello` is not** — the server has
-committed the session by then, so the retransmitted hello is routed to that
-session and dropped by its receive path (§ 4.10), and the connect fails on the
-10-second ceiling for the application to retry. That asymmetry is the same
-principle read twice: the side holding no state is the side that can afford to
-answer again, and the side that has committed one is the side that has stopped
-listening for the question.
+The server holds no timer of its own: it never decides on its own to send
+anything again, and every reply it sends is an answer to a hello in front of it.
+A retransmitted hello may therefore be answered more than once — the stateless
+cookie and PoW checks (§ 6.8, § 6.9) re-pass by construction — so a client must
+tolerate a duplicate `HelloRetryRequest` or `ServerHello` and act on the first.
+
+**A repeated hello is answered on both sides of the commit point.** Before the
+server has committed a session, it holds no state for the exchange and simply
+re-derives the same `HelloRetryRequest` from the retransmitted hello. After it
+has committed one, the retransmitted hello arrives on a connection id the demux
+already routes, and would be delivered to a session whose receive path does not
+parse handshake messages (§ 4.10) — which is where a single lost `ServerHello`
+used to cost the whole connect, since the reply flight is six datagrams of the
+thirteen a PhantomUDP handshake spends and is the only flight with no
+retransmission of its own. The server instead **retains the reply flight it
+sent** and repeats it, under five rules that a second implementation should treat
+as part of the protocol rather than as an implementation detail:
+
+1. **A repeat is the bytes that were already sent**, datagram for datagram —
+   never a re-derivation. Running `process_client_hello` again would draw fresh
+   KEM randomness and a fresh `session_id`, producing a valid `ServerHello` for a
+   session the server never committed.
+2. **A repeat is owed only to the hello the reply was computed over**, compared
+   in full. This is not a heuristic for peer identity: the signature covers the
+   whole `ClientHello` (§ 6.5), so the retained reply is a valid answer to that
+   hello and to no other, and a client that re-derives its hello instead of
+   repeating it byte for byte gets no repair and must fall back to a fresh
+   connect. It is also the admission gate — obtaining a repeat requires
+   possession of a hello that already carried a valid IP-bound cookie, so a
+   spoofed source cannot reach it.
+3. **A repeat goes only to the address the original went to**, taken from the
+   server's record of the completed handshake and never from the datagram that
+   triggered it. The amplification factor towards whoever asks is therefore zero,
+   and towards the recorded address it is the ratio the first exchange already
+   had (~6.7 KB of reply for ~3.5 KB of hello, inside the 3× of RFC 9000 § 8.2,
+   because each repeat costs the asker a whole flight).
+4. **The retention is bounded three ways**: by a repeat count equal to the number
+   of times the client repeats its own flight, by a window equal to the client's
+   whole retransmission budget (8 s — past it nobody is still asking), and by the
+   first inbound packet that AEAD-opens, which proves the client derived keys
+   from the reply and so can only have received it.
+5. **Retention is best-effort.** A server that is already holding its maximum
+   number of retained flights keeps none for a new session; the handshake still
+   completes, that session simply has no repair.
+
+A client therefore repairs a lost flight in either direction by re-sending its
+own flight unchanged, and the connect fails only when the path loses every
+repetition.
 
 `HandshakeStage` (`Initial → ClassicalReady → Established | Failed`,
 `handshake.rs`) supports optimistic start. `process_client_hello`
@@ -2518,8 +2551,9 @@ points at them. In the order they appear above:
   as unconstrained. Stated as a limit of this implementation's receive path, with
   the minimum a sender may rely on.
 - **§ 6.1** — the handshake has no reliability under it; the client retransmits
-  its whole flight on a bounded stop-and-wait schedule and the server never
-  retransmits.
+  its whole flight on a bounded stop-and-wait schedule, and at that time the
+  server never answered a repeated flight once it had committed a session. See
+  the note below: that half has since changed.
 - **§ 6.2** — there is no client authentication; `client_verify_key` is carried,
   transcript-covered, and verified by nobody.
 - **§ 6.6** — resumption transmits nothing: both ends derive the secret and reuse
@@ -2530,6 +2564,16 @@ points at them. In the order they appear above:
   first hello with only `cookie` / `pow_solution` replaced.
 - **§ 12.1** — a path challenge and its echo are the same frame; the receiver's own
   registry state decides which it received.
+
+One change has landed since that pass and is reflected in § 6.1. A server that has
+committed a session now **repeats its retained reply flight** when the same hello
+arrives again, instead of routing it to a session that cannot read it — measured
+loss of a single reply datagram was costing whole connects, and the reply is six
+datagrams of the thirteen a PhantomUDP handshake spends. **No serialized byte
+moved**: a repeat is the bytes already sent, no message gained a field, no version
+was bumped, and the frozen vectors are untouched. What a second implementation has
+to know is in the five rules of § 6.1, and the one that changes client behaviour is
+that a retransmitted hello must be the previous hello unchanged.
 
 The earlier sync covered, in order: `WIRE_VERSION` / `PROTOCOL_VERSION` / `PROTOCOL_VARIANT`;
 the 15-byte `PacketHeader` grammar and `HP_PROTECTED_OFFSET`; the 47-byte AAD

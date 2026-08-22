@@ -209,10 +209,13 @@ has been the reason a byte-perfect encoder still could not connect:
   or the key package looks harmless and breaks 0-RTT keying and decapsulation
   respectively.
 - **Nothing under the handshake is reliable on PhantomUDP.** The ARQ does not
-  exist yet, so a lost `Initial` is repaired only by the client re-sending its
-  whole flight on its own timer; the server answers what arrives and never
-  retransmits (PROTOCOL.md § 6.1). Build the client timer before you test on a
-  path that loses anything.
+  exist yet, so every repair starts with the client re-sending its whole flight
+  on its own timer; the server holds no timer and only ever answers a hello in
+  front of it (PROTOCOL.md § 6.1). Build the client timer before you test on a
+  path that loses anything — and re-send the flight **unchanged**, because a
+  server whose reply was lost repeats the bytes it already sent and will only do
+  so for the exact hello that reply answers. A re-derived hello is a different
+  question and gets a fresh handshake at best.
 - **There is no client authentication and no ticket message.**
   `ClientHello.client_verify_key` is transcript-covered and verified by nobody
   (PROTOCOL.md § 6.2), and a resumption "ticket" is never transmitted at all —

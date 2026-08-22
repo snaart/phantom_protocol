@@ -900,6 +900,56 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **A lost `ServerHello` cost the whole PhantomUDP connect, and the client's retransmits
+  bought nothing.** Measured on a real path: four connects in one campaign run failed with
+  `Timeout` after exactly 8.000 s — the client's whole retransmission budget — against a
+  server that had received the hello, completed the handshake and sent the reply. The reply
+  flight is 6555 bytes in six datagrams, six of the thirteen a PhantomUDP handshake spends,
+  and it was the only flight with no retransmission under it. The client did repeat its
+  hello three times, and each repetition was swallowed: the demux routes by connection id
+  before it looks at a datagram's type, so a repeated hello was delivered into the
+  established session's inbound channel and dropped by a pump that does not parse handshake
+  messages. The server had no trigger to answer again, so one lost datagram out of six was
+  an unrecoverable connect — one in 29 isolated connects at the ~0.6%-per-datagram loss the
+  raw control measured that run, and three of eight in a burst.
+
+  A PhantomUDP listener now retains the reply flight it sent and repeats it when the same
+  hello arrives again. Five rules make that safe, and they are in `PROTOCOL.md` § 6.1
+  because a second implementation has to know them. A repeat is the **bytes already sent**,
+  never a re-derivation — running the handshake again would draw fresh KEM randomness and a
+  fresh session id and produce a valid `ServerHello` for a session the server never
+  committed. A repeat is owed **only to the hello the reply was computed over**, compared in
+  full, which is both the security gate (obtaining one requires possession of a hello that
+  already carried a valid IP-bound cookie, so a spoofed source cannot reach it) and a
+  correctness requirement (the signature covers the whole `ClientHello`, so the retained
+  reply answers that hello and no other). A repeat goes **only to the address the original
+  went to**, taken from the server's record of the completed handshake and never from the
+  datagram that triggered it, so the amplification factor towards whoever asks is zero and
+  towards the recorded address it is the 1.90× the first exchange already had — inside the
+  3× of RFC 9000 § 8.2, checked when the flight is retained rather than argued. And the
+  retention is bounded three ways: three repeats, matching the number the client sends;
+  eight seconds, matching the whole budget a client spends before abandoning the connect;
+  and the first inbound packet that AEAD-opens, which proves the client derived keys from
+  the reply and so received it. At most 256 flights are retained at once — 256 × 6657 B
+  ≈ 1.63 MiB, a floor on what the host must have rather than a ceiling on what the process
+  will use — and past that a new session simply gets no repair.
+
+  **No serialized byte moved.** No message gained a field, no version was bumped, the frozen
+  wire vectors are untouched. The one thing that changes for a client is that a
+  retransmitted hello must be the previous hello unchanged, which is what the shipped client
+  already does and what `INTEROP.md` now says explicitly.
+
+- **The investigation above could not determine whether the client's repeated hellos reached
+  the server at all**, which is what separates "one reply flight was lost downstream" from
+  "the path fell silent in both directions" — and no artifact on either side answered it.
+  `MetricsSnapshotFfi` gains `initial_on_committed_route_total`, the always-on count of
+  handshake-type datagrams arriving on a connection the listener has already routed, with
+  the OTel counter `phantom.handshake.initial_on_committed_route` beside it. Unlabeled: the
+  only attribution worth having would be per peer, which the cardinality contract keeps out
+  of instrument labels. Appended last in the FFI record, so a consumer built against an
+  older copy of the hand-curated C header is missing a field rather than misreading the ones
+  it knew.
+
 - **The claim that a peer flooding a non-reading application moves no window growth, which
   was false on the opened-stream path.** Growth is credited by the delivery task at the
   moment it hands a frame *onward*, before the blocking send into the bounded queue behind
