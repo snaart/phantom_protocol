@@ -1634,6 +1634,51 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   documented as not to be moved without an audit — so it should not have reached foreign
   callers by accident. Both remain public Rust API for soak and integration harnesses.
   Breaking for any binding consumer that called them.
+- **`docs/DEFERRED_WORK.md` §4 no longer rests its ECN deferral on an `unsafe` block that
+  does not exist.** It argued that reading the ingress ECN codepoint would mean a *net-new*
+  `unsafe` `recvmsg`/cmsg path in `udp_transport.rs`, parenthesising that "the module's only
+  current `unsafe` is a `setsockopt(SO_MAX_PACING_RATE)` call for egress pacing". Neither the
+  call nor the module survives: `transport/udp_transport.rs` was deleted as a `pub mod`
+  nothing could reach and took the crate's last native `unsafe` opt-in and `core`'s direct
+  `libc` dependency with it, and the pacing it never performed is done in userspace by
+  `transport::pacer::Pacer` off the BBR estimator. The two remaining
+  `#![allow(unsafe_code)]` opt-ins are wasm32-only and WASI-only, so no native build compiles
+  any `unsafe` at all.
+
+  The correction cuts in the direction that makes the item harder, which is why it is worth
+  making rather than quietly deleting a parenthesis: an ECN ingress path is not the next
+  `unsafe` block in a module that already has one, it is the **first** on the platform every
+  production deployment runs on, and it returns `libc` to a dependency graph that no longer
+  carries it. §4 now says that, names the surviving module correctly
+  (`core/src/api/udp_transport.rs`), and stops recommending `socket2::Socket::set_tos` for
+  the egress half — the locked socket2 0.6 spells it `set_tos_v4` / `set_tclass_v6`, and it
+  offers `set_recv_tos_v4` / `set_recv_tclass_v6` for enabling the ingress option without
+  `unsafe`, which narrows the `unsafe` to the cmsg readback alone.
+- **`docs/architecture/ARCHITECTURE.md` §10 listed the same deleted module as a live
+  performance landmark** — one row of the landmark table credited `udp_transport.rs` with
+  "pacing offload via `SO_MAX_PACING_RATE` (Linux `fq` qdisc)", which is a kernel mechanism
+  this crate has never asked for on any target it currently builds. The row now names the
+  userspace pacer and the estimator that drives it. The same section's panic-site count was
+  18; `scripts/check_panic_sites.py` counts 23, and the sentence now says so and names the
+  script that keeps the two from drifting again.
+- **`PacketFlags::COMPRESSED`'s own rustdoc said "Payload is compressed."** The
+  `transport::compression` module now opens by saying nothing calls it, but the flag sat one
+  screen away in the same public API, in a list where every neighbour — `RELIABLE`, `ACK`,
+  `FIN`, `ENCRYPTED`, `REKEY`, `PATH_VALIDATION`, `WINDOW_UPDATE`, `KEEPALIVE`, `PADDED`,
+  `COVER`, `CONTROL` — is a bit some send path really does set, and it read as the twelfth.
+  `docs/protocol/PROTOCOL.md` already marked the same bit "_Defined but unused_ … Treat as
+  reserved; do not emit", so the rustdoc that docs.rs publishes as the API contradicted the
+  wire specification about one byte's meaning. It now says the same thing, and adds what the
+  spec row leaves implicit: the receive path does not test the bit either, so a peer that set
+  it gets its payload handed to the AEAD-plaintext parser unchanged — a decode failure, not a
+  decompression.
+
+  `COALESCED` gained the matching note in the other direction, because the two asymmetries
+  are not the same shape and reading them alike gets one of them wrong. That bundle format is
+  genuinely live inbound — `unwrap_coalesced_packet` is wired into the pump — while no send
+  path sets the bit. Accepting what we never emit is interoperable; the flag doc now states
+  which half is which rather than describing a format and leaving the direction to be
+  inferred.
 
 
 ## [0.2.2] - 2026-06-22

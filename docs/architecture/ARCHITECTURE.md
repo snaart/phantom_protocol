@@ -358,8 +358,9 @@ header (PROTOCOL.md § 4.1 / § 4.2). `from_wire` is bounds-checked and overflow
 Errors flow upward as typed `CoreError` (UniFFI-exported) at the API boundary; internally
 as module-level enums (`HandshakeError`, `CryptoError`, `WireError`). Conversions are
 mechanical `From` impls. The recv/handshake/data-plane hot paths carry **no**
-`unwrap`/`expect`/`panic`/`unreachable` (`#![deny(clippy::unwrap_used, …)]`; the 18
-inventoried production panic sites are documented in `docs/security/panic-sites.md`).
+`unwrap`/`expect`/`panic`/`unreachable` (`#![deny(clippy::unwrap_used, …)]`; the 23
+inventoried production panic sites are documented in `docs/security/panic-sites.md`,
+and `scripts/check_panic_sites.py` fails CI when the inventory and the code disagree).
 A wrong-key / wrong-AAD / wrong-PN failure all surface as a single opaque "decrypt failed".
 
 ---
@@ -371,7 +372,7 @@ A wrong-key / wrong-AAD / wrong-PN failure all surface as a single opaque "decry
 | `run_data_pump` (recv) | Every inbound packet | Unbounded delivery-queue decoupling; authenticated SACK ACK; the 10 ms tick also runs the (cheap) liveness sweep |
 | `send_app_data` | Every outbound packet | Pre-sized buffers; PN drawn once at send (nonce never reused) |
 | `session.rs::encrypt/decrypt_packet` | Per packet | Lock-free `ArcSwap` `CryptoState` load; nonce from the authenticated header |
-| `udp_transport.rs` | UDP fast path | Pacing offload via `SO_MAX_PACING_RATE` (Linux `fq` qdisc) |
+| `pacer.rs` + `bandwidth_estimator.rs` | Every outbound packet | Userspace token-bucket pacing at the BBR-estimated rate; no kernel pacing offload (the `SO_MAX_PACING_RATE` module was deleted unreachable) |
 | `adaptive_crypto.rs` | Per AEAD op | HW-AES detection; ring/aws-lc optimized paths |
 | `observability/atomics.rs` | Per packet record | Lock-free `CachePadded` atomics (~2.5 ns/call) |
 

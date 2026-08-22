@@ -188,7 +188,15 @@ impl PacketFlags {
     pub const PRIORITY: u16 = 0x0010;
     /// Payload is encrypted
     pub const ENCRYPTED: u16 = 0x0020;
-    /// Payload is compressed
+    /// Payload is compressed — **reserved; nothing sets it and nothing tests it.**
+    /// No send path in this crate calls [`crate::transport::compression`], so every
+    /// packet this library emits is uncompressed, and the receive path never reads
+    /// this bit either: a peer that set it would have its payload handed to the
+    /// AEAD-plaintext parser unchanged, which is a decode failure and not a
+    /// decompression. It sits among flags the sender really does set, which is why
+    /// it says so here rather than only in the wire specification — the module
+    /// documentation of [`crate::transport::compression`] explains why connecting it
+    /// is a wire decision rather than a cleanup. Do not emit.
     pub const COMPRESSED: u16 = 0x0040;
     /// In-session control frame (WIRE v8). The AEAD **plaintext** leads with a
     /// one-byte [`ControlSubtype`] and carries whatever that subtype defines after it
@@ -211,7 +219,13 @@ impl PacketFlags {
     /// (Phase 4.2). Payload carries the 32-byte challenge or response.
     pub const PATH_VALIDATION: u16 = 0x0200;
     /// Payload is a coalesced bundle of inner packets in
-    /// `[count: u16][len1: u16][payload1]...` format (Phase 2.5).
+    /// `[count: u16][len1: u16][payload1]...` format (Phase 2.5). **Accepted but never
+    /// emitted:** the receive path splits an inbound bundle
+    /// ([`crate::transport::packet_coalescer_codec::unwrap_coalesced_packet`], wired
+    /// into the data pump), while no send path in this crate sets the bit. Unlike
+    /// `COMPRESSED` that asymmetry is interoperable in the direction that matters — a
+    /// peer that bundles is understood — so this bit is live on the wire even though
+    /// this implementation only ever reads it.
     pub const COALESCED: u16 = 0x0400;
     /// Per-stream flow control update (Phase 4.3). Payload is
     /// [`WINDOW_UPDATE_PAYLOAD_LEN`] bytes: a big-endian `u64` **cumulative limit** — the
