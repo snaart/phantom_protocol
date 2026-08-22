@@ -1572,12 +1572,17 @@ as part of the protocol rather than as an implementation detail:
    handshake messages, and dropped there. It does not start a fresh handshake,
    and the connect fails on the client's own deadline.
 
-   The comparison is also the admission gate, and the honest statement of what it
-   gates is *possession*: only a party holding the exact hello can draw a repeat,
-   which means the client, or someone who was on the path when the hello crossed
-   it. A source that never saw it cannot construct one — the hello carries the
-   client's own 32-byte nonce and key package — so an off-path or spoofed sender
-   is excluded. An on-path observer is not, and rule 3 is what makes that
+   The comparison is also the admission gate, and it gates on *possession of
+   those bytes and on nothing else*. **No part of it consults the source
+   address**, so nothing here excludes a sender by where it claims to be: a
+   party that can reproduce the retained question draws a repeat whatever
+   address it sends from, and one that cannot draws nothing however legitimate
+   its address looks. What that leaves out is a sender that never saw the hello,
+   because it cannot construct one — the hello carries the client's own 32-byte
+   nonce and key package — and not because it was recognised as off-path. The
+   difference matters when reasoning about a spoofed source: spoofing buys
+   nothing here, and is not defended against here either. An observer that *was*
+   on the path holds the bytes and is admitted; rule 3 is what makes that
    harmless in the direction that matters. What it can still do is spend the
    budget of rule 4; see the note after this list.
 3. **A repeat goes only to the address the original went to**, taken from the
@@ -1595,18 +1600,30 @@ as part of the protocol rather than as an implementation detail:
    bytes of envelope per datagram plus eight more per fragment, in the direction
    that flatters the result.
 4. **The retention is bounded three ways**: by a repeat count equal to the number
-   of times the client repeats its own flight, by a window equal to the client's
-   whole retransmission budget (8 s — past it nobody is still asking), and by the
-   first inbound packet that AEAD-opens, which proves the client derived keys
-   from the reply and so can only have received it.
+   of times the client repeats its own flight, by a window that outlasts the
+   client's **last** question without outlasting its whole wait, and by the first
+   inbound packet that AEAD-opens, which proves the client derived keys from the
+   reply and so can only have received it. Be precise about the second, because
+   the obvious statement of it is a tautology: a client's total wait *is* its
+   retransmission budget by construction, since each interval is clipped to what
+   remains of it. The number a window has to clear is when the last question goes
+   out — 7 s here, the sum of every interval but the final one — and the number it
+   must not exceed is the whole wait, 8 s. This implementation retains for 8 s;
+   anything in `[7 s, 8 s]` is conformant.
 5. **Retention is best-effort, and a full server drops its oldest answer rather
    than refusing its newest.** A server holds a bounded amount of retained reply
    — bounded in bytes, since what a flight costs is a property of the parameter
    set and not of the mechanism — and when a new one will not fit, the entry
    nearest its own deadline is dropped to make room. A session can therefore lose
-   its repair before its window closes; the one that loses it is always the one
-   whose client has had longest to give up, never the one that has just
-   completed. Refusing the newcomer instead reads as the more conservative
+   its repair before its window closes. Be exact about which one does: **not** the
+   one whose client has given up, because at the moment room has to be made every
+   remaining candidate is a client that has neither been heard from nor run out
+   of time — entries in those two states are released first and are not in the
+   running. What separates the candidates is how much window each has left, so
+   the one that goes is the one with the least of it: dropping it forfeits the
+   fewest remaining seconds in which the answer could still be asked for, and it
+   has already stood through more of its client's retransmits than any other. The
+   newest entry, whose whole window is ahead of it, is never the one dropped. Refusing the newcomer instead reads as the more conservative
    choice and is the opposite: the entries that fill the table are established
    sessions whose clients have gone quiet, so once they fill it every session
    established afterwards goes unrepaired — under exactly the burst of concurrent
@@ -1614,19 +1631,38 @@ as part of the protocol rather than as an implementation detail:
    should count what it drops, because an evicted session behaves exactly like
    one from before this mechanism existed and no other artifact says otherwise.
 6. **A client that is still waiting for a reply ignores every datagram that is
-   not a handshake one.** The rules above only ever get a chance to run if the
-   client is still connecting when its retransmit timer fires, and a server that
-   has committed a session is free to use it: an application greeting written the
-   moment the session is accepted, a keepalive, cover traffic. Those are
-   short-header datagrams (§ 4.2) carrying keys the client does not have, because
-   the reply that would have carried them is the flight that went missing. A
-   client that hands such a datagram to its handshake parser sees a malformed
-   reply and ends the attempt, and the repair then holds only against a server
-   that happens to say nothing for a whole retransmit interval. Discarding it
-   costs nothing this layer was promising — nothing under the handshake is
-   reliable, and reliable stream data is re-sent by the ARQ once the session is
-   up — and it must not disturb the retransmit schedule, or a talkative peer
-   could postpone the repetition indefinitely.
+   not a handshake datagram of its own connection.** Both halves are obligations
+   and they guard different things.
+
+   The *type* is what a committed server's own traffic fails. The rules above
+   only ever get a chance to run if the client is still connecting when its
+   retransmit timer fires, and a server that has committed a session is free to
+   use it: an application greeting written the moment the session is accepted, a
+   keepalive, cover traffic. Those are short-header datagrams (§ 4.2) carrying
+   keys the client does not have, because the reply that would have carried them
+   is the flight that went missing. A client that hands such a datagram to its
+   handshake parser sees a malformed reply and ends the attempt, and the repair
+   then holds only against a server that happens to say nothing for a whole
+   retransmit interval.
+
+   The *connection id* is what an unrelated sender fails, and without it the type
+   check narrows the problem rather than removing it. `PacketType` is two bits of
+   a cleartext byte in the unauthenticated envelope (§ 4.2), so any sender writes
+   it: a client that accepts a handshake datagram on type alone can be killed by
+   one datagram of noise from anyone who can reach its port, which is the same
+   failure with one byte set instead of none. So a client MUST require the outer
+   `ConnId` to be the one it is connecting under, which during the handshake is
+   its own bootstrap id (§ 4.2) — the server echoes it on every reply, including
+   a `HelloRetryRequest` and a `ServerReject`, and the rotating chain does not
+   begin until the session is established. That leaves an off-path sender needing
+   to guess 64 bits it has never seen, rather than needing to guess nothing. The
+   check is worth doing **before** reassembly, so a spray cannot displace a
+   half-reassembled reply from the fragment buffer either.
+
+   Discarding costs nothing this layer was promising — nothing under the
+   handshake is reliable, and reliable stream data is re-sent by the ARQ once the
+   session is up — and it must not disturb the retransmit schedule, or a
+   talkative peer could postpone the repetition indefinitely.
 
 **The budget of rule 4 is spendable by anyone holding the hello, and that is
 accepted rather than gated.** Rule 2 admits the client and anyone who was on the
@@ -1634,10 +1670,18 @@ path when the hello crossed it; rule 3 leaves the second of those with nothing t
 receive, since the repeat goes to the recorded address. What it can still do is
 present the hello three times and leave the genuine client's own repetition
 unanswered. A second implementation should not add a gate for this and should not
-claim one: the position that supplies the hello is the position that can drop the
-reply outright, which suppresses the connect entirely rather than suppressing a
-repair for it, and every bound available here keys on a property that position
-controls. `threat-model.md` § D.0 records it in the same terms.
+claim one — but not for the reason that first suggests itself. "Whoever can supply
+the hello can drop the reply" is true of an in-line position and false of the
+commonest one: a sniff-and-inject attacker on a shared medium, a mirrored port or
+a tap sees every datagram and forwards none, so it can copy the hello and burn the
+repeats while being unable to drop anything. What makes this acceptable is the
+size of it. Spending the budget costs one connection its repair, and only matters
+if that connection's reply is also lost; the repeats it triggers are delivered to
+the genuine client, so the spending itself hands the victim extra copies of what
+it was waiting for; and every bound that would remove it keys on something the
+position controls — the source address, the timing, the verbatim hello — so a gate
+here would refuse repeats the genuine client is owed and stop nobody.
+`threat-model.md` § D.0 records it in the same terms.
 
 A client therefore repairs a lost flight in either direction by re-sending its
 own flight unchanged, and the connect fails when the path loses every repetition
@@ -2629,8 +2673,11 @@ moved**: a repeat is the bytes already sent, no message gained a field, no versi
 was bumped, and the frozen vectors are untouched. What a second implementation has
 to know is in the six rules of § 6.1, and two of them change client behaviour: a
 retransmitted hello must be the previous hello unchanged, and a client still
-waiting for a reply must discard a short-header datagram rather than read it as a
-malformed one.
+waiting for a reply must discard any datagram that is not a handshake datagram
+**carrying its own bootstrap connection id** — reading a short-header datagram as
+a malformed reply ends the connect, and accepting one on its type alone leaves the
+connect endable by any sender that can reach the port, since the type is a
+cleartext field of the unauthenticated envelope.
 
 The earlier sync covered, in order: `WIRE_VERSION` / `PROTOCOL_VERSION` / `PROTOCOL_VARIANT`;
 the 15-byte `PacketHeader` grammar and `HP_PROTECTED_OFFSET`; the 47-byte AAD
