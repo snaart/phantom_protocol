@@ -117,62 +117,40 @@ fn next_handshake_wait(attempt: u32, spent: Duration) -> Option<Duration> {
     Some(rto.min(remaining))
 }
 
-/// How many times the Handshake-phase schedule repeats a flight before it gives up.
+/// The intervals a client actually waits out, in order, walked from
+/// [`next_handshake_wait`] exactly as the receive loop spends them.
 ///
-/// Walked out of [`next_handshake_wait`] rather than restated, because it is the number the
-/// **server's** repeat budget is sized against (PROTOCOL § 6.1): a server that answers fewer
-/// repeats than the client sends leaves the last ones unanswered, and one that answers more
-/// is offering work nobody will ask for. Restating "three" in the listener would let the two
-/// drift the moment the interval or the budget changed, and the drift would show up only as
-/// a connect that fails on a lossy path.
+/// Today that is `[1 s, 2 s, 4 s, 1 s]`: the flight is repeated at the end of each interval
+/// but the last, and the last interval is the one the client spends waiting for the answer
+/// to its final repeat before abandoning the connect.
 ///
-/// Test-only, because its whole job is to be compared against that constant: production
-/// reads the constant, and this is what makes the constant answerable to the schedule.
+/// Two numbers the **server** is sized against come out of this walk (PROTOCOL § 6.1), and
+/// they are different numbers, which is the reason the whole schedule is returned rather
+/// than either of them:
+///
+/// * `len() - 1` is the repeat count `MAX_FLIGHT_REPEATS` must equal — a server answering
+///   fewer leaves the client's last questions unanswered, one answering more offers work
+///   nobody will ask for.
+/// * the sum of all but the last interval is **when the last question is asked**, which is
+///   what `HANDSHAKE_FLIGHT_RETENTION` has to outlast. The *total* sum is not that number
+///   and cannot stand in for it: the total is an identity on
+///   [`HANDSHAKE_RETRANSMIT_BUDGET`] — every wait is clipped to what remains of the budget,
+///   so the walk terminates exactly on it for any initial RTO and any budget — and an
+///   assertion against an identity is an assertion about nothing.
+///
+/// Test-only, because its whole job is to be compared against those constants: production
+/// reads the constants, and this is what makes them answerable to the schedule.
 #[cfg(test)]
-pub(crate) fn handshake_retransmit_count() -> u32 {
+pub(crate) fn handshake_retransmit_schedule() -> Vec<Duration> {
     let mut attempt = 0u32;
     let mut spent = Duration::ZERO;
-    let mut repeats = 0u32;
-    // Each expiry that still leaves time to be answered is one repeat; the expiry that
-    // exhausts the budget is the give-up point and repeats nothing, exactly as the receive
-    // loop spends it.
+    let mut waits = Vec::new();
     while let Some(wait) = next_handshake_wait(attempt, spent) {
-        spent = spent.saturating_add(wait);
-        attempt = attempt.saturating_add(1);
-        if next_handshake_wait(attempt, spent).is_none() {
-            break;
-        }
-        repeats = repeats.saturating_add(1);
-    }
-    repeats
-}
-
-/// How long the Handshake-phase schedule waits, in total, before it gives up.
-///
-/// The sibling of [`handshake_retransmit_count`] and there for the same reason: it is the
-/// number the **server's** retention window is sized against (PROTOCOL § 6.1). At the far end
-/// of this walk the client has abandoned the connect, so an answer retained past it is
-/// answering nobody, and an answer dropped before it is dropped while the question is still
-/// in flight.
-///
-/// It is walked rather than read off [`HANDSHAKE_RETRANSMIT_BUDGET`] because the schedule is
-/// what a client actually spends and the budget is only its intended ceiling. The two agree
-/// today because each wait is clipped to land on it; a schedule that stopped agreeing —
-/// overshooting, or terminating early — would move the moment a client gives up without
-/// moving the constant, and the listener's window would silently be sized against a client
-/// that no longer exists.
-///
-/// Test-only, for the same reason as its sibling: production reads the constant, and this is
-/// what makes the constant answerable to the schedule.
-#[cfg(test)]
-pub(crate) fn handshake_retransmit_total_wait() -> Duration {
-    let mut attempt = 0u32;
-    let mut spent = Duration::ZERO;
-    while let Some(wait) = next_handshake_wait(attempt, spent) {
+        waits.push(wait);
         spent = spent.saturating_add(wait);
         attempt = attempt.saturating_add(1);
     }
-    spent
+    waits
 }
 
 const PHASE_HANDSHAKE: u8 = 0;
