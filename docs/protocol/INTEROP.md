@@ -70,8 +70,21 @@ enforcement is legible.
 field in any message; each peer independently resolves AES-256-GCM vs
 ChaCha20-Poly1305 from local CPU capability and derives its keys — and its
 header-protection mask primitive — accordingly (PROTOCOL.md § 2). Two peers that
-resolve it differently finish the handshake and then fail every packet. Pin one
-suite per deployment and pin it on both ends; do not build a probe for it.
+resolve it differently finish the handshake and then fail every packet.
+
+"Pin one suite on both ends" is the right instruction and it is not a knob. This
+implementation exposes no way to choose: the suite comes from `HwCaps::detect()`
+with no override, no constructor takes one, and `PhantomConfig` has no field for
+it. So a second implementation does not get to declare a suite — it has to
+reproduce the same decision, which is a property of the *target its peer was built
+for*: AES-256-GCM iff the CPU reports the AES extension on `x86`/`x86_64`
+(AES-NI) or `aarch64` (ARMv8 crypto), and **ChaCha20-Poly1305 unconditionally on
+every other target**, `wasm32` included — the capability probe is hard-coded
+`false` there. PROTOCOL.md § 2 has the table. The case that bites is a browser or
+WASI client against an `x86_64` server: both are conformant, both complete the
+handshake, and neither can read a byte the other sends. Under `--features fips`
+the question does not arise (AES only), but that build is out of scope here
+anyway (§ 6).
 
 **And one asymmetry is not a constant at all: which side swaps.** Every
 per-direction key pair is derived once and assigned by role — the initiator
@@ -182,6 +195,31 @@ fields concatenate in **declaration order** (load-bearing).
 > not valid KEM/signature material — they freeze the serialization *container*.
 > Validating the PQ encodings themselves is Rung 0's job.
 
+**Four things about the exchange that no fixture can show you**, because a vector
+freezes one message and every one of these is about the sequence around it. Each
+has been the reason a byte-perfect encoder still could not connect:
+
+- **The first flight is always retried.** A hello with no cookie fails the
+  address-validation gate whatever the server's load is, so a non-resuming connect
+  is a `HelloRetryRequest` and then a second hello, every time (PROTOCOL.md § 6.8).
+  Treat the retry as the normal path, not the overload path.
+- **The retried hello is the *same* hello** — replace `cookie` and
+  `pow_solution`, carry everything else through byte for byte, and verify the
+  server's signature against the hello you finally sent. Regenerating the `nonce`
+  or the key package looks harmless and breaks 0-RTT keying and decapsulation
+  respectively.
+- **Nothing under the handshake is reliable on PhantomUDP.** The ARQ does not
+  exist yet, so a lost `Initial` is repaired only by the client re-sending its
+  whole flight on its own timer; the server answers what arrives and never
+  retransmits (PROTOCOL.md § 6.1). Build the client timer before you test on a
+  path that loses anything.
+- **There is no client authentication and no ticket message.**
+  `ClientHello.client_verify_key` is transcript-covered and verified by nobody
+  (PROTOCOL.md § 6.2), and a resumption "ticket" is never transmitted at all —
+  both ends derive the secret from the previous session and reuse its `session_id`
+  (PROTOCOL.md § 6.6). Looking for a `NewSessionTicket` is time spent on a message
+  that does not exist.
+
 ### Rung 3 — Transcript signing
 
 Compute the signed transcript hash per PROTOCOL.md § 6.5. The signing input is
@@ -223,6 +261,26 @@ the HP key-derivation labels exactly — see the KDF label inventory in
 PROTOCOL.md § 3, and note that the negotiated-off-the-wire suite (§ 1 above)
 selects the mask primitive as well as the AEAD.
 
+**Start at the top of the schedule, with the KEM combiner, and expect no help from
+this guide's earlier rungs if you get it wrong.** Every key on this rung descends
+from one 32-byte value, and that value is not either raw shared secret: it is
+`HKDF-SHA-256` Extract-then-Expand over **four** concatenated inputs — the
+classical shared secret, the ML-KEM-768 shared key, the sender's ephemeral
+classical public key (the one on the wire in `HybridCiphertext`), and the
+recipient's classical public key from the `ClientHello` — under the label
+`HybridKEM_X25519_Kyber768`. PROTOCOL.md § 3 gives the byte lengths and the exact
+construction. Combining only the first two is the single highest-cost mistake in
+this document, and the reason is that nothing catches it: the signature does not
+depend on the shared secret, so the transcript verifies, the `session_id` matches
+because it is echoed rather than recomputed, your peer reports an established
+session — and then every packet in both directions fails its AEAD. That is the
+failure § 1 warns about, arrived at by way of a rung that passed.
+
+While you are in § 3, note that Extract-vs-Expand is decided **per label** and
+that half the call sites go each way. A schedule that uniformly extracts, or
+uniformly does not, is right at half its sites and produces this same symptom at
+the other half.
+
 ### Rung 4b — The AEAD plaintext codecs
 
 Opening the AEAD gets you a plaintext, not a message. What is inside depends on
@@ -231,7 +289,7 @@ the (authenticated) flags, and each shape has its own grammar in PROTOCOL.md
 
 | Flag | Plaintext |
 | --- | --- |
-| `RELIABLE` | `stream_offset: u32 be` then the application bytes — a frame shorter than the 4-byte prefix is malformed |
+| `RELIABLE` | `stream_offset: u32 be` then the application bytes — a frame shorter than the 4-byte prefix is malformed. The offset is a **frame counter from 0**, not a byte position (PROTOCOL.md § 4.5) |
 | `ACK` | a `Sack`, scoped to the packet's `stream_id` |
 | `WINDOW_UPDATE` | exactly 8 bytes: a big-endian `u64` **cumulative limit** — the total the receiver will let you send on that stream. Apply it as a maximum, never a sum |
 | `PATH_VALIDATION` | exactly 32 bytes: a challenge or its echo |
@@ -316,12 +374,50 @@ primitive with a capture step in front of it. Below both, a repeat is refused be
 your branch runs, so the branch needs no state of its own. The same section states
 what to do with a flag you do not recognise: ignore it, never reject the packet.
 
+Two last things about the reliable shape, both of which a peer gets wrong quietly
+rather than loudly. **Two counters run on one stream and the SACK depends on not
+conflating them.** The `stream_offset` counts *frames*: the first reliable frame
+on a stream carries `0` and each subsequent one carries one more, whatever its
+length — so three full-size chunks are offsets 0, 1, 2, and a SACK range of
+`(0, 2)` covers all three. The `WINDOW_UPDATE` total counts *application bytes*.
+Unreliable frames carry no offset and are outside both. Closing a stream is not a
+separate frame type either: it is a `RELIABLE | FIN` segment with its 4-byte
+offset and **zero bytes after it**, which takes the next offset in sequence and is
+acknowledged like any other segment. Mind the near-collision with the persist
+probe — a `RELIABLE` frame with an empty payload and no `FIN` is a window probe,
+delivers nothing, and consumes no offset.
+
+**And there is a ceiling on what you may put in one frame.** This one is not a
+property of the format — nothing on the wire carries a length — but a limit of
+this implementation's receive path, and a peer that exceeds it stalls with no
+diagnostic at either end. The data pump drops any inbound frame over
+`MAX_RECV_FRAME` = 1335 bytes before header protection and before the AEAD,
+measured over the whole inner image (15-byte header + ciphertext + tag) and after
+a PhantomUDP datagram has been reassembled, so fragmenting does not evade it. In
+application bytes that is **1300 reliable, 1304 unreliable**, and those are the
+figures to size a sender against; PROTOCOL.md § 4.10 has the derivation. A refused
+frame is never acknowledged and its retransmits meet the same gate, so the symptom
+is a stream that stops rather than an error. A future revision may raise the number
+and offers no way to discover that it has, so do not build a sender that assumes
+more than the minimum above.
+
 ### Rung 5 — Migration & liveness (optional for a minimal peer)
 
 The rotating outer connection ID, path validation, and liveness machinery are
 PROTOCOL.md § 4.7 and § 12. A minimal single-path client can defer these; a peer
 that wants seamless Wi-Fi↔cellular migration must implement the CID chain
 (§ 4.7) and the path-validation grammar (§ 12).
+
+One rule here has no wire representation at all and so cannot be read off a
+capture: **a path challenge and its echo are byte-identical frames.** Both are
+`ENCRYPTED | PATH_VALIDATION`, `stream_id` 0, 32 bytes of plaintext. Which one you
+have received follows from the state *your* path registry holds for the frame's
+`path_id`: `Validating` means it is the echo of the challenge you issued (compare
+in constant time, then consume — never echo); `Validated` or `Failed` means it is
+a late duplicate (ignore); anything else means it is the peer's challenge (echo
+the same 32 bytes back on the same `path_id`, to the peer address you are already
+established with). PROTOCOL.md § 12.1 has the table. Echoing unconditionally gives
+two peers running the same dispatch an exchange that never terminates.
 
 ---
 
@@ -366,17 +462,22 @@ Never hand-edit a `.bin`. See `core/tests/wire_vectors/README.md`.
 A peer is wire-conformant with the default build of this repository when:
 
 - [ ] It is built for `WIRE_VERSION = 8`, `PROTOCOL_VERSION = 5`, `PROTOCOL_VARIANT = phantom-default-1`, and treats a mismatch as a hard error (no downgrade).
-- [ ] It agrees with its peer on the AEAD suite (not negotiated — § 1) and assigns the per-direction keys by role, initiator un-swapped and responder swapped (§ 1).
+- [ ] It agrees with its peer on the AEAD suite (not negotiated, and not selectable in this implementation — § 1) and assigns the per-direction keys by role, initiator un-swapped and responder swapped (§ 1).
 - [ ] Its AEAD / KDF / hash / ML-KEM / ML-DSA primitives reproduce every KAT in `cavp.rs` (Rung 0).
+- [ ] Its hybrid-KEM combiner is Extract-then-Expand over all **four** inputs — both shared secrets, the classical ciphertext, the recipient's classical public key — under `HybridKEM_X25519_Kyber768` (PROTOCOL.md § 3, Rung 4).
 - [ ] `encode(value)` equals each packet `.bin`, and `decode(.bin)` equals the value, for the four packet fixtures (Rung 1).
 - [ ] It frames packets for its transport — the 9-byte PhantomUDP envelope with zeroed reserved bits, or the 4-byte big-endian message prefix every stream leg except WebSocket carries (Rung 1b).
 - [ ] It allocates stream ids in its own parity — odd from 3 as the initiator, even from 2 as the responder, with 0 and 1 reserved (PROTOCOL.md § 4.4).
 - [ ] The same holds for all borsh handshake / sub-struct fixtures (Rung 2).
+- [ ] It treats the cookie `HelloRetryRequest` as the normal first answer, replies with the *same* hello (only `cookie` / `pow_solution` replaced), and — on PhantomUDP — retransmits its own flight on a bounded timer (Rung 2, PROTOCOL.md § 6.1 / § 6.8).
 - [ ] Its transcript hash equals `transcript_hash.bin` (Rung 3).
 - [ ] Its AEAD nonce/AAD construction and HP masking reproduce PROTOCOL.md § 4.6 / § 5; a tampered AAD byte (version included) fails decryption with no oracle (Rung 4).
 - [ ] It reads the AEAD plaintext by flag — reliable offset prefix, SACK, cumulative window limit, path challenge, padding trailer (Rung 4b).
 - [ ] It dispatches a `CONTROL` frame on its leading subtype byte and **returns on every arm**, the unknown subtype and the empty plaintext included, so no control byte can reach its application (Rung 4b, PROTOCOL.md § 4.11). Emitting a `CLOSE` is optional; dispatching one is not.
 - [ ] It applies an inbound `WINDOW_UPDATE` as a maximum, counts its own sent bytes once per byte, and never sends past the highest limit received (§ 4.5 of PROTOCOL.md).
+- [ ] It numbers reliable frames from 0 in steps of one — not by byte — and closes a stream with a zero-length `RELIABLE \| FIN` segment that consumes an offset (Rung 4b, PROTOCOL.md § 4.5).
+- [ ] It keeps every frame it emits within the 1300-byte reliable / 1304-byte unreliable receive ceiling (Rung 4b, PROTOCOL.md § 4.10).
+- [ ] (If migrating) it decides challenge-vs-echo from its own path-registry state and never echoes on a `Validating` or terminal path (Rung 5, PROTOCOL.md § 12.1).
 - [ ] `tests/wire_vectors_decode.py` agrees with the peer's serializer in both directions (§ 3).
 - [ ] (If migrating) the CID chain and path-validation grammar match PROTOCOL.md § 4.7 / § 12 (Rung 5).
 
@@ -410,3 +511,16 @@ limit) and `7 → 8` / `4 → 5` (the `CONTROL` subtype byte and the `CLOSE`
 announcement, Rung 4b). Both changed an AEAD plaintext and no header byte, so no
 fixture grammar moved — only the version byte inside the four packet fixtures and
 the two `ClientHello` fixtures, and `transcript_hash.bin` with them.
+
+**2026-08-22, commit `bb3f5936`.** This guide was audited against PROTOCOL.md and
+both against the source, on the question of whether a peer built strictly to the
+two would produce the same bytes. It would not, in nine places. The corrections
+land in PROTOCOL.md — which is where the grammar lives — and are summarised in its
+§ 13; the pointers here were updated with them. What changed above: § 1 gained the
+suite-resolution rule and the fact that it is not selectable; Rung 2 gained the
+four properties of the exchange that no single-message fixture can show; Rung 4
+gained the KEM combiner, which is the highest-cost mistake in the set precisely
+because every rung below it still passes; Rung 4b gained the two per-stream
+counters, the FIN sentinel and the receive-side frame ceiling; and Rung 5 gained
+the challenge-versus-echo rule. Nothing on the wire moved, so no fixture changed
+and no version was bumped.

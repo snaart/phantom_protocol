@@ -34,6 +34,56 @@ all four regenerated and CI-gated by `.github/workflows/bindings.yml`).
 | WASI Preview 2 | ✅ supported — `wasm32-wasip2` hard CI gate (`wasi-leg`); see `wasi.md` |
 | Embedded (Cortex-M) | ✅ supported — `thumbv7em-none-eabihf` hard CI gate (`embedded,no-std`) |
 
+## Choosing a transport
+
+Bind PhantomUDP (`PhantomUdpListener::bind_udp`) unless something stops you. It
+is the production transport: it is the one that can migrate a live session across
+a network change, and it is the one whose reliability and congestion control have
+somewhere to work. Every other row below it is a fallback for reach.
+
+| Leg | Deploy it when | What you give up |
+| --- | --- | --- |
+| PhantomUDP | always, by default | nothing — this is the reference path |
+| TCP | UDP is blocked, throttled, or unavailable to the client — carrier NAT, corporate egress filtering, a proxy that only forwards streams | latency under load (below), and `migrate()` — it returns `Err(Unsupported)` |
+| Mimicry (`mimicry` feature) | the deployment additionally needs the flow to look like HTTPS to a passive classifier | everything TCP gives up, plus the honest caveats in `docs/security/threat-model.md` § 6.1 — it is obfuscation, not a security boundary |
+| WebSocket | the client is a browser | as TCP |
+
+### Phantom over TCP is for compatibility, not for speed
+
+Worth stating plainly, because the leg is easy to reach for and its cost is
+invisible until a real path is under load.
+
+Phantom's reliability layer — ARQ, SACK-driven loss detection, BBR-style
+congestion control — is transport-independent and runs unchanged on every leg.
+Over a datagram socket it is the only such layer, which is the arrangement it was
+designed for. Over TCP it is the second one: the kernel below it already
+retransmits, already sequences, and already has a congestion window of its own.
+Neither loop can see the other, so they interact only through the queue between
+them — and that queue is inside the round-trip figure our side measures, so a
+filling kernel send buffer reads to us as a lengthening path.
+
+Measured, by the WAN harness in `testbed/`:
+
+| Observation on the TCP leg | Figure | Read it as |
+| --- | --- | --- |
+| min-RTT, worst seen | up to **4112 ms** | queueing under our own sender; no route the harness runs over is four seconds long |
+| application throughput, across campaign runs | **0.75–4.33 Mbit/s** | a range, not a rating — path capacity moved with it |
+| run `20260822-062705`, both ends from `8f710f69` | 4.83 Mbit/s received by the server | the one figure with a same-run control beside it: raw UDP echo measured 13.26 Mbit/s round-trip and the one-way downlink ceiling 20.90 Mbit/s on that path in that run |
+
+The harness, its controls and its caveats are described in `testbed/README.md`.
+Do not quote a throughput number from the table above without the raw control
+from the same run beside it; path capacity on that route has moved by a factor
+of ten between campaigns.
+
+None of this touches correctness or security. The leg carries the identical inner
+wire (`docs/protocol/PROTOCOL.md`), and pinning, the AEAD and the replay window
+sit above the transport and behave the same on all of them. Two things follow for
+an operator. If your clients can reach a UDP port, give them one, and offer TCP as
+the fallback rather than the default. And if you must run TCP for everyone,
+size expectations against the numbers above rather than against `BENCHMARKS.md`,
+whose figures are loopback and in-process and say nothing about a queue on a real
+path.
+
 ## Configuration
 
 Phantom Protocol has no config file or environment-variable surface
@@ -47,7 +97,7 @@ The relevant runtime-visible knobs are:
 | --- | --- | --- |
 | Listen address | `PhantomListener::bind(addr)` | "host:port" |
 | Adaptive PoW difficulty | automatic | Tiered by handshake rate; see Phase 1.14. |
-| Cipher suite | not negotiated | AES-256-GCM is pinned for every session (the `ClientHello` carries no suite field). `ChaCha20Poly1305` survives as an enum variant for wire stability and is rejected outright under `--features fips`. |
+| Cipher suite | not negotiated, and not selectable | The `ClientHello` carries no suite field and no API accepts one: each peer resolves it from its own target. AES-256-GCM where the CPU reports the AES extension on `x86`/`x86_64`/`aarch64`, **ChaCha20-Poly1305 unconditionally everywhere else** — every `wasm32` build included. Both ends must land on the same answer or the session establishes and then carries nothing; see `docs/protocol/PROTOCOL.md` § 2. Under `--features fips` it is pinned to AES-256-GCM and `ChaCha20Poly1305` is rejected outright. |
 | Wire format version | pinned constant (not negotiated) | `WIRE_VERSION` = <!--pinned:WIRE_VERSION-->8 — a single pinned value; the receive path drops any frame whose version differs. (`PROTOCOL_VERSION` = <!--pinned:PROTOCOL_VERSION-->5 is the borsh handshake version.) |
 | Rekey trigger | automatic (`REKEY_SOFT_LIMIT` = 2^32 AEAD invocations) | The data pump rotates the traffic secret itself; `PhantomSession::set_rekey_threshold(u64)` (Rust-only) lowers the watermark for tests. |
 | Tracing level | `RUST_LOG` | Standard `tracing_subscriber` filter syntax. |

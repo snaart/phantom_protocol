@@ -813,6 +813,91 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   `aead_failure_total`. Nothing about what is counted changes; the counters were always there,
   only unreadable.
 
+### Documented
+
+- **Nine places where a peer built strictly to `INTEROP.md` and `PROTOCOL.md` would not
+  interoperate.** An audit of the clean-room guide against the source asked one question —
+  would a second implementation following these two documents produce the same bytes — and
+  the answer was no in nine places. Only one was a contradiction anyone could have caught by
+  reading; the rest were silences, which is the harder kind, because nothing in a document
+  points at what it never mentions. Nothing on the wire moved, no fixture changed and no
+  version was bumped: the corrections are in the specification.
+
+  **The error.** § 3 wrote the hybrid-KEM combiner as
+  `HKDF-SHA-256(classical_secret ‖ kyber_secret)`. It is a full Extract-then-Expand over
+  **four** concatenated inputs — the two raw shared secrets, then the classical ciphertext
+  (the sender's ephemeral classical public key), then the recipient's classical public key
+  — 128 bytes of IKM on the default build rather than 64, under
+  `info = b"HybridKEM_X25519_Kyber768"` (`b"HybridKEM_P256_Kyber768"`, and 194 bytes, under
+  fips). The row was also missing from both lists of the Extract-vs-Expand inventory
+  immediately below it. This was the highest-severity item in the set because of where the
+  failure lands: the transcript signature does not depend on the shared secret, so a peer
+  built to the old sentence verifies the signature, adopts the `session_id` the
+  `ServerHello` carries, reports an established session — and then fails every packet in
+  both directions. That is precisely the failure § 1 of the guide warns about, arrived at by
+  following § 3.
+
+  **The one where the document moved instead of the code.** § 4.10 told an implementer it
+  could pick any chunk size and interoperate. The receive path drops any inbound frame over
+  `MAX_RECV_FRAME` = 1335 bytes before header protection and before the AEAD, on every leg
+  and after PhantomUDP reassembly — 1300 application bytes reliable, 1304 unreliable. The
+  ceiling ships in a released version and lowering a receiver's tolerance afterwards is not
+  something a peer can detect, so the section now states it: as a limit of *this
+  implementation's receive path*, with the constant named, the minimum a sender may rely on
+  given, and the note that a future revision may raise it and offers no way to discover that
+  it has. A refused frame is dropped rather than answered, so the symptom is a stream that
+  stops with no error at either end.
+
+  **The seven silences**, each verified against the source before it was written down:
+  § 2, the AEAD suite is resolved from the peer's *target* and cannot be overridden by any
+  API — AES-256-GCM only where the CPU reports the AES extension on `x86`/`x86_64`/`aarch64`,
+  ChaCha20-Poly1305 unconditionally everywhere else, `wasm32` included, so a browser client
+  and an `x86_64` server are both conformant and cannot exchange a byte; § 4.5, the reliable
+  `stream_offset` is a frame counter starting at 0 rather than a byte position, and closing a
+  stream is a zero-length `RELIABLE | FIN` segment that consumes one; § 6.1, nothing under
+  the handshake is reliable on PhantomUDP — the client re-sends its whole flight on a bounded
+  stop-and-wait schedule and the server never retransmits, so a lost `HelloRetryRequest` is
+  repaired and a lost `ServerHello` is not; § 6.2, there is no client authentication at all
+  and `ClientHello.client_verify_key` is carried, transcript-covered and verified by nobody;
+  § 6.6, resumption transmits nothing — both ends derive the secret from the previous
+  session's shared secret and reuse its `session_id`, so there is no ticket message to look
+  for; § 6.8, the cookie round is unconditional on first contact, a resumption ticket
+  bypasses it on the byte-pipe legs *only* (over PhantomUDP the stateless demux pre-gate
+  reads nothing but the cookie), and the retried hello is the first hello with only `cookie`
+  and `pow_solution` replaced; and § 12.1, a path challenge and its echo are byte-identical
+  frames whose reading follows from the receiver's own path-registry state, so a peer that
+  echoes unconditionally never terminates the exchange.
+
+  `INTEROP.md` gained the corresponding pointers — the suite-resolution rule in § 1, the four
+  properties of the handshake exchange that no single-message fixture can show in Rung 2, the
+  key schedule in Rung 4, the two per-stream counters and the frame ceiling in Rung 4b, the
+  challenge-versus-echo rule in Rung 5 — and six new conformance-checklist items.
+  `docs/operations/deployment.md`'s configuration table had the suite as "AES-256-GCM is
+  pinned for every session", which is true only under `--features fips`; it now carries the
+  same per-target rule.
+
+- **Phantom over TCP is a compatibility leg, not a fast one, and it now says so.** Its
+  reliability layer — ARQ, SACK loss detection, congestion control — is transport-independent
+  and runs unchanged on every leg. Over a datagram socket it is the only such layer, which is
+  what it was designed for; over TCP it is the second, stacked on a kernel that already
+  retransmits and already has a congestion window, with no visibility into it. The two loops
+  then interact only through the queue between them, and that queue is inside the round-trip
+  figure our side measures. The WAN harness has observed **min-RTT up to 4112 ms** on this
+  leg — queueing under our own sender rather than any property of the route — against
+  application throughput spanning **0.75–4.33 Mbit/s** across campaign runs; in run
+  `20260822-062705`, both ends built from `8f710f69`, the server received 4.83 Mbit/s over
+  this leg while raw UDP echo on the same path in the same run measured 13.26 Mbit/s
+  round-trip.
+
+  Recorded as what the leg is for rather than as a defect awaiting a fix. Disabling the ARQ
+  on byte-pipe transports is a large change to `run_data_pump` on a leg that is not the
+  production transport, and it is not being made now. So `README.md`,
+  `docs/operations/deployment.md` and the leg's own module documentation now say the same
+  thing: use this leg for reach — a network that blocks or throttles UDP, a proxy, a browser
+  sandbox — use PhantomUDP wherever you have the choice, and expect worse latency under load
+  here. Correctness and security are untouched: the inner wire, the pinning, the AEAD and the
+  replay window are identical on every transport.
+
 ### Fixed
 
 - **The claim that a peer flooding a non-reading application moves no window growth, which
