@@ -93,6 +93,7 @@ pub(crate) struct HotPathAtomics {
     replay_rejected_total: CachePadded<AtomicU64>,
     aead_failure_total: CachePadded<AtomicU64>,
     unencrypted_dropped_total: CachePadded<AtomicU64>,
+    initial_on_committed_route_total: CachePadded<AtomicU64>,
 
     /// Process-start timestamp for uptime calculation. Set once at
     /// construction; the snapshot reader computes `elapsed()` on read.
@@ -122,6 +123,7 @@ impl HotPathAtomics {
             replay_rejected_total: CachePadded::new(AtomicU64::new(0)),
             aead_failure_total: CachePadded::new(AtomicU64::new(0)),
             unencrypted_dropped_total: CachePadded::new(AtomicU64::new(0)),
+            initial_on_committed_route_total: CachePadded::new(AtomicU64::new(0)),
             started_at: Instant::now(),
         }
     }
@@ -236,6 +238,22 @@ impl HotPathAtomics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment the always-on count of handshake-type datagrams arriving on a
+    /// connection the listener has already committed a route to — a client
+    /// repeating its flight because it has not seen the reply (PROTOCOL § 6.1).
+    ///
+    /// It exists because of a question that could not be answered from any
+    /// artifact on either side of a failed connect: whether the client's repeated
+    /// hellos reached the server at all. A non-zero count says one flight went
+    /// missing on the way down; zero, against a client that timed out, says the
+    /// path fell silent in both directions. Those need different remedies and were
+    /// indistinguishable without this.
+    #[inline]
+    pub(crate) fn record_initial_on_committed_route(&self) {
+        self.initial_on_committed_route_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     // --- Read accessors (cold path) ---
 
     pub(crate) fn packets_total(&self, dir: usize) -> u64 {
@@ -317,6 +335,11 @@ impl HotPathAtomics {
 
     pub(crate) fn unencrypted_dropped_total(&self) -> u64 {
         self.unencrypted_dropped_total.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn initial_on_committed_route_total(&self) -> u64 {
+        self.initial_on_committed_route_total
+            .load(Ordering::Relaxed)
     }
 
     pub(crate) fn uptime_secs(&self) -> u64 {
@@ -420,6 +443,7 @@ mod tests {
         assert_eq!(h.replay_rejected_total(), 0);
         assert_eq!(h.aead_failure_total(), 0);
         assert_eq!(h.unencrypted_dropped_total(), 0);
+        assert_eq!(h.initial_on_committed_route_total(), 0);
 
         h.record_replay_rejected();
         h.record_replay_rejected();
@@ -427,10 +451,15 @@ mod tests {
         h.record_unencrypted_dropped();
         h.record_unencrypted_dropped();
         h.record_unencrypted_dropped();
+        h.record_initial_on_committed_route();
+        h.record_initial_on_committed_route();
+        h.record_initial_on_committed_route();
+        h.record_initial_on_committed_route();
 
         assert_eq!(h.replay_rejected_total(), 2);
         assert_eq!(h.aead_failure_total(), 1);
         assert_eq!(h.unencrypted_dropped_total(), 3);
+        assert_eq!(h.initial_on_committed_route_total(), 4);
     }
 
     #[test]

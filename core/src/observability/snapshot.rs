@@ -9,7 +9,7 @@
 //! byte / timing totals, the session/stream gauges, the handshake
 //! sum+count fields, and the always-on security counters
 //! (`replay_rejected_total`, `aead_failure_total`,
-//! `unencrypted_dropped_total`). The snapshot is always
+//! `unencrypted_dropped_total`, `initial_on_committed_route_total`). The snapshot is always
 //! available regardless of the `telemetry-otel` feature, since the atomics
 //! always exist. The labeled OTel instruments in `instruments.rs` carry
 //! the same events with attribution; both paths are populated together.
@@ -55,6 +55,13 @@ pub struct MetricsSnapshot {
     /// (Invariant 2, the stripped-flag downgrade defence). A non-zero value on a
     /// healthy peer means someone on the path is rewriting header flags.
     pub unencrypted_dropped_total: u64,
+    /// Handshake-type datagrams that arrived on a PhantomUDP connection the
+    /// listener had already committed a route to — a client repeating its flight
+    /// because it never saw the reply (PROTOCOL § 6.1). Read against a client that
+    /// timed out connecting, a non-zero value says one reply flight was lost on
+    /// the way down and zero says the path went silent in both directions; nothing
+    /// else distinguishes those.
+    pub initial_on_committed_route_total: u64,
 
     pub uptime_secs: u64,
 }
@@ -92,6 +99,7 @@ impl Default for MetricsSnapshot {
             replay_rejected_total: 0,
             aead_failure_total: 0,
             unencrypted_dropped_total: 0,
+            initial_on_committed_route_total: 0,
             uptime_secs: 0,
         }
     }
@@ -168,6 +176,7 @@ impl MetricsSnapshot {
             replay_rejected_total: h.replay_rejected_total(),
             aead_failure_total: h.aead_failure_total(),
             unencrypted_dropped_total: h.unencrypted_dropped_total(),
+            initial_on_committed_route_total: h.initial_on_committed_route_total(),
             uptime_secs: h.uptime_secs(),
         }
     }
@@ -209,7 +218,7 @@ pub struct MetricsSnapshotFfi {
     pub replay_rejected_total: u64,
     pub aead_failure_total: u64,
     pub uptime_secs: u64,
-    /// Deliberately last in the record, and it must stay last.
+    /// Deliberately near the end of the record, and new fields go after it.
     ///
     /// UniFFI lays a record out in declaration order and the generated bindings
     /// read it back the same way, so inserting a field anywhere but the end
@@ -221,6 +230,17 @@ pub struct MetricsSnapshotFfi {
     /// placement where a stale reader is merely missing a field rather than
     /// misreading the ones it already knew.
     pub unencrypted_dropped_total: u64,
+    /// Handshake-type datagrams that arrived on a PhantomUDP connection the listener
+    /// had already committed a route to — a client repeating its flight because it
+    /// never saw the reply (PROTOCOL § 6.1). Appended last for the reason above.
+    ///
+    /// Repetition is normal on a lossy path and is what the server's repeat answers,
+    /// so a small non-zero value is health rather than alarm. What it is for is
+    /// reading against a client that timed out connecting: non-zero says its
+    /// questions arrived and one reply flight was lost on the way down; zero says the
+    /// path fell silent in both directions. Nothing else on either side tells those
+    /// apart.
+    pub initial_on_committed_route_total: u64,
 }
 
 impl From<MetricsSnapshot> for MetricsSnapshotFfi {
@@ -245,6 +265,7 @@ impl From<MetricsSnapshot> for MetricsSnapshotFfi {
             aead_failure_total: s.aead_failure_total,
             uptime_secs: s.uptime_secs,
             unencrypted_dropped_total: s.unencrypted_dropped_total,
+            initial_on_committed_route_total: s.initial_on_committed_route_total,
         }
     }
 }
@@ -300,6 +321,7 @@ mod tests {
         assert_eq!(ffi.replay_rejected_total, 0);
         assert_eq!(ffi.aead_failure_total, 0);
         assert_eq!(ffi.unencrypted_dropped_total, 0);
+        assert_eq!(ffi.initial_on_committed_route_total, 0);
         assert_eq!(ffi.uptime_secs, 0);
     }
 
@@ -318,6 +340,7 @@ mod tests {
         h.record_replay_rejected();
         h.record_aead_failure();
         h.record_unencrypted_dropped();
+        h.record_initial_on_committed_route();
 
         let snap = MetricsSnapshot::capture(&h);
         let ffi = snap.to_ffi();
@@ -340,6 +363,7 @@ mod tests {
         assert_eq!(ffi.replay_rejected_total, 1);
         assert_eq!(ffi.aead_failure_total, 1);
         assert_eq!(ffi.unencrypted_dropped_total, 1);
+        assert_eq!(ffi.initial_on_committed_route_total, 1);
     }
 
     #[test]

@@ -557,7 +557,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 56893:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 55912:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -569,9 +569,9 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 18540:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 31956:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 10962:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 14127:
+    if lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 59359:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 56290:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1496,7 +1496,7 @@ class MetricsSnapshotFfi:
     server-accepted session the counters are the owning listener's aggregate
     (shared `Arc<Observability>` handle), not per-connection.
 """
-    def __init__(self, *, packets_sent:int, packets_recv:int, bytes_sent:int, bytes_recv:int, avg_encrypt_ns:int, avg_decrypt_ns:int, encrypt_count:int, decrypt_count:int, rtt_us_path_0:int, active_sessions:int, active_streams:int, handshakes_success:int, handshakes_failure:int, handshake_latency_ns_sum:int, handshake_latency_count:int, replay_rejected_total:int, aead_failure_total:int, uptime_secs:int, unencrypted_dropped_total:int):
+    def __init__(self, *, packets_sent:int, packets_recv:int, bytes_sent:int, bytes_recv:int, avg_encrypt_ns:int, avg_decrypt_ns:int, encrypt_count:int, decrypt_count:int, rtt_us_path_0:int, active_sessions:int, active_streams:int, handshakes_success:int, handshakes_failure:int, handshake_latency_ns_sum:int, handshake_latency_count:int, replay_rejected_total:int, aead_failure_total:int, uptime_secs:int, unencrypted_dropped_total:int, initial_on_committed_route_total:int):
         self.packets_sent = packets_sent
         self.packets_recv = packets_recv
         self.bytes_sent = bytes_sent
@@ -1516,12 +1516,13 @@ class MetricsSnapshotFfi:
         self.aead_failure_total = aead_failure_total
         self.uptime_secs = uptime_secs
         self.unencrypted_dropped_total = unencrypted_dropped_total
+        self.initial_on_committed_route_total = initial_on_committed_route_total
         
         
 
     
     def __str__(self):
-        return "MetricsSnapshotFfi(packets_sent={}, packets_recv={}, bytes_sent={}, bytes_recv={}, avg_encrypt_ns={}, avg_decrypt_ns={}, encrypt_count={}, decrypt_count={}, rtt_us_path_0={}, active_sessions={}, active_streams={}, handshakes_success={}, handshakes_failure={}, handshake_latency_ns_sum={}, handshake_latency_count={}, replay_rejected_total={}, aead_failure_total={}, uptime_secs={}, unencrypted_dropped_total={})".format(self.packets_sent, self.packets_recv, self.bytes_sent, self.bytes_recv, self.avg_encrypt_ns, self.avg_decrypt_ns, self.encrypt_count, self.decrypt_count, self.rtt_us_path_0, self.active_sessions, self.active_streams, self.handshakes_success, self.handshakes_failure, self.handshake_latency_ns_sum, self.handshake_latency_count, self.replay_rejected_total, self.aead_failure_total, self.uptime_secs, self.unencrypted_dropped_total)
+        return "MetricsSnapshotFfi(packets_sent={}, packets_recv={}, bytes_sent={}, bytes_recv={}, avg_encrypt_ns={}, avg_decrypt_ns={}, encrypt_count={}, decrypt_count={}, rtt_us_path_0={}, active_sessions={}, active_streams={}, handshakes_success={}, handshakes_failure={}, handshake_latency_ns_sum={}, handshake_latency_count={}, replay_rejected_total={}, aead_failure_total={}, uptime_secs={}, unencrypted_dropped_total={}, initial_on_committed_route_total={})".format(self.packets_sent, self.packets_recv, self.bytes_sent, self.bytes_recv, self.avg_encrypt_ns, self.avg_decrypt_ns, self.encrypt_count, self.decrypt_count, self.rtt_us_path_0, self.active_sessions, self.active_streams, self.handshakes_success, self.handshakes_failure, self.handshake_latency_ns_sum, self.handshake_latency_count, self.replay_rejected_total, self.aead_failure_total, self.uptime_secs, self.unencrypted_dropped_total, self.initial_on_committed_route_total)
     def __eq__(self, other):
         if self.packets_sent != other.packets_sent:
             return False
@@ -1561,6 +1562,8 @@ class MetricsSnapshotFfi:
             return False
         if self.unencrypted_dropped_total != other.unencrypted_dropped_total:
             return False
+        if self.initial_on_committed_route_total != other.initial_on_committed_route_total:
+            return False
         return True
 
 class _UniffiFfiConverterTypeMetricsSnapshotFfi(_UniffiConverterRustBuffer):
@@ -1586,6 +1589,7 @@ class _UniffiFfiConverterTypeMetricsSnapshotFfi(_UniffiConverterRustBuffer):
             aead_failure_total=_UniffiFfiConverterUInt64.read(buf),
             uptime_secs=_UniffiFfiConverterUInt64.read(buf),
             unencrypted_dropped_total=_UniffiFfiConverterUInt64.read(buf),
+            initial_on_committed_route_total=_UniffiFfiConverterUInt64.read(buf),
         )
 
     @staticmethod
@@ -1609,6 +1613,7 @@ class _UniffiFfiConverterTypeMetricsSnapshotFfi(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt64.check_lower(value.aead_failure_total)
         _UniffiFfiConverterUInt64.check_lower(value.uptime_secs)
         _UniffiFfiConverterUInt64.check_lower(value.unencrypted_dropped_total)
+        _UniffiFfiConverterUInt64.check_lower(value.initial_on_committed_route_total)
 
     @staticmethod
     def write(value, buf):
@@ -1631,6 +1636,7 @@ class _UniffiFfiConverterTypeMetricsSnapshotFfi(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt64.write(value.aead_failure_total, buf)
         _UniffiFfiConverterUInt64.write(value.uptime_secs, buf)
         _UniffiFfiConverterUInt64.write(value.unencrypted_dropped_total, buf)
+        _UniffiFfiConverterUInt64.write(value.initial_on_committed_route_total, buf)
 
 # The Duration type.
 Duration = datetime.timedelta
@@ -2754,12 +2760,12 @@ class PhantomStreamProtocol(typing.Protocol):
 
         **Message boundaries are not preserved.** The session's data pump splits
         `data` into chunks of
-        [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — one chunk
-        plus its packet overhead is exactly one PhantomUDP datagram — and buffers
-        each chunk as its own reliable write, so the peer's [`recv`](Self::recv)
-        yields one result *per chunk*, not one per `send_reliable`. Order is
-        guaranteed; grouping is not, and nothing marks where one call's payload
-        ended.
+        [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — 1156 on
+        this build, sized so that one chunk plus its packet overhead is exactly
+        one PhantomUDP datagram — and buffers each chunk as its own reliable
+        write, so the peer's [`recv`](Self::recv) yields one result *per chunk*,
+        not one per `send_reliable`. Order is guaranteed; grouping is not, and
+        nothing marks where one call's payload ended.
 
         Frame the messages yourself if you need them: write a length prefix ahead
         of each payload and accumulate `recv` results until the declared length is
@@ -2781,10 +2787,11 @@ class PhantomStreamProtocol(typing.Protocol):
         **Message boundaries are not preserved**, exactly as in
         [`send_reliable`](Self::send_reliable): the pump splits `data` into
         chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes
-        and sends each on its own. Here that is sharper than on the reliable
-        path, because the chunks are independent datagrams: any subset of them
-        can be lost or arrive out of order, so a payload larger than one chunk
-        can reach the peer with a hole in the middle and no signal that it did.
+        — 1156 on this build — and sends each on its own. Here that is sharper
+        than on the reliable path, because the chunks are independent datagrams:
+        any subset of them can be lost or arrive out of order, so a payload
+        larger than one chunk can reach the peer with a hole in the middle and no
+        signal that it did.
 
         Keep unreliable payloads within one chunk, or carry your own length
         prefix and sequence number and drop incomplete messages —
@@ -2899,12 +2906,12 @@ class PhantomStream(PhantomStreamProtocol):
 
         **Message boundaries are not preserved.** The session's data pump splits
         `data` into chunks of
-        [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — one chunk
-        plus its packet overhead is exactly one PhantomUDP datagram — and buffers
-        each chunk as its own reliable write, so the peer's [`recv`](Self::recv)
-        yields one result *per chunk*, not one per `send_reliable`. Order is
-        guaranteed; grouping is not, and nothing marks where one call's payload
-        ended.
+        [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — 1156 on
+        this build, sized so that one chunk plus its packet overhead is exactly
+        one PhantomUDP datagram — and buffers each chunk as its own reliable
+        write, so the peer's [`recv`](Self::recv) yields one result *per chunk*,
+        not one per `send_reliable`. Order is guaranteed; grouping is not, and
+        nothing marks where one call's payload ended.
 
         Frame the messages yourself if you need them: write a length prefix ahead
         of each payload and accumulate `recv` results until the declared length is
@@ -2941,10 +2948,11 @@ class PhantomStream(PhantomStreamProtocol):
         **Message boundaries are not preserved**, exactly as in
         [`send_reliable`](Self::send_reliable): the pump splits `data` into
         chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes
-        and sends each on its own. Here that is sharper than on the reliable
-        path, because the chunks are independent datagrams: any subset of them
-        can be lost or arrive out of order, so a payload larger than one chunk
-        can reach the peer with a hole in the middle and no signal that it did.
+        — 1156 on this build — and sends each on its own. Here that is sharper
+        than on the reliable path, because the chunks are independent datagrams:
+        any subset of them can be lost or arrive out of order, so a payload
+        larger than one chunk can reach the peer with a hole in the middle and no
+        signal that it did.
 
         Keep unreliable payloads within one chunk, or carry your own length
         prefix and sequence number and drop incomplete messages —
@@ -3159,9 +3167,12 @@ class PhantomSessionProtocol(typing.Protocol):
     `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
     `Connecting` (handshake rejection, a wrong pin) and `Closed` from
     `disconnect()`. `Migrating` is entered when the path goes silent and left
-    again for `Connected` if it recovers; sends keep buffering throughout. There
-    is no intermediate classical-only state — the hybrid handshake is one flight,
-    so the session is either unkeyed or fully post-quantum keyed.
+    again for `Connected` if it recovers; sends keep buffering throughout.
+    [`Draining`](ConnectionState::Draining) is the one state that buffers
+    nothing: it means the *peer* announced its close, so reads continue while
+    writes are refused rather than queued for a wire they will never reach.
+    There is no intermediate classical-only state — the hybrid handshake is one
+    flight, so the session is either unkeyed or fully post-quantum keyed.
 
     # Example
 
@@ -3454,11 +3465,12 @@ class PhantomSessionProtocol(typing.Protocol):
 
         **Message boundaries are not preserved.** The data pump splits `data`
         into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
-        bytes — one chunk plus its packet overhead is exactly one PhantomUDP
-        datagram — and writes each chunk separately, so the peer's
-        [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
-        An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
-        nothing marks where one `send` ended and the next began.
+        bytes — 1156 on this build, sized so that one chunk plus its packet
+        overhead is exactly one PhantomUDP datagram — and writes each chunk
+        separately, so the peer's [`recv`](Self::recv) yields one result *per
+        chunk*, not one per `send`. An 8 KiB `send` arrives as eight `recv`s.
+        Nothing reassembles them, and nothing marks where one `send` ended and
+        the next began.
 
         This is silent when it bites: the first chunk of a structured message
         usually still parses, as a truncated one, so a caller that reads a single
@@ -3526,9 +3538,12 @@ class PhantomSession(PhantomSessionProtocol):
     `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
     `Connecting` (handshake rejection, a wrong pin) and `Closed` from
     `disconnect()`. `Migrating` is entered when the path goes silent and left
-    again for `Connected` if it recovers; sends keep buffering throughout. There
-    is no intermediate classical-only state — the hybrid handshake is one flight,
-    so the session is either unkeyed or fully post-quantum keyed.
+    again for `Connected` if it recovers; sends keep buffering throughout.
+    [`Draining`](ConnectionState::Draining) is the one state that buffers
+    nothing: it means the *peer* announced its close, so reads continue while
+    writes are refused rather than queued for a wire they will never reach.
+    There is no intermediate classical-only state — the hybrid handshake is one
+    flight, so the session is either unkeyed or fully post-quantum keyed.
 
     # Example
 
@@ -4082,11 +4097,12 @@ class PhantomSession(PhantomSessionProtocol):
 
         **Message boundaries are not preserved.** The data pump splits `data`
         into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
-        bytes — one chunk plus its packet overhead is exactly one PhantomUDP
-        datagram — and writes each chunk separately, so the peer's
-        [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
-        An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
-        nothing marks where one `send` ended and the next began.
+        bytes — 1156 on this build, sized so that one chunk plus its packet
+        overhead is exactly one PhantomUDP datagram — and writes each chunk
+        separately, so the peer's [`recv`](Self::recv) yields one result *per
+        chunk*, not one per `send`. An 8 KiB `send` arrives as eight `recv`s.
+        Nothing reassembles them, and nothing marks where one `send` ended and
+        the next began.
 
         This is silent when it bites: the first chunk of a structured message
         usually still parses, as a truncated one, so a caller that reads a single

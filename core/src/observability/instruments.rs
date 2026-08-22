@@ -80,6 +80,8 @@ mod otel_off {
         #[inline(always)]
         pub(crate) fn record_unencrypted_dropped(&self, _leg: crate::transport::types::LegType) {}
         #[inline(always)]
+        pub(crate) fn record_initial_on_committed_route(&self) {}
+        #[inline(always)]
         pub(crate) fn record_path_migration(&self, _from: u8, _to: u8) {}
         #[inline(always)]
         pub(crate) fn record_cookie(&self, _outcome: CookieOutcome) {}
@@ -137,6 +139,10 @@ mod otel_on {
         replay_rejected: Counter<u64>,
         aead_failed: Counter<u64>,
         unencrypted_dropped: Counter<u64>,
+        /// Handshake-type datagrams on an already-committed route. No attributes at all:
+        /// the only attribution worth having would be per peer, which the cardinality
+        /// contract in `attrs.rs` forbids.
+        initial_on_committed_route: Counter<u64>,
 
         // Path lifecycle.
         path_migrations: Counter<u64>,
@@ -182,6 +188,13 @@ mod otel_on {
             let unencrypted_dropped = meter
                 .u64_counter(format!("{ns}.security.unencrypted_dropped"))
                 .with_description("Non-empty post-handshake packets dropped because the ENCRYPTED flag was absent")
+                .build();
+            let initial_on_committed_route = meter
+                .u64_counter(format!("{ns}.handshake.initial_on_committed_route"))
+                .with_description(
+                    "Handshake-type datagrams arriving on a connection already routed — a \
+                     client repeating its flight because it has not seen the reply",
+                )
                 .build();
             let path_migrations = meter
                 .u64_counter(format!("{ns}.path.migrations"))
@@ -239,6 +252,7 @@ mod otel_on {
                 replay_rejected,
                 aead_failed,
                 unencrypted_dropped,
+                initial_on_committed_route,
                 path_migrations,
                 rekey,
                 early_data,
@@ -289,6 +303,11 @@ mod otel_on {
         pub(crate) fn record_unencrypted_dropped(&self, leg: crate::transport::types::LegType) {
             self.unencrypted_dropped
                 .add(1, &[KeyValue::new("leg", leg_str(leg))]);
+        }
+
+        #[cold]
+        pub(crate) fn record_initial_on_committed_route(&self) {
+            self.initial_on_committed_route.add(1, &[]);
         }
 
         pub(crate) fn record_path_migration(&self, from: u8, to: u8) {

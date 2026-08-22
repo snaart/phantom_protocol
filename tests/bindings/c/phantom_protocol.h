@@ -325,11 +325,19 @@ typedef struct PhantomMetricsSnapshotFfi {
      * flag. Always populated; a non-zero value means the downgrade defence
      * fired, which is otherwise indistinguishable from nothing arriving. */
     uint64_t uptime_secs;
-    /* Appended last, and new fields must keep going last: this header carries no
+    /* Appended, and new fields must keep going after: this header carries no
      * length, so a consumer built against an older copy reads at the offsets it
      * knew. Appending leaves such a reader merely missing a field; inserting
      * anywhere else makes it misread every field that followed. */
     uint64_t unencrypted_dropped_total;
+    /* Handshake-type datagrams that arrived on a PhantomUDP connection the
+     * listener had already committed a route to — a client repeating its flight
+     * because it never saw the reply. Repetition is normal on a lossy path and
+     * is what the server's repeat answers, so a small non-zero value is health.
+     * Read against a client that timed out connecting, non-zero says its
+     * questions arrived and one reply flight was lost on the way down, and zero
+     * says the path fell silent in both directions. */
+    uint64_t initial_on_committed_route_total;
 } PhantomMetricsSnapshotFfi;
 
 /* ====================================================================

@@ -231,6 +231,21 @@ impl Observability {
         self.instruments.record_unencrypted_dropped(leg);
     }
 
+    /// Record a handshake-type datagram arriving on a connection the PhantomUDP listener has
+    /// already committed a route to — a client repeating its flight because it has not seen
+    /// the reply (PROTOCOL § 6.1).
+    ///
+    /// Deliberately unlabeled: the interesting attribute would be which peer is repeating,
+    /// and peer identity is exactly what the cardinality contract in
+    /// [`attrs`] module keeps out of instrument labels.
+    ///
+    /// [`attrs`]: crate::observability::attrs
+    #[inline]
+    pub fn record_initial_on_committed_route(&self) {
+        self.atomics.record_initial_on_committed_route();
+        self.instruments.record_initial_on_committed_route();
+    }
+
     pub fn record_path_migration(&self, from: u8, to: u8) {
         self.instruments.record_path_migration(from, to);
     }
@@ -283,16 +298,19 @@ mod tests {
         assert_eq!(s.replay_rejected_total, 0);
         assert_eq!(s.aead_failure_total, 0);
         assert_eq!(s.unencrypted_dropped_total, 0);
+        assert_eq!(s.initial_on_committed_route_total, 0);
 
         obs.record_replay_rejected(ReplayReason::Duplicate);
         obs.record_replay_rejected(ReplayReason::Duplicate);
         obs.record_aead_failure(LegType::Tcp, AeadAlgorithm::Aes256Gcm);
         obs.record_unencrypted_dropped(LegType::Tcp);
+        obs.record_initial_on_committed_route();
 
         let s = obs.snapshot();
         assert_eq!(s.replay_rejected_total, 2);
         assert_eq!(s.aead_failure_total, 1);
         assert_eq!(s.unencrypted_dropped_total, 1);
+        assert_eq!(s.initial_on_committed_route_total, 1);
     }
 
     #[test]
