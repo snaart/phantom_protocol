@@ -783,6 +783,15 @@ impl FlightTable {
     /// give up, while the newcomer's client is by construction still connecting. An eviction
     /// is counted (`handshake_flight_evicted_total`), because an evicted session is back to
     /// the pre-repair behaviour and nothing else on either side of that connect would say so.
+    ///
+    /// Scoping the budget per source address was the other candidate and it is worse here, in
+    /// both directions. It does not tighten the global bound — it multiplies it, since the
+    /// ceiling becomes sources × per-source allowance — and there is no source to protect
+    /// against: an entry exists only for a peer that echoed an IP-bound cookie and then
+    /// completed a full post-quantum handshake, so the work of filling this table is already
+    /// far above the work of holding it. What per-source keying would actually do is charge a
+    /// busy NAT for its own clients, which is the population most likely to be on the lossy
+    /// path this repair exists for.
     fn retain(&mut self, cid: ConnId, flight: HandshakeFlight, now: Instant) -> bool {
         // RFC 9000 § 8.2, checked once so no repeat has to. A flight larger than the limit
         // allows is refused rather than truncated: half a `ServerHello` is not an answer.
