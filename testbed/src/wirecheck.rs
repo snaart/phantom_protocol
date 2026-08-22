@@ -36,6 +36,19 @@
 //! reported twice: raw bits per byte over payloads long enough to reach the
 //! eight-bit ceiling, and as a fraction of each payload's own ceiling over all
 //! of them.
+//!
+//! ## Two ways to get a capture, one way to read it
+//!
+//! [`analyze`] does not care where the bytes came from, and two callers feed it.
+//! The probe's `wire_capture` scenario runs `tcpdump` against a real path — the
+//! honest version of the question, and the one that needs a WAN daemon and the
+//! right to open a BPF device. [`loopback`] runs the same session against a
+//! listener in the same process and takes the capture with a forwarding relay
+//! instead, which needs neither; that is the one wired into the test suite and
+//! the one behind `phantom-wirecheck`. Both render through [`report_lines`], so
+//! a reader is never comparing two dialects of the same result. What the cheap
+//! one cannot reach is listed in [`loopback`]'s own documentation, and it is
+//! not a short list.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -45,7 +58,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::report::WireCheckSample;
 use crate::stats::Summary;
+
+pub mod loopback;
 
 /// Payload length at which Shannon entropy can reach 8.0 bits per byte.
 ///
@@ -626,6 +642,146 @@ pub const ENCRYPTED_FLAG_STATEMENT: &[&str] = &[
      instrument for the same event still compiles to a no-op without the telemetry-otel feature; \
      the counter does not.",
 ];
+
+// ── Reporting ───────────────────────────────────────────────────────────────
+
+/// Render one check into the lines a reader sees, in the order they must be
+/// heard.
+///
+/// The verdict and the reasons for it come first: someone scanning an artifact
+/// must not have to reach the end of a paragraph about entropy to learn that
+/// the search proved nothing. The statement about the `ENCRYPTED` flag comes
+/// last and always, including on a skip, where it is the only thing the check
+/// has to say.
+///
+/// One renderer, used by the privileged WAN scenario and by the unprivileged
+/// loopback runner alike — two that drifted apart would let the same capture
+/// read as two different results depending on who took it.
+pub fn report_lines(sample: &WireCheckSample) -> Vec<String> {
+    let f = &sample.findings;
+    let mut lines = Vec::new();
+
+    match f.verdict {
+        Verdict::Pass => lines.push(format!(
+            "VERDICT pass: the {} application payload(s) this probe generated appear nowhere \
+             in {} captured frames, and the positive control does appear — so the search was \
+             capable of finding something",
+            sample.probe_messages, f.frames_total
+        )),
+        Verdict::Failed => lines.push(
+            "VERDICT failed: this run did not establish that the wire carries no application \
+             bytes"
+                .to_string(),
+        ),
+        Verdict::Skipped => lines.push(
+            "VERDICT skipped: no capture was taken, so the wire was not examined at all"
+                .to_string(),
+        ),
+    }
+    for r in &f.reasons {
+        lines.push(format!("  reason: {r}"));
+    }
+
+    if f.verdict != Verdict::Skipped {
+        let undecodable: usize = f.undecodable.iter().map(|u| u.frames).sum();
+        lines.push(format!(
+            "capture: {} frames ({} link type), {} decoded to a transport payload, {} not ({}); \
+             {} before the session was established, {} after{}",
+            f.frames_total,
+            f.link_type_name,
+            f.frames_decoded,
+            undecodable,
+            if f.undecodable.is_empty() {
+                "none".to_string()
+            } else {
+                f.undecodable
+                    .iter()
+                    .map(|u| format!("{}: {}", u.reason, u.frames))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            f.handshake_frames,
+            f.established_frames,
+            if f.capture_truncated {
+                "; the file ends mid-record, which is the expected shape when the capture is stopped"
+            } else {
+                ""
+            }
+        ));
+
+        let negative = f
+            .needles
+            .iter()
+            .filter(|n| n.polarity == Polarity::MustNotAppear);
+        lines.push(format!(
+            "negative search: {} needles over {} B payloads the probe generated \
+             (each message searched for whole and by its leading marker), {} hits",
+            negative.clone().count(),
+            sample.probe_payload_bytes,
+            negative.map(|n| n.frames_hit).sum::<usize>()
+        ));
+        for n in &f.needles {
+            match n.polarity {
+                Polarity::MustAppear => lines.push(format!(
+                    "positive control `{}` ({} B): {} frame(s), {} of them before establishment \
+                     — this is what shows the search can find anything at all",
+                    n.label, n.needle_bytes, n.frames_hit, n.hits_in_handshake
+                )),
+                Polarity::Observed => lines.push(format!(
+                    "observed (open by design, not a verdict) `{}` ({} B): {} frame(s)",
+                    n.label, n.needle_bytes, n.frames_hit
+                )),
+                Polarity::MustNotAppear => {}
+            }
+        }
+
+        let e = &f.established_entropy;
+        lines.push(format!(
+            "entropy of established-session payloads — evidence of unstructured bytes, not proof \
+             of encryption: {} payloads, {} of them at least {} B where 8.0 bits/byte is \
+             reachable. Over those {}: min {:.2}, p50 {:.2}, max {:.2} bits/byte. As a fraction \
+             of each payload's own arithmetic ceiling, over all {} non-trivial payloads: min \
+             {:.3}, p50 {:.3}. A short packet cannot reach 8 bits/byte for reasons that have \
+             nothing to do with cryptography, which is why the second figure exists",
+            e.payloads,
+            e.full_scale_payloads,
+            FULL_SCALE_LEN,
+            e.bits_per_byte.count,
+            e.bits_per_byte.min,
+            e.bits_per_byte.p50,
+            e.bits_per_byte.max,
+            e.ratio_of_ceiling.count,
+            e.ratio_of_ceiling.min,
+            e.ratio_of_ceiling.p50,
+        ));
+
+        if let Some(c) = &sample.session_counters {
+            lines.push(format!(
+                "session counters over the same exchange: {} replay rejections, {} AEAD failures, \
+                 {} unencrypted post-handshake packets refused, {} packets sent, {} received",
+                c.replay_rejected_total,
+                c.aead_failure_total,
+                c.unencrypted_dropped_total,
+                c.packets_sent,
+                c.packets_recv
+            ));
+        }
+    }
+
+    // Outside the block above: a capture that was taken but could not be read
+    // still has a path worth naming, and its verdict is a skip.
+    if let Some(p) = &sample.capture_path {
+        lines.push(format!(
+            "capture kept at {p}; reproduce with: {}",
+            sample.capture_command
+        ));
+    }
+
+    // Always last, and always in full: the part of invariant 2 a capture cannot
+    // reach, and where the answer actually comes from.
+    lines.extend(f.encrypted_flag.iter().cloned());
+    lines
+}
 
 // ── pcap reading ────────────────────────────────────────────────────────────
 

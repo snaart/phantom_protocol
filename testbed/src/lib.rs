@@ -1,6 +1,6 @@
 //! Real-network (WAN) test harness for the Phantom protocol.
 //!
-//! Two binaries share this library:
+//! Three binaries share this library:
 //!
 //! - `phantom-testd` — the daemon. Binds every network-testable leg (PhantomUDP,
 //!   Phantom-over-TCP, mimic-TLS), a QUIC reference leg, and the raw TCP/UDP
@@ -8,6 +8,11 @@
 //!   server-side statistics.
 //! - `phantom-probe` — the client. Drives a scenario matrix across those legs
 //!   and writes raw per-operation samples.
+//! - `phantom-wirecheck` — the odd one out, and deliberately so. It needs
+//!   neither host nor privileges: it drives a PhantomUDP session against a
+//!   listener in its own process and searches a capture of it for the
+//!   application payloads it sent. See [`wirecheck::loopback`] for what that
+//!   settles and, at greater length, what it does not.
 //!
 //! Three kinds of leg, and confusing them is how a result gets misread: the
 //! Phantom legs are the protocol under test, the raw legs are controls carrying

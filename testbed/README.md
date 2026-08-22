@@ -21,6 +21,7 @@ reports is a statement about the shipped surface rather than a private path.
 |---|---|---|
 | `phantom-testd` | the remote host | every network-testable leg + raw controls, plus server-side statistics |
 | `phantom-probe` | the operator's machine | the scenario matrix, raw per-operation samples |
+| `phantom-wirecheck` | anywhere, unprivileged | one question — is the application's data on the wire — over a loopback session it drives itself |
 
 ### Listeners
 
@@ -206,6 +207,63 @@ examined the wire at all.
 The capture is kept at `samples/<leg>/wire_capture.pcap` alongside the record,
 and the record carries the `tcpdump` command line that produced it, so the whole
 result can be re-derived by hand.
+
+### `phantom-wirecheck`: the same question on one machine, without root
+
+The scenario above needs a daemon on the far end of a real path and the right to
+open a BPF device. A check that needs both is a check nobody runs, so the same
+question has a second answer that costs nothing:
+
+```bash
+cargo run --manifest-path testbed/Cargo.toml --bin phantom-wirecheck
+# or, keeping the evidence:
+cargo run --manifest-path testbed/Cargo.toml --bin phantom-wirecheck -- \
+    --messages 32 --keep-capture ./wirecheck.pcap
+```
+
+No arguments, no daemon, no `sudo`. It binds a PhantomUDP listener in its own
+process, drives a full session against it — handshake, eight 1 KiB application
+messages echoed back byte-exact, close — and searches the capture for those
+payloads and for the positive control, with the same `analyze` and the same
+report the WAN scenario uses. The exit status is the verdict: `0` pass, `2`
+failed (including the case where the search found nothing at all and therefore
+proved nothing), `1` could not run.
+
+**The capture does not come from `tcpdump`.** The client is pointed at a relay —
+an ordinary UDP socket that forwards every datagram between the two ends and
+writes each into a classic-pcap file as it goes. Opening a UDP socket needs no
+rights, so the whole check runs unprivileged. What the file holds is the
+datagram exactly as it crossed; the link, IP and UDP headers around it are the
+relay's own reconstruction, naming the session's two real endpoints rather than
+the relay, and nothing below the datagram is visible to it.
+
+**What a loopback capture proves:** that this build, driving a complete
+PhantomUDP session, puts none of the application payloads it was given onto the
+wire in the clear — and that the search saying so can find something, because
+the same pass finds the `PROTOCOL_VARIANT` tag in the handshake.
+
+**What it does not prove**, and none of this is reachable without the WAN host:
+
+- nothing about the `ENCRYPTED` flag, for the same reason no capture can reach
+  it — see above;
+- nothing about a real path. Loopback has microsecond RTT, no loss, no
+  reordering and no NAT, so retransmissions, fragments, path validations and
+  migrations barely occur or do not occur at all. Those are code paths that
+  *build packets*, and a leak confined to one of them is invisible here. This is
+  the same rule that governs every other number in this repository;
+- only PhantomUDP — the relay forwards datagrams, so the TCP and mimicry legs
+  are untouched;
+- only the traffic one short exchange produces. A packet type this exchange
+  never emits has not been examined.
+
+**It runs in CI, and the privileged one does not.** The loopback check is driven
+by the tests in `src/wirecheck/loopback.rs`, which `cargo test --manifest-path
+testbed/Cargo.toml` runs — CI's `testbed-check` job. They need loopback sockets
+and nothing else. Capturing with `tcpdump` needs `cap_net_raw` or root; some
+hosted runners would grant it through passwordless `sudo`, but a security check
+that only runs as root is one that gets switched off the first time it is
+inconvenient. The privileged path stays the operator's; the unprivileged one is
+what guards the property on every commit.
 
 ### Reordering: how far back, and how long after
 

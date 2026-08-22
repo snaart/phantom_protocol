@@ -2088,141 +2088,21 @@ fn skipped_sample(leg: Leg, command: String, why: String) -> WireCheckSample {
 
 /// Turn one check into its sample record and the notes a reader sees.
 ///
-/// The notes are ordered so the verdict and the reasons for it come first: a
-/// reader scanning `summary.json` must not have to reach the end of a paragraph
-/// about entropy to learn that the search proved nothing.
+/// The lines themselves come from [`wirecheck::report_lines`], which the
+/// unprivileged loopback runner also renders through, so the same capture reads
+/// the same way whoever took it. What is decided here is what the verdict does
+/// to the scenario's counts: a pass is an ok, a failure is an error, and a skip
+/// is neither — an absence with a stated cause is not a result in either
+/// direction.
 fn record_wire_check(out: &mut ScenarioOutput, sample: WireCheckSample) {
-    let f = &sample.findings;
-    match f.verdict {
-        wirecheck::Verdict::Pass => {
-            out.summary.ok_count += 1;
-            out.note(format!(
-                "VERDICT pass: the {} application payload(s) this probe generated appear nowhere \
-                 in {} captured frames, and the positive control does appear — so the search was \
-                 capable of finding something",
-                sample.probe_messages, f.frames_total
-            ));
-        }
-        wirecheck::Verdict::Failed => {
-            out.summary.error_count += 1;
-            out.note("VERDICT failed: this run did not establish that the wire carries no application bytes".to_string());
-        }
-        wirecheck::Verdict::Skipped => {
-            out.note(
-                "VERDICT skipped: no capture was taken, so the wire was not examined at all"
-                    .to_string(),
-            );
-        }
+    match sample.findings.verdict {
+        wirecheck::Verdict::Pass => out.summary.ok_count += 1,
+        wirecheck::Verdict::Failed => out.summary.error_count += 1,
+        wirecheck::Verdict::Skipped => {}
     }
-    for r in &f.reasons {
-        out.note(format!("  reason: {r}"));
+    for line in wirecheck::report_lines(&sample) {
+        out.note(line);
     }
-
-    if f.verdict != wirecheck::Verdict::Skipped {
-        let undecodable: usize = f.undecodable.iter().map(|u| u.frames).sum();
-        out.note(format!(
-            "capture: {} frames ({} link type), {} decoded to a transport payload, {} not ({}); \
-             {} before the session was established, {} after{}",
-            f.frames_total,
-            f.link_type_name,
-            f.frames_decoded,
-            undecodable,
-            if f.undecodable.is_empty() {
-                "none".to_string()
-            } else {
-                f.undecodable
-                    .iter()
-                    .map(|u| format!("{}: {}", u.reason, u.frames))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            },
-            f.handshake_frames,
-            f.established_frames,
-            if f.capture_truncated {
-                "; the file ends mid-record, which is the expected shape when the capture is stopped"
-            } else {
-                ""
-            }
-        ));
-
-        let negative: usize = f
-            .needles
-            .iter()
-            .filter(|n| n.polarity == wirecheck::Polarity::MustNotAppear)
-            .count();
-        out.note(format!(
-            "negative search: {negative} needles over {} B payloads the probe generated \
-             (each message searched for whole and by its leading marker), {} hits",
-            sample.probe_payload_bytes,
-            f.needles
-                .iter()
-                .filter(|n| n.polarity == wirecheck::Polarity::MustNotAppear)
-                .map(|n| n.frames_hit)
-                .sum::<usize>()
-        ));
-        for n in &f.needles {
-            match n.polarity {
-                wirecheck::Polarity::MustAppear => out.note(format!(
-                    "positive control `{}` ({} B): {} frame(s), {} of them before establishment \
-                     — this is what shows the search can find anything at all",
-                    n.label, n.needle_bytes, n.frames_hit, n.hits_in_handshake
-                )),
-                wirecheck::Polarity::Observed => out.note(format!(
-                    "observed (open by design, not a verdict) `{}` ({} B): {} frame(s)",
-                    n.label, n.needle_bytes, n.frames_hit
-                )),
-                wirecheck::Polarity::MustNotAppear => {}
-            }
-        }
-
-        let e = &f.established_entropy;
-        out.note(format!(
-            "entropy of established-session payloads — evidence of unstructured bytes, not proof \
-             of encryption: {} payloads, {} of them at least {} B where 8.0 bits/byte is \
-             reachable. Over those {}: min {:.2}, p50 {:.2}, max {:.2} bits/byte. As a fraction \
-             of each payload's own arithmetic ceiling, over all {} non-trivial payloads: min \
-             {:.3}, p50 {:.3}. A short packet cannot reach 8 bits/byte for reasons that have \
-             nothing to do with cryptography, which is why the second figure exists",
-            e.payloads,
-            e.full_scale_payloads,
-            wirecheck::FULL_SCALE_LEN,
-            e.bits_per_byte.count,
-            e.bits_per_byte.min,
-            e.bits_per_byte.p50,
-            e.bits_per_byte.max,
-            e.ratio_of_ceiling.count,
-            e.ratio_of_ceiling.min,
-            e.ratio_of_ceiling.p50,
-        ));
-
-        if let Some(c) = &sample.session_counters {
-            out.note(format!(
-                "session counters over the same exchange: {} replay rejections, {} AEAD failures, \
-                 {} unencrypted post-handshake packets refused, {} packets sent, {} received",
-                c.replay_rejected_total,
-                c.aead_failure_total,
-                c.unencrypted_dropped_total,
-                c.packets_sent,
-                c.packets_recv
-            ));
-        }
-    }
-
-    // Outside the block above: a capture that was taken but could not be read
-    // still has a path worth naming, and its verdict is a skip.
-    if let Some(p) = &sample.capture_path {
-        out.note(format!(
-            "capture kept at {p}; reproduce with: {}",
-            sample.capture_command
-        ));
-    }
-
-    // Always last, and always in full: the part of invariant 2 a capture cannot
-    // reach, and where the answer actually comes from.
-    for line in &f.encrypted_flag {
-        out.note(line.clone());
-    }
-
     out.sink.push(&sample);
 }
 
