@@ -422,9 +422,12 @@ impl<T: SessionTransport> SessionTransport for ObservedTransport<T> {
 /// `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
 /// `Connecting` (handshake rejection, a wrong pin) and `Closed` from
 /// `disconnect()`. `Migrating` is entered when the path goes silent and left
-/// again for `Connected` if it recovers; sends keep buffering throughout. There
-/// is no intermediate classical-only state — the hybrid handshake is one flight,
-/// so the session is either unkeyed or fully post-quantum keyed.
+/// again for `Connected` if it recovers; sends keep buffering throughout.
+/// [`Draining`](ConnectionState::Draining) is the one state that buffers
+/// nothing: it means the *peer* announced its close, so reads continue while
+/// writes are refused rather than queued for a wire they will never reach.
+/// There is no intermediate classical-only state — the hybrid handshake is one
+/// flight, so the session is either unkeyed or fully post-quantum keyed.
 ///
 /// # Example
 ///

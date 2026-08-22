@@ -1622,7 +1622,8 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   was permanently false. An embedder following the rustdoc would have waited for a state
   that cannot arrive, or gated its send path on a readiness flag that never turns true.
   The session rustdoc now describes the machine that exists —
-  `Connecting → Connected → Migrating → Dead`, plus `Failed` and `Closed`. Use
+  `Connecting → Connected → Migrating → Dead`, plus `Failed`, `Closed` and the
+  peer-initiated `Draining` added later in this window. Use
   `is_data_ready()`: because the handshake is one flight, a data-ready session is
   post-quantum protected by construction. Discriminants `1..=3` are left retired rather
   than reused. Breaking for the FFI enum and for `is_pqc_ready()` callers, within the
