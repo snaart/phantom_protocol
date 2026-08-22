@@ -5103,11 +5103,12 @@ impl PhantomSession {
     ///
     /// **Message boundaries are not preserved.** The data pump splits `data`
     /// into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
-    /// bytes — one chunk plus its packet overhead is exactly one PhantomUDP
-    /// datagram — and writes each chunk separately, so the peer's
-    /// [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
-    /// An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
-    /// nothing marks where one `send` ended and the next began.
+    /// bytes — 1156 on this build, sized so that one chunk plus its packet
+    /// overhead is exactly one PhantomUDP datagram — and writes each chunk
+    /// separately, so the peer's [`recv`](Self::recv) yields one result *per
+    /// chunk*, not one per `send`. An 8 KiB `send` arrives as eight `recv`s.
+    /// Nothing reassembles them, and nothing marks where one `send` ended and
+    /// the next began.
     ///
     /// This is silent when it bites: the first chunk of a structured message
     /// usually still parses, as a truncated one, so a caller that reads a single

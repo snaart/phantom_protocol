@@ -179,6 +179,22 @@ mod tests {
         );
     }
 
+    /// The chunk size is quoted as a bare number in prose that no compiler reads.
+    ///
+    /// It is derived, and deliberately so — raising `PATH_MTU` widens it and
+    /// nothing in the transport has to move. But the send-path API documentation
+    /// tells embedders the figure outright, because "boundaries are preserved
+    /// below some constant you can go look up" is advice nobody acts on, and an
+    /// embedder sizes its own framing against the number it was given. A silently
+    /// stale one is worse than none. This is the thing that has to move: when it
+    /// fails, update the figure in `PhantomSession::send`,
+    /// `PhantomStream::send_reliable` and `PhantomStream::send_unreliable`, and
+    /// in the `MAX_APP_CHUNK` arithmetic above, then change it here.
+    #[test]
+    fn the_chunk_size_quoted_in_the_send_path_docs_is_still_this_one() {
+        assert_eq!(MAX_APP_CHUNK, 1156);
+    }
+
     /// The envelope module and this one must agree; they are the same constants,
     /// and this fails if the re-export is ever replaced by a second definition.
     #[test]
