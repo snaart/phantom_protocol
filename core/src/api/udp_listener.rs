@@ -654,7 +654,12 @@ const MAX_FLIGHT_REPEATS: u32 = 3;
 /// be asking. A shorter window would drop the answer while the question was still in flight;
 /// a longer one would hold kilobytes for a peer that has already gone.
 ///
+/// The coupling is checked by [`the_retention_window_matches_how_long_the_client_keeps_asking`],
+/// against the client's schedule walked interval by interval rather than against the budget
+/// constant this is defined as — which would assert nothing.
+///
 /// [`HANDSHAKE_RETRANSMIT_BUDGET`]: crate::api::udp_transport::HANDSHAKE_RETRANSMIT_BUDGET
+/// [`the_retention_window_matches_how_long_the_client_keeps_asking`]: self::tests::the_retention_window_matches_how_long_the_client_keeps_asking
 const HANDSHAKE_FLIGHT_RETENTION: Duration = crate::api::udp_transport::HANDSHAKE_RETRANSMIT_BUDGET;
 
 /// How much memory a listener's retained reply flights may occupy at once (PROTOCOL § 6.1).
@@ -1399,6 +1404,31 @@ mod tests {
             "the server answers {MAX_FLIGHT_REPEATS} repeats while the client sends \
              {client_repeats}; the two must be the same number, derived from the client's \
              schedule and not restated"
+        );
+    }
+
+    /// The server retains its answer for exactly as long as the client keeps asking, and
+    /// that is a coupling rather than a coincidence.
+    ///
+    /// The sibling of the test above, for the other end of the same window. The client's
+    /// retransmission schedule is in the transport and the server's retention deadline is in
+    /// the listener, neither can see the other, and the failure from a disagreement is
+    /// invisible on a clean path: retain for too little and the answer is dropped while the
+    /// question is still in flight, retain for too long and the listener holds kilobytes for
+    /// a peer that abandoned the connect. So the window is walked out of the client's own
+    /// schedule — the total time it waits before giving up — and compared. Asserting against
+    /// `HANDSHAKE_RETRANSMIT_BUDGET` instead would be no assertion at all, since the
+    /// listener's constant is defined as that budget; what makes this a test is that the walk
+    /// is over the intervals a client actually spends, so a schedule that stopped landing on
+    /// its own ceiling turns this red rather than moving the give-up point in silence.
+    #[test]
+    fn the_retention_window_matches_how_long_the_client_keeps_asking() {
+        let client_gives_up_after = crate::api::udp_transport::handshake_retransmit_total_wait();
+        assert_eq!(
+            HANDSHAKE_FLIGHT_RETENTION, client_gives_up_after,
+            "the listener holds a reply for {HANDSHAKE_FLIGHT_RETENTION:?} while the client \
+             asks for {client_gives_up_after:?}; the two must be the same duration, derived \
+             from the client's schedule and not restated"
         );
     }
 

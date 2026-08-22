@@ -147,6 +147,34 @@ pub(crate) fn handshake_retransmit_count() -> u32 {
     repeats
 }
 
+/// How long the Handshake-phase schedule waits, in total, before it gives up.
+///
+/// The sibling of [`handshake_retransmit_count`] and there for the same reason: it is the
+/// number the **server's** retention window is sized against (PROTOCOL § 6.1). At the far end
+/// of this walk the client has abandoned the connect, so an answer retained past it is
+/// answering nobody, and an answer dropped before it is dropped while the question is still
+/// in flight.
+///
+/// It is walked rather than read off [`HANDSHAKE_RETRANSMIT_BUDGET`] because the schedule is
+/// what a client actually spends and the budget is only its intended ceiling. The two agree
+/// today because each wait is clipped to land on it; a schedule that stopped agreeing —
+/// overshooting, or terminating early — would move the moment a client gives up without
+/// moving the constant, and the listener's window would silently be sized against a client
+/// that no longer exists.
+///
+/// Test-only, for the same reason as its sibling: production reads the constant, and this is
+/// what makes the constant answerable to the schedule.
+#[cfg(test)]
+pub(crate) fn handshake_retransmit_total_wait() -> Duration {
+    let mut attempt = 0u32;
+    let mut spent = Duration::ZERO;
+    while let Some(wait) = next_handshake_wait(attempt, spent) {
+        spent = spent.saturating_add(wait);
+        attempt = attempt.saturating_add(1);
+    }
+    spent
+}
+
 const PHASE_HANDSHAKE: u8 = 0;
 const PHASE_ESTABLISHED: u8 = 1;
 
