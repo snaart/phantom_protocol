@@ -2829,15 +2829,21 @@ async fn recv_window_growth_is_bounded_per_session_not_per_stream() {
 /// times one allowance — and that arithmetic is published, which makes it a thing that can
 /// go stale.
 ///
-/// `CHANGELOG.md`, `docs/security/threat-model.md` §5 §D.1 and
-/// `docs/operations/deployment.md` all state the figure for the reference server's default
-/// `PHANTOM_MAX_SESSIONS` of 1024, and `phantom-server`'s `--max-recv-window-growth-mib`
-/// divides a stated budget by the same per-session constant to derive a session cap. A
-/// figure copied into four places is a figure that drifts, so it is pinned here against
-/// what sessions are *observed* to draw rather than against the constant it was typed
-/// from: if the allowance ever stopped being enforced, the observed per-session maximum
-/// would exceed it and the published product would silently understate the process by
-/// whatever factor the enforcement was out.
+/// `CHANGELOG.md`, `docs/security/threat-model.md` §5 §D.1,
+/// `docs/operations/deployment.md` and the Helm chart's `values.yaml` all state the figure
+/// for the reference server's default `PHANTOM_MAX_SESSIONS` of 1024. This test pins it
+/// against what sessions are *observed* to draw rather than against the constant it was
+/// typed from: if the allowance ever stopped being enforced, the observed per-session
+/// maximum would exceed it and the published product would silently understate the process
+/// by whatever factor the enforcement was out.
+///
+/// The two constants below are literals in a crate that cannot see `server/`, so this test
+/// on its own could only ever agree with the tree it was written against.
+/// `scripts/check_memory_arithmetic.py` is what couples them: it reads
+/// `PHANTOM_MAX_SESSIONS`'s clap default out of `server/src/config.rs`, reads
+/// `SESSION_RECV_WINDOW_GROWTH_BUDGET` out of `core/src/transport/stream.rs`, recomputes
+/// the product, and fails when this file or any published statement of it disagrees. Change
+/// the server's default and that script is what says so — this test would stay green.
 ///
 /// Companion to `recv_window_growth_is_bounded_per_session_not_per_stream`, which pins the
 /// *per-session* half. This one pins the multiplier.
@@ -2846,6 +2852,9 @@ async fn the_published_process_growth_figure_is_the_session_cap_times_what_a_ses
     tokio::time::pause();
     const SESSIONS: usize = 4;
     const STREAMS_PER_SESSION: usize = 16;
+    // Both figures below are checked against `server/src/config.rs` and
+    // `core/src/transport/stream.rs` by `scripts/check_memory_arithmetic.py`, which parses
+    // these two lines by name. Keep the names and the literal forms.
     /// `PHANTOM_MAX_SESSIONS`'s default in the reference server.
     const REFERENCE_DEFAULT_SESSION_CAP: u64 = 1024;
     /// The receive-window growth those sessions commit, as published alongside that cap.
@@ -2915,8 +2924,8 @@ async fn the_published_process_growth_figure_is_the_session_cap_times_what_a_ses
     assert!(
         REFERENCE_DEFAULT_SESSION_CAP * worst <= PUBLISHED_PROCESS_GROWTH,
         "{REFERENCE_DEFAULT_SESSION_CAP} sessions each drawing the observed {worst} B come \
-         to more than the published {PUBLISHED_PROCESS_GROWTH} B; the documents and \
-         `--max-recv-window-growth-mib` are both out"
+         to more than the published {PUBLISHED_PROCESS_GROWTH} B, so every document that \
+         states the product is out"
     );
     assert!(
         REFERENCE_DEFAULT_SESSION_CAP * (worst + u64::from(INITIAL_STREAM_WINDOW))

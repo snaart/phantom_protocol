@@ -72,8 +72,22 @@
 //! `1024 × 8 MiB` = 8 GiB at the reference server's default
 //! `PHANTOM_MAX_SESSIONS`, before any other row is counted. Admission control is
 //! therefore what bounds a process and it belongs to the embedder;
-//! `phantom-server` will also take the ceiling directly and derive the cap from
-//! it (`--max-recv-window-growth-mib`).
+//! `phantom-server` prints that product at startup.
+//!
+//! It is **a floor on what the host must have, not a ceiling on what the process
+//! will use**: window growth is one term of the table above and among the
+//! smallest, and it is an advertisement rather than a residency — the bytes it
+//! admits come to rest in the reorder buffers and the delivery queues, which are
+//! separately bounded and individually larger. `phantom-server` deliberately
+//! offers no flag that divides a memory budget by it;
+//! `docs/operations/deployment.md` records why, twice over.
+//!
+//! One thing the allowance does **not** rest on is the application's
+//! cooperation. Growth is credited by the delivery task as it hands a frame to
+//! the bounded queue behind `recv()` — one queue ahead of the application
+//! reading it — and a peer opens as many streams, hence as many queues, as it
+//! likes. A peer facing an application that never reads therefore still reaches
+//! the allowance; the allowance is what stops it.
 
 use crate::crypto::hybrid_sign::HybridVerifyingKey;
 use crate::errors::CoreError;

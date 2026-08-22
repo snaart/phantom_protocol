@@ -10,6 +10,20 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Removed
 
+- **No flag that turns a memory budget into a session cap, and a second removal on the
+  record.** `--max-recv-window-growth-mib` was built to state the left-hand side of that
+  arithmetic and derive `--max-sessions` from it, and it is removed before shipping.
+  Its arithmetic was exact, which is what makes it worth recording: the earlier
+  `--max-recv-memory-mib` divided by a per-session *total* that was an estimate corrected
+  upward three times, this one divided by a constant the transport enforces, and it was
+  still the wrong thing to offer. Its unit is MiB, nobody reaches for a MiB-denominated
+  server flag except with a memory limit in hand — so what it was handed was a memory limit
+  and what it returned was a session cap that same memory could not support, by the ratio
+  between this term and the two the deployment guide ranks an order of magnitude above it. A knob whose documentation has to say "do not
+  read this as its unit reads" belongs in the log instead, so that is where it is:
+  `phantom-server` prints `recv_window_growth_commitment` beside the session cap at startup
+  and offers no control that appears to bound it. Sizing a host ends in measurement.
+
 - **`api::session::SESSION_RECV_MEMORY_COMMITMENT`, and `phantom-server`'s
   `--max-recv-memory-mib` / `PHANTOM_MAX_RECV_MEMORY_MIB` with it.** The constant published a
   single per-session resident total for the receive path, and the flag divided an operator's
@@ -386,35 +400,29 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
-- **The arithmetic that turns a per-session memory bound into a per-process one, and
-  `phantom-server`'s `--max-recv-window-growth-mib` / `PHANTOM_MAX_RECV_WINDOW_GROWTH_MIB`
-  to state its left-hand side.** Every receive-side bound this transport enforces is
-  enforced *per session* — the growth allowance most explicitly, since one
-  `SharedRecvTuning` handle is created per session and nothing divides it between
-  concurrent ones. What that means for a process was left for the reader to work out, and
-  the reference server admits 1024 sessions by default, so the figure it works out to is
-  `1024 × SESSION_RECV_WINDOW_GROWTH_BUDGET` = **8 GiB of receive-window growth alone**,
-  before a reorder entry or a delivery-queue slot is counted. That product is now written
-  down in `docs/security/threat-model.md` §5 §D.1, `docs/operations/deployment.md` and the
-  entry above, and pinned in `security_invariants.rs` against what sessions are *observed*
-  to draw rather than against the constant it was typed from — so the enforcement failing
-  and the documents going stale are the same test failure.
+- **The arithmetic that turns a per-session memory bound into a per-process one.** Every
+  receive-side bound this transport enforces is enforced *per session* — the growth
+  allowance most explicitly, since one `SharedRecvTuning` handle is created per session and
+  nothing divides it between concurrent ones. What that means for a process was left for the
+  reader to work out, and the reference server admits 1024 sessions by default, so the figure
+  it works out to is `1024 × SESSION_RECV_WINDOW_GROWTH_BUDGET` = **8 GiB of receive-window
+  growth alone**, before a reorder entry or a delivery-queue slot is counted. That product is
+  now written down in `docs/security/threat-model.md` §5 §D.1,
+  `docs/operations/deployment.md`, `docs/operations/helm/phantom-protocol/values.yaml` and
+  on the constant itself, `phantom-server` prints it at startup, and
+  `scripts/check_memory_arithmetic.py` re-derives it from `PHANTOM_MAX_SESSIONS`'s default in
+  `server/src/config.rs` and the constant in `core/src/transport/stream.rs` and fails when any
+  copy of it disagrees — so changing either constant moves every published statement of the
+  product or breaks the build. The per-session half stays pinned in `security_invariants.rs`
+  against what sessions are *observed* to draw rather than against the constant it was typed
+  from.
 
-  The flag states a ceiling on that one term and lowers `--max-sessions` to the sessions
-  that fit: `8192` buys exactly the shipped default of `1024`, and a value below `8` refuses
-  to start rather than admitting a session the stated ceiling cannot hold. `0`, the default,
-  states no ceiling and leaves every existing configuration untouched.
-
-  It is deliberately **not** the `--max-recv-memory-mib` removed above returning under a new
-  name. That one divided an operator's budget by a published per-session *total*, and the
-  total was an estimate that was corrected upward three times; a cap derived from an
-  estimate under-provisions a host by exactly the factor the estimate is out. This one
-  divides by an allowance the transport enforces and a test measures, so its answer is
-  sound — but sound about 8 MiB of a per-session footprint that reaches hundreds of
-  megabytes, which makes it a floor on what the host must have rather than a ceiling on what
-  it will use, and the flag's own help text and the deployment guide both say so in those
-  words. Sizing a host still ends in measurement; what the flag adds is the ability to
-  reject a configuration that is already too large on the cheapest term.
+  Every one of those places states it in the same words: **a floor on what the host must
+  have, not a ceiling on what the process will use.** Window growth is one term of the
+  receive path and among the smallest — the same guide ranks the reorder structure and the
+  per-stream delivery queues an order of magnitude above it per session — and it is an
+  *advertisement* rather than a residency: what the allowance buys a peer is the right to
+  have that much outstanding, while the bytes it admits come to rest in those other buffers.
 
   A **process-wide** second tier of budget, shared by concurrent sessions, was the other way
   to close this and is rejected on the record in §D.1. It would bound the 8 GiB, and it
@@ -677,6 +685,37 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   only unreadable.
 
 ### Fixed
+
+- **The claim that a peer flooding a non-reading application moves no window growth, which
+  was false on the opened-stream path.** Growth is credited by the delivery task at the
+  moment it hands a frame *onward*, before the blocking send into the bounded queue behind
+  `recv()` returns — one queue short of the application reading anything. On the
+  opened-stream path that queue is `STREAM_RECV_CHANNEL_DEPTH` frames, more than the whole
+  climb from the 64 KiB initial window to the 1 MiB ceiling costs, and the peer picks how
+  many such queues exist because every stream it opens gets one. Measured: nine peer-opened
+  streams draw 8 323 072 of the 8 388 608 B allowance with no application read at all. What
+  bounds it is the session allowance, not the reader — which is the honest form of the
+  argument and the reason the allowance exists. Two tests in `transport::stream` pin both
+  halves, and the documentation on `tune_recv_window`, `record_app_consumed`,
+  `api::session`, the threat model and the deployment guide now say it the same way.
+
+- **`docs/operations/kubernetes.md` sized a pod from 64 KiB per session.** The figure was
+  eight times below the typical one the deployment guide publishes and three orders of
+  magnitude below what a hostile peer can drive, and it was the number the Helm chart's
+  defaults were derived from — so a pod sized from that page under-provisioned twice over.
+  It now carries the same two figures the deployment guide separates and the same
+  growth-commitment arithmetic, and the chart's `values.yaml` carries them beside
+  `resources.limits.memory`, which is where the number is actually consumed.
+
+- **The claim that auto-tuning's round-trip reference is a constant, which is true of a case
+  rather than of the mechanism.** It is `AUTOTUNE_RTT_FALLBACK` only when the stream has no
+  round trip of its own — the receive-only case auto-tuning exists for, and the case in
+  which no round trip observed elsewhere in the connection is ever substituted for it. On a
+  stream that also sends it is that stream's `min_rtt`, a measurement, and a peer can raise
+  it: only upward, only by delaying every acknowledgement from the first (the reference is a
+  minimum, not an average), and only to reach the `MAX_RECV_WINDOW` ceiling sooner rather
+  than a higher one. Corrected on the constant, on `tune_recv_window`, in
+  `docs/security/threat-model.md` §5, and in the name of the test that pins it.
 
 - **Both sliding filters were as long as the peer cared to make them.** `WindowFilter`'s deque
   is pruned from the front by the horizon and from the back by domination, and a monotone
@@ -1056,15 +1095,17 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   bounded and individually larger, and that all of them are commitments **per session**:
   nothing divides any of them between concurrent sessions, so a process commits its session
   cap times each — 1024 × 8 MiB = 8 GiB of window growth alone at the reference server's
-  default. The round-trip reference
+  default, a floor on what the host must have rather than a ceiling on what the process will
+  use. The round-trip reference
   the interval is derived from is a constant on a receive-only stream, which is the flow
   auto-tuning exists for, because such a stream never measures a round trip of its own. On a
   stream that also sends, it is that stream's own `min_rtt`, and a peer that delays every
-  acknowledgement can stretch it — the interval is `2 × rtt`, so a longer one lowers the
-  consumption rate a doubling has to beat. What that buys the peer is bounded and is not the
-  dangerous direction: it can reach the ceiling sooner, never pass it, and every doubling is
-  still paid for in bytes the local application actually consumed. `MAX_SEND_WINDOW` moves
-  with the ceiling — the two ends of one credit ledger must agree.
+  acknowledgement from the first can stretch it — the interval is `2 × rtt`, so a longer one
+  lowers the delivery rate a doubling has to beat. What that buys the peer is bounded and is
+  not the dangerous direction: it can reach the ceiling sooner, never pass it. Every doubling
+  is still paid for in bytes delivered onward, which is one bounded queue short of bytes the
+  application read — see the Fixed entry above for what that gap is worth.
+  `MAX_SEND_WINDOW` moves with the ceiling — the two ends of one credit ledger must agree.
 
 - **Every full-size PhantomUDP segment was sent as two datagrams.** The data pump chunked
   application data at 1300 bytes, a number chosen independently of the datagram budget it
@@ -1212,14 +1253,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   products and stops. The threshold sits deliberately below the round half, because a flow
   that really is window-limited achieves about half its nominal ceiling and a test placed on
   that figure would never fire on the flow it exists for.
-  What the growth is tied to is the whole of its safety argument: **demonstrated application
-  consumption, never arrival**. The counter is fed only by the delivery task, as it hands
-  bytes onward to the application, so a peer that floods a reader that never reads moves the
-  window by exactly nothing, however long it keeps it up. Measuring over a time interval
-  rather than a byte count matters for the same reason — the bounded delivery queue in front
-  of the application absorbs one queue's worth of bytes even when the reader has stopped, and
-  a byte-triggered rule would read that transient as a sustained rate and climb the whole
-  ladder on it. The round trip the interval is measured against is the *minimum* RTT sampled
+  What the growth is tied to is the whole of its safety argument: **delivery onward, never
+  arrival**. The counter is fed only by the delivery task, so nothing a peer merely sends
+  moves the window. Delivery is one bounded queue short of the application reading, though,
+  and that gap is the peer's to spend — see the Fixed entry above, which measures it.
+  Measuring over a time interval rather than a byte count is what keeps it from being free:
+  the queue in front of the application absorbs one queue's worth even when the reader has
+  stopped, and a byte-triggered rule would read that arriving in a burst as a sustained rate
+  and climb the whole ladder inside a single round trip. With the interval, each rung costs
+  the peer an interval of wall-clock time. The round trip the interval is measured against is the *minimum* RTT sampled
   on the stream rather than the smoothed one: a saturated path inflates the smoothed estimate,
   a longer estimate makes growth easier, and a larger window queues more, which is a loop that
   ends at the cap no matter what the application does.
