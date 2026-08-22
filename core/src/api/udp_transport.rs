@@ -9,7 +9,7 @@
 use crate::api::session::{FramePhase, SessionTransport};
 use crate::errors::CoreError;
 use crate::transport::phantom_udp::datagram::{encode_datagrams, push_datagram, FragmentAssembler};
-use crate::transport::phantom_udp::envelope::{ConnId, PacketType, PATH_MTU};
+use crate::transport::phantom_udp::envelope::{decode_header, ConnId, PacketType, PATH_MTU};
 // `HDR_LEN` is referenced only by the test module (`super::HDR_LEN`); a plain top-level
 // import trips clippy's `--lib` unused-import check, which excludes `#[cfg(test)]` code.
 #[cfg(test)]
@@ -556,6 +556,44 @@ impl SessionTransport for UdpClientTransport {
                 }
             };
             let datagram = if from_prev { &buf_prev[..n] } else { &buf[..n] };
+            // PROTOCOL § 6.1 rule 6: while the handshake runs, nothing that is not a
+            // handshake datagram *of this connection* may reach the reply parser, and the
+            // two halves of that are guarding different things.
+            //
+            // The type is what a committed server's own traffic fails: it may already be
+            // sending short-header frames (an application greeting written on accept, a
+            // keepalive) while the client is still waiting for a `ServerHello` that went
+            // missing, and the caller parses whatever it is handed as a `ServerReply`, so
+            // handing one up ends the connect with "invalid server reply".
+            //
+            // The connection id is what an *unrelated sender* fails, and without it the
+            // type check narrows the attack rather than removing it: the type lives in the
+            // unauthenticated outer envelope, so a datagram addressed to a connecting
+            // client with that one byte set to `Initial` would be handed up and kill the
+            // connect. The socket is unconnected and accepts any source, so this is the
+            // only field on an unauthenticated datagram that an off-path sender cannot
+            // simply choose — `cid` is 64 bits of `getrandom` output that only appears on
+            // this connection's own datagrams. During the handshake `established_cid` is
+            // still unset (the pump raises the phase before stamping it), so the bootstrap
+            // id is the whole of what this connection answers to.
+            //
+            // Checked before `push_datagram` rather than after it so a spray cannot evict
+            // this connection's half-reassembled reply from the fragment assembler either,
+            // at the cost of one extra header decode per handshake datagram — a handful
+            // per connect, and never on the data path.
+            //
+            // Dropping here rather than at the caller keeps the retransmit schedule intact:
+            // `attempt` / `spent` / `retransmit_at` live across this `continue`, so a peer
+            // that talks cannot postpone the repeat the client's own timer is about to
+            // trigger, nor extend the budget it gives up on. The phase is re-read rather
+            // than reusing the loop-top snapshot so the check reflects the transport's
+            // state now.
+            if self.phase.load(Ordering::Relaxed) == PHASE_HANDSHAKE {
+                match decode_header(datagram) {
+                    Ok((hdr, _)) if hdr.ty == PacketType::Initial && hdr.cid == self.cid => {}
+                    _ => continue,
+                }
+            }
             let mut asm = self.reasm.lock().await;
             let decoded = push_datagram(&mut asm, datagram);
             // Overlap-drop (D7): a well-formed datagram on the NEW (active) socket means the
@@ -568,29 +606,7 @@ impl SessionTransport for UdpClientTransport {
                 self.prev_socket.store(Arc::new(None));
             }
             match decoded {
-                Ok((hdr, Some(frame))) => {
-                    // PROTOCOL § 6.1: while the handshake runs, the only frame that can be a
-                    // reply is a handshake one, and the caller above parses whatever it is
-                    // handed as a `ServerReply` — so returning anything else ends the connect
-                    // with "invalid server reply". A server that has committed its session
-                    // may already be sending short-header traffic (an application greeting, a
-                    // keepalive) while the client is still waiting for a `ServerHello` that
-                    // went missing, and that traffic would otherwise kill the very connect the
-                    // reply repeat exists to save. Dropping it costs nothing the transport was
-                    // promising: nothing under the handshake is reliable, and the ARQ re-sends
-                    // any reliable stream data once the session is up.
-                    //
-                    // Dropping here rather than at the caller is what keeps the retransmit
-                    // schedule intact — `attempt`/`spent`/`retransmit_at` live across this
-                    // `continue`, so a peer that talks cannot postpone the repeat that the
-                    // client's own timer is about to trigger, and cannot extend the budget it
-                    // gives up on either. The phase is re-read rather than reusing the
-                    // loop-top snapshot so the check reflects the transport's state now.
-                    if hdr.ty != PacketType::Initial
-                        && self.phase.load(Ordering::Relaxed) == PHASE_HANDSHAKE
-                    {
-                        continue;
-                    }
+                Ok((_hdr, Some(frame))) => {
                     // M-1 (server-migration candidate detection): record the source + frame
                     // length of this still-AEAD-pending frame. The candidate is committed ONLY
                     // by the post-decrypt `confirm_authenticated_source`, so a spoofed / replayed
@@ -1292,6 +1308,12 @@ mod tests {
     /// The second half is what keeps the gate from being a blanket drop: once the session is
     /// Established the same datagram is delivered, because then it is exactly what the pump
     /// is waiting for.
+    ///
+    /// This covers the type half of the gate only. The type is a field of the
+    /// unauthenticated envelope, so on its own it narrows what an unrelated sender has to
+    /// write rather than excluding it; the connection-id half is what excludes it, and
+    /// `a_handshake_datagram_for_another_connection_cannot_end_this_one` is where that is
+    /// pinned.
     #[tokio::test]
     async fn a_short_header_datagram_mid_handshake_is_ignored_rather_than_ending_the_connect() {
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1342,6 +1364,87 @@ mod tests {
             .expect("established sessions must still receive short-header traffic")
             .expect("recv");
         assert_eq!(&got[..], &b"session-data"[..]);
+    }
+
+    /// A handshake datagram that does not carry this connection's id is not a reply, whoever
+    /// sent it and whatever type byte it claims.
+    ///
+    /// The type gate above is necessary and not sufficient, and the difference is the whole
+    /// of this test. `PacketType` lives in the unauthenticated outer envelope: it is a
+    /// two-bit field of a cleartext byte that any sender writes. A gate that only asks
+    /// "is this a handshake datagram" therefore leaves a connecting client killable by one
+    /// datagram from anyone who can reach its port — the caller parses whatever it is handed
+    /// as a `ServerReply` and treats a parse failure as terminal, so a payload of noise under
+    /// an `Initial` header ends the attempt. That is the same failure the type gate was added
+    /// to remove, reached by setting one byte instead of none.
+    ///
+    /// The connection id is what makes the gate a gate. It is 64 bits drawn from the system
+    /// CSPRNG at `connect`, it appears only on this connection's own datagrams, and during
+    /// the handshake it is the *bootstrap* id — the pump raises the frame phase before it
+    /// stamps the rotating chain, so there is no window in which a second id would be
+    /// legitimate. Deleting the `hdr.cid == self.cid` half of that check is the naive version
+    /// of this mechanism, and the first half of this test is what fails against it.
+    ///
+    /// The second half is the control: with the *right* id the same sender is answered, so
+    /// what the first half measures is the id and not the reply's provenance — nothing here
+    /// checks source addresses, and this test would pass against a listener that did while
+    /// saying nothing about the one that does not.
+    #[tokio::test]
+    async fn a_handshake_datagram_for_another_connection_cannot_end_this_one() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+        // Default phase is Handshake.
+        client.send_bytes(b"client-hello").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, from) = peer.recv_from(&mut buf).await.unwrap();
+
+        // A third party that never saw this connection's datagrams: it can reach the port and
+        // it can set the type byte, and that is all it has.
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut wrong = client.cid();
+        wrong[0] ^= 0xFF;
+        for d in
+            encode_datagrams(PacketType::Initial, &wrong, 0, b"not-your-reply").expect("encode")
+        {
+            stranger.send_to(&d, from).await.unwrap();
+        }
+        // ... and the real reply, after it, so the assertion is "the stranger's datagram was
+        // skipped" rather than "nothing arrived at all".
+        for d in encode_datagrams(PacketType::Initial, &client.cid(), 1, b"server-hello")
+            .expect("encode")
+        {
+            peer.send_to(&d, from).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), client.recv_bytes())
+            .await
+            .expect("the real reply must still be reachable")
+            .expect("recv");
+        assert_eq!(
+            &got[..],
+            &b"server-hello"[..],
+            "a handshake-typed datagram carrying a connection id that is not this \
+             connection's was handed up as if it were a reply; the caller parses it as a \
+             ServerReply and one datagram from anyone who can reach the port ends the connect"
+        );
+
+        // The control: the same stranger, the same socket, the right connection id.
+        for d in encode_datagrams(PacketType::Initial, &client.cid(), 2, b"second-reply")
+            .expect("encode")
+        {
+            stranger.send_to(&d, from).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), client.recv_bytes())
+            .await
+            .expect("a datagram carrying this connection's id must still be delivered")
+            .expect("recv");
+        assert_eq!(
+            &got[..],
+            &b"second-reply"[..],
+            "the gate is the connection id and nothing else: this transport never compares \
+             source addresses, and a test that passed only because the sender differed would \
+             be measuring a check that does not exist"
+        );
     }
 
     /// The handshake shim must still be waiting when an honest reply arrives later than a

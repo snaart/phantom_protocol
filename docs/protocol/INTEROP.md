@@ -221,14 +221,22 @@ has been the reason a byte-perfect encoder still could not connect:
   there. Your connect then fails on your own deadline with no error from the
   server. Keep the encoded flight and re-send those bytes.
 - **While your client is still waiting for a reply, discard anything that is not
-  a handshake datagram** instead of feeding it to your reply parser. The server
-  commits its session when it sends the `ServerHello`, so from that instant it may
-  send short-header traffic your client has no keys for — and if the reply was the
-  flight that got lost, that traffic arrives first. Treating it as a malformed
+  a handshake datagram carrying your own connection id** instead of feeding it to
+  your reply parser. Two different senders make this necessary. The server commits
+  its session when it sends the `ServerHello`, so from that instant it may send
+  short-header traffic your client has no keys for — and if the reply was the
+  flight that got lost, that traffic arrives first; treating it as a malformed
   reply ends the connect before your own retransmit timer ever fires, which makes
-  the whole repair conditional on the server staying quiet. Discarding it must
-  also leave the timer alone, or a talkative peer postpones your retransmission
-  for as long as it keeps talking.
+  the whole repair conditional on the server staying quiet. And `PacketType` is
+  two bits of a cleartext byte in the unauthenticated envelope, so a check on type
+  alone leaves your connect endable by one datagram of noise from anyone who can
+  reach your port. Require the outer `ConnId` to be the bootstrap id you are
+  connecting under: the server echoes it on every reply, `HelloRetryRequest` and
+  `ServerReject` included, and the rotating chain does not start until the session
+  is up. Do the check before reassembly, or a spray still displaces your
+  half-reassembled reply from the fragment buffer. Discarding must also leave the
+  timer alone, or a talkative peer postpones your retransmission for as long as it
+  keeps talking.
 - **There is no client authentication and no ticket message.**
   `ClientHello.client_verify_key` is transcript-covered and verified by nobody
   (PROTOCOL.md § 6.2), and a resumption "ticket" is never transmitted at all —
@@ -486,6 +494,7 @@ A peer is wire-conformant with the default build of this repository when:
 - [ ] It allocates stream ids in its own parity — odd from 3 as the initiator, even from 2 as the responder, with 0 and 1 reserved (PROTOCOL.md § 4.4).
 - [ ] The same holds for all borsh handshake / sub-struct fixtures (Rung 2).
 - [ ] It treats the cookie `HelloRetryRequest` as the normal first answer, replies with the *same* hello (only `cookie` / `pow_solution` replaced), and — on PhantomUDP — retransmits its own flight on a bounded timer (Rung 2, PROTOCOL.md § 6.1 / § 6.8).
+- [ ] While connecting, it discards every datagram that is not a handshake datagram carrying its own bootstrap `ConnId`, before reassembling it, and without disturbing its retransmit timer (Rung 2, PROTOCOL.md § 6.1 rule 6).
 - [ ] Its transcript hash equals `transcript_hash.bin` (Rung 3).
 - [ ] Its AEAD nonce/AAD construction and HP masking reproduce PROTOCOL.md § 4.6 / § 5; a tampered AAD byte (version included) fails decryption with no oracle (Rung 4).
 - [ ] It reads the AEAD plaintext by flag — reliable offset prefix, SACK, cumulative window limit, path challenge, padding trailer (Rung 4b).
