@@ -35,9 +35,28 @@ Pre-1.0: minor versions may break.
 - `0.x → 1.0`: marks API stability. After 1.0, strict SemVer applies.
 
 The `cargo-semver-checks` CI job (`.github/workflows/release.yml`) is the
-automated guardrail. Manual review remains authoritative because SemVer is a
-contract about *intent*, not just signatures (e.g. behavioural changes that
-match the same signature are still breaking).
+automated guardrail, and pre-1.0 it guards the *record* rather than the surface.
+Breaking the Rust API is permitted here, so the tool finding a break is not a
+failure; the job fails on the two things that are. A run that produced no verdict
+compared nothing and is a broken check, not a clean one — `scripts/semver_report.sh`
+tells those apart by reading the report rather than the exit code. And a break the
+CHANGELOG's `[Unreleased]` section does not name is one a consumer meets as a
+compiler error instead of a list — `scripts/check_changelog_breaking.py` requires
+each reported symbol, and its owner, to appear there. The report itself is attached
+to every pull-request run as the `semver-checks-report` artifact and printed to the
+job summary.
+
+The comparison covers default features plus `telemetry-otel`, `mimicry` and
+`embedded` — the largest set of this crate's features that builds together on one
+host, and the same set docs.rs uses. `fips`, `wasi-leg` and `no-std` are compared
+by nothing, so a break confined to one of those three reaches a release
+unannounced; that is the standing gap in this axis, not an oversight of a
+particular release.
+
+Manual review remains authoritative because SemVer is a contract about *intent*,
+not just signatures (e.g. behavioural changes that match the same signature are
+still breaking), and because the tool compares shapes and not values: a `pub const`
+whose number changed passes it silently.
 
 ### What counts as a public API break
 
@@ -310,8 +329,12 @@ migration.
 
 ## 10. Tooling
 
-- `cargo-semver-checks`: `.github/workflows/release.yml` runs it PR-triggered to
-  detect SemVer-breaking changes from the latest published version.
+- `cargo-semver-checks`: `.github/workflows/release.yml` runs it PR-triggered
+  against the latest published version, through `scripts/semver_report.sh`. The
+  report is uploaded as the `semver-checks-report` artifact;
+  `scripts/check_changelog_breaking.py` then requires every symbol in it to be
+  named in `CHANGELOG.md`. See §2 for what does and does not fail that job, and
+  `scripts/check_changelog_breaking_test.sh` for the gate's own cases.
 - `git tag` policy: `vX.Y.Z` on the commit that produced the corresponding
   `Cargo.toml` version; the tag-triggered release pipeline builds cross-target
   artifacts with SLSA-3 build-provenance attestation.

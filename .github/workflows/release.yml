@@ -40,9 +40,10 @@ jobs:
   #
   # What fails this job, and what does not. A 0.x crate is allowed to break its
   # Rust API between minors, so the tool *finding* breakage is not a failure —
-  # it is a fact to record. What is a failure is a run that could not compare
-  # anything, which `scripts/semver_report.sh` catches by insisting on a verdict
-  # line rather than trusting the exit code.
+  # it is a fact to record. Two things are failures: a run that could not
+  # compare anything, and a break that nobody wrote down. The first is caught by
+  # `scripts/semver_report.sh` (which insists on a verdict line rather than
+  # trusting the exit code), the second by `scripts/check_changelog_breaking.py`.
   #
   # This replaces a `continue-on-error: true` step that had never compared
   # anything: with no feature flags the tool enables every feature it does not
@@ -94,12 +95,18 @@ jobs:
           name: semver-checks-report
           path: semver-report.txt
           if-no-files-found: warn
-      # The script above decides whether this job is green, and it decides it by
-      # reading text. These cases are what says it reads it correctly — the
+      - name: Every breaking change is named in CHANGELOG.md
+        run: |
+          python3 scripts/check_changelog_breaking.py \
+            --report "${GITHUB_WORKSPACE}/semver-report.txt"
+      # Both scripts above decide whether this job is green, and both decide it
+      # by reading text. These cases are what says they read it correctly — the
       # verdict-versus-exit-code distinction in particular, which is the thing
       # the old arrangement got wrong. They stub cargo and cost a second.
-      - name: The script's own cases
-        run: scripts/semver_report_test.sh
+      - name: The two scripts' own cases
+        run: |
+          scripts/semver_report_test.sh
+          scripts/check_changelog_breaking_test.sh
 
   # ── Pre-release sanity ────────────────────────────────────────────
   # Verify the publish dry-run succeeds. Catches version bumps that
