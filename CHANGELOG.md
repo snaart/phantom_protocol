@@ -1496,95 +1496,6 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   now re-derives the inventory and fails when the two disagree — as a `pre-commit` hook and
   as the `panic-sites` CI job. No behaviour changed; the four new comments are comments.
 
-
-- **Connection migration could hang the client receive loop.** `UdpClientTransport::recv_bytes`
-  did not wake when `migrate_to()` rebound the local socket: a receive parked on the old
-  socket (which goes silent once the server follows the client) would block forever. Both
-  the single-socket and the dual-socket migration-overlap receive paths now wake on a
-  migration and re-snapshot the active/previous sockets, also closing a loop-top torn-read
-  race (a migration interleaved between the two socket loads) and a hang on a second
-  migration during an overlap. Regression-tested (each guard verified to fail without the
-  fix).
-- **C ABI declaration for `PhantomListener::shutdown` was wrong.** The hand-curated C
-  header declared the synchronous `shutdown()` as an async future handle
-  (`uint64_t ...(void *ptr)`); it is now correctly `void ...(void *ptr, RustCallStatus *)`,
-  matching the actual ABI and the other bindings.
-- **Per-stream receive was lossy and could deliver EOF before data.** Inbound data on
-  an opened stream (id ≥ 2) was double-delivered — once losslessly to `session.recv()`
-  and once via a best-effort `try_send` that **dropped** on a full/unknown channel — so
-  `PhantomStream::recv()` lost bytes under load. Opened-stream delivery is now lossless
-  and backpressured via a dedicated delivery task that never blocks the raw-app path, and
-  a reliable in-order FIN (carried over the ARQ path, retransmitted until SACKed) now
-  surfaces clean EOF strictly **after** all data — so a FIN arriving over a gap on a
-  lossy/reordering path no longer truncates the stream. (Two bugs in this area were caught
-  in review: a DashMap shard guard held across an `await` that could stall
-  `open_stream()` / the pump, and the premature-EOF ordering — both fixed and
-  regression-tested.)
-- **Inert legacy `connect()` now reports `Failed`** instead of an eternal `Connecting`
-  shell, so misuse is observable via `connection_state()` (use `connect_pinned` /
-  `connect_pinned_udp`).
-- **Dropping the last `PhantomSession` handle now closes the session** (sends an in-order
-  `Close` so the peer sees EOF), fixing a regression where extra internal command
-  senders kept the pump alive after the handle was dropped.
-- **Release tarballs contained no library.** The packaging step copied from
-  `core/target/<triple>/release/` — a path that does not exist, since `core` is the only
-  workspace member and cargo's target directory is the repository root — and the copy was
-  guarded by `2>/dev/null || true`, so every published `0.1.0`–`0.2.2` artifact silently
-  shipped `LICENSE` + `README.md` only. The path is corrected, the `cdylib` (the actual
-  FFI delivery vehicle) is shipped alongside the `rlib`, and a missing library now fails
-  the job loudly instead of producing an empty tarball.
-- **The Helm chart ignored the mounted signing-key Secret**, so every pod minted a fresh
-  identity on restart and broke client key pinning. The chart published `PHANTOM_BIND_PORT`
-  and `PHANTOM_SIGNING_KEY_PATH`, neither of which `phantom-server` reads, and the
-  Deployment never set `PHANTOM_SIGNING_KEY_FILE` at all. It now emits `PHANTOM_BIND`
-  (a full `SocketAddr`) and `PHANTOM_SIGNING_KEY_FILE` pointing at the mounted key. The
-  sample manifest in `docs/operations/kubernetes.md` had the same defect.
-- **`--otel-trace-sample-ratio` was parsed and then discarded** (`let _ = cfg.trace_sample_ratio;`),
-  so no sampler was ever installed and the effective trace rate was 100% regardless of the
-  flag. The ratio is now applied as `Sampler::ParentBased(TraceIdRatioBased(ratio))`, which
-  also makes it effective from the `OTEL_TRACES_SAMPLER_ARG` env form without additionally
-  setting `OTEL_TRACES_SAMPLER`. The default changed `0.01` → `1.0` so shipped behaviour is
-  unchanged — lower it deliberately.
-- **`core/examples/embedded_demo.rs` did not compile** under `--features embedded`: the
-  `embedded-io-async` 0.6 → 0.7 bump made `Write::flush` a required method and the example's
-  `MockWriter` never gained one (`E0046`). It went unnoticed because the `embedded-feature`
-  CI job runs `cargo test --lib`, and `--lib` never builds examples; the job now checks them.
-- **The iOS static-library flow could not work.** `build-xcframework.sh` and the by-hand
-  `lipo` recipes feed `libphantom_protocol.a` to `xcodebuild -create-xcframework`, but
-  `[lib] crate-type = ["lib", "cdylib"]` never emits a static archive. The slices are now
-  built with `cargo rustc --crate-type staticlib`. (Adding `staticlib` to the manifest is
-  *not* a valid fix: a staticlib is a final artifact, so it makes cargo demand a
-  `#[panic_handler]` and a `#[global_allocator]` from the library and breaks the
-  `thumbv7em-none-eabihf` bare-metal build.)
-- **Several hand-curated C ABI declarations were wrong**, so a C consumer following the
-  header got undefined behaviour rather than a compile error: `open_stream` was declared
-  async although it is synchronous, `flush_queue` was declared to complete to `void`
-  although it yields `u32`, a `_pointer` future poll/complete family was documented that
-  does not exist in the cdylib (objects complete through `_u64`), and the `ConnectionState`
-  discriminant comment named five states that do not exist. The maximum-datagram macro
-  advertised 65507 bytes where PhantomUDP's path MTU is 1200, and a comment still described
-  the replay window as per-stream.
-- **`phantom_helpers.h`'s blocking wrappers could not work.** `Vec<u8>` arguments were
-  passed as raw bytes although UniFFI lowers them as a RustBuffer of
-  `[i32 big-endian length][payload]` (only a top-level `String` is raw UTF-8), so
-  `phantom_blocking_connect_pinned` failed unconditionally with `RustCallStatus.code == 2`;
-  and the helpers passed the caller's handle straight to the scaffolding, but a UniFFI
-  method **consumes** its receiver — every generated binding clones per call — so the second
-  call on a session was a use-after-free. Both are fixed with explicit lowering and
-  clone-per-call helpers.
-- **`phantom_protocol.h` was unusable from C++** even though it guards its declarations
-  with `extern "C"`: `PhantomRustBuffer` was defined *inside* `PhantomRustCallStatus`, which
-  C gives file scope but C++ scopes to the enclosing class, leaving the type incomplete for
-  every C++ translation unit. Hoisted; layout and ABI unchanged.
-- **`check_versions.sh` did not cover `python/pyproject.toml`**, the maturin manifest that
-  `PACKAGING.md` designates as the recommended PyPI path and which carries its own hardcoded
-  version — so it could drift from `core/Cargo.toml` undetected. Six manifests are now
-  drift-checked, not five.
-- **`.github/CODEOWNERS` had drifted from `CONTRIBUTING.md`'s touch-with-care set**: it still
-  routed the deleted `transport/legs/faketls.rs` (matching nothing, so the rule was inert)
-  and omitted `transport/udp_transport.rs` and `transport/legs/mimic_tls/`, which therefore
-  never requested codeowner review.
-
 ### Documented
 
 - **`connect_pinned*` returns before the handshake completes.** The returned session is
@@ -1622,7 +1533,8 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   was permanently false. An embedder following the rustdoc would have waited for a state
   that cannot arrive, or gated its send path on a readiness flag that never turns true.
   The session rustdoc now describes the machine that exists —
-  `Connecting → Connected → Migrating → Dead`, plus `Failed` and `Closed`. Use
+  `Connecting → Connected → Migrating → Dead`, plus `Failed`, `Closed` and the
+  peer-initiated `Draining` added later in this window. Use
   `is_data_ready()`: because the handshake is one flight, a data-ready session is
   post-quantum protected by construction. Discriminants `1..=3` are left retired rather
   than reused. Breaking for the FFI enum and for `is_pqc_ready()` callers, within the

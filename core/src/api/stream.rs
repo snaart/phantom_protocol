@@ -82,12 +82,12 @@ impl PhantomStream {
     ///
     /// **Message boundaries are not preserved.** The session's data pump splits
     /// `data` into chunks of
-    /// [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — one chunk
-    /// plus its packet overhead is exactly one PhantomUDP datagram — and buffers
-    /// each chunk as its own reliable write, so the peer's [`recv`](Self::recv)
-    /// yields one result *per chunk*, not one per `send_reliable`. Order is
-    /// guaranteed; grouping is not, and nothing marks where one call's payload
-    /// ended.
+    /// [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — 1156 on
+    /// this build, sized so that one chunk plus its packet overhead is exactly
+    /// one PhantomUDP datagram — and buffers each chunk as its own reliable
+    /// write, so the peer's [`recv`](Self::recv) yields one result *per chunk*,
+    /// not one per `send_reliable`. Order is guaranteed; grouping is not, and
+    /// nothing marks where one call's payload ended.
     ///
     /// Frame the messages yourself if you need them: write a length prefix ahead
     /// of each payload and accumulate `recv` results until the declared length is
@@ -116,10 +116,11 @@ impl PhantomStream {
     /// **Message boundaries are not preserved**, exactly as in
     /// [`send_reliable`](Self::send_reliable): the pump splits `data` into
     /// chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes
-    /// and sends each on its own. Here that is sharper than on the reliable
-    /// path, because the chunks are independent datagrams: any subset of them
-    /// can be lost or arrive out of order, so a payload larger than one chunk
-    /// can reach the peer with a hole in the middle and no signal that it did.
+    /// — 1156 on this build — and sends each on its own. Here that is sharper
+    /// than on the reliable path, because the chunks are independent datagrams:
+    /// any subset of them can be lost or arrive out of order, so a payload
+    /// larger than one chunk can reach the peer with a hole in the middle and no
+    /// signal that it did.
     ///
     /// Keep unreliable payloads within one chunk, or carry your own length
     /// prefix and sequence number and drop incomplete messages —

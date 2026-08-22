@@ -422,9 +422,12 @@ impl<T: SessionTransport> SessionTransport for ObservedTransport<T> {
 /// `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
 /// `Connecting` (handshake rejection, a wrong pin) and `Closed` from
 /// `disconnect()`. `Migrating` is entered when the path goes silent and left
-/// again for `Connected` if it recovers; sends keep buffering throughout. There
-/// is no intermediate classical-only state — the hybrid handshake is one flight,
-/// so the session is either unkeyed or fully post-quantum keyed.
+/// again for `Connected` if it recovers; sends keep buffering throughout.
+/// [`Draining`](ConnectionState::Draining) is the one state that buffers
+/// nothing: it means the *peer* announced its close, so reads continue while
+/// writes are refused rather than queued for a wire they will never reach.
+/// There is no intermediate classical-only state — the hybrid handshake is one
+/// flight, so the session is either unkeyed or fully post-quantum keyed.
 ///
 /// # Example
 ///
@@ -5103,11 +5106,12 @@ impl PhantomSession {
     ///
     /// **Message boundaries are not preserved.** The data pump splits `data`
     /// into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
-    /// bytes — one chunk plus its packet overhead is exactly one PhantomUDP
-    /// datagram — and writes each chunk separately, so the peer's
-    /// [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
-    /// An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
-    /// nothing marks where one `send` ended and the next began.
+    /// bytes — 1156 on this build, sized so that one chunk plus its packet
+    /// overhead is exactly one PhantomUDP datagram — and writes each chunk
+    /// separately, so the peer's [`recv`](Self::recv) yields one result *per
+    /// chunk*, not one per `send`. An 8 KiB `send` arrives as eight `recv`s.
+    /// Nothing reassembles them, and nothing marks where one `send` ended and
+    /// the next began.
     ///
     /// This is silent when it bites: the first chunk of a structured message
     /// usually still parses, as a truncated one, so a caller that reads a single
