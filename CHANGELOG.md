@@ -285,6 +285,116 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Changed
 
+- **Every Rust API break in this window, in one list.** What follows is the whole set that
+  `cargo-semver-checks` reports for this branch against the published 0.2.2, grouped by the
+  kind of change, naming every symbol and the edit a consumer has to make. Where the
+  reasoning is already written down elsewhere in these notes, this list does not repeat it:
+  it exists so that an upgrade is planned from a list rather than discovered one compiler
+  error at a time.
+
+  The list is complete by construction rather than by diligence.
+  `scripts/semver_report.sh` runs the comparison on every pull request and attaches its
+  report to the run, and `scripts/check_changelog_breaking.py` fails that run when a symbol
+  in the report is not named in this section. It replaces a check that had been marked
+  `continue-on-error` and, separately, had never compared anything: run with no feature
+  flags the tool turns on every feature it does not recognise as exotic, which for this
+  crate pairs `fips` with `no-std`, which `core/src/lib.rs` rejects outright — so the run
+  died building rustdoc and exited non-zero exactly as a real finding does.
+
+  Three things the tool does not see, stated here because a complete-looking list invites
+  the assumption that it sees everything:
+
+  * **Feature sets it cannot build together.** The comparison covers default features plus
+    `telemetry-otel`, `mimicry` and `embedded` — the same set `[package.metadata.docs.rs]`
+    names, and the largest that builds on one host. The `fips`, `wasi-leg` and `no-std`
+    surfaces are compared by nothing; a break in `CoreError::FipsSelfTestFailure` or in the
+    WASI leg arrives unannounced.
+  * **Values.** It compares shapes, not numbers, so a `pub const` whose value changed is
+    absent from it. This window has one that matters — `MAX_SEND_WINDOW` and
+    `MAX_RECV_WINDOW` went from 512 KiB to 1 MiB, recorded below.
+  * **The FFI ABI.** It reads Rust signatures, and the UniFFI record layout is a second,
+    independent compatibility axis. `MetricsSnapshotFfi` gained a field mid-record this
+    window, which breaks every generated binding and breaks the C one silently; that is its
+    own entry below and nothing in the semver report hints at it.
+
+  *Modules and types that are gone* — delete the import; the reasoning is under **Removed**:
+
+  * `transport::udp_transport`, with `UdpTransport`, `UdpHandshakeListener`, `PacedSender`
+    and `FastSender`. No caller could reach them and constructing one produced a socket
+    helper wired to nothing. The live transport is `api::udp_transport`.
+  * `transport::device_profile`, with `DeviceProfile`, `DeviceTier`, `PqKemLevel` and
+    `PqSignLevel`. The handshake negotiates one fixed hybrid suite and never selected a
+    tier, so nothing replaces them.
+
+  *Methods that are gone* — each has a successor:
+
+  * `PhantomSession::connect_with_resumption` → `PhantomSession::builder(addr)`, then
+    `.pinned_key(key).transport(t).resumption(hint, early_data).connect()`.
+  * `PhantomSession::is_pqc_ready` → `is_data_ready()`. The handshake is a single flight,
+    so a data-ready session is post-quantum protected by construction.
+  * `PhantomListener::bind_with_signing_key_with_runtime` →
+    `PhantomListener::builder(addr).signing_key(k).runtime(r).bind()`.
+  * `PhantomListener::bind_with_signing_key_mimic` (feature `mimicry`) →
+    `PhantomListener::builder(addr).signing_key(k).mimic_sni(sni).bind()`.
+  * `Session::set_cid_slide_tx` → `Session::set_demux_link(DemuxLink { .. })`. The channel
+    it used to install is now one field of `DemuxLink`, beside the route-retire signal the
+    demux needs to reclaim a departed session's routes.
+  * `BandwidthEstimator::set_app_limited` → pass `app_limited_now` to `Stream::poll_send`.
+    The flag belongs to the packet, not to the estimator's current mood: it rides out on the
+    segment and comes back on `RetiredSegment::app_limited_at_send`.
+  * `Stream::local_recv_window` → `Stream::advertised_recv_window`.
+  * `Stream::apply_peer_window_update(credit: u32)` →
+    `Stream::apply_peer_window_limit(limit: u64)`. The argument changed meaning as well as
+    width: it is the peer's absolute limit now, not an increment, so a lost update no longer
+    subtracts from the window for good.
+  * `Stream::stage_window_update_credit(credit: u32)` →
+    `Stream::stage_window_update_limit(limit: u64)`, and `Stream::take_pending_window_update`
+    yields `Option<u64>` to match.
+
+  *Enum variants that are gone* — a `match` that named them stops compiling:
+
+  * `ConnectionState::{ClassicalReady, PqcUpgrading, PqcReady}`: states no production path
+    ever wrote. `ConnectionState` is `#[non_exhaustive]`, so any `match` on it already had a
+    wildcard; delete the three arms. See **Documented**.
+  * `BbrState::FastRecovery`: loss is a signal, not a phase. See **Fixed**.
+
+  *Struct fields that are gone* — drop them from any struct literal:
+
+  * `PhantomConfig::{max_packet_size, send_buffer_size, recv_buffer_size, auto_fallback,
+    fallback_loss_threshold, fallback_failure_threshold, connect_timeout, upgrade_delay}`.
+    These are the eight fields nothing read. Start from `PhantomConfig::default()` (or
+    `mobile()` / `server()`) and set only the four that are honoured.
+
+  *Struct fields that are new* — breaking only for a struct literal, because a literal has
+  to name every field. All five of these types are produced by the library and read by the
+  caller, so the fix is almost always to stop constructing one by hand:
+
+  * `MetricsSnapshot::{replay_rejected_total, aead_failure_total, unencrypted_dropped_total}`
+    — take it from `Observability::snapshot()`.
+  * `OutboundSegment::fin` — take it from `Stream::poll_send`.
+  * `RetiredSegment::{delivered_at_send, delivered_time_at_send, app_limited_at_send}` —
+    take it from the SACK path; these three carry the delivery state the segment was *sent*
+    in, which is what makes a BBR sample mean anything.
+  * `BandwidthSnapshot::{last_delivery_rate_bps, delivered_bytes, delivered_time, state,
+    app_limited}` — take it from `Session::bandwidth_snapshot()`.
+  * `DeliverySample::{delivered_at, rtt_sampled}` — built by the ack path.
+
+  *Enum variants that are new* — these three enums are exhaustive, so a `match` without a
+  wildcard needs one more arm: `SessionCommand::SetStreamPriority`,
+  `EarlyDataOutcome::RejectedDisabled`, `PathValidationOutcome::Timeout`.
+
+  *Signatures that changed shape*:
+
+  * `Stream::poll_send`: one argument became four and `Option<OutboundSegment>` became
+    `Result<OutboundSegment, SendBlocked>` — full entry below.
+  * `Stream::record_app_consumed(n: u32)` → `(n: u32, reliable: bool) -> Option<u64>`. Pass
+    `false` for unreliable delivery: it is not flow-controlled, and counting it would walk
+    this side's advertised limit ahead of the total the peer keeps.
+  * `PhantomStream::new(handle, tx)` → `(handle, tx, session_state: Arc<AtomicU8>)`. The
+    third argument is the session's published state, which is what lets a write into a
+    `Draining` session be refused rather than queued for a pump that will discard it.
+  * `PhantomUdpListener::accept`: `&Arc<Self>` → `Arc<Self>` — full entry below.
+
 - **`BandwidthEstimator::on_ack` and `Session::on_packet_acked` now hand back the RTT sample
   the acknowledgement produced.** `on_ack` returns `(u64, Duration)` where it returned the
   pacing rate alone, and `on_packet_acked` returns that `Duration` where it returned a

@@ -1,8 +1,9 @@
 name: Release
 
 # Two trigger surfaces:
-# 1. `cargo-semver-checks` on every PR — guards against accidental
-#    breaking changes in the public Rust API.
+# 1. `cargo-semver-checks` on every PR — produces the list of public Rust API
+#    breaks against the published release, and requires each one to be written
+#    down in CHANGELOG.md before the PR lands.
 # 2. A tag push (`v*.*.*`) triggers the release pipeline:
 #    publish dry-run + build release artifacts + GitHub Release draft.
 on:
@@ -31,34 +32,81 @@ concurrency:
 
 jobs:
   # ── SemVer hygiene ────────────────────────────────────────────────
-  # `cargo-semver-checks` compares the current branch's public surface
-  # against the latest published version of `phantom-protocol` on crates.io.
-  # Failures here mean the PR introduces a breaking change that would
-  # require a major-version bump. Run on PRs only; tag pushes are
-  # post-bump and so are expected to legitimately change the API.
+  # `cargo-semver-checks` compares this branch's public surface against the
+  # latest `phantom-protocol` published on crates.io, and the comparison is
+  # kept: written to the job summary and uploaded as an artifact, so the list
+  # of what broke exists while the change is being reviewed rather than being
+  # reconstructed on release day.
+  #
+  # What fails this job, and what does not. A 0.x crate is allowed to break its
+  # Rust API between minors, so the tool *finding* breakage is not a failure —
+  # it is a fact to record. Two things are failures: a run that could not
+  # compare anything, and a break that nobody wrote down. The first is caught by
+  # `scripts/semver_report.sh` (which insists on a verdict line rather than
+  # trusting the exit code), the second by `scripts/check_changelog_breaking.py`.
+  #
+  # This replaces a `continue-on-error: true` step that had never compared
+  # anything: with no feature flags the tool enables every feature it does not
+  # recognise as exotic, which for this crate means `fips` and `no-std`
+  # together, which `core/src/lib.rs` rejects with a `compile_error!`. The run
+  # died building rustdoc for the current crate and exited non-zero — the same
+  # non-zero a genuine finding produces, and swallowed the same way. See
+  # `scripts/semver_report.sh` for the feature set that does build and for what
+  # it still cannot see.
   semver-checks:
     name: cargo-semver-checks
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
+      # No `fetch-depth: 0`: the baseline is the crate published on crates.io,
+      # resolved through the registry, and no step here passes `--baseline-rev`.
+      # Git history supplied nothing to this job.
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          # Need full history so cargo-semver-checks can locate the
-          # previous tagged release.
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "."
-      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
-        # A crates.io baseline now exists (0.2.x is published), so this check is
-        # meaningful. It stays non-blocking during pre-1.0 iteration — the 0.x
-        # line breaks the Rust API deliberately while the FFI shims stay stable.
-        # Promote it to a hard gate at 1.0.
-        continue-on-error: true
+      # A prebuilt binary rather than `obi1kenobi/cargo-semver-checks-action`:
+      # that action runs the tool itself and leaves the output only in the job
+      # log, and the report is the deliverable here. `taiki-e/install-action` is
+      # already the installer this repository uses for cargo-fuzz.
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
-          manifest-path: core/Cargo.toml
-          release-type: minor
+          tool: cargo-semver-checks
+      - name: Compare the public API against the published release
+        run: scripts/semver_report.sh "${GITHUB_WORKSPACE}/semver-report.txt"
+      # `always()` on both of the next two steps: a report is most worth having
+      # when the step that produced it failed.
+      - name: Publish the report to the job summary
+        if: always()
+        run: |
+          {
+            echo '## cargo-semver-checks'
+            echo ''
+            echo '```'
+            cat "${GITHUB_WORKSPACE}/semver-report.txt" 2>/dev/null || echo '(no report was written)'
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semver-checks-report
+          path: semver-report.txt
+          if-no-files-found: warn
+      - name: Every breaking change is named in CHANGELOG.md
+        run: |
+          python3 scripts/check_changelog_breaking.py \
+            --report "${GITHUB_WORKSPACE}/semver-report.txt"
+      # Both scripts above decide whether this job is green, and both decide it
+      # by reading text. These cases are what says they read it correctly — the
+      # verdict-versus-exit-code distinction in particular, which is the thing
+      # the old arrangement got wrong. They stub cargo and cost a second.
+      - name: The two scripts' own cases
+        run: |
+          scripts/semver_report_test.sh
+          scripts/check_changelog_breaking_test.sh
 
   # ── Pre-release sanity ────────────────────────────────────────────
   # Verify the publish dry-run succeeds. Catches version bumps that

@@ -13,6 +13,8 @@ Cargo.lock
 .idea
 output.md
 test_output.txt
+# Written by scripts/semver_report.sh; uploaded as a CI artifact, never committed.
+semver-report.txt
 tests/bindings/libphantom_protocol.dylib
 # Security
 *.crt
