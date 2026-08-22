@@ -66,8 +66,8 @@ pub fn encode_datagrams(
 /// the other. An anti-amplification bound is about bytes on the path, and only the sender of
 /// a frame holds its datagrams: a receiver is handed the reassembled frame and nothing else,
 /// so without this it would have to divide wire bytes by frame bytes and call the result a
-/// ratio. Derived from the encoder's own rule rather than restated, and pinned against it by
-/// [`tests::wire_len_agrees_with_the_encoder`].
+/// ratio. Derived from the encoder's own rule rather than restated, and pinned against it at
+/// every fragment boundary by the `wire_len_agrees_with_the_encoder` test below.
 ///
 /// For an inbound frame this is a *lower* bound on what the peer actually spent, since the
 /// chunking is the sender's choice and a wasteful sender spends more. That is the safe
