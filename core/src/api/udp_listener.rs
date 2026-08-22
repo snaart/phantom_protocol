@@ -673,10 +673,11 @@ const HANDSHAKE_FLIGHT_RETENTION: Duration = Duration::from_secs(8);
 ///
 /// A count would be the obvious bound and it would be the wrong one, because what is being
 /// bounded is bytes and a flight's size is a property of the crypto, not of this file: a
-/// `ServerHello` is 6555 bytes of borsh in six datagrams, 6657 bytes on the wire once the
-/// outer envelope is counted, and a future parameter set moves that without touching
-/// anything here. Stated as bytes, the budget keeps meaning the same thing when that figure
-/// changes.
+/// `ServerHello` is 6554 bytes of borsh, 6555 once the `ServerReply` discriminant frames it,
+/// six datagrams and 6657 bytes on the wire once the outer envelope and the fragment
+/// sub-headers are counted — and a future parameter set moves all of that without touching
+/// anything here. Stated as bytes, the budget keeps meaning the same thing when those figures
+/// change.
 ///
 /// **Charged in residency, not in wire bytes.** What an entry costs the host is the
 /// allocations it holds, and those exceed what went on the path: the datagrams of a
