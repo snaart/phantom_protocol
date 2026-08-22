@@ -660,6 +660,33 @@ pub struct ClientMetrics {
     /// gate refused something" and "nothing arrived" — a capture cannot tell them
     /// apart, since header protection hides the flag it turns on.
     pub unencrypted_dropped_total: u64,
+    /// Handshake datagrams that arrived for a connection the listener had already
+    /// committed a route to — a client asking its question again.
+    ///
+    /// This is the counter a failed connect is read against, and it exists because
+    /// the artifact could not answer the question once already: when four connects
+    /// timed out on 2026-08-22 it took the server's own session records plus the
+    /// library's constants to establish that the reply had been sent and lost,
+    /// rather than the request never arriving. A non-zero value here says the
+    /// client's repeat reached the listener; the two below say what it did with it.
+    #[serde(default)]
+    pub initial_on_committed_route_total: u64,
+    /// Retained reply flights actually repeated. Read beside the counter above:
+    /// asked-and-answered is a repaired connect, asked-and-not-answered is a
+    /// connect the retention could not cover, and the two are indistinguishable
+    /// without both numbers.
+    #[serde(default)]
+    pub handshake_flight_repeated_total: u64,
+    /// Retained flights dropped to make room. Non-zero means the retention budget
+    /// bound during this run, so a connect that failed here may have failed for
+    /// want of a repeat rather than for want of a path.
+    #[serde(default)]
+    pub handshake_flight_evicted_total: u64,
+    /// Reply flights never retained, because repeating one would have exceeded the
+    /// anti-amplification bound. Those sessions have no repair at all, which is a
+    /// property of the parameter set rather than of the run.
+    #[serde(default)]
+    pub handshake_flight_refused_total: u64,
     pub uptime_secs: u64,
 }
 
@@ -684,6 +711,10 @@ impl From<phantom_protocol::observability::MetricsSnapshotFfi> for ClientMetrics
             replay_rejected_total: s.replay_rejected_total,
             aead_failure_total: s.aead_failure_total,
             unencrypted_dropped_total: s.unencrypted_dropped_total,
+            initial_on_committed_route_total: s.initial_on_committed_route_total,
+            handshake_flight_repeated_total: s.handshake_flight_repeated_total,
+            handshake_flight_evicted_total: s.handshake_flight_evicted_total,
+            handshake_flight_refused_total: s.handshake_flight_refused_total,
             uptime_secs: s.uptime_secs,
         }
     }
