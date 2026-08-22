@@ -1565,11 +1565,21 @@ as part of the protocol rather than as an implementation detail:
 2. **A repeat is owed only to the hello the reply was computed over**, compared
    in full. This is not a heuristic for peer identity: the signature covers the
    whole `ClientHello` (§ 6.5), so the retained reply is a valid answer to that
-   hello and to no other, and a client that re-derives its hello instead of
-   repeating it byte for byte gets no repair and must fall back to a fresh
-   connect. It is also the admission gate — obtaining a repeat requires
-   possession of a hello that already carried a valid IP-bound cookie, so a
-   spoofed source cannot reach it.
+   hello and to no other. A client that re-derives its hello instead of repeating
+   it byte for byte therefore gets no repair — and gets nothing else either: the
+   re-derived hello arrives on a connection id the server already routes, so it
+   is delivered to the established session, whose receive path does not parse
+   handshake messages, and dropped there. It does not start a fresh handshake,
+   and the connect fails on the client's own deadline.
+
+   The comparison is also the admission gate, and the honest statement of what it
+   gates is *possession*: only a party holding the exact hello can draw a repeat,
+   which means the client, or someone who was on the path when the hello crossed
+   it. A source that never saw it cannot construct one — the hello carries the
+   client's own 32-byte nonce and key package — so an off-path or spoofed sender
+   is excluded. An on-path observer is not, and rule 3 is what makes that
+   harmless in the direction that matters. What it can still do is spend the
+   budget of rule 4; see the note after this list.
 3. **A repeat goes only to the address the original went to**, taken from the
    server's record of the completed handshake and never from the datagram that
    triggered it. The amplification factor towards whoever asks is therefore zero,

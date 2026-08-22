@@ -919,10 +919,13 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   never a re-derivation — running the handshake again would draw fresh KEM randomness and a
   fresh session id and produce a valid `ServerHello` for a session the server never
   committed. A repeat is owed **only to the hello the reply was computed over**, compared in
-  full, which is both the security gate (obtaining one requires possession of a hello that
-  already carried a valid IP-bound cookie, so a spoofed source cannot reach it) and a
-  correctness requirement (the signature covers the whole `ClientHello`, so the retained
-  reply answers that hello and no other). A repeat goes **only to the address the original
+  full, which is both the security gate (drawing a repeat requires possession of the exact
+  hello, so an off-path or spoofed source — which cannot construct the client's own nonce and
+  key package — is excluded; an on-path observer is not, and rule 3 is what makes that
+  harmless in the direction that matters) and a correctness requirement (the signature covers
+  the whole `ClientHello`, so the retained reply answers that hello and no other; a
+  re-derived hello draws nothing at all, since it lands on a routed connection id and is
+  dropped by a session that does not parse handshake messages). A repeat goes **only to the address the original
   went to**, taken from the server's record of the completed handshake and never from the
   datagram that triggered it, so the amplification factor towards whoever asks is zero and
   towards the recorded address it is the ratio the first exchange already had — 6657 wire

@@ -215,7 +215,11 @@ has been the reason a byte-perfect encoder still could not connect:
   path that loses anything — and re-send the flight **unchanged**, because a
   server whose reply was lost repeats the bytes it already sent and will only do
   so for the exact hello that reply answers. A re-derived hello is a different
-  question and gets a fresh handshake at best.
+  question and draws **nothing at all**, not a fresh handshake: it arrives on a
+  connection id the server already routes, so it is handed to the established
+  session, whose receive path does not parse handshake messages, and dropped
+  there. Your connect then fails on your own deadline with no error from the
+  server. Keep the encoded flight and re-send those bytes.
 - **While your client is still waiting for a reply, discard anything that is not
   a handshake datagram** instead of feeding it to your reply parser. The server
   commits its session when it sends the `ServerHello`, so from that instant it may
