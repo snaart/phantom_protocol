@@ -82,6 +82,10 @@ mod otel_off {
         #[inline(always)]
         pub(crate) fn record_initial_on_committed_route(&self) {}
         #[inline(always)]
+        pub(crate) fn record_handshake_flight_repeated(&self) {}
+        #[inline(always)]
+        pub(crate) fn record_handshake_flight_evicted(&self) {}
+        #[inline(always)]
         pub(crate) fn record_path_migration(&self, _from: u8, _to: u8) {}
         #[inline(always)]
         pub(crate) fn record_cookie(&self, _outcome: CookieOutcome) {}
@@ -143,6 +147,10 @@ mod otel_on {
         /// the only attribution worth having would be per peer, which the cardinality
         /// contract in `attrs.rs` forbids.
         initial_on_committed_route: Counter<u64>,
+        /// Retained reply flights actually repeated, and retained reply flights dropped to
+        /// make room for a newer one. Unlabeled for the same reason as the counter above.
+        handshake_flight_repeated: Counter<u64>,
+        handshake_flight_evicted: Counter<u64>,
 
         // Path lifecycle.
         path_migrations: Counter<u64>,
@@ -194,6 +202,20 @@ mod otel_on {
                 .with_description(
                     "Handshake-type datagrams arriving on a connection already routed — a \
                      client repeating its flight because it has not seen the reply",
+                )
+                .build();
+            let handshake_flight_repeated = meter
+                .u64_counter(format!("{ns}.handshake.flight_repeated"))
+                .with_description(
+                    "Retained server reply flights repeated in answer to a client's repeated \
+                     hello",
+                )
+                .build();
+            let handshake_flight_evicted = meter
+                .u64_counter(format!("{ns}.handshake.flight_evicted"))
+                .with_description(
+                    "Retained server reply flights dropped to make room for a newer one — the \
+                     reply repair running out of its memory budget",
                 )
                 .build();
             let path_migrations = meter
@@ -253,6 +275,8 @@ mod otel_on {
                 aead_failed,
                 unencrypted_dropped,
                 initial_on_committed_route,
+                handshake_flight_repeated,
+                handshake_flight_evicted,
                 path_migrations,
                 rekey,
                 early_data,
@@ -308,6 +332,16 @@ mod otel_on {
         #[cold]
         pub(crate) fn record_initial_on_committed_route(&self) {
             self.initial_on_committed_route.add(1, &[]);
+        }
+
+        #[cold]
+        pub(crate) fn record_handshake_flight_repeated(&self) {
+            self.handshake_flight_repeated.add(1, &[]);
+        }
+
+        #[cold]
+        pub(crate) fn record_handshake_flight_evicted(&self) {
+            self.handshake_flight_evicted.add(1, &[]);
         }
 
         pub(crate) fn record_path_migration(&self, from: u8, to: u8) {

@@ -9,7 +9,8 @@
 //! byte / timing totals, the session/stream gauges, the handshake
 //! sum+count fields, and the always-on security counters
 //! (`replay_rejected_total`, `aead_failure_total`,
-//! `unencrypted_dropped_total`, `initial_on_committed_route_total`). The snapshot is always
+//! `unencrypted_dropped_total`, `initial_on_committed_route_total`,
+//! `handshake_flight_repeated_total`, `handshake_flight_evicted_total`). The snapshot is always
 //! available regardless of the `telemetry-otel` feature, since the atomics
 //! always exist. The labeled OTel instruments in `instruments.rs` carry
 //! the same events with attribution; both paths are populated together.
@@ -62,6 +63,15 @@ pub struct MetricsSnapshot {
     /// the way down and zero says the path went silent in both directions; nothing
     /// else distinguishes those.
     pub initial_on_committed_route_total: u64,
+    /// Retained reply flights this listener actually repeated (PROTOCOL § 6.1),
+    /// one per repeat sent. The counter above says a client asked again; this one
+    /// says an answer went back. Repeats arriving with none going back is a
+    /// listener whose retention did not cover that session.
+    pub handshake_flight_repeated_total: u64,
+    /// Retained reply flights dropped to make room for a newer one. Non-zero means
+    /// the repair is running out of the memory it is allowed and some sessions are
+    /// back to losing a connect to a single lost reply datagram.
+    pub handshake_flight_evicted_total: u64,
 
     pub uptime_secs: u64,
 }
@@ -100,6 +110,8 @@ impl Default for MetricsSnapshot {
             aead_failure_total: 0,
             unencrypted_dropped_total: 0,
             initial_on_committed_route_total: 0,
+            handshake_flight_repeated_total: 0,
+            handshake_flight_evicted_total: 0,
             uptime_secs: 0,
         }
     }
@@ -177,6 +189,8 @@ impl MetricsSnapshot {
             aead_failure_total: h.aead_failure_total(),
             unencrypted_dropped_total: h.unencrypted_dropped_total(),
             initial_on_committed_route_total: h.initial_on_committed_route_total(),
+            handshake_flight_repeated_total: h.handshake_flight_repeated_total(),
+            handshake_flight_evicted_total: h.handshake_flight_evicted_total(),
             uptime_secs: h.uptime_secs(),
         }
     }
@@ -241,6 +255,24 @@ pub struct MetricsSnapshotFfi {
     /// path fell silent in both directions. Nothing else on either side tells those
     /// apart.
     pub initial_on_committed_route_total: u64,
+    /// Retained reply flights this listener actually repeated (PROTOCOL § 6.1), one
+    /// per repeat sent rather than per datagram of it. Appended for the reason above.
+    ///
+    /// The field before it says a client asked again; this one says an answer went
+    /// back, and the pair is what makes a failed connect readable. Questions arriving
+    /// and answers going back is the repair working. Questions arriving and no answers
+    /// is a listener that had nothing retained for that session — it was evicted,
+    /// expired, or the budget for it was already spent. No questions at all is a path
+    /// that went silent upstream, which is a different fault in a different direction.
+    pub handshake_flight_repeated_total: u64,
+    /// Retained reply flights dropped to make room for a newer one (PROTOCOL § 6.1).
+    /// Appended for the reason above.
+    ///
+    /// This is the repair running out of the memory it is allowed. Non-zero says the
+    /// listener is completing handshakes faster than its retention budget covers, and
+    /// that the evicted sessions are back to losing a whole connect to one lost reply
+    /// datagram — a rare, load-dependent failure that nothing else makes visible.
+    pub handshake_flight_evicted_total: u64,
 }
 
 impl From<MetricsSnapshot> for MetricsSnapshotFfi {
@@ -266,6 +298,8 @@ impl From<MetricsSnapshot> for MetricsSnapshotFfi {
             uptime_secs: s.uptime_secs,
             unencrypted_dropped_total: s.unencrypted_dropped_total,
             initial_on_committed_route_total: s.initial_on_committed_route_total,
+            handshake_flight_repeated_total: s.handshake_flight_repeated_total,
+            handshake_flight_evicted_total: s.handshake_flight_evicted_total,
         }
     }
 }
@@ -322,6 +356,8 @@ mod tests {
         assert_eq!(ffi.aead_failure_total, 0);
         assert_eq!(ffi.unencrypted_dropped_total, 0);
         assert_eq!(ffi.initial_on_committed_route_total, 0);
+        assert_eq!(ffi.handshake_flight_repeated_total, 0);
+        assert_eq!(ffi.handshake_flight_evicted_total, 0);
         assert_eq!(ffi.uptime_secs, 0);
     }
 
@@ -341,6 +377,8 @@ mod tests {
         h.record_aead_failure();
         h.record_unencrypted_dropped();
         h.record_initial_on_committed_route();
+        h.record_handshake_flight_repeated();
+        h.record_handshake_flight_evicted();
 
         let snap = MetricsSnapshot::capture(&h);
         let ffi = snap.to_ffi();
@@ -364,6 +402,8 @@ mod tests {
         assert_eq!(ffi.aead_failure_total, 1);
         assert_eq!(ffi.unencrypted_dropped_total, 1);
         assert_eq!(ffi.initial_on_committed_route_total, 1);
+        assert_eq!(ffi.handshake_flight_repeated_total, 1);
+        assert_eq!(ffi.handshake_flight_evicted_total, 1);
     }
 
     #[test]

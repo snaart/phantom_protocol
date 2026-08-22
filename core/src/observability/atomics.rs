@@ -94,6 +94,8 @@ pub(crate) struct HotPathAtomics {
     aead_failure_total: CachePadded<AtomicU64>,
     unencrypted_dropped_total: CachePadded<AtomicU64>,
     initial_on_committed_route_total: CachePadded<AtomicU64>,
+    handshake_flight_repeated_total: CachePadded<AtomicU64>,
+    handshake_flight_evicted_total: CachePadded<AtomicU64>,
 
     /// Process-start timestamp for uptime calculation. Set once at
     /// construction; the snapshot reader computes `elapsed()` on read.
@@ -124,6 +126,8 @@ impl HotPathAtomics {
             aead_failure_total: CachePadded::new(AtomicU64::new(0)),
             unencrypted_dropped_total: CachePadded::new(AtomicU64::new(0)),
             initial_on_committed_route_total: CachePadded::new(AtomicU64::new(0)),
+            handshake_flight_repeated_total: CachePadded::new(AtomicU64::new(0)),
+            handshake_flight_evicted_total: CachePadded::new(AtomicU64::new(0)),
             started_at: Instant::now(),
         }
     }
@@ -248,9 +252,47 @@ impl HotPathAtomics {
     /// missing on the way down; zero, against a client that timed out, says the
     /// path fell silent in both directions. Those need different remedies and were
     /// indistinguishable without this.
+    ///
+    /// It answers only that first question. It is bumped when the datagram
+    /// arrives, before anything has decided whether an answer is owed, so on its
+    /// own it cannot say whether the listener repaired the connect or had nothing
+    /// to send — [`record_handshake_flight_repeated`] is the other half.
+    ///
+    /// [`record_handshake_flight_repeated`]: Self::record_handshake_flight_repeated
     #[inline]
     pub(crate) fn record_initial_on_committed_route(&self) {
         self.initial_on_committed_route_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the always-on count of retained reply flights actually repeated
+    /// (PROTOCOL § 6.1) — one per repeat sent, not per datagram of it.
+    ///
+    /// Read against [`record_initial_on_committed_route`]: repeats arriving with no
+    /// repeats sent is a listener that had nothing to answer with, which is a
+    /// different fault from a path that lost the answer on the way down and a
+    /// different fault again from one that never carried the question.
+    ///
+    /// [`record_initial_on_committed_route`]: Self::record_initial_on_committed_route
+    #[inline]
+    pub(crate) fn record_handshake_flight_repeated(&self) {
+        self.handshake_flight_repeated_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the always-on count of retained reply flights dropped to make room
+    /// for a newer one (PROTOCOL § 6.1).
+    ///
+    /// This is the repair running out of the memory it is allowed, and it is the
+    /// only externally visible sign of it: an evicted session's connect still
+    /// succeeds unless its reply is lost, so the failures it causes are rare,
+    /// load-dependent and indistinguishable from the ones the repair was built for.
+    /// A non-zero rate says the listener is completing handshakes faster than its
+    /// retention budget covers, and that some clients are back to the pre-repair
+    /// behaviour.
+    #[inline]
+    pub(crate) fn record_handshake_flight_evicted(&self) {
+        self.handshake_flight_evicted_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -340,6 +382,14 @@ impl HotPathAtomics {
     pub(crate) fn initial_on_committed_route_total(&self) -> u64 {
         self.initial_on_committed_route_total
             .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn handshake_flight_repeated_total(&self) -> u64 {
+        self.handshake_flight_repeated_total.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn handshake_flight_evicted_total(&self) -> u64 {
+        self.handshake_flight_evicted_total.load(Ordering::Relaxed)
     }
 
     pub(crate) fn uptime_secs(&self) -> u64 {
@@ -444,6 +494,8 @@ mod tests {
         assert_eq!(h.aead_failure_total(), 0);
         assert_eq!(h.unencrypted_dropped_total(), 0);
         assert_eq!(h.initial_on_committed_route_total(), 0);
+        assert_eq!(h.handshake_flight_repeated_total(), 0);
+        assert_eq!(h.handshake_flight_evicted_total(), 0);
 
         h.record_replay_rejected();
         h.record_replay_rejected();
@@ -455,11 +507,16 @@ mod tests {
         h.record_initial_on_committed_route();
         h.record_initial_on_committed_route();
         h.record_initial_on_committed_route();
+        h.record_handshake_flight_repeated();
+        h.record_handshake_flight_repeated();
+        h.record_handshake_flight_evicted();
 
         assert_eq!(h.replay_rejected_total(), 2);
         assert_eq!(h.aead_failure_total(), 1);
         assert_eq!(h.unencrypted_dropped_total(), 3);
         assert_eq!(h.initial_on_committed_route_total(), 4);
+        assert_eq!(h.handshake_flight_repeated_total(), 2);
+        assert_eq!(h.handshake_flight_evicted_total(), 1);
     }
 
     #[test]

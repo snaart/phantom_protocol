@@ -246,6 +246,32 @@ impl Observability {
         self.instruments.record_initial_on_committed_route();
     }
 
+    /// Record a retained reply flight actually being repeated (PROTOCOL § 6.1) — one per
+    /// repeat sent, not per datagram of it.
+    ///
+    /// The counter above says a client asked again; this one says the listener had an answer
+    /// and sent it. Kept apart because the two failures they separate need opposite remedies:
+    /// questions arriving with no answers going back is a listener whose retention did not
+    /// cover the session, while questions never arriving at all is a path that went silent
+    /// upstream. A single counter reads identically in both.
+    #[inline]
+    pub fn record_handshake_flight_repeated(&self) {
+        self.atomics.record_handshake_flight_repeated();
+        self.instruments.record_handshake_flight_repeated();
+    }
+
+    /// Record a retained reply flight dropped to make room for a newer one (PROTOCOL § 6.1).
+    ///
+    /// The repair holds a bounded amount of memory; past it the oldest answer goes so the
+    /// newest can be kept. An evicted session is back to the behaviour that made a single
+    /// lost reply datagram cost a whole connect, and nothing else on either side of that
+    /// connect would say so — which is why the eviction is counted rather than merely done.
+    #[inline]
+    pub fn record_handshake_flight_evicted(&self) {
+        self.atomics.record_handshake_flight_evicted();
+        self.instruments.record_handshake_flight_evicted();
+    }
+
     pub fn record_path_migration(&self, from: u8, to: u8) {
         self.instruments.record_path_migration(from, to);
     }
@@ -299,18 +325,25 @@ mod tests {
         assert_eq!(s.aead_failure_total, 0);
         assert_eq!(s.unencrypted_dropped_total, 0);
         assert_eq!(s.initial_on_committed_route_total, 0);
+        assert_eq!(s.handshake_flight_repeated_total, 0);
+        assert_eq!(s.handshake_flight_evicted_total, 0);
 
         obs.record_replay_rejected(ReplayReason::Duplicate);
         obs.record_replay_rejected(ReplayReason::Duplicate);
         obs.record_aead_failure(LegType::Tcp, AeadAlgorithm::Aes256Gcm);
         obs.record_unencrypted_dropped(LegType::Tcp);
         obs.record_initial_on_committed_route();
+        obs.record_handshake_flight_repeated();
+        obs.record_handshake_flight_evicted();
+        obs.record_handshake_flight_evicted();
 
         let s = obs.snapshot();
         assert_eq!(s.replay_rejected_total, 2);
         assert_eq!(s.aead_failure_total, 1);
         assert_eq!(s.unencrypted_dropped_total, 1);
         assert_eq!(s.initial_on_committed_route_total, 1);
+        assert_eq!(s.handshake_flight_repeated_total, 1);
+        assert_eq!(s.handshake_flight_evicted_total, 2);
     }
 
     #[test]

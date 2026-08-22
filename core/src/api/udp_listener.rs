@@ -91,6 +91,11 @@ pub struct PhantomUdpListener {
     /// Live gauge mirroring the demux `routes` table size (H-1 observability). The
     /// demux owns the table; this lets `active_route_count()` read it without a lock.
     active_routes: Arc<AtomicUsize>,
+    /// Live gauge mirroring the demux `flights` table size (PROTOCOL § 6.1). Same
+    /// arrangement as `active_routes`: the demux task owns the table and nothing outside it
+    /// can look, so without this the only evidence that a retained reply was ever released
+    /// would be the absence of a repeat — which is also what a working repair looks like.
+    retained_flights: Arc<AtomicUsize>,
     /// Optional liveness config derived from a `PhantomConfig` supplied at bind time.
     /// When `Some`, applied to every accepted session immediately after the handshake.
     liveness: Option<crate::transport::liveness::LivenessConfig>,
@@ -159,6 +164,7 @@ impl PhantomUdpListener {
             accepted_rx: Mutex::new(accepted_rx),
             demux: parking_lot::Mutex::new(None),
             active_routes: Arc::new(AtomicUsize::new(0)),
+            retained_flights: Arc::new(AtomicUsize::new(0)),
             liveness: config.map(|c| c.liveness()),
         }))
     }
@@ -651,26 +657,29 @@ const MAX_FLIGHT_REPEATS: u32 = 3;
 /// [`HANDSHAKE_RETRANSMIT_BUDGET`]: crate::api::udp_transport::HANDSHAKE_RETRANSMIT_BUDGET
 const HANDSHAKE_FLIGHT_RETENTION: Duration = crate::api::udp_transport::HANDSHAKE_RETRANSMIT_BUDGET;
 
-/// How many reply flights the listener retains at once (PROTOCOL § 6.1).
+/// How much memory a listener's retained reply flights may occupy at once (PROTOCOL § 6.1).
 ///
-/// This is the memory the repair costs, and the arithmetic is: a `ServerHello` is 6555 bytes
-/// of borsh in six datagrams, 6657 bytes on the wire once the outer envelope is counted, so
-/// **256 × 6657 B ≈ 1.63 MiB** — a floor on what the host must have, not a ceiling on what
-/// the process will use, since a listener also holds the in-flight copy of each reply until
-/// its handshake finishes.
+/// A count would be the obvious bound and it would be the wrong one, because what is being
+/// bounded is bytes and a flight's size is a property of the crypto, not of this file: a
+/// `ServerHello` is 6555 bytes of borsh in six datagrams, 6657 bytes on the wire once the
+/// outer envelope is counted, and a future parameter set moves that without touching
+/// anything here. Stated as bytes, the budget admits **8 MiB ÷ 6657 B ≈ 1260** of today's
+/// flights and keeps meaning the same thing when that figure changes.
 ///
-/// It is [`MAX_INFLIGHT_HANDSHAKES`] on purpose: the listener already refuses to run more
-/// than that many unauthenticated handshakes at once, so retaining at most as many answers as
-/// it will entertain questions keeps one number governing both. Steady-state occupancy is far
-/// below it — an entry is released the moment its client sends anything authenticated, which
-/// on a healthy path is one round trip — and the cap matters only when a population of
-/// clients has stopped answering, which is the case the retention exists for.
+/// 8 MiB for a whole listener is what one session may raise its receive windows by
+/// (`SESSION_RECV_WINDOW_GROWTH_BUDGET`), so the entire repair costs a server what a single
+/// busy connection is already allowed to advertise. As always it is a floor on what the host
+/// must have, not a ceiling on what the process will use — a listener also holds the
+/// in-flight copy of each reply until its handshake finishes.
 ///
-/// Past the cap a new flight is simply not retained: the handshake still completes and the
-/// connect still works, it just has no repair if its reply is lost. Refusing the newcomer
-/// rather than evicting an incumbent is the safer half of that trade, because the incumbent
-/// is a session whose client may already be repeating its question.
-const MAX_RETAINED_FLIGHTS: usize = MAX_INFLIGHT_HANDSHAKES;
+/// What the budget buys is *time*, and that is the honest way to read it. An entry is
+/// released the moment its client sends anything authenticated, which on a healthy path is
+/// one round trip, so the table holds the sessions established in roughly the last
+/// `budget ÷ completion rate` seconds. A listener completing a thousand handshakes a second
+/// covers about the last second — which is the client's first retransmit interval, the one
+/// that matters most. Past that the oldest answers go first: see [`FlightTable::retain`] for
+/// why that is the opposite of the earlier behaviour and not merely a different one.
+const RETAINED_FLIGHT_BUDGET: usize = 8 * 1024 * 1024;
 
 /// The most a repeat may send for what triggered it (RFC 9000 § 8.2).
 ///
@@ -702,27 +711,58 @@ struct RetainedFlight {
 ///
 /// Everything here is about what an entry costs and how it ends. An entry is several
 /// kilobytes committed on behalf of a peer that has passed the cookie round but has not yet
-/// proved it received anything, so it is bounded three ways — by [`MAX_RETAINED_FLIGHTS`], by
-/// [`HANDSHAKE_FLIGHT_RETENTION`], and by the peer's own first authenticated packet — and the
-/// three are independent: none of them can be held open by anything the peer does.
+/// proved it received anything, so it is bounded three ways — by [`RETAINED_FLIGHT_BUDGET`],
+/// by [`HANDSHAKE_FLIGHT_RETENTION`], and by the peer's own first authenticated packet — and
+/// the three are independent: none of them can be held open by anything the peer does.
 struct FlightTable {
     flights: HashMap<ConnId, RetainedFlight>,
+    /// Wire bytes currently retained. Maintained rather than recomputed because the budget
+    /// is consulted on every completed handshake and a sum over the table is not.
+    retained_bytes: usize,
+    /// Live gauge of `flights.len()`, mirrored to the listener so the demux's own reclaim
+    /// can be observed from outside the task that owns the table.
+    occupancy: Arc<AtomicUsize>,
+    observability: Arc<Observability>,
 }
 
 impl FlightTable {
-    fn new() -> Self {
+    fn new(occupancy: Arc<AtomicUsize>, observability: Arc<Observability>) -> Self {
         Self {
             flights: HashMap::new(),
+            retained_bytes: 0,
+            occupancy,
+            observability,
+        }
+    }
+
+    fn sync(&self) {
+        self.occupancy.store(self.flights.len(), Ordering::Relaxed);
+    }
+
+    /// Drop one entry, giving its bytes back to the budget. The only way an entry leaves.
+    fn forget(&mut self, cid: &ConnId) {
+        if let Some(e) = self.flights.remove(cid) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(e.flight.wire_bytes);
         }
     }
 
     /// Retain `flight` under `cid`, or decline to.
     ///
-    /// Declining is not a failure path — it is the ordinary answer when the table is full of
-    /// live entries or when the flight would make this listener an amplifier — and it costs
-    /// exactly what the server did before this mechanism existed: a lost reply is a lost
-    /// connect for that one client. Returns whether the flight was kept, which is what the
-    /// tests assert against.
+    /// Declining happens for exactly one reason — the flight would make this listener an
+    /// amplifier — and it is not a failure path: it costs what the server did before this
+    /// mechanism existed, a lost reply being a lost connect for that one client. Returns
+    /// whether the flight was kept, which is what the tests assert against.
+    ///
+    /// **A full table evicts, it does not refuse.** Refusing the newcomer was the first
+    /// shape of this and it is a peer-reachable off-switch: once enough established-but-silent
+    /// sessions occupy the budget, every session established after them has no repair, and
+    /// the population that fills it is exactly the burst of concurrent connects the repair
+    /// was built for. Evicting instead bounds the same memory while keeping the mechanism on,
+    /// and the entry that goes is the oldest — every entry carries the same retention, so the
+    /// oldest is both nearest its own deadline and the one whose client has had longest to
+    /// give up, while the newcomer's client is by construction still connecting. An eviction
+    /// is counted (`handshake_flight_evicted_total`), because an evicted session is back to
+    /// the pre-repair behaviour and nothing else on either side of that connect would say so.
     fn retain(&mut self, cid: ConnId, flight: HandshakeFlight, now: Instant) -> bool {
         // RFC 9000 § 8.2, checked once so no repeat has to. A flight larger than the limit
         // allows is refused rather than truncated: half a `ServerHello` is not an answer.
@@ -733,12 +773,32 @@ impl FlightTable {
         {
             return false;
         }
-        if self.flights.len() >= MAX_RETAINED_FLIGHTS {
+        // A second handshake under the same bootstrap id replaces the first; give the old
+        // entry's bytes back before charging the new one, or the budget leaks by the
+        // difference and the table shrinks for reasons no counter explains.
+        self.forget(&cid);
+        // Free what has genuinely ended before taking anything from a live entry.
+        if self.retained_bytes + flight.wire_bytes > RETAINED_FLIGHT_BUDGET {
             self.sweep(now);
-            if self.flights.len() >= MAX_RETAINED_FLIGHTS {
-                return false;
-            }
         }
+        // A flight is at most `MAX_TOTAL_CHUNKS` datagrams (~253 KiB), far inside the budget,
+        // so this empties the table only if the budget is ever set below one flight — and the
+        // emptiness guard is what keeps that a single over-budget entry rather than a spin.
+        while !self.flights.is_empty()
+            && self.retained_bytes + flight.wire_bytes > RETAINED_FLIGHT_BUDGET
+        {
+            let Some(oldest) = self
+                .flights
+                .iter()
+                .min_by_key(|(_, e)| e.expires_at)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            self.forget(&oldest);
+            self.observability.record_handshake_flight_evicted();
+        }
+        self.retained_bytes += flight.wire_bytes;
         self.flights.insert(
             cid,
             RetainedFlight {
@@ -747,6 +807,7 @@ impl FlightTable {
                 expires_at: now + HANDSHAKE_FLIGHT_RETENTION,
             },
         );
+        self.sync();
         true
     }
 
@@ -768,7 +829,8 @@ impl FlightTable {
         // The client has demonstrably heard us, or has run out of time to ask. Either way the
         // bytes are dead weight and the reclaim happens here rather than waiting for a sweep.
         if entry.flight.delivered.load(Ordering::Relaxed) || now >= entry.expires_at {
-            self.flights.remove(cid);
+            self.forget(cid);
+            self.sync();
             return None;
         }
         let mut hasher = Sha256::new();
@@ -785,8 +847,12 @@ impl FlightTable {
         let peer = entry.flight.peer;
         entry.repeats_left -= 1;
         if entry.repeats_left == 0 {
-            self.flights.remove(cid);
+            self.forget(cid);
         }
+        self.sync();
+        // Counted here rather than where the repeated hello arrived, so the artifact
+        // separates "the listener answered" from "the listener had nothing to answer with".
+        self.observability.record_handshake_flight_repeated();
         Some((datagrams, peer))
     }
 
@@ -796,8 +862,16 @@ impl FlightTable {
     /// datagram arriving for the entry in question — a client that hears the reply sends its
     /// next packet under a rotated connection id, and one that gives up sends nothing at all.
     fn sweep(&mut self, now: Instant) {
-        self.flights
-            .retain(|_, e| !e.flight.delivered.load(Ordering::Relaxed) && now < e.expires_at);
+        let mut kept = 0usize;
+        self.flights.retain(|_, e| {
+            let keep = !e.flight.delivered.load(Ordering::Relaxed) && now < e.expires_at;
+            if keep {
+                kept += e.flight.wire_bytes;
+            }
+            keep
+        });
+        self.retained_bytes = kept;
+        self.sync();
     }
 }
 
@@ -846,7 +920,10 @@ async fn run_udp_demux(listener: Arc<PhantomUdpListener>) {
     let mut routes = RouteTable::new(listener.active_routes.clone());
     // PROTOCOL § 6.1: the reply flights this listener can still repeat. Bounded by count, by
     // time, and by each client's own first authenticated packet — see [`FlightTable`].
-    let mut flights = FlightTable::new();
+    let mut flights = FlightTable::new(
+        listener.retained_flights.clone(),
+        listener.observability.clone(),
+    );
     // Per-source-IP in-flight handshake counter (H-2). Incremented when a slot is committed
     // to an address-validated source, decremented when that handshake task finishes.
     let mut pending = PendingByIp::new();
@@ -1276,6 +1353,15 @@ mod tests {
         RouteTable::new(Arc::new(AtomicUsize::new(0)))
     }
 
+    /// A retention table with its own gauge and metrics sink, so a unit test sees exactly
+    /// the counters its own operations produced.
+    fn flight_table() -> FlightTable {
+        FlightTable::new(
+            Arc::new(AtomicUsize::new(0)),
+            Observability::new(ObservabilityConfig::default()),
+        )
+    }
+
     /// A retained reply flight standing in for a real `ServerHello`: `datagrams` bytes of
     /// answer to a `question_bytes`-byte hello, sized so the amplification bound is
     /// satisfied unless a test deliberately breaks it.
@@ -1332,7 +1418,7 @@ mod tests {
     #[test]
     fn a_repeat_answers_only_the_question_its_reply_was_computed_for() {
         let now = Instant::now();
-        let mut table = FlightTable::new();
+        let mut table = flight_table();
         let question = vec![0xA5u8; 3000];
         let answer = vec![vec![0x11u8; 1200], vec![0x22u8; 1200]];
         assert!(table.retain(cid(1), test_flight(&question, answer.clone()), now));
@@ -1380,7 +1466,7 @@ mod tests {
     #[test]
     fn a_question_that_does_not_match_leaves_the_budget_untouched() {
         let now = Instant::now();
-        let mut table = FlightTable::new();
+        let mut table = flight_table();
         let question = vec![0x5Au8; 2000];
         assert!(table.retain(cid(3), test_flight(&question, vec![vec![0u8; 1000]]), now));
 
@@ -1404,7 +1490,7 @@ mod tests {
     #[test]
     fn the_repeat_budget_is_spent_and_the_flight_released() {
         let now = Instant::now();
-        let mut table = FlightTable::new();
+        let mut table = flight_table();
         let question = vec![0x3Cu8; 2000];
         assert!(table.retain(cid(4), test_flight(&question, vec![vec![0u8; 1500]]), now));
 
@@ -1439,7 +1525,7 @@ mod tests {
         let now = Instant::now();
         let question = vec![0x77u8; 2000];
 
-        let mut table = FlightTable::new();
+        let mut table = flight_table();
         let flight = test_flight(&question, vec![vec![0u8; 1500]]);
         let latch = flight.delivered.clone();
         assert!(table.retain(cid(5), flight, now));
@@ -1450,7 +1536,7 @@ mod tests {
         );
         assert!(table.flights.is_empty(), "and the bytes go with the answer");
 
-        let mut table = FlightTable::new();
+        let mut table = flight_table();
         let flight = test_flight(&question, vec![vec![0u8; 1500]]);
         let latch = flight.delivered.clone();
         assert!(table.retain(cid(6), flight, now));
@@ -1472,7 +1558,7 @@ mod tests {
     fn a_retained_flight_expires_on_its_own_deadline() {
         let now = Instant::now();
         let question = vec![0x11u8; 2000];
-        let mut table = FlightTable::new();
+        let mut table = flight_table();
         assert!(table.retain(cid(7), test_flight(&question, vec![vec![0u8; 1500]]), now));
 
         let just_inside = now + HANDSHAKE_FLIGHT_RETENTION - Duration::from_millis(1);
@@ -1489,7 +1575,7 @@ mod tests {
         );
         assert!(table.flights.is_empty());
 
-        let mut table = FlightTable::new();
+        let mut table = flight_table();
         assert!(table.retain(cid(8), test_flight(&question, vec![vec![0u8; 1500]]), now));
         table.sweep(past);
         assert!(
@@ -1498,51 +1584,145 @@ mod tests {
         );
     }
 
-    /// The retention table does not grow past its bound, and the bound is the memory this
-    /// repair costs.
+    /// A full retention table evicts its oldest answer; it never stops answering.
     ///
-    /// A retained flight is several kilobytes committed for a peer that has cleared the
-    /// cookie round but has not yet proved it received anything, and how many such peers
-    /// exist at once is not something this listener chooses. So the cap is enforced, the
-    /// newcomer is refused rather than an incumbent evicted — an incumbent may be a session
-    /// whose client is already repeating its question — and space comes back only when
-    /// entries genuinely end.
+    /// This is the whole difference between a bound and an off-switch. A retained flight is
+    /// several kilobytes committed for a peer that has cleared the cookie round but has not
+    /// yet proved it received anything, and how many such peers exist at once is not
+    /// something this listener chooses — so the budget binds, and what it does when it binds
+    /// decides whether the repair survives load. Refusing the newcomer, which is what this
+    /// did first, means a population of established-but-silent sessions filling the budget
+    /// turns the repair off for every session established after them, silently and globally,
+    /// under exactly the burst of concurrent connects it exists for. Evicting the oldest
+    /// bounds the same memory and keeps the mechanism on: the entry that goes is nearest its
+    /// own deadline and belongs to the client that has had longest to give up, while the
+    /// newcomer's client is by construction still connecting.
+    ///
+    /// The assertions are the halves of that, and each fails against a different wrong
+    /// version: the budget is enforced (a table that never evicts is unbounded memory), the
+    /// newcomer is kept (a table that refuses is the off-switch), and the eviction is counted
+    /// (an operator whose repair has quietly stopped covering a session has nothing else to
+    /// read).
     #[test]
-    fn the_retention_table_refuses_to_grow_past_its_bound() {
+    fn a_full_retention_table_evicts_its_oldest_answer_rather_than_refusing_the_newcomer() {
         let now = Instant::now();
-        let mut table = FlightTable::new();
-        let question = vec![0x2Bu8; 2000];
-        for i in 0..MAX_RETAINED_FLIGHTS {
+        let mut table = flight_table();
+        let question = vec![0x2Bu8; 4000];
+        // About the size of a real reply flight, so what fills the budget here is what
+        // fills it in production — without this test having to know today's exact figure.
+        let flight_bytes = 8 * 1024;
+        let fits = RETAINED_FLIGHT_BUDGET / flight_bytes;
+        let answer = || vec![vec![0u8; flight_bytes]];
+
+        // A millisecond apart, so "oldest" names one entry rather than a tie. Production
+        // ties are possible and any of the tied entries is the right one to drop.
+        for i in 0..fits {
             let key = (i as u64).to_be_bytes();
             assert!(
-                table.retain(key, test_flight(&question, vec![vec![0u8; 1500]]), now),
-                "entry {i} is inside the cap of {MAX_RETAINED_FLIGHTS}"
+                table.retain(
+                    key,
+                    test_flight(&question, answer()),
+                    now + Duration::from_millis(i as u64)
+                ),
+                "entry {i} is inside the budget of {RETAINED_FLIGHT_BUDGET} bytes"
             );
         }
-        assert_eq!(table.flights.len(), MAX_RETAINED_FLIGHTS);
-
-        let overflow = u64::MAX.to_be_bytes();
-        assert!(
-            !table.retain(overflow, test_flight(&question, vec![vec![0u8; 1500]]), now),
-            "past the cap a flight is simply not retained: the handshake still completes, it \
-             just has no repair"
-        );
-        assert!(
-            table.flights.len() == MAX_RETAINED_FLIGHTS && !table.flights.contains_key(&overflow),
-            "and the refusal must not have displaced an incumbent, which may be a session \
-             whose client is repeating its question right now"
+        assert_eq!(table.flights.len(), fits);
+        assert_eq!(
+            table
+                .observability
+                .snapshot()
+                .handshake_flight_evicted_total,
+            0,
+            "nothing has been displaced yet"
         );
 
-        // Space comes back when entries end, not before.
-        let past = now + HANDSHAKE_FLIGHT_RETENTION;
+        let later = now + Duration::from_millis(fits as u64);
+        let newcomer = u64::MAX.to_be_bytes();
         assert!(
-            table.retain(
-                overflow,
-                test_flight(&question, vec![vec![0u8; 1500]]),
-                past
-            ),
-            "once the incumbents' windows have closed the newcomer is admitted"
+            table.retain(newcomer, test_flight(&question, answer()), later),
+            "a full table must still take the newcomer: refusing it is a peer-reachable \
+             off-switch, since the sessions that fill the budget are the ones that have gone \
+             quiet and the one being refused is the one still connecting"
         );
+        assert!(
+            table.flights.contains_key(&newcomer),
+            "and it must actually be retained, not merely accepted"
+        );
+        assert!(
+            !table.flights.contains_key(&0u64.to_be_bytes()),
+            "the entry that goes is the oldest — nearest its own deadline, and the client \
+             that has had longest to give up"
+        );
+        assert_eq!(
+            table.flights.len(),
+            fits,
+            "the budget still binds: an eviction makes room, it does not raise the ceiling"
+        );
+        assert_eq!(
+            table
+                .observability
+                .snapshot()
+                .handshake_flight_evicted_total,
+            1,
+            "an evicted session is back to losing a connect to one lost reply datagram, and \
+             this counter is the only thing that says so"
+        );
+        assert_eq!(
+            table.occupancy.load(Ordering::Relaxed),
+            table.flights.len(),
+            "the gauge must track the table, or the demux's own reclaim is unobservable"
+        );
+    }
+
+    /// Retained bytes are given back, so the budget bounds what is held rather than how many
+    /// sessions this listener may ever repair.
+    ///
+    /// Every way an entry can leave has to return its bytes: the sweep, a spent repeat
+    /// budget, a client that has been heard from, and a second handshake replacing the first
+    /// under the same bootstrap id. Miss any one of them and the accounting drifts upward
+    /// until the table evicts on every insertion — which looks exactly like healthy
+    /// operation, except that no session gets a repair and the eviction counter climbs with
+    /// nothing to explain it.
+    #[test]
+    fn every_way_a_flight_ends_gives_its_bytes_back() {
+        let now = Instant::now();
+        let mut table = flight_table();
+        let question = vec![0x4Du8; 4000];
+        let answer = || vec![vec![0u8; 2000]];
+
+        // Replaced by a second handshake on the same bootstrap id.
+        assert!(table.retain(cid(1), test_flight(&question, answer()), now));
+        assert!(table.retain(cid(1), test_flight(&question, answer()), now));
+        assert_eq!(
+            table.retained_bytes, 2000,
+            "a replacement is one flight's worth of bytes, not two"
+        );
+
+        // Spent by its repeat budget.
+        for _ in 0..MAX_FLIGHT_REPEATS {
+            assert!(table.repeat(&cid(1), &question, now).is_some());
+        }
+        assert_eq!(
+            table.retained_bytes, 0,
+            "a spent flight gives its bytes back"
+        );
+
+        // Released by the client being heard from, through the sweep.
+        let flight = test_flight(&question, answer());
+        let latch = flight.delivered.clone();
+        assert!(table.retain(cid(2), flight, now));
+        latch.store(true, Ordering::Relaxed);
+        table.sweep(now);
+        assert_eq!(table.retained_bytes, 0, "so does one the sweep reclaims");
+
+        // Released by its own deadline, on the repeat path.
+        assert!(table.retain(cid(3), test_flight(&question, answer()), now));
+        assert!(table
+            .repeat(&cid(3), &question, now + HANDSHAKE_FLIGHT_RETENTION)
+            .is_none());
+        assert_eq!(table.retained_bytes, 0, "and so does an expired one");
+        assert_eq!(table.occupancy.load(Ordering::Relaxed), 0);
     }
 
     /// A reply large enough to make this listener a useful amplifier is never retained.
@@ -1554,7 +1734,7 @@ mod tests {
     #[test]
     fn a_reply_that_would_amplify_is_never_retained() {
         let now = Instant::now();
-        let mut table = FlightTable::new();
+        let mut table = flight_table();
         let question = vec![0u8; 1000];
 
         let at_the_limit = vec![vec![0u8; 1000]; FLIGHT_AMPLIFICATION_LIMIT];
@@ -2002,6 +2182,206 @@ mod tests {
             .expect("the repaired session carries data")
             .expect("a frame");
         assert_eq!(echoed, b"ping".to_vec());
+
+        listener.shutdown();
+    }
+
+    /// The two handshake-repair counters answer different questions, and one of them cannot
+    /// answer either question alone.
+    ///
+    /// The counter that says "a client asked again" is bumped when the datagram arrives,
+    /// before anything has decided whether an answer is owed — which is the only place it can
+    /// be, since a flight that arrives in pieces is still a flight that arrived. On its own it
+    /// therefore reads identically whether the listener repaired the connect or had nothing
+    /// retained for it, and telling those apart is the entire reason it was added: an
+    /// investigation into failed connects could not determine, from either side, whether the
+    /// client's repeated hellos reached the server at all.
+    ///
+    /// So the repeat is counted separately, where the decision is made. Arrivals without
+    /// repeats is a listener whose retention did not cover that session — evicted, expired, or
+    /// its budget already spent — and it is a different fault from a path that never carried
+    /// the question, needing a different remedy. This drives both halves through the real
+    /// demux: noise on a committed connection id, which is an arrival and nothing more, then
+    /// the exact hello, which is both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_arrival_counter_and_the_repeat_counter_answer_different_questions() {
+        use crate::transport::phantom_udp::datagram::encode_datagrams;
+        use crate::transport::phantom_udp::envelope::decode_header;
+
+        let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+            .await
+            .expect("bind a loopback PhantomUDP listener");
+        let server_addr: SocketAddr = listener.local_addr().parse().expect("the bound address");
+        let pinned = listener.verifying_key_bytes();
+
+        let acceptor = listener.clone();
+        let accepted = tokio::spawn(async move { acceptor.accept().await });
+        let (relay_addr, captured) = spawn_recording_relay(server_addr).await;
+        let client = crate::api::session::connect_pinned_udp(
+            "127.0.0.1".to_string(),
+            relay_addr.port(),
+            pinned,
+        )
+        .await
+        .expect("the client socket binds");
+        client.await_ready().await.expect("the handshake completes");
+        let _outcome = accepted
+            .await
+            .expect("the accept task")
+            .expect("an accepted session");
+
+        // The last flight the client sent is the cookie-bearing hello the reply answers;
+        // fragment ids are allocated in order, so the highest is the most recent.
+        let flight = {
+            let seen = captured.lock();
+            let newest = seen
+                .keys()
+                .copied()
+                .max()
+                .expect("a captured client flight");
+            seen.get(&newest).cloned().expect("its datagrams")
+        };
+        let cid = decode_header(&flight[0]).expect("a captured header").0.cid;
+
+        let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe socket");
+        probe.connect(server_addr).await.expect("probe connect");
+        let before = listener.metrics_snapshot();
+
+        // Noise on the committed connection id: a handshake-type datagram that is not the
+        // hello the retained reply answers.
+        const NOISE: u64 = 4;
+        for i in 0..NOISE {
+            for d in encode_datagrams(PacketType::Initial, &cid, i as u32, b"not-the-hello")
+                .expect("encode")
+            {
+                probe.send(&d).await.expect("send noise");
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while listener.metrics_snapshot().initial_on_committed_route_total
+            < before.initial_on_committed_route_total + NOISE
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let after_noise = listener.metrics_snapshot();
+        assert_eq!(
+            after_noise.initial_on_committed_route_total,
+            before.initial_on_committed_route_total + NOISE,
+            "every handshake datagram on a committed connection is an arrival, whatever it \
+             turns out to contain"
+        );
+        assert_eq!(
+            after_noise.handshake_flight_repeated_total, before.handshake_flight_repeated_total,
+            "and none of it was answered — a counter that rose here could not tell a repaired \
+             connect from a listener with nothing to send"
+        );
+
+        // The exact hello: an answer is owed, and one repeat goes out for the whole flight.
+        for d in &flight {
+            probe.send(d).await.expect("replay the captured flight");
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while listener.metrics_snapshot().handshake_flight_repeated_total
+            == after_noise.handshake_flight_repeated_total
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let after_hello = listener.metrics_snapshot();
+        assert_eq!(
+            after_hello.handshake_flight_repeated_total,
+            after_noise.handshake_flight_repeated_total + 1,
+            "one repeat is owed per repeated flight, not per datagram of it"
+        );
+        assert_eq!(
+            after_hello.initial_on_committed_route_total,
+            after_noise.initial_on_committed_route_total + flight.len() as u64,
+            "while arrivals are counted per datagram, which is what makes a partially \
+             delivered flight visible at all"
+        );
+
+        listener.shutdown();
+    }
+
+    /// The demux's own clock is what releases a retained reply, and deleting that one call
+    /// must not leave the suite green.
+    ///
+    /// A healthy session never touches its retention entry again. It is keyed on the
+    /// bootstrap connection id, and a client that received the reply rotates off that id
+    /// immediately — so no datagram will ever arrive to reclaim the entry lazily, and no
+    /// unit test of the table can tell whether anything calls `sweep` in production. Without
+    /// the timer the table fills with answers to questions nobody is asking and stays full,
+    /// which is worse than the bound it looks like: the retention budget then belongs
+    /// permanently to sessions that have long since finished, and every new session displaces
+    /// one of them instead of a genuinely live entry.
+    ///
+    /// So this drives the real demux and watches the real gauge. One session establishes (an
+    /// answer is retained), one application byte crosses (the server's inbound packet
+    /// AEAD-opens, which latches the client's proof of receipt), and the entry must then go
+    /// on its own — with nothing arriving on that connection id to prompt it. The generous
+    /// deadline is deliberate: the assertion is that the reclaim happens at all, and
+    /// `ROUTE_SWEEP_INTERVAL` is the rate it happens at.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retained_reply_is_released_by_the_demux_clock_alone() {
+        let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+            .await
+            .expect("bind a loopback PhantomUDP listener");
+        let port: u16 = listener
+            .local_addr()
+            .parse::<SocketAddr>()
+            .expect("the bound address")
+            .port();
+        let pinned = listener.verifying_key_bytes();
+
+        let acceptor = listener.clone();
+        let accepted = tokio::spawn(async move { acceptor.accept().await });
+        let client = crate::api::session::connect_pinned_udp("127.0.0.1".to_string(), port, pinned)
+            .await
+            .expect("the client socket binds");
+        client.await_ready().await.expect("the handshake completes");
+        let outcome = accepted
+            .await
+            .expect("the accept task")
+            .expect("an accepted session");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while listener.retained_flights.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            listener.retained_flights.load(Ordering::Relaxed),
+            1,
+            "the reply this handshake sent must be retained, or the rest of this test is \
+             about an empty table"
+        );
+
+        // One authenticated byte is the client's proof that it received the reply, which is
+        // what makes the retained copy dead weight. Nothing else happens on this connection.
+        let server = outcome.session();
+        client
+            .send(b"heard-you".to_vec())
+            .await
+            .expect("client write");
+        let echoed = tokio::time::timeout(Duration::from_secs(10), server.recv())
+            .await
+            .expect("the session carries data")
+            .expect("a frame");
+        assert_eq!(echoed, b"heard-you".to_vec());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while listener.retained_flights.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            listener.retained_flights.load(Ordering::Relaxed),
+            0,
+            "a reply whose client has been heard from was still held after {:?}; nothing will \
+             ever arrive on its connection id to reclaim it, so the demux's periodic sweep is \
+             the only thing that can — and without it the retention budget is permanently \
+             owned by sessions that finished long ago",
+            Duration::from_secs(10)
+        );
 
         listener.shutdown();
     }

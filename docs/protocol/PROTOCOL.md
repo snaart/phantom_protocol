@@ -1581,9 +1581,20 @@ as part of the protocol rather than as an implementation detail:
    whole retransmission budget (8 s — past it nobody is still asking), and by the
    first inbound packet that AEAD-opens, which proves the client derived keys
    from the reply and so can only have received it.
-5. **Retention is best-effort.** A server that is already holding its maximum
-   number of retained flights keeps none for a new session; the handshake still
-   completes, that session simply has no repair.
+5. **Retention is best-effort, and a full server drops its oldest answer rather
+   than refusing its newest.** A server holds a bounded amount of retained reply
+   — bounded in bytes, since what a flight costs is a property of the parameter
+   set and not of the mechanism — and when a new one will not fit, the entry
+   nearest its own deadline is dropped to make room. A session can therefore lose
+   its repair before its window closes; the one that loses it is always the one
+   whose client has had longest to give up, never the one that has just
+   completed. Refusing the newcomer instead reads as the more conservative
+   choice and is the opposite: the entries that fill the table are established
+   sessions whose clients have gone quiet, so once they fill it every session
+   established afterwards goes unrepaired — under exactly the burst of concurrent
+   connects the repair exists for, and with nothing to show for it. A server
+   should count what it drops, because an evicted session behaves exactly like
+   one from before this mechanism existed and no other artifact says otherwise.
 6. **A client that is still waiting for a reply ignores every datagram that is
    not a handshake one.** The rules above only ever get a chance to run if the
    client is still connecting when its retransmit timer fires, and a server that

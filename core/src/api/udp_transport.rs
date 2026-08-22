@@ -1162,6 +1162,10 @@ mod tests {
         assert_eq!(got.as_deref(), Some(&b"hello"[..]));
 
         // Peer replies with a >MTU frame (fragments); client reassembles via recv_bytes.
+        // Short-header traffic belongs to an established session — a client still waiting
+        // for its handshake reply discards it — so the phase moves first, as the pump moves
+        // it the moment `process_server_hello` returns.
+        client.set_frame_phase(FramePhase::Established);
         let big: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
         for d in encode_datagrams(PacketType::OneRtt, &client.cid(), 1, &big).expect("encode") {
             peer.send_to(&d, from).await.unwrap();
@@ -1290,8 +1294,8 @@ mod tests {
 
         // And the gate is a phase gate, not a blanket refusal.
         client.set_frame_phase(FramePhase::Established);
-        for d in encode_datagrams(PacketType::OneRtt, &client.cid(), 2, b"session-data")
-            .expect("encode")
+        for d in
+            encode_datagrams(PacketType::OneRtt, &client.cid(), 2, b"session-data").expect("encode")
         {
             peer.send_to(&d, from).await.unwrap();
         }

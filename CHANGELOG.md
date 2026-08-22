@@ -930,9 +930,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   retention is bounded three ways: three repeats, matching the number the client sends;
   eight seconds, matching the whole budget a client spends before abandoning the connect;
   and the first inbound packet that AEAD-opens, which proves the client derived keys from
-  the reply and so received it. At most 256 flights are retained at once — 256 × 6657 B
-  ≈ 1.63 MiB, a floor on what the host must have rather than a ceiling on what the process
-  will use — and past that a new session simply gets no repair.
+  the reply and so received it. Retention itself is bounded in bytes rather than by a count,
+  because what a flight costs is a property of the parameter set and not of the mechanism:
+  8 MiB per listener, which admits about 1260 of today's 6657-byte flights and keeps meaning
+  the same thing when that figure moves. It is a floor on what the host must have rather than
+  a ceiling on what the process will use. A full table **evicts its oldest answer rather than
+  refusing its newest**, and that is not a detail — refusing the newcomer makes a full table a
+  peer-reachable off-switch, since the entries filling it are established sessions whose
+  clients have gone quiet, so every session established afterwards would go unrepaired under
+  exactly the burst of concurrent connects that motivated this. Evictions are counted.
 
   **No serialized byte moved.** No message gained a field, no version was bumped, the frozen
   wire vectors are untouched. The one thing that changes for a client is that a
@@ -942,13 +948,23 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 - **The investigation above could not determine whether the client's repeated hellos reached
   the server at all**, which is what separates "one reply flight was lost downstream" from
   "the path fell silent in both directions" — and no artifact on either side answered it.
-  `MetricsSnapshotFfi` gains `initial_on_committed_route_total`, the always-on count of
-  handshake-type datagrams arriving on a connection the listener has already routed, with
-  the OTel counter `phantom.handshake.initial_on_committed_route` beside it. Unlabeled: the
-  only attribution worth having would be per peer, which the cardinality contract keeps out
-  of instrument labels. Appended last in the FFI record, so a consumer built against an
-  older copy of the hand-curated C header is missing a field rather than misreading the ones
-  it knew.
+  `MetricsSnapshotFfi` gains three always-on counters, with OTel counters beside each.
+  `initial_on_committed_route_total` (`phantom.handshake.initial_on_committed_route`) counts
+  handshake-type datagrams arriving on a connection the listener has already routed — the
+  question reaching the server. It is bumped when the datagram arrives, before anything has
+  decided whether an answer is owed, so on its own it reads identically whether the listener
+  repaired the connect or had nothing to send; `handshake_flight_repeated_total`
+  (`phantom.handshake.flight_repeated`) is the other half, counted where the decision is made,
+  one per repeated flight rather than per datagram of it. Arrivals with no repeats is a
+  listener whose retention did not cover that session; no arrivals at all is a path that never
+  carried the question, and those need different remedies.
+  `handshake_flight_evicted_total` (`phantom.handshake.flight_evicted`) counts retained
+  answers dropped to make room for newer ones — the repair running out of its memory budget,
+  which is otherwise invisible because an evicted session behaves exactly like one from before
+  this mechanism existed. All three are unlabeled: the only attribution worth having would be
+  per peer, which the cardinality contract keeps out of instrument labels. Appended at the end
+  of the FFI record, so a consumer built against an older copy of the hand-curated C header is
+  missing fields rather than misreading the ones it knew.
 
 - **The claim that a peer flooding a non-reading application moves no window growth, which
   was false on the opened-stream path.** Growth is credited by the delivery task at the
