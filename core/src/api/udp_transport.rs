@@ -1470,6 +1470,77 @@ mod tests {
         );
     }
 
+    /// The datagrams a mid-handshake client now discards must not buy their sender anything
+    /// either — not a frame handed up, and not a moment of the schedule.
+    ///
+    /// The sibling above sprays bytes that cannot decode, which the read has always dropped.
+    /// This sprays the case that was added: well-formed short-header datagrams, each a
+    /// complete frame, of the shape a committed server's session traffic has. Discarding them
+    /// is what keeps a talkative server from ending a connect it is about to repair — but a
+    /// discard is also a resumption of the read, and a resumption that rearmed the timer would
+    /// hand an off-path sender the length of the wait. So both directions are asserted: the
+    /// refusal still arrives (it is not stretched by the spray) and it does not arrive early
+    /// (the schedule was genuinely spent, not skipped).
+    ///
+    /// Before the discard existed this test would not have reached either assertion: the first
+    /// sprayed datagram was handed up as a reply and the caller ended the connect on it.
+    #[tokio::test]
+    async fn a_short_header_spray_cannot_postpone_or_shorten_the_handshake_refusal() {
+        let black_hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = black_hole.local_addr().unwrap();
+        let client = UdpClientTransport::connect(server).await.unwrap();
+        client.send_bytes(b"client-hello").await.unwrap();
+
+        let cid = client.cid();
+        let off_path = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spray = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (_n, victim) = black_hole.recv_from(&mut buf).await.unwrap();
+            let mut packet_id = 0u32;
+            loop {
+                // A whole frame every time, so nothing here is dropped by the decode: the
+                // only thing that stops it being handed up is the phase gate.
+                if let Ok(dgrams) =
+                    encode_datagrams(PacketType::OneRtt, &cid, packet_id, b"session-traffic")
+                {
+                    for d in &dgrams {
+                        let _ = off_path.send_to(d, victim).await;
+                    }
+                }
+                packet_id = packet_id.wrapping_add(1);
+                tokio::time::sleep(HANDSHAKE_INITIAL_RTO / 10).await;
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            client.recv_bytes(),
+        )
+        .await;
+        spray.abort();
+        let elapsed = started.elapsed();
+
+        let outcome = outcome.expect("a short-header spray held the read past the deadline");
+        assert!(
+            matches!(outcome, Err(CoreError::Timeout)),
+            "a path that never answers is a Timeout even while short-header traffic arrives \
+             on it, got {outcome:?}"
+        );
+        assert!(
+            elapsed < crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            "the spray stretched the refusal to {elapsed:?}, past the {:?} session deadline — \
+             a discard that rearmed the retransmit timer would last exactly as long as the \
+             sender kept sending",
+            crate::api::session::CLIENT_HANDSHAKE_DEADLINE
+        );
+        assert!(
+            elapsed >= HANDSHAKE_RETRANSMIT_BUDGET / 2,
+            "gave up after only {elapsed:?}; discarding a datagram must leave the schedule \
+             where it was, not consume it"
+        );
+    }
+
     /// A lost first flight must be retransmitted promptly. "Promptly" is
     /// [`HANDSHAKE_INITIAL_RTO`]: soon enough that a dropped flight costs one interval
     /// rather than the whole connect, late enough that a reply merely in flight on a
