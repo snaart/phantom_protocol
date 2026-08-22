@@ -338,6 +338,18 @@ typedef struct PhantomMetricsSnapshotFfi {
      * questions arrived and one reply flight was lost on the way down, and zero
      * says the path fell silent in both directions. */
     uint64_t initial_on_committed_route_total;
+    /* Retained reply flights this listener actually repeated, one per repeated
+     * flight rather than per datagram of it. The field above says a client asked
+     * again; this one says an answer went back, and the pair is what makes a
+     * failed connect readable: arrivals with no repeats is a listener that had
+     * nothing retained for that session, while no arrivals at all is a path that
+     * never carried the question. */
+    uint64_t handshake_flight_repeated_total;
+    /* Retained reply flights dropped to make room for a newer one — the repair
+     * running out of the memory it is allowed. Expected to be zero; non-zero
+     * says the evicted sessions are back to losing a whole connect to one lost
+     * reply datagram, which nothing else makes visible. */
+    uint64_t handshake_flight_evicted_total;
 } PhantomMetricsSnapshotFfi;
 
 /* ====================================================================

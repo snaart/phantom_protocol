@@ -5089,6 +5089,30 @@ data class MetricsSnapshotFfi (
      * apart.
      */
     var `initialOnCommittedRouteTotal`: kotlin.ULong
+    , 
+    /**
+     * Retained reply flights this listener actually repeated (PROTOCOL § 6.1), one
+     * per repeat sent rather than per datagram of it. Appended for the reason above.
+     *
+     * The field before it says a client asked again; this one says an answer went
+     * back, and the pair is what makes a failed connect readable. Questions arriving
+     * and answers going back is the repair working. Questions arriving and no answers
+     * is a listener that had nothing retained for that session — it was evicted,
+     * expired, or the budget for it was already spent. No questions at all is a path
+     * that went silent upstream, which is a different fault in a different direction.
+     */
+    var `handshakeFlightRepeatedTotal`: kotlin.ULong
+    , 
+    /**
+     * Retained reply flights dropped to make room for a newer one (PROTOCOL § 6.1).
+     * Appended for the reason above.
+     *
+     * This is the repair running out of the memory it is allowed. Non-zero says the
+     * listener is completing handshakes faster than its retention budget covers, and
+     * that the evicted sessions are back to losing a whole connect to one lost reply
+     * datagram — a rare, load-dependent failure that nothing else makes visible.
+     */
+    var `handshakeFlightEvictedTotal`: kotlin.ULong
     
 ){
     
@@ -5125,6 +5149,8 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
         )
     }
 
@@ -5148,7 +5174,9 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.allocationSize(value.`aeadFailureTotal`) +
             FfiConverterULong.allocationSize(value.`uptimeSecs`) +
             FfiConverterULong.allocationSize(value.`unencryptedDroppedTotal`) +
-            FfiConverterULong.allocationSize(value.`initialOnCommittedRouteTotal`)
+            FfiConverterULong.allocationSize(value.`initialOnCommittedRouteTotal`) +
+            FfiConverterULong.allocationSize(value.`handshakeFlightRepeatedTotal`) +
+            FfiConverterULong.allocationSize(value.`handshakeFlightEvictedTotal`)
     )
 
     override fun write(value: MetricsSnapshotFfi, buf: ByteBuffer) {
@@ -5172,6 +5200,8 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.write(value.`uptimeSecs`, buf)
             FfiConverterULong.write(value.`unencryptedDroppedTotal`, buf)
             FfiConverterULong.write(value.`initialOnCommittedRouteTotal`, buf)
+            FfiConverterULong.write(value.`handshakeFlightRepeatedTotal`, buf)
+            FfiConverterULong.write(value.`handshakeFlightEvictedTotal`, buf)
     }
 }
 

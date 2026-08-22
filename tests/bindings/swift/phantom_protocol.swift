@@ -3177,6 +3177,28 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
      * apart.
      */
     public var initialOnCommittedRouteTotal: UInt64
+    /**
+     * Retained reply flights this listener actually repeated (PROTOCOL § 6.1), one
+     * per repeat sent rather than per datagram of it. Appended for the reason above.
+     *
+     * The field before it says a client asked again; this one says an answer went
+     * back, and the pair is what makes a failed connect readable. Questions arriving
+     * and answers going back is the repair working. Questions arriving and no answers
+     * is a listener that had nothing retained for that session — it was evicted,
+     * expired, or the budget for it was already spent. No questions at all is a path
+     * that went silent upstream, which is a different fault in a different direction.
+     */
+    public var handshakeFlightRepeatedTotal: UInt64
+    /**
+     * Retained reply flights dropped to make room for a newer one (PROTOCOL § 6.1).
+     * Appended for the reason above.
+     *
+     * This is the repair running out of the memory it is allowed. Non-zero says the
+     * listener is completing handshakes faster than its retention budget covers, and
+     * that the evicted sessions are back to losing a whole connect to one lost reply
+     * datagram — a rare, load-dependent failure that nothing else makes visible.
+     */
+    public var handshakeFlightEvictedTotal: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3205,7 +3227,27 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
          * questions arrived and one reply flight was lost on the way down; zero says the
          * path fell silent in both directions. Nothing else on either side tells those
          * apart.
-         */initialOnCommittedRouteTotal: UInt64) {
+         */initialOnCommittedRouteTotal: UInt64, 
+        /**
+         * Retained reply flights this listener actually repeated (PROTOCOL § 6.1), one
+         * per repeat sent rather than per datagram of it. Appended for the reason above.
+         *
+         * The field before it says a client asked again; this one says an answer went
+         * back, and the pair is what makes a failed connect readable. Questions arriving
+         * and answers going back is the repair working. Questions arriving and no answers
+         * is a listener that had nothing retained for that session — it was evicted,
+         * expired, or the budget for it was already spent. No questions at all is a path
+         * that went silent upstream, which is a different fault in a different direction.
+         */handshakeFlightRepeatedTotal: UInt64, 
+        /**
+         * Retained reply flights dropped to make room for a newer one (PROTOCOL § 6.1).
+         * Appended for the reason above.
+         *
+         * This is the repair running out of the memory it is allowed. Non-zero says the
+         * listener is completing handshakes faster than its retention budget covers, and
+         * that the evicted sessions are back to losing a whole connect to one lost reply
+         * datagram — a rare, load-dependent failure that nothing else makes visible.
+         */handshakeFlightEvictedTotal: UInt64) {
         self.packetsSent = packetsSent
         self.packetsRecv = packetsRecv
         self.bytesSent = bytesSent
@@ -3226,6 +3268,8 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
         self.uptimeSecs = uptimeSecs
         self.unencryptedDroppedTotal = unencryptedDroppedTotal
         self.initialOnCommittedRouteTotal = initialOnCommittedRouteTotal
+        self.handshakeFlightRepeatedTotal = handshakeFlightRepeatedTotal
+        self.handshakeFlightEvictedTotal = handshakeFlightEvictedTotal
     }
 
     
@@ -3263,7 +3307,9 @@ public struct FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer {
                 aeadFailureTotal: FfiConverterUInt64.read(from: &buf), 
                 uptimeSecs: FfiConverterUInt64.read(from: &buf), 
                 unencryptedDroppedTotal: FfiConverterUInt64.read(from: &buf), 
-                initialOnCommittedRouteTotal: FfiConverterUInt64.read(from: &buf)
+                initialOnCommittedRouteTotal: FfiConverterUInt64.read(from: &buf), 
+                handshakeFlightRepeatedTotal: FfiConverterUInt64.read(from: &buf), 
+                handshakeFlightEvictedTotal: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -3288,6 +3334,8 @@ public struct FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.uptimeSecs, into: &buf)
         FfiConverterUInt64.write(value.unencryptedDroppedTotal, into: &buf)
         FfiConverterUInt64.write(value.initialOnCommittedRouteTotal, into: &buf)
+        FfiConverterUInt64.write(value.handshakeFlightRepeatedTotal, into: &buf)
+        FfiConverterUInt64.write(value.handshakeFlightEvictedTotal, into: &buf)
     }
 }
 
