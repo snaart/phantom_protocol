@@ -86,6 +86,8 @@ mod otel_off {
         #[inline(always)]
         pub(crate) fn record_handshake_flight_evicted(&self) {}
         #[inline(always)]
+        pub(crate) fn record_handshake_flight_refused(&self) {}
+        #[inline(always)]
         pub(crate) fn record_path_migration(&self, _from: u8, _to: u8) {}
         #[inline(always)]
         pub(crate) fn record_cookie(&self, _outcome: CookieOutcome) {}
@@ -151,6 +153,7 @@ mod otel_on {
         /// make room for a newer one. Unlabeled for the same reason as the counter above.
         handshake_flight_repeated: Counter<u64>,
         handshake_flight_evicted: Counter<u64>,
+        handshake_flight_refused: Counter<u64>,
 
         // Path lifecycle.
         path_migrations: Counter<u64>,
@@ -218,6 +221,13 @@ mod otel_on {
                      reply repair running out of its memory budget",
                 )
                 .build();
+            let handshake_flight_refused = meter
+                .u64_counter(format!("{ns}.handshake.flight_refused"))
+                .with_description(
+                    "Server reply flights never retained, because repeating one would exceed \
+                     the RFC 9000 §8.2 amplification limit — the reply repair not arming at all",
+                )
+                .build();
             let path_migrations = meter
                 .u64_counter(format!("{ns}.path.migrations"))
                 .with_description("Successful multi-path migrations")
@@ -277,6 +287,7 @@ mod otel_on {
                 initial_on_committed_route,
                 handshake_flight_repeated,
                 handshake_flight_evicted,
+                handshake_flight_refused,
                 path_migrations,
                 rekey,
                 early_data,
@@ -342,6 +353,11 @@ mod otel_on {
         #[cold]
         pub(crate) fn record_handshake_flight_evicted(&self) {
             self.handshake_flight_evicted.add(1, &[]);
+        }
+
+        #[cold]
+        pub(crate) fn record_handshake_flight_refused(&self) {
+            self.handshake_flight_refused.add(1, &[]);
         }
 
         pub(crate) fn record_path_migration(&self, from: u8, to: u8) {

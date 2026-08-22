@@ -350,6 +350,13 @@ typedef struct PhantomMetricsSnapshotFfi {
      * says the evicted sessions are back to losing a whole connect to one lost
      * reply datagram, which nothing else makes visible. */
     uint64_t handshake_flight_evicted_total;
+    /* Reply flights never retained at all, because repeating one would have
+     * exceeded the RFC 9000 s8.2 amplification limit. The third way the repair
+     * can fail to cover a session and the only one that is not about load: the
+     * two fields above mean the mechanism ran and then let go, this one means it
+     * never armed. Zero for every build whose reply is inside the bound, so
+     * non-zero says a message size has moved past it. */
+    uint64_t handshake_flight_refused_total;
 } PhantomMetricsSnapshotFfi;
 
 /* ====================================================================

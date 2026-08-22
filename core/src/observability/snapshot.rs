@@ -10,7 +10,8 @@
 //! sum+count fields, and the always-on security counters
 //! (`replay_rejected_total`, `aead_failure_total`,
 //! `unencrypted_dropped_total`, `initial_on_committed_route_total`,
-//! `handshake_flight_repeated_total`, `handshake_flight_evicted_total`). The snapshot is always
+//! `handshake_flight_repeated_total`, `handshake_flight_evicted_total`,
+//! `handshake_flight_refused_total`). The snapshot is always
 //! available regardless of the `telemetry-otel` feature, since the atomics
 //! always exist. The labeled OTel instruments in `instruments.rs` carry
 //! the same events with attribution; both paths are populated together.
@@ -72,6 +73,10 @@ pub struct MetricsSnapshot {
     /// the repair is running out of the memory it is allowed and some sessions are
     /// back to losing a connect to a single lost reply datagram.
     pub handshake_flight_evicted_total: u64,
+    /// Reply flights never retained at all, because repeating one would have exceeded
+    /// the RFC 9000 § 8.2 amplification limit. Zero with today's messages; non-zero
+    /// says a message size moved past the bound and the repair stopped arming.
+    pub handshake_flight_refused_total: u64,
 
     pub uptime_secs: u64,
 }
@@ -112,6 +117,7 @@ impl Default for MetricsSnapshot {
             initial_on_committed_route_total: 0,
             handshake_flight_repeated_total: 0,
             handshake_flight_evicted_total: 0,
+            handshake_flight_refused_total: 0,
             uptime_secs: 0,
         }
     }
@@ -191,6 +197,7 @@ impl MetricsSnapshot {
             initial_on_committed_route_total: h.initial_on_committed_route_total(),
             handshake_flight_repeated_total: h.handshake_flight_repeated_total(),
             handshake_flight_evicted_total: h.handshake_flight_evicted_total(),
+            handshake_flight_refused_total: h.handshake_flight_refused_total(),
             uptime_secs: h.uptime_secs(),
         }
     }
@@ -273,6 +280,16 @@ pub struct MetricsSnapshotFfi {
     /// that the evicted sessions are back to losing a whole connect to one lost reply
     /// datagram — a rare, load-dependent failure that nothing else makes visible.
     pub handshake_flight_evicted_total: u64,
+    /// Reply flights never retained at all, because repeating one would have exceeded
+    /// the RFC 9000 § 8.2 amplification limit (PROTOCOL § 6.1 rule 3). Appended for the
+    /// reason above.
+    ///
+    /// The third way the repair can fail to cover a session, and the only one that is not
+    /// about load: the two fields above mean the mechanism ran and then let go, this one
+    /// means it never armed. It reads zero for every build whose reply is inside the bound —
+    /// today's is 1.99x against a limit of 3 — so a non-zero value is a message size having
+    /// moved, which changes no byte a peer would notice and which nothing else reports.
+    pub handshake_flight_refused_total: u64,
 }
 
 impl From<MetricsSnapshot> for MetricsSnapshotFfi {
@@ -300,6 +317,7 @@ impl From<MetricsSnapshot> for MetricsSnapshotFfi {
             initial_on_committed_route_total: s.initial_on_committed_route_total,
             handshake_flight_repeated_total: s.handshake_flight_repeated_total,
             handshake_flight_evicted_total: s.handshake_flight_evicted_total,
+            handshake_flight_refused_total: s.handshake_flight_refused_total,
         }
     }
 }
@@ -358,6 +376,7 @@ mod tests {
         assert_eq!(ffi.initial_on_committed_route_total, 0);
         assert_eq!(ffi.handshake_flight_repeated_total, 0);
         assert_eq!(ffi.handshake_flight_evicted_total, 0);
+        assert_eq!(ffi.handshake_flight_refused_total, 0);
         assert_eq!(ffi.uptime_secs, 0);
     }
 
@@ -379,6 +398,7 @@ mod tests {
         h.record_initial_on_committed_route();
         h.record_handshake_flight_repeated();
         h.record_handshake_flight_evicted();
+        h.record_handshake_flight_refused();
 
         let snap = MetricsSnapshot::capture(&h);
         let ffi = snap.to_ffi();
@@ -404,6 +424,7 @@ mod tests {
         assert_eq!(ffi.initial_on_committed_route_total, 1);
         assert_eq!(ffi.handshake_flight_repeated_total, 1);
         assert_eq!(ffi.handshake_flight_evicted_total, 1);
+        assert_eq!(ffi.handshake_flight_refused_total, 1);
     }
 
     #[test]

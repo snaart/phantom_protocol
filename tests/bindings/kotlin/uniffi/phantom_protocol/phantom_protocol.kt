@@ -5113,6 +5113,19 @@ data class MetricsSnapshotFfi (
      * datagram — a rare, load-dependent failure that nothing else makes visible.
      */
     var `handshakeFlightEvictedTotal`: kotlin.ULong
+    , 
+    /**
+     * Reply flights never retained at all, because repeating one would have exceeded
+     * the RFC 9000 § 8.2 amplification limit (PROTOCOL § 6.1 rule 3). Appended for the
+     * reason above.
+     *
+     * The third way the repair can fail to cover a session, and the only one that is not
+     * about load: the two fields above mean the mechanism ran and then let go, this one
+     * means it never armed. It reads zero for every build whose reply is inside the bound —
+     * today's is 1.99x against a limit of 3 — so a non-zero value is a message size having
+     * moved, which changes no byte a peer would notice and which nothing else reports.
+     */
+    var `handshakeFlightRefusedTotal`: kotlin.ULong
     
 ){
     
@@ -5151,6 +5164,7 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
         )
     }
 
@@ -5176,7 +5190,8 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.allocationSize(value.`unencryptedDroppedTotal`) +
             FfiConverterULong.allocationSize(value.`initialOnCommittedRouteTotal`) +
             FfiConverterULong.allocationSize(value.`handshakeFlightRepeatedTotal`) +
-            FfiConverterULong.allocationSize(value.`handshakeFlightEvictedTotal`)
+            FfiConverterULong.allocationSize(value.`handshakeFlightEvictedTotal`) +
+            FfiConverterULong.allocationSize(value.`handshakeFlightRefusedTotal`)
     )
 
     override fun write(value: MetricsSnapshotFfi, buf: ByteBuffer) {
@@ -5202,6 +5217,7 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.write(value.`initialOnCommittedRouteTotal`, buf)
             FfiConverterULong.write(value.`handshakeFlightRepeatedTotal`, buf)
             FfiConverterULong.write(value.`handshakeFlightEvictedTotal`, buf)
+            FfiConverterULong.write(value.`handshakeFlightRefusedTotal`, buf)
     }
 }
 

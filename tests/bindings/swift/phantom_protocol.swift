@@ -3199,6 +3199,18 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
      * datagram — a rare, load-dependent failure that nothing else makes visible.
      */
     public var handshakeFlightEvictedTotal: UInt64
+    /**
+     * Reply flights never retained at all, because repeating one would have exceeded
+     * the RFC 9000 § 8.2 amplification limit (PROTOCOL § 6.1 rule 3). Appended for the
+     * reason above.
+     *
+     * The third way the repair can fail to cover a session, and the only one that is not
+     * about load: the two fields above mean the mechanism ran and then let go, this one
+     * means it never armed. It reads zero for every build whose reply is inside the bound —
+     * today's is 1.99x against a limit of 3 — so a non-zero value is a message size having
+     * moved, which changes no byte a peer would notice and which nothing else reports.
+     */
+    public var handshakeFlightRefusedTotal: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3247,7 +3259,18 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
          * listener is completing handshakes faster than its retention budget covers, and
          * that the evicted sessions are back to losing a whole connect to one lost reply
          * datagram — a rare, load-dependent failure that nothing else makes visible.
-         */handshakeFlightEvictedTotal: UInt64) {
+         */handshakeFlightEvictedTotal: UInt64, 
+        /**
+         * Reply flights never retained at all, because repeating one would have exceeded
+         * the RFC 9000 § 8.2 amplification limit (PROTOCOL § 6.1 rule 3). Appended for the
+         * reason above.
+         *
+         * The third way the repair can fail to cover a session, and the only one that is not
+         * about load: the two fields above mean the mechanism ran and then let go, this one
+         * means it never armed. It reads zero for every build whose reply is inside the bound —
+         * today's is 1.99x against a limit of 3 — so a non-zero value is a message size having
+         * moved, which changes no byte a peer would notice and which nothing else reports.
+         */handshakeFlightRefusedTotal: UInt64) {
         self.packetsSent = packetsSent
         self.packetsRecv = packetsRecv
         self.bytesSent = bytesSent
@@ -3270,6 +3293,7 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
         self.initialOnCommittedRouteTotal = initialOnCommittedRouteTotal
         self.handshakeFlightRepeatedTotal = handshakeFlightRepeatedTotal
         self.handshakeFlightEvictedTotal = handshakeFlightEvictedTotal
+        self.handshakeFlightRefusedTotal = handshakeFlightRefusedTotal
     }
 
     
@@ -3309,7 +3333,8 @@ public struct FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer {
                 unencryptedDroppedTotal: FfiConverterUInt64.read(from: &buf), 
                 initialOnCommittedRouteTotal: FfiConverterUInt64.read(from: &buf), 
                 handshakeFlightRepeatedTotal: FfiConverterUInt64.read(from: &buf), 
-                handshakeFlightEvictedTotal: FfiConverterUInt64.read(from: &buf)
+                handshakeFlightEvictedTotal: FfiConverterUInt64.read(from: &buf), 
+                handshakeFlightRefusedTotal: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -3336,6 +3361,7 @@ public struct FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.initialOnCommittedRouteTotal, into: &buf)
         FfiConverterUInt64.write(value.handshakeFlightRepeatedTotal, into: &buf)
         FfiConverterUInt64.write(value.handshakeFlightEvictedTotal, into: &buf)
+        FfiConverterUInt64.write(value.handshakeFlightRefusedTotal, into: &buf)
     }
 }
 

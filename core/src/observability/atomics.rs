@@ -96,6 +96,7 @@ pub(crate) struct HotPathAtomics {
     initial_on_committed_route_total: CachePadded<AtomicU64>,
     handshake_flight_repeated_total: CachePadded<AtomicU64>,
     handshake_flight_evicted_total: CachePadded<AtomicU64>,
+    handshake_flight_refused_total: CachePadded<AtomicU64>,
 
     /// Process-start timestamp for uptime calculation. Set once at
     /// construction; the snapshot reader computes `elapsed()` on read.
@@ -128,6 +129,7 @@ impl HotPathAtomics {
             initial_on_committed_route_total: CachePadded::new(AtomicU64::new(0)),
             handshake_flight_repeated_total: CachePadded::new(AtomicU64::new(0)),
             handshake_flight_evicted_total: CachePadded::new(AtomicU64::new(0)),
+            handshake_flight_refused_total: CachePadded::new(AtomicU64::new(0)),
             started_at: Instant::now(),
         }
     }
@@ -296,6 +298,22 @@ impl HotPathAtomics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A reply flight was never retained at all, because repeating it would have
+    /// exceeded the RFC 9000 § 8.2 amplification limit against the hello that drew it.
+    ///
+    /// The sibling of the eviction counter and the same kind of blind spot: an entry
+    /// that was refused and one that was never offered look identical from outside,
+    /// yet the first means every connect of that shape has no repair while the second
+    /// means the listener is idle. It cannot happen with today's messages — the reply
+    /// is 1.99x the smallest hello that can draw it, against a limit of 3 — so a
+    /// non-zero value says a message size moved and the repair has silently stopped
+    /// arming, which is exactly the kind of change nothing else reports.
+    #[inline]
+    pub(crate) fn record_handshake_flight_refused(&self) {
+        self.handshake_flight_refused_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     // --- Read accessors (cold path) ---
 
     pub(crate) fn packets_total(&self, dir: usize) -> u64 {
@@ -390,6 +408,10 @@ impl HotPathAtomics {
 
     pub(crate) fn handshake_flight_evicted_total(&self) -> u64 {
         self.handshake_flight_evicted_total.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn handshake_flight_refused_total(&self) -> u64 {
+        self.handshake_flight_refused_total.load(Ordering::Relaxed)
     }
 
     pub(crate) fn uptime_secs(&self) -> u64 {
@@ -496,6 +518,7 @@ mod tests {
         assert_eq!(h.initial_on_committed_route_total(), 0);
         assert_eq!(h.handshake_flight_repeated_total(), 0);
         assert_eq!(h.handshake_flight_evicted_total(), 0);
+        assert_eq!(h.handshake_flight_refused_total(), 0);
 
         h.record_replay_rejected();
         h.record_replay_rejected();
@@ -510,6 +533,11 @@ mod tests {
         h.record_handshake_flight_repeated();
         h.record_handshake_flight_repeated();
         h.record_handshake_flight_evicted();
+        h.record_handshake_flight_refused();
+        h.record_handshake_flight_refused();
+        h.record_handshake_flight_refused();
+        h.record_handshake_flight_refused();
+        h.record_handshake_flight_refused();
 
         assert_eq!(h.replay_rejected_total(), 2);
         assert_eq!(h.aead_failure_total(), 1);
@@ -517,6 +545,7 @@ mod tests {
         assert_eq!(h.initial_on_committed_route_total(), 4);
         assert_eq!(h.handshake_flight_repeated_total(), 2);
         assert_eq!(h.handshake_flight_evicted_total(), 1);
+        assert_eq!(h.handshake_flight_refused_total(), 5);
     }
 
     #[test]

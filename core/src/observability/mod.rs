@@ -272,6 +272,20 @@ impl Observability {
         self.instruments.record_handshake_flight_evicted();
     }
 
+    /// Record a reply flight that was never retained, because repeating it would have
+    /// exceeded the RFC 9000 § 8.2 amplification limit (PROTOCOL § 6.1 rule 3).
+    ///
+    /// The third of the three ways the repair can fail to cover a session, and the only one
+    /// that is not about load: an eviction and an expiry both mean the mechanism ran, while
+    /// a refusal means it never armed. It cannot fire with today's messages, so a non-zero
+    /// value is a message size having moved past the bound — a change that alters no
+    /// serialized byte a peer would notice and that nothing else reports.
+    #[inline]
+    pub fn record_handshake_flight_refused(&self) {
+        self.atomics.record_handshake_flight_refused();
+        self.instruments.record_handshake_flight_refused();
+    }
+
     pub fn record_path_migration(&self, from: u8, to: u8) {
         self.instruments.record_path_migration(from, to);
     }
@@ -327,6 +341,7 @@ mod tests {
         assert_eq!(s.initial_on_committed_route_total, 0);
         assert_eq!(s.handshake_flight_repeated_total, 0);
         assert_eq!(s.handshake_flight_evicted_total, 0);
+        assert_eq!(s.handshake_flight_refused_total, 0);
 
         obs.record_replay_rejected(ReplayReason::Duplicate);
         obs.record_replay_rejected(ReplayReason::Duplicate);
@@ -336,6 +351,9 @@ mod tests {
         obs.record_handshake_flight_repeated();
         obs.record_handshake_flight_evicted();
         obs.record_handshake_flight_evicted();
+        obs.record_handshake_flight_refused();
+        obs.record_handshake_flight_refused();
+        obs.record_handshake_flight_refused();
 
         let s = obs.snapshot();
         assert_eq!(s.replay_rejected_total, 2);
@@ -344,6 +362,7 @@ mod tests {
         assert_eq!(s.initial_on_committed_route_total, 1);
         assert_eq!(s.handshake_flight_repeated_total, 1);
         assert_eq!(s.handshake_flight_evicted_total, 2);
+        assert_eq!(s.handshake_flight_refused_total, 3);
     }
 
     #[test]
