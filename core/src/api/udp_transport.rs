@@ -810,8 +810,16 @@ impl UdpServerTransport {
     /// every other path it goes with the transport. A second call yields `None`, which makes
     /// "at most one retained flight per handshake" a property of the type rather than of its
     /// callers.
+    ///
+    /// Taking also forgets the question, which is what stops the slot refilling. The accept
+    /// path takes the flight before the data pump exists, and the pump moves the transport to
+    /// the Established phase a moment *after* it starts — so a frame sent in that window would
+    /// otherwise be retained as a handshake reply and held, unread by anyone, for the life of
+    /// the session. With no question on record nothing is a reply, and the window closes.
     pub(crate) fn take_handshake_flight(&self) -> Option<HandshakeFlight> {
-        self.handshake_flight.lock().take()
+        let taken = self.handshake_flight.lock().take();
+        self.last_handshake_question.store(Arc::new(None));
+        taken
     }
 
     /// Migrate the server's send path to a fresh local socket (the server-side mirror of
@@ -1484,6 +1492,86 @@ mod tests {
         let (hdr, got) = push_datagram(&mut asm, &buf[..n]).unwrap();
         assert_eq!(hdr.cid, [3u8; 8]);
         assert_eq!(got.as_deref(), Some(&b"to-peer"[..]));
+    }
+
+    /// The reply flight a handshake sent is retained exactly once, for exactly the hello it
+    /// answers, and only while the handshake is running (PROTOCOL § 6.1).
+    ///
+    /// Three properties, and the third is the one that is easy to lose. The accept path takes
+    /// the flight before the data pump exists, and the pump moves this transport to the
+    /// Established phase a moment *after* it starts — so without forgetting the question on
+    /// the way out, a frame sent in that window would be retained as a handshake reply and
+    /// held, unread by anyone, for the whole life of the session. That is a per-session leak
+    /// of a few kilobytes that no test of the repair itself would notice, because the repair
+    /// works either way.
+    #[tokio::test]
+    async fn a_handshake_reply_is_retained_once_and_only_while_the_handshake_runs() {
+        use tokio::sync::mpsc;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let st = UdpServerTransport::new(sock.clone(), peer_addr, [11u8; 8], tx.clone(), rx);
+
+        assert!(
+            st.take_handshake_flight().is_none(),
+            "a transport that has answered nothing retains nothing"
+        );
+
+        // The hello, then the reply to it — the shape of the accept path.
+        tx.send((Bytes::from_static(b"a-client-hello"), peer_addr))
+            .await
+            .unwrap();
+        let _ = st.recv_bytes().await.unwrap();
+        st.send_bytes(b"the-server-reply").await.unwrap();
+
+        let flight = st
+            .take_handshake_flight()
+            .expect("a handshake-phase reply is retained");
+        assert_eq!(
+            flight.peer, peer_addr,
+            "the retained destination is where the reply actually went"
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(b"a-client-hello");
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(
+            flight.question, expected,
+            "the retained flight names the hello it answers, not some other frame"
+        );
+        assert!(
+            flight.wire_bytes >= b"the-server-reply".len(),
+            "the retained wire size must count the envelope, since that is what the \
+             amplification bound is measured in"
+        );
+        assert!(
+            !flight.delivered.load(Ordering::Relaxed),
+            "nothing has authenticated yet"
+        );
+
+        assert!(
+            st.take_handshake_flight().is_none(),
+            "the flight has exactly one owner"
+        );
+
+        // The window between the accept path taking the flight and the pump declaring the
+        // session Established. Anything sent here is session traffic, not a reply.
+        st.send_bytes(b"still-in-the-handshake-phase")
+            .await
+            .unwrap();
+        assert!(
+            st.take_handshake_flight().is_none(),
+            "a frame sent after the reply was handed on must not be retained as a reply; \
+             otherwise every accepted session parks kilobytes nothing will ever read"
+        );
+
+        // And the latch the listener releases retention on is set by an authenticated packet.
+        st.confirm_authenticated_source();
+        assert!(
+            flight.delivered.load(Ordering::Relaxed),
+            "an inbound packet that AEAD-opened is proof the client received the reply, and \
+             the retained copy must learn it through the shared latch"
+        );
     }
 
     /// P4.1: a frame from a source other than the established peer registers a
