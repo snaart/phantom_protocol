@@ -63,8 +63,8 @@ The relevant runtime-visible knobs are:
       budget; `PHANTOM_MAX_SESSIONS_PER_IP` set for the expected client mix
       (see *Session caps & resource limits* below). The cap times 8 MiB is the
       process's receive-window-growth commitment on its own — 8 GiB at the
-      default — and `PHANTOM_MAX_RECV_WINDOW_GROWTH_MIB` will enforce a ceiling
-      on that one term if you state it.
+      default, which the server prints at startup. Read it as a floor on what
+      the host must have, not a ceiling on what the process will use.
 - [ ] sysctl tuning applied (see `systemd.md`).
 - [ ] CI build of the wrapper binary completes for all target
       platforms.
@@ -83,7 +83,6 @@ env vars):
 | Setting | Env | Default | Purpose |
 | --- | --- | --- | --- |
 | `--max-sessions` | `PHANTOM_MAX_SESSIONS` | `1024` | Global concurrent-session ceiling. At the cap the accept loop stops accepting — new connections queue in the OS backlog (`somaxconn` / `tcp_max_syn_backlog`) until a session closes. Backpressure, not a hard drop. `0` = unbounded. |
-| `--max-recv-window-growth-mib` | `PHANTOM_MAX_RECV_WINDOW_GROWTH_MIB` | `0` | Ceiling on the receive-window **growth** the process commits, in MiB. Lowers the session cap to `mib / 8`, since a session may draw 8 MiB of growth and nothing divides that between sessions. Below `8` the server refuses to start. `0` states no ceiling. A floor on the host's requirement, not a ceiling on its footprint — see the memory note below. |
 | `--max-sessions-per-ip` | `PHANTOM_MAX_SESSIONS_PER_IP` | `64` | Per-source-IP concurrent-session ceiling. A peer already at the cap has further connections rejected (closed right after the handshake), so one source cannot monopolise the global pool. `0` disables. |
 
 **Size `PHANTOM_MAX_SESSIONS` against two limits:**
@@ -141,12 +140,20 @@ env vars):
   ```
 
   8 GiB of receive-window growth alone, at the shipped default, before a single
-  reorder entry, delivery item or queue slot is counted. The other rows have no
-  such constant — their per-session figures are worst cases derived from several
-  constants apiece — so the same multiplication applied to them produces an
-  estimate, not a bound, and the numbers it yields (64 GiB of reorder structure,
-  290 GiB of delivery queues) are useful only as a statement about which term
-  dominates.
+  reorder entry, delivery item or queue slot is counted. **It is a floor on what
+  the host must have, not a ceiling on what the process will use.** The other
+  rows have no such constant — their per-session figures are worst cases derived
+  from several constants apiece — so the same multiplication applied to them
+  produces an estimate, not a bound; but the numbers it yields (64 GiB of
+  reorder structure, 290 GiB of delivery queues) say plainly which term
+  dominates, and it is not this one.
+
+  Nor does the growth allowance need the application's cooperation to be spent.
+  The transport credits window growth as the delivery task hands a frame to the
+  bounded queue behind `recv()`, which is one queue ahead of the application
+  actually reading it, and a peer opens as many streams as it likes — so a peer
+  facing an application that never reads still reaches the allowance. The
+  allowance is what bounds it; the reader is not.
 
   Pick a posture:
 
@@ -159,24 +166,30 @@ env vars):
     under load, and set `PHANTOM_MAX_SESSIONS` from that with headroom for the
     rows above.
 
-  `--max-recv-window-growth-mib` / `PHANTOM_MAX_RECV_WINDOW_GROWTH_MIB` states
-  the left-hand side of that arithmetic and derives the cap from it: the session
-  cap is lowered to `mib / 8` sessions, `8192` buys exactly the default `1024`,
-  and a value below `8` refuses to start rather than admitting a session the
-  stated ceiling cannot hold. `0`, the default, states no ceiling and leaves the
-  cap alone.
+  **Why there is no flag that turns a memory budget into a session cap.** Two
+  have been tried and both were removed, and the second removal is the one worth
+  recording, because its arithmetic was correct. `--max-recv-memory-mib` divided
+  an operator's MiB by a published per-session *total*; that total was an
+  estimate corrected upward three times, and a cap derived from an estimate
+  under-provisions a host by exactly the factor the estimate is out.
+  `--max-recv-window-growth-mib` replaced it and divided by the enforced growth
+  constant instead, so its answer was exact — and it was still wrong to offer.
+  Its unit is MiB, and nobody reaches for a MiB-denominated server flag except
+  with a memory limit in hand — so the number an operator hands it is their
+  memory limit, and what comes back is a session cap that same memory cannot
+  support, by the ratio between this term and the ones the table above ranks an
+  order of magnitude higher. Hand it 8 GiB and it admits 1024 sessions, whose
+  reorder structure and delivery queues alone are measured in tens and hundreds
+  of gigabytes. A knob whose documentation has to say "do not read this as its unit
+  reads" is better as a log line, which is what it now is: `phantom-server`
+  prints the product at startup and offers no control that appears to bound it.
 
-  **It is a floor on what the host must have, not a ceiling on what it will
-  use** — it bounds one term of four, and not the dominant one. A different flag
-  used to live here that divided a memory budget by a published *total* for a
-  session; it was removed because that total was an estimate, and a cap derived
-  from an estimate under-provisions the host by exactly the factor the estimate
-  is out. This one divides by an allowance the transport enforces and a test
-  measures, so what it computes is sound as far as it goes — but "as far as it
-  goes" is 8 MiB of a per-session footprint that reaches hundreds of megabytes,
-  and reading its answer as a memory budget would repeat the removed flag's
-  mistake with better arithmetic. Use it to reject a configuration that is
-  already too large on the cheapest term; keep sizing by measurement.
+  Growth is also an *advertisement* rather than a residency. What the allowance
+  buys the peer is the right to have that much outstanding; the bytes it admits
+  come to rest in the reorder buffers and the delivery queues, which are the
+  rows this term is small next to. That is the second reason its MiB do not
+  translate into a memory figure, and the first reason the 8 GiB above is a
+  floor rather than a total.
 
 The per-IP cap is a *session-count* cap, not a handshake-rate limit — an
 abusive IP can still trigger (cheap, PoW/cookie-gated) handshakes that are then

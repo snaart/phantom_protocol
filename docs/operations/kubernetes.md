@@ -109,11 +109,28 @@ probe.
 
 ## Resource requests and limits
 
-From `perf-tuning.md`: ~**64 KiB** working memory per session; **3–4 GB/s per core** ceiling
-(AES-256-GCM with AES-NI).
+From `perf-tuning.md`: **3–4 GB/s per core** ceiling (AES-256-GCM with AES-NI).
 
-**Memory.** `N × 64 KiB + ~64 MiB` (process + tokio runtime). The sample manifest targets
-~1 000 sessions: 128 MiB request, 512 MiB limit.
+**Memory.** Size it from `deployment.md`, "Session caps & resource limits", which separates
+the two figures this section used to conflate. A session carrying ordinary traffic sits
+around **512 KiB**; an authenticated but hostile peer can move one session's receive
+footprint into the hundreds of megabytes, and nothing divides any of it between concurrent
+sessions. The sample manifest targets ~1 000 sessions of ordinary traffic: 128 MiB request,
+512 MiB limit.
+
+One term is an exact constant and is the one to check a pod against — a session may draw
+8 MiB of receive-window growth across all its streams, so at `phantom-server`'s default cap
+
+```text
+  1024 × 8 MiB = 8 GiB of receive-window growth alone
+```
+
+is committed before a reorder entry or a delivery-queue slot is counted. That is sixteen
+times the limit above, so a pod on these numbers must lower `PHANTOM_MAX_SESSIONS` to match;
+the server prints the product at startup. Read it as **a floor on what the host must have,
+not a ceiling on what the process will use**: growth is one term of four and not the largest,
+and it is an advertisement rather than a residency — the bytes it admits come to rest in the
+reorder buffers and the delivery queues.
 
 **CPU.** One core saturates at ~3–4 GB/s. Handshake-heavy workloads need extra headroom for the
 PQC keygen path (~10–15 ms per handshake server-side). `2000m` suits moderate fan-out.

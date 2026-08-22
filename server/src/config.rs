@@ -80,37 +80,13 @@ pub struct Config {
     /// what one session holds. There is no single library constant for the second
     /// factor — see the receive-memory section of `phantom_protocol::api::session`
     /// for why, and `docs/operations/deployment.md` for how to size against it.
-    /// One term of it does have a constant, and `--max-recv-window-growth-mib`
-    /// derives this cap from that term rather than the other way round.
+    /// One term of it does have a constant, and the cap times that constant is
+    /// logged at startup ([`Config::recv_window_growth_commitment_mib`]) so the
+    /// arithmetic is in front of whoever set this number.
     /// Also keep it comfortably below `LimitNOFILE`. `0` means unbounded (not
     /// recommended).
     #[arg(long, env = "PHANTOM_MAX_SESSIONS", default_value = "1024")]
     pub max_sessions: usize,
-
-    /// Ceiling on the receive-window **growth** this process will commit to peers, in MiB.
-    /// `0` (the default) states no ceiling and leaves `--max-sessions` exactly as typed.
-    ///
-    /// Receive-window growth is the one receive-side quantity with an enforced per-session
-    /// constant behind it: a session may hand out `SESSION_RECV_WINDOW_GROWTH_BUDGET`
-    /// (8 MiB) of window growth across all of its streams, however many it opens, and
-    /// nothing divides that between concurrent sessions. So a process admitting `N`
-    /// sessions commits `N × 8 MiB` of it — 8 GiB at the default cap of 1024. Stating a
-    /// ceiling here lowers `--max-sessions` to the sessions that fit inside it, and a
-    /// ceiling too small for even one session refuses to start rather than admitting one
-    /// anyway.
-    ///
-    /// **This is a floor on what the host must have, not a ceiling on what it will use.**
-    /// Window growth is one term of a session's receive footprint; the reorder buffers, the
-    /// delivery backlog and the per-stream delivery queues are separately bounded and are
-    /// individually larger. No single library constant totals them — see the receive-memory
-    /// section of `phantom_protocol::api::session` for why one was published, corrected
-    /// upward three times, and then withdrawn. Sizing a host still ends in measurement
-    /// against the deployment's own traffic (`docs/operations/deployment.md`); what this
-    /// flag adds is a configuration that cannot be wrong in the cheap direction, because a
-    /// cap whose growth commitment alone exceeds the host is wrong before any measurement
-    /// is taken.
-    #[arg(long, env = "PHANTOM_MAX_RECV_WINDOW_GROWTH_MIB", default_value = "0")]
-    pub max_recv_window_growth_mib: usize,
 
     /// Maximum concurrent sessions from a single source IP. A peer already at
     /// this many active sessions has further connections rejected (closed right
@@ -121,44 +97,41 @@ pub struct Config {
 }
 
 impl Config {
-    /// The session cap actually enforced, once `--max-recv-window-growth-mib` has been
-    /// applied to it.
+    /// Receive-window growth this process commits at the configured session cap, rendered
+    /// for the startup log.
     ///
-    /// Returns `Err` when the stated ceiling cannot hold a single session's growth
-    /// allowance. Admitting one session anyway would put the process past the figure the
-    /// operator wrote down, silently, which is the outcome writing it down was meant to
-    /// rule out — and a server that starts having quietly discarded a limit is worse than
-    /// one that refuses and says which limit.
-    pub fn effective_max_sessions(&self) -> Result<usize, String> {
-        if self.max_recv_window_growth_mib == 0 {
-            return Ok(self.max_sessions);
+    /// The transport hands each session `SESSION_RECV_WINDOW_GROWTH_BUDGET` of receive-window
+    /// growth to spend across all of its streams and divides that between concurrent sessions
+    /// not at all, so the product is exact rather than an estimate — the only receive-side
+    /// figure about this process that is. It is stated here, in the log, rather than offered
+    /// as a knob, and the distinction is the whole design:
+    ///
+    /// - **It is a floor on what the host must have, not a ceiling on what the process will
+    ///   use.** Growth is one term of a session's receive footprint and not the largest;
+    ///   `docs/operations/deployment.md` ranks the reorder structure and the delivery queues
+    ///   an order of magnitude above it. Growth is also an *advertisement* — the right to
+    ///   have that much outstanding — while the bytes it admits come to rest in those other
+    ///   buffers.
+    /// - A flag that divided an operator's MiB by this constant to derive a session cap was
+    ///   tried and removed. Twice now, in two forms: the first divided by a per-session
+    ///   *total* that was an estimate, the second by this enforced constant. The second is
+    ///   arithmetically sound and still wrong to offer, because its unit is MiB — an operator
+    ///   reaches for a MiB-denominated server flag with a memory limit in hand, so what it is
+    ///   handed is a memory limit and what it returns is a session cap that same memory cannot
+    ///   support. A knob whose documentation has to say "do not read this as its unit reads"
+    ///   should be a log line instead, which is what this is. Size `--max-sessions` by
+    ///   measurement.
+    ///
+    /// `None` when the cap is unbounded: the product does not exist, and rendering it as `0`
+    /// would read as "commits nothing" — the opposite of what an unbounded cap means.
+    pub fn recv_window_growth_commitment_mib(&self) -> Option<u64> {
+        if self.max_sessions == 0 {
+            return None;
         }
-        let ceiling = (self.max_recv_window_growth_mib as u64).saturating_mul(1024 * 1024);
-        let fits = ceiling / u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET);
-        if fits == 0 {
-            return Err(format!(
-                "--max-recv-window-growth-mib {} is below the {} MiB of window growth one \
-                 session may draw; raise it, or state none and size --max-sessions by \
-                 measurement",
-                self.max_recv_window_growth_mib,
-                SESSION_RECV_WINDOW_GROWTH_BUDGET.div_ceil(1024 * 1024)
-            ));
-        }
-        // `fits` is a ceiling an operator typed divided by 8 MiB, so on any target this
-        // binary is built for it is far inside `usize`; the conversion is written as a
-        // saturating one rather than a cast so that a 32-bit host cannot turn an absurd
-        // ceiling into a small cap by wrapping.
-        let fits = usize::try_from(fits).unwrap_or(usize::MAX);
-        Ok(if self.max_sessions == 0 {
-            // "Unbounded" means the operator supplied no cap of their own, so the ceiling
-            // supplies one. This is the combination where the growth arithmetic is the only
-            // thing standing between the process and its memory.
-            fits
-        } else {
-            // A generous ceiling is not licence to admit more than was asked for: the two
-            // are both upper bounds, so the enforced cap is the lower of them.
-            self.max_sessions.min(fits)
-        })
+        Some(
+            (self.max_sessions as u64).saturating_mul(u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET))
+                / (1024 * 1024),
+        )
     }
 }
 
@@ -166,7 +139,7 @@ impl Config {
 mod tests {
     use super::*;
 
-    fn cfg(max_sessions: usize, max_recv_window_growth_mib: usize) -> Config {
+    fn cfg(max_sessions: usize) -> Config {
         Config {
             bind: "0.0.0.0:4242".parse().expect("literal bind address"),
             signing_key_file: PathBuf::from("/dev/null"),
@@ -176,64 +149,31 @@ mod tests {
             log_json: false,
             log_filter: String::new(),
             max_sessions,
-            max_recv_window_growth_mib,
             max_sessions_per_ip: 0,
         }
     }
 
-    /// The allowance a session may draw, in MiB — the divisor the flag works in.
-    fn per_session_mib() -> usize {
-        SESSION_RECV_WINDOW_GROWTH_BUDGET as usize / (1024 * 1024)
+    /// The published arithmetic, computed by the binary that admits the sessions rather than
+    /// restated from a document. The shipped default of 1024 sessions is 8 GiB — the figure
+    /// `docs/operations/deployment.md`, `docs/security/threat-model.md` and `CHANGELOG.md`
+    /// all print, and `scripts/check_memory_arithmetic.py` is what keeps those copies of it
+    /// tied to this one.
+    #[test]
+    fn the_default_cap_commits_the_published_growth_figure() {
+        assert_eq!(cfg(1024).recv_window_growth_commitment_mib(), Some(8 * 1024));
     }
 
-    /// Opt-in: with no budget stated the operator's cap stands exactly as typed, unbounded
-    /// form included. Nobody's existing configuration changes because this flag exists.
+    /// It is a product, so it tracks the cap. An operator who halves the cap has halved this.
     #[test]
-    fn no_budget_leaves_the_session_cap_alone() {
-        assert_eq!(cfg(1024, 0).effective_max_sessions(), Ok(1024));
-        assert_eq!(cfg(0, 0).effective_max_sessions(), Ok(0));
+    fn the_commitment_tracks_the_cap_it_is_derived_from() {
+        assert_eq!(cfg(1).recv_window_growth_commitment_mib(), Some(8));
+        assert_eq!(cfg(512).recv_window_growth_commitment_mib(), Some(4 * 1024));
     }
 
-    /// The arithmetic the flag exists for: a stated budget divided by the per-session
-    /// allowance is the number of sessions whose growth fits inside it.
+    /// An unbounded cap has no product, and reporting `0` for it would read as "commits
+    /// nothing" — precisely backwards.
     #[test]
-    fn a_budget_lowers_the_cap_to_the_sessions_whose_growth_fits() {
-        let ten = 10 * per_session_mib();
-        assert_eq!(cfg(1024, ten).effective_max_sessions(), Ok(10));
-        // An unbounded cap takes the budget's answer: that combination is precisely the one
-        // where nothing else supplies a bound.
-        assert_eq!(cfg(0, ten).effective_max_sessions(), Ok(10));
-    }
-
-    /// The default cap and the published process figure are the same statement, so the flag
-    /// has to agree with the documents: 8 GiB of stated budget must buy exactly the 1024
-    /// sessions `PHANTOM_MAX_SESSIONS` defaults to.
-    #[test]
-    fn the_published_default_arithmetic_round_trips_through_the_flag() {
-        assert_eq!(cfg(0, 8 * 1024).effective_max_sessions(), Ok(1024));
-    }
-
-    /// A generous budget is not licence to raise the cap. The operator asked for at most
-    /// `max_sessions`, and a memory figure is a ceiling rather than a target.
-    #[test]
-    fn a_generous_budget_does_not_raise_the_cap() {
-        assert_eq!(
-            cfg(8, 1000 * per_session_mib()).effective_max_sessions(),
-            Ok(8)
-        );
-    }
-
-    /// A budget too small for one session refuses to start. Admitting one anyway would put
-    /// the process over the figure the operator stated, which is the one outcome stating a
-    /// budget was meant to rule out.
-    #[test]
-    fn a_budget_too_small_for_one_session_is_refused() {
-        let err = cfg(1024, 1)
-            .effective_max_sessions()
-            .expect_err("a budget below one session's allowance must refuse");
-        assert!(
-            err.contains("below") && err.contains("growth"),
-            "the message has to say which quantity was too small: {err}"
-        );
+    fn an_unbounded_cap_has_no_commitment_to_report() {
+        assert_eq!(cfg(0).recv_window_growth_commitment_mib(), None);
     }
 }
