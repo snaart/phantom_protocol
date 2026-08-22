@@ -1835,6 +1835,13 @@ mod tests {
     /// Both sides are wire bytes, which is what an amplification bound is about and what the
     /// production check now compares: `wire_len` counts the envelope and fragment sub-headers
     /// that the reassembled frame no longer shows.
+    ///
+    /// Default build only, for the reason `core/tests/wire_vectors.rs` carries the same gate:
+    /// the frozen vectors are default-build bytes, and `HybridKeyPackage.classical_pk` is a
+    /// 32-byte X25519 key there against a 65-byte P-256 one under `fips`, so decoding one in
+    /// the other build is not a smaller measurement — it is a different message. The fips
+    /// build's own ratio is a separate figure and would need its own frozen pair.
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn the_real_reply_is_well_inside_the_amplification_limit() {
         use crate::transport::handshake::ClientHello;
