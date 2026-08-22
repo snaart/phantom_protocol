@@ -925,8 +925,12 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   reply answers that hello and no other). A repeat goes **only to the address the original
   went to**, taken from the server's record of the completed handshake and never from the
   datagram that triggered it, so the amplification factor towards whoever asks is zero and
-  towards the recorded address it is the 1.90× the first exchange already had — inside the
-  3× of RFC 9000 § 8.2, checked when the flight is retained rather than argued. And the
+  towards the recorded address it is the ratio the first exchange already had — 6657 wire
+  bytes out for 3350 in, 1.99×, inside the 3× of RFC 9000 § 8.2, checked when the flight is
+  retained rather than argued. Wire bytes on both sides, and against the smallest hello that
+  can draw a repeat (the minimal one plus the cookie `udp_admit` makes unconditional), since
+  a bound measured in two different quantities against a flattering denominator is not the
+  bound it is published as. And the
   retention is bounded three ways: three repeats, matching the number the client sends;
   eight seconds, matching the whole budget a client spends before abandoning the connect;
   and the first inbound packet that AEAD-opens, which proves the client derived keys from

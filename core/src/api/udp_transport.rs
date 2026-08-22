@@ -757,8 +757,14 @@ pub(crate) struct HandshakeFlight {
     /// Total wire bytes of `datagrams`, kept beside them so the amplification bound can be
     /// checked once, at retention, rather than on every repeat.
     pub(crate) wire_bytes: usize,
-    /// Wire bytes of the question, for the same reason.
-    pub(crate) question_bytes: usize,
+    /// Wire bytes of the question, for the same reason — and **the same quantity**, which is
+    /// the whole point of storing it rather than the frame length that is to hand. An
+    /// anti-amplification bound compares what went out on the path against what came in on
+    /// it; a reassembled frame is neither, and dividing one by the other yields a number that
+    /// is not a ratio of anything. The receiving side never sees the question's datagrams, so
+    /// this is `wire_len` of its frame: exact for a sender that chunks as this implementation
+    /// does, and a lower bound on what any other sender spent, which is the safe direction.
+    pub(crate) question_wire_bytes: usize,
     /// Set by the session the first time an inbound packet authenticates.
     pub(crate) delivered: Arc<AtomicBool>,
 }
@@ -975,14 +981,14 @@ impl SessionTransport for UdpServerTransport {
         // dropped here — and the question they answer is whatever `recv_bytes` last saw,
         // which on this transport is the hello the handshake task is replying to.
         if ty == PacketType::Initial {
-            if let Some((question, question_bytes)) = **self.last_handshake_question.load() {
+            if let Some((question, question_wire_bytes)) = **self.last_handshake_question.load() {
                 let wire_bytes = dgrams.iter().map(Vec::len).sum();
                 *self.handshake_flight.lock() = Some(HandshakeFlight {
                     datagrams: Arc::new(dgrams),
                     peer,
                     question,
                     wire_bytes,
-                    question_bytes,
+                    question_wire_bytes,
                     delivered: self.peer_authenticated.clone(),
                 });
             }
@@ -1014,8 +1020,12 @@ impl SessionTransport for UdpServerTransport {
             let mut hasher = Sha256::new();
             hasher.update(&frame);
             let digest: [u8; 32] = hasher.finalize().into();
-            self.last_handshake_question
-                .store(Arc::new(Some((digest, frame.len()))));
+            // Recorded as wire bytes, not frame bytes, because that is what the
+            // amplification bound is measured in on the other side of the comparison.
+            self.last_handshake_question.store(Arc::new(Some((
+                digest,
+                crate::transport::phantom_udp::datagram::wire_len(frame.len()),
+            ))));
         }
         Ok(frame)
     }
@@ -1663,6 +1673,13 @@ mod tests {
             flight.wire_bytes >= b"the-server-reply".len(),
             "the retained wire size must count the envelope, since that is what the \
              amplification bound is measured in"
+        );
+        assert_eq!(
+            flight.question_wire_bytes,
+            crate::transport::phantom_udp::datagram::wire_len(b"a-client-hello".len()),
+            "and the question must be recorded in that same quantity. The reassembled frame \
+             length is what is to hand here and it is the wrong one: dividing wire bytes by \
+             frame bytes is not a ratio of anything, and the error grows with every fragment"
         );
         assert!(
             !flight.delivered.load(Ordering::Relaxed),

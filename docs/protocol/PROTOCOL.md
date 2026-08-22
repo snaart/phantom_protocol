@@ -1574,8 +1574,16 @@ as part of the protocol rather than as an implementation detail:
    server's record of the completed handshake and never from the datagram that
    triggered it. The amplification factor towards whoever asks is therefore zero,
    and towards the recorded address it is the ratio the first exchange already
-   had (~6.7 KB of reply for ~3.5 KB of hello, inside the 3× of RFC 9000 § 8.2,
-   because each repeat costs the asker a whole flight).
+   had, because each repeat costs the asker a whole flight. Measure that ratio in
+   **wire bytes on both sides** — datagrams out over datagrams in, envelopes and
+   fragment sub-headers included — and against the *smallest* hello that can draw
+   a repeat, which over UDP is the minimal `ClientHello` plus the cookie
+   `udp_admit` makes unconditional; every other optional field only enlarges the
+   denominator. For this implementation that is 6657 out for 3350 in, **1.99×**,
+   inside the 3× of RFC 9000 § 8.2. A reassembled frame is not a wire length and
+   dividing one by the other is not a ratio of anything: the difference is nine
+   bytes of envelope per datagram plus eight more per fragment, in the direction
+   that flatters the result.
 4. **The retention is bounded three ways**: by a repeat count equal to the number
    of times the client repeats its own flight, by a window equal to the client's
    whole retransmission budget (8 s — past it nobody is still asking), and by the

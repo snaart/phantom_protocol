@@ -689,12 +689,27 @@ const RETAINED_FLIGHT_BUDGET: usize = 8 * 1024 * 1024;
 /// The most a repeat may send for what triggered it (RFC 9000 § 8.2).
 ///
 /// Checked once, when the flight is retained, so every entry in the table satisfies it by
-/// construction and the check costs nothing per repeat. Today's ratio is 6657 out for 3506
-/// in — 1.90×, the same ratio the first exchange already had, because a repeat is only ever
-/// owed to a peer that sent the whole hello again. The bound is here for the case where that
-/// stops being true: a reply that grew, or a hello that shrank, past the point where
-/// answering it twice would make this listener a useful amplifier is refused retention
-/// instead.
+/// construction and the check costs nothing per repeat.
+///
+/// **Wire bytes on both sides**, which is the only reading under which the number means
+/// anything: a reply's datagrams against the datagrams the hello arrived in. The receiving
+/// side is handed a reassembled frame and never sees its datagrams, so the question's wire
+/// size is computed with [`wire_len`] — exact for a sender that chunks as this implementation
+/// does, and a lower bound for any other, which is the safe direction for a bound on what the
+/// asker paid.
+///
+/// Today's ratio is **6657 out for 3350 in — 1.99×**, measured by
+/// [`the_real_reply_is_well_inside_the_amplification_limit`] against the *smallest* hello
+/// that can ever draw a repeat: the minimal `ClientHello` plus the cookie that `udp_admit`
+/// makes unconditional over UDP. Every other optional field only enlarges the denominator, so
+/// that is the worst case rather than a typical one. It is also the ratio the first exchange
+/// already had, because a repeat is only ever owed to a peer that sent the whole hello again.
+/// The bound is here for the case where that stops being true: a reply that grew, or a hello
+/// that shrank, past the point where answering it twice would make this listener a useful
+/// amplifier is refused retention instead.
+///
+/// [`wire_len`]: crate::transport::phantom_udp::datagram::wire_len
+/// [`the_real_reply_is_well_inside_the_amplification_limit`]: self::tests::the_real_reply_is_well_inside_the_amplification_limit
 const FLIGHT_AMPLIFICATION_LIMIT: usize = 3;
 
 /// Max concurrent in-flight (un-established) handshakes one source IP may hold (H-2). Bounds
@@ -773,7 +788,7 @@ impl FlightTable {
         // allows is refused rather than truncated: half a `ServerHello` is not an answer.
         if flight.wire_bytes
             > flight
-                .question_bytes
+                .question_wire_bytes
                 .saturating_mul(FLIGHT_AMPLIFICATION_LIMIT)
         {
             return false;
@@ -1367,9 +1382,10 @@ mod tests {
         )
     }
 
-    /// A retained reply flight standing in for a real `ServerHello`: `datagrams` bytes of
-    /// answer to a `question_bytes`-byte hello, sized so the amplification bound is
-    /// satisfied unless a test deliberately breaks it.
+    /// A retained reply flight standing in for a real `ServerHello`: an answer of `answer`'s
+    /// datagrams to a `question`-byte hello, both measured in wire bytes exactly as the
+    /// production path measures them, so a test that trips the amplification bound trips the
+    /// one production enforces.
     fn test_flight(question: &[u8], answer: Vec<Vec<u8>>) -> HandshakeFlight {
         let mut hasher = Sha256::new();
         hasher.update(question);
@@ -1380,7 +1396,7 @@ mod tests {
             peer: "203.0.113.7:41000".parse().expect("a peer address"),
             question: digest,
             wire_bytes,
-            question_bytes: question.len(),
+            question_wire_bytes: crate::transport::phantom_udp::datagram::wire_len(question.len()),
             delivered: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1755,76 +1771,113 @@ mod tests {
         assert_eq!(table.occupancy.load(Ordering::Relaxed), 0);
     }
 
-    /// A reply large enough to make this listener a useful amplifier is never retained.
+    /// A reply large enough to make this listener a useful amplifier is never retained, and
+    /// the limit is a ratio of wire bytes to wire bytes.
     ///
     /// RFC 9000 § 8.2 in one line, checked once at retention so no repeat has to carry it.
     /// Today the real ratio is far inside the limit — a repeat is only ever owed to a peer
     /// that sent the whole hello again, so it is the same ratio the first exchange already
     /// had — and this is what keeps that true if the reply grows or the hello shrinks.
+    ///
+    /// Walked exactly to the boundary, in the same quantity production compares: the
+    /// question's wire size, envelope included, is what the reply is allowed three of. A
+    /// version that divided by the reassembled frame length instead would put the boundary
+    /// nine bytes further out for an unfragmented hello and seventeen per fragment beyond
+    /// that, which is a bound nobody stated and no test would have noticed.
     #[test]
     fn a_reply_that_would_amplify_is_never_retained() {
+        use crate::transport::phantom_udp::datagram::wire_len;
+
         let now = Instant::now();
         let mut table = flight_table();
         let question = vec![0u8; 1000];
+        let allowed = wire_len(question.len()) * FLIGHT_AMPLIFICATION_LIMIT;
 
-        let at_the_limit = vec![vec![0u8; 1000]; FLIGHT_AMPLIFICATION_LIMIT];
         assert!(
-            table.retain(cid(9), test_flight(&question, at_the_limit), now),
-            "exactly {FLIGHT_AMPLIFICATION_LIMIT}× what triggered it is inside the limit"
+            table.retain(
+                cid(9),
+                test_flight(&question, vec![vec![0u8; allowed]]),
+                now
+            ),
+            "exactly {FLIGHT_AMPLIFICATION_LIMIT}× the {} wire bytes that triggered it is \
+             inside the limit",
+            wire_len(question.len())
         );
 
-        let mut over = vec![vec![0u8; 1000]; FLIGHT_AMPLIFICATION_LIMIT];
-        over.push(vec![0u8; 1]);
         assert!(
-            !table.retain(cid(10), test_flight(&question, over), now),
+            !table.retain(
+                cid(10),
+                test_flight(&question, vec![vec![0u8; allowed + 1]]),
+                now
+            ),
             "one byte past it is refused: a listener that answers a small datagram with a \
              large one is a reflector, whoever asked"
         );
         assert!(!table.flights.contains_key(&cid(10)));
     }
 
-    /// The `ServerHello` this build actually sends is well inside the amplification limit.
+    /// The reply this build sends is well inside the amplification limit, measured against
+    /// the *smallest* hello that can ever draw one.
     ///
-    /// The bound above is a runtime refusal, which means a reply that outgrew it would stop
-    /// being retained and the repair would quietly stop working — green tests, connects
-    /// failing on lossy paths exactly as before. This measures the real messages instead:
-    /// the frozen `ClientHello` and `ServerHello` wire vectors, enveloped as the transport
-    /// envelopes them, so the ratio in the constant's documentation is a fact about this
-    /// tree rather than a recollection.
+    /// The bound in `retain` is a runtime refusal, which means a reply that outgrew it would
+    /// stop being retained and the repair would quietly stop working — green tests, connects
+    /// failing on lossy paths exactly as before. So the real messages are measured here.
+    ///
+    /// Which hello is the right denominator is the whole of it, and the answer is the
+    /// smallest one that can reach a retained reply, because the ratio is worst there. Over
+    /// UDP that is not the minimal `ClientHello`: `udp_admit` is unconditional, so every
+    /// hello that leads to a committed session carries a cookie, and every *other* optional
+    /// field only makes the hello larger. A PoW solution, a resumption id and binder, an
+    /// early-data blob — the frozen `client_hello_full` vector carries all four, and using it
+    /// would flatter the ratio by a few hundred bytes of denominator that a real client
+    /// need not send. The minimal vector with a cookie added back is the honest floor.
+    ///
+    /// Both sides are wire bytes, which is what an amplification bound is about and what the
+    /// production check now compares: `wire_len` counts the envelope and fragment sub-headers
+    /// that the reassembled frame no longer shows.
     #[test]
     fn the_real_reply_is_well_inside_the_amplification_limit() {
-        use crate::transport::phantom_udp::datagram::encode_datagrams;
+        use crate::transport::handshake::ClientHello;
+        use crate::transport::phantom_udp::datagram::wire_len;
 
-        let hello = std::fs::read(concat!(
+        let minimal = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/wire_vectors/client_hello_full.bin"
+            "/tests/wire_vectors/client_hello_minimal.bin"
         ))
-        .expect("the frozen ClientHello vector");
+        .expect("the frozen minimal ClientHello vector");
+        let mut hello: ClientHello =
+            borsh::from_slice(&minimal).expect("the frozen vector decodes as a ClientHello");
+        // The one field a committed session's hello must carry, and the only one.
+        hello.cookie = Some([0x5Au8; 32]);
+        let question = borsh::to_vec(&hello).expect("re-encode the cookie-bearing hello");
+
         let reply = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/wire_vectors/server_hello.bin"
         ))
         .expect("the frozen ServerHello vector");
         // The reply carries the discriminant byte of `ServerReply` ahead of the borsh body.
-        let reply_frame_len = reply.len() + 1;
+        let answer_frame_len = reply.len() + 1;
 
-        let question_bytes: usize = encode_datagrams(PacketType::Initial, &cid(1), 0, &hello)
-            .expect("the hello fragments")
-            .iter()
-            .map(Vec::len)
-            .sum();
-        let answer_bytes: usize =
-            encode_datagrams(PacketType::Initial, &cid(1), 0, &vec![0u8; reply_frame_len])
-                .expect("the reply fragments")
-                .iter()
-                .map(Vec::len)
-                .sum();
+        let question_wire = wire_len(question.len());
+        let answer_wire = wire_len(answer_frame_len);
 
         assert!(
-            answer_bytes <= question_bytes * FLIGHT_AMPLIFICATION_LIMIT,
-            "the reply this build sends ({answer_bytes} wire bytes) must stay inside \
-             {FLIGHT_AMPLIFICATION_LIMIT}× the hello that triggers it ({question_bytes} wire \
-             bytes), or it stops being retained and the repair silently stops working"
+            answer_wire <= question_wire * FLIGHT_AMPLIFICATION_LIMIT,
+            "the reply this build sends ({answer_wire} wire bytes) must stay inside \
+             {FLIGHT_AMPLIFICATION_LIMIT}× the smallest hello that can trigger it \
+             ({question_wire} wire bytes), or it stops being retained and the repair silently \
+             stops working"
+        );
+
+        // The figures the constant's documentation states, so a change in either message
+        // turns the published ratio red rather than leaving it a recollection.
+        assert_eq!(
+            (question_wire, answer_wire),
+            (3350, 6657),
+            "the published amplification arithmetic is {answer_wire}/{question_wire} = {:.2}×, \
+             not the 6657/3350 = 1.99× documented on FLIGHT_AMPLIFICATION_LIMIT",
+            answer_wire as f64 / question_wire as f64
         );
     }
 
