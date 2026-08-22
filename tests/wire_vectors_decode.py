@@ -23,6 +23,22 @@ What it covers:
     and `extensions` are off the wire; the 15-byte header has session_id off-wire).
     Fully decoded **and** re-encoded, same as the borsh structs.
 
+  * **the 47-byte AEAD AAD image** — encode only, and necessarily so: the image is
+    authenticated but never transmitted, so there is nothing to decode it *from*.
+    PROTOCOL.md § 4.2 states it as a second table beside the wire layout and leaves
+    the relationship between the two for the reader to work out by diffing them;
+    what is written here is that relationship as one checkable claim, with the
+    fixture supplying fourteen of the fifteen fields independently of the encoder.
+
+  * **the signed handshake transcript** — encode only, for the sharper reason: its
+    committed artefact is a SHA-256 digest, and a hash cannot be decoded. Every
+    other vector here would still pass if this file and the Rust shared a
+    compensating pair of mistakes in encode and decode; this one cannot, because
+    there is no decode side to compensate. It composes the transcript out of the
+    committed message fixtures and hashes it, and the negative cases below fix the
+    field order and the borsh encoding of the leading field, neither of which the
+    fixture can state on its own.
+
   * **the `WINDOW_UPDATE` plaintext** — an 8-byte big-endian cumulative limit, together
     with the rule a receiver of one must apply. It has no frozen fixture (it is an AEAD
     plaintext, not an outer container), so what is stated here is the codec and the rule,
@@ -39,6 +55,7 @@ any mismatch). Regenerate the fixtures from Rust with
 
 from __future__ import annotations
 
+import hashlib
 import struct
 import sys
 from itertools import permutations
@@ -818,6 +835,198 @@ def control_subtype_registry():
         pass
     else:
         raise Failure("an empty CONTROL plaintext names no subtype and must be refused")
+
+
+# ─── the 47-byte AEAD AAD image (encode only) ──────────────────────────────
+#
+# PROTOCOL.md § 4.2 prints two tables — the 15-byte wire layout and the 47-byte
+# image the AEAD authenticates — and states neither in terms of the other. The
+# relationship between them is the thing a second implementation actually needs,
+# because the image is what its AEAD has to reproduce byte for byte and no
+# fixture can carry it: `session_id` is authenticated and never transmitted, so
+# an image is not something a peer ever receives and decodes.
+
+AAD_SIZE = 47
+
+
+def enc_aad_image(h, session_id: bytes) -> bytes:
+    """The 47-byte image an AEAD open must reproduce, from header fields.
+
+    Written as an encoder over the decoded fields rather than as a splice of the
+    wire bytes, so that the check below compares two independently-built things:
+    this, which goes field by field through the widths and byte order § 4.2
+    gives, against the fixture's own bytes with the session_id put in. A splice
+    on both sides would agree however wrong the field widths were.
+    """
+    check(len(session_id) == 32, "the AAD image carries a 32-byte session_id")
+    return (
+        bytes([h["version"]])
+        + session_id
+        + struct.pack(">Q", h["packet_number"])
+        + struct.pack(">H", h["flags"])
+        + struct.pack(">H", h["stream_id"])
+        + bytes([h["epoch"], h["path_id"]])
+    )
+
+
+@vector
+def aad_image():
+    """The AAD image is the wire header with the session_id spliced in at offset 1.
+
+    That sentence is the whole of what a second implementation has to know, and it
+    is the one form § 4.2 does not put it in. Everything else about the image
+    follows: the field order after the session_id is the wire order, the widths are
+    the wire widths, and the version byte leads both.
+    """
+    raw = load("packet_header.bin")
+    h = dec_packet_header(raw)
+    # Off-wire, so no fixture fixes it and any value serves. This one is the
+    # session_id the handshake fixtures carry, so the two sets describe one
+    # session rather than two.
+    session_id = arr32(0xE0)
+
+    aad = enc_aad_image(h, session_id)
+    check(len(aad) == AAD_SIZE, f"the AAD image is {AAD_SIZE} bytes, got {len(aad)}")
+    check(aad == raw[:1] + session_id + raw[1:],
+          "the AAD image must be the 15-byte wire header with the 32-byte session_id "
+          "inserted after the version byte")
+
+    # The reason the image exists rather than the wire bytes being used directly.
+    # A packet delivered to the wrong session reconstructs *that* session's id, so
+    # the image it rebuilds differs from the one the sender authenticated and the
+    # open fails — which only works if the id is genuinely part of the image.
+    check(enc_aad_image(h, arr32(0x00)) != aad,
+          "a different session_id must produce a different AAD image, or a "
+          "mis-delivered packet would open cleanly against the wrong session")
+
+
+# ─── the signed handshake transcript (encode only) ─────────────────────────
+
+
+def enc_handshake_transcript(v) -> bytes:
+    """Borsh-encode the seven-field transcript of PROTOCOL.md § 6.5.
+
+    Two things here are load-bearing and neither is visible in the struct listing
+    the spec prints. The leading `protocol_variant` is a byte *slice*, so borsh
+    gives it the same `u32`-little-endian length prefix a `Vec<u8>` gets — while
+    `server_nonce` and `session_id` are fixed 32-byte arrays and get none. And a
+    nested struct contributes exactly its own encoding with no wrapper, which is
+    why the whole `ClientHello` fixture can be dropped in unchanged.
+    """
+    w = BorshWriter()
+    w.vec_u8(v["protocol_variant"])
+    enc_client_hello(w, v["client_hello"])
+    w.fixed(v["server_nonce"])
+    enc_ciphertext(w, v["ciphertext"])
+    enc_verify_key(w, v["server_verify_key"])
+    w.fixed(v["session_id"])
+    w.boolean(v["early_data_accepted"])
+    return bytes(w.buf)
+
+
+def transcript_digest(v) -> bytes:
+    """`SHA256(borsh(transcript))` — the message both signature halves are over."""
+    return hashlib.sha256(enc_handshake_transcript(v)).digest()
+
+
+@vector
+def transcript_hash():
+    """The signed transcript, composed from the committed message fixtures.
+
+    This is the only vector here that cannot be written as a round trip, and that
+    is what makes it worth having. Every other check in this file passes an
+    encoder's output back through its own decoder somewhere; a pair of matching
+    errors — a field read and written at the same wrong width, say — survives that
+    intact. A digest admits no such pair: the bytes are either the bytes the Rust
+    hashed or they are not, and `transcript_hash.bin` says which.
+
+    It also localises a failure. The transcript is assembled out of fixtures each
+    of which is separately round-tripped above, so if those pass and this one does
+    not, what moved is the composition — the field order, the borsh encoding of the
+    leading slice, or the trailing bool — and not any message's own grammar.
+    """
+    transcript = {
+        "protocol_variant": PROTOCOL_VARIANT,
+        "client_hello": borsh_roundtrip(
+            "client_hello_full.bin", dec_client_hello, enc_client_hello),
+        "server_nonce": arr32(0x70),
+        "ciphertext": borsh_roundtrip(
+            "hybrid_ciphertext.bin", dec_ciphertext, enc_ciphertext),
+        "server_verify_key": borsh_roundtrip(
+            "hybrid_verifying_key.bin", dec_verify_key, enc_verify_key),
+        "session_id": arr32(0xE0),
+        "early_data_accepted": True,
+    }
+    expected = load("transcript_hash.bin")
+    check(len(expected) == 32, f"transcript_hash.bin must be 32 bytes, got {len(expected)}")
+    got = transcript_digest(transcript)
+    check(got == expected,
+          f"transcript digest {got.hex()} != fixture {expected.hex()}; the signing "
+          "input differs from the reference peer's, so its signatures will not verify")
+
+    # Each mutation below is a reading of § 6.5 that the prose permits and the
+    # bytes do not, so the fixture alone cannot rule any of them out. They are
+    # listed by the misreading rather than by the field, because that is what an
+    # implementer arrives at them from.
+    def mutated(**over):
+        return transcript_digest({**transcript, **over})
+
+    # `protocol_variant` is a slice, not a fixed array: its 17 bytes carry a u32
+    # length prefix. Written raw the digest is over a buffer four bytes shorter,
+    # and — since both peers would still agree on the *tag* — the failure surfaces
+    # only as a signature that will not verify.
+    raw_variant = BorshWriter()
+    raw_variant.fixed(PROTOCOL_VARIANT)
+    enc_client_hello(raw_variant, transcript["client_hello"])
+    raw_variant.fixed(transcript["server_nonce"])
+    enc_ciphertext(raw_variant, transcript["ciphertext"])
+    enc_verify_key(raw_variant, transcript["server_verify_key"])
+    raw_variant.fixed(transcript["session_id"])
+    raw_variant.boolean(True)
+    check(hashlib.sha256(bytes(raw_variant.buf)).digest() != expected,
+          "an unprefixed protocol_variant reproduced the fixture digest")
+
+    # The verdict is signed (Invariant 9) — an on-path flip of
+    # ServerHello.early_data_accepted has to break the signature.
+    check(mutated(early_data_accepted=False) != expected,
+          "flipping the 0-RTT verdict left the transcript digest unchanged")
+
+    # The verdict is the *last* field and the variant the *first* (Invariant 10).
+    # A six-field reading that drops the trailing bool, and a seven-field one that
+    # orders the two the other way round, must both diverge.
+    six_field = BorshWriter()
+    six_field.vec_u8(PROTOCOL_VARIANT)
+    enc_client_hello(six_field, transcript["client_hello"])
+    six_field.fixed(transcript["server_nonce"])
+    enc_ciphertext(six_field, transcript["ciphertext"])
+    enc_verify_key(six_field, transcript["server_verify_key"])
+    six_field.fixed(transcript["session_id"])
+    check(hashlib.sha256(bytes(six_field.buf)).digest() != expected,
+          "a transcript without the trailing early_data_accepted reproduced the fixture")
+
+    verdict_first = BorshWriter()
+    verdict_first.boolean(True)
+    verdict_first.vec_u8(PROTOCOL_VARIANT)
+    enc_client_hello(verdict_first, transcript["client_hello"])
+    verdict_first.fixed(transcript["server_nonce"])
+    enc_ciphertext(verdict_first, transcript["ciphertext"])
+    enc_verify_key(verdict_first, transcript["server_verify_key"])
+    verdict_first.fixed(transcript["session_id"])
+    check(hashlib.sha256(bytes(verdict_first.buf)).digest() != expected,
+          "moving the verdict ahead of protocol_variant reproduced the fixture")
+
+    # The transcript covers the *whole* ClientHello, the sealed early-data blob
+    # included (Invariant 7). A peer that signed the hello minus its 0-RTT payload
+    # would let an on-path attacker strip it undetected.
+    without_early_data = dict(transcript["client_hello"], early_data=None)
+    check(mutated(client_hello=without_early_data) != expected,
+          "stripping early_data from the covered hello reproduced the fixture digest")
+
+    # And the version is under the signature, which is the whole of this
+    # protocol's downgrade resistance — there is no version negotiation to attack.
+    downgraded = dict(transcript["client_hello"], version=PROTOCOL_VERSION - 1)
+    check(mutated(client_hello=downgraded) != expected,
+          "downgrading client_hello.version reproduced the fixture digest")
 
 
 def main() -> int:

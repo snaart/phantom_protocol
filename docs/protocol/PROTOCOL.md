@@ -1926,6 +1926,22 @@ because they govern AEAD plaintexts rather than outer containers: the
 that an unassigned byte drops the frame and that a plaintext naming no subtype is
 refused rather than read as a default.
 
+Two of its checks are **encoders with no decode side**, and the distinction is worth
+keeping because it is where the evidence is strongest. A round trip — encode, decode,
+compare — survives a pair of matching errors: a field read and written at the same
+wrong width agrees with itself. Neither of these can do that. The 47-byte AAD image
+(§ 4.2) is authenticated and never transmitted, so no fixture can carry one and there
+is nothing to decode; the check states the relationship the two tables in § 4.2 leave
+the reader to derive, namely that the image is the 15-byte wire header with the
+32-byte `session_id` inserted after the version byte. And the signed transcript
+(§ 6.5) has a fixture, `transcript_hash.bin`, but it is a digest — a hash cannot be
+decoded, so only an exact re-encoding reproduces it. That check composes the
+transcript out of the committed message fixtures and pins, by mutation, the three
+things the fixture alone cannot state: that the leading `protocol_variant` is a
+length-prefixed slice rather than a fixed array, that `early_data_accepted` is the
+trailing field, and that the covered `ClientHello` includes its `version` and its
+sealed early-data blob (Invariants 7, 9, 10).
+
 | Fixture | Codec | Type |
 | --- | --- | --- |
 | `packet_header.bin` | hand-rolled big-endian | `PacketHeader` (§ 4.2) |

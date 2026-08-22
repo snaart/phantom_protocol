@@ -386,6 +386,26 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **Two encoder-only conformance checks in `tests/wire_vectors_decode.py`, covering the
+  signed handshake transcript and the 47-byte AEAD AAD image.** Every check the independent
+  decoder carried until now was a round trip, and a round trip has a blind spot that matters
+  precisely for a second implementation: a field read and written at the same wrong width
+  agrees with itself, so encode-then-decode passes while the bytes are wrong. Neither of the
+  two additions can do that, because neither has a decode side to compensate. The AAD image
+  is authenticated and never transmitted, so no fixture can carry one; the check states the
+  relationship the two tables in PROTOCOL.md § 4.2 leave the reader to derive by eye — the
+  image is the 15-byte wire header with the 32-byte `session_id` inserted after the version
+  byte — and builds it field by field from the decoded fixture rather than by splicing the
+  fixture's own bytes, so the two sides are independent. The transcript has a fixture,
+  `transcript_hash.bin`, but it is a SHA-256 digest and a digest cannot be decoded: only an
+  exact re-encoding reproduces it. That check composes the transcript out of the committed
+  `ClientHello` / ciphertext / verifying-key fixtures and pins, by mutation, the three
+  readings of § 6.5 the prose permits and the bytes refuse — the leading `protocol_variant`
+  is a length-prefixed slice rather than a fixed array, `early_data_accepted` is the trailing
+  field, and the covered `ClientHello` includes both its `version` and its sealed early-data
+  blob (Invariants 7, 9, 10). PROTOCOL.md § 11 and INTEROP.md Rung 3 record the distinction,
+  since Rung 3 is the one rung where building the decoder first proves nothing.
+
 - **`core/examples/bottleneck_sim.rs` — a bottleneck-link model driven by the real congestion
   controller, so a claim about it can be checked from the tree.** A fixed-rate link with a FIFO
   queue and a fixed propagation delay, ticked a millisecond at a time, with the sender's window
