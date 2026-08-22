@@ -386,6 +386,45 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **The arithmetic that turns a per-session memory bound into a per-process one, and
+  `phantom-server`'s `--max-recv-window-growth-mib` / `PHANTOM_MAX_RECV_WINDOW_GROWTH_MIB`
+  to state its left-hand side.** Every receive-side bound this transport enforces is
+  enforced *per session* — the growth allowance most explicitly, since one
+  `SharedRecvTuning` handle is created per session and nothing divides it between
+  concurrent ones. What that means for a process was left for the reader to work out, and
+  the reference server admits 1024 sessions by default, so the figure it works out to is
+  `1024 × SESSION_RECV_WINDOW_GROWTH_BUDGET` = **8 GiB of receive-window growth alone**,
+  before a reorder entry or a delivery-queue slot is counted. That product is now written
+  down in `docs/security/threat-model.md` §5 §D.1, `docs/operations/deployment.md` and the
+  entry above, and pinned in `security_invariants.rs` against what sessions are *observed*
+  to draw rather than against the constant it was typed from — so the enforcement failing
+  and the documents going stale are the same test failure.
+
+  The flag states a ceiling on that one term and lowers `--max-sessions` to the sessions
+  that fit: `8192` buys exactly the shipped default of `1024`, and a value below `8` refuses
+  to start rather than admitting a session the stated ceiling cannot hold. `0`, the default,
+  states no ceiling and leaves every existing configuration untouched.
+
+  It is deliberately **not** the `--max-recv-memory-mib` removed above returning under a new
+  name. That one divided an operator's budget by a published per-session *total*, and the
+  total was an estimate that was corrected upward three times; a cap derived from an
+  estimate under-provisions a host by exactly the factor the estimate is out. This one
+  divides by an allowance the transport enforces and a test measures, so its answer is
+  sound — but sound about 8 MiB of a per-session footprint that reaches hundreds of
+  megabytes, which makes it a floor on what the host must have rather than a ceiling on what
+  it will use, and the flag's own help text and the deployment guide both say so in those
+  words. Sizing a host still ends in measurement; what the flag adds is the ability to
+  reject a configuration that is already too large on the cheapest term.
+
+  A **process-wide** second tier of budget, shared by concurrent sessions, was the other way
+  to close this and is rejected on the record in §D.1. It would bound the 8 GiB, and it
+  would do it by making one peer's growth decisions determine another peer's window: growth
+  is first-come, so a peer that opens sessions and drains them just fast enough to earn
+  doublings exhausts the process allowance and pins every session admitted afterwards at the
+  64 KiB initial window — 2.6 Mbit/s on a 200 ms path, with nothing in the affected sessions
+  distinguishing that from a slow path. The present design's failure mode is a host sized
+  too small, which an operator can see and fix.
+
 - **`core/examples/bottleneck_sim.rs` — a bottleneck-link model driven by the real congestion
   controller, so a claim about it can be checked from the tree.** A fixed-rate link with a FIFO
   queue and a fixed propagation delay, ticked a millisecond at a time, with the sender's window
@@ -1013,8 +1052,11 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   draws on one handle, so the bound holds rather than merely being intended. Growth remains
   driven by what the application consumed, never by what arrived. What the budget bounds and
   what it does not is set out in the entry below and in `docs/security/threat-model.md`
-  §5 §D.1; the short form is that it is 8 MiB of a 429 MiB per-session commitment, and that
-  the commitment is per session rather than per process. The round-trip reference
+  §5 §D.1; the short form is that it is one term of five, that the other four are separately
+  bounded and individually larger, and that all of them are commitments **per session**:
+  nothing divides any of them between concurrent sessions, so a process commits its session
+  cap times each — 1024 × 8 MiB = 8 GiB of window growth alone at the reference server's
+  default. The round-trip reference
   the interval is derived from is a constant on a receive-only stream, which is the flow
   auto-tuning exists for, because such a stream never measures a round trip of its own. On a
   stream that also sends, it is that stream's own `min_rtt`, and a peer that delays every

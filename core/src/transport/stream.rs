@@ -203,8 +203,24 @@ const _: () =
 /// and says which are enforced and which are only observed.
 ///
 /// It is also per **session**: nothing here divides it between concurrent sessions, so a
-/// process draws it once per session it admits. Admission control is what bounds the
-/// process, and it is the embedder's (`PHANTOM_MAX_SESSIONS` in the reference server).
+/// process draws it once per session it admits, and the arithmetic that follows is the
+/// whole of what a process commits to window growth —
+///
+/// ```text
+///   sessions admitted × SESSION_RECV_WINDOW_GROWTH_BUDGET
+///          1024       ×              8 MiB                =  8 GiB
+/// ```
+///
+/// — 1024 being the reference server's default `PHANTOM_MAX_SESSIONS`. Admission control is
+/// therefore what bounds the process, and it is the embedder's; `phantom-server` also
+/// accepts the ceiling directly (`--max-recv-window-growth-mib`) and derives the session cap
+/// from it.
+///
+/// A process-wide second tier over this one was considered and rejected: growth is
+/// first-come, so a shared allowance lets a peer that opens and drains sessions quickly pin
+/// every session admitted after it at the initial window. That is one peer steering another
+/// peer's control loop, which is a worse failure than a host sized too small — see
+/// `docs/security/threat-model.md` §5 §D.1.
 pub const SESSION_RECV_WINDOW_GROWTH_BUDGET: u32 = 8 * 1024 * 1024;
 
 /// RTT reference used by receive-window auto-tuning when the stream has no RTT sample of

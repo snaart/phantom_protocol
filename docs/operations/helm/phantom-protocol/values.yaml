@@ -160,7 +160,11 @@ signingKey:
 # Environment variables passed to the container
 # ---------------------------------------------------------------------------
 # Override RUST_LOG, or add PHANTOM_MAX_SESSIONS / PHANTOM_MAX_SESSIONS_PER_IP /
-# PHANTOM_LOG_JSON as required — see server/src/config.rs and .env.example.
+# PHANTOM_MAX_RECV_WINDOW_GROWTH_MIB / PHANTOM_LOG_JSON as required — see
+# server/src/config.rs and .env.example. The growth ceiling is worth stating
+# where `resources.limits.memory` is set: it lowers PHANTOM_MAX_SESSIONS to the
+# sessions whose receive-window growth fits, so a pod cannot be configured to
+# admit more sessions than that one term alone has room for.
 # PHANTOM_BIND (a full SocketAddr, e.g. "0.0.0.0:4242") and
 # PHANTOM_SIGNING_KEY_FILE are rendered by the Deployment from `service.port`
 # and the `signingKey` block; override those values rather than duplicating the

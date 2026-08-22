@@ -2,7 +2,9 @@
 //!
 //! Boot sequence:
 //!
-//! 1. Parse CLI / env into [`config::Config`].
+//! 1. Parse CLI / env into [`config::Config`] and resolve the session cap —
+//!    a stated receive-window-growth ceiling that cannot hold one session is
+//!    refused here, before anything is initialised or bound.
 //! 2. Install the OpenTelemetry pipeline — an OTLP/gRPC exporter that *pushes*
 //!    metrics + traces to a Collector (`--otlp-endpoint` /
 //!    `OTEL_EXPORTER_OTLP_ENDPOINT`). There is no inbound `/metrics` port.
@@ -25,6 +27,7 @@ mod telemetry;
 use anyhow::{Context, Result};
 use clap::Parser;
 use phantom_protocol::api::listener::PhantomListener;
+use phantom_protocol::transport::stream::SESSION_RECV_WINDOW_GROWTH_BUDGET;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -112,6 +115,14 @@ impl Drop for PerIpGuard {
 async fn main() -> Result<()> {
     let cfg = Config::parse();
 
+    // Resolve the session cap before anything is initialised, exported or bound. A stated
+    // receive-window-growth ceiling that cannot hold one session is a configuration error,
+    // and a process that reports it only after opening its listen socket has already
+    // accepted the connection it was told not to.
+    let max_sessions = cfg
+        .effective_max_sessions()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     // OTel must be installed BEFORE the tracing subscriber so the
     // `tracing-opentelemetry` layer has a tracer to bridge into. The
     // subscriber then composes the OTel layer alongside the fmt layer.
@@ -183,18 +194,43 @@ async fn main() -> Result<()> {
     // single figure for the second factor — the receive path's buffers each carry
     // their own bound, and adding them up produces something that reads as a total
     // while omitting whatever it has not enumerated — so sizing here comes from
-    // measurement under the traffic the deployment actually carries.
-    let session_slots = Arc::new(Semaphore::new(if cfg.max_sessions == 0 {
+    // measurement under the traffic the deployment actually carries. The one term
+    // that *is* an enforced constant is receive-window growth, and
+    // `--max-recv-window-growth-mib` has already been applied to `max_sessions`
+    // above; the figure logged below is the growth those sessions commit, which is
+    // a lower bound on the host's requirement rather than a statement of it.
+    let session_slots = Arc::new(Semaphore::new(if max_sessions == 0 {
         Semaphore::MAX_PERMITS
     } else {
-        cfg.max_sessions
+        max_sessions
     }));
     let per_ip = PerIpLimiter::new(cfg.max_sessions_per_ip);
+    // Rendered rather than logged as a number, because an unbounded cap has no product
+    // and a zero in this field would read as "commits nothing" — the opposite of what an
+    // unbounded cap means.
+    let growth_commitment = if max_sessions == 0 {
+        "unbounded".to_string()
+    } else {
+        let mib = (max_sessions as u64)
+            .saturating_mul(u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET))
+            / (1024 * 1024);
+        format!("{mib} MiB")
+    };
     tracing::info!(
-        max_sessions = cfg.max_sessions,
+        max_sessions,
+        max_sessions_configured = cfg.max_sessions,
         max_sessions_per_ip = cfg.max_sessions_per_ip,
+        recv_window_growth_commitment = %growth_commitment,
         "session admission control active"
     );
+    if max_sessions != cfg.max_sessions {
+        tracing::warn!(
+            max_sessions,
+            max_sessions_configured = cfg.max_sessions,
+            max_recv_window_growth_mib = cfg.max_recv_window_growth_mib,
+            "session cap lowered to the sessions the stated receive-window-growth ceiling holds"
+        );
+    }
 
     // JoinSet tracks every spawned handler so we can give them a
     // bounded drain window on shutdown.

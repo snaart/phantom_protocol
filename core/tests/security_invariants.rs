@@ -2825,6 +2825,108 @@ async fn recv_window_growth_is_bounded_per_session_not_per_stream() {
     );
 }
 
+/// The growth allowance is per session, so what a *process* commits is its session cap
+/// times one allowance — and that arithmetic is published, which makes it a thing that can
+/// go stale.
+///
+/// `CHANGELOG.md`, `docs/security/threat-model.md` §5 §D.1 and
+/// `docs/operations/deployment.md` all state the figure for the reference server's default
+/// `PHANTOM_MAX_SESSIONS` of 1024, and `phantom-server`'s `--max-recv-window-growth-mib`
+/// divides a stated budget by the same per-session constant to derive a session cap. A
+/// figure copied into four places is a figure that drifts, so it is pinned here against
+/// what sessions are *observed* to draw rather than against the constant it was typed
+/// from: if the allowance ever stopped being enforced, the observed per-session maximum
+/// would exceed it and the published product would silently understate the process by
+/// whatever factor the enforcement was out.
+///
+/// Companion to `recv_window_growth_is_bounded_per_session_not_per_stream`, which pins the
+/// *per-session* half. This one pins the multiplier.
+#[tokio::test]
+async fn the_published_process_growth_figure_is_the_session_cap_times_what_a_session_draws() {
+    tokio::time::pause();
+    const SESSIONS: usize = 4;
+    const STREAMS_PER_SESSION: usize = 16;
+    /// `PHANTOM_MAX_SESSIONS`'s default in the reference server.
+    const REFERENCE_DEFAULT_SESSION_CAP: u64 = 1024;
+    /// The receive-window growth those sessions commit, as published alongside that cap.
+    const PUBLISHED_PROCESS_GROWTH: u64 = 8 * 1024 * 1024 * 1024;
+
+    // Drive every stream of every session far past what any window could absorb, so growth
+    // stops where the session runs out of allowance rather than where an application
+    // stopped reading. Sessions are built and driven one at a time: what is being measured
+    // is the maximum one of them reaches, and that is the multiplicand of the arithmetic.
+    let mut per_session_growth = Vec::new();
+    for i in 0..SESSIONS {
+        let (session, _peer) = make_session_pair([0x70 + i as u8; 32]);
+        let streams: Vec<_> = (0..STREAMS_PER_SESSION)
+            .map(|_| session.open_stream())
+            .collect();
+        for s in &streams {
+            s.record_app_consumed(1, true); // open each stream's measurement interval
+        }
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            for s in &streams {
+                s.record_app_consumed(MAX_RECV_WINDOW, true);
+            }
+        }
+        per_session_growth.push(
+            streams
+                .iter()
+                .map(|s| u64::from(s.advertised_recv_window() - INITIAL_STREAM_WINDOW))
+                .sum::<u64>(),
+        );
+    }
+
+    let worst = *per_session_growth
+        .iter()
+        .max()
+        .expect("SESSIONS is non-zero, so there is a maximum");
+
+    // The multiplicand has to be the real per-session maximum from both sides. Too high and
+    // the published product is not a bound at all; too low — a session that never managed
+    // to spend its allowance — and the product would look safe for a reason that has
+    // nothing to do with enforcement. The smallest step a window can grow by is one
+    // `INITIAL_STREAM_WINDOW` (the first doubling of a fresh stream), so a session within
+    // one of those of the allowance has spent everything a doubling could claim.
+    assert!(
+        worst <= u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+        "a session drew {worst} B of window growth against a \
+         {SESSION_RECV_WINDOW_GROWTH_BUDGET} B allowance — the per-session bound is not \
+         holding, so every published process figure derived from it understates by the \
+         same factor"
+    );
+    assert!(
+        worst + u64::from(INITIAL_STREAM_WINDOW) > u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+        "a session only managed {worst} B of the {SESSION_RECV_WINDOW_GROWTH_BUDGET} B \
+         allowance, so this test is not measuring the maximum and the arithmetic below \
+         would pass for the wrong reason"
+    );
+
+    let total: u64 = per_session_growth.iter().sum();
+    assert!(
+        total <= SESSIONS as u64 * u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+        "{SESSIONS} sessions drew {total} B between them; nothing divides the allowance \
+         across sessions, so the process figure is the session count times one allowance"
+    );
+
+    // The published product, checked against the observed multiplicand rather than against
+    // the constant it was written from.
+    assert!(
+        REFERENCE_DEFAULT_SESSION_CAP * worst <= PUBLISHED_PROCESS_GROWTH,
+        "{REFERENCE_DEFAULT_SESSION_CAP} sessions each drawing the observed {worst} B come \
+         to more than the published {PUBLISHED_PROCESS_GROWTH} B; the documents and \
+         `--max-recv-window-growth-mib` are both out"
+    );
+    assert!(
+        REFERENCE_DEFAULT_SESSION_CAP * (worst + u64::from(INITIAL_STREAM_WINDOW))
+            > PUBLISHED_PROCESS_GROWTH,
+        "the published {PUBLISHED_PROCESS_GROWTH} B is loose against what \
+         {REFERENCE_DEFAULT_SESSION_CAP} sessions of {worst} B actually reach; a figure \
+         with slack in it invites being read as headroom that is not there"
+    );
+}
+
 /// Bytes the real delivery queue takes to park `n` one-byte items, over and above the
 /// payload — measured, not modelled. The payloads are allocated before the measurement
 /// starts and sliced inside it, exactly as the reliable receive path does

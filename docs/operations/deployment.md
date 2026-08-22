@@ -61,7 +61,10 @@ The relevant runtime-visible knobs are:
 - [ ] File descriptor limit raised (≥65535) on the server host.
 - [ ] `PHANTOM_MAX_SESSIONS` set **below** `LimitNOFILE` and within the memory
       budget; `PHANTOM_MAX_SESSIONS_PER_IP` set for the expected client mix
-      (see *Session caps & resource limits* below).
+      (see *Session caps & resource limits* below). The cap times 8 MiB is the
+      process's receive-window-growth commitment on its own — 8 GiB at the
+      default — and `PHANTOM_MAX_RECV_WINDOW_GROWTH_MIB` will enforce a ceiling
+      on that one term if you state it.
 - [ ] sysctl tuning applied (see `systemd.md`).
 - [ ] CI build of the wrapper binary completes for all target
       platforms.
@@ -80,6 +83,7 @@ env vars):
 | Setting | Env | Default | Purpose |
 | --- | --- | --- | --- |
 | `--max-sessions` | `PHANTOM_MAX_SESSIONS` | `1024` | Global concurrent-session ceiling. At the cap the accept loop stops accepting — new connections queue in the OS backlog (`somaxconn` / `tcp_max_syn_backlog`) until a session closes. Backpressure, not a hard drop. `0` = unbounded. |
+| `--max-recv-window-growth-mib` | `PHANTOM_MAX_RECV_WINDOW_GROWTH_MIB` | `0` | Ceiling on the receive-window **growth** the process commits, in MiB. Lowers the session cap to `mib / 8`, since a session may draw 8 MiB of growth and nothing divides that between sessions. Below `8` the server refuses to start. `0` states no ceiling. A floor on the host's requirement, not a ceiling on its footprint — see the memory note below. |
 | `--max-sessions-per-ip` | `PHANTOM_MAX_SESSIONS_PER_IP` | `64` | Per-source-IP concurrent-session ceiling. A peer already at the cap has further connections rejected (closed right after the handshake), so one source cannot monopolise the global pool. `0` disables. |
 
 **Size `PHANTOM_MAX_SESSIONS` against two limits:**
@@ -127,6 +131,23 @@ env vars):
   is exposed to `N ×` whatever one session reaches — which is why the session
   cap is a memory setting whether or not it was set as one.
 
+  **Every commitment above is per session, and the multiplier is the session
+  cap.** For the one row that is an enforced constant rather than a measured
+  worst case, that arithmetic is exact:
+
+  ```text
+    PHANTOM_MAX_SESSIONS × SESSION_RECV_WINDOW_GROWTH_BUDGET
+              1024       ×          8 MiB                    =  8 GiB
+  ```
+
+  8 GiB of receive-window growth alone, at the shipped default, before a single
+  reorder entry, delivery item or queue slot is counted. The other rows have no
+  such constant — their per-session figures are worst cases derived from several
+  constants apiece — so the same multiplication applied to them produces an
+  estimate, not a bound, and the numbers it yields (64 GiB of reorder structure,
+  290 GiB of delivery queues) are useful only as a statement about which term
+  dominates.
+
   Pick a posture:
 
   - **Trusted or authenticated-and-accountable clients** (the common case):
@@ -136,10 +157,26 @@ env vars):
   - **Open to the internet**: measure. Run the deployment's own traffic against
     a session cap you can afford to be wrong about, watch peak RSS per session
     under load, and set `PHANTOM_MAX_SESSIONS` from that with headroom for the
-    rows above. A flag that divided a memory budget by a per-session constant
-    used to live here; it was removed because the constant it divided by was an
-    estimate, and a cap derived from an estimate under-provisions the host by
-    exactly the factor the estimate is out.
+    rows above.
+
+  `--max-recv-window-growth-mib` / `PHANTOM_MAX_RECV_WINDOW_GROWTH_MIB` states
+  the left-hand side of that arithmetic and derives the cap from it: the session
+  cap is lowered to `mib / 8` sessions, `8192` buys exactly the default `1024`,
+  and a value below `8` refuses to start rather than admitting a session the
+  stated ceiling cannot hold. `0`, the default, states no ceiling and leaves the
+  cap alone.
+
+  **It is a floor on what the host must have, not a ceiling on what it will
+  use** — it bounds one term of four, and not the dominant one. A different flag
+  used to live here that divided a memory budget by a published *total* for a
+  session; it was removed because that total was an estimate, and a cap derived
+  from an estimate under-provisions the host by exactly the factor the estimate
+  is out. This one divides by an allowance the transport enforces and a test
+  measures, so what it computes is sound as far as it goes — but "as far as it
+  goes" is 8 MiB of a per-session footprint that reaches hundreds of megabytes,
+  and reading its answer as a memory budget would repeat the removed flag's
+  mistake with better arithmetic. Use it to reject a configuration that is
+  already too large on the cheapest term; keep sizing by measurement.
 
 The per-IP cap is a *session-count* cap, not a handshake-rate limit — an
 abusive IP can still trigger (cheap, PoW/cookie-gated) handshakes that are then

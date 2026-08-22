@@ -29,6 +29,12 @@
 //! | [`SESSION_RECV_WINDOW_GROWTH_BUDGET`](crate::transport::stream::SESSION_RECV_WINDOW_GROWTH_BUDGET) | window growth across all streams of a session | `SharedRecvTuning` hands growth out of one allowance |
 //! | [`RECV_DELIVERY_HARD_CAP`] + [`MAX_DELIVERY_CHARGE_PER_FRAME`] | the session's delivery backlog | the reader tears the session down; the second term is the frame that crossed the line |
 //! | [`STREAM_RECV_CHANNEL_DEPTH`], [`RAW_APP_RECV_CHANNEL_DEPTH`] | one delivered-stream queue | the channel is bounded; the delivery task blocks rather than growing it |
+//! | a minimum time separation between retained entries | each of the session's two sliding estimator filters | `crate::transport::bandwidth_estimator`, which admits any sample that moves the reading and thins only its successors |
+//!
+//! The last row is in a different chain from the others: its input is the peer's
+//! *acknowledgements*, not its data, so the reasoning that bounds a receive
+//! buffer never reaches it. It is here because that is exactly how it came to be
+//! unbounded.
 //!
 //! One number that looks like it belongs in that table is **observed rather than
 //! enforced**, and reading it as a bound is the mistake this section exists to
@@ -57,6 +63,17 @@
 //! under the traffic it will actually carry, use the rows above to reason about
 //! what a hostile peer can move, and treat any single figure claiming to cover
 //! the receive path as an estimate.
+//!
+//! **Every row is a bound on one session**, and that is the last thing to carry
+//! away from here. Nothing divides any of them between concurrent sessions, so
+//! what a process commits is its admission cap times each row. For the growth
+//! allowance — the one row whose per-session figure is a single constant, which
+//! makes the product a bound rather than an estimate — that is
+//! `1024 × 8 MiB` = 8 GiB at the reference server's default
+//! `PHANTOM_MAX_SESSIONS`, before any other row is counted. Admission control is
+//! therefore what bounds a process and it belongs to the embedder;
+//! `phantom-server` will also take the ceiling directly and derive the cap from
+//! it (`--max-recv-window-growth-mib`).
 
 use crate::crypto::hybrid_sign::HybridVerifyingKey;
 use crate::errors::CoreError;
