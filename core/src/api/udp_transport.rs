@@ -540,7 +540,29 @@ impl SessionTransport for UdpClientTransport {
                 self.prev_socket.store(Arc::new(None));
             }
             match decoded {
-                Ok((_hdr, Some(frame))) => {
+                Ok((hdr, Some(frame))) => {
+                    // PROTOCOL § 6.1: while the handshake runs, the only frame that can be a
+                    // reply is a handshake one, and the caller above parses whatever it is
+                    // handed as a `ServerReply` — so returning anything else ends the connect
+                    // with "invalid server reply". A server that has committed its session
+                    // may already be sending short-header traffic (an application greeting, a
+                    // keepalive) while the client is still waiting for a `ServerHello` that
+                    // went missing, and that traffic would otherwise kill the very connect the
+                    // reply repeat exists to save. Dropping it costs nothing the transport was
+                    // promising: nothing under the handshake is reliable, and the ARQ re-sends
+                    // any reliable stream data once the session is up.
+                    //
+                    // Dropping here rather than at the caller is what keeps the retransmit
+                    // schedule intact — `attempt`/`spent`/`retransmit_at` live across this
+                    // `continue`, so a peer that talks cannot postpone the repeat that the
+                    // client's own timer is about to trigger, and cannot extend the budget it
+                    // gives up on either. The phase is re-read rather than reusing the
+                    // loop-top snapshot so the check reflects the transport's state now.
+                    if hdr.ty != PacketType::Initial
+                        && self.phase.load(Ordering::Relaxed) == PHASE_HANDSHAKE
+                    {
+                        continue;
+                    }
                     // M-1 (server-migration candidate detection): record the source + frame
                     // length of this still-AEAD-pending frame. The candidate is committed ONLY
                     // by the post-decrypt `confirm_authenticated_source`, so a spoofed / replayed
@@ -1212,6 +1234,72 @@ mod tests {
         let (_s, n, r) = tokio::join!(send, recv, recv_client);
         assert!(n >= super::HDR_LEN);
         assert_eq!(&r.unwrap().unwrap()[..], &b"reply"[..]);
+    }
+
+    /// A short-header datagram arriving mid-handshake is ignored, not mistaken for a reply.
+    ///
+    /// The caller above `recv_bytes` parses whatever it is handed as a `ServerReply` and
+    /// treats a parse failure as terminal, so a frame that cannot be one ends the connect.
+    /// A server that has committed its session is free to send short-header traffic — an
+    /// application greeting on accept, a keepalive — while the client is still waiting for a
+    /// `ServerHello` that went missing, and the client has no keys to open it with. Without
+    /// this gate the reply-repeat repair (PROTOCOL § 6.1) would hold only against a server
+    /// that happened to stay silent for the whole retransmit interval, which is not a
+    /// property anything guarantees.
+    ///
+    /// The second half is what keeps the gate from being a blanket drop: once the session is
+    /// Established the same datagram is delivered, because then it is exactly what the pump
+    /// is waiting for.
+    #[tokio::test]
+    async fn a_short_header_datagram_mid_handshake_is_ignored_rather_than_ending_the_connect() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+        // Default phase is Handshake.
+        client.send_bytes(b"client-hello").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, from) = peer.recv_from(&mut buf).await.unwrap();
+
+        // The server speaks its session before this client can open anything, and only then
+        // does the reply arrive. Both go out back to back so ordering on loopback is fixed.
+        for d in encode_datagrams(
+            PacketType::OneRtt,
+            &client.cid(),
+            0,
+            b"committed-session-traffic",
+        )
+        .expect("encode")
+        {
+            peer.send_to(&d, from).await.unwrap();
+        }
+        for d in encode_datagrams(PacketType::Initial, &client.cid(), 1, b"server-hello")
+            .expect("encode")
+        {
+            peer.send_to(&d, from).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), client.recv_bytes())
+            .await
+            .expect("the reply must still be reachable")
+            .expect("recv");
+        assert_eq!(
+            &got[..],
+            &b"server-hello"[..],
+            "a mid-handshake short-header datagram was handed up as if it were a reply; the \
+             caller parses it as a ServerReply and fails the whole connect"
+        );
+
+        // And the gate is a phase gate, not a blanket refusal.
+        client.set_frame_phase(FramePhase::Established);
+        for d in encode_datagrams(PacketType::OneRtt, &client.cid(), 2, b"session-data")
+            .expect("encode")
+        {
+            peer.send_to(&d, from).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), client.recv_bytes())
+            .await
+            .expect("established sessions must still receive short-header traffic")
+            .expect("recv");
+        assert_eq!(&got[..], &b"session-data"[..]);
     }
 
     /// The handshake shim must still be waiting when an honest reply arrives later than a

@@ -1555,7 +1555,7 @@ parse handshake messages (§ 4.10) — which is where a single lost `ServerHello
 used to cost the whole connect, since the reply flight is six datagrams of the
 thirteen a PhantomUDP handshake spends and is the only flight with no
 retransmission of its own. The server instead **retains the reply flight it
-sent** and repeats it, under five rules that a second implementation should treat
+sent** and repeats it, under six rules that a second implementation should treat
 as part of the protocol rather than as an implementation detail:
 
 1. **A repeat is the bytes that were already sent**, datagram for datagram —
@@ -1584,10 +1584,25 @@ as part of the protocol rather than as an implementation detail:
 5. **Retention is best-effort.** A server that is already holding its maximum
    number of retained flights keeps none for a new session; the handshake still
    completes, that session simply has no repair.
+6. **A client that is still waiting for a reply ignores every datagram that is
+   not a handshake one.** The rules above only ever get a chance to run if the
+   client is still connecting when its retransmit timer fires, and a server that
+   has committed a session is free to use it: an application greeting written the
+   moment the session is accepted, a keepalive, cover traffic. Those are
+   short-header datagrams (§ 4.2) carrying keys the client does not have, because
+   the reply that would have carried them is the flight that went missing. A
+   client that hands such a datagram to its handshake parser sees a malformed
+   reply and ends the attempt, and the repair then holds only against a server
+   that happens to say nothing for a whole retransmit interval. Discarding it
+   costs nothing this layer was promising — nothing under the handshake is
+   reliable, and reliable stream data is re-sent by the ARQ once the session is
+   up — and it must not disturb the retransmit schedule, or a talkative peer
+   could postpone the repetition indefinitely.
 
 A client therefore repairs a lost flight in either direction by re-sending its
-own flight unchanged, and the connect fails only when the path loses every
-repetition.
+own flight unchanged, and the connect fails when the path loses every repetition
+— or when a repeat is not owed, which rules 2, 4 and 5 each describe a way to
+reach.
 
 `HandshakeStage` (`Initial → ClassicalReady → Established | Failed`,
 `handshake.rs`) supports optimistic start. `process_client_hello`
@@ -2572,8 +2587,10 @@ loss of a single reply datagram was costing whole connects, and the reply is six
 datagrams of the thirteen a PhantomUDP handshake spends. **No serialized byte
 moved**: a repeat is the bytes already sent, no message gained a field, no version
 was bumped, and the frozen vectors are untouched. What a second implementation has
-to know is in the five rules of § 6.1, and the one that changes client behaviour is
-that a retransmitted hello must be the previous hello unchanged.
+to know is in the six rules of § 6.1, and two of them change client behaviour: a
+retransmitted hello must be the previous hello unchanged, and a client still
+waiting for a reply must discard a short-header datagram rather than read it as a
+malformed one.
 
 The earlier sync covered, in order: `WIRE_VERSION` / `PROTOCOL_VERSION` / `PROTOCOL_VARIANT`;
 the 15-byte `PacketHeader` grammar and `HP_PROTECTED_OFFSET`; the 47-byte AAD

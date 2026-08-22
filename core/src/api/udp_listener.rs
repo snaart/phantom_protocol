@@ -1629,12 +1629,21 @@ mod tests {
     /// field, so exactly one flight goes missing however many datagrams it is made of, and
     /// every later flight — including the repair — arrives.
     ///
+    /// `speak_in_the_gap` puts a single short-header datagram on the wire towards the client
+    /// in place of the flight it just swallowed — the shape of a server that has committed
+    /// its session and started using it (an application greeting on accept, a keepalive)
+    /// while the client is still waiting for a reply it never received. The client cannot
+    /// open it, so what it does with it decides whether the repair holds against a server
+    /// that speaks or only against one that stays silent.
+    ///
     /// Returns the address a client should connect to and how many datagrams were
     /// swallowed, so a test can assert the loss it asked for actually happened rather than
     /// passing because the path was clean.
     async fn spawn_flight_swallowing_relay(
         server_addr: SocketAddr,
+        speak_in_the_gap: bool,
     ) -> (SocketAddr, Arc<AtomicUsize>) {
+        use crate::transport::phantom_udp::datagram::encode_datagrams;
         use crate::transport::phantom_udp::envelope::{decode_header, FRAG_SUBHDR_LEN};
 
         let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("relay socket");
@@ -1672,6 +1681,25 @@ mod tests {
                                 if *left > 0 {
                                     *left -= 1;
                                     counter.fetch_add(1, Ordering::Relaxed);
+                                    // The last piece of the doomed flight is the moment the
+                                    // server has finished replying and, as far as it knows,
+                                    // has a session. Speak here and the client is holding an
+                                    // unopenable datagram with no keys and no reply.
+                                    if *left == 0 && speak_in_the_gap {
+                                        if let (Some(c), Ok(dgrams)) = (
+                                            client,
+                                            encode_datagrams(
+                                                PacketType::OneRtt,
+                                                &hdr.cid,
+                                                0,
+                                                b"committed-session-traffic",
+                                            ),
+                                        ) {
+                                            for d in &dgrams {
+                                                let _ = downstream.send_to(d, c).await;
+                                            }
+                                        }
+                                    }
                                     continue;
                                 }
                             }
@@ -1877,7 +1905,7 @@ mod tests {
         let acceptor = listener.clone();
         let accepted = tokio::spawn(async move { acceptor.accept().await });
 
-        let (relay_addr, swallowed) = spawn_flight_swallowing_relay(server_addr).await;
+        let (relay_addr, swallowed) = spawn_flight_swallowing_relay(server_addr, false).await;
         let client = crate::api::session::connect_pinned_udp(
             "127.0.0.1".to_string(),
             relay_addr.port(),
@@ -1902,6 +1930,65 @@ mod tests {
             "the repeated client flight must be visible to an operator: this counter is the \
              only thing that distinguishes a reply lost on the way down from a path that \
              went silent in both directions"
+        );
+
+        let outcome = accepted
+            .await
+            .expect("the accept task")
+            .expect("an accepted session");
+        let server = outcome.session();
+        client.send(b"ping".to_vec()).await.expect("client write");
+        let echoed = tokio::time::timeout(Duration::from_secs(10), server.recv())
+            .await
+            .expect("the repaired session carries data")
+            .expect("a frame");
+        assert_eq!(echoed, b"ping".to_vec());
+
+        listener.shutdown();
+    }
+
+    /// The repair must hold against a server that starts using the session it committed,
+    /// not only against one that happens to stay silent until the client's timer fires.
+    ///
+    /// Between the moment a server establishes a session and the moment the client repeats
+    /// the hello it never got an answer to, the server is free to send short-header traffic:
+    /// an application greeting written on `accept()`, a keepalive, cover traffic. The client
+    /// has no keys for any of it — the reply that carried them is the flight that went
+    /// missing — and whatever it does with that datagram decides the connect. Handing it up
+    /// as a reply ends the attempt with `invalid server reply` before the retransmit timer
+    /// ever expires, and the whole repair is then conditional on server silence, which is
+    /// not a property anything guarantees. Nothing else in the suite covers that window,
+    /// because every other relay here forwards or drops and none of them speaks.
+    ///
+    /// Same shape as the test above, so what it adds is exactly the one datagram.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_repair_survives_a_server_that_speaks_before_the_client_has_the_keys() {
+        let listener = PhantomUdpListener::bind_udp("127.0.0.1:0".to_string())
+            .await
+            .expect("bind a loopback PhantomUDP listener");
+        let server_addr: SocketAddr = listener.local_addr().parse().expect("the bound address");
+        let pinned = listener.verifying_key_bytes();
+
+        let acceptor = listener.clone();
+        let accepted = tokio::spawn(async move { acceptor.accept().await });
+
+        let (relay_addr, swallowed) = spawn_flight_swallowing_relay(server_addr, true).await;
+        let client = crate::api::session::connect_pinned_udp(
+            "127.0.0.1".to_string(),
+            relay_addr.port(),
+            pinned,
+        )
+        .await
+        .expect("the client socket binds");
+
+        client.await_ready().await.expect(
+            "the handshake must survive an unopenable datagram arriving while its reply is \
+             still missing",
+        );
+        assert!(
+            swallowed.load(Ordering::Relaxed) > 0,
+            "the relay must actually have swallowed a flight, or the client was never in the \
+             window this test is about"
         );
 
         let outcome = accepted

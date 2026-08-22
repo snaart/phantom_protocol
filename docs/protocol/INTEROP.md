@@ -216,6 +216,15 @@ has been the reason a byte-perfect encoder still could not connect:
   server whose reply was lost repeats the bytes it already sent and will only do
   so for the exact hello that reply answers. A re-derived hello is a different
   question and gets a fresh handshake at best.
+- **While your client is still waiting for a reply, discard anything that is not
+  a handshake datagram** instead of feeding it to your reply parser. The server
+  commits its session when it sends the `ServerHello`, so from that instant it may
+  send short-header traffic your client has no keys for — and if the reply was the
+  flight that got lost, that traffic arrives first. Treating it as a malformed
+  reply ends the connect before your own retransmit timer ever fires, which makes
+  the whole repair conditional on the server staying quiet. Discarding it must
+  also leave the timer alone, or a talkative peer postpones your retransmission
+  for as long as it keeps talking.
 - **There is no client authentication and no ticket message.**
   `ClientHello.client_verify_key` is transcript-covered and verified by nobody
   (PROTOCOL.md § 6.2), and a resumption "ticket" is never transmitted at all —
