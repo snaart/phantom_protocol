@@ -9,15 +9,16 @@
 use crate::api::session::{FramePhase, SessionTransport};
 use crate::errors::CoreError;
 use crate::transport::phantom_udp::datagram::{encode_datagrams, push_datagram, FragmentAssembler};
-use crate::transport::phantom_udp::envelope::{ConnId, PacketType, PATH_MTU};
+use crate::transport::phantom_udp::envelope::{decode_header, ConnId, PacketType, PATH_MTU};
 // `HDR_LEN` is referenced only by the test module (`super::HDR_LEN`); a plain top-level
 // import trips clippy's `--lib` unused-import check, which excludes `#[cfg(test)]` code.
 #[cfg(test)]
 use crate::transport::phantom_udp::envelope::HDR_LEN;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -79,7 +80,7 @@ const HANDSHAKE_INITIAL_RTO: Duration = Duration::from_secs(1);
 /// loop gives up on the first read that fails rather than on the fourth.
 ///
 /// [`CLIENT_HANDSHAKE_DEADLINE`]: crate::api::session::CLIENT_HANDSHAKE_DEADLINE
-const HANDSHAKE_RETRANSMIT_BUDGET: Duration = Duration::from_secs(8);
+pub(crate) const HANDSHAKE_RETRANSMIT_BUDGET: Duration = Duration::from_secs(8);
 
 // The budget is only meaningful if it really is inside the deadline it is sized against;
 // a later edit to either constant that inverts them is a compile error rather than a
@@ -114,6 +115,42 @@ fn next_handshake_wait(attempt: u32, spent: Duration) -> Option<Duration> {
         .checked_mul(doublings)
         .unwrap_or(HANDSHAKE_RETRANSMIT_BUDGET);
     Some(rto.min(remaining))
+}
+
+/// The intervals a client actually waits out, in order, walked from
+/// [`next_handshake_wait`] exactly as the receive loop spends them.
+///
+/// Today that is `[1 s, 2 s, 4 s, 1 s]`: the flight is repeated at the end of each interval
+/// but the last, and the last interval is the one the client spends waiting for the answer
+/// to its final repeat before abandoning the connect.
+///
+/// Two numbers the **server** is sized against come out of this walk (PROTOCOL § 6.1), and
+/// they are different numbers, which is the reason the whole schedule is returned rather
+/// than either of them:
+///
+/// * `len() - 1` is the repeat count `MAX_FLIGHT_REPEATS` must equal — a server answering
+///   fewer leaves the client's last questions unanswered, one answering more offers work
+///   nobody will ask for.
+/// * the sum of all but the last interval is **when the last question is asked**, which is
+///   what `HANDSHAKE_FLIGHT_RETENTION` has to outlast. The *total* sum is not that number
+///   and cannot stand in for it: the total is an identity on
+///   [`HANDSHAKE_RETRANSMIT_BUDGET`] — every wait is clipped to what remains of the budget,
+///   so the walk terminates exactly on it for any initial RTO and any budget — and an
+///   assertion against an identity is an assertion about nothing.
+///
+/// Test-only, because its whole job is to be compared against those constants: production
+/// reads the constants, and this is what makes them answerable to the schedule.
+#[cfg(test)]
+pub(crate) fn handshake_retransmit_schedule() -> Vec<Duration> {
+    let mut attempt = 0u32;
+    let mut spent = Duration::ZERO;
+    let mut waits = Vec::new();
+    while let Some(wait) = next_handshake_wait(attempt, spent) {
+        waits.push(wait);
+        spent = spent.saturating_add(wait);
+        attempt = attempt.saturating_add(1);
+    }
+    waits
 }
 
 const PHASE_HANDSHAKE: u8 = 0;
@@ -497,6 +534,44 @@ impl SessionTransport for UdpClientTransport {
                 }
             };
             let datagram = if from_prev { &buf_prev[..n] } else { &buf[..n] };
+            // PROTOCOL § 6.1 rule 6: while the handshake runs, nothing that is not a
+            // handshake datagram *of this connection* may reach the reply parser, and the
+            // two halves of that are guarding different things.
+            //
+            // The type is what a committed server's own traffic fails: it may already be
+            // sending short-header frames (an application greeting written on accept, a
+            // keepalive) while the client is still waiting for a `ServerHello` that went
+            // missing, and the caller parses whatever it is handed as a `ServerReply`, so
+            // handing one up ends the connect with "invalid server reply".
+            //
+            // The connection id is what an *unrelated sender* fails, and without it the
+            // type check narrows the attack rather than removing it: the type lives in the
+            // unauthenticated outer envelope, so a datagram addressed to a connecting
+            // client with that one byte set to `Initial` would be handed up and kill the
+            // connect. The socket is unconnected and accepts any source, so this is the
+            // only field on an unauthenticated datagram that an off-path sender cannot
+            // simply choose — `cid` is 64 bits of `getrandom` output that only appears on
+            // this connection's own datagrams. During the handshake `established_cid` is
+            // still unset (the pump raises the phase before stamping it), so the bootstrap
+            // id is the whole of what this connection answers to.
+            //
+            // Checked before `push_datagram` rather than after it so a spray cannot evict
+            // this connection's half-reassembled reply from the fragment assembler either,
+            // at the cost of one extra header decode per handshake datagram — a handful
+            // per connect, and never on the data path.
+            //
+            // Dropping here rather than at the caller keeps the retransmit schedule intact:
+            // `attempt` / `spent` / `retransmit_at` live across this `continue`, so a peer
+            // that talks cannot postpone the repeat the client's own timer is about to
+            // trigger, nor extend the budget it gives up on. The phase is re-read rather
+            // than reusing the loop-top snapshot so the check reflects the transport's
+            // state now.
+            if self.phase.load(Ordering::Relaxed) == PHASE_HANDSHAKE {
+                match decode_header(datagram) {
+                    Ok((hdr, _)) if hdr.ty == PacketType::Initial && hdr.cid == self.cid => {}
+                    _ => continue,
+                }
+            }
             let mut asm = self.reasm.lock().await;
             let decoded = push_datagram(&mut asm, datagram);
             // Overlap-drop (D7): a well-formed datagram on the NEW (active) socket means the
@@ -639,6 +714,55 @@ impl SessionTransport for UdpClientTransport {
     }
 }
 
+/// A server handshake reply exactly as it went on the wire, together with the question it
+/// answers, so the listener can repeat it if the client asks the same question again
+/// (PROTOCOL § 6.1).
+///
+/// Three things about its shape are load-bearing rather than convenient.
+///
+/// It holds **datagrams, not a message**. A repeat has to be the bytes that were already
+/// sent, not a re-derivation: `process_client_hello` draws fresh randomness for the KEM
+/// encapsulation and the session id, so running it again would produce a different, equally
+/// valid `ServerHello` for a session the server has already committed under different keys.
+/// Repeating is therefore the only safe answer, and re-deriving is the unsafe one.
+///
+/// `question` is the digest of the frame the reply answers, and it is what decides whether a
+/// repeat is owed. That is not a heuristic for "is this the same client": the reply's
+/// signature covers the whole `ClientHello` (Invariant 7), so a retained reply is a valid
+/// answer to *that* hello and to no other. A hello that differs in any byte — a fresh nonce,
+/// a different cookie — needs a fresh handshake and would be rejected by the client's own
+/// transcript check if it were answered from here. Same question, same answer; different
+/// question, no answer.
+///
+/// `delivered` is shared with the live session and set the first time an inbound packet
+/// AEAD-opens. A peer can only produce such a packet from the session keys the reply
+/// carried, so the latch is proof of receipt that nothing off-path can forge, and once it is
+/// set the retained bytes are dead weight.
+pub(crate) struct HandshakeFlight {
+    /// The reply flight as it was sent, datagram for datagram. `Arc` so repeating it costs a
+    /// refcount rather than a copy of several kilobytes on the demux thread.
+    pub(crate) datagrams: Arc<Vec<Vec<u8>>>,
+    /// The only address a repeat is ever sent to — the one the original went to. A resend is
+    /// therefore not a reflector: its destination comes from the server's own record of a
+    /// completed handshake, never from the datagram that triggered it.
+    pub(crate) peer: SocketAddr,
+    /// SHA-256 of the handshake frame this reply answers.
+    pub(crate) question: [u8; 32],
+    /// Total wire bytes of `datagrams`, kept beside them so the amplification bound can be
+    /// checked once, at retention, rather than on every repeat.
+    pub(crate) wire_bytes: usize,
+    /// Wire bytes of the question, for the same reason — and **the same quantity**, which is
+    /// the whole point of storing it rather than the frame length that is to hand. An
+    /// anti-amplification bound compares what went out on the path against what came in on
+    /// it; a reassembled frame is neither, and dividing one by the other yields a number that
+    /// is not a ratio of anything. The receiving side never sees the question's datagrams, so
+    /// this is `wire_len` of its frame: exact for a sender that chunks as this implementation
+    /// does, and a lower bound on what any other sender spent, which is the safe direction.
+    pub(crate) question_wire_bytes: usize,
+    /// Set by the session the first time an inbound packet authenticates.
+    pub(crate) delivered: Arc<AtomicBool>,
+}
+
 /// Per-session server transport. The listener's demux task reassembles inbound datagrams and pushes
 /// the inner frames to `rx`; outbound frames are enveloped and sent to the captured `peer` from
 /// `send_socket`. A server migration ([`migrate_to`](Self::migrate_to)) swaps `send_socket` to a
@@ -687,6 +811,17 @@ pub struct UdpServerTransport {
     /// a spoofed (never-decrypting) datagram cannot clobber the candidate slot.
     last_recv_src: ArcSwap<Option<SocketAddr>>,
     last_frame_len: AtomicU64,
+    /// SHA-256 of the most recent frame received while still in the Handshake phase, with its
+    /// wire length — the question the next handshake-phase reply answers (PROTOCOL § 6.1).
+    /// Only the handshake task reads this channel before the phase flips, so at the moment a
+    /// reply is sent this really is the hello being replied to.
+    last_handshake_question: ArcSwap<Option<([u8; 32], usize)>>,
+    /// The most recent handshake-phase reply, retained for the listener to repeat. Taken
+    /// once, by the accept path, when the handshake succeeds; dropped with the transport on
+    /// every other path.
+    handshake_flight: parking_lot::Mutex<Option<HandshakeFlight>>,
+    /// Shared with any retained flight: set the first time an inbound packet AEAD-opens.
+    peer_authenticated: Arc<AtomicBool>,
 }
 
 impl UdpServerTransport {
@@ -712,7 +847,29 @@ impl UdpServerTransport {
             cand_sent: AtomicU64::new(0),
             last_recv_src: ArcSwap::from_pointee(None),
             last_frame_len: AtomicU64::new(0),
+            last_handshake_question: ArcSwap::from_pointee(None),
+            handshake_flight: parking_lot::Mutex::new(None),
+            peer_authenticated: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Take the retained handshake reply flight, if this transport sent one (PROTOCOL § 6.1).
+    ///
+    /// Taken rather than borrowed so exactly one holder owns the several kilobytes: the accept
+    /// path moves it into the listener's retention table when the handshake succeeds, and on
+    /// every other path it goes with the transport. A second call yields `None`, which makes
+    /// "at most one retained flight per handshake" a property of the type rather than of its
+    /// callers.
+    ///
+    /// Taking also forgets the question, which is what stops the slot refilling. The accept
+    /// path takes the flight before the data pump exists, and the pump moves the transport to
+    /// the Established phase a moment *after* it starts — so a frame sent in that window would
+    /// otherwise be retained as a handshake reply and held, unread by anyone, for the life of
+    /// the session. With no question on record nothing is a reply, and the window closes.
+    pub(crate) fn take_handshake_flight(&self) -> Option<HandshakeFlight> {
+        let taken = self.handshake_flight.lock().take();
+        self.last_handshake_question.store(Arc::new(None));
+        taken
     }
 
     /// Migrate the server's send path to a fresh local socket (the server-side mirror of
@@ -810,6 +967,26 @@ impl SessionTransport for UdpServerTransport {
                 .await
                 .map_err(|e| CoreError::NetworkError(format!("udp send_to: {e}")))?;
         }
+        // PROTOCOL § 6.1: keep a handshake reply as it went out, so the listener can repeat
+        // it byte for byte if the client's flight comes round again. Only the handshake phase
+        // retains: an established session's frames are carried by the ARQ, which is the
+        // mechanism this one exists to stand in for while there is none. The datagrams are
+        // moved rather than copied — they were built for this send and would otherwise be
+        // dropped here — and the question they answer is whatever `recv_bytes` last saw,
+        // which on this transport is the hello the handshake task is replying to.
+        if ty == PacketType::Initial {
+            if let Some((question, question_wire_bytes)) = **self.last_handshake_question.load() {
+                let wire_bytes = dgrams.iter().map(Vec::len).sum();
+                *self.handshake_flight.lock() = Some(HandshakeFlight {
+                    datagrams: Arc::new(dgrams),
+                    peer,
+                    question,
+                    wire_bytes,
+                    question_wire_bytes,
+                    delivered: self.peer_authenticated.clone(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -829,10 +1006,30 @@ impl SessionTransport for UdpServerTransport {
         self.last_recv_src.store(Arc::new(Some(src)));
         self.last_frame_len
             .store(frame.len() as u64, Ordering::Relaxed);
+        // PROTOCOL § 6.1: while the handshake runs, remember what was asked. The digest is
+        // taken here rather than in the listener because this is the one place that sees the
+        // reassembled frame the reply is computed from, and it costs a hash of a few kilobytes
+        // once per handshake — never on the data path, which is what the phase gate buys.
+        if self.phase.load(Ordering::Relaxed) == PHASE_HANDSHAKE {
+            let mut hasher = Sha256::new();
+            hasher.update(&frame);
+            let digest: [u8; 32] = hasher.finalize().into();
+            // Recorded as wire bytes, not frame bytes, because that is what the
+            // amplification bound is measured in on the other side of the comparison.
+            self.last_handshake_question.store(Arc::new(Some((
+                digest,
+                crate::transport::phantom_udp::datagram::wire_len(frame.len()),
+            ))));
+        }
         Ok(frame)
     }
 
     fn confirm_authenticated_source(&self) {
+        // PROTOCOL § 6.1: an inbound packet has AEAD-opened, so the peer holds keys it could
+        // only have derived from the reply this session's handshake sent — proof of receipt
+        // that nothing off-path can forge. Latched before the same-address early return
+        // below, because whether the peer moved has nothing to do with whether it heard us.
+        self.peer_authenticated.store(true, Ordering::Relaxed);
         // M-1: the frame from `last_recv_src` just authenticated (AEAD-opened), so it really is
         // the established peer — possibly at a NEW address (migration / NAT rebind). Register it
         // as the candidate the session challenges before switching, and (re)seed its
@@ -997,6 +1194,10 @@ mod tests {
         assert_eq!(got.as_deref(), Some(&b"hello"[..]));
 
         // Peer replies with a >MTU frame (fragments); client reassembles via recv_bytes.
+        // Short-header traffic belongs to an established session — a client still waiting
+        // for its handshake reply discards it — so the phase moves first, as the pump moves
+        // it the moment `process_server_hello` returns.
+        client.set_frame_phase(FramePhase::Established);
         let big: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
         for d in encode_datagrams(PacketType::OneRtt, &client.cid(), 1, &big).expect("encode") {
             peer.send_to(&d, from).await.unwrap();
@@ -1069,6 +1270,159 @@ mod tests {
         let (_s, n, r) = tokio::join!(send, recv, recv_client);
         assert!(n >= super::HDR_LEN);
         assert_eq!(&r.unwrap().unwrap()[..], &b"reply"[..]);
+    }
+
+    /// A short-header datagram arriving mid-handshake is ignored, not mistaken for a reply.
+    ///
+    /// The caller above `recv_bytes` parses whatever it is handed as a `ServerReply` and
+    /// treats a parse failure as terminal, so a frame that cannot be one ends the connect.
+    /// A server that has committed its session is free to send short-header traffic — an
+    /// application greeting on accept, a keepalive — while the client is still waiting for a
+    /// `ServerHello` that went missing, and the client has no keys to open it with. Without
+    /// this gate the reply-repeat repair (PROTOCOL § 6.1) would hold only against a server
+    /// that happened to stay silent for the whole retransmit interval, which is not a
+    /// property anything guarantees.
+    ///
+    /// The second half is what keeps the gate from being a blanket drop: once the session is
+    /// Established the same datagram is delivered, because then it is exactly what the pump
+    /// is waiting for.
+    ///
+    /// This covers the type half of the gate only. The type is a field of the
+    /// unauthenticated envelope, so on its own it narrows what an unrelated sender has to
+    /// write rather than excluding it; the connection-id half is what excludes it, and
+    /// `a_handshake_datagram_for_another_connection_cannot_end_this_one` is where that is
+    /// pinned.
+    #[tokio::test]
+    async fn a_short_header_datagram_mid_handshake_is_ignored_rather_than_ending_the_connect() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+        // Default phase is Handshake.
+        client.send_bytes(b"client-hello").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, from) = peer.recv_from(&mut buf).await.unwrap();
+
+        // The server speaks its session before this client can open anything, and only then
+        // does the reply arrive. Both go out back to back so ordering on loopback is fixed.
+        for d in encode_datagrams(
+            PacketType::OneRtt,
+            &client.cid(),
+            0,
+            b"committed-session-traffic",
+        )
+        .expect("encode")
+        {
+            peer.send_to(&d, from).await.unwrap();
+        }
+        for d in encode_datagrams(PacketType::Initial, &client.cid(), 1, b"server-hello")
+            .expect("encode")
+        {
+            peer.send_to(&d, from).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), client.recv_bytes())
+            .await
+            .expect("the reply must still be reachable")
+            .expect("recv");
+        assert_eq!(
+            &got[..],
+            &b"server-hello"[..],
+            "a mid-handshake short-header datagram was handed up as if it were a reply; the \
+             caller parses it as a ServerReply and fails the whole connect"
+        );
+
+        // And the gate is a phase gate, not a blanket refusal.
+        client.set_frame_phase(FramePhase::Established);
+        for d in
+            encode_datagrams(PacketType::OneRtt, &client.cid(), 2, b"session-data").expect("encode")
+        {
+            peer.send_to(&d, from).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), client.recv_bytes())
+            .await
+            .expect("established sessions must still receive short-header traffic")
+            .expect("recv");
+        assert_eq!(&got[..], &b"session-data"[..]);
+    }
+
+    /// A handshake datagram that does not carry this connection's id is not a reply, whoever
+    /// sent it and whatever type byte it claims.
+    ///
+    /// The type gate above is necessary and not sufficient, and the difference is the whole
+    /// of this test. `PacketType` lives in the unauthenticated outer envelope: it is a
+    /// two-bit field of a cleartext byte that any sender writes. A gate that only asks
+    /// "is this a handshake datagram" therefore leaves a connecting client killable by one
+    /// datagram from anyone who can reach its port — the caller parses whatever it is handed
+    /// as a `ServerReply` and treats a parse failure as terminal, so a payload of noise under
+    /// an `Initial` header ends the attempt. That is the same failure the type gate was added
+    /// to remove, reached by setting one byte instead of none.
+    ///
+    /// The connection id is what makes the gate a gate. It is 64 bits drawn from the system
+    /// CSPRNG at `connect`, it appears only on this connection's own datagrams, and during
+    /// the handshake it is the *bootstrap* id — the pump raises the frame phase before it
+    /// stamps the rotating chain, so there is no window in which a second id would be
+    /// legitimate. Deleting the `hdr.cid == self.cid` half of that check is the naive version
+    /// of this mechanism, and the first half of this test is what fails against it.
+    ///
+    /// The second half is the control: with the *right* id the same sender is answered, so
+    /// what the first half measures is the id and not the reply's provenance — nothing here
+    /// checks source addresses, and this test would pass against a listener that did while
+    /// saying nothing about the one that does not.
+    #[tokio::test]
+    async fn a_handshake_datagram_for_another_connection_cannot_end_this_one() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpClientTransport::connect(peer_addr).await.unwrap();
+        // Default phase is Handshake.
+        client.send_bytes(b"client-hello").await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (_n, from) = peer.recv_from(&mut buf).await.unwrap();
+
+        // A third party that never saw this connection's datagrams: it can reach the port and
+        // it can set the type byte, and that is all it has.
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut wrong = client.cid();
+        wrong[0] ^= 0xFF;
+        for d in
+            encode_datagrams(PacketType::Initial, &wrong, 0, b"not-your-reply").expect("encode")
+        {
+            stranger.send_to(&d, from).await.unwrap();
+        }
+        // ... and the real reply, after it, so the assertion is "the stranger's datagram was
+        // skipped" rather than "nothing arrived at all".
+        for d in encode_datagrams(PacketType::Initial, &client.cid(), 1, b"server-hello")
+            .expect("encode")
+        {
+            peer.send_to(&d, from).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), client.recv_bytes())
+            .await
+            .expect("the real reply must still be reachable")
+            .expect("recv");
+        assert_eq!(
+            &got[..],
+            &b"server-hello"[..],
+            "a handshake-typed datagram carrying a connection id that is not this \
+             connection's was handed up as if it were a reply; the caller parses it as a \
+             ServerReply and one datagram from anyone who can reach the port ends the connect"
+        );
+
+        // The control: the same stranger, the same socket, the right connection id.
+        for d in encode_datagrams(PacketType::Initial, &client.cid(), 2, b"second-reply")
+            .expect("encode")
+        {
+            stranger.send_to(&d, from).await.unwrap();
+        }
+        let got = tokio::time::timeout(Duration::from_secs(3), client.recv_bytes())
+            .await
+            .expect("a datagram carrying this connection's id must still be delivered")
+            .expect("recv");
+        assert_eq!(
+            &got[..],
+            &b"second-reply"[..],
+            "the gate is the connection id and nothing else: this transport never compares \
+             source addresses, and a test that passed only because the sender differed would \
+             be measuring a check that does not exist"
+        );
     }
 
     /// The handshake shim must still be waiting when an honest reply arrives later than a
@@ -1194,6 +1548,77 @@ mod tests {
             elapsed < crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
             "the spray stretched the refusal to {elapsed:?}, past the {:?} session deadline",
             crate::api::session::CLIENT_HANDSHAKE_DEADLINE
+        );
+    }
+
+    /// The datagrams a mid-handshake client now discards must not buy their sender anything
+    /// either — not a frame handed up, and not a moment of the schedule.
+    ///
+    /// The sibling above sprays bytes that cannot decode, which the read has always dropped.
+    /// This sprays the case that was added: well-formed short-header datagrams, each a
+    /// complete frame, of the shape a committed server's session traffic has. Discarding them
+    /// is what keeps a talkative server from ending a connect it is about to repair — but a
+    /// discard is also a resumption of the read, and a resumption that rearmed the timer would
+    /// hand an off-path sender the length of the wait. So both directions are asserted: the
+    /// refusal still arrives (it is not stretched by the spray) and it does not arrive early
+    /// (the schedule was genuinely spent, not skipped).
+    ///
+    /// Before the discard existed this test would not have reached either assertion: the first
+    /// sprayed datagram was handed up as a reply and the caller ended the connect on it.
+    #[tokio::test]
+    async fn a_short_header_spray_cannot_postpone_or_shorten_the_handshake_refusal() {
+        let black_hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = black_hole.local_addr().unwrap();
+        let client = UdpClientTransport::connect(server).await.unwrap();
+        client.send_bytes(b"client-hello").await.unwrap();
+
+        let cid = client.cid();
+        let off_path = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spray = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (_n, victim) = black_hole.recv_from(&mut buf).await.unwrap();
+            let mut packet_id = 0u32;
+            loop {
+                // A whole frame every time, so nothing here is dropped by the decode: the
+                // only thing that stops it being handed up is the phase gate.
+                if let Ok(dgrams) =
+                    encode_datagrams(PacketType::OneRtt, &cid, packet_id, b"session-traffic")
+                {
+                    for d in &dgrams {
+                        let _ = off_path.send_to(d, victim).await;
+                    }
+                }
+                packet_id = packet_id.wrapping_add(1);
+                tokio::time::sleep(HANDSHAKE_INITIAL_RTO / 10).await;
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            client.recv_bytes(),
+        )
+        .await;
+        spray.abort();
+        let elapsed = started.elapsed();
+
+        let outcome = outcome.expect("a short-header spray held the read past the deadline");
+        assert!(
+            matches!(outcome, Err(CoreError::Timeout)),
+            "a path that never answers is a Timeout even while short-header traffic arrives \
+             on it, got {outcome:?}"
+        );
+        assert!(
+            elapsed < crate::api::session::CLIENT_HANDSHAKE_DEADLINE,
+            "the spray stretched the refusal to {elapsed:?}, past the {:?} session deadline — \
+             a discard that rearmed the retransmit timer would last exactly as long as the \
+             sender kept sending",
+            crate::api::session::CLIENT_HANDSHAKE_DEADLINE
+        );
+        assert!(
+            elapsed >= HANDSHAKE_RETRANSMIT_BUDGET / 2,
+            "gave up after only {elapsed:?}; discarding a datagram must leave the schedule \
+             where it was, not consume it"
         );
     }
 
@@ -1349,6 +1774,93 @@ mod tests {
         let (hdr, got) = push_datagram(&mut asm, &buf[..n]).unwrap();
         assert_eq!(hdr.cid, [3u8; 8]);
         assert_eq!(got.as_deref(), Some(&b"to-peer"[..]));
+    }
+
+    /// The reply flight a handshake sent is retained exactly once, for exactly the hello it
+    /// answers, and only while the handshake is running (PROTOCOL § 6.1).
+    ///
+    /// Three properties, and the third is the one that is easy to lose. The accept path takes
+    /// the flight before the data pump exists, and the pump moves this transport to the
+    /// Established phase a moment *after* it starts — so without forgetting the question on
+    /// the way out, a frame sent in that window would be retained as a handshake reply and
+    /// held, unread by anyone, for the whole life of the session. That is a per-session leak
+    /// of a few kilobytes that no test of the repair itself would notice, because the repair
+    /// works either way.
+    #[tokio::test]
+    async fn a_handshake_reply_is_retained_once_and_only_while_the_handshake_runs() {
+        use tokio::sync::mpsc;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let st = UdpServerTransport::new(sock.clone(), peer_addr, [11u8; 8], tx.clone(), rx);
+
+        assert!(
+            st.take_handshake_flight().is_none(),
+            "a transport that has answered nothing retains nothing"
+        );
+
+        // The hello, then the reply to it — the shape of the accept path.
+        tx.send((Bytes::from_static(b"a-client-hello"), peer_addr))
+            .await
+            .unwrap();
+        let _ = st.recv_bytes().await.unwrap();
+        st.send_bytes(b"the-server-reply").await.unwrap();
+
+        let flight = st
+            .take_handshake_flight()
+            .expect("a handshake-phase reply is retained");
+        assert_eq!(
+            flight.peer, peer_addr,
+            "the retained destination is where the reply actually went"
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(b"a-client-hello");
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(
+            flight.question, expected,
+            "the retained flight names the hello it answers, not some other frame"
+        );
+        assert!(
+            flight.wire_bytes >= b"the-server-reply".len(),
+            "the retained wire size must count the envelope, since that is what the \
+             amplification bound is measured in"
+        );
+        assert_eq!(
+            flight.question_wire_bytes,
+            crate::transport::phantom_udp::datagram::wire_len(b"a-client-hello".len()),
+            "and the question must be recorded in that same quantity. The reassembled frame \
+             length is what is to hand here and it is the wrong one: dividing wire bytes by \
+             frame bytes is not a ratio of anything, and the error grows with every fragment"
+        );
+        assert!(
+            !flight.delivered.load(Ordering::Relaxed),
+            "nothing has authenticated yet"
+        );
+
+        assert!(
+            st.take_handshake_flight().is_none(),
+            "the flight has exactly one owner"
+        );
+
+        // The window between the accept path taking the flight and the pump declaring the
+        // session Established. Anything sent here is session traffic, not a reply.
+        st.send_bytes(b"still-in-the-handshake-phase")
+            .await
+            .unwrap();
+        assert!(
+            st.take_handshake_flight().is_none(),
+            "a frame sent after the reply was handed on must not be retained as a reply; \
+             otherwise every accepted session parks kilobytes nothing will ever read"
+        );
+
+        // And the latch the listener releases retention on is set by an authenticated packet.
+        st.confirm_authenticated_source();
+        assert!(
+            flight.delivered.load(Ordering::Relaxed),
+            "an inbound packet that AEAD-opened is proof the client received the reply, and \
+             the retained copy must learn it through the shared latch"
+        );
     }
 
     /// P4.1: a frame from a source other than the established peer registers a

@@ -1226,9 +1226,12 @@ public func FfiConverterTypePhantomListener_lower(_ value: PhantomListener) -> U
  * `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
  * `Connecting` (handshake rejection, a wrong pin) and `Closed` from
  * `disconnect()`. `Migrating` is entered when the path goes silent and left
- * again for `Connected` if it recovers; sends keep buffering throughout. There
- * is no intermediate classical-only state — the hybrid handshake is one flight,
- * so the session is either unkeyed or fully post-quantum keyed.
+ * again for `Connected` if it recovers; sends keep buffering throughout.
+ * [`Draining`](ConnectionState::Draining) is the one state that buffers
+ * nothing: it means the *peer* announced its close, so reads continue while
+ * writes are refused rather than queued for a wire they will never reach.
+ * There is no intermediate classical-only state — the hybrid handshake is one
+ * flight, so the session is either unkeyed or fully post-quantum keyed.
  *
  * # Example
  *
@@ -1521,11 +1524,12 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
      *
      * **Message boundaries are not preserved.** The data pump splits `data`
      * into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
-     * bytes — one chunk plus its packet overhead is exactly one PhantomUDP
-     * datagram — and writes each chunk separately, so the peer's
-     * [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
-     * An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
-     * nothing marks where one `send` ended and the next began.
+     * bytes — 1156 on this build, sized so that one chunk plus its packet
+     * overhead is exactly one PhantomUDP datagram — and writes each chunk
+     * separately, so the peer's [`recv`](Self::recv) yields one result *per
+     * chunk*, not one per `send`. An 8 KiB `send` arrives as eight `recv`s.
+     * Nothing reassembles them, and nothing marks where one `send` ended and
+     * the next began.
      *
      * This is silent when it bites: the first chunk of a structured message
      * usually still parses, as a truncated one, so a caller that reads a single
@@ -1593,9 +1597,12 @@ public protocol PhantomSessionProtocol: AnyObject, Sendable {
  * `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
  * `Connecting` (handshake rejection, a wrong pin) and `Closed` from
  * `disconnect()`. `Migrating` is entered when the path goes silent and left
- * again for `Connected` if it recovers; sends keep buffering throughout. There
- * is no intermediate classical-only state — the hybrid handshake is one flight,
- * so the session is either unkeyed or fully post-quantum keyed.
+ * again for `Connected` if it recovers; sends keep buffering throughout.
+ * [`Draining`](ConnectionState::Draining) is the one state that buffers
+ * nothing: it means the *peer* announced its close, so reads continue while
+ * writes are refused rather than queued for a wire they will never reach.
+ * There is no intermediate classical-only state — the hybrid handshake is one
+ * flight, so the session is either unkeyed or fully post-quantum keyed.
  *
  * # Example
  *
@@ -2178,11 +2185,12 @@ open func resumptionHint()async  -> ResumptionHint?  {
      *
      * **Message boundaries are not preserved.** The data pump splits `data`
      * into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
-     * bytes — one chunk plus its packet overhead is exactly one PhantomUDP
-     * datagram — and writes each chunk separately, so the peer's
-     * [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
-     * An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
-     * nothing marks where one `send` ended and the next began.
+     * bytes — 1156 on this build, sized so that one chunk plus its packet
+     * overhead is exactly one PhantomUDP datagram — and writes each chunk
+     * separately, so the peer's [`recv`](Self::recv) yields one result *per
+     * chunk*, not one per `send`. An 8 KiB `send` arrives as eight `recv`s.
+     * Nothing reassembles them, and nothing marks where one `send` ended and
+     * the next began.
      *
      * This is silent when it bites: the first chunk of a structured message
      * usually still parses, as a truncated one, so a caller that reads a single
@@ -2376,12 +2384,12 @@ public protocol PhantomStreamProtocol: AnyObject, Sendable {
      *
      * **Message boundaries are not preserved.** The session's data pump splits
      * `data` into chunks of
-     * [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — one chunk
-     * plus its packet overhead is exactly one PhantomUDP datagram — and buffers
-     * each chunk as its own reliable write, so the peer's [`recv`](Self::recv)
-     * yields one result *per chunk*, not one per `send_reliable`. Order is
-     * guaranteed; grouping is not, and nothing marks where one call's payload
-     * ended.
+     * [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — 1156 on
+     * this build, sized so that one chunk plus its packet overhead is exactly
+     * one PhantomUDP datagram — and buffers each chunk as its own reliable
+     * write, so the peer's [`recv`](Self::recv) yields one result *per chunk*,
+     * not one per `send_reliable`. Order is guaranteed; grouping is not, and
+     * nothing marks where one call's payload ended.
      *
      * Frame the messages yourself if you need them: write a length prefix ahead
      * of each payload and accumulate `recv` results until the declared length is
@@ -2403,10 +2411,11 @@ public protocol PhantomStreamProtocol: AnyObject, Sendable {
      * **Message boundaries are not preserved**, exactly as in
      * [`send_reliable`](Self::send_reliable): the pump splits `data` into
      * chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes
-     * and sends each on its own. Here that is sharper than on the reliable
-     * path, because the chunks are independent datagrams: any subset of them
-     * can be lost or arrive out of order, so a payload larger than one chunk
-     * can reach the peer with a hole in the middle and no signal that it did.
+     * — 1156 on this build — and sends each on its own. Here that is sharper
+     * than on the reliable path, because the chunks are independent datagrams:
+     * any subset of them can be lost or arrive out of order, so a payload
+     * larger than one chunk can reach the peer with a hole in the middle and no
+     * signal that it did.
      *
      * Keep unreliable payloads within one chunk, or carry your own length
      * prefix and sequence number and drop incomplete messages —
@@ -2556,12 +2565,12 @@ open func recv()async throws  -> Data?  {
      *
      * **Message boundaries are not preserved.** The session's data pump splits
      * `data` into chunks of
-     * [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — one chunk
-     * plus its packet overhead is exactly one PhantomUDP datagram — and buffers
-     * each chunk as its own reliable write, so the peer's [`recv`](Self::recv)
-     * yields one result *per chunk*, not one per `send_reliable`. Order is
-     * guaranteed; grouping is not, and nothing marks where one call's payload
-     * ended.
+     * [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — 1156 on
+     * this build, sized so that one chunk plus its packet overhead is exactly
+     * one PhantomUDP datagram — and buffers each chunk as its own reliable
+     * write, so the peer's [`recv`](Self::recv) yields one result *per chunk*,
+     * not one per `send_reliable`. Order is guaranteed; grouping is not, and
+     * nothing marks where one call's payload ended.
      *
      * Frame the messages yourself if you need them: write a length prefix ahead
      * of each payload and accumulate `recv` results until the declared length is
@@ -2598,10 +2607,11 @@ open func sendReliable(data: Data)async throws   {
      * **Message boundaries are not preserved**, exactly as in
      * [`send_reliable`](Self::send_reliable): the pump splits `data` into
      * chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes
-     * and sends each on its own. Here that is sharper than on the reliable
-     * path, because the chunks are independent datagrams: any subset of them
-     * can be lost or arrive out of order, so a payload larger than one chunk
-     * can reach the peer with a hole in the middle and no signal that it did.
+     * — 1156 on this build — and sends each on its own. Here that is sharper
+     * than on the reliable path, because the chunks are independent datagrams:
+     * any subset of them can be lost or arrive out of order, so a payload
+     * larger than one chunk can reach the peer with a hole in the middle and no
+     * signal that it did.
      *
      * Keep unreliable payloads within one chunk, or carry your own length
      * prefix and sequence number and drop incomplete messages —
@@ -3141,7 +3151,7 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
     public var aeadFailureTotal: UInt64
     public var uptimeSecs: UInt64
     /**
-     * Deliberately last in the record, and it must stay last.
+     * Deliberately near the end of the record, and new fields go after it.
      *
      * UniFFI lays a record out in declaration order and the generated bindings
      * read it back the same way, so inserting a field anywhere but the end
@@ -3154,12 +3164,59 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
      * misreading the ones it already knew.
      */
     public var unencryptedDroppedTotal: UInt64
+    /**
+     * Handshake-type datagrams that arrived on a PhantomUDP connection the listener
+     * had already committed a route to — a client repeating its flight because it
+     * never saw the reply (PROTOCOL § 6.1). Appended last for the reason above.
+     *
+     * Repetition is normal on a lossy path and is what the server's repeat answers,
+     * so a small non-zero value is health rather than alarm. What it is for is
+     * reading against a client that timed out connecting: non-zero says its
+     * questions arrived and one reply flight was lost on the way down; zero says the
+     * path fell silent in both directions. Nothing else on either side tells those
+     * apart.
+     */
+    public var initialOnCommittedRouteTotal: UInt64
+    /**
+     * Retained reply flights this listener actually repeated (PROTOCOL § 6.1), one
+     * per repeat sent rather than per datagram of it. Appended for the reason above.
+     *
+     * The field before it says a client asked again; this one says an answer went
+     * back, and the pair is what makes a failed connect readable. Questions arriving
+     * and answers going back is the repair working. Questions arriving and no answers
+     * is a listener that had nothing retained for that session — it was evicted,
+     * expired, or the budget for it was already spent. No questions at all is a path
+     * that went silent upstream, which is a different fault in a different direction.
+     */
+    public var handshakeFlightRepeatedTotal: UInt64
+    /**
+     * Retained reply flights dropped to make room for a newer one (PROTOCOL § 6.1).
+     * Appended for the reason above.
+     *
+     * This is the repair running out of the memory it is allowed. Non-zero says the
+     * listener is completing handshakes faster than its retention budget covers, and
+     * that the evicted sessions are back to losing a whole connect to one lost reply
+     * datagram — a rare, load-dependent failure that nothing else makes visible.
+     */
+    public var handshakeFlightEvictedTotal: UInt64
+    /**
+     * Reply flights never retained at all, because repeating one would have exceeded
+     * the RFC 9000 § 8.2 amplification limit (PROTOCOL § 6.1 rule 3). Appended for the
+     * reason above.
+     *
+     * The third way the repair can fail to cover a session, and the only one that is not
+     * about load: the two fields above mean the mechanism ran and then let go, this one
+     * means it never armed. It reads zero for every build whose reply is inside the bound —
+     * today's is 1.99x against a limit of 3 — so a non-zero value is a message size having
+     * moved, which changes no byte a peer would notice and which nothing else reports.
+     */
+    public var handshakeFlightRefusedTotal: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(packetsSent: UInt64, packetsRecv: UInt64, bytesSent: UInt64, bytesRecv: UInt64, avgEncryptNs: UInt64, avgDecryptNs: UInt64, encryptCount: UInt64, decryptCount: UInt64, rttUsPath0: UInt64, activeSessions: Int64, activeStreams: Int64, handshakesSuccess: UInt64, handshakesFailure: UInt64, handshakeLatencyNsSum: UInt64, handshakeLatencyCount: UInt64, replayRejectedTotal: UInt64, aeadFailureTotal: UInt64, uptimeSecs: UInt64, 
         /**
-         * Deliberately last in the record, and it must stay last.
+         * Deliberately near the end of the record, and new fields go after it.
          *
          * UniFFI lays a record out in declaration order and the generated bindings
          * read it back the same way, so inserting a field anywhere but the end
@@ -3170,7 +3227,50 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
          * this counter where it asked for `uptime_secs`. Appending is the only
          * placement where a stale reader is merely missing a field rather than
          * misreading the ones it already knew.
-         */unencryptedDroppedTotal: UInt64) {
+         */unencryptedDroppedTotal: UInt64, 
+        /**
+         * Handshake-type datagrams that arrived on a PhantomUDP connection the listener
+         * had already committed a route to — a client repeating its flight because it
+         * never saw the reply (PROTOCOL § 6.1). Appended last for the reason above.
+         *
+         * Repetition is normal on a lossy path and is what the server's repeat answers,
+         * so a small non-zero value is health rather than alarm. What it is for is
+         * reading against a client that timed out connecting: non-zero says its
+         * questions arrived and one reply flight was lost on the way down; zero says the
+         * path fell silent in both directions. Nothing else on either side tells those
+         * apart.
+         */initialOnCommittedRouteTotal: UInt64, 
+        /**
+         * Retained reply flights this listener actually repeated (PROTOCOL § 6.1), one
+         * per repeat sent rather than per datagram of it. Appended for the reason above.
+         *
+         * The field before it says a client asked again; this one says an answer went
+         * back, and the pair is what makes a failed connect readable. Questions arriving
+         * and answers going back is the repair working. Questions arriving and no answers
+         * is a listener that had nothing retained for that session — it was evicted,
+         * expired, or the budget for it was already spent. No questions at all is a path
+         * that went silent upstream, which is a different fault in a different direction.
+         */handshakeFlightRepeatedTotal: UInt64, 
+        /**
+         * Retained reply flights dropped to make room for a newer one (PROTOCOL § 6.1).
+         * Appended for the reason above.
+         *
+         * This is the repair running out of the memory it is allowed. Non-zero says the
+         * listener is completing handshakes faster than its retention budget covers, and
+         * that the evicted sessions are back to losing a whole connect to one lost reply
+         * datagram — a rare, load-dependent failure that nothing else makes visible.
+         */handshakeFlightEvictedTotal: UInt64, 
+        /**
+         * Reply flights never retained at all, because repeating one would have exceeded
+         * the RFC 9000 § 8.2 amplification limit (PROTOCOL § 6.1 rule 3). Appended for the
+         * reason above.
+         *
+         * The third way the repair can fail to cover a session, and the only one that is not
+         * about load: the two fields above mean the mechanism ran and then let go, this one
+         * means it never armed. It reads zero for every build whose reply is inside the bound —
+         * today's is 1.99x against a limit of 3 — so a non-zero value is a message size having
+         * moved, which changes no byte a peer would notice and which nothing else reports.
+         */handshakeFlightRefusedTotal: UInt64) {
         self.packetsSent = packetsSent
         self.packetsRecv = packetsRecv
         self.bytesSent = bytesSent
@@ -3190,6 +3290,10 @@ public struct MetricsSnapshotFfi: Equatable, Hashable {
         self.aeadFailureTotal = aeadFailureTotal
         self.uptimeSecs = uptimeSecs
         self.unencryptedDroppedTotal = unencryptedDroppedTotal
+        self.initialOnCommittedRouteTotal = initialOnCommittedRouteTotal
+        self.handshakeFlightRepeatedTotal = handshakeFlightRepeatedTotal
+        self.handshakeFlightEvictedTotal = handshakeFlightEvictedTotal
+        self.handshakeFlightRefusedTotal = handshakeFlightRefusedTotal
     }
 
     
@@ -3226,7 +3330,11 @@ public struct FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer {
                 replayRejectedTotal: FfiConverterUInt64.read(from: &buf), 
                 aeadFailureTotal: FfiConverterUInt64.read(from: &buf), 
                 uptimeSecs: FfiConverterUInt64.read(from: &buf), 
-                unencryptedDroppedTotal: FfiConverterUInt64.read(from: &buf)
+                unencryptedDroppedTotal: FfiConverterUInt64.read(from: &buf), 
+                initialOnCommittedRouteTotal: FfiConverterUInt64.read(from: &buf), 
+                handshakeFlightRepeatedTotal: FfiConverterUInt64.read(from: &buf), 
+                handshakeFlightEvictedTotal: FfiConverterUInt64.read(from: &buf), 
+                handshakeFlightRefusedTotal: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -3250,6 +3358,10 @@ public struct FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.aeadFailureTotal, into: &buf)
         FfiConverterUInt64.write(value.uptimeSecs, into: &buf)
         FfiConverterUInt64.write(value.unencryptedDroppedTotal, into: &buf)
+        FfiConverterUInt64.write(value.initialOnCommittedRouteTotal, into: &buf)
+        FfiConverterUInt64.write(value.handshakeFlightRepeatedTotal, into: &buf)
+        FfiConverterUInt64.write(value.handshakeFlightEvictedTotal, into: &buf)
+        FfiConverterUInt64.write(value.handshakeFlightRefusedTotal, into: &buf)
     }
 }
 
@@ -4812,7 +4924,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomsession_send() != 56893) {
+    if (uniffi_phantom_protocol_checksum_method_phantomsession_send() != 55912) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675) {
@@ -4830,10 +4942,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 18540) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 31956) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 10962) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 14127) {
+    if (uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 59359) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 56290) {

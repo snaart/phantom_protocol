@@ -900,6 +900,131 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Fixed
 
+- **A lost `ServerHello` cost the whole PhantomUDP connect, and the client's retransmits
+  bought nothing.** Measured on a real path: four connects in one campaign run failed with
+  `Timeout` after exactly 8.000 s — the client's whole retransmission budget — against a
+  server that had received the hello, completed the handshake and sent the reply. The reply
+  flight is 6555 bytes in six datagrams, six of the thirteen a PhantomUDP handshake spends,
+  and it was the only flight with no retransmission under it. The client did repeat its
+  hello three times, and each repetition was swallowed: the demux routes by connection id
+  before it looks at a datagram's type, so a repeated hello was delivered into the
+  established session's inbound channel and dropped by a pump that does not parse handshake
+  messages. The server had no trigger to answer again, so one lost datagram out of six was
+  an unrecoverable connect — one in 29 isolated connects at the ~0.6%-per-datagram loss the
+  raw control measured that run, and three of eight in a burst.
+
+  A PhantomUDP listener now retains the reply flight it sent and repeats it when the same
+  hello arrives again. **Six** rules make that safe, and they are in `PROTOCOL.md` § 6.1
+  because a second implementation has to know them — two of the six are obligations on the
+  *client*, so a peer built from this entry alone would ship the defect this repair removed.
+  A repeat is the **bytes already sent**, never a re-derivation — running the handshake again
+  would draw fresh KEM randomness and a fresh session id and produce a valid `ServerHello`
+  for a session the server never committed. A repeat is owed **only to the hello the reply
+  was computed over**, compared in full, which is both the security gate and a correctness
+  requirement (the signature covers the whole `ClientHello`, so the retained reply answers
+  that hello and no other; a re-derived hello draws nothing at all, since it lands on a
+  routed connection id and is dropped by a session that does not parse handshake messages).
+  Be exact about what that gate is: it reads the retained question and **never the source
+  address**, so a sender that cannot reproduce those bytes draws nothing whatever address it
+  claims, and one that can draws a repeat whatever address it claims. A party that never saw
+  the hello is out because it cannot construct one — the hello carries the client's own
+  32-byte nonce and key package — and not because anything recognised it as off-path; an
+  on-path observer is in, and rule 3 is what makes that harmless in the direction that
+  matters. A repeat goes **only to the address the original
+  went to**, taken from the server's record of the completed handshake and never from the
+  datagram that triggered it, so the amplification factor towards whoever asks is zero and
+  towards the recorded address it is the ratio the first exchange already had — 6657 wire
+  bytes out for 3350 in, 1.99×, inside the 3× of RFC 9000 § 8.2, checked when the flight is
+  retained rather than argued. Wire bytes on both sides, and against the smallest hello that
+  can draw a repeat (the minimal one plus the cookie `udp_admit` makes unconditional), since
+  a bound measured in two different quantities against a flattering denominator is not the
+  bound it is published as. A flight that fails that check is refused retention outright —
+  the repair never arms for it — so the refusal is counted, and the ratio is measured in
+  every build rather than only in the one whose frozen vectors a test can read.
+
+  The retention is bounded three ways: three repeats, matching the number the client sends;
+  a window that outlasts the client's **last** question (7 s) without outlasting its whole
+  wait (8 s) — the total wait is the client's budget by construction, since every interval is
+  clipped to what remains of it, so a window sized against *that* is a statement which cannot
+  be wrong and cannot be checked, while the last question is a different number that moves on
+  its own; and the first inbound packet that AEAD-opens, which proves the client derived keys
+  from the reply and so received it. Retention itself is bounded in bytes rather than by a
+  count, because what a flight costs is a property of the parameter set and not of the
+  mechanism: 8 MiB per listener. Charged in **residency** rather than wire bytes — the encoder
+  allocates every fragment at the path MTU while the last one is short, and the map slot and
+  vector headers are memory the wire never sees, so an entry costs 7540 B against 6657 B sent
+  and the budget admits **1112** of them rather than the 1260 a wire-byte division gives. It
+  is a floor on what the host must have rather than a ceiling on what the process will use.
+
+  That capacity is also a rate, and there are two of them rather than one. An entry is
+  released the moment its client sends anything authenticated, but an entry whose client says
+  nothing lives its whole 8-second retention, so a listener completing `r` handshakes a
+  second holds `r × 8 s`: the table **binds at about 139 completions/s**, and covers every
+  session's *first* repeat — the one that pays on a lossy path — up to about **1112/s**.
+  Between them the mechanism narrows rather than switching off. Both figures are published
+  where the budget is defined and both are recomputed by a test; the earlier note quoted the
+  second as though it were the first, understating the binding rate eightfold, which is the
+  ratio of the retention to one second.
+
+  A full table **evicts its oldest answer rather than refusing its newest**, and that is not
+  a detail — refusing the newcomer makes a full table a peer-reachable off-switch, since the
+  entries filling it are established sessions whose clients have gone quiet, so every session
+  established afterwards would go unrepaired under exactly the burst of concurrent connects
+  that motivated this. The oldest is chosen because it has the least of its window left, not
+  because its client has given up: by the time room has to be made, every remaining candidate
+  is a client that has neither been heard from nor timed out, since those two are released
+  first. Evictions are counted.
+
+  One consequence is accepted rather than gated, and is written down in `threat-model.md`
+  § D.0 instead of being implied away: anyone holding the hello can present it three times
+  and leave the genuine client's own repetition unanswered. The reasoning is *not* that the
+  party could drop the reply instead — that is true of an in-line position and false of the
+  commonest one, a sniff-and-inject attacker on a shared medium or a mirrored port, which
+  sees every datagram and forwards none. It is that the cost is small and cannot be aimed:
+  one connection loses a repair that only matters if its reply is also lost, the repeats it
+  triggers are delivered to that client rather than to the attacker, and every bound that
+  would remove it keys on something the attacker controls.
+
+  **No serialized byte moved.** No message gained a field, no version was bumped, the frozen
+  wire vectors are untouched. Two things change for a client, both now in `INTEROP.md` and
+  in § 6.1: a retransmitted hello must be the previous hello unchanged, which is what the
+  shipped client already does; and a client still waiting for a reply must discard every
+  datagram that is not a handshake datagram **carrying its own bootstrap connection id**,
+  before reassembling it and without disturbing its retransmit timer. Both halves of that
+  second obligation are load-bearing. Reading a committed server's short-header traffic as a
+  malformed reply ends the connect before the retransmit timer fires, which makes the whole
+  repair conditional on the server staying silent; and accepting a datagram on its *type*
+  alone leaves the connect endable by one datagram from anyone who can reach the port, since
+  `PacketType` is two bits of a cleartext byte in the unauthenticated envelope. Requiring the
+  connection id leaves an off-path sender needing to guess 64 bits it has never seen.
+
+- **The investigation above could not determine whether the client's repeated hellos reached
+  the server at all**, which is what separates "one reply flight was lost downstream" from
+  "the path fell silent in both directions" — and no artifact on either side answered it.
+  `MetricsSnapshotFfi` gains four always-on counters, with OTel counters beside each.
+  `initial_on_committed_route_total` (`phantom.handshake.initial_on_committed_route`) counts
+  handshake-type datagrams arriving on a connection the listener has already routed — the
+  question reaching the server. It is bumped when the datagram arrives, before anything has
+  decided whether an answer is owed, so on its own it reads identically whether the listener
+  repaired the connect or had nothing to send; `handshake_flight_repeated_total`
+  (`phantom.handshake.flight_repeated`) is the other half, counted where the decision is made,
+  one per repeated flight rather than per datagram of it. Arrivals with no repeats is a
+  listener whose retention did not cover that session; no arrivals at all is a path that never
+  carried the question, and those need different remedies.
+  `handshake_flight_evicted_total` (`phantom.handshake.flight_evicted`) counts retained
+  answers dropped to make room for newer ones — the repair running out of its memory budget,
+  which is otherwise invisible because an evicted session behaves exactly like one from before
+  this mechanism existed. `handshake_flight_refused_total`
+  (`phantom.handshake.flight_refused`) is the third way the repair can fail to cover a session
+  and the only one that is not about load: a reply too large for the amplification bound is
+  never retained at all, so the mechanism never arms rather than running and letting go. It
+  reads zero for every build whose reply is inside the bound, which makes a non-zero value a
+  message size having moved past it — a change that alters no byte a peer would notice and
+  that nothing else reports. All four are unlabeled: the only attribution worth having would
+  be per peer, which the cardinality contract keeps out of instrument labels. Appended at the
+  end of the FFI record, so a consumer built against an older copy of the hand-curated C
+  header is missing fields rather than misreading the ones it knew.
+
 - **The claim that a peer flooding a non-reading application moves no window growth, which
   was false on the opened-stream path.** Growth is credited by the delivery task at the
   moment it hands a frame *onward*, before the blocking send into the bounded queue behind

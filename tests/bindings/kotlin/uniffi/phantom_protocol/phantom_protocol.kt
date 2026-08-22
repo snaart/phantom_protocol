@@ -1141,7 +1141,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_resumption_hint() != 52321) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 56893) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_send() != 55912) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomsession_set_traffic_shaping() != 41675) {
@@ -1159,10 +1159,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_recv() != 18540) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 31956) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_reliable() != 10962) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 14127) {
+    if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_send_unreliable() != 59359) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_phantom_protocol_checksum_method_phantomstream_set_priority() != 56290) {
@@ -2681,9 +2681,12 @@ public object FfiConverterTypePhantomListener: FfiConverter<PhantomListener, Lon
  * `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
  * `Connecting` (handshake rejection, a wrong pin) and `Closed` from
  * `disconnect()`. `Migrating` is entered when the path goes silent and left
- * again for `Connected` if it recovers; sends keep buffering throughout. There
- * is no intermediate classical-only state — the hybrid handshake is one flight,
- * so the session is either unkeyed or fully post-quantum keyed.
+ * again for `Connected` if it recovers; sends keep buffering throughout.
+ * [`Draining`](ConnectionState::Draining) is the one state that buffers
+ * nothing: it means the *peer* announced its close, so reads continue while
+ * writes are refused rather than queued for a wire they will never reach.
+ * There is no intermediate classical-only state — the hybrid handshake is one
+ * flight, so the session is either unkeyed or fully post-quantum keyed.
  *
  * # Example
  *
@@ -2976,11 +2979,12 @@ public interface PhantomSessionInterface {
      *
      * **Message boundaries are not preserved.** The data pump splits `data`
      * into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
-     * bytes — one chunk plus its packet overhead is exactly one PhantomUDP
-     * datagram — and writes each chunk separately, so the peer's
-     * [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
-     * An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
-     * nothing marks where one `send` ended and the next began.
+     * bytes — 1156 on this build, sized so that one chunk plus its packet
+     * overhead is exactly one PhantomUDP datagram — and writes each chunk
+     * separately, so the peer's [`recv`](Self::recv) yields one result *per
+     * chunk*, not one per `send`. An 8 KiB `send` arrives as eight `recv`s.
+     * Nothing reassembles them, and nothing marks where one `send` ended and
+     * the next began.
      *
      * This is silent when it bites: the first chunk of a structured message
      * usually still parses, as a truncated one, so a caller that reads a single
@@ -3050,9 +3054,12 @@ public interface PhantomSessionInterface {
  * `Connecting → Connected → Migrating → Dead`, with `Failed` reachable from
  * `Connecting` (handshake rejection, a wrong pin) and `Closed` from
  * `disconnect()`. `Migrating` is entered when the path goes silent and left
- * again for `Connected` if it recovers; sends keep buffering throughout. There
- * is no intermediate classical-only state — the hybrid handshake is one flight,
- * so the session is either unkeyed or fully post-quantum keyed.
+ * again for `Connected` if it recovers; sends keep buffering throughout.
+ * [`Draining`](ConnectionState::Draining) is the one state that buffers
+ * nothing: it means the *peer* announced its close, so reads continue while
+ * writes are refused rather than queued for a wire they will never reach.
+ * There is no intermediate classical-only state — the hybrid handshake is one
+ * flight, so the session is either unkeyed or fully post-quantum keyed.
  *
  * # Example
  *
@@ -3695,11 +3702,12 @@ open class PhantomSession: Disposable, AutoCloseable, PhantomSessionInterface
      *
      * **Message boundaries are not preserved.** The data pump splits `data`
      * into chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK)
-     * bytes — one chunk plus its packet overhead is exactly one PhantomUDP
-     * datagram — and writes each chunk separately, so the peer's
-     * [`recv`](Self::recv) yields one result *per chunk*, not one per `send`.
-     * An 8 KiB `send` arrives as eight `recv`s. Nothing reassembles them, and
-     * nothing marks where one `send` ended and the next began.
+     * bytes — 1156 on this build, sized so that one chunk plus its packet
+     * overhead is exactly one PhantomUDP datagram — and writes each chunk
+     * separately, so the peer's [`recv`](Self::recv) yields one result *per
+     * chunk*, not one per `send`. An 8 KiB `send` arrives as eight `recv`s.
+     * Nothing reassembles them, and nothing marks where one `send` ended and
+     * the next began.
      *
      * This is silent when it bites: the first chunk of a structured message
      * usually still parses, as a truncated one, so a caller that reads a single
@@ -4040,12 +4048,12 @@ public interface PhantomStreamInterface {
      *
      * **Message boundaries are not preserved.** The session's data pump splits
      * `data` into chunks of
-     * [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — one chunk
-     * plus its packet overhead is exactly one PhantomUDP datagram — and buffers
-     * each chunk as its own reliable write, so the peer's [`recv`](Self::recv)
-     * yields one result *per chunk*, not one per `send_reliable`. Order is
-     * guaranteed; grouping is not, and nothing marks where one call's payload
-     * ended.
+     * [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — 1156 on
+     * this build, sized so that one chunk plus its packet overhead is exactly
+     * one PhantomUDP datagram — and buffers each chunk as its own reliable
+     * write, so the peer's [`recv`](Self::recv) yields one result *per chunk*,
+     * not one per `send_reliable`. Order is guaranteed; grouping is not, and
+     * nothing marks where one call's payload ended.
      *
      * Frame the messages yourself if you need them: write a length prefix ahead
      * of each payload and accumulate `recv` results until the declared length is
@@ -4067,10 +4075,11 @@ public interface PhantomStreamInterface {
      * **Message boundaries are not preserved**, exactly as in
      * [`send_reliable`](Self::send_reliable): the pump splits `data` into
      * chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes
-     * and sends each on its own. Here that is sharper than on the reliable
-     * path, because the chunks are independent datagrams: any subset of them
-     * can be lost or arrive out of order, so a payload larger than one chunk
-     * can reach the peer with a hole in the middle and no signal that it did.
+     * — 1156 on this build — and sends each on its own. Here that is sharper
+     * than on the reliable path, because the chunks are independent datagrams:
+     * any subset of them can be lost or arrive out of order, so a payload
+     * larger than one chunk can reach the peer with a hole in the middle and no
+     * signal that it did.
      *
      * Keep unreliable payloads within one chunk, or carry your own length
      * prefix and sequence number and drop incomplete messages —
@@ -4275,12 +4284,12 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
      *
      * **Message boundaries are not preserved.** The session's data pump splits
      * `data` into chunks of
-     * [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — one chunk
-     * plus its packet overhead is exactly one PhantomUDP datagram — and buffers
-     * each chunk as its own reliable write, so the peer's [`recv`](Self::recv)
-     * yields one result *per chunk*, not one per `send_reliable`. Order is
-     * guaranteed; grouping is not, and nothing marks where one call's payload
-     * ended.
+     * [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes — 1156 on
+     * this build, sized so that one chunk plus its packet overhead is exactly
+     * one PhantomUDP datagram — and buffers each chunk as its own reliable
+     * write, so the peer's [`recv`](Self::recv) yields one result *per chunk*,
+     * not one per `send_reliable`. Order is guaranteed; grouping is not, and
+     * nothing marks where one call's payload ended.
      *
      * Frame the messages yourself if you need them: write a length prefix ahead
      * of each payload and accumulate `recv` results until the declared length is
@@ -4322,10 +4331,11 @@ open class PhantomStream: Disposable, AutoCloseable, PhantomStreamInterface
      * **Message boundaries are not preserved**, exactly as in
      * [`send_reliable`](Self::send_reliable): the pump splits `data` into
      * chunks of [`MAX_APP_CHUNK`](crate::transport::mtu::MAX_APP_CHUNK) bytes
-     * and sends each on its own. Here that is sharper than on the reliable
-     * path, because the chunks are independent datagrams: any subset of them
-     * can be lost or arrive out of order, so a payload larger than one chunk
-     * can reach the peer with a hole in the middle and no signal that it did.
+     * — 1156 on this build — and sends each on its own. Here that is sharper
+     * than on the reliable path, because the chunks are independent datagrams:
+     * any subset of them can be lost or arrive out of order, so a payload
+     * larger than one chunk can reach the peer with a hole in the middle and no
+     * signal that it did.
      *
      * Keep unreliable payloads within one chunk, or carry your own length
      * prefix and sequence number and drop incomplete messages —
@@ -5052,7 +5062,7 @@ data class MetricsSnapshotFfi (
     var `uptimeSecs`: kotlin.ULong
     , 
     /**
-     * Deliberately last in the record, and it must stay last.
+     * Deliberately near the end of the record, and new fields go after it.
      *
      * UniFFI lays a record out in declaration order and the generated bindings
      * read it back the same way, so inserting a field anywhere but the end
@@ -5065,6 +5075,57 @@ data class MetricsSnapshotFfi (
      * misreading the ones it already knew.
      */
     var `unencryptedDroppedTotal`: kotlin.ULong
+    , 
+    /**
+     * Handshake-type datagrams that arrived on a PhantomUDP connection the listener
+     * had already committed a route to — a client repeating its flight because it
+     * never saw the reply (PROTOCOL § 6.1). Appended last for the reason above.
+     *
+     * Repetition is normal on a lossy path and is what the server's repeat answers,
+     * so a small non-zero value is health rather than alarm. What it is for is
+     * reading against a client that timed out connecting: non-zero says its
+     * questions arrived and one reply flight was lost on the way down; zero says the
+     * path fell silent in both directions. Nothing else on either side tells those
+     * apart.
+     */
+    var `initialOnCommittedRouteTotal`: kotlin.ULong
+    , 
+    /**
+     * Retained reply flights this listener actually repeated (PROTOCOL § 6.1), one
+     * per repeat sent rather than per datagram of it. Appended for the reason above.
+     *
+     * The field before it says a client asked again; this one says an answer went
+     * back, and the pair is what makes a failed connect readable. Questions arriving
+     * and answers going back is the repair working. Questions arriving and no answers
+     * is a listener that had nothing retained for that session — it was evicted,
+     * expired, or the budget for it was already spent. No questions at all is a path
+     * that went silent upstream, which is a different fault in a different direction.
+     */
+    var `handshakeFlightRepeatedTotal`: kotlin.ULong
+    , 
+    /**
+     * Retained reply flights dropped to make room for a newer one (PROTOCOL § 6.1).
+     * Appended for the reason above.
+     *
+     * This is the repair running out of the memory it is allowed. Non-zero says the
+     * listener is completing handshakes faster than its retention budget covers, and
+     * that the evicted sessions are back to losing a whole connect to one lost reply
+     * datagram — a rare, load-dependent failure that nothing else makes visible.
+     */
+    var `handshakeFlightEvictedTotal`: kotlin.ULong
+    , 
+    /**
+     * Reply flights never retained at all, because repeating one would have exceeded
+     * the RFC 9000 § 8.2 amplification limit (PROTOCOL § 6.1 rule 3). Appended for the
+     * reason above.
+     *
+     * The third way the repair can fail to cover a session, and the only one that is not
+     * about load: the two fields above mean the mechanism ran and then let go, this one
+     * means it never armed. It reads zero for every build whose reply is inside the bound —
+     * today's is 1.99x against a limit of 3 — so a non-zero value is a message size having
+     * moved, which changes no byte a peer would notice and which nothing else reports.
+     */
+    var `handshakeFlightRefusedTotal`: kotlin.ULong
     
 ){
     
@@ -5100,6 +5161,10 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
         )
     }
 
@@ -5122,7 +5187,11 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.allocationSize(value.`replayRejectedTotal`) +
             FfiConverterULong.allocationSize(value.`aeadFailureTotal`) +
             FfiConverterULong.allocationSize(value.`uptimeSecs`) +
-            FfiConverterULong.allocationSize(value.`unencryptedDroppedTotal`)
+            FfiConverterULong.allocationSize(value.`unencryptedDroppedTotal`) +
+            FfiConverterULong.allocationSize(value.`initialOnCommittedRouteTotal`) +
+            FfiConverterULong.allocationSize(value.`handshakeFlightRepeatedTotal`) +
+            FfiConverterULong.allocationSize(value.`handshakeFlightEvictedTotal`) +
+            FfiConverterULong.allocationSize(value.`handshakeFlightRefusedTotal`)
     )
 
     override fun write(value: MetricsSnapshotFfi, buf: ByteBuffer) {
@@ -5145,6 +5214,10 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.write(value.`aeadFailureTotal`, buf)
             FfiConverterULong.write(value.`uptimeSecs`, buf)
             FfiConverterULong.write(value.`unencryptedDroppedTotal`, buf)
+            FfiConverterULong.write(value.`initialOnCommittedRouteTotal`, buf)
+            FfiConverterULong.write(value.`handshakeFlightRepeatedTotal`, buf)
+            FfiConverterULong.write(value.`handshakeFlightEvictedTotal`, buf)
+            FfiConverterULong.write(value.`handshakeFlightRefusedTotal`, buf)
     }
 }
 

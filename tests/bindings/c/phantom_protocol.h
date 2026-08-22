@@ -325,11 +325,38 @@ typedef struct PhantomMetricsSnapshotFfi {
      * flag. Always populated; a non-zero value means the downgrade defence
      * fired, which is otherwise indistinguishable from nothing arriving. */
     uint64_t uptime_secs;
-    /* Appended last, and new fields must keep going last: this header carries no
+    /* Appended, and new fields must keep going after: this header carries no
      * length, so a consumer built against an older copy reads at the offsets it
      * knew. Appending leaves such a reader merely missing a field; inserting
      * anywhere else makes it misread every field that followed. */
     uint64_t unencrypted_dropped_total;
+    /* Handshake-type datagrams that arrived on a PhantomUDP connection the
+     * listener had already committed a route to — a client repeating its flight
+     * because it never saw the reply. Repetition is normal on a lossy path and
+     * is what the server's repeat answers, so a small non-zero value is health.
+     * Read against a client that timed out connecting, non-zero says its
+     * questions arrived and one reply flight was lost on the way down, and zero
+     * says the path fell silent in both directions. */
+    uint64_t initial_on_committed_route_total;
+    /* Retained reply flights this listener actually repeated, one per repeated
+     * flight rather than per datagram of it. The field above says a client asked
+     * again; this one says an answer went back, and the pair is what makes a
+     * failed connect readable: arrivals with no repeats is a listener that had
+     * nothing retained for that session, while no arrivals at all is a path that
+     * never carried the question. */
+    uint64_t handshake_flight_repeated_total;
+    /* Retained reply flights dropped to make room for a newer one — the repair
+     * running out of the memory it is allowed. Expected to be zero; non-zero
+     * says the evicted sessions are back to losing a whole connect to one lost
+     * reply datagram, which nothing else makes visible. */
+    uint64_t handshake_flight_evicted_total;
+    /* Reply flights never retained at all, because repeating one would have
+     * exceeded the RFC 9000 s8.2 amplification limit. The third way the repair
+     * can fail to cover a session and the only one that is not about load: the
+     * two fields above mean the mechanism ran and then let go, this one means it
+     * never armed. Zero for every build whose reply is inside the bound, so
+     * non-zero says a message size has moved past it. */
+    uint64_t handshake_flight_refused_total;
 } PhantomMetricsSnapshotFfi;
 
 /* ====================================================================

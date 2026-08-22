@@ -9,7 +9,9 @@
 //! byte / timing totals, the session/stream gauges, the handshake
 //! sum+count fields, and the always-on security counters
 //! (`replay_rejected_total`, `aead_failure_total`,
-//! `unencrypted_dropped_total`). The snapshot is always
+//! `unencrypted_dropped_total`, `initial_on_committed_route_total`,
+//! `handshake_flight_repeated_total`, `handshake_flight_evicted_total`,
+//! `handshake_flight_refused_total`). The snapshot is always
 //! available regardless of the `telemetry-otel` feature, since the atomics
 //! always exist. The labeled OTel instruments in `instruments.rs` carry
 //! the same events with attribution; both paths are populated together.
@@ -55,6 +57,26 @@ pub struct MetricsSnapshot {
     /// (Invariant 2, the stripped-flag downgrade defence). A non-zero value on a
     /// healthy peer means someone on the path is rewriting header flags.
     pub unencrypted_dropped_total: u64,
+    /// Handshake-type datagrams that arrived on a PhantomUDP connection the
+    /// listener had already committed a route to — a client repeating its flight
+    /// because it never saw the reply (PROTOCOL § 6.1). Read against a client that
+    /// timed out connecting, a non-zero value says one reply flight was lost on
+    /// the way down and zero says the path went silent in both directions; nothing
+    /// else distinguishes those.
+    pub initial_on_committed_route_total: u64,
+    /// Retained reply flights this listener actually repeated (PROTOCOL § 6.1),
+    /// one per repeat sent. The counter above says a client asked again; this one
+    /// says an answer went back. Repeats arriving with none going back is a
+    /// listener whose retention did not cover that session.
+    pub handshake_flight_repeated_total: u64,
+    /// Retained reply flights dropped to make room for a newer one. Non-zero means
+    /// the repair is running out of the memory it is allowed and some sessions are
+    /// back to losing a connect to a single lost reply datagram.
+    pub handshake_flight_evicted_total: u64,
+    /// Reply flights never retained at all, because repeating one would have exceeded
+    /// the RFC 9000 § 8.2 amplification limit. Zero with today's messages; non-zero
+    /// says a message size moved past the bound and the repair stopped arming.
+    pub handshake_flight_refused_total: u64,
 
     pub uptime_secs: u64,
 }
@@ -92,6 +114,10 @@ impl Default for MetricsSnapshot {
             replay_rejected_total: 0,
             aead_failure_total: 0,
             unencrypted_dropped_total: 0,
+            initial_on_committed_route_total: 0,
+            handshake_flight_repeated_total: 0,
+            handshake_flight_evicted_total: 0,
+            handshake_flight_refused_total: 0,
             uptime_secs: 0,
         }
     }
@@ -168,6 +194,10 @@ impl MetricsSnapshot {
             replay_rejected_total: h.replay_rejected_total(),
             aead_failure_total: h.aead_failure_total(),
             unencrypted_dropped_total: h.unencrypted_dropped_total(),
+            initial_on_committed_route_total: h.initial_on_committed_route_total(),
+            handshake_flight_repeated_total: h.handshake_flight_repeated_total(),
+            handshake_flight_evicted_total: h.handshake_flight_evicted_total(),
+            handshake_flight_refused_total: h.handshake_flight_refused_total(),
             uptime_secs: h.uptime_secs(),
         }
     }
@@ -209,7 +239,7 @@ pub struct MetricsSnapshotFfi {
     pub replay_rejected_total: u64,
     pub aead_failure_total: u64,
     pub uptime_secs: u64,
-    /// Deliberately last in the record, and it must stay last.
+    /// Deliberately near the end of the record, and new fields go after it.
     ///
     /// UniFFI lays a record out in declaration order and the generated bindings
     /// read it back the same way, so inserting a field anywhere but the end
@@ -221,6 +251,45 @@ pub struct MetricsSnapshotFfi {
     /// placement where a stale reader is merely missing a field rather than
     /// misreading the ones it already knew.
     pub unencrypted_dropped_total: u64,
+    /// Handshake-type datagrams that arrived on a PhantomUDP connection the listener
+    /// had already committed a route to — a client repeating its flight because it
+    /// never saw the reply (PROTOCOL § 6.1). Appended last for the reason above.
+    ///
+    /// Repetition is normal on a lossy path and is what the server's repeat answers,
+    /// so a small non-zero value is health rather than alarm. What it is for is
+    /// reading against a client that timed out connecting: non-zero says its
+    /// questions arrived and one reply flight was lost on the way down; zero says the
+    /// path fell silent in both directions. Nothing else on either side tells those
+    /// apart.
+    pub initial_on_committed_route_total: u64,
+    /// Retained reply flights this listener actually repeated (PROTOCOL § 6.1), one
+    /// per repeat sent rather than per datagram of it. Appended for the reason above.
+    ///
+    /// The field before it says a client asked again; this one says an answer went
+    /// back, and the pair is what makes a failed connect readable. Questions arriving
+    /// and answers going back is the repair working. Questions arriving and no answers
+    /// is a listener that had nothing retained for that session — it was evicted,
+    /// expired, or the budget for it was already spent. No questions at all is a path
+    /// that went silent upstream, which is a different fault in a different direction.
+    pub handshake_flight_repeated_total: u64,
+    /// Retained reply flights dropped to make room for a newer one (PROTOCOL § 6.1).
+    /// Appended for the reason above.
+    ///
+    /// This is the repair running out of the memory it is allowed. Non-zero says the
+    /// listener is completing handshakes faster than its retention budget covers, and
+    /// that the evicted sessions are back to losing a whole connect to one lost reply
+    /// datagram — a rare, load-dependent failure that nothing else makes visible.
+    pub handshake_flight_evicted_total: u64,
+    /// Reply flights never retained at all, because repeating one would have exceeded
+    /// the RFC 9000 § 8.2 amplification limit (PROTOCOL § 6.1 rule 3). Appended for the
+    /// reason above.
+    ///
+    /// The third way the repair can fail to cover a session, and the only one that is not
+    /// about load: the two fields above mean the mechanism ran and then let go, this one
+    /// means it never armed. It reads zero for every build whose reply is inside the bound —
+    /// today's is 1.99x against a limit of 3 — so a non-zero value is a message size having
+    /// moved, which changes no byte a peer would notice and which nothing else reports.
+    pub handshake_flight_refused_total: u64,
 }
 
 impl From<MetricsSnapshot> for MetricsSnapshotFfi {
@@ -245,6 +314,10 @@ impl From<MetricsSnapshot> for MetricsSnapshotFfi {
             aead_failure_total: s.aead_failure_total,
             uptime_secs: s.uptime_secs,
             unencrypted_dropped_total: s.unencrypted_dropped_total,
+            initial_on_committed_route_total: s.initial_on_committed_route_total,
+            handshake_flight_repeated_total: s.handshake_flight_repeated_total,
+            handshake_flight_evicted_total: s.handshake_flight_evicted_total,
+            handshake_flight_refused_total: s.handshake_flight_refused_total,
         }
     }
 }
@@ -300,6 +373,10 @@ mod tests {
         assert_eq!(ffi.replay_rejected_total, 0);
         assert_eq!(ffi.aead_failure_total, 0);
         assert_eq!(ffi.unencrypted_dropped_total, 0);
+        assert_eq!(ffi.initial_on_committed_route_total, 0);
+        assert_eq!(ffi.handshake_flight_repeated_total, 0);
+        assert_eq!(ffi.handshake_flight_evicted_total, 0);
+        assert_eq!(ffi.handshake_flight_refused_total, 0);
         assert_eq!(ffi.uptime_secs, 0);
     }
 
@@ -318,6 +395,10 @@ mod tests {
         h.record_replay_rejected();
         h.record_aead_failure();
         h.record_unencrypted_dropped();
+        h.record_initial_on_committed_route();
+        h.record_handshake_flight_repeated();
+        h.record_handshake_flight_evicted();
+        h.record_handshake_flight_refused();
 
         let snap = MetricsSnapshot::capture(&h);
         let ffi = snap.to_ffi();
@@ -340,6 +421,10 @@ mod tests {
         assert_eq!(ffi.replay_rejected_total, 1);
         assert_eq!(ffi.aead_failure_total, 1);
         assert_eq!(ffi.unencrypted_dropped_total, 1);
+        assert_eq!(ffi.initial_on_committed_route_total, 1);
+        assert_eq!(ffi.handshake_flight_repeated_total, 1);
+        assert_eq!(ffi.handshake_flight_evicted_total, 1);
+        assert_eq!(ffi.handshake_flight_refused_total, 1);
     }
 
     #[test]

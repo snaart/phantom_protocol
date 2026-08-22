@@ -59,6 +59,27 @@ pub fn encode_datagrams(
     Ok(out)
 }
 
+/// Wire bytes [`encode_datagrams`] spends on a frame of `frame_len` bytes — the payload plus
+/// every envelope and fragment sub-header it takes to carry it.
+///
+/// It exists so a quantity measured on one side of a comparison can be the same quantity as
+/// the other. An anti-amplification bound is about bytes on the path, and only the sender of
+/// a frame holds its datagrams: a receiver is handed the reassembled frame and nothing else,
+/// so without this it would have to divide wire bytes by frame bytes and call the result a
+/// ratio. Derived from the encoder's own rule rather than restated, and pinned against it at
+/// every fragment boundary by the `wire_len_agrees_with_the_encoder` test below.
+///
+/// For an inbound frame this is a *lower* bound on what the peer actually spent, since the
+/// chunking is the sender's choice and a wasteful sender spends more. That is the safe
+/// direction for a bound built on what the asker paid.
+pub fn wire_len(frame_len: usize) -> usize {
+    if frame_len <= MAX_INNER_UNFRAGMENTED {
+        return super::envelope::HDR_LEN + frame_len;
+    }
+    let chunks = frame_len.div_ceil(MAX_INNER_FRAG_CHUNK);
+    frame_len + chunks * (super::envelope::HDR_LEN + FRAG_SUBHDR_LEN)
+}
+
 /// Decode one datagram. Returns its header and, when the datagram completes a frame
 /// (or is unfragmented), the reassembled frame. Fragments are fed to `asm`.
 pub fn push_datagram(
@@ -90,6 +111,43 @@ pub fn push_datagram(
 mod tests {
     use super::*;
     use crate::transport::phantom_udp::envelope::{EnvelopeError, PacketType};
+
+    /// [`wire_len`] must be what the encoder actually spends, at every boundary.
+    ///
+    /// It is a second statement of the encoder's fragmentation rule, written where a
+    /// receiver can reach it, and a second statement drifts. The lengths walked here are the
+    /// ones where it would: either side of the unfragmented ceiling, either side of each
+    /// chunk boundary, and the empty frame.
+    #[test]
+    fn wire_len_agrees_with_the_encoder() {
+        let cid = [3u8; 8];
+        let mut lengths = vec![
+            0usize,
+            1,
+            MAX_INNER_UNFRAGMENTED - 1,
+            MAX_INNER_UNFRAGMENTED,
+        ];
+        for chunks in 1..=6usize {
+            let boundary = chunks * MAX_INNER_FRAG_CHUNK;
+            lengths.push(boundary.saturating_sub(1));
+            lengths.push(boundary);
+            lengths.push(boundary + 1);
+        }
+        for len in lengths {
+            let frame = vec![0xA7u8; len];
+            let spent: usize = encode_datagrams(PacketType::Initial, &cid, 0, &frame)
+                .expect("encode")
+                .iter()
+                .map(Vec::len)
+                .sum();
+            assert_eq!(
+                wire_len(len),
+                spent,
+                "wire_len says {} for a {len}-byte frame, the encoder spends {spent}",
+                wire_len(len)
+            );
+        }
+    }
 
     #[test]
     fn unfragmented_single_datagram_roundtrip() {
