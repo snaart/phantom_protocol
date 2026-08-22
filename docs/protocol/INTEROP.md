@@ -192,10 +192,23 @@ version (Invariant 7) and build-variant (Invariant 10) downgrade-resistant.
 
 | Vector | Freezes |
 | --- | --- |
-| `transcript_hash.bin` (32 B) | the real `compute_transcript_hash` output over the deterministic transcript (asserted by the lib unit test `transport::handshake::tests::transcript_hash_wire_vector`) |
+| `transcript_hash.bin` (32 B) | the real `compute_transcript_hash` output over the deterministic transcript (asserted by the lib unit test `transport::handshake::tests::transcript_hash_wire_vector`, and independently by `tests/wire_vectors_decode.py`, which rebuilds the transcript from the message fixtures above and hashes it) |
 
 If your transcript hash matches this fixture byte-for-byte, your signing input is
 wire-compatible and your signatures will verify against a reference peer.
+
+This is the one rung where a round trip would prove nothing and only an encoder
+will do, so build that direction first. A digest cannot be decoded, which means
+there is no forgiving reader to meet your writer halfway: the bytes you hash are
+either the bytes the reference peer hashes or they are not. Three readings of § 6.5
+that the prose permits and the bytes refuse are worth checking against before you
+suspect anything else — the leading `protocol_variant` is a length-prefixed slice
+and not a fixed array (borsh gives it the `u32` little-endian prefix a `Vec<u8>`
+gets, while `server_nonce` and `session_id` are fixed arrays and get none), a
+nested message contributes exactly its own encoding with no wrapper, and
+`early_data_accepted` is the trailing field. Each of the three is pinned by a
+mutation in the Python check, so a divergence localises to one of them rather than
+to "the signature does not verify".
 
 ### Rung 4 — AEAD record protection + header protection
 
