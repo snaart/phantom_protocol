@@ -203,8 +203,30 @@ const _: () =
 /// and says which are enforced and which are only observed.
 ///
 /// It is also per **session**: nothing here divides it between concurrent sessions, so a
-/// process draws it once per session it admits. Admission control is what bounds the
-/// process, and it is the embedder's (`PHANTOM_MAX_SESSIONS` in the reference server).
+/// process draws it once per session it admits, and the arithmetic that follows is the
+/// whole of what a process commits to window growth —
+///
+/// ```text
+///   sessions admitted × SESSION_RECV_WINDOW_GROWTH_BUDGET
+///          1024       ×              8 MiB                =  8 GiB
+/// ```
+///
+/// — 1024 being the reference server's default `PHANTOM_MAX_SESSIONS`. Admission control is
+/// therefore what bounds the process, and it is the embedder's. `phantom-server` states that
+/// product in its startup log, so an operator reads it at the moment they can act on it.
+///
+/// That figure is **a floor on what the host must have, not a ceiling on what the process
+/// will use**: it is one term of the receive path, and the section of
+/// `crate::api::session` referenced above ranks two others an order of magnitude above it
+/// per session. Growth is also an advertisement rather than a residency — what it buys the
+/// peer is the right to have that much outstanding, and the bytes land in the buffers those
+/// other rows bound. Nothing here is a memory budget; sizing a host ends in measurement.
+///
+/// A process-wide second tier over this one was considered and rejected: growth is
+/// first-come, so a shared allowance lets a peer that opens and drains sessions quickly pin
+/// every session admitted after it at the initial window. That is one peer steering another
+/// peer's control loop, which is a worse failure than a host sized too small — see
+/// `docs/security/threat-model.md` §5 §D.1.
 pub const SESSION_RECV_WINDOW_GROWTH_BUDGET: u32 = 8 * 1024 * 1024;
 
 /// RTT reference used by receive-window auto-tuning when the stream has no RTT sample of
@@ -214,13 +236,22 @@ pub const SESSION_RECV_WINDOW_GROWTH_BUDGET: u32 = 8 * 1024 * 1024;
 /// so reusing it keeps one answer to "how long is a round trip when we have not measured
 /// one".
 ///
-/// The reference has to be a constant rather than something observed during the connection,
-/// because it is the denominator of the consumption rate a window must beat to grow: raising
-/// it lowers that bar in proportion. Every round trip this side could observe before
-/// application data moves — the handshake exchange, the gap to the peer's first packet — is
-/// a quantity the peer chooses by delaying, so an observed reference would hand the peer a
-/// dial on how much memory this side is willing to commit to it. Erring low costs growth on
-/// paths longer than about 250 ms, which is the safe direction to err.
+/// What this constant covers, stated precisely, because it is easy to over-claim: the
+/// reference [`Stream::tune_recv_window`] divides by is **this constant only when the stream
+/// has no round trip of its own**. When it has one it is that stream's `min_rtt`, a
+/// measurement — so "the reference is a constant" is true of a download and not of the
+/// mechanism.
+///
+/// The reference matters because it is the denominator of the consumption rate a window must
+/// beat to grow: a longer one lowers that bar in proportion. Which is why no round trip
+/// observed *outside* the stream is ever substituted here. The handshake exchange and the gap
+/// to the peer's first packet are both quantities the far end sets by choosing when to answer,
+/// and a reference drawn from either would be a dial the peer holds on how much memory this
+/// side commits to it, with nothing spent to turn it. `min_rtt` is not that: it is the
+/// *minimum* over the stream's own acknowledged sends, so moving it means delaying every
+/// acknowledgement from the first one rather than choosing a convenient moment, and it buys a
+/// bounded thing — the ceiling arrives sooner, never higher. Erring low costs growth on paths
+/// longer than about 250 ms, which is the safe direction to err.
 const AUTOTUNE_RTT_FALLBACK: Duration = RtoEstimator::MIN_RTO;
 
 /// Receive-tuning state shared by every [`Stream`] of one session: the session-wide growth
@@ -1038,12 +1069,25 @@ impl Stream {
     ///
     /// ## What the growth is tied to
     ///
-    /// **Application consumption, never arrival.** `n` reaches this function only from the
-    /// delivery task, which counts bytes it has handed onward to the application, and the
-    /// interval is opened by the first such byte. A peer that sends fast to an application
-    /// that never reads calls this function zero times and moves nothing. That is the whole
-    /// memory-safety argument, and it is why the trigger may not be moved to the receive
-    /// path, where "bytes arrived" is entirely the peer's choice.
+    /// **Delivery, never arrival.** `n` reaches this function only from the delivery task,
+    /// which counts bytes it has handed onward, and the interval is opened by the first such
+    /// byte. Nothing on the receive path calls it, which is the part that matters: "bytes
+    /// arrived" is entirely the peer's choice, and a trigger reading it would be no trigger at
+    /// all.
+    ///
+    /// Delivery is not the same event as the application reading, and the gap between them is
+    /// the honest limit of this argument. The delivery task credits `n` as it hands a frame to
+    /// the bounded queue behind `recv()`, before the blocking send that puts it there returns,
+    /// so a peer earns credit for everything that queue will hold whether or not anybody ever
+    /// takes it out. On the opened-stream path that is
+    /// `STREAM_RECV_CHANNEL_DEPTH` frames — more than the whole ladder below costs — and the
+    /// peer chooses how many such queues exist, because every stream it opens gets one. So the
+    /// reachable statement is not "an application that never reads grants nothing" but "an
+    /// application that never reads grants at most the queues in front of it, and
+    /// [`SESSION_RECV_WINDOW_GROWTH_BUDGET`] is what caps the total". Both halves are pinned
+    /// by `one_delivery_queue_of_credit_buys_the_whole_ladder_with_no_read_at_all` and
+    /// `peer_opened_queues_reach_the_session_allowance_with_no_read_at_all` in this file's
+    /// tests.
     ///
     /// The rule: over a closed interval of `2 × RTT`, if the application consumed more than
     /// **four fifths of a window** — a rate above `0.4 × window / RTT` — the window is close
@@ -1060,31 +1104,34 @@ impl Stream {
     /// that prompted this work showed (1.2 Mbit/s against a 2.62 Mbit/s window ceiling, 46%).
     /// A threshold sitting on that same figure would never fire on the flow it exists for.
     ///
-    /// Measuring over a *time* interval rather than a byte count is deliberate. The delivery
-    /// pipeline in front of the application is a bounded queue, so a stalled reader still
-    /// absorbs one queue's worth of bytes in a burst; a byte-triggered test would read that
-    /// one-off burst as a sustained rate and climb the whole ladder on it. An interval no
-    /// shorter than a round trip cannot be satisfied by a transient.
+    /// Measuring over a *time* interval rather than a byte count is deliberate, and it is what
+    /// keeps the queue transient above from being free. A byte-triggered test would take one
+    /// queue's worth arriving in a burst as a sustained rate and climb the whole ladder inside
+    /// a single round trip. With the interval, each rung needs its own closed interval, so the
+    /// peer has to *pace* the queue out over as many intervals as there are rungs — which
+    /// costs it wall-clock time and, on the way up, throughput it could have had by sending
+    /// faster.
     ///
     /// ## What a hostile but authenticated peer gets
     ///
-    /// Nothing it does not have to buy. Moving this stream's window from 64 KiB to the
-    /// 1 MiB cap costs it four doublings, and each one requires the local application to
-    /// consume four fifths of the *current* window inside one round-trip-length interval —
-    /// ~790 KiB of genuinely consumed data in total, at a rate the peer cannot supply on its
-    /// own because the application has to keep up with it. If the application stops, the
-    /// window stops where it is.
+    /// Four doublings from 64 KiB to the 1 MiB cap, each of which has to be paid for with four
+    /// fifths of the *current* window inside one round-trip-length interval — about 790 KiB of
+    /// credit in total. What it does **not** have to do is persuade the application to read
+    /// any of it: as above, a queue's worth of credit is granted at delivery, and one
+    /// opened-stream queue holds more than 790 KiB. So the ceiling on one stream is reachable
+    /// against a `recv()` nobody calls, and the peer's real cost is the four intervals it
+    /// takes and the streams it has to open to repeat the trick. What stops it is
+    /// [`SESSION_RECV_WINDOW_GROWTH_BUDGET`] — an allowance, deliberately, rather than a hope
+    /// about the application.
     ///
-    /// The interval itself is not entirely outside the peer's reach, and claiming otherwise
-    /// would be the more comfortable statement rather than the true one. On a stream that
-    /// also *sends*, `min_rtt` is a real measurement and a peer that delays every one of its
-    /// acknowledgements can raise it, which lengthens the interval and so lowers the
-    /// consumption rate a doubling has to beat. What that buys is bounded and is not the
-    /// dangerous direction: it can only bring the window to the [`MAX_RECV_WINDOW`] ceiling
-    /// **sooner**, never past it, and the peer pays for it in its own throughput because
-    /// every doubling still has to be earned in bytes the local application actually took.
-    /// A receive-only stream — the flow auto-tuning exists for — never feeds its estimator
-    /// at all and uses the constant.
+    /// The interval is not entirely outside the peer's reach either. On a stream that also
+    /// *sends*, the reference is that stream's `min_rtt` rather than the constant, and because
+    /// it is a *minimum* over the stream's own acknowledged sends, raising it means delaying
+    /// every acknowledgement from the first — not picking a convenient one. What that buys is
+    /// bounded and is not the dangerous direction: a longer interval lowers the bar, so the
+    /// [`MAX_RECV_WINDOW`] ceiling arrives **sooner**, never higher, and the peer pays for it
+    /// in its own throughput. A receive-only stream — the flow auto-tuning exists for — never
+    /// feeds its estimator at all and uses the constant.
     ///
     /// Having paid, the peer may hold one window of unconsumed data on this stream and one
     /// window plus 64 KiB of reorder buffer ([`Self::recv_reorder_byte_limit`]). What bounds
@@ -1180,9 +1227,11 @@ impl Stream {
             .saturating_add(u64::from(self.advertised_recv_window()))
     }
 
-    /// Record that the application has actually consumed `n` bytes from this
-    /// stream (called by the receive *delivery* task on real drainage, not
-    /// on routing). Advances the consumed total and returns `Some(limit)` — the cumulative
+    /// Record that `n` bytes have been delivered onward from this stream — called by the
+    /// receive *delivery* task as it hands a frame to the queue behind `recv()`, never by the
+    /// routing path. It is one bounded queue short of "the application has read them", which
+    /// is the qualification `tune_recv_window` spells out and the reason the session
+    /// growth allowance exists. Advances the consumed total and returns `Some(limit)` — the cumulative
     /// limit to advertise in a `WINDOW_UPDATE` — when it is worth spending a frame on:
     /// either the unreported consumption has crossed half the initial window, or the
     /// advertised window just grew. The half-window threshold trades update frequency
@@ -2245,6 +2294,8 @@ impl std::fmt::Debug for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::session::STREAM_RECV_CHANNEL_DEPTH;
+    use crate::transport::mtu::MAX_RECV_PAYLOAD;
 
     /// The reorder-buffer entry cap has to sit in a window, and both walls are real.
     ///
@@ -3567,12 +3618,17 @@ mod tests {
     // is, more than 51.2 KiB per 400 ms at the 64 KiB initial window, 128 KiB/s. The clock is
     // paused, so every number below is exact rather than a race with the scheduler.
 
-    /// The safety direction, and the reason the feature is defensible: bytes *arriving* move
-    /// nothing. Only the delivery task, handing bytes onward to the application, calls
-    /// `record_app_consumed` — so a peer that floods a reader that never reads cannot make
-    /// the receiver widen its own buffer by one byte, no matter how long it keeps it up.
+    /// The safety direction, stated as narrowly as it is true: bytes *arriving* move nothing.
+    /// The receive path never calls `record_app_consumed`; only the delivery task does, as it
+    /// hands frames onward. So a peer whose frames pile up in the reorder buffer or stop at
+    /// the delivery queue's door widens nothing here, however long it keeps it up.
+    ///
+    /// It does **not** say that a peer facing an application that never reads gets nothing —
+    /// the queue between delivery and `recv()` is credited on the way in, and
+    /// `one_delivery_queue_of_credit_buys_the_whole_ladder_with_no_read_at_all` measures what
+    /// that is worth.
     #[tokio::test]
-    async fn arrival_without_consumption_never_grows_the_window() {
+    async fn arrival_without_delivery_never_grows_the_window() {
         tokio::time::pause();
         let s = Stream::new(1);
         assert_eq!(s.advertised_recv_window(), INITIAL_STREAM_WINDOW);
@@ -3589,8 +3645,8 @@ mod tests {
         assert_eq!(
             s.advertised_recv_window(),
             INITIAL_STREAM_WINDOW,
-            "the advertised window must be a function of what the application consumed, \
-             never of what the peer chose to send"
+            "the advertised window must be a function of what was delivered onward, never of \
+             what the peer chose to send"
         );
         assert_eq!(s.recv_reorder_byte_limit(), MAX_RECV_REORDER_BYTES);
     }
@@ -3780,6 +3836,146 @@ mod tests {
         );
     }
 
+    /// Bytes one opened stream's delivery queue holds before the task filling it blocks.
+    ///
+    /// The pump credits consumption in the delivery task, at the moment it hands a frame
+    /// *onward* to that queue and before the blocking send that puts it there completes —
+    /// `run_data_pump`'s Task B in `crate::api::session`. So the queue's capacity is credit a
+    /// peer can earn without the application ever calling `recv()`, and it is bounded in
+    /// slots by [`STREAM_RECV_CHANNEL_DEPTH`] and in bytes by [`MAX_RECV_PAYLOAD`], which is
+    /// what a peer maximising the weight of a slot sends.
+    fn one_delivery_queue_of_credit() -> u64 {
+        STREAM_RECV_CHANNEL_DEPTH as u64 * MAX_RECV_PAYLOAD as u64
+    }
+
+    /// Drive `s` up the doubling ladder the way a peer would that is trying to buy every rung
+    /// with as few bytes as possible: exactly one byte more than the current window's bar, per
+    /// closed interval. Returns the credit spent, which is the figure to compare against what
+    /// a delivery queue holds.
+    async fn climb_the_ladder_on_the_cheapest_credit(s: &Stream) -> u64 {
+        let mut credited = 1u64;
+        s.record_app_consumed(1, true); // opens the first interval
+        let mut intervals = 0u32;
+        while s.advertised_recv_window() < MAX_RECV_WINDOW {
+            let bar = u64::from(s.advertised_recv_window()) * 4 / 5 + 1;
+            tokio::time::advance(AUTOTUNE_RTT_FALLBACK * 2).await;
+            s.record_app_consumed(bar as u32, true);
+            credited += bar;
+            intervals += 1;
+            assert!(
+                intervals <= 8,
+                "the ladder stalled at {} B after {intervals} intervals; this test is no \
+                 longer measuring the cost of climbing it",
+                s.advertised_recv_window()
+            );
+        }
+        credited
+    }
+
+    /// **What the delivery queue in front of the application buys a peer.** The growth trigger
+    /// is fed by the delivery task as it hands a frame onward, not by the application reading
+    /// it, and one bounded queue sits between those two events. So "growth is earned by
+    /// consumption" is true of the counter and not of the application: a peer can spend a
+    /// whole queue's worth of credit against a `recv()` nobody ever calls.
+    ///
+    /// The size of that opening is what this pins. On the opened-stream path the queue holds
+    /// [`STREAM_RECV_CHANNEL_DEPTH`] frames of up to [`MAX_RECV_PAYLOAD`], which is more than
+    /// the entire ladder from the initial window to the ceiling costs — so the transient is
+    /// not a couple of rungs, it is all of them. The one thing the peer cannot skip is time:
+    /// each rung needs its own closed measurement interval, which is why pacing beats
+    /// flooding here and why a fast peer that fills the queue inside one interval gets less
+    /// than a patient one.
+    #[tokio::test]
+    async fn one_delivery_queue_of_credit_buys_the_whole_ladder_with_no_read_at_all() {
+        tokio::time::pause();
+        let s = Stream::new(2);
+        let credited = climb_the_ladder_on_the_cheapest_credit(&s).await;
+
+        assert_eq!(s.advertised_recv_window(), MAX_RECV_WINDOW);
+        assert!(
+            credited < one_delivery_queue_of_credit(),
+            "the ladder cost {credited} B and one opened stream's delivery queue holds {} B \
+             — if the queue no longer covers the climb, the documented reach of a peer whose \
+             application never reads has shrunk and every statement of it needs revisiting",
+            one_delivery_queue_of_credit()
+        );
+    }
+
+    /// **And the peer picks how many of those queues exist.** Every stream a peer opens gets
+    /// its own delivery queue — `handle_packet` registers one on the stream-creating segment,
+    /// with no embedder involvement, up to `MAX_STREAMS` — so the transient above is per
+    /// stream and its multiplier is the peer's to choose. Nine of them draw essentially the
+    /// whole session allowance while no application reads a byte.
+    ///
+    /// What still holds after that is the bound the process arithmetic rests on:
+    /// [`SESSION_RECV_WINDOW_GROWTH_BUDGET`] is what stops it, not the application's
+    /// cooperation. That is the honest form of the safety argument — the allowance is
+    /// peer-reachable, and it is an allowance rather than a hope.
+    #[tokio::test]
+    async fn peer_opened_queues_reach_the_session_allowance_with_no_read_at_all() {
+        tokio::time::pause();
+        // Nine, because a stream's whole climb is 960 KiB of growth and the allowance is
+        // 8 MiB: eight streams leave room and nine do not.
+        const STREAMS: u16 = 9;
+        assert!(
+            u64::from(STREAMS) * u64::from(MAX_RECV_WINDOW - INITIAL_STREAM_WINDOW)
+                > u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET),
+            "fewer streams than this cannot exhaust the allowance, so the test would pass \
+             without demonstrating anything"
+        );
+
+        let tuning = Arc::new(SharedRecvTuning::default());
+        let streams: Vec<Stream> = (2..2 + STREAMS)
+            .map(|id| Stream::with_recv_tuning(id, tuning.clone()))
+            .collect();
+
+        // In lockstep, each paying only the bar its own window sets — the cheapest credit
+        // that buys a rung. A stream stops paying once it has spent what its delivery queue
+        // holds, because that is where the real thing stops: the delivery task blocks on a
+        // full queue and no further credit is recorded until the application reads, which by
+        // assumption it never does.
+        let mut credited = vec![1u64; streams.len()];
+        for s in &streams {
+            s.record_app_consumed(1, true);
+        }
+        for _ in 0..8 {
+            tokio::time::advance(AUTOTUNE_RTT_FALLBACK * 2).await;
+            for (i, s) in streams.iter().enumerate() {
+                let bar = u64::from(s.advertised_recv_window()) * 4 / 5 + 1;
+                if credited[i] + bar > one_delivery_queue_of_credit() {
+                    continue;
+                }
+                s.record_app_consumed(bar as u32, true);
+                credited[i] += bar;
+            }
+        }
+
+        for (i, spent) in credited.iter().enumerate() {
+            assert!(
+                *spent <= one_delivery_queue_of_credit(),
+                "stream {i} needed {spent} B of credit, more than the {} B its delivery \
+                 queue holds — a never-reading application would have stopped it and this \
+                 test would be measuring a cooperative reader",
+                one_delivery_queue_of_credit()
+            );
+        }
+
+        let drawn = u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET)
+            - u64::from(tuning.remaining_growth_budget());
+        assert!(
+            drawn * 8 >= u64::from(SESSION_RECV_WINDOW_GROWTH_BUDGET) * 7,
+            "nine peer-opened streams drew only {drawn} B of the \
+             {SESSION_RECV_WINDOW_GROWTH_BUDGET} B allowance without a single read; the \
+             documented reach of a hostile peer is overstated"
+        );
+        assert!(
+            tuning.remaining_growth_budget() <= INITIAL_STREAM_WINDOW,
+            "the allowance still has {} B in it, which is the one thing that must not be \
+             claimed: it is the allowance, not the application, that stops this",
+            tuning.remaining_growth_budget()
+        );
+    }
+
     /// A long-lived session opens and closes streams. If growth were spent for good, the
     /// budget would drain away and every later stream would be pinned at the initial window —
     /// the same failure the budget exists to prevent, only slower.
@@ -3804,20 +4000,23 @@ mod tests {
         );
     }
 
-    /// **The RTT reference is a constant on purpose.** A stream that only receives never puts
-    /// a reliable segment on the wire, so `record_rtt_sample` — reached only from `ack` and
-    /// `on_sack`, both send-side — is never called and `min_rtt()` stays `None` for the life
-    /// of the transfer. That is the case auto-tuning exists for, and the obvious repair is to
-    /// feed it a round trip observed elsewhere in the connection.
+    /// **On a receive-only stream the RTT reference is a constant, on purpose.** Such a stream
+    /// never puts a reliable segment on the wire, so `record_rtt_sample` — reached only from
+    /// `ack` and `on_sack`, both send-side — is never called and `min_rtt()` stays `None` for
+    /// the life of the transfer. That is the case auto-tuning exists for, and the obvious
+    /// repair is to feed it a round trip observed elsewhere in the connection.
     ///
-    /// It must not be. The interval is `2 × rtt_used` and growth requires the application to
-    /// consume `0.8 × window` inside it, so the consumption rate a peer has to be outrun by
-    /// is inversely proportional to `rtt_used` — and every round trip this side could observe
-    /// before application data moves is one the far end sets by choosing when to answer. What
-    /// this pins is the direction: whatever the peer does, the bar this side holds it to is
-    /// the same one, and it comes from a constant.
+    /// It must not be. The interval is `2 × rtt_used` and growth requires `0.8 × window` to be
+    /// delivered inside it, so the rate a peer has to be outrun by is inversely proportional
+    /// to `rtt_used` — and every round trip this side could observe before application data
+    /// moves is one the far end sets by choosing when to answer, at no cost to itself.
+    ///
+    /// The scope of what is pinned here is exactly this case, and the difference matters.
+    /// A stream that also sends uses its own `min_rtt`, which is a measurement; the ways in
+    /// which that is and is not the peer's to move are set out on
+    /// [`AUTOTUNE_RTT_FALLBACK`] and `tune_recv_window`.
     #[tokio::test]
-    async fn the_growth_bar_does_not_move_with_anything_the_peer_controls() {
+    async fn a_receive_only_stream_holds_its_growth_bar_against_a_constant() {
         tokio::time::pause();
 
         // A trickle: 30 KB/s, against the 131 KB/s that the 64 KiB window at the 200 ms
@@ -3832,7 +4031,7 @@ mod tests {
         assert_eq!(
             s.advertised_recv_window(),
             INITIAL_STREAM_WINDOW,
-            "a trickle earned window growth — the consumption bar is being computed against \
+            "a trickle earned window growth — the delivery bar is being computed against \
              something other than the fixed reference"
         );
 
@@ -3848,10 +4047,15 @@ mod tests {
     }
 
     /// The reason the trigger is a time interval and not a byte count. The delivery queue in
-    /// front of the application is bounded but not empty, so even a stalled reader absorbs
-    /// one queue's worth of bytes in a burst. A byte-triggered tuner would read that burst as
-    /// a sustained rate and climb the entire ladder on it; an interval no shorter than a
-    /// round trip lets it buy at most the one doubling the burst genuinely paid for.
+    /// front of the application is bounded but not empty, so even a stalled reader absorbs one
+    /// queue's worth of bytes. A byte-triggered tuner would take that arriving in a burst as a
+    /// sustained rate and climb the entire ladder inside a single round trip; the interval
+    /// lets a burst buy at most the one doubling it genuinely paid for.
+    ///
+    /// It does not deny the queue's worth of credit, only its delivery in one go — a peer
+    /// willing to pace the same bytes across one interval per rung still climbs, which is what
+    /// `one_delivery_queue_of_credit_buys_the_whole_ladder_with_no_read_at_all` measures. What
+    /// the interval takes from the peer is time, not the rungs.
     #[tokio::test]
     async fn a_burst_shorter_than_the_interval_does_not_climb_the_ladder() {
         tokio::time::pause();

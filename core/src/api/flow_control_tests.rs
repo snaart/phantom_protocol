@@ -121,9 +121,17 @@ async fn a_promptly_drained_download_beats_the_fixed_window_rate_ceiling() {
 
 /// **The safety direction, end to end.** The advertised window is a memory-safety mechanism
 /// first: it bounds how much an unacknowledged peer can make this side buffer. Growing it is
-/// therefore tied to demonstrated *application consumption* and never to arrival — so a
-/// receiver whose application never reads must stall its peer, and must stall it at
-/// substantially the same point as before auto-tuning existed.
+/// tied to what the delivery task hands *onward* and never to arrival — so a receiver whose
+/// application never reads must stall its peer, and must stall it at substantially the same
+/// point as before auto-tuning existed.
+///
+/// Onward is not the same as read, and the gap is the bounded queue in front of `recv()`.
+/// This test measures the raw-app path, where that queue is one 256-slot channel per session
+/// and the transient it buys is therefore fixed. The opened-stream path is the one to be
+/// careful about: 1024 slots per stream, and the peer picks the stream count — see
+/// `transport::stream`'s
+/// `peer_opened_queues_reach_the_session_allowance_with_no_read_at_all`, which measures what
+/// that reaches.
 ///
 /// What bounds the number below: the initial 64 KiB window, plus the doublings the bounded
 /// delivery queue in front of `recv()` can pay for as it fills (the queue absorbs a few
@@ -133,11 +141,13 @@ async fn a_promptly_drained_download_beats_the_fixed_window_rate_ceiling() {
 /// stream's send buffer, which is why this measures the wire and not the sender's API.
 ///
 /// Note what does **not** appear in that list:
-/// [`crate::transport::stream::MAX_RECV_WINDOW`]. The queue transient is a fixed number of
-/// bytes — the 256-slot `recv()` channel — so it pays for a fixed number of doublings no
-/// matter how many rungs the ceiling above it offers. That is the property worth pinning: a
-/// ceiling is not an allowance, and this test's bound is therefore allowed to stay where it
-/// was when the ceiling was half its present size.
+/// [`crate::transport::stream::MAX_RECV_WINDOW`]. On *this* path the queue transient is a
+/// fixed number of bytes — one 256-slot `recv()` channel per session — so it pays for a fixed
+/// number of doublings no matter how many rungs the ceiling above it offers. That is the
+/// property worth pinning here: a ceiling is not an allowance, and this test's bound is
+/// therefore allowed to stay where it was when the ceiling was half its present size. It is a
+/// property of the raw-app queue's fixed size, not of the tuner, and it does not carry over
+/// to a path whose queue count the peer chooses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_receiver_that_never_reads_stalls_the_sender() {
     let (client, server, server_wire) = establish_counted(ONE_WAY, LINK_BYTES_PER_SEC).await;

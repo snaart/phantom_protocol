@@ -261,6 +261,24 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - run: scripts/check_panic_sites.py
 
+  memory-arithmetic:
+    # The published receive-window-growth product has two factors in two crates
+    # that cannot see each other — a clap default in server/, a constant in
+    # core/ — and six documents plus one test restate it. The test written to
+    # stop that figure drifting held both factors as literals of its own, so it
+    # agreed with the tree it was written against and nothing else. This is the
+    # coupling. No toolchain needed — it is a text scan, like the job above, and
+    # it belongs in branch protection beside it.
+    name: published memory arithmetic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # The script's own cases run first. A gate that has quietly stopped
+      # matching anything reports the same success as a tree that agrees, and
+      # nothing but these cases tells the two apart.
+      - run: scripts/check_memory_arithmetic_test.py
+      - run: scripts/check_memory_arithmetic.py
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest

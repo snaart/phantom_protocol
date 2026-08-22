@@ -66,6 +66,18 @@ repos:
         files: ^(core/src/.*\.rs|docs/security/panic-sites\.md)$
         pass_filenames: false
 
+      # ── Published memory arithmetic ───────────────────────────────────
+      - id: check-memory-arithmetic
+        name: published memory arithmetic matches its constants
+        # The session cap is a clap default in server/, the per-session growth
+        # allowance is a constant in core/, and six documents plus one test
+        # state their product. Neither crate can see the other's number, so
+        # nothing but this script notices when one of them moves.
+        entry: scripts/check_memory_arithmetic.py
+        language: system
+        files: ^(server/src/config\.rs|core/src/transport/stream\.rs|core/src/api/session\.rs|core/tests/security_invariants\.rs|CHANGELOG\.md|docs/security/threat-model\.md|docs/operations/deployment\.md|docs/operations/kubernetes\.md|docs/operations/helm/phantom-protocol/values\.yaml|\.env\.example|server/README\.md)$
+        pass_filenames: false
+
       # ── Landing-page copy that ships inside the crate ─────────────────
       - id: sync-readme
         name: core/README.md mirrors README.md

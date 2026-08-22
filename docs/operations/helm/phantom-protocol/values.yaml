@@ -47,13 +47,41 @@ service:
 # ---------------------------------------------------------------------------
 # Resource budgets
 # ---------------------------------------------------------------------------
-# From perf-tuning.md / kubernetes.md:
-#   ~64 KiB working memory per session; 3-4 GB/s per core (AES-256-GCM + AES-NI).
-# Defaults target ~1 000 concurrent sessions on a single pod:
-#   memory request = N*64KiB + ~64MiB overhead ≈ 128 MiB
-#   memory limit   = 4x request for burst headroom
 # CPU: 500m request keeps scheduling flexible; 2000m limit caps at ~2 cores
-#   (sufficient for the PQC keygen path at ~10-15 ms/handshake).
+#   (sufficient for the PQC keygen path at ~10-15 ms/handshake, 3-4 GB/s per
+#   core for AES-256-GCM + AES-NI).
+#
+# Memory: these defaults are sized for ~1 000 sessions of *ordinary* traffic and
+# are only safe with PHANTOM_MAX_SESSIONS set to match the pod. Read
+# docs/operations/deployment.md, "Session caps & resource limits", before
+# trusting them. The two figures it separates:
+#
+#   * A session carrying ordinary traffic sits around 512 KiB. That is what the
+#     limit below is sized from, and it is a typical figure, not a bound.
+#   * An authenticated but hostile peer can move one session's receive
+#     footprint into the hundreds of megabytes, and nothing divides any of it
+#     between concurrent sessions.
+#
+# One term of the second figure is an exact constant, and it is the one to check
+# a pod against: a session may draw 8 MiB of receive-window growth across all its
+# streams, and nothing divides that between sessions, so at the server's default
+# cap of 1024
+#
+#     1024 × 8 MiB = 8 GiB of receive-window growth alone
+#
+# is committed before a reorder entry or a delivery-queue slot is counted. That is
+# sixteen times the limit set below, so a pod on these defaults must also lower
+# PHANTOM_MAX_SESSIONS, in the env block further down. The server prints the
+# product at startup; compare it with limits.memory here.
+#
+# That product is a floor on what the host must have, not a ceiling on what the
+# process will use: growth is one term of four and not the largest, and it is an
+# advertisement rather than a residency — the bytes it admits come to rest in the
+# reorder buffers and the delivery queues, which deployment.md ranks an order of
+# magnitude above it. Sizing a pod ends in measurement under its own traffic.
+#
+# The request below is a scheduling floor rather than a derivation; the limit is
+# roughly where ~1 000 typical sessions land. Both move with the session cap.
 resources:
   requests:
     cpu: "500m"
@@ -161,6 +189,10 @@ signingKey:
 # ---------------------------------------------------------------------------
 # Override RUST_LOG, or add PHANTOM_MAX_SESSIONS / PHANTOM_MAX_SESSIONS_PER_IP /
 # PHANTOM_LOG_JSON as required — see server/src/config.rs and .env.example.
+# PHANTOM_MAX_SESSIONS is the one to set alongside `resources.limits.memory`
+# above: the server admits 1024 sessions unless told otherwise, and that cap
+# commits 8 GiB of receive-window growth on its own — a floor on what the host
+# must have, not a ceiling on what the process will use.
 # PHANTOM_BIND (a full SocketAddr, e.g. "0.0.0.0:4242") and
 # PHANTOM_SIGNING_KEY_FILE are rendered by the Deployment from `service.port`
 # and the `signingKey` block; override those values rather than duplicating the
