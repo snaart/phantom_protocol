@@ -624,7 +624,10 @@ Client, under `results/<run-id>/`:
 - `samples/<leg>/<scenario>.window.jsonl` — the congestion window sampled every 200 ms
   through each bulk transfer: cwnd, bytes in flight, bandwidth estimate, BBR phase,
   app-limited flag. This is what separates a sender-bound transfer from a slow link;
-  throughput alone cannot.
+  throughput alone cannot. The series covers the transfer and **not** the teardown
+  that follows it: a drain's rows are exactly the rows in which outstanding bytes
+  collapse, and they would land in the tail that both the ceiling reading and the
+  convergence reading are taken over
   **On the `quic` leg only `cwnd_bytes` and `min_rtt_us` carry values**, and
   `min_rtt_us` holds quinn's *smoothed* RTT rather than a windowed minimum;
   quinn exposes no bytes-in-flight, bandwidth estimate, pacing rate, delivered
