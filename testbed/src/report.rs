@@ -459,6 +459,75 @@ pub struct WindowSample {
     pub app_limited: bool,
 }
 
+/// One rung of the byte-ceiling sweep: a saturating transfer at one frame size,
+/// and where the bytes outstanding settled.
+///
+/// A saturated sender can be sitting against either of two byte ceilings — the
+/// ARQ send buffer or the peer's advertised flow-control window — and at the
+/// frame size the rest of the matrix runs at they are within half a percent of
+/// each other, so no field of a [`WindowSample`] tells them apart. They differ
+/// in **units**: the buffer is bounded in segments, so its byte figure moves
+/// with the frame size, and the window is bounded in bytes and does not. Moving
+/// the frame is therefore the only thing that separates them, and this record is
+/// one such rung.
+///
+/// Both candidates travel in the record beside the measurement, with the library
+/// constants they were computed from. That is deliberate and is the same bargain
+/// as [`WindowSample::bw_filter_window_ms`]: a reading whose bounds are held in
+/// an analysis script goes wrong silently the day a constant moves, and the
+/// failure mode is a confident label naming a bound the run was never taken
+/// against.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendCeilingSample {
+    pub leg: Leg,
+    pub t_unix_ns: u64,
+    /// Index into the sweep, so rungs stay ordered after any sort.
+    pub rung: u16,
+    /// Application bytes per frame the rung was driven at.
+    pub frame_bytes: u32,
+    /// What one such frame cost on the wire — the unit both ceilings are in.
+    pub wire_frame_bytes: u32,
+    /// Segments of the ARQ send buffer one frame occupies.
+    pub segments_per_frame: u32,
+    /// `transport::stream::MAX_PENDING_PACKETS` as this build has it.
+    pub send_buffer_segments: u32,
+    /// `transport::mtu::MAX_APP_CHUNK` as this build has it.
+    pub app_chunk_bytes: u32,
+    /// The two candidate ceilings at this frame size, in bytes. The lower of
+    /// the two is the one that can bind; whether the sender actually reached it
+    /// is what the rung measures.
+    pub arq_buffer_bytes: u64,
+    /// `transport::stream::MAX_SEND_WINDOW`, read from the library rather than
+    /// restated.
+    pub peer_window_bytes: u64,
+    pub window_ns: u64,
+    pub client_bytes: u64,
+    pub client_frames: u64,
+    pub megabits_per_sec: f64,
+    /// What the server counted, which is the honest figure — `None` when its
+    /// report never came back.
+    pub server_bytes: Option<u64>,
+    pub server_frames: Option<u64>,
+    /// Congestion-window samples taken over the rung, and how many of them the
+    /// tail statistics below were drawn from.
+    ///
+    /// The tail is where a saturated sender sits: the head of any transfer is
+    /// the controller climbing, and a distribution over the whole of it
+    /// describes the climb rather than the ceiling.
+    pub window_samples: usize,
+    pub tail_samples: usize,
+    pub tail_share: f64,
+    /// Bytes outstanding over that tail, and the congestion window beside it —
+    /// a window that never rose above the ceiling means the rung never put the
+    /// question, whatever the outstanding bytes did.
+    pub inflight_tail: Summary,
+    pub cwnd_tail: Summary,
+    /// The session refused a frame for longer than an operation budget, so the
+    /// rung ended on backpressure rather than on its own clock.
+    pub stalled: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThroughputSample {
     pub leg: Leg,

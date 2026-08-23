@@ -111,6 +111,25 @@ struct Args {
     #[arg(long)]
     upload_secs: Option<u64>,
 
+    /// Size each bulk upload from the round trip this run measures, instead of
+    /// running a fixed number of seconds.
+    ///
+    /// Convergence is not counted in seconds. Startup costs round trips, the
+    /// gain cycle that follows it raises the bandwidth estimate by a quarter per
+    /// four round trips, and both are terms in how long a transfer must run
+    /// before its mean rate is a capacity rather than a convergence time — so a
+    /// window fixed in seconds gives a long path *less* convergence than a short
+    /// one, which is backwards. This derives the window instead: 110 round trips
+    /// (16 for Startup, 67 for a 40x climb at 1.25x per four rounds, and a
+    /// further quarter so the last quarter of the transfer is a plateau). That
+    /// costs 22 s on a 200 ms path and 25 s on a 230 ms path, per upload and
+    /// per leg. The derivation is in `probe::converge`.
+    ///
+    /// Needs `clock_sync`, which is what measures the round trip; a run that
+    /// filters it out is refused rather than quietly falling back.
+    #[arg(long, conflicts_with = "upload_secs")]
+    upload_converge: bool,
+
     /// Override the application frame size used by `upload`, `download` and
     /// `bidir`, in bytes.
     ///
@@ -212,6 +231,7 @@ async fn main() -> Result<()> {
         legs,
         out_root: args.out,
         params,
+        upload_converge: args.upload_converge,
         upload_results: !args.no_upload,
         only: args.only.map(|v| v.into_iter().collect()),
         capture_iface: args.capture_iface,
@@ -362,6 +382,48 @@ mod tests {
             assert!(
                 resolved_params(&parse(&argv)).is_err(),
                 "{argv:?} must be refused rather than silently clamped"
+            );
+        }
+    }
+
+    /// The two ways of setting the upload window are exclusive, because they
+    /// answer the same question differently and the loser would be invisible.
+    #[test]
+    fn the_window_cannot_be_both_derived_and_fixed() {
+        assert!(
+            Args::try_parse_from([
+                "phantom-probe",
+                "--host",
+                "example.invalid",
+                "--pin-hex",
+                "aa",
+                "--upload-secs",
+                "60",
+                "--upload-converge",
+            ])
+            .is_err(),
+            "a fixed window and a derived one cannot both apply"
+        );
+        assert!(parse(&["--upload-converge"]).upload_converge);
+        assert!(!parse(&[]).upload_converge);
+    }
+
+    /// The flag's help states what a converged upload costs in wall clock, and
+    /// an operator budgets a run against that figure. It has to be the number
+    /// the derivation produces rather than one written down beside it.
+    #[test]
+    fn the_help_states_the_wall_clock_the_derivation_actually_produces() {
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        // Rendered help wraps to the terminal, so compare against a form with
+        // the line breaks taken out.
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for ms in [200u64, 230] {
+            let cost = phantom_testbed::probe::converge::cost_at(Duration::from_millis(ms));
+            let claim = format!("{:.0} s on a {ms} ms path", cost.as_secs_f64());
+            assert!(
+                flat.contains(&claim),
+                "the help must state the derived cost verbatim; missing {claim:?}"
             );
         }
     }
