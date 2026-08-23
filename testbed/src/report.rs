@@ -216,6 +216,20 @@ pub struct RunMeta {
 
     pub clock: Option<ClockEstimate>,
 
+    /// Intervals during which the probe's own host was not executing.
+    ///
+    /// Empty on a run that stayed awake, and `#[serde(default)]` so artifacts
+    /// written before this field existed still load — they are runs for which
+    /// the question was not asked, which is a different thing from a run that
+    /// answered no, and only the absence of the field distinguishes them.
+    ///
+    /// A suspension makes every scenario whose window overlaps it unreadable
+    /// as a measurement of the path: the connect inside it records `Timeout`
+    /// while the daemon, still running, completes the handshake and counts it
+    /// a success. See [`crate::suspend`].
+    #[serde(default)]
+    pub suspensions: Vec<crate::suspend::Suspension>,
+
     /// Everything a reader must know before over-reading this data set.
     ///
     /// Written into the artifact itself rather than left to a README, because

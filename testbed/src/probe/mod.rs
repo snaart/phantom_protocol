@@ -466,8 +466,14 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
         // Filled from the daemon's STATS reply during clock_sync; see there.
         daemon_build: None,
         clock: None,
+        suspensions: Vec::new(),
         caveats: caveats(&cfg),
     };
+
+    // Started before the first scenario so the whole run is covered, including
+    // the clock exchange the rest of the record is calibrated against.
+    let suspend_watch = crate::suspend::SuspendWatch::new();
+    let suspend_task = suspend_watch.spawn();
 
     let mut st = RunState {
         dir: dir.clone(),
@@ -717,7 +723,27 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
 
     st.meta.finished_utc = Some(utc_stamp());
     st.meta.finished_unix_ns = Some(unix_nanos());
+    // Before anything else is written or printed: whether this process was
+    // running for the run it just recorded. A suspension turns Timeouts and
+    // fallen rates into artifacts of the host rather than of the path, and the
+    // reader has to be told that ahead of the numbers, not after them.
+    suspend_task.abort();
+    st.meta.suspensions = suspend_watch.take();
+    let run_span = Duration::from_nanos(
+        st.meta
+            .finished_unix_ns
+            .unwrap_or(st.meta.started_unix_ns)
+            .saturating_sub(st.meta.started_unix_ns),
+    );
+    let suspend_verdict = crate::suspend::verdict(&st.meta.suspensions, run_span);
+    if let Some(v) = suspend_verdict.clone() {
+        st.meta.caveats.push(v);
+    }
     st.flush_summary()?;
+
+    if let Some(v) = suspend_verdict {
+        println!("\n  VERDICT host suspended: {v}");
+    }
 
     println!("\n  scenarios: {}", st.summaries.len());
     println!("  errors recorded: {}", st.total_errors);

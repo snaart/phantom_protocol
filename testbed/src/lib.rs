@@ -51,6 +51,7 @@ pub mod proto;
 pub mod quic;
 pub mod report;
 pub mod stats;
+pub mod suspend;
 pub mod sysinfo;
 pub mod testd;
 pub mod uplink;
