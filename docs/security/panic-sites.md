@@ -12,11 +12,26 @@ purpose, so failures surface as readable diagnostics.
 
 The crate's `#![deny(clippy::unwrap_used, clippy::expect_used, …)]` (see
 `core/src/lib.rs`) means a new panic site needs an explicit `#[allow(...)]`
-next to the comment, which keeps the list small and reviewed. One module is
-outside that net: `runtime/wasm_runtime.rs` is `#[cfg(target_arch =
-"wasm32")]`, which the native `clippy` job never compiles and the `wasm32`
-cross job only `cargo check`s. Its row carries the rationale but no
-statement-level `#[allow]`.
+next to the comment, which keeps the list small and reviewed.
+
+That net has a hole, and knowing its shape matters more than the net does,
+because the hole is where a site can appear with nothing objecting. **A lint
+only bites where clippy runs, and every `cargo clippy` invocation in
+`.github/workflows/` targets the native host.** The `embedded`, `fips`,
+`mimicry` and `telemetry-otel` jobs vary the feature set, not the target, so
+rows 1, 3, 5 and 6 are linted exactly as the default-build rows are. The six
+rows behind a `wasm32` or `wasi` cfg — 7, 8, 9, 10, 13, 14 — are not: nothing
+compiles them but `cargo check` in the `cross.yml` matrix and the
+`wasi-integration` job, and `cargo check` does not run clippy. On those six the
+`#[allow]` attributes are documentation rather than suppression, and row 10
+(`runtime/wasm_runtime.rs`) carries none at all.
+
+What guards them instead is the `// PANIC-SAFETY:` marker plus
+`scripts/check_panic_sites.py`, which reads text and so sees every file whatever
+its cfg. Four of those six rows are recent, and they reached this table because
+the script insisted rather than because a compiler did — which is the case for
+keeping the script text-based, even though reading text is also where its
+limits come from ("Deliberate limits", below).
 
 **Rows are keyed on file and enclosing function, never on a line number.**
 A line number in a checked-in document goes wrong the moment anyone inserts a
@@ -28,12 +43,24 @@ pointed at the code it described.
 `scripts/check_panic_sites.py` now re-derives the inventory from the source
 and fails when the two disagree — see "Maintaining this file" below.
 
-This file enumerates **23** production panic sites (rows): 13 always-on, 3
-fips-only (gated on `feature = "fips"`), 5 wasi-only (`feature = "wasi-leg"` +
+This file enumerates **23** production panic sites (rows): 12 always-on, 1
+default-build-only (`cfg(not(feature = "fips"))`), 3 fips-only (gated on
+`feature = "fips"`), 5 wasi-only (`feature = "wasi-leg"` +
 `cfg(target_os = "wasi")`), 1 embedded-runtime-only (`feature = "embedded"` +
 `std`), and 1 browser-wasm-only (`cfg(target_arch = "wasm32")`). Counting
 individual calls rather than rows, three rows cover several calls each (rows
 1, 2 and 10, two calls each except row 10's three).
+
+Two things the `Build` column means precisely, because an auditor sizing up one
+build has to add the buckets up. **"always" means every `std` build**, not every
+build: `transport/{fragmentation,sack,stream}.rs` and the whole of `crypto/` are
+declared `#[cfg(feature = "std")]`, and `runtime/embedded_runtime.rs` needs
+`std` as well, so the bare-metal `--no-default-features --features
+embedded,no-std` recipe compiles **no** row in this table at all. And rows 4 and
+5 are the *same function* in two mutually exclusive impls — a default build
+compiles row 4 and not row 5, a fips build the reverse — which is why row 4 is
+counted apart from the twelve. A default build therefore holds 13 sites
+(12 + row 4) and a fips build 15 (12 + rows 1, 3, 5); neither holds 16.
 
 ## Sites
 
@@ -42,7 +69,7 @@ individual calls rather than rows, three rows cover several calls each (rows
 | 1 | `core/src/crypto/hybrid_kem.rs` | `generate` | fips | `PrivateKey::generate(&ECDH_P256).expect(...)` + `sk.compute_public_key().expect(...)` (×2) | `aws_lc_rs::agreement::PrivateKey::generate` only fails when the AWS-LC CTR_DRBG itself returns an error — the same unrecoverable condition that makes `getrandom` failure (row 4) a panic. `compute_public_key` on a freshly-generated valid P-256 private cannot fail. `HybridSecretKey::generate` returns `(Self, HybridKeyPackage)` infallibly (no `Result`), so error propagation here would be an API break; loud panic matches the row 4 convention. (Added in the FIPS primitive swap.) |
 | 2 | `core/src/crypto/kdf.rs` | `derive_early_data_keying` | always | `hk.expand(EARLY_DATA_{KEY,NONCE}_INFO, ...).expect(...)` (×2) | `Hkdf::expand` only fails when the requested output length exceeds 255 × HashLen (= 8160 bytes for SHA-256). The two outputs here are 32 bytes (AEAD key) and 12 bytes (AEAD nonce), both compile-time constants far below the ceiling. (Added Phase 4.1 alongside the V3 0-RTT early-data keying.) |
 | 3 | `core/src/crypto/kdf.rs` | `derive_key_32` | fips | `hk.expand(label.as_bytes(), &mut out).expect(...)` | HKDF-SHA256 `expand` only errors when output length exceeds 255 × HashLen = 8160 bytes for SHA-256. `derive_key_32` requests exactly 32 bytes — far below the ceiling. (Added in the FIPS primitive swap.) |
-| 4 | `core/src/crypto/rng.rs` | `fill_bytes` | always | `fill(dest).expect("OS RNG (getrandom) failed")` (the non-fips `impl RngProvider for OsRng`) | `getrandom` only fails when the OS CSPRNG itself is broken or unavailable — an unrecoverable condition at this layer. Panicking loudly is preferable to silently producing zeros or propagating a partially-filled buffer that the caller would treat as good entropy. (Added Phase 3.8 with the `RngProvider` trait extraction.) |
+| 4 | `core/src/crypto/rng.rs` | `fill_bytes` | default (not fips) | `fill(dest).expect("OS RNG (getrandom) failed")` (the `#[cfg(not(feature = "fips"))]` `impl RngProvider for OsRng`) | `getrandom` only fails when the OS CSPRNG itself is broken or unavailable — an unrecoverable condition at this layer. Panicking loudly is preferable to silently producing zeros or propagating a partially-filled buffer that the caller would treat as good entropy. (Added Phase 3.8 with the `RngProvider` trait extraction.) |
 | 5 | `core/src/crypto/rng.rs` | `fill_bytes` | fips | `rng.fill(dest).expect("AWS-LC CTR_DRBG fill failed")` (the `#[cfg(feature = "fips")]` impl of the same trait) | `aws_lc_rs::rand::SystemRandom::fill` only fails when the AWS-LC CTR_DRBG itself is broken or in a self-test-failed state — unrecoverable at this layer. Direct fips-build analogue of row 4; same panic-loud-rather-than-silent-zeros policy. (Added in the FIPS primitive swap.) |
 | 6 | `core/src/runtime/embedded_runtime.rs` | `poll` | embedded + std | `self.inner.lock().expect("SleepFuture mutex poisoned")` (in `impl Future for SleepFuture`) | The `std::sync::Mutex` is private to this `SleepFuture` and its parker thread, neither of which panics while holding it. A `PoisonError` would indicate an unrecoverable runtime bug, not adversary input. (`EmbeddedRuntime` is the std-backed scaffold; bare-metal embedders ship their own runtime.) |
 | 7 | `core/src/runtime/wasi_runtime.rs` | `drive` | wasi | `self.inner.tasks.lock().expect("WasiRuntime task queue mutex poisoned")` | The mutex is a `std::sync::Mutex` over the private `tasks: Vec<TaskSlot>` field of `WasiInner`. Only ever held briefly inside `drive`, `spawn` and `tasks_pending`. A poison would mean a panic occurred inside one of those calls — by which point the runtime state is unrecoverable. (Added alongside the `wasi-leg` feature; mirrors the `EmbeddedRuntime` mutex pattern.) |
@@ -118,6 +145,15 @@ marks it, which is why rows 15 and 16 exist. It also checks per function
 rather than per call, so a second unmarked panic added to a function that
 already has a marker will not be caught. Both gaps are for review to close,
 not the script.
+
+The second gap was walked by hand on **2026-08-23**, commit `1ca07d2e`, by
+counting panicking calls per marked function outside `#[cfg(test)]` and
+comparing against the multiplicities this table claims. Every function agreed:
+`generate` 2, `derive_early_data_keying` 2, `sleep` 3, `process_chunk` 2 under
+2 markers, `on_sack` 2 under 2, `fill_bytes` 2 under 2 (one per cfg impl), and
+one each elsewhere. `to_wire` holds three markers and zero explicit calls,
+which is the whole point of rows 15–17: they cover a saturating cast, an index
+and a subtraction, and no tooling here would have found any of the three.
 
 ## Adversarial review checklist
 
