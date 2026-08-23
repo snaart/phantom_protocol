@@ -33,6 +33,8 @@ reports is a statement about the shipped surface rather than a private path.
 | 4245 | UDP | QUIC via `quinn` | **reference** |
 | 4342 | TCP | raw TCP echo | **control, no protocol** |
 | 4343 | UDP | raw UDP echo | **control, no protocol** |
+| 4344 | UDP | raw UDP downstream source (server → client) | **control, no protocol** |
+| 4345 | UDP | raw UDP uplink sink (client → server) | **control, no protocol** |
 
 All three Phantom listeners are built from one persisted 64-byte signing seed,
 so a single pin hex covers every leg and cross-leg comparison is not confounded
@@ -43,7 +45,10 @@ Three kinds of leg, and confusing them is how a result gets misread:
 **Under test** is the protocol this repository ships.
 
 **Controls** are the denominator. Without them, "PhantomUDP sustained X Mbit/s at
-Y ms" says nothing, because the link's own ceiling is unknown.
+Y ms" says nothing, because the link's own ceiling is unknown. Two of the four
+are echoes and so bound the two directions together and neither alone; the other
+two are one way each, and those are what put a number under a single direction's
+`download` and `upload`.
 
 **The reference** is a mature implementation of the same class — reliable,
 encrypted, multiplexed, over UDP — driven over the same path in the same run,
@@ -134,7 +139,7 @@ Useful flags: `--legs udp,tcp,mimic,quic,raw_tcp,raw_udp`,
 `clock_sync`, `handshake`, `handshake_repair`, `wire_capture`, `rtt_sweep`,
 `message_integrity`, `upload`, `download`, `bidir`, `streams`, `zero_rtt`,
 `rekey`, `migration`, `concurrency`, `negative`, `liveness_soak`, and the
-raw-leg baselines (`rtt_sweep`, `throughput`).
+raw-leg baselines (`rtt_sweep`, `throughput`, `downstream`, `upstream`).
 
 `upload`, `download` and `bidir` additionally record the sender's congestion-control
 state throughout, and the daemon reports its own in `STATS` — during a download the
@@ -330,11 +335,79 @@ that only runs as root is one that gets switched off the first time it is
 inconvenient. The privileged path stays the operator's; the unprivileged one is
 what guards the property on every commit.
 
+### `downstream` and `upstream`: the two one-way ladders
+
+An echo bounds the two directions together and neither of them alone, so a
+`download` divided by an echo figure and an `upload` divided by the same figure
+are both statements about the wrong thing. These two are the same instrument
+aimed in opposite directions: one side paces raw datagrams up a ladder of
+offered rates and the other counts what arrived. Same pacer, same rungs, same
+datagram size, same sequence-numbered header, same receiver bookkeeping — so the
+two numbers can be read side by side, which is exactly how they are printed.
+
+Each rung records four things, and collapsing any of them into another is how a
+control comes to report its own scheduler as the path's ceiling:
+
+| | |
+|---|---|
+| **offered** | the rate the rung asked for |
+| **sender achieved** | what the sender actually put on its own socket, which is not the same number |
+| **receiver saw** | what the far end counted, over the far end's own first-to-last-arrival window |
+| **loss, reordering, duplication** | separately, per gap — see the section below |
+
+**The receiver's account is the honest one.** On the uplink the receiver is the
+daemon, so what it counted has to travel back over the wire — arrivals,
+duplicates, and the whole reorder distribution. That is the only structural
+difference between the two ladders, and it is forced: downstream the receiver is
+the client, which keeps its own ledger locally and needs nothing but the
+sender's totals back.
+
+**What bounds the sender, and at what rate it starts to matter.** Every run says
+this in its own scenario notes rather than leaving it to be rediscovered,
+because both raw controls have measured themselves before now: the UDP pacer
+once reported `tokio::time::sleep`'s ~1 ms granularity as the path's ceiling, and
+the TCP control measured first its own socket buffer and then its own
+bufferbloat. The pacer is a credit bucket on a 1 ms tick that batches within a
+tick, so the timer stops mattering above one datagram per tick — 9.6 Mbit/s at
+1200 B, which is the exact figure the non-batching version of that loop once
+reported as a path ceiling. Above it the limit is one `sendto` per datagram
+(20 833 a second at the top of the default ladder) plus whatever the socket's
+send buffer refuses. On the receiving side the sink asks for a 4 MiB receive
+buffer, because a receiver that drops datagrams in the kernel during a
+scheduling gap reports them as the path's loss. Every one of these shows up as a
+rung short of its own offer, recorded per rung, marking it inadmissible — never
+as a path ceiling.
+
+**A ceiling and a floor are different claims.** A rung where the path pushed
+back — loss appeared, or the sender could not reach its own offer — means the
+ladder found a limit, and the best admissible rate is a **measured ceiling**. A
+ladder that climbed every rung cleanly did not find one, and its best rate is a
+**lower bound**; calling that a ceiling would assert the path cannot do more,
+which the run never tested. Both ladders label themselves, and `analyze.py`
+re-derives the label from the raw rungs rather than trusting the note.
+
+Two things about the uplink ladder that have no counterpart downstream, both
+forced by which end is doing the counting. The rung is **armed before it
+starts**: the receiver's ledger opens the sequence numbers below its first
+arrival as gaps, so datagrams arriving before the sink knew a rung existed would
+be booked as loss the path never caused — the sink answers a request with a
+`Ready` and the client sends nothing until it comes. And a **refusal is
+explicit**: downstream a declined burst is reported as a sender that achieved
+zero, which reads correctly as inadmissible, whereas here the same silence would
+read as a receiver that saw nothing, which is a measurement and a false one.
+
+Both ladders are gated by the same return-routability cookie, for different
+reasons. The downstream source would otherwise turn a 40-byte request into a
+burst aimed at a forged address. The uplink sink amplifies nothing — its replies
+are smaller than what provokes them — but an armed rung costs it a receiver
+ledger, and a ledger any spoofed source can allocate is a table an attacker
+fills; the cookie plus a four-rung concurrency bound is what closes that.
+
 ### Reordering: how far back, and how long after
 
-Both raw UDP controls — the client → server echo and the server → client
-downstream source — number every datagram and stamp it, so each rung reports a
-**reorder distance distribution** rather than a count. The count was not enough
+All three raw UDP controls — the echo and the two one-way ladders — number every
+datagram and stamp it, so each rung reports a **reorder distance distribution**
+rather than a count. The count was not enough
 to size anything: this path has been measured delivering 60 Mbit/s at 1.1% loss
 while reordering 13–14% of datagrams, and a transport's tolerance for that is a
 distance and a duration, both of which have to clear the tail rather than the
@@ -375,9 +448,11 @@ than the path's.
 
 The echo control's figures are **round-trip**: a datagram counted there crossed
 the path twice, so its distances bound the two directions together and neither
-alone. The downstream control's are one-way. The daemon is unchanged by any of
-this — it echoes bytes and keeps no state, so the sequence number and stamp ride
-in what was already filler, at the same datagram size, on the same rate ladder.
+alone. The two one-way ladders' are one-way, and between them they size a
+reordering tolerance in the direction it will actually be applied in. The echo
+daemon is unchanged by any of this — it echoes bytes and keeps no state, so the
+sequence number and stamp ride in what was already filler, at the same datagram
+size, on the same rate ladder.
 
 ### What the reference leg covers
 
@@ -420,10 +495,13 @@ Client, under `results/<run-id>/`:
 - `samples/<leg>/wire_capture.pcap` — the raw capture the encryption check was
   derived from, kept next to its own `wire_capture.jsonl`. Absent when the run
   had no capture rights, in which case the record says so and why
-- `samples/raw_udp/downstream.jsonl` and `samples/raw_udp/throughput.jsonl` — one
-  record per rate rung of each raw control, carrying both ends' accounts and the
-  reorder distributions described above. `analyze.py` prints them under
-  "Raw UDP reordering and the loss it is not"
+- `samples/raw_udp/downstream.jsonl`, `samples/raw_udp/upstream.jsonl` and
+  `samples/raw_udp/throughput.jsonl` — one record per rate rung of each raw
+  control, in one record shape whose `direction` field says which, carrying both
+  ends' accounts and the reorder distributions described above. `analyze.py`
+  prints the two one-way ladders beside each other under "Raw UDP one-way
+  capacity ladders", and all three under "Raw UDP reordering and the loss it is
+  not"
 - `summary.json`, `errors.jsonl`
 
 Server, under `/var/lib/phantom-testd/`:

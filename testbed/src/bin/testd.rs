@@ -1,8 +1,9 @@
 //! `phantom-testd` — the WAN testbed daemon.
 //!
 //! Binds every network-testable Phantom leg from a single persisted identity,
-//! a QUIC reference leg, and raw TCP/UDP echo controls, and records server-side
-//! statistics for the duration of the run.
+//! a QUIC reference leg, and the raw TCP/UDP controls — two echoes plus a
+//! one-way source and sink — and records server-side statistics for the
+//! duration of the run.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -50,6 +51,13 @@ struct Args {
     /// direction; this is what puts a denominator under a `download` figure.
     #[arg(long, env = "TESTD_RAW_UDP_DOWN_BIND", default_value = "0.0.0.0:4344")]
     raw_udp_down_bind: SocketAddr,
+
+    /// Raw UDP uplink sink (no Phantom): the client → server capacity control,
+    /// the mirror of the source above. It is what puts a denominator under an
+    /// `upload` figure, and the receiver's account of a rung — not the
+    /// sender's — is the honest one.
+    #[arg(long, env = "TESTD_RAW_UDP_UP_BIND", default_value = "0.0.0.0:4345")]
+    raw_udp_up_bind: SocketAddr,
 
     /// Disable the mimic-TLS leg.
     #[arg(long, env = "TESTD_NO_MIMIC")]
@@ -130,6 +138,7 @@ async fn main() -> Result<()> {
         raw_tcp_bind: args.raw_tcp_bind,
         raw_udp_bind: args.raw_udp_bind,
         raw_udp_down_bind: args.raw_udp_down_bind,
+        raw_udp_up_bind: args.raw_udp_up_bind,
         enable_mimic: !args.no_mimic,
         enable_quic: !args.no_quic,
         mimic_sni: args.mimic_sni,

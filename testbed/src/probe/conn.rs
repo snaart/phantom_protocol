@@ -62,6 +62,10 @@ pub struct Endpoints {
     /// second probe against the same `raw_udp` control group, measuring the
     /// direction the echo cannot isolate.
     pub raw_udp_down_port: u16,
+    /// The one-way client → server control — the same arrangement mirrored, and
+    /// for the same reason: the echo bounds the two directions together, and an
+    /// `upload` figure needs a denominator in the direction it was measured in.
+    pub raw_udp_up_port: u16,
     pub sni: String,
     /// The daemon's QUIC certificate, DER, as pinned by the operator.
     ///
@@ -90,6 +94,11 @@ impl Endpoints {
     /// The raw downstream source's address.
     pub fn raw_downstream_addr(&self) -> String {
         format!("{}:{}", self.host, self.raw_udp_down_port)
+    }
+
+    /// The raw uplink sink's address.
+    pub fn raw_upstream_addr(&self) -> String {
+        format!("{}:{}", self.host, self.raw_udp_up_port)
     }
 }
 
@@ -477,6 +486,7 @@ mod tests {
             raw_tcp_port: 4342,
             raw_udp_port: 4343,
             raw_udp_down_port: 4344,
+            raw_udp_up_port: 4345,
             sni: "www.example.com".into(),
             quic_cert: None,
         }
@@ -493,10 +503,11 @@ mod tests {
         assert_eq!(e.port_for(Leg::RawUdp), 4343);
         assert_eq!(e.addr_for(Leg::Udp), "example.test:4243");
         assert_eq!(e.raw_downstream_addr(), "example.test:4344");
+        assert_eq!(e.raw_upstream_addr(), "example.test:4345");
 
         // No two listeners may share a port, or a run would silently measure
-        // the wrong one. The downstream source is in the list even though it is
-        // not a leg: it is a distinct listener on the daemon.
+        // the wrong one. The two one-way controls are in the list even though
+        // neither is a leg: each is a distinct listener on the daemon.
         let mut ports: Vec<u16> = [
             Leg::Udp,
             Leg::Tcp,
@@ -509,6 +520,7 @@ mod tests {
         .map(|l| e.port_for(*l))
         .collect();
         ports.push(e.raw_udp_down_port);
+        ports.push(e.raw_udp_up_port);
         let mut uniq = ports.clone();
         uniq.sort_unstable();
         uniq.dedup();

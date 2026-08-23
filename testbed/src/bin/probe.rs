@@ -70,6 +70,9 @@ struct Args {
     /// The daemon's one-way downstream source (the `downstream` scenario).
     #[arg(long, default_value_t = 4344)]
     raw_udp_down_port: u16,
+    /// The daemon's one-way uplink sink (the `upstream` scenario).
+    #[arg(long, default_value_t = 4345)]
+    raw_udp_up_port: u16,
 
     /// SNI presented to the mimic-TLS leg. Must match the daemon's.
     #[arg(long, default_value = "www.cloudflare.com")]
@@ -201,6 +204,7 @@ async fn main() -> Result<()> {
             raw_tcp_port: args.raw_tcp_port,
             raw_udp_port: args.raw_udp_port,
             raw_udp_down_port: args.raw_udp_down_port,
+            raw_udp_up_port: args.raw_udp_up_port,
             sni: args.sni,
             quic_cert,
         },
