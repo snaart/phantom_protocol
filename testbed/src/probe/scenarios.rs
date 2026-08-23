@@ -326,6 +326,37 @@ struct PourOutcome {
     error: Option<CoreError>,
 }
 
+/// Pour frames for `duration` with the congestion-window sampler running over
+/// exactly that interval, and stop it with the transfer.
+///
+/// The pairing is the point, and it is why the two calls are not left to the
+/// scenarios. A transfer's teardown asks the peer for its tally and waits, which
+/// on a full send buffer takes seconds; sampling through it appends rows where
+/// outstanding bytes are collapsing towards zero. Every reading taken over the
+/// tail of such a series — where a saturated sender sits, which is the one place
+/// a byte ceiling shows — is then partly a reading of the drain. The throughput
+/// figure covers the pour interval, so the window series must too.
+async fn burst_with_window(
+    link: Arc<dyn MsgLink>,
+    leg: Leg,
+    phase: &str,
+    frame_size: usize,
+    duration: Duration,
+    win: &mut WindowTracker,
+    sink: &mut SampleSink,
+) -> (PourOutcome, Vec<crate::report::WindowSample>) {
+    let recorder = WindowRecorder::start(link.clone(), leg, phase);
+    let poured = pour_frames(
+        link.as_ref(),
+        frame_size,
+        Instant::now() + duration,
+        win,
+        sink,
+    )
+    .await;
+    (poured, recorder.finish().await)
+}
+
 /// Offer fixed-size frames as fast as the session will take them, until the
 /// deadline.
 ///
@@ -1212,14 +1243,14 @@ pub async fn upload(
         }
     };
     out.mark(framed.as_ref(), "upload:begin").await;
-    let recorder = WindowRecorder::start(framed.clone(), leg, "upload");
 
     let mut win = WindowTracker::new(leg, "upload");
-    let deadline = Instant::now() + window.duration;
-    let poured = pour_frames(
-        framed.as_ref(),
+    let (poured, window_samples) = burst_with_window(
+        framed.clone(),
+        leg,
+        "upload",
         frame_size,
-        deadline,
+        window.duration,
         &mut win,
         &mut out.sink,
     )
@@ -1294,7 +1325,7 @@ pub async fn upload(
         }
     }
 
-    note_window(&mut out, &recorder.finish().await);
+    note_window(&mut out, &window_samples);
     if let Some(n) = framed.transport_note() {
         out.note(n);
     }
@@ -1574,6 +1605,10 @@ pub async fn bidir(
 
     stop.store(true, Ordering::Relaxed);
     let (up_frames, up_bytes) = uploader.await.unwrap_or((0, 0));
+    // Both halves of the exchange have stopped, so the transfer is over and the
+    // rest is teardown; a series that keeps sampling through the drain reports
+    // outstanding bytes collapsing as though the transfer had ended that way.
+    let window_samples = recorder.finish().await;
     let down_tp = down.finish();
     if capped {
         out.note(format!(
@@ -1592,7 +1627,7 @@ pub async fn bidir(
         Err((why, e)) => out.error(leg, "bidir", why.context(), &e),
     }
 
-    note_window(&mut out, &recorder.finish().await);
+    note_window(&mut out, &window_samples);
     if let Some(n) = framed.transport_note() {
         out.note(n);
     }
@@ -1730,13 +1765,18 @@ async fn send_ceiling_rung(
 
     let phase = format!("send_ceiling:{frame}");
     out.mark(link.as_ref(), format!("{phase}:begin")).await;
-    let recorder = WindowRecorder::start(link.clone(), leg, &phase);
 
     let mut win = WindowTracker::new(leg, phase.clone());
-    let poured = pour_frames(
-        link.as_ref(),
+    // The sampler covers the burst and stops with it. The tail statistic below
+    // is where a saturated sender sat, and the drain is precisely the interval
+    // in which outstanding bytes fall away from whatever bound was holding
+    // them — see [`burst_with_window`].
+    let (poured, samples) = burst_with_window(
+        link.clone(),
+        leg,
+        &phase,
         frame_size,
-        Instant::now() + duration,
+        duration,
         &mut win,
         &mut out.sink,
     )
@@ -1764,7 +1804,6 @@ async fn send_ceiling_rung(
         }
     }
 
-    let samples = recorder.finish().await;
     let (infl, cwnd, taken) = tail_of(&samples, converge::PLATEAU_SHARE);
     sample.window_samples = samples.len();
     sample.tail_samples = taken;
@@ -4514,6 +4553,59 @@ mod tests {
             "a refused frame is not bytes on the wire"
         );
         assert!(matches!(out.error, Some(CoreError::ConnectionClosed)));
+    }
+
+    /// The sampler has to stop with the transfer, not with the session.
+    ///
+    /// Teardown asks the peer for its tally and waits behind everything still
+    /// in the send buffer, which on a saturated transfer is seconds. Rows taken
+    /// through that show outstanding bytes collapsing towards zero, and the tail
+    /// of the series — the one place a byte ceiling is visible, and where the
+    /// convergence reading is taken — becomes partly a reading of the drain.
+    // Two threads deliberately: the scripted link answers a send without ever
+    // awaiting anything, so on a single-threaded runtime the pour loop never
+    // yields and the sampler task — which is the thing under test — would not
+    // get to run at all. A real link awaits its socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_window_sampler_stops_with_the_transfer_and_not_with_the_session() {
+        let link = Arc::new(ScriptedLink::default());
+        let calls = link.window_calls.clone();
+        let mut win = WindowTracker::new(Leg::Udp, "upload");
+        let mut sink = SampleSink::new();
+
+        let (poured, samples) = burst_with_window(
+            link.clone(),
+            Leg::Udp,
+            "upload",
+            256,
+            Duration::from_millis(500),
+            &mut win,
+            &mut sink,
+        )
+        .await;
+
+        assert!(poured.frames > 0, "the burst must have offered something");
+        let last = samples.last().expect("the sampler must have run at all");
+        // No row may lie past the burst. The bound is the burst plus one sample
+        // interval, and it is not timing-sensitive in the direction that
+        // matters: the sampler reads its elapsed time immediately after testing
+        // the stop flag, so a late wake-up finds the flag set and takes no
+        // sample at all. A drain folded into this series would put rows seconds
+        // past the burst, which is what this excludes.
+        assert!(
+            last.elapsed_ms <= 500 + WindowRecorder::INTERVAL.as_millis() as u64,
+            "a row {} ms into a 500 ms burst is a row from the teardown",
+            last.elapsed_ms
+        );
+        let served = calls.load(Ordering::Relaxed);
+        // Whatever the scenario does next — and what it does next is wait out a
+        // drain — no further row may join the series.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            served,
+            "the sampler kept running past the transfer it was sampling"
+        );
     }
 
     /// Frames that land are counted at their wire cost, which is the unit both
