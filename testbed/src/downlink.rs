@@ -1,11 +1,13 @@
 //! The raw UDP capacity controls: wire formats and receiver bookkeeping.
 //!
 //! Most of this file is the server → client control, described below. The
-//! sequence-number bookkeeping ([`SeqTracker`], [`ReorderProfile`]) and the
-//! echo control's own datagram header ([`EchoHeader`]) live here too, so that
-//! both directions are counted by exactly the same code — a reorder distance
-//! measured one way and a differently-derived one measured the other way would
-//! not be comparable, which is the whole point of having both.
+//! sequence-number bookkeeping ([`SeqTracker`], [`ReorderProfile`],
+//! [`loss_fraction`]) and the echo control's own datagram header
+//! ([`EchoHeader`]) live here too, so that all three raw controls — the echo,
+//! this one, and the client → server ladder in [`crate::uplink`] — are counted
+//! by exactly the same code. A reorder distance measured one way and a
+//! differently-derived one measured the other way would not be comparable,
+//! which is the whole point of having more than one.
 //!
 //! ## Why it exists
 //!
@@ -682,12 +684,7 @@ impl SeqTracker {
     /// denominator, and inventing one from the highest sequence number seen
     /// would silently report zero loss for a rung that was cut off early.
     pub fn loss_fraction(&self, sender_datagrams: Option<u64>) -> Option<f64> {
-        let sent = sender_datagrams?;
-        if sent == 0 {
-            return None;
-        }
-        let ratio = self.received.min(sent) as f64 / sent as f64;
-        Some((1.0 - ratio).clamp(0.0, 1.0))
+        loss_fraction(self.received, sender_datagrams)
     }
 
     /// Move the high-water mark from `highest` to `seq`, opening the sequence
@@ -757,17 +754,41 @@ impl SeqTracker {
     }
 }
 
-// ── Fixed-width readers ─────────────────────────────────────────────────────
+/// The fraction of a sender's datagrams that never arrived.
+///
+/// Free-standing because the two ladders arrive at it from opposite sides: on
+/// the downstream one the receiver holds the tracker and the sender's count
+/// comes over the wire, on the uplink one it is the other way round. One
+/// definition means a loss figure means the same thing whichever direction
+/// produced it — which is the entire point of having both.
+///
+/// `None` when the sender's count is unknown: without it there is no
+/// denominator, and inventing one from what happened to arrive would report a
+/// rung that was cut off early as lossless.
+pub fn loss_fraction(received: u64, sender_datagrams: Option<u64>) -> Option<f64> {
+    let sent = sender_datagrams?;
+    if sent == 0 {
+        return None;
+    }
+    let ratio = received.min(sent) as f64 / sent as f64;
+    Some((1.0 - ratio).clamp(0.0, 1.0))
+}
 
-fn be16(b: &[u8]) -> u16 {
+// ── Fixed-width readers ─────────────────────────────────────────────────────
+//
+// Shared with [`crate::uplink`], which encodes its own datagrams at the same
+// offsets in the same order: two copies of these would be two places for an
+// endianness to drift.
+
+pub(crate) fn be16(b: &[u8]) -> u16 {
     u16::from_be_bytes([b[0], b[1]])
 }
 
-fn be32(b: &[u8]) -> u32 {
+pub(crate) fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
 
-fn be64(b: &[u8]) -> u64 {
+pub(crate) fn be64(b: &[u8]) -> u64 {
     u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
@@ -992,6 +1013,29 @@ mod tests {
         // would report this same rung as lossless.
         assert_eq!(cut.loss_fraction(None), None);
         assert_eq!(cut.loss_fraction(Some(0)), None);
+    }
+
+    /// The uplink ladder holds the two halves on opposite hosts — the receiver's
+    /// count comes over the wire and the sender's is local — so it reaches this
+    /// arithmetic without a tracker. Both callers must get the same answer from
+    /// the same pair of numbers, or a loss figure means one thing downstream and
+    /// another upstream.
+    #[test]
+    fn loss_has_one_definition_whichever_side_holds_the_ledger() {
+        let mut t = SeqTracker::new();
+        for seq in 0..900u64 {
+            t.observe(seq);
+        }
+        assert_eq!(t.loss_fraction(Some(1000)), loss_fraction(900, Some(1000)));
+        let l = loss_fraction(900, Some(1000)).expect("both counts known");
+        assert!((l - 0.10).abs() < 1e-9, "got {l}");
+
+        // The same edges the method has: no denominator, a nonsensical one, and
+        // a receiver that outcounted the sender.
+        assert_eq!(loss_fraction(10, None), None);
+        assert_eq!(loss_fraction(10, Some(0)), None);
+        assert_eq!(loss_fraction(10, Some(5)), Some(0.0));
+        assert_eq!(loss_fraction(0, Some(100)), Some(1.0));
     }
 
     #[test]

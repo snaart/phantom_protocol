@@ -43,7 +43,7 @@ use crate::wirecheck::{
     self, filter_for, needles_for, probe_marker, tcpdump_args, Capture, CaptureRequest, Needle,
     Polarity, PROBE_PAYLOAD_BYTES,
 };
-use crate::{downlink, pacing};
+use crate::{downlink, pacing, uplink};
 
 /// What one scenario produced.
 pub struct ScenarioOutput {
@@ -2948,7 +2948,7 @@ pub async fn raw_udp_throughput(
         // across two formats. Everything in it is round-trip: a datagram
         // counted here crossed the path twice, so a distance measured here
         // bounds the sum of the two directions, never either alone.
-        out.sink.push(&crate::report::DownstreamSample {
+        out.sink.push(&crate::report::RungSample {
             leg,
             direction: "raw_udp_echo_roundtrip".to_string(),
             t_unix_ns: unix_nanos(),
@@ -3138,11 +3138,17 @@ fn stamps_at(base: Instant, now: Instant, sender_stamp_ns: u64) -> downlink::Sta
 }
 
 /// Prose for one rung, written so the console transcript alone is readable.
-fn rung_note(s: &crate::report::DownstreamSample) -> String {
+///
+/// Shared by both one-way ladders. Which end is local differs between them and
+/// nothing else does, so the reason an inadmissible rung is inadmissible comes
+/// from the rung's own `note` rather than being restated here — restating it
+/// once meant every uplink rung the receiver failed to report on was announced
+/// as a sender that fell short, which it was not.
+fn rung_note(s: &crate::report::RungSample) -> String {
     let offered = s.offered_bps / 1e6;
     let Some(sender) = s.sender_bps else {
         return format!(
-            "asked {offered:.0} Mbit/s -> the daemon never reported: {} datagrams arrived, but with no sender-side count there is no denominator and this rung is not evidence",
+            "asked {offered:.0} Mbit/s -> the sender never reported: {} datagrams arrived, but with no sender-side count there is no denominator and this rung is not evidence",
             s.received_datagrams
         );
     };
@@ -3150,18 +3156,20 @@ fn rung_note(s: &crate::report::DownstreamSample) -> String {
         .loss_fraction
         .map(|l| format!("{:.1}%", l * 100.0))
         .unwrap_or_else(|| "unknown".to_string());
+    let verdict = if s.admissible {
+        String::new()
+    } else if s.note.is_empty() {
+        " — NOT ADMISSIBLE".to_string()
+    } else {
+        format!(" — NOT ADMISSIBLE: {}", s.note)
+    };
     format!(
-        "asked {offered:.0} Mbit/s -> sender achieved {:.2}, receiver saw {:.2} Mbit/s, loss {loss}, reordered {}, duplicated {}{}{}",
+        "asked {offered:.0} Mbit/s -> sender achieved {:.2}, receiver saw {:.2} Mbit/s, loss {loss}, reordered {}, duplicated {}{}{verdict}",
         sender / 1e6,
         s.receiver_bps / 1e6,
         s.reordered_datagrams,
         s.duplicate_datagrams,
         reorder_note(&s.reorder),
-        if s.admissible {
-            ""
-        } else {
-            " — NOT ADMISSIBLE, the sender never reached its own offer"
-        }
     )
 }
 
@@ -3217,7 +3225,7 @@ async fn measure_rung(
     kbps: u64,
     per_rung: Duration,
     out: &mut ScenarioOutput,
-) -> (crate::report::DownstreamSample, bool) {
+) -> (crate::report::RungSample, bool) {
     /// Attempts at getting past the return-routability challenge. Two is enough
     /// for the expected case (no cookie yet, or one that just expired); a third
     /// covers a lost request datagram.
@@ -3367,7 +3375,7 @@ async fn measure_rung(
         ""
     };
 
-    let sample = crate::report::DownstreamSample {
+    let sample = crate::report::RungSample {
         leg: Leg::RawUdp,
         direction: "raw_udp_downstream".to_string(),
         t_unix_ns: unix_nanos(),
@@ -3395,6 +3403,472 @@ async fn measure_rung(
         note: note.to_string(),
     };
     (sample, reached_the_daemon)
+}
+
+/// Raw UDP one-way capacity, client → server — the upload denominator.
+///
+/// The mirror of [`raw_udp_downstream`], and it exists because the direction it
+/// covers had no control at all. Every campaign this harness has run had to say
+/// so in its caveats: the two echoes are round trips, so a byte counted in
+/// either crossed the path twice and bounds neither direction alone, and the
+/// only one-way control ran the other way. An `upload` figure was therefore
+/// quoted against nothing, which is the one thing a protocol number may not be.
+///
+/// This side paces datagrams at each offered rate and states what it actually
+/// managed; the daemon counts what arrived and sends back its own account —
+/// arrivals, duplicates, and the same reorder distribution the downstream
+/// ladder records. The receiver's account is the honest one: `send()` buffers,
+/// so a sender counting its own socket writes is measuring itself.
+///
+/// A rung where this side fell short of its own offer is marked inadmissible,
+/// because it measures the client's scheduler rather than the link. What bounds
+/// the client is named in the scenario's own notes rather than left to be
+/// discovered — see [`uplink_sender_bound_note`].
+pub async fn raw_udp_upstream(ep: &Endpoints, rungs: &[u64], per_rung: Duration) -> ScenarioOutput {
+    let leg = Leg::RawUdp;
+    let mut out = ScenarioOutput::new(leg, "upstream");
+
+    let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await else {
+        out.summary.error_count += 1;
+        out.note("could not bind a local UDP socket");
+        return out;
+    };
+    let addr = ep.raw_upstream_addr();
+    if sock.connect(&addr).await.is_err() {
+        out.summary.error_count += 1;
+        out.note(format!("could not associate with {addr}"));
+        return out;
+    }
+
+    let mut ladder = UplinkLadder::new(sock, downlink::DEFAULT_PAYLOAD);
+    out.note(uplink_sender_bound_note(ladder.payload.len(), rungs));
+
+    let mut best: Option<Throughput> = None;
+    // Whether anything on the path ever pushed back — the difference between a
+    // measured ceiling and a ladder that simply ran out of rungs. Read exactly
+    // as the downstream ladder reads it, and for the same reason: without
+    // pushback the best rate is a lower bound, and calling it a ceiling is the
+    // overclaim this control group exists to prevent.
+    let mut saw_pushback = false;
+
+    for (i, &kbps) in rungs.iter().enumerate() {
+        let rung = i as u16;
+        let (sample, reached) = ladder.measure(rung, kbps, per_rung, &mut out).await;
+
+        if sample.admissible
+            && best
+                .as_ref()
+                .is_none_or(|b| sample.receiver_bps > b.megabits_per_sec * 1e6)
+        {
+            // Built from the rung's own arrivals rather than from a rounded
+            // rate, so the headline in `summary.json` is recomputable from the
+            // JSONL like every other number here.
+            best = Some(Throughput::new(
+                sample.received_bytes,
+                sample.received_datagrams,
+                sample.observed_window_ns,
+            ));
+        }
+        // A rung the receiver never reported on (`None`) says nothing either
+        // way and must not be read as pushback — it is a missing measurement,
+        // not a full path.
+        if sample.sender_reached_offer == Some(false)
+            || sample.loss_fraction.is_some_and(|l| l > 0.001)
+        {
+            saw_pushback = true;
+        }
+        out.note(rung_note(&sample));
+        out.sink.push(&sample);
+
+        // A sink that answered nothing at all will answer nothing on the next
+        // rung either, and each attempt costs its own timeouts. Say so once and
+        // stop rather than spending the ladder discovering it four more times.
+        if !reached {
+            out.note(format!(
+                "the uplink sink at {addr} answered nothing — the remaining {} rung(s) were not attempted",
+                rungs.len() - i - 1
+            ));
+            break;
+        }
+    }
+
+    match &best {
+        Some(t) if saw_pushback => {
+            out.note(format!(
+                "upstream ceiling {:.2} Mbit/s — the path pushed back at or below this rate (loss appeared, or this side could not reach its own offer), so it is a measured ceiling and every leg's upload must be read against it",
+                t.megabits_per_sec
+            ));
+        }
+        Some(t) => {
+            out.note(format!(
+                "upstream carries AT LEAST {:.2} Mbit/s — the ladder ran out of rungs before the path did: nothing was lost and the sender reached every offer, so this is a lower bound, not a ceiling. An upload below it is attributable to the transport; an upload near it is not yet distinguishable from the path",
+                t.megabits_per_sec
+            ));
+        }
+        None => out.note(
+            "no rung was admissible: on every rate this side either fell short of its own offer or the receiver never reported, so this run has NO upstream denominator and its upload figures cannot be attributed",
+        ),
+    }
+    out.summary.throughput = best;
+    out
+}
+
+/// What bounds the sender on this ladder, stated in the artifact.
+///
+/// The instrument is a system too, and both raw controls have at some point
+/// measured themselves. The UDP pacer once reported `tokio::time::sleep`'s
+/// ~1 ms granularity as the path's ceiling, and the TCP control measured first
+/// its own socket buffer and then its own bufferbloat. So this says what the
+/// sender runs into and at what rate it starts to matter, derived from the
+/// constants rather than remembered.
+fn uplink_sender_bound_note(payload_len: usize, rungs: &[u64]) -> String {
+    // The rate at which a sender that could not batch within a tick would stop
+    // tracking its offer. The credit-bucket pacer does batch, so this is the
+    // bound that was removed rather than one that remains — but it is the exact
+    // number an earlier version of this harness reported as a path ceiling.
+    let one_per_tick = payload_len as f64 * 8.0 / pacing::TICK.as_secs_f64();
+    let top = rungs.iter().copied().max().unwrap_or(0);
+    let datagrams_per_sec = top as f64 * 125.0 / payload_len as f64;
+    format!(
+        "what bounds this sender: a {:.0} ms pacing tick, batched, so the timer stops mattering above one datagram per tick ({:.1} Mbit/s at {payload_len} B — the figure a non-batching version of this loop once reported as the path's own); above that the limit is one sendto per datagram, {datagrams_per_sec:.0} a second at the top rung of this ladder, plus whatever the socket's send buffer refuses. Every one of those shows up as a rung short of its own offer, which is recorded per rung and marks it inadmissible — never as a path ceiling",
+        pacing::TICK.as_secs_f64() * 1e3,
+        one_per_tick / 1e6,
+    )
+}
+
+/// Consecutive send failures that end an uplink rung early.
+///
+/// `ENOBUFS` under a saturated uplink is expected and must not abort the
+/// measurement — that is the path pushing back and is exactly what the rung is
+/// for. A socket that has stopped accepting anything at all is a different
+/// thing, and spinning on it would burn the rung's whole window producing
+/// nothing. The daemon's own send loop is bounded the same way.
+const UPLINK_MAX_SEND_ERRORS: u32 = 256;
+
+/// The client's end of the uplink ladder: one socket, its buffers, and the
+/// cookie it earned.
+struct UplinkLadder {
+    sock: UdpSocket,
+    /// Distinguishes this run's traffic from a previous probe's on the same
+    /// port, so a rung that outlived its requester cannot be counted in here.
+    run_nonce: u64,
+    cookie: [u8; downlink::COOKIE_LEN],
+    payload: Vec<u8>,
+    buf: Vec<u8>,
+}
+
+/// What answering a request told us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Armed {
+    /// The sink is counting; send.
+    Yes,
+    /// The sink declined, and said so rather than going quiet — which is the
+    /// whole reason [`uplink::Ready`] exists: silence here would read as a path
+    /// that swallowed the rung.
+    Declined,
+    /// The sink answered — a challenge came back — but never armed the rung.
+    NoReady,
+    /// Nothing came back at all.
+    Silent,
+}
+
+/// What one rung actually put on the wire, by this side's own account.
+#[derive(Debug, Clone, Copy, Default)]
+struct SentRung {
+    datagrams: u64,
+    bytes: u64,
+    elapsed_ns: u64,
+}
+
+impl UplinkLadder {
+    fn new(sock: UdpSocket, payload_len: usize) -> Self {
+        Self {
+            sock,
+            run_nonce: unix_nanos() ^ ((std::process::id() as u64) << 40),
+            cookie: [0u8; downlink::COOKIE_LEN],
+            // Deterministic filler of the same shape the other two controls
+            // send, so nothing on the path can benefit from compressibility and
+            // the three are offering identically shaped traffic.
+            payload: PayloadGen::new(180).fill(payload_len),
+            buf: vec![0u8; 65_536],
+        }
+    }
+
+    /// Drive one rung: arm it, pace it, and fold both accounts into a record.
+    ///
+    /// The second half of the return says whether the sink answered *anything*,
+    /// which is a different failure from a rung that ran badly and is what lets
+    /// the ladder abandon an unreachable sink instead of timing out five times.
+    async fn measure(
+        &mut self,
+        rung: u16,
+        kbps: u64,
+        per_rung: Duration,
+        out: &mut ScenarioOutput,
+    ) -> (crate::report::RungSample, bool) {
+        let offered_bps = kbps as f64 * 1000.0;
+        let armed = self.arm(rung, kbps, per_rung).await;
+        let reached_the_daemon = armed != Armed::Silent;
+        if reached_the_daemon {
+            out.summary.ok_count += 1;
+        } else {
+            out.summary.error_count += 1;
+        }
+
+        if armed != Armed::Yes {
+            let note = match armed {
+                Armed::Declined => {
+                    "the sink declined to observe this rung, so nothing was sent and nothing about the path can be read from it"
+                }
+                Armed::NoReady => {
+                    "the sink answered the request but never armed the rung, so nothing was sent"
+                }
+                _ => "the sink never answered the request, so nothing was sent",
+            };
+            return (
+                self.sample(rung, offered_bps, per_rung, SentRung::default(), None, note),
+                reached_the_daemon,
+            );
+        }
+
+        let sent = self.send_rung(rung, kbps, per_rung).await;
+        let report = self.collect_report(rung).await;
+        (
+            self.sample(rung, offered_bps, per_rung, sent, report, ""),
+            true,
+        )
+    }
+
+    /// Ask the sink to start counting, earning a cookie if it has none.
+    ///
+    /// Nothing is sent until this returns [`Armed::Yes`]. The receiver's ledger
+    /// opens the sequence numbers below its first arrival as gaps, so datagrams
+    /// that reached the sink before it knew a rung existed would be booked as
+    /// loss the path never caused.
+    async fn arm(&mut self, rung: u16, kbps: u64, per_rung: Duration) -> Armed {
+        /// Attempts at getting a rung armed. Two covers the expected case (no
+        /// cookie yet, or one that just expired); a third covers a lost
+        /// request or a lost answer.
+        const ATTEMPTS: usize = 3;
+        /// How long to wait for the sink's answer. Generous against a ~230 ms
+        /// path plus the daemon's own scheduling.
+        const REPLY: Duration = Duration::from_secs(5);
+
+        // Built from locals rather than from `self`, so the closure holds no
+        // borrow while the receive below needs the buffer mutably.
+        let run_nonce = self.run_nonce;
+        let payload_len = self.payload.len().min(u16::MAX as usize) as u16;
+        let request = |cookie: [u8; downlink::COOKIE_LEN]| uplink::Request {
+            run_nonce,
+            cookie,
+            rung,
+            offered_kbps: kbps.min(u32::MAX as u64) as u32,
+            duration_ms: per_rung.as_millis().min(u32::MAX as u128) as u32,
+            payload_len,
+        };
+
+        let mut heard = false;
+        for _ in 0..ATTEMPTS {
+            if self
+                .sock
+                .send(&request(self.cookie).encode())
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let deadline = Instant::now() + REPLY;
+            loop {
+                let budget = deadline.saturating_duration_since(Instant::now());
+                if budget.is_zero() {
+                    break;
+                }
+                let Ok(Ok(n)) = tokio::time::timeout(budget, self.sock.recv(&mut self.buf)).await
+                else {
+                    break;
+                };
+                let datagram = &self.buf[..n];
+                if let Some(ch) = uplink::Challenge::decode(datagram) {
+                    if ch.run_nonce == self.run_nonce {
+                        self.cookie = ch.cookie;
+                        heard = true;
+                        break;
+                    }
+                    continue;
+                }
+                if let Some(r) = uplink::Ready::decode(datagram) {
+                    if r.run_nonce != self.run_nonce || r.rung != rung {
+                        continue;
+                    }
+                    return if r.accepted {
+                        Armed::Yes
+                    } else {
+                        Armed::Declined
+                    };
+                }
+                // A late report from the previous rung, or something else
+                // entirely. Neither answers this question.
+            }
+        }
+        // A challenge is an answer: the sink is reachable and simply never
+        // armed the rung. Silence is a different finding and the ladder acts on
+        // it differently, so the two do not collapse into one verdict.
+        if heard {
+            Armed::NoReady
+        } else {
+            Armed::Silent
+        }
+    }
+
+    /// Pace one rung at the offered rate for its bounded interval.
+    async fn send_rung(&mut self, rung: u16, kbps: u64, per_rung: Duration) -> SentRung {
+        let mut pacer = pacing::Pacer::new(kbps, self.payload.len());
+        let mut tick = tokio::time::interval(pacing::TICK);
+        tick.set_missed_tick_behavior(pacing::MISSED_TICK);
+
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + per_rung;
+        let mut sent = SentRung::default();
+        let mut consecutive_errors = 0u32;
+
+        'rung: while tokio::time::Instant::now() < deadline {
+            tick.tick().await;
+            for _ in 0..pacer.on_tick() {
+                if tokio::time::Instant::now() >= deadline {
+                    break 'rung;
+                }
+                uplink::DataHeader {
+                    run_nonce: self.run_nonce,
+                    rung,
+                    seq: sent.datagrams,
+                    send_unix_ns: unix_nanos(),
+                }
+                .write_into(&mut self.payload);
+                match self.sock.send(&self.payload).await {
+                    Ok(n) => {
+                        consecutive_errors = 0;
+                        sent.datagrams += 1;
+                        sent.bytes += n as u64;
+                    }
+                    Err(_) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= UPLINK_MAX_SEND_ERRORS {
+                            break 'rung;
+                        }
+                    }
+                }
+            }
+        }
+        sent.elapsed_ns = started.elapsed().as_nanos() as u64;
+        sent
+    }
+
+    /// Wait for the receiver's account of the rung just sent.
+    async fn collect_report(&mut self, rung: u16) -> Option<uplink::Report> {
+        /// Slack past the rung's own length for the account to come back: the
+        /// sink holds its window open for its grace period, then spaces four
+        /// copies of the report.
+        const WAIT: Duration = Duration::from_secs(6);
+
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let budget = deadline.saturating_duration_since(Instant::now());
+            if budget.is_zero() {
+                return None;
+            }
+            let Ok(Ok(n)) = tokio::time::timeout(budget, self.sock.recv(&mut self.buf)).await
+            else {
+                return None;
+            };
+            if let Some(r) = uplink::Report::decode(&self.buf[..n]) {
+                if r.run_nonce == self.run_nonce && r.rung == rung {
+                    return Some(r);
+                }
+            }
+        }
+    }
+
+    /// Fold this side's account and the receiver's into one record.
+    fn sample(
+        &self,
+        rung: u16,
+        offered_bps: f64,
+        per_rung: Duration,
+        sent: SentRung,
+        report: Option<uplink::Report>,
+        note: &str,
+    ) -> crate::report::RungSample {
+        let sender_bps = pacing::bits_per_sec(sent.bytes, sent.elapsed_ns);
+        let reached = pacing::reached_offer(offered_bps, sender_bps);
+        let received_datagrams = report.as_ref().map(|r| r.received_datagrams).unwrap_or(0);
+
+        // The first arrival's bytes are excluded because they landed at the
+        // start of the window rather than during it: `n` datagrams span `n - 1`
+        // gaps, and counting all `n` over that span overstates the rate at low
+        // counts. The same arithmetic the downstream ladder does, on figures
+        // the receiver measured.
+        let receiver_bps = report
+            .as_ref()
+            .map(|r| {
+                pacing::bits_per_sec(
+                    r.received_bytes.saturating_sub(r.first_datagram_bytes),
+                    r.observed_window_ns,
+                )
+            })
+            .unwrap_or(0.0);
+
+        // Same precedence as the downstream ladder's, with the sides swapped:
+        // the far end's account is the one that can go missing, and without it
+        // nothing else about the rung can be said.
+        let note = if !note.is_empty() {
+            note
+        } else if report.is_none() {
+            "the receiver never reported what it saw, so there is no account of this rung but this side's own — and a sender's account of an upload is not one"
+        } else if !reached {
+            "this side fell short of its own offer: the rung measures the client, not the path"
+        } else if received_datagrams < 2 {
+            "too few datagrams arrived to measure an interval"
+        } else {
+            ""
+        };
+
+        crate::report::RungSample {
+            leg: Leg::RawUdp,
+            direction: "raw_udp_upstream".to_string(),
+            t_unix_ns: unix_nanos(),
+            rung,
+            offered_bps,
+            payload_bytes: self.payload.len(),
+            requested_ns: per_rung.as_nanos() as u64,
+            // On this ladder the sender is local, so its account is always
+            // known — the optional half of the record is the receiver's, and it
+            // is the one that can go missing. The downstream ladder holds the
+            // same pair the other way round.
+            sender_datagrams: Some(sent.datagrams),
+            sender_bytes: Some(sent.bytes),
+            sender_elapsed_ns: Some(sent.elapsed_ns),
+            sender_bps: Some(sender_bps),
+            sender_reached_offer: Some(reached),
+            received_datagrams,
+            received_bytes: report.as_ref().map(|r| r.received_bytes).unwrap_or(0),
+            reordered_datagrams: report.as_ref().map(|r| r.reordered_datagrams).unwrap_or(0),
+            duplicate_datagrams: report.as_ref().map(|r| r.duplicate_datagrams).unwrap_or(0),
+            reorder: report
+                .as_ref()
+                .map(|r| r.reorder.clone())
+                .unwrap_or_default(),
+            observed_window_ns: report.as_ref().map(|r| r.observed_window_ns).unwrap_or(0),
+            receiver_bps,
+            // Without the receiver's count there is no numerator, and reading
+            // the zero above as "nothing arrived" would report a rung nobody
+            // observed as a path that swallowed it whole.
+            loss_fraction: report
+                .as_ref()
+                .and_then(|r| downlink::loss_fraction(r.received_datagrams, Some(sent.datagrams))),
+            admissible: reached && report.is_some() && received_datagrams >= 2,
+            note: note.to_string(),
+        }
+    }
 }
 
 /// Raw UDP echo round trips. Also the direct path-MTU probe.
@@ -3494,6 +3968,7 @@ mod tests {
             raw_tcp_port: 1,
             raw_udp_port: 1,
             raw_udp_down_port: 1,
+            raw_udp_up_port: 1,
             sni: "www.example.com".into(),
             quic_cert: None,
         }
@@ -4241,6 +4716,225 @@ mod tests {
         assert!(
             PROTOCOL_VARIANT.iter().all(|b| b.is_ascii_graphic()),
             "the control has to be findable as a literal byte string"
+        );
+    }
+
+    // ── The upstream ladder ─────────────────────────────────────────────────
+
+    /// A ladder whose socket is bound but pointed nowhere in particular, so its
+    /// record-building can be exercised without a path.
+    async fn idle_ladder() -> UplinkLadder {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        UplinkLadder::new(sock, downlink::DEFAULT_PAYLOAD)
+    }
+
+    fn account(received: u64, bytes: u64, window_ns: u64) -> uplink::Report {
+        uplink::Report {
+            run_nonce: 1,
+            rung: 0,
+            received_datagrams: received,
+            received_bytes: bytes,
+            first_datagram_bytes: downlink::DEFAULT_PAYLOAD as u64,
+            reordered_datagrams: 0,
+            duplicate_datagrams: 0,
+            observed_window_ns: window_ns,
+            reorder: downlink::ReorderProfile::default(),
+        }
+    }
+
+    /// The property the whole scenario exists for: an upload rate is what the
+    /// *receiver* saw over the receiver's own window, not what this side handed
+    /// to a socket. The two are recorded side by side and the second is never
+    /// substituted for the first.
+    #[tokio::test]
+    async fn an_upstream_rung_is_rated_on_the_receivers_account_not_the_senders() {
+        let l = idle_ladder().await;
+        // A second of sending, of which the receiver saw four fifths.
+        let sent = SentRung {
+            datagrams: 1000,
+            bytes: 1_200_000,
+            elapsed_ns: 1_000_000_000,
+        };
+        let s = l.sample(
+            0,
+            9_600_000.0,
+            Duration::from_secs(1),
+            sent,
+            Some(account(800, 960_000, 1_000_000_000)),
+            "",
+        );
+
+        assert_eq!(s.direction, "raw_udp_upstream");
+        assert_eq!(s.sender_bps, Some(9_600_000.0));
+        assert!(
+            (s.receiver_bps - (960_000.0 - 1200.0) * 8.0).abs() < 1.0,
+            "the rate must come from the receiver's bytes over the receiver's window, got {}",
+            s.receiver_bps
+        );
+        assert!(
+            s.receiver_bps < s.sender_bps.unwrap_or(0.0),
+            "a fifth of the rung went missing and the record must show it"
+        );
+        let loss = s.loss_fraction.expect("both counts are known");
+        assert!((loss - 0.2).abs() < 1e-9, "got {loss}");
+        assert!(s.admissible, "the sender reached its offer and 800 arrived");
+        assert!(s.note.is_empty());
+    }
+
+    /// A rung the receiver never reported on is not a lossless rung and not a
+    /// total loss either — it is a missing measurement, and both of the other
+    /// two readings are wrong in a way that would reach a conclusion.
+    #[tokio::test]
+    async fn a_rung_with_no_receiver_account_is_a_missing_measurement() {
+        let l = idle_ladder().await;
+        let sent = SentRung {
+            datagrams: 1000,
+            bytes: 1_200_000,
+            elapsed_ns: 1_000_000_000,
+        };
+        let s = l.sample(0, 9_600_000.0, Duration::from_secs(1), sent, None, "");
+
+        assert_eq!(
+            s.loss_fraction, None,
+            "zero arrivals with no account is not 100% loss"
+        );
+        assert!(!s.admissible);
+        assert_eq!(s.receiver_bps, 0.0);
+        assert!(
+            s.note.contains("never reported"),
+            "the reason must reach the artifact: {}",
+            s.note
+        );
+        // The sender's half is still there: it is what says the rung ran at all.
+        assert_eq!(s.sender_datagrams, Some(1000));
+        assert_eq!(s.sender_reached_offer, Some(true));
+    }
+
+    /// A rung this side never reached measures this side. Reading a loss figure
+    /// from it as though it were the link's is precisely the mistake the whole
+    /// control group exists to prevent.
+    #[tokio::test]
+    async fn a_rung_short_of_its_own_offer_is_marked_inadmissible() {
+        let l = idle_ladder().await;
+        let sent = SentRung {
+            datagrams: 500,
+            bytes: 600_000,
+            elapsed_ns: 1_000_000_000,
+        };
+        let s = l.sample(
+            0,
+            9_600_000.0,
+            Duration::from_secs(1),
+            sent,
+            Some(account(500, 600_000, 1_000_000_000)),
+            "",
+        );
+        assert_eq!(s.sender_reached_offer, Some(false));
+        assert!(!s.admissible);
+        assert!(s.note.contains("not the path"), "{}", s.note);
+        // And the console line names that reason rather than guessing at one.
+        let line = rung_note(&s);
+        assert!(line.contains("NOT ADMISSIBLE"), "{line}");
+        assert!(line.contains("measures the client"), "{line}");
+    }
+
+    /// An instrument is a system too. What bounds this sender has to be in the
+    /// artifact, and derived from the constants rather than remembered — a
+    /// remembered figure is right until the tick moves.
+    #[test]
+    fn the_scenario_states_what_bounds_its_own_sender() {
+        let note = uplink_sender_bound_note(1200, crate::pacing::DEFAULT_RUNGS_KBPS);
+        assert!(note.contains("1 ms pacing tick"), "{note}");
+        // 1200 B once per millisecond is 9.6 Mbit/s — the exact figure a
+        // non-batching version of this loop reported as a path ceiling.
+        assert!(note.contains("9.6 Mbit/s"), "{note}");
+        // 200 Mbit/s in 1200 B datagrams is 20 833 sendto calls a second.
+        assert!(note.contains("20833"), "{note}");
+        assert!(note.contains("inadmissible"), "{note}");
+
+        // Derived, not written down: a different datagram size moves both.
+        let other = uplink_sender_bound_note(600, crate::pacing::DEFAULT_RUNGS_KBPS);
+        assert!(other.contains("4.8 Mbit/s"), "{other}");
+        assert!(!other.contains("9.6 Mbit/s"), "{other}");
+    }
+
+    /// End to end against a sink in this process: request, challenge, arm,
+    /// pace, and the receiver's account coming back. Loopback proves the
+    /// exchange rather than anything about a path — no rate assertion is made,
+    /// and none would mean anything at microsecond RTT.
+    #[tokio::test]
+    async fn the_upstream_ladder_completes_a_rung_and_records_both_accounts() {
+        let sink = UdpSocket::bind("127.0.0.1:0").await.expect("bind sink");
+        let port = sink.local_addr().expect("addr").port();
+        let stats = Arc::new(crate::testd::baseline::BaselineStats::default());
+        let served = stats.clone();
+        tokio::spawn(async move {
+            let _ = crate::testd::baseline::serve_udp_sink(sink, served).await;
+        });
+
+        let mut ep = closed_endpoints();
+        ep.raw_udp_up_port = port;
+        let out = raw_udp_upstream(&ep, &[1_000], Duration::from_millis(300)).await;
+
+        assert_eq!(out.summary.error_count, 0, "{:?}", out.summary.notes);
+        assert_eq!(out.sink.len(), 1, "one rung, one record");
+        let rec: serde_json::Value =
+            serde_json::from_str(&out.sink.lines()[0]).expect("the record must be JSON");
+        assert_eq!(rec["direction"], "raw_udp_upstream");
+        assert_eq!(rec["leg"], "raw_udp");
+        assert!(
+            rec["received_datagrams"].as_u64().unwrap_or(0) > 0,
+            "the sink counted nothing: {rec}"
+        );
+        assert!(
+            rec["sender_datagrams"].as_u64().unwrap_or(0) > 0,
+            "this side sent nothing: {rec}"
+        );
+        assert!(
+            rec["observed_window_ns"].as_u64().unwrap_or(0) > 0,
+            "the receiver's window has to be an interval it measured: {rec}"
+        );
+        assert_eq!(
+            rec["reorder"]["horizon"].as_u64(),
+            Some(4096),
+            "the receiver's ledger must travel with its counts"
+        );
+        assert!(
+            !rec["loss_fraction"].is_null(),
+            "both counts are known: {rec}"
+        );
+        assert_eq!(
+            stats.up_reports.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// A ladder that reached no sink must say it has no denominator, not fall
+    /// back on a number. The whole scenario exists to stop an upload figure
+    /// being quoted against nothing, and quoting it against a rung nobody
+    /// observed would be the same fault wearing a control's name.
+    #[tokio::test]
+    async fn an_upstream_ladder_that_reached_no_sink_reports_no_denominator() {
+        // Port 1 on loopback: nothing listens, and a connected UDP socket makes
+        // the refusal visible as an error rather than a silent black hole.
+        let out = raw_udp_upstream(&closed_endpoints(), &[1_000], Duration::from_millis(100)).await;
+
+        assert!(out.summary.throughput.is_none(), "no rung was admissible");
+        assert!(out.summary.error_count > 0);
+        let notes = out.summary.notes.join("\n");
+        assert!(
+            notes.contains("NO upstream denominator"),
+            "the artifact must say the direction is unnormalised: {notes}"
+        );
+        assert!(
+            !notes.contains("upstream ceiling") && !notes.contains("carries AT LEAST"),
+            "a ladder that measured nothing must claim neither a ceiling nor a floor: {notes}"
+        );
+        // And it gives up rather than spending the whole ladder discovering the
+        // same silence, which is why only the first rung was attempted.
+        assert!(
+            notes.contains("answered nothing"),
+            "the reason for stopping has to be recorded: {notes}"
         );
     }
 }

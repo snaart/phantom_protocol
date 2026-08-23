@@ -4,7 +4,7 @@
 //!
 //! - `phantom-testd` — the daemon. Binds every network-testable leg (PhantomUDP,
 //!   Phantom-over-TCP, mimic-TLS), a QUIC reference leg, and the raw TCP/UDP
-//!   controls — two echoes plus a one-way downstream source — and records
+//!   controls — two echoes plus a one-way source in each direction — and records
 //!   server-side statistics.
 //! - `phantom-probe` — the client. Drives a scenario matrix across those legs
 //!   and writes raw per-operation samples.
@@ -53,4 +53,5 @@ pub mod report;
 pub mod stats;
 pub mod sysinfo;
 pub mod testd;
+pub mod uplink;
 pub mod wirecheck;

@@ -9,12 +9,16 @@
 //! `TcpSessionTransport`, so the framing cost is matched and the difference
 //! measured is the protocol's, not the framing's.
 //!
-//! Three controls, and they answer different questions. The echoes are round
-//! trips, so neither direction is isolated in them; the **downstream source**
-//! ([`serve_udp_source`]) sends one way, server → client, which is the only one
-//! of the three that puts a number under every leg's `download`.
+//! Four controls, and they answer different questions. The echoes are round
+//! trips, so neither direction is isolated in them; the two one-way controls
+//! are what put a number under a single direction. The **downstream source**
+//! ([`serve_udp_source`]) sends server → client, under every leg's `download`.
+//! The **uplink sink** ([`serve_udp_sink`]) receives client → server, under
+//! every leg's `upload` — and that one is the receiver, so the account it keeps
+//! is the honest one: a sender counts what it handed to a socket.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -23,11 +27,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 use crate::downlink::{
-    Challenge, CookieMinter, DataHeader, Report, Request, MAX_PAYLOAD, MIN_PAYLOAD,
+    Challenge, CookieMinter, DataHeader, Report, Request, SeqTracker, Stamps, MAX_PAYLOAD,
+    MIN_PAYLOAD,
 };
 use crate::pacing::{Pacer, MISSED_TICK, TICK};
 use crate::proto::PayloadGen;
 use crate::report::unix_nanos;
+use crate::uplink;
 
 /// Matches the established-phase frame cap of `TcpSessionTransport`.
 const MAX_FRAME: u32 = 4 * 1024 * 1024;
@@ -61,6 +67,17 @@ pub struct BaselineStats {
     pub down_bytes: AtomicU64,
     pub down_challenges: AtomicU64,
     pub down_refused: AtomicU64,
+    /// Uplink sink: rungs armed, datagrams and bytes observed, requests turned
+    /// away, and accounts sent back. `up_reports` is the one to read against a
+    /// client that reported no denominator — a report the sink says it sent and
+    /// the probe never saw is a loss on the way *down*, which is a different
+    /// finding from a rung that was never observed.
+    pub up_rungs: AtomicU64,
+    pub up_datagrams: AtomicU64,
+    pub up_bytes: AtomicU64,
+    pub up_challenges: AtomicU64,
+    pub up_refused: AtomicU64,
+    pub up_reports: AtomicU64,
 }
 
 /// Length-prefixed TCP echo.
@@ -408,6 +425,303 @@ async fn send_report(sock: &UdpSocket, peer: std::net::SocketAddr, plan: &RungPl
             tokio::time::sleep(REPORT_SPACING).await;
         }
         let _ = sock.send_to(&bytes, peer).await;
+    }
+}
+
+// ── Uplink sink ─────────────────────────────────────────────────────────────
+
+/// Rungs the sink will observe at once.
+///
+/// Not a bandwidth bound — inbound rungs do not contend for the daemon's uplink
+/// the way outbound bursts do — but a memory one, and a bound on what a
+/// measurement is worth. Each armed rung holds a [`SeqTracker`]: a fixed
+/// 4096-slot window plus the individual reorder measurements behind its
+/// percentiles, which its own cap keeps finite. Four of those is a bound a
+/// 2 GB host does not notice, and two probes measuring at once would each be
+/// measuring the other anyway.
+const MAX_CONCURRENT_UPLINK_RUNGS: usize = 4;
+
+/// How long past a rung's own length the sink keeps counting.
+///
+/// Datagrams the client put on the wire at the end of its interval are still in
+/// flight when that interval ends, and a window that closed with them still
+/// crossing would book them as loss the path never caused. Two seconds clears
+/// any plausible path delay plus a reordering tail. It is deliberately a fixed
+/// wait rather than an early close on silence: closing on a quiet period would
+/// turn a stalled sender into a shortened observation, and a shortened
+/// observation reads as loss.
+const UPLINK_RUNG_GRACE: Duration = Duration::from_secs(2);
+
+/// How often expired rungs are swept out and their accounts sent.
+const UPLINK_SWEEP: Duration = Duration::from_millis(100);
+
+/// Receive buffer asked for on the sink socket.
+///
+/// The instrument must not measure itself, and on a receiver the way it does
+/// that is by dropping datagrams in the kernel during a scheduling gap and
+/// reporting them as the path's loss. The top of the default ladder is
+/// 200 Mbit/s — about 25 MB/s in 1200 B datagrams — so 4 MiB is roughly 160 ms
+/// of cover. The kernel may clamp, which is why the grant is logged rather than
+/// the request.
+const UPLINK_RECV_BUFFER: usize = 4 * 1024 * 1024;
+
+/// One-way paced datagram sink: the client → server capacity control.
+pub async fn run_udp_sink(addr: String, stats: Arc<BaselineStats>) -> std::io::Result<()> {
+    let sock = UdpSocket::bind(&addr).await?;
+    tracing::info!(addr = %addr, "raw UDP uplink sink listening");
+    serve_udp_sink(sock, stats).await
+}
+
+/// Serve on an already-bound socket. See [`serve_tcp`] for why this split
+/// exists.
+pub async fn serve_udp_sink(sock: UdpSocket, stats: Arc<BaselineStats>) -> std::io::Result<()> {
+    let granted = size_udp_recv_buffer(&sock, UPLINK_RECV_BUFFER);
+    tracing::debug!(
+        granted,
+        asked = UPLINK_RECV_BUFFER,
+        "uplink sink receive buffer"
+    );
+
+    let sock = Arc::new(sock);
+    let minter = CookieMinter::new();
+    let mut rungs: HashMap<SocketAddr, UpRung> = HashMap::new();
+
+    // Every uplink datagram is at most `MAX_PAYLOAD`, so a fixed buffer of that
+    // size is not a truncation risk — and it means this listener cannot be made
+    // to read a large datagram on a sender's say-so.
+    let mut buf = vec![0u8; MAX_PAYLOAD];
+    let mut sweep = tokio::time::interval(UPLINK_SWEEP);
+    sweep.set_missed_tick_behavior(MISSED_TICK);
+
+    loop {
+        // The received bytes are handled after the `select!` rather than inside
+        // an arm: the receive future holds `buf` mutably for as long as the
+        // expression lasts, and the handler needs to read it.
+        let woke = tokio::select! {
+            r = sock.recv_from(&mut buf) => match r {
+                Ok((n, peer)) => Some((n, peer)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "raw udp sink recv failed");
+                    None
+                }
+            },
+            _ = sweep.tick() => None,
+        };
+
+        match woke {
+            Some((n, peer)) => {
+                on_uplink_datagram(&sock, &minter, &stats, &mut rungs, peer, &buf[..n]).await
+            }
+            None => expire_uplink_rungs(&sock, &stats, &mut rungs),
+        }
+    }
+}
+
+/// Ask the kernel for a larger receive buffer and report what it granted.
+///
+/// The grant matters more than the request: operating systems clamp, and a
+/// silently clamped buffer is exactly how a control comes to measure itself.
+fn size_udp_recv_buffer(sock: &UdpSocket, want: usize) -> usize {
+    use std::os::fd::{AsRawFd, BorrowedFd};
+    // SAFETY: the fd is owned by `sock` and outlives this borrow; socket2 only
+    // reads and sets options on it, and does not take ownership.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(sock.as_raw_fd()) };
+    let s2 = socket2::SockRef::from(&borrowed);
+    let _ = s2.set_recv_buffer_size(want);
+    s2.recv_buffer_size().unwrap_or(0)
+}
+
+/// One rung being observed: the receiver's ledger and the window it covers.
+struct UpRung {
+    run_nonce: u64,
+    rung: u16,
+    tracker: SeqTracker,
+    /// Zero of this rung's receive clock. Reorder displacements are differences
+    /// within it, so where it starts does not matter — only that it is
+    /// monotonic and that the sender's stamps are never subtracted from it.
+    base: Instant,
+    deadline: Instant,
+    /// The first arrival and how many bytes it carried. The bytes are reported
+    /// so the client can measure over the interval the arrivals span: `n`
+    /// datagrams span `n - 1` gaps.
+    first: Option<(Instant, u64)>,
+    last: Option<Instant>,
+    received_bytes: u64,
+}
+
+impl UpRung {
+    /// Arm a rung for a request that has already passed the cookie gate.
+    fn armed(req: &uplink::Request) -> Self {
+        // A request is not permission to keep a ledger for as long as the asker
+        // likes. The same clamp the downstream source puts on a burst, for the
+        // same reason: nothing in this path ever hears from the client again,
+        // so the rung has to be self-terminating or it is unbounded.
+        let duration = Duration::from_millis(req.duration_ms.max(1) as u64).min(MAX_RUNG);
+        let now = Instant::now();
+        Self {
+            run_nonce: req.run_nonce,
+            rung: req.rung,
+            tracker: SeqTracker::new(),
+            base: now,
+            deadline: now + duration + UPLINK_RUNG_GRACE,
+            first: None,
+            last: None,
+            received_bytes: 0,
+        }
+    }
+
+    fn account(&self) -> uplink::Report {
+        // First arrival to last arrival: the receiver's own observation
+        // interval, which excludes the request's round trip and the client's
+        // start-up. The same definition the downstream ladder's receiver uses.
+        let observed_window_ns = match (self.first, self.last) {
+            (Some((a, _)), Some(b)) if b > a => b.duration_since(a).as_nanos() as u64,
+            _ => 0,
+        };
+        uplink::Report {
+            run_nonce: self.run_nonce,
+            rung: self.rung,
+            received_datagrams: self.tracker.received(),
+            received_bytes: self.received_bytes,
+            first_datagram_bytes: self.first.map(|(_, n)| n).unwrap_or(0),
+            reordered_datagrams: self.tracker.reordered(),
+            duplicate_datagrams: self.tracker.duplicates(),
+            observed_window_ns,
+            // Taken here, after the grace period has drained the tail: it is
+            // this call that draws the line between a gap still open and one a
+            // late arrival filled.
+            reorder: self.tracker.profile(),
+        }
+    }
+}
+
+async fn on_uplink_datagram(
+    sock: &Arc<UdpSocket>,
+    minter: &CookieMinter,
+    stats: &Arc<BaselineStats>,
+    rungs: &mut HashMap<SocketAddr, UpRung>,
+    peer: SocketAddr,
+    datagram: &[u8],
+) {
+    let len = datagram.len();
+    // Data first: at the top of the ladder it is twenty thousand datagrams a
+    // second against one request per rung, and the cheap branch belongs where
+    // the traffic is.
+    if let Some(h) = uplink::DataHeader::decode(datagram) {
+        // No armed rung means no ledger to put it in, and answering would make
+        // a public port a reflector. Silence.
+        let Some(r) = rungs.get_mut(&peer) else {
+            return;
+        };
+        if h.run_nonce != r.run_nonce || h.rung != r.rung {
+            return;
+        }
+        let now = Instant::now();
+        let stamps = Stamps {
+            recv_ns: now.saturating_duration_since(r.base).as_nanos() as u64,
+            send_ns: h.send_unix_ns,
+        };
+        if r.tracker.observe_stamped(h.seq, stamps) {
+            r.received_bytes += len as u64;
+            if r.first.is_none() {
+                r.first = Some((now, len as u64));
+            }
+        }
+        // Updated even for a duplicate: it still arrived, and the window is
+        // about when arrivals stopped rather than about which were distinct.
+        r.last = Some(now);
+        stats.up_datagrams.fetch_add(1, Ordering::Relaxed);
+        stats.up_bytes.fetch_add(len as u64, Ordering::Relaxed);
+        return;
+    }
+
+    // Unrecognised traffic gets no reply whatsoever. A public UDP port that
+    // answers scans is a reflector, and this one exists to measure a path.
+    let Some(req) = uplink::Request::decode(datagram) else {
+        return;
+    };
+
+    let now_secs = unix_nanos() / 1_000_000_000;
+    if !req.has_cookie() || !minter.verify(&req.cookie, peer, now_secs) {
+        let ch = uplink::Challenge {
+            run_nonce: req.run_nonce,
+            cookie: minter.mint(peer, now_secs),
+        };
+        let _ = sock.send_to(&ch.encode(), peer).await;
+        stats.up_challenges.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    // A request replaces that peer's rung rather than being refused as a
+    // duplicate. A repeated request means the client never saw the `Ready` and
+    // has therefore sent nothing yet, so re-arming is idempotent — and refusing
+    // it would strand a rung the client is still waiting to start.
+    if !rungs.contains_key(&peer) && rungs.len() >= MAX_CONCURRENT_UPLINK_RUNGS {
+        let _ = sock
+            .send_to(
+                &uplink::Ready {
+                    run_nonce: req.run_nonce,
+                    rung: req.rung,
+                    accepted: false,
+                }
+                .encode(),
+                peer,
+            )
+            .await;
+        stats.up_refused.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(%peer, rung = req.rung, "declining an uplink rung: no slot free");
+        return;
+    }
+
+    rungs.insert(peer, UpRung::armed(&req));
+    stats.up_rungs.fetch_add(1, Ordering::Relaxed);
+    let _ = sock
+        .send_to(
+            &uplink::Ready {
+                run_nonce: req.run_nonce,
+                rung: req.rung,
+                accepted: true,
+            }
+            .encode(),
+            peer,
+        )
+        .await;
+}
+
+/// Close out every rung whose window has ended and send its account back.
+fn expire_uplink_rungs(
+    sock: &Arc<UdpSocket>,
+    stats: &Arc<BaselineStats>,
+    rungs: &mut HashMap<SocketAddr, UpRung>,
+) {
+    let now = Instant::now();
+    let due: Vec<SocketAddr> = rungs
+        .iter()
+        .filter(|(_, r)| now >= r.deadline)
+        .map(|(p, _)| *p)
+        .collect();
+
+    for peer in due {
+        let Some(r) = rungs.remove(&peer) else {
+            continue;
+        };
+        let bytes = r.account().encode();
+        stats.up_reports.fetch_add(1, Ordering::Relaxed);
+        let sock = sock.clone();
+        // Spawned, and without the settling pause the downstream report takes
+        // first: that pause exists because a burst has just filled the sender's
+        // own send queue, and this rung filled the queue in the other
+        // direction. Spaced copies are kept for the reason they were
+        // introduced — the report is a single unacknowledged datagram carrying
+        // the denominator for the whole rung.
+        tokio::spawn(async move {
+            for i in 0..REPORT_COPIES {
+                if i > 0 {
+                    tokio::time::sleep(REPORT_SPACING).await;
+                }
+                let _ = sock.send_to(&bytes, peer).await;
+            }
+        });
     }
 }
 
@@ -804,5 +1118,433 @@ mod tests {
             "the refusal names the rate it declined, so the rung reads as unreached"
         );
         assert!(stats.down_refused.load(Ordering::Relaxed) >= 1);
+    }
+
+    // ── Uplink sink ─────────────────────────────────────────────────────────
+
+    /// The rung length every uplink test asks for. Short: what these pin is the
+    /// bookkeeping, and the sink's window closes a fixed grace period after the
+    /// rung's own end whatever that end was.
+    const UP_RUNG_MS: u32 = 200;
+
+    async fn sink_pair(stats: Arc<BaselineStats>) -> UdpSocket {
+        let server = UdpSocket::bind("127.0.0.1:0").await.expect("bind server");
+        let addr = server.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = serve_udp_sink(server, stats).await;
+        });
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        client.connect(addr).await.expect("connect");
+        client
+    }
+
+    fn up_request(
+        nonce: u64,
+        cookie: [u8; crate::downlink::COOKIE_LEN],
+        rung: u16,
+        ms: u32,
+    ) -> uplink::Request {
+        uplink::Request {
+            run_nonce: nonce,
+            cookie,
+            rung,
+            offered_kbps: 1_000,
+            duration_ms: ms,
+            payload_len: PAYLOAD_LEN as u16,
+        }
+    }
+
+    fn up_datagram(nonce: u64, rung: u16, seq: u64) -> Vec<u8> {
+        let mut b = vec![0u8; PAYLOAD_LEN as usize];
+        uplink::DataHeader {
+            run_nonce: nonce,
+            rung,
+            seq,
+            send_unix_ns: unix_nanos(),
+        }
+        .write_into(&mut b);
+        b
+    }
+
+    /// Get past the challenge and arm a rung, returning the cookie.
+    async fn arm_uplink(client: &UdpSocket, nonce: u64, rung: u16, ms: u32) -> [u8; 12] {
+        let mut buf = vec![0u8; 2048];
+        client
+            .send(&up_request(nonce, [0; crate::downlink::COOKIE_LEN], rung, ms).encode())
+            .await
+            .expect("send");
+        let n = recv_within(client, &mut buf, Duration::from_secs(3))
+            .await
+            .expect("a request without a cookie must draw a challenge");
+        let cookie = uplink::Challenge::decode(&buf[..n])
+            .expect("challenge")
+            .cookie;
+
+        client
+            .send(&up_request(nonce, cookie, rung, ms).encode())
+            .await
+            .expect("send");
+        let n = recv_within(client, &mut buf, Duration::from_secs(3))
+            .await
+            .expect("a cookie-bearing request must be answered");
+        let r = uplink::Ready::decode(&buf[..n]).expect("ready");
+        assert!(r.accepted, "the sink declined a rung it had a slot for");
+        assert_eq!(r.rung, rung);
+        cookie
+    }
+
+    /// Wait out the sink's own window and take its account of the rung.
+    async fn wait_for_account(client: &UdpSocket, nonce: u64, rung: u16) -> uplink::Report {
+        let mut buf = vec![0u8; 2048];
+        let deadline = Instant::now() + UPLINK_RUNG_GRACE + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let Some(n) = recv_within(client, &mut buf, Duration::from_millis(500)).await else {
+                continue;
+            };
+            if let Some(r) = uplink::Report::decode(&buf[..n]) {
+                if r.run_nonce == nonce && r.rung == rung {
+                    return r;
+                }
+            }
+        }
+        panic!("the sink never sent an account of the rung");
+    }
+
+    /// The whole round: challenge, cookie, arm, count, and the receiver's own
+    /// account of what arrived — which on an upload is the only honest one,
+    /// because a sender counts what it handed to a socket.
+    #[tokio::test]
+    async fn the_uplink_sink_challenges_arms_counts_and_reports() {
+        let stats = Arc::new(BaselineStats::default());
+        let client = sink_pair(stats.clone()).await;
+        arm_uplink(&client, 0xB1, 0, UP_RUNG_MS).await;
+
+        for seq in 0..10u64 {
+            client
+                .send(&up_datagram(0xB1, 0, seq))
+                .await
+                .expect("send data");
+        }
+
+        let r = wait_for_account(&client, 0xB1, 0).await;
+        assert_eq!(r.received_datagrams, 10);
+        assert_eq!(r.received_bytes, 10 * PAYLOAD_LEN as u64);
+        assert_eq!(r.first_datagram_bytes, PAYLOAD_LEN as u64);
+        assert_eq!(r.reordered_datagrams, 0);
+        assert_eq!(r.duplicate_datagrams, 0);
+        assert!(
+            r.observed_window_ns > 0,
+            "ten arrivals span an interval, and a zero one makes the rate infinite"
+        );
+        assert_eq!(
+            r.reorder.horizon, 4096,
+            "the ledger must say how far back it can see"
+        );
+        assert_eq!(r.reorder.gaps_lost, 0);
+        assert_eq!(r.reorder.gaps_filled, 0);
+
+        assert_eq!(stats.up_rungs.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.up_challenges.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.up_datagrams.load(Ordering::Relaxed), 10);
+        assert_eq!(stats.up_reports.load(Ordering::Relaxed), 1);
+
+        // And the rung is gone: a client that keeps sending after its window
+        // closed is not counted into anything, which is what makes the rung
+        // self-terminating rather than dependent on hearing from the client.
+        client
+            .send(&up_datagram(0xB1, 0, 99))
+            .await
+            .expect("send data");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            stats.up_datagrams.load(Ordering::Relaxed),
+            10,
+            "a datagram after the window closed was still counted"
+        );
+    }
+
+    /// The account is of what arrived, not of what was promised — and a gap the
+    /// window never slid past is neither loss nor reordering. Whether those
+    /// missing datagrams are the path's loss is a question only the sender's
+    /// count can answer, which is why it is answered on the other side.
+    #[tokio::test]
+    async fn the_sinks_account_reports_arrivals_and_leaves_loss_to_the_sender() {
+        let stats = Arc::new(BaselineStats::default());
+        let client = sink_pair(stats.clone()).await;
+        arm_uplink(&client, 0xB2, 1, UP_RUNG_MS).await;
+
+        // Ten sent, two never posted: exactly the shape a lossy path produces.
+        for seq in 0..10u64 {
+            if seq == 3 || seq == 7 {
+                continue;
+            }
+            client
+                .send(&up_datagram(0xB2, 1, seq))
+                .await
+                .expect("send data");
+        }
+
+        let r = wait_for_account(&client, 0xB2, 1).await;
+        assert_eq!(r.received_datagrams, 8);
+        assert_eq!(
+            r.reorder.gaps_open_at_end, 2,
+            "a gap the horizon never reached is not a measured loss"
+        );
+        assert_eq!(r.reorder.gaps_lost, 0);
+        assert_eq!(r.reordered_datagrams, 0);
+
+        // The fraction is the client's to compute, and it needs both halves:
+        // the receiver's arrivals and the sender's own count.
+        let loss = crate::downlink::loss_fraction(r.received_datagrams, Some(10))
+            .expect("both counts known");
+        assert!((loss - 0.2).abs() < 1e-9, "got {loss}");
+        assert_eq!(
+            crate::downlink::loss_fraction(r.received_datagrams, None),
+            None,
+            "without the sender's count there is no denominator"
+        );
+    }
+
+    /// Reordering and duplication are separate quantities from loss, measured
+    /// with the same code that measures them downstream — the whole reason the
+    /// bookkeeping lives in one module.
+    #[tokio::test]
+    async fn the_sink_counts_reordering_and_duplication_apart_from_loss() {
+        let stats = Arc::new(BaselineStats::default());
+        let client = sink_pair(stats.clone()).await;
+        arm_uplink(&client, 0xB3, 2, UP_RUNG_MS).await;
+
+        // 0, 1, 3, 2, 4 — one datagram overtaken — then 2 again.
+        for seq in [0u64, 1, 3, 2, 4, 2] {
+            client
+                .send(&up_datagram(0xB3, 2, seq))
+                .await
+                .expect("send data");
+        }
+
+        let r = wait_for_account(&client, 0xB3, 2).await;
+        assert_eq!(
+            r.received_datagrams, 5,
+            "a duplicate is not a second arrival"
+        );
+        assert_eq!(r.duplicate_datagrams, 1);
+        assert_eq!(r.reordered_datagrams, 1);
+        assert_eq!(r.reorder.gaps_filled, 1, "the overtaken one filled its gap");
+        assert_eq!(r.reorder.gaps_lost, 0);
+        assert_eq!(r.reorder.distance.count, 1);
+        assert_eq!(
+            r.reorder.distance.max, 1.0,
+            "seq 2 arrived one sequence number behind the highest seen"
+        );
+        assert_eq!(
+            r.received_bytes,
+            5 * PAYLOAD_LEN as u64,
+            "a duplicate's bytes are not credited"
+        );
+    }
+
+    /// A cookie minted for one address must not arm a rung for another. Nothing
+    /// here amplifies, but an armed rung costs the daemon a receiver ledger, and
+    /// a ledger any spoofed source can allocate is a table an attacker fills.
+    #[tokio::test]
+    async fn a_cookie_from_another_peer_only_earns_another_challenge_at_the_sink() {
+        let stats = Arc::new(BaselineStats::default());
+        let server = UdpSocket::bind("127.0.0.1:0").await.expect("bind server");
+        let addr = server.local_addr().expect("addr");
+        let s = stats.clone();
+        tokio::spawn(async move {
+            let _ = serve_udp_sink(server, s).await;
+        });
+
+        let a = UdpSocket::bind("127.0.0.1:0").await.expect("bind a");
+        a.connect(addr).await.expect("connect a");
+        let b = UdpSocket::bind("127.0.0.1:0").await.expect("bind b");
+        b.connect(addr).await.expect("connect b");
+
+        let mut buf = vec![0u8; 2048];
+        a.send(&up_request(1, [0; crate::downlink::COOKIE_LEN], 0, UP_RUNG_MS).encode())
+            .await
+            .expect("send");
+        let n = recv_within(&a, &mut buf, Duration::from_secs(3))
+            .await
+            .expect("challenge");
+        let stolen = uplink::Challenge::decode(&buf[..n])
+            .expect("challenge")
+            .cookie;
+
+        b.send(&up_request(2, stolen, 0, UP_RUNG_MS).encode())
+            .await
+            .expect("send");
+        let n = recv_within(&b, &mut buf, Duration::from_secs(3))
+            .await
+            .expect("reply");
+        assert!(
+            uplink::Challenge::decode(&buf[..n]).is_some(),
+            "a stolen cookie must earn a challenge, not an armed rung"
+        );
+        assert!(uplink::Ready::decode(&buf[..n]).is_none());
+        assert_eq!(stats.up_rungs.load(Ordering::Relaxed), 0);
+    }
+
+    /// A public UDP port that answers anything it is sent is a reflector. Data
+    /// for a peer with no armed rung is in that category too: there is no
+    /// ledger to put it in, and answering would be a reply to whatever address
+    /// the sender cared to forge.
+    #[tokio::test]
+    async fn the_sink_answers_neither_junk_nor_data_it_never_armed() {
+        let stats = Arc::new(BaselineStats::default());
+        let client = sink_pair(stats.clone()).await;
+        let mut buf = vec![0u8; 2048];
+
+        for junk in [
+            b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            vec![0u8; 40],
+            vec![0xFFu8; 512],
+            b"PHRAWUQ".to_vec(),
+            // A downstream request: the right shape on the wrong control.
+            request(9, [1; crate::downlink::COOKIE_LEN], 1_000, 500)
+                .encode()
+                .to_vec(),
+            up_datagram(0xB4, 0, 0),
+        ] {
+            client.send(&junk).await.expect("send");
+        }
+        assert!(
+            recv_within(&client, &mut buf, Duration::from_millis(600))
+                .await
+                .is_none(),
+            "the sink replied to traffic it did not recognise"
+        );
+        assert_eq!(stats.up_challenges.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.up_rungs.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            stats.up_datagrams.load(Ordering::Relaxed),
+            0,
+            "data with no armed rung must not be counted into one"
+        );
+    }
+
+    /// A repeated request means the client never saw the answer and has
+    /// therefore sent nothing yet. Refusing it as a duplicate would strand a
+    /// rung the client is still waiting to start, so it re-arms instead.
+    #[tokio::test]
+    async fn a_repeated_request_re_arms_the_rung_rather_than_being_refused() {
+        let stats = Arc::new(BaselineStats::default());
+        let client = sink_pair(stats.clone()).await;
+        let cookie = arm_uplink(&client, 0xB5, 0, UP_RUNG_MS).await;
+
+        let mut buf = vec![0u8; 2048];
+        client
+            .send(&up_request(0xB5, cookie, 0, UP_RUNG_MS).encode())
+            .await
+            .expect("send");
+        let n = recv_within(&client, &mut buf, Duration::from_secs(3))
+            .await
+            .expect("the repeat must be answered");
+        let r = uplink::Ready::decode(&buf[..n]).expect("ready");
+        assert!(r.accepted, "a repeated request must not be refused");
+
+        for seq in 0..4u64 {
+            client
+                .send(&up_datagram(0xB5, 0, seq))
+                .await
+                .expect("send data");
+        }
+        let acct = wait_for_account(&client, 0xB5, 0).await;
+        assert_eq!(acct.received_datagrams, 4);
+        assert_eq!(stats.up_refused.load(Ordering::Relaxed), 0);
+    }
+
+    /// Past the concurrency bound the sink says no rather than going quiet.
+    /// Silence there is indistinguishable from a path that swallowed the whole
+    /// rung, and those two call for opposite conclusions.
+    #[tokio::test]
+    async fn a_rung_past_the_concurrency_bound_is_declined_rather_than_ignored() {
+        let stats = Arc::new(BaselineStats::default());
+        let server = UdpSocket::bind("127.0.0.1:0").await.expect("bind server");
+        let addr = server.local_addr().expect("addr");
+        let s = stats.clone();
+        tokio::spawn(async move {
+            let _ = serve_udp_sink(server, s).await;
+        });
+
+        // Long enough that the earlier rungs are still armed when the last one
+        // asks. Every client is a distinct peer, which is what the bound counts.
+        let held_ms = 10_000;
+        let mut clients = Vec::new();
+        for i in 0..MAX_CONCURRENT_UPLINK_RUNGS {
+            let c = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+            c.connect(addr).await.expect("connect");
+            arm_uplink(&c, 0xC0 + i as u64, 0, held_ms).await;
+            clients.push(c);
+        }
+
+        let extra = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        extra.connect(addr).await.expect("connect");
+        let mut buf = vec![0u8; 2048];
+        extra
+            .send(&up_request(0xCF, [0; crate::downlink::COOKIE_LEN], 0, held_ms).encode())
+            .await
+            .expect("send");
+        let n = recv_within(&extra, &mut buf, Duration::from_secs(3))
+            .await
+            .expect("challenge");
+        let cookie = uplink::Challenge::decode(&buf[..n])
+            .expect("challenge")
+            .cookie;
+        extra
+            .send(&up_request(0xCF, cookie, 0, held_ms).encode())
+            .await
+            .expect("send");
+        let n = recv_within(&extra, &mut buf, Duration::from_secs(3))
+            .await
+            .expect("a declined rung must still be answered");
+        let r = uplink::Ready::decode(&buf[..n]).expect("ready");
+        assert!(!r.accepted, "the bound must be enforced");
+        assert_eq!(r.run_nonce, 0xCF);
+        assert!(stats.up_refused.load(Ordering::Relaxed) >= 1);
+        assert_eq!(
+            stats.up_rungs.load(Ordering::Relaxed),
+            MAX_CONCURRENT_UPLINK_RUNGS as u64
+        );
+    }
+
+    /// A request is not permission to keep a ledger for as long as the asker
+    /// likes: the clamp is what guarantees a client that disappears cannot
+    /// leave the sink holding one, since nothing in this path hears from it
+    /// again.
+    #[test]
+    fn an_uplink_rung_is_clamped_to_what_the_sink_will_hold() {
+        let armed = UpRung::armed(&uplink::Request {
+            run_nonce: 1,
+            cookie: [1; crate::downlink::COOKIE_LEN],
+            rung: 9,
+            offered_kbps: u32::MAX,
+            duration_ms: u32::MAX,
+            payload_len: u16::MAX,
+        });
+        let held = armed.deadline.saturating_duration_since(armed.base);
+        assert!(
+            held <= MAX_RUNG + UPLINK_RUNG_GRACE,
+            "a rung asking for forever was held {held:?}"
+        );
+
+        // And a zero-length request still opens a window rather than one that
+        // has already closed.
+        let tiny = UpRung::armed(&uplink::Request {
+            run_nonce: 1,
+            cookie: [1; crate::downlink::COOKIE_LEN],
+            rung: 0,
+            offered_kbps: 0,
+            duration_ms: 0,
+            payload_len: 0,
+        });
+        assert!(tiny.deadline > tiny.base);
+        assert_eq!(tiny.account().received_datagrams, 0);
+        assert_eq!(
+            tiny.account().observed_window_ns,
+            0,
+            "no arrivals span no interval, and a made-up one would divide into a rate"
+        );
     }
 }

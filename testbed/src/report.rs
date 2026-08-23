@@ -480,10 +480,18 @@ pub struct ThroughputSample {
 /// its own scheduler as the path's ceiling. So the sender's account travels
 /// with the receiver's, and [`Self::sender_reached_offer`] states in a field —
 /// not in prose — whether the rung is admissible as evidence at all.
+///
+/// One record shape carries all three ladders — the round-trip echo and the two
+/// one-way controls — and [`Self::direction`] is what tells them apart. That is
+/// deliberate: the uplink and downlink numbers are read side by side, and a
+/// second record shape would be a second set of definitions to keep in step.
+/// Which end is local differs between them and nothing else does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownstreamSample {
+pub struct RungSample {
     pub leg: Leg,
-    /// `raw_udp_downstream` — server → client, no protocol in the way.
+    /// `raw_udp_downstream` (server → client), `raw_udp_upstream`
+    /// (client → server), or `raw_udp_echo_roundtrip` — no protocol in the way
+    /// in any of them.
     pub direction: String,
     pub t_unix_ns: u64,
     /// Index into the ladder, so rungs stay ordered after any sort.
@@ -950,6 +958,16 @@ impl SampleSink {
         self.lines.is_empty()
     }
 
+    /// The serialized records as they will be written.
+    ///
+    /// Read-only, and here so a test can assert on the record a scenario
+    /// actually emitted rather than on a value it built by hand — the two
+    /// differ exactly where a scenario fills a field wrongly, which is the
+    /// case worth catching.
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
     /// Write every accumulated line to `path`, creating parent directories.
     pub fn write_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
@@ -1255,7 +1273,7 @@ mod tests {
     /// run's analysis.
     #[test]
     fn a_downstream_rung_serialises_with_every_field_the_analysis_reads() {
-        let s = DownstreamSample {
+        let s = RungSample {
             leg: Leg::RawUdp,
             direction: "raw_udp_downstream".into(),
             t_unix_ns: 1,
@@ -1321,7 +1339,7 @@ mod tests {
         // A rung with no sender report must serialise its unknowns as null, not
         // as zero: zero would read as "the sender sent nothing", which is a
         // measurement, and the truth is that nothing is known.
-        let unknown = DownstreamSample {
+        let unknown = RungSample {
             sender_datagrams: None,
             sender_bytes: None,
             sender_elapsed_ns: None,
@@ -1355,7 +1373,7 @@ mod tests {
             "received_bytes":36000000,"reordered_datagrams":12,"duplicate_datagrams":0,
             "observed_window_ns":5000000000,"receiver_bps":57600000.0,
             "loss_fraction":0.04,"admissible":true,"note":""}"#;
-        let s: DownstreamSample = serde_json::from_str(old).expect("an older rung must load");
+        let s: RungSample = serde_json::from_str(old).expect("an older rung must load");
         assert_eq!(s.reordered_datagrams, 12);
         assert_eq!(
             s.reorder,

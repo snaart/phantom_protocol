@@ -121,6 +121,49 @@ def repair_reading(counters):
     return lines
 
 
+# The two one-way controls, in the order they are read. A round trip bounds the
+# two directions together and neither alone, so each of these is the denominator
+# for exactly one of them: a `download` is divided by the first and an `upload`
+# by the second.
+ONE_WAY_DIRECTIONS = ("raw_udp_downstream", "raw_udp_upstream")
+
+# Loss below this is noise rather than the path declining to carry the rate. It
+# matches the Rust side's threshold, and both exist because a single datagram
+# lost on a rung of a hundred thousand is not a ceiling.
+LADDER_PUSHBACK_LOSS = 0.001
+
+
+def ladder_verdict(rows):
+    """The best rate a one-way ladder measured, and what it is evidence of.
+
+    Three outcomes, and the difference between the first two is the difference
+    between a measurement and an overclaim. A rung where the path pushed back —
+    loss appeared, or the sender could not reach its own offer — means the
+    ladder found the limit, and the best admissible rate below that is a
+    **ceiling**. A ladder that climbed every rung cleanly did not find a limit;
+    its best rate is a **lower bound**, and calling it a ceiling would state
+    that the path cannot do more, which nothing in the run supports.
+
+    Only admissible rungs contribute a rate. A rung the sender never reached
+    measures the sender, and a rung the far end never reported on measures
+    nothing — but both still count as pushback if they say the sender fell
+    short, because that is the instrument reaching its own limit and the
+    ceiling below it is real either way.
+
+    Returns `(bits_per_second or None, "ceiling" | "lower bound" | "none")`.
+    """
+    admissible = [r for r in rows if r.get("admissible")]
+    pushback = any(
+        r.get("sender_reached_offer") is False
+        or (r.get("loss_fraction") is not None and r["loss_fraction"] > LADDER_PUSHBACK_LOSS)
+        for r in rows
+    )
+    if not admissible:
+        return (None, "none")
+    return (max(r.get("receiver_bps") or 0.0 for r in admissible),
+            "ceiling" if pushback else "lower bound")
+
+
 def read_jsonl(path):
     """Yield records, skipping lines a truncated run left half-written."""
     try:
@@ -294,6 +337,67 @@ def analyze_client(run_dir):
             f"  {leg:8} {direction:16} {len(v):>8} "
             f"{pct(v, .50):>9.2f}M {max(v):>9.2f}M {min(v):>9.2f}M"
         )
+
+    # ── the one-way capacity ladders ─────────────────────────────────────
+    #
+    # Printed together and immediately after the protocol throughput above,
+    # because a protocol rate without the raw control from the same run is not a
+    # result. The two ladders are the same instrument aimed in opposite
+    # directions — same pacer, same rungs, same datagram, same bookkeeping — so
+    # the only thing that differs between the two blocks below is which end of
+    # the path was doing the sending.
+    section("Raw UDP one-way capacity ladders (what a rate is divided by)")
+    ladders = defaultdict(list)
+    for f in sorted(run_dir.glob("samples/*/*.jsonl")):
+        for r in read_jsonl(f):
+            if r.get("direction") in ONE_WAY_DIRECTIONS:
+                ladders[r["direction"]].append(r)
+    if not ladders:
+        print("  neither one-way control ran: no rate in this run can be separated from the path")
+    else:
+        print(
+            f"  {'direction':20} {'rung':>5} {'offered':>9} {'sender':>9} "
+            f"{'receiver':>10} {'loss':>7} {'reord':>7} {'dup':>6}"
+        )
+        for direction in ONE_WAY_DIRECTIONS:
+            rows = ladders.get(direction)
+            if not rows:
+                print(f"  {direction:20} not run — nothing normalises that direction in this run")
+                continue
+            for r in sorted(rows, key=lambda r: r["rung"]):
+                snd = r.get("sender_bps")
+                loss = r.get("loss_fraction")
+                mark = "" if r.get("admissible") else "  (inadmissible)"
+                print(
+                    f"  {direction:20} {r['rung']:>5} {r['offered_bps'] / 1e6:>8.0f}M "
+                    f"{'       —' if snd is None else f'{snd / 1e6:>8.2f}M'} "
+                    f"{r.get('receiver_bps', 0.0) / 1e6:>9.2f}M "
+                    f"{'      —' if loss is None else f'{loss * 100:>6.1f}%'} "
+                    f"{r.get('reordered_datagrams', 0):>7} {r.get('duplicate_datagrams', 0):>6}"
+                    f"{mark}"
+                )
+                if not r.get("admissible") and r.get("note"):
+                    print(f"  {'':20} {r['note']}")
+            best, kind = ladder_verdict(rows)
+            if kind == "none":
+                print(
+                    f"  {'':20} NO denominator: no rung was admissible, so nothing in this "
+                    "direction can be attributed"
+                )
+            elif kind == "ceiling":
+                # Deliberately not "the path pushed back": a rung the sender
+                # never reached is the instrument's limit rather than the
+                # link's, and both produce a ceiling here.
+                print(
+                    f"  {'':20} measured ceiling {best / 1e6:.2f} Mbit/s — the ladder found a "
+                    "limit at or below it (loss appeared, or the sender could not reach its "
+                    "own offer)"
+                )
+            else:
+                print(
+                    f"  {'':20} carries AT LEAST {best / 1e6:.2f} Mbit/s — the ladder ran out of "
+                    "rungs before the path did, so this is a floor and not a ceiling"
+                )
 
     # ── raw-path reordering ──────────────────────────────────────────────
     #
@@ -775,6 +879,11 @@ def self_test():
     backwards compatibility as much as arithmetic: every run recorded before
     they existed must still load, so "the fields are missing" has to reach the
     reader as silence rather than as four zeros or a traceback.
+
+    The ladder verdict is the fourth, and it is the one that decides whether a
+    number is a ceiling or a floor. A ladder that climbed every rung cleanly did
+    not find the path's limit; printing its best rate as a ceiling would state
+    that the path cannot do more, which is a claim the run never tested.
     """
     label_cases = [
         ([{"bw_filter_window_ms": 10000}] * 3, "filtered max over 10s horizon"),
@@ -829,6 +938,57 @@ def self_test():
         (counters(2, 2, 0, 7), ["never retained at all"]),
     ]
 
+    def rung(offered, receiver, *, admissible=True, reached=True, loss=0.0):
+        return {
+            "rung": 0,
+            "offered_bps": offered,
+            "sender_bps": offered,
+            "sender_reached_offer": reached,
+            "receiver_bps": receiver,
+            "loss_fraction": loss,
+            "admissible": admissible,
+        }
+
+    ladder_cases = [
+        # Nothing ran.
+        ([], (None, "none")),
+        # A clean climb found no limit, so the top rung is a floor.
+        (
+            [rung(1e6, 0.99e6), rung(5e6, 4.9e6), rung(20e6, 19.5e6)],
+            (19.5e6, "lower bound"),
+        ),
+        # Loss on the top rung is the path declining to carry it.
+        (
+            [rung(5e6, 4.9e6), rung(20e6, 12e6, loss=0.4)],
+            (12e6, "ceiling"),
+        ),
+        # So is the sender failing to reach its own offer — that is the
+        # instrument's limit, and the best rate below it is still real.
+        (
+            [rung(5e6, 4.9e6), rung(200e6, 0.0, admissible=False, reached=False)],
+            (4.9e6, "ceiling"),
+        ),
+        # Pushback with nothing admissible measures nothing at all.
+        (
+            [rung(5e6, 0.0, admissible=False, reached=False)],
+            (None, "none"),
+        ),
+        # A rung the far end never reported on carries a null loss, which is
+        # "unknown" rather than "none" — it must not read as a clean rung and
+        # must not read as pushback either.
+        (
+            [rung(5e6, 4.9e6), dict(rung(20e6, 0.0, admissible=False), loss_fraction=None)],
+            (4.9e6, "lower bound"),
+        ),
+        # A single datagram lost on a large rung is noise, not a ceiling.
+        (
+            [rung(20e6, 19.5e6, loss=0.0005)],
+            (19.5e6, "lower bound"),
+        ),
+        # An older artifact with no admissibility field cannot be quoted.
+        ([{"rung": 0, "offered_bps": 1e6, "receiver_bps": 1e6}], (None, "none")),
+    ]
+
     failures = 0
     for rows, want in label_cases:
         got = filtered_max_label(rows)
@@ -860,7 +1020,19 @@ def self_test():
         if not ok:
             failures += 1
         print(f"  {status}: repair_reading({c!r}) -> {got!r} (want {wanted!r})")
-    total = len(label_cases) + len(ceiling_cases) + len(repair_cases) + len(reading_cases)
+    for rows, want in ladder_cases:
+        got = ladder_verdict(rows)
+        status = "ok" if got == want else "FAIL"
+        if got != want:
+            failures += 1
+        print(f"  {status}: ladder_verdict({len(rows)} rung(s)) -> {got!r} (want {want!r})")
+    total = (
+        len(label_cases)
+        + len(ceiling_cases)
+        + len(repair_cases)
+        + len(reading_cases)
+        + len(ladder_cases)
+    )
     print(f"{total - failures}/{total} ok")
     return 1 if failures else 0
 

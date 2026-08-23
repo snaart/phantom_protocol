@@ -460,6 +460,16 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
                     scenarios::raw_udp_downstream(ep, &p.raw_rungs_kbps, p.raw_rate_step).await,
                 )?;
             }
+            // And its mirror, client → server, which is what an `upload` is
+            // divided by. Run immediately after the downstream ladder and over
+            // the same window on the same rungs, because the two numbers are
+            // read side by side and a path's capacity moves between minutes.
+            if leg == Leg::RawUdp && cfg.wants("upstream") {
+                st.absorb(
+                    leg,
+                    scenarios::raw_udp_upstream(ep, &p.raw_rungs_kbps, p.raw_rate_step).await,
+                )?;
+            }
             continue;
         }
 
@@ -617,11 +627,13 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
 /// Scenario names the raw controls answer to. They carry no protocol, so they
 /// run only the probes that describe the path itself.
 ///
-/// `throughput` is a round trip and `downstream` is one way, server → client.
-/// Both are here because they answer different questions: the first bounds what
-/// the path can carry at all, the second bounds the direction every `download`
-/// figure in the run is measured in.
-const RAW_SCENARIOS: &[&str] = &["rtt_sweep", "throughput", "downstream"];
+/// `throughput` is a round trip; `downstream` and `upstream` are one way each.
+/// All three are here because they answer different questions: the first bounds
+/// what the path can carry at all, and the other two bound the two directions
+/// every `download` and `upload` figure in the run is measured in. A round trip
+/// bounds neither on its own, which is why one one-way control is not enough
+/// either.
+const RAW_SCENARIOS: &[&str] = &["rtt_sweep", "throughput", "downstream", "upstream"];
 
 /// Every scenario the matrix runs against the protocol under test.
 ///
@@ -805,10 +817,13 @@ fn caveats(cfg: &ProbeConfig) -> Vec<String> {
         "Migration is a local UDP port rebind, not an interface change: it exercises the migration path and the server's path validation, but the external NAT mapping may not change and the client cannot observe whether it did.".to_string(),
         "Throughput is application-level goodput measured at the testbed protocol, so it excludes Phantom headers, AEAD tags, and any retransmission.".to_string(),
         "The raw TCP/UDP legs carry no Phantom at all; they are the control group, and protocol numbers are meaningful mainly as ratios against them.".to_string(),
-        "The raw TCP and raw UDP throughput controls are round trips: every byte they count crossed the path twice, so neither bounds a single direction. The raw_udp downstream scenario is the only one-way control, and it covers server -> client.".to_string(),
+        "The raw TCP and raw UDP throughput controls are round trips: every byte they count crossed the path twice, so neither bounds a single direction. The one-way controls are the raw_udp downstream and upstream ladders, which cover server -> client and client -> server respectively; each is the denominator for one direction and neither speaks for the other.".to_string(),
     ];
     if !cfg.wants("downstream") || !cfg.legs.contains(&Leg::RawUdp) {
         v.push("No one-way downstream control ran, so this run cannot say whether a low download figure is the transport or the server's uplink.".to_string());
+    }
+    if !cfg.wants("upstream") || !cfg.legs.contains(&Leg::RawUdp) {
+        v.push("No one-way upstream control ran, so this run cannot say whether a low upload figure is the transport or the client's uplink, and its upload numbers have nothing to be normalised against.".to_string());
     }
     if cfg.legs.iter().any(|l| l.is_reference()) {
         v.push(
@@ -1204,6 +1219,7 @@ mod tests {
                 raw_tcp_port: 4,
                 raw_udp_port: 5,
                 raw_udp_down_port: 7,
+                raw_udp_up_port: 8,
                 sni: "s".into(),
                 quic_cert: None,
             },
@@ -1230,6 +1246,66 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("No raw baseline leg"))
         );
+    }
+
+    /// A round trip bounds the two directions together and neither alone, so a
+    /// run needs a one-way control in each. The pair is what makes an `upload`
+    /// number and a `download` number statements about the protocol rather than
+    /// about whatever the path happened to be doing that minute.
+    #[test]
+    fn each_direction_has_its_own_one_way_control() {
+        for s in ["downstream", "upstream"] {
+            assert!(
+                RAW_SCENARIOS.contains(&s),
+                "{s} must be a scenario the raw legs answer to"
+            );
+        }
+        let mut cfg = demo_cfg(vec![Leg::RawUdp], Profile::Smoke);
+        cfg.only = Some(["upstream".to_string()].into_iter().collect());
+        assert!(cfg.wants("upstream"));
+        assert!(
+            cfg.unknown_filters().is_empty(),
+            "the uplink ladder's own name is not a typo"
+        );
+
+        let c = caveats(&demo_cfg(vec![Leg::Udp, Leg::RawUdp], Profile::Standard)).join("\n");
+        assert!(
+            c.contains("client -> server"),
+            "the direction each one-way control covers must travel with the numbers: {c}"
+        );
+        assert!(c.contains("server -> client"), "{c}");
+        assert!(
+            c.contains("neither speaks for the other"),
+            "one one-way control is not two: {c}"
+        );
+    }
+
+    /// Every campaign before this control existed had to record that upload was
+    /// measured against nothing. A run that still skips it must say the same
+    /// thing rather than leaving the omission to be noticed.
+    #[test]
+    fn a_run_without_the_upstream_control_says_upload_has_no_denominator() {
+        let mut cfg = demo_cfg(vec![Leg::Udp, Leg::RawUdp], Profile::Standard);
+        cfg.only = Some(["downstream".to_string()].into_iter().collect());
+        let c = caveats(&cfg).join("\n");
+        assert!(
+            c.contains("No one-way upstream control ran"),
+            "the missing denominator must be stated: {c}"
+        );
+        assert!(
+            c.contains("nothing to be normalised against"),
+            "and what its absence costs: {c}"
+        );
+        assert!(!c.contains("No one-way downstream control ran"), "{c}");
+
+        // A run with no raw UDP leg at all loses both, and must say both.
+        let neither = caveats(&demo_cfg(vec![Leg::Udp, Leg::RawTcp], Profile::Standard)).join("\n");
+        assert!(neither.contains("No one-way upstream control ran"));
+        assert!(neither.contains("No one-way downstream control ran"));
+
+        // And a run that has them carries neither complaint.
+        let both = caveats(&demo_cfg(vec![Leg::Udp, Leg::RawUdp], Profile::Standard)).join("\n");
+        assert!(!both.contains("No one-way"), "{both}");
     }
 
     #[test]
