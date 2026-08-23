@@ -510,6 +510,31 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **`handshake_repair` — the WAN harness now loses a `ServerHello` flight on purpose, because
+  the path will not.** The listener's retained-flight repeat is pinned by the library's own
+  tests and had never been observed working on a real path: four measurement runs across two
+  days produced 76 consecutive successful UDP handshakes and
+  `initial_on_committed_route_total = 0`, because the path did not happen to lose a handshake
+  datagram. The new scenario stands a relay on the probe's own machine, lets every datagram
+  cross the WAN in both directions, and drops exactly one fragmented downstream handshake
+  flight — identified by that flight's own `total_chunks`, so one flight goes missing however
+  many datagrams it is, and every later flight including the repeat arrives. Keying on the
+  fragment's `packet_id` instead would have swallowed the repair too, since the repeat is the
+  retained flight byte for byte.
+
+  It refuses to call a completed connect a pass. An attempt is `repaired` only when a flight
+  was really lost **and** the listener's own counters moved on both halves —
+  `initial_on_committed_route_total` (the client asked again) and
+  `handshake_flight_repeated_total` (an answer went back). Everything short of that is
+  recorded as `inconclusive` with the reason, which is neither a pass nor a failure; the one
+  shape that is a finding is a flight really lost and a connect that never came back, which is
+  what a listener with no retention produces on every attempt. Each attempt is timed against a
+  baseline connect through the same relay with nothing swallowed, so the elapsed excess says
+  whether the listener's repeat carried the connect or a later client retransmission did.
+  In the `smoke` profile and up. `analyze.py` prints the four repair counters per leg wherever
+  they are non-zero, with the reading the pair supports, and still loads runs recorded before
+  the fields existed.
+
 - **The arithmetic that turns a per-session memory bound into a per-process one.** Every
   receive-side bound this transport enforces is enforced *per session* — the growth
   allowance most explicitly, since one `SharedRecvTuning` handle is created per session and

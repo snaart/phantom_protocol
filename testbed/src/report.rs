@@ -271,6 +271,69 @@ pub struct HandshakeSample {
     pub error_kind: Option<String>,
 }
 
+/// One deliberately damaged handshake: a connect whose server reply flight was
+/// dropped before it reached the client, and what the listener did about it.
+///
+/// Every field here exists to stop the record being read as a pass when it is
+/// not one. A connect that completed while nothing was swallowed says nothing;
+/// a connect that completed while the listener recorded no repeat says the
+/// repair was not what carried it; and an elapsed time with no baseline beside
+/// it cannot say whether the listener's repeat or the client's own third
+/// retransmission got the session open.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandshakeRepairSample {
+    pub seq: u64,
+    pub leg: Leg,
+    pub t_unix_ns: u64,
+    /// Datagrams the relay refused to deliver to the client. Zero means the
+    /// attempt crossed a clean path and is evidence about nothing.
+    pub swallowed_datagrams: u64,
+    /// How many datagrams the doomed flight declared itself to be, from its own
+    /// `total_chunks`. Differs from the count above only when the path lost part
+    /// of the flight before the relay saw it, which leaves swallow budget to
+    /// spend on the repeat and costs the connect one more retransmit.
+    pub flight_total_chunks: Option<u16>,
+    /// Wall clock from the first socket call to a session that has completed the
+    /// handshake and verified the pinned identity.
+    pub ready_ns: Option<u64>,
+    /// The same measurement through the same relay with nothing swallowed.
+    ///
+    /// The denominator. An elapsed connect on its own is a number; against this
+    /// it is the cost of the loss, with the relay's own hop cancelled out of
+    /// both sides.
+    pub baseline_ready_ns: Option<u64>,
+    /// The client's first handshake-retransmit interval and the whole budget it
+    /// sits in, carried so the elapsed times above can be read against the
+    /// schedule that produced them without the reader holding a copy of it.
+    pub first_retransmit_ns: u64,
+    pub retransmit_budget_ns: u64,
+    /// Movement in `initial_on_committed_route_total` on the **server** across
+    /// this attempt: the client's repeated flight arriving.
+    pub asked_delta: Option<u64>,
+    /// Movement in `handshake_flight_repeated_total`: an answer going back.
+    ///
+    /// Asked-and-answered is a repaired connect. Asked-and-not-answered is a
+    /// connect the listener's retention could not cover. The pair is the whole
+    /// reading, and either number alone is ambiguous between them.
+    pub answered_delta: Option<u64>,
+    /// Movement in `handshake_flight_evicted_total` and
+    /// `handshake_flight_refused_total` — the two ways retention fails to cover
+    /// a session, by running out of budget and by never arming.
+    pub evicted_delta: Option<u64>,
+    pub refused_delta: Option<u64>,
+    /// The listener's counters after the attempt, in full. Deltas are the
+    /// reading, but a delta cannot be re-derived from another delta, and these
+    /// are what a later question about this run gets to ask.
+    pub server_counters: Option<ClientMetrics>,
+    /// True only for an attempt that both lost a flight and was repaired.
+    pub ok: bool,
+    /// `repaired`, or `inconclusive: …`, or `failed: …` — in the artifact's own
+    /// words, so a reader does not have to reconstruct the rule from the fields.
+    pub verdict: String,
+    pub error: Option<String>,
+    pub error_kind: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RttSample {
     pub seq: u64,

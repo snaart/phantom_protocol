@@ -37,6 +37,90 @@ def filtered_max_label(rows):
     return f"filtered max over {horizons.pop() / 1000:g}s horizon"
 
 
+# The four counters PhantomUDP's reply-flight repeat leaves behind (PROTOCOL § 6.1).
+# Named once because three readers below have to agree on them.
+REPAIR_FIELDS = (
+    "initial_on_committed_route_total",
+    "handshake_flight_repeated_total",
+    "handshake_flight_evicted_total",
+    "handshake_flight_refused_total",
+)
+
+
+def repair_counters(metrics):
+    """The four reply-flight counters, or `None` where the artifact predates them.
+
+    Absent and zero are different statements — a run written before these existed did
+    not observe nothing, it observed nothing *about this* — so they get different
+    answers and neither gets a default. The four landed together, so a snapshot
+    carrying some of them and not others is a shape nothing produces; it is refused
+    rather than half-read, because half a pair cannot support the reading below.
+    """
+    if not isinstance(metrics, dict):
+        return None
+    got = {}
+    for k in REPAIR_FIELDS:
+        v = metrics.get(k)
+        # `bool` is an `int` in Python, and a counter that reads True is a corrupt
+        # record rather than a value of one.
+        if isinstance(v, bool) or not isinstance(v, int):
+            return None
+        got[k] = v
+    return got
+
+
+def repair_reading(counters):
+    """What the four counters mean together, one line per fact worth stating.
+
+    Empty for an artifact that predates them and empty when all four stayed at zero:
+    no client had to repeat its flight, which is the ordinary case on a path that
+    did not lose a handshake datagram. Printing four zeros there would invite them
+    being read as a fault.
+
+    The pair at the top is the whole reading, and it took a failed run to learn why
+    both halves are needed. `initial_on_committed_route` counts a client asking its
+    question again and is incremented before the listener decides whether to answer;
+    `handshake_flight_repeated` counts an answer going back. Asked-and-answered is a
+    repaired connect. Asked-and-not-answered is one the retention could not cover.
+    Neither number alone separates those.
+    """
+    if not counters or not any(counters.values()):
+        return []
+    asked = counters["initial_on_committed_route_total"]
+    answered = counters["handshake_flight_repeated_total"]
+    evicted = counters["handshake_flight_evicted_total"]
+    refused = counters["handshake_flight_refused_total"]
+    lines = [
+        f"reply-flight repeat: {asked} question(s) repeated, {answered} answered, "
+        f"{evicted} retained flight(s) evicted, {refused} never retained"
+    ]
+    if asked and answered:
+        lines.append(
+            f"{min(asked, answered)} connect(s) survived a reply lost on the way down"
+        )
+    if asked > answered:
+        lines.append(
+            f"{asked - answered} repeat(s) drew no answer — the listener held nothing for "
+            "those sessions, and each is a connect the repair could not cover"
+        )
+    if answered > asked:
+        lines.append(
+            "more answers than questions: these are daemon-wide totals, so this reading "
+            "spans repeats whose questions were counted outside it"
+        )
+    if evicted:
+        lines.append(
+            "retention ran out of the memory it is allowed, so the evicted sessions were "
+            "back to losing a whole connect to one lost datagram"
+        )
+    if refused:
+        lines.append(
+            "some replies were never retained at all: repeating one would have crossed the "
+            "anti-amplification bound, which means a message size moved"
+        )
+    return lines
+
+
 def read_jsonl(path):
     """Yield records, skipping lines a truncated run left half-written."""
     try:
@@ -145,6 +229,54 @@ def analyze_client(run_dir):
             f"  {leg:8} {len(rows):>5} {rate:>5.0f}% "
             f"{fmt_ms(pct(setup, .50))}   {fmt_ms(pct(total, .50))}   {fmt_ms(pct(total, .99))}"
         )
+
+    # ── deliberately damaged handshakes ──────────────────────────────────
+    #
+    # The only scenario whose loss the harness supplies rather than measuring.
+    # A relay on the probe's own machine drops one datagram flight of the
+    # server's reply; everything else about the exchange is real. Read the
+    # verdicts before the timings: an attempt that swallowed nothing is an
+    # ordinary connect wearing this scenario's name.
+    section("Handshake repair (one server reply flight lost on purpose)")
+    any_repair = False
+    for f in sorted(run_dir.glob("samples/*/handshake_repair.jsonl")):
+        rows = list(read_jsonl(f))
+        if not rows:
+            continue
+        any_repair = True
+        leg = rows[0]["leg"]
+        tally = defaultdict(int)
+        for r in rows:
+            # The verdict carries its reason after a colon; the word before it is
+            # the classification.
+            tally[str(r.get("verdict", "unrecorded")).split(":")[0]] += 1
+        counted = ", ".join(f"{n} {k}" for k, n in sorted(tally.items()))
+        print(f"  {leg:8} {len(rows)} attempt(s): {counted}")
+
+        base = next((r["baseline_ready_ns"] for r in rows if r.get("baseline_ready_ns")), None)
+        ready = [r["ready_ns"] for r in rows if r.get("ok") and r.get("ready_ns")]
+        if ready and base:
+            median = pct(ready, .50)
+            print(
+                f"           repaired connect p50 {ms(median):.0f} ms against a {ms(base):.0f} ms "
+                f"undamaged baseline through the same relay — excess {ms(median - base):.0f} ms"
+            )
+            first, budget = rows[0].get("first_retransmit_ns"), rows[0].get("retransmit_budget_ns")
+            if first and budget:
+                print(
+                    f"           the client repeats its flight after {ms(first):.0f} ms and gives up at "
+                    f"{ms(budget):.0f} ms: an excess near the first is the listener's repeat carrying "
+                    "the connect, near the budget a later retransmit carrying it instead"
+                )
+        # Anything that is not a plain pass is the part worth reading in full.
+        for r in rows:
+            if not r.get("ok"):
+                print(f"           #{r.get('seq')} {r.get('verdict', 'no verdict recorded')}")
+        last = next((r["server_counters"] for r in reversed(rows) if r.get("server_counters")), None)
+        for line in repair_reading(repair_counters(last)):
+            print(f"           {line}")
+    if not any_repair:
+        print("  (not run)")
 
     # ── throughput ───────────────────────────────────────────────────────
     section("Throughput (per-second windows, so a stall shows as a dip)")
@@ -605,6 +737,12 @@ def analyze_server(server_dir):
             f", replay rejected {m.get('replay_rejected_total')}, aead failures {m.get('aead_failure_total')}"
             f", unencrypted refused {m.get('unencrypted_dropped_total')}"
         )
+        # Printed only where something happened. On a path that lost no handshake
+        # datagram all four stay at zero, which is the ordinary case and not news;
+        # against a client that timed out connecting they are the only thing that
+        # separates a reply lost on the way down from a path that fell silent.
+        for line in repair_reading(repair_counters(m)):
+            print(f"  {'':8} {line}")
 
     section("Server: events worth reading")
     counts = defaultdict(int)
@@ -619,7 +757,7 @@ def analyze_server(server_dir):
 
 
 def self_test():
-    """Check the two derivations that must not be stated from memory.
+    """Check the derivations that must not be stated from memory.
 
     The filtered-maximum label is the one line whose job is to say which window
     the maximum was taken over, so it must be read off the rows. Three shapes
@@ -632,6 +770,11 @@ def self_test():
     early, and deriving it from the durations it is used to classify would be
     circular. An artifact that does not carry it must produce `None`, not a
     default that would read as measured.
+
+    The reply-flight counters are the third, and the obligation there is
+    backwards compatibility as much as arithmetic: every run recorded before
+    they existed must still load, so "the fields are missing" has to reach the
+    reader as silence rather than as four zeros or a traceback.
     """
     label_cases = [
         ([{"bw_filter_window_ms": 10000}] * 3, "filtered max over 10s horizon"),
@@ -655,6 +798,37 @@ def self_test():
         ("keepalive_ms=x session_timeout_ms=120000", None),
         (None, None),
     ]
+    def counters(asked, answered, evicted=0, refused=0):
+        return dict(zip(REPAIR_FIELDS, (asked, answered, evicted, refused)))
+
+    # `None` means "this artifact cannot answer" and `{}`-ish zeros mean "nothing
+    # happened". Only the first is allowed to come from a missing field.
+    repair_cases = [
+        ({}, None),
+        # Runs written before the counters existed: every other metric present.
+        ({"handshakes_success": 4, "aead_failure_total": 0}, None),
+        (None, None),
+        ("not a record", None),
+        # A partial set is a shape nothing writes, so it is refused rather than
+        # half-read.
+        ({REPAIR_FIELDS[0]: 3}, None),
+        # A counter that reads True is a corrupt record, not a one.
+        (counters(True, 1), None),
+        (counters(0, 0), counters(0, 0)),
+        (counters(3, 2, 1, 0), counters(3, 2, 1, 0)),
+    ]
+    # What the pair says, in the words a reader acts on.
+    reading_cases = [
+        (None, []),
+        (counters(0, 0), []),
+        (counters(2, 2), ["2 connect(s) survived"]),
+        (counters(3, 1), ["1 connect(s) survived", "2 repeat(s) drew no answer"]),
+        (counters(4, 0), ["4 repeat(s) drew no answer"]),
+        (counters(1, 2), ["more answers than questions"]),
+        (counters(2, 2, 5, 0), ["ran out of the memory it is allowed"]),
+        (counters(2, 2, 0, 7), ["never retained at all"]),
+    ]
+
     failures = 0
     for rows, want in label_cases:
         got = filtered_max_label(rows)
@@ -668,7 +842,25 @@ def self_test():
         if got != want:
             failures += 1
         print(f"  {status}: {detail!r} -> {got!r} (want {want!r})")
-    total = len(label_cases) + len(ceiling_cases)
+    for metrics, want in repair_cases:
+        got = repair_counters(metrics)
+        status = "ok" if got == want else "FAIL"
+        if got != want:
+            failures += 1
+        print(f"  {status}: repair_counters({metrics!r}) -> {got!r} (want {want!r})")
+    for c, wanted in reading_cases:
+        got = repair_reading(c)
+        joined = "\n".join(got)
+        ok = (not wanted and not got) or all(w in joined for w in wanted)
+        # A non-empty reading must always lead with the raw four, or the lines
+        # after it have nothing to be read against.
+        if got and "reply-flight repeat:" not in got[0]:
+            ok = False
+        status = "ok" if ok else "FAIL"
+        if not ok:
+            failures += 1
+        print(f"  {status}: repair_reading({c!r}) -> {got!r} (want {wanted!r})")
+    total = len(label_cases) + len(ceiling_cases) + len(repair_cases) + len(reading_cases)
     print(f"{total - failures}/{total} ok")
     return 1 if failures else 0
 

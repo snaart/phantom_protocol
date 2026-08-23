@@ -131,14 +131,79 @@ Useful flags: `--legs udp,tcp,mimic,quic,raw_tcp,raw_udp`,
 
 ## Scenarios
 
-`clock_sync`, `handshake`, `wire_capture`, `rtt_sweep`, `message_integrity`,
-`upload`, `download`, `bidir`, `streams`, `zero_rtt`, `rekey`, `migration`,
-`concurrency`, `negative`, `liveness_soak`, and the raw-leg baselines
-(`rtt_sweep`, `throughput`).
+`clock_sync`, `handshake`, `handshake_repair`, `wire_capture`, `rtt_sweep`,
+`message_integrity`, `upload`, `download`, `bidir`, `streams`, `zero_rtt`,
+`rekey`, `migration`, `concurrency`, `negative`, `liveness_soak`, and the
+raw-leg baselines (`rtt_sweep`, `throughput`).
 
 `upload`, `download` and `bidir` additionally record the sender's congestion-control
 state throughout, and the daemon reports its own in `STATS` — during a download the
 server is the sender, so the client's window is not the one that governs it.
+
+### `handshake_repair`: lose one reply flight on purpose
+
+The only scenario whose loss the harness supplies rather than measures, and the
+reason is that the path will not supply it on request.
+
+PhantomUDP spends thirteen datagrams on a handshake and six of them are the
+`ServerHello` — the one flight that, until recently, had no retransmission of
+its own, so a single datagram of it lost on the way down cost the whole connect.
+The listener now retains the flight it sent and repeats it byte for byte when
+the same question arrives again. That repair is pinned by the library's own
+tests and has never been observed working on a real path: four measurement runs
+across two days produced 76 consecutive successful UDP handshakes and
+`initial_on_committed_route_total = 0`, because the path did not happen to lose
+a handshake datagram. Waiting for a lossy day is not a test strategy.
+
+So the loss is manufactured. A relay on the probe's own machine stands between
+the client socket and the daemon; every datagram still crosses the WAN in both
+directions, and the relay decides only which of them reaches the client. What
+that produces is a real handshake against the real daemon with one real flight
+missing.
+
+**Which datagram, and how it is chosen.** By fragment identity, not by a clock
+and not by a coin. The first fragmented handshake datagram coming down names the
+size of its own flight in `total_chunks`, and that many datagrams are swallowed
+— so exactly one flight goes missing however many datagrams it is made of, and
+every later flight, including the listener's repeat, arrives. Only one message
+in this handshake fragments (a `HelloRetryRequest` is tens of bytes; a
+`ServerHello` carries a hybrid KEM ciphertext and a ~4 KB hybrid signature), so
+that rule names the reply the connect turns on without the relay parsing a
+handshake message or holding a key. It deliberately does *not* key on the
+fragment's `packet_id`, which would be the obvious way to name a flight: the
+repeat is the retained flight byte for byte and carries the same id, so such a
+rule would swallow the repair along with the thing it repairs.
+
+**What it asserts, and what it refuses to call a pass.** The connect completing
+is necessary and nowhere near sufficient — a relay that swallowed nothing leaves
+an ordinary connect, and an ordinary connect succeeds. So an attempt is
+`repaired` only when a flight was actually lost **and** the listener's own
+counters moved on both halves: `initial_on_committed_route_total` (the client's
+repeated question arrived) and `handshake_flight_repeated_total` (an answer went
+back). Anything short of that is recorded as `inconclusive` with the reason,
+which is neither a pass nor a failure — the path declining to cooperate is not
+the protocol misbehaving. The one shape that *is* a finding is a flight really
+lost and a connect that never came back.
+
+**What it looks like against a listener without the repair**, which is what
+makes it a test rather than a decoration. The client repeats its flight at 1 s,
+3 s and 7 s; the demux routes those repeats by connection id onto a route it has
+already committed, where a pump that does not parse handshake messages drops
+them; nothing triggers a second reply. Every attempt ends `failed`, with the
+elapsed connect sitting at the client's 8 s retransmit budget and `asked_delta`
+non-zero against `answered_delta` of zero.
+
+**The elapsed time is part of the reading.** Every attempt is measured against a
+baseline connect through the same relay with nothing swallowed, so the relay's
+own hop cancels out of both sides. A connect the repeat carried completes about
+one first-retransmit interval late; one that took until the budget was carried by
+a later retransmission instead, and that is a different statement about the same
+success. `analyze.py` prints both numbers with the schedule beside them.
+
+It runs on the PhantomUDP leg only. On a byte-pipe leg the handshake rides a
+stream that retransmits it, so no single datagram of the reply can go missing and
+there is nothing for a listener to repeat; those legs record a skip with that
+reason, as does the reference leg.
 
 ### `wire_capture`: is the application's data on the wire?
 
@@ -319,6 +384,7 @@ in what was already filler, at the same datagram size, on the same rate ladder.
 | Scenario | On `quic` |
 |---|---|
 | `handshake`, `rtt_sweep`, `upload`, `download`, `bidir`, `concurrency` | runs — the same code, over the same application protocol |
+| `handshake_repair` | skipped — QUIC acknowledges and retransmits its own handshake packets in every implementation, so the failure this exists to catch cannot occur there and the counters it reads have no counterpart |
 | `clock_sync` | skipped — the run's clock offset is estimated once, on a Phantom leg |
 | `message_integrity` | skipped — it measures a property of `PhantomSession::send()`; QUIC streams have no message boundaries at all, by specification |
 | `streams` | skipped — the leg deliberately uses one bidirectional stream so the byte-pipe comparison is like-for-like |
