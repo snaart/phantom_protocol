@@ -96,6 +96,30 @@ struct Args {
     #[arg(long)]
     concurrency: Option<usize>,
 
+    /// Override the seconds each bulk upload runs for.
+    ///
+    /// The default profile windows are short relative to how long a BBR-style
+    /// controller takes to converge on a long path: `smoke`'s ten seconds is
+    /// about fifty round trips at 200 ms, and a transfer that spends most of
+    /// them still raising its own bandwidth estimate reports a convergence rate
+    /// under the name of a capacity. Lengthening the window is what separates
+    /// the two, and it is the cheapest way to find out which one a given number
+    /// was.
+    #[arg(long)]
+    upload_secs: Option<u64>,
+
+    /// Override the application frame size used by `upload`, `download` and
+    /// `bidir`, in bytes.
+    ///
+    /// It is the one term that moves the ARQ send buffer's byte ceiling —
+    /// `MAX_PENDING_PACKETS` **segments**, so the bytes scale with the frame —
+    /// while leaving the peer's flow-control window, a byte bound, exactly
+    /// where it was. At the default 1024 the two land within half a percent of
+    /// each other and no recorded field tells a sender pinned against one from
+    /// a sender pinned against the other; halving this separates them by two.
+    #[arg(long)]
+    transfer_frame: Option<u32>,
+
     /// Override the RTT sweep's payload sizes, in bytes. Useful for isolating a
     /// size that misbehaves without re-running the whole sweep.
     #[arg(long, value_delimiter = ',')]
@@ -157,39 +181,14 @@ async fn main() -> Result<()> {
     // Deduplicate while preserving the order the operator asked for — running a
     // leg twice would double its wall clock for no extra information.
     let mut legs: Vec<Leg> = Vec::new();
-    for l in args.legs {
+    for &l in &args.legs {
         if !legs.contains(&l) {
             legs.push(l);
         }
     }
     anyhow::ensure!(!legs.is_empty(), "no legs selected");
 
-    let mut params = Params::for_profile(args.profile);
-    if let Some(s) = args.soak_secs {
-        params.soak = Duration::from_secs(s);
-    }
-    if let Some(c) = args.concurrency {
-        params.concurrency = c.max(1);
-    }
-    if let Some(sizes) = args.rtt_sizes {
-        anyhow::ensure!(!sizes.is_empty(), "--rtt-sizes cannot be empty");
-        params.rtt_sizes = sizes;
-    }
-    if let Some(n) = args.rtt_per_size {
-        params.rtt_per_size = n.max(1);
-    }
-    if let Some(rungs) = args.raw_rungs_kbps {
-        anyhow::ensure!(!rungs.is_empty(), "--raw-rungs-kbps cannot be empty");
-        anyhow::ensure!(
-            rungs.iter().all(|&r| r > 0),
-            "--raw-rungs-kbps must be positive rates"
-        );
-        params.raw_rungs_kbps = rungs;
-    }
-    if let Some(s) = args.raw_rung_secs {
-        anyhow::ensure!(s > 0, "--raw-rung-secs must be at least 1");
-        params.raw_rate_step = Duration::from_secs(s);
-    }
+    let params = resolved_params(&args)?;
 
     let cfg = ProbeConfig {
         endpoints: Endpoints {
@@ -218,6 +217,56 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// The profile's knobs with the operator's overrides applied.
+///
+/// Split out of `main` so the overrides can be exercised without a daemon: they
+/// are the levers a measurement is steered with, and one that silently does not
+/// take — an upload longer than the wall-clock cap that bounds it, say — costs a
+/// run and is invisible in the artifact it produces.
+fn resolved_params(args: &Args) -> Result<Params> {
+    let mut params = Params::for_profile(args.profile);
+    if let Some(s) = args.soak_secs {
+        params.soak = Duration::from_secs(s);
+    }
+    if let Some(c) = args.concurrency {
+        params.concurrency = c.max(1);
+    }
+    if let Some(s) = args.upload_secs {
+        anyhow::ensure!(s > 0, "--upload-secs must be at least 1");
+        params.upload = Duration::from_secs(s);
+        // The wall-clock cap bounds every bulk transfer, so a longer upload
+        // than the cap would be silently cut back to it — an override that
+        // quietly does not take is worse than one that is refused.
+        params.transfer_cap = params.transfer_cap.max(params.upload);
+    }
+    if let Some(f) = args.transfer_frame {
+        // The sink message carries a length prefix, a verb and a sequence
+        // number before any payload; below that the frame is header alone.
+        anyhow::ensure!(f >= 64, "--transfer-frame must be at least 64 bytes");
+        params.transfer_frame = f;
+    }
+    if let Some(sizes) = &args.rtt_sizes {
+        anyhow::ensure!(!sizes.is_empty(), "--rtt-sizes cannot be empty");
+        params.rtt_sizes = sizes.clone();
+    }
+    if let Some(n) = args.rtt_per_size {
+        params.rtt_per_size = n.max(1);
+    }
+    if let Some(rungs) = &args.raw_rungs_kbps {
+        anyhow::ensure!(!rungs.is_empty(), "--raw-rungs-kbps cannot be empty");
+        anyhow::ensure!(
+            rungs.iter().all(|&r| r > 0),
+            "--raw-rungs-kbps must be positive rates"
+        );
+        params.raw_rungs_kbps = rungs.clone();
+    }
+    if let Some(s) = args.raw_rung_secs {
+        anyhow::ensure!(s > 0, "--raw-rung-secs must be at least 1");
+        params.raw_rate_step = Duration::from_secs(s);
+    }
+    Ok(params)
+}
+
 /// Resolve the QUIC certificate pin, if one was supplied.
 ///
 /// Accepts hex or raw DER from a file, because the daemon writes both
@@ -244,4 +293,81 @@ fn load_quic_cert(args: &Args) -> Result<Option<Vec<u8>>> {
     let der = hex::decode(text.trim()).context("QUIC certificate is not valid hex")?;
     anyhow::ensure!(!der.is_empty(), "QUIC certificate is empty");
     Ok(Some(der))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The smallest command line the parser accepts, plus whatever is under test.
+    fn parse(extra: &[&str]) -> Args {
+        let mut argv = vec![
+            "phantom-probe",
+            "--host",
+            "example.invalid",
+            "--pin-hex",
+            "aa",
+        ];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("the parser must accept this command line")
+    }
+
+    #[test]
+    fn a_longer_upload_carries_the_wall_clock_cap_that_bounds_it_upward() {
+        // `smoke` runs a 10 s upload under a 60 s cap. Asking for 180 s without
+        // moving the cap would run 60 and record it as if it had run 180 — the
+        // shape of override that is invisible in the artifact it produced.
+        let p = resolved_params(&parse(&["--upload-secs", "180"])).expect("override must apply");
+        assert_eq!(p.upload, Duration::from_secs(180));
+        assert!(
+            p.transfer_cap >= p.upload,
+            "the cap must not silently truncate the window that was asked for: \
+             cap {:?} < upload {:?}",
+            p.transfer_cap,
+            p.upload
+        );
+    }
+
+    #[test]
+    fn a_shorter_upload_leaves_the_cap_where_the_profile_put_it() {
+        let base = Params::for_profile(Profile::Smoke).transfer_cap;
+        let p = resolved_params(&parse(&["--upload-secs", "5"])).expect("override must apply");
+        assert_eq!(p.upload, Duration::from_secs(5));
+        assert_eq!(
+            p.transfer_cap, base,
+            "a shorter upload is no reason to widen the cap"
+        );
+    }
+
+    #[test]
+    fn the_transfer_frame_override_reaches_the_bulk_scenarios() {
+        // This is the one knob that separates the ARQ send buffer's ceiling — a
+        // segment count, so its byte figure scales with the frame — from the
+        // peer's flow-control window, which is a byte figure that does not.
+        let p = resolved_params(&parse(&["--transfer-frame", "512"])).expect("override must apply");
+        assert_eq!(p.transfer_frame, 512);
+    }
+
+    #[test]
+    fn overrides_that_would_produce_an_unmeasurable_run_are_refused() {
+        for argv in [
+            vec!["--upload-secs", "0"],
+            vec!["--transfer-frame", "8"],
+            vec!["--raw-rung-secs", "0"],
+        ] {
+            assert!(
+                resolved_params(&parse(&argv)).is_err(),
+                "{argv:?} must be refused rather than silently clamped"
+            );
+        }
+    }
+
+    #[test]
+    fn an_untouched_command_line_is_exactly_the_profile() {
+        let p = resolved_params(&parse(&[])).expect("no overrides must apply cleanly");
+        let base = Params::for_profile(Profile::Smoke);
+        assert_eq!(p.upload, base.upload);
+        assert_eq!(p.transfer_frame, base.transfer_frame);
+        assert_eq!(p.transfer_cap, base.transfer_cap);
+    }
 }
