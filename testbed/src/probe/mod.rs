@@ -945,9 +945,15 @@ fn caveats(cfg: &ProbeConfig) -> Vec<String> {
         "RTT is the primary latency metric (single clock, exact). One-way figures depend on the clock_sync offset and carry its dispersion as an error bar.".to_string(),
         "Migration is a local UDP port rebind, not an interface change: it exercises the migration path and the server's path validation, but the external NAT mapping may not change and the client cannot observe whether it did.".to_string(),
         "Throughput is application-level goodput measured at the testbed protocol, so it excludes Phantom headers, AEAD tags, and any retransmission.".to_string(),
-        "The raw TCP/UDP legs carry no Phantom at all; they are the control group, and protocol numbers are meaningful mainly as ratios against them.".to_string(),
+        "The raw TCP/UDP legs carry no Phantom at all, and the raw UDP ladders are the denominator every protocol throughput number is a ratio against.".to_string(),
         "The raw TCP and raw UDP throughput controls are round trips: every byte they count crossed the path twice, so neither bounds a single direction. The one-way controls are the raw_udp downstream and upstream ladders, which cover server -> client and client -> server respectively; each is the denominator for one direction and neither speaks for the other.".to_string(),
     ];
+    if cfg.legs.contains(&Leg::RawTcp) {
+        v.push("\"Raw\" on the TCP leg means no Phantom, not no protocol, and for TCP those differ. A UDP socket adds nothing to the path, which is what makes the datagram ladders denominators; a TCP socket adds congestion control, reliability and flow control, which are the mechanisms under test. The raw TCP echo's throughput is therefore what a kernel TCP achieves here - a yardstick of the same kind as the QUIC leg, not a floor beneath a TCP-substrate leg. A one-way tcp or mimic figure above it is expected, because that one crossed the path once and this one twice. Its latency sweep is a different matter and remains the path's own round-trip floor.".to_string());
+    }
+    if cfg.legs.iter().any(|l| matches!(l, Leg::Tcp | Leg::Mimic)) {
+        v.push("No one-way TCP control exists in this harness. One would need a source port and a sink port on the daemon counting arrivals at the receiving end, one connection per direction so the measured direction's acknowledgements are not queued behind the other's data, and socket buffers verified by grant at both ends - and it would still be a reference rather than a control, for the reason above. Until then a tcp or mimic figure is normalised by the raw UDP ladder for its direction, which measures the path both substrates ride.".to_string());
+    }
     if !cfg.wants("downstream") || !cfg.legs.contains(&Leg::RawUdp) {
         v.push("No one-way downstream control ran, so this run cannot say whether a low download figure is the transport or the server's uplink.".to_string());
     }
@@ -965,7 +971,7 @@ fn caveats(cfg: &ProbeConfig) -> Vec<String> {
             "quinn's default congestion controller is Cubic (loss-based) and is deliberately left at its default; the protocol under test uses a BBR-style estimator. The two congestion-window series are not the same statistic — compare outcomes, not the shape of the curve.".to_string(),
         );
         v.push(
-            "The quic leg's flow-control windows are raised to 8 MiB, matching the socket buffers the raw TCP control asks for, so that neither is bounded by a default buffer instead of by the path. quinn's own default stream window (1.25 MB) would cap a 250 ms path near 40 Mbit/s.".to_string(),
+            "The quic leg's flow-control windows are raised to 8 MiB so that flow control is not the binding constraint instead of the path; quinn's own default stream window (1.25 MB) would cap a 250 ms path near 40 Mbit/s. That is not the 1 MiB the raw TCP control asks for, deliberately: the control also sends, and at 8 MiB it filled its own send buffer and reported its queue as the link.".to_string(),
         );
         v.push(
             "In the quic leg's window samples only cwnd_bytes and min_rtt_us carry values, and min_rtt_us holds quinn's smoothed RTT rather than a windowed minimum; quinn exposes no bytes-in-flight, bandwidth estimate, pacing rate, delivered total or app-limited flag, so those fields are zero rather than approximated. Its loss counters appear in the scenario notes.".to_string(),
@@ -1262,6 +1268,51 @@ mod tests {
         let raw_only =
             caveats(&demo_cfg(vec![Leg::RawTcp, Leg::RawUdp], Profile::Smoke)).join("\n");
         assert!(!raw_only.contains("wire_capture"), "{raw_only}");
+    }
+
+    /// The raw TCP echo has come in under the TCP-substrate legs it was being
+    /// read as bounding, twice, and both times the reading that followed was
+    /// "the control is broken". It is not: a one-way figure is not bounded by a
+    /// two-way one, and a TCP socket is not a protocol-free substrate. A run
+    /// that carries the echo has to carry both sentences, or the inversion will
+    /// be reinterpreted from scratch every campaign.
+    #[test]
+    fn the_raw_tcp_echo_is_not_offered_as_a_one_way_denominator() {
+        let c = caveats(&demo_cfg(
+            vec![Leg::Tcp, Leg::Mimic, Leg::RawTcp, Leg::RawUdp],
+            Profile::Standard,
+        ))
+        .join("\n");
+        assert!(
+            c.contains("no Phantom, not no protocol"),
+            "the word \"raw\" has to be qualified where it is misleading: {c}"
+        );
+        assert!(c.contains("not a floor beneath a TCP-substrate leg"), "{c}");
+        assert!(
+            c.contains("above it is expected"),
+            "the inversion must be pre-empted rather than left to read as a fault: {c}"
+        );
+        assert!(
+            c.contains("No one-way TCP control exists in this harness"),
+            "a missing control is a fact about the run: {c}"
+        );
+        assert!(
+            c.contains("normalised by the raw UDP ladder for its direction"),
+            "saying what is missing is only half of it; the denominator that does exist has to be named: {c}"
+        );
+
+        // A run that drove neither the echo nor a TCP-substrate leg has neither
+        // reading to pre-empt, and a caveat about a leg that did not run is
+        // noise a reader has to discount.
+        let udp_only = caveats(&demo_cfg(vec![Leg::Udp, Leg::RawUdp], Profile::Smoke)).join("\n");
+        assert!(
+            !udp_only.contains("no Phantom, not no protocol"),
+            "{udp_only}"
+        );
+        assert!(
+            !udp_only.contains("No one-way TCP control exists"),
+            "{udp_only}"
+        );
     }
 
     #[test]

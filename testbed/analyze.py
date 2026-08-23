@@ -427,11 +427,24 @@ CONTROL_LEGS = frozenset({"raw_tcp", "raw_udp"})
 # nothing under it rather than divided by the echo.
 DIRECTION_CONTROL = {"upload": "raw_udp_upstream", "download": "raw_udp_downstream"}
 
-# The raw control that carries the same substrate as a leg under test, with no
-# protocol on it. This is the pairing behind "a leg cannot beat its own control":
-# Phantom-over-TCP and mimic-TLS both ride a TCP socket, so the raw TCP echo is
-# the floor beneath them, and PhantomUDP rides datagrams.
-SUBSTRATE_CONTROL = {"udp": "raw_udp", "tcp": "raw_tcp", "mimic": "raw_tcp"}
+# The round-trip echo that carries the same substrate as a leg under test.
+#
+# Pairing by substrate, so a TCP leg is put beside the TCP echo. What the
+# pairing is *for* changed: it used to state a floor — "a leg cannot beat the
+# same path carrying no protocol" — and that reading was wrong twice over. A
+# one-way rate is not bounded by a two-way one (on a shared bottleneck the echo
+# gets at most half of what one direction alone gets), and on TCP the echo is
+# not protocol-free anyway: a TCP socket carries congestion control, reliability
+# and flow control, which are the mechanisms under test. So the pairing now
+# exists to *pre-empt* the inversion rather than to report it as a fault, and
+# the only floor a leg has is the one-way ladder in [`DIRECTION_CONTROL`].
+SUBSTRATE_ROUND_TRIP = {"udp": "raw_udp", "tcp": "raw_tcp", "mimic": "raw_tcp"}
+
+# Legs whose substrate has no one-way control in this harness at all. Both TCP
+# legs: the only one-way ladders are datagram ladders. Named rather than left
+# implicit, because "there is no such measurement in this run" is a fact about
+# the run and disappears if nobody prints it.
+NO_ONE_WAY_CONTROL = frozenset({"tcp", "mimic"})
 
 # Which side's book a direction's rate is taken from, and why. `send()` buffers,
 # so a sending side's own per-window counts say how full its own buffer got —
@@ -615,41 +628,65 @@ def arrival_tail_share(rows):
     return tail / total
 
 
-def outperformed_controls(under_test, controls):
-    """Controls a leg under test beat, and which legs beat them.
+def roundtrip_inversions(under_test, roundtrips):
+    """One-way leg rates that came in above the round-trip echo of their substrate.
 
-    A leg carrying a protocol cannot exceed the same path carrying no protocol,
-    so a control that comes in under a leg it is supposed to bound is not a
-    denominator — it is an instrument that measured itself and has to be
-    re-verified before any share taken against it means anything. Both raw
-    controls have done this before: the UDP pacer once reported the granularity
-    of its own sleep as the path's ceiling, and the TCP echo reported first a
-    default socket buffer and later its own bufferbloat.
+    This used to be read as an instrument fault — "a protocol cannot beat the
+    same path carrying none, so the control measured itself" — and it is not
+    one. Two independent reasons, either of which is sufficient:
 
-    Pairing is by substrate, not by anything read off the numbers. A TCP leg's
-    floor is the raw TCP echo whatever the UDP ladder says, and comparing across
-    substrates would flag the difference between TCP and UDP as an instrument
-    fault.
+    - The echo is a **round trip**. Every byte it counts crossed the path twice,
+      both directions ride one connection's ack clock so each meters the other's
+      acknowledgements, and the daemon turns each frame around in lockstep. A
+      one-way rate is not bounded by a two-way one; on a shared bottleneck the
+      echo gets at most half of what one direction alone gets.
+    - On TCP the echo is not protocol-free. A UDP socket adds nothing to the
+      path, which is what makes the datagram ladders denominators. A TCP socket
+      adds congestion control, reliability and flow control — the mechanisms
+      under test — so its figure is what a kernel TCP achieves here, a yardstick
+      of the same kind as the QUIC leg.
+
+    Both raw controls really have measured themselves before (the UDP pacer's
+    sleep granularity, the TCP echo's default buffer and then its own
+    bufferbloat), which is why the sentence was believable. The check that
+    catches that class of fault is [`denominator_broken`], against the one-way
+    ladder every share is actually divided by. This one exists so the inversion
+    is explained where it is printed instead of being rediscovered.
+
+    Pairing is by substrate, not by anything read off the numbers: a TCP leg
+    goes beside the TCP echo, so the sentence printed is about the pair that
+    shares a socket type.
     """
-    beaten = defaultdict(list)
+    above = defaultdict(list)
     for leg, bps in sorted(under_test.items()):
-        control = SUBSTRATE_CONTROL.get(leg)
-        if control is None or bps is None:
+        echo = SUBSTRATE_ROUND_TRIP.get(leg)
+        if echo is None or bps is None:
             continue
-        floor = controls.get(control)
-        if floor is not None and bps > floor:
-            beaten[control].append(leg)
-    return dict(beaten)
+        rate = roundtrips.get(echo)
+        if rate is not None and bps > rate:
+            above[echo].append(leg)
+    return dict(above)
+
+
+def legs_without_a_one_way_control(driven):
+    """Driven legs whose substrate this harness has no one-way control for.
+
+    Their figures are still normalised — by the raw UDP ladder for the
+    direction, which measures the path both substrates ride — but the pairing is
+    across substrates and that is worth saying once per column rather than
+    assuming the reader reconstructs it.
+    """
+    return sorted(leg for leg in driven if leg in NO_ONE_WAY_CONTROL)
 
 
 def denominator_broken(shares):
     """Legs that took more than the whole of the one-way control for their direction.
 
-    The same fault as [`outperformed_controls`] seen from the other side, and it
-    is kept separate because the evidence is different: there the control is a
-    protocol-free run of the same substrate, here it is the paced ladder that
-    every share in the table is divided by. A share above one condemns the
-    column, not the row.
+    The real instrument-measures-itself check, and the only one this file makes:
+    the ladder here is paced by the sender and counted by the receiver, one way,
+    so a leg that took more than the whole of it in the same direction is a
+    comparison of two like quantities and one of them is wrong. A share above
+    one condemns the column, not the row.
     """
     return sorted(leg for leg, share in shares.items() if share is not None and share > 1.0)
 
@@ -1924,9 +1961,13 @@ def comparison_section(run_dir, meta):
     - each row says which of the three roles it is — under test, reference,
       control — so a reference is never read as a competitor and a control is
       never read as a result;
-    - a control that came in under a leg it bounds is called out, because that
-      is an instrument measuring itself and everything divided by it is wrong
-      until it is re-verified;
+    - a round-trip echo that came in under a one-way leg of its own substrate
+      says so on its own row, and says that this is expected. That inversion
+      used to be printed as an instrument fault and is not one: a one-way rate
+      is not bounded by a two-way one, and on TCP the echo is not protocol-free
+      to begin with. The fault it was confused with — a leg taking more than the
+      whole of the one-way ladder — is checked separately and condemns the
+      column;
     - a transfer that was still speeding up when it ended is marked as such, so
       that its mean is read as the convergence time it is rather than as a
       capacity the path was never asked for.
@@ -2016,6 +2057,23 @@ def comparison_section(run_dir, meta):
                 "together and neither one on its own"
             )
 
+        crossed = legs_without_a_one_way_control(driven)
+        if crossed:
+            # Printed under the denominator because it qualifies it, and once
+            # per column rather than once per row: the fact is about the
+            # harness, not about any one leg's number.
+            print(
+                f"               {', '.join(crossed)} ride a TCP socket and this harness has no "
+                "one-way TCP control, so their\n               share is taken across substrates, "
+                "against the datagram ladder — which measures the path\n               both ride. "
+                "A one-way TCP control would need a source and a sink port counting arrivals\n"
+                "               at the receiving end, one connection per direction so the measured "
+                "direction's\n               acknowledgements are not queued behind the other's "
+                "data, and buffers verified by grant\n               at both ends — and it would "
+                "still be a reference and not a control, because a TCP\n               socket "
+                "carries the congestion control under test"
+            )
+
         receipts = (
             {leg: receipt_of(run_dir, leg, direction) for leg in driven}
             if NUMERATOR_SIDE[direction] == "server"
@@ -2079,12 +2137,18 @@ def comparison_section(run_dir, meta):
             rows.append({"label": leg, "leg": leg, "bps": bps, "marks": marks})
 
         for name, bps in sorted(roundtrip.items()):
-            rows.append({
-                "label": name,
-                "leg": name,
-                "bps": bps,
-                "marks": ["round trip: bounds the two directions together, normalises neither"],
-            })
+            marks = ["round trip: bounds the two directions together, normalises neither"]
+            if name == "raw_tcp":
+                # A property of the leg, not of this run's numbers, so it is
+                # stated whether or not anything came in above it. The row says
+                # `control` because the leg's latency sweep is one; its
+                # throughput is not, and the two share a row.
+                marks.append(
+                    "and not protocol-free either — a TCP socket carries the congestion control, "
+                    "reliability and flow control under test, so this figure is what a kernel TCP "
+                    "achieves here: a yardstick of quic's kind, not a floor beneath tcp or mimic"
+                )
+            rows.append({"label": name, "leg": name, "bps": bps, "marks": marks})
         if denom:
             # The ladder rides `raw_udp`, which is what gives it its role, but it
             # is labelled by direction — and the substrate check below keys on
@@ -2104,7 +2168,7 @@ def comparison_section(run_dir, meta):
             if r["role"] == "under test":
                 shares[r["leg"]] = r["share"]
 
-        beaten = outperformed_controls(
+        above = roundtrip_inversions(
             {r["leg"]: r["bps"] for r in rows if r["role"] == "under test"},
             {r["leg"]: r["bps"] for r in rows
              if r["role"] == "control" and r["label"] not in ONE_WAY_DIRECTIONS},
@@ -2119,12 +2183,14 @@ def comparison_section(run_dir, meta):
                     "unclassified: testbed/src/report.rs gives this leg a role and this file does "
                     "not, so it is neither compared nor used as a denominator"
                 ))
-            if r["label"] in beaten:
+            if r["label"] in above:
+                # On the echo's own row, not on the legs': the thing being
+                # explained is what this figure is, and a reader looking at a
+                # leg above it is looking here next.
                 r["marks"].append(
-                    "\033[33mOUTPERFORMED by " + ", ".join(beaten[r["label"]])
-                    + " — a protocol cannot beat the same path carrying none, so this control is "
-                    "measuring itself and is not usable as a denominator until it is "
-                    "re-verified\033[0m"
+                    "one-way rates above it (" + ", ".join(above[r["label"]])
+                    + ") are expected and are not an instrument fault: those crossed the path once "
+                    "and this crossed it twice"
                 )
 
         order = {"under test": 0, "reference": 1, "control": 2, None: 3}
@@ -2517,12 +2583,16 @@ def self_test():
     by time rather than average rates over windows of unequal length.
     `arrival_tail_share` must give a flat transfer the same answer whatever the
     sampler's period, or the marker that says "this mean is a convergence time"
-    fires on transfers that converged. `outperformed_controls` must pair a leg
-    with its own substrate and no other, since a TCP leg beating a UDP ladder is
-    a fact about two transports rather than a fault in an instrument. And
-    `denominator_broken` must fire on a share above one and not on a share of
-    exactly one, which is a leg that reached its control and not one that
-    passed it.
+    fires on transfers that converged. `roundtrip_inversions` must pair a leg
+    with its own substrate and no other, since a TCP leg above a UDP ladder is a
+    fact about two transports rather than about either instrument — and what it
+    reports is an expected inversion, not a fault, because a one-way rate is not
+    bounded by a two-way one. `legs_without_a_one_way_control` must name both
+    TCP legs and neither UDP one, so that a share taken across substrates is
+    labelled as one. And `denominator_broken`, which is the only real
+    instrument-measures-itself check here, must fire on a share above one and
+    not on a share of exactly one, which is a leg that reached its control and
+    not one that passed it.
 
     The upload numerator is the tenth, and its obligation is a disclosure. The
     honest figure for a direction is the arriving side's count, which on an
@@ -2921,20 +2991,34 @@ def self_test():
         (wins([100] * 3), None),
         ([], None),
     ]
-    # Substrate pairing, and the two ways it must decline to fire: a leg that
-    # beat a control it does not ride, and a control that was not beaten.
-    outperform_cases = [
+    # Substrate pairing, and the two ways it must decline to fire: a leg above
+    # an echo it does not ride, and an echo nothing came in above. The first two
+    # cases are the readings that prompted this — 3.01 and 2.36 Mbit/s of
+    # one-way TCP-substrate upload over a 2.32 Mbit/s round-trip echo, which is
+    # an inversion to explain and not a fault to report.
+    inversion_cases = [
         ({"tcp": 2.98e6}, {"raw_tcp": 2.32e6}, {"raw_tcp": ["tcp"]}),
         ({"tcp": 2.98e6, "mimic": 2.37e6}, {"raw_tcp": 2.32e6}, {"raw_tcp": ["mimic", "tcp"]}),
         ({"tcp": 1.0e6}, {"raw_tcp": 2.32e6}, {}),
         # PhantomUDP is under the UDP echo and over the TCP one. Only its own
-        # substrate is consulted, so nothing fires.
+        # substrate is consulted, so nothing fires: a UDP leg above a TCP echo
+        # is a fact about two transports and says nothing about either.
         ({"udp": 9.31e6}, {"raw_tcp": 2.32e6, "raw_udp": 26.87e6}, {}),
         ({"udp": 30.0e6}, {"raw_udp": 26.87e6}, {"raw_udp": ["udp"]}),
-        # A leg with no figure and a control absent from this run are both
-        # "cannot say", not "did not beat it".
+        # A leg with no figure and an echo absent from this run are both
+        # "cannot say", not "did not exceed it".
         ({"tcp": None}, {"raw_tcp": 2.32e6}, {}),
         ({"tcp": 2.98e6}, {}, {}),
+    ]
+    # Which driven legs have no one-way control of their own substrate. Both TCP
+    # legs always, whatever else ran; never a UDP leg, which has two ladders;
+    # never a control or reference, which are not normalised against anything.
+    no_control_cases = [
+        (["udp", "tcp", "mimic", "quic"], ["mimic", "tcp"]),
+        (["udp"], []),
+        (["tcp"], ["tcp"]),
+        ([], []),
+        (["raw_tcp", "raw_udp", "quic"], []),
     ]
     # Which legs a run drove. The declaration over-reports a `--only` run and
     # the directories under-report nothing, so the answer is the intersection —
@@ -3116,11 +3200,16 @@ def self_test():
         ok = ok and receipt_of(root, "tcp", "upload") is None
     failures += 0 if ok else 1
     print(f"  {'ok' if ok else 'FAIL'}: receipt_of reads the newest record and nothing where there is none")
-    for legs, controls, want in outperform_cases:
-        got = outperformed_controls(legs, controls)
+    for legs, echoes, want in inversion_cases:
+        got = roundtrip_inversions(legs, echoes)
         ok = got == want
         failures += 0 if ok else 1
-        print(f"  {'ok' if ok else 'FAIL'}: outperformed_controls({legs}, {controls}) -> {got} (want {want})")
+        print(f"  {'ok' if ok else 'FAIL'}: roundtrip_inversions({legs}, {echoes}) -> {got} (want {want})")
+    for driven, want in no_control_cases:
+        got = legs_without_a_one_way_control(driven)
+        ok = got == want
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: legs_without_a_one_way_control({driven}) -> {got} (want {want})")
     for shares, want in broken_cases:
         got = denominator_broken(shares)
         ok = got == want
@@ -3250,7 +3339,8 @@ def self_test():
         + len(tail_cases)
         + len(observed_cases)
         + len(rate_cases)
-        + len(outperform_cases)
+        + len(inversion_cases)
+        + len(no_control_cases)
         + len(broken_cases)
         + len(driven_cases)
         + 7

@@ -9,6 +9,15 @@
 //! `TcpSessionTransport`, so the framing cost is matched and the difference
 //! measured is the protocol's, not the framing's.
 //!
+//! **"Raw" here means no Phantom, not no protocol — and for TCP those are
+//! different things.** A UDP socket adds nothing to the path, which is what
+//! makes the datagram ladders a denominator. A TCP socket adds congestion
+//! control, reliability and flow control: the very mechanisms under test. So
+//! the TCP echo's *throughput* is what a kernel TCP achieves here, which is a
+//! yardstick of the same kind as the QUIC leg and not a floor beneath anything.
+//! Its *latency* sweep is a different matter and remains the path's own
+//! round-trip floor. The probe's scenario states this beside its number.
+//!
 //! Four controls, and they answer different questions. The echoes are round
 //! trips, so neither direction is isolated in them; the two one-way controls
 //! are what put a number under a single direction. The **downstream source**
@@ -38,14 +47,31 @@ use crate::uplink;
 /// Matches the established-phase frame cap of `TcpSessionTransport`.
 const MAX_FRAME: u32 = 4 * 1024 * 1024;
 
+/// Room the echo's reusable frame buffer keeps between frames.
+///
+/// Large frames are still served — the buffer grows for them — but it is
+/// released afterwards, because this port is public and unauthenticated: a peer
+/// that declares one `MAX_FRAME` frame would otherwise leave four megabytes
+/// resident for as long as it holds the connection open. The reuse exists to
+/// keep an allocation out of the turnaround loop, and only ordinary frame sizes
+/// are in that loop.
+const ECHO_BUF_BYTES: usize = 4 + 64 * 1024;
+
+/// What this side asks the kernel for in each direction, matching the probe's
+/// own request so that neither end is the smaller of the pair.
+const SOCKET_BUFFER: usize = 1024 * 1024;
+
 /// Request larger socket buffers; the kernel may clamp, and that is fine — the
 /// point is not to be the bottleneck, not to hit an exact number.
-fn size_socket_buffers(sock: &tokio::net::TcpStream, want: usize) {
-    use std::os::fd::{AsRawFd, BorrowedFd};
-    // SAFETY: the fd is owned by `sock` and outlives this borrow; socket2 only
-    // sets options on it and never takes ownership.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(sock.as_raw_fd()) };
-    let s2 = socket2::SockRef::from(&borrowed);
+///
+/// Generic over anything holding a socket because it is applied twice: once to
+/// the **listening** socket and once to each accepted one. The listener is the
+/// load-bearing call — an accepted connection's window scale is chosen when the
+/// SYN-ACK is built, from the buffer the listener held, so sizing only the
+/// accepted socket raises the buffer while leaving the advertised window capped
+/// by a factor derived from the default.
+fn size_socket_buffers<S: std::os::fd::AsFd>(sock: &S, want: usize) {
+    let s2 = socket2::SockRef::from(sock);
     let _ = s2.set_send_buffer_size(want);
     let _ = s2.set_recv_buffer_size(want);
 }
@@ -93,6 +119,11 @@ pub async fn run_tcp(addr: String, stats: Arc<BaselineStats>) -> std::io::Result
 /// the server starts (a test on port 0) can bind once and hand the socket over,
 /// rather than binding, closing, and racing to rebind the same port.
 pub async fn serve_tcp(listener: TcpListener, stats: Arc<BaselineStats>) -> std::io::Result<()> {
+    // Before the first accept, so that every connection's SYN-ACK carries a
+    // window scale chosen from this size rather than from the default. Doing it
+    // only on the accepted socket, as this did, raises the buffer after the
+    // factor that caps the advertised window has already been fixed.
+    size_socket_buffers(&listener, SOCKET_BUFFER);
     loop {
         let (mut sock, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -107,28 +138,52 @@ pub async fn serve_tcp(listener: TcpListener, stats: Arc<BaselineStats>) -> std:
         // Size the buffers for the bandwidth-delay product. A control that
         // leaves them at the OS default measures `default / rtt` and reports it
         // as the link — which is how this probe once produced a "path ceiling"
-        // that was really the kernel's.
-        size_socket_buffers(&sock, 1024 * 1024);
+        // that was really the kernel's. The accepted socket is sized as well as
+        // the listener because inheritance covers the window scale, and this
+        // covers the buffer itself on systems that do not carry it over.
+        size_socket_buffers(&sock, SOCKET_BUFFER);
         stats.tcp_conns.fetch_add(1, Ordering::Relaxed);
         let stats = stats.clone();
 
+        // One task per connection turning each frame around in lockstep: read a
+        // whole frame, then write it back. That is what an echo is, but it also
+        // couples the two directions — when the return path backs up, the write
+        // parks and this task stops reading, so the forward direction cannot
+        // stay full while the reverse is congested. Together with both
+        // directions sharing one connection's ack clock it is why the echo's
+        // throughput bounds the two directions together and neither alone; the
+        // probe's own scenario says so beside the number rather than leaving it
+        // to be rediscovered.
         tokio::spawn(async move {
-            let mut len_buf = [0u8; 4];
+            // The frame's whole wire form, header included, in one buffer that
+            // survives between frames. The body used to be a fresh allocation
+            // per frame, which put an allocator call inside the turnaround this
+            // control is measuring; and the header and body used to be two
+            // writes, which with Nagle off puts a four-byte segment on the wire
+            // ahead of every frame whenever the send buffer had drained, so the
+            // control's packet rate was twice its frame rate for nothing.
+            let mut frame = vec![0u8; ECHO_BUF_BYTES];
             loop {
-                if sock.read_exact(&mut len_buf).await.is_err() {
+                if sock.read_exact(&mut frame[..4]).await.is_err() {
                     break;
                 }
-                let len = u32::from_be_bytes(len_buf);
+                let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
                 if len > MAX_FRAME {
                     tracing::warn!(%peer, len, "raw tcp frame over cap; closing");
                     break;
                 }
-                let mut body = vec![0u8; len as usize];
-                if sock.read_exact(&mut body).await.is_err() {
+                let total = 4 + len as usize;
+                if frame.len() < total {
+                    frame.resize(total, 0);
+                }
+                if sock.read_exact(&mut frame[4..total]).await.is_err() {
                     break;
                 }
-                if sock.write_all(&len_buf).await.is_err() || sock.write_all(&body).await.is_err() {
+                if sock.write_all(&frame[..total]).await.is_err() {
                     break;
+                }
+                if frame.len() > ECHO_BUF_BYTES {
+                    frame = vec![0u8; ECHO_BUF_BYTES];
                 }
                 stats.tcp_frames.fetch_add(1, Ordering::Relaxed);
                 stats.tcp_bytes.fetch_add(len as u64, Ordering::Relaxed);

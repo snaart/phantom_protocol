@@ -16,7 +16,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -3073,31 +3073,260 @@ pub async fn raw_tcp_rtt(ep: &Endpoints, sizes: &[usize], per_size: usize) -> Sc
     out
 }
 
-/// Ask the kernel for larger socket buffers and report what it granted.
+/// What the raw TCP echo asks the kernel for in each direction.
 ///
-/// The grant matters more than the request: operating systems clamp, and a
-/// silently clamped buffer is exactly how a control measures itself.
-fn set_socket_buffers(sock: &TcpStream, want: usize) -> (usize, usize) {
-    use std::os::fd::{AsRawFd, BorrowedFd};
-    // SAFETY: the fd is owned by `sock` and outlives the borrow; socket2 only
-    // reads and sets options on it, and does not take ownership.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(sock.as_raw_fd()) };
-    let s2 = socket2::SockRef::from(&borrowed);
-    let _ = s2.set_send_buffer_size(want);
-    let _ = s2.set_recv_buffer_size(want);
-    (
-        s2.send_buffer_size().unwrap_or(0),
-        s2.recv_buffer_size().unwrap_or(0),
-    )
+/// Size the socket buffers for the bandwidth-delay product. TCP cannot keep
+/// more in flight than its send buffer holds, so with the OS default this probe
+/// measures `buffer / rtt` — on a 200 ms path a 128 KB default caps it near
+/// 5 Mbit/s regardless of the link, and an earlier version of this control
+/// reported 4.65 Mbit/s as "the path", which was the kernel's default.
+///
+/// A few bandwidth-delay products, not "as much as the kernel will give". At
+/// 8 MiB on a path losing 6% at 19 Mbit/s, TCP fills the buffer, the queue
+/// becomes the round trip, and the control collapses — it measured 1.34 Mbit/s
+/// on a link carrying 9.5. That is bufferbloat, and a control measuring its own
+/// queue is no better than one measuring its own timer. 1 MiB is about three
+/// times the product at 9.5 Mbit/s and 250 ms.
+const TCP_ECHO_SOCKET_BUFFER: usize = 1024 * 1024;
+
+/// A local socket sized for the echo, handed back **before** it has dialled,
+/// with the grant the kernel actually gave.
+///
+/// Unconnected on purpose, and that is the whole point of the function
+/// existing. TCP chooses its window scale in the SYN from the receive buffer it
+/// holds at that moment, so a size set on an already-connected stream raises
+/// the buffer while leaving the advertised window capped by a factor derived
+/// from the default — the control then still measures part of its own socket,
+/// which is the fault this sizing exists to remove. Returning a socket that has
+/// not dialled makes the ordering a property of the type rather than of the
+/// order two lines happen to be written in.
+///
+/// The grant is read here rather than after the connect because an explicit
+/// request locks the size: this is both the figure the window scale was chosen
+/// from and the figure that persists.
+fn prepare_echo_socket(peer: SocketAddr) -> std::io::Result<(tokio::net::TcpSocket, usize, usize)> {
+    let sock = match peer {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    // A refused request is not fatal — the grant below is what the rest of the
+    // scenario reasons from, and a clamped or ignored one shows up there.
+    let _ = sock.set_send_buffer_size(TCP_ECHO_SOCKET_BUFFER as u32);
+    let _ = sock.set_recv_buffer_size(TCP_ECHO_SOCKET_BUFFER as u32);
+    let snd = sock.send_buffer_size().unwrap_or(0) as usize;
+    let rcv = sock.recv_buffer_size().unwrap_or(0) as usize;
+    Ok((sock, snd, rcv))
 }
 
-/// Raw TCP bulk throughput — the capacity denominator.
+/// How close to a locally-derived ceiling a reading has to sit before it is
+/// read as being held there.
 ///
-/// Saturates the length-prefixed echo control while draining it concurrently,
-/// so the number is the path's own bidirectional ceiling with no Phantom in the
-/// way. Without this, a protocol throughput figure cannot be attributed: a slow
-/// result might be the transport or might be the link, and the two are not
-/// distinguishable from the protocol leg alone.
+/// The same bargain `CEILING_PROXIMITY` makes in `analyze.py`: a sender
+/// retiring and refilling continuously never sits exactly on a bound, and a
+/// threshold tight enough to demand that would never fire.
+const TCP_ECHO_CEILING_PROXIMITY: f64 = 0.95;
+
+/// What the raw TCP echo's own sender runs into, and at what rate each of them
+/// starts to matter.
+///
+/// The instrument is a system too, and this control in particular has twice
+/// reported itself as the path — first the kernel's default socket buffer,
+/// then its own bufferbloat.
+/// So the quantities that would produce a third such reading are derived from
+/// what the socket actually granted, stated before the transfer runs, and
+/// checked against the result after it.
+///
+/// One bound cannot be sized away and is therefore stated unconditionally: this
+/// is an **echo**. Every byte it counts crossed the path twice, both directions
+/// share one connection's ack clock, and the daemon turns each frame around in
+/// lockstep — so when the return path backs up the daemon stops reading, and
+/// the forward direction cannot stay full while the reverse is congested. The
+/// figure bounds the two directions together and neither of them alone.
+#[derive(Debug, Clone, Copy)]
+struct TcpEchoBounds {
+    /// The TCP handshake's own round trip, measured on this connection.
+    ///
+    /// One SYN / SYN-ACK exchange, so it carries the daemon's accept latency as
+    /// well as the path and is an estimate rather than a measurement. It is
+    /// used for one thing only — turning a buffer size into a rate — and an
+    /// estimate is enough for that.
+    connect_ns: u64,
+    /// What `getsockopt` reported after the request, not what was asked for.
+    send_buf: usize,
+    recv_buf: usize,
+    frame_bytes: usize,
+    /// `None` when the option could not be read back. An assumed Nagle setting
+    /// is one of the ways a control measures itself, so an unverifiable one is
+    /// reported as unknown rather than as off.
+    nodelay: Option<bool>,
+}
+
+/// What a finished raw TCP echo reading turned out to be sitting on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpEchoBound {
+    /// The writer never filled even its own send buffer, so the figure is this
+    /// client's send loop rather than anything about the path.
+    SendLoop,
+    /// The reading is at the rate the socket buffer alone permits over the
+    /// measured round trip. Raise the buffer and measure again before quoting
+    /// it as anything but the buffer.
+    SocketBuffer,
+    /// Neither local bound accounts for it. That leaves the path, the peer, and
+    /// the echo's own turnaround — and the echo still bounds no single
+    /// direction.
+    NeitherLocal,
+    /// The socket refused to report its buffers, so the buffer bound cannot be
+    /// ruled in or out and the reading is unattributable.
+    Unreadable,
+}
+
+impl TcpEchoBounds {
+    /// The rate the socket buffers alone permit: what is certainly available,
+    /// and what was reported.
+    ///
+    /// TCP keeps no more outstanding than the smaller of its own send buffer
+    /// and its peer's advertised window, and that amount drains once per round
+    /// trip, so `buffer / rtt` caps this connection whatever the link carries.
+    /// Two figures rather than one because the grant does not mean the same
+    /// thing on every system: Linux reports double what was asked for and
+    /// spends part of it on socket-buffer overhead rather than on payload,
+    /// while macOS reports what it set. Half the reported figure is what is
+    /// certainly available, and a verdict is taken against that one so the
+    /// check errs towards flagging a buffer-bound reading rather than missing
+    /// it.
+    ///
+    /// Only this side's buffers are visible. The daemon asks for the same size,
+    /// so this stands in for the pair; a run where it did not would show as a
+    /// reading below this ceiling, which is the safe direction.
+    fn buffer_ceiling_bps(&self) -> Option<(f64, f64)> {
+        let rtt = self.connect_ns as f64 / 1e9;
+        let win = self.send_buf.min(self.recv_buf) as f64;
+        if rtt <= 0.0 || win <= 0.0 {
+            return None;
+        }
+        let reported = win * 8.0 / rtt;
+        Some((reported / 2.0, reported))
+    }
+
+    /// What bounds this sender, stated in the artifact before the transfer runs.
+    fn note(&self) -> String {
+        let nagle = match self.nodelay {
+            Some(true) => "Nagle off, read back from the socket".to_string(),
+            Some(false) => {
+                "Nagle is ON: the request did not take, and this reading is the algorithm's coalescing, not the path's".to_string()
+            }
+            None => {
+                "Nagle state could not be read back, so it is unknown rather than off".to_string()
+            }
+        };
+        let buffers = match self.buffer_ceiling_bps() {
+            Some((low, high)) => format!(
+                "socket buffers granted send {} KiB / receive {} KiB against a {:.0} ms connect round trip, so the window alone caps this connection between {:.2} and {:.2} Mbit/s (the lower figure is what is certainly payload; Linux reports twice the request and spends part of it on overhead). A reading at that number is the buffer and not the link — this control once reported the kernel's 128 KiB default as \"the path\", and once its own queue at 8 MiB",
+                self.send_buf / 1024,
+                self.recv_buf / 1024,
+                self.connect_ns as f64 / 1e6,
+                low / 1e6,
+                high / 1e6,
+            ),
+            None => format!(
+                "socket buffers or the connect round trip could not be read (send {} B, receive {} B, connect {} ns), so the buffer bound cannot be computed and this reading is unattributable",
+                self.send_buf, self.recv_buf, self.connect_ns
+            ),
+        };
+        let writes = match self.buffer_ceiling_bps() {
+            Some((_, high)) if self.frame_bytes > 0 => format!(
+                "; at {} B frames, saturating that ceiling would take {:.0} writes a second on this side and the same number of read-write turnarounds on the daemon's",
+                self.frame_bytes,
+                high / 8.0 / self.frame_bytes as f64,
+            ),
+            _ => String::new(),
+        };
+        format!(
+            "what bounds this sender: {buffers}{writes}. {nagle}. And one that no sizing removes — this is an echo, so every byte counted crossed the path twice, both directions ride one connection's ack clock, and the daemon turns each frame around in lockstep, parking its reads whenever the return direction backs up. The number below bounds the two directions together and neither alone, and is not a denominator for any one-way figure"
+        )
+    }
+
+    /// Which bound, if any, the finished reading turned out to be sitting on.
+    ///
+    /// `ahead_at_deadline` is how far the writer had run ahead of the echo at
+    /// the moment it stopped — everything it had handed to the socket that had
+    /// not come back. A writer being metered by the connection is parked on a
+    /// full send buffer and so is at least a buffer ahead; a writer that never
+    /// filled its own send buffer was metered by its own loop, and then the
+    /// figure is this client's and says nothing about the path. Measured at the
+    /// deadline rather than at the end, because by the end everything has
+    /// drained and the difference is zero either way.
+    ///
+    /// The send-loop question is asked first: a buffer that never filled cannot
+    /// be what limited the rate.
+    fn classify(&self, echoed_bps: f64, ahead_at_deadline: u64) -> TcpEchoBound {
+        let Some((low, _)) = self.buffer_ceiling_bps() else {
+            return TcpEchoBound::Unreadable;
+        };
+        // Half the reported grant, for the same reason the ceiling uses half:
+        // on Linux that is the part of it a payload can occupy.
+        if ahead_at_deadline < (self.send_buf / 2) as u64 {
+            return TcpEchoBound::SendLoop;
+        }
+        if echoed_bps >= TCP_ECHO_CEILING_PROXIMITY * low {
+            return TcpEchoBound::SocketBuffer;
+        }
+        TcpEchoBound::NeitherLocal
+    }
+
+    /// The verdict as the line a reader sees.
+    fn verdict(&self, echoed_bps: f64, ahead_at_deadline: u64) -> String {
+        match self.classify(echoed_bps, ahead_at_deadline) {
+            TcpEchoBound::SendLoop => format!(
+                "what bound it: this side's own send loop. At the deadline the writer was only {ahead_at_deadline} B ahead of the echo, less than half the {} B send buffer it was granted, so it never filled its own socket — the figure is this client's loop and is not evidence about the path",
+                self.send_buf
+            ),
+            TcpEchoBound::SocketBuffer => format!(
+                "what bound it: the socket buffer. {:.2} Mbit/s is at or above {:.0}% of the {:.2} Mbit/s the granted window certainly permits over a {:.0} ms round trip, so this reading is the buffer rather than the link — raise it and measure again before quoting the number",
+                echoed_bps / 1e6,
+                TCP_ECHO_CEILING_PROXIMITY * 100.0,
+                self.buffer_ceiling_bps().map_or(0.0, |(low, _)| low) / 1e6,
+                self.connect_ns as f64 / 1e6,
+            ),
+            TcpEchoBound::NeitherLocal => format!(
+                "what bound it: neither local bound. The writer was {ahead_at_deadline} B ahead at the deadline, so it was parked on a full socket, and {:.2} Mbit/s is below what the granted window permits — what remains is the path, the peer, and this echo's own turnaround, which are not separable from here",
+                echoed_bps / 1e6,
+            ),
+            TcpEchoBound::Unreadable => {
+                "what bound it: cannot say. The socket did not report its buffers or the connect round trip, so the buffer bound is neither ruled in nor out and this reading is unattributable".to_string()
+            }
+        }
+    }
+}
+
+/// Raw TCP bulk echo — kernel TCP on this path, both directions at once.
+///
+/// Saturates the length-prefixed echo while draining it concurrently, so the
+/// number is not one round trip at a time. What it is *not* is a denominator,
+/// and two separate things make it so.
+///
+/// It is a **round trip**: every byte counted crossed the path twice, both
+/// directions ride one connection's ack clock so each meters the other's
+/// acknowledgements, and the daemon turns each frame around in lockstep. A
+/// one-way rate is not bounded by a two-way one — on a shared bottleneck the
+/// echo gets at most half of what one direction alone gets — so a one-way leg
+/// figure coming in above this is expected and is not evidence of an instrument
+/// fault.
+///
+/// And "raw" here means no Phantom, not no protocol. A UDP socket adds nothing
+/// to the path, which is what makes the datagram ladders denominators; a TCP
+/// socket adds congestion control, reliability and flow control, which are the
+/// mechanisms under test. So this figure is what a kernel TCP achieves here — a
+/// yardstick of the same kind as the QUIC leg, not a floor beneath a
+/// TCP-substrate leg. The one-way capacity every leg's upload and download must
+/// be read against is the raw UDP ladder for that direction, which measures the
+/// path both substrates ride.
+///
+/// A real one-way TCP control would need a source port and a sink port on the
+/// daemon counting arrivals at the receiving end, one connection per direction
+/// so the measured direction's acknowledgements are not queued behind the
+/// other's data, and buffers verified by grant at both ends. It would still be
+/// a reference and not a control, for the reason in the paragraph above.
 pub async fn raw_tcp_throughput(
     ep: &Endpoints,
     cap: Duration,
@@ -3108,7 +3337,25 @@ pub async fn raw_tcp_throughput(
     let mut out = ScenarioOutput::new(leg, "throughput");
 
     let addr = ep.addr_for(leg);
-    let sock = match tokio::time::timeout(conn::CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
+    // Resolved before anything is timed, so that a slow name lookup does not
+    // land in the round trip every buffer figure below is divided by.
+    let peer =
+        match tokio::time::timeout(conn::CONNECT_TIMEOUT, tokio::net::lookup_host(&addr)).await {
+            Ok(Ok(mut it)) => it.next(),
+            _ => None,
+        };
+    let Some(peer) = peer else {
+        out.summary.error_count += 1;
+        out.note(format!("could not resolve the raw TCP control at {addr}"));
+        return out;
+    };
+    let Ok((prepared, snd, rcv)) = prepare_echo_socket(peer) else {
+        out.summary.error_count += 1;
+        out.note("could not open a local TCP socket for the raw control");
+        return out;
+    };
+    let dialled = Instant::now();
+    let sock = match tokio::time::timeout(conn::CONNECT_TIMEOUT, prepared.connect(peer)).await {
         Ok(Ok(s)) => s,
         _ => {
             out.summary.error_count += 1;
@@ -3116,53 +3363,67 @@ pub async fn raw_tcp_throughput(
             return out;
         }
     };
-    let _ = sock.set_nodelay(true);
-    // Size the socket buffers for the bandwidth-delay product. TCP cannot keep
-    // more in flight than its send buffer holds, so with the OS default this
-    // probe measures `buffer / rtt` — on a 200 ms path a 128 KB default caps it
-    // near 5 Mbit/s regardless of the link. An earlier version of this control
-    // reported 4.65 Mbit/s as "the path", which was the kernel's default.
-    // A few bandwidth-delay products, not "as much as the kernel will give".
-    // At 8 MiB on a path that loses 6% at 19 Mbit/s, TCP fills the buffer, the
-    // queue becomes the round trip, and the control collapses — it measured
-    // 1.34 Mbit/s on a link carrying 9.5. That is bufferbloat, and a control
-    // measuring its own queue is no better than one measuring its own timer.
-    // 1 MiB is ~3x the product at 9.5 Mbit/s and 250 ms.
-    let (snd, rcv) = set_socket_buffers(&sock, 1024 * 1024);
-    out.note(format!(
-        "socket buffers: send {} KiB, receive {} KiB (asked for 1024 KiB) — this bounds TCP at buffer/RTT, so it must exceed the path's bandwidth-delay product for the number below to mean anything",
-        snd / 1024,
-        rcv / 1024
-    ));
+    // The handshake is one round trip, and it is the only measurement of the
+    // path this scenario makes on its own. Everything that turns a buffer into
+    // a rate needs it, and taking it from another scenario would mean quoting a
+    // number from a connection this one never had.
+    let connect_ns = dialled.elapsed().as_nanos() as u64;
+    let nodelay = match sock.set_nodelay(true) {
+        // Read back rather than assumed: a request that silently did not take
+        // would leave the algorithm's coalescing in the reading.
+        Ok(()) => sock.nodelay().ok(),
+        Err(_) => Some(false),
+    };
+    let bounds = TcpEchoBounds {
+        connect_ns,
+        send_buf: snd,
+        recv_buf: rcv,
+        frame_bytes: frame_size,
+        nodelay,
+    };
+    out.note(bounds.note());
     let (mut rd, mut wr) = sock.into_split();
 
-    let payload = PayloadGen::new(160).fill(frame_size);
+    // Published by the reader so the writer can ask, at the instant it stops,
+    // how far ahead of the echo it had got. Sampled then and not at the end,
+    // because by the end the connection has drained and the answer is zero
+    // whatever bound the transfer.
+    let echoed = Arc::new(AtomicU64::new(0));
+
+    // Header and payload in one buffer, written once. Two writes with Nagle off
+    // put a four-byte segment on the wire ahead of every frame whenever the
+    // send buffer had drained, which is the control paying twice the packet
+    // rate for its own framing.
+    let mut frame = (frame_size as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&PayloadGen::new(160).fill(frame_size));
     let deadline = tokio::time::Instant::now() + cap;
 
     // Writer and reader run concurrently: a send-then-receive loop would
     // measure one round trip at a time and report the bandwidth-delay product
     // rather than the link.
-    let writer = tokio::spawn(async move {
-        let mut sent = 0u64;
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                break;
+    let writer = {
+        let echoed = echoed.clone();
+        tokio::spawn(async move {
+            let mut sent = 0u64;
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                if wr.write_all(&frame).await.is_err() {
+                    break;
+                }
+                sent += frame_size as u64;
             }
-            if wr
-                .write_all(&(payload.len() as u32).to_be_bytes())
-                .await
-                .is_err()
-                || wr.write_all(&payload).await.is_err()
-            {
-                break;
-            }
-            sent += payload.len() as u64;
-        }
-        let _ = wr.shutdown().await;
-        sent
-    });
+            let ahead = sent.saturating_sub(echoed.load(Ordering::Relaxed));
+            let _ = wr.shutdown().await;
+            (sent, ahead)
+        })
+    };
 
     let mut win = WindowTracker::new(leg, "raw_echo");
+    // Reused across frames for the same reason the daemon's is: an allocation
+    // per frame would sit inside the loop whose rate is being measured.
+    let mut body = vec![0u8; frame_size];
     let mut lb = [0u8; 4];
     loop {
         if tokio::time::Instant::now() >= deadline + Duration::from_secs(5) {
@@ -3176,27 +3437,33 @@ pub async fn raw_tcp_throughput(
         if n == 0 || n > 4 * 1024 * 1024 {
             break;
         }
-        let mut body = vec![0u8; n];
-        match tokio::time::timeout(Duration::from_secs(10), rd.read_exact(&mut body)).await {
+        if body.len() < n {
+            body.resize(n, 0);
+        }
+        match tokio::time::timeout(Duration::from_secs(10), rd.read_exact(&mut body[..n])).await {
             Ok(Ok(_)) => {}
             _ => break,
         }
         out.summary.ok_count += 1;
+        echoed.fetch_add(n as u64, Ordering::Relaxed);
         if let Some(sample) = win.add(n) {
             out.sink.push(&sample);
         }
     }
 
-    let sent = writer.await.unwrap_or(0);
+    let (sent, ahead) = writer.await.unwrap_or((0, 0));
     let tp = win.finish();
     out.note(format!(
-        "raw TCP, no Phantom: {} B offered, {} B echoed back in {:.1} s — {:.2} Mbit/s each way",
+        "raw TCP, no Phantom: {} B offered, {} B echoed back in {:.1} s — {:.2} Mbit/s carried in both directions at once",
         sent,
         tp.bytes,
         tp.duration_ns as f64 / 1e9,
         tp.megabits_per_sec
     ));
-    out.note("this is the path's own ceiling; every protocol throughput figure should be read against it");
+    out.note(bounds.verdict(tp.megabits_per_sec * 1e6, ahead));
+    out.note(
+        "this is a round trip and it is kernel TCP: it bounds the two directions together, normalises neither, and a one-way leg figure above it is expected rather than an instrument fault. The one-way denominator for either direction is the raw UDP ladder for that direction",
+    );
     out.summary.throughput = Some(tp);
     out
 }
@@ -4383,6 +4650,222 @@ mod tests {
     fn unused_pin() -> Vec<u8> {
         let (_sk, vk) = HybridSigningKey::generate();
         vk.to_bytes()
+    }
+
+    /// A raw TCP echo whose buffers and round trip are the ones this control
+    /// asks for on a real path: 1 MiB granted, 240 ms, 1024 B frames.
+    fn tcp_echo_bounds() -> TcpEchoBounds {
+        TcpEchoBounds {
+            connect_ns: 240_000_000,
+            send_buf: 1024 * 1024,
+            recv_buf: 1024 * 1024,
+            frame_bytes: 1024,
+            nodelay: Some(true),
+        }
+    }
+
+    /// The buffer ceiling is the arithmetic that catches this control measuring
+    /// its own socket, so it has to be the arithmetic and not a description of
+    /// it: the window drains once per round trip, and half the reported grant
+    /// is the part a payload can certainly occupy.
+    #[test]
+    fn the_buffer_ceiling_is_the_window_over_the_measured_round_trip() {
+        let b = tcp_echo_bounds();
+        let (low, high) = b.buffer_ceiling_bps().expect("both figures readable");
+        assert!(
+            (high - (1024.0 * 1024.0 * 8.0 / 0.240)).abs() < 1.0,
+            "reported ceiling is buffer/rtt, got {high}"
+        );
+        assert!(
+            (low - high / 2.0).abs() < 1.0,
+            "the certain half, got {low}"
+        );
+
+        // A socket that reported nothing leaves the bound neither ruled in nor
+        // out, which is a different answer from "the buffer was not it".
+        let unreadable = TcpEchoBounds { send_buf: 0, ..b };
+        assert!(unreadable.buffer_ceiling_bps().is_none());
+        assert_eq!(
+            unreadable.classify(1e6, 4 * 1024 * 1024),
+            TcpEchoBound::Unreadable
+        );
+        let no_rtt = TcpEchoBounds { connect_ns: 0, ..b };
+        assert!(no_rtt.buffer_ceiling_bps().is_none());
+    }
+
+    /// The three readings this control can produce, and which one each is. The
+    /// send-loop case is asked first on purpose: a buffer that never filled
+    /// cannot be what held the rate down, and answering "socket buffer" there
+    /// would send the next campaign to raise a buffer that was never touched.
+    #[test]
+    fn a_finished_echo_reading_names_the_bound_it_sat_on() {
+        let b = tcp_echo_bounds();
+        let (low, _) = b.buffer_ceiling_bps().expect("readable");
+
+        // Parked on a full socket and well under the window's ceiling: nothing
+        // local accounts for it. This is the shape of the readings that started
+        // this — 2.32 Mbit/s against a 17 Mbit/s window ceiling.
+        assert_eq!(
+            b.classify(2.32e6, 2 * 1024 * 1024),
+            TcpEchoBound::NeitherLocal
+        );
+
+        // At the window ceiling: the buffer, not the link.
+        assert_eq!(b.classify(low, 2 * 1024 * 1024), TcpEchoBound::SocketBuffer);
+        assert_eq!(
+            b.classify(low * TCP_ECHO_CEILING_PROXIMITY, 2 * 1024 * 1024),
+            TcpEchoBound::SocketBuffer
+        );
+
+        // Never filled its own send buffer: the figure is this client's loop,
+        // and it stays that answer even at a rate that would otherwise read as
+        // buffer-bound.
+        assert_eq!(b.classify(2.32e6, 1024), TcpEchoBound::SendLoop);
+        assert_eq!(b.classify(low, 1024), TcpEchoBound::SendLoop);
+    }
+
+    /// The instrument is a system too. Every reading this control can produce
+    /// has to carry the sentence that stops it being read as a one-way
+    /// denominator, because that reading is the one it has invited twice — and
+    /// the verdict has to name a bound in every case, including the case where
+    /// it cannot name one.
+    #[test]
+    fn the_echo_states_what_bounds_it_before_and_after_it_runs() {
+        let b = tcp_echo_bounds();
+        let note = b.note();
+        assert!(note.contains("what bounds this sender"), "{note}");
+        assert!(note.contains("socket buffers granted"), "{note}");
+        assert!(note.contains("Nagle off"), "{note}");
+        assert!(
+            note.contains("crossed the path twice") && note.contains("lockstep"),
+            "the bound no sizing removes must be named: {note}"
+        );
+        assert!(
+            note.contains("not a denominator for any one-way figure"),
+            "{note}"
+        );
+
+        for (bps, ahead, want) in [
+            (2.32e6, 2 * 1024 * 1024, "neither local bound"),
+            (20.0e6, 2 * 1024 * 1024, "the socket buffer"),
+            (2.32e6, 1024, "this side's own send loop"),
+        ] {
+            let v = b.verdict(bps, ahead);
+            assert!(v.contains(want), "wanted {want:?} in {v}");
+        }
+        let blind = TcpEchoBounds { send_buf: 0, ..b };
+        assert!(
+            blind.verdict(2.32e6, 0).contains("cannot say"),
+            "an unreadable socket must not be reported as a measured bound"
+        );
+
+        // A request that did not take must be visible in the note, because the
+        // reading would then be the algorithm's coalescing.
+        let nagling = TcpEchoBounds {
+            nodelay: Some(false),
+            ..b
+        };
+        assert!(nagling.note().contains("Nagle is ON"), "{}", nagling.note());
+        let unknown = TcpEchoBounds { nodelay: None, ..b };
+        assert!(
+            unknown.note().contains("unknown rather than off"),
+            "an unverifiable setting is not a verified one: {}",
+            unknown.note()
+        );
+    }
+
+    /// The socket has to be sized before it dials, and the request has to be
+    /// shown to have done something.
+    ///
+    /// Both halves matter. The ordering is what the buffer request is *for*:
+    /// TCP fixes its window scale from the receive buffer it holds when it
+    /// builds the SYN, so a size set afterwards raises the buffer and leaves
+    /// the advertised window capped by a factor taken from the default. And the
+    /// effect is asserted against this machine's own unconfigured default,
+    /// which is the positive control such a check needs: an assertion that
+    /// the grant is "large" would pass on a system that grants that much
+    /// anyway, and would then be evidence of nothing.
+    #[tokio::test]
+    async fn the_echos_socket_is_sized_before_it_dials() {
+        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().expect("literal address");
+
+        let plain = tokio::net::TcpSocket::new_v4().expect("a bare socket");
+        let default_snd = plain.send_buffer_size().expect("readable") as usize;
+        let default_rcv = plain.recv_buffer_size().expect("readable") as usize;
+
+        // The returned socket is a `TcpSocket`, which `connect` consumes by
+        // value to produce a `TcpStream`. So a caller cannot hold this and have
+        // already dialled it: the ordering is carried by the signature, and
+        // what is left for a test to establish is that the request took.
+        let (_sized, snd, rcv) = prepare_echo_socket(peer).expect("a sized socket");
+
+        assert!(
+            snd >= default_snd && rcv >= default_rcv,
+            "the request must never shrink the buffer: got {snd}/{rcv} against a default of {default_snd}/{default_rcv}"
+        );
+        assert!(
+            snd > default_snd || default_snd >= TCP_ECHO_SOCKET_BUFFER,
+            "the send request had no effect and the default was already below it: {snd} against {default_snd}, asking {TCP_ECHO_SOCKET_BUFFER}"
+        );
+        assert!(
+            rcv > default_rcv || default_rcv >= TCP_ECHO_SOCKET_BUFFER,
+            "the receive request had no effect and the default was already below it: {rcv} against {default_rcv}, asking {TCP_ECHO_SOCKET_BUFFER}"
+        );
+    }
+
+    /// End to end against the daemon's own echo, on loopback: the control has
+    /// to carry its sender's bounds and its round-trip disclaimer into the
+    /// notes a reader actually sees, not merely be able to render them.
+    ///
+    /// Loopback is the right place for this and the wrong place for the number:
+    /// what is asserted is the shape of the record and that the echo returns
+    /// bytes at all under the single-write framing both ends now use. The rate
+    /// on a microsecond path is not a measurement of anything and is not
+    /// asserted.
+    #[tokio::test]
+    async fn the_raw_tcp_echo_records_its_own_bounds_and_refuses_to_be_a_denominator() {
+        use crate::testd::baseline::{serve_tcp, BaselineStats};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let stats = Arc::new(BaselineStats::default());
+        let s = stats.clone();
+        tokio::spawn(async move {
+            let _ = serve_tcp(listener, s).await;
+        });
+
+        let ep = Endpoints {
+            raw_tcp_port: port,
+            ..closed_endpoints()
+        };
+        let out = raw_tcp_throughput(&ep, Duration::from_millis(300), 1024).await;
+        let notes = out.summary.notes.join("\n");
+
+        assert_eq!(out.summary.error_count, 0, "{notes}");
+        assert!(
+            out.summary.ok_count > 0,
+            "the echo returned nothing: {notes}"
+        );
+        assert!(
+            stats.tcp_frames.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the daemon side counted no frames: {notes}"
+        );
+        assert!(notes.contains("what bounds this sender"), "{notes}");
+        assert!(notes.contains("what bound it:"), "{notes}");
+        assert!(
+            notes.contains("carried in both directions at once"),
+            "the headline must not read as a per-direction rate: {notes}"
+        );
+        assert!(
+            notes.contains("normalises neither"),
+            "a control that does not bound a direction has to say so: {notes}"
+        );
+        assert!(
+            notes.contains("one-way leg figure above it is expected"),
+            "the inversion this control produces must be pre-empted, not left to be read as a fault: {notes}"
+        );
     }
 
     /// The frame arithmetic the byte-ceiling sweep rests on has to be the

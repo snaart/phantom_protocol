@@ -31,7 +31,7 @@ reports is a statement about the shipped surface rather than a private path.
 | 4243 | UDP | PhantomUDP — the production transport | under test |
 | 4244 | TCP | mimic-TLS (`mimicry` feature) | under test |
 | 4245 | UDP | QUIC via `quinn` | **reference** |
-| 4342 | TCP | raw TCP echo | **control, no protocol** |
+| 4342 | TCP | raw TCP echo | latency: **control**. throughput: **round trip, and kernel TCP** — see below |
 | 4343 | UDP | raw UDP echo | **control, no protocol** |
 | 4344 | UDP | raw UDP downstream source (server → client) | **control, no protocol** |
 | 4345 | UDP | raw UDP uplink sink (client → server) | **control, no protocol** |
@@ -49,6 +49,53 @@ Y ms" says nothing, because the link's own ceiling is unknown. Two of the four
 are echoes and so bound the two directions together and neither alone; the other
 two are one way each, and those are what put a number under a single direction's
 `download` and `upload`.
+
+**The raw TCP echo's throughput is not a denominator, and it has been read as
+one twice.** Two independent reasons, either sufficient on its own.
+
+*It is a round trip.* Every byte it counts crossed the path twice; both
+directions ride one connection's ack clock, so each meters the other's
+acknowledgements; and the daemon turns each frame around in lockstep, parking
+its reads whenever the return direction backs up. A one-way rate is not bounded
+by a two-way one — on a shared bottleneck the echo gets at most half of what one
+direction alone gets. So a one-way `tcp` or `mimic` figure coming in **above**
+it is expected. Two runs produced exactly that (control 2.32 Mbit/s against
+`tcp` 3.01 and `mimic` 2.36) and the reading taken from it was "the control is
+broken". The control was not broken; the comparison was.
+
+*And "raw" here means no Phantom, not no protocol.* A UDP socket adds nothing to
+the path, which is what makes the datagram ladders denominators. A TCP socket
+adds congestion control, reliability and flow control — the mechanisms under
+test. Its throughput is therefore what a **kernel TCP** achieves on this path: a
+yardstick of the same kind as the QUIC leg, not a floor beneath a leg that rides
+a TCP socket. Its *latency* sweep is a different matter and remains the path's
+own round-trip floor.
+
+**There is no one-way TCP control in this harness.** One would need a source port
+and a sink port on the daemon counting arrivals at the *receiving* end, one
+connection per direction so the measured direction's acknowledgements are not
+queued behind the other's data, and socket buffers verified by grant at both
+ends. Even then it would be a reference and not a control, for the reason above.
+Until it exists, a `tcp` or `mimic` figure is normalised by the raw UDP ladder
+for its direction — a pairing across substrates, which measures the path both
+ride and which `analyze.py` labels as such wherever it prints it.
+
+The scenario states what bounds its own sender in the run's own notes, the way
+the upstream ladder does: the granted socket buffers converted to a rate over
+the connection's own measured round trip, the Nagle setting read back from the
+socket rather than assumed, the write rate saturating that ceiling would need,
+and afterwards a verdict naming which of them the finished reading sat on —
+including "neither, and this is still a round trip".
+
+Those buffers are asked for **before the connect**, and on the daemon on the
+**listening** socket. TCP fixes its window scale in the SYN from the receive
+buffer it holds at that moment, so a size set on an already-connected stream
+raises the buffer and leaves the advertised window capped by a factor taken from
+the default — which is the last remaining way this control had of measuring its
+own socket. The probe's side is a `TcpSocket` that `connect` consumes, so the
+ordering is carried by the type rather than by the order two lines are written
+in, and the test asserts the grant against this machine's own unconfigured
+default rather than against a constant.
 
 **The reference** is a mature implementation of the same class — reliable,
 encrypted, multiplexed, over UDP — driven over the same path in the same run,
@@ -72,8 +119,10 @@ What it does not, and cannot:
   at its default — the point is to measure it as shipped. Phantom's is
   BBR-style. The two window series are not the same statistic.
 - **Flow control.** quinn's default 1.25 MB stream window would cap a 250 ms path
-  near 40 Mbit/s regardless of the link, so the windows are raised to 8 MiB —
-  the same figure the raw TCP control asks the kernel for, for the same reason.
+  near 40 Mbit/s regardless of the link, so the windows are raised to 8 MiB.
+  That is deliberately *not* the 1 MiB the raw TCP control asks the kernel for:
+  the control also sends, and at 8 MiB it filled its own send buffer and reported
+  the resulting queue as the link. A receive window has no such failure mode.
   This is the only knob touched, and it is touched to stop the reference being
   handicapped.
 
@@ -796,15 +845,26 @@ tables: quinn's cryptography is classical TLS 1.3, so its handshake is not
 comparable like-for-like with a hybrid post-quantum one, while its throughput
 and loss behaviour on the same path are.
 
-**A control that came in under a leg it bounds is called out.** A protocol
-cannot beat the same path carrying no protocol, so such a control measured
-itself and nothing divided by it means anything until it is re-verified — the
-failure both raw controls have had before, the UDP pacer reporting its own sleep
-granularity and the TCP echo reporting first a socket buffer and later its own
-bufferbloat. Pairing is by substrate: a TCP leg's floor is the raw TCP echo, and
-comparing across substrates would flag the difference between two transports as
-an instrument fault. The same check applied to the share column is the reading
-that a share above 100% condemns the column rather than the row.
+**A round-trip echo that came in under a one-way leg of its own substrate says
+so, and says that this is expected.** That inversion used to be printed as an
+instrument fault — "a protocol cannot beat the same path carrying none" — and it
+is not one, for either of two independent reasons: a one-way rate is not bounded
+by a two-way one, and a TCP socket is not a protocol-free substrate to begin
+with. Pairing is still by substrate, so the sentence is about the pair that
+shares a socket type; comparing across substrates would say something about two
+transports rather than about either instrument. The real
+instrument-measures-itself check is the one on the share column — a share above
+100% is a leg taking more than the whole of the *one-way* ladder in the same
+direction, which is a comparison of two like quantities with one of them wrong,
+and it condemns the column rather than the row. Both raw controls really have
+measured themselves before (the UDP pacer reporting its own sleep granularity,
+the TCP echo reporting first a socket buffer and later its own bufferbloat),
+which is why the older sentence was believable.
+
+**A leg with no one-way control of its own substrate is labelled as such.** Both
+TCP legs are in that position; their share is taken across substrates against
+the datagram ladder, which measures the path both ride, and the column says so
+once rather than leaving each row to be reconstructed.
 
 **A transfer that never converged is marked, and its mean is named as a
 convergence time.** The threshold is the one the send-bound section uses, and on
