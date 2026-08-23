@@ -541,6 +541,108 @@ pub struct ThroughputSample {
     pub cumulative_bytes: u64,
 }
 
+/// One transfer counted from both ends: what the sender handed the API, and
+/// what the receiving side actually took in.
+///
+/// `send()` buffers, so a sending side's own per-window counts say how full its
+/// own buffer got and not what crossed the path. On an upload the arriving side
+/// is the server, and its count reached a reader only as a sentence in the
+/// scenario's notes — prose no analysis can divide by, which is how the leg
+/// comparison came to publish a client-side number for a direction whose honest
+/// figure is the server's. These are the same numbers as fields.
+///
+/// Both books travel in one record, for the reason [`RungSample`] carries the
+/// sender's account beside the receiver's: the pair *is* the reading. The
+/// sender's figure alone is what was offered, the receiver's alone has no
+/// offered rate to be read against, and joining them after the fact means
+/// matching two files on a timestamp.
+///
+/// The three server fields are optional together. A transfer whose closing
+/// report never came back still writes a receipt, with those three absent and
+/// `error` saying which half failed; zeros there would say "nothing arrived",
+/// which is a different fact from "nobody counted". A run that has no receipt
+/// file at all is a third thing again — one recorded before this existed.
+///
+/// Only the upload direction writes one. On a download the arriving side is the
+/// client, whose own sampling windows are already the honest figure, so there is
+/// no second book to fetch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferReceiptSample {
+    pub leg: Leg,
+    pub direction: String,
+    pub t_unix_ns: u64,
+    /// What the client handed the session, in the client's own units: wire
+    /// bytes, meaning payload plus this harness's frame header.
+    pub client_bytes: u64,
+    pub client_frames: u64,
+    /// The interval the client drove the burst over, from its own clock.
+    pub client_window_ns: u64,
+    /// Payload bytes the server decrypted and counted — payload only, so the
+    /// two byte figures differ by one frame header each and are not subtractable
+    /// without it.
+    pub server_bytes: Option<u64>,
+    pub server_frames: Option<u64>,
+    /// First arrival to last arrival at the server: its own observation span,
+    /// which excludes the connect and the client's start-up. This is the
+    /// denominator the honest rate is taken over, and it is not the client's
+    /// window — the two differ by whatever was still in flight at each end.
+    pub server_observed_ns: Option<u64>,
+    /// Why the server's side is absent, when it is. Absent for a receipt that
+    /// has one.
+    pub error: Option<String>,
+}
+
+impl TransferReceiptSample {
+    /// A transfer whose closing report came back, with what the server counted.
+    pub fn counted(
+        leg: Leg,
+        direction: &str,
+        client: &Throughput,
+        server_frames: u64,
+        server_bytes: u64,
+        server_observed_ns: u64,
+    ) -> Self {
+        Self {
+            server_bytes: Some(server_bytes),
+            server_frames: Some(server_frames),
+            server_observed_ns: Some(server_observed_ns),
+            error: None,
+            ..Self::skeleton(leg, direction, client)
+        }
+    }
+
+    /// A transfer whose closing report did not come back, and why.
+    ///
+    /// Written rather than omitted: a missing file says the run predates the
+    /// receipt entirely, and that is a different thing from a run that tried to
+    /// count and could not. An analysis that cannot tell them apart has to
+    /// describe both in the words of whichever it guessed.
+    pub fn uncounted(leg: Leg, direction: &str, client: &Throughput, why: &str) -> Self {
+        Self {
+            server_bytes: None,
+            server_frames: None,
+            server_observed_ns: None,
+            error: Some(why.to_string()),
+            ..Self::skeleton(leg, direction, client)
+        }
+    }
+
+    fn skeleton(leg: Leg, direction: &str, client: &Throughput) -> Self {
+        Self {
+            leg,
+            direction: direction.to_string(),
+            t_unix_ns: unix_nanos(),
+            client_bytes: client.bytes,
+            client_frames: client.frames,
+            client_window_ns: client.duration_ns,
+            server_bytes: None,
+            server_frames: None,
+            server_observed_ns: None,
+            error: None,
+        }
+    }
+}
+
 /// One rung of a raw UDP capacity ladder, recorded from both ends.
 ///
 /// The fields exist in pairs on purpose. A rung has an *offered* rate, a rate
@@ -1233,6 +1335,118 @@ mod tests {
         for other in [Leg::Udp, Leg::Tcp, Leg::Mimic, Leg::RawTcp, Leg::RawUdp] {
             assert!(!other.is_reference(), "{other} is not a reference leg");
         }
+    }
+
+    /// A client-side throughput figure, of the shape an upload burst produces.
+    fn client_book() -> Throughput {
+        Throughput::new(3_100_000, 3100, 12_000_000_000)
+    }
+
+    /// The honest upload rate has to be computable from the record's own fields,
+    /// which is the whole reason the record exists: it was already stated in
+    /// prose, and prose is not a denominator.
+    #[test]
+    fn a_counted_receipt_yields_the_server_observed_rate_without_prose() {
+        let r = TransferReceiptSample::counted(
+            Leg::Udp,
+            "upload",
+            &client_book(),
+            3059,
+            3_059_210,
+            12_476_000_000,
+        );
+
+        let bytes = r.server_bytes.expect("counted");
+        let span = r.server_observed_ns.expect("counted");
+        let bps = bytes as f64 * 8.0 / (span as f64 / 1e9);
+        assert!(
+            (bps / 1e6 - 1.961).abs() < 0.01,
+            "server-observed rate must fall out of the fields: {bps}"
+        );
+        assert_eq!(r.server_frames, Some(3059));
+        assert!(r.error.is_none());
+
+        // And the sending side's own book travels beside it, so the record is
+        // one reading rather than half of one waiting on a join. The two differ
+        // here by exactly what buffering hides, which is the point.
+        assert_eq!(r.client_bytes, 3_100_000);
+        assert_eq!(r.client_frames, 3100);
+        assert_eq!(r.client_window_ns, 12_000_000_000);
+    }
+
+    /// Absent and zero are different statements. A transfer nobody counted must
+    /// not read as a transfer where nothing arrived — the second is a finding
+    /// and the first is a gap in the instrument.
+    #[test]
+    fn an_uncounted_receipt_says_nobody_counted_rather_than_nothing_arrived() {
+        let r = TransferReceiptSample::uncounted(
+            Leg::Tcp,
+            "upload",
+            &client_book(),
+            "sink_end sent, no report: Timeout",
+        );
+
+        assert_eq!(r.server_bytes, None);
+        assert_eq!(r.server_frames, None);
+        assert_eq!(r.server_observed_ns, None);
+        assert!(
+            r.error.as_deref().unwrap_or_default().contains("no report"),
+            "the reason has to travel with the gap: {:?}",
+            r.error
+        );
+        // The client's book is still recorded: it is the only figure such a run
+        // has, and dropping the row would leave the leg out of the comparison
+        // entirely.
+        assert_eq!(r.client_bytes, 3_100_000);
+    }
+
+    /// The three server fields are one fact and have to be optional together —
+    /// two of three would let an analysis compute a rate over a span nobody
+    /// measured.
+    #[test]
+    fn the_server_side_of_a_receipt_is_present_or_absent_as_a_whole() {
+        for r in [
+            TransferReceiptSample::counted(Leg::Udp, "upload", &client_book(), 1, 2, 3),
+            TransferReceiptSample::uncounted(Leg::Udp, "upload", &client_book(), "why"),
+        ] {
+            let present = [
+                r.server_bytes.is_some(),
+                r.server_frames.is_some(),
+                r.server_observed_ns.is_some(),
+            ];
+            assert!(
+                present.iter().all(|p| *p) || present.iter().all(|p| !*p),
+                "the server's three fields disagreed: {present:?}"
+            );
+            // `error` is the converse of them: exactly one of the two states.
+            assert_eq!(r.error.is_some(), !present[0]);
+        }
+    }
+
+    /// The reader that opens this file joins on `leg` and `direction`, and the
+    /// absent server side has to arrive as JSON null rather than as a missing
+    /// key — a missing key and a zero are what the record exists to separate.
+    #[test]
+    fn a_receipt_serialises_with_its_absences_visible() {
+        let v: serde_json::Value = serde_json::to_value(TransferReceiptSample::uncounted(
+            Leg::Mimic,
+            "upload",
+            &client_book(),
+            "sink_end send blocked: Timeout",
+        ))
+        .expect("serialize");
+
+        assert_eq!(v["leg"], "mimic");
+        assert_eq!(v["direction"], "upload");
+        assert!(v["server_bytes"].is_null(), "{v}");
+        assert!(v["server_frames"].is_null(), "{v}");
+        assert!(v["server_observed_ns"].is_null(), "{v}");
+        assert_eq!(v["client_bytes"], 3_100_000u64);
+
+        let back: TransferReceiptSample =
+            serde_json::from_value(v).expect("a receipt must round-trip");
+        assert_eq!(back.server_bytes, None);
+        assert_eq!(back.client_frames, 3100);
     }
 
     #[test]

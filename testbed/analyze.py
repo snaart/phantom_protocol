@@ -433,6 +433,114 @@ DIRECTION_CONTROL = {"upload": "raw_udp_upstream", "download": "raw_udp_downstre
 # the floor beneath them, and PhantomUDP rides datagrams.
 SUBSTRATE_CONTROL = {"udp": "raw_udp", "tcp": "raw_tcp", "mimic": "raw_tcp"}
 
+# Which side's book a direction's rate is taken from, and why. `send()` buffers,
+# so a sending side's own per-window counts say how full its own buffer got —
+# they are an offered rate, not a delivered one. The honest figure is always the
+# arriving side's, and which end that is depends on the direction: on a download
+# the client receives and its own windows are the answer, on an upload the server
+# receives and the answer has to come back from it.
+#
+# Stated as a mapping because the two directions are printed by one loop, and a
+# rule held in the reader's head is the rule that got broken: the comparison
+# printed the client's count for both and disclosed it in a footnote.
+NUMERATOR_SIDE = {"upload": "server", "download": "client"}
+
+
+def receipt_of(run_dir, leg, direction):
+    """The transfer receipt for one leg's transfer, or `None` where there is none.
+
+    Absent for every run recorded before the receipt existed, and absent for a
+    leg whose transfer never got as far as closing. Both mean the arriving side's
+    count cannot be had from this artifact; neither means it was zero.
+
+    The last record wins, for the same reason the sinks append: a re-run of one
+    scenario into an existing directory adds rather than replaces, and the newest
+    row is the one that describes the transfer whose windows sit beside it.
+    """
+    rows = [r for r in read_jsonl(run_dir / "samples" / leg / f"{direction}.receipt.jsonl")
+            if isinstance(r, dict)]
+    return rows[-1] if rows else None
+
+
+def server_observed_bps(receipt):
+    """Bits per second the server counted, over its own observation span.
+
+    `None` unless the receipt carries all of the count and the span it was taken
+    over — the three fields are one fact, and two of them would be a rate over an
+    interval nobody measured. A zero span is refused for the same reason
+    [`mean_bps`] refuses one: it would report an infinite rate for a transfer
+    that recorded no interval.
+
+    `bool` is an `int` in Python, so a field reading True is a corrupt record
+    rather than a byte count of one.
+    """
+    if not isinstance(receipt, dict):
+        return None
+    got = []
+    for k in ("server_bytes", "server_observed_ns"):
+        v = receipt.get(k)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+            return None
+        got.append(v)
+    return got[0] * 8 / (got[1] / 1e9)
+
+
+def upload_rate(receipt, client_bps):
+    """An upload's rate, the book it came from, and what to say about the other.
+
+    The client's number is not the result. On an upload the arriving side is the
+    server, so its count over its own observation span is the numerator whenever
+    the run recorded one, and the client's figure goes beside it as what the
+    sender believed rather than as what crossed the path.
+
+    Where no server count exists the client's figure is printed and *named* as
+    the sending side's book. The substitution is never silent and the row is
+    never dropped: a run whose uploads went missing from the comparison would
+    read as a run whose uploads did not happen, and every artifact recorded
+    before the receipt existed is in exactly that state.
+
+    Returns `(bps, side, marks)`, where `side` is the key of [`NUMERATOR_SIDE`]
+    the figure actually came from — `"client"` there while the direction's rule
+    says `"server"` is precisely the case a reader must not miss.
+    """
+    server = server_observed_bps(receipt)
+    believed = (
+        "the client's own book read nothing — it closed no sampling window"
+        if client_bps is None
+        else f"the client's own book read {client_bps / 1e6:.2f} Mbit/s, which is what the sender "
+             "believed it was doing"
+    )
+    if server is not None:
+        got = receipt.get("server_bytes")
+        frames = receipt.get("server_frames")
+        span_ms = receipt.get("server_observed_ns", 0) / 1e6
+        return (
+            server,
+            "server",
+            [
+                f"server-observed: {got} B in {frames} frame(s) over the server's own "
+                f"{span_ms:.0f} ms observation span",
+                believed,
+            ],
+        )
+    # Two ways to have no server count, and they lead to different fixes: an
+    # artifact that predates the record, and a transfer whose closing report
+    # never came back. The second says so in the receipt it did write.
+    why = (
+        f"the transfer could not be counted ({receipt.get('error') or 'reason not recorded'})"
+        if isinstance(receipt, dict)
+        else "this run recorded no receipt for it"
+    )
+    said = (
+        f"the server-observed rate is unavailable for this run: {why}, and the client closed no "
+        "sampling window either — this row has no figure from either book"
+        if client_bps is None
+        else f"the server-observed rate is unavailable for this run: {why}. The figure shown is "
+             "the client's own send-side count, which is how full its buffer got and not what "
+             "crossed the path"
+    )
+    return (client_bps, "client", [f"\033[33m{said}\033[0m"])
+
 
 def leg_role(leg):
     """`under test`, `reference`, `control` — or `None` for an unknown name.
@@ -1798,9 +1906,16 @@ def comparison_section(run_dir, meta):
 
     The section exists because the alternative is arithmetic done in the reader's
     head across four scenarios in a log, and that arithmetic has been done
-    against the wrong denominator before. Three things are therefore fixed here
+    against the wrong denominator before. Five things are therefore fixed here
     rather than left to the reader:
 
+    - the numerator is the **arriving** side's count, which is a different end of
+      the path in each direction. On a download that is the client, whose own
+      sampling windows are already what came in. On an upload it is the server,
+      because `send()` buffers and the client's windows measure how full its own
+      buffer got — an offered rate, not a delivered one. Where a run carries no
+      server count the client's figure is printed and named as the sender's own
+      book, never quietly promoted to stand for the other;
     - the denominator is the **one-way** control for that direction and nothing
       else. Where it did not run, the rate is printed with a blank share and a
       line saying so, because the round-trip echo bounds the two directions
@@ -1826,6 +1941,12 @@ def comparison_section(run_dir, meta):
         "  the dedicated upload and download scenarios only: bidir drives both directions at once "
         "and is a\n  different experiment, so its download half does not belong in a column with "
         "an uncontended one"
+    )
+    print(
+        "  every rate here is counted by whichever end received it, and that is not the same end "
+        "in both\n  directions: download is counted by the client, upload by the server. A sending "
+        "side's own counts\n  measure how full its buffer got, because send() returns before the "
+        "bytes have crossed anything"
     )
 
     driven = exercised_legs(run_dir, meta)
@@ -1895,20 +2016,40 @@ def comparison_section(run_dir, meta):
                 "together and neither one on its own"
             )
 
+        receipts = (
+            {leg: receipt_of(run_dir, leg, direction) for leg in driven}
+            if NUMERATOR_SIDE[direction] == "server"
+            else {}
+        )
         if direction == "upload":
             print(
-                "  numerator:   what the client's own window counts recorded it sending. That is "
-                "the sending side's book,\n               not the receiving side's — the honest "
-                "upload figure is what the server took in over its own\n               observation "
-                "span, which is in the scenario's notes and in the daemon's artifact"
+                "  numerator:   what the server counted arriving, over its own observation span. "
+                "The client's window\n               counts are the sending side's book — send() "
+                "buffers, so they say how full that buffer got\n               rather than what "
+                "crossed the path, and this direction's arriving side is the far end"
             )
+            if not any(server_observed_bps(r) is not None for r in receipts.values()):
+                print(
+                    "               \033[33mno transfer in this run carries a server count, which "
+                    "is the state of every run\n               recorded before the receipt existed. "
+                    "The rows below fall back to the client's own book and\n               say so "
+                    "one by one\033[0m"
+                )
         else:
-            print("  numerator:   what the client received, which on a download is the arriving side's own book")
+            print(
+                "  numerator:   what the client counted arriving, over its own sampling windows. "
+                "On a download the\n               client is the arriving side, so its book is the "
+                "honest one and no second count is needed"
+            )
 
         rows = []
         for leg in driven:
             samples = transfers.get((leg, direction))
-            bps = mean_bps(samples) if samples else None
+            client_bps = mean_bps(samples) if samples else None
+            if NUMERATOR_SIDE[direction] == "server":
+                bps, _side, book_marks = upload_rate(receipts.get(leg), client_bps)
+            else:
+                bps, book_marks = client_bps, []
             marks = []
             if bps is None:
                 marks.append(
@@ -1916,7 +2057,12 @@ def comparison_section(run_dir, meta):
                     "window in this direction — read the errors section before reading the rows "
                     "above as the whole run\033[0m"
                 )
+                marks.extend(book_marks)
             else:
+                # Which book the number came from leads, because everything after
+                # it is a statement about that number and reads differently
+                # depending on the answer.
+                marks.extend(book_marks)
                 share, why = transfer_acceleration(run_dir, leg, direction, samples)
                 if share is None:
                     marks.append(f"whether it converged is unknown — {why}")
@@ -2377,6 +2523,15 @@ def self_test():
     `denominator_broken` must fire on a share above one and not on a share of
     exactly one, which is a leg that reached its control and not one that
     passed it.
+
+    The upload numerator is the tenth, and its obligation is a disclosure. The
+    honest figure for a direction is the arriving side's count, which on an
+    upload is the server's; `server_observed_bps` must refuse anything short of
+    the whole count-and-span, and `upload_rate` must fall back to the sending
+    side's own book only in words the reader cannot miss. A silent substitution
+    is the defect itself — the comparison published a sender's number under a
+    receiver's heading and disclosed it in a footnote — and dropping the row
+    instead would turn every archived run into one whose uploads never happened.
     """
     label_cases = [
         ([{"bw_filter_window_ms": 10000}] * 3, "filtered max over 10s horizon"),
@@ -2799,6 +2954,103 @@ def self_test():
         (["udp", "tcp"], ["udp"], ["udp"]),
         (["udp"], [], []),
     ]
+
+    def receipt(**kw):
+        """A transfer receipt with no server side, which is the shape to vary from."""
+        r = {
+            "leg": "udp",
+            "direction": "upload",
+            "t_unix_ns": 1,
+            "client_bytes": 3_100_000,
+            "client_frames": 3100,
+            "client_window_ns": 12_000_000_000,
+            "server_bytes": None,
+            "server_frames": None,
+            "server_observed_ns": None,
+            "error": "sink_end sent, no report: Timeout",
+        }
+        r.update(kw)
+        return r
+
+    def counted(**kw):
+        """One where the far end reported: 1.25 MB over 10 s is exactly 1 Mbit/s."""
+        r = receipt(
+            server_bytes=1_250_000,
+            server_frames=1000,
+            server_observed_ns=10_000_000_000,
+            error=None,
+        )
+        r.update(kw)
+        return r
+
+    # The count and the span it was taken over are one fact. Two of the three
+    # fields would be a rate over an interval nobody measured, so anything short
+    # of the whole set is refused rather than half-read — the same rule the
+    # reply-flight counters follow, for the same reason.
+    observed_cases = [
+        (counted(), 1e6),
+        (receipt(), None),
+        (counted(server_bytes=None), None),
+        (counted(server_observed_ns=None), None),
+        # A transfer that recorded no interval has no rate; dividing by it would
+        # report an infinite one.
+        (counted(server_observed_ns=0), None),
+        (counted(server_bytes=0), None),
+        # `bool` is an `int` here, so a field reading True is a corrupt record
+        # and not a byte count of one.
+        (counted(server_bytes=True), None),
+        (None, None),
+        ("not a record", None),
+    ]
+    # Which book an upload's rate comes from, and what the row says about the
+    # other one. The substitution must never be silent and the row must never go
+    # missing: an upload dropped from the comparison reads as an upload that did
+    # not happen, and every run archived before the receipt existed would be in
+    # that state.
+    rate_cases = [
+        (
+            "counted, with the sender's book beside it",
+            counted(),
+            2e6,
+            (1e6, "server"),
+            ["server-observed", "1250000 B", "10000 ms", "2.00 Mbit/s", "sender believed"],
+        ),
+        (
+            "counted, with no sender's book to put beside it",
+            counted(),
+            None,
+            (1e6, "server"),
+            ["server-observed", "closed no sampling window"],
+        ),
+        (
+            "the closing report never came back",
+            receipt(),
+            2e6,
+            (2e6, "client"),
+            ["unavailable for this run", "no report", "client's own send-side count"],
+        ),
+        (
+            "an artifact older than the receipt",
+            None,
+            2e6,
+            (2e6, "client"),
+            ["unavailable for this run", "recorded no receipt", "not what crossed the path"],
+        ),
+        (
+            "neither side counted anything",
+            None,
+            None,
+            (None, "client"),
+            ["no figure from either book"],
+        ),
+        (
+            "a span of zero is not a measurement",
+            counted(server_observed_ns=0),
+            2e6,
+            (2e6, "client"),
+            ["unavailable for this run"],
+        ),
+    ]
     # A share above one condemns the column: the ladder is below a leg that runs
     # over it, so it measured itself.
     broken_cases = [
@@ -2829,6 +3081,41 @@ def self_test():
         )
         failures += 0 if ok else 1
         print(f"  {'ok' if ok else 'FAIL'}: arrival_tail_share({len(rows)} window(s)) -> {got!r} (want {want!r})")
+    for rec, want in observed_cases:
+        got = server_observed_bps(rec)
+        ok = (got is None and want is None) or (
+            got is not None and want is not None and abs(got - want) < 1e-6
+        )
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: server_observed_bps -> {got!r} (want {want!r})")
+    for name, rec, client_bps, (want_bps, want_side), wanted in rate_cases:
+        bps, side, marks = upload_rate(rec, client_bps)
+        joined = "\n".join(marks)
+        ok = side == want_side and all(w in joined for w in wanted)
+        ok = ok and (
+            (bps is None and want_bps is None)
+            or (bps is not None and want_bps is not None and abs(bps - want_bps) < 1e-6)
+        )
+        # A fallback that does not announce itself is the defect this whole
+        # reading exists to close, so the warning colour is part of the contract
+        # rather than decoration.
+        if side != NUMERATOR_SIDE["upload"]:
+            ok = ok and "\033[33m" in joined
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: upload_rate({name}) -> {bps!r} from the {side}'s book")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        (root / "samples" / "udp").mkdir(parents=True)
+        with open(root / "samples" / "udp" / "upload.receipt.jsonl", "w") as f:
+            f.write(json.dumps(counted(server_bytes=1)) + "\n")
+            f.write(json.dumps(counted(server_bytes=2)) + "\n")
+        # Sinks append, so a re-run of one scenario leaves both records and the
+        # newest is the one describing the transfer whose windows sit beside it.
+        ok = receipt_of(root, "udp", "upload")["server_bytes"] == 2
+        ok = ok and receipt_of(root, "udp", "download") is None
+        ok = ok and receipt_of(root, "tcp", "upload") is None
+    failures += 0 if ok else 1
+    print(f"  {'ok' if ok else 'FAIL'}: receipt_of reads the newest record and nothing where there is none")
     for legs, controls, want in outperform_cases:
         got = outperformed_controls(legs, controls)
         ok = got == want
@@ -2961,10 +3248,12 @@ def self_test():
         + len(role_cases)
         + len(mean_cases)
         + len(tail_cases)
+        + len(observed_cases)
+        + len(rate_cases)
         + len(outperform_cases)
         + len(broken_cases)
         + len(driven_cases)
-        + 6
+        + 7
     )
 
     for rows, want in label_cases:
