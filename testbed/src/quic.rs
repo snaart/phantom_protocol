@@ -35,10 +35,10 @@
 //!   windows are not the same statistic; compare outcomes, not curves.
 //! - **Flow control.** quinn's default stream receive window is 1.25 MB, which
 //!   on a 250 ms path is a hard ~40 Mbit/s ceiling regardless of the link. That
-//!   would be measuring quinn's default sizing, not the path — the same trap the
-//!   raw TCP control avoids by asking for 8 MiB socket buffers. So the windows
-//!   are raised here, symmetrically, to the same 8 MiB. This is the one tuning
-//!   knob touched, and it is touched to *stop* the reference being handicapped.
+//!   would be measuring quinn's default sizing, not the path — the same trap
+//!   the raw TCP control fell into twice with its socket buffers. So the windows
+//!   are raised here, symmetrically, to 8 MiB. This is the one tuning knob
+//!   touched, and it is touched to *stop* the reference being handicapped.
 //!
 //! ## Certificates
 //!
@@ -91,10 +91,15 @@ pub const SERVER_NAME: &str = "phantom-testd";
 /// Flow-control window, both directions, both ends.
 ///
 /// Sized well past the ~1 MB bandwidth-delay product of a 250 ms / 34 Mbit/s
-/// path so that flow control is never the binding constraint. Deliberately the
-/// same 8 MiB the raw TCP control asks the kernel for, for the same reason: a
-/// measurement bounded by a default buffer size reports the buffer, not the
-/// link.
+/// path so that flow control is never the binding constraint, for the reason a
+/// receive window has to be sized at all: a measurement bounded by a default
+/// buffer reports the buffer, not the link.
+///
+/// Not the same figure the raw TCP control asks for, and the difference is not
+/// an oversight. That control asks for 1 MiB because it also *sends*, and at
+/// 8 MiB it filled its own send buffer, made the queue into the round trip, and
+/// reported 1.34 Mbit/s on a link carrying 9.5. A receive window has no such
+/// failure mode: nothing here queues behind it.
 const FLOW_WINDOW: u64 = 8 * 1024 * 1024;
 
 /// Idle timeout. Long enough to survive the gaps between scenario phases on a
