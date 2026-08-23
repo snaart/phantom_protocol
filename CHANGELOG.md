@@ -510,6 +510,38 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
 
 ### Added
 
+- **The WAN harness now answers "what stopped the sender", instead of only "how fast did it
+  go".** `analyze.py` gained a per-sample census over every *sending* window series: at each
+  200 ms tick, whether the congestion window had no room, the bytes outstanding were against
+  the flow-control/send-buffer ceiling, the pacer's own `rate × min_rtt` was the meter, or the
+  window simply had headroom nobody used. The verdicts are ranked so they partition the
+  samples rather than overlapping. Beside the census it prints how much of the transfer was
+  spent still accelerating, when Startup ended and what the bandwidth estimate was worth by
+  then, how many gain cycles remained afterwards and what they are worth at 1.25× per four
+  round trips, and a round trip implied by `inflight` over the rate it actually retired at —
+  the last because `min_rtt` is a minimum over a ten-second filter and the profile's transfers
+  are ten seconds long, so on them it is very nearly a constant by construction.
+
+  Three things it deliberately refuses to do. A client-side `download` series is not a
+  sending side and is skipped saying so; the role is decided from the rows, because the file
+  name is wrong in both directions (`bidir` *is* one). `app_limited` is counted next to the
+  census and never inside it: the flag is raised by a drain that found no *unsent* segment,
+  which is equally the state of a stream whose buffer is full of unacknowledged ones, so on a
+  saturated transfer it reports an idle application at the moment the application is blocked.
+  And where the peer's flow-control window and the ARQ send buffer land within a few percent
+  of each other — which they do at the default frame size, by design — it says the two are
+  not separable from the record rather than picking one.
+
+- **`phantom-probe --upload-secs` and `--transfer-frame`.** The two levers those readings ask
+  for. The first lengthens the bulk upload: the profile windows are short relative to how long
+  a BBR-style controller takes to converge on a long path, and a transfer that spends most of
+  its round trips still raising its own estimate reports a convergence rate under the name of
+  a capacity. It carries the wall-clock transfer cap upward with it, because an upload longer
+  than the cap that bounds every transfer would otherwise be silently cut back to it. The
+  second changes the application frame size, which is the only term that moves the ARQ send
+  buffer's byte ceiling — that bound is a segment count — while leaving the peer's
+  flow-control window, a byte bound, exactly where it was.
+
 - **`handshake_repair` — the WAN harness now loses a `ServerHello` flight on purpose, because
   the path will not.** The listener's retained-flight repeat is pinned by the library's own
   tests and had never been observed working on a real path: four measurement runs across two
@@ -924,6 +956,15 @@ once it reaches 1.0.0. Pre-1.0 releases may have breaking changes between minors
   replay window are identical on every transport.
 
 ### Fixed
+
+- **`analyze.py` reported a stalled sender on every run, about a side that was never
+  sending.** The congestion-window section warned "window never left its 5600 B floor —
+  sender-bound, not link-bound" for the client's own `download` series, where the sender is
+  the daemon and the client's window sits at its floor with nothing outstanding because that
+  is what a receiver's congestion window does. Every run in every campaign carried the
+  warning, for every leg. The series' role is now read off the window and the bytes
+  outstanding rather than assumed, so the warning is left for the case it was written for: a
+  sender that really did not get a window.
 
 - **A lost `ServerHello` cost the whole PhantomUDP connect, and the client's retransmits
   bought nothing.** Measured on a real path: four connects in one campaign run failed with
