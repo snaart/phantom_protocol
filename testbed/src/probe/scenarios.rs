@@ -30,6 +30,7 @@ use crate::probe::conn::{
     self, connect_framed, connect_leg, connect_leg_resumed, connect_link, connect_link_staged,
     echo_once, error_kind, Endpoints, DRAIN_TIMEOUT, OP_TIMEOUT,
 };
+use crate::probe::converge;
 use crate::probe::relay::{Relay, RelayStats};
 use crate::proto::{Msg, PayloadGen};
 use crate::report::{
@@ -283,7 +284,132 @@ fn note_window_as(
 
 /// Per-frame bytes a `SINK` costs on top of its payload: the framing length
 /// prefix plus the verb and sequence number.
-const SINK_FRAME_OVERHEAD: u64 = 4 + 1 + 8;
+const SINK_FRAME_OVERHEAD: u64 = crate::framing::LEN_PREFIX as u64 + 1 + 8;
+
+/// Payload bytes a `SINK` gives up to its own verb and sequence number.
+///
+/// Held back so that a scenario driven at `n` bytes per frame offers `n` bytes
+/// of application message, not `n` plus a header. What that costs on the wire is
+/// [`sink_wire_bytes`], and the two differ by the length prefix alone.
+const SINK_PAYLOAD_HOLDBACK: usize = 1 + 8;
+
+/// What one `SINK` frame driven at `frame_size` costs on the wire.
+///
+/// The byte-ceiling sweep turns on this arithmetic — both candidate ceilings are
+/// stated in wire bytes, and one of them is stated in segments of wire bytes —
+/// so it is derived here and pinned against the encoder by a test rather than
+/// carried as a remembered constant.
+pub fn sink_wire_bytes(frame_size: usize) -> usize {
+    crate::framing::LEN_PREFIX + 1 + 8 + frame_size.saturating_sub(SINK_PAYLOAD_HOLDBACK)
+}
+
+/// The frame size whose wire form is exactly `segments` application chunks.
+///
+/// The ARQ send buffer is bounded in segments, and a frame is split into
+/// `ceil(wire_bytes / MAX_APP_CHUNK)` of them. A frame that fills its segments
+/// exactly is therefore the one that states the buffer's byte ceiling without a
+/// remainder, which is what makes a sweep rung's arithmetic exact rather than
+/// approximate.
+pub fn frame_filling_segments(segments: usize) -> u32 {
+    let wire = segments.max(1) * phantom_protocol::transport::mtu::MAX_APP_CHUNK;
+    // The inverse of `sink_wire_bytes`: the two differ by the length prefix.
+    (wire.saturating_sub(crate::framing::LEN_PREFIX)) as u32
+}
+
+/// Outcome of pouring frames into a session until a deadline.
+struct PourOutcome {
+    frames: u64,
+    /// The session refused a frame for longer than an operation budget. Not a
+    /// fault — it is the transport applying backpressure, and the point at which
+    /// an offered rate stops being offered.
+    stalled: bool,
+    error: Option<CoreError>,
+}
+
+/// Pour frames for `duration` with the congestion-window sampler running over
+/// exactly that interval, and stop it with the transfer.
+///
+/// The pairing is the point, and it is why the two calls are not left to the
+/// scenarios. A transfer's teardown asks the peer for its tally and waits, which
+/// on a full send buffer takes seconds; sampling through it appends rows where
+/// outstanding bytes are collapsing towards zero. Every reading taken over the
+/// tail of such a series — where a saturated sender sits, which is the one place
+/// a byte ceiling shows — is then partly a reading of the drain. The throughput
+/// figure covers the pour interval, so the window series must too.
+async fn burst_with_window(
+    link: Arc<dyn MsgLink>,
+    leg: Leg,
+    phase: &str,
+    frame_size: usize,
+    duration: Duration,
+    win: &mut WindowTracker,
+    sink: &mut SampleSink,
+) -> (PourOutcome, Vec<crate::report::WindowSample>) {
+    let recorder = WindowRecorder::start(link.clone(), leg, phase);
+    let poured = pour_frames(
+        link.as_ref(),
+        frame_size,
+        Instant::now() + duration,
+        win,
+        sink,
+    )
+    .await;
+    (poured, recorder.finish().await)
+}
+
+/// Offer fixed-size frames as fast as the session will take them, until the
+/// deadline.
+///
+/// Shared by `upload` and by the byte-ceiling sweep so that the two measure the
+/// same thing: a rung of the sweep is an upload at a different frame size, and a
+/// second copy of this loop would make that sentence false in whichever detail
+/// the copies came to differ by.
+async fn pour_frames(
+    link: &dyn MsgLink,
+    frame_size: usize,
+    deadline: Instant,
+    win: &mut WindowTracker,
+    sink: &mut SampleSink,
+) -> PourOutcome {
+    let mut gen = PayloadGen::new(4);
+    let payload = gen.fill(frame_size.saturating_sub(SINK_PAYLOAD_HOLDBACK));
+    let mut seq = 0u64;
+
+    while Instant::now() < deadline {
+        let wire = crate::framing::encode_framed(&Msg::Sink {
+            seq,
+            payload: payload.clone(),
+        });
+        let n = wire.len();
+        match tokio::time::timeout(OP_TIMEOUT, link.send_encoded(wire)).await {
+            Ok(Ok(())) => {
+                if let Some(s) = win.add(n) {
+                    sink.push(&s);
+                }
+            }
+            Ok(Err(e)) => {
+                return PourOutcome {
+                    frames: seq,
+                    stalled: false,
+                    error: Some(e),
+                }
+            }
+            Err(_) => {
+                return PourOutcome {
+                    frames: seq,
+                    stalled: true,
+                    error: None,
+                }
+            }
+        }
+        seq += 1;
+    }
+    PourOutcome {
+        frames: seq,
+        stalled: false,
+        error: None,
+    }
+}
 
 /// Rolling one-second throughput window.
 ///
@@ -292,7 +418,10 @@ const SINK_FRAME_OVERHEAD: u64 = 4 + 1 + 8;
 /// A per-second series makes the freeze visible as a hole.
 struct WindowTracker {
     leg: Leg,
-    direction: &'static str,
+    /// Owned rather than `&'static str` because the byte-ceiling sweep runs
+    /// several transfers within one scenario and each has to be separable in the
+    /// per-second series: its direction names the rung's frame size.
+    direction: String,
     started: Instant,
     window_start: Instant,
     window_bytes: u64,
@@ -302,11 +431,11 @@ struct WindowTracker {
 }
 
 impl WindowTracker {
-    fn new(leg: Leg, direction: &'static str) -> Self {
+    fn new(leg: Leg, direction: impl Into<String>) -> Self {
         let now = Instant::now();
         Self {
             leg,
-            direction,
+            direction: direction.into(),
             started: now,
             window_start: now,
             window_bytes: 0,
@@ -326,7 +455,7 @@ impl WindowTracker {
         if elapsed >= Duration::from_secs(1) {
             let s = ThroughputSample {
                 leg: self.leg,
-                direction: self.direction.to_string(),
+                direction: self.direction.clone(),
                 t_unix_ns: unix_nanos(),
                 window_bytes: self.window_bytes,
                 window_frames: self.window_frames,
@@ -1096,10 +1225,15 @@ pub async fn upload(
     ep: &Endpoints,
     pin: &[u8],
     leg: Leg,
-    duration: Duration,
+    window: &converge::UploadWindow,
     frame_size: usize,
 ) -> ScenarioOutput {
     let mut out = ScenarioOutput::new(leg, "upload");
+    // First note on the scenario, ahead of any rate it produces: whether this
+    // window can hold a convergence decides whether the rate below is a capacity
+    // or a convergence time, and the two are not the same number wearing
+    // different words.
+    out.note(window.note());
     let t0 = Instant::now();
     let framed = match connect_link(leg, ep, pin).await {
         Ok(s) => s,
@@ -1109,47 +1243,27 @@ pub async fn upload(
         }
     };
     out.mark(framed.as_ref(), "upload:begin").await;
-    let recorder = WindowRecorder::start(framed.clone(), leg, "upload");
 
-    let mut gen = PayloadGen::new(4);
-    let payload = gen.fill(frame_size.saturating_sub(9));
     let mut win = WindowTracker::new(leg, "upload");
-    let deadline = Instant::now() + duration;
-    let mut seq = 0u64;
-    let mut stalled = false;
-
-    while Instant::now() < deadline {
-        let wire = crate::framing::encode_framed(&Msg::Sink {
-            seq,
-            payload: payload.clone(),
-        });
-        let n = wire.len();
-        match tokio::time::timeout(OP_TIMEOUT, framed.send_encoded(wire)).await {
-            Ok(Ok(())) => {
-                if let Some(s) = win.add(n) {
-                    out.sink.push(&s);
-                }
-                out.summary.ok_count += 1;
-            }
-            Ok(Err(e)) => {
-                out.error(leg, "upload", "send", &e);
-                break;
-            }
-            Err(_) => {
-                // Not a fault: `send()` blocked longer than an operation budget
-                // because the session is already saturated. That is the
-                // transport applying backpressure, and it is the end of the
-                // measurement window, not an error in it.
-                stalled = true;
-                break;
-            }
-        }
-        seq += 1;
+    let (poured, window_samples) = burst_with_window(
+        framed.clone(),
+        leg,
+        "upload",
+        frame_size,
+        window.duration,
+        &mut win,
+        &mut out.sink,
+    )
+    .await;
+    let seq = poured.frames;
+    out.summary.ok_count += seq as usize;
+    if let Some(e) = &poured.error {
+        out.error(leg, "upload", "send", e);
     }
 
     let local = win.finish();
     out.summary.throughput = Some(local.clone());
-    if stalled {
+    if poured.stalled {
         out.note(
             "the send path applied backpressure before the window elapsed — the offered rate exceeded what the session would accept, which is the point at which this number saturates",
         );
@@ -1211,7 +1325,7 @@ pub async fn upload(
         }
     }
 
-    note_window(&mut out, &recorder.finish().await);
+    note_window(&mut out, &window_samples);
     if let Some(n) = framed.transport_note() {
         out.note(n);
     }
@@ -1491,6 +1605,10 @@ pub async fn bidir(
 
     stop.store(true, Ordering::Relaxed);
     let (up_frames, up_bytes) = uploader.await.unwrap_or((0, 0));
+    // Both halves of the exchange have stopped, so the transfer is over and the
+    // rest is teardown; a series that keeps sampling through the drain reports
+    // outstanding bytes collapsing as though the transfer had ended that way.
+    let window_samples = recorder.finish().await;
     let down_tp = down.finish();
     if capped {
         out.note(format!(
@@ -1509,13 +1627,254 @@ pub async fn bidir(
         Err((why, e)) => out.error(leg, "bidir", why.context(), &e),
     }
 
-    note_window(&mut out, &recorder.finish().await);
+    note_window(&mut out, &window_samples);
     if let Some(n) = framed.transport_note() {
         out.note(n);
     }
     out.mark(framed.as_ref(), "bidir:end").await;
     framed.close().await;
     out
+}
+
+// ── 6b. send_ceiling ────────────────────────────────────────────────────────
+
+/// Segments one stream's ARQ send buffer holds outstanding.
+///
+/// `transport::stream::MAX_PENDING_PACKETS`. It is the one term of this
+/// scenario's arithmetic that cannot be read from the library — the constant is
+/// `pub(crate)` — so it is stated here once, with its address, and written into
+/// every sample so that a reading is against the number this run used rather
+/// than against a copy kept in whatever tool is doing the reading.
+const SEND_BUFFER_SEGMENTS: u32 = 1024;
+
+/// Which byte ceiling holds a saturated sender, by moving the one term that
+/// separates them.
+///
+/// A sender with everything else out of the way sits against the lower of two
+/// bounds: the ARQ send buffer (`MAX_PENDING_PACKETS` **segments**) and the
+/// peer's advertised flow-control window (`MAX_SEND_WINDOW` **bytes**). The
+/// second was deliberately set just under what the first can hold, so at the
+/// frame size the rest of the matrix runs at they are 1.004x apart and no
+/// recorded field can say which of them a sender was held by.
+///
+/// The frame size is what tells them apart, because the buffer's byte figure
+/// scales with it and the window's does not. Each rung here is a saturating
+/// transfer at one frame size, and the rungs at the two ends are the ones that
+/// carry evidence: far below one application chunk the buffer binds by a factor
+/// of four, and at an exact multiple of a chunk the peer's window binds by 13%.
+/// A rung that settles on its own lower bound makes that bound real; two such
+/// rungs, one of each kind, make both real, and the ambiguous middle then
+/// follows from arithmetic rather than from a measurement that cannot resolve
+/// it. A rung that settles well below its own lower bound is the more
+/// interesting outcome: whatever stopped that sender was neither ceiling.
+///
+/// Each rung runs on a fresh session, so the controller starts from the same
+/// place in every one of them — reusing a session would hand the later rungs a
+/// bandwidth estimate the earlier ones had to climb to.
+pub async fn send_ceiling(
+    ep: &Endpoints,
+    pin: &[u8],
+    leg: Leg,
+    frames: &[u32],
+    window: &converge::UploadWindow,
+) -> ScenarioOutput {
+    let mut out = ScenarioOutput::new(leg, "send_ceiling");
+    // The rungs run for the upload's window because a rung is an upload: a
+    // sender that never saturates never reaches a ceiling, and then the sweep
+    // measures the climb instead of the bound.
+    out.note(format!(
+        "each rung is a saturating transfer at one frame size, over the same window as upload; {}",
+        window.note()
+    ));
+    out.note(format!(
+        "the two candidates: the ARQ send buffer, {SEND_BUFFER_SEGMENTS} segments (transport::stream::MAX_PENDING_PACKETS), and the peer's flow-control window, {} B (transport::stream::MAX_SEND_WINDOW); a frame occupies ceil(wire bytes / {} B) segments",
+        phantom_protocol::transport::stream::MAX_SEND_WINDOW,
+        phantom_protocol::transport::mtu::MAX_APP_CHUNK,
+    ));
+
+    for (idx, &frame) in frames.iter().enumerate() {
+        let rung = idx.min(u16::MAX as usize) as u16;
+        let sample = send_ceiling_rung(ep, pin, leg, rung, frame, window.duration, &mut out).await;
+        out.note(rung_reading(&sample));
+        out.sink.push(&sample);
+    }
+    out
+}
+
+/// One rung: connect, saturate, and record where the outstanding bytes settled.
+async fn send_ceiling_rung(
+    ep: &Endpoints,
+    pin: &[u8],
+    leg: Leg,
+    rung: u16,
+    frame: u32,
+    duration: Duration,
+    out: &mut ScenarioOutput,
+) -> crate::report::SendCeilingSample {
+    let frame_size = frame as usize;
+    let wire = sink_wire_bytes(frame_size);
+    let chunk = phantom_protocol::transport::mtu::MAX_APP_CHUNK;
+    let segments_per_frame = wire.div_ceil(chunk).max(1);
+    // The buffer holds whole segments, so a frame that does not fill its last
+    // one wastes the remainder — which is why the ceiling is stated in whole
+    // frames' worth of bytes rather than in `segments × chunk`.
+    let frames_buffered = (SEND_BUFFER_SEGMENTS as usize / segments_per_frame).max(1);
+    let arq_buffer_bytes = (frames_buffered * wire) as u64;
+
+    let mut sample = crate::report::SendCeilingSample {
+        leg,
+        t_unix_ns: unix_nanos(),
+        rung,
+        frame_bytes: frame,
+        wire_frame_bytes: wire as u32,
+        segments_per_frame: segments_per_frame as u32,
+        send_buffer_segments: SEND_BUFFER_SEGMENTS,
+        app_chunk_bytes: chunk as u32,
+        arq_buffer_bytes,
+        peer_window_bytes: phantom_protocol::transport::stream::MAX_SEND_WINDOW as u64,
+        window_ns: 0,
+        client_bytes: 0,
+        client_frames: 0,
+        megabits_per_sec: 0.0,
+        server_bytes: None,
+        server_frames: None,
+        window_samples: 0,
+        tail_samples: 0,
+        tail_share: converge::PLATEAU_SHARE,
+        inflight_tail: Summary::default(),
+        cwnd_tail: Summary::default(),
+        stalled: false,
+        error: None,
+    };
+
+    let t0 = Instant::now();
+    let link = match connect_link(leg, ep, pin).await {
+        Ok(l) => l,
+        Err(e) => {
+            out.error_after(
+                leg,
+                "send_ceiling",
+                &format!("connect at {frame} B"),
+                &e,
+                t0,
+            );
+            sample.error = Some(format!("{e:?}"));
+            return sample;
+        }
+    };
+
+    let phase = format!("send_ceiling:{frame}");
+    out.mark(link.as_ref(), format!("{phase}:begin")).await;
+
+    let mut win = WindowTracker::new(leg, phase.clone());
+    // The sampler covers the burst and stops with it. The tail statistic below
+    // is where a saturated sender sat, and the drain is precisely the interval
+    // in which outstanding bytes fall away from whatever bound was holding
+    // them — see [`burst_with_window`].
+    let (poured, samples) = burst_with_window(
+        link.clone(),
+        leg,
+        &phase,
+        frame_size,
+        duration,
+        &mut win,
+        &mut out.sink,
+    )
+    .await;
+    out.summary.ok_count += poured.frames as usize;
+    if let Some(e) = &poured.error {
+        out.error(leg, "send_ceiling", &format!("send at {frame} B"), e);
+        sample.error = Some(format!("{e:?}"));
+    }
+    sample.stalled = poured.stalled;
+
+    let local = win.finish();
+    sample.client_bytes = local.bytes;
+    sample.client_frames = local.frames;
+    sample.window_ns = local.duration_ns;
+    sample.megabits_per_sec = local.megabits_per_sec;
+
+    match sink_end_and_report(link.as_ref(), poured.frames, win.cumulative).await {
+        Ok((frames, bytes, _, _)) => {
+            sample.server_frames = Some(frames);
+            sample.server_bytes = Some(bytes);
+        }
+        Err((why, e)) => {
+            out.error(leg, "send_ceiling", why.context(), &e);
+        }
+    }
+
+    let (infl, cwnd, taken) = tail_of(&samples, converge::PLATEAU_SHARE);
+    sample.window_samples = samples.len();
+    sample.tail_samples = taken;
+    sample.inflight_tail = infl;
+    sample.cwnd_tail = cwnd;
+    note_window(out, &samples);
+
+    out.mark(link.as_ref(), format!("{phase}:end")).await;
+    link.close().await;
+    sample
+}
+
+/// Bytes outstanding and congestion window over the last `share` of a window
+/// series, plus how many samples that was.
+///
+/// The tail rather than the whole: every transfer begins with a controller that
+/// has no estimate yet, and a distribution taken across that describes the climb.
+/// The share is the same quarter a converged transfer's capacity is read over, so
+/// the two statements are about the same part of the same transfer.
+fn tail_of(samples: &[crate::report::WindowSample], share: f64) -> (Summary, Summary, usize) {
+    if samples.is_empty() {
+        return (Summary::default(), Summary::default(), 0);
+    }
+    let want = ((samples.len() as f64 * share).ceil() as usize).clamp(1, samples.len());
+    let tail = &samples[samples.len() - want..];
+    let infl: Vec<u64> = tail.iter().map(|w| w.inflight_bytes).collect();
+    let cwnd: Vec<u64> = tail.iter().map(|w| w.cwnd_bytes).collect();
+    (Summary::of_u64(&infl), Summary::of_u64(&cwnd), want)
+}
+
+/// The rung restated in one line: its two candidates, which of them is the lower
+/// bound at this frame size, and where the outstanding bytes actually settled.
+///
+/// Deliberately no verdict. Which ceiling the *sweep* shows binding is a reading
+/// across rungs, and it lives in `analyze.py` — the tool that re-derives every
+/// number in a run from the raw records and is checked by its own self-test. A
+/// second implementation of that rule here would be a second definition, and
+/// this project has already had two tools disagree about a median on identical
+/// data.
+fn rung_reading(s: &crate::report::SendCeilingSample) -> String {
+    if let Some(e) = &s.error {
+        return format!("{} B frames: no reading — {e}", s.frame_bytes);
+    }
+    let (binding, which) = if s.arq_buffer_bytes <= s.peer_window_bytes {
+        (s.arq_buffer_bytes, "send buffer")
+    } else {
+        (s.peer_window_bytes, "peer window")
+    };
+    let other = s.arq_buffer_bytes.max(s.peer_window_bytes);
+    let reached = if binding > 0 {
+        s.inflight_tail.p90 / binding as f64
+    } else {
+        0.0
+    };
+    format!(
+        "{frame} B frames ({wire} B on the wire, {seg} segment(s) each): send buffer {arq} B, peer window {peer} B — the lower is the {which}, by {sep:.2}x; outstanding bytes over the last quarter p50 {p50:.0} B, p90 {p90:.0} B, max {max:.0} B ({reached:.2} of that bound), congestion window p50 {cwnd:.0} B",
+        frame = s.frame_bytes,
+        wire = s.wire_frame_bytes,
+        seg = s.segments_per_frame,
+        arq = s.arq_buffer_bytes,
+        peer = s.peer_window_bytes,
+        sep = if binding > 0 {
+            other as f64 / binding as f64
+        } else {
+            0.0
+        },
+        p50 = s.inflight_tail.p50,
+        p90 = s.inflight_tail.p90,
+        max = s.inflight_tail.max,
+        cwnd = s.cwnd_tail.p50,
+    )
 }
 
 // ── 7. streams ──────────────────────────────────────────────────────────────
@@ -3980,6 +4339,296 @@ mod tests {
     fn unused_pin() -> Vec<u8> {
         let (_sk, vk) = HybridSigningKey::generate();
         vk.to_bytes()
+    }
+
+    /// The frame arithmetic the byte-ceiling sweep rests on has to be the
+    /// encoder's, not a description of it. Both ceilings are stated in wire
+    /// bytes, and one of them in segments of wire bytes, so a frame that is one
+    /// byte off the encoder puts a rung on the wrong side of a segment boundary.
+    #[test]
+    fn a_frames_wire_cost_is_taken_from_the_encoder_and_not_described() {
+        for frame in [64usize, 256, 1024, 2308, 4620] {
+            let mut gen = PayloadGen::new(4);
+            let wire = crate::framing::encode_framed(&Msg::Sink {
+                seq: 0,
+                payload: gen.fill(frame.saturating_sub(SINK_PAYLOAD_HOLDBACK)),
+            });
+            assert_eq!(
+                sink_wire_bytes(frame),
+                wire.len(),
+                "the sweep's arithmetic disagrees with the encoder at {frame} B"
+            );
+        }
+    }
+
+    /// A rung whose wire frame fills its segments exactly is what makes the send
+    /// buffer's byte ceiling an exact figure rather than one with a remainder,
+    /// and the remainder is the whole margin the sweep works in.
+    #[test]
+    fn a_frame_sized_to_fill_segments_fills_them_exactly() {
+        let chunk = phantom_protocol::transport::mtu::MAX_APP_CHUNK;
+        for segments in 1..=4usize {
+            let frame = frame_filling_segments(segments) as usize;
+            let wire = sink_wire_bytes(frame);
+            assert_eq!(wire, segments * chunk, "{segments} segments");
+            assert_eq!(
+                wire.div_ceil(chunk),
+                segments,
+                "no partial trailing segment"
+            );
+        }
+        // And the two ends of a sweep must actually separate the ceilings: far
+        // below a chunk the send buffer binds, at a whole multiple of one the
+        // peer's window does. A ladder where both ends fell on the same side
+        // would run for the same wall clock and settle nothing.
+        let peer = phantom_protocol::transport::stream::MAX_SEND_WINDOW as u64;
+        let small = sink_wire_bytes(256) as u64 * SEND_BUFFER_SEGMENTS as u64;
+        assert!(small * 3 < peer, "a small frame must bind on the buffer");
+        let big_frames = SEND_BUFFER_SEGMENTS as u64 / 2;
+        let big = big_frames * sink_wire_bytes(frame_filling_segments(2) as usize) as u64;
+        assert!(
+            big > peer,
+            "a two-segment frame must bind on the peer window"
+        );
+    }
+
+    /// The tail statistic is where a saturated sender sits. Taken over the whole
+    /// series it would describe the climb, which is the error the whole
+    /// convergence work exists to stop.
+    #[test]
+    fn the_tail_statistic_covers_the_last_quarter_and_nothing_earlier() {
+        let series: Vec<crate::report::WindowSample> = (0..20)
+            .map(|i| window_row(i, if i < 15 { 1000 } else { 500_000 }))
+            .collect();
+
+        let (infl, cwnd, taken) = tail_of(&series, 0.25);
+        assert_eq!(taken, 5, "a quarter of twenty samples");
+        assert_eq!(infl.min, 500_000.0, "nothing from the climb may enter it");
+        assert_eq!(infl.p50, 500_000.0);
+        assert_eq!(cwnd.count, 5);
+
+        // Degenerate shapes must not panic or report a tail they did not have.
+        assert_eq!(tail_of(&[], 0.25).2, 0);
+        assert_eq!(
+            tail_of(&series[..1], 0.25).2,
+            1,
+            "one sample is its own tail"
+        );
+    }
+
+    /// The rung's line has to name both candidates, which is lower, and where
+    /// the bytes settled — but never which one the sweep shows binding. That is
+    /// a reading across rungs and lives in one place, `analyze.py`, because two
+    /// implementations of one definition have already disagreed here.
+    #[test]
+    fn a_rungs_line_states_both_candidates_and_claims_no_verdict() {
+        let mut s = ceiling_sample(256);
+        s.inflight_tail = Summary::of_u64(&[260_000, 264_000, 266_000]);
+        s.cwnd_tail = Summary::of_u64(&[900_000]);
+
+        let line = rung_reading(&s);
+        assert!(line.contains("send buffer 266240 B"), "{line}");
+        assert!(line.contains("peer window 1048576 B"), "{line}");
+        assert!(line.contains("the lower is the send buffer"), "{line}");
+        assert!(
+            line.contains("3.94x"),
+            "the separation must be stated: {line}"
+        );
+        for banned in ["binds", "bound by", "verdict"] {
+            assert!(
+                !line.contains(banned),
+                "a single rung must not claim the sweep's reading: {line}"
+            );
+        }
+
+        // A rung that could not run says so instead of reporting zeroes as a
+        // measurement of a sender that sent nothing.
+        let mut failed = ceiling_sample(256);
+        failed.error = Some("Timeout".into());
+        assert!(rung_reading(&failed).contains("no reading"));
+    }
+
+    /// A rung driven at a frame larger than one application chunk states the
+    /// buffer's ceiling in whole frames, because the buffer holds whole segments
+    /// and a frame that straddles two of them cannot be half-buffered.
+    #[test]
+    fn the_buffer_ceiling_is_whole_frames_of_whole_segments() {
+        let two = ceiling_sample(frame_filling_segments(2));
+        assert_eq!(two.segments_per_frame, 2);
+        assert_eq!(
+            two.arq_buffer_bytes,
+            (SEND_BUFFER_SEGMENTS as u64 / 2) * two.wire_frame_bytes as u64
+        );
+        assert!(
+            two.arq_buffer_bytes > two.peer_window_bytes,
+            "at this frame the peer's window is the lower bound — that is the point of the rung"
+        );
+    }
+
+    /// A window row with the two fields the tail statistic reads.
+    fn window_row(i: u64, inflight: u64) -> crate::report::WindowSample {
+        crate::report::WindowSample {
+            leg: Leg::Udp,
+            phase: "send_ceiling:256".into(),
+            t_unix_ns: 1_000_000_000 + i * 200_000_000,
+            elapsed_ms: i * 200,
+            cwnd_bytes: 2_000_000,
+            inflight_bytes: inflight,
+            bottleneck_bw_bps: 1_000_000,
+            last_delivery_rate_bps: 1_000_000,
+            bw_filter_window_ms: 10_000,
+            pacing_rate_bps: 1_000_000,
+            min_rtt_us: 200_000,
+            delivered_bytes: i * 100_000,
+            state: "probe_bw".into(),
+            app_limited: false,
+        }
+    }
+
+    /// A rung record with the ceiling arithmetic filled in exactly as the
+    /// scenario fills it, and nothing measured yet.
+    fn ceiling_sample(frame: u32) -> crate::report::SendCeilingSample {
+        let wire = sink_wire_bytes(frame as usize);
+        let chunk = phantom_protocol::transport::mtu::MAX_APP_CHUNK;
+        let seg = wire.div_ceil(chunk).max(1);
+        crate::report::SendCeilingSample {
+            leg: Leg::Udp,
+            t_unix_ns: 0,
+            rung: 0,
+            frame_bytes: frame,
+            wire_frame_bytes: wire as u32,
+            segments_per_frame: seg as u32,
+            send_buffer_segments: SEND_BUFFER_SEGMENTS,
+            app_chunk_bytes: chunk as u32,
+            arq_buffer_bytes: ((SEND_BUFFER_SEGMENTS as usize / seg).max(1) * wire) as u64,
+            peer_window_bytes: phantom_protocol::transport::stream::MAX_SEND_WINDOW as u64,
+            window_ns: 0,
+            client_bytes: 0,
+            client_frames: 0,
+            megabits_per_sec: 0.0,
+            server_bytes: None,
+            server_frames: None,
+            window_samples: 0,
+            tail_samples: 0,
+            tail_share: 0.25,
+            inflight_tail: Summary::default(),
+            cwnd_tail: Summary::default(),
+            stalled: false,
+            error: None,
+        }
+    }
+
+    /// The send loop `upload` and every sweep rung share. A deadline already
+    /// past must offer nothing rather than one frame: a rung of one frame is a
+    /// measurement of the loop's own structure.
+    #[tokio::test]
+    async fn the_shared_send_loop_offers_nothing_after_its_deadline() {
+        let link = ScriptedLink::default();
+        let mut win = WindowTracker::new(Leg::Udp, "upload");
+        let mut sink = SampleSink::new();
+        let out = pour_frames(&link, 256, Instant::now(), &mut win, &mut sink).await;
+        assert_eq!(out.frames, 0);
+        assert!(out.error.is_none() && !out.stalled);
+        assert_eq!(win.cumulative, 0);
+    }
+
+    /// And a link that refuses reports the refusal rather than counting the
+    /// frame it could not send.
+    #[tokio::test]
+    async fn the_shared_send_loop_reports_a_refusal_without_counting_the_frame() {
+        let link = ScriptedLink::failing_sends();
+        let mut win = WindowTracker::new(Leg::Udp, "send_ceiling:256");
+        let mut sink = SampleSink::new();
+        let out = pour_frames(
+            &link,
+            256,
+            Instant::now() + Duration::from_secs(5),
+            &mut win,
+            &mut sink,
+        )
+        .await;
+        assert_eq!(out.frames, 0);
+        assert_eq!(
+            win.cumulative, 0,
+            "a refused frame is not bytes on the wire"
+        );
+        assert!(matches!(out.error, Some(CoreError::ConnectionClosed)));
+    }
+
+    /// The sampler has to stop with the transfer, not with the session.
+    ///
+    /// Teardown asks the peer for its tally and waits behind everything still
+    /// in the send buffer, which on a saturated transfer is seconds. Rows taken
+    /// through that show outstanding bytes collapsing towards zero, and the tail
+    /// of the series — the one place a byte ceiling is visible, and where the
+    /// convergence reading is taken — becomes partly a reading of the drain.
+    // Two threads deliberately: the scripted link answers a send without ever
+    // awaiting anything, so on a single-threaded runtime the pour loop never
+    // yields and the sampler task — which is the thing under test — would not
+    // get to run at all. A real link awaits its socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_window_sampler_stops_with_the_transfer_and_not_with_the_session() {
+        let link = Arc::new(ScriptedLink::default());
+        let calls = link.window_calls.clone();
+        let mut win = WindowTracker::new(Leg::Udp, "upload");
+        let mut sink = SampleSink::new();
+
+        let (poured, samples) = burst_with_window(
+            link.clone(),
+            Leg::Udp,
+            "upload",
+            256,
+            Duration::from_millis(500),
+            &mut win,
+            &mut sink,
+        )
+        .await;
+
+        assert!(poured.frames > 0, "the burst must have offered something");
+        let last = samples.last().expect("the sampler must have run at all");
+        // No row may lie past the burst. The bound is the burst plus one sample
+        // interval, and it is not timing-sensitive in the direction that
+        // matters: the sampler reads its elapsed time immediately after testing
+        // the stop flag, so a late wake-up finds the flag set and takes no
+        // sample at all. A drain folded into this series would put rows seconds
+        // past the burst, which is what this excludes.
+        assert!(
+            last.elapsed_ms <= 500 + WindowRecorder::INTERVAL.as_millis() as u64,
+            "a row {} ms into a 500 ms burst is a row from the teardown",
+            last.elapsed_ms
+        );
+        let served = calls.load(Ordering::Relaxed);
+        // Whatever the scenario does next — and what it does next is wait out a
+        // drain — no further row may join the series.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            served,
+            "the sampler kept running past the transfer it was sampling"
+        );
+    }
+
+    /// Frames that land are counted at their wire cost, which is the unit both
+    /// byte ceilings are stated in.
+    #[tokio::test]
+    async fn the_shared_send_loop_counts_frames_at_their_wire_cost() {
+        let link = ScriptedLink::default();
+        let mut win = WindowTracker::new(Leg::Udp, "upload");
+        let mut sink = SampleSink::new();
+        let out = pour_frames(
+            &link,
+            256,
+            Instant::now() + Duration::from_millis(30),
+            &mut win,
+            &mut sink,
+        )
+        .await;
+        assert!(out.frames > 0, "a live link must have taken some frames");
+        assert_eq!(
+            win.cumulative,
+            out.frames * sink_wire_bytes(256) as u64,
+            "the byte tally must be frames at their wire cost"
+        );
     }
 
     /// A concurrent session that never connected is a session the run intended

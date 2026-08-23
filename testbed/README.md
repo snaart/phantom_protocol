@@ -132,35 +132,62 @@ the longest scenario for almost no extra information.
 
 Useful flags: `--legs udp,tcp,mimic,quic,raw_tcp,raw_udp`,
 `--only rtt_sweep,upload`, `--rtt-sizes 64,1024,8192`, `--soak-secs`,
-`--concurrency`, `--upload-secs`, `--transfer-frame`, `--capture-iface`,
-`--no-upload`.
+`--concurrency`, `--upload-secs`, `--upload-converge`, `--transfer-frame`,
+`--capture-iface`, `--no-upload`.
 
-The last two exist to settle questions the default matrix cannot, and both are
+Three of those exist to settle questions the default matrix cannot, and all are
 described under "Reading a run" below, where the readings they answer live:
 
-- `--upload-secs` lengthens the bulk upload. The profile windows are short
-  relative to how long a BBR-style controller takes to converge on a long path —
-  `smoke`'s ten seconds is about fifty round trips at 200 ms — and a transfer
-  that spends most of them still raising its own bandwidth estimate reports a
-  convergence rate under the name of a capacity. It carries `transfer_cap`
+- `--upload-converge` sizes each bulk upload from the round trip the run itself
+  measures instead of from a number of seconds. **Convergence is not counted in
+  seconds.** Startup costs round trips; the gain cycle that follows raises the
+  bandwidth estimate by a quarter per four round trips; both terms are round
+  trips, so a window fixed in seconds gives a long path *less* convergence than a
+  short one, which is backwards. The derived window is **110 round trips** — 16
+  for Startup, 67 for a 40× climb at 1.25× per four rounds, and a further quarter
+  so the last quarter of the transfer is a plateau rather than the top of the
+  ramp. That costs **22 s on a 200 ms path and 25 s on a 230 ms one**, per upload
+  and per leg; the byte-ceiling sweep's rungs use the same window, so a `smoke`
+  run over four legs (four uploads plus two sweep rungs, 10 s each by default)
+  spends about **a minute and a half** more than its fixed-window form on a
+  230 ms path. On `standard` the flag would *shorten* the uploads: its fixed 60 s
+  is 261 round trips there, already past what the derivation asks for — which the
+  upload's own note says, so a fixed window that is long enough is not made to
+  look suspect. The
+  arithmetic, its measured inputs, and the cost figure are in
+  [`probe::converge`](src/probe/converge.rs) with the tests that pin them. It
+  needs `clock_sync`, which measures the round trip, and a run that filters that
+  out is refused rather than quietly falling back.
+- `--upload-secs` sets the window in seconds instead. It carries `transfer_cap`
   upward with it, because an upload longer than the wall-clock cap that bounds
-  every transfer would otherwise be silently cut back to the cap.
-- `--transfer-frame` changes the application frame size. It is the only knob
-  that moves the ARQ send buffer's byte ceiling — that bound is
-  `MAX_PENDING_PACKETS` **segments**, so its byte figure scales with the frame —
-  while leaving the peer's flow-control window, a byte bound, exactly where it
-  was. At the default 1024 the two land within half a percent of each other.
+  every transfer would otherwise be silently cut back to the cap. The two flags
+  are exclusive: they answer the same question differently and the loser would be
+  invisible.
+- `--transfer-frame` changes the application frame size for `upload`, `download`
+  and `bidir`. It is the only knob that moves the ARQ send buffer's byte ceiling
+  — that bound is `MAX_PENDING_PACKETS` **segments**, so its byte figure scales
+  with the frame — while leaving the peer's flow-control window, a byte bound,
+  exactly where it was. At the default 1024 the two land within half a percent of
+  each other. The `send_ceiling` scenario walks that knob on its own; this flag
+  is for asking the rest of the matrix the same question.
+
+Whatever the window, the run states what it is and what it can hold: every upload
+carries a note saying how many round trips its window was and whether that is
+enough for the estimate to converge, and the same line lands in the run's
+caveats. A ten-second upload on a 191 ms path says so in the words *this window
+cannot converge, so its mean rate is a convergence time and not a capacity*.
 
 ## Scenarios
 
 `clock_sync`, `handshake`, `handshake_repair`, `wire_capture`, `rtt_sweep`,
-`message_integrity`, `upload`, `download`, `bidir`, `streams`, `zero_rtt`,
-`rekey`, `migration`, `concurrency`, `negative`, `liveness_soak`, and the
-raw-leg baselines (`rtt_sweep`, `throughput`, `downstream`, `upstream`).
+`message_integrity`, `upload`, `download`, `bidir`, `send_ceiling`, `streams`,
+`zero_rtt`, `rekey`, `migration`, `concurrency`, `negative`, `liveness_soak`, and
+the raw-leg baselines (`rtt_sweep`, `throughput`, `downstream`, `upstream`).
 
-`upload`, `download` and `bidir` additionally record the sender's congestion-control
-state throughout, and the daemon reports its own in `STATS` — during a download the
-server is the sender, so the client's window is not the one that governs it.
+`upload`, `download`, `bidir` and every rung of `send_ceiling` additionally record
+the sender's congestion-control state throughout, and the daemon reports its own
+in `STATS` — during a download the server is the sender, so the client's window is
+not the one that governs it.
 
 ### `handshake_repair`: lose one reply flight on purpose
 
@@ -352,6 +379,56 @@ that only runs as root is one that gets switched off the first time it is
 inconvenient. The privileged path stays the operator's; the unprivileged one is
 what guards the property on every commit.
 
+### `send_ceiling`: which byte ceiling holds a saturated sender
+
+A sender with congestion control and the pacer out of the way sits against the
+lower of two byte bounds, and they are not the same defect:
+
+| bound | unit | what it means when it binds |
+|---|---|---|
+| ARQ send buffer, `MAX_PENDING_PACKETS` | **segments** | this side is holding as many unacknowledged segments as it will hold — a local memory bound |
+| peer flow-control window, `MAX_SEND_WINDOW` | **bytes** | the receiver has not opened its window further — a bound the peer sets |
+
+`MAX_RECV_WINDOW` was deliberately set just under what the send buffer can hold,
+so at the 1024 B frame the rest of the matrix runs at the two are 1 052 672 B and
+1 048 576 B — **1.004× apart**. No field of a window sample distinguishes a sender
+held by one from a sender held by the other, and a measured run has already sat
+at 1 019 776 B outstanding without the artifact being able to say which bound
+that was.
+
+The frame size is the only term they do not share: the buffer's byte figure
+scales with it and the window's does not. So each rung of this scenario is a
+saturating transfer at one frame size, and the rungs that carry evidence are the
+ones at the ends:
+
+| rung | wire frame | buffer | peer window | lower, and by |
+|---|---|---|---|---|
+| 256 B | 260 B | 266 240 B | 1 048 576 B | **buffer**, 3.94× |
+| 1024 B (the default) | 1028 B | 1 052 672 B | 1 048 576 B | peer window, 1.004× — settles nothing |
+| 2308 B | 2312 B (2 chunks) | 1 183 744 B | 1 048 576 B | **peer window**, 1.13× |
+
+**What the sweep can and cannot conclude.** A single rung confirms only that the
+sender obeys `min(buffer, window)`, which was never in doubt — at every frame
+size one of them is lower by construction. The reading is across rungs: a rung at
+each end settling on its own lower bound makes *both* bounds real, and which one
+binds at any other frame size then follows from arithmetic (they swap at
+`MAX_SEND_WINDOW / MAX_PENDING_PACKETS` = 1024 B on the wire, four bytes below
+the default frame). The outcome worth having is the other one: a rung that
+settles well short of the bound it had room to reach says whatever held that
+sender was **neither** ceiling, and the census above it says what did.
+
+Each rung is a fresh session, so every rung's controller starts from the same
+place; reusing one would hand the later rungs an estimate the earlier ones had to
+climb to. Rungs run for the same window as `upload`, because a rung that never
+saturates never reaches a ceiling — `analyze.py` reports such a rung as *never
+saturated* rather than as a bound that did not bind. It runs on one leg (the UDP
+leg when present), like the soak and for the same reason: each rung is a whole
+transfer, and the bounds live in code every Phantom leg shares.
+
+Both candidates and the three library constants behind them travel **in each
+record**, so a reading a year from now is against the numbers this run used
+rather than against a copy kept in whatever tool is doing the reading.
+
 ### `downstream` and `upstream`: the two one-way ladders
 
 An echo bounds the two directions together and neither of them alone, so a
@@ -471,12 +548,57 @@ daemon is unchanged by any of this — it echoes bytes and keeps no state, so th
 sequence number and stamp ride in what was already filler, at the same datagram
 size, on the same rate ladder.
 
+Because this is the precondition for a whole class of work and has silently gone
+unmet for three campaigns, both ladders' reordering figures are printed **at the
+top** of `analyze.py`'s report, before anything that would depend on them, with
+the run's own verdict on whether it can support such work at all. A run that
+shows reordering is meant to be impossible to walk past.
+
+### What a reordering investigation needs from a run before it can begin
+
+Nothing about a transport's reordering tolerance can be worked on from a run that
+does not meet all of these. Each one has cost a false start.
+
+1. **Reordering in the direction under study, from that run's own one-way
+   control.** The round-trip echo bounds the two directions together and
+   attributes neither; a distance measured there cannot size a threshold that
+   will be applied in one direction. `raw_udp_upstream` is the denominator for
+   anything about sending, `raw_udp_downstream` for anything about receiving.
+2. **On an admissible rung.** A rung whose sender never reached its own offer
+   measures the sender's scheduler; its reordering is partly the instrument's.
+3. **With the distance tail inside the receiver's horizon.** When the worst
+   distance reaches the 4096-slot window, the tail is the instrument's rather
+   than the path's, and a threshold sized on it is sized on this harness.
+   `analyze.py` says so where it happens.
+4. **With loss from the same rung beside it.** The two trade off, and a rule that
+   declares reordering as loss is exactly what a tolerance exists to prevent: the
+   same route has given 13.4% reordering at 0.12% loss and 0% reordering at 7.69%
+   loss in adjacent runs.
+5. **In at least two runs.** By the rule above, one run is that run's weather. A
+   path property observed once is not a property.
+6. **With a positive control.** A search that found nothing is worth nothing
+   until it is shown capable of finding something — for reordering that means the
+   same instrument, on the same run, reporting it where it does occur (another
+   rung, another direction, or a deliberately reordered rung).
+7. **With the protocol numbers from the same run**, because the question is
+   always what a *transport* did on a path that reordered, and path capacity
+   moves tenfold between runs.
+
+And one thing such an investigation may not conclude, recorded here because it
+has been proposed twice and rejected twice: **no threshold may be learned from
+the timing or content of the peer's acknowledgements.** A sender cannot
+distinguish "the peer received it late" from "the peer acknowledged it late" —
+they are one observation — so any tolerance derived from acknowledgement order is
+a quantity the peer writes. That includes a learned reordering allowance and a
+purely time-based rule taking the maximum of smoothed and latest RTT.
+
 ### What the reference leg covers
 
 | Scenario | On `quic` |
 |---|---|
 | `handshake`, `rtt_sweep`, `upload`, `download`, `bidir`, `concurrency` | runs — the same code, over the same application protocol |
 | `handshake_repair` | skipped — QUIC acknowledges and retransmits its own handshake packets in every implementation, so the failure this exists to catch cannot occur there and the counters it reads have no counterpart |
+| `send_ceiling` | skipped — it separates two of this protocol's own byte bounds by moving the frame size; quinn has neither in that shape and reports no bytes in flight, so its rungs would carry no reading |
 | `clock_sync` | skipped — the run's clock offset is estimated once, on a Phantom leg |
 | `message_integrity` | skipped — it measures a property of `PhantomSession::send()`; QUIC streams have no message boundaries at all, by specification |
 | `streams` | skipped — the leg deliberately uses one bidirectional stream so the byte-pipe comparison is like-for-like |
@@ -502,13 +624,20 @@ Client, under `results/<run-id>/`:
 - `samples/<leg>/<scenario>.window.jsonl` — the congestion window sampled every 200 ms
   through each bulk transfer: cwnd, bytes in flight, bandwidth estimate, BBR phase,
   app-limited flag. This is what separates a sender-bound transfer from a slow link;
-  throughput alone cannot.
+  throughput alone cannot. The series covers the transfer and **not** the teardown
+  that follows it: a drain's rows are exactly the rows in which outstanding bytes
+  collapse, and they would land in the tail that both the ceiling reading and the
+  convergence reading are taken over
   **On the `quic` leg only `cwnd_bytes` and `min_rtt_us` carry values**, and
   `min_rtt_us` holds quinn's *smoothed* RTT rather than a windowed minimum;
   quinn exposes no bytes-in-flight, bandwidth estimate, pacing rate, delivered
   total or app-limited flag, so those stay zero rather than being approximated,
   and `state` reads `quic:cubic`. quinn's loss and MTU counters, which have no
   field in the record, appear in each transfer's summary notes instead
+- `samples/<leg>/send_ceiling.jsonl` — one record per frame size of the
+  byte-ceiling sweep: both candidate bounds, the library constants they were
+  computed from, and the bytes outstanding over the transfer's last quarter. Its
+  window series lands in `send_ceiling.window.jsonl`, one `phase` per rung
 - `samples/<leg>/wire_capture.pcap` — the raw capture the encryption check was
   derived from, kept next to its own `wire_capture.jsonl`. Absent when the run
   had no capture rights, in which case the record says so and why
@@ -659,8 +788,40 @@ the send buffer can hold — window granted past that point is memory a receiver
 commits for data that cannot arrive. At the default 1024 B frame they are
 1 048 576 B and 1 052 672 B, and no field in the record distinguishes a sender
 held by one from a sender held by the other. The section says so where it
-applies rather than picking a winner. Halving `--transfer-frame` separates them
-by two, because only one of the two ceilings moves.
+applies rather than picking a winner, and the `send_ceiling` sweep above is what
+resolves it: only one of the two ceilings moves with the frame size. Its reading
+is printed under "Which byte ceiling held the sender".
+
+### The shape of a transfer: a capacity, or a refusal to name one
+
+A mean rate is a capacity only if the transfer reached a rate at all. A BBR-style
+controller does not begin at the path's rate — it climbs to it — so a transfer
+that ends mid-climb reports its own convergence time under the name of a
+capacity. Six measured uploads did exactly that: 12–19% of their bytes in the
+first half, 44–62% in the last quarter, with the bandwidth estimate reaching half
+its own peak 77–91% of the way through.
+
+So every sending-side series gets a shape, printed with the census and computed
+in one place ([`transfer_shape`](analyze.py)) for the client's uploads and for
+the daemon's own per-session series alike:
+
+| | |
+|---|---|
+| **capacity** | the rate over the transfer's **last quarter** — and only when it converged |
+| **convergence** | when delivery first reached 90% of that final rate, in ms and as a share of the transfer |
+| **plateau** | whether the bandwidth estimate stopped climbing at all: it must have come within 5% of its own best by 80% of the way through |
+
+A transfer that did not converge is reported as `NOT CONVERGED` **and no capacity
+figure is printed for it**, in the field as well as in the prose — the record
+carries `capacity_bps: null`, so a reader joining these records cannot quote a
+ramp's mean as a capacity by accident. The line says what the mean actually is (a
+convergence time) and points at `--upload-converge`.
+
+The two bars are the gain cycle's own constants rather than round numbers: 90% of
+the final rate is above what one probing round moves, and a window derived by
+`--upload-converge` places convergence at 75% of the transfer, so a run sized
+that way clears the 80% plateau bar with margin. The design target is stricter
+than the acceptance test, which is the right way round.
 
 Four library constants the window rows do not carry are printed at the top of
 the section with the file they come from. Everything else in `analyze.py` is

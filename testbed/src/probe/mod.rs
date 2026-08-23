@@ -6,6 +6,7 @@
 //! all-or-nothing writer would turn any interruption into a total loss.
 
 pub mod conn;
+pub mod converge;
 pub mod relay;
 pub mod scenarios;
 
@@ -66,6 +67,22 @@ pub struct Params {
     pub upload: Duration,
     pub download_bytes: u64,
     pub transfer_frame: u32,
+    /// Frame sizes the `send_ceiling` sweep walks.
+    ///
+    /// Two of the three are what make the sweep able to answer anything, and
+    /// which two is arithmetic rather than taste. The ARQ send buffer bounds a
+    /// stream in **segments**, so its byte ceiling scales with the frame; the
+    /// peer's flow-control window is a byte bound and does not. At a frame near
+    /// one application chunk the two land within half a percent of each other
+    /// and no recorded field separates them — which is exactly the default the
+    /// `upload` scenario already runs at. So the sweep spends its rungs on the
+    /// two ends where they *are* separated: one frame far below a chunk, where
+    /// the buffer binds by a factor of four, and one whose wire form is an exact
+    /// multiple of a chunk, where the peer's window binds by 13%. A rung at
+    /// each end that lands on its own lower bound is what makes both bounds
+    /// real, and the ambiguous middle then follows from arithmetic instead of
+    /// from a measurement that cannot resolve it.
+    pub ceiling_frames: Vec<u32>,
     pub bidir_bytes: u64,
     /// Wall-clock ceiling on a single bulk transfer.
     ///
@@ -124,6 +141,9 @@ impl Params {
                 upload: Duration::from_secs(10),
                 download_bytes: 8 * 1024 * 1024,
                 transfer_frame: 1024,
+                // The two ends only: the ambiguous middle is what `upload`
+                // already runs, and a smoke run's whole budget is ten minutes.
+                ceiling_frames: vec![256, scenarios::frame_filling_segments(2)],
                 bidir_bytes: 4 * 1024 * 1024,
                 transfer_cap: Duration::from_secs(60),
                 raw_throughput: Duration::from_secs(15),
@@ -156,6 +176,9 @@ impl Params {
                 upload: Duration::from_secs(60),
                 download_bytes: 64 * 1024 * 1024,
                 transfer_frame: 1024,
+                // Plus the default frame, so the sweep carries the rung the rest
+                // of the matrix is measured at rather than only its brackets.
+                ceiling_frames: vec![256, 1024, scenarios::frame_filling_segments(2)],
                 bidir_bytes: 32 * 1024 * 1024,
                 transfer_cap: Duration::from_secs(180),
                 raw_throughput: Duration::from_secs(30),
@@ -188,6 +211,12 @@ impl Params {
                 upload: Duration::from_secs(180),
                 download_bytes: 128 * 1024 * 1024,
                 transfer_frame: 1024,
+                ceiling_frames: vec![
+                    256,
+                    1024,
+                    scenarios::frame_filling_segments(2),
+                    scenarios::frame_filling_segments(4),
+                ],
                 bidir_bytes: 64 * 1024 * 1024,
                 transfer_cap: Duration::from_secs(420),
                 raw_throughput: Duration::from_secs(60),
@@ -219,6 +248,15 @@ pub struct ProbeConfig {
     pub legs: Vec<Leg>,
     pub out_root: PathBuf,
     pub params: Params,
+    /// Derive each bulk upload's window from the round trip this run measures,
+    /// instead of running the profile's fixed number of seconds.
+    ///
+    /// See [`converge`]: convergence is counted in round trips, so a window
+    /// fixed in seconds gives a long path *less* convergence than a short one,
+    /// which is backwards. The measured round trip comes from `clock_sync`, and
+    /// a run that will not reach it is refused up front rather than falling back
+    /// silently — see [`ProbeConfig::validate`].
+    pub upload_converge: bool,
     pub upload_results: bool,
     /// When set, only these scenario names run. Everything else is skipped.
     pub only: Option<std::collections::HashSet<String>>,
@@ -253,6 +291,45 @@ impl ProbeConfig {
             .collect();
         unknown.sort();
         unknown
+    }
+
+    /// Refuse a run whose flags ask for something it cannot deliver.
+    ///
+    /// One case so far, and it is the shape worth refusing: `--upload-converge`
+    /// sizes the upload window from the round trip `clock_sync` measures, so a
+    /// run that filters `clock_sync` out, or that selects no leg it can run on,
+    /// would fall back to the fixed window and record a fallback. That is a run
+    /// spent measuring the thing the operator asked not to measure, and it is
+    /// cheaper to say so before it starts than after.
+    pub fn validate(&self) -> Result<()> {
+        if self.upload_converge {
+            anyhow::ensure!(
+                self.wants("clock_sync"),
+                "--upload-converge derives the upload window from the round trip clock_sync \
+                 measures, and --only excludes clock_sync from this run"
+            );
+            anyhow::ensure!(
+                self.legs.iter().any(|l| l.is_phantom()),
+                "--upload-converge derives the upload window from the round trip clock_sync \
+                 measures, and clock_sync runs over a Phantom leg — this run selects none"
+            );
+        }
+        Ok(())
+    }
+
+    /// The one leg that carries the byte-ceiling sweep.
+    ///
+    /// One leg by design, like the soak, and for the same reason: each rung is a
+    /// whole saturating transfer, so sweeping every leg multiplies the longest
+    /// block in the matrix for an answer about `transport/stream.rs`, which is
+    /// the same code underneath all of them. PhantomUDP gets it — it is the
+    /// production transport and the leg the question was asked about.
+    fn ceiling_leg(&self) -> Option<Leg> {
+        self.legs
+            .iter()
+            .copied()
+            .find(|l| *l == Leg::Udp)
+            .or_else(|| self.legs.iter().copied().find(|l| l.is_phantom()))
     }
 
     /// The one leg that carries the long soak.
@@ -346,6 +423,7 @@ impl RunState {
 }
 
 pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
+    cfg.validate()?;
     let run_id = run_id_stamp();
     let dir = cfg.out_root.join(&run_id);
     std::fs::create_dir_all(&dir)?;
@@ -415,11 +493,30 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
         )?;
     }
 
+    // Every bulk upload in this run gets the same window, resolved once and
+    // here — after `clock_sync`, which is what measures the round trip it is
+    // derived from, and before the first leg, so that the legs are comparable
+    // with each other. The note travels into the run's caveats as well as into
+    // each upload's own summary, because it is the difference between a rate
+    // and a convergence time and that has to be beside the number wherever the
+    // number is read.
+    let upload_window = converge::UploadWindow::resolve(
+        cfg.upload_converge,
+        p.upload,
+        st.meta
+            .clock
+            .as_ref()
+            .map(|c| Duration::from_nanos(c.min_rtt_ns)),
+    );
+    println!("\n  {}", upload_window.note());
+    st.meta.caveats.push(upload_window.note());
+    st.flush_summary()?;
+
     for &leg in &cfg.legs {
         println!("\n  ── leg {leg} ──");
 
         if leg.is_reference() {
-            run_reference_leg(&cfg, &mut st, leg).await?;
+            run_reference_leg(&cfg, &mut st, leg, &upload_window).await?;
             continue;
         }
 
@@ -516,7 +613,7 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
         if cfg.wants("upload") {
             st.absorb(
                 leg,
-                scenarios::upload(ep, pin, leg, p.upload, p.transfer_frame as usize).await,
+                scenarios::upload(ep, pin, leg, &upload_window, p.transfer_frame as usize).await,
             )?;
         }
         if cfg.wants("download") {
@@ -545,6 +642,14 @@ pub async fn run(cfg: ProbeConfig) -> Result<PathBuf> {
                     p.transfer_cap,
                 )
                 .await,
+            )?;
+        }
+        // Last of the bulk block, and on one leg only: each rung is a whole
+        // saturating transfer of its own.
+        if cfg.wants("send_ceiling") && cfg.ceiling_leg() == Some(leg) {
+            st.absorb(
+                leg,
+                scenarios::send_ceiling(ep, pin, leg, &p.ceiling_frames, &upload_window).await,
             )?;
         }
         if cfg.wants("streams") {
@@ -651,6 +756,7 @@ const PHANTOM_SCENARIOS: &[&str] = &[
     "upload",
     "download",
     "bidir",
+    "send_ceiling",
     "streams",
     "zero_rtt",
     "rekey",
@@ -693,6 +799,10 @@ const QUIC_SKIPPED: &[(&str, &str)] = &[
         "this measures a property of PhantomSession::send() — that it splits payloads above its internal chunk size and delivers the pieces separately. QUIC streams have no message boundaries at all, by specification, so the same probe would report an expected non-property as though it were a defect",
     ),
     (
+        "send_ceiling",
+        "the sweep exists to tell two of this protocol's own byte ceilings apart — the ARQ send buffer, which is bounded in segments and so moves with the frame size, and the peer's advertised flow-control window, which is bounded in bytes and does not. quinn has neither bound in that shape and reports no bytes in flight at all, so its rungs would carry no reading",
+    ),
+    (
         "streams",
         "the reference leg deliberately uses a single bidirectional stream so that the byte-pipe comparison is like-for-like; measuring QUIC's multiplexing would need a different server shape and would not be comparing anything the Phantom legs do here",
     ),
@@ -724,7 +834,12 @@ const QUIC_SKIPPED: &[(&str, &str)] = &[
 
 /// Drive the scenarios the reference leg does cover, and record the rest as
 /// skipped.
-async fn run_reference_leg(cfg: &ProbeConfig, st: &mut RunState, leg: Leg) -> Result<()> {
+async fn run_reference_leg(
+    cfg: &ProbeConfig,
+    st: &mut RunState,
+    leg: Leg,
+    upload_window: &converge::UploadWindow,
+) -> Result<()> {
     /// Both the operator's `--only` filter and the leg's own coverage list have
     /// to agree. Routing through [`QUIC_COVERED`] rather than hard-coding the
     /// names here is what makes that list load-bearing instead of decorative.
@@ -764,7 +879,7 @@ async fn run_reference_leg(cfg: &ProbeConfig, st: &mut RunState, leg: Leg) -> Re
     if runs(cfg, "upload") {
         st.absorb(
             leg,
-            scenarios::upload(ep, pin, leg, p.upload, p.transfer_frame as usize).await,
+            scenarios::upload(ep, pin, leg, upload_window, p.transfer_frame as usize).await,
         )?;
     }
     if runs(cfg, "download") {
@@ -857,6 +972,18 @@ fn caveats(cfg: &ProbeConfig) -> Vec<String> {
         v.push(
             "The handshake_repair scenario manufactures its own loss: a relay on this machine drops one datagram flight of the server's reply before it reaches the client. Every datagram still crosses the real path in both directions and only the delivery decision is local, so what it reports is a real handshake with a real flight missing rather than a simulation. An attempt that lost nothing is recorded as inconclusive rather than as a pass, and its numbers are not evidence about the repair.".to_string(),
         );
+    }
+    if cfg.legs.contains(&Leg::RawUdp) && (cfg.wants("downstream") || cfg.wants("upstream")) {
+        v.push(
+            "Reordering is measured by the raw controls only, and a reordering figure from one run is not a property of the path: two adjacent runs over this same route gave 13.4% reordering at 0.12% loss and 0% reordering at 7.69% loss. Any tolerance sized on a single run is sized on that run's weather.".to_string(),
+        );
+    }
+    if cfg.wants("send_ceiling") {
+        if let Some(l) = cfg.ceiling_leg() {
+            v.push(format!(
+                "The byte-ceiling sweep ran only on the {l} leg. The two bounds it separates — the ARQ send buffer and the peer's flow-control window — live in code every Phantom leg shares, but the byte pipe underneath differs, so this run says nothing about where a saturated sender sits on the other legs."
+            ));
+        }
     }
     if let Some(l) = cfg.soak_leg() {
         v.push(format!(
@@ -1201,6 +1328,110 @@ mod tests {
         assert!(!no_udp.contains("manufactures its own loss"), "{no_udp}");
     }
 
+    /// A derived upload window is measured against the round trip `clock_sync`
+    /// produces. A run that cannot reach that scenario would fall back to the
+    /// fixed window and spend its wall clock measuring the thing the operator
+    /// asked not to measure, so it is refused before it starts.
+    #[test]
+    fn a_derived_upload_window_needs_the_scenario_that_measures_the_path() {
+        let mut cfg = demo_cfg(vec![Leg::Udp, Leg::RawUdp], Profile::Smoke);
+        cfg.upload_converge = true;
+        assert!(cfg.validate().is_ok(), "clock_sync runs by default");
+
+        cfg.only = Some(["upload".to_string()].into_iter().collect());
+        let e = cfg
+            .validate()
+            .expect_err("filtering clock_sync out must be refused");
+        assert!(format!("{e}").contains("clock_sync"), "{e}");
+
+        // And a run with no Phantom leg has no session to measure it over.
+        let mut raw_only = demo_cfg(vec![Leg::RawUdp], Profile::Smoke);
+        raw_only.upload_converge = true;
+        assert!(raw_only.validate().is_err());
+
+        // None of this constrains a run that did not ask for it.
+        let mut plain = demo_cfg(vec![Leg::RawUdp], Profile::Smoke);
+        plain.only = Some(["upload".to_string()].into_iter().collect());
+        assert!(plain.validate().is_ok());
+    }
+
+    /// The sweep's rungs are what separate the two byte ceilings, and they only
+    /// do that at the two ends: below one application chunk the send buffer is
+    /// the lower bound, at a whole multiple of one the peer's window is. A
+    /// profile whose ladder sat entirely on one side would run for the same wall
+    /// clock and settle nothing.
+    #[test]
+    fn every_profiles_ceiling_ladder_brackets_the_crossover() {
+        let peer = phantom_protocol::transport::stream::MAX_SEND_WINDOW as u64;
+        let segments = 1024u64; // scenarios::SEND_BUFFER_SEGMENTS, restated by the test
+        for p in [Profile::Smoke, Profile::Standard, Profile::Deep] {
+            let x = Params::for_profile(p);
+            assert!(
+                x.ceiling_frames.len() >= 2,
+                "{p:?}: one rung separates nothing"
+            );
+            let mut buffer_binds = false;
+            let mut window_binds = false;
+            for &f in &x.ceiling_frames {
+                assert!(f >= 64, "{p:?}: frames must carry the header fields");
+                let wire = scenarios::sink_wire_bytes(f as usize) as u64;
+                let per_frame =
+                    wire.div_ceil(phantom_protocol::transport::mtu::MAX_APP_CHUNK as u64);
+                let arq = (segments / per_frame.max(1)) * wire;
+                buffer_binds |= arq * 2 < peer;
+                window_binds |= arq > peer;
+            }
+            assert!(
+                buffer_binds,
+                "{p:?}: no rung where the send buffer is clearly the lower bound"
+            );
+            assert!(
+                window_binds,
+                "{p:?}: no rung where the peer's window is the lower bound"
+            );
+        }
+    }
+
+    /// Each rung is a whole saturating transfer, so the sweep runs on one leg —
+    /// the production transport when it is in the run — and the artifact says
+    /// which, because the other legs are then uncovered.
+    #[test]
+    fn the_ceiling_sweep_runs_on_one_leg_and_says_which() {
+        let cfg = demo_cfg(vec![Leg::Tcp, Leg::Udp, Leg::RawUdp], Profile::Smoke);
+        assert_eq!(cfg.ceiling_leg(), Some(Leg::Udp));
+        assert_eq!(
+            demo_cfg(vec![Leg::Mimic, Leg::Tcp], Profile::Smoke).ceiling_leg(),
+            Some(Leg::Mimic),
+            "otherwise the first Phantom leg carries it"
+        );
+        assert_eq!(
+            demo_cfg(vec![Leg::RawUdp], Profile::Smoke).ceiling_leg(),
+            None
+        );
+        let c = caveats(&cfg).join("\n");
+        assert!(
+            c.contains("byte-ceiling sweep ran only on the udp leg"),
+            "{c}"
+        );
+    }
+
+    /// Reordering measured once is weather, not a property of the path, and the
+    /// caveat that says so has to travel with any run that measures it — the two
+    /// adjacent runs it quotes are why every reordering claim here needs two
+    /// runs before it is a claim.
+    #[test]
+    fn a_run_that_measures_reordering_says_one_run_cannot_establish_it() {
+        let c = caveats(&demo_cfg(vec![Leg::Udp, Leg::RawUdp], Profile::Standard)).join("\n");
+        assert!(c.contains("13.4% reordering"), "{c}");
+        assert!(c.contains("7.69% loss"), "{c}");
+        assert!(c.contains("that run's weather"), "{c}");
+
+        // A run with no raw UDP control measures none of it and must not carry
+        // a caveat about a measurement it never took.
+        let none = caveats(&demo_cfg(vec![Leg::Udp, Leg::RawTcp], Profile::Standard)).join("\n");
+        assert!(!none.contains("reordering"), "{none}");
+    }
+
     #[test]
     fn profile_names_are_stable() {
         assert_eq!(Profile::Smoke.as_str(), "smoke");
@@ -1228,6 +1459,7 @@ mod tests {
             legs,
             out_root: PathBuf::from("/tmp"),
             params: Params::for_profile(profile),
+            upload_converge: false,
             upload_results: false,
             only: None,
             capture_iface: "any".into(),

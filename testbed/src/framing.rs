@@ -45,7 +45,12 @@ use crate::proto::{Msg, MAX_FRAME_BODY};
 use crate::report::{unix_nanos, Leg, WindowSample};
 
 /// Length-prefix width. Matches `TcpSessionTransport`'s own framing choice.
-const LEN_PREFIX: usize = 4;
+/// Bytes of length prefix every framed message carries.
+///
+/// Public because a scenario that has to know what a frame costs on the wire —
+/// the byte-ceiling sweep, whose whole subject is the frame size — must derive
+/// it from the encoder rather than hold its own copy of the number.
+pub const LEN_PREFIX: usize = 4;
 
 /// Upper bound on a reassembled message, with room for the verb byte.
 const MAX_MESSAGE: usize = MAX_FRAME_BODY + 1;
