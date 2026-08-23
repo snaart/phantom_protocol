@@ -748,6 +748,55 @@ Recomputes everything from the raw JSONL rather than trusting `summary.json`,
 using the same nearest-rank percentile definition as the Rust side. Standard
 library only.
 
+### "Leg comparison by direction": one denominator, one table
+
+A run produces a rate for each leg under test, for the reference, and for four
+different controls, and until this section existed the comparison between them
+was arithmetic done in a reader's head across four scenarios in a log. That
+arithmetic has been done against the wrong denominator, which is why the section
+fixes four things rather than laying the numbers out and stopping.
+
+**One table per direction, and the denominator is the one-way ladder for that
+direction.** A round trip bounds the two directions together and neither on its
+own, so the echoes are listed but normalise nothing. Where the ladder for a
+direction did not run — every archive older than the `upstream` scenario is in
+this position for uploads — the rates are printed with an empty share column and
+a line saying that nothing in the run normalises them. Falling back to the echo
+would divide a one-way rate by a two-way figure and produce a share that looks
+like an answer.
+
+**Every row says which of the three roles it is.** The classification mirrors
+`Leg::is_phantom` and `Leg::is_reference` in [`report.rs`](src/report.rs); a leg
+name this file does not recognise is printed as unclassified rather than
+defaulted, because the default that suggests itself is `control` and a control
+is what everything else is divided by. The reference carries its caveat in both
+tables: quinn's cryptography is classical TLS 1.3, so its handshake is not
+comparable like-for-like with a hybrid post-quantum one, while its throughput
+and loss behaviour on the same path are.
+
+**A control that came in under a leg it bounds is called out.** A protocol
+cannot beat the same path carrying no protocol, so such a control measured
+itself and nothing divided by it means anything until it is re-verified — the
+failure both raw controls have had before, the UDP pacer reporting its own sleep
+granularity and the TCP echo reporting first a socket buffer and later its own
+bufferbloat. Pairing is by substrate: a TCP leg's floor is the raw TCP echo, and
+comparing across substrates would flag the difference between two transports as
+an instrument fault. The same check applied to the share column is the reading
+that a share above 100% condemns the column rather than the row.
+
+**A transfer that never converged is marked, and its mean is named as a
+convergence time.** The threshold is the one the send-bound section uses, and on
+an upload the evidence is the same too — the sender's acknowledged-byte series,
+because the client's own window counts there are its socket buffer draining. On
+a download the client *is* the arriving side, so its counts answer directly.
+Where neither book can answer, the row says which one was missing instead of
+going blank; a blank cell would be indistinguishable from "converged".
+
+A leg that the run drove and that produced no figure keeps its row, with the
+reason. It leaves no transfer file behind, so a table built by scanning files
+omits it — and a leg whose session never came up is exactly the row that must
+not go missing, because the legs that remain then read as the whole run.
+
 ### "What stopped the sender": the census, and what it cannot see
 
 Throughput says how fast a transfer went; it never says why it did not go

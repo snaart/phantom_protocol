@@ -16,6 +16,7 @@ import json
 import math
 import pathlib
 import sys
+import tempfile
 from collections import defaultdict
 
 def filtered_max_label(rows):
@@ -409,6 +410,142 @@ def ceiling_sweep_reading(rows):
     return {"rungs": readings, "lines": lines}
 
 
+# ── putting the legs beside each other ───────────────────────────────────
+#
+# The three roles the harness defines, mirroring `Leg::is_phantom` and
+# `Leg::is_reference` in `testbed/src/report.rs`. That file is where the
+# classification is defined and this is a copy of it, so this is the part that
+# goes stale — which is why [`leg_role`] answers `None` for a name it does not
+# recognise rather than defaulting to anything.
+LEGS_UNDER_TEST = frozenset({"udp", "tcp", "mimic"})
+REFERENCE_LEGS = frozenset({"quic"})
+CONTROL_LEGS = frozenset({"raw_tcp", "raw_udp"})
+
+# Which one-way ladder normalises which direction. A round trip bounds the two
+# directions together and neither alone, so this mapping is the only denominator
+# a direction gets: where the ladder did not run, the rate is printed with
+# nothing under it rather than divided by the echo.
+DIRECTION_CONTROL = {"upload": "raw_udp_upstream", "download": "raw_udp_downstream"}
+
+# The raw control that carries the same substrate as a leg under test, with no
+# protocol on it. This is the pairing behind "a leg cannot beat its own control":
+# Phantom-over-TCP and mimic-TLS both ride a TCP socket, so the raw TCP echo is
+# the floor beneath them, and PhantomUDP rides datagrams.
+SUBSTRATE_CONTROL = {"udp": "raw_udp", "tcp": "raw_tcp", "mimic": "raw_tcp"}
+
+
+def leg_role(leg):
+    """`under test`, `reference`, `control` — or `None` for an unknown name.
+
+    An unrecognised leg is reported as unclassified rather than defaulted,
+    because the default that would suggest itself is `control`, and a control is
+    a denominator. A leg added to the Rust enum and not here would then quietly
+    become the yardstick for the legs it was added to be measured against.
+    """
+    if leg in LEGS_UNDER_TEST:
+        return "under test"
+    if leg in REFERENCE_LEGS:
+        return "reference"
+    if leg in CONTROL_LEGS:
+        return "control"
+    return None
+
+
+def mean_bps(rows):
+    """Bits per second over the sampling windows a transfer actually recorded.
+
+    Bytes divided by time, not a mean of the per-window rates: the windows are
+    not all the same length, and averaging rates over unequal intervals weights
+    the short ones as heavily as the long ones.
+
+    This is a mean over the windows that closed, so it omits whatever the
+    transfer did after the last one — which on a transfer that never stopped
+    accelerating is its fastest part. That is not a defect to be corrected here;
+    it is the reason the marker beside each row exists.
+    """
+    b = sum(r.get("window_bytes", 0) for r in rows)
+    ns = sum(r.get("window_ns", 0) for r in rows)
+    return (b * 8 / (ns / 1e9)) if b and ns else None
+
+
+def arrival_tail_share(rows):
+    """Share of a transfer's bytes that arrived in its final quarter.
+
+    Asked of a book that records *arrivals*, which is the only book on which the
+    question is about the path. A sending side's own per-window counts answer it
+    about a socket buffer instead: the first window of an upload absorbs
+    whatever the buffer will take, so the curve there is the buffer's shape. So
+    this is used on the receiving side only, and an upload's answer comes from
+    the sender's acknowledged-byte series through [`transfer_shape`].
+
+    A window straddling the quarter mark contributes in proportion rather than
+    whole. Counting it whole makes the answer depend on how many windows the
+    transfer happened to fit into — a perfectly flat five-window transfer would
+    read 40% and be marked as still climbing — and that is a statement about the
+    sampler's period, not about the transfer.
+    """
+    usable = sorted(
+        (r for r in rows if r.get("window_ns") and r.get("t_unix_ns")),
+        key=lambda r: r["t_unix_ns"],
+    )
+    if len(usable) < 4:
+        return None
+    start = usable[0]["t_unix_ns"] - usable[0]["window_ns"]
+    span = usable[-1]["t_unix_ns"] - start
+    total = sum(r.get("window_bytes", 0) for r in usable)
+    if span <= 0 or total <= 0:
+        return None
+    cut = start + 0.75 * span
+    tail = 0.0
+    for r in usable:
+        end, width = r["t_unix_ns"], r["window_ns"]
+        if end <= cut:
+            continue
+        begin = end - width
+        share = 1.0 if begin >= cut else (end - cut) / width
+        tail += r.get("window_bytes", 0) * share
+    return tail / total
+
+
+def outperformed_controls(under_test, controls):
+    """Controls a leg under test beat, and which legs beat them.
+
+    A leg carrying a protocol cannot exceed the same path carrying no protocol,
+    so a control that comes in under a leg it is supposed to bound is not a
+    denominator — it is an instrument that measured itself and has to be
+    re-verified before any share taken against it means anything. Both raw
+    controls have done this before: the UDP pacer once reported the granularity
+    of its own sleep as the path's ceiling, and the TCP echo reported first a
+    default socket buffer and later its own bufferbloat.
+
+    Pairing is by substrate, not by anything read off the numbers. A TCP leg's
+    floor is the raw TCP echo whatever the UDP ladder says, and comparing across
+    substrates would flag the difference between TCP and UDP as an instrument
+    fault.
+    """
+    beaten = defaultdict(list)
+    for leg, bps in sorted(under_test.items()):
+        control = SUBSTRATE_CONTROL.get(leg)
+        if control is None or bps is None:
+            continue
+        floor = controls.get(control)
+        if floor is not None and bps > floor:
+            beaten[control].append(leg)
+    return dict(beaten)
+
+
+def denominator_broken(shares):
+    """Legs that took more than the whole of the one-way control for their direction.
+
+    The same fault as [`outperformed_controls`] seen from the other side, and it
+    is kept separate because the evidence is different: there the control is a
+    protocol-free run of the same substrate, here it is the paced ladder that
+    every share in the table is divided by. A share above one condemns the
+    column, not the row.
+    """
+    return sorted(leg for leg, share in shares.items() if share is not None and share > 1.0)
+
+
 # ── what stopped the sender ──────────────────────────────────────────────
 #
 # Four library constants the window rows do not carry. Every other number in
@@ -650,10 +787,13 @@ PEAK_BAND = 0.95
 # than the acceptance test, which is the right way round.
 PLATEAU_REACHED_BY = 0.80
 
-# Bytes in the last quarter, above which the transfer was still accelerating.
-# An even transfer puts 25% there; the six uploads that provoked all of this put
-# 44–62% there.
-RAMP_LAST_QUARTER_SHARE = 0.35
+# Bytes in the last quarter, above which the transfer was still accelerating and
+# the mean over it is a convergence time rather than a rate. An even transfer
+# puts 25% there; the six uploads that provoked all of this put 44–62% there.
+# Defined once because two sections ask the question — the shape below and the
+# leg comparison — and "still climbing" from one printed beside "converged" from
+# the other would be a disagreement about the threshold, not about the transfer.
+STILL_ACCELERATING_LAST_QUARTER = 0.35
 
 # The fraction of its final rate a transfer has to reach for the reaching to
 # count as converged. Ninety percent, so the figure is not moved by one probing
@@ -753,7 +893,7 @@ def transfer_shape(rows):
     # sampled to have one cannot be converged: there would be nothing to report
     # as the rate it converged to.
     converged = (
-        plateaued and last_quarter_share <= RAMP_LAST_QUARTER_SHARE and final_rate is not None
+        plateaued and last_quarter_share <= STILL_ACCELERATING_LAST_QUARTER and final_rate is not None
     )
     return {
         "duration_ms": dur,
@@ -1189,6 +1329,10 @@ def analyze_client(run_dir):
                     "rungs before the path did, so this is a floor and not a ceiling"
                 )
 
+    # Placed directly after the ladders it divides by, so the denominator a
+    # reader is about to see used is still the last number they read.
+    comparison_section(run_dir, meta)
+
     # ── raw-path reordering ──────────────────────────────────────────────
     #
     # The distance columns are what size a transport's reordering tolerance.
@@ -1578,6 +1722,324 @@ def ceiling_sweep_section(run_dir):
     )
 
 
+# What a direction is called in the table heading, and which way the bytes went.
+DIRECTION_TITLE = {
+    "upload": "upload — client → server",
+    "download": "download — server → client",
+}
+
+# The one line about the reference leg that has to travel with any comparison
+# against it. Kept here because two tables print it and a caveat that appears in
+# one of them is a caveat the other reader does not get.
+REFERENCE_CAVEAT = (
+    "quic is the reference, not a competitor: its cryptography is classical TLS 1.3, so its "
+    "handshake is not comparable\n           like-for-like with a hybrid post-quantum one. Its "
+    "throughput and loss behaviour on the same path are."
+)
+
+
+def transfer_acceleration(run_dir, leg, direction, rows):
+    """Was this transfer still speeding up when it ended, and on whose evidence.
+
+    One question, two books, and which one can answer depends on the direction.
+    On a download the client is the receiving side: its per-window counts are
+    arrivals and [`arrival_tail_share`] reads them directly. On an upload they
+    are a socket buffer draining, so the answer comes instead from the sender's
+    own acknowledged-byte series through [`transfer_shape`] — the same reading
+    the send-bound section makes, against the same threshold.
+
+    Returns `(last_quarter_share or None, reason_when_None)`.
+    """
+    if direction == "download":
+        return (
+            arrival_tail_share(rows),
+            "fewer than four sampling windows, so the last quarter is not resolvable",
+        )
+    window = [r for r in read_jsonl(run_dir / "samples" / leg / f"{direction}.window.jsonl")
+              if r.get("t_unix_ns")]
+    if not window:
+        return (None, "this run recorded no sender window series for it")
+    role = series_role(window)
+    if role == "reference":
+        return (None, "the reference leg keeps no delivered-byte series to read a ramp out of")
+    if role != "sender":
+        return (None, "the sending side's window series is the daemon's, not this artifact's")
+    shape = transfer_shape(window)
+    if not shape:
+        return (None, "too few window samples to judge")
+    return (shape["last_quarter_share"], "")
+
+
+def exercised_legs(run_dir, meta):
+    """The legs this run actually drove, whether or not they produced a figure.
+
+    Both halves are needed and neither is enough. `run.json` declares the legs
+    the run was configured with, which over-reports a `--only` run: it names all
+    six while five have no directory and were never touched. The sample
+    directories under-report nothing but say only that a leg was reached, so the
+    intersection is the set that was driven.
+
+    The point of asking at all is the leg that was driven and produced no
+    transfer. It leaves no `upload.jsonl` to be found by a scan over the files,
+    so a table built from the files alone omits it — and a leg whose session
+    never came up is exactly the row that must not go missing from a comparison,
+    because the legs that remain then look like the whole run.
+
+    Controls are excluded: their figures come from their own scenarios, and a
+    control has no upload or download of its own to be missing.
+    """
+    dirs = {p.name for p in (run_dir / "samples").glob("*") if p.is_dir()}
+    declared = meta.get("legs") or sorted(dirs)
+    return sorted(leg for leg in declared if leg in dirs and leg_role(leg) != "control")
+
+
+def comparison_section(run_dir, meta):
+    """Every leg's rate for one direction, in one table, over one denominator.
+
+    The section exists because the alternative is arithmetic done in the reader's
+    head across four scenarios in a log, and that arithmetic has been done
+    against the wrong denominator before. Three things are therefore fixed here
+    rather than left to the reader:
+
+    - the denominator is the **one-way** control for that direction and nothing
+      else. Where it did not run, the rate is printed with a blank share and a
+      line saying so, because the round-trip echo bounds the two directions
+      together and substituting it would divide a one-way rate by a two-way
+      figure;
+    - each row says which of the three roles it is — under test, reference,
+      control — so a reference is never read as a competitor and a control is
+      never read as a result;
+    - a control that came in under a leg it bounds is called out, because that
+      is an instrument measuring itself and everything divided by it is wrong
+      until it is re-verified;
+    - a transfer that was still speeding up when it ended is marked as such, so
+      that its mean is read as the convergence time it is rather than as a
+      capacity the path was never asked for.
+
+    Only the dedicated `upload` and `download` scenarios are listed. `bidir` runs
+    both directions against each other and is a different experiment, so putting
+    its download half in the same column as an uncontended one would compare two
+    things that were never the same measurement.
+    """
+    section("Leg comparison by direction (one denominator, one table)")
+    print(
+        "  the dedicated upload and download scenarios only: bidir drives both directions at once "
+        "and is a\n  different experiment, so its download half does not belong in a column with "
+        "an uncontended one"
+    )
+
+    driven = exercised_legs(run_dir, meta)
+    transfers = {}
+    for direction in ("upload", "download"):
+        for leg in driven:
+            rows = [r for r in read_jsonl(run_dir / "samples" / leg / f"{direction}.jsonl")
+                    if r.get("direction") == direction and r.get("window_ns")]
+            if rows:
+                transfers[(leg, direction)] = rows
+
+    ladders, echo_roundtrip, tcp_echo = defaultdict(list), [], []
+    for f in sorted(run_dir.glob("samples/raw_*/*.jsonl")):
+        for r in read_jsonl(f):
+            d = r.get("direction")
+            if d in ONE_WAY_DIRECTIONS:
+                ladders[d].append(r)
+            elif d == ROUND_TRIP_DIRECTION:
+                echo_roundtrip.append(r)
+            elif d == "raw_echo":
+                tcp_echo.append(r)
+
+    # Both of these crossed the path twice, so they belong in both tables and are
+    # the denominator of neither. They are listed because the substrate check
+    # below needs them, and because a control missing from a comparison is a
+    # control nobody re-verifies.
+    roundtrip = {}
+    if tcp_echo:
+        roundtrip["raw_tcp"] = mean_bps(tcp_echo)
+    if echo_roundtrip:
+        best, kind = ladder_verdict(echo_roundtrip)
+        if best:
+            roundtrip["raw_udp"] = best
+
+    if not driven and not roundtrip and not ladders:
+        print("  (no transfer or control figures in this run)")
+        return
+
+    for direction in ("upload", "download"):
+        print(f"\n  \033[1m{DIRECTION_TITLE[direction]}\033[0m")
+
+        control_name = DIRECTION_CONTROL[direction]
+        denom, denom_kind = ladder_verdict(ladders.get(control_name, []))
+        if denom:
+            print(
+                f"  denominator: {control_name} at {denom / 1e6:.2f} Mbit/s "
+                f"({'measured ceiling' if denom_kind == 'ceiling' else 'a floor, not a ceiling — the ladder ran out of rungs first'})"
+            )
+            if denom_kind != "ceiling":
+                print("               a share of a floor is an upper bound on the share, not the share")
+        else:
+            # "Did not run" and "ran and measured nothing" are different facts
+            # about the run and lead to different fixes, so they are not given
+            # the same sentence.
+            why = (
+                "every rung was inadmissible, so it measured nothing"
+                if ladders.get(control_name)
+                else "it did not run"
+            )
+            print(
+                f"  \033[33mdenominator: none — {control_name}: {why}. Nothing in this run "
+                f"normalises this direction\033[0m"
+            )
+            print(
+                "               the round-trip echoes below are not a substitute: a byte counted "
+                "there crossed the path\n               twice, so they bound the two directions "
+                "together and neither one on its own"
+            )
+
+        if direction == "upload":
+            print(
+                "  numerator:   what the client's own window counts recorded it sending. That is "
+                "the sending side's book,\n               not the receiving side's — the honest "
+                "upload figure is what the server took in over its own\n               observation "
+                "span, which is in the scenario's notes and in the daemon's artifact"
+            )
+        else:
+            print("  numerator:   what the client received, which on a download is the arriving side's own book")
+
+        rows = []
+        for leg in driven:
+            samples = transfers.get((leg, direction))
+            bps = mean_bps(samples) if samples else None
+            marks = []
+            if bps is None:
+                marks.append(
+                    "\033[33mno figure: this leg was driven in this run and closed no sampling "
+                    "window in this direction — read the errors section before reading the rows "
+                    "above as the whole run\033[0m"
+                )
+            else:
+                share, why = transfer_acceleration(run_dir, leg, direction, samples)
+                if share is None:
+                    marks.append(f"whether it converged is unknown — {why}")
+                elif share > STILL_ACCELERATING_LAST_QUARTER:
+                    marks.append(
+                        f"\033[33mSTILL ACCELERATING: {share:.0%} of its bytes landed in the last "
+                        "quarter, so this mean is a convergence time and not a capacity\033[0m"
+                    )
+                else:
+                    # Said rather than left blank: an empty cell here would be
+                    # the same cell a row gets when the question could not be
+                    # asked, and those are opposite readings.
+                    marks.append(f"converged — {share:.0%} of its bytes in the last quarter")
+            rows.append({"label": leg, "leg": leg, "bps": bps, "marks": marks})
+
+        for name, bps in sorted(roundtrip.items()):
+            rows.append({
+                "label": name,
+                "leg": name,
+                "bps": bps,
+                "marks": ["round trip: bounds the two directions together, normalises neither"],
+            })
+        if denom:
+            # The ladder rides `raw_udp`, which is what gives it its role, but it
+            # is labelled by direction — and the substrate check below keys on
+            # the label so that the ladder and the echo, which share a leg, do
+            # not become one entry with the loser silently dropped.
+            rows.append({
+                "label": control_name,
+                "leg": "raw_udp",
+                "bps": denom,
+                "marks": ["the denominator this column is taken against"],
+            })
+
+        shares = {}
+        for r in rows:
+            r["role"] = leg_role(r["leg"])
+            r["share"] = (r["bps"] / denom) if (denom and r["bps"]) else None
+            if r["role"] == "under test":
+                shares[r["leg"]] = r["share"]
+
+        beaten = outperformed_controls(
+            {r["leg"]: r["bps"] for r in rows if r["role"] == "under test"},
+            {r["leg"]: r["bps"] for r in rows
+             if r["role"] == "control" and r["label"] not in ONE_WAY_DIRECTIONS},
+        )
+        for r in rows:
+            # Role first: it says what kind of claim the row can support, and
+            # everything after it is read differently depending on the answer.
+            if r["role"] == "reference":
+                r["marks"].insert(0, "a yardstick, not a competitor — see the note below the handshake table")
+            if r["role"] is None:
+                r["marks"].insert(0, (
+                    "unclassified: testbed/src/report.rs gives this leg a role and this file does "
+                    "not, so it is neither compared nor used as a denominator"
+                ))
+            if r["label"] in beaten:
+                r["marks"].append(
+                    "\033[33mOUTPERFORMED by " + ", ".join(beaten[r["label"]])
+                    + " — a protocol cannot beat the same path carrying none, so this control is "
+                    "measuring itself and is not usable as a denominator until it is "
+                    "re-verified\033[0m"
+                )
+
+        order = {"under test": 0, "reference": 1, "control": 2, None: 3}
+        rows.sort(key=lambda r: (order[r["role"]], -(r["bps"] or 0.0)))
+        print(f"\n  {'role':11} {'leg':20} {'Mbit/s':>9} {'share':>8}   what the number is")
+        for r in rows:
+            rate = "        —" if r["bps"] is None else f"{r['bps'] / 1e6:>8.2f}M"
+            share = "       —" if r["share"] is None else f"{r['share'] * 100:>7.1f}%"
+            head = r["marks"][0] if r["marks"] else ""
+            print(f"  {r['role'] or 'unknown':11} {r['label']:20} {rate} {share}   {head}".rstrip())
+            for extra in r["marks"][1:]:
+                print(f"  {'':11} {'':20} {'':>9} {'':>8}   {extra}")
+
+        broken = denominator_broken(shares)
+        if broken:
+            print(
+                f"  \033[33mthe share column is not usable: {', '.join(broken)} took more than the "
+                f"whole of {control_name}, so the ladder\n  measured itself rather than the "
+                f"path\033[0m"
+            )
+
+    # ── handshake, which no control bounds ───────────────────────────────
+    #
+    # Its own table because there is no raw control for it: neither raw echo
+    # performs a handshake, so a share column here would have nothing under it.
+    # The comparison that does exist is against the reference, and it is the one
+    # comparison in this file that is not like-for-like.
+    print("\n  \033[1mhandshake latency — no control performs one, so there is no share\033[0m")
+    hs = []
+    for f in sorted(run_dir.glob("samples/*/handshake.jsonl")):
+        rows = list(read_jsonl(f))
+        if not rows:
+            continue
+        ok = [r for r in rows if r.get("ok")]
+        total = [r["connect_ns"] for r in ok if r.get("connect_ns")]
+        hs.append({
+            "leg": rows[0]["leg"],
+            "role": leg_role(rows[0]["leg"]),
+            "n": len(rows),
+            "ok": 100.0 * len(ok) / len(rows),
+            "p50": pct(total, .50),
+            "p99": pct(total, .99),
+        })
+    if not hs:
+        print("  (no handshake samples in this run)")
+        return
+    order = {"under test": 0, "reference": 1, "control": 2, None: 3}
+    # Fastest first within a role, so the column being compared is also the one
+    # the rows are ordered by. A leg whose every attempt failed has no median
+    # and sorts last rather than wherever a nan happens to land.
+    hs.sort(key=lambda r: (order[r["role"]], math.inf if math.isnan(r["p50"]) else r["p50"]))
+    print(f"\n  {'role':11} {'leg':20} {'n':>5} {'ok%':>6} {'p50':>8} {'p99':>8}")
+    for r in hs:
+        print(
+            f"  {r['role'] or 'unknown':11} {r['leg']:20} {r['n']:>5} {r['ok']:>5.0f}% "
+            f"{fmt_ms(r['p50'])} {fmt_ms(r['p99'])}"
+        )
+    if any(r["role"] == "reference" for r in hs):
+        print(f"           {REFERENCE_CAVEAT}")
+
+
 def liveness_ceiling_s(detail):
     """Seconds the daemon will hold a session whose peer has gone silent.
 
@@ -1901,6 +2363,20 @@ def self_test():
     The reordering headline is the eighth, and its obligation is a direction. A
     round-trip control attributes none, so reordering seen only there cannot
     start an investigation that a one-way ladder's could.
+
+    The comparison derivations are the ninth, and every one of them exists to
+    stop a wrong denominator. `leg_role` must answer `None` for a name it does
+    not know, because the default that suggests itself is `control` and a
+    control is what everything else is divided by. `mean_bps` must divide bytes
+    by time rather than average rates over windows of unequal length.
+    `arrival_tail_share` must give a flat transfer the same answer whatever the
+    sampler's period, or the marker that says "this mean is a convergence time"
+    fires on transfers that converged. `outperformed_controls` must pair a leg
+    with its own substrate and no other, since a TCP leg beating a UDP ladder is
+    a fact about two transports rather than a fault in an instrument. And
+    `denominator_broken` must fire on a share above one and not on a share of
+    exactly one, which is a leg that reached its control and not one that
+    passed it.
     """
     label_cases = [
         ([{"bw_filter_window_ms": 10000}] * 3, "filtered max over 10s horizon"),
@@ -2234,7 +2710,148 @@ def self_test():
         ),
     ]
 
+    # The three roles, and the fourth answer that is not a role. `None` is the
+    # one that matters: a leg this file does not know must not fall through to
+    # `control`, because a control is a denominator.
+    role_cases = [
+        ("udp", "under test"),
+        ("tcp", "under test"),
+        ("mimic", "under test"),
+        ("quic", "reference"),
+        ("raw_tcp", "control"),
+        ("raw_udp", "control"),
+        ("wireguard", None),
+        ("", None),
+    ]
+    # Bytes over time, not a mean of rates: the second case has one long slow
+    # window and one short fast one, and averaging the two rates would report
+    # 5.5 Mbit/s for a transfer that moved 1.1 MB in 1.1 s.
+    mean_cases = [
+        ([{"window_bytes": 125_000, "window_ns": 1_000_000_000}], 1e6),
+        (
+            [
+                {"window_bytes": 125_000, "window_ns": 1_000_000_000},
+                {"window_bytes": 12_500, "window_ns": 100_000_000},
+            ],
+            1e6,
+        ),
+        ([], None),
+        ([{"window_bytes": 0, "window_ns": 1_000_000_000}], None),
+        # A window with no duration cannot contribute a rate and must not make
+        # the whole transfer's rate infinite.
+        ([{"window_bytes": 1000, "window_ns": 0}], None),
+    ]
+
+    def wins(shares, width_ns=1_000_000_000):
+        """Windows carrying the given per-window byte counts, back to back."""
+        return [
+            {"t_unix_ns": (i + 1) * width_ns, "window_ns": width_ns, "window_bytes": b}
+            for i, b in enumerate(shares)
+        ]
+
+    # A flat transfer delivers a quarter of its bytes in its last quarter
+    # whatever the window count — that is what the proportional straddle buys,
+    # and counting the straddling window whole would read the five-window case
+    # as 40% and mark a flat transfer as still climbing.
+    tail_cases = [
+        (wins([100] * 4), 0.25),
+        (wins([100] * 5), 0.25),
+        (wins([100] * 10), 0.25),
+        # Back-loaded: the shape measured on every upload that never left the
+        # ramp.
+        (wins([10, 20, 30, 340]), 0.85),
+        # Front-loaded, the shape a transfer that converged early makes.
+        (wins([340, 30, 20, 10]), 0.025),
+        # Three windows cannot resolve a quarter.
+        (wins([100] * 3), None),
+        ([], None),
+    ]
+    # Substrate pairing, and the two ways it must decline to fire: a leg that
+    # beat a control it does not ride, and a control that was not beaten.
+    outperform_cases = [
+        ({"tcp": 2.98e6}, {"raw_tcp": 2.32e6}, {"raw_tcp": ["tcp"]}),
+        ({"tcp": 2.98e6, "mimic": 2.37e6}, {"raw_tcp": 2.32e6}, {"raw_tcp": ["mimic", "tcp"]}),
+        ({"tcp": 1.0e6}, {"raw_tcp": 2.32e6}, {}),
+        # PhantomUDP is under the UDP echo and over the TCP one. Only its own
+        # substrate is consulted, so nothing fires.
+        ({"udp": 9.31e6}, {"raw_tcp": 2.32e6, "raw_udp": 26.87e6}, {}),
+        ({"udp": 30.0e6}, {"raw_udp": 26.87e6}, {"raw_udp": ["udp"]}),
+        # A leg with no figure and a control absent from this run are both
+        # "cannot say", not "did not beat it".
+        ({"tcp": None}, {"raw_tcp": 2.32e6}, {}),
+        ({"tcp": 2.98e6}, {}, {}),
+    ]
+    # Which legs a run drove. The declaration over-reports a `--only` run and
+    # the directories under-report nothing, so the answer is the intersection —
+    # and the case that matters is the last one, a leg that was driven and left
+    # no transfer behind.
+    driven_cases = [
+        (["udp", "tcp", "mimic", "quic", "raw_tcp", "raw_udp"], ["udp"], ["udp"]),
+        (
+            ["udp", "tcp", "mimic", "quic", "raw_tcp", "raw_udp"],
+            ["udp", "tcp", "mimic", "quic", "raw_tcp", "raw_udp"],
+            ["mimic", "quic", "tcp", "udp"],
+        ),
+        # An artifact whose run.json predates the field falls back to what is on
+        # disk rather than reporting no legs at all.
+        (None, ["udp", "tcp", "raw_tcp"], ["tcp", "udp"]),
+        # Declared and never reached.
+        (["udp", "tcp"], ["udp"], ["udp"]),
+        (["udp"], [], []),
+    ]
+    # A share above one condemns the column: the ladder is below a leg that runs
+    # over it, so it measured itself.
+    broken_cases = [
+        ({"udp": 0.13, "tcp": 0.04}, []),
+        ({"udp": 1.4}, ["udp"]),
+        ({"udp": 1.4, "tcp": 1.1, "mimic": 0.2}, ["tcp", "udp"]),
+        ({"udp": None}, []),
+        ({"udp": 1.0}, []),
+    ]
+
     failures = 0
+    for leg, want in role_cases:
+        got = leg_role(leg)
+        ok = got == want
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: leg_role({leg!r}) -> {got!r} (want {want!r})")
+    for rows, want in mean_cases:
+        got = mean_bps(rows)
+        ok = (got is None and want is None) or (
+            got is not None and want is not None and abs(got - want) < 1e-6
+        )
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: mean_bps({len(rows)} window(s)) -> {got!r} (want {want!r})")
+    for rows, want in tail_cases:
+        got = arrival_tail_share(rows)
+        ok = (got is None and want is None) or (
+            got is not None and want is not None and abs(got - want) < 1e-9
+        )
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: arrival_tail_share({len(rows)} window(s)) -> {got!r} (want {want!r})")
+    for legs, controls, want in outperform_cases:
+        got = outperformed_controls(legs, controls)
+        ok = got == want
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: outperformed_controls({legs}, {controls}) -> {got} (want {want})")
+    for shares, want in broken_cases:
+        got = denominator_broken(shares)
+        ok = got == want
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: denominator_broken({shares}) -> {got} (want {want})")
+    for declared, on_disk, want in driven_cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for leg in on_disk:
+                (root / "samples" / leg).mkdir(parents=True)
+            (root / "samples").mkdir(exist_ok=True)
+            got = exercised_legs(root, {} if declared is None else {"legs": declared})
+        ok = got == want
+        failures += 0 if ok else 1
+        print(
+            f"  {'ok' if ok else 'FAIL'}: exercised_legs(declared={declared}, "
+            f"on disk={on_disk}) -> {got} (want {want})"
+        )
     for rows, want_role in side_cases:
         got = series_role(rows)
         ok = got == want_role
@@ -2341,6 +2958,12 @@ def self_test():
         + len(shape_cases)
         + len(sweep_cases)
         + len(reorder_cases)
+        + len(role_cases)
+        + len(mean_cases)
+        + len(tail_cases)
+        + len(outperform_cases)
+        + len(broken_cases)
+        + len(driven_cases)
         + 6
     )
 
