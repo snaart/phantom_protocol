@@ -80,7 +80,9 @@ mod otel_off {
         #[inline(always)]
         pub(crate) fn record_unencrypted_dropped(&self, _leg: crate::transport::types::LegType) {}
         #[inline(always)]
-        pub(crate) fn record_initial_on_committed_route(&self) {}
+        pub(crate) fn record_initial_datagram_on_committed_route(&self) {}
+        #[inline(always)]
+        pub(crate) fn record_initial_flight_on_committed_route(&self) {}
         #[inline(always)]
         pub(crate) fn record_handshake_flight_repeated(&self) {}
         #[inline(always)]
@@ -145,12 +147,15 @@ mod otel_on {
         replay_rejected: Counter<u64>,
         aead_failed: Counter<u64>,
         unencrypted_dropped: Counter<u64>,
-        /// Handshake-type datagrams on an already-committed route. No attributes at all:
-        /// the only attribution worth having would be per peer, which the cardinality
-        /// contract in `attrs.rs` forbids.
-        initial_on_committed_route: Counter<u64>,
+        /// The same event in two units, kept apart because one of them is comparable with
+        /// `handshake_flight_repeated` below and the other is not: `_datagrams_` counts
+        /// wire arrivals (three per fragmented hello), `_flights_` counts questions asked.
+        /// No attributes at all on either: the only attribution worth having would be per
+        /// peer, which the cardinality contract in `attrs.rs` forbids.
+        initial_datagrams_on_committed_route: Counter<u64>,
+        initial_flights_on_committed_route: Counter<u64>,
         /// Retained reply flights actually repeated, and retained reply flights dropped to
-        /// make room for a newer one. Unlabeled for the same reason as the counter above.
+        /// make room for a newer one. Unlabeled for the same reason as the counters above.
         handshake_flight_repeated: Counter<u64>,
         handshake_flight_evicted: Counter<u64>,
         handshake_flight_refused: Counter<u64>,
@@ -200,11 +205,23 @@ mod otel_on {
                 .u64_counter(format!("{ns}.security.unencrypted_dropped"))
                 .with_description("Non-empty post-handshake packets dropped because the ENCRYPTED flag was absent")
                 .build();
-            let initial_on_committed_route = meter
-                .u64_counter(format!("{ns}.handshake.initial_on_committed_route"))
+            let initial_datagrams_on_committed_route = meter
+                .u64_counter(format!(
+                    "{ns}.handshake.initial_datagrams_on_committed_route"
+                ))
                 .with_description(
-                    "Handshake-type datagrams arriving on a connection already routed — a \
-                     client repeating its flight because it has not seen the reply",
+                    "Handshake-type datagrams arriving on a connection already routed — the \
+                     wire cost of clients repeating themselves, several per repeated flight. \
+                     Not comparable with flight_repeated; use \
+                     initial_flights_on_committed_route for that",
+                )
+                .build();
+            let initial_flights_on_committed_route = meter
+                .u64_counter(format!("{ns}.handshake.initial_flights_on_committed_route"))
+                .with_description(
+                    "Reassembled handshake messages arriving on a connection already routed — \
+                     one per question a client asked again because it has not seen the reply. \
+                     The half that pairs with flight_repeated",
                 )
                 .build();
             let handshake_flight_repeated = meter
@@ -284,7 +301,8 @@ mod otel_on {
                 replay_rejected,
                 aead_failed,
                 unencrypted_dropped,
-                initial_on_committed_route,
+                initial_datagrams_on_committed_route,
+                initial_flights_on_committed_route,
                 handshake_flight_repeated,
                 handshake_flight_evicted,
                 handshake_flight_refused,
@@ -341,8 +359,13 @@ mod otel_on {
         }
 
         #[cold]
-        pub(crate) fn record_initial_on_committed_route(&self) {
-            self.initial_on_committed_route.add(1, &[]);
+        pub(crate) fn record_initial_datagram_on_committed_route(&self) {
+            self.initial_datagrams_on_committed_route.add(1, &[]);
+        }
+
+        #[cold]
+        pub(crate) fn record_initial_flight_on_committed_route(&self) {
+            self.initial_flights_on_committed_route.add(1, &[]);
         }
 
         #[cold]

@@ -2441,8 +2441,9 @@ async fn udp_cookieless_initials_get_no_slot_until_address_validated() {
 /// possession of the exact bytes — receives nothing at all. A repeat's destination comes
 /// from the server's record of a completed handshake, and the address in that record echoed
 /// an IP-bound cookie, which is what proves it is a real source. The listener's
-/// `initial_on_committed_route_total` is what keeps that half from being vacuous: it says
-/// the replay reached the branch that decides whether to repeat and chose to send nothing.
+/// `initial_flights_on_committed_route_total` is what keeps that half from being vacuous: it
+/// says the replay reassembled and reached the branch that decides whether to repeat, and
+/// that the branch chose to send nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn udp_handshake_reply_repeat_stays_inside_the_anti_amplification_bound() {
     use phantom_protocol::api::session::connect_pinned_udp;
@@ -2565,7 +2566,9 @@ async fn udp_handshake_reply_repeat_stays_inside_the_anti_amplification_bound() 
             .expect("a captured client flight");
         seen.get(&newest).cloned().expect("its datagrams")
     };
-    let before = listener.metrics_snapshot().initial_on_committed_route_total;
+    let before = listener
+        .metrics_snapshot()
+        .initial_flights_on_committed_route_total;
     let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     attacker.connect(server_addr).await.unwrap();
     let mut asked = 0usize;
@@ -2584,13 +2587,19 @@ async fn udp_handshake_reply_repeat_stays_inside_the_anti_amplification_bound() 
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while listener.metrics_snapshot().initial_on_committed_route_total == before
+    while listener
+        .metrics_snapshot()
+        .initial_flights_on_committed_route_total
+        == before
         && std::time::Instant::now() < deadline
     {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
-        listener.metrics_snapshot().initial_on_committed_route_total > before,
+        listener
+            .metrics_snapshot()
+            .initial_flights_on_committed_route_total
+            > before,
         "the replay must have reached the branch that decides whether to repeat; if it never \
          got there, the zero above is about routing rather than about the bound"
     );

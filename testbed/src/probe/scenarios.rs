@@ -651,11 +651,17 @@ const FIRST_RETRANSMIT: Duration = Duration::from_secs(1);
 const RETRANSMIT_BUDGET: Duration = Duration::from_secs(8);
 
 /// Movement in the listener's four repair counters across one attempt.
+///
+/// `asked` and `answered` are both **per flight**, and that is load-bearing rather than
+/// incidental: they are compared with each other, and the listener also publishes the same
+/// arrivals per datagram. Reading the per-datagram figure here would put three questions
+/// against every answer on today's messages and report a working repair as a broken one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RepairDeltas {
-    /// `initial_on_committed_route_total` — the client's repeated flight arriving.
+    /// `initial_flights_on_committed_route_total` — the client's repeated flight arriving,
+    /// once per flight however many datagrams carried it.
     asked: u64,
-    /// `handshake_flight_repeated_total` — an answer going back.
+    /// `handshake_flight_repeated_total` — an answer going back, also once per flight.
     answered: u64,
     /// `handshake_flight_evicted_total` / `handshake_flight_refused_total` — the two ways
     /// retention fails to cover a session: by running out of budget, and by never arming.
@@ -816,8 +822,8 @@ async fn server_repair_counters(link: &dyn MsgLink) -> Option<ClientMetrics> {
 /// retains the flight it sent and repeats it byte for byte when the same question arrives
 /// again. That repair is pinned by the library's own tests and has never been seen working on
 /// a real path: four measurement runs across two days produced 76 consecutive successful UDP
-/// handshakes and `initial_on_committed_route_total = 0`, because the path did not happen to
-/// lose a handshake datagram. Waiting for a lossy day is not a test strategy, so the loss is
+/// handshakes and `initial_flights_on_committed_route_total = 0`, because the path did not
+/// happen to lose a handshake datagram. Waiting for a lossy day is not a test strategy, so the loss is
 /// manufactured — locally, deterministically, and on one flight only — while everything else
 /// about the exchange stays real.
 ///
@@ -920,8 +926,8 @@ pub async fn handshake_repair(
         let deltas = match (&before, &after) {
             (Some(b), Some(a)) => Some(RepairDeltas {
                 asked: a
-                    .initial_on_committed_route_total
-                    .saturating_sub(b.initial_on_committed_route_total),
+                    .initial_flights_on_committed_route_total
+                    .saturating_sub(b.initial_flights_on_committed_route_total),
                 answered: a
                     .handshake_flight_repeated_total
                     .saturating_sub(b.handshake_flight_repeated_total),
@@ -5868,7 +5874,7 @@ mod tests {
         // `MetricsSnapshotFfi`, which an accepted session shares.
         let m = listener.metrics_snapshot();
         let observed = RepairDeltas {
-            asked: m.initial_on_committed_route_total,
+            asked: m.initial_flights_on_committed_route_total,
             answered: m.handshake_flight_repeated_total,
             evicted: m.handshake_flight_evicted_total,
             refused: m.handshake_flight_refused_total,
@@ -5876,6 +5882,17 @@ mod tests {
         assert!(
             observed.asked > 0 && observed.answered > 0,
             "the question and the answer both have to be visible to an operator, saw {observed:?}"
+        );
+        // `asked` is compared with `answered`, so it has to be the flight-unit counter and not
+        // the datagram-unit one the listener publishes beside it. The repeated hello is
+        // fragmented, so the two differ here by the fragment count — reading the wrong one
+        // would report this repaired connect as a listener that ignored two questions out of
+        // three, which is a reading a live run actually produced.
+        assert!(
+            observed.asked < m.initial_datagrams_on_committed_route_total,
+            "the arrivals of one fragmented repeat must count as fewer flights than datagrams; \
+             {observed:?} against {} datagrams means the deltas are being read in datagrams",
+            m.initial_datagrams_on_committed_route_total
         );
         assert_eq!(
             classify_repair(swallowed, true, Some(observed)),

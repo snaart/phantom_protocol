@@ -250,8 +250,8 @@ The listener now retains the flight it sent and repeats it byte for byte when
 the same question arrives again. That repair is pinned by the library's own
 tests and has never been observed working on a real path: four measurement runs
 across two days produced 76 consecutive successful UDP handshakes and
-`initial_on_committed_route_total = 0`, because the path did not happen to lose
-a handshake datagram. Waiting for a lossy day is not a test strategy.
+`initial_flights_on_committed_route_total = 0`, because the path did not happen
+to lose a handshake datagram. Waiting for a lossy day is not a test strategy.
 
 So the loss is manufactured. A relay on the probe's own machine stands between
 the client socket and the daemon; every datagram still crosses the WAN in both
@@ -276,10 +276,14 @@ rule would swallow the repair along with the thing it repairs.
 is necessary and nowhere near sufficient — a relay that swallowed nothing leaves
 an ordinary connect, and an ordinary connect succeeds. So an attempt is
 `repaired` only when a flight was actually lost **and** the listener's own
-counters moved on both halves: `initial_on_committed_route_total` (the client's
-repeated question arrived) and `handshake_flight_repeated_total` (an answer went
-back). Anything short of that is recorded as `inconclusive` with the reason,
-which is neither a pass nor a failure — the path declining to cooperate is not
+counters moved on both halves: `initial_flights_on_committed_route_total` (the
+client's repeated question arrived) and `handshake_flight_repeated_total` (an
+answer went back). Both are counted per flight, which is what makes them
+comparable — the listener publishes the same arrivals per datagram as
+`initial_datagrams_on_committed_route_total`, and today's hello is three
+fragments, so reading that one here would show two unanswered questions for
+every answered one. Anything short of that is recorded as `inconclusive` with
+the reason, which is neither a pass nor a failure — the path declining to cooperate is not
 the protocol misbehaving. The one shape that *is* a finding is a flight really
 lost and a connect that never came back.
 

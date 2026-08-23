@@ -116,7 +116,11 @@ async fn main() -> Result<()> {
             let s = progress_obs.snapshot();
             tracing::info!(
                 active_sessions = s.active_sessions,
-                handshakes_ok = s.handshakes_success,
+                // Named for what the counter means: the server finished these, which is
+                // not the same as the client having received the reply — nothing under
+                // the handshake acknowledges it, so a reply lost downstream still counts
+                // here. On this loopback demo the two agree; on a real path they need not.
+                handshakes_finished_here = s.handshakes_success,
                 handshakes_failed = s.handshakes_failure,
                 packets_sent = s.packets_sent,
                 packets_recv = s.packets_recv,

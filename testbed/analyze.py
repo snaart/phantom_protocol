@@ -40,8 +40,14 @@ def filtered_max_label(rows):
 
 # The four counters PhantomUDP's reply-flight repeat leaves behind (PROTOCOL § 6.1).
 # Named once because three readers below have to agree on them.
+#
+# The first is the flight-unit arrival count, not the datagram-unit one the listener
+# publishes beside it: it is subtracted from and compared against the repeat count
+# below, and today's cookie-bearing hello crosses the path in three fragments, so the
+# datagram figure would report two unanswered questions for every one that was
+# answered. That is a reading this file produced once, from a real run.
 REPAIR_FIELDS = (
-    "initial_on_committed_route_total",
+    "initial_flights_on_committed_route_total",
     "handshake_flight_repeated_total",
     "handshake_flight_evicted_total",
     "handshake_flight_refused_total",
@@ -79,15 +85,17 @@ def repair_reading(counters):
     being read as a fault.
 
     The pair at the top is the whole reading, and it took a failed run to learn why
-    both halves are needed. `initial_on_committed_route` counts a client asking its
-    question again and is incremented before the listener decides whether to answer;
-    `handshake_flight_repeated` counts an answer going back. Asked-and-answered is a
-    repaired connect. Asked-and-not-answered is one the retention could not cover.
-    Neither number alone separates those.
+    both halves are needed. `initial_flights_on_committed_route` counts a client asking
+    its question again — once per question, whatever number of datagrams carried it —
+    and is incremented before the listener decides whether to answer;
+    `handshake_flight_repeated` counts an answer going back, in the same unit.
+    Asked-and-answered is a repaired connect. Asked-and-not-answered is one the
+    retention could not cover. Neither number alone separates those, and neither
+    survives being read in a different unit from the other.
     """
     if not counters or not any(counters.values()):
         return []
-    asked = counters["initial_on_committed_route_total"]
+    asked = counters["initial_flights_on_committed_route_total"]
     answered = counters["handshake_flight_repeated_total"]
     evicted = counters["handshake_flight_evicted_total"]
     refused = counters["handshake_flight_refused_total"]
@@ -2506,8 +2514,16 @@ def analyze_server(server_dir):
                     f"   rx {pl['packets_recv']:>9} pkt / {pl['bytes_recv']:>12} B"
                 )
         m = s.get("metrics", {})
+        # "finished here", not "ok": the daemon counts a handshake the moment it has
+        # sent its reply, and nothing under the handshake acknowledges that reply. A
+        # session whose reply was lost is counted here and never spoke — this run's own
+        # artifacts hold one at dur=135.0s, rx=0, tx=0 — so a server total above the
+        # probe's successes is an ordinary reading of a lossy path rather than a
+        # contradiction. The repair lines below are what say what became of those.
         print(
-            f"  {leg:8} handshakes ok {m.get('handshakes_success')} / failed {m.get('handshakes_failure')}"
+            f"  {leg:8} handshakes finished here {m.get('handshakes_success')}"
+            f" / failed {m.get('handshakes_failure')}"
+            f" (server-side completion, not proof the peer received the reply)"
             f", replay rejected {m.get('replay_rejected_total')}, aead failures {m.get('aead_failure_total')}"
             f", unencrypted refused {m.get('unencrypted_dropped_total')}"
         )

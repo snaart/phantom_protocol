@@ -5047,6 +5047,18 @@ data class MetricsSnapshotFfi (
     , 
     var `activeStreams`: kotlin.Long
     , 
+    /**
+     * Handshakes **this side** completed — not a count of peers that joined.
+     *
+     * A server records one the moment it has derived keys and sent its `ServerHello`,
+     * and nothing under the handshake acknowledges that reply, so a flight lost on the
+     * way down leaves a session counted here that the peer never saw. A live run held
+     * exactly such a session for 135 s with no byte in either direction, counted as a
+     * success while its client was reporting timeouts. Read a server's total against a
+     * client's failures as two measurements of one path, not as a contradiction; the
+     * two `*_on_committed_route_total` fields and `handshake_flight_repeated_total`
+     * are what say whether the reply was asked for again and re-sent.
+     */
     var `handshakesSuccess`: kotlin.ULong
     , 
     var `handshakesFailure`: kotlin.ULong
@@ -5077,29 +5089,36 @@ data class MetricsSnapshotFfi (
     var `unencryptedDroppedTotal`: kotlin.ULong
     , 
     /**
-     * Handshake-type datagrams that arrived on a PhantomUDP connection the listener
-     * had already committed a route to — a client repeating its flight because it
-     * never saw the reply (PROTOCOL § 6.1). Appended last for the reason above.
+     * **Unit: datagrams.** Handshake-type datagrams that arrived on a PhantomUDP
+     * connection the listener had already committed a route to, counted as each one
+     * lands and before reassembly (PROTOCOL § 6.1). Appended for the reason above.
      *
-     * Repetition is normal on a lossy path and is what the server's repeat answers,
-     * so a small non-zero value is health rather than alarm. What it is for is
-     * reading against a client that timed out connecting: non-zero says its
-     * questions arrived and one reply flight was lost on the way down; zero says the
-     * path fell silent in both directions. Nothing else on either side tells those
-     * apart.
+     * What it measures is the duplicate wire load a repeating client puts on the
+     * listener, which is a real question and the only one this offset has ever
+     * answered — a cookie-bearing hello is three fragments, so one repeated question
+     * moves it by three. It keeps its place in the record for exactly that reason:
+     * the name gained a unit, the number did not change, so a consumer built against
+     * an older header reads the same quantity it always did.
+     *
+     * **Not the field to read against `handshake_flight_repeated_total`** — that one
+     * counts flights, so the comparison is off by the fragment count and reads as
+     * answers gone missing. `initial_flights_on_committed_route_total` is the half
+     * that pairs with it.
      */
-    var `initialOnCommittedRouteTotal`: kotlin.ULong
+    var `initialDatagramsOnCommittedRouteTotal`: kotlin.ULong
     , 
     /**
-     * Retained reply flights this listener actually repeated (PROTOCOL § 6.1), one
-     * per repeat sent rather than per datagram of it. Appended for the reason above.
+     * **Unit: flights.** Retained reply flights this listener actually repeated
+     * (PROTOCOL § 6.1), one per repeat sent rather than per datagram of it. Appended
+     * for the reason above.
      *
-     * The field before it says a client asked again; this one says an answer went
-     * back, and the pair is what makes a failed connect readable. Questions arriving
-     * and answers going back is the repair working. Questions arriving and no answers
-     * is a listener that had nothing retained for that session — it was evicted,
-     * expired, or the budget for it was already spent. No questions at all is a path
-     * that went silent upstream, which is a different fault in a different direction.
+     * **Meant to be read together with `initial_flights_on_committed_route_total`,
+     * which is in the same unit**: that one says a client asked again, this one says
+     * an answer went back, and the pair is what makes a failed connect readable.
+     * Asks and answers together is the repair working. Asks and no answers is a
+     * listener that had nothing retained for that session — it was evicted, expired,
+     * or the budget for it was already spent. No asks at all is a path that went
+     * silent upstream, which is a different fault in a different direction.
      */
     var `handshakeFlightRepeatedTotal`: kotlin.ULong
     , 
@@ -5126,6 +5145,28 @@ data class MetricsSnapshotFfi (
      * moved, which changes no byte a peer would notice and which nothing else reports.
      */
     var `handshakeFlightRefusedTotal`: kotlin.ULong
+    , 
+    /**
+     * **Unit: flights.** Reassembled handshake messages that arrived on a PhantomUDP
+     * connection the listener had already committed a route to — one per question a
+     * client asked again because it never saw the reply (PROTOCOL § 6.1). Appended
+     * last for the reason given above, which is also why it is not adjacent to the
+     * field it is read with.
+     *
+     * Repetition is normal on a lossy path and is what the server's repeat answers,
+     * so a small non-zero value is health rather than alarm. What it is for is
+     * reading against a client that timed out connecting: non-zero says its
+     * questions arrived and one reply flight was lost on the way down; zero says the
+     * path fell silent in both directions. Nothing else on either side tells those
+     * apart.
+     *
+     * **Meant to be read together with `handshake_flight_repeated_total`, which is in
+     * the same unit.** The datagram-unit field of the same event
+     * (`initial_datagrams_on_committed_route_total`) is a different measurement, and
+     * comparing that one with the repeat count invents missing answers that never
+     * existed.
+     */
+    var `initialFlightsOnCommittedRouteTotal`: kotlin.ULong
     
 ){
     
@@ -5165,6 +5206,7 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
         )
     }
 
@@ -5188,10 +5230,11 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.allocationSize(value.`aeadFailureTotal`) +
             FfiConverterULong.allocationSize(value.`uptimeSecs`) +
             FfiConverterULong.allocationSize(value.`unencryptedDroppedTotal`) +
-            FfiConverterULong.allocationSize(value.`initialOnCommittedRouteTotal`) +
+            FfiConverterULong.allocationSize(value.`initialDatagramsOnCommittedRouteTotal`) +
             FfiConverterULong.allocationSize(value.`handshakeFlightRepeatedTotal`) +
             FfiConverterULong.allocationSize(value.`handshakeFlightEvictedTotal`) +
-            FfiConverterULong.allocationSize(value.`handshakeFlightRefusedTotal`)
+            FfiConverterULong.allocationSize(value.`handshakeFlightRefusedTotal`) +
+            FfiConverterULong.allocationSize(value.`initialFlightsOnCommittedRouteTotal`)
     )
 
     override fun write(value: MetricsSnapshotFfi, buf: ByteBuffer) {
@@ -5214,10 +5257,11 @@ public object FfiConverterTypeMetricsSnapshotFfi: FfiConverterRustBuffer<Metrics
             FfiConverterULong.write(value.`aeadFailureTotal`, buf)
             FfiConverterULong.write(value.`uptimeSecs`, buf)
             FfiConverterULong.write(value.`unencryptedDroppedTotal`, buf)
-            FfiConverterULong.write(value.`initialOnCommittedRouteTotal`, buf)
+            FfiConverterULong.write(value.`initialDatagramsOnCommittedRouteTotal`, buf)
             FfiConverterULong.write(value.`handshakeFlightRepeatedTotal`, buf)
             FfiConverterULong.write(value.`handshakeFlightEvictedTotal`, buf)
             FfiConverterULong.write(value.`handshakeFlightRefusedTotal`, buf)
+            FfiConverterULong.write(value.`initialFlightsOnCommittedRouteTotal`, buf)
     }
 }
 

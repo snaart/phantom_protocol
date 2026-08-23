@@ -93,7 +93,11 @@ pub(crate) struct HotPathAtomics {
     replay_rejected_total: CachePadded<AtomicU64>,
     aead_failure_total: CachePadded<AtomicU64>,
     unencrypted_dropped_total: CachePadded<AtomicU64>,
-    initial_on_committed_route_total: CachePadded<AtomicU64>,
+    /// Two counts of the same event in two units — see the recorders. The `_flights_` one
+    /// is the half of the pair `handshake_flight_repeated_total` is read against; the
+    /// `_datagrams_` one measures a different quantity and is not comparable with it.
+    initial_datagrams_on_committed_route_total: CachePadded<AtomicU64>,
+    initial_flights_on_committed_route_total: CachePadded<AtomicU64>,
     handshake_flight_repeated_total: CachePadded<AtomicU64>,
     handshake_flight_evicted_total: CachePadded<AtomicU64>,
     handshake_flight_refused_total: CachePadded<AtomicU64>,
@@ -126,7 +130,8 @@ impl HotPathAtomics {
             replay_rejected_total: CachePadded::new(AtomicU64::new(0)),
             aead_failure_total: CachePadded::new(AtomicU64::new(0)),
             unencrypted_dropped_total: CachePadded::new(AtomicU64::new(0)),
-            initial_on_committed_route_total: CachePadded::new(AtomicU64::new(0)),
+            initial_datagrams_on_committed_route_total: CachePadded::new(AtomicU64::new(0)),
+            initial_flights_on_committed_route_total: CachePadded::new(AtomicU64::new(0)),
             handshake_flight_repeated_total: CachePadded::new(AtomicU64::new(0)),
             handshake_flight_evicted_total: CachePadded::new(AtomicU64::new(0)),
             handshake_flight_refused_total: CachePadded::new(AtomicU64::new(0)),
@@ -198,6 +203,18 @@ impl HotPathAtomics {
     /// surfaced through the live snapshot. The labeled OTel `Histogram`
     /// (`{ns}.handshake.duration`) is a separate path in the instrument
     /// holder; the facade's `record_handshake` drives both together.
+    ///
+    /// **Success here means "this side finished", not "the peer heard the
+    /// reply".** Each side counts its own completion, and the server's is
+    /// recorded the moment it has derived keys and sent its reply — after which
+    /// nothing under the handshake is reliable, so a reply lost on the way down
+    /// leaves a session that this counter has already called successful and that
+    /// the peer never joined. A live run recorded exactly that: a session with
+    /// `dur=135.0 s, rx=0, tx=0`, counted as a success against a client seeing
+    /// timeouts. Read against a client's own failures the asymmetry is the
+    /// finding, not a contradiction; `initial_flights_on_committed_route_total`
+    /// and `handshake_flight_repeated_total` are what say whether the reply was
+    /// asked for again and re-sent.
     pub(crate) fn record_handshake_success(&self, duration_ns: u64) {
         self.handshake_success_count.fetch_add(1, Ordering::Relaxed);
         self.handshake_latency_ns_sum
@@ -244,9 +261,34 @@ impl HotPathAtomics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increment the always-on count of handshake-type datagrams arriving on a
-    /// connection the listener has already committed a route to — a client
-    /// repeating its flight because it has not seen the reply (PROTOCOL § 6.1).
+    /// **Unit: one datagram.** Increment the always-on count of handshake-type
+    /// *datagrams* arriving on a connection the listener has already committed a
+    /// route to, counted as each one lands and before reassembly (PROTOCOL § 6.1).
+    ///
+    /// This is the wire cost of clients repeating themselves, not the number of
+    /// times they asked: a cookie-bearing `ClientHello` is three fragments, so one
+    /// repeated question moves this by three. It is the only measure of that cost
+    /// the listener has — the demux records no per-packet counters of its own —
+    /// which is why it is kept, and why it is kept under a name that says
+    /// `datagrams`.
+    ///
+    /// **Do not read it against [`record_handshake_flight_repeated`]**, which
+    /// counts flights: the comparison is off by the fragment count and reads as
+    /// answers gone missing. [`record_initial_flight_on_committed_route`] is the
+    /// half that pairs with it.
+    ///
+    /// [`record_handshake_flight_repeated`]: Self::record_handshake_flight_repeated
+    /// [`record_initial_flight_on_committed_route`]: Self::record_initial_flight_on_committed_route
+    #[inline]
+    pub(crate) fn record_initial_datagram_on_committed_route(&self) {
+        self.initial_datagrams_on_committed_route_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// **Unit: one flight.** Increment the always-on count of *reassembled*
+    /// handshake messages arriving on a connection the listener has already
+    /// committed a route to — one per question the client asked again, however
+    /// many datagrams carried it (PROTOCOL § 6.1).
     ///
     /// It exists because of a question that could not be answered from any
     /// artifact on either side of a failed connect: whether the client's repeated
@@ -255,27 +297,29 @@ impl HotPathAtomics {
     /// path fell silent in both directions. Those need different remedies and were
     /// indistinguishable without this.
     ///
-    /// It answers only that first question. It is bumped when the datagram
-    /// arrives, before anything has decided whether an answer is owed, so on its
-    /// own it cannot say whether the listener repaired the connect or had nothing
-    /// to send — [`record_handshake_flight_repeated`] is the other half.
+    /// **Meant to be read together with [`record_handshake_flight_repeated`], and
+    /// in the same unit as it**: this one is bumped before anything has decided
+    /// whether an answer is owed, so alone it cannot say whether the listener
+    /// repaired the connect or had nothing to send.
     ///
     /// [`record_handshake_flight_repeated`]: Self::record_handshake_flight_repeated
     #[inline]
-    pub(crate) fn record_initial_on_committed_route(&self) {
-        self.initial_on_committed_route_total
+    pub(crate) fn record_initial_flight_on_committed_route(&self) {
+        self.initial_flights_on_committed_route_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increment the always-on count of retained reply flights actually repeated
-    /// (PROTOCOL § 6.1) — one per repeat sent, not per datagram of it.
+    /// **Unit: one flight.** Increment the always-on count of retained reply
+    /// flights actually repeated (PROTOCOL § 6.1) — one per repeat sent, not per
+    /// datagram of it.
     ///
-    /// Read against [`record_initial_on_committed_route`]: repeats arriving with no
-    /// repeats sent is a listener that had nothing to answer with, which is a
-    /// different fault from a path that lost the answer on the way down and a
-    /// different fault again from one that never carried the question.
+    /// **Meant to be read together with
+    /// [`record_initial_flight_on_committed_route`], which is in the same unit**:
+    /// asks arriving with no repeats sent is a listener that had nothing to answer
+    /// with, which is a different fault from a path that lost the answer on the way
+    /// down and a different fault again from one that never carried the question.
     ///
-    /// [`record_initial_on_committed_route`]: Self::record_initial_on_committed_route
+    /// [`record_initial_flight_on_committed_route`]: Self::record_initial_flight_on_committed_route
     #[inline]
     pub(crate) fn record_handshake_flight_repeated(&self) {
         self.handshake_flight_repeated_total
@@ -397,8 +441,13 @@ impl HotPathAtomics {
         self.unencrypted_dropped_total.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn initial_on_committed_route_total(&self) -> u64 {
-        self.initial_on_committed_route_total
+    pub(crate) fn initial_datagrams_on_committed_route_total(&self) -> u64 {
+        self.initial_datagrams_on_committed_route_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn initial_flights_on_committed_route_total(&self) -> u64 {
+        self.initial_flights_on_committed_route_total
             .load(Ordering::Relaxed)
     }
 
@@ -515,7 +564,8 @@ mod tests {
         assert_eq!(h.replay_rejected_total(), 0);
         assert_eq!(h.aead_failure_total(), 0);
         assert_eq!(h.unencrypted_dropped_total(), 0);
-        assert_eq!(h.initial_on_committed_route_total(), 0);
+        assert_eq!(h.initial_datagrams_on_committed_route_total(), 0);
+        assert_eq!(h.initial_flights_on_committed_route_total(), 0);
         assert_eq!(h.handshake_flight_repeated_total(), 0);
         assert_eq!(h.handshake_flight_evicted_total(), 0);
         assert_eq!(h.handshake_flight_refused_total(), 0);
@@ -526,10 +576,12 @@ mod tests {
         h.record_unencrypted_dropped();
         h.record_unencrypted_dropped();
         h.record_unencrypted_dropped();
-        h.record_initial_on_committed_route();
-        h.record_initial_on_committed_route();
-        h.record_initial_on_committed_route();
-        h.record_initial_on_committed_route();
+        h.record_initial_datagram_on_committed_route();
+        h.record_initial_datagram_on_committed_route();
+        h.record_initial_datagram_on_committed_route();
+        h.record_initial_datagram_on_committed_route();
+        h.record_initial_flight_on_committed_route();
+        h.record_initial_flight_on_committed_route();
         h.record_handshake_flight_repeated();
         h.record_handshake_flight_repeated();
         h.record_handshake_flight_evicted();
@@ -542,7 +594,10 @@ mod tests {
         assert_eq!(h.replay_rejected_total(), 2);
         assert_eq!(h.aead_failure_total(), 1);
         assert_eq!(h.unencrypted_dropped_total(), 3);
-        assert_eq!(h.initial_on_committed_route_total(), 4);
+        // Four datagrams carrying two flights: the two totals count the same event in
+        // different units, and each has to move on its own recorder only.
+        assert_eq!(h.initial_datagrams_on_committed_route_total(), 4);
+        assert_eq!(h.initial_flights_on_committed_route_total(), 2);
         assert_eq!(h.handshake_flight_repeated_total(), 2);
         assert_eq!(h.handshake_flight_evicted_total(), 1);
         assert_eq!(h.handshake_flight_refused_total(), 5);
