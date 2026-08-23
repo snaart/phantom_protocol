@@ -127,7 +127,24 @@ the longest scenario for almost no extra information.
 
 Useful flags: `--legs udp,tcp,mimic,quic,raw_tcp,raw_udp`,
 `--only rtt_sweep,upload`, `--rtt-sizes 64,1024,8192`, `--soak-secs`,
-`--concurrency`, `--capture-iface`, `--no-upload`.
+`--concurrency`, `--upload-secs`, `--transfer-frame`, `--capture-iface`,
+`--no-upload`.
+
+The last two exist to settle questions the default matrix cannot, and both are
+described under "Reading a run" below, where the readings they answer live:
+
+- `--upload-secs` lengthens the bulk upload. The profile windows are short
+  relative to how long a BBR-style controller takes to converge on a long path —
+  `smoke`'s ten seconds is about fifty round trips at 200 ms — and a transfer
+  that spends most of them still raising its own bandwidth estimate reports a
+  convergence rate under the name of a capacity. It carries `transfer_cap`
+  upward with it, because an upload longer than the wall-clock cap that bounds
+  every transfer would otherwise be silently cut back to the cap.
+- `--transfer-frame` changes the application frame size. It is the only knob
+  that moves the ARQ send buffer's byte ceiling — that bound is
+  `MAX_PENDING_PACKETS` **segments**, so its byte figure scales with the frame —
+  while leaving the peer's flow-control window, a byte bound, exactly where it
+  was. At the default 1024 the two land within half a percent of each other.
 
 ## Scenarios
 
@@ -523,6 +540,54 @@ behaviour into a measurement rather than a trap.
 Recomputes everything from the raw JSONL rather than trusting `summary.json`,
 using the same nearest-rank percentile definition as the Rust side. Standard
 library only.
+
+### "What stopped the sender": the census, and what it cannot see
+
+Throughput says how fast a transfer went; it never says why it did not go
+faster. The section under that heading asks the second question of every
+*sending* window series, one verdict per 200 ms sample, ranked so that the
+verdicts partition the samples rather than overlapping:
+
+| verdict | what it means |
+|---|---|
+| `cwnd` | less than one application chunk of congestion window was free |
+| `ceiling` | bytes outstanding were against the flow-control / send-buffer pair |
+| `paced` | neither, and outstanding bytes sat at the pacer's own `rate × min_rtt` |
+| `window_headroom` | none of those — the window had room and nothing was using it |
+
+**A client-side `download` series is not a sending side** and is skipped with
+that reason. On a download the sender is the daemon and its window is in
+`windows.jsonl`; the client's own series is a receiver's, which means a window
+pinned at its 5600 B floor, nothing in flight, and the application-limited flag
+set in every sample. That shape reads as a catastrophic stall, and this tool
+printed it as one — "sender-bound, not link-bound" — on every run until the role
+was decided from the rows instead of assumed. The role is read off the window
+and the bytes outstanding, not off the file name, because the name is wrong in
+both directions: `bidir` *is* a sending side.
+
+**`app_limited` is counted beside the census and never inside it.** The flag is
+raised by a drain pass that found no *unsent* segment, and a stream whose send
+buffer is full of unacknowledged ones is in exactly that state while the
+application behind it is blocked. On a saturated bulk transfer the flag
+therefore reports an idle application at the moment the application is hardest
+against the transport. Printing it next to the `ceiling` count is what makes the
+disagreement visible; folding it in would hide it.
+
+**Two of the five candidate limits are not separable from this artifact.** The
+peer's advertised flow-control window (`MAX_SEND_WINDOW`, 1 MiB) and the ARQ
+send buffer (`MAX_PENDING_PACKETS` segments) are both byte ceilings a saturated
+sender sits against, and `MAX_RECV_WINDOW` was deliberately set just under what
+the send buffer can hold — window granted past that point is memory a receiver
+commits for data that cannot arrive. At the default 1024 B frame they are
+1 048 576 B and 1 052 672 B, and no field in the record distinguishes a sender
+held by one from a sender held by the other. The section says so where it
+applies rather than picking a winner. Halving `--transfer-frame` separates them
+by two, because only one of the two ceilings moves.
+
+Four library constants the window rows do not carry are printed at the top of
+the section with the file they come from. Everything else in `analyze.py` is
+recomputed from the artifact; these cannot be, and a constant read from memory
+is how a label comes to name a bound the run was never taken against.
 
 ```bash
 ./stall_verdict.py client results/<run-id>

@@ -121,6 +121,338 @@ def repair_reading(counters):
     return lines
 
 
+# ── what stopped the sender ──────────────────────────────────────────────
+#
+# Four library constants the window rows do not carry. Every other number in
+# this file is recomputed from the artifact; these cannot be, because nothing
+# writes them into it. They are therefore printed beside the readings that use
+# them, with the file they come from, so a reader who suspects one has drifted
+# can check it in the time it takes to open `core/src/transport/stream.rs` —
+# which is the same bargain `bw_filter_window_ms` was added to avoid having to
+# make, and the reason to prefer a recorded horizon wherever one exists.
+SEND_BUFFER_SEGMENTS = 1024  # transport::stream::MAX_PENDING_PACKETS
+PEER_SEND_WINDOW_BYTES = 1024 * 1024  # transport::stream::MAX_SEND_WINDOW
+APP_CHUNK_BYTES = 1156  # transport::mtu::MAX_APP_CHUNK
+CWND_FLOOR_BYTES = 5600  # PROBE_RTT_CWND_PACKETS × MIN_PACKET_SIZE
+
+# How close to a ceiling a sample has to sit before it is read as being held
+# there. One segment of slack is too tight — the sampler takes whichever instant
+# it happens to take, and a paced sender is retiring and re-filling continuously
+# — so this is a fraction rather than a count.
+CEILING_PROXIMITY = 0.95
+
+# How far the pacer's own target may miss `inflight` and still be read as the
+# thing metering it. The gain cycle moves the target by ±25% between rounds and
+# the sampler aliases across that cycle, so a band narrower than the gain spread
+# would classify the same steady state differently depending on which round the
+# tick landed in.
+PACED_BAND = (0.75, 1.25)
+
+
+def series_is_a_sender(rows):
+    """Whether a window series describes a sending side at all.
+
+    Decided from the rows rather than from the file's name, because the name is
+    wrong in both directions: `bidir` is a sending side and `download` is not,
+    and a client-side `download` series is exactly the shape that reads as a
+    catastrophic stall — window pinned at its floor, nothing in flight,
+    application-limited in every sample — when in truth the sender was on the
+    other end of the path and its window is in the daemon's `windows.jsonl`.
+
+    The test is on the window rather than on bytes acknowledged, because a
+    receiver acknowledges a few: it sends the request that starts the transfer,
+    and every download series in every run carries exactly that — 40 bytes
+    delivered, once, and a congestion window that never moves off its floor. So
+    "delivered anything" would call every receiver a sender.
+
+    Either half is enough, and the second half is what keeps a genuinely stalled
+    sender inside the analysis: a sender pinned at the floor still had a flight
+    outstanding, which is four packets, while a receiver's request is a fraction
+    of one chunk. Both halves are false only for a side that never sent
+    application data at all.
+
+    On the reference leg the in-flight figure is zero because the leg reports
+    none; that case is named separately by [`series_is_reference`] so the two do
+    not get one answer.
+    """
+    return any(
+        r.get("cwnd_bytes", 0) > CWND_FLOOR_BYTES or r.get("inflight_bytes", 0) >= APP_CHUNK_BYTES
+        for r in rows
+    )
+
+
+def series_is_reference(rows):
+    """Whether these rows come from the QUIC reference leg.
+
+    Read off `state`, which the recorder sets to `quic:<controller>` there. The
+    leg exposes a congestion window and a smoothed RTT and nothing else of this
+    shape, so every field the census below reads is zero by construction and a
+    census over it would describe the instrument.
+    """
+    return any(str(r.get("state", "")).startswith("quic:") for r in rows)
+
+
+def series_role(rows):
+    """`reference`, `receiver` or `sender` — which of the three a series is.
+
+    Ranked, and the reference leg comes first, because it is the one case where
+    the sender test answers yes for the wrong reason: quinn reports a congestion
+    window and nothing else, so a window well clear of the floor sits beside a
+    permanently zero in-flight figure. Deciding it here rather than at each call
+    site is what stops the ordering from being re-derived, differently, by the
+    next reader.
+    """
+    if series_is_reference(rows):
+        return "reference"
+    return "sender" if series_is_a_sender(rows) else "receiver"
+
+
+def frame_bytes_of(transfer_rows):
+    """Mean application frame size, from the transfer's own byte and frame counts.
+
+    Derived rather than assumed because it is one of the two terms in the ARQ
+    ceiling below, and the other one — how many segments the buffer holds — is
+    fixed. A run driven at a different frame size therefore gets a different
+    ceiling without anyone editing this file, which is the property that makes
+    the ceiling worth printing at all.
+    """
+    b = sum(r.get("window_bytes", 0) for r in transfer_rows)
+    n = sum(r.get("window_frames", 0) for r in transfer_rows)
+    return b / n if n else None
+
+
+def arq_ceiling_bytes(frame):
+    """Bytes one stream's ARQ send buffer can hold outstanding at this frame size.
+
+    The buffer's bound is `MAX_PENDING_PACKETS` **segments**, and a frame larger
+    than `MAX_APP_CHUNK` is split into several of them, so the byte figure moves
+    with the frame size while the segment figure does not. That is the whole
+    reason this is a function: the peer's flow-control window is a byte bound
+    that does *not* move with frame size, and the two are only told apart by
+    changing the one term they do not share.
+    """
+    if not frame or frame <= 0:
+        return None
+    per_frame = math.ceil(frame / APP_CHUNK_BYTES)
+    return int(SEND_BUFFER_SEGMENTS * (frame / per_frame))
+
+
+def ceilings_separable(frame):
+    """The two byte ceilings a saturated sender can be sitting against, and
+    whether this frame size tells them apart.
+
+    They are the peer's advertised flow-control window and this side's ARQ send
+    buffer. `MAX_RECV_WINDOW` was deliberately set just under what the send
+    buffer can hold — window granted past that point is memory a receiver
+    commits for data that cannot arrive — so at a frame size near
+    `MAX_APP_CHUNK` the two land within a fraction of a percent of each other
+    and no field in the record separates them. Returned as a fact about the
+    measurement, not hidden behind a chosen winner.
+    """
+    arq = arq_ceiling_bytes(frame)
+    if arq is None:
+        return None
+    lo, hi = min(arq, PEER_SEND_WINDOW_BYTES), max(arq, PEER_SEND_WINDOW_BYTES)
+    return {
+        "arq": arq,
+        "peer_window": PEER_SEND_WINDOW_BYTES,
+        "binding": lo,
+        "separation": hi / lo,
+        # Ten percent is the smallest gap the 200 ms sampler can resolve against
+        # a window that is being retired and re-filled every round trip.
+        "separable": hi / lo >= 1.10,
+    }
+
+
+def bound_census(rows, ceiling_bytes):
+    """What stopped the sender, one verdict per window sample.
+
+    The verdicts are ranked, because more than one bound can be tight at the
+    same instant and a census that double-counts sums to more than its samples:
+
+    - `cwnd` — less than one application chunk of congestion window is free, so
+      the next segment cannot go out whatever else is true. Unambiguous, and
+      therefore first.
+    - `ceiling` — bytes outstanding are against the flow-control/send-buffer
+      pair. Which of the two is a question this cannot answer; see
+      [`ceilings_separable`].
+    - `paced` — neither of the above, and bytes outstanding sit at the pacer's
+      own target of `rate × min_rtt`. The release rate is the meter.
+    - `window_headroom` — none of the above: the window had room, the ceiling
+      was far off, and the sender was not at the paced target either.
+
+    `app_limited` is deliberately **not** a verdict here, and that is the point
+    of the whole function. The flag is raised by a drain pass that found no
+    *unsent* segment, which is equally the state of a stream whose send buffer
+    is full of unacknowledged ones — so on a saturated bulk transfer it reports
+    the application as idle at exactly the moment the application is blocked.
+    It is counted separately, beside the census, so the disagreement between the
+    two is visible rather than averaged into one of them.
+    """
+    tally = defaultdict(int)
+    app_flag = 0
+    for r in rows:
+        cwnd = r.get("cwnd_bytes", 0)
+        infl = r.get("inflight_bytes", 0)
+        if r.get("app_limited"):
+            app_flag += 1
+        if cwnd and cwnd - infl < APP_CHUNK_BYTES:
+            tally["cwnd"] += 1
+            continue
+        if ceiling_bytes and infl >= CEILING_PROXIMITY * ceiling_bytes:
+            tally["ceiling"] += 1
+            continue
+        target = r.get("pacing_rate_bps", 0) * r.get("min_rtt_us", 0) / 1e6
+        if target and PACED_BAND[0] <= infl / target <= PACED_BAND[1]:
+            tally["paced"] += 1
+            continue
+        tally["window_headroom"] += 1
+    return dict(tally), app_flag
+
+
+def startup_exit(rows):
+    """When Startup ended and what the bandwidth estimate was worth by then.
+
+    Startup is the connection's only exponential phase; everything after it
+    climbs at the gain cycle's 1.25× per four round trips. So the estimate at
+    the moment of exit is the floor the rest of the transfer has to climb from,
+    and on a transfer of a few dozen round trips that floor, not any ceiling, is
+    what the mean rate is made of.
+
+    `None` means the series ended still in Startup, which is a different and
+    much better outcome than an early exit — not a missing measurement.
+    """
+    last = None
+    for r in rows:
+        if r.get("state") == "startup":
+            last = r
+        elif last is not None:
+            return {"at_ms": last["elapsed_ms"], "bw_bps": last["bottleneck_bw_bps"]}
+    return None
+
+
+def convergence(rows):
+    """How much of the transfer was spent still accelerating.
+
+    A transfer that delivers most of its bytes in its last quarter did not
+    measure a rate, it measured a ramp — and a mean over it is a statement about
+    how fast the controller converges, not about what the path carries. The
+    third figure is the blunt one: when the estimate first reached half of the
+    best it would ever reach in this transfer, as a fraction of the way through.
+    """
+    usable = [r for r in rows if r.get("elapsed_ms") is not None]
+    if len(usable) < 4:
+        return None
+    dur = usable[-1]["elapsed_ms"]
+    total = usable[-1].get("delivered_bytes", 0)
+    if dur <= 0 or total <= 0:
+        return None
+
+    def delivered_by(ms):
+        seen = 0
+        for r in usable:
+            if r["elapsed_ms"] <= ms:
+                seen = r.get("delivered_bytes", 0)
+        return seen
+
+    peak = max(r.get("bottleneck_bw_bps", 0) for r in usable)
+    half_peak_at = next(
+        (r["elapsed_ms"] for r in usable if r.get("bottleneck_bw_bps", 0) >= peak / 2), None
+    )
+    return {
+        "duration_ms": dur,
+        "first_half_share": delivered_by(dur / 2) / total,
+        "last_quarter_share": (total - delivered_by(dur * 0.75)) / total,
+        "half_peak_at_ms": half_peak_at,
+        "half_peak_share": (half_peak_at / dur) if half_peak_at is not None else None,
+    }
+
+
+def measured_min_rtt_us(rows):
+    """The smallest round trip the estimator actually measured on this transfer.
+
+    Rows recorded before the first acknowledgement carry the estimator's opening
+    guess rather than a measurement — 100 ms, which on this path is roughly half
+    the truth — and a minimum taken over all rows picks it every time. A row
+    with no bandwidth estimate has had no acknowledgement, so that is the test.
+    """
+    seen = [r["min_rtt_us"] for r in rows if r.get("min_rtt_us") and r.get("bottleneck_bw_bps")]
+    return min(seen) if seen else None
+
+
+def implied_rtt_us(rows, coarse_ns=1_000_000_000):
+    """Round trip implied by what was outstanding and how fast it retired.
+
+    `min_rtt_us` cannot answer the queueing question on a transfer of this
+    length and it is not its fault: the filter behind it is a minimum over a
+    ten-second window and ProbeRTT — the thing that re-measures it — runs on a
+    ten-second timer, so on a ten-second transfer the figure is very nearly a
+    constant by construction. Dividing bytes outstanding by the rate they
+    actually retired at gives a round trip that does move, and the gap between
+    the two is the standing queue.
+
+    Coarsened to one-second spans first. Over a single 200 ms sample the
+    acknowledgement arithmetic is lumpy enough — a SACK covering a whole window
+    lands in one span and none in the next — that per-sample ratios describe the
+    acknowledgement pattern rather than the path.
+    """
+    out = []
+    i = 0
+    while i < len(rows) - 1:
+        j = i
+        while j < len(rows) - 1 and (rows[j]["t_unix_ns"] - rows[i]["t_unix_ns"]) < coarse_ns:
+            j += 1
+        span = (rows[j]["t_unix_ns"] - rows[i]["t_unix_ns"]) / 1e9
+        grew = rows[j].get("delivered_bytes", 0) - rows[i].get("delivered_bytes", 0)
+        if span > 0 and grew > 0:
+            span_rows = rows[i : j + 1]
+            mean_infl = sum(r.get("inflight_bytes", 0) for r in span_rows) / len(span_rows)
+            out.append(mean_infl / (grew / span) * 1e6)
+        i = max(j, i + 1)
+    return pct(out, 0.50) if out else None
+
+
+def delivery_ratios(rows):
+    """The estimator's two readings against what the connection actually delivered.
+
+    Returns `(filtered, raw)`, each a list of ratios over the intervals where
+    delivery moved. The numerators are different statistics and must not be
+    summarised the same way — see the block at the call site in
+    `analyze_server`, which is the longer statement of why.
+    """
+    est, raw = [], []
+    for a, b in zip(rows, rows[1:]):
+        span = (b["t_unix_ns"] - a["t_unix_ns"]) / 1e9
+        grew = b.get("delivered_bytes", 0) - a.get("delivered_bytes", 0)
+        if span <= 0 or grew <= 0:
+            continue
+        actual = grew / span
+        est.append(b.get("bottleneck_bw_bps", 0) / actual)
+        if b.get("last_delivery_rate_bps", 0):
+            raw.append(b["last_delivery_rate_bps"] / actual)
+    return est, raw
+
+
+def probe_headroom(exit_ms, duration_ms, min_rtt_us):
+    """How much the gain cycle could raise the estimate in the time left.
+
+    ProbeBW asks the path for a quarter more than its estimate one round trip in
+    four, so the compounding unit is four round trips and the factor per unit is
+    1.25. This is a **lower bound** on what the phase can do — its congestion
+    window is twice the bandwidth-delay product, so a probing round can deliver
+    more than a quarter over — but a lower bound is the useful direction: when
+    it already exceeds the climb the transfer needs, the climb was never the
+    constraint, and when it falls short the transfer cannot have finished
+    climbing whatever else happened.
+    """
+    if not min_rtt_us or duration_ms is None or exit_ms is None or duration_ms <= exit_ms:
+        return None
+    rtt_ms = min_rtt_us / 1000.0
+    rounds = (duration_ms - exit_ms) / rtt_ms
+    cycles = rounds / 4.0
+    return {"rounds": rounds, "cycles": cycles, "factor": 1.25**cycles}
+
+
 def read_jsonl(path):
     """Yield records, skipping lines a truncated run left half-written."""
     try:
@@ -384,9 +716,20 @@ def analyze_client(run_dir):
             f"inflight peak {max(infl):>7} B, bw peak {max(bw) * 8 / 1e6:6.2f} Mbit/s"
         )
         print(f"         {'':17} phases: {' → '.join(states)}; app-limited in {limited}/{len(rows)} samples")
+        # Both readings below are statements about a *sender*, and half of these
+        # series are not one: on a download the sender is the daemon, and the
+        # client's own window then sits at its floor with nothing outstanding
+        # because that is what a receiver's congestion window does. Calling that
+        # "sender-bound" was a finding this tool printed on every run, about a
+        # side that was never sending.
+        role = series_role(rows)
+        if role == "reference":
+            print("         reference leg — no bytes-in-flight statistic, so neither reading applies")
+        elif role == "receiver":
+            print("         receiving side (this window never left its floor) — the sender's is the daemon's")
         # 5600 B is PROBE_RTT_CWND_PACKETS * MIN_PACKET_SIZE. A series that
         # never leaves it means the sender, not the link, set the rate.
-        if max(cw) <= 5600:
+        elif max(cw) <= CWND_FLOOR_BYTES:
             print("         \033[33mwindow never left its 5600 B floor — sender-bound, not link-bound\033[0m")
         # A window with room to spare that is never filled points at the
         # application or the pacer rather than congestion control.
@@ -394,6 +737,8 @@ def analyze_client(run_dir):
             print("         window had room it never used — look at the pacer or the send loop, not cwnd")
     if not any_w:
         print("  (no window series — this run predates the cwnd instrumentation)")
+
+    send_bound_section(run_dir)
 
     # ── message boundaries ───────────────────────────────────────────────
     section("Message-boundary integrity")
@@ -473,6 +818,125 @@ def analyze_client(run_dir):
     section("Caveats recorded with this run")
     for c in meta.get("caveats", []):
         print(f"  · {c}")
+
+
+def send_bound_section(run_dir):
+    """What stopped the sender, per transfer, and whether it ever stopped climbing.
+
+    The question this answers is the one throughput alone cannot: at each
+    moment, why was the sender not sending more. It is asked of the *sending*
+    side only — a client-side download series is the receiver's and is skipped
+    with that reason rather than classified into nonsense.
+
+    Two readings sit beside the census because either one alone has been
+    misread here before. The convergence figures say whether the transfer ever
+    reached a steady state at all; a transfer that delivers most of its bytes
+    in its last quarter has measured how fast the controller converges, and a
+    census over it is a census of a ramp. And the application-limited count is
+    printed against the census rather than inside it, because the flag is
+    raised by a drain that found nothing *unsent* — which is also what a send
+    buffer full of unacknowledged segments looks like.
+    """
+    section("What stopped the sender (one verdict per window sample)")
+    print(
+        f"  ceilings from the library, not from the artifact: ARQ send buffer "
+        f"{SEND_BUFFER_SEGMENTS} segments, peer send window {PEER_SEND_WINDOW_BYTES} B, "
+        f"app chunk {APP_CHUNK_BYTES} B (core/src/transport/{{stream,mtu}}.rs)"
+    )
+    any_series = False
+    for f in sorted(run_dir.glob("samples/*/*.window.jsonl")):
+        rows = [r for r in read_jsonl(f) if r.get("t_unix_ns")]
+        if not rows:
+            continue
+        leg, phase = rows[0]["leg"], rows[0]["phase"]
+        tag = f"{leg}/{phase}"
+        role = series_role(rows)
+        if role == "reference":
+            print(f"  {tag:18} reference leg — reports no bytes in flight, nothing to classify")
+            continue
+        if role == "receiver":
+            print(f"  {tag:18} receiving side — the sender's window for this transfer is the daemon's")
+            continue
+        any_series = True
+
+        frame = frame_bytes_of(list(read_jsonl(f.with_name(f"{phase}.jsonl"))))
+        ceilings = ceilings_separable(frame)
+        tally, app_flag = bound_census(rows, ceilings["binding"] if ceilings else None)
+        n = len(rows)
+        census = "  ".join(
+            f"{k} {round(100 * v / n)}%" for k, v in sorted(tally.items(), key=lambda kv: -kv[1])
+        )
+        print(f"  {tag:18} {n} samples: {census}")
+        print(f"  {'':18} app-limited flag set in {round(100 * app_flag / n)}% of them")
+        if app_flag and tally.get("ceiling"):
+            print(
+                f"  {'':18}   ↑ read that against the ceiling count: a send buffer full of "
+                "unacknowledged segments raises the same flag as an idle application"
+            )
+
+        conv = convergence(rows)
+        if conv:
+            share = conv["half_peak_share"]
+            when = f"{conv['half_peak_at_ms']} ms ({share:.0%} through)" if share is not None else "—"
+            print(
+                f"  {'':18} delivered {conv['first_half_share']:.0%} of its bytes in the first "
+                f"half and {conv['last_quarter_share']:.0%} in the last quarter; the estimate "
+                f"reached half its own peak at {when}"
+            )
+            if conv["last_quarter_share"] > 0.35:
+                print(
+                    f"  {'':18}   this transfer was still accelerating when it ended — its mean "
+                    "rate is a convergence time, not a capacity"
+                )
+
+        exited = startup_exit(rows)
+        rtt_us = measured_min_rtt_us(rows) or 0
+        if exited is None:
+            print(f"  {'':18} never left Startup — the whole transfer ran in the exponential phase")
+        else:
+            head = probe_headroom(exited["at_ms"], conv["duration_ms"] if conv else None, rtt_us)
+            grew = max(r.get("bottleneck_bw_bps", 0) for r in rows) / max(1, exited["bw_bps"])
+            line = (
+                f"  {'':18} left Startup at {exited['at_ms']} ms with the estimate at "
+                f"{exited['bw_bps'] * 8 / 1e6:.2f} Mbit/s; it grew {grew:.1f}× after that"
+            )
+            print(line)
+            if head:
+                print(
+                    f"  {'':18}   {head['rounds']:.0f} round trips remained = "
+                    f"{head['cycles']:.1f} gain cycles, worth at least {head['factor']:.1f}× "
+                    "at 1.25× per four rounds"
+                )
+
+        implied = implied_rtt_us(rows)
+        if implied and rtt_us:
+            print(
+                f"  {'':18} round trip implied by inflight/delivered {implied / 1000:.0f} ms "
+                f"against a windowed min_rtt of {rtt_us / 1000:.0f} ms "
+                f"— {(implied - rtt_us) / 1000:+.0f} ms of standing queue"
+            )
+
+        est, raw = delivery_ratios(rows)
+        if est:
+            raw_txt = f"{pct(raw, 0.5):.2f}×" if raw else "absent in this artifact"
+            print(
+                f"  {'':18} estimate vs delivered: {filtered_max_label(rows)} median "
+                f"{pct(est, 0.5):.2f}×, single-ack sample median {raw_txt}"
+            )
+
+        if ceilings:
+            print(
+                f"  {'':18} at {frame:.0f} B frames the two byte ceilings are "
+                f"{ceilings['arq']} B (send buffer) and {ceilings['peer_window']} B (peer window)"
+            )
+            if not ceilings["separable"]:
+                print(
+                    f"  {'':18}   \033[33mthey are {ceilings['separation']:.3f}× apart — no field in "
+                    "this record separates them. Re-run at a smaller --transfer-frame: the "
+                    "buffer's ceiling moves with it and the peer's does not\033[0m"
+                )
+    if not any_series:
+        print("  (no sending-side window series in this run)")
 
 
 def liveness_ceiling_s(detail):
@@ -685,17 +1149,7 @@ def analyze_server(server_dir):
             #
             # Only intervals of real delivery count. A window where nothing was
             # delivered has no rate to be a multiple of.
-            est_ratio, raw_ratio = [], []
-            for a, b in zip(rows, rows[1:]):
-                span_s = (b["t_unix_ns"] - a["t_unix_ns"]) / 1e9
-                grew = b["delivered_bytes"] - a["delivered_bytes"]
-                if span_s <= 0 or grew <= 0:
-                    continue
-                actual = grew / span_s
-                est_ratio.append(b["bottleneck_bw_bps"] / actual)
-                raw = b.get("last_delivery_rate_bps", 0)
-                if raw:
-                    raw_ratio.append(raw / actual)
+            est_ratio, raw_ratio = delivery_ratios(rows)
             if est_ratio:
                 print(
                     f"  {'':26} vs delivered (mean over each interval), "
@@ -775,6 +1229,13 @@ def self_test():
     backwards compatibility as much as arithmetic: every run recorded before
     they existed must still load, so "the fields are missing" has to reach the
     reader as silence rather than as four zeros or a traceback.
+
+    The send-bound derivations are the fourth, and they carry two obligations of
+    their own. A series that is not a sending side must be refused rather than
+    classified — a client-side download reads as a total stall and did for as
+    long as this tool has existed. And the census must never place one sample in
+    two buckets, because a census whose parts exceed its whole is read as
+    evidence for whichever part the reader was already expecting.
     """
     label_cases = [
         ([{"bw_filter_window_ms": 10000}] * 3, "filtered max over 10s horizon"),
@@ -829,7 +1290,128 @@ def self_test():
         (counters(2, 2, 0, 7), ["never retained at all"]),
     ]
 
+    def win(**kw):
+        row = {
+            "leg": "udp",
+            "phase": "upload",
+            "t_unix_ns": 0,
+            "elapsed_ms": 0,
+            "cwnd_bytes": 0,
+            "inflight_bytes": 0,
+            "bottleneck_bw_bps": 0,
+            "pacing_rate_bps": 0,
+            "min_rtt_us": 200_000,
+            "delivered_bytes": 0,
+            "state": "probe_bw",
+            "app_limited": False,
+        }
+        row.update(kw)
+        return row
+
+    # A receiver's series and the reference leg's are the two shapes that must
+    # not be classified; a sender's must be, including one that stalled at the
+    # window floor — that is precisely the case the floor warning exists for,
+    # and excluding it would silence the warning instead of the false one.
+    #
+    # The receiver row is taken from the artifact rather than invented: every
+    # client-side download series in every run carries a 40-byte request
+    # acknowledged once against a window that never leaves 5600.
+    side_cases = [
+        ([win(delivered_bytes=40, inflight_bytes=40, cwnd_bytes=5600)] * 3, "receiver"),
+        ([win(delivered_bytes=4096, cwnd_bytes=100_000, inflight_bytes=90_000)], "sender"),
+        # quinn's window clears the floor while its in-flight figure stays zero,
+        # so the sender test says yes for the wrong reason and the ranking has
+        # to catch it first.
+        ([win(delivered_bytes=0, state="quic:cubic", cwnd_bytes=12000)], "reference"),
+        ([win(delivered_bytes=8192, cwnd_bytes=5600, inflight_bytes=5600)], "sender"),
+    ]
+    # The buffer's ceiling is a segment count, so it moves with the frame size;
+    # the peer's window is a byte count and does not. That difference is the
+    # only thing that ever tells them apart.
+    ceiling_split_cases = [
+        (1028, 1_052_672, False),
+        (512, 524_288, True),
+        (256, 262_144, True),
+        # Above one app chunk a frame becomes several segments, so the byte
+        # ceiling stops tracking the frame size linearly.
+        (2312, 1_183_744, True),
+        (None, None, None),
+        (0, None, None),
+    ]
+    # Ranked verdicts, one per sample, and they must partition the samples.
+    census_rows = [
+        # One chunk of window left is no window at all.
+        win(cwnd_bytes=100_000, inflight_bytes=99_500),
+        # Against the ceiling with the window wide open.
+        win(cwnd_bytes=2_000_000, inflight_bytes=1_020_000),
+        # Metered by the pacer: 1 MB/s over a 200 ms round trip is 200 000 B.
+        win(cwnd_bytes=2_000_000, inflight_bytes=200_000, pacing_rate_bps=1_000_000),
+        # None of the three.
+        win(cwnd_bytes=2_000_000, inflight_bytes=10_000, pacing_rate_bps=1_000_000),
+        # The flag is counted, never classified.
+        win(cwnd_bytes=2_000_000, inflight_bytes=1_030_000, app_limited=True),
+    ]
+    # Startup's exit is the floor the rest of the transfer climbs from; a series
+    # that ends still in Startup has no exit, which is not a missing reading.
+    startup_cases = [
+        ([win(state="startup", elapsed_ms=0, bottleneck_bw_bps=10)], None),
+        (
+            [
+                win(state="startup", elapsed_ms=0, bottleneck_bw_bps=10),
+                win(state="startup", elapsed_ms=200, bottleneck_bw_bps=99),
+                win(state="probe_bw", elapsed_ms=400, bottleneck_bw_bps=120),
+            ],
+            {"at_ms": 200, "bw_bps": 99},
+        ),
+    ]
+
     failures = 0
+    for rows, want_role in side_cases:
+        got = series_role(rows)
+        ok = got == want_role
+        failures += 0 if ok else 1
+        print(
+            f"  {'ok' if ok else 'FAIL'}: series_role(state={rows[0]['state']}, "
+            f"cwnd={rows[0]['cwnd_bytes']}, inflight={rows[0]['inflight_bytes']}) "
+            f"-> {got!r} (want {want_role!r})"
+        )
+    for frame, want_arq, want_sep in ceiling_split_cases:
+        c = ceilings_separable(frame)
+        got = (c["arq"], c["separable"]) if c else (None, None)
+        ok = got == (want_arq, want_sep)
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: ceilings_separable({frame!r}) -> {got} (want {(want_arq, want_sep)})")
+    tally, app_flag = bound_census(census_rows, 1_052_672)
+    want_tally = {"cwnd": 1, "ceiling": 2, "paced": 1, "window_headroom": 1}
+    ok = tally == want_tally and app_flag == 1 and sum(tally.values()) == len(census_rows)
+    failures += 0 if ok else 1
+    print(f"  {'ok' if ok else 'FAIL'}: bound_census -> {tally}, app {app_flag} (want {want_tally}, app 1)")
+    for rows, want in startup_cases:
+        got = startup_exit(rows)
+        ok = got == want
+        failures += 0 if ok else 1
+        print(f"  {'ok' if ok else 'FAIL'}: startup_exit(n={len(rows)}) -> {got} (want {want})")
+    # 40 round trips left at 200 ms is 10 gain cycles, 1.25^10 ≈ 9.31×.
+    head = probe_headroom(2000, 10000, 200_000)
+    ok = head is not None and abs(head["cycles"] - 10.0) < 1e-9 and abs(head["factor"] - 1.25**10) < 1e-9
+    failures += 0 if ok else 1
+    print(f"  {'ok' if ok else 'FAIL'}: probe_headroom(2000,10000,200000) -> {head} (want 10 cycles)")
+    ok = probe_headroom(9000, 8000, 200_000) is None and probe_headroom(0, 10, 0) is None
+    failures += 0 if ok else 1
+    print(f"  {'ok' if ok else 'FAIL'}: probe_headroom refuses a transfer that ended inside Startup")
+    # The opening guess is 100 ms and it is not a measurement; a minimum that
+    # takes it reports half the real round trip and halves every round count
+    # derived from it.
+    rtt_rows = [
+        win(min_rtt_us=100_000, bottleneck_bw_bps=0),
+        win(min_rtt_us=196_000, bottleneck_bw_bps=25_000),
+        win(min_rtt_us=191_000, bottleneck_bw_bps=40_000),
+    ]
+    ok = measured_min_rtt_us(rtt_rows) == 191_000 and measured_min_rtt_us(rtt_rows[:1]) is None
+    failures += 0 if ok else 1
+    print(f"  {'ok' if ok else 'FAIL'}: measured_min_rtt_us skips rows recorded before the first ack")
+    extra = len(side_cases) + len(ceiling_split_cases) + len(startup_cases) + 4
+
     for rows, want in label_cases:
         got = filtered_max_label(rows)
         status = "ok" if got == want else "FAIL"
@@ -860,7 +1442,7 @@ def self_test():
         if not ok:
             failures += 1
         print(f"  {status}: repair_reading({c!r}) -> {got!r} (want {wanted!r})")
-    total = len(label_cases) + len(ceiling_cases) + len(repair_cases) + len(reading_cases)
+    total = extra + len(label_cases) + len(ceiling_cases) + len(repair_cases) + len(reading_cases)
     print(f"{total - failures}/{total} ok")
     return 1 if failures else 0
 
