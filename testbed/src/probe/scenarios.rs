@@ -37,7 +37,7 @@ use crate::report::{
     unix_nanos, BuildId, ClientMetrics, ConcurrencySample, ErrorRecord, HandshakeRepairSample,
     HandshakeSample, Leg, MessageIntegritySample, MigrationSample, NegativeSample, RekeySample,
     RttSample, SampleSink, ScenarioSummary, ServerStats, SoakSample, StreamSample,
-    ThroughputSample, WireCheckSample, ZeroRttSample,
+    ThroughputSample, TransferReceiptSample, WireCheckSample, ZeroRttSample,
 };
 use crate::stats::{Summary, Throughput};
 use crate::wirecheck::{
@@ -54,6 +54,12 @@ pub struct ScenarioOutput {
     /// samples as `<scenario>.window.jsonl`. Kept in its own file because it is
     /// a different record shape sampled on a different clock.
     pub window: SampleSink,
+    /// What the receiving side counted for the whole transfer, written as
+    /// `<scenario>.receipt.jsonl`. One record per transfer rather than a series,
+    /// and it can only be filled once the transfer has been closed and its far
+    /// end has reported — so it cannot ride in the per-window rows, which are
+    /// already on disk by then.
+    pub receipt: SampleSink,
     pub summary: ScenarioSummary,
     pub errors: Vec<ErrorRecord>,
     /// Only `clock_sync` fills this.
@@ -72,6 +78,7 @@ impl ScenarioOutput {
             file: format!("{scenario}.jsonl"),
             sink: SampleSink::new(),
             window: SampleSink::new(),
+            receipt: SampleSink::new(),
             summary: ScenarioSummary {
                 leg,
                 scenario: scenario.to_string(),
@@ -1281,7 +1288,14 @@ pub async fn upload(
         .map(|s| s.metrics_snapshot())
         .map(|m| (m.bytes_sent, m.packets_sent))
         .unwrap_or((0, 0));
-    match sink_end_and_report(framed.as_ref(), seq, win.cumulative).await {
+    let report = sink_end_and_report(framed.as_ref(), seq, win.cumulative).await;
+    // The honest upload figure, in fields, on both branches and before either
+    // is read. It is stated below in prose as well, but prose is not a
+    // denominator: the leg comparison divides a rate by a control, and until
+    // this record existed the only machine-readable rate for this direction was
+    // the sending side's own count of how full its own buffer got.
+    out.receipt.push(&upload_receipt(leg, &local, &report));
+    match report {
         Ok((frames, bytes, first_ns, last_ns)) => {
             let server_span = last_ns.saturating_sub(first_ns);
             let server_tp = Throughput::new(bytes, frames, server_span);
@@ -1356,6 +1370,36 @@ impl SinkEndFailure {
             Self::SendBlocked => "sink_end send blocked",
             Self::NoReport => "sink_end sent, no report",
         }
+    }
+}
+
+/// What the closing report said, as the record an analysis reads.
+///
+/// Separated from the scenario so that both outcomes are reachable without a
+/// network. The branch that matters is the failing one: a transfer whose report
+/// never came back still has to leave a receipt, or "this run predates the
+/// record" and "this transfer could not be counted" arrive at the reader as the
+/// same silence and get described in the words of whichever was guessed.
+fn upload_receipt(
+    leg: Leg,
+    client: &Throughput,
+    report: &Result<(u64, u64, u64, u64), (SinkEndFailure, CoreError)>,
+) -> TransferReceiptSample {
+    match report {
+        Ok((frames, bytes, first_ns, last_ns)) => TransferReceiptSample::counted(
+            leg,
+            "upload",
+            client,
+            *frames,
+            *bytes,
+            last_ns.saturating_sub(*first_ns),
+        ),
+        Err((why, e)) => TransferReceiptSample::uncounted(
+            leg,
+            "upload",
+            client,
+            &format!("{}: {e:?}", why.context()),
+        ),
     }
 }
 
@@ -4697,6 +4741,85 @@ mod tests {
         out.mark(&link, "download:end").await;
 
         assert!(out.errors[0].elapsed_ns.is_some());
+    }
+
+    /// The upload's numerator is the server's count, and it has to reach the
+    /// artifact as fields. It was stated only in a note, so the leg comparison
+    /// published the sending side's own book for a direction whose honest figure
+    /// is the receiving side's, and said so in a footnote.
+    #[test]
+    fn a_closed_upload_records_what_the_server_counted_and_over_what_span() {
+        let client = Throughput::new(3_100_000, 3100, 12_000_000_000);
+        let r = upload_receipt(
+            Leg::Udp,
+            &client,
+            &Ok((3059, 3_059_210, 1_000_000_000, 13_476_000_000)),
+        );
+
+        assert_eq!(r.direction, "upload");
+        assert_eq!(r.server_frames, Some(3059));
+        assert_eq!(r.server_bytes, Some(3_059_210));
+        assert_eq!(
+            r.server_observed_ns,
+            Some(12_476_000_000),
+            "the span is first arrival to last, not the client's window"
+        );
+        assert_ne!(
+            r.server_observed_ns,
+            Some(r.client_window_ns),
+            "the two ends do not observe the same interval, and the record must not imply they do"
+        );
+    }
+
+    /// The failing branch is the one that decides whether an analysis can tell
+    /// an artifact that predates this record from a transfer that tried to count
+    /// and could not. Both are silence in the file unless the second writes.
+    #[test]
+    fn an_upload_whose_report_never_came_back_still_leaves_a_receipt() {
+        let client = Throughput::new(3_100_000, 3100, 12_000_000_000);
+        let r = upload_receipt(
+            Leg::Tcp,
+            &client,
+            &Err((SinkEndFailure::NoReport, CoreError::Timeout)),
+        );
+
+        assert_eq!(r.server_bytes, None, "nothing was counted");
+        assert_eq!(r.client_bytes, 3_100_000, "the sender's book survives");
+        let why = r.error.clone().unwrap_or_default();
+        assert!(
+            why.contains("no report") && why.contains("Timeout"),
+            "the receipt must name which half failed and how: {why}"
+        );
+
+        let blocked = upload_receipt(
+            Leg::Tcp,
+            &client,
+            &Err((SinkEndFailure::SendBlocked, CoreError::Timeout)),
+        );
+        assert_ne!(
+            blocked.error, r.error,
+            "the two closing failures have different causes and must not read alike"
+        );
+    }
+
+    /// The receipt is a different record shape from the per-second series and
+    /// arrives after the last of them is already on disk, so it gets its own
+    /// sink rather than a row in theirs.
+    #[test]
+    fn a_scenario_starts_with_no_receipt_and_keeps_it_out_of_the_sample_series() {
+        let mut out = ScenarioOutput::new(Leg::Udp, "upload");
+        assert!(out.receipt.is_empty());
+
+        let client = Throughput::new(1, 1, 1);
+        out.receipt
+            .push(&upload_receipt(Leg::Udp, &client, &Ok((1, 2, 0, 3))));
+
+        assert_eq!(out.receipt.len(), 1);
+        assert!(
+            out.sink.is_empty(),
+            "a receipt in the throughput series would be summed as a window"
+        );
+        assert!(out.window.is_empty());
     }
 
     /// A mark is best-effort, but its loss is not free: `download:begin` and

@@ -634,6 +634,16 @@ Client, under `results/<run-id>/`:
   total or app-limited flag, so those stay zero rather than being approximated,
   and `state` reads `quic:cubic`. quinn's loss and MTU counters, which have no
   field in the record, appear in each transfer's summary notes instead
+- `samples/<leg>/upload.receipt.jsonl` — one record per upload: what the client
+  handed the session and what the **server** counted arriving, over the server's
+  own observation span. That second count is the honest upload figure — `send()`
+  buffers, so the client's own per-window counts say how full its buffer got and
+  not what crossed the path — and it is here as fields rather than only in the
+  scenario's notes, because prose is not something an analysis can divide by.
+  The three server fields are absent together on a transfer whose closing report
+  never came back, with `error` saying which half failed; the file is absent
+  entirely on any run recorded before it existed. A download writes none: there
+  the arriving side is the client, whose own windows are already the answer
 - `samples/<leg>/send_ceiling.jsonl` — one record per frame size of the
   byte-ceiling sweep: both candidate bounds, the library constants they were
   computed from, and the bytes outstanding over the transfer's last quarter. Its
@@ -754,7 +764,19 @@ A run produces a rate for each leg under test, for the reference, and for four
 different controls, and until this section existed the comparison between them
 was arithmetic done in a reader's head across four scenarios in a log. That
 arithmetic has been done against the wrong denominator, which is why the section
-fixes four things rather than laying the numbers out and stopping.
+fixes five things rather than laying the numbers out and stopping.
+
+**The numerator is the arriving side's count, and that is a different end of the
+path in each direction.** On a download the client receives, so its own sampling
+windows are the figure. On an upload the server receives, and the client's
+windows measure how full its own buffer got — `send()` returns before anything
+has crossed the path, so a sending side's count is an offered rate. The server's
+count travels in `samples/<leg>/upload.receipt.jsonl` with the observation span
+it was taken over, and the table divides that. Where a run carries none — every
+archive older than the receipt, and any transfer whose closing report never came
+back — the client's figure is printed with the substitution named on the row.
+It is never made silently and the row is never dropped: an upload missing from
+the comparison reads as an upload that did not happen.
 
 **One table per direction, and the denominator is the one-way ladder for that
 direction.** A round trip bounds the two directions together and neither on its

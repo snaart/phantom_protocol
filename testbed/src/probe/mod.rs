@@ -347,6 +347,17 @@ impl ProbeConfig {
     }
 }
 
+/// Where a scenario's sidecar series lands, given the path of its own samples.
+///
+/// One derivation for every sidecar rather than one per call site. A transfer
+/// leaves three files that an analysis joins by name alone — `upload.jsonl`,
+/// `upload.window.jsonl`, `upload.receipt.jsonl` — and a second spelling of the
+/// rule is a second place for the name to drift out of step with the reader
+/// that opens it, which fails as a file that is simply never found.
+fn sidecar_path(samples: &Path, kind: &str) -> PathBuf {
+    samples.with_extension(format!("{kind}.jsonl"))
+}
+
 /// Accumulates the run's outputs, flushing each scenario as it completes.
 struct RunState {
     dir: PathBuf,
@@ -365,7 +376,10 @@ impl RunState {
             out.sink.write_to(&path)?;
         }
         if !out.window.is_empty() {
-            out.window.write_to(&path.with_extension("window.jsonl"))?;
+            out.window.write_to(&sidecar_path(&path, "window"))?;
+        }
+        if !out.receipt.is_empty() {
+            out.receipt.write_to(&sidecar_path(&path, "receipt"))?;
         }
         for e in &out.errors {
             self.error_sink.push(e);
@@ -1145,6 +1159,30 @@ mod tests {
     // integrity probe walks keep bracketing the real split point if the path-MTU
     // budget ever moves.
     use phantom_protocol::transport::mtu::MAX_APP_CHUNK;
+
+    /// A sidecar an analysis cannot find is a sidecar that was never written.
+    /// The three files a transfer leaves are joined by name and by nothing else,
+    /// so the naming rule is pinned here rather than restated per call site.
+    #[test]
+    fn a_scenarios_sidecars_sit_beside_its_samples_under_predictable_names() {
+        let samples = PathBuf::from("results/run/samples/udp/upload.jsonl");
+
+        assert_eq!(
+            sidecar_path(&samples, "window"),
+            PathBuf::from("results/run/samples/udp/upload.window.jsonl")
+        );
+        assert_eq!(
+            sidecar_path(&samples, "receipt"),
+            PathBuf::from("results/run/samples/udp/upload.receipt.jsonl")
+        );
+        // Same directory as the samples, and one file per kind: a sidecar that
+        // landed elsewhere, or that two kinds shared, would be read as the other.
+        assert_eq!(sidecar_path(&samples, "receipt").parent(), samples.parent());
+        assert_ne!(
+            sidecar_path(&samples, "receipt"),
+            sidecar_path(&samples, "window")
+        );
+    }
 
     #[test]
     fn every_profile_is_internally_consistent() {
